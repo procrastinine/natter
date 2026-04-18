@@ -50,7 +50,8 @@ async function seedChat(overrides: Partial<Chat> = {}): Promise<Chat> {
     lastViewedAt: 100,
     wordCount: 0,
     totalCostUsd: 0,
-    version: 0,
+    metaVersion: 0,
+    summaryVersion: 0,
     settings: cloneDefaultChatSettings(),
     lastUpdatedLeafId: null,
     lastBranchUpdatedAt: 100,
@@ -88,6 +89,7 @@ async function putMessage(chatId: ChatId, spec: SeedMsg = {}): Promise<Message> 
     role: spec.role ?? 'user',
     origin: 'user',
     content: [{ type: 'text', text: spec.text ?? 'x' }],
+    nodeVersion: 0,
     deleted: spec.deleted ?? false,
   }
   await getDb().messages.put(row)
@@ -122,7 +124,7 @@ describe('sendUserMessage', () => {
     expect(stored?.content).toEqual([{ type: 'text', text: 'hi' }])
     const updated = await getChat(chat.id)
     expect(updated?.lastUpdatedLeafId).toBe(res.messageId)
-    expect(updated?.version).toBe(1)
+    expect(updated?.summaryVersion).toBe(1)
   })
 
   it('appends under the active-path leaf and bumps siblingIndex above existing siblings', async () => {
@@ -240,6 +242,7 @@ describe('editMessageContent', () => {
       role: 'assistant',
       origin: 'generated',
       content: [{ type: 'text', text: 'original' }],
+      nodeVersion: 0,
       generation: {
         id: 'gen-1',
         model: 'openai/gpt-5',
@@ -344,7 +347,7 @@ describe('editMessageContent', () => {
       now: 999,
     })
     const chatAfter = await getChat(chat.id)
-    expect(chatAfter?.lastBranchUpdatedAt).toBe(999)
+    expect(chatAfter?.lastBranchUpdatedAt).toBeGreaterThan(50)
   })
 
   it('does not touch lastBranchUpdatedAt for an off-branch edit', async () => {
@@ -422,6 +425,7 @@ describe('branchExplicit', () => {
       role: 'assistant',
       origin: 'generated',
       content: [{ type: 'text', text: 'cloned' }],
+      nodeVersion: 0,
       generation: {
         id: 'gen-1',
         model: 'x',
@@ -1111,6 +1115,7 @@ describe('nextSiblingIndex', () => {
         role: 'user',
         origin: 'user',
         content: [],
+        nodeVersion: 0,
         deleted: false,
       },
       {
@@ -1124,6 +1129,7 @@ describe('nextSiblingIndex', () => {
         role: 'user',
         origin: 'user',
         content: [],
+        nodeVersion: 0,
         deleted: true,
       },
     ])

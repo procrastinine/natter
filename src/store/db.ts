@@ -12,6 +12,7 @@ import type {
   ChatFolder,
   ChatPreset,
   ChatTag,
+  ChildListState,
   ConnectionProfile,
   DraftRow,
   KeyRecord,
@@ -62,6 +63,7 @@ export interface SettingsRow {
 export class NatterDb extends Dexie {
   chats!: Table<Chat, string>
   messages!: Table<Message, string>
+  childLists!: Table<ChildListState, string>
   attachments!: Table<Attachment, string>
   profiles!: Table<ConnectionProfile, string>
   presets!: Table<ChatPreset, string>
@@ -108,6 +110,74 @@ export function registerSchema(db: Dexie): void {
     presetResolutions: '&[profileId+presetSlug], fetchedAt',
     drafts: '&chatId, updatedAt',
   })
+
+  interface LegacyChatV1 extends Omit<Chat, 'metaVersion' | 'summaryVersion'> {
+    version?: number
+  }
+
+  interface LegacyMessageV1 extends Omit<Message, 'nodeVersion'> {
+    nodeVersion?: number
+  }
+
+  db.version(2)
+    .stores({
+      chats:
+        'id, updatedAt, createdAt, lastViewedAt, lastUpdatedLeafId, lastBranchUpdatedAt, wordCount, totalCostUsd, archived, pinned, presetId, folderId, *tags',
+      messages:
+        'id, chatId, parentId, turnId, [chatId+parentId], [chatId+createdAt], [chatId+turnId], [chatId+deleted]',
+      childLists: 'id, [chatId+parentId], updatedAt',
+      attachments: 'id, contentHash, refCount, createdAt',
+      profiles: 'id, name, kind, lastUsedAt, archived',
+      presets: 'id, name, connectionProfileId, lastUsedAt, archived',
+      folders: 'id, name, sortIndex, lastUsedAt',
+      tags: 'id, &nameLower, lastUsedAt',
+      chatBranchCache: '&chatId, branchLeafId, generatedAt',
+      keys: 'id, name',
+      settings: '&key',
+      models: '&[profileId+queryKey], fetchedAt',
+      endpoints: '&[profileId+modelId], fetchedAt',
+      privacyPolicies: '&[profileId+modelId], fetchedAt',
+      providers: '&profileId, fetchedAt',
+      generations: 'id, chatId, gen_id',
+      presetResolutions: '&[profileId+presetSlug], fetchedAt',
+      drafts: '&chatId, updatedAt',
+    })
+    .upgrade(async (tx) => {
+      const chats = tx.table<LegacyChatV1>('chats')
+      await chats.toCollection().modify((row) => {
+        const version = row.version ?? 0
+        delete row.version
+        ;(row as Chat).metaVersion = version
+        ;(row as Chat).summaryVersion = version
+      })
+
+      const messages = tx.table<LegacyMessageV1>('messages')
+      await messages.toCollection().modify((row) => {
+        if (row.nodeVersion === undefined) {
+          ;(row as Message).nodeVersion = 0
+        }
+      })
+
+      const childLists = tx.table<ChildListState>('childLists')
+      const messageRows = await messages.toArray()
+      const seen = new Set<string>()
+      for (const row of messageRows) {
+        const id = childListKey(row.chatId, row.parentId)
+        if (seen.has(id)) continue
+        seen.add(id)
+        await childLists.put({
+          id,
+          chatId: row.chatId,
+          parentId: row.parentId,
+          version: 0,
+          updatedAt: 0,
+        })
+      }
+    })
+}
+
+export function childListKey(chatId: string, parentId: string | null): string {
+  return `${chatId}:${parentId ?? '__root__'}`
 }
 
 let singleton: NatterDb | null = null

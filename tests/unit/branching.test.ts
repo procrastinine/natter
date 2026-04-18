@@ -19,6 +19,7 @@ function fixtureAssistant(): Message {
     role: 'assistant',
     origin: 'generated',
     content: [{ type: 'text', text: 'hello' }],
+    nodeVersion: 0,
     generation: {
       id: 'gen_abc',
       model: 'anthropic/claude-opus-4.7',

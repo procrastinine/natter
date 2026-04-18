@@ -20,6 +20,7 @@ function buildAssistantMessage(overrides: Partial<Message> = {}): Message {
     role: 'assistant',
     origin: 'generated',
     content: [{ type: 'text', text: 'hi' }],
+    nodeVersion: 0,
     deleted: false,
     ...overrides,
   }

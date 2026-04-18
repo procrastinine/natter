@@ -1,15 +1,15 @@
 // Chat-level persistence helpers. See `plan/02-data-model.md §2.1` and
 // `plan/03-storage.md §3.1`.
 //
-// These helpers own *chat-row* CRUD (create / read / list / soft-delete) and
-// the thin read-side API the UI and the message-tree ops use. Anything that
-// mutates more than the chat row goes through `withChatLock` from
-// `src/store/locks.ts`.
+// These helpers own chat-row CRUD and the read-side APIs that sit above the
+// repository boundary. Visible chat-row writes go through `WorkspaceRepository`
+// so browser mode already matches the future daemon contract.
 
 import type { Chat, ChatId, ChatSettings, Message, MessageId, PresetId } from '../core/types'
 import { cloneDefaultChatSettings } from '../core/defaults'
 import { newId } from '../lib/ulid'
 import { postEvent } from './broadcast'
+import { getBrowserRepository } from './browser-repo'
 import { getDb, openDb } from './db'
 
 export interface CreateChatInput {
@@ -35,7 +35,8 @@ export async function createChat(input: CreateChatInput = {}): Promise<Chat> {
     lastViewedAt: now,
     wordCount: 0,
     totalCostUsd: 0,
-    version: 0,
+    metaVersion: 0,
+    summaryVersion: 0,
     settings: input.settings ?? cloneDefaultChatSettings(),
     lastUpdatedLeafId: null,
     lastBranchUpdatedAt: now,
@@ -46,7 +47,13 @@ export async function createChat(input: CreateChatInput = {}): Promise<Chat> {
   }
   if (input.presetId !== undefined) chat.presetId = input.presetId
   await db.chats.put(chat)
-  postEvent({ kind: 'chat-mutated', chatId: chat.id, version: 0 })
+  postEvent({
+    kind: 'chat-mutated',
+    chatId: chat.id,
+    metaVersion: 0,
+    summaryVersion: 0,
+    affected: [{ kind: 'chat-meta', chatId: chat.id }],
+  })
   return chat
 }
 
@@ -75,45 +82,37 @@ export async function getMessage(
 // Hard chat delete — cascading message + attachment-refcount cleanup — is a
 // Phase 5+ concern gated behind the storage settings pane.
 export async function archiveChat(chatId: ChatId, now = Date.now()): Promise<void> {
-  const db = getDb()
-  const chat = await db.chats.get(chatId)
-  if (!chat) return
-  await db.chats.put({
-    ...chat,
-    archived: true,
-    updatedAt: now,
-    version: chat.version + 1,
+  const repo = getBrowserRepository()
+  await repo.runMutation([{ kind: 'chat-meta', chatId }], async (ctx) => {
+    const chat = await ctx.getChat(chatId)
+    if (!chat || chat.archived) return
+    ctx.patchChatMeta(chatId, { archived: true, updatedAt: now })
   })
-  postEvent({ kind: 'chat-mutated', chatId, version: chat.version + 1 })
 }
 
 export async function unarchiveChat(
   chatId: ChatId,
   now = Date.now(),
 ): Promise<void> {
-  const db = getDb()
-  const chat = await db.chats.get(chatId)
-  if (!chat) return
-  await db.chats.put({
-    ...chat,
-    archived: false,
-    updatedAt: now,
-    version: chat.version + 1,
+  const repo = getBrowserRepository()
+  await repo.runMutation([{ kind: 'chat-meta', chatId }], async (ctx) => {
+    const chat = await ctx.getChat(chatId)
+    if (!chat?.archived) return
+    ctx.patchChatMeta(chatId, { archived: false, updatedAt: now })
   })
-  postEvent({ kind: 'chat-mutated', chatId, version: chat.version + 1 })
 }
 
-// Record a chat-open event per §2.1.2 rule 1. Bumps `lastViewedAt` only —
-// does NOT touch `lastUpdatedLeafId`, branch cache, or `version`. Written
-// OUTSIDE `withChatLock` because it's allowed to race harmlessly: the later
-// tab's write wins, which is fine since `lastViewedAt` is monotonic.
+// Record a chat-open event per §2.1.2 rule 1. Bumps `lastViewedAt` only and is
+// explicitly non-visible: it does not advance summary/meta versions or emit a
+// chat-mutated event.
 export async function touchLastViewed(
   chatId: ChatId,
   now = Date.now(),
 ): Promise<void> {
-  const db = getDb()
-  const chat = await db.chats.get(chatId)
-  if (!chat) return
-  if (chat.lastViewedAt >= now) return
-  await db.chats.put({ ...chat, lastViewedAt: now })
+  const repo = getBrowserRepository()
+  await repo.runMutation([{ kind: 'chat-meta', chatId }], async (ctx) => {
+    const chat = await ctx.getChat(chatId)
+    if (!chat || chat.lastViewedAt >= now) return
+    ctx.patchChatMeta(chatId, { lastViewedAt: now }, { touchVisibleState: false, broadcast: false })
+  })
 }

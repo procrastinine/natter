@@ -1,11 +1,8 @@
 // Per-tab ephemeral state for active streams. See `plan/03-storage.md §3.10` and
 // `plan/06-streaming.md §6.2`.
 //
-// Owns the `chatId → ActiveStream` map so `withChatLock`-adjacent code can
-// ask "is this chat currently streaming in this tab?" without racing against
-// IDB writes. The map never crosses tabs — each tab runs its own stream, and
-// cross-tab awareness goes through BroadcastChannel (`stream-started` /
-// `stream-ended`) to the appropriate UI slices.
+// Streams are keyed by `streamId`, not `chatId`, so one chat can host multiple
+// concurrent same-tab streams as long as they target different output rows.
 
 import { create } from 'zustand'
 import type { ChatId, MessageId } from '../../core/types'
@@ -20,40 +17,48 @@ export interface ActiveStream {
 }
 
 export interface StreamStoreState {
-  activeByChatId: Record<ChatId, ActiveStream>
-  isActive: (chatId: ChatId) => boolean
-  getActive: (chatId: ChatId) => ActiveStream | undefined
+  activeByStreamId: Record<string, ActiveStream>
+  isActive: (streamId: string) => boolean
+  isTargetActive: (chatId: ChatId, messageId?: MessageId) => boolean
+  getActive: (streamId: string) => ActiveStream | undefined
+  listByChat: (chatId: ChatId) => ActiveStream[]
   setActive: (stream: ActiveStream) => void
-  updateTextLen: (chatId: ChatId, textLen: number) => void
-  clearActive: (chatId: ChatId) => void
+  updateTextLen: (streamId: string, textLen: number) => void
+  clearActive: (streamId: string) => void
   reset: () => void
 }
 
 export const useStreamStore = create<StreamStoreState>((set, get) => ({
-  activeByChatId: {},
-  isActive: (chatId) => get().activeByChatId[chatId] !== undefined,
-  getActive: (chatId) => get().activeByChatId[chatId],
+  activeByStreamId: {},
+  isActive: (streamId) => get().activeByStreamId[streamId] !== undefined,
+  isTargetActive: (chatId, messageId) =>
+    Object.values(get().activeByStreamId).some(
+      (stream) => stream.chatId === chatId && stream.messageId === messageId,
+    ),
+  getActive: (streamId) => get().activeByStreamId[streamId],
+  listByChat: (chatId) =>
+    Object.values(get().activeByStreamId).filter((stream) => stream.chatId === chatId),
   setActive: (stream) =>
     set((state) => ({
-      activeByChatId: { ...state.activeByChatId, [stream.chatId]: stream },
+      activeByStreamId: { ...state.activeByStreamId, [stream.streamId]: stream },
     })),
-  updateTextLen: (chatId, textLen) =>
+  updateTextLen: (streamId, textLen) =>
     set((state) => {
-      const existing = state.activeByChatId[chatId]
+      const existing = state.activeByStreamId[streamId]
       if (!existing) return state
       return {
-        activeByChatId: {
-          ...state.activeByChatId,
-          [chatId]: { ...existing, textLen },
+        activeByStreamId: {
+          ...state.activeByStreamId,
+          [streamId]: { ...existing, textLen },
         },
       }
     }),
-  clearActive: (chatId) =>
+  clearActive: (streamId) =>
     set((state) => {
-      if (!(chatId in state.activeByChatId)) return state
-      const next = { ...state.activeByChatId }
-      delete next[chatId]
-      return { activeByChatId: next }
+      if (!(streamId in state.activeByStreamId)) return state
+      const next = { ...state.activeByStreamId }
+      delete next[streamId]
+      return { activeByStreamId: next }
     }),
-  reset: () => set({ activeByChatId: {} }),
+  reset: () => set({ activeByStreamId: {} }),
 }))

@@ -1,0 +1,4 @@
+{
+  "telemetry.telemetryLevel": "off",
+  "typescript.disableAutomaticTypeAcquisition": true
+}

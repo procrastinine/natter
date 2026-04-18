@@ -8,10 +8,10 @@
 // The ref count is authoritative for "are we still using this?", but GC rescans
 // both tables before a delete so a bug elsewhere can't silently lose data.
 
-import type { Transaction } from 'dexie'
 import type { Attachment, AttachmentId, AttachmentKind, ChatId } from '../core/types'
 import { newId } from '../lib/ulid'
 import { getDb } from './db'
+import type { MutationContext } from './repository'
 
 export const DEFAULT_ORPHAN_GC_AGE_MS = 24 * 60 * 60 * 1000
 
@@ -71,29 +71,27 @@ export async function putAttachment(row: Attachment): Promise<void> {
 }
 
 export async function incRefs(
-  tx: Transaction,
+  ctx: MutationContext,
   ids: readonly AttachmentId[],
 ): Promise<void> {
   if (ids.length === 0) return
-  const table = tx.table<Attachment, AttachmentId>('attachments')
   for (const id of ids) {
-    const row = await table.get(id)
+    const row = await ctx.getAttachment(id)
     if (!row) continue
-    await table.put({ ...row, refCount: row.refCount + 1 })
+    await ctx.putAttachment({ ...row, refCount: row.refCount + 1 })
   }
 }
 
 export async function decRefs(
-  tx: Transaction,
+  ctx: MutationContext,
   ids: readonly AttachmentId[],
 ): Promise<void> {
   if (ids.length === 0) return
-  const table = tx.table<Attachment, AttachmentId>('attachments')
   for (const id of ids) {
-    const row = await table.get(id)
+    const row = await ctx.getAttachment(id)
     if (!row) continue
     const next = row.refCount - 1
-    await table.put({ ...row, refCount: next < 0 ? 0 : next })
+    await ctx.putAttachment({ ...row, refCount: next < 0 ? 0 : next })
   }
 }
 

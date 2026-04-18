@@ -53,6 +53,7 @@ export function cloneForExplicitBranch(source: Message, input: BranchExplicitInp
     role: source.role,
     origin: 'imported',
     content: structuredClone(source.content),
+    nodeVersion: 0,
     deleted: false,
   }
   if (source.attachmentRefs !== undefined) {

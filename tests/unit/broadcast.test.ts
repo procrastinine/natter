@@ -12,14 +12,28 @@ afterEach(() => {
 
 // Wait for BroadcastChannel's microtask fan-out to complete. Vitest + jsdom
 // queue deliveries on the task queue, so `setTimeout(_, 0)` drains them.
-const tick = (): Promise<void> => new Promise((r) => setTimeout(r, 0))
+const tick = (ms = 25): Promise<void> => new Promise((r) => setTimeout(r, ms))
 
 describe('broadcast', () => {
   it('fans out a posted event to local subscribers exactly once', () => {
     const received: BroadcastEvent[] = []
     const unsub = onEvent((ev) => received.push(ev))
-    postEvent({ kind: 'chat-mutated', chatId: 'C1', version: 1 })
-    expect(received).toEqual([{ kind: 'chat-mutated', chatId: 'C1', version: 1 }])
+    postEvent({
+      kind: 'chat-mutated',
+      chatId: 'C1',
+      metaVersion: 1,
+      summaryVersion: 2,
+      affected: [{ kind: 'message', chatId: 'C1', messageId: 'M1' }],
+    })
+    expect(received).toEqual([
+      {
+        kind: 'chat-mutated',
+        chatId: 'C1',
+        metaVersion: 1,
+        summaryVersion: 2,
+        affected: [{ kind: 'message', chatId: 'C1', messageId: 'M1' }],
+      },
+    ])
     unsub()
   })
 
@@ -43,11 +57,29 @@ describe('broadcast', () => {
   it('stops delivering after unsubscribe', () => {
     const received: BroadcastEvent[] = []
     const unsub = onEvent((ev) => received.push(ev))
-    postEvent({ kind: 'chat-mutated', chatId: 'C1', version: 1 })
+    postEvent({
+      kind: 'chat-mutated',
+      chatId: 'C1',
+      metaVersion: 1,
+      summaryVersion: 1,
+      affected: [{ kind: 'chat-meta', chatId: 'C1' }],
+    })
     unsub()
-    postEvent({ kind: 'chat-mutated', chatId: 'C1', version: 2 })
+    postEvent({
+      kind: 'chat-mutated',
+      chatId: 'C1',
+      metaVersion: 2,
+      summaryVersion: 2,
+      affected: [{ kind: 'chat-meta', chatId: 'C1' }],
+    })
     expect(received).toHaveLength(1)
-    expect(received[0]).toEqual({ kind: 'chat-mutated', chatId: 'C1', version: 1 })
+    expect(received[0]).toEqual({
+      kind: 'chat-mutated',
+      chatId: 'C1',
+      metaVersion: 1,
+      summaryVersion: 1,
+      affected: [{ kind: 'chat-meta', chatId: 'C1' }],
+    })
   })
 
   it('crosses a BroadcastChannel to other tabs exactly once and does not echo to the sender', async () => {
@@ -88,10 +120,22 @@ describe('broadcast', () => {
         postEvent({ kind: 'settings-mutated', key: 'derived' })
       }
     })
-    postEvent({ kind: 'chat-mutated', chatId: 'C1', version: 1 })
+    postEvent({
+      kind: 'chat-mutated',
+      chatId: 'C1',
+      metaVersion: 1,
+      summaryVersion: 1,
+      affected: [{ kind: 'children', chatId: 'C1', parentId: null }],
+    })
     // Exactly two events: the original plus the downstream one. No repeat.
     expect(seen).toEqual([
-      { kind: 'chat-mutated', chatId: 'C1', version: 1 },
+      {
+        kind: 'chat-mutated',
+        chatId: 'C1',
+        metaVersion: 1,
+        summaryVersion: 1,
+        affected: [{ kind: 'children', chatId: 'C1', parentId: null }],
+      },
       { kind: 'settings-mutated', key: 'derived' },
     ])
     unsub()

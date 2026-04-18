@@ -354,7 +354,8 @@ export interface Chat {
   lastViewedAt: number
   wordCount: number
   totalCostUsd: number
-  version: number
+  metaVersion: number
+  summaryVersion: number
   settings: ChatSettings
   presetId?: PresetId
   lastUpdatedLeafId: MessageId | null
@@ -401,6 +402,14 @@ export interface ChatBranchCache {
     createdAt: number
     editedAt: number
   }>
+}
+
+export interface ChildListState {
+  id: string
+  chatId: ChatId
+  parentId: MessageId | null
+  version: number
+  updatedAt: number
 }
 
 // ---------------------------------------------------------------------------
@@ -535,6 +544,7 @@ export interface Message {
   responsesEchoItem?: ResponsesOutputItem
   attachmentRefs?: AttachmentId[]
   approval?: MessageApproval
+  nodeVersion: number
   pinCache?: boolean
   hiddenFromContext?: boolean
   deleted: boolean
@@ -652,6 +662,18 @@ export interface KeyRecord {
 // Root key is `'__root__'` so `Record` lookup can represent "which child of the
 // virtual root is the active top-level message."
 export type CursorMap = Record<string, MessageId>
+
+export type MutationScope =
+  | { kind: 'chat-meta'; chatId: ChatId }
+  | { kind: 'message'; messageId: MessageId }
+  | { kind: 'children'; chatId: ChatId; parentId: MessageId | null }
+  | { kind: 'draft'; chatId: ChatId }
+  | { kind: 'attachment'; attachmentId: AttachmentId }
+
+export interface ChatVersions {
+  metaVersion: number
+  summaryVersion: number
+}
 
 // ---------------------------------------------------------------------------
 // /models + /endpoints cache shapes

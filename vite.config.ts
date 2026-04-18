@@ -4,6 +4,9 @@ import react from '@vitejs/plugin-react'
 import { defineConfig } from 'vite'
 
 export default defineConfig({
+  // Relative asset URLs keep the exported bundle portable across static hosts
+  // and subpaths instead of assuming deployment at `/`.
+  base: './',
   plugins: [react(), tailwindcss()],
   server: {
     port: 5173,

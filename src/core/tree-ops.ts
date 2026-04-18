@@ -1,14 +1,13 @@
 // Low-level tree mutators used by `src/core/messages.ts`. See
 // `plan/08-branching.md §8.4.2–§8.4.10` and §8.10 for invariants.
 //
-// Every helper here assumes the caller already holds `withChatLock` and passes
-// in the Dexie Transaction. The helpers do not start transactions of their
-// own, do not broadcast, and do not write cursor state — they return the data
-// the caller needs to apply those side effects.
+// These helpers run inside a repository mutation. They do not start
+// transactions of their own, do not broadcast, and do not write cursor state —
+// they return the data the caller needs to apply those side effects.
 
-import type { Transaction } from 'dexie'
 import type { ChatId, Message, MessageId } from './types'
 import { groupByParent } from './active-path'
+import type { MutationContext } from '../store/repository'
 
 export class TreeChangedError extends Error {
   readonly chatId: ChatId
@@ -22,10 +21,10 @@ export class TreeChangedError extends Error {
 }
 
 export async function loadChatMessages(
-  tx: Transaction,
+  ctx: MutationContext,
   chatId: ChatId,
 ): Promise<Message[]> {
-  return tx.table<Message, MessageId>('messages').where('chatId').equals(chatId).toArray()
+  return ctx.listMessages(chatId)
 }
 
 // `max(siblingIndex) + 1` across live AND tombstoned children — the uniqueness
@@ -67,21 +66,11 @@ export function assertNoCycle(
 // after splice-up and insert-between reparenting. Caller must have already
 // persisted any new/changed children under this parent before calling.
 export async function renumberSiblingsByCreatedAt(
-  tx: Transaction,
+  ctx: MutationContext,
   chatId: ChatId,
   parentId: MessageId | null,
 ): Promise<void> {
-  const table = tx.table<Message, MessageId>('messages')
-  // Dexie compound-index lookup can be flaky for null secondary keys across
-  // IDB implementations; fall back to a full chat scan filtered in memory
-  // when the parent is null. The chat's message set is small enough that
-  // the extra filter cost is negligible.
-  const rows =
-    parentId === null
-      ? (await table.where('chatId').equals(chatId).toArray()).filter(
-          (m) => m.parentId === null,
-        )
-      : await table.where('[chatId+parentId]').equals([chatId, parentId]).toArray()
+  const rows = await ctx.listChildren(chatId, parentId)
   rows.sort((a, b) => {
     if (a.createdAt !== b.createdAt) return a.createdAt - b.createdAt
     return a.id < b.id ? -1 : a.id > b.id ? 1 : 0
@@ -89,7 +78,7 @@ export async function renumberSiblingsByCreatedAt(
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i] as Message
     if (row.siblingIndex !== i) {
-      await table.put({ ...row, siblingIndex: i })
+      await ctx.putMessage({ ...row, siblingIndex: i })
     }
   }
 }
@@ -110,20 +99,19 @@ export interface SoftDeleteResult {
 // the plan for the correctness argument around walking through chains of
 // deleted ancestors instead of naively splicing one level up.
 export async function softDeleteWithSplice(
-  tx: Transaction,
+  ctx: MutationContext,
   chatId: ChatId,
   nodeIdsToDelete: readonly MessageId[],
 ): Promise<SoftDeleteResult> {
   if (nodeIdsToDelete.length === 0) {
     return { tombstoned: [], reparented: [] }
   }
-  const table = tx.table<Message, MessageId>('messages')
   const deletedSet = new Set<MessageId>(nodeIdsToDelete)
   const cache = new Map<MessageId, Message>()
 
   const deletedNodes: Message[] = []
   for (const id of nodeIdsToDelete) {
-    const row = await table.get(id)
+    const row = await ctx.getMessage(id)
     if (!row) continue
     if (row.chatId !== chatId) {
       throw new TreeChangedError(chatId, `node ${id} belongs to another chat`)
@@ -140,7 +128,7 @@ export async function softDeleteWithSplice(
     while (p && deletedSet.has(p)) {
       let parent = cache.get(p)
       if (!parent) {
-        const fetched = await table.get(p)
+        const fetched = await ctx.getMessage(p)
         if (fetched) {
           parent = fetched
           cache.set(p, fetched)
@@ -155,7 +143,7 @@ export async function softDeleteWithSplice(
   const affectedParents = new Set<MessageId | null>()
 
   for (const node of deletedNodes) {
-    const kids = await table.where('[chatId+parentId]').equals([chatId, node.id]).toArray()
+    const kids = await ctx.listChildren(chatId, node.id)
     const newParentId = await firstLiveAncestor(node)
     for (const kid of kids) {
       if (deletedSet.has(kid.id)) continue
@@ -164,17 +152,17 @@ export async function softDeleteWithSplice(
         previousParentId: node.id,
         newParentId,
       })
-      await table.put({ ...kid, parentId: newParentId })
+      await ctx.putMessage({ ...kid, parentId: newParentId })
       affectedParents.add(newParentId)
     }
   }
 
   for (const node of deletedNodes) {
-    await table.put({ ...node, deleted: true })
+    await ctx.putMessage({ ...node, deleted: true })
   }
 
   for (const parent of affectedParents) {
-    await renumberSiblingsByCreatedAt(tx, chatId, parent)
+    await renumberSiblingsByCreatedAt(ctx, chatId, parent)
   }
 
   return {
@@ -186,13 +174,12 @@ export async function softDeleteWithSplice(
 // Cascade variant: tombstone every descendant of the requested nodes; do NOT
 // splice. The "Also delete descendants" checkbox (§8.4.10) uses this.
 export async function cascadeSoftDelete(
-  tx: Transaction,
+  ctx: MutationContext,
   chatId: ChatId,
   nodeIdsToDelete: readonly MessageId[],
 ): Promise<MessageId[]> {
   if (nodeIdsToDelete.length === 0) return []
-  const table = tx.table<Message, MessageId>('messages')
-  const all = await loadChatMessages(tx, chatId)
+  const all = await loadChatMessages(ctx, chatId)
   const byParent = groupByParent(all)
   const toTombstone = new Set<MessageId>(nodeIdsToDelete)
   const stack: MessageId[] = [...nodeIdsToDelete]
@@ -207,10 +194,10 @@ export async function cascadeSoftDelete(
     }
   }
   for (const id of toTombstone) {
-    const row = await table.get(id)
+    const row = await ctx.getMessage(id)
     if (!row) continue
     if (!row.deleted) {
-      await table.put({ ...row, deleted: true })
+      await ctx.putMessage({ ...row, deleted: true })
     }
   }
   return [...toTombstone]

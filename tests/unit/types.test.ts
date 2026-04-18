@@ -2,10 +2,13 @@ import { describe, expectTypeOf, it } from 'vitest'
 import type {
   Attachment,
   ChatSettings,
+  ChatVersions,
+  ChildListState,
   ConnectionProfile,
   DataPolicy,
   Message,
   MessageApproval,
+  MutationScope,
   ProviderPreferences,
   ResponseFormat,
   ToolDefinition,
@@ -73,6 +76,25 @@ describe('Phase 0 type additions', () => {
 
   it('Attachment.contentHash is required', () => {
     expectTypeOf<Attachment['contentHash']>().toEqualTypeOf<string>()
+  })
+
+  it('chat/message storage version fields are explicit', () => {
+    expectTypeOf<Message['nodeVersion']>().toEqualTypeOf<number>()
+    expectTypeOf<ChatVersions['metaVersion']>().toEqualTypeOf<number>()
+    expectTypeOf<ChatVersions['summaryVersion']>().toEqualTypeOf<number>()
+    expectTypeOf<ChildListState['version']>().toEqualTypeOf<number>()
+  })
+
+  it('MutationScope covers chat-meta, message, children, draft, and attachment scopes', () => {
+    expectTypeOf<Extract<MutationScope, { kind: 'chat-meta' }>['chatId']>().toEqualTypeOf<string>()
+    expectTypeOf<Extract<MutationScope, { kind: 'message' }>['messageId']>().toEqualTypeOf<string>()
+    expectTypeOf<Extract<MutationScope, { kind: 'children' }>['parentId']>().toEqualTypeOf<
+      string | null
+    >()
+    expectTypeOf<Extract<MutationScope, { kind: 'draft' }>['chatId']>().toEqualTypeOf<string>()
+    expectTypeOf<Extract<MutationScope, { kind: 'attachment' }>['attachmentId']>().toEqualTypeOf<
+      string
+    >()
   })
 
   it('Message.approval uses the MessageApproval union', () => {

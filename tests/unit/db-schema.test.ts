@@ -34,6 +34,7 @@ describe('Dexie schema', () => {
         'attachments',
         'chatBranchCache',
         'chats',
+        'childLists',
         'drafts',
         'endpoints',
         'folders',
@@ -70,6 +71,7 @@ describe('Dexie schema', () => {
     await second.open()
     const row = await second.settings.get('hello')
     expect(row?.value).toBe('world')
+    expect(second.tables.map((t) => t.name)).toContain('childLists')
     await second.delete()
   })
 })
@@ -95,7 +97,7 @@ function registerV1(db: Dexie): void {
 
 function registerV1Through3(db: Dexie): void {
   registerSchema(db)
-  db.version(2)
+  db.version(3)
     .stores({ profiles: 'id, name, kind, lastUsedAt, archived' })
     .upgrade(async (tx) => {
       await tx
@@ -105,7 +107,7 @@ function registerV1Through3(db: Dexie): void {
           if (row.appTitle === undefined) row.appTitle = 'Natter'
         })
     })
-  db.version(3)
+  db.version(4)
     .stores({ settings: '&key' })
     .upgrade(async (tx) => {
       const settings = tx.table<MinimalSetting>('settings')
@@ -126,7 +128,7 @@ describe('Dexie migrations', () => {
     const db = new Dexie(name)
     registerV1Through3(db)
     await db.open()
-    expect(db.verno).toBe(3)
+    expect(db.verno).toBe(4)
     expect(db.tables.map((t) => t.name).includes('settings')).toBe(true)
     const tag = await db.table<MinimalSetting>('settings').get('schemaTag')
     expect(tag).toBeUndefined()
@@ -164,7 +166,7 @@ describe('Dexie migrations', () => {
     const up = new Dexie(name)
     registerV1Through3(up)
     await up.open()
-    expect(up.verno).toBe(3)
+    expect(up.verno).toBe(4)
     const profile = await up.table<MinimalProfile>('profiles').get('P1')
     expect(profile?.appTitle).toBe('CustomTitle') // preserved — v2 only fills undefined
     const tag = await up.table<MinimalSetting>('settings').get('schemaTag')
@@ -174,7 +176,7 @@ describe('Dexie migrations', () => {
     const reopen = new Dexie(name)
     registerV1Through3(reopen)
     await reopen.open()
-    expect(reopen.verno).toBe(3)
+    expect(reopen.verno).toBe(4)
     const tag2 = await reopen.table<MinimalSetting>('settings').get('schemaTag')
     expect(tag2?.value).toBe('preexisting')
     await reopen.delete()

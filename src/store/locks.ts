@@ -1,203 +1,143 @@
-// Chat locks. See `plan/03-storage.md §3.5–§3.7`.
-//
-// Two cross-tab locks, both keyed by chat id:
-//   - `chat:{id}`          — mutations to that chat
-//   - `chat:{id}:generate` — the single in-flight generation owner for the chat
-//
-// Legal acquisition order is `:generate` → `{id}`. Acquiring `:generate` while
-// already holding plain `{id}` violates the ordering rule and can deadlock when
-// two tabs fight for the pair.
-//
-// `withChatLock` is the chokepoint for every mutating write. It:
-//   - enforces the ordering rule in-process
-//   - holds `navigator.locks.request('chat:{id}', exclusive)` cross-tab
-//   - opens a Dexie rw transaction covering the hot tables
-//   - loads the chat row, hands the caller a structured clone + a patch fn
-//   - bumps `chat.version` and `chat.updatedAt` exactly once on commit
-//   - broadcasts `chat-mutated` AFTER the commit settles (never before)
-//
-// Callers return arbitrary values from the callback; the wrapper returns both
-// the value and the new version.
+import type { MutationScope } from '../core/types'
 
-import type { Chat, ChatId } from '../core/types'
-import type { Transaction } from 'dexie'
-import { getDb } from './db'
-import { postEvent } from './broadcast'
+const SCOPE_KIND_ORDER = {
+  'chat-meta': 0,
+  message: 1,
+  children: 2,
+  draft: 3,
+  attachment: 4,
+} as const
 
-export type ChatLockKind = 'chat' | 'generate'
+const TEST_HELD_SCOPES: string[] = []
+const FALLBACK_QUEUES = new Map<string, Promise<void>>()
 
-export interface ChatLockName {
-  chatId: string
-  kind: ChatLockKind
-}
+export class ScopeOrderError extends Error {
+  readonly requested: string
+  readonly held: string[]
 
-export class LockOrderError extends Error {
-  readonly chatId: string
-  constructor(chatId: string, message: string) {
-    super(message)
-    this.name = 'LockOrderError'
-    this.chatId = chatId
+  constructor(requested: string, held: string[]) {
+    super(`ScopeOrder:${requested}:${held.join(',')}`)
+    this.name = 'ScopeOrderError'
+    this.requested = requested
+    this.held = [...held]
   }
 }
 
-export class ChatMissingError extends Error {
-  readonly chatId: string
-  constructor(chatId: string) {
-    super(`ChatMissing:${chatId}`)
-    this.name = 'ChatMissingError'
-    this.chatId = chatId
+function compareScopeKeys(a: string, b: string): number {
+  const [aKind] = a.split(':', 1)
+  const [bKind] = b.split(':', 1)
+  const aRank = SCOPE_KIND_ORDER[aKind as keyof typeof SCOPE_KIND_ORDER]
+  const bRank = SCOPE_KIND_ORDER[bKind as keyof typeof SCOPE_KIND_ORDER]
+  if (aRank !== bRank) return aRank - bRank
+  return a.localeCompare(b)
+}
+
+export function scopeResourceName(scope: MutationScope): string {
+  switch (scope.kind) {
+    case 'chat-meta':
+      return `chat-meta:${scope.chatId}`
+    case 'message':
+      return `message:${scope.messageId}`
+    case 'children':
+      return `children:${scope.chatId}:${scope.parentId ?? '__root__'}`
+    case 'draft':
+      return `draft:${scope.chatId}`
+    case 'attachment':
+      return `attachment:${scope.attachmentId}`
   }
 }
 
-export interface ChatMutationContext {
-  tx: Transaction
-  chat: Chat
-  patchChat: (patch: Partial<Chat>) => void
-}
-
-export interface ChatMutationResult<T> {
-  value: T
-  version: number
-}
-
-const heldByChat = new Map<string, ChatLockKind[]>()
-
-export function lockResourceName({ chatId, kind }: ChatLockName): string {
-  return kind === 'generate' ? `chat:${chatId}:generate` : `chat:${chatId}`
-}
-
-export function assertAcquireOrder(name: ChatLockName): void {
-  const stack = heldByChat.get(name.chatId) ?? []
-  if (name.kind === 'generate' && stack.includes('chat')) {
-    throw new LockOrderError(
-      name.chatId,
-      `Illegal lock escalation: cannot acquire chat:${name.chatId}:generate while chat:${name.chatId} is held`,
-    )
+export function normalizeMutationScopes(scopes: readonly MutationScope[]): MutationScope[] {
+  const keyed = new Map<string, MutationScope>()
+  for (const scope of scopes) {
+    keyed.set(scopeResourceName(scope), scope)
   }
-  if (stack.includes(name.kind)) {
-    throw new LockOrderError(
-      name.chatId,
-      `Re-entrant acquisition of ${lockResourceName(name)} is not allowed`,
-    )
+  return [...keyed.entries()]
+    .sort(([a], [b]) => compareScopeKeys(a, b))
+    .map(([, scope]) => scope)
+}
+
+export function assertAcquireOrder(resourceName: string): void {
+  const lastHeld = TEST_HELD_SCOPES.at(-1)
+  if (lastHeld && compareScopeKeys(lastHeld, resourceName) >= 0) {
+    throw new ScopeOrderError(resourceName, TEST_HELD_SCOPES)
   }
 }
 
-// Tracked lock runner. Enforces the ordering rule on a per-async-flow stack.
-// Does NOT cross tabs — `withChatLock` layers `navigator.locks.request` on top.
-export async function withTrackedLock<T>(
-  name: ChatLockName,
+export async function withTrackedScopes<T>(
+  scopes: readonly MutationScope[],
   fn: () => Promise<T> | T,
 ): Promise<T> {
-  assertAcquireOrder(name)
-  const stack = heldByChat.get(name.chatId) ?? []
-  stack.push(name.kind)
-  heldByChat.set(name.chatId, stack)
+  const normalized = normalizeMutationScopes(scopes)
+  const acquired: string[] = []
+  for (const scope of normalized) {
+    const resourceName = scopeResourceName(scope)
+    assertAcquireOrder(resourceName)
+    TEST_HELD_SCOPES.push(resourceName)
+    acquired.push(resourceName)
+  }
   try {
     return await fn()
   } finally {
-    const current = heldByChat.get(name.chatId)
-    if (current) {
-      const idx = current.lastIndexOf(name.kind)
-      if (idx >= 0) current.splice(idx, 1)
-      if (current.length === 0) heldByChat.delete(name.chatId)
+    for (let i = acquired.length - 1; i >= 0; i -= 1) {
+      const resourceName = acquired[i] as string
+      const top = TEST_HELD_SCOPES.at(-1)
+      if (top === resourceName) {
+        TEST_HELD_SCOPES.pop()
+      } else {
+        const idx = TEST_HELD_SCOPES.lastIndexOf(resourceName)
+        if (idx >= 0) TEST_HELD_SCOPES.splice(idx, 1)
+      }
     }
   }
 }
 
-// Web-Locks binding. In the browser we delegate to `navigator.locks.request`
-// for cross-tab serialization; in environments without it (jsdom, Node tests)
-// we fall back to an in-memory promise queue keyed by the resource name. Both
-// paths provide same-origin exclusive semantics; only the browser path spans
-// tabs.
-const inMemoryQueues = new Map<string, Promise<unknown>>()
-
-type NavigatorLocks = {
-  request: <T>(
-    name: string,
-    options: { mode: 'exclusive' },
-    callback: () => Promise<T> | T,
-  ) => Promise<T>
-}
-
-function getNavigatorLocks(): NavigatorLocks | null {
-  if (typeof navigator === 'undefined') return null
-  const maybe = (navigator as unknown as { locks?: NavigatorLocks }).locks
-  return maybe && typeof maybe.request === 'function' ? maybe : null
-}
-
-export async function acquireWebLock<T>(
+async function withFallbackLock<T>(
   resourceName: string,
   fn: () => Promise<T> | T,
 ): Promise<T> {
-  const locks = getNavigatorLocks()
-  if (locks) {
-    return locks.request(resourceName, { mode: 'exclusive' }, fn)
-  }
-  const previous = inMemoryQueues.get(resourceName) ?? Promise.resolve()
-  // Run `fn` once the previous holder settles, regardless of whether it threw
-  // — mirrors `navigator.locks.request` semantics (a failing holder still
-  // releases the lock).
-  const settled = previous.then(fn, fn)
-  const tail = settled.then(
-    () => {},
-    () => {},
-  )
-  inMemoryQueues.set(resourceName, tail)
-  tail.then(() => {
-    if (inMemoryQueues.get(resourceName) === tail) {
-      inMemoryQueues.delete(resourceName)
-    }
+  const prior = FALLBACK_QUEUES.get(resourceName) ?? Promise.resolve()
+  let release!: () => void
+  const gate = new Promise<void>((resolve) => {
+    release = resolve
   })
-  return settled
+  const queued = prior.then(() => gate)
+  FALLBACK_QUEUES.set(resourceName, queued)
+  await prior
+  try {
+    return await fn()
+  } finally {
+    release()
+    if (FALLBACK_QUEUES.get(resourceName) === queued) {
+      FALLBACK_QUEUES.delete(resourceName)
+    }
+  }
 }
 
-// `withChatLock` serializes via the cross-tab web lock; it deliberately does
-// NOT interact with the in-process tracker. Concurrent calls from independent
-// async flows in the same tab would false-positive under the tracker's "single
-// stack per chat id" model. The tracker exists for explicit ordering assertions
-// by code that interleaves `chat` and `:generate` in a known flow (streaming,
-// Phase 6). Nested misuse of `withChatLock` inside `withChatGenerateLock`
-// relies on that call pattern's explicit tracker usage.
-export async function withChatLock<T>(
-  chatId: ChatId,
-  fn: (ctx: ChatMutationContext) => Promise<T> | T,
-): Promise<ChatMutationResult<T>> {
-  const resource = lockResourceName({ chatId, kind: 'chat' })
-  return acquireWebLock(resource, async () => {
-    const db = getDb()
-    let value!: T
-    let chatPatch: Partial<Chat> = {}
-    let newVersion = 0
-    await db.transaction(
-      'rw',
-      [db.chats, db.messages, db.attachments, db.drafts, db.chatBranchCache],
-      async (tx) => {
-        const existing = await db.chats.get(chatId)
-        if (!existing) throw new ChatMissingError(chatId)
-        const ctx: ChatMutationContext = {
-          tx,
-          chat: structuredClone(existing),
-          patchChat: (patch) => {
-            chatPatch = { ...chatPatch, ...patch }
-          },
-        }
-        value = await fn(ctx)
-        newVersion = existing.version + 1
-        const next: Chat = {
-          ...existing,
-          ...chatPatch,
-          version: newVersion,
-          updatedAt: Date.now(),
-        }
-        await db.chats.put(next)
-      },
-    )
-    postEvent({ kind: 'chat-mutated', chatId, version: newVersion })
-    return { value, version: newVersion }
-  })
+async function withSingleScopeLock<T>(
+  resourceName: string,
+  fn: () => Promise<T> | T,
+): Promise<T> {
+  if (typeof navigator !== 'undefined' && 'locks' in navigator && navigator.locks) {
+    return navigator.locks.request(resourceName, async () => fn())
+  }
+  return withFallbackLock(resourceName, fn)
+}
+
+export async function withMutationLocks<T>(
+  scopes: readonly MutationScope[],
+  fn: () => Promise<T> | T,
+): Promise<T> {
+  const normalized = normalizeMutationScopes(scopes)
+  const run = async (index: number): Promise<T> => {
+    if (index >= normalized.length) return fn()
+    const scope = normalized[index] as MutationScope
+    return withSingleScopeLock(scopeResourceName(scope), () => run(index + 1))
+  }
+  return run(0)
 }
 
 export function __resetLockTrackerForTests(): void {
-  heldByChat.clear()
-  inMemoryQueues.clear()
+  TEST_HELD_SCOPES.length = 0
+  FALLBACK_QUEUES.clear()
 }

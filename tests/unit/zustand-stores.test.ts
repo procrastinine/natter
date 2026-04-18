@@ -10,9 +10,9 @@ beforeEach(() => {
 })
 
 describe('streamStore', () => {
-  it('tracks active streams by chat id', () => {
-    const { setActive, isActive, getActive } = useStreamStore.getState()
-    expect(isActive('C1')).toBe(false)
+  it('tracks active streams by stream id', () => {
+    const { setActive, isActive, getActive, listByChat } = useStreamStore.getState()
+    expect(isActive('S1')).toBe(false)
     setActive({
       streamId: 'S1',
       chatId: 'C1',
@@ -20,38 +20,44 @@ describe('streamStore', () => {
       ownerClientId: 'tab-a',
       textLen: 0,
     })
-    expect(isActive('C1')).toBe(true)
-    expect(getActive('C1')?.streamId).toBe('S1')
+    expect(isActive('S1')).toBe(true)
+    expect(getActive('S1')?.streamId).toBe('S1')
+    expect(listByChat('C1').map((stream) => stream.streamId)).toEqual(['S1'])
   })
 
-  it('updateTextLen is a no-op when no stream is active for that chat', () => {
+  it('updateTextLen is a no-op when no stream is active for that id', () => {
     const { updateTextLen, getActive } = useStreamStore.getState()
     updateTextLen('ghost', 99)
     expect(getActive('ghost')).toBeUndefined()
   })
 
-  it('updateTextLen mutates only the matching stream', () => {
-    const { setActive, updateTextLen, getActive } = useStreamStore.getState()
+  it('supports multiple same-chat streams keyed independently', () => {
+    const { setActive, updateTextLen, getActive, isTargetActive } = useStreamStore.getState()
     setActive({
       streamId: 'S1',
       chatId: 'C1',
+      messageId: 'M1',
       startedAt: 1,
       ownerClientId: 'tab-a',
       textLen: 0,
     })
     setActive({
       streamId: 'S2',
-      chatId: 'C2',
+      chatId: 'C1',
+      messageId: 'M2',
       startedAt: 2,
       ownerClientId: 'tab-a',
       textLen: 0,
     })
-    updateTextLen('C1', 128)
-    expect(getActive('C1')?.textLen).toBe(128)
-    expect(getActive('C2')?.textLen).toBe(0)
+    updateTextLen('S1', 128)
+    expect(getActive('S1')?.textLen).toBe(128)
+    expect(getActive('S2')?.textLen).toBe(0)
+    expect(isTargetActive('C1', 'M1')).toBe(true)
+    expect(isTargetActive('C1', 'M2')).toBe(true)
+    expect(isTargetActive('C1', 'M3')).toBe(false)
   })
 
-  it('clearActive removes only the targeted chat', () => {
+  it('clearActive removes only the targeted stream', () => {
     const { setActive, clearActive, isActive } = useStreamStore.getState()
     setActive({
       streamId: 'S1',
@@ -67,9 +73,9 @@ describe('streamStore', () => {
       ownerClientId: 'tab-a',
       textLen: 0,
     })
-    clearActive('C1')
-    expect(isActive('C1')).toBe(false)
-    expect(isActive('C2')).toBe(true)
+    clearActive('S1')
+    expect(isActive('S1')).toBe(false)
+    expect(isActive('S2')).toBe(true)
   })
 })
 

@@ -3,13 +3,19 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import { newId } from '../../src/lib/ulid'
 import { __resetBroadcastForTests, type BroadcastEvent, onEvent } from '../../src/store/broadcast'
+import {
+  __resetBrowserRepositoryForTests,
+  ChatMissingError,
+  getBrowserRepository,
+  resolveMutationTableNames,
+} from '../../src/store/browser-repo'
 import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
-import { ChatMissingError, withChatLock } from '../../src/store/locks'
 import type { Chat, Message } from '../../src/core/types'
 
 const DB_NAME = 'natter'
 
 async function resetAll() {
+  __resetBrowserRepositoryForTests()
   __resetDbForTests()
   __resetBroadcastForTests()
   await Dexie.delete(DB_NAME)
@@ -34,7 +40,8 @@ async function seedChat(overrides: Partial<Chat> = {}): Promise<Chat> {
     lastViewedAt: 100,
     wordCount: 0,
     totalCostUsd: 0,
-    version: 0,
+    metaVersion: 0,
+    summaryVersion: 0,
     settings: cloneDefaultChatSettings(),
     lastUpdatedLeafId: null,
     lastBranchUpdatedAt: 100,
@@ -60,135 +67,315 @@ function makeMessage(chatId: string, overrides: Partial<Message> = {}): Message 
     role: 'user',
     origin: 'user',
     content: [{ type: 'text', text: 'hi' }],
+    nodeVersion: 0,
     deleted: false,
     ...overrides,
   }
 }
 
-describe('withChatLock', () => {
-  it('bumps chat.version exactly once per call and returns both the value and the new version', async () => {
-    const chat = await seedChat()
-    const result = await withChatLock(chat.id, async ({ chat: snapshot }) => {
-      expect(snapshot.version).toBe(0)
-      return 'done'
-    })
-    expect(result).toEqual({ value: 'done', version: 1 })
-    const stored = await getDb().chats.get(chat.id)
-    expect(stored?.version).toBe(1)
+describe('browser repository mutation executor', () => {
+  it('derives the minimal browser table set from the declared scopes', () => {
+    expect(resolveMutationTableNames([{ kind: 'chat-meta', chatId: 'C1' }])).toEqual([
+      'chats',
+      'settings',
+    ])
+    expect(resolveMutationTableNames([{ kind: 'draft', chatId: 'C1' }])).toEqual([
+      'chats',
+      'drafts',
+      'settings',
+    ])
+    expect(resolveMutationTableNames([{ kind: 'attachment', attachmentId: 'A1' }])).toEqual([
+      'attachments',
+      'settings',
+    ])
+    expect(
+      resolveMutationTableNames([
+        { kind: 'message', messageId: 'M1' },
+        { kind: 'children', chatId: 'C1', parentId: null },
+      ]),
+    ).toEqual(['chats', 'childLists', 'messages', 'settings'])
   })
 
-  it('applies chat patches staged via patchChat on commit', async () => {
-    const chat = await seedChat()
-    await withChatLock(chat.id, async ({ patchChat }) => {
-      patchChat({ title: 'Renamed' })
-      patchChat({ wordCount: 42 })
-    })
-    const stored = await getDb().chats.get(chat.id)
-    expect(stored?.title).toBe('Renamed')
-    expect(stored?.wordCount).toBe(42)
-    expect(stored?.version).toBe(1)
-  })
-
-  it('bumps updatedAt to a fresh wall-clock timestamp', async () => {
-    const chat = await seedChat({ updatedAt: 100 })
-    const before = Date.now()
-    await withChatLock(chat.id, async () => undefined)
-    const stored = await getDb().chats.get(chat.id)
-    expect(stored?.updatedAt).toBeGreaterThanOrEqual(before)
-  })
-
-  it('persists writes made to other tables inside the callback', async () => {
-    const chat = await seedChat()
-    const messageId = newId()
-    await withChatLock(chat.id, async () => {
-      await getDb().messages.put(makeMessage(chat.id, { id: messageId }))
-    })
-    const row = await getDb().messages.get(messageId)
-    expect(row?.id).toBe(messageId)
-  })
-
-  it('rolls back all writes if the callback throws', async () => {
-    const chat = await seedChat()
-    await expect(
-      withChatLock(chat.id, async () => {
-        await getDb().messages.put(makeMessage(chat.id, { id: 'will-not-persist' }))
-        throw new Error('boom')
-      }),
-    ).rejects.toThrow('boom')
-    const messageMiss = await getDb().messages.get('will-not-persist')
-    expect(messageMiss).toBeUndefined()
-    const chatStill = await getDb().chats.get(chat.id)
-    expect(chatStill?.version).toBe(0)
-  })
-
-  it('throws ChatMissingError when the chat does not exist', async () => {
+  it('throws ChatMissingError when a scoped mutation targets a missing chat', async () => {
+    const repo = getBrowserRepository()
     await openDb()
     await expect(
-      withChatLock('ghost', async () => undefined),
+      repo.runMutation([{ kind: 'chat-meta', chatId: 'ghost' }], async (ctx) => {
+        ctx.patchChatMeta('ghost', { title: 'nope' })
+      }),
     ).rejects.toBeInstanceOf(ChatMissingError)
   })
 
-  it('serializes concurrent callers and loses no writes', async () => {
-    const chat = await seedChat()
-    const db = getDb()
-    const ids = Array.from({ length: 8 }, () => newId())
-    await Promise.all(
-      ids.map((id) =>
-        withChatLock(chat.id, async () => {
-          const current = await db.chats.get(chat.id)
-          // If the lock weren't exclusive, two writers would see the same
-          // version here and clobber each other's message write on commit.
-          const stamped = makeMessage(chat.id, {
-            id,
-            content: [{ type: 'text', text: `v${current?.version ?? '??'}` }],
-          })
-          await db.messages.put(stamped)
-        }),
-      ),
-    )
-    const finalChat = await db.chats.get(chat.id)
-    expect(finalChat?.version).toBe(ids.length)
-    const stored = await db.messages.where('chatId').equals(chat.id).toArray()
-    expect(stored.map((m) => m.id).sort()).toEqual(ids.sort())
-    // Each callback saw the previous version; the distinct set should be 0..7.
-    const seenVersions = new Set(
-      stored.map((m) => (m.content[0] as { type: 'text'; text: string }).text),
-    )
-    expect(seenVersions).toEqual(new Set(['v0', 'v1', 'v2', 'v3', 'v4', 'v5', 'v6', 'v7']))
-  })
-
-  it('broadcasts chat-mutated exactly once after commit, with the new version', async () => {
+  it('visible chat-meta writes bump metaVersion and summaryVersion and broadcast once', async () => {
+    const repo = getBrowserRepository()
     const chat = await seedChat()
     const received: BroadcastEvent[] = []
-    const unsub = onEvent((ev) => {
-      if (ev.kind === 'chat-mutated' && ev.chatId === chat.id) received.push(ev)
+    const unsub = onEvent((event) => {
+      if (event.kind === 'chat-mutated' && event.chatId === chat.id) received.push(event)
     })
-    await withChatLock(chat.id, async () => undefined)
+
+    const result = await repo.runMutation([{ kind: 'chat-meta', chatId: chat.id }], async (ctx) => {
+      ctx.patchChatMeta(chat.id, { title: 'Renamed', titleStatus: 'manual' })
+      return 'done'
+    })
+
     unsub()
-    expect(received).toEqual([{ kind: 'chat-mutated', chatId: chat.id, version: 1 }])
+    const stored = await getDb().chats.get(chat.id)
+    expect(result.value).toBe('done')
+    expect(stored?.title).toBe('Renamed')
+    expect(stored?.metaVersion).toBe(1)
+    expect(stored?.summaryVersion).toBe(1)
+    expect(received).toEqual([
+      {
+        kind: 'chat-mutated',
+        chatId: chat.id,
+        metaVersion: 1,
+        summaryVersion: 1,
+        affected: [{ kind: 'chat-meta', chatId: chat.id }],
+      },
+    ])
   })
 
-  it('does not broadcast when the callback throws', async () => {
+  it('does not recompute message-derived summary fields for chat-meta-only writes', async () => {
+    const repo = getBrowserRepository()
+    const chat = await seedChat({
+      title: 'Original',
+      updatedAt: 150,
+      wordCount: 77,
+      totalCostUsd: 12.5,
+      lastUpdatedLeafId: 'MISSING_LEAF',
+      lastBranchUpdatedAt: 140,
+    })
+
+    await repo.runMutation([{ kind: 'chat-meta', chatId: chat.id }], async (ctx) => {
+      ctx.patchChatMeta(chat.id, { title: 'Renamed', titleStatus: 'manual' })
+    })
+
+    const stored = await getDb().chats.get(chat.id)
+    expect(stored?.title).toBe('Renamed')
+    expect(stored?.metaVersion).toBe(1)
+    expect(stored?.summaryVersion).toBe(1)
+    expect(stored?.updatedAt).toBeGreaterThanOrEqual(150)
+    expect(stored?.wordCount).toBe(77)
+    expect(stored?.totalCostUsd).toBe(12.5)
+    expect(stored?.lastUpdatedLeafId).toBe('MISSING_LEAF')
+    expect(stored?.lastBranchUpdatedAt).toBe(140)
+  })
+
+  it('non-visible chat-meta writes do not bump versions or broadcast', async () => {
+    const repo = getBrowserRepository()
     const chat = await seedChat()
     const received: BroadcastEvent[] = []
-    const unsub = onEvent((ev) => {
-      if (ev.kind === 'chat-mutated') received.push(ev)
+    const unsub = onEvent((event) => {
+      if (event.kind === 'chat-mutated') received.push(event)
     })
-    await expect(
-      withChatLock(chat.id, async () => {
-        throw new Error('abort')
-      }),
-    ).rejects.toThrow('abort')
+
+    await repo.runMutation([{ kind: 'chat-meta', chatId: chat.id }], async (ctx) => {
+      ctx.patchChatMeta(chat.id, { lastViewedAt: 200 }, { touchVisibleState: false, broadcast: false })
+    })
+
     unsub()
+    const stored = await getDb().chats.get(chat.id)
+    expect(stored?.lastViewedAt).toBe(200)
+    expect(stored?.metaVersion).toBe(0)
+    expect(stored?.summaryVersion).toBe(0)
     expect(received).toEqual([])
   })
 
-  it('structured-clones the chat snapshot so callback mutations do not leak into the committed row', async () => {
-    const chat = await seedChat({ title: 'Original' })
-    await withChatLock(chat.id, async ({ chat: snapshot }) => {
-      snapshot.title = 'MutatedInPlace'
+  it('treats a no-op visible chat-meta patch as a no-op', async () => {
+    const repo = getBrowserRepository()
+    const chat = await seedChat({ title: 'Same', titleStatus: 'manual' })
+    const beforeMeta = await repo.getWorkspaceMeta()
+    const received: BroadcastEvent[] = []
+    const unsub = onEvent((event) => {
+      if (event.kind === 'chat-mutated' && event.chatId === chat.id) received.push(event)
     })
+
+    await repo.runMutation([{ kind: 'chat-meta', chatId: chat.id }], async (ctx) => {
+      ctx.patchChatMeta(chat.id, { title: 'Same', titleStatus: 'manual' })
+    })
+
+    unsub()
     const stored = await getDb().chats.get(chat.id)
-    expect(stored?.title).toBe('Original')
+    const afterMeta = await repo.getWorkspaceMeta()
+    expect(stored?.metaVersion).toBe(0)
+    expect(stored?.summaryVersion).toBe(0)
+    expect(received).toEqual([])
+    expect(afterMeta.mutationCounter).toBe(beforeMeta.mutationCounter)
+  })
+
+  it('persists same-parent inserts without dropping either write', async () => {
+    const repo = getBrowserRepository()
+    const chat = await seedChat()
+    const first = makeMessage(chat.id, { id: 'M1' })
+    const second = makeMessage(chat.id, { id: 'M2', siblingIndex: 1 })
+
+    await Promise.all([
+      repo.runMutation(
+        [
+          { kind: 'message', messageId: first.id },
+          { kind: 'children', chatId: chat.id, parentId: null },
+        ],
+        async (ctx) => {
+          await ctx.putMessage(first)
+        },
+      ),
+      repo.runMutation(
+        [
+          { kind: 'message', messageId: second.id },
+          { kind: 'children', chatId: chat.id, parentId: null },
+        ],
+        async (ctx) => {
+          await ctx.putMessage(second)
+        },
+      ),
+    ])
+
+    const stored = await getDb().messages.where('chatId').equals(chat.id).toArray()
+    expect(stored.map((message) => message.id).sort()).toEqual(['M1', 'M2'])
+  })
+
+  it('persists disjoint message-scope edits in the same chat without either write being lost', async () => {
+    const repo = getBrowserRepository()
+    const chat = await seedChat()
+    const first = makeMessage(chat.id, { id: 'M1' })
+    const second = makeMessage(chat.id, { id: 'M2', siblingIndex: 1 })
+    await getDb().messages.bulkPut([first, second])
+
+    await Promise.all([
+      repo.runMutation([{ kind: 'message', messageId: first.id }], async (ctx) => {
+        const current = (await ctx.getMessage(first.id)) as Message
+        await ctx.putMessage({
+          ...current,
+          content: [{ type: 'text', text: 'edited-1' }],
+        })
+      }),
+      repo.runMutation([{ kind: 'message', messageId: second.id }], async (ctx) => {
+        const current = (await ctx.getMessage(second.id)) as Message
+        await ctx.putMessage({
+          ...current,
+          content: [{ type: 'text', text: 'edited-2' }],
+        })
+      }),
+    ])
+
+    const storedFirst = await getDb().messages.get(first.id)
+    const storedSecond = await getDb().messages.get(second.id)
+    expect((storedFirst?.content[0] as { type: 'text'; text: string }).text).toBe('edited-1')
+    expect((storedSecond?.content[0] as { type: 'text'; text: string }).text).toBe('edited-2')
+  })
+
+  it('persists writes in different chats independently', async () => {
+    const repo = getBrowserRepository()
+    const left = await seedChat({ id: 'C_LEFT' })
+    const right = await seedChat({ id: 'C_RIGHT' })
+    const leftMessage = makeMessage(left.id, { id: 'LM1' })
+    const rightMessage = makeMessage(right.id, { id: 'RM1' })
+
+    await Promise.all([
+      repo.runMutation(
+        [
+          { kind: 'message', messageId: leftMessage.id },
+          { kind: 'children', chatId: left.id, parentId: null },
+        ],
+        async (ctx) => {
+          await ctx.putMessage(leftMessage)
+        },
+      ),
+      repo.runMutation(
+        [
+          { kind: 'message', messageId: rightMessage.id },
+          { kind: 'children', chatId: right.id, parentId: null },
+        ],
+        async (ctx) => {
+          await ctx.putMessage(rightMessage)
+        },
+      ),
+    ])
+
+    expect(await getDb().messages.get(leftMessage.id)).toBeDefined()
+    expect(await getDb().messages.get(rightMessage.id)).toBeDefined()
+  })
+
+  it('serializes overlapping message scopes and increments nodeVersion on each committed rewrite', async () => {
+    const repo = getBrowserRepository()
+    const chat = await seedChat()
+    const row = makeMessage(chat.id, { id: 'M1' })
+    await getDb().messages.put(row)
+
+    await Promise.all([
+      repo.runMutation([{ kind: 'message', messageId: row.id }], async (ctx) => {
+        const current = (await ctx.getMessage(row.id)) as Message
+        await ctx.putMessage({
+          ...current,
+          content: [{ type: 'text', text: 'v1' }],
+        })
+      }),
+      repo.runMutation([{ kind: 'message', messageId: row.id }], async (ctx) => {
+        const current = (await ctx.getMessage(row.id)) as Message
+        await ctx.putMessage({
+          ...current,
+          content: [{ type: 'text', text: 'v2' }],
+        })
+      }),
+    ])
+
+    const stored = await getDb().messages.get(row.id)
+    expect(stored?.nodeVersion).toBe(2)
+    expect(['v1', 'v2']).toContain((stored?.content[0] as { type: 'text'; text: string }).text)
+  })
+
+  it('rolls back message writes when the callback throws', async () => {
+    const repo = getBrowserRepository()
+    const chat = await seedChat()
+
+    await expect(
+      repo.runMutation(
+        [
+          { kind: 'message', messageId: 'will-not-persist' },
+          { kind: 'children', chatId: chat.id, parentId: null },
+        ],
+        async (ctx) => {
+          await ctx.putMessage(makeMessage(chat.id, { id: 'will-not-persist' }))
+          throw new Error('boom')
+        },
+      ),
+    ).rejects.toThrow('boom')
+
+    expect(await getDb().messages.get('will-not-persist')).toBeUndefined()
+  })
+
+  it('rejects undeclared structural writes', async () => {
+    const repo = getBrowserRepository()
+    const chat = await seedChat()
+
+    await expect(
+      repo.runMutation([{ kind: 'message', messageId: 'M1' }], async (ctx) => {
+        await ctx.putMessage(makeMessage(chat.id, { id: 'M1' }))
+      }),
+    ).rejects.toThrow('UndeclaredScope:children:')
+  })
+
+  it('advances workspace mutation metadata for attachment-only writes', async () => {
+    const repo = getBrowserRepository()
+    const before = await repo.getWorkspaceMeta()
+
+    await repo.runMutation([{ kind: 'attachment', attachmentId: 'A1' }], async (ctx) => {
+      await ctx.putAttachment({
+        id: 'A1',
+        contentHash: 'hash',
+        kind: 'file',
+        mime: 'text/plain',
+        filename: 'a.txt',
+        sizeBytes: 1,
+        createdAt: 1,
+        blob: new Blob(['a']),
+        refCount: 0,
+      })
+    })
+
+    const after = await repo.getWorkspaceMeta()
+    expect(after.lastMutationAt).toBeGreaterThanOrEqual(before.lastMutationAt)
+    expect(after.mutationCounter).toBe(before.mutationCounter + 1)
   })
 })

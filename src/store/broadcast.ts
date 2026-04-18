@@ -8,6 +8,7 @@
 // direct dispatch (their own BC instance ignores their own posts).
 
 import type { ChatId, KeyId, ProfileId, PresetId, FolderId, TagId } from '../core/types'
+import type { ChatMutationSummary } from './repository'
 
 export type EngineKind = 'daemon' | 'in-tab'
 export type AutoTitleStatus = 'auto' | 'auto-failed' | 'manual'
@@ -15,7 +16,13 @@ export type StreamOutcome = 'done' | 'error' | 'abort'
 export type EngineDetachReason = 'daemon-offline' | 'tab-close' | 'shutdown'
 
 export type BroadcastEvent =
-  | { kind: 'chat-mutated'; chatId: ChatId; version: number }
+  | {
+      kind: 'chat-mutated'
+      chatId: ChatId
+      metaVersion: number
+      summaryVersion: number
+      affected: ChatMutationSummary[]
+    }
   | { kind: 'chat-deleted'; chatId: ChatId }
   | { kind: 'branch-cache-refreshed'; chatId: ChatId }
   | { kind: 'profile-mutated'; profileId: ProfileId }
