@@ -4,6 +4,7 @@ import {
   cloneDefaultPrivacyPrefs,
   DEFAULT_CHAT_SETTINGS,
   DEFAULT_PRIVACY_PREFS,
+  SEED_DEFAULT_MODEL_CANDIDATES,
   UNKNOWN_POLICY,
 } from '../../src/core/defaults'
 
@@ -105,5 +106,17 @@ describe('defaults', () => {
     const a = cloneDefaultPrivacyPrefs()
     a.paretoFilter = false
     expect(DEFAULT_PRIVACY_PREFS.paretoFilter).toBe(true)
+  })
+
+  it('SEED_DEFAULT_MODEL_CANDIDATES matches the first-run seed preference list', () => {
+    expect(SEED_DEFAULT_MODEL_CANDIDATES).toMatchInlineSnapshot(`
+      [
+        "anthropic/claude-opus-4.7",
+        "openai/gpt-5.4",
+        "google/gemini-3.1-pro",
+        "z-ai/glm-5.1",
+      ]
+    `)
+    expect(Object.isFrozen(SEED_DEFAULT_MODEL_CANDIDATES)).toBe(true)
   })
 })

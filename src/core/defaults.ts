@@ -6,6 +6,18 @@
 
 import type { ChatSettings, DataPolicy, PrivacyPrefs } from './types'
 
+// First-run seed: ordered candidate model list consumed by `resolveDefaultModel`
+// when creating the seed ChatPreset for a new ConnectionProfile. See
+// `plan/14-details.md §14.35.8`. The actual fetch + resolution lives in Phase 5;
+// this constant is the pure-data default that Phase 2 pins so no other
+// subsystem has to hardcode the list.
+export const SEED_DEFAULT_MODEL_CANDIDATES: readonly string[] = Object.freeze([
+  'anthropic/claude-opus-4.7',
+  'openai/gpt-5.4',
+  'google/gemini-3.1-pro',
+  'z-ai/glm-5.1',
+])
+
 export const DEFAULT_PRIVACY_PREFS: Readonly<PrivacyPrefs> = Object.freeze({
   denyDataCollection: true,
   zdrOnly: false,
