@@ -4,5 +4,20 @@
  * Owns: [data-ui='composer'|'composer-input'|'attachment-chip'|'attachment-menu'|
  *              'token-counter'|'composer-actions'|'image-output-settings'|
  *              'video-cost-notice'].
- * Filled in Phase 8.
+ * Phase 7 ships a minimal stylesheet so the textarea/send row is usable;
+ * polish (density, shortcuts, attachment affordances) lands in Phase 8.
  */
+
+[data-ui='composer-input'] {
+  width: 100%;
+  min-height: 60px;
+  resize: vertical;
+  font: inherit;
+  padding: 6px;
+  box-sizing: border-box;
+}
+
+[data-ui='composer-actions'] {
+  display: flex;
+  justify-content: flex-end;
+}

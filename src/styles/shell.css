@@ -2,5 +2,60 @@
  * shell.css — app frame, overlays, status bar, empty states, responsive shell.
  * Owns: [data-ui='app-shell'|'main-pane'|'settings-overlay'|'status-bar'|
  *              'empty-state'|'sample-prompts'].
- * Filled in Phase 8.
+ *
+ * Phase 7 adds a minimal grid so the sidebar / header / main regions lay out
+ * at all. Polish (tokens, typography, density) arrives in Phase 8.
  */
+
+[data-ui='app-shell'] {
+  display: grid;
+  grid-template-columns: 240px 1fr;
+  grid-template-rows: 40px 1fr;
+  grid-template-areas:
+    'sidebar header'
+    'sidebar main';
+  height: 100%;
+}
+
+[data-ui='app-shell'] > [data-ui='sidebar'] {
+  grid-area: sidebar;
+  border-right: 1px solid rgba(0, 0, 0, 0.1);
+  overflow-y: auto;
+  padding: 8px;
+}
+
+[data-ui='app-shell'] > [data-ui='header'] {
+  grid-area: header;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.1);
+  display: flex;
+  align-items: center;
+  padding: 0 12px;
+}
+
+[data-ui='app-shell'] > [data-ui='main-pane'] {
+  grid-area: main;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
+[data-ui='main-pane'] > [data-ui='message-list'] {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 12px;
+}
+
+[data-ui='main-pane'] > [data-ui='composer'] {
+  flex: 0 0 auto;
+  border-top: 1px solid rgba(0, 0, 0, 0.1);
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+[data-ui='main-pane'] > [data-ui='empty-state'],
+[data-ui='main-pane'] > [data-ui='first-run'] {
+  padding: 24px;
+}

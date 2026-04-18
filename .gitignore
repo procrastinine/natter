@@ -5,6 +5,7 @@ dist-engine
 coverage
 playwright-report
 test-results
+.playwright-cli
 *.local
 .env
 .env.*
