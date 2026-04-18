@@ -1,0 +1,47 @@
+{
+  "name": "natter",
+  "version": "0.0.0",
+  "private": true,
+  "description": "A browser-only chat UI for LLM APIs. Bring a key, open a tab, have a natter.",
+  "type": "module",
+  "packageManager": "pnpm@10.21.0",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "test": "vitest",
+    "test:run": "vitest run",
+    "typecheck": "tsc -b --noEmit",
+    "lint": "biome lint .",
+    "format": "biome format --write .",
+    "check": "biome check --write ."
+  },
+  "dependencies": {
+    "@tanstack/react-query": "^5.99.0",
+    "@tanstack/react-virtual": "^3.13.24",
+    "dexie": "^4.4.2",
+    "dexie-react-hooks": "^4.4.0",
+    "react": "^19.2.5",
+    "react-dom": "^19.2.5",
+    "streamdown": "^2.5.0",
+    "ulidx": "^2.4.1",
+    "zod": "^4.3.6",
+    "zustand": "^5.0.12"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.4.12",
+    "@tailwindcss/vite": "^4.2.2",
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2",
+    "@testing-library/user-event": "^14.6.1",
+    "@types/node": "^25.6.0",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.1",
+    "jsdom": "^29.0.2",
+    "tailwindcss": "^4.2.2",
+    "typescript": "^6.0.3",
+    "vite": "^8.0.8",
+    "vitest": "^4.1.4"
+  }
+}
