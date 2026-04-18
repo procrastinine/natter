@@ -84,10 +84,14 @@ const SAMPLING_WIRE_KEY: Readonly<Record<SamplingKey, string>> = Object.freeze({
 // later phases can bolt on image/audio/file/video without revisiting callers.
 function serializeContent(items: ContentItem[]): unknown {
   if (items.length === 0) return ''
-  if (items.length === 1 && items[0]?.type === 'text') {
-    // Collapse a single text block to a plain string. OpenAI-compatible
-    // endpoints accept both string and array content, but the string shape
-    // is idiomatic for simple turns and keeps the wire trivially diffable.
+  if (
+    items.length === 1 &&
+    (items[0]?.type === 'text' || items[0]?.type === 'output_text')
+  ) {
+    // Collapse a single text/output_text block to a plain string. OpenAI-
+    // compatible endpoints accept both string and array content, and echoing
+    // an assistant turn as a plain string is what upstreams expect for
+    // multi-turn context. Array form is reserved for mixed-modality turns.
     return items[0].text
   }
   const parts: unknown[] = []
