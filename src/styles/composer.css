@@ -1,0 +1,8 @@
+/*
+ * composer.css — composer shell, attachment chips, send row, token counter,
+ *                lock banner placement.
+ * Owns: [data-ui='composer'|'composer-input'|'attachment-chip'|'attachment-menu'|
+ *              'token-counter'|'composer-actions'|'image-output-settings'|
+ *              'video-cost-notice'].
+ * Filled in Phase 8.
+ */

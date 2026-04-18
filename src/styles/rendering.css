@@ -1,0 +1,7 @@
+/*
+ * rendering.css — markdown elements, code/math/mermaid, media blocks, citations,
+ *                 blocked-image stub.
+ * Owns: [data-ui='markdown'|'code-block'|'code-toolbar'|'math-block'|'media-block'|
+ *              'annotations'|'citation-link'|'blocked-image'|'image-allowlist'].
+ * Filled in Phase 8.
+ */

@@ -1,0 +1,6 @@
+/*
+ * banners.css — blocking banners, warning banners, empty states, migration/BYOK notices.
+ * Owns: [data-ui='banner'|'blocking-banner'|'warning-banner'|'notice-banner'|
+ *              'tip-callout'|'update-banner'|'compatibility-banner'|'lock-banner'].
+ * Filled in Phase 8.
+ */

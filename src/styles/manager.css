@@ -1,0 +1,8 @@
+/*
+ * manager.css — preset/connection manager modal, editors, storage pane, key manager,
+ *               folder/tag manager, auto-title log panel, cost breakdown modal.
+ * Owns: [data-ui='manager-modal'|'manager-list'|'editor-form'|'storage-pane'|
+ *              'key-manager'|'folder-manager'|'tag-manager'|'tag-merge-confirm'|
+ *              'autotitle-log'|'cost-breakdown-modal'].
+ * Filled in Phase 8.
+ */

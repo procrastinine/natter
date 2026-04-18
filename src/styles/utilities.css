@@ -1,0 +1,5 @@
+/*
+ * utilities.css — visually-hidden, overflow, focus helpers, print overrides.
+ * Owns: .sr-only, .focus-ring, .truncate, [data-ui='print-only'].
+ * Filled in Phase 8.
+ */

@@ -1,0 +1,6 @@
+/*
+ * shell.css — app frame, overlays, status bar, empty states, responsive shell.
+ * Owns: [data-ui='app-shell'|'main-pane'|'settings-overlay'|'status-bar'|
+ *              'empty-state'|'sample-prompts'].
+ * Filled in Phase 8.
+ */

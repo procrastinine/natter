@@ -1,0 +1,8 @@
+/*
+ * settings-pane.css — right-side pane, section layout, field groups, tabs,
+ *                     chat-organization settings.
+ * Owns: [data-ui='settings-pane'|'settings-tab'|'settings-section'|'field-group'|
+ *              'media-settings'|'rendering-settings'|'observability-panel'|
+ *              'chat-org-settings'|'autotitle-settings'].
+ * Filled in Phase 8.
+ */

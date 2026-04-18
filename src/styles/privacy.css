@@ -1,0 +1,7 @@
+/*
+ * privacy.css — privacy badge, provider eligibility rows, policy summaries,
+ *               zero-eligible modal details.
+ * Owns: [data-ui='privacy-badge'|'policy-summary'|'provider-eligibility'|'privacy-modal'|
+ *              'provider-error'].
+ * Filled in Phase 8.
+ */

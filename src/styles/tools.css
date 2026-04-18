@@ -1,0 +1,7 @@
+/*
+ * tools.css — tool cards, approval modal content, tool loop banner,
+ *             tool/result-specific chrome.
+ * Owns: [data-ui='tool-card'|'tool-approval'|'tool-loop-banner'|'structured-output-editor'|
+ *              'server-tool-card'|'ocr-upsell'].
+ * Filled in Phase 8.
+ */

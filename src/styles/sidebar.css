@@ -1,0 +1,9 @@
+/*
+ * sidebar.css — sidebar layout, chat rows, grouping headers, folder tree, tag chips,
+ *               search, sort picker, filter chips, bulk-select toolbar, footer actions.
+ * Owns: [data-ui='sidebar'|'chat-row'|'chat-group'|'chat-search'|'search-bar'|
+ *              'search-snippet'|'search-progress'|'filter-chip'|'folder-tree'|
+ *              'folder-header'|'folder-drop-indicator'|'tag-chip'|'tag-chip-popover'|
+ *              'sort-menu'|'bulk-toolbar'|'sidebar-footer'].
+ * Filled in Phase 8.
+ */

@@ -1,0 +1,7 @@
+/*
+ * forms.css — labels, helper text, validation, sliders, segmented controls,
+ *             JSON/schema editors.
+ * Owns: [data-ui='field'|'label'|'helper'|'validation'|'slider'|'segmented'|
+ *              'schema-editor'|'json-editor'|'logit-bias-editor'].
+ * Filled in Phase 8.
+ */

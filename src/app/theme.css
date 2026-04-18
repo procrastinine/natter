@@ -1,0 +1,50 @@
+/*
+ * theme.css — style entrypoint.
+ *
+ * Imports the shared style files in the order declared in plan/10-ui.md §10.20:
+ *   1. tokens.css
+ *   2. themes.css
+ *   3. motion.css
+ *   4. primitives.css, forms.css, modals.css
+ *   5. domain files (shell.css through rendering.css)
+ *   6. utilities.css
+ *
+ * Tailwind is included once here so @layer rules inside the shared files resolve.
+ */
+
+@import 'tailwindcss';
+
+@import '../styles/tokens.css';
+@import '../styles/themes.css';
+@import '../styles/motion.css';
+
+@import '../styles/primitives.css';
+@import '../styles/forms.css';
+@import '../styles/modals.css';
+
+@import '../styles/shell.css';
+@import '../styles/sidebar.css';
+@import '../styles/header.css';
+@import '../styles/messages.css';
+@import '../styles/branching.css';
+@import '../styles/composer.css';
+@import '../styles/reasoning.css';
+@import '../styles/tools.css';
+@import '../styles/settings-pane.css';
+@import '../styles/pickers.css';
+@import '../styles/privacy.css';
+@import '../styles/manager.css';
+@import '../styles/banners.css';
+@import '../styles/rendering.css';
+
+@import '../styles/utilities.css';
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+}

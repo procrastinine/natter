@@ -1,0 +1,7 @@
+/*
+ * messages.css — message rows, badges, hover actions, inline edit, error banners in rows.
+ * Owns: [data-ui='message'|'message-header'|'message-body'|'message-actions'|
+ *              'inline-editor'|'message-badge'|'message-cost-badge'|'fallback-chip'|
+ *              'stream-overflow'].
+ * Filled in Phase 8.
+ */
