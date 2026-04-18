@@ -1,9 +1,8 @@
-// Dexie schema declaration (v1). Kept exactly in sync with `plan/03-storage.md §3.1`.
+// Dexie schema + open/close. Schema kept in lockstep with `plan/03-storage.md §3.1`.
 //
-// Phase 0 declares the schema + row types. Phase 3 owns the full migration path,
-// transaction wrappers, and broadcast fan-out. The database is exported here but
-// not auto-opened — consumers call `openDb()` (Phase 3) or operate on the typed
-// table declarations for contract tests.
+// The module exports a single default-name singleton for production. Tests that
+// need isolation use `createDbForTests(name)` to mint a uniquely-named instance
+// and close it when they're done.
 
 import Dexie, { type Table } from 'dexie'
 import type {
@@ -81,36 +80,49 @@ export class NatterDb extends Dexie {
 
   constructor(name = 'natter') {
     super(name)
-    this.version(1).stores({
-      chats:
-        'id, updatedAt, createdAt, lastViewedAt, lastUpdatedLeafId, lastBranchUpdatedAt, wordCount, totalCostUsd, archived, pinned, presetId, folderId, *tags',
-      messages:
-        'id, chatId, parentId, turnId, [chatId+parentId], [chatId+createdAt], [chatId+turnId], [chatId+deleted]',
-      attachments: 'id, contentHash, refCount, createdAt',
-      profiles: 'id, name, kind, lastUsedAt, archived',
-      presets: 'id, name, connectionProfileId, lastUsedAt, archived',
-      folders: 'id, name, sortIndex, lastUsedAt',
-      tags: 'id, &nameLower, lastUsedAt',
-      chatBranchCache: '&chatId, branchLeafId, generatedAt',
-      keys: 'id, name',
-      settings: '&key',
-      models: '&[profileId+queryKey], fetchedAt',
-      endpoints: '&[profileId+modelId], fetchedAt',
-      privacyPolicies: '&[profileId+modelId], fetchedAt',
-      providers: '&[profileId], fetchedAt',
-      generations: 'id, chatId, gen_id',
-      presetResolutions: '&[profileId+presetSlug], fetchedAt',
-      drafts: '&chatId, updatedAt',
-    })
+    registerSchema(this)
   }
 }
 
-// Singleton instance. Not auto-opened — Phase 3 owns the open+migrate flow.
+// Schema registration is pulled out so test-only subclasses can replay v1 and
+// then tack on synthetic v2/v3 upgrades.
+export function registerSchema(db: Dexie): void {
+  db.version(1).stores({
+    chats:
+      'id, updatedAt, createdAt, lastViewedAt, lastUpdatedLeafId, lastBranchUpdatedAt, wordCount, totalCostUsd, archived, pinned, presetId, folderId, *tags',
+    messages:
+      'id, chatId, parentId, turnId, [chatId+parentId], [chatId+createdAt], [chatId+turnId], [chatId+deleted]',
+    attachments: 'id, contentHash, refCount, createdAt',
+    profiles: 'id, name, kind, lastUsedAt, archived',
+    presets: 'id, name, connectionProfileId, lastUsedAt, archived',
+    folders: 'id, name, sortIndex, lastUsedAt',
+    tags: 'id, &nameLower, lastUsedAt',
+    chatBranchCache: '&chatId, branchLeafId, generatedAt',
+    keys: 'id, name',
+    settings: '&key',
+    models: '&[profileId+queryKey], fetchedAt',
+    endpoints: '&[profileId+modelId], fetchedAt',
+    privacyPolicies: '&[profileId+modelId], fetchedAt',
+    providers: '&profileId, fetchedAt',
+    generations: 'id, chatId, gen_id',
+    presetResolutions: '&[profileId+presetSlug], fetchedAt',
+    drafts: '&chatId, updatedAt',
+  })
+}
+
 let singleton: NatterDb | null = null
 
 export function getDb(): NatterDb {
   if (!singleton) singleton = new NatterDb()
   return singleton
+}
+
+// Explicit open — resolves when the underlying IDBDatabase is ready and the
+// schema has settled. Safe to call repeatedly; Dexie caches the open call.
+export async function openDb(): Promise<NatterDb> {
+  const db = getDb()
+  if (!db.isOpen()) await db.open()
+  return db
 }
 
 // Test-only reset so unit tests can swap in their own jsdom-backed IDB.
@@ -119,4 +131,11 @@ export function __resetDbForTests(): void {
     singleton.close()
     singleton = null
   }
+}
+
+// Mint a uniquely-named Dexie instance for integration tests that want to
+// assert migrations or multi-chat concurrency without polluting the singleton.
+// Caller is responsible for `await db.delete()` on teardown.
+export function createDbForTests(name: string): NatterDb {
+  return new NatterDb(name)
 }
