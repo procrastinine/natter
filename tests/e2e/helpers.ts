@@ -12,19 +12,32 @@ export interface SeedOptions {
   model?: string
 }
 
-// Walk the first-run form. `apiKey` defaults to a harmless placeholder because
-// the route-mocked specs never hit OpenRouter. Use `seedReal(page)` when the
-// spec needs the real key from `key.txt`.
+// Open the connection-setup modal from the connection header and submit a
+// stub key. `apiKey` defaults to a harmless placeholder because the
+// route-mocked specs never hit OpenRouter. Use `seedReal(page)` when the spec
+// needs the real key from `key.txt`.
 export async function seedFirstRun(page: Page, opts: SeedOptions = {}): Promise<void> {
   const apiKey = opts.apiKey ?? 'sk-or-v1-test-00000000000000000000000000000000000000000000'
   await page.goto('/')
-  const input = page.locator('[data-ui="first-run-key"]')
+  await page.locator('[data-ui="connection-add"]').click()
+  const input = page.locator('[data-ui="connection-setup-key"]')
   await input.fill(apiKey)
-  await page.locator('[data-ui="first-run-submit"]').click()
-  // Empty state appears when profileCount advances from 0 to 1.
-  await page.locator('[data-ui="empty-state"]').waitFor({ state: 'visible' })
+  await page.locator('[data-ui="connection-setup-submit"]').click()
+  // The modal closes automatically once the seed completes; wait for it.
+  await page
+    .locator('[data-ui="connection-setup-modal"]')
+    .waitFor({ state: 'detached' })
+  // Connection header now shows the configured profile.
+  await page
+    .locator('[data-ui="connection-header"][data-state="configured"]')
+    .waitFor({ state: 'visible' })
 }
 
+// Navigate to the blank-chat surface (`#/new`) and wait for the composer to
+// render. NOTE: this does NOT create a `Chat` row on its own — by design.
+// Chat rows materialize on first send. Tests that need an actual row to exist
+// should follow with `sendMessage` (which materializes) or use
+// `createChatAndSend` for the combined flow.
 export async function createChatAndOpen(page: Page): Promise<void> {
   await page.locator('[data-ui="new-chat"]').click()
   await page.locator('[data-ui="composer"]').waitFor({ state: 'visible' })
@@ -33,6 +46,16 @@ export async function createChatAndOpen(page: Page): Promise<void> {
 export async function sendMessage(page: Page, text: string): Promise<void> {
   await page.locator('[data-ui="composer-input"]').fill(text)
   await page.locator('[data-ui="send"]').click()
+}
+
+// Goes through the full new-chat-then-send flow: navigates to `#/new`, fills
+// the composer, sends, and waits for the chat row to materialize in the
+// sidebar. Useful for tests that just need any chat to exist before exercising
+// some other feature (title editing, settings drawer, etc.).
+export async function createChatAndSend(page: Page, text: string): Promise<void> {
+  await createChatAndOpen(page)
+  await sendMessage(page, text)
+  await page.locator('[data-ui="chat-row"]').first().waitFor({ state: 'visible' })
 }
 
 export interface SseDelta {

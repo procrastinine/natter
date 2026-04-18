@@ -1,0 +1,152 @@
+import { useLiveQuery } from 'dexie-react-hooks'
+import { useCallback, useState } from 'react'
+import { getSetting, setSetting } from '../../store/settings'
+import { DEFAULT_IMAGE_ORIGINS } from '../../core/image-allowlist'
+import { TrashIcon } from '../icons/Icon'
+
+const STORAGE_KEY = 'image-allowlist'
+
+export async function readImageAllowlist(): Promise<string[]> {
+  const stored = await getSetting<string[]>(STORAGE_KEY)
+  return stored ?? []
+}
+
+export async function writeImageAllowlist(next: string[]): Promise<void> {
+  await setSetting(STORAGE_KEY, next)
+}
+
+export function normalizeOrigin(input: string): string | null {
+  const trimmed = input.trim()
+  if (trimmed.length === 0) return null
+  if (trimmed.startsWith('data:') || trimmed.startsWith('blob:')) {
+    return trimmed
+  }
+  if (/^https?:\/\//.test(trimmed)) {
+    const candidate = trimmed.replace(/\/$/, '')
+    try {
+      const u = new URL(candidate)
+      return u.origin
+    } catch {
+      return candidate
+    }
+  }
+  if (trimmed.startsWith('*.')) {
+    return `https://${trimmed}`
+  }
+  return `https://${trimmed}`
+}
+
+export function ImageAllowlistPanel() {
+  const allowlist = useLiveQuery(readImageAllowlist, [], [])
+  const [draft, setDraft] = useState('')
+  const [error, setError] = useState<string | null>(null)
+
+  const onAdd = useCallback(async () => {
+    const normalized = normalizeOrigin(draft)
+    if (!normalized) {
+      setError('Enter an origin like https://example.com or https://*.example.com.')
+      return
+    }
+    const current = await readImageAllowlist()
+    if (current.includes(normalized) || DEFAULT_IMAGE_ORIGINS.includes(normalized)) {
+      setError('Origin already allowed.')
+      return
+    }
+    setError(null)
+    setDraft('')
+    await writeImageAllowlist([...current, normalized])
+  }, [draft])
+
+  const onRemove = useCallback(async (origin: string) => {
+    const current = await readImageAllowlist()
+    await writeImageAllowlist(current.filter((v) => v !== origin))
+  }, [])
+
+  return (
+    <div data-ui="settings-section">
+      <h3>Image whitelist</h3>
+      <p data-ui="helper">
+        Images from origins not on this whitelist are replaced with a
+        blocked-image stub. Built-in origins are always allowed.
+      </p>
+      <div data-ui="image-allowlist-add">
+        <input
+          aria-label="Origin to allow"
+          data-ui="image-allowlist-input"
+          type="text"
+          placeholder="https://example.com"
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') {
+              e.preventDefault()
+              void onAdd()
+            }
+          }}
+        />
+        <button type="button" data-ui="image-allowlist-add-button" onClick={() => void onAdd()}>
+          Add
+        </button>
+      </div>
+      {error ? (
+        <span data-ui="helper" data-validation="invalid" role="alert">
+          {error}
+        </span>
+      ) : null}
+      <table data-ui="image-allowlist">
+        <thead>
+          <tr>
+            <th scope="col">Origin</th>
+            <th scope="col">Source</th>
+            <th scope="col" data-ui="image-allowlist-action-col">
+              <span data-ui="visually-hidden">Actions</span>
+            </th>
+          </tr>
+        </thead>
+        <tbody>
+          {DEFAULT_IMAGE_ORIGINS.map((origin) => (
+            <tr
+              key={origin}
+              data-ui="image-allowlist-row"
+              data-origin={origin}
+              data-builtin="true"
+            >
+              <td>
+                <code>{origin}</code>
+              </td>
+              <td data-ui="image-allowlist-source">built-in</td>
+              <td data-ui="image-allowlist-action-cell" />
+            </tr>
+          ))}
+          {allowlist.map((origin) => (
+            <tr
+              key={origin}
+              data-ui="image-allowlist-row"
+              data-origin={origin}
+              data-builtin="false"
+            >
+              <td>
+                <code>{origin}</code>
+              </td>
+              <td data-ui="image-allowlist-source">custom</td>
+              <td data-ui="image-allowlist-action-cell">
+                <button
+                  type="button"
+                  data-ui="icon-button"
+                  data-size="sm"
+                  data-variant="danger"
+                  data-role="image-allowlist-remove"
+                  aria-label={`Remove ${origin}`}
+                  title="Remove"
+                  onClick={() => void onRemove(origin)}
+                >
+                  <TrashIcon size={14} />
+                </button>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}

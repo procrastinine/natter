@@ -1,5 +1,86 @@
 /*
  * motion.css — animations, transitions, reduced-motion overrides.
  * Owns: [data-animated], [data-streaming], [data-generating], [data-reduced-motion].
- * Filled in Phase 8.
+ * See plan/10-ui.md §10.21.4, §10.15.
  */
+
+@keyframes natter-caret-blink {
+  0%,
+  49% {
+    opacity: 1;
+  }
+  50%,
+  100% {
+    opacity: 0;
+  }
+}
+
+@keyframes natter-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes natter-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(2px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+[data-streaming='true']::after {
+  content: '';
+  display: inline-block;
+  width: var(--stream-caret-width);
+  height: 1em;
+  margin-left: 2px;
+  background: currentColor;
+  vertical-align: -0.2em;
+  animation: natter-caret-blink 1s steps(2, end) infinite;
+}
+
+[data-animated='true'] {
+  animation: natter-fade-in var(--duration-fast) var(--ease-standard);
+}
+
+[data-generating='true'] [data-ui='spinner'],
+[data-ui='spinner'] {
+  animation: natter-spin 1s linear infinite;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+[data-reduced-motion='true'],
+[data-reduced-motion='true'] * {
+  animation-duration: 0ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0ms !important;
+}
+
+[data-reduced-motion='true']::after,
+[data-reduced-motion='true'] [data-streaming='true']::after {
+  animation: none !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0ms !important;
+  }
+  [data-streaming='true']::after {
+    animation: none !important;
+    opacity: 0.6;
+  }
+}

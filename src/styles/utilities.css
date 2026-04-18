@@ -1,5 +1,44 @@
 /*
  * utilities.css — visually-hidden, overflow, focus helpers, print overrides.
  * Owns: .sr-only, .focus-ring, .truncate, [data-ui='print-only'].
- * Filled in Phase 8.
+ * See plan/10-ui.md §10.20.
  */
+
+.sr-only,
+[data-ui='visually-hidden'] {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.truncate {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.focus-ring:focus-visible {
+  outline: var(--focus-ring-width) solid var(--color-border-focus);
+  outline-offset: 1px;
+}
+
+[data-ui='print-only'] {
+  display: none;
+}
+
+@media print {
+  [data-ui='print-only'] {
+    display: block;
+  }
+  [data-ui='sidebar'],
+  [data-ui='composer'],
+  [data-ui='settings-overlay'] {
+    display: none !important;
+  }
+}

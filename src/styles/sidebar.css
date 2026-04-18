@@ -1,47 +1,294 @@
 /*
- * sidebar.css — sidebar layout, chat rows, grouping headers, folder tree, tag chips,
- *               search, sort picker, filter chips, bulk-select toolbar, footer actions.
- * Owns: [data-ui='sidebar'|'chat-row'|'chat-group'|'chat-search'|'search-bar'|
- *              'search-snippet'|'search-progress'|'filter-chip'|'folder-tree'|
- *              'folder-header'|'folder-drop-indicator'|'tag-chip'|'tag-chip-popover'|
- *              'sort-menu'|'bulk-toolbar'|'sidebar-footer'].
- * Phase 7 ships a minimal stylesheet so the new-chat button + chat list are
- * stacked and selectable; polish (folders, tags, search) lands in Phase 8.
+ * sidebar.css — sidebar layout, brand row, chat rows (full-width highlight,
+ * two-line title + preview, hover delete), folder/tags/search slots, footer.
+ * See plan/10-ui.md §10.20.
  */
 
-[data-ui='new-chat'] {
-  display: block;
-  width: 100%;
-  padding: 6px 8px;
-  margin-bottom: 8px;
-  text-align: left;
+[data-ui='sidebar'] {
+  color: var(--color-fg-primary);
+  font-size: var(--font-size-md);
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: 0;
+  overflow: hidden;
+}
+
+[data-ui='sidebar-header'] {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--color-border-subtle);
+  flex: 0 0 auto;
+  min-height: var(--header-height);
+}
+
+/* The brand "natter" intentionally uses a different typeface from the rest
+ * of the UI so it reads as a logotype rather than a generic title. We use
+ * a serif stack with tight tracking and slightly larger size to give it
+ * weight without shouting. */
+[data-ui='brand'] {
+  font-family: 'Georgia', 'Iowan Old Style', 'Palatino', 'Times New Roman',
+    serif;
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--color-fg-primary);
+  text-decoration: none;
+  letter-spacing: -0.02em;
+  font-style: italic;
+  line-height: 1;
+  flex: 1 1 auto;
+}
+
+[data-ui='brand']:hover {
+  color: var(--color-accent);
+}
+
+[data-ui='sidebar-toggle'] {
   background: transparent;
-  border: 1px solid rgba(0, 0, 0, 0.15);
-  border-radius: 4px;
+  border: 1px solid transparent;
+  color: var(--color-fg-muted);
+  width: 26px;
+  height: 26px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: var(--font-size-md);
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+[data-ui='sidebar-toggle']:hover {
+  color: var(--color-fg-primary);
+  background: var(--color-bg-hover);
+}
+
+/* New-chat affordance: the icon IS the affordance — no surrounding border or
+ * background by default, since the icon's own paper rectangle would conflict
+ * with another rectangle frame. Only a soft hover background. */
+[data-ui='new-chat'] {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  background: transparent;
+  border: none;
+  color: var(--color-fg-secondary);
+  text-decoration: none;
+  border-radius: var(--radius-sm);
   cursor: pointer;
 }
+
+[data-ui='new-chat']:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-fg-primary);
+}
+
+[data-ui='new-chat-icon'] {
+  display: block;
+}
+
+/* Sidebar footer is a clickable row in its entirety — hovering anywhere
+ * inside it (over the icon, the label, the surrounding padding) shows the
+ * highlight, not just over a pill around the text. The button is sized to
+ * fill the footer; the footer itself has zero padding so the highlight
+ * goes edge-to-edge of the sidebar width. */
+[data-ui='sidebar-footer'] {
+  margin-top: auto;
+  border-top: 1px solid var(--color-border-subtle);
+  padding: 0;
+  flex: 0 0 auto;
+}
+
+[data-ui='open-global-settings'] {
+  background: transparent;
+  border: none;
+  color: var(--color-fg-secondary);
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+  padding: var(--space-3) var(--space-4);
+  border-radius: 0;
+  width: 100%;
+  text-align: left;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-3);
+  line-height: 1;
+}
+
+[data-ui='open-global-settings']:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-fg-primary);
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * Chat list rows
+ *
+ * Selection highlight extends edge-to-edge across the sidebar (no horizontal
+ * padding on the row container). Faint hairline divider between rows.
+ * Two-line layout: title (line 1) + first-message preview (line 2).
+ * Delete affordance is hover-only on the right side of the row.
+ * ────────────────────────────────────────────────────────────────────── */
 
 [data-ui='chat-list'] {
   list-style: none;
-  padding: 0;
   margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  flex: 1 1 auto;
+  overflow-y: auto;
+  border-top: 1px solid transparent;
+}
+
+[data-ui='chat-row'] {
+  position: relative;
+  border-bottom: 1px solid var(--color-border-subtle);
+}
+
+[data-ui='chat-row-link'] {
   display: flex;
   flex-direction: column;
   gap: 2px;
-}
-
-[data-ui='chat-row-button'] {
-  display: block;
-  width: 100%;
-  padding: 4px 8px;
-  text-align: left;
+  padding: var(--space-3) var(--space-4);
   background: transparent;
-  border: none;
-  border-radius: 4px;
+  color: var(--color-fg-primary);
+  text-decoration: none;
   cursor: pointer;
+  width: 100%;
+  min-width: 0;
 }
 
-[data-ui='chat-row'][data-active='true'] > [data-ui='chat-row-button'] {
-  background: rgba(0, 0, 0, 0.08);
-  font-weight: 600;
+[data-ui='chat-row-link']:hover {
+  background: var(--color-bg-hover);
+}
+
+[data-ui='chat-row'][data-active='true'] > [data-ui='chat-row-link'] {
+  background: var(--color-bg-selected);
+}
+
+/* Sidebar rows read like a dense list (not a heading per row). Title one
+ * notch below body (a ~14 px compromise between the default md/15 and the
+ * too-cramped sm/13 size). Preview stays at sm so the second line stays
+ * comfortably readable. Selection is signalled by the full-width tint,
+ * not by type-size. */
+[data-ui='chat-row-title'] {
+  font-size: 14px;
+  font-weight: var(--font-weight-medium);
+  color: var(--color-fg-primary);
+  line-height: var(--line-height-tight);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+[data-ui='chat-row-preview'] {
+  font-size: var(--font-size-sm);
+  color: var(--color-fg-muted);
+  line-height: var(--line-height-tight);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+[data-ui='chat-row'][data-title-status='untitled']
+  [data-ui='chat-row-title'] {
+  color: var(--color-fg-muted);
+  font-style: italic;
+  font-weight: var(--font-weight-regular);
+}
+
+[data-ui='chat-row'][data-title-status='pending']
+  [data-ui='chat-row-title']::after {
+  content: ' · titling…';
+  color: var(--color-fg-muted);
+  font-style: italic;
+  font-size: var(--font-size-xs);
+}
+
+/* Hover-revealed delete icon. Hidden by default; appears on row hover or
+ * when the button itself receives keyboard focus. Square hit area, danger
+ * tint on hover. The button itself is positioned absolutely against the
+ * row (which is `position: relative` above), so it sits centred on the
+ * row's right edge regardless of two-line / one-line content. */
+[data-ui='chat-row-delete'] {
+  position: absolute;
+  top: 50%;
+  right: var(--space-3);
+  transform: translateY(-50%);
+  appearance: none;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--color-fg-muted);
+  width: 24px;
+  height: 24px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  opacity: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+
+[data-ui='chat-row']:hover [data-ui='chat-row-delete'],
+[data-ui='chat-row-delete']:focus-visible {
+  opacity: 1;
+}
+
+[data-ui='chat-row-delete']:hover {
+  color: var(--color-danger);
+  background: var(--color-bg-hover);
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * Collapsed sidebar — narrow rail, hide labels, center icons.
+ * ────────────────────────────────────────────────────────────────────── */
+
+[data-ui='sidebar'][data-collapsed='true'] [data-ui='sidebar-header'] {
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-2);
+}
+
+[data-ui='sidebar'][data-collapsed='true'] [data-ui='chat-row-link'] {
+  padding: var(--space-3) var(--space-2);
+  align-items: center;
+  text-align: center;
+}
+
+[data-ui='sidebar'][data-collapsed='true'] [data-ui='chat-row-title'] {
+  font-size: var(--font-size-xs);
+  white-space: normal;
+  word-break: break-word;
+  text-align: center;
+  -webkit-line-clamp: 2;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+[data-ui='sidebar'][data-collapsed='true'] [data-ui='chat-row-preview'] {
+  display: none;
+}
+
+[data-ui='sidebar'][data-collapsed='true'] [data-ui='chat-row-delete'] {
+  display: none;
+}
+
+[data-ui='sidebar'][data-collapsed='true']
+  [data-ui='sidebar-footer'] {
+  padding: var(--space-2);
+}
+
+[data-ui='sidebar'][data-collapsed='true']
+  [data-ui='open-global-settings'] {
+  justify-content: center;
+  padding: var(--space-2);
 }

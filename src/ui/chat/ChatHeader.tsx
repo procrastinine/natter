@@ -1,0 +1,234 @@
+import { useLiveQuery } from 'dexie-react-hooks'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import type { ChatId, CursorMap } from '../../core/types'
+import { exportChatAsTxt, triggerBrowserDownload } from '../../core/chat-export'
+import { getChat, setManualTitle } from '../../store/chats'
+import { useChatStore } from '../../store/zustand/chatStore'
+import {
+  CloseIcon,
+  CogIcon,
+  DownloadIcon,
+  InfoIcon,
+  PencilIcon,
+} from '../icons/Icon'
+
+// Stable empty reference so useChatStore's selector doesn't allocate a fresh
+// `{}` every render — React 19's useSyncExternalStore detects that as an
+// infinite loop ("getSnapshot should be cached").
+const EMPTY_CURSOR: CursorMap = Object.freeze({}) as CursorMap
+
+export interface ChatHeaderProps {
+  chatId: ChatId | null
+  settingsOpen: boolean
+  onToggleSettings: () => void
+}
+
+export function ChatHeader({
+  chatId,
+  settingsOpen,
+  onToggleSettings,
+}: ChatHeaderProps) {
+  const chat = useLiveQuery(
+    () => (chatId ? getChat(chatId) : Promise.resolve(undefined)),
+    [chatId],
+    undefined,
+  )
+  const cursor = useChatStore((s) =>
+    chatId ? s.cursors[chatId] ?? EMPTY_CURSOR : EMPTY_CURSOR,
+  )
+  const [editing, setEditing] = useState(false)
+  const [draftTitle, setDraftTitle] = useState('')
+  const [showInfo, setShowInfo] = useState(false)
+  const inputRef = useRef<HTMLInputElement | null>(null)
+  const titleLabelRef = useRef<HTMLSpanElement | null>(null)
+
+  // Cancel any in-progress title edit when the active chat changes — otherwise
+  // the editor would stay open against the next chat's title (confusing).
+  useEffect(() => {
+    setEditing(false)
+    setDraftTitle('')
+    setShowInfo(false)
+  }, [chatId])
+
+  useEffect(() => {
+    if (editing && inputRef.current) {
+      inputRef.current.focus()
+      inputRef.current.select()
+    }
+  }, [editing])
+
+  const beginEdit = useCallback(() => {
+    if (!chat) return
+    setDraftTitle(chat.title)
+    setEditing(true)
+  }, [chat])
+  const cancelEdit = useCallback(() => {
+    setEditing(false)
+    setDraftTitle('')
+  }, [])
+  const commitEdit = useCallback(async () => {
+    if (!chat) return
+    const trimmed = draftTitle.trim()
+    if (trimmed.length === 0) {
+      // Empty trim is a no-op cancel rather than a hard error: the user
+      // probably meant to discard the edit. Closing edit mode silently is
+      // less obnoxious than "Title cannot be empty."
+      cancelEdit()
+      return
+    }
+    // Whether or not the title actually changed, exit edit mode silently.
+    // "Unchanged" is not an error worth surfacing to the user.
+    await setManualTitle(chat.id, trimmed)
+    setEditing(false)
+    setDraftTitle('')
+  }, [chat, draftTitle, cancelEdit])
+
+  const handleDownload = useCallback(async () => {
+    if (!chat) return
+    const { filename, content } = await exportChatAsTxt(chat.id, cursor)
+    triggerBrowserDownload(filename, content)
+  }, [chat, cursor])
+
+  const displayTitle = chat?.title?.trim().length
+    ? chat.title
+    : 'Untitled chat'
+
+  // When no chat is active there's no title to edit, no streaming to abort,
+  // and no chat-model panel to toggle — render nothing.
+  if (!chat) {
+    return null
+  }
+
+  return (
+    <>
+      {editing ? (
+        <input
+          ref={inputRef}
+          data-ui="chat-title-editor"
+          type="text"
+          value={draftTitle}
+          onChange={(e) => setDraftTitle(e.target.value)}
+          onBlur={() => void commitEdit()}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') {
+              e.preventDefault()
+              void commitEdit()
+            } else if (e.key === 'Escape') {
+              e.preventDefault()
+              cancelEdit()
+            }
+          }}
+          maxLength={200}
+          aria-label="Chat title"
+        />
+      ) : (
+        <div data-ui="chat-title" data-title-status={chat.titleStatus}>
+          <span
+            ref={titleLabelRef}
+            data-ui="chat-title-label"
+            tabIndex={0}
+            onKeyDown={(e) => {
+              if (e.key === 'F2' || e.key === 'Enter') {
+                e.preventDefault()
+                beginEdit()
+              }
+            }}
+            onDoubleClick={beginEdit}
+          >
+            {displayTitle}
+          </span>
+          <button
+            type="button"
+            data-ui="icon-button"
+            data-size="sm"
+            data-role="chat-title-edit"
+            aria-label="Edit chat title"
+            title="Rename chat"
+            onClick={beginEdit}
+          >
+            <PencilIcon size={14} />
+          </button>
+        </div>
+      )}
+      <span data-ui="header-spacer" />
+      <button
+        type="button"
+        data-ui="icon-button"
+        data-role="chat-download"
+        aria-label="Download chat as .txt"
+        title="Download chat (.txt)"
+        onClick={() => void handleDownload()}
+      >
+        <DownloadIcon size={18} />
+      </button>
+      <button
+        type="button"
+        data-ui="icon-button"
+        data-role="chat-info"
+        aria-label={showInfo ? 'Hide chat info' : 'Show chat info'}
+        aria-expanded={showInfo}
+        title="Chat info"
+        onClick={() => setShowInfo((v) => !v)}
+      >
+        <InfoIcon size={18} />
+      </button>
+      <button
+        type="button"
+        data-ui="icon-button"
+        data-role="settings-cog"
+        aria-label="Toggle chat model panel"
+        aria-expanded={settingsOpen}
+        title="Model settings"
+        onClick={onToggleSettings}
+      >
+        <CogIcon size={20} />
+      </button>
+      {showInfo ? (
+        <div
+          data-ui="chat-info-popover"
+          role="dialog"
+          aria-label="Chat info"
+        >
+          <div data-ui="chat-info-popover-header">
+            <span>Chat info</span>
+            <button
+              type="button"
+              data-ui="icon-button"
+              data-size="sm"
+              aria-label="Close chat info"
+              onClick={() => setShowInfo(false)}
+            >
+              <CloseIcon size={14} />
+            </button>
+          </div>
+          <dl data-ui="chat-info-popover-fields">
+            <div>
+              <dt>Title</dt>
+              <dd>{displayTitle}</dd>
+            </div>
+            <div>
+              <dt>Created</dt>
+              <dd>{new Date(chat.createdAt).toLocaleString()}</dd>
+            </div>
+            <div>
+              <dt>Updated</dt>
+              <dd>{new Date(chat.updatedAt).toLocaleString()}</dd>
+            </div>
+            <div>
+              <dt>Word count</dt>
+              <dd>{chat.wordCount.toLocaleString()}</dd>
+            </div>
+            <div>
+              <dt>Total cost</dt>
+              <dd>${chat.totalCostUsd.toFixed(6)}</dd>
+            </div>
+            <div>
+              <dt>Model</dt>
+              <dd>{chat.settings.model || '—'}</dd>
+            </div>
+          </dl>
+        </div>
+      ) : null}
+    </>
+  )
+}

@@ -1,42 +1,308 @@
 /*
- * messages.css — message rows, badges, hover actions, inline edit, error banners in rows.
- * Owns: [data-ui='message'|'message-header'|'message-body'|'message-actions'|
- *              'inline-editor'|'message-badge'|'message-cost-badge'|'fallback-chip'|
- *              'stream-overflow'].
- * Phase 7 ships a minimal stylesheet so message rows are visually separated;
- * polish (role chips, hover actions, density) lands in Phase 8.
+ * messages.css — message rows: monochrome reading area, three-column
+ * grid (left gutter + centered text column + right gutter), faint full-
+ * width hairline divider that spans only the text column, quiet right-
+ * aligned action row, info disclosure dl, error / crash banners.
+ *
+ * The glyph sits in the LEFT GUTTER outside the centered text column
+ * (per user feedback: the divider should be exactly centered against the
+ * text width; the glyphs hang to the left of it).
+ *
+ * Owns: [data-ui='message-list'|'message'|'message-header'|'message-role'|
+ *              'message-body'|'message-actions'|'message-action'|
+ *              'message-info'|'message-info-row'|'profile-glyph'|
+ *              'inline-editor'|'message-edited'|'message-imported'|
+ *              'message-error'|'message-crash'|'message-continue'|
+ *              'stream-overflow'|'fallback-chip'].
+ * See plan/10-ui.md §10.6.
  */
 
-[data-ui='message'] {
-  padding: 8px 4px;
-  border-bottom: 1px solid rgba(0, 0, 0, 0.06);
+[data-ui='message-list'] {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  width: 100%;
 }
 
+/* Each message is a 3-col grid:
+ *   1. left gutter (glyph) — sized to fit the glyph + gap, sits OUTSIDE
+ *      the centered text column so the gutter doesn't push the text
+ *      off-center.
+ *   2. text column — centered, max-width = `--message-max-width`.
+ *   3. right gutter — same width as the left so the text column lands
+ *      dead center of the available main-pane width.
+ *
+ * The hairline divider hangs off the bottom of the TEXT column only, so
+ * it's also centered (the rule lives on `data-ui="message-body-column"`,
+ * not on the row, since the row spans the whole main pane). */
+[data-ui='message'] {
+  display: grid;
+  grid-template-columns:
+    minmax(var(--message-glyph-gutter), 1fr)
+    minmax(0, var(--message-max-width))
+    minmax(var(--message-glyph-gutter), 1fr);
+  column-gap: 0;
+  padding: var(--message-row-padding) 0 0;
+}
+
+/* Vertically center the round glyph on the role label (User / Assistant)
+ * rather than on the top of the whole row. The row is taller than the
+ * header line (it also holds the body and action row) so the default
+ * top-anchored position leaves the glyph floating above the label text.
+ * Computation: negative top margin of (glyph - label-line) / 2 pulls the
+ * glyph up by half the overhang. Label line-height = font-size-md * 1.5. */
+[data-ui='profile-glyph'] {
+  grid-column: 1;
+  justify-self: end;
+  align-self: start;
+  margin-right: var(--message-gutter);
+  margin-top: calc(
+    (var(--font-size-md) * 1.5 - var(--message-glyph-size)) / 2
+  );
+  width: var(--message-glyph-size);
+  height: var(--message-glyph-size);
+  border-radius: 50%;
+  background: var(--color-bg-surface-2);
+  color: var(--color-fg-secondary);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  user-select: none;
+  flex: 0 0 auto;
+}
+
+[data-ui='profile-glyph'][data-role='assistant'] {
+  background: var(--color-bg-surface-3);
+  color: var(--color-fg-primary);
+}
+
+[data-ui='profile-glyph'][data-role='system'] {
+  background: var(--color-bg-surface-2);
+  color: var(--color-fg-muted);
+}
+
+[data-ui='profile-glyph'][data-role='tool'] {
+  background: var(--color-bg-surface-2);
+  color: var(--color-fg-muted);
+}
+
+[data-ui='message'][data-origin='imported'] [data-ui='profile-glyph'] {
+  border: 1px dashed var(--color-fg-muted);
+}
+
+/* Text column. The divider is a border on this element so it spans only
+ * the centered text-width, not the gutters. */
+[data-ui='message-body-column'] {
+  grid-column: 2;
+  min-width: 0;
+  padding-bottom: var(--message-row-padding-bottom);
+  border-bottom: 1px solid var(--color-border-subtle);
+}
+
+[data-ui='message']:last-child > [data-ui='message-body-column'] {
+  border-bottom: none;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * Header: prominent role label + (assistant only) right-aligned model +
+ * token-count chips. State pills (edited / imported) sit between role
+ * and chips.
+ * ────────────────────────────────────────────────────────────────────── */
+
 [data-ui='message-header'] {
-  font-size: 12px;
-  opacity: 0.7;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  margin-bottom: 4px;
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-3);
+  margin-bottom: var(--space-2);
+  font-size: var(--font-size-sm);
+  color: var(--color-fg-muted);
+}
+
+[data-ui='message-role'] {
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-fg-primary);
+  font-size: var(--font-size-md);
+  letter-spacing: -0.005em;
+  text-transform: none;
+}
+
+[data-ui='message-edited'],
+[data-ui='message-imported'] {
+  font-size: var(--font-size-xs);
+  color: var(--color-fg-muted);
+  font-style: italic;
+  cursor: default;
+}
+
+/* Right-side header chips for assistant messages — model id + token count.
+ * Pushed to the trailing edge via the spacer below. */
+[data-ui='message-header-spacer'] {
+  flex: 1 1 auto;
+}
+
+[data-ui='message-model-chip'],
+[data-ui='message-tokens-chip'] {
+  font-size: var(--font-size-xs);
+  color: var(--color-fg-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+[data-ui='message-model-chip'] {
+  font-family: var(--font-mono);
 }
 
 [data-ui='message-body'] {
   white-space: pre-wrap;
-  line-height: 1.5;
+  line-height: var(--line-height-body);
+  color: var(--color-fg-primary);
+  overflow-wrap: anywhere;
+  font-size: var(--font-size-md);
+}
+
+[data-ui='message-body'] p,
+[data-ui='message-body'] ul,
+[data-ui='message-body'] ol,
+[data-ui='message-body'] pre,
+[data-ui='message-body'] blockquote {
+  margin: 0 0 var(--space-3);
+}
+
+[data-ui='message-body'] p:last-child,
+[data-ui='message-body'] ul:last-child,
+[data-ui='message-body'] ol:last-child,
+[data-ui='message-body'] pre:last-child,
+[data-ui='message-body'] blockquote:last-child {
+  margin-bottom: 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * Action row — RIGHT-ALIGNED to the trailing edge of the text column.
+ * Always visible, low-weight. Icon-only buttons (square 22 px hit areas
+ * via icons.css). The icons themselves are imported from the SVG library
+ * so the alignment doesn't drift across pairs.
+ * ────────────────────────────────────────────────────────────────────── */
+
+[data-ui='message-actions'] {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+  font-size: var(--font-size-xs);
+  color: var(--color-fg-muted);
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * Info disclosure (revealed by the info icon)
+ * ────────────────────────────────────────────────────────────────────── */
+
+[data-ui='message-info'] {
+  margin: var(--space-3) 0 0;
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  column-gap: var(--space-4);
+  row-gap: var(--space-1);
+  background: var(--color-bg-surface-2);
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-sm);
+  font-size: var(--font-size-xs);
+}
+
+[data-ui='message-info-row'] {
+  display: contents;
+}
+
+[data-ui='message-info'] dt {
+  color: var(--color-fg-muted);
+}
+
+[data-ui='message-info'] dd {
+  margin: 0;
+  color: var(--color-fg-primary);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  word-break: break-all;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * Error / abort / crash banners — keep these clearly delineated even in
+ * the otherwise quiet reading area.
+ * ────────────────────────────────────────────────────────────────────── */
+
+[data-ui='message'][data-state='crashed'] {
+  background: var(--color-banner-danger-bg);
+  border: 1px solid var(--color-border-strong);
+  border-left: 3px solid var(--color-danger);
+  border-radius: var(--radius-sm);
+  padding: var(--space-3);
+  display: block;
+}
+
+[data-ui='message-crash'] {
+  padding: var(--space-2);
+  color: var(--color-danger);
+  font-size: var(--font-size-sm);
 }
 
 [data-ui='message-error'] {
-  margin-top: 6px;
-  padding: 6px 8px;
-  font-size: 13px;
-  background: rgba(220, 38, 38, 0.08);
-  border: 1px solid rgba(220, 38, 38, 0.3);
-  border-radius: 4px;
-  color: rgb(139, 24, 24);
+  margin-top: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--font-size-sm);
+  background: var(--color-banner-danger-bg);
+  border: 1px solid var(--color-border-subtle);
+  border-left: 3px solid var(--color-danger);
+  border-radius: var(--radius-sm);
+  color: var(--color-danger);
 }
 
 [data-ui='message-error'][data-role='abort'] {
-  background: rgba(59, 130, 246, 0.08);
-  border-color: rgba(59, 130, 246, 0.3);
-  color: rgb(30, 58, 138);
+  background: var(--color-banner-info-bg);
+  border-left-color: var(--color-info);
+  color: var(--color-info);
+}
+
+[data-ui='message-continue'] {
+  margin-left: var(--space-3);
+  background: transparent;
+  border: 1px solid var(--color-border-default);
+  color: var(--color-info);
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-sm);
+  font-size: var(--font-size-xs);
+  cursor: pointer;
+}
+
+[data-ui='stream-overflow'] {
+  margin-top: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  background: var(--color-bg-surface-2);
+  border: 1px dashed var(--color-border-default);
+  border-radius: var(--radius-sm);
+  font-size: var(--font-size-xs);
+  color: var(--color-fg-muted);
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+[data-ui='stream-overflow-reveal'] {
+  background: transparent;
+  border: 1px solid var(--color-border-default);
+  color: var(--color-fg-primary);
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-sm);
+  font-size: var(--font-size-xs);
+  cursor: pointer;
+}
+
+[data-ui='message-body'][data-overflow='truncated'] {
+  max-height: 12em;
+  overflow: hidden;
+  position: relative;
+  mask-image: linear-gradient(
+    to bottom,
+    rgba(0, 0, 0, 1) 0,
+    rgba(0, 0, 0, 1) calc(100% - var(--content-fade-height)),
+    rgba(0, 0, 0, 0) 100%
+  );
 }

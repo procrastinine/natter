@@ -119,6 +119,32 @@ test('HTTP 503 no_provider_available surfaces as error row', async ({ page }) =>
   await expect(err).toContainText(/no provider free/)
 })
 
+test('network drop mid-stream persists partial text + abortReason=network + Continue affordance', async ({ page }) => {
+  // Abort the fetch before any chunk lands. Playwright `route.abort()` surfaces
+  // to the browser as a TypeError ("Failed to fetch"); the transport layer
+  // normalizes that into ApiError{kind:'network'}, which the send pipeline
+  // converts to abortReason='network' per Phase 7 plan.
+  await page.route('**/api/v1/chat/completions', async (route) => {
+    await route.abort('internetdisconnected')
+  })
+  await createChatAndOpen(page)
+  await sendMessage(page, 'drop this')
+  const assistant = page.locator('[data-ui="message"][data-role="assistant"]').first()
+  const banner = assistant.locator('[data-ui="message-error"][data-role="abort"]')
+  await expect(banner).toBeVisible()
+  await expect(banner).toHaveAttribute('data-reason', 'network')
+  await expect(banner.locator('[data-ui="message-continue"]')).toBeVisible()
+
+  const chatId = await firstChatId(page)
+  const rows = await readMessages(page, chatId)
+  const assistantRow = rows.find((r) => r.role === 'assistant') as {
+    content: Array<{ type: string; text: string }>
+    generation: { abortReason?: string; finishedAt?: number }
+  }
+  expect(assistantRow.generation.abortReason).toBe('network')
+  expect(typeof assistantRow.generation.finishedAt).toBe('number')
+})
+
 test('malformed SSE JSON is skipped; surrounding stream commits cleanly', async ({ page }) => {
   const body = [
     'data: {"id":"g1","choices":[{"delta":{"content":"A"}}]}',

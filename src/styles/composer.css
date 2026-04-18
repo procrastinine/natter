@@ -4,20 +4,193 @@
  * Owns: [data-ui='composer'|'composer-input'|'attachment-chip'|'attachment-menu'|
  *              'token-counter'|'composer-actions'|'image-output-settings'|
  *              'video-cost-notice'].
- * Phase 7 ships a minimal stylesheet so the textarea/send row is usable;
- * polish (density, shortcuts, attachment affordances) lands in Phase 8.
+ * See plan/10-ui.md §10.7.
  */
 
-[data-ui='composer-input'] {
+[data-ui='composer'] {
   width: 100%;
-  min-height: 60px;
-  resize: vertical;
-  font: inherit;
-  padding: 6px;
-  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  background: var(--color-bg-surface-1);
+  border-top: 1px solid var(--color-border-subtle);
+  position: relative;
+  /* Pad inside the composer so the textarea + actions don't sit flush
+   * against the resize-handle band on top, the send-button row on the
+   * bottom, or the main-pane left/right edges. The textarea itself is
+   * a card on a slightly different surface that's clearly separated
+   * from these chrome areas. */
+  padding: var(--space-4) var(--space-5);
 }
 
+/* Top-edge resize handle. The composer grows upward as the user drags so
+ * the visual handle lives on the TOP border (per user feedback: a bottom-
+ * right handle that moves the top is unintuitive). Thin invisible band
+ * with row-resize cursor; expands its hitbox without taking visible space. */
+[data-ui='composer-resize-handle'] {
+  position: absolute;
+  top: -3px;
+  left: 0;
+  right: 0;
+  height: 7px;
+  cursor: row-resize;
+  background: transparent;
+  z-index: 1;
+  user-select: none;
+  touch-action: none;
+}
+
+[data-ui='composer-resize-handle']::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 36px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--color-border-default);
+  transform: translate(-50%, -50%);
+  opacity: 0;
+  transition: opacity var(--duration-fast) var(--ease-standard);
+}
+
+[data-ui='composer-resize-handle']:hover::after,
+[data-ui='composer']:focus-within [data-ui='composer-resize-handle']::after {
+  opacity: 0.7;
+}
+
+/* The composer body is a stacked card: textarea on top, action row below.
+ * Both share a single white surface bounded by a 1-px gray border that
+ * does NOT change on focus — only the textarea gets the focus highlight
+ * (a subtle inset blue outline) so the visual change is contained to the
+ * actual input area. */
+[data-ui='composer-body'] {
+  max-width: var(--message-max-width);
+  width: 100%;
+  margin: 0 auto;
+  background: var(--color-bg-surface-1);
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-md);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* Textarea region is the actual input; gets a light gray surface so it
+ * reads as the "type here" affordance distinct from the surrounding
+ * chrome. Focus ring is inset so the highlight stays *inside* the
+ * textarea — the wrapping card doesn't change. */
+[data-ui='composer-input'] {
+  width: 100%;
+  resize: none;
+  font: inherit;
+  padding: var(--space-4);
+  box-sizing: border-box;
+  background: var(--color-bg-surface-2);
+  border: none;
+  color: var(--color-fg-primary);
+  outline: none;
+  font-size: var(--font-size-md);
+  line-height: var(--line-height-body);
+}
+
+[data-ui='composer-input']:focus,
+[data-ui='composer-input']:focus-visible {
+  outline: 2px solid var(--color-border-focus);
+  outline-offset: -2px;
+}
+
+[data-ui='composer-input']::placeholder {
+  color: var(--color-fg-muted);
+}
+
+/* Action row sits flush at the bottom of the card. Hairline divider
+ * separates it from the textarea so the input and the action surface
+ * are visually distinct. White background (different from the gray
+ * textarea). Send button fills the bottom-right corner. */
 [data-ui='composer-actions'] {
   display: flex;
-  justify-content: flex-end;
+  align-items: stretch;
+  gap: 0;
+  padding: 0 0 0 var(--space-4);
+  background: var(--color-bg-surface-1);
+  border-top: 1px solid var(--color-border-subtle);
+  min-height: 36px;
+}
+
+[data-ui='composer-disabled-reason'] {
+  max-width: var(--message-max-width);
+  margin: var(--space-2) auto 0;
+  color: var(--color-warning);
+  font-size: var(--font-size-xs);
+}
+
+[data-ui='token-counter'] {
+  color: var(--color-fg-muted);
+  font-size: var(--font-size-xs);
+  font-variant-numeric: tabular-nums;
+  margin-right: auto;
+  align-self: center;
+}
+
+[data-ui='token-counter'][data-over-limit='true'] {
+  color: var(--color-danger);
+  font-weight: var(--font-weight-medium);
+}
+
+/* Send button fills the entire bottom-right corner of the card: full
+ * height of the action row, only the bottom-right corner radiused to
+ * match the card. No padding-margin around it. Pressing Enter (or the
+ * configured send shortcut) submits, so the button is mostly visual
+ * confirmation that the action exists. */
+[data-ui='send'] {
+  background: var(--color-accent);
+  color: var(--color-accent-contrast);
+  border: none;
+  border-radius: 0;
+  padding: 0 var(--space-5);
+  font-weight: var(--font-weight-medium);
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+  align-self: stretch;
+  min-width: 96px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+}
+
+[data-ui='send']:hover:not(:disabled) {
+  background: var(--color-accent-hover);
+}
+
+[data-ui='send']:disabled {
+  opacity: var(--opacity-disabled);
+  cursor: not-allowed;
+}
+
+/* While a stream is in flight the same slot shows a Stop affordance.
+ * The Stop button keeps `data-ui="abort"` (so existing e2e tests still
+ * find it) but overrides the header's pill styling inside the composer
+ * so it fills the Send slot: full action-row height, square bottom-right
+ * corner, danger tint, icon + label. */
+[data-ui='composer-actions'] > [data-ui='abort'] {
+  background: var(--color-danger);
+  color: var(--color-fg-inverse);
+  border: none;
+  border-radius: 0;
+  padding: 0 var(--space-5);
+  font-weight: var(--font-weight-medium);
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+  align-self: stretch;
+  min-width: 96px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+}
+
+[data-ui='composer-actions'] > [data-ui='abort']:hover {
+  background: color-mix(in srgb, var(--color-danger) 85%, #000);
 }

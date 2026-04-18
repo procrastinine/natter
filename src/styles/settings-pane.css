@@ -1,8 +1,158 @@
 /*
  * settings-pane.css — right-side pane, section layout, field groups, tabs,
- *                     chat-organization settings.
+ *                    chat-organization settings.
  * Owns: [data-ui='settings-pane'|'settings-tab'|'settings-section'|'field-group'|
  *              'media-settings'|'rendering-settings'|'observability-panel'|
  *              'chat-org-settings'|'autotitle-settings'].
- * Filled in Phase 8.
+ * See plan/10-ui.md §10.20.
  */
+
+[data-ui='settings-pane'] {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+  background: var(--color-bg-surface-1);
+}
+
+[data-ui='settings-pane-header'] {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--color-border-subtle);
+  min-height: var(--header-height);
+}
+
+[data-ui='settings-pane-header'] h2,
+[data-ui='settings-pane-title'] {
+  margin: 0;
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-semibold);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--color-fg-muted);
+}
+
+/* The close-X icon button (data-ui="icon-button" + data-role="settings-pane-close")
+ * carries its own visual style from icons.css; here we just push it to the
+ * trailing edge of the pane header. */
+[data-ui='settings-pane-header'] > [data-role='settings-pane-close'] {
+  margin-left: auto;
+}
+
+/* Tab strip. No `overflow-x: auto` — that triggers a horizontal
+ * scrollbar gutter even when the tabs fit, which the user flagged.
+ * Tabs are sized by their content; if a future tab list overflows the
+ * modal width we'll wrap to a second row instead of scrolling. */
+[data-ui='settings-tabs'] {
+  display: flex;
+  gap: 0;
+  padding: 0 var(--space-4);
+  border-bottom: 1px solid var(--color-border-default);
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+}
+
+[data-ui='settings-tab'] {
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--color-fg-muted);
+  padding: var(--space-3) var(--space-4);
+  border-radius: 0;
+  font-size: var(--font-size-md);
+  font-weight: var(--font-weight-medium);
+  cursor: pointer;
+  white-space: nowrap;
+  margin-bottom: -1px;
+  line-height: 1.4;
+}
+
+[data-ui='settings-tab'][aria-selected='true'] {
+  color: var(--color-fg-primary);
+  border-bottom-color: var(--color-accent);
+  background: transparent;
+}
+
+[data-ui='settings-tab']:hover:not([aria-selected='true']) {
+  color: var(--color-fg-secondary);
+}
+
+[data-ui='settings-panel'] {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: var(--space-4);
+}
+
+/* Section rhythm: keep within-section spacing comfortable so labelled
+ * controls breathe (gap: --space-3), but keep section-to-section spacing
+ * tighter so distinct sections like Appearance / Composer don't drift
+ * apart visually. */
+[data-ui='settings-section'] {
+  margin-bottom: var(--space-3);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+[data-ui='settings-section'] > h3 {
+  margin: 0 0 var(--space-1);
+  font-size: var(--font-size-md);
+  color: var(--color-fg-primary);
+  font-weight: var(--font-weight-semibold);
+  letter-spacing: normal;
+  text-transform: none;
+}
+
+[data-ui='field-group'] {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+/* Rendering's two code-theme dropdowns are visually paired; render them
+ * stacked with extra breathing room between them so the labels don't run
+ * up against each other. */
+[data-ui='rendering-settings'] {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+/* Inline value chip next to slider labels, e.g. `Chat width  920px`. */
+[data-ui='field-value'] {
+  margin-left: var(--space-2);
+  color: var(--color-fg-muted);
+  font-variant-numeric: tabular-nums;
+  font-weight: var(--font-weight-regular);
+}
+
+[data-ui='chat-max-width-slider'] {
+  width: 100%;
+  accent-color: var(--color-accent);
+}
+
+[data-ui='system-prompt-textarea'] {
+  min-height: 160px;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  line-height: var(--line-height-body);
+}
+
+[data-ui='system-prompt-token-estimate'] {
+  align-self: flex-end;
+  color: var(--color-fg-muted);
+  font-size: var(--font-size-xs);
+}
+
+[data-ui='settings-toast'] {
+  background: var(--color-banner-info-bg);
+  border: 1px solid var(--color-border-subtle);
+  border-left: 3px solid var(--color-info);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+  color: var(--color-fg-primary);
+  font-size: var(--font-size-xs);
+  margin-bottom: var(--space-3);
+}

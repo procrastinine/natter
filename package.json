@@ -18,6 +18,10 @@
     "check": "biome check --write ."
   },
   "dependencies": {
+    "@streamdown/cjk": "^1.0.3",
+    "@streamdown/code": "^1.1.1",
+    "@streamdown/math": "^1.0.2",
+    "@streamdown/mermaid": "^1.0.2",
     "@tanstack/react-query": "^5.99.0",
     "@tanstack/react-virtual": "^3.13.24",
     "dexie": "^4.4.2",
@@ -42,6 +46,7 @@
     "@vitejs/plugin-react": "^6.0.1",
     "fake-indexeddb": "^6.2.5",
     "jsdom": "^29.0.2",
+    "katex": "^0.16.45",
     "tailwindcss": "^4.2.2",
     "typescript": "^6.0.3",
     "vite": "^8.0.8",

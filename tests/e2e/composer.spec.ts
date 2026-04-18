@@ -56,3 +56,24 @@ test('input clears after a successful send', async ({ page }) => {
   await expect(page.locator('[data-ui="message"][data-role="assistant"]')).toBeVisible()
   expect(await input.inputValue()).toBe('')
 })
+
+test('Send is disabled while a stream owns the active placeholder', async ({ page }) => {
+  // Hold the fetch open with a 1.5s delay so the stream is unambiguously
+  // active when we probe Send.
+  await mockChatCompletions(page, {
+    delayMs: 1500,
+    body: buildSseBody([{ id: 'g', content: 'slow', finish: 'stop' }]),
+  })
+  const input = page.locator('[data-ui="composer-input"]')
+  await input.fill('please wait')
+  const send = page.locator('[data-ui="send"]')
+  await send.click()
+  // Send should flip to disabled within the lifetime of the in-flight stream.
+  await expect(send).toBeDisabled()
+  // And the abort button surfaces while streaming.
+  await expect(page.locator('[data-ui="abort"]')).toBeVisible()
+  // After the stream finishes, Send unlocks (once input has text again).
+  await expect(page.locator('[data-ui="message"][data-role="assistant"]')).toBeVisible({ timeout: 5000 })
+  await input.fill('next')
+  await expect(send).toBeEnabled()
+})

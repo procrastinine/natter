@@ -1,5 +1,5 @@
 import { useLiveQuery } from 'dexie-react-hooks'
-import { useMemo } from 'react'
+import { memo, useMemo } from 'react'
 import { activePath } from '../../core/active-path'
 import type { ChatId, CursorMap } from '../../core/types'
 import { loadChatMessages } from '../../store/chats'
@@ -15,7 +15,12 @@ export interface MessageListProps {
 // `useSyncExternalStore` (getSnapshot must return a stable value).
 const EMPTY_CURSOR: CursorMap = Object.freeze({}) as CursorMap
 
-export function MessageList({ chatId }: MessageListProps) {
+// Memoized at the list level so prefs changes (theme, send shortcut,
+// chat width) on the Shell don't cascade into a re-render of the
+// markdown-heavy children.
+export const MessageList = memo(function MessageList({
+  chatId,
+}: MessageListProps) {
   const messages = useLiveQuery(() => loadChatMessages(chatId), [chatId], [])
   const cursor = useChatStore(
     (state) => state.cursors[chatId] ?? EMPTY_CURSOR,
@@ -31,4 +36,4 @@ export function MessageList({ chatId }: MessageListProps) {
       ))}
     </div>
   )
-}
+})

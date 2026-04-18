@@ -1,6 +1,117 @@
 /*
- * reasoning.css — reasoning panel, summary/details disclosures, encrypted badge.
- * Owns: [data-ui='reasoning'|'reasoning-summary'|'reasoning-details'|'reasoning-badge'|
- *              'reasoning-error'|'reasoning-overflow'].
- * Filled in Phase 8.
+ * reasoning.css — reasoning panel inside an assistant message. Quiet by
+ * default (sits in the calm reading area), expands on click.
+ * Owns: [data-ui='reasoning'|'reasoning-summary'|'reasoning-details'|
+ *              'reasoning-section'|'reasoning-badge'|'reasoning-error'|
+ *              'reasoning-overflow'].
+ * See plan/10-ui.md §10.20, plan/11-rendering.md §11.9.
  */
+
+/* Subtle info-tint — reasoning is a distinct lane from main prose, so a
+ * light wash of color helps it register. Uses the unified --color-info-
+ * tint-soft / --color-info-border tokens so it matches every other
+ * "calm light-blue surface" in the app (selected sidebar row, info
+ * banners, etc.). */
+[data-ui='reasoning'] {
+  border: 1px solid var(--color-info-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-info-tint-soft);
+  margin: var(--space-2) 0 var(--space-3);
+  padding: 0;
+  font-size: var(--font-size-sm);
+  color: var(--color-fg-secondary);
+  display: flex;
+  flex-direction: column;
+}
+
+[data-ui='reasoning-summary'] {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  font-size: var(--font-size-sm);
+  color: var(--color-fg-secondary);
+  cursor: pointer;
+  list-style: none;
+}
+
+[data-ui='reasoning-summary']::-webkit-details-marker {
+  display: none;
+}
+
+/* Inline triangular marker — drawn with CSS borders so the chevron stays
+ * pixel-aligned regardless of font metrics (the legacy `▸`/`▾` font
+ * glyphs jittered the baseline when toggled). */
+[data-ui='reasoning-summary']::before {
+  content: '';
+  width: 0;
+  height: 0;
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  border-left: 6px solid currentColor;
+  display: inline-block;
+  margin-right: 4px;
+  transform-origin: 25% 50%;
+  transition: transform var(--duration-fast) var(--ease-standard);
+}
+
+[data-ui='reasoning'][open] [data-ui='reasoning-summary']::before {
+  transform: rotate(90deg);
+}
+
+[data-ui='reasoning-badge'] {
+  font-size: var(--font-size-xs);
+  padding: 1px var(--space-2);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-surface-3);
+  color: var(--color-fg-muted);
+  border: 1px solid var(--color-border-subtle);
+  font-weight: var(--font-weight-regular);
+  margin-left: auto;
+}
+
+[data-ui='reasoning'][data-reasoning-format='encrypted'] [data-ui='reasoning-badge'] {
+  background: transparent;
+  color: var(--color-fg-muted);
+  border-color: var(--color-border-default);
+}
+
+[data-ui='reasoning-details'] {
+  padding: var(--space-4) var(--space-4) var(--space-4);
+  border-top: 1px solid var(--color-border-subtle);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  font-size: var(--font-size-sm);
+  line-height: var(--line-height-body);
+  color: var(--color-fg-primary);
+}
+
+[data-ui='reasoning-section'] {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+[data-ui='reasoning-section'] p {
+  margin: 0;
+  white-space: pre-wrap;
+  font-size: var(--font-size-sm);
+  line-height: var(--line-height-body);
+}
+
+[data-ui='reasoning-section'][data-reasoning-kind='text'] p {
+  font-family: var(--font-sans);
+}
+
+[data-ui='reasoning-section'][data-reasoning-kind='summary'] p {
+  font-family: var(--font-sans);
+  color: var(--color-fg-secondary);
+}
+
+[data-ui='reasoning-section'][data-reasoning-kind='encrypted'] p {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  color: var(--color-fg-muted);
+  font-style: italic;
+}

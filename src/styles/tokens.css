@@ -1,5 +1,172 @@
 /*
  * tokens.css — shared design tokens.
  * Owns: :root, [data-theme], [data-density].
- * Filled in Phase 8; see plan/10-ui.md §10.20, §10.21.
+ * Source: plan/10-ui.md §10.21.
+ *
+ * All token names here are required by the Phase-8 contract test in
+ * tests/unit/tokens-css.test.ts. Themes may change values, not names.
  */
+
+:root {
+  /* --- Color tokens (§10.21.1) --- */
+  --color-bg-app: #fbfbfb;
+  --color-bg-surface-1: #ffffff;
+  --color-bg-surface-2: #f4f5f7;
+  --color-bg-surface-3: #e9ebef;
+  --color-bg-overlay: rgba(24, 26, 32, 0.45);
+  --color-bg-hover: rgba(15, 23, 42, 0.05);
+  --color-bg-active: rgba(15, 23, 42, 0.09);
+  /* Single light-blue tint used everywhere a calm "this region is a
+   * blue surface" is needed: selected sidebar row, reasoning panel,
+   * info banners, abort banners, etc. The hue is derived from
+   * --color-accent (#2563eb) so the tints sit in the SAME hue family
+   * as the Send button — different saturations of one blue, not two
+   * competing blues. */
+  --color-info-tint-soft: rgba(37, 99, 235, 0.07);
+  --color-info-tint-strong: rgba(37, 99, 235, 0.14);
+  --color-info-border: rgba(37, 99, 235, 0.24);
+  --color-bg-selected: var(--color-info-tint-strong);
+  --color-bg-disabled: rgba(15, 23, 42, 0.04);
+  --color-fg-primary: #0f172a;
+  --color-fg-secondary: #334155;
+  --color-fg-muted: #64748b;
+  --color-fg-disabled: rgba(15, 23, 42, 0.35);
+  --color-fg-inverse: #ffffff;
+  --color-border-subtle: rgba(15, 23, 42, 0.08);
+  --color-border-default: rgba(15, 23, 42, 0.14);
+  --color-border-strong: rgba(15, 23, 42, 0.28);
+  --color-border-focus: #2563eb;
+  --color-accent: #2563eb;
+  --color-accent-hover: #1d4ed8;
+  --color-accent-active: #1e40af;
+  --color-accent-contrast: #ffffff;
+  --color-link: #1d4ed8;
+  --color-link-hover: #1e3a8a;
+  --color-success: #15803d;
+  --color-warning: #b45309;
+  --color-danger: #b91c1c;
+  --color-info: #0369a1;
+  --color-banner-info-bg: var(--color-info-tint-soft);
+  --color-banner-success-bg: rgba(22, 163, 74, 0.1);
+  --color-banner-warning-bg: rgba(234, 179, 8, 0.12);
+  --color-banner-danger-bg: rgba(220, 38, 38, 0.1);
+  --color-role-user: #2563eb;
+  --color-role-assistant: #15803d;
+  --color-role-system: #64748b;
+  --color-role-tool: #7c3aed;
+  --color-role-imported: #c2410c;
+  --color-privacy-green: #15803d;
+  --color-privacy-yellow: #ca8a04;
+  --color-privacy-orange: #c2410c;
+  --color-privacy-red: #b91c1c;
+  --color-privacy-open: #64748b;
+  --color-streaming: #2563eb;
+  --color-generating: #7c3aed;
+  --color-archived: #94a3b8;
+  --color-pinned: #d97706;
+  --color-blocked: #b91c1c;
+  --color-citation: #1d4ed8;
+  --color-citation-hover: #1e3a8a;
+  --color-backdrop-scrim: rgba(15, 23, 42, 0.45);
+  --color-code-bg: #f6f7f9;
+  --color-code-border: rgba(15, 23, 42, 0.1);
+  --color-code-toolbar-bg: #eef0f4;
+  --color-code-toolbar-fg: #475569;
+  --color-selection: rgba(37, 99, 235, 0.25);
+
+  /* --- Typography (§10.21.2) --- */
+  --font-sans: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto,
+    'Helvetica Neue', Arial, sans-serif;
+  --font-mono: ui-monospace, 'SF Mono', Menlo, Consolas, 'Liberation Mono',
+    monospace;
+  --font-size-xs: 12px;
+  --font-size-sm: 13px;
+  --font-size-md: 15px;
+  --font-size-lg: 17px;
+  --font-size-xl: 22px;
+  --line-height-tight: 1.2;
+  --line-height-body: 1.5;
+  --line-height-loose: 1.7;
+  --font-weight-regular: 400;
+  --font-weight-medium: 500;
+  --font-weight-semibold: 600;
+  --font-weight-bold: 700;
+
+  /* --- Spacing, sizing, radius, shadow, z-index (§10.21.3) --- */
+  --space-1: 2px;
+  --space-2: 4px;
+  --space-3: 8px;
+  --space-4: 12px;
+  --space-5: 16px;
+  --space-6: 20px;
+  --space-8: 28px;
+  --space-10: 40px;
+  --sidebar-width: 260px;
+  --sidebar-width-collapsed: 48px;
+  --sidebar-folder-indent: 14px;
+  --sidebar-row-tag-gap: 4px;
+  --sidebar-search-progress-width: 180px;
+  --header-height: 40px;
+  --settings-pane-width: 360px;
+  --composer-min-height: 80px;
+  --composer-max-height: 260px;
+  --message-gutter: 12px;
+  --message-glyph-size: 32px;
+  --message-glyph-gutter: 56px;
+  --message-row-padding: 18px;
+  --message-row-padding-bottom: 20px;
+  --message-row-gap: 10px;
+  --message-max-width: 920px;
+  --branch-indent-step: 10px;
+  --banner-stack-gap: 8px;
+  --dropdown-max-height: 380px;
+  --attachment-chip-height: 32px;
+  --code-block-max-height: 520px;
+  --modal-width-sm: 360px;
+  --modal-width-md: 560px;
+  --modal-width-lg: 840px;
+  --radius-xs: 3px;
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 10px;
+  --radius-pill: 9999px;
+  --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.08);
+  --shadow-md: 0 2px 6px rgba(15, 23, 42, 0.1);
+  --shadow-lg: 0 6px 18px rgba(15, 23, 42, 0.14);
+  --shadow-overlay: 0 20px 48px rgba(15, 23, 42, 0.28);
+  --focus-ring-width: 2px;
+  --z-sidebar: 10;
+  --z-header: 20;
+  --z-settings-pane: 30;
+  --z-dropdown: 40;
+  --z-toast: 60;
+  --z-modal: 80;
+  --z-overlay: 90;
+  --z-drag-ghost: 100;
+
+  /* --- Motion (§10.21.4) --- */
+  --duration-instant: 0ms;
+  --duration-fast: 120ms;
+  --duration-normal: 200ms;
+  --duration-slow: 320ms;
+  --ease-standard: cubic-bezier(0.2, 0, 0.2, 1);
+  --ease-emphasized: cubic-bezier(0.2, 0, 0, 1);
+  --ease-decelerate: cubic-bezier(0.05, 0.7, 0.1, 1);
+  --ease-accelerate: cubic-bezier(0.3, 0, 0.8, 0.15);
+
+  /* --- Effect tokens (§10.21.5) --- */
+  --opacity-disabled: 0.45;
+  --opacity-muted: 0.72;
+  --backdrop-blur-overlay: blur(6px);
+  --stream-caret-width: 2px;
+  --content-fade-height: 24px;
+}
+
+[data-density='compact'] {
+  --message-row-gap: 6px;
+  --space-3: 6px;
+  --space-4: 10px;
+  --space-5: 12px;
+  --header-height: 36px;
+  --composer-min-height: 64px;
+}

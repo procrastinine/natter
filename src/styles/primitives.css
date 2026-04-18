@@ -2,5 +2,110 @@
  * primitives.css — buttons, inputs, chips, menus, tabs, checkboxes, tooltips, toasts.
  * Owns: [data-ui='button'|'input'|'textarea'|'chip'|'tab'|'menu'|'toast'|
  *              'checkbox'|'tooltip'|'context-menu'].
- * Filled in Phase 8.
+ * See plan/10-ui.md §10.20, §10.22.
  */
+
+html,
+body {
+  background: var(--color-bg-app);
+  color: var(--color-fg-primary);
+  font-family: var(--font-sans);
+  font-size: var(--font-size-md);
+  line-height: var(--line-height-body);
+}
+
+::selection {
+  background: var(--color-selection);
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: var(--color-bg-surface-2);
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-sm);
+  padding: var(--space-2) var(--space-4);
+  cursor: pointer;
+  transition:
+    background var(--duration-fast) var(--ease-standard),
+    border-color var(--duration-fast) var(--ease-standard);
+}
+
+button:hover:not(:disabled) {
+  background: var(--color-bg-hover);
+}
+
+button:active:not(:disabled) {
+  background: var(--color-bg-active);
+}
+
+button:disabled,
+button[data-state='disabled'] {
+  opacity: var(--opacity-disabled);
+  cursor: not-allowed;
+}
+
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+[tabindex]:focus-visible {
+  outline: var(--focus-ring-width) solid var(--color-border-focus);
+  outline-offset: 1px;
+}
+
+input,
+textarea,
+select {
+  font: inherit;
+  color: var(--color-fg-primary);
+  background: var(--color-bg-surface-1);
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-sm);
+  padding: var(--space-2) var(--space-3);
+}
+
+textarea {
+  resize: vertical;
+  line-height: var(--line-height-body);
+}
+
+[data-ui='chip'] {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-pill);
+  background: var(--color-bg-surface-2);
+  color: var(--color-fg-secondary);
+  border: 1px solid var(--color-border-subtle);
+  font-size: var(--font-size-xs);
+  line-height: 1;
+}
+
+[data-ui='tooltip'] {
+  position: absolute;
+  background: var(--color-fg-primary);
+  color: var(--color-fg-inverse);
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-sm);
+  font-size: var(--font-size-xs);
+  box-shadow: var(--shadow-md);
+  pointer-events: none;
+}
+
+[data-ui='toast'] {
+  padding: var(--space-3) var(--space-5);
+  background: var(--color-bg-surface-1);
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+}
+
+[data-ui='menu'] {
+  background: var(--color-bg-surface-1);
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+  padding: var(--space-2) 0;
+  min-width: 160px;
+}

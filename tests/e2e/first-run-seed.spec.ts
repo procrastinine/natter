@@ -7,17 +7,45 @@ test.beforeEach(async ({ page }) => {
   await page.goto('/')
 })
 
-test('first-run form is shown when no profile exists', async ({ page }) => {
-  await expect(page.locator('[data-ui="first-run-key"]')).toBeVisible()
-  await expect(page.locator('[data-ui="first-run-submit"]')).toBeDisabled()
+test('app boots without a connection — empty state visible, "Add connection" CTA in header', async ({
+  page,
+}) => {
+  // No first-run blocker any more: the empty state and connection header are
+  // both visible immediately. The composer is not present yet (no chat).
+  await expect(page.locator('[data-ui="empty-state"]')).toBeVisible()
+  await expect(
+    page.locator('[data-ui="connection-header"][data-state="unset"]'),
+  ).toBeVisible()
+  await expect(page.locator('[data-ui="connection-add"]')).toBeVisible()
 })
 
-test('pasting a key enables submit and seeds a profile + preset', async ({ page }) => {
-  await page.locator('[data-ui="first-run-key"]').fill('sk-or-v1-test-0000000000000000000000000000000000')
-  const submit = page.locator('[data-ui="first-run-submit"]')
-  await expect(submit).toBeEnabled()
-  await submit.click()
-  await expect(page.locator('[data-ui="empty-state"]')).toBeVisible()
+test('opening the connection-setup modal requires a key before the submit enables', async ({
+  page,
+}) => {
+  await page.locator('[data-ui="connection-add"]').click()
+  await expect(page.locator('[data-ui="connection-setup-modal"]')).toBeVisible()
+  await expect(page.locator('[data-ui="connection-setup-submit"]')).toBeDisabled()
+  await page
+    .locator('[data-ui="connection-setup-key"]')
+    .fill('sk-or-v1-test-0000000000000000000000000000000000')
+  await expect(page.locator('[data-ui="connection-setup-submit"]')).toBeEnabled()
+})
+
+test('submitting the connection-setup modal seeds a profile + preset and updates the header', async ({
+  page,
+}) => {
+  await page.locator('[data-ui="connection-add"]').click()
+  await page
+    .locator('[data-ui="connection-setup-key"]')
+    .fill('sk-or-v1-test-seed-0000000000000000000000000000')
+  await page.locator('[data-ui="connection-setup-submit"]').click()
+  // Modal closes; header reflects the new profile.
+  await page
+    .locator('[data-ui="connection-setup-modal"]')
+    .waitFor({ state: 'detached' })
+  await expect(
+    page.locator('[data-ui="connection-header"][data-state="configured"]'),
+  ).toBeVisible()
   const counts = await page.evaluate(async () => {
     const db = await new Promise<IDBDatabase>((resolve, reject) => {
       const req = indexedDB.open('natter')
@@ -42,21 +70,74 @@ test('pasting a key enables submit and seeds a profile + preset', async ({ page 
   expect(counts).toEqual({ keys: 1, profiles: 1, presets: 1 })
 })
 
-test('seeded profile and preset survive a reload', async ({ page }) => {
-  await page.locator('[data-ui="first-run-key"]').fill('sk-or-v1-test-persist-0000000000000000000000')
-  await page.locator('[data-ui="first-run-submit"]').click()
-  await expect(page.locator('[data-ui="empty-state"]')).toBeVisible()
+test('seeded profile survives a reload and the connection header stays configured', async ({
+  page,
+}) => {
+  await page.locator('[data-ui="connection-add"]').click()
+  await page
+    .locator('[data-ui="connection-setup-key"]')
+    .fill('sk-or-v1-test-persist-0000000000000000000000')
+  await page.locator('[data-ui="connection-setup-submit"]').click()
+  await expect(
+    page.locator('[data-ui="connection-header"][data-state="configured"]'),
+  ).toBeVisible()
   await page.reload()
-  // First-run form should NOT reappear — seeded profile persisted.
-  await expect(page.locator('[data-ui="first-run-key"]')).toHaveCount(0)
-  await expect(page.locator('[data-ui="empty-state"]')).toBeVisible()
+  // Still configured after reload.
+  await expect(
+    page.locator('[data-ui="connection-header"][data-state="configured"]'),
+  ).toBeVisible()
+  await expect(page.locator('[data-ui="connection-add"]')).toHaveCount(0)
 })
 
-test('submit is disabled when the key input is empty', async ({ page }) => {
-  const submit = page.locator('[data-ui="first-run-submit"]')
+test('whitespace-only key keeps submit disabled; trim happens on save', async ({ page }) => {
+  await page.locator('[data-ui="connection-add"]').click()
+  const key = page.locator('[data-ui="connection-setup-key"]')
+  const submit = page.locator('[data-ui="connection-setup-submit"]')
+  await key.fill('   \t  ')
   await expect(submit).toBeDisabled()
-  await page.locator('[data-ui="first-run-key"]').fill('not-empty')
+  await key.fill('  sk-or-v1-test-whitespace-000000000000000000  ')
   await expect(submit).toBeEnabled()
-  await page.locator('[data-ui="first-run-key"]').fill('')
-  await expect(submit).toBeDisabled()
+  await submit.click()
+  await expect(
+    page.locator('[data-ui="connection-header"][data-state="configured"]'),
+  ).toBeVisible()
+  const previews = await page.evaluate(async () => {
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const req = indexedDB.open('natter')
+      req.onsuccess = () => resolve(req.result)
+      req.onerror = () => reject(req.error)
+    })
+    try {
+      return await new Promise<string[]>((resolve, reject) => {
+        const tx = db.transaction('keys', 'readonly')
+        const req = tx.objectStore('keys').getAll()
+        req.onsuccess = () => {
+          const rows = req.result as Array<{ obscuredPreview: string }>
+          resolve(rows.map((r) => r.obscuredPreview))
+        }
+        req.onerror = () => reject(req.error)
+      })
+    } finally {
+      db.close()
+    }
+  })
+  expect(previews).toHaveLength(1)
+  // obscurePreview keeps 10-char prefix + 4-char suffix. Trimmed prefix is
+  // "sk-or-v1-t"; untrimmed would be "  sk-or-v1".
+  expect(previews[0]?.startsWith('sk-or-v1-t')).toBe(true)
+  expect(previews[0]?.startsWith('  ')).toBe(false)
+})
+
+test('Send button is disabled with a "configure a connection" tooltip when no profile exists', async ({
+  page,
+}) => {
+  // Navigate to #/new to expose the composer without a configured connection.
+  await page.locator('[data-ui="new-chat"]').click()
+  await expect(page.locator('[data-ui="composer-input"]')).toBeVisible()
+  await page.locator('[data-ui="composer-input"]').fill('hi')
+  const send = page.locator('[data-ui="send"]')
+  await expect(send).toBeDisabled()
+  await expect(
+    page.locator('[data-ui="composer-disabled-reason"]'),
+  ).toContainText(/Add a connection/)
 })

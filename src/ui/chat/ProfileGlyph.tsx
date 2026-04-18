@@ -1,0 +1,57 @@
+import type { Message } from '../../core/types'
+import type { ProfilePictureRef } from '../../core/global-settings'
+import { PersonIcon, RobotIcon } from '../icons/Icon'
+
+export interface ProfileGlyphProps {
+  role: Message['role']
+  // Override the default picture for the user / assistant glyphs (consumed
+  // from global preferences). System / tool / developer fall back to the
+  // generic person silhouette since they don't have a meaningful default.
+  userPicture?: ProfilePictureRef
+  assistantPicture?: ProfilePictureRef
+}
+
+const ROLE_LABEL: Record<Message['role'], string> = {
+  user: 'You',
+  assistant: 'Assistant',
+  system: 'System',
+  developer: 'Developer',
+  tool: 'Tool',
+}
+
+function pictureForRole(
+  role: Message['role'],
+  userPicture: ProfilePictureRef,
+  assistantPicture: ProfilePictureRef,
+): ProfilePictureRef {
+  if (role === 'user') return userPicture
+  if (role === 'assistant') return assistantPicture
+  return 'default-person'
+}
+
+// Circular gutter glyph for each turn — generic SVG silhouette by default
+// (person for user, robot for assistant). Per-role color is intentionally
+// avoided in the reading area; the silhouette + role label carry the
+// identification.
+export function ProfileGlyph({
+  role,
+  userPicture = 'default-person',
+  assistantPicture = 'default-robot',
+}: ProfileGlyphProps) {
+  const picture = pictureForRole(role, userPicture, assistantPicture)
+  return (
+    <span
+      data-ui="profile-glyph"
+      data-role={role}
+      data-picture={picture}
+      aria-label={ROLE_LABEL[role]}
+      role="img"
+    >
+      {picture === 'default-robot' ? (
+        <RobotIcon size={20} />
+      ) : (
+        <PersonIcon size={20} />
+      )}
+    </span>
+  )
+}

@@ -116,3 +116,72 @@ export async function touchLastViewed(
     ctx.patchChatMeta(chatId, { lastViewedAt: now }, { touchVisibleState: false, broadcast: false })
   })
 }
+
+// Manual title edit. Sets `titleStatus = 'manual'` and overwrites `title` with
+// the trimmed value. Callers must pre-validate that the trimmed title is
+// non-empty — the helper defensively short-circuits if it is anyway. See
+// plan/02-data-model.md §2.1.1 and plan/10-ui.md §10.3 inline title editor.
+export async function setManualTitle(
+  chatId: ChatId,
+  title: string,
+  now = Date.now(),
+): Promise<boolean> {
+  const trimmed = title.trim()
+  if (trimmed.length === 0) return false
+  const repo = getBrowserRepository()
+  let changed = false
+  await repo.runMutation([{ kind: 'chat-meta', chatId }], async (ctx) => {
+    const chat = await ctx.getChat(chatId)
+    if (!chat) return
+    if (chat.title === trimmed && chat.titleStatus === 'manual') {
+      return
+    }
+    changed = true
+    ctx.patchChatMeta(chatId, {
+      title: trimmed,
+      titleStatus: 'manual',
+      updatedAt: now,
+    })
+  })
+  return changed
+}
+
+// Partial `ChatSettings` patch through the chat-meta scope. Used by the
+// settings pane (system prompt edit, rendering pref tweaks, etc.). Returns
+// true if anything actually changed. Concurrency is LWW on the chat-meta row,
+// consistent with other settings edits. See plan/14-details.md §14.35.5.
+export async function updateChatSettings(
+  chatId: ChatId,
+  patch: Partial<ChatSettings>,
+  now = Date.now(),
+): Promise<boolean> {
+  const keys = Object.keys(patch) as Array<keyof ChatSettings>
+  if (keys.length === 0) return false
+  const repo = getBrowserRepository()
+  let changed = false
+  await repo.runMutation([{ kind: 'chat-meta', chatId }], async (ctx) => {
+    const chat = await ctx.getChat(chatId)
+    if (!chat) return
+    const nextSettings = { ...chat.settings, ...patch }
+    if (sameSettingsFor(chat.settings, nextSettings, keys)) return
+    changed = true
+    ctx.patchChatMeta(chatId, {
+      settings: nextSettings,
+      updatedAt: now,
+    })
+  })
+  return changed
+}
+
+function sameSettingsFor(
+  prev: ChatSettings,
+  next: ChatSettings,
+  keys: Array<keyof ChatSettings>,
+): boolean {
+  for (const key of keys) {
+    if (!Object.is(prev[key], next[key])) {
+      if (JSON.stringify(prev[key]) !== JSON.stringify(next[key])) return false
+    }
+  }
+  return true
+}

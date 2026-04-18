@@ -2,5 +2,42 @@
  * banners.css — blocking banners, warning banners, empty states, migration/BYOK notices.
  * Owns: [data-ui='banner'|'blocking-banner'|'warning-banner'|'notice-banner'|
  *              'tip-callout'|'update-banner'|'compatibility-banner'|'lock-banner'].
- * Filled in Phase 8.
+ * See plan/10-ui.md §10.20.
  */
+
+[data-ui='banner'],
+[data-ui='notice-banner'],
+[data-ui='warning-banner'],
+[data-ui='blocking-banner'],
+[data-ui='tip-callout'] {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-border-subtle);
+  background: var(--color-bg-surface-2);
+  color: var(--color-fg-primary);
+  font-size: var(--font-size-sm);
+  margin-bottom: var(--banner-stack-gap);
+}
+
+[data-tone='info'] {
+  background: var(--color-banner-info-bg);
+  border-left: 3px solid var(--color-info);
+}
+
+[data-tone='success'] {
+  background: var(--color-banner-success-bg);
+  border-left: 3px solid var(--color-success);
+}
+
+[data-tone='warning'] {
+  background: var(--color-banner-warning-bg);
+  border-left: 3px solid var(--color-warning);
+}
+
+[data-tone='danger'] {
+  background: var(--color-banner-danger-bg);
+  border-left: 3px solid var(--color-danger);
+}

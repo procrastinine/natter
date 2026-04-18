@@ -23,6 +23,7 @@ const EXPECTED_ORDER = [
   '../styles/themes.css',
   '../styles/motion.css',
   '../styles/primitives.css',
+  '../styles/icons.css',
   '../styles/forms.css',
   '../styles/modals.css',
   '../styles/shell.css',

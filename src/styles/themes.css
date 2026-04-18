@@ -1,5 +1,178 @@
 /*
  * themes.css — theme-specific token assignments.
  * Owns: [data-theme='light'|'dark'|'high-contrast'].
- * Filled in Phase 8.
+ * See plan/10-ui.md §10.20, §10.21.
+ *
+ * `:root` / Phase-8 default is the light palette (defined in tokens.css); light
+ * lives here too for symmetry when a tab carries an explicit `data-theme='light'`.
+ * Dark inherits via @media when no explicit theme is set.
  */
+
+[data-theme='light'] {
+  color-scheme: light;
+}
+
+[data-theme='dark'] {
+  color-scheme: dark;
+  --color-bg-app: #0b0d12;
+  --color-bg-surface-1: #10131a;
+  --color-bg-surface-2: #161b24;
+  --color-bg-surface-3: #1e2430;
+  --color-bg-overlay: rgba(0, 0, 0, 0.55);
+  --color-bg-hover: rgba(255, 255, 255, 0.06);
+  --color-bg-active: rgba(255, 255, 255, 0.1);
+  /* Dark-mode tint family derived from --color-accent (#60a5fa) so it
+   * matches the Send button's hue. */
+  --color-info-tint-soft: rgba(96, 165, 250, 0.08);
+  --color-info-tint-strong: rgba(96, 165, 250, 0.18);
+  --color-info-border: rgba(96, 165, 250, 0.32);
+  --color-bg-selected: var(--color-info-tint-strong);
+  --color-bg-disabled: rgba(255, 255, 255, 0.04);
+  --color-fg-primary: #f1f5f9;
+  --color-fg-secondary: #cbd5e1;
+  --color-fg-muted: #94a3b8;
+  --color-fg-disabled: rgba(241, 245, 249, 0.32);
+  --color-fg-inverse: #0b0d12;
+  --color-border-subtle: rgba(255, 255, 255, 0.08);
+  --color-border-default: rgba(255, 255, 255, 0.14);
+  --color-border-strong: rgba(255, 255, 255, 0.28);
+  --color-border-focus: #60a5fa;
+  --color-accent: #60a5fa;
+  --color-accent-hover: #3b82f6;
+  --color-accent-active: #2563eb;
+  --color-accent-contrast: #0b1020;
+  --color-link: #93c5fd;
+  --color-link-hover: #bfdbfe;
+  --color-success: #4ade80;
+  --color-warning: #fbbf24;
+  --color-danger: #f87171;
+  --color-info: #38bdf8;
+  --color-banner-info-bg: var(--color-info-tint-soft);
+  --color-banner-success-bg: rgba(34, 197, 94, 0.12);
+  --color-banner-warning-bg: rgba(251, 191, 36, 0.12);
+  --color-banner-danger-bg: rgba(248, 113, 113, 0.12);
+  --color-role-user: #60a5fa;
+  --color-role-assistant: #4ade80;
+  --color-role-system: #94a3b8;
+  --color-role-tool: #c084fc;
+  --color-role-imported: #fb923c;
+  --color-privacy-green: #4ade80;
+  --color-privacy-yellow: #facc15;
+  --color-privacy-orange: #fb923c;
+  --color-privacy-red: #f87171;
+  --color-privacy-open: #94a3b8;
+  --color-streaming: #60a5fa;
+  --color-generating: #c084fc;
+  --color-archived: #64748b;
+  --color-pinned: #fbbf24;
+  --color-blocked: #f87171;
+  --color-citation: #93c5fd;
+  --color-citation-hover: #bfdbfe;
+  --color-backdrop-scrim: rgba(0, 0, 0, 0.6);
+  --color-code-bg: #11151d;
+  --color-code-border: rgba(255, 255, 255, 0.1);
+  --color-code-toolbar-bg: #1a202b;
+  --color-code-toolbar-fg: #94a3b8;
+  --color-selection: rgba(96, 165, 250, 0.35);
+}
+
+[data-theme='high-contrast'] {
+  color-scheme: dark;
+  --color-bg-app: #000000;
+  --color-bg-surface-1: #000000;
+  --color-bg-surface-2: #0a0a0a;
+  --color-bg-surface-3: #181818;
+  --color-bg-overlay: rgba(0, 0, 0, 0.75);
+  --color-bg-hover: rgba(255, 255, 255, 0.18);
+  --color-bg-active: rgba(255, 255, 255, 0.3);
+  --color-info-tint-soft: #001a2e;
+  --color-info-tint-strong: #003366;
+  --color-info-border: #0066aa;
+  --color-bg-selected: var(--color-info-tint-strong);
+  --color-bg-disabled: #1a1a1a;
+  --color-fg-primary: #ffffff;
+  --color-fg-secondary: #ffffff;
+  --color-fg-muted: #e5e5e5;
+  --color-fg-disabled: #7a7a7a;
+  --color-fg-inverse: #000000;
+  --color-border-subtle: #ffffff;
+  --color-border-default: #ffffff;
+  --color-border-strong: #ffffff;
+  --color-border-focus: #ffd400;
+  --color-accent: #ffd400;
+  --color-accent-hover: #fff000;
+  --color-accent-active: #ffffff;
+  --color-accent-contrast: #000000;
+  --color-link: #66ccff;
+  --color-link-hover: #bfe6ff;
+  --color-success: #33ff66;
+  --color-warning: #ffcc00;
+  --color-danger: #ff6666;
+  --color-info: #66ccff;
+  --color-banner-info-bg: var(--color-info-tint-soft);
+  --color-banner-success-bg: #003300;
+  --color-banner-warning-bg: #554400;
+  --color-banner-danger-bg: #550000;
+  --color-role-user: #66ccff;
+  --color-role-assistant: #33ff66;
+  --color-role-system: #cccccc;
+  --color-role-tool: #cc99ff;
+  --color-role-imported: #ffaa66;
+  --color-privacy-green: #33ff66;
+  --color-privacy-yellow: #ffd400;
+  --color-privacy-orange: #ffaa66;
+  --color-privacy-red: #ff6666;
+  --color-privacy-open: #cccccc;
+  --color-streaming: #66ccff;
+  --color-generating: #cc99ff;
+  --color-archived: #888888;
+  --color-pinned: #ffd400;
+  --color-blocked: #ff6666;
+  --color-citation: #66ccff;
+  --color-citation-hover: #bfe6ff;
+  --color-backdrop-scrim: rgba(0, 0, 0, 0.85);
+  --color-code-bg: #000000;
+  --color-code-border: #ffffff;
+  --color-code-toolbar-bg: #181818;
+  --color-code-toolbar-fg: #ffffff;
+  --color-selection: #ffd400;
+  --focus-ring-width: 3px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) {
+    color-scheme: dark;
+    --color-bg-app: #0b0d12;
+    --color-bg-surface-1: #10131a;
+    --color-bg-surface-2: #161b24;
+    --color-bg-surface-3: #1e2430;
+    --color-bg-overlay: rgba(0, 0, 0, 0.55);
+    --color-bg-hover: rgba(255, 255, 255, 0.06);
+    --color-bg-active: rgba(255, 255, 255, 0.1);
+    --color-info-tint-soft: rgba(96, 165, 250, 0.08);
+    --color-info-tint-strong: rgba(96, 165, 250, 0.18);
+    --color-info-border: rgba(96, 165, 250, 0.32);
+    --color-bg-selected: var(--color-info-tint-strong);
+    --color-bg-disabled: rgba(255, 255, 255, 0.04);
+    --color-fg-primary: #f1f5f9;
+    --color-fg-secondary: #cbd5e1;
+    --color-fg-muted: #94a3b8;
+    --color-fg-disabled: rgba(241, 245, 249, 0.32);
+    --color-fg-inverse: #0b0d12;
+    --color-border-subtle: rgba(255, 255, 255, 0.08);
+    --color-border-default: rgba(255, 255, 255, 0.14);
+    --color-border-strong: rgba(255, 255, 255, 0.28);
+    --color-border-focus: #60a5fa;
+    --color-accent: #60a5fa;
+    --color-accent-hover: #3b82f6;
+    --color-accent-active: #2563eb;
+    --color-accent-contrast: #0b1020;
+    --color-link: #93c5fd;
+    --color-link-hover: #bfdbfe;
+    --color-code-bg: #11151d;
+    --color-code-border: rgba(255, 255, 255, 0.1);
+    --color-code-toolbar-bg: #1a202b;
+    --color-code-toolbar-fg: #94a3b8;
+    --color-selection: rgba(96, 165, 250, 0.35);
+  }
+}

@@ -1,0 +1,88 @@
+/*
+ * icons.css — visual contract for the SVG icon library at src/ui/icons/Icon.tsx.
+ *
+ * The icons are sized via the `size` prop, but their *display* needs are
+ * uniform: block-level, inherits color, and an optional rotation expressed
+ * as a data attribute (so the project's no-inline-style discipline holds).
+ *
+ * The accompanying `[data-ui="icon-button"]` mixin gives every icon-only
+ * button a SQUARE hit area (no taller-than-wide pills on hover) plus a
+ * consistent hover background and focus ring — see CLAUDE.md / icon-
+ * alignment memory.
+ */
+
+[data-icon] {
+  display: block;
+  flex: 0 0 auto;
+}
+
+/* Only the chevron animates its rotation. Every other icon skips the
+ * transition declaration so the browser doesn't track it as a candidate
+ * compositor animation on every hover/paint — important on dense
+ * surfaces with many icons (action rows, chat-title-bar, sidebar). */
+[data-icon='chevron'] {
+  transition: transform var(--duration-fast) var(--ease-standard);
+}
+
+[data-icon][data-icon-rotate='90'] {
+  transform: rotate(90deg);
+}
+
+[data-icon][data-icon-rotate='180'] {
+  transform: rotate(180deg);
+}
+
+[data-icon][data-icon-rotate='270'] {
+  transform: rotate(270deg);
+}
+
+/* Generic icon-button mixin. Square (28×28 by default), centered glyph,
+ * subtle hover background, focus-visible ring. Apply by setting
+ * `data-ui="icon-button"` on the button element. */
+[data-ui='icon-button'] {
+  appearance: none;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--color-fg-secondary);
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  text-decoration: none;
+  flex: 0 0 auto;
+}
+
+[data-ui='icon-button'][data-size='sm'] {
+  width: 22px;
+  height: 22px;
+}
+
+[data-ui='icon-button'][data-size='lg'] {
+  width: 32px;
+  height: 32px;
+}
+
+[data-ui='icon-button']:hover:not(:disabled),
+[data-ui='icon-button'][aria-expanded='true'] {
+  background: var(--color-bg-hover);
+  color: var(--color-fg-primary);
+}
+
+[data-ui='icon-button']:focus-visible {
+  outline: var(--focus-ring-width) solid var(--color-accent);
+  outline-offset: 1px;
+}
+
+[data-ui='icon-button']:disabled {
+  cursor: not-allowed;
+  opacity: var(--opacity-disabled);
+}
+
+/* Variant: danger hover (e.g. delete actions). */
+[data-ui='icon-button'][data-variant='danger']:hover:not(:disabled) {
+  color: var(--color-danger);
+}

@@ -3,5 +3,61 @@
  *             JSON/schema editors.
  * Owns: [data-ui='field'|'label'|'helper'|'validation'|'slider'|'segmented'|
  *              'schema-editor'|'json-editor'|'logit-bias-editor'].
- * Filled in Phase 8.
+ * See plan/10-ui.md §10.20.
  */
+
+[data-ui='field'] {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+[data-ui='label'],
+[data-ui='field'] label {
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-medium);
+  color: var(--color-fg-secondary);
+}
+
+[data-ui='helper'] {
+  font-size: var(--font-size-xs);
+  color: var(--color-fg-muted);
+}
+
+[data-validation='invalid'] input,
+[data-validation='invalid'] textarea {
+  border-color: var(--color-danger);
+}
+
+[data-ui='segmented'] {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  background: var(--color-bg-surface-2);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-sm);
+}
+
+[data-ui='segmented'] button {
+  background: transparent;
+  border: 1px solid transparent;
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-xs);
+  font-size: var(--font-size-xs);
+  color: var(--color-fg-muted);
+  cursor: pointer;
+}
+
+[data-ui='segmented'] button[aria-checked='true'] {
+  background: var(--color-bg-surface-1);
+  color: var(--color-fg-primary);
+  border-color: var(--color-border-default);
+}
+
+/* Native <select> styling — we INTENTIONALLY keep the OS-native chevron
+ * here. An earlier revision swapped to a custom SVG chevron via
+ * `appearance: none` + background-image to give the arrow more right-
+ * edge padding, but that caused noticeable hover-time perf degradation
+ * on Chromium/macOS (the native shadow-DOM render path is significantly
+ * cheaper than our custom-painted alternative). The cramped native
+ * arrow is the lesser evil. */

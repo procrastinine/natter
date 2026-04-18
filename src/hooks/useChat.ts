@@ -26,6 +26,7 @@ import { activePath, cursorKeyOf, groupByParent } from '../core/active-path'
 import type { ChatCompletionsTransformOptions } from '../core/transforms'
 import { toChatCompletions } from '../core/transforms'
 import type {
+  AbortReason,
   CapabilityDescriptor,
   ChatId,
   ChatUsage,
@@ -226,6 +227,7 @@ export async function sendText(input: SendTextInput): Promise<SendTextResult> {
       ))
 
   let outcome: 'done' | 'error' | 'abort' = 'done'
+  let abortReason: AbortReason | undefined
   let streamError: ApiError | undefined
 
   try {
@@ -257,6 +259,13 @@ export async function sendText(input: SendTextInput): Promise<SendTextResult> {
   } catch (err) {
     if (abortController.signal.aborted) {
       outcome = 'abort'
+      abortReason = 'user'
+    } else if (err instanceof ApiError && err.kind === 'network') {
+      // Network drop: the fetch never reached completion. Treat as an abort
+      // with a 'network' reason so the UI can surface a Continue affordance
+      // (plan/13-delivery.md Phase 7 e2e row: network drop mid-stream).
+      outcome = 'abort'
+      abortReason = 'network'
     } else {
       outcome = 'error'
       streamError = err instanceof ApiError ? err : undefined
@@ -270,6 +279,7 @@ export async function sendText(input: SendTextInput): Promise<SendTextResult> {
       accumulator,
       requestedModel,
       outcome,
+      ...(abortReason ? { abortReason } : {}),
       ...(streamError ? { error: streamError } : {}),
       now: now(),
     })
@@ -411,12 +421,13 @@ async function flushPartial(ctx: FlushContext): Promise<void> {
 
 interface FinalizeContext extends FlushContext {
   outcome: 'done' | 'error' | 'abort'
+  abortReason?: AbortReason
   error?: ApiError
   now: number
 }
 
 async function finalize(ctx: FinalizeContext): Promise<void> {
-  const { repo, messageId, accumulator, requestedModel, outcome, error, now } = ctx
+  const { repo, messageId, accumulator, requestedModel, outcome, abortReason, error, now } = ctx
   await repo.runMutation(
     [{ kind: 'message', messageId }],
     async (inner) => {
@@ -427,7 +438,7 @@ async function finalize(ctx: FinalizeContext): Promise<void> {
         finishedAt: now,
       })
       if (outcome === 'abort') {
-        generation.abortReason = 'user'
+        generation.abortReason = abortReason ?? 'user'
       }
       const finalError = error ?? accumulator.midStreamError
       if (finalError) {

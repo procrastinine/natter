@@ -3,5 +3,348 @@
  *                 blocked-image stub.
  * Owns: [data-ui='markdown'|'code-block'|'code-toolbar'|'math-block'|'media-block'|
  *              'annotations'|'citation-link'|'blocked-image'|'image-allowlist'].
- * Filled in Phase 8.
+ * See plan/10-ui.md §10.20, plan/11-rendering.md.
  */
+
+[data-ui='markdown'] {
+  color: var(--color-fg-primary);
+  line-height: var(--line-height-body);
+  font-size: var(--font-size-md);
+  overflow-wrap: anywhere;
+}
+
+[data-ui='markdown'] h1,
+[data-ui='markdown'] h2,
+[data-ui='markdown'] h3,
+[data-ui='markdown'] h4,
+[data-ui='markdown'] h5,
+[data-ui='markdown'] h6 {
+  font-family: var(--font-sans);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-fg-primary);
+  margin: var(--space-5) 0 var(--space-2);
+  line-height: var(--line-height-tight);
+}
+
+[data-ui='markdown'] h1 {
+  font-size: calc(var(--font-size-xl) * 1.1);
+}
+[data-ui='markdown'] h2 {
+  font-size: var(--font-size-xl);
+}
+[data-ui='markdown'] h3 {
+  font-size: var(--font-size-lg);
+}
+[data-ui='markdown'] h4,
+[data-ui='markdown'] h5,
+[data-ui='markdown'] h6 {
+  font-size: var(--font-size-md);
+}
+
+[data-ui='markdown'] p {
+  margin: 0 0 var(--space-3);
+}
+
+[data-ui='markdown'] strong {
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-fg-primary);
+}
+
+[data-ui='markdown'] em {
+  font-style: italic;
+}
+
+[data-ui='markdown'] a {
+  color: var(--color-link);
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
+}
+
+[data-ui='markdown'] a:hover {
+  color: var(--color-link-hover);
+}
+
+[data-ui='markdown'] ul,
+[data-ui='markdown'] ol {
+  margin: 0 0 var(--space-3);
+  padding-left: var(--space-6);
+}
+
+[data-ui='markdown'] li {
+  margin: 0 0 var(--space-1);
+}
+
+[data-ui='markdown'] li > ul,
+[data-ui='markdown'] li > ol {
+  margin: var(--space-1) 0 var(--space-2);
+}
+
+[data-ui='markdown'] blockquote {
+  border-left: 3px solid var(--color-border-default);
+  margin: 0 0 var(--space-3);
+  padding: var(--space-1) var(--space-4);
+  color: var(--color-fg-secondary);
+  background: var(--color-bg-surface-2);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+}
+
+[data-ui='markdown'] hr {
+  border: none;
+  border-top: 1px solid var(--color-border-subtle);
+  margin: var(--space-4) 0;
+}
+
+[data-ui='markdown'] code {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  background: var(--color-code-bg);
+  border: 1px solid var(--color-code-border);
+  padding: 0 var(--space-1);
+  border-radius: var(--radius-xs);
+}
+
+[data-ui='markdown'] pre {
+  font-family: var(--font-mono);
+  background: var(--color-code-bg);
+  border: 1px solid var(--color-code-border);
+  border-radius: var(--radius-sm);
+  padding: var(--space-3);
+  margin: 0 0 var(--space-3);
+  overflow-x: auto;
+  font-size: var(--font-size-sm);
+  max-height: var(--code-block-max-height);
+}
+
+[data-ui='markdown'] pre code {
+  background: transparent;
+  border: none;
+  padding: 0;
+}
+
+/* Streamdown wraps its code in `outer div (bg-sidebar) → body div
+ * (bg-background, rounded + border + padding) → <pre>`. Our default
+ * pre rule above adds its OWN surface + border + padding, which stacks
+ * as a third visual layer inside the already-boxed body — the user
+ * flagged this as "gray-white-gray 3 layers". Drop our pre chrome
+ * when it's inside Streamdown's body wrapper so the result matches
+ * the 2-layer tables (outer sidebar tint + inner body). Bare <pre>
+ * elements (raw HTML in markdown) still get the default treatment. */
+[data-ui='markdown'] [data-streamdown='code-block-body'] pre,
+[data-ui='markdown'] [data-streamdown='code-block-body'] > pre {
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  padding: 0;
+  margin: 0;
+  max-height: none;
+}
+
+[data-ui='code-block'] {
+  background: var(--color-code-bg);
+  border: 1px solid var(--color-code-border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  margin: 0 0 var(--space-3);
+  position: relative;
+}
+
+[data-ui='code-block'][data-overflow='truncated'] pre {
+  max-height: var(--code-block-max-height);
+  overflow: auto;
+}
+
+[data-ui='code-toolbar'] {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-1) var(--space-3);
+  background: var(--color-code-toolbar-bg);
+  color: var(--color-code-toolbar-fg);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  border-bottom: 1px solid var(--color-code-border);
+}
+
+[data-ui='code-toolbar-actions'] {
+  display: inline-flex;
+  gap: var(--space-2);
+}
+
+[data-ui='code-toolbar'] button {
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--color-code-toolbar-fg);
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-sm);
+  font-size: var(--font-size-xs);
+  cursor: pointer;
+}
+
+[data-ui='code-toolbar'] button:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-fg-primary);
+}
+
+[data-ui='markdown'] table {
+  border-collapse: collapse;
+  margin: 0 0 var(--space-3);
+  font-size: var(--font-size-sm);
+  width: 100%;
+}
+
+[data-ui='markdown'] th,
+[data-ui='markdown'] td {
+  border: 1px solid var(--color-border-default);
+  padding: var(--space-1) var(--space-3);
+  text-align: left;
+}
+
+[data-ui='markdown'] th {
+  background: var(--color-bg-surface-2);
+  font-weight: var(--font-weight-semibold);
+}
+
+[data-ui='math-block'] {
+  display: block;
+  padding: var(--space-2) var(--space-3);
+  background: var(--color-bg-surface-2);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  margin: 0 0 var(--space-3);
+  white-space: pre-wrap;
+  overflow-x: auto;
+}
+
+[data-ui='math-block'][data-state='error'] {
+  border-color: var(--color-danger);
+  background: var(--color-banner-danger-bg);
+  color: var(--color-danger);
+}
+
+[data-ui='math-block-error'] {
+  display: block;
+  color: var(--color-danger);
+  font-size: var(--font-size-xs);
+  margin-top: var(--space-1);
+  font-family: var(--font-sans);
+  font-style: italic;
+}
+
+[data-ui='citation-link'] {
+  display: inline;
+  color: var(--color-citation);
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+}
+
+[data-ui='citation-link']:hover {
+  color: var(--color-citation-hover);
+}
+
+[data-ui='citation-link'][data-citation-kind='file'] {
+  cursor: pointer;
+}
+
+[data-ui='blocked-image'] {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border: 1px dashed var(--color-blocked);
+  border-radius: var(--radius-sm);
+  background: var(--color-banner-danger-bg);
+  color: var(--color-blocked);
+  font-size: var(--font-size-xs);
+  font-family: var(--font-sans);
+  max-width: 100%;
+}
+
+[data-ui='blocked-image-allow'] {
+  background: transparent;
+  border: 1px solid var(--color-blocked);
+  color: var(--color-blocked);
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-sm);
+  font-size: var(--font-size-xs);
+  cursor: pointer;
+}
+
+/* Real <table> for the image whitelist (origins are tabular data —
+ * URL + source + action — not a list). Header row, alternating row
+ * tint, monospaced URL column, trailing action cell with the trash
+ * icon button. */
+[data-ui='image-allowlist'] {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--font-size-sm);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+[data-ui='image-allowlist'] thead th {
+  text-align: left;
+  background: var(--color-bg-surface-2);
+  color: var(--color-fg-muted);
+  font-weight: var(--font-weight-medium);
+  font-size: var(--font-size-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--color-border-subtle);
+}
+
+[data-ui='image-allowlist'] tbody td {
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--color-border-subtle);
+  vertical-align: middle;
+}
+
+[data-ui='image-allowlist'] tbody tr:last-child td {
+  border-bottom: none;
+}
+
+[data-ui='image-allowlist'] tbody tr:nth-child(even) {
+  background: var(--color-bg-surface-2);
+}
+
+[data-ui='image-allowlist'] code {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  color: var(--color-fg-primary);
+  word-break: break-all;
+}
+
+[data-ui='image-allowlist-source'] {
+  color: var(--color-fg-muted);
+  font-size: var(--font-size-xs);
+  white-space: nowrap;
+  width: 1%;
+}
+
+[data-ui='image-allowlist-action-col'],
+[data-ui='image-allowlist-action-cell'] {
+  width: 36px;
+  text-align: right;
+}
+
+[data-ui='image-allowlist-add'] {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: var(--space-2);
+}
+
+[data-ui='image-allowlist-add'] input {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+}
+
+[data-ui='markdown'] sup {
+  font-size: 0.75em;
+  vertical-align: super;
+  line-height: 0;
+}
