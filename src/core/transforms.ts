@@ -19,6 +19,8 @@
 //   have to retouch transform callers.)
 
 import type { ChatCompletionRequestWire } from '../api/types'
+import { isFreeModel } from './model-predicates'
+import type { WireProviderPrivacy } from './privacy-filter'
 import type {
   CapabilityDescriptor,
   ChatSettings,
@@ -41,6 +43,11 @@ export interface ChatCompletionsTransformOptions {
   // Optional slug rewrite (§5.1 step 0). When set, the wire `model` uses the
   // rewritten slug while `generation.requestedModel` keeps the original.
   rewriteSlug?: (slug: string) => string
+  // Pre-computed privacy-filter output from `usePrivacyRouting`. When
+  // provided, its auto-ignore / only / order / deny / zdr fragments are
+  // merged with `settings.providerPrefs` before the wire `provider`
+  // block is built. See `plan/09-privacy.md §9.9`.
+  privacy?: WireProviderPrivacy
 }
 
 export interface ChatCompletionsTransformResult {
@@ -199,8 +206,9 @@ export function toChatCompletions(
   // through only when the endpoint advertises the `provider` key; other
   // providers would reject it. In practice direct endpoints lack `/endpoints`
   // data so `supported` is undefined and the knob ships.
-  if (settings.providerPrefs && gate('provider')) {
-    wire.provider = toWireProviderPrefs(settings.providerPrefs)
+  if (gate('provider')) {
+    const providerBlock = buildProviderBlock(settings, opts.privacy)
+    if (providerBlock) wire.provider = providerBlock
   }
 
   // Context strategy → plugins: only the explicit `middle_out_plugin` case
@@ -226,6 +234,45 @@ function toWireResponseFormat(format: ChatSettings['responseFormat']): unknown {
       ...(format.jsonSchema.strict !== undefined ? { strict: format.jsonSchema.strict } : {}),
     },
   }
+}
+
+// Merge the user's manual `providerPrefs` with the privacy-filter's
+// wire fragment, then apply the free-model exception. Returns
+// `undefined` when neither side has anything to contribute (keeps the
+// wire envelope clean for non-OpenRouter endpoints).
+function buildProviderBlock(
+  settings: ChatSettings,
+  privacy: WireProviderPrivacy | undefined,
+): Record<string, unknown> | undefined {
+  const base = settings.providerPrefs ? toWireProviderPrefs(settings.providerPrefs) : {}
+  if (privacy) {
+    // Auto-ignore wins additively: user-ignored + Pareto-excluded + hard-
+    // denied are unioned. `only` from the filter replaces the user's
+    // `only` (the filter already applied it and trimmed to kept-set
+    // survivors; sending both would be redundant). `order` follows the
+    // same rule. `data_collection` / `zdr` come from `privacy.*`.
+    if (privacy.ignore) base.ignore = privacy.ignore
+    if (privacy.only) base.only = privacy.only
+    if (privacy.order) base.order = privacy.order
+    if (privacy.data_collection) base.data_collection = privacy.data_collection
+    if (privacy.zdr) base.zdr = privacy.zdr
+  }
+  // `allowFallbacks` is a top-level ChatSettings knob (stored separately
+  // from `providerPrefs` because it's not a routing preference — it's a
+  // "may my request be served by the model I didn't pick?" decision).
+  // Emit it unconditionally when the user has set one.
+  if (settings.allowFallbacks === false) base.allow_fallbacks = false
+  if (isFreeModel(settings.model)) {
+    // Free-model exception. OpenRouter ignores these fields on `*:free`
+    // models; sending them is just noise. See plan/05 §5.4 and
+    // plan/09-privacy.md §9.9.
+    delete base.data_collection
+    delete base.zdr
+    delete base.only
+    delete base.ignore
+    delete base.order
+  }
+  return Object.keys(base).length > 0 ? base : undefined
 }
 
 function toWireProviderPrefs(

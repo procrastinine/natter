@@ -306,6 +306,26 @@ export function SendIcon({ size = 18, ariaLabel }: IconProps) {
   )
 }
 
+// Padlock — privacy surface. Closed/open variant picks the visual. See
+// `plan/09-privacy.md §9.11`.
+export function LockIcon({ size = 18, ariaLabel }: IconProps) {
+  return (
+    <BaseSvg size={size} {...(ariaLabel ? { 'aria-label': ariaLabel } : {})}>
+      <rect x="5.5" y="10.5" width="13" height="10" rx="1.8" />
+      <path d="M8 10.5V7.5a4 4 0 0 1 8 0v3" />
+    </BaseSvg>
+  )
+}
+
+export function LockOpenIcon({ size = 18, ariaLabel }: IconProps) {
+  return (
+    <BaseSvg size={size} {...(ariaLabel ? { 'aria-label': ariaLabel } : {})}>
+      <rect x="5.5" y="10.5" width="13" height="10" rx="1.8" />
+      <path d="M8 10.5V7.5a4 4 0 0 1 7.8-1" />
+    </BaseSvg>
+  )
+}
+
 // Generic robot silhouette — default assistant profile glyph.
 export function RobotIcon({ size = 18, ariaLabel }: IconProps) {
   return (

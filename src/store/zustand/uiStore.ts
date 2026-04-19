@@ -39,6 +39,19 @@ export interface UiStoreState {
   // In-memory settings for the next chat, so the chat-model panel works
   // on /new before anything is persisted. Null means "not yet seeded".
   draftChat: DraftChatSettings | null
+  // Chat id whose privacy filter left zero eligible providers; triggers
+  // the zero-eligible modal per §10.13.1. Cleared by any of the three
+  // quick-fix actions (switch model / disable Pareto / allow fallbacks)
+  // or by explicit dismiss. We store only the chat id — the modal reads
+  // the live `usePrivacyRouting` result so it shows the current filter
+  // decision, not a stale snapshot.
+  zeroEligibleChatId: ChatId | null
+  // Session-scoped banner dismissals. The BYOK banner is surfaced per
+  // profile; dismissing it stores the profile id here so the banner
+  // stays hidden for the life of the tab. A hard reload re-surfaces it
+  // (user can re-dismiss). Persisting dismiss-per-profile forever would
+  // be surprising the day the user actually wants to act on it.
+  dismissedBanners: { kind: 'byok'; profileId: string }[]
   setTheme: (theme: ThemePreference) => void
   setSidebarCollapsed: (collapsed: boolean) => void
   setActiveChatId: (chatId: ChatId | null) => void
@@ -48,6 +61,8 @@ export interface UiStoreState {
   setFocusMode: (on: boolean) => void
   setDraftChat: (value: DraftChatSettings | null) => void
   patchDraftSettings: (patch: Partial<ChatSettings>) => void
+  setZeroEligibleChatId: (chatId: ChatId | null) => void
+  dismissBanner: (entry: { kind: 'byok'; profileId: string }) => void
   reset: () => void
 }
 
@@ -61,6 +76,8 @@ const INITIAL: Pick<
   | 'cascadeDelete'
   | 'focusMode'
   | 'draftChat'
+  | 'zeroEligibleChatId'
+  | 'dismissedBanners'
 > = {
   theme: 'system',
   sidebarCollapsed: false,
@@ -70,6 +87,8 @@ const INITIAL: Pick<
   cascadeDelete: false,
   focusMode: false,
   draftChat: null,
+  zeroEligibleChatId: null,
+  dismissedBanners: [],
 }
 
 export const useUiStore = create<UiStoreState>((set) => ({
@@ -96,6 +115,18 @@ export const useUiStore = create<UiStoreState>((set) => ({
           settings: { ...state.draftChat.settings, ...patch },
         },
       }
+    }),
+  setZeroEligibleChatId: (zeroEligibleChatId) => set({ zeroEligibleChatId }),
+  dismissBanner: (entry) =>
+    set((state) => {
+      if (
+        state.dismissedBanners.some(
+          (d) => d.kind === entry.kind && d.profileId === entry.profileId,
+        )
+      ) {
+        return state
+      }
+      return { dismissedBanners: [...state.dismissedBanners, entry] }
     }),
   reset: () => set(INITIAL),
 }))

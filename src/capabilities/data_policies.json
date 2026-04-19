@@ -1,0 +1,106 @@
+{
+  "comment": "Hand-curated per-provider DataPolicy fallbacks keyed by `/endpoints.provider_name` (the JSON API value). Sources: openrouter.ai/docs/guides/privacy/provider-logging.md, openrouter.ai/{model}/providers HTML, and verified live curls (CLAUDE.md #2). Used when the live scrape is missing or when `/endpoints.provider_name` doesn't match any scraped `provider_display_name` (e.g. Google Vertex variants collapse to `Google` in the JSON API). Scrape wins on match; curated fills gaps; UNKNOWN_POLICY is the final fallback.",
+  "policies": {
+    "Azure": {
+      "training": false,
+      "trainingOpenRouter": false,
+      "retainsPrompts": false,
+      "canPublish": false,
+      "termsOfServiceURL": "https://www.microsoft.com/en-us/legal/terms-of-use",
+      "privacyPolicyURL": "https://www.microsoft.com/en-us/privacy/privacystatement"
+    },
+    "OpenAI": {
+      "training": false,
+      "trainingOpenRouter": false,
+      "retainsPrompts": true,
+      "requiresUserIDs": true,
+      "canPublish": false,
+      "termsOfServiceURL": "https://openai.com/policies/row-terms-of-use/",
+      "privacyPolicyURL": "https://openai.com/policies/privacy-policy/"
+    },
+    "Amazon Bedrock": {
+      "training": false,
+      "trainingOpenRouter": false,
+      "retainsPrompts": false,
+      "canPublish": false,
+      "termsOfServiceURL": "https://aws.amazon.com/service-terms/",
+      "privacyPolicyURL": "https://aws.amazon.com/privacy"
+    },
+    "Anthropic": {
+      "training": false,
+      "trainingOpenRouter": false,
+      "retainsPrompts": true,
+      "retentionDays": 30,
+      "requiresUserIDs": true,
+      "canPublish": false,
+      "termsOfServiceURL": "https://www.anthropic.com/legal/commercial-terms",
+      "privacyPolicyURL": "https://www.anthropic.com/legal/privacy"
+    },
+    "Google": {
+      "training": false,
+      "trainingOpenRouter": false,
+      "retainsPrompts": false,
+      "requiresUserIDs": true,
+      "canPublish": false,
+      "termsOfServiceURL": "https://cloud.google.com/terms/",
+      "privacyPolicyURL": "https://cloud.google.com/terms/cloud-privacy-notice"
+    },
+    "Google AI Studio": {
+      "training": false,
+      "trainingOpenRouter": false,
+      "retainsPrompts": true,
+      "retentionDays": 55,
+      "canPublish": false,
+      "termsOfServiceURL": "https://ai.google.dev/terms",
+      "privacyPolicyURL": "https://policies.google.com/privacy"
+    },
+    "DeepInfra": {
+      "training": false,
+      "trainingOpenRouter": false,
+      "retainsPrompts": false,
+      "canPublish": false,
+      "termsOfServiceURL": "https://deepinfra.com/terms",
+      "privacyPolicyURL": "https://deepinfra.com/privacy"
+    },
+    "Novita": {
+      "training": false,
+      "trainingOpenRouter": false,
+      "retainsPrompts": false,
+      "canPublish": false,
+      "termsOfServiceURL": "https://novita.ai/legal/terms-of-service",
+      "privacyPolicyURL": "https://novita.ai/legal/privacy-policy"
+    },
+    "Chutes": {
+      "training": false,
+      "trainingOpenRouter": false,
+      "retainsPrompts": false,
+      "canPublish": false,
+      "termsOfServiceURL": "https://chutes.ai/tos",
+      "privacyPolicyURL": "https://chutes.ai/privacy"
+    },
+    "DeepSeek": {
+      "training": true,
+      "trainingOpenRouter": false,
+      "retainsPrompts": true,
+      "canPublish": false,
+      "termsOfServiceURL": "https://platform.deepseek.com/downloads/DeepSeek%20Terms%20of%20Use.html",
+      "privacyPolicyURL": "https://platform.deepseek.com/downloads/DeepSeek%20Privacy%20Policy.html"
+    },
+    "Cerebras": {
+      "training": false,
+      "trainingOpenRouter": false,
+      "retainsPrompts": false,
+      "canPublish": false,
+      "termsOfServiceURL": "https://www.cerebras.ai/terms-of-service",
+      "privacyPolicyURL": "https://www.cerebras.ai/privacy"
+    },
+    "Groq": {
+      "training": false,
+      "trainingOpenRouter": false,
+      "retainsPrompts": false,
+      "canPublish": false,
+      "termsOfServiceURL": "https://groq.com/terms-of-use/",
+      "privacyPolicyURL": "https://groq.com/privacy-policy/"
+    }
+  }
+}

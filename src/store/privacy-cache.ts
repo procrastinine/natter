@@ -52,3 +52,37 @@ export async function clearProvidersForProfile(profileId: ProfileId): Promise<vo
   const db = getDb()
   await db.providers.delete(profileId)
 }
+
+// In-memory in-flight dedup for privacy scrapes. Same rationale as
+// `dedupedEndpointsFetch` in `models-cache.ts`: two sibling components
+// (header badge + provider picker) opening at the same time would
+// otherwise fire two scrapes against the same (profile, model). The
+// Map shares one Promise. Single-tab only — cross-tab overlap collapses
+// harmlessly into the last-writer-wins cache row.
+const privacyInFlight = new Map<string, Promise<void>>()
+
+export function dedupedPrivacyFetch(
+  profileId: ProfileId,
+  modelId: string,
+  fetchPayload: () => Promise<unknown>,
+): Promise<void> {
+  const key = `${profileId}\u0000${modelId}`
+  const existing = privacyInFlight.get(key)
+  if (existing) return existing
+  const promise = (async () => {
+    try {
+      const payload = await fetchPayload()
+      await putCachedPrivacyPolicy(profileId, modelId, payload)
+    } finally {
+      privacyInFlight.delete(key)
+    }
+  })()
+  privacyInFlight.set(key, promise)
+  return promise
+}
+
+// Test-only reset — wipes the in-flight map so a fresh test can observe
+// its own dedup behavior without contamination from an earlier case.
+export function __resetPrivacyInFlightForTests(): void {
+  privacyInFlight.clear()
+}

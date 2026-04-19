@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { activePath } from '../core/active-path'
 import { estimatePromptSize, tokenizerFromSettings } from '../core/prompt-size'
 import { cloneDefaultChatSettings } from '../core/defaults'
+import { resolvePrivacyForSend } from '../core/privacy-request'
 import {
   applyBaseFontSizeToDocument,
   applyChatMaxWidthToDocument,
@@ -285,12 +286,23 @@ export function Shell() {
         console.error('send: resolveKey failed', err)
         return
       }
+      const privacy = await resolvePrivacyForSend({ chat, profile })
+      if (privacy.filter?.zeroEligible) {
+        // Every endpoint was hard-denied or Pareto-excluded for this
+        // model. Surface the §10.13.1 modal so the user can pick a
+        // recovery action rather than silently sending to a training
+        // provider. The composer keeps the draft text in place so the
+        // modal can retry-send after the user resolves it.
+        useUiStore.getState().setZeroEligibleChatId(activeChatId)
+        return
+      }
       try {
         const result = await send({
           chatId: activeChatId,
           connection: profile,
           apiKey,
           content: [{ type: 'text', text }],
+          ...(privacy.wire ? { transform: { privacy: privacy.wire } } : {}),
         })
         if (result.outcome !== 'done') {
           console.info('send: stream ended with outcome', result.outcome, result.error?.kind)
@@ -321,12 +333,18 @@ export function Shell() {
         console.error('send: resolveKey failed', err)
         return
       }
+      const privacy = await resolvePrivacyForSend({ chat, profile })
+      if (privacy.filter?.zeroEligible) {
+        useUiStore.getState().setZeroEligibleChatId(chat.id)
+        return
+      }
       try {
         const result = await send({
           chatId: chat.id,
           connection: profile,
           apiKey,
           content: [{ type: 'text', text }],
+          ...(privacy.wire ? { transform: { privacy: privacy.wire } } : {}),
         })
         if (result.outcome !== 'done') {
           console.info('send: stream ended with outcome', result.outcome, result.error?.kind)
