@@ -5,7 +5,7 @@
  */
 
 .sr-only,
-[data-ui='visually-hidden'] {
+[data-ui="visually-hidden"] {
   position: absolute;
   width: 1px;
   height: 1px;
@@ -28,17 +28,17 @@
   outline-offset: 1px;
 }
 
-[data-ui='print-only'] {
+[data-ui="print-only"] {
   display: none;
 }
 
 @media print {
-  [data-ui='print-only'] {
+  [data-ui="print-only"] {
     display: block;
   }
-  [data-ui='sidebar'],
-  [data-ui='composer'],
-  [data-ui='settings-overlay'] {
+  [data-ui="sidebar"],
+  [data-ui="composer"],
+  [data-ui="settings-overlay"] {
     display: none !important;
   }
 }

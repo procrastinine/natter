@@ -20,9 +20,7 @@ test('oversized stream lane renders with a "show full" disclosure that reveals t
   // Payload must exceed the 20k threshold in MessageStreamOverflow.
   const huge = 'abcdefghij'.repeat(2500)
   await mockChatCompletions(page, {
-    body: buildSseBody([
-      { id: 'big-oversize', content: huge, finish: 'stop' },
-    ]),
+    body: buildSseBody([{ id: 'big-oversize', content: huge, finish: 'stop' }]),
   })
   await createChatAndOpen(page)
   await sendMessage(page, 'flood me')

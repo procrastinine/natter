@@ -35,14 +35,10 @@ describe('ReasoningBlock', () => {
     const { container } = render(<ReasoningBlock details={details} />)
     openSummary(container)
     expect(
-      container.querySelector(
-        '[data-ui="reasoning-section"][data-reasoning-kind="summary"]',
-      ),
+      container.querySelector('[data-ui="reasoning-section"][data-reasoning-kind="summary"]'),
     ).toBeTruthy()
     expect(
-      container.querySelector(
-        '[data-ui="reasoning-section"][data-reasoning-kind="text"]',
-      ),
+      container.querySelector('[data-ui="reasoning-section"][data-reasoning-kind="text"]'),
     ).toBeTruthy()
     expect(screen.getByText(/Analyzed the problem/)).toBeTruthy()
     expect(screen.getByText(/work through this systematically/)).toBeTruthy()
@@ -59,9 +55,7 @@ describe('ReasoningBlock', () => {
     expect(container.querySelector('[data-reasoning-format="encrypted"]')).toBeTruthy()
     openSummary(container)
     expect(
-      container.querySelector(
-        '[data-ui="reasoning-section"][data-reasoning-kind="encrypted"]',
-      ),
+      container.querySelector('[data-ui="reasoning-section"][data-reasoning-kind="encrypted"]'),
     ).toBeTruthy()
     expect(screen.getByText(/8 chars/)).toBeTruthy()
   })

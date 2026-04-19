@@ -42,10 +42,7 @@ describe('resolveDefaultModel', () => {
     const now = Date.parse('2026-04-18T00:00:00Z')
     const within30 = new Date(now + 30 * 24 * 60 * 60 * 1000).toISOString()
     const chosen = resolveDefaultModel(
-      [
-        { id: 'anthropic/claude-opus-4.7', expirationDate: within30 },
-        { id: 'openai/gpt-5.4' },
-      ],
+      [{ id: 'anthropic/claude-opus-4.7', expirationDate: within30 }, { id: 'openai/gpt-5.4' }],
       { now },
     )
     expect(chosen).toBe('openai/gpt-5.4')

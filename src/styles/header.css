@@ -7,12 +7,12 @@
  * See plan/10-ui.md §10.3.
  */
 
-[data-ui='chat-title-bar'] {
+[data-ui="chat-title-bar"] {
   /* layout + height come from shell.css; this block is for inner content. */
   font-size: var(--font-size-md);
 }
 
-[data-ui='chat-title'] {
+[data-ui="chat-title"] {
   display: inline-flex;
   align-items: center;
   gap: var(--space-2);
@@ -20,7 +20,7 @@
   flex: 1 1 auto;
 }
 
-[data-ui='chat-title-label'] {
+[data-ui="chat-title-label"] {
   font-weight: var(--font-weight-semibold);
   font-size: var(--font-size-md);
   color: var(--color-fg-primary);
@@ -30,21 +30,21 @@
   min-width: 0;
 }
 
-[data-ui='chat-title'][data-title-status='untitled'] [data-ui='chat-title-label'],
-[data-ui='chat-title'][data-title-status='pending'] [data-ui='chat-title-label'] {
+[data-ui="chat-title"][data-title-status="untitled"] [data-ui="chat-title-label"],
+[data-ui="chat-title"][data-title-status="pending"] [data-ui="chat-title-label"] {
   color: var(--color-fg-muted);
   font-style: italic;
   font-weight: var(--font-weight-regular);
 }
 
-[data-ui='chat-title'][data-title-status='pending']::after {
-  content: '…';
+[data-ui="chat-title"][data-title-status="pending"]::after {
+  content: "…";
   color: var(--color-fg-muted);
   animation: natter-caret-blink 1.2s steps(2, end) infinite;
 }
 
-[data-ui='chat-title-edit'],
-[data-ui='chat-title-retry'] {
+[data-ui="chat-title-edit"],
+[data-ui="chat-title-retry"] {
   background: transparent;
   border: 1px solid transparent;
   color: var(--color-fg-muted);
@@ -57,17 +57,17 @@
 
 /* The pencil glyph in our font points up-right; when sitting to the
  * RIGHT of the title it should point at the text on its left, so we mirror. */
-[data-ui='chat-title-edit'] {
+[data-ui="chat-title-edit"] {
   transform: scaleX(-1);
 }
 
-[data-ui='chat-title-edit']:hover,
-[data-ui='chat-title-retry']:hover {
+[data-ui="chat-title-edit"]:hover,
+[data-ui="chat-title-retry"]:hover {
   color: var(--color-fg-primary);
   background: var(--color-bg-hover);
 }
 
-[data-ui='chat-title-editor'] {
+[data-ui="chat-title-editor"] {
   flex: 1 1 100%;
   min-width: 0;
   padding: var(--space-2) var(--space-3);
@@ -82,21 +82,21 @@
 /* When the title editor is active, the trailing header-spacer would
  * otherwise compete with the input for available width — collapse it
  * so the editor truly fills the row. */
-[data-ui='chat-title-editor'] + [data-ui='header-spacer'] {
+[data-ui="chat-title-editor"] + [data-ui="header-spacer"] {
   display: none;
 }
 
-[data-ui='chat-title-error'] {
+[data-ui="chat-title-error"] {
   margin-left: var(--space-2);
   color: var(--color-danger);
   font-size: var(--font-size-xs);
 }
 
-[data-ui='header-spacer'] {
+[data-ui="header-spacer"] {
   flex: 1 1 auto;
 }
 
-[data-ui='settings-cog'] {
+[data-ui="settings-cog"] {
   background: transparent;
   border: 1px solid transparent;
   color: var(--color-fg-secondary);
@@ -110,13 +110,13 @@
   justify-content: center;
 }
 
-[data-ui='settings-cog']:hover,
-[data-ui='settings-cog'][aria-expanded='true'] {
+[data-ui="settings-cog"]:hover,
+[data-ui="settings-cog"][aria-expanded="true"] {
   background: var(--color-bg-hover);
   color: var(--color-fg-primary);
 }
 
-[data-ui='abort'] {
+[data-ui="abort"] {
   background: var(--color-danger);
   color: var(--color-fg-inverse);
   border: none;
@@ -126,7 +126,7 @@
   cursor: pointer;
 }
 
-[data-ui='abort']:hover {
+[data-ui="abort"]:hover {
   background: color-mix(in srgb, var(--color-danger) 85%, #000);
 }
 
@@ -140,7 +140,7 @@
  * Anchor comes from shell.css `[data-ui='chat-title-bar'] { position: relative; }`.
  * ────────────────────────────────────────────────────────────────────── */
 
-[data-ui='chat-info-popover'] {
+[data-ui="chat-info-popover"] {
   position: absolute;
   top: calc(100% + var(--space-2));
   right: var(--space-4);
@@ -158,7 +158,7 @@
   color: var(--color-fg-primary);
 }
 
-[data-ui='chat-info-popover-header'] {
+[data-ui="chat-info-popover-header"] {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -170,7 +170,7 @@
   font-size: var(--font-size-sm);
 }
 
-[data-ui='chat-info-popover-fields'] {
+[data-ui="chat-info-popover-fields"] {
   margin: 0;
   padding: var(--space-3) var(--space-4);
   display: grid;
@@ -180,17 +180,17 @@
   align-items: baseline;
 }
 
-[data-ui='chat-info-popover-fields'] > div {
+[data-ui="chat-info-popover-fields"] > div {
   display: contents;
 }
 
-[data-ui='chat-info-popover-fields'] dt {
+[data-ui="chat-info-popover-fields"] dt {
   color: var(--color-fg-muted);
   font-size: var(--font-size-xs);
   font-weight: var(--font-weight-regular);
 }
 
-[data-ui='chat-info-popover-fields'] dd {
+[data-ui="chat-info-popover-fields"] dd {
   margin: 0;
   color: var(--color-fg-primary);
   font-size: var(--font-size-sm);
@@ -210,7 +210,7 @@
  * Expanded: thin row + a stacked detail block (viewer / editor) below it.
  * ────────────────────────────────────────────────────────────────────── */
 
-[data-ui='connection-header'] {
+[data-ui="connection-header"] {
   flex: 0 0 auto;
   display: flex;
   flex-direction: column;
@@ -220,7 +220,7 @@
   font-size: var(--font-size-sm);
 }
 
-[data-ui='connection-row'] {
+[data-ui="connection-row"] {
   display: flex;
   align-items: center;
   gap: var(--space-3);
@@ -235,20 +235,19 @@
   min-height: 32px;
 }
 
-[data-ui='connection-row']:hover {
+[data-ui="connection-row"]:hover {
   background: var(--color-bg-hover);
 }
 
-[data-ui='connection-header'][data-state='unset'] [data-ui='connection-row'] {
+[data-ui="connection-header"][data-state="unset"] [data-ui="connection-row"] {
   cursor: default;
 }
 
-[data-ui='connection-header'][data-state='unset']
-  [data-ui='connection-row']:hover {
+[data-ui="connection-header"][data-state="unset"] [data-ui="connection-row"]:hover {
   background: transparent;
 }
 
-[data-ui='connection-chevron'] {
+[data-ui="connection-chevron"] {
   font-size: var(--font-size-xs);
   color: var(--color-fg-muted);
   width: 12px;
@@ -256,7 +255,7 @@
   justify-content: center;
 }
 
-[data-ui='connection-name'] {
+[data-ui="connection-name"] {
   color: var(--color-fg-primary);
   font-weight: var(--font-weight-semibold);
   overflow: hidden;
@@ -265,11 +264,11 @@
   max-width: 260px;
 }
 
-[data-ui='connection-row-spacer'] {
+[data-ui="connection-row-spacer"] {
   flex: 1 1 auto;
 }
 
-[data-ui='connection-baseurl'] {
+[data-ui="connection-baseurl"] {
   font-family: var(--font-mono);
   font-size: var(--font-size-xs);
   color: var(--color-fg-muted);
@@ -278,7 +277,7 @@
   padding: 2px var(--space-2);
 }
 
-[data-ui='connection-status-dot'] {
+[data-ui="connection-status-dot"] {
   display: inline-block;
   width: 8px;
   height: 8px;
@@ -287,27 +286,27 @@
   flex: 0 0 auto;
 }
 
-[data-ui='connection-status-dot'][data-state='no-key'] {
+[data-ui="connection-status-dot"][data-state="no-key"] {
   background: var(--color-warning);
 }
 
-[data-ui='connection-status-dot'][data-state='unset'] {
+[data-ui="connection-status-dot"][data-state="unset"] {
   background: var(--color-fg-muted);
 }
 
-[data-ui='connection-status-text'] {
+[data-ui="connection-status-text"] {
   color: var(--color-fg-muted);
   font-size: var(--font-size-xs);
   font-variant-numeric: tabular-nums;
 }
 
-[data-ui='connection-empty'] {
+[data-ui="connection-empty"] {
   color: var(--color-fg-muted);
   font-style: italic;
   flex: 1 1 auto;
 }
 
-[data-ui='connection-add'] {
+[data-ui="connection-add"] {
   background: var(--color-accent);
   color: var(--color-accent-contrast);
   border: none;
@@ -317,11 +316,11 @@
   cursor: pointer;
 }
 
-[data-ui='connection-add']:hover {
+[data-ui="connection-add"]:hover {
   background: var(--color-accent-hover);
 }
 
-[data-ui='connection-detail'] {
+[data-ui="connection-detail"] {
   padding: var(--space-3) var(--space-5) var(--space-4);
   border-top: 1px solid var(--color-border-subtle);
   background: var(--color-bg-surface-2);
@@ -339,7 +338,7 @@
  * width of the longest option, regardless of the select element's CSS
  * width. There's no way to widen the popup without dropping the native
  * <select> for a custom div-based dropdown. We accept this for now. */
-[data-ui='connection-switcher'] {
+[data-ui="connection-switcher"] {
   display: flex;
   align-items: center;
   gap: var(--space-3);
@@ -349,13 +348,13 @@
  * grid below (70px), so the dropdown left edge lines up with the field
  * values column. The grid's column-gap (`--space-3`) is also matched
  * here as the row's flex-gap so the alignment is exact. */
-[data-ui='connection-switcher'] > label {
+[data-ui="connection-switcher"] > label {
   color: var(--color-fg-muted);
   font-size: var(--font-size-sm);
   flex: 0 0 70px;
 }
 
-[data-ui='connection-profile-select'] {
+[data-ui="connection-profile-select"] {
   flex: 1 1 auto;
   background: var(--color-bg-surface-1);
   border: 1px solid var(--color-border-default);
@@ -367,7 +366,7 @@
   min-width: 0;
 }
 
-[data-ui='connection-new'] {
+[data-ui="connection-new"] {
   background: transparent;
   border: 1px solid var(--color-border-default);
   color: var(--color-fg-primary);
@@ -379,17 +378,17 @@
   flex: 0 0 auto;
 }
 
-[data-ui='connection-new']:hover {
+[data-ui="connection-new"]:hover {
   background: var(--color-bg-hover);
   border-color: var(--color-border-strong);
 }
 
-[data-ui='connection-key-optional'] {
+[data-ui="connection-key-optional"] {
   color: var(--color-fg-muted);
   font-style: italic;
 }
 
-[data-ui='connection-edit-delete'] {
+[data-ui="connection-edit-delete"] {
   background: transparent;
   border: 1px solid var(--color-border-default);
   color: var(--color-danger);
@@ -399,12 +398,12 @@
   cursor: pointer;
 }
 
-[data-ui='connection-edit-delete']:hover:not(:disabled) {
+[data-ui="connection-edit-delete"]:hover:not(:disabled) {
   background: var(--color-banner-danger-bg);
   border-color: var(--color-danger);
 }
 
-[data-ui='connection-save-as'] {
+[data-ui="connection-save-as"] {
   background: transparent;
   border: 1px solid var(--color-border-default);
   color: var(--color-fg-primary);
@@ -414,16 +413,16 @@
   cursor: pointer;
 }
 
-[data-ui='connection-save-as']:hover:not(:disabled) {
+[data-ui="connection-save-as"]:hover:not(:disabled) {
   background: var(--color-bg-hover);
   border-color: var(--color-border-strong);
 }
 
-[data-ui='connection-actions-spacer'] {
+[data-ui="connection-actions-spacer"] {
   flex: 1 1 auto;
 }
 
-[data-ui='connection-fields'] {
+[data-ui="connection-fields"] {
   display: grid;
   grid-template-columns: 70px 1fr;
   gap: var(--space-2) var(--space-3);
@@ -434,35 +433,35 @@
 /* Each field row uses display: contents so its dt/dd participate directly in
  * the dl grid. The actions row is laid out separately as a flex container,
  * so it must NOT use display: contents — otherwise the flex on it is lost. */
-[data-ui='connection-fields'] > div:not([data-ui='connection-actions']) {
+[data-ui="connection-fields"] > div:not([data-ui="connection-actions"]) {
   display: contents;
 }
 
-[data-ui='connection-fields'] dt {
+[data-ui="connection-fields"] dt {
   color: var(--color-fg-muted);
   font-size: var(--font-size-sm);
   font-weight: var(--font-weight-regular);
 }
 
-[data-ui='connection-fields'] dd {
+[data-ui="connection-fields"] dd {
   margin: 0;
   color: var(--color-fg-primary);
   font-size: var(--font-size-sm);
   word-break: break-all;
 }
 
-[data-ui='connection-fields'] dd code {
+[data-ui="connection-fields"] dd code {
   font-family: var(--font-mono);
   font-size: var(--font-size-sm);
   color: var(--color-fg-secondary);
 }
 
-[data-ui='connection-key-missing'] {
+[data-ui="connection-key-missing"] {
   color: var(--color-warning);
   font-style: italic;
 }
 
-[data-ui='connection-actions'] {
+[data-ui="connection-actions"] {
   grid-column: 1 / -1;
   display: flex;
   justify-content: flex-end;
@@ -472,24 +471,24 @@
 
 /* The API-key row also hosts the Edit button on its right edge so the
  * viewer panel doesn't waste a row of empty space below the value. */
-[data-ui='connection-key-row'] {
+[data-ui="connection-key-row"] {
   display: flex;
   align-items: center;
   gap: var(--space-3);
 }
 
-[data-ui='connection-key-row'] > code {
+[data-ui="connection-key-row"] > code {
   flex: 1 1 auto;
   min-width: 0;
 }
 
-[data-ui='connection-key-row'] > [data-ui='connection-edit'] {
+[data-ui="connection-key-row"] > [data-ui="connection-edit"] {
   flex: 0 0 auto;
   margin-left: auto;
 }
 
-[data-ui='connection-edit'],
-[data-ui='connection-edit-cancel'] {
+[data-ui="connection-edit"],
+[data-ui="connection-edit-cancel"] {
   background: transparent;
   border: 1px solid var(--color-border-default);
   color: var(--color-fg-primary);
@@ -499,13 +498,13 @@
   cursor: pointer;
 }
 
-[data-ui='connection-edit']:hover,
-[data-ui='connection-edit-cancel']:hover:not(:disabled) {
+[data-ui="connection-edit"]:hover,
+[data-ui="connection-edit-cancel"]:hover:not(:disabled) {
   background: var(--color-bg-hover);
   border-color: var(--color-border-strong);
 }
 
-[data-ui='connection-edit-save'] {
+[data-ui="connection-edit-save"] {
   background: var(--color-accent);
   color: var(--color-accent-contrast);
   border: none;
@@ -515,40 +514,36 @@
   cursor: pointer;
 }
 
-[data-ui='connection-edit-save']:hover:not(:disabled) {
+[data-ui="connection-edit-save"]:hover:not(:disabled) {
   background: var(--color-accent-hover);
 }
 
-[data-ui='connection-edit-save']:disabled,
-[data-ui='connection-edit-cancel']:disabled {
+[data-ui="connection-edit-save"]:disabled,
+[data-ui="connection-edit-cancel"]:disabled {
   opacity: var(--opacity-disabled);
   cursor: not-allowed;
 }
 
-[data-ui='connection-editor'] {
+[data-ui="connection-editor"] {
   display: flex;
   flex-direction: column;
   gap: var(--space-3);
 }
 
-[data-ui='connection-editor'] [data-ui='field-group'] {
+[data-ui="connection-editor"] [data-ui="field-group"] {
   display: grid;
   grid-template-columns: 70px 1fr;
   align-items: center;
   gap: var(--space-2) var(--space-3);
 }
 
-[data-ui='connection-editor'] [data-ui='field-group'] > label {
+[data-ui="connection-editor"] [data-ui="field-group"] > label {
   color: var(--color-fg-muted);
   font-size: var(--font-size-sm);
 }
 
-[data-ui='connection-editor']
-  [data-ui='field-group']
-  > input,
-[data-ui='connection-editor']
-  [data-ui='field-group']
-  > select {
+[data-ui="connection-editor"] [data-ui="field-group"] > input,
+[data-ui="connection-editor"] [data-ui="field-group"] > select {
   background: var(--color-bg-surface-1);
   border: 1px solid var(--color-border-default);
   border-radius: var(--radius-sm);
@@ -559,29 +554,23 @@
   min-width: 0;
 }
 
-[data-ui='connection-editor']
-  [data-ui='field-group']
-  > input:focus-visible,
-[data-ui='connection-editor']
-  [data-ui='field-group']
-  > select:focus-visible {
+[data-ui="connection-editor"] [data-ui="field-group"] > input:focus-visible,
+[data-ui="connection-editor"] [data-ui="field-group"] > select:focus-visible {
   outline: var(--focus-ring-width) solid var(--color-accent);
   outline-offset: 1px;
 }
 
-[data-ui='connection-editor']
-  [data-ui='field-group']
-  > input[aria-invalid='true'] {
+[data-ui="connection-editor"] [data-ui="field-group"] > input[aria-invalid="true"] {
   border-color: var(--color-danger);
 }
 
-[data-ui='connection-editor'] [data-ui='helper'] {
+[data-ui="connection-editor"] [data-ui="helper"] {
   grid-column: 2 / 3;
   font-size: var(--font-size-xs);
   color: var(--color-fg-muted);
 }
 
-[data-ui='connection-editor'] [data-ui='helper'][data-validation='invalid'] {
+[data-ui="connection-editor"] [data-ui="helper"][data-validation="invalid"] {
   color: var(--color-danger);
 }
 
@@ -589,7 +578,7 @@
  * Connection setup modal (first-run / "Add connection" CTA)
  * ────────────────────────────────────────────────────────────────────── */
 
-[data-ui='connection-setup-overlay'] {
+[data-ui="connection-setup-overlay"] {
   position: fixed;
   inset: 0;
   z-index: var(--z-overlay);
@@ -598,14 +587,14 @@
   justify-content: center;
 }
 
-[data-ui='connection-setup-scrim'] {
+[data-ui="connection-setup-scrim"] {
   position: absolute;
   inset: 0;
   background: var(--color-backdrop-scrim);
   backdrop-filter: var(--backdrop-blur-overlay);
 }
 
-[data-ui='connection-setup-modal'] {
+[data-ui="connection-setup-modal"] {
   position: relative;
   z-index: 1;
   background: var(--color-bg-surface-1);
@@ -618,14 +607,14 @@
   flex-direction: column;
 }
 
-[data-ui='connection-setup-modal'] > header {
+[data-ui="connection-setup-modal"] > header {
   display: flex;
   align-items: center;
   padding: var(--space-3) var(--space-5);
   border-bottom: 1px solid var(--color-border-subtle);
 }
 
-[data-ui='connection-setup-modal'] > header > h2 {
+[data-ui="connection-setup-modal"] > header > h2 {
   margin: 0;
   font-size: var(--font-size-lg);
 }
@@ -633,15 +622,15 @@
 /* The close-X icon button (data-ui="icon-button" + data-role="connection-setup-close")
  * is right-aligned in the modal header. Its visual style comes from
  * icons.css; here we just push it to the trailing edge. */
-[data-ui='connection-setup-modal'] > header > [data-role='connection-setup-close'] {
+[data-ui="connection-setup-modal"] > header > [data-role="connection-setup-close"] {
   margin-left: auto;
 }
 
-[data-ui='connection-setup-modal'] > [data-ui='settings-section'] {
+[data-ui="connection-setup-modal"] > [data-ui="settings-section"] {
   padding: var(--space-5);
 }
 
-[data-ui='connection-setup-modal'] > footer {
+[data-ui="connection-setup-modal"] > footer {
   display: flex;
   align-items: center;
   gap: var(--space-3);
@@ -650,7 +639,7 @@
   justify-content: flex-end;
 }
 
-[data-ui='connection-setup-submit'] {
+[data-ui="connection-setup-submit"] {
   background: var(--color-accent);
   color: var(--color-accent-contrast);
   border: none;
@@ -659,7 +648,7 @@
   cursor: pointer;
 }
 
-[data-ui='connection-setup-submit']:disabled {
+[data-ui="connection-setup-submit"]:disabled {
   opacity: var(--opacity-disabled);
   cursor: not-allowed;
 }

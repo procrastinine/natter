@@ -24,9 +24,7 @@ export async function seedFirstRun(page: Page, opts: SeedOptions = {}): Promise<
   await input.fill(apiKey)
   await page.locator('[data-ui="connection-setup-submit"]').click()
   // The modal closes automatically once the seed completes; wait for it.
-  await page
-    .locator('[data-ui="connection-setup-modal"]')
-    .waitFor({ state: 'detached' })
+  await page.locator('[data-ui="connection-setup-modal"]').waitFor({ state: 'detached' })
   // Connection header now shows the configured profile.
   await page
     .locator('[data-ui="connection-header"][data-state="configured"]')
@@ -71,10 +69,7 @@ export interface SseDelta {
 
 // Build an SSE body from a list of lane-tagged frames. Each `SseDelta` is one
 // `data:` frame; `[DONE]` is appended automatically unless `options.noDone`.
-export function buildSseBody(
-  frames: SseDelta[],
-  options: { noDone?: boolean } = {},
-): string {
+export function buildSseBody(frames: SseDelta[], options: { noDone?: boolean } = {}): string {
   const lines: string[] = []
   for (const frame of frames) {
     const body: Record<string, unknown> = {}
@@ -88,7 +83,9 @@ export function buildSseBody(
       const delta: Record<string, unknown> = {}
       if (frame.content !== undefined) delta.content = frame.content
       if (frame.reasoning !== undefined) delta.reasoning = frame.reasoning
-      body.choices = [{ delta, ...(frame.finish !== undefined ? { finish_reason: frame.finish } : {}) }]
+      body.choices = [
+        { delta, ...(frame.finish !== undefined ? { finish_reason: frame.finish } : {}) },
+      ]
     }
     if (frame.usage !== undefined) body.usage = frame.usage
     lines.push(`data: ${JSON.stringify(body)}`)
@@ -112,17 +109,8 @@ export interface MockChatOptions {
 // Intercept `/api/v1/chat/completions` on the given page and return a canned
 // SSE or JSON response. Returns an unroute handle the caller can await to
 // remove the interception (rarely needed — specs usually run once per page).
-export async function mockChatCompletions(
-  page: Page,
-  options: MockChatOptions,
-): Promise<void> {
-  const {
-    body,
-    status = 200,
-    json,
-    headers = {},
-    delayMs,
-  } = options
+export async function mockChatCompletions(page: Page, options: MockChatOptions): Promise<void> {
+  const { body, status = 200, json, headers = {}, delayMs } = options
   await page.route('**/api/v1/chat/completions', async (route) => {
     if (delayMs) await new Promise((r) => setTimeout(r, delayMs))
     if (json !== undefined) {

@@ -1,9 +1,9 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import 'fake-indexeddb/auto'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { IDBFactory } from 'fake-indexeddb'
-import { EmptyState } from '../../src/ui/chat/EmptyState'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
+import { EmptyState } from '../../src/ui/chat/EmptyState'
 
 beforeEach(() => {
   ;(globalThis as unknown as { indexedDB: IDBFactory }).indexedDB = new IDBFactory()

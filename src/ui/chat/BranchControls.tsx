@@ -9,18 +9,18 @@
 // to an arbitrary sibling number.
 
 import {
+  type KeyboardEvent,
+  type MouseEvent,
   useCallback,
   useEffect,
   useRef,
   useState,
-  type KeyboardEvent,
-  type MouseEvent,
 } from 'react'
 import { chatHref } from '../../app/router'
 import { cursorKeyOf, groupByParent, indexById } from '../../core/active-path'
 import { resolveLastUpdatedBranchBelow } from '../../core/branch-resolve'
-import type { ChatId, CursorMap, Message } from '../../core/types'
 import { swipe } from '../../core/messages'
+import type { ChatId, CursorMap, Message } from '../../core/types'
 import { useChatStore } from '../../store/zustand/chatStore'
 
 export interface BranchControlsProps {
@@ -29,11 +29,7 @@ export interface BranchControlsProps {
   messages: readonly Message[]
 }
 
-export function BranchControls({
-  chatId,
-  message,
-  messages,
-}: BranchControlsProps) {
+export function BranchControls({ chatId, message, messages }: BranchControlsProps) {
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState('')
   const inputRef = useRef<HTMLInputElement | null>(null)
@@ -52,9 +48,7 @@ export function BranchControls({
   }, [editing])
 
   const byParent = groupByParent(messages)
-  const siblings = (byParent.get(message.parentId) ?? []).filter(
-    (m) => !m.deleted,
-  )
+  const siblings = (byParent.get(message.parentId) ?? []).filter((m) => !m.deleted)
   if (siblings.length < 2) return null
   const sorted = [...siblings].sort((a, b) => a.siblingIndex - b.siblingIndex)
   const idx = sorted.findIndex((s) => s.id === message.id)
@@ -113,37 +107,21 @@ export function BranchControls({
     useChatStore.getState().setCursor(chatId, nextCursor)
   }
 
-  const handleAnchorStep = (direction: -1 | 1) =>
-    (e: MouseEvent<HTMLAnchorElement>) => {
-      if (
-        e.defaultPrevented ||
-        e.button !== 0 ||
-        e.metaKey ||
-        e.ctrlKey ||
-        e.shiftKey ||
-        e.altKey
-      ) {
-        return
-      }
-      e.preventDefault()
-      applyStep(direction)
+  const handleAnchorStep = (direction: -1 | 1) => (e: MouseEvent<HTMLAnchorElement>) => {
+    if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) {
+      return
     }
+    e.preventDefault()
+    applyStep(direction)
+  }
 
-  const handleJumpAnchor =
-    (targetId: string) => (e: MouseEvent<HTMLAnchorElement>) => {
-      if (
-        e.defaultPrevented ||
-        e.button !== 0 ||
-        e.metaKey ||
-        e.ctrlKey ||
-        e.shiftKey ||
-        e.altKey
-      ) {
-        return
-      }
-      e.preventDefault()
-      jumpTo(targetId)
+  const handleJumpAnchor = (targetId: string) => (e: MouseEvent<HTMLAnchorElement>) => {
+    if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) {
+      return
     }
+    e.preventDefault()
+    jumpTo(targetId)
+  }
 
   const beginEdit = () => {
     setDraft(String(idx + 1))
@@ -258,9 +236,7 @@ export function BranchControls({
             inputMode="numeric"
             value={draft}
             size={Math.max(2, draft.length + 1)}
-            onChange={(e) =>
-              setDraft(e.target.value.replace(/[^0-9]/g, ''))
-            }
+            onChange={(e) => setDraft(e.target.value.replace(/[^0-9]/g, ''))}
             onKeyDown={handleEditKey}
             onBlur={commitEdit}
             aria-label="Jump to variant number (⏎ jumps · ⌘⏎ opens in a new tab)"

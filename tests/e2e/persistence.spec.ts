@@ -1,5 +1,5 @@
-import { expect, test } from '@playwright/test'
 import type { Page } from '@playwright/test'
+import { expect, test } from '@playwright/test'
 import {
   buildSseBody,
   clearIndexedDb,
@@ -37,7 +37,9 @@ test.beforeEach(async ({ page }) => {
   await seedFirstRun(page)
 })
 
-test('reloading a chat preserves user + assistant messages and generation meta', async ({ page }) => {
+test('reloading a chat preserves user + assistant messages and generation meta', async ({
+  page,
+}) => {
   await mockChatCompletions(page, {
     body: buildSseBody([
       { id: 'gen-persist', content: 'persisted text' },
@@ -69,14 +71,21 @@ test('multi-turn: second send includes prior turn in request body', async ({ pag
   await createChatAndOpen(page)
   await sendMessage(page, 'turn one')
   await expect(
-    page.locator('[data-ui="message"][data-role="assistant"]').first().locator('[data-ui="message-body"]'),
+    page
+      .locator('[data-ui="message"][data-role="assistant"]')
+      .first()
+      .locator('[data-ui="message-body"]'),
   ).toHaveText('first-reply')
   await sendMessage(page, 'turn two')
   await expect(
-    page.locator('[data-ui="message"][data-role="assistant"]').nth(1).locator('[data-ui="message-body"]'),
+    page
+      .locator('[data-ui="message"][data-role="assistant"]')
+      .nth(1)
+      .locator('[data-ui="message-body"]'),
   ).toHaveText('second-reply')
   expect(bodies).toHaveLength(2)
-  const secondMessages = (bodies[1] as { messages: Array<{ role: string; content: string }> }).messages
+  const secondMessages = (bodies[1] as { messages: Array<{ role: string; content: string }> })
+    .messages
   const roles = secondMessages.map((m) => m.role)
   // First turn's user + assistant are echoed before turn two's user message.
   expect(roles).toEqual(['user', 'assistant', 'user'])
@@ -87,13 +96,21 @@ test('multi-turn: second send includes prior turn in request body', async ({ pag
 test('chat.lastUpdatedLeafId points at the assistant row after send', async ({ page }) => {
   await mockChatCompletions(page, {
     body: buildSseBody([
-      { id: 'g', content: 'leaf', finish: 'stop', usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2, cost: 0.00002 } },
+      {
+        id: 'g',
+        content: 'leaf',
+        finish: 'stop',
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2, cost: 0.00002 },
+      },
     ]),
   })
   await createChatAndOpen(page)
   await sendMessage(page, 'one')
   await expect(
-    page.locator('[data-ui="message"][data-role="assistant"]').first().locator('[data-ui="message-body"]'),
+    page
+      .locator('[data-ui="message"][data-role="assistant"]')
+      .first()
+      .locator('[data-ui="message-body"]'),
   ).toHaveText('leaf')
 
   const chatId = await firstChatId(page)
@@ -112,7 +129,10 @@ test('chat.totalCostUsd matches the sum of generation.cost across live rows', as
       contentType: 'text/event-stream',
       body: buildSseBody([
         { id: `g-${turn}`, content: `reply ${turn}` },
-        { finish: 'stop', usage: { prompt_tokens: 1, completion_tokens: 2, total_tokens: 3, cost } },
+        {
+          finish: 'stop',
+          usage: { prompt_tokens: 1, completion_tokens: 2, total_tokens: 3, cost },
+        },
       ]),
     })
   })
@@ -123,7 +143,7 @@ test('chat.totalCostUsd matches the sum of generation.cost across live rows', as
   await expect(page.locator('[data-ui="message"][data-role="assistant"]').nth(1)).toBeVisible()
 
   const chatId = await firstChatId(page)
-  const messages = await readMessages(page, chatId) as Array<{
+  const messages = (await readMessages(page, chatId)) as Array<{
     deleted: boolean
     generation?: { cost?: number }
   }>
@@ -143,7 +163,10 @@ test('streaming assistant row commits generation.finishedAt on close', async ({ 
   await createChatAndOpen(page)
   await sendMessage(page, 'end')
   await expect(
-    page.locator('[data-ui="message"][data-role="assistant"]').first().locator('[data-ui="message-body"]'),
+    page
+      .locator('[data-ui="message"][data-role="assistant"]')
+      .first()
+      .locator('[data-ui="message-body"]'),
   ).toHaveText('bye')
   const finishedAt = await page.evaluate(async () => {
     const db = await new Promise<IDBDatabase>((resolve, reject) => {
@@ -156,9 +179,9 @@ test('streaming assistant row commits generation.finishedAt on close', async ({ 
         const tx = db.transaction('messages', 'readonly')
         const req = tx.objectStore('messages').getAll()
         req.onsuccess = () => {
-          const rows = (req.result as Array<{ role: string; generation?: { finishedAt?: number } }>).filter(
-            (r) => r.role === 'assistant',
-          )
+          const rows = (
+            req.result as Array<{ role: string; generation?: { finishedAt?: number } }>
+          ).filter((r) => r.role === 'assistant')
           resolve(rows[0]?.generation?.finishedAt)
         }
         req.onerror = () => reject(req.error)

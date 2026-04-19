@@ -7,7 +7,7 @@
  * See plan/10-ui.md §10.7.
  */
 
-[data-ui='composer'] {
+[data-ui="composer"] {
   width: 100%;
   display: flex;
   flex-direction: column;
@@ -27,7 +27,7 @@
  * the visual handle lives on the TOP border (per user feedback: a bottom-
  * right handle that moves the top is unintuitive). Thin invisible band
  * with row-resize cursor; expands its hitbox without taking visible space. */
-[data-ui='composer-resize-handle'] {
+[data-ui="composer-resize-handle"] {
   position: absolute;
   top: -3px;
   left: 0;
@@ -40,8 +40,8 @@
   touch-action: none;
 }
 
-[data-ui='composer-resize-handle']::after {
-  content: '';
+[data-ui="composer-resize-handle"]::after {
+  content: "";
   position: absolute;
   left: 50%;
   top: 50%;
@@ -54,8 +54,8 @@
   transition: opacity var(--duration-fast) var(--ease-standard);
 }
 
-[data-ui='composer-resize-handle']:hover::after,
-[data-ui='composer']:focus-within [data-ui='composer-resize-handle']::after {
+[data-ui="composer-resize-handle"]:hover::after,
+[data-ui="composer"]:focus-within [data-ui="composer-resize-handle"]::after {
   opacity: 0.7;
 }
 
@@ -64,7 +64,7 @@
  * does NOT change on focus — only the textarea gets the focus highlight
  * (a subtle inset blue outline) so the visual change is contained to the
  * actual input area. */
-[data-ui='composer-body'] {
+[data-ui="composer-body"] {
   max-width: var(--message-max-width);
   width: 100%;
   margin: 0 auto;
@@ -80,7 +80,7 @@
  * reads as the "type here" affordance distinct from the surrounding
  * chrome. Focus ring is inset so the highlight stays *inside* the
  * textarea — the wrapping card doesn't change. */
-[data-ui='composer-input'] {
+[data-ui="composer-input"] {
   width: 100%;
   resize: none;
   font: inherit;
@@ -94,13 +94,13 @@
   line-height: var(--line-height-body);
 }
 
-[data-ui='composer-input']:focus,
-[data-ui='composer-input']:focus-visible {
+[data-ui="composer-input"]:focus,
+[data-ui="composer-input"]:focus-visible {
   outline: 2px solid var(--color-border-focus);
   outline-offset: -2px;
 }
 
-[data-ui='composer-input']::placeholder {
+[data-ui="composer-input"]::placeholder {
   color: var(--color-fg-muted);
 }
 
@@ -110,7 +110,7 @@
  * textarea). Send button fills the bottom-right corner. Height kept
  * compact so the composer — especially in auto-size mode (normal view)
  * — doesn't dominate the bottom of the main pane. */
-[data-ui='composer-actions'] {
+[data-ui="composer-actions"] {
   display: flex;
   align-items: stretch;
   gap: 0;
@@ -120,14 +120,14 @@
   min-height: 30px;
 }
 
-[data-ui='composer-disabled-reason'] {
+[data-ui="composer-disabled-reason"] {
   max-width: var(--message-max-width);
   margin: var(--space-2) auto 0;
   color: var(--color-warning);
   font-size: var(--font-size-xs);
 }
 
-[data-ui='token-counter'] {
+[data-ui="token-counter"] {
   color: var(--color-fg-muted);
   font-size: var(--font-size-xs);
   font-variant-numeric: tabular-nums;
@@ -135,7 +135,7 @@
   align-self: center;
 }
 
-[data-ui='token-counter'][data-over-limit='true'] {
+[data-ui="token-counter"][data-over-limit="true"] {
   color: var(--color-danger);
   font-weight: var(--font-weight-medium);
 }
@@ -145,7 +145,7 @@
  * match the card. No padding-margin around it. Pressing Enter (or the
  * configured send shortcut) submits, so the button is mostly visual
  * confirmation that the action exists. */
-[data-ui='send'] {
+[data-ui="send"] {
   /* Slight inner shade on top so the send button reads the same way
    * every other affordance does (they all have shading; a flat accent
    * felt out of place). Gradient is very subtle — a 6% darken on the
@@ -168,11 +168,10 @@
   align-items: center;
   justify-content: center;
   gap: var(--space-2);
-  box-shadow: inset 0 1px 0
-    color-mix(in srgb, var(--color-accent-contrast) 20%, transparent);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--color-accent-contrast) 20%, transparent);
 }
 
-[data-ui='send']:hover:not(:disabled) {
+[data-ui="send"]:hover:not(:disabled) {
   background: linear-gradient(
     to bottom,
     color-mix(in srgb, var(--color-accent-hover) 92%, #000) 0%,
@@ -180,7 +179,7 @@
   );
 }
 
-[data-ui='send']:disabled {
+[data-ui="send"]:disabled {
   opacity: var(--opacity-disabled);
   cursor: not-allowed;
 }
@@ -190,7 +189,7 @@
  * find it) but overrides the header's pill styling inside the composer
  * so it fills the Send slot: full action-row height, square bottom-right
  * corner, danger tint, icon + label. */
-[data-ui='composer-actions'] > [data-ui='abort'] {
+[data-ui="composer-actions"] > [data-ui="abort"] {
   background: var(--color-danger);
   color: var(--color-fg-inverse);
   border: none;
@@ -207,6 +206,6 @@
   gap: var(--space-2);
 }
 
-[data-ui='composer-actions'] > [data-ui='abort']:hover {
+[data-ui="composer-actions"] > [data-ui="abort"]:hover {
   background: color-mix(in srgb, var(--color-danger) 85%, #000);
 }

@@ -70,9 +70,7 @@ export function normalizeChatUsage(usage: ChatUsage | null | undefined): Normali
   }
 }
 
-export function normalizeResponsesUsage(
-  usage: ResponsesUsage | null | undefined,
-): NormalizedUsage {
+export function normalizeResponsesUsage(usage: ResponsesUsage | null | undefined): NormalizedUsage {
   if (!usage) return emptyUsage()
   return {
     promptTokens: usage.input_tokens ?? 0,

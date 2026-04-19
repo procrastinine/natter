@@ -32,9 +32,7 @@ test('pencil opens the inline editor; Enter commits and sets titleStatus=manual'
   await expect(editor).toBeFocused()
   await editor.fill('Branching deep-dive')
   await editor.press('Enter')
-  await expect(page.locator('[data-ui="chat-title-label"]')).toHaveText(
-    'Branching deep-dive',
-  )
+  await expect(page.locator('[data-ui="chat-title-label"]')).toHaveText('Branching deep-dive')
   const chatId = await firstChatId(page)
   const row = await page.evaluate(async (id) => {
     const db = await new Promise<IDBDatabase>((resolve, reject) => {
@@ -80,9 +78,7 @@ test('empty-after-trim is treated as a silent cancel (no error, editor closes)',
   await expect(page.locator('[data-ui="chat-title-label"]')).toHaveText('Untitled chat')
 })
 
-test('committing an unchanged title is a silent no-op (no error banner)', async ({
-  page,
-}) => {
+test('committing an unchanged title is a silent no-op (no error banner)', async ({ page }) => {
   await createChatAndSend(page, 'seed')
   // First, set a title we control.
   await page.locator('[data-ui="chat-title-edit"]').click()
@@ -96,9 +92,7 @@ test('committing an unchanged title is a silent no-op (no error banner)', async 
   await expect(page.locator('[data-ui="chat-title-label"]')).toHaveText('Stable title')
 })
 
-test('navigating to a different chat cancels any in-progress title edit', async ({
-  page,
-}) => {
+test('navigating to a different chat cancels any in-progress title edit', async ({ page }) => {
   await createChatAndSend(page, 'first chat')
   await createChatAndSend(page, 'second chat')
   // Open the editor on the active (second) chat.
@@ -124,15 +118,11 @@ test('title commit bumps updatedAt + metaVersion, leaves branch state untouched,
   page,
 }) => {
   await mockChatCompletions(page, {
-    body: buildSseBody([
-      { id: 'gen-1', content: 'hello', finish: 'stop' },
-    ]),
+    body: buildSseBody([{ id: 'gen-1', content: 'hello', finish: 'stop' }]),
   })
   await createChatAndOpen(page)
   await sendMessage(page, 'establish a branch')
-  await expect(
-    page.locator('[data-ui="message"][data-role="assistant"]').first(),
-  ).toBeVisible()
+  await expect(page.locator('[data-ui="message"][data-role="assistant"]').first()).toBeVisible()
   const chatId = await firstChatId(page)
   const before = await readChat(page, chatId)
 
@@ -146,9 +136,7 @@ test('title commit bumps updatedAt + metaVersion, leaves branch state untouched,
   expect(after.title).toBe('After send')
   expect(after.titleStatus).toBe('manual')
   expect(Number(after.updatedAt)).toBeGreaterThan(Number(before.updatedAt))
-  expect(Number(after.metaVersion)).toBeGreaterThanOrEqual(
-    Number(before.metaVersion) + 1,
-  )
+  expect(Number(after.metaVersion)).toBeGreaterThanOrEqual(Number(before.metaVersion) + 1)
   // Title edits do NOT move the branch leaf.
   expect(after.lastUpdatedLeafId).toBe(before.lastUpdatedLeafId)
   expect(Number(after.lastBranchUpdatedAt)).toBe(Number(before.lastBranchUpdatedAt))

@@ -13,7 +13,7 @@ import type {
   MutationScope,
 } from '../core/types'
 import { postEvent } from './broadcast'
-import { childListKey, openDb, type NatterDb, type SettingsRow } from './db'
+import { childListKey, type NatterDb, openDb, type SettingsRow } from './db'
 import { withMutationLocks } from './locks'
 import type {
   ChatMutationSummary,
@@ -344,401 +344,393 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     const mutationTables = resolveMutationTables(db, scopes)
 
     const result: WorkspaceMutationResult<T> = await withMutationLocks(scopes, async () =>
-      db.transaction<WorkspaceMutationResult<T>>(
-        'rw',
-        mutationTables,
-        async (tx: Transaction) => {
-          const { assertScope } = createScopeChecker(scopes)
-          const chatStates = new Map<ChatId, ChatMutationState>()
-          const affectedMessageIds = new Set<MessageId>()
-          let wroteWorkspaceState = false
+      db.transaction<WorkspaceMutationResult<T>>('rw', mutationTables, async (tx: Transaction) => {
+        const { assertScope } = createScopeChecker(scopes)
+        const chatStates = new Map<ChatId, ChatMutationState>()
+        const affectedMessageIds = new Set<MessageId>()
+        let wroteWorkspaceState = false
 
-          const ensureChatState = async (chatId: ChatId): Promise<ChatMutationState> => {
-            const existing = chatStates.get(chatId)
-            if (existing) return existing
-            const beforeChat = await loadChatOrThrow(tx.table<Chat, ChatId>('chats'), chatId)
-            const state: ChatMutationState = {
-              beforeChat,
-              visibleMetaPatch: {},
-              hiddenMetaPatch: {},
-              summaryPatch: {},
-              visibleMetaDirty: false,
-              summaryVersionDirty: false,
-              messageSummaryDirty: false,
-              broadcast: false,
-              changedMessageIds: new Set<MessageId>(),
-              affected: new Map<string, ChatMutationSummary>(),
-            }
-            chatStates.set(chatId, state)
-            return state
+        const ensureChatState = async (chatId: ChatId): Promise<ChatMutationState> => {
+          const existing = chatStates.get(chatId)
+          if (existing) return existing
+          const beforeChat = await loadChatOrThrow(tx.table<Chat, ChatId>('chats'), chatId)
+          const state: ChatMutationState = {
+            beforeChat,
+            visibleMetaPatch: {},
+            hiddenMetaPatch: {},
+            summaryPatch: {},
+            visibleMetaDirty: false,
+            summaryVersionDirty: false,
+            messageSummaryDirty: false,
+            broadcast: false,
+            changedMessageIds: new Set<MessageId>(),
+            affected: new Map<string, ChatMutationSummary>(),
           }
+          chatStates.set(chatId, state)
+          return state
+        }
 
-          const ensureBeforeMessages = async (state: ChatMutationState): Promise<Message[]> => {
-            if (state.beforeMessages) return state.beforeMessages
-            const beforeMessages = await tx
-              .table<Message, MessageId>('messages')
-              .where('chatId')
-              .equals(state.beforeChat.id)
-              .toArray()
-            state.beforeMessages = beforeMessages.map(cloneMessage)
-            return state.beforeMessages
+        const ensureBeforeMessages = async (state: ChatMutationState): Promise<Message[]> => {
+          if (state.beforeMessages) return state.beforeMessages
+          const beforeMessages = await tx
+            .table<Message, MessageId>('messages')
+            .where('chatId')
+            .equals(state.beforeChat.id)
+            .toArray()
+          state.beforeMessages = beforeMessages.map(cloneMessage)
+          return state.beforeMessages
+        }
+
+        for (const scope of scopes) {
+          if (scope.kind === 'chat-meta' || scope.kind === 'children' || scope.kind === 'draft') {
+            await ensureChatState(scope.chatId)
           }
+        }
 
-          for (const scope of scopes) {
-            if (
-              scope.kind === 'chat-meta' ||
-              scope.kind === 'children' ||
-              scope.kind === 'draft'
-            ) {
-              await ensureChatState(scope.chatId)
-            }
+        const requireChatState = (chatId: ChatId): ChatMutationState => {
+          const state = chatStates.get(chatId)
+          if (!state) {
+            throw new Error(`ChatStateUnavailable:${chatId}`)
           }
+          return state
+        }
 
-          const requireChatState = (chatId: ChatId): ChatMutationState => {
+        const bumpChildList = async (
+          chatId: ChatId,
+          parentId: MessageId | null,
+          bumpNow = now,
+        ): Promise<ChildListState> => {
+          assertScope({ kind: 'children', chatId, parentId })
+          const table = tx.table<ChildListState, string>('childLists')
+          const id = childListKey(chatId, parentId)
+          const existing = await table.get(id)
+          const next: ChildListState = existing
+            ? { ...existing, version: existing.version + 1, updatedAt: bumpNow }
+            : { id, chatId, parentId, version: 1, updatedAt: bumpNow }
+          await table.put(next)
+          wroteWorkspaceState = true
+          const state = await ensureChatState(chatId)
+          state.broadcast = true
+          upsertAffected(state, { kind: 'children', chatId, parentId })
+          return next
+        }
+
+        const ctx: MutationContext = {
+          getChat: async (chatId) => {
             const state = chatStates.get(chatId)
-            if (!state) {
-              throw new Error(`ChatStateUnavailable:${chatId}`)
-            }
-            return state
-          }
-
-          const bumpChildList = async (
-            chatId: ChatId,
-            parentId: MessageId | null,
-            bumpNow = now,
-          ): Promise<ChildListState> => {
-            assertScope({ kind: 'children', chatId, parentId })
-            const table = tx.table<ChildListState, string>('childLists')
-            const id = childListKey(chatId, parentId)
-            const existing = await table.get(id)
-            const next: ChildListState = existing
-              ? { ...existing, version: existing.version + 1, updatedAt: bumpNow }
-              : { id, chatId, parentId, version: 1, updatedAt: bumpNow }
-            await table.put(next)
-            wroteWorkspaceState = true
-            const state = await ensureChatState(chatId)
-            state.broadcast = true
-            upsertAffected(state, { kind: 'children', chatId, parentId })
-            return next
-          }
-
-          const ctx: MutationContext = {
-            getChat: async (chatId) => {
-              const state = chatStates.get(chatId)
-              if (!state) return tx.table<Chat, ChatId>('chats').get(chatId)
-              return {
-                ...state.beforeChat,
-                ...state.hiddenMetaPatch,
-                ...state.visibleMetaPatch,
-                ...state.summaryPatch,
-              }
-            },
-
-            patchChatMeta: (chatId, patch, options = {}) => {
-              const { touchVisibleState = true, broadcast = touchVisibleState } = options
-              assertScope({ kind: 'chat-meta', chatId })
-              const state = requireChatState(chatId)
-              const current = {
-                ...state.beforeChat,
-                ...state.hiddenMetaPatch,
-                ...state.visibleMetaPatch,
-                ...state.summaryPatch,
-              }
-              if (touchVisibleState) {
-                const applied = changedPatch(current, stripMetaPatch(patch))
-                if (!applied) return
-                state.visibleMetaPatch = {
-                  ...state.visibleMetaPatch,
-                  ...applied,
-                }
-                state.visibleMetaDirty = true
-                state.summaryVersionDirty = true
-              } else {
-                const applied = changedPatch(current, stripMetaPatch(patch))
-                if (!applied) return
-                state.hiddenMetaPatch = {
-                  ...state.hiddenMetaPatch,
-                  ...applied,
-                }
-              }
-              state.broadcast ||= broadcast
-              upsertAffected(state, { kind: 'chat-meta', chatId })
-            },
-
-            patchChatSummary: (chatId, patch) => {
-              const state = requireChatState(chatId)
-              const current = {
-                ...state.beforeChat,
-                ...state.hiddenMetaPatch,
-                ...state.visibleMetaPatch,
-                ...state.summaryPatch,
-              }
-              const applied = changedPatch(current, stripSummaryPatch(patch))
-              if (!applied) return
-              state.summaryPatch = {
-                ...state.summaryPatch,
-                ...applied,
-              }
-              state.summaryVersionDirty = true
-              state.broadcast = true
-              upsertAffected(state, { kind: 'chat-meta', chatId })
-            },
-
-            getMessage: async (messageId) => tx.table<Message, MessageId>('messages').get(messageId),
-
-            listMessages: async (chatId) =>
-              tx.table<Message, MessageId>('messages').where('chatId').equals(chatId).toArray(),
-
-            listChildren: async (chatId, parentId) => {
-              const rows =
-                parentId === null
-                  ? await tx.table<Message, MessageId>('messages').where('chatId').equals(chatId).toArray()
-                  : await tx
-                      .table<Message, MessageId>('messages')
-                      .where('[chatId+parentId]')
-                      .equals([chatId, parentId])
-                      .toArray()
-              return rows.filter((row) => row.parentId === parentId)
-            },
-
-            putMessage: async (message) => {
-              const table = tx.table<Message, MessageId>('messages')
-              const existing = await table.get(message.id)
-              const chatId = existing?.chatId ?? message.chatId
-              const state = await ensureChatState(chatId)
-              const clone = cloneMessage(message)
-
-              assertScope({ kind: 'message', messageId: clone.id })
-              if (existing) {
-                if (existing.chatId !== clone.chatId) {
-                  throw new Error(`CrossChatMessageMove:${clone.id}`)
-                }
-                const moved =
-                  existing.parentId !== clone.parentId || existing.siblingIndex !== clone.siblingIndex
-                const deletionChanged = existing.deleted !== clone.deleted
-                if (moved || deletionChanged) {
-                  assertScope({ kind: 'children', chatId, parentId: existing.parentId })
-                  assertScope({ kind: 'children', chatId, parentId: clone.parentId })
-                }
-                const changed = stableStringify(existing) !== stableStringify(clone)
-                if (!changed) return
-                await ensureBeforeMessages(state)
-                clone.nodeVersion = existing.nodeVersion + 1
-                await table.put(clone)
-                wroteWorkspaceState = true
-                if (moved || deletionChanged) {
-                  await bumpChildList(chatId, existing.parentId)
-                  if (existing.parentId !== clone.parentId) {
-                    await bumpChildList(chatId, clone.parentId)
-                  }
-                }
-              } else {
-                await ensureBeforeMessages(state)
-                assertScope({ kind: 'children', chatId, parentId: clone.parentId })
-                if (clone.nodeVersion === undefined) clone.nodeVersion = 0
-                await table.put(clone)
-                wroteWorkspaceState = true
-                await bumpChildList(chatId, clone.parentId)
-              }
-
-              state.summaryVersionDirty = true
-              state.messageSummaryDirty = true
-              state.broadcast = true
-              state.changedMessageIds.add(clone.id)
-              affectedMessageIds.add(clone.id)
-              upsertAffected(state, { kind: 'message', chatId, messageId: clone.id })
-            },
-
-            deleteMessage: async (messageId) => {
-              assertScope({ kind: 'message', messageId })
-              const table = tx.table<Message, MessageId>('messages')
-              const existing = await table.get(messageId)
-              if (!existing) return
-              const state = await ensureChatState(existing.chatId)
-              await ensureBeforeMessages(state)
-              assertScope({ kind: 'children', chatId: existing.chatId, parentId: existing.parentId })
-              await table.delete(messageId)
-              wroteWorkspaceState = true
-              await bumpChildList(existing.chatId, existing.parentId)
-              state.summaryVersionDirty = true
-              state.messageSummaryDirty = true
-              state.broadcast = true
-              state.changedMessageIds.add(messageId)
-              affectedMessageIds.add(messageId)
-              upsertAffected(state, {
-                kind: 'message',
-                chatId: existing.chatId,
-                messageId,
-              })
-            },
-
-            getChildList: async (chatId, parentId) => {
-              const row = await tx
-                .table<ChildListState, string>('childLists')
-                .get(childListKey(chatId, parentId))
-              return (
-                row ?? {
-                  id: childListKey(chatId, parentId),
-                  chatId,
-                  parentId,
-                  version: 0,
-                  updatedAt: 0,
-                }
-              )
-            },
-
-            bumpChildList,
-
-            getAttachment: async (attachmentId) =>
-              tx.table<Attachment, AttachmentId>('attachments').get(attachmentId),
-
-            putAttachment: async (attachment) => {
-              assertScope({ kind: 'attachment', attachmentId: attachment.id })
-              await tx.table<Attachment, AttachmentId>('attachments').put(attachment)
-              wroteWorkspaceState = true
-            },
-
-            deleteAttachment: async (attachmentId) => {
-              assertScope({ kind: 'attachment', attachmentId })
-              const table = tx.table<Attachment, AttachmentId>('attachments')
-              const existing = await table.get(attachmentId)
-              if (!existing) return
-              await table.delete(attachmentId)
-              wroteWorkspaceState = true
-            },
-
-            getDraft: async (chatId) => tx.table<DraftRow, ChatId>('drafts').get(chatId),
-
-            putDraft: async (draft) => {
-              assertScope({ kind: 'draft', chatId: draft.chatId })
-              const state = await ensureChatState(draft.chatId)
-              const table = tx.table<DraftRow, ChatId>('drafts')
-              const existing = await table.get(draft.chatId)
-              if (existing && stableStringify(existing) === stableStringify(draft)) return
-              await table.put(draft)
-              wroteWorkspaceState = true
-              state.broadcast = true
-              upsertAffected(state, { kind: 'draft', chatId: draft.chatId })
-            },
-
-            deleteDraft: async (chatId) => {
-              assertScope({ kind: 'draft', chatId })
-              const state = await ensureChatState(chatId)
-              const table = tx.table<DraftRow, ChatId>('drafts')
-              const existing = await table.get(chatId)
-              if (!existing) return
-              await table.delete(chatId)
-              wroteWorkspaceState = true
-              state.broadcast = true
-              upsertAffected(state, { kind: 'draft', chatId })
-            },
-          }
-
-          const value = await fn(ctx)
-
-          const chatVersions: Record<ChatId, ChatVersions> = {}
-          const affectedChatIds: ChatId[] = []
-          const chatTable = tx.table<Chat, ChatId>('chats')
-
-          for (const [chatId, state] of chatStates) {
-            const current = await chatTable.get(chatId)
-            if (!current) throw new ChatMissingError(chatId)
-            const next: Chat = {
-              ...current,
+            if (!state) return tx.table<Chat, ChatId>('chats').get(chatId)
+            return {
+              ...state.beforeChat,
               ...state.hiddenMetaPatch,
               ...state.visibleMetaPatch,
+              ...state.summaryPatch,
             }
+          },
 
-            if (state.visibleMetaDirty) {
-              next.metaVersion = current.metaVersion + 1
+          patchChatMeta: (chatId, patch, options = {}) => {
+            const { touchVisibleState = true, broadcast = touchVisibleState } = options
+            assertScope({ kind: 'chat-meta', chatId })
+            const state = requireChatState(chatId)
+            const current = {
+              ...state.beforeChat,
+              ...state.hiddenMetaPatch,
+              ...state.visibleMetaPatch,
+              ...state.summaryPatch,
             }
-
-            if (state.summaryVersionDirty) {
-              next.updatedAt = now
-              next.summaryVersion = current.summaryVersion + 1
-            }
-
-            if (state.messageSummaryDirty) {
-              const afterMessages = await tx
-                .table<Message, MessageId>('messages')
-                .where('chatId')
-                .equals(chatId)
-                .toArray()
-              const nextLeafId = findLastUpdatedLeafId(afterMessages)
-              next.lastUpdatedLeafId = nextLeafId
-              next.wordCount = countWords(buildBranchMessages(afterMessages, nextLeafId))
-              next.totalCostUsd = computeTotalCostUsd(afterMessages)
-              const beforeMessages = state.beforeMessages ?? []
-              if (
-                shouldBumpLastBranchUpdatedAt(
-                  state.beforeChat,
-                  beforeMessages,
-                  afterMessages,
-                  state.changedMessageIds,
-                )
-              ) {
-                next.lastBranchUpdatedAt = now
+            if (touchVisibleState) {
+              const applied = changedPatch(current, stripMetaPatch(patch))
+              if (!applied) return
+              state.visibleMetaPatch = {
+                ...state.visibleMetaPatch,
+                ...applied,
+              }
+              state.visibleMetaDirty = true
+              state.summaryVersionDirty = true
+            } else {
+              const applied = changedPatch(current, stripMetaPatch(patch))
+              if (!applied) return
+              state.hiddenMetaPatch = {
+                ...state.hiddenMetaPatch,
+                ...applied,
               }
             }
+            state.broadcast ||= broadcast
+            upsertAffected(state, { kind: 'chat-meta', chatId })
+          },
 
-            const summaryPatch = stripSummaryPatch(state.summaryPatch)
-            const patched: Chat = { ...next, ...summaryPatch }
+          patchChatSummary: (chatId, patch) => {
+            const state = requireChatState(chatId)
+            const current = {
+              ...state.beforeChat,
+              ...state.hiddenMetaPatch,
+              ...state.visibleMetaPatch,
+              ...state.summaryPatch,
+            }
+            const applied = changedPatch(current, stripSummaryPatch(patch))
+            if (!applied) return
+            state.summaryPatch = {
+              ...state.summaryPatch,
+              ...applied,
+            }
+            state.summaryVersionDirty = true
+            state.broadcast = true
+            upsertAffected(state, { kind: 'chat-meta', chatId })
+          },
 
-            const changed = stableStringify(current) !== stableStringify(patched)
-            if (changed) {
-              await chatTable.put(patched)
+          getMessage: async (messageId) => tx.table<Message, MessageId>('messages').get(messageId),
+
+          listMessages: async (chatId) =>
+            tx.table<Message, MessageId>('messages').where('chatId').equals(chatId).toArray(),
+
+          listChildren: async (chatId, parentId) => {
+            const rows =
+              parentId === null
+                ? await tx
+                    .table<Message, MessageId>('messages')
+                    .where('chatId')
+                    .equals(chatId)
+                    .toArray()
+                : await tx
+                    .table<Message, MessageId>('messages')
+                    .where('[chatId+parentId]')
+                    .equals([chatId, parentId])
+                    .toArray()
+            return rows.filter((row) => row.parentId === parentId)
+          },
+
+          putMessage: async (message) => {
+            const table = tx.table<Message, MessageId>('messages')
+            const existing = await table.get(message.id)
+            const chatId = existing?.chatId ?? message.chatId
+            const state = await ensureChatState(chatId)
+            const clone = cloneMessage(message)
+
+            assertScope({ kind: 'message', messageId: clone.id })
+            if (existing) {
+              if (existing.chatId !== clone.chatId) {
+                throw new Error(`CrossChatMessageMove:${clone.id}`)
+              }
+              const moved =
+                existing.parentId !== clone.parentId || existing.siblingIndex !== clone.siblingIndex
+              const deletionChanged = existing.deleted !== clone.deleted
+              if (moved || deletionChanged) {
+                assertScope({ kind: 'children', chatId, parentId: existing.parentId })
+                assertScope({ kind: 'children', chatId, parentId: clone.parentId })
+              }
+              const changed = stableStringify(existing) !== stableStringify(clone)
+              if (!changed) return
+              await ensureBeforeMessages(state)
+              clone.nodeVersion = existing.nodeVersion + 1
+              await table.put(clone)
               wroteWorkspaceState = true
-              affectedChatIds.push(chatId)
-            }
-            chatVersions[chatId] = {
-              metaVersion: patched.metaVersion,
-              summaryVersion: patched.summaryVersion,
-            }
-          }
-
-          if (wroteWorkspaceState) {
-            const stored = (
-              await tx.table<SettingsRow, string>('settings').get(WORKSPACE_META_KEY)
-            )?.value as
-              | StoredWorkspaceMeta
-              | undefined
-            const mutationMeta =
-              stored ?? {
-                workspaceId: WORKSPACE_ID,
-                backendKind: 'browser-idb' as const,
-                lastMutationAt: 0,
-                mutationCounter: 0,
+              if (moved || deletionChanged) {
+                await bumpChildList(chatId, existing.parentId)
+                if (existing.parentId !== clone.parentId) {
+                  await bumpChildList(chatId, clone.parentId)
+                }
               }
-            const nextWorkspaceMeta: StoredWorkspaceMeta = {
-              ...mutationMeta,
-              lastMutationAt: now,
-              mutationCounter: mutationMeta.mutationCounter + 1,
+            } else {
+              await ensureBeforeMessages(state)
+              assertScope({ kind: 'children', chatId, parentId: clone.parentId })
+              if (clone.nodeVersion === undefined) clone.nodeVersion = 0
+              await table.put(clone)
+              wroteWorkspaceState = true
+              await bumpChildList(chatId, clone.parentId)
             }
-            await tx.table<SettingsRow, string>('settings').put({
-              key: WORKSPACE_META_KEY,
-              value: nextWorkspaceMeta,
+
+            state.summaryVersionDirty = true
+            state.messageSummaryDirty = true
+            state.broadcast = true
+            state.changedMessageIds.add(clone.id)
+            affectedMessageIds.add(clone.id)
+            upsertAffected(state, { kind: 'message', chatId, messageId: clone.id })
+          },
+
+          deleteMessage: async (messageId) => {
+            assertScope({ kind: 'message', messageId })
+            const table = tx.table<Message, MessageId>('messages')
+            const existing = await table.get(messageId)
+            if (!existing) return
+            const state = await ensureChatState(existing.chatId)
+            await ensureBeforeMessages(state)
+            assertScope({ kind: 'children', chatId: existing.chatId, parentId: existing.parentId })
+            await table.delete(messageId)
+            wroteWorkspaceState = true
+            await bumpChildList(existing.chatId, existing.parentId)
+            state.summaryVersionDirty = true
+            state.messageSummaryDirty = true
+            state.broadcast = true
+            state.changedMessageIds.add(messageId)
+            affectedMessageIds.add(messageId)
+            upsertAffected(state, {
+              kind: 'message',
+              chatId: existing.chatId,
+              messageId,
             })
+          },
+
+          getChildList: async (chatId, parentId) => {
+            const row = await tx
+              .table<ChildListState, string>('childLists')
+              .get(childListKey(chatId, parentId))
+            return (
+              row ?? {
+                id: childListKey(chatId, parentId),
+                chatId,
+                parentId,
+                version: 0,
+                updatedAt: 0,
+              }
+            )
+          },
+
+          bumpChildList,
+
+          getAttachment: async (attachmentId) =>
+            tx.table<Attachment, AttachmentId>('attachments').get(attachmentId),
+
+          putAttachment: async (attachment) => {
+            assertScope({ kind: 'attachment', attachmentId: attachment.id })
+            await tx.table<Attachment, AttachmentId>('attachments').put(attachment)
+            wroteWorkspaceState = true
+          },
+
+          deleteAttachment: async (attachmentId) => {
+            assertScope({ kind: 'attachment', attachmentId })
+            const table = tx.table<Attachment, AttachmentId>('attachments')
+            const existing = await table.get(attachmentId)
+            if (!existing) return
+            await table.delete(attachmentId)
+            wroteWorkspaceState = true
+          },
+
+          getDraft: async (chatId) => tx.table<DraftRow, ChatId>('drafts').get(chatId),
+
+          putDraft: async (draft) => {
+            assertScope({ kind: 'draft', chatId: draft.chatId })
+            const state = await ensureChatState(draft.chatId)
+            const table = tx.table<DraftRow, ChatId>('drafts')
+            const existing = await table.get(draft.chatId)
+            if (existing && stableStringify(existing) === stableStringify(draft)) return
+            await table.put(draft)
+            wroteWorkspaceState = true
+            state.broadcast = true
+            upsertAffected(state, { kind: 'draft', chatId: draft.chatId })
+          },
+
+          deleteDraft: async (chatId) => {
+            assertScope({ kind: 'draft', chatId })
+            const state = await ensureChatState(chatId)
+            const table = tx.table<DraftRow, ChatId>('drafts')
+            const existing = await table.get(chatId)
+            if (!existing) return
+            await table.delete(chatId)
+            wroteWorkspaceState = true
+            state.broadcast = true
+            upsertAffected(state, { kind: 'draft', chatId })
+          },
+        }
+
+        const value = await fn(ctx)
+
+        const chatVersions: Record<ChatId, ChatVersions> = {}
+        const affectedChatIds: ChatId[] = []
+        const chatTable = tx.table<Chat, ChatId>('chats')
+
+        for (const [chatId, state] of chatStates) {
+          const current = await chatTable.get(chatId)
+          if (!current) throw new ChatMissingError(chatId)
+          const next: Chat = {
+            ...current,
+            ...state.hiddenMetaPatch,
+            ...state.visibleMetaPatch,
           }
 
-          for (const [chatId, state] of chatStates) {
-            if (!state.broadcast) continue
-            const versions = chatVersions[chatId]
-            if (!versions) continue
-            pendingEvents.push({
-              chatId,
-              versions,
-              affected: [...state.affected.values()],
-            })
+          if (state.visibleMetaDirty) {
+            next.metaVersion = current.metaVersion + 1
           }
 
-          return {
-            value,
-            affectedChatIds,
-            affectedMessageIds: [...affectedMessageIds],
-            chatVersions,
+          if (state.summaryVersionDirty) {
+            next.updatedAt = now
+            next.summaryVersion = current.summaryVersion + 1
           }
-        },
-      ),
+
+          if (state.messageSummaryDirty) {
+            const afterMessages = await tx
+              .table<Message, MessageId>('messages')
+              .where('chatId')
+              .equals(chatId)
+              .toArray()
+            const nextLeafId = findLastUpdatedLeafId(afterMessages)
+            next.lastUpdatedLeafId = nextLeafId
+            next.wordCount = countWords(buildBranchMessages(afterMessages, nextLeafId))
+            next.totalCostUsd = computeTotalCostUsd(afterMessages)
+            const beforeMessages = state.beforeMessages ?? []
+            if (
+              shouldBumpLastBranchUpdatedAt(
+                state.beforeChat,
+                beforeMessages,
+                afterMessages,
+                state.changedMessageIds,
+              )
+            ) {
+              next.lastBranchUpdatedAt = now
+            }
+          }
+
+          const summaryPatch = stripSummaryPatch(state.summaryPatch)
+          const patched: Chat = { ...next, ...summaryPatch }
+
+          const changed = stableStringify(current) !== stableStringify(patched)
+          if (changed) {
+            await chatTable.put(patched)
+            wroteWorkspaceState = true
+            affectedChatIds.push(chatId)
+          }
+          chatVersions[chatId] = {
+            metaVersion: patched.metaVersion,
+            summaryVersion: patched.summaryVersion,
+          }
+        }
+
+        if (wroteWorkspaceState) {
+          const stored = (await tx.table<SettingsRow, string>('settings').get(WORKSPACE_META_KEY))
+            ?.value as StoredWorkspaceMeta | undefined
+          const mutationMeta = stored ?? {
+            workspaceId: WORKSPACE_ID,
+            backendKind: 'browser-idb' as const,
+            lastMutationAt: 0,
+            mutationCounter: 0,
+          }
+          const nextWorkspaceMeta: StoredWorkspaceMeta = {
+            ...mutationMeta,
+            lastMutationAt: now,
+            mutationCounter: mutationMeta.mutationCounter + 1,
+          }
+          await tx.table<SettingsRow, string>('settings').put({
+            key: WORKSPACE_META_KEY,
+            value: nextWorkspaceMeta,
+          })
+        }
+
+        for (const [chatId, state] of chatStates) {
+          if (!state.broadcast) continue
+          const versions = chatVersions[chatId]
+          if (!versions) continue
+          pendingEvents.push({
+            chatId,
+            versions,
+            affected: [...state.affected.values()],
+          })
+        }
+
+        return {
+          value,
+          affectedChatIds,
+          affectedMessageIds: [...affectedMessageIds],
+          chatVersions,
+        }
+      }),
     )
 
     for (const event of pendingEvents) {

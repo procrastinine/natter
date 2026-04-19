@@ -18,11 +18,7 @@ export function FocusModeToggle() {
       data-state={focusMode ? 'active' : 'idle'}
       aria-label={focusMode ? 'Exit reading mode' : 'Enter reading mode'}
       aria-pressed={focusMode}
-      title={
-        focusMode
-          ? 'Show chrome (exit reading mode)'
-          : 'Hide chrome (reading mode)'
-      }
+      title={focusMode ? 'Show chrome (exit reading mode)' : 'Hide chrome (reading mode)'}
       onClick={() => setFocusMode(!focusMode)}
     >
       {focusMode ? <EyeOffIcon size={18} /> : <EyeIcon size={18} />}

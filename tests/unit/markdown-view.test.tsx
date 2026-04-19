@@ -9,18 +9,14 @@ describe('MarkdownView', () => {
   })
 
   it('renders headings and paragraphs', () => {
-    const { container } = render(
-      <MarkdownView content={'# Hello\n\nThis is a paragraph.'} />,
-    )
+    const { container } = render(<MarkdownView content={'# Hello\n\nThis is a paragraph.'} />)
     const h1 = container.querySelector('h1')
     expect(h1?.textContent).toMatch(/Hello/)
     expect(container.querySelector('p')?.textContent).toMatch(/paragraph/)
   })
 
   it('marks external links with rel="noopener noreferrer" and target="_blank"', () => {
-    const { container } = render(
-      <MarkdownView content="[open](https://example.com)" />,
-    )
+    const { container } = render(<MarkdownView content="[open](https://example.com)" />)
     const anchor = container.querySelector('a')
     expect(anchor?.getAttribute('href')).toMatch(/https:\/\/example\.com/)
     expect(anchor?.getAttribute('target')).toBe('_blank')
@@ -28,12 +24,8 @@ describe('MarkdownView', () => {
   })
 
   it('renders streaming flag on the root when passed', () => {
-    const { container } = render(
-      <MarkdownView content="streaming..." streaming />,
-    )
-    expect(
-      container.querySelector('[data-ui="markdown"][data-streaming="true"]'),
-    ).toBeTruthy()
+    const { container } = render(<MarkdownView content="streaming..." streaming />)
+    expect(container.querySelector('[data-ui="markdown"][data-streaming="true"]')).toBeTruthy()
   })
 
   it('blocks images from unlisted origins with a visible fallback', () => {
@@ -46,9 +38,7 @@ describe('MarkdownView', () => {
   })
 
   it('allows images from the default allowlist (openrouter.ai)', () => {
-    const { container } = render(
-      <MarkdownView content="![alt](https://openrouter.ai/logo.png)" />,
-    )
+    const { container } = render(<MarkdownView content="![alt](https://openrouter.ai/logo.png)" />)
     expect(container.querySelector('img[src="https://openrouter.ai/logo.png"]')).toBeTruthy()
   })
 
@@ -59,9 +49,7 @@ describe('MarkdownView', () => {
         allowImageOrigins={['https://cdn.mysite.example']}
       />,
     )
-    expect(
-      container.querySelector('img[src="https://cdn.mysite.example/a.png"]'),
-    ).toBeTruthy()
+    expect(container.querySelector('img[src="https://cdn.mysite.example/a.png"]')).toBeTruthy()
   })
 
   it('renders lists, tables, and blockquotes from fixtures', () => {

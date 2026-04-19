@@ -23,9 +23,7 @@ export function cursorKeyOf(parentId: MessageId | null): string {
 // Group messages by parent id, sorted by siblingIndex. The `null` bucket
 // holds top-level messages. Sorting up front lets downstream walks assume
 // stable ordering without re-sorting at every fork.
-export function groupByParent(
-  messages: readonly Message[],
-): Map<MessageId | null, Message[]> {
+export function groupByParent(messages: readonly Message[]): Map<MessageId | null, Message[]> {
   const buckets = new Map<MessageId | null, Message[]>()
   for (const m of messages) {
     const bucket = buckets.get(m.parentId)
@@ -101,10 +99,7 @@ export function pickDefaultChild(
 // Walk root→leaf choosing a live child at each fork: cursor pin if valid,
 // else `pickDefaultChild`. Returns the messages on the active path. Empty
 // when the chat has no live messages.
-export function activePath(
-  messages: readonly Message[],
-  cursor: CursorMap,
-): Message[] {
+export function activePath(messages: readonly Message[], cursor: CursorMap): Message[] {
   const byParent = groupByParent(messages)
   const byId = indexById(messages)
   const path: Message[] = []
@@ -139,9 +134,7 @@ export function liveLeaves(messages: readonly Message[]): Message[] {
 
 // `chat.lastUpdatedLeafId` per §2.1.2: the live leaf with the greatest
 // `createdAt`. Tiebreak: greater ULID id. Returns `null` for empty chats.
-export function findLastUpdatedLeafId(
-  messages: readonly Message[],
-): MessageId | null {
+export function findLastUpdatedLeafId(messages: readonly Message[]): MessageId | null {
   let best: Message | null = null
   for (const leaf of liveLeaves(messages)) {
     if (!best) {

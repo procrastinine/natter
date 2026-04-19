@@ -22,16 +22,22 @@
 // callbacks; components call `sendText({chat, connection, ...})`.
 
 import { useCallback, useRef } from 'react'
+import { chatCompletions } from '../api/chat-completions'
+import { ApiError } from '../api/errors'
+import { type StreamLaneEvent, splitChatStream } from '../api/stream-transforms'
+import type { ChatStreamChunk } from '../api/types'
 import { activePath, cursorKeyOf, groupByParent } from '../core/active-path'
+import { sendUserMessage } from '../core/messages'
 import type { ChatCompletionsTransformOptions } from '../core/transforms'
 import { toChatCompletions } from '../core/transforms'
+import { nextSiblingIndex } from '../core/tree-ops'
 import type {
   AbortReason,
   CapabilityDescriptor,
   ChatId,
   ChatUsage,
-  ContentItem,
   ConnectionProfile,
+  ContentItem,
   FinishReason,
   GenerationMeta,
   Message,
@@ -39,18 +45,9 @@ import type {
   ReasoningDetail,
 } from '../core/types'
 import { newId } from '../lib/ulid'
-import { chatCompletions } from '../api/chat-completions'
-import { ApiError } from '../api/errors'
-import {
-  splitChatStream,
-  type StreamLaneEvent,
-} from '../api/stream-transforms'
-import type { ChatStreamChunk } from '../api/types'
-import { nextSiblingIndex } from '../core/tree-ops'
-import { getBrowserRepository } from '../store/browser-repo'
 import { postEvent } from '../store/broadcast'
+import { getBrowserRepository } from '../store/browser-repo'
 import { getChat, loadChatMessages } from '../store/chats'
-import { sendUserMessage } from '../core/messages'
 import { useChatStore } from '../store/zustand/chatStore'
 import { useStreamStore } from '../store/zustand/streamStore'
 
@@ -93,8 +90,7 @@ export interface SendTextInput {
 // Used by edit-then-send (the user sibling already exists; we just need
 // a fresh assistant reply) and regenerate-after-branch flows. No user
 // message is created here.
-export interface SendFromMessageInput
-  extends Omit<SendTextInput, 'content'> {
+export interface SendFromMessageInput extends Omit<SendTextInput, 'content'> {
   // Any existing message on the active path; the assistant placeholder
   // will be created as its child. Typically a user-role message.
   parentMessageId: MessageId
@@ -149,9 +145,7 @@ export async function sendText(input: SendTextInput): Promise<SendTextResult> {
 // already created the user sibling (e.g. via `insertSibling` with
 // role:'user', origin:'user'); all that's left is to attach an assistant
 // placeholder under it and stream the reply. No user message is created.
-export async function sendFromMessage(
-  input: SendFromMessageInput,
-): Promise<SendTextResult> {
+export async function sendFromMessage(input: SendFromMessageInput): Promise<SendTextResult> {
   return openAssistantStreamUnder({
     ...input,
     parentMessageId: input.parentMessageId,
@@ -201,11 +195,7 @@ async function openAssistantStreamUnder(
     },
   )
 
-  useChatStore.getState().patchCursor(
-    input.chatId,
-    cursorKeyOf(input.parentMessageId),
-    assistantId,
-  )
+  useChatStore.getState().patchCursor(input.chatId, cursorKeyOf(input.parentMessageId), assistantId)
 
   const baseCursor = useChatStore.getState().getCursor(input.chatId) ?? {}
   const allMessages = await loadChatMessages(input.chatId)
@@ -230,7 +220,10 @@ async function openAssistantStreamUnder(
   const abortController = new AbortController()
   const userSignal = input.signal
   if (userSignal?.aborted) abortController.abort(userSignal.reason)
-  else userSignal?.addEventListener('abort', () => abortController.abort(userSignal.reason), { once: true })
+  else
+    userSignal?.addEventListener('abort', () => abortController.abort(userSignal.reason), {
+      once: true,
+    })
 
   useStreamStore.getState().setActive({
     streamId,
@@ -431,21 +424,18 @@ interface FlushContext {
 
 async function flushPartial(ctx: FlushContext): Promise<void> {
   const { repo, chatId, streamId, messageId, accumulator, requestedModel } = ctx
-  await repo.runMutation(
-    [{ kind: 'message', messageId }],
-    async (inner) => {
-      const current = await inner.getMessage(messageId)
-      if (!current) return
-      const reasoning = collectReasoning(accumulator)
-      const next: Message = {
-        ...current,
-        content: [{ type: 'output_text', text: accumulator.textBuffer }],
-      }
-      if (reasoning.length > 0) next.reasoningDetails = reasoning
-      next.generation = updatedGeneration(current.generation, accumulator, requestedModel, {})
-      await inner.putMessage(next)
-    },
-  )
+  await repo.runMutation([{ kind: 'message', messageId }], async (inner) => {
+    const current = await inner.getMessage(messageId)
+    if (!current) return
+    const reasoning = collectReasoning(accumulator)
+    const next: Message = {
+      ...current,
+      content: [{ type: 'output_text', text: accumulator.textBuffer }],
+    }
+    if (reasoning.length > 0) next.reasoningDetails = reasoning
+    next.generation = updatedGeneration(current.generation, accumulator, requestedModel, {})
+    await inner.putMessage(next)
+  })
   accumulator.lastFlushedAt = Date.now()
   accumulator.lastFlushedTextLen = accumulator.textBuffer.length
   useStreamStore.getState().updateTextLen(streamId, accumulator.textBuffer.length)
@@ -467,38 +457,33 @@ interface FinalizeContext extends FlushContext {
 
 async function finalize(ctx: FinalizeContext): Promise<void> {
   const { repo, messageId, accumulator, requestedModel, outcome, abortReason, error, now } = ctx
-  await repo.runMutation(
-    [{ kind: 'message', messageId }],
-    async (inner) => {
-      const current = await inner.getMessage(messageId)
-      if (!current) return
-      const reasoning = collectReasoning(accumulator)
-      const generation = updatedGeneration(current.generation, accumulator, requestedModel, {
-        finishedAt: now,
-      })
-      if (outcome === 'abort') {
-        generation.abortReason = abortReason ?? 'user'
+  await repo.runMutation([{ kind: 'message', messageId }], async (inner) => {
+    const current = await inner.getMessage(messageId)
+    if (!current) return
+    const reasoning = collectReasoning(accumulator)
+    const generation = updatedGeneration(current.generation, accumulator, requestedModel, {
+      finishedAt: now,
+    })
+    if (outcome === 'abort') {
+      generation.abortReason = abortReason ?? 'user'
+    }
+    const finalError = error ?? accumulator.midStreamError
+    if (finalError) {
+      generation.error = {
+        code: String(finalError.code),
+        message: finalError.message,
+        ...(finalError.httpStatus !== undefined ? { statusCode: finalError.httpStatus } : {}),
+        raw: finalError,
       }
-      const finalError = error ?? accumulator.midStreamError
-      if (finalError) {
-        generation.error = {
-          code: String(finalError.code),
-          message: finalError.message,
-          ...(finalError.httpStatus !== undefined
-            ? { statusCode: finalError.httpStatus }
-            : {}),
-          raw: finalError,
-        }
-      }
-      const next: Message = {
-        ...current,
-        content: [{ type: 'output_text', text: accumulator.textBuffer }],
-        generation,
-      }
-      if (reasoning.length > 0) next.reasoningDetails = reasoning
-      await inner.putMessage(next)
-    },
-  )
+    }
+    const next: Message = {
+      ...current,
+      content: [{ type: 'output_text', text: accumulator.textBuffer }],
+      generation,
+    }
+    if (reasoning.length > 0) next.reasoningDetails = reasoning
+    await inner.putMessage(next)
+  })
 }
 
 function collectReasoning(acc: ChatAccumulator): ReasoningDetail[] {
@@ -548,21 +533,18 @@ export async function recoverOrphans(now = Date.now()): Promise<number> {
     for (const message of messages) {
       const gen = message.generation
       if (!gen || gen.finishedAt !== undefined || gen.abortReason !== undefined) continue
-      await repo.runMutation(
-        [{ kind: 'message', messageId: message.id }],
-        async (ctx) => {
-          const current = await ctx.getMessage(message.id)
-          if (!current?.generation || current.generation.finishedAt !== undefined) return
-          await ctx.putMessage({
-            ...current,
-            generation: {
-              ...current.generation,
-              finishedAt: now,
-              abortReason: 'tab-close',
-            },
-          })
-        },
-      )
+      await repo.runMutation([{ kind: 'message', messageId: message.id }], async (ctx) => {
+        const current = await ctx.getMessage(message.id)
+        if (!current?.generation || current.generation.finishedAt !== undefined) return
+        await ctx.putMessage({
+          ...current,
+          generation: {
+            ...current.generation,
+            finishedAt: now,
+            abortReason: 'tab-close',
+          },
+        })
+      })
       recovered += 1
     }
   }
@@ -571,9 +553,7 @@ export async function recoverOrphans(now = Date.now()): Promise<number> {
 
 export interface UseChatApi {
   send: (input: Omit<SendTextInput, 'signal'>) => Promise<SendTextResult>
-  sendFrom: (
-    input: Omit<SendFromMessageInput, 'signal'>,
-  ) => Promise<SendTextResult>
+  sendFrom: (input: Omit<SendFromMessageInput, 'signal'>) => Promise<SendTextResult>
   abort: () => void
   isStreaming: () => boolean
 }
@@ -594,20 +574,17 @@ export function useChat(): UseChatApi {
     }
   }, [])
 
-  const sendFrom = useCallback(
-    async (input: Omit<SendFromMessageInput, 'signal'>) => {
-      const ctl = new AbortController()
-      controllerRef.current = ctl
-      try {
-        const result = await sendFromMessage({ ...input, signal: ctl.signal })
-        streamIdRef.current = result.streamId
-        return result
-      } finally {
-        if (controllerRef.current === ctl) controllerRef.current = null
-      }
-    },
-    [],
-  )
+  const sendFrom = useCallback(async (input: Omit<SendFromMessageInput, 'signal'>) => {
+    const ctl = new AbortController()
+    controllerRef.current = ctl
+    try {
+      const result = await sendFromMessage({ ...input, signal: ctl.signal })
+      streamIdRef.current = result.streamId
+      return result
+    } finally {
+      if (controllerRef.current === ctl) controllerRef.current = null
+    }
+  }, [])
 
   const abort = useCallback(() => {
     controllerRef.current?.abort()

@@ -30,8 +30,6 @@ describe('MathBlock', () => {
 
   it('carries data-display="true" for display-mode math', () => {
     const { container } = render(<MathBlock source="x^2" display />)
-    expect(
-      container.querySelector('[data-ui="math-block"][data-display="true"]'),
-    ).toBeTruthy()
+    expect(container.querySelector('[data-ui="math-block"][data-display="true"]')).toBeTruthy()
   })
 })

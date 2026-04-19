@@ -7,7 +7,7 @@
 // remote tabs only see the BroadcastChannel path and local tabs only see the
 // direct dispatch (their own BC instance ignores their own posts).
 
-import type { ChatId, KeyId, ProfileId, PresetId, FolderId, TagId } from '../core/types'
+import type { ChatId, FolderId, KeyId, PresetId, ProfileId, TagId } from '../core/types'
 import type { ChatMutationSummary } from './repository'
 
 export type EngineKind = 'daemon' | 'in-tab'

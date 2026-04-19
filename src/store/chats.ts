@@ -5,8 +5,8 @@
 // repository boundary. Visible chat-row writes go through `WorkspaceRepository`
 // so browser mode already matches the future daemon contract.
 
-import type { Chat, ChatId, ChatSettings, Message, MessageId, PresetId } from '../core/types'
 import { cloneDefaultChatSettings } from '../core/defaults'
+import type { Chat, ChatId, ChatSettings, Message, MessageId, PresetId } from '../core/types'
 import { newId } from '../lib/ulid'
 import { postEvent } from './broadcast'
 import { getBrowserRepository } from './browser-repo'
@@ -72,9 +72,7 @@ export async function loadChatMessages(chatId: ChatId): Promise<Message[]> {
   return getDb().messages.where('chatId').equals(chatId).toArray()
 }
 
-export async function getMessage(
-  messageId: MessageId,
-): Promise<Message | undefined> {
+export async function getMessage(messageId: MessageId): Promise<Message | undefined> {
   return getDb().messages.get(messageId)
 }
 
@@ -90,10 +88,7 @@ export async function archiveChat(chatId: ChatId, now = Date.now()): Promise<voi
   })
 }
 
-export async function unarchiveChat(
-  chatId: ChatId,
-  now = Date.now(),
-): Promise<void> {
+export async function unarchiveChat(chatId: ChatId, now = Date.now()): Promise<void> {
   const repo = getBrowserRepository()
   await repo.runMutation([{ kind: 'chat-meta', chatId }], async (ctx) => {
     const chat = await ctx.getChat(chatId)
@@ -105,10 +100,7 @@ export async function unarchiveChat(
 // Record a chat-open event per §2.1.2 rule 1. Bumps `lastViewedAt` only and is
 // explicitly non-visible: it does not advance summary/meta versions or emit a
 // chat-mutated event.
-export async function touchLastViewed(
-  chatId: ChatId,
-  now = Date.now(),
-): Promise<void> {
+export async function touchLastViewed(chatId: ChatId, now = Date.now()): Promise<void> {
   const repo = getBrowserRepository()
   await repo.runMutation([{ kind: 'chat-meta', chatId }], async (ctx) => {
     const chat = await ctx.getChat(chatId)
@@ -150,6 +142,65 @@ export async function setManualTitle(
 // settings pane (system prompt edit, rendering pref tweaks, etc.). Returns
 // true if anything actually changed. Concurrency is LWW on the chat-meta row,
 // consistent with other settings edits. See plan/14-details.md §14.35.5.
+// Link / unlink the breadcrumb preset reference on a chat. Used when the
+// user loads a preset into an existing chat or saves the chat's current
+// settings as a new preset.
+// Flip a message's `hiddenFromContext` flag. Hidden messages are
+// excluded from the outgoing request (the transform layer already honors
+// the flag) and surfaced with a dashed profile ring in the UI. The
+// message stays visible in the chat — this is context visibility, not
+// deletion. Idempotent; no-op if the flag is already the desired value.
+export async function toggleMessageHidden(messageId: MessageId): Promise<void> {
+  const repo = getBrowserRepository()
+  await repo.runMutation([{ kind: 'message', messageId }], async (ctx) => {
+    const current = await ctx.getMessage(messageId)
+    if (!current) return
+    const next = !current.hiddenFromContext
+    if (current.hiddenFromContext === next) return
+    await ctx.putMessage({ ...current, hiddenFromContext: next })
+  })
+}
+
+// Clears `generation.abortReason` and any recorded error on a message,
+// removing the "Stream interrupted" banner. Keeps all other generation
+// metadata intact (usage, model, reasoning details). Used for the dismiss
+// button on the abort banner and auto-cleared after a successful continue.
+export async function dismissAbortReason(messageId: MessageId): Promise<void> {
+  const repo = getBrowserRepository()
+  await repo.runMutation([{ kind: 'message', messageId }], async (ctx) => {
+    const current = await ctx.getMessage(messageId)
+    if (!current) return
+    const gen = current.generation
+    if (!gen) return
+    if (gen.abortReason === undefined && gen.error === undefined) return
+    const nextGen = { ...gen }
+    delete (nextGen as { abortReason?: unknown }).abortReason
+    delete (nextGen as { error?: unknown }).error
+    await ctx.putMessage({ ...current, generation: nextGen })
+  })
+}
+
+export async function setChatPreset(
+  chatId: ChatId,
+  presetId: PresetId | null,
+  now = Date.now(),
+): Promise<void> {
+  const repo = getBrowserRepository()
+  await repo.runMutation([{ kind: 'chat-meta', chatId }], async (ctx) => {
+    const chat = await ctx.getChat(chatId)
+    if (!chat) return
+    if ((chat.presetId ?? null) === presetId) return
+    // exactOptionalPropertyTypes rejects `{ presetId: undefined }` — we
+    // have to cast when clearing the field so the Partial<Chat> literal
+    // doesn't carry the undefined value explicitly.
+    const next: Partial<Chat> =
+      presetId === null
+        ? ({ updatedAt: now, presetId: undefined } as unknown as Partial<Chat>)
+        : { updatedAt: now, presetId }
+    ctx.patchChatMeta(chatId, next)
+  })
+}
+
 export async function updateChatSettings(
   chatId: ChatId,
   patch: Partial<ChatSettings>,
@@ -216,9 +267,7 @@ export async function refreshChatPreview(chatId: ChatId): Promise<void> {
   }
   const trimmed = plain.replace(/\s+/g, ' ').trim()
   const preview =
-    trimmed.length > PREVIEW_MAX_CHARS
-      ? `${trimmed.slice(0, PREVIEW_MAX_CHARS - 1)}…`
-      : trimmed
+    trimmed.length > PREVIEW_MAX_CHARS ? `${trimmed.slice(0, PREVIEW_MAX_CHARS - 1)}…` : trimmed
   const repo = getBrowserRepository()
   await repo.runMutation([{ kind: 'chat-meta', chatId }], async (ctx) => {
     const chat = await ctx.getChat(chatId)

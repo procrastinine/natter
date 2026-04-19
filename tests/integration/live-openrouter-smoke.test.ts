@@ -6,9 +6,9 @@
 // Cheap model choice: `google/gemini-3.1-flash-lite-preview`. Roundtrip cost
 // is a handful of tokens (≤20 in / ≤10 out) at sub-cent pricing.
 
-import Dexie from 'dexie'
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
+import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import type { ChatSettings, ConnectionProfile } from '../../src/core/types'
@@ -93,7 +93,13 @@ function liveReasoningSettings(model: string): ChatSettings {
     ...base,
     model,
     maxCompletionTokens: 256,
-    reasoning: { mode: 'enabled', effort: 'low', exclude: false, summary: 'off', carryForward: 'off' },
+    reasoning: {
+      mode: 'enabled',
+      effort: 'low',
+      exclude: false,
+      summary: 'off',
+      carryForward: 'off',
+    },
   }
 }
 
@@ -105,9 +111,7 @@ describe.skipIf(!RUN)('Phase 7 live OpenRouter chat-completions smoke', () => {
       chatId: chat.id,
       connection: liveProfile(),
       apiKey,
-      content: [
-        { type: 'text', text: 'Reply with exactly one word: "pong".' },
-      ],
+      content: [{ type: 'text', text: 'Reply with exactly one word: "pong".' }],
     })
     expect(result.outcome).toBe('done')
 
@@ -128,9 +132,7 @@ describe.skipIf(!RUN)('Phase 7 live OpenRouter chat-completions smoke', () => {
     expect(gen?.finishedAt).toBeDefined()
     // Cost may or may not be populated by the stream depending on provider
     // — at least one of cost or usage must be present.
-    expect(
-      gen?.cost !== undefined || gen?.usage?.total_tokens !== undefined,
-    ).toBe(true)
+    expect(gen?.cost !== undefined || gen?.usage?.total_tokens !== undefined).toBe(true)
   }, 60_000)
 
   it('carries a multi-turn conversation (prior assistant message echoed back)', async () => {
@@ -141,9 +143,7 @@ describe.skipIf(!RUN)('Phase 7 live OpenRouter chat-completions smoke', () => {
       chatId: chat.id,
       connection: liveProfile(),
       apiKey,
-      content: [
-        { type: 'text', text: 'Reply with exactly this word: ORANGE' },
-      ],
+      content: [{ type: 'text', text: 'Reply with exactly this word: ORANGE' }],
     })
     // Turn 2: confirm the model can see turn 1's reply by asking it to
     // repeat its own previous word verbatim.
@@ -173,8 +173,7 @@ describe.skipIf(!RUN)('Phase 7 live OpenRouter chat-completions smoke', () => {
       content: [
         {
           type: 'text',
-          text:
-            'Think step by step: what is 17 * 13? Answer with only the number.',
+          text: 'Think step by step: what is 17 * 13? Answer with only the number.',
         },
       ],
     })
@@ -222,8 +221,7 @@ describe.skipIf(!RUN)('Phase 7 live OpenRouter chat-completions smoke', () => {
       content: [
         {
           type: 'text',
-          text:
-            'Think through this carefully: what is 143 * 37? Answer with only the number.',
+          text: 'Think through this carefully: what is 143 * 37? Answer with only the number.',
         },
       ],
     })

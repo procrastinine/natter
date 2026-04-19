@@ -6,19 +6,19 @@
  * See plan/10-ui.md §10.20, plan/11-rendering.md.
  */
 
-[data-ui='markdown'] {
+[data-ui="markdown"] {
   color: var(--color-fg-primary);
   line-height: var(--line-height-body);
   font-size: var(--font-size-md);
   overflow-wrap: anywhere;
 }
 
-[data-ui='markdown'] h1,
-[data-ui='markdown'] h2,
-[data-ui='markdown'] h3,
-[data-ui='markdown'] h4,
-[data-ui='markdown'] h5,
-[data-ui='markdown'] h6 {
+[data-ui="markdown"] h1,
+[data-ui="markdown"] h2,
+[data-ui="markdown"] h3,
+[data-ui="markdown"] h4,
+[data-ui="markdown"] h5,
+[data-ui="markdown"] h6 {
   font-family: var(--font-sans);
   font-weight: var(--font-weight-semibold);
   color: var(--color-fg-primary);
@@ -26,61 +26,61 @@
   line-height: var(--line-height-tight);
 }
 
-[data-ui='markdown'] h1 {
+[data-ui="markdown"] h1 {
   font-size: calc(var(--font-size-xl) * 1.1);
 }
-[data-ui='markdown'] h2 {
+[data-ui="markdown"] h2 {
   font-size: var(--font-size-xl);
 }
-[data-ui='markdown'] h3 {
+[data-ui="markdown"] h3 {
   font-size: var(--font-size-lg);
 }
-[data-ui='markdown'] h4,
-[data-ui='markdown'] h5,
-[data-ui='markdown'] h6 {
+[data-ui="markdown"] h4,
+[data-ui="markdown"] h5,
+[data-ui="markdown"] h6 {
   font-size: var(--font-size-md);
 }
 
-[data-ui='markdown'] p {
+[data-ui="markdown"] p {
   margin: 0 0 var(--space-3);
 }
 
-[data-ui='markdown'] strong {
+[data-ui="markdown"] strong {
   font-weight: var(--font-weight-semibold);
   color: var(--color-fg-primary);
 }
 
-[data-ui='markdown'] em {
+[data-ui="markdown"] em {
   font-style: italic;
 }
 
-[data-ui='markdown'] a {
+[data-ui="markdown"] a {
   color: var(--color-link);
   text-decoration: underline;
   text-decoration-thickness: 1px;
   text-underline-offset: 2px;
 }
 
-[data-ui='markdown'] a:hover {
+[data-ui="markdown"] a:hover {
   color: var(--color-link-hover);
 }
 
-[data-ui='markdown'] ul,
-[data-ui='markdown'] ol {
+[data-ui="markdown"] ul,
+[data-ui="markdown"] ol {
   margin: 0 0 var(--space-3);
   padding-left: var(--space-6);
 }
 
-[data-ui='markdown'] li {
+[data-ui="markdown"] li {
   margin: 0 0 var(--space-1);
 }
 
-[data-ui='markdown'] li > ul,
-[data-ui='markdown'] li > ol {
+[data-ui="markdown"] li > ul,
+[data-ui="markdown"] li > ol {
   margin: var(--space-1) 0 var(--space-2);
 }
 
-[data-ui='markdown'] blockquote {
+[data-ui="markdown"] blockquote {
   border-left: 3px solid var(--color-border-default);
   margin: 0 0 var(--space-3);
   padding: var(--space-1) var(--space-4);
@@ -89,13 +89,13 @@
   border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
 }
 
-[data-ui='markdown'] hr {
+[data-ui="markdown"] hr {
   border: none;
   border-top: 1px solid var(--color-border-subtle);
   margin: var(--space-4) 0;
 }
 
-[data-ui='markdown'] code {
+[data-ui="markdown"] code {
   font-family: var(--font-mono);
   font-size: 0.9em;
   background: var(--color-code-bg);
@@ -104,7 +104,7 @@
   border-radius: var(--radius-xs);
 }
 
-[data-ui='markdown'] pre {
+[data-ui="markdown"] pre {
   font-family: var(--font-mono);
   background: var(--color-code-bg);
   border: 1px solid var(--color-code-border);
@@ -116,7 +116,7 @@
   max-height: var(--code-block-max-height);
 }
 
-[data-ui='markdown'] pre code {
+[data-ui="markdown"] pre code {
   background: transparent;
   border: none;
   padding: 0;
@@ -130,8 +130,8 @@
  * when it's inside Streamdown's body wrapper so the result matches
  * the 2-layer tables (outer sidebar tint + inner body). Bare <pre>
  * elements (raw HTML in markdown) still get the default treatment. */
-[data-ui='markdown'] [data-streamdown='code-block-body'] pre,
-[data-ui='markdown'] [data-streamdown='code-block-body'] > pre {
+[data-ui="markdown"] [data-streamdown="code-block-body"] pre,
+[data-ui="markdown"] [data-streamdown="code-block-body"] > pre {
   background: transparent;
   border: none;
   border-radius: 0;
@@ -140,7 +140,7 @@
   max-height: none;
 }
 
-[data-ui='code-block'] {
+[data-ui="code-block"] {
   background: var(--color-code-bg);
   border: 1px solid var(--color-code-border);
   border-radius: var(--radius-sm);
@@ -149,12 +149,12 @@
   position: relative;
 }
 
-[data-ui='code-block'][data-overflow='truncated'] pre {
+[data-ui="code-block"][data-overflow="truncated"] pre {
   max-height: var(--code-block-max-height);
   overflow: auto;
 }
 
-[data-ui='code-toolbar'] {
+[data-ui="code-toolbar"] {
   display: flex;
   gap: var(--space-2);
   align-items: center;
@@ -167,12 +167,12 @@
   border-bottom: 1px solid var(--color-code-border);
 }
 
-[data-ui='code-toolbar-actions'] {
+[data-ui="code-toolbar-actions"] {
   display: inline-flex;
   gap: var(--space-2);
 }
 
-[data-ui='code-toolbar'] button {
+[data-ui="code-toolbar"] button {
   background: transparent;
   border: 1px solid transparent;
   color: var(--color-code-toolbar-fg);
@@ -182,31 +182,31 @@
   cursor: pointer;
 }
 
-[data-ui='code-toolbar'] button:hover {
+[data-ui="code-toolbar"] button:hover {
   background: var(--color-bg-hover);
   color: var(--color-fg-primary);
 }
 
-[data-ui='markdown'] table {
+[data-ui="markdown"] table {
   border-collapse: collapse;
   margin: 0 0 var(--space-3);
   font-size: var(--font-size-sm);
   width: 100%;
 }
 
-[data-ui='markdown'] th,
-[data-ui='markdown'] td {
+[data-ui="markdown"] th,
+[data-ui="markdown"] td {
   border: 1px solid var(--color-border-default);
   padding: var(--space-1) var(--space-3);
   text-align: left;
 }
 
-[data-ui='markdown'] th {
+[data-ui="markdown"] th {
   background: var(--color-bg-surface-2);
   font-weight: var(--font-weight-semibold);
 }
 
-[data-ui='math-block'] {
+[data-ui="math-block"] {
   display: block;
   padding: var(--space-2) var(--space-3);
   background: var(--color-bg-surface-2);
@@ -219,13 +219,13 @@
   overflow-x: auto;
 }
 
-[data-ui='math-block'][data-state='error'] {
+[data-ui="math-block"][data-state="error"] {
   border-color: var(--color-danger);
   background: var(--color-banner-danger-bg);
   color: var(--color-danger);
 }
 
-[data-ui='math-block-error'] {
+[data-ui="math-block-error"] {
   display: block;
   color: var(--color-danger);
   font-size: var(--font-size-xs);
@@ -234,22 +234,22 @@
   font-style: italic;
 }
 
-[data-ui='citation-link'] {
+[data-ui="citation-link"] {
   display: inline;
   color: var(--color-citation);
   text-decoration: underline;
   text-decoration-thickness: 1px;
 }
 
-[data-ui='citation-link']:hover {
+[data-ui="citation-link"]:hover {
   color: var(--color-citation-hover);
 }
 
-[data-ui='citation-link'][data-citation-kind='file'] {
+[data-ui="citation-link"][data-citation-kind="file"] {
   cursor: pointer;
 }
 
-[data-ui='blocked-image'] {
+[data-ui="blocked-image"] {
   display: inline-flex;
   align-items: center;
   gap: var(--space-2);
@@ -263,7 +263,7 @@
   max-width: 100%;
 }
 
-[data-ui='blocked-image-allow'] {
+[data-ui="blocked-image-allow"] {
   background: transparent;
   border: 1px solid var(--color-blocked);
   color: var(--color-blocked);
@@ -277,7 +277,7 @@
  * URL + source + action — not a list). Header row, alternating row
  * tint, monospaced URL column, trailing action cell with the trash
  * icon button. */
-[data-ui='image-allowlist'] {
+[data-ui="image-allowlist"] {
   width: 100%;
   border-collapse: collapse;
   font-size: var(--font-size-sm);
@@ -286,7 +286,7 @@
   overflow: hidden;
 }
 
-[data-ui='image-allowlist'] thead th {
+[data-ui="image-allowlist"] thead th {
   text-align: left;
   background: var(--color-bg-surface-2);
   color: var(--color-fg-muted);
@@ -298,52 +298,52 @@
   border-bottom: 1px solid var(--color-border-subtle);
 }
 
-[data-ui='image-allowlist'] tbody td {
+[data-ui="image-allowlist"] tbody td {
   padding: var(--space-2) var(--space-3);
   border-bottom: 1px solid var(--color-border-subtle);
   vertical-align: middle;
 }
 
-[data-ui='image-allowlist'] tbody tr:last-child td {
+[data-ui="image-allowlist"] tbody tr:last-child td {
   border-bottom: none;
 }
 
-[data-ui='image-allowlist'] tbody tr:nth-child(even) {
+[data-ui="image-allowlist"] tbody tr:nth-child(even) {
   background: var(--color-bg-surface-2);
 }
 
-[data-ui='image-allowlist'] code {
+[data-ui="image-allowlist"] code {
   font-family: var(--font-mono);
   font-size: var(--font-size-xs);
   color: var(--color-fg-primary);
   word-break: break-all;
 }
 
-[data-ui='image-allowlist-source'] {
+[data-ui="image-allowlist-source"] {
   color: var(--color-fg-muted);
   font-size: var(--font-size-xs);
   white-space: nowrap;
   width: 1%;
 }
 
-[data-ui='image-allowlist-action-col'],
-[data-ui='image-allowlist-action-cell'] {
+[data-ui="image-allowlist-action-col"],
+[data-ui="image-allowlist-action-cell"] {
   width: 36px;
   text-align: right;
 }
 
-[data-ui='image-allowlist-add'] {
+[data-ui="image-allowlist-add"] {
   display: grid;
   grid-template-columns: 1fr auto;
   gap: var(--space-2);
 }
 
-[data-ui='image-allowlist-add'] input {
+[data-ui="image-allowlist-add"] input {
   font-family: var(--font-mono);
   font-size: var(--font-size-sm);
 }
 
-[data-ui='markdown'] sup {
+[data-ui="markdown"] sup {
   font-size: 0.75em;
   vertical-align: super;
   line-height: 0;

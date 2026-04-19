@@ -12,21 +12,11 @@
 //
 // Out of scope here: drag-reorder (V2), graphical layout (V2).
 
-import { useCallback, useMemo, useState, type MouseEvent } from 'react'
+import { type MouseEvent, useCallback, useMemo, useState } from 'react'
 import { chatHref } from '../../app/router'
-import {
-  activePath,
-  cursorKeyOf,
-  groupByParent,
-  indexById,
-} from '../../core/active-path'
+import { activePath, cursorKeyOf, groupByParent, indexById } from '../../core/active-path'
 import { resolveLastUpdatedBranchBelow } from '../../core/branch-resolve'
-import type {
-  ChatId,
-  CursorMap,
-  Message,
-  MessageId,
-} from '../../core/types'
+import type { ChatId, CursorMap, Message, MessageId } from '../../core/types'
 import { useChatStore } from '../../store/zustand/chatStore'
 import { CloseIcon } from '../icons/Icon'
 
@@ -86,15 +76,9 @@ function cursorForNode(
   return next
 }
 
-export function BranchTreeView({
-  chatId,
-  messages,
-  onClose,
-}: BranchTreeViewProps) {
+export function BranchTreeView({ chatId, messages, onClose }: BranchTreeViewProps) {
   const [query, setQuery] = useState('')
-  const cursor = useChatStore(
-    (s) => s.cursors[chatId],
-  )
+  const cursor = useChatStore((s) => s.cursors[chatId])
   const rows = useMemo(() => buildTreeRows(messages), [messages])
   const byId = useMemo(() => indexById(messages), [messages])
   const activeIds = useMemo(() => {
@@ -102,9 +86,7 @@ export function BranchTreeView({
     return new Set(path.map((m) => m.id))
   }, [messages, cursor])
   const q = query.trim().toLowerCase()
-  const filtered = q
-    ? rows.filter((r) => previewOf(r.message).toLowerCase().includes(q))
-    : rows
+  const filtered = q ? rows.filter((r) => previewOf(r.message).toLowerCase().includes(q)) : rows
 
   const handleSelect = useCallback(
     (messageId: MessageId) => {
@@ -124,17 +106,8 @@ export function BranchTreeView({
     [chatId, messages, byId, onClose],
   )
 
-  const anchorClick = (messageId: MessageId) => (
-    e: MouseEvent<HTMLAnchorElement>,
-  ) => {
-    if (
-      e.defaultPrevented ||
-      e.button !== 0 ||
-      e.metaKey ||
-      e.ctrlKey ||
-      e.shiftKey ||
-      e.altKey
-    ) {
+  const anchorClick = (messageId: MessageId) => (e: MouseEvent<HTMLAnchorElement>) => {
+    if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) {
       return
     }
     e.preventDefault()
@@ -149,12 +122,7 @@ export function BranchTreeView({
         if (e.target === e.currentTarget) onClose()
       }}
     >
-      <div
-        data-ui="branch-tree"
-        role="dialog"
-        aria-modal="true"
-        aria-label="Branch tree"
-      >
+      <div data-ui="branch-tree" role="dialog" aria-modal="true" aria-label="Branch tree">
         <div data-ui="branch-tree-header">
           <h2>Branch tree</h2>
           <input
@@ -198,16 +166,10 @@ export function BranchTreeView({
                     aria-label={`Focus message (${row.message.role})`}
                     title="Click to focus; ⌘-click to open in a new tab"
                   >
-                    <span data-ui="branch-tree-role">
-                      {row.message.role}
-                    </span>
-                    <span data-ui="branch-tree-preview">
-                      {previewOf(row.message)}
-                    </span>
+                    <span data-ui="branch-tree-role">{row.message.role}</span>
+                    <span data-ui="branch-tree-preview">{previewOf(row.message)}</span>
                     {row.siblingCount > 1 ? (
-                      <span data-ui="branch-tree-variants">
-                        {row.siblingCount} variants
-                      </span>
+                      <span data-ui="branch-tree-variants">{row.siblingCount} variants</span>
                     ) : null}
                   </a>
                 </li>

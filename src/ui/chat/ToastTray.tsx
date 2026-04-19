@@ -12,10 +12,7 @@ export function ToastTray() {
   useEffect(() => {
     if (toasts.length === 0) return
     const timers = toasts.map((t) => {
-      const remaining = Math.max(
-        0,
-        t.createdAt + t.durationMs - Date.now(),
-      )
+      const remaining = Math.max(0, t.createdAt + t.durationMs - Date.now())
       return window.setTimeout(() => dismiss(t.id), remaining)
     })
     return () => {

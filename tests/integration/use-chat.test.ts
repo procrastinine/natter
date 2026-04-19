@@ -3,11 +3,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { ApiError } from '../../src/api/errors'
 import type { ChatStreamChunk } from '../../src/api/types'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
-import type {
-  ChatSettings,
-  ConnectionProfile,
-  Message,
-} from '../../src/core/types'
+import type { ChatSettings, ConnectionProfile, Message } from '../../src/core/types'
 import { recoverOrphans, sendText } from '../../src/hooks/useChat'
 import { newId } from '../../src/lib/ulid'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
@@ -75,14 +71,10 @@ async function messagesFor(chatId: string): Promise<Message[]> {
 }
 
 function liveMessagesSortedByCreated(messages: Message[]): Message[] {
-  return messages
-    .filter((m) => !m.deleted)
-    .sort((a, b) => a.createdAt - b.createdAt)
+  return messages.filter((m) => !m.deleted).sort((a, b) => a.createdAt - b.createdAt)
 }
 
-async function* stream(
-  ...chunks: ChatStreamChunk[]
-): AsyncGenerator<ChatStreamChunk> {
+async function* stream(...chunks: ChatStreamChunk[]): AsyncGenerator<ChatStreamChunk> {
   for (const c of chunks) yield c
 }
 
@@ -98,8 +90,11 @@ describe('sendText — chat-completions streaming', () => {
         stream(
           {
             type: 'delta',
-            chunk: { id: 'gen-x', model: 'google/gemini-3.1-flash-lite-preview',
-                     choices: [{ delta: { content: 'Hi ' } }] },
+            chunk: {
+              id: 'gen-x',
+              model: 'google/gemini-3.1-flash-lite-preview',
+              choices: [{ delta: { content: 'Hi ' } }],
+            },
           },
           { type: 'delta', chunk: { choices: [{ delta: { content: 'there' } }] } },
           {

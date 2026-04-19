@@ -18,6 +18,7 @@
 //   wired in Phase 7 yet — this just reserves the shape so later phases don't
 //   have to retouch transform callers.)
 
+import type { ChatCompletionRequestWire } from '../api/types'
 import type {
   CapabilityDescriptor,
   ChatSettings,
@@ -26,9 +27,6 @@ import type {
   MessageRole,
   SamplingKey,
 } from './types'
-import type {
-  ChatCompletionRequestWire,
-} from '../api/types'
 
 export interface ChatCompletionsTransformOptions {
   // Live capability descriptor — from `/endpoints` (OpenRouter) or a static
@@ -84,10 +82,7 @@ const SAMPLING_WIRE_KEY: Readonly<Record<SamplingKey, string>> = Object.freeze({
 // later phases can bolt on image/audio/file/video without revisiting callers.
 function serializeContent(items: ContentItem[]): unknown {
   if (items.length === 0) return ''
-  if (
-    items.length === 1 &&
-    (items[0]?.type === 'text' || items[0]?.type === 'output_text')
-  ) {
+  if (items.length === 1 && (items[0]?.type === 'text' || items[0]?.type === 'output_text')) {
     // Collapse a single text/output_text block to a plain string. OpenAI-
     // compatible endpoints accept both string and array content, and echoing
     // an assistant turn as a plain string is what upstreams expect for
@@ -113,15 +108,10 @@ function toWireRole(role: MessageRole): string {
   return role
 }
 
-export function buildChatMessages(
-  settings: ChatSettings,
-  path: readonly Message[],
-): unknown[] {
+export function buildChatMessages(settings: ChatSettings, path: readonly Message[]): unknown[] {
   const visible = path.filter((m) => m.hiddenFromContext !== true && !m.deleted)
   const messages: unknown[] = []
-  const hasImportedSystem = visible.some(
-    (m) => m.role === 'system' || m.role === 'developer',
-  )
+  const hasImportedSystem = visible.some((m) => m.role === 'system' || m.role === 'developer')
   if (!hasImportedSystem && settings.systemPrompt.length > 0) {
     messages.push({
       role: settings.systemRole,
@@ -233,9 +223,7 @@ function toWireResponseFormat(format: ChatSettings['responseFormat']): unknown {
     json_schema: {
       name: format.jsonSchema.name,
       schema: format.jsonSchema.schema,
-      ...(format.jsonSchema.strict !== undefined
-        ? { strict: format.jsonSchema.strict }
-        : {}),
+      ...(format.jsonSchema.strict !== undefined ? { strict: format.jsonSchema.strict } : {}),
     },
   }
 }
@@ -267,21 +255,23 @@ function toWireProviderPrefs(
 
 function buildReasoning(settings: ChatSettings): Record<string, unknown> | undefined {
   const reasoning = settings.reasoning
-  if (reasoning.mode === 'off') {
-    // `enabled: false` is explicit "don't think" — distinct from omitting the
-    // field. Providers that default-enable reasoning (Claude 4.7) need this
-    // form to actually stand down.
-    return { enabled: false }
-  }
-  if (reasoning.mode === 'enabled' && reasoning.exclude === false && reasoning.effort === undefined && reasoning.maxTokens === undefined) {
-    // Plain "on" with nothing else configured — don't emit an empty object.
+  if (reasoning.mode === 'default') {
+    // Don't emit the `reasoning` field — let the provider pick. Distinct
+    // from `off`, which explicitly disables thinking.
     return undefined
   }
-  const body: Record<string, unknown> = {}
-  if (reasoning.mode !== 'enabled') body.enabled = true
+  if (reasoning.mode === 'off') {
+    // Explicit "don't think". Providers that default-enable reasoning
+    // (Claude 4.7 adaptive) need this form to actually stand down.
+    return { enabled: false }
+  }
+  // Build the body from whichever knobs are set. `enabled: true` is
+  // always emitted for non-default, non-off modes so the provider knows
+  // we want reasoning. Summary and exclude ride along independently.
+  const body: Record<string, unknown> = { enabled: true }
   if (reasoning.effort !== undefined) body.effort = reasoning.effort
   if (reasoning.maxTokens !== undefined) body.max_tokens = reasoning.maxTokens
   if (reasoning.exclude) body.exclude = true
   if (reasoning.summary && reasoning.summary !== 'off') body.summary = reasoning.summary
-  return Object.keys(body).length > 0 ? body : undefined
+  return body
 }

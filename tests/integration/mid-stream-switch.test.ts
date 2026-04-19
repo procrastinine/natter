@@ -17,11 +17,7 @@ import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ChatStreamChunk } from '../../src/api/types'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
-import type {
-  ChatSettings,
-  ConnectionProfile,
-  Message,
-} from '../../src/core/types'
+import type { ChatSettings, ConnectionProfile, Message } from '../../src/core/types'
 import { sendText } from '../../src/hooks/useChat'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import {
@@ -29,7 +25,7 @@ import {
   getBrowserRepository,
 } from '../../src/store/browser-repo'
 import { createChat } from '../../src/store/chats'
-import { __resetDbForTests, openDb, getDb } from '../../src/store/db'
+import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
 import { useChatStore } from '../../src/store/zustand/chatStore'
 import { useStreamStore } from '../../src/store/zustand/streamStore'
 
@@ -55,7 +51,10 @@ function profile(overrides: Partial<ConnectionProfile> = {}): ConnectionProfile 
   }
 }
 
-function settings(model = 'google/gemini-3.1-flash-lite-preview', overrides: Partial<ChatSettings> = {}): ChatSettings {
+function settings(
+  model = 'google/gemini-3.1-flash-lite-preview',
+  overrides: Partial<ChatSettings> = {},
+): ChatSettings {
   const base = cloneDefaultChatSettings()
   return {
     ...base,
@@ -146,17 +145,26 @@ describe('mid-stream preset/connection/model switch', () => {
       beforeFirst: () => undefined,
       beforeSecondChunk: async () => {
         // Tab B mutates chat.settings + presetId between chunks.
-        await getDb().chats.where('id').equals(chat.id).modify((row) => {
-          row.settings = settings('model-s2', { profileId: 'prof-s2' })
-          row.presetId = 'preset-s2'
-        })
+        await getDb()
+          .chats.where('id')
+          .equals(chat.id)
+          .modify((row) => {
+            row.settings = settings('model-s2', { profileId: 'prof-s2' })
+            row.presetId = 'preset-s2'
+          })
         sawSwitch = true
       },
-      first: { type: 'delta', chunk: { id: 'pre-switch', choices: [{ delta: { content: 'pre-' } }] } },
+      first: {
+        type: 'delta',
+        chunk: { id: 'pre-switch', choices: [{ delta: { content: 'pre-' } }] },
+      },
       second: { type: 'delta', chunk: { choices: [{ delta: { content: 'post' } }] } },
       usage: {
         type: 'delta',
-        chunk: { choices: [{ delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 1, completion_tokens: 2, total_tokens: 3 } },
+        chunk: {
+          choices: [{ delta: {}, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 1, completion_tokens: 2, total_tokens: 3 },
+        },
       },
     })
 
@@ -197,7 +205,10 @@ describe('mid-stream preset/connection/model switch', () => {
       openStream: (open) => {
         secondWire = open.wireBody
         return (async function* () {
-          yield { type: 'delta', chunk: { id: 'g-2', choices: [{ delta: { content: 'ok' }, finish_reason: 'stop' }] } }
+          yield {
+            type: 'delta',
+            chunk: { id: 'g-2', choices: [{ delta: { content: 'ok' }, finish_reason: 'stop' }] },
+          }
         })()
       },
     })
@@ -211,15 +222,21 @@ describe('mid-stream preset/connection/model switch', () => {
 
     const stream = twoChunkStream({
       beforeSecondChunk: async () => {
-        await getDb().chats.where('id').equals(chat.id).modify((row) => {
-          row.settings = { ...row.settings, profileId: 'prof-s2' }
-        })
+        await getDb()
+          .chats.where('id')
+          .equals(chat.id)
+          .modify((row) => {
+            row.settings = { ...row.settings, profileId: 'prof-s2' }
+          })
       },
       first: { type: 'delta', chunk: { id: 'conn', choices: [{ delta: { content: 'A' } }] } },
       second: { type: 'delta', chunk: { choices: [{ delta: { content: 'B' } }] } },
       usage: {
         type: 'delta',
-        chunk: { choices: [{ delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 1, completion_tokens: 2, total_tokens: 3 } },
+        chunk: {
+          choices: [{ delta: {}, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 1, completion_tokens: 2, total_tokens: 3 },
+        },
       },
     })
 
@@ -251,9 +268,12 @@ describe('mid-stream preset/connection/model switch', () => {
 
     const stream = twoChunkStream({
       beforeSecondChunk: async () => {
-        await getDb().chats.where('id').equals(chat.id).modify((row) => {
-          row.settings = { ...row.settings, model: 'new-model' }
-        })
+        await getDb()
+          .chats.where('id')
+          .equals(chat.id)
+          .modify((row) => {
+            row.settings = { ...row.settings, model: 'new-model' }
+          })
       },
       first: { type: 'delta', chunk: { id: 'mo', choices: [{ delta: { content: 'first ' } }] } },
       second: { type: 'delta', chunk: { choices: [{ delta: { content: 'half' } }] } },
@@ -285,7 +305,10 @@ describe('mid-stream preset/connection/model switch', () => {
       openStream: (open) => {
         secondWire = open.wireBody
         return (async function* () {
-          yield { type: 'delta', chunk: { id: 'mo-2', choices: [{ delta: { content: 'ok' }, finish_reason: 'stop' }] } }
+          yield {
+            type: 'delta',
+            chunk: { id: 'mo-2', choices: [{ delta: { content: 'ok' }, finish_reason: 'stop' }] },
+          }
         })()
       },
     })
@@ -318,9 +341,12 @@ describe('preset-edit mid-stream', () => {
     const stream = twoChunkStream({
       beforeSecondChunk: async () => {
         // Tab B edits the preset but DOES NOT touch chat.settings.
-        await getDb().presets.where('id').equals('preset-1').modify((row) => {
-          row.settings = settings('edited-model')
-        })
+        await getDb()
+          .presets.where('id')
+          .equals('preset-1')
+          .modify((row) => {
+            row.settings = settings('edited-model')
+          })
       },
       first: { type: 'delta', chunk: { id: 'ed', choices: [{ delta: { content: 'pre-' } }] } },
       second: { type: 'delta', chunk: { choices: [{ delta: { content: 'edit' } }] } },
@@ -356,7 +382,10 @@ describe('preset-edit mid-stream', () => {
       openStream: (open) => {
         nextCaptured = open.wireBody
         return (async function* () {
-          yield { type: 'delta', chunk: { id: 'ed-2', choices: [{ delta: { content: 'ok' }, finish_reason: 'stop' }] } }
+          yield {
+            type: 'delta',
+            chunk: { id: 'ed-2', choices: [{ delta: { content: 'ok' }, finish_reason: 'stop' }] },
+          }
         })()
       },
     })

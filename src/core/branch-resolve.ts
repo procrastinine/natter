@@ -60,10 +60,7 @@ export function seedCursorAtMessage(
 // This routine does NOT write `cursor[parentOfTarget] = target`. That entry is
 // the caller's responsibility — it's the swipe/search-click decision. The
 // helper only handles `target → leaf` below.
-export function resolveLastUpdatedBranchBelow(
-  input: ResolveBranchInput,
-  cursor: CursorMap,
-): void {
+export function resolveLastUpdatedBranchBelow(input: ResolveBranchInput, cursor: CursorMap): void {
   const { byParent, byId } = input
   let currentId: MessageId | null = input.targetId
   while (currentId !== null) {

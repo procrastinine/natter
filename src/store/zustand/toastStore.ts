@@ -27,10 +27,7 @@ export interface Toast {
   createdAt: number
 }
 
-export type BannerKind =
-  | 'chat-not-found'
-  | 'mutation-conflict'
-  | 'stale-edit'
+export type BannerKind = 'chat-not-found' | 'mutation-conflict' | 'stale-edit'
 
 export interface Banner {
   id: string
@@ -75,15 +72,13 @@ export const useToastStore = create<ToastStoreState>((set) => ({
     set((state) => ({ toasts: [...state.toasts, toast] }))
     return id
   },
-  dismissToast: (id) =>
-    set((state) => ({ toasts: state.toasts.filter((x) => x.id !== id) })),
+  dismissToast: (id) => set((state) => ({ toasts: state.toasts.filter((x) => x.id !== id) })),
   pushBanner: (b) => {
     const id = nextId('banner')
     set((state) => ({ banners: [...state.banners, { ...b, id }] }))
     return id
   },
-  dismissBanner: (id) =>
-    set((state) => ({ banners: state.banners.filter((x) => x.id !== id) })),
+  dismissBanner: (id) => set((state) => ({ banners: state.banners.filter((x) => x.id !== id) })),
   clearBannersByKind: (kind) =>
     set((state) => ({ banners: state.banners.filter((x) => x.kind !== kind) })),
   reset: () => set({ toasts: [], banners: [] }),

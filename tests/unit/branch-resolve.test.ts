@@ -1,9 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import {
-  ROOT_CURSOR_KEY,
-  groupByParent,
-  indexById,
-} from '../../src/core/active-path'
+import { groupByParent, indexById, ROOT_CURSOR_KEY } from '../../src/core/active-path'
 import { resolveLastUpdatedBranchBelow } from '../../src/core/branch-resolve'
 import type { CursorMap, Message } from '../../src/core/types'
 

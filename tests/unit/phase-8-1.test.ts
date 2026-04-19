@@ -13,19 +13,13 @@ import {
   forkChatFromMessage,
 } from '../../src/core/chat-fork'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
-import {
-  applyStructuralSnapshot,
-  snapshotMessages,
-} from '../../src/core/undo'
 import { deletePair } from '../../src/core/messages'
 import type { Chat, ChatId, Message, MessageId, MessageRole } from '../../src/core/types'
+import { applyStructuralSnapshot, snapshotMessages } from '../../src/core/undo'
 import { newId } from '../../src/lib/ulid'
-import {
-  plaintextOf,
-  writeTextInto,
-} from '../../src/ui/chat/InlineEditor'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
+import { plaintextOf, writeTextInto } from '../../src/ui/chat/InlineEditor'
 
 const DB_NAME = 'natter'
 
@@ -78,10 +72,7 @@ interface SeedMsg {
   deleted?: boolean
 }
 
-async function putMessage(
-  chatId: ChatId,
-  spec: SeedMsg = {},
-): Promise<Message> {
+async function putMessage(chatId: ChatId, spec: SeedMsg = {}): Promise<Message> {
   const row: Message = {
     id: spec.id ?? newId(),
     chatId,
@@ -109,14 +100,8 @@ describe('computeBranchTitle', () => {
     expect(computeBranchTitle('   ', [])).toBe('Untitled chat Branch 1')
   })
   it('skips taken branch numbers', () => {
-    const existing = [
-      'Design review',
-      'Design review Branch 1',
-      'Design review Branch 2',
-    ]
-    expect(computeBranchTitle('Design review', existing)).toBe(
-      'Design review Branch 3',
-    )
+    const existing = ['Design review', 'Design review Branch 1', 'Design review Branch 2']
+    expect(computeBranchTitle('Design review', existing)).toBe('Design review Branch 3')
   })
   it('does not reuse "Branch 2" when "Branch 3" exists but 2 is free', () => {
     const existing = ['Notes', 'Notes Branch 3']
@@ -195,26 +180,16 @@ describe('forkChatFromMessage', () => {
     const fork = await getDb().chats.get(forkId)
     expect(fork?.title).toBe('Design review Branch 1')
     expect(fork?.titleStatus).toBe('manual')
-    const forkMessages = await getDb()
-      .messages.where('chatId')
-      .equals(forkId)
-      .toArray()
+    const forkMessages = await getDb().messages.where('chatId').equals(forkId).toArray()
     expect(forkMessages).toHaveLength(2)
-    const roles = forkMessages
-      .sort((a, b) => a.createdAt - b.createdAt)
-      .map((m) => m.role)
+    const roles = forkMessages.sort((a, b) => a.createdAt - b.createdAt).map((m) => m.role)
     expect(roles).toEqual(['user', 'assistant'])
     // The sibling A2 and descendant U2 are NOT copied.
     for (const m of forkMessages) {
-      expect(['root', 'a']).toContain(
-        (m.content[0] as { type: string; text: string }).text,
-      )
+      expect(['root', 'a']).toContain((m.content[0] as { type: string; text: string }).text)
     }
     // Source chat is untouched.
-    const sourceRows = await getDb()
-      .messages.where('chatId')
-      .equals(chat.id)
-      .toArray()
+    const sourceRows = await getDb().messages.where('chatId').equals(chat.id).toArray()
     expect(sourceRows).toHaveLength(4)
   })
 })
@@ -267,10 +242,7 @@ describe('undo snapshot for structural deletes', () => {
       messageId: assistant.id,
       cursor: {},
     })
-    const afterDelete = await getDb()
-      .messages.where('chatId')
-      .equals(chat.id)
-      .toArray()
+    const afterDelete = await getDb().messages.where('chatId').equals(chat.id).toArray()
     expect(afterDelete.every((m) => m.deleted)).toBe(true)
     await applyStructuralSnapshot({
       chatId: chat.id,
@@ -278,10 +250,7 @@ describe('undo snapshot for structural deletes', () => {
       newMessageIds: [],
       attachmentIds: [],
     })
-    const afterUndo = await getDb()
-      .messages.where('chatId')
-      .equals(chat.id)
-      .toArray()
+    const afterUndo = await getDb().messages.where('chatId').equals(chat.id).toArray()
     expect(afterUndo.find((m) => m.id === user.id)?.deleted).toBe(false)
     expect(afterUndo.find((m) => m.id === assistant.id)?.deleted).toBe(false)
   })

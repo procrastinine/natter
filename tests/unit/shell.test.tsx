@@ -25,9 +25,7 @@ describe('shell smoke render', () => {
     // bar), regardless of whether a connection is configured. This is the
     // entry point users use to add or edit credentials, so it must always be
     // mounted.
-    expect(
-      container.querySelector('[data-ui="connection-header"]'),
-    ).toBeInTheDocument()
+    expect(container.querySelector('[data-ui="connection-header"]')).toBeInTheDocument()
     // The shell no longer renders a separate top-of-shell <header> region —
     // the chat title row (only present when a chat is active) is `[data-ui=
     // "chat-title-bar"]` inside main-pane.
@@ -37,9 +35,7 @@ describe('shell smoke render', () => {
   it('does NOT render the chat-model panel or global-settings modal by default', () => {
     const { container } = render(<App />)
     expect(container.querySelector('[data-ui="chat-model-panel"]')).not.toBeInTheDocument()
-    expect(
-      container.querySelector('[data-ui="global-settings-overlay"]'),
-    ).not.toBeInTheDocument()
+    expect(container.querySelector('[data-ui="global-settings-overlay"]')).not.toBeInTheDocument()
     // The shell exposes the chat-model panel state via a data attribute so
     // CSS can grow / shrink the grid columns without remounting.
     expect(container.querySelector('[data-ui="app-shell"]')).toHaveAttribute(

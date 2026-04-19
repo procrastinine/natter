@@ -1,16 +1,14 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
+  type ChatCompletionsContext,
   chatCompletions,
   chatCompletionsOnce,
-  type ChatCompletionsContext,
 } from '../../src/api/chat-completions'
 import { ApiError } from '../../src/api/errors'
 import type { ChatStreamChunk } from '../../src/api/types'
 import type { ConnectionProfile } from '../../src/core/types'
 
-function makeProfile(
-  overrides: Partial<ConnectionProfile> = {},
-): ConnectionProfile {
+function makeProfile(overrides: Partial<ConnectionProfile> = {}): ConnectionProfile {
   return {
     id: 'prof',
     name: 'OpenRouter',
@@ -50,7 +48,11 @@ function sseResponse(body: string, extraHeaders: Record<string, string> = {}): R
   })
 }
 
-function jsonResponse(body: unknown, status = 200, extraHeaders: Record<string, string> = {}): Response {
+function jsonResponse(
+  body: unknown,
+  status = 200,
+  extraHeaders: Record<string, string> = {},
+): Response {
   return new Response(JSON.stringify(body), {
     status,
     headers: { 'content-type': 'application/json', ...extraHeaders },
@@ -164,11 +166,7 @@ describe('chatCompletions', () => {
     ].join('\n')
     vi.stubGlobal(
       'fetch',
-      vi.fn(() =>
-        Promise.resolve(
-          sseResponse(body, { 'x-generation-id': 'gen-42' }),
-        ),
-      ),
+      vi.fn(() => Promise.resolve(sseResponse(body, { 'x-generation-id': 'gen-42' }))),
     )
     const chunks: ChatStreamChunk[] = []
     for await (const c of chatCompletions(ctx(), {
@@ -187,18 +185,16 @@ describe('chatCompletions', () => {
   it('throws ApiError on HTTP 429 before the body can be consumed', async () => {
     vi.stubGlobal(
       'fetch',
-      vi.fn(() =>
-        Promise.resolve(
-          jsonResponse({ error: { code: 429, message: 'slow' } }, 429),
-        ),
-      ),
+      vi.fn(() => Promise.resolve(jsonResponse({ error: { code: 429, message: 'slow' } }, 429))),
     )
     await expect(async () => {
       for await (const _ of chatCompletions(ctx(), {
         model: 'm',
         messages: [],
         stream: true,
-      })) { /* noop */ }
+      })) {
+        /* noop */
+      }
     }).rejects.toBeInstanceOf(ApiError)
   })
 })

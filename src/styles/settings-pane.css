@@ -7,7 +7,7 @@
  * See plan/10-ui.md §10.20.
  */
 
-[data-ui='settings-pane'] {
+[data-ui="settings-pane"] {
   display: flex;
   flex-direction: column;
   height: 100%;
@@ -15,7 +15,7 @@
   background: var(--color-bg-surface-1);
 }
 
-[data-ui='settings-pane-header'] {
+[data-ui="settings-pane-header"] {
   display: flex;
   align-items: center;
   gap: var(--space-2);
@@ -24,8 +24,8 @@
   min-height: var(--header-height);
 }
 
-[data-ui='settings-pane-header'] h2,
-[data-ui='settings-pane-title'] {
+[data-ui="settings-pane-header"] h2,
+[data-ui="settings-pane-title"] {
   margin: 0;
   font-size: var(--font-size-sm);
   font-weight: var(--font-weight-semibold);
@@ -37,7 +37,7 @@
 /* The close-X icon button (data-ui="icon-button" + data-role="settings-pane-close")
  * carries its own visual style from icons.css; here we just push it to the
  * trailing edge of the pane header. */
-[data-ui='settings-pane-header'] > [data-role='settings-pane-close'] {
+[data-ui="settings-pane-header"] > [data-role="settings-pane-close"] {
   margin-left: auto;
 }
 
@@ -45,7 +45,7 @@
  * scrollbar gutter even when the tabs fit, which the user flagged.
  * Tabs are sized by their content; if a future tab list overflows the
  * modal width we'll wrap to a second row instead of scrolling. */
-[data-ui='settings-tabs'] {
+[data-ui="settings-tabs"] {
   display: flex;
   gap: 0;
   padding: 0 var(--space-4);
@@ -54,7 +54,7 @@
   flex-wrap: wrap;
 }
 
-[data-ui='settings-tab'] {
+[data-ui="settings-tab"] {
   background: transparent;
   border: none;
   border-bottom: 2px solid transparent;
@@ -69,17 +69,17 @@
   line-height: 1.4;
 }
 
-[data-ui='settings-tab'][aria-selected='true'] {
+[data-ui="settings-tab"][aria-selected="true"] {
   color: var(--color-fg-primary);
   border-bottom-color: var(--color-accent);
   background: transparent;
 }
 
-[data-ui='settings-tab']:hover:not([aria-selected='true']) {
+[data-ui="settings-tab"]:hover:not([aria-selected="true"]) {
   color: var(--color-fg-secondary);
 }
 
-[data-ui='settings-panel'] {
+[data-ui="settings-panel"] {
   flex: 1 1 auto;
   overflow-y: auto;
   padding: var(--space-4);
@@ -89,14 +89,14 @@
  * controls breathe (gap: --space-3), but keep section-to-section spacing
  * tighter so distinct sections like Appearance / Composer don't drift
  * apart visually. */
-[data-ui='settings-section'] {
+[data-ui="settings-section"] {
   margin-bottom: var(--space-3);
   display: flex;
   flex-direction: column;
   gap: var(--space-3);
 }
 
-[data-ui='settings-section'] > h3 {
+[data-ui="settings-section"] > h3 {
   margin: 0 0 var(--space-1);
   font-size: var(--font-size-md);
   color: var(--color-fg-primary);
@@ -105,7 +105,7 @@
   text-transform: none;
 }
 
-[data-ui='field-group'] {
+[data-ui="field-group"] {
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
@@ -114,40 +114,40 @@
 /* Rendering's two code-theme dropdowns are visually paired; render them
  * stacked with extra breathing room between them so the labels don't run
  * up against each other. */
-[data-ui='rendering-settings'] {
+[data-ui="rendering-settings"] {
   display: flex;
   flex-direction: column;
   gap: var(--space-4);
 }
 
 /* Inline value chip next to slider labels, e.g. `Chat width  920px`. */
-[data-ui='field-value'] {
+[data-ui="field-value"] {
   margin-left: var(--space-2);
   color: var(--color-fg-muted);
   font-variant-numeric: tabular-nums;
   font-weight: var(--font-weight-regular);
 }
 
-[data-ui='chat-max-width-slider'] {
+[data-ui="chat-max-width-slider"] {
   width: 100%;
   accent-color: var(--color-accent);
 }
 
-[data-ui='system-prompt-textarea'] {
+[data-ui="system-prompt-textarea"] {
   min-height: 160px;
   font-family: var(--font-mono);
   font-size: var(--font-size-sm);
   line-height: var(--line-height-body);
 }
 
-[data-ui='continue-prompt'] {
+[data-ui="continue-prompt"] {
   min-height: 120px;
   font-size: var(--font-size-sm);
   line-height: var(--line-height-body);
   resize: vertical;
 }
 
-[data-ui='toggle-row'] {
+[data-ui="toggle-row"] {
   display: inline-flex;
   align-items: center;
   gap: var(--space-2);
@@ -159,7 +159,7 @@
 /* Inline link-like action embedded inside a <label> (e.g. Reset to
  * default next to a field name). Text-only, muted so it doesn't
  * compete with the label itself. */
-[data-ui='field-inline-action'] {
+[data-ui="field-inline-action"] {
   background: transparent;
   border: none;
   padding: 0 var(--space-2);
@@ -172,17 +172,17 @@
   text-underline-offset: 2px;
 }
 
-[data-ui='field-inline-action']:hover {
+[data-ui="field-inline-action"]:hover {
   color: var(--color-accent-hover);
 }
 
-[data-ui='system-prompt-token-estimate'] {
+[data-ui="system-prompt-token-estimate"] {
   align-self: flex-end;
   color: var(--color-fg-muted);
   font-size: var(--font-size-xs);
 }
 
-[data-ui='settings-toast'] {
+[data-ui="settings-toast"] {
   background: var(--color-banner-info-bg);
   border: 1px solid var(--color-border-subtle);
   border-left: 3px solid var(--color-info);

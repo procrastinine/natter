@@ -7,11 +7,11 @@ import {
   DEFAULT_CONTINUE_PROMPT,
   DEFAULT_GLOBAL_PREFERENCES,
   readGlobalPreferences,
+  type SendShortcut,
   writeAutoScrollOnOpen,
   writeAutoScrollOnStream,
   writeContinuePrompt,
   writeSendShortcut,
-  type SendShortcut,
 } from '../../core/global-settings'
 
 const SHORTCUT_OPTIONS: ReadonlyArray<{ value: SendShortcut; label: string }> = [
@@ -20,11 +20,7 @@ const SHORTCUT_OPTIONS: ReadonlyArray<{ value: SendShortcut; label: string }> = 
 ]
 
 export function GeneralSettings() {
-  const prefs = useLiveQuery(
-    readGlobalPreferences,
-    [],
-    DEFAULT_GLOBAL_PREFERENCES,
-  )
+  const prefs = useLiveQuery(readGlobalPreferences, [], DEFAULT_GLOBAL_PREFERENCES)
   const onShortcut = useCallback(async (value: SendShortcut) => {
     await writeSendShortcut(value)
   }, [])
@@ -35,9 +31,7 @@ export function GeneralSettings() {
     await writeAutoScrollOnStream(value)
   }, [])
 
-  const [continueDraft, setContinueDraft] = useState<string>(
-    prefs.continuePrompt,
-  )
+  const [continueDraft, setContinueDraft] = useState<string>(prefs.continuePrompt)
   const continueLastPersistedRef = useRef<string>(prefs.continuePrompt)
   const continueTimerRef = useRef<number | null>(null)
   useEffect(() => {
@@ -87,10 +81,7 @@ export function GeneralSettings() {
       <div data-ui="settings-section">
         <h3>Scroll</h3>
         <div data-ui="field-group">
-          <label
-            data-ui="toggle-row"
-            htmlFor="auto-scroll-open-toggle"
-          >
+          <label data-ui="toggle-row" htmlFor="auto-scroll-open-toggle">
             <input
               id="auto-scroll-open-toggle"
               data-ui="auto-scroll-open-toggle"
@@ -101,17 +92,13 @@ export function GeneralSettings() {
             <span>Jump to the branch leaf when opening a chat</span>
           </label>
           <span data-ui="helper">
-            When on, the chat loads already positioned at the latest
-            message (no visible scroll — the view is placed before
-            paint). When off, the chat opens at the top and you can
-            scroll down manually.
+            When on, the chat loads already positioned at the latest message (no visible scroll —
+            the view is placed before paint). When off, the chat opens at the top and you can scroll
+            down manually.
           </span>
         </div>
         <div data-ui="field-group">
-          <label
-            data-ui="toggle-row"
-            htmlFor="auto-scroll-stream-toggle"
-          >
+          <label data-ui="toggle-row" htmlFor="auto-scroll-stream-toggle">
             <input
               id="auto-scroll-stream-toggle"
               data-ui="auto-scroll-stream-toggle"
@@ -122,9 +109,8 @@ export function GeneralSettings() {
             <span>Auto-scroll to the bottom during streams</span>
           </label>
           <span data-ui="helper">
-            When off, new tokens during a live stream don't pull the
-            viewport down. You can still jump to the latest reply via
-            the floating chip.
+            When off, new tokens during a live stream don't pull the viewport down. You can still
+            jump to the latest reply via the floating chip.
           </span>
         </div>
       </div>
@@ -154,9 +140,9 @@ export function GeneralSettings() {
             spellCheck
           />
           <span data-ui="helper">
-            Injected as the system prompt when you hit Continue on an
-            assistant message. The original chat system prompt is
-            appended underneath so the assistant retains its character.
+            Injected as the system prompt when you hit Continue on an assistant message. The
+            original chat system prompt is appended underneath so the assistant retains its
+            character.
           </span>
         </div>
       </div>

@@ -1,12 +1,7 @@
 import { describe, expect, it } from 'vitest'
-import { buildChatMessages, toChatCompletions } from '../../src/core/transforms'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
-import type {
-  CapabilityDescriptor,
-  ChatSettings,
-  Message,
-  MessageRole,
-} from '../../src/core/types'
+import { buildChatMessages, toChatCompletions } from '../../src/core/transforms'
+import type { CapabilityDescriptor, ChatSettings, Message, MessageRole } from '../../src/core/types'
 
 function textMessage(
   overrides: Partial<Message> & { id: string; role: MessageRole; text: string },
@@ -43,9 +38,7 @@ function settings(overrides: Partial<ChatSettings> = {}): ChatSettings {
 
 describe('toChatCompletions', () => {
   it('plain text conversation — envelope + messages + stream', () => {
-    const path = [
-      textMessage({ id: 'u1', role: 'user', text: 'hi' }),
-    ]
+    const path = [textMessage({ id: 'u1', role: 'user', text: 'hi' })]
     const { wire, requestedModel } = toChatCompletions(settings(), path)
     expect(wire.model).toBe('anthropic/claude-haiku-4.5')
     expect(wire.stream).toBe(true)
@@ -58,10 +51,7 @@ describe('toChatCompletions', () => {
 
   it('prepends the system prompt when non-empty and absent from the path', () => {
     const path = [textMessage({ id: 'u1', role: 'user', text: 'hello' })]
-    const { wire } = toChatCompletions(
-      settings({ systemPrompt: 'Be concise.' }),
-      path,
-    )
+    const { wire } = toChatCompletions(settings({ systemPrompt: 'Be concise.' }), path)
     expect(wire.messages).toEqual([
       { role: 'system', content: 'Be concise.' },
       { role: 'user', content: 'hello' },
@@ -73,10 +63,7 @@ describe('toChatCompletions', () => {
       textMessage({ id: 's1', role: 'system', text: 'imported system' }),
       textMessage({ id: 'u1', role: 'user', text: 'hi' }),
     ]
-    const { wire } = toChatCompletions(
-      settings({ systemPrompt: 'Would-be system' }),
-      path,
-    )
+    const { wire } = toChatCompletions(settings({ systemPrompt: 'Would-be system' }), path)
     expect(wire.messages).toEqual([
       { role: 'system', content: 'imported system' },
       { role: 'user', content: 'hi' },
@@ -144,11 +131,22 @@ describe('toChatCompletions', () => {
     expect(wire.reasoning).toEqual({ enabled: false })
   })
 
-  it('omits reasoning object for plain enabled mode with no extras', () => {
+  it('emits bare { enabled: true } for plain enabled mode', () => {
     const path = [textMessage({ id: 'u1', role: 'user', text: 'hi' })]
     const { wire } = toChatCompletions(
       settings({
         reasoning: { mode: 'enabled', exclude: false, summary: 'off', carryForward: 'off' },
+      }),
+      path,
+    )
+    expect(wire.reasoning).toEqual({ enabled: true })
+  })
+
+  it('omits reasoning entirely for default mode (let provider pick)', () => {
+    const path = [textMessage({ id: 'u1', role: 'user', text: 'hi' })]
+    const { wire } = toChatCompletions(
+      settings({
+        reasoning: { mode: 'default', exclude: false, summary: 'off', carryForward: 'off' },
       }),
       path,
     )

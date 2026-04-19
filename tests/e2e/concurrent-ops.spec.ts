@@ -20,14 +20,13 @@ test.beforeEach(async ({ page }) => {
   await seedFirstRun(page)
 })
 
-test('two tabs streaming different chats run in parallel without aborting each other', async ({ page }) => {
+test('two tabs streaming different chats run in parallel without aborting each other', async ({
+  page,
+}) => {
   // Tab A: create chat #1, open a slow stream.
   await mockChatCompletions(page, {
     delayMs: 1500,
-    body: buildSseBody([
-      { id: 'a', content: 'tab-a-reply' },
-      { finish: 'stop' },
-    ]),
+    body: buildSseBody([{ id: 'a', content: 'tab-a-reply' }, { finish: 'stop' }]),
   })
   await createChatAndOpen(page)
   await sendMessage(page, 'hello-A')
@@ -37,22 +36,26 @@ test('two tabs streaming different chats run in parallel without aborting each o
   const second = await page.context().newPage()
   await second.goto('/')
   await mockChatCompletions(second, {
-    body: buildSseBody([
-      { id: 'b', content: 'tab-b-reply', finish: 'stop' },
-    ]),
+    body: buildSseBody([{ id: 'b', content: 'tab-b-reply', finish: 'stop' }]),
   })
   await second.locator('[data-ui="new-chat"]').click()
   await second.locator('[data-ui="composer"]').waitFor({ state: 'visible' })
   await second.locator('[data-ui="composer-input"]').fill('hello-B')
   await second.locator('[data-ui="send"]').click()
   await expect(
-    second.locator('[data-ui="message"][data-role="assistant"]').first().locator('[data-ui="message-body"]'),
+    second
+      .locator('[data-ui="message"][data-role="assistant"]')
+      .first()
+      .locator('[data-ui="message-body"]'),
   ).toHaveText('tab-b-reply', { timeout: 5000 })
 
   // Tab A's slow stream finishes unperturbed — this is the real assertion:
   // tab B's parallel activity does not interrupt tab A's in-flight request.
   await expect(
-    page.locator('[data-ui="message"][data-role="assistant"]').first().locator('[data-ui="message-body"]'),
+    page
+      .locator('[data-ui="message"][data-role="assistant"]')
+      .first()
+      .locator('[data-ui="message-body"]'),
   ).toHaveText('tab-a-reply', { timeout: 5000 })
 
   // The shared IndexedDB contains at least two distinct chats.
@@ -77,13 +80,12 @@ test('two tabs streaming different chats run in parallel without aborting each o
   await second.close()
 })
 
-test('bumping lastViewedAt on the active chat from tab B leaves the stream intact', async ({ page }) => {
+test('bumping lastViewedAt on the active chat from tab B leaves the stream intact', async ({
+  page,
+}) => {
   await mockChatCompletions(page, {
     delayMs: 1500,
-    body: buildSseBody([
-      { id: 'lv', content: 'viewed-safe' },
-      { finish: 'stop' },
-    ]),
+    body: buildSseBody([{ id: 'lv', content: 'viewed-safe' }, { finish: 'stop' }]),
   })
   await createChatAndOpen(page)
   await sendMessage(page, 'view me')
@@ -118,17 +120,17 @@ test('bumping lastViewedAt on the active chat from tab B leaves the stream intac
 
   // Stream still completes and the assistant row finalises.
   await expect(
-    page.locator('[data-ui="message"][data-role="assistant"]').first().locator('[data-ui="message-body"]'),
+    page
+      .locator('[data-ui="message"][data-role="assistant"]')
+      .first()
+      .locator('[data-ui="message-body"]'),
   ).toHaveText('viewed-safe', { timeout: 5000 })
 })
 
 test('renaming the chat while streaming does not abort the stream', async ({ page }) => {
   await mockChatCompletions(page, {
     delayMs: 1500,
-    body: buildSseBody([
-      { id: 'rn', content: 'renamed-ok' },
-      { finish: 'stop' },
-    ]),
+    body: buildSseBody([{ id: 'rn', content: 'renamed-ok' }, { finish: 'stop' }]),
   })
   await createChatAndOpen(page)
   await sendMessage(page, 'keep streaming')
@@ -164,6 +166,9 @@ test('renaming the chat while streaming does not abort the stream', async ({ pag
 
   // Assertion: the assistant row still completes with the streamed reply.
   await expect(
-    page.locator('[data-ui="message"][data-role="assistant"]').first().locator('[data-ui="message-body"]'),
+    page
+      .locator('[data-ui="message"][data-role="assistant"]')
+      .first()
+      .locator('[data-ui="message-body"]'),
   ).toHaveText('renamed-ok', { timeout: 5000 })
 })

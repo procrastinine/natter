@@ -5,9 +5,9 @@
 // transactions of their own, do not broadcast, and do not write cursor state —
 // they return the data the caller needs to apply those side effects.
 
-import type { ChatId, Message, MessageId } from './types'
-import { groupByParent } from './active-path'
 import type { MutationContext } from '../store/repository'
+import { groupByParent } from './active-path'
+import type { ChatId, Message, MessageId } from './types'
 
 export class TreeChangedError extends Error {
   readonly chatId: ChatId
@@ -20,10 +20,7 @@ export class TreeChangedError extends Error {
   }
 }
 
-export async function loadChatMessages(
-  ctx: MutationContext,
-  chatId: ChatId,
-): Promise<Message[]> {
+export async function loadChatMessages(ctx: MutationContext, chatId: ChatId): Promise<Message[]> {
   return ctx.listMessages(chatId)
 }
 
@@ -235,10 +232,7 @@ export function collectTurnChain(
 // The walk goes up via `parentId`, following `turnId === node.turnId`. The
 // data model guarantees a turn chain is strictly parent→child under a shared
 // `turnId`, so at most one such ancestor exists.
-export function turnHeadOf(
-  message: Message,
-  byId: Map<MessageId, Message>,
-): Message {
+export function turnHeadOf(message: Message, byId: Map<MessageId, Message>): Message {
   let cur: Message = message
   while (cur.turnIndex !== 0) {
     const parent = cur.parentId ? byId.get(cur.parentId) : undefined

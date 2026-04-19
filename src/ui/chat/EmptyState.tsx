@@ -12,7 +12,7 @@ interface Prompt {
 
 const SAMPLE_PROMPTS: readonly Prompt[] = [
   {
-    title: 'Explain like I\'m five',
+    title: "Explain like I'm five",
     body: 'Explain how TCP congestion control works as if I were five.',
     preview: 'Beginner-friendly walkthroughs',
   },
@@ -53,14 +53,12 @@ export function EmptyState({ onPick }: EmptyStateProps) {
     <div data-ui="empty-state">
       <div>
         <h2>Pick or start a chat.</h2>
-        <p>Every chat is a branching tree; feel free to swipe and regenerate without losing history.</p>
+        <p>
+          Every chat is a branching tree; feel free to swipe and regenerate without losing history.
+        </p>
       </div>
       {dismissed ? (
-        <button
-          type="button"
-          data-ui="sample-prompts-restore"
-          onClick={() => void onRestore()}
-        >
+        <button type="button" data-ui="sample-prompts-restore" onClick={() => void onRestore()}>
           Show sample prompts
         </button>
       ) : (
@@ -79,11 +77,7 @@ export function EmptyState({ onPick }: EmptyStateProps) {
               </button>
             ))}
           </div>
-          <button
-            type="button"
-            data-ui="sample-prompts-dismiss"
-            onClick={() => void onDismiss()}
-          >
+          <button type="button" data-ui="sample-prompts-dismiss" onClick={() => void onDismiss()}>
             Dismiss sample prompts
           </button>
         </>

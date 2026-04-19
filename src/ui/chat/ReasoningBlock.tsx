@@ -38,11 +38,7 @@ export function ReasoningBlock({ details }: ReasoningBlockProps) {
       ? 'summary'
       : 'plaintext'
   return (
-    <details
-      data-ui="reasoning"
-      data-reasoning-format={format}
-      data-reasoning-count={total}
-    >
+    <details data-ui="reasoning" data-reasoning-format={format} data-reasoning-count={total}>
       <summary data-ui="reasoning-summary">
         <span>Reasoning ({total})</span>
         <span data-ui="reasoning-badge" data-kind={format}>
@@ -51,10 +47,7 @@ export function ReasoningBlock({ details }: ReasoningBlockProps) {
       </summary>
       <div data-ui="reasoning-details">
         {parts.summary.length > 0 ? (
-          <section
-            data-ui="reasoning-section"
-            data-reasoning-kind="summary"
-          >
+          <section data-ui="reasoning-section" data-reasoning-kind="summary">
             {parts.summary.map((entry, idx) => (
               <p key={keyFor(entry, 'summary', idx)}>
                 {textOrFallback(entry.summary, 'Empty summary.')}
@@ -63,10 +56,7 @@ export function ReasoningBlock({ details }: ReasoningBlockProps) {
           </section>
         ) : null}
         {parts.text.length > 0 ? (
-          <section
-            data-ui="reasoning-section"
-            data-reasoning-kind="text"
-          >
+          <section data-ui="reasoning-section" data-reasoning-kind="text">
             {parts.text.map((entry, idx) => (
               <p key={keyFor(entry, 'text', idx)}>
                 {textOrFallback(entry.text, 'Empty reasoning block.')}
@@ -75,19 +65,10 @@ export function ReasoningBlock({ details }: ReasoningBlockProps) {
           </section>
         ) : null}
         {parts.encrypted.length > 0 ? (
-          <section
-            data-ui="reasoning-section"
-            data-reasoning-kind="encrypted"
-          >
+          <section data-ui="reasoning-section" data-reasoning-kind="encrypted">
             {parts.encrypted.map((entry, idx) => (
-              <p
-                key={keyFor(entry, 'encrypted', idx)}
-                data-state="encrypted"
-              >
-                <em>
-                  Encrypted reasoning preserved — {(entry.data ?? '').length}{' '}
-                  chars.
-                </em>
+              <p key={keyFor(entry, 'encrypted', idx)} data-state="encrypted">
+                <em>Encrypted reasoning preserved — {(entry.data ?? '').length} chars.</em>
               </p>
             ))}
           </section>

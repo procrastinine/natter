@@ -42,11 +42,7 @@ export function CodeBlock({ code, language, fileName }: CodeBlockProps) {
 
   if (overLimit && !showLarge) {
     return (
-      <div
-        data-ui="code-block"
-        data-state="oversized"
-        data-overflow="truncated"
-      >
+      <div data-ui="code-block" data-state="oversized" data-overflow="truncated">
         <div data-ui="code-toolbar">
           <span data-ui="code-toolbar-language">{language ?? 'text'}</span>
           <div data-ui="code-toolbar-actions">
@@ -60,11 +56,7 @@ export function CodeBlock({ code, language, fileName }: CodeBlockProps) {
             <button type="button" data-ui="code-toolbar-copy" onClick={onCopy}>
               Copy
             </button>
-            <button
-              type="button"
-              data-ui="code-toolbar-download"
-              onClick={onDownload}
-            >
+            <button type="button" data-ui="code-toolbar-download" onClick={onDownload}>
               Download
             </button>
           </div>
@@ -86,11 +78,7 @@ export function CodeBlock({ code, language, fileName }: CodeBlockProps) {
           <button type="button" data-ui="code-toolbar-copy" onClick={onCopy}>
             Copy
           </button>
-          <button
-            type="button"
-            data-ui="code-toolbar-download"
-            onClick={onDownload}
-          >
+          <button type="button" data-ui="code-toolbar-download" onClick={onDownload}>
             Download
           </button>
         </div>

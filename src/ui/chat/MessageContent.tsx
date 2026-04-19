@@ -1,10 +1,7 @@
 import { useMemo } from 'react'
 import type { ContentItem } from '../../core/types'
 import { MarkdownView } from './MarkdownView'
-import {
-  DEFAULT_OVERFLOW_THRESHOLD,
-  MessageStreamOverflow,
-} from './MessageStreamOverflow'
+import { DEFAULT_OVERFLOW_THRESHOLD, MessageStreamOverflow } from './MessageStreamOverflow'
 
 export interface MessageContentProps {
   content: ContentItem[]
@@ -21,8 +18,7 @@ export function MessageContent({
     () =>
       content
         .map((item) => {
-          if (item.type === 'text' || item.type === 'output_text')
-            return item.text
+          if (item.type === 'text' || item.type === 'output_text') return item.text
           return ''
         })
         .join(''),

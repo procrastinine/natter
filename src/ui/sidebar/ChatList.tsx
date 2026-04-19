@@ -1,13 +1,9 @@
 import { useLiveQuery } from 'dexie-react-hooks'
 import { memo, useCallback } from 'react'
+import { chatHref, makeAnchorClickHandler, navigateHome } from '../../app/router'
 import type { Chat, ChatId } from '../../core/types'
 import { archiveChat } from '../../store/chats'
 import { getDb } from '../../store/db'
-import {
-  chatHref,
-  makeAnchorClickHandler,
-  navigateHome,
-} from '../../app/router'
 import { TrashIcon } from '../icons/Icon'
 
 export interface ChatListProps {
@@ -24,20 +20,29 @@ export interface ChatListProps {
 async function loadChatRows(): Promise<Chat[]> {
   const db = getDb()
   const rows = await db.chats.toArray()
-  return rows
-    .filter((r) => !r.archived)
-    .sort((a, b) => b.updatedAt - a.updatedAt)
+  return rows.filter((r) => !r.archived).sort((a, b) => b.updatedAt - a.updatedAt)
 }
 
-export const ChatList = memo(function ChatList({
-  activeChatId,
-  collapsed,
-}: ChatListProps) {
+function isEmptyDraft(chat: Chat): boolean {
+  // A chat with no messages has no previewText (or the empty string).
+  // Eager-materialized /new chats sit in this state until the first user
+  // message — keep them out of the sidebar so the row doesn't appear
+  // until the user has actually started a conversation.
+  const p = chat.previewText
+  return p === undefined || p === ''
+}
+
+export const ChatList = memo(function ChatList({ activeChatId, collapsed }: ChatListProps) {
   const rows = useLiveQuery(loadChatRows, [], [])
+  const visibleRows = (rows ?? []).filter(
+    (chat) => chat.id === activeChatId || !isEmptyDraft(chat),
+  )
   const handleDelete = useCallback(
     async (chat: Chat) => {
       const label = chat.title?.trim().length ? chat.title : 'this untitled chat'
-      const confirmed = window.confirm(`Delete "${label}"? You can restore it later from the archive.`)
+      const confirmed = window.confirm(
+        `Delete "${label}"? You can restore it later from the archive.`,
+      )
       if (!confirmed) return
       await archiveChat(chat.id)
       if (activeChatId === chat.id) navigateHome()
@@ -46,10 +51,8 @@ export const ChatList = memo(function ChatList({
   )
   return (
     <ul data-ui="chat-list">
-      {(rows ?? []).map((chat) => {
-        const displayTitle = chat.title?.trim().length
-          ? chat.title
-          : 'Untitled chat'
+      {visibleRows.map((chat) => {
+        const displayTitle = chat.title?.trim().length ? chat.title : 'Untitled chat'
         const preview = chat.previewText ?? ''
         const href = chatHref(chat.id)
         return (
@@ -66,9 +69,7 @@ export const ChatList = memo(function ChatList({
               onClick={makeAnchorClickHandler(href)}
             >
               <span data-ui="chat-row-title">{displayTitle}</span>
-              {!collapsed && preview ? (
-                <span data-ui="chat-row-preview">{preview}</span>
-              ) : null}
+              {!collapsed && preview ? <span data-ui="chat-row-preview">{preview}</span> : null}
             </a>
             {collapsed ? null : (
               <button

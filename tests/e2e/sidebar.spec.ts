@@ -17,7 +17,9 @@ test.beforeEach(async ({ page }) => {
   })
 })
 
-test('clicking new-chat navigates to a blank composer without creating a chat row', async ({ page }) => {
+test('clicking new-chat navigates to a blank composer without creating a chat row', async ({
+  page,
+}) => {
   await expect(page.locator('[data-ui="chat-row"]')).toHaveCount(0)
   await createChatAndOpen(page)
   // Composer is ready, but no chat row yet — rows materialize on first send.
@@ -25,7 +27,9 @@ test('clicking new-chat navigates to a blank composer without creating a chat ro
   await expect(page.locator('[data-ui="chat-row"]')).toHaveCount(0)
 })
 
-test('chat rows materialize only on first send (no spam from repeated new-chat clicks)', async ({ page }) => {
+test('chat rows materialize only on first send (no spam from repeated new-chat clicks)', async ({
+  page,
+}) => {
   // Three #/new visits with NO send → still zero rows.
   await createChatAndOpen(page)
   await createChatAndOpen(page)
@@ -71,7 +75,9 @@ test('reload preserves the active chat (URL is the source of truth)', async ({ p
   await expect(page.locator('[data-ui="composer"]')).toBeVisible()
 })
 
-test('chat-row anchor exposes a real href so middle/Cmd-click can open it in a new tab', async ({ page }) => {
+test('chat-row anchor exposes a real href so middle/Cmd-click can open it in a new tab', async ({
+  page,
+}) => {
   await createChatAndSend(page, 'inspect href')
   const link = page.locator('[data-ui="chat-row-link"]').first()
   const href = await link.getAttribute('href')

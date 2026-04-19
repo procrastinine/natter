@@ -119,7 +119,9 @@ test('HTTP 503 no_provider_available surfaces as error row', async ({ page }) =>
   await expect(err).toContainText(/no provider free/)
 })
 
-test('network drop mid-stream persists partial text + abortReason=network + Continue affordance', async ({ page }) => {
+test('network drop mid-stream persists partial text + abortReason=network + Continue affordance', async ({
+  page,
+}) => {
   // Abort the fetch before any chunk lands. Playwright `route.abort()` surfaces
   // to the browser as a TypeError ("Failed to fetch"); the transport layer
   // normalizes that into ApiError{kind:'network'}, which the send pipeline

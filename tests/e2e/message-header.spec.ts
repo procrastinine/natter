@@ -41,12 +41,8 @@ test('assistant header shows the role label only; model + tokens + cost live in 
   })
   await createChatAndOpen(page)
   await sendMessage(page, 'hello')
-  const assistant = page
-    .locator('[data-ui="message"][data-role="assistant"]')
-    .first()
-  await expect(assistant.locator('[data-ui="message-role"]')).toHaveText(
-    'Assistant',
-  )
+  const assistant = page.locator('[data-ui="message"][data-role="assistant"]').first()
+  await expect(assistant.locator('[data-ui="message-role"]')).toHaveText('Assistant')
   // The factual chips are NOT in the header anymore.
   await expect(assistant.locator('[data-ui="message-model"]')).toHaveCount(0)
   await expect(assistant.locator('[data-ui="message-token-count"]')).toHaveCount(0)
@@ -57,9 +53,7 @@ test('assistant header shows the role label only; model + tokens + cost live in 
     'Assistant',
   )
   // Reveal the info disclosure and verify the full factual record is there.
-  await assistant
-    .locator('[data-ui="message-action"][data-action="info"]')
-    .click()
+  await assistant.locator('[data-ui="message-action"][data-action="info"]').click()
   const info = assistant.locator('[data-ui="message-info"]')
   await expect(info).toContainText('google/gemini-3.1-flash-lite-preview')
   await expect(info).toContainText('Prompt tokens')
@@ -70,17 +64,13 @@ test('assistant header shows the role label only; model + tokens + cost live in 
   await expect(info).toContainText('$0.000150')
 })
 
-test('user messages still get the role label, no model/tokens/cost anywhere', async ({
-  page,
-}) => {
+test('user messages still get the role label, no model/tokens/cost anywhere', async ({ page }) => {
   await mockChatCompletions(page, {
     body: buildSseBody([{ id: 'gen-u', content: 'hi', finish: 'stop' }]),
   })
   await createChatAndOpen(page)
   await sendMessage(page, 'user message')
-  const user = page
-    .locator('[data-ui="message"][data-role="user"]')
-    .first()
+  const user = page.locator('[data-ui="message"][data-role="user"]').first()
   await expect(user.locator('[data-ui="message-role"]')).toHaveText('You')
   await expect(user.locator('[data-ui="message-model"]')).toHaveCount(0)
   await expect(user.locator('[data-ui="message-token-count"]')).toHaveCount(0)

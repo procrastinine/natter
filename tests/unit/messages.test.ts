@@ -17,7 +17,7 @@ import {
   sendUserMessage,
   swipe,
 } from '../../src/core/messages'
-import { TreeChangedError, nextSiblingIndex } from '../../src/core/tree-ops'
+import { nextSiblingIndex, TreeChangedError } from '../../src/core/tree-ops'
 import type { Chat, ChatId, Message, MessageId, MessageRole } from '../../src/core/types'
 import { newId } from '../../src/lib/ulid'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
@@ -222,9 +222,9 @@ describe('regenerateAssistant', () => {
       parentId: null,
       deleted: true,
     })
-    await expect(
-      regenerateAssistant({ chatId: chat.id, messageId: 'A' }),
-    ).rejects.toBeInstanceOf(TreeChangedError)
+    await expect(regenerateAssistant({ chatId: chat.id, messageId: 'A' })).rejects.toBeInstanceOf(
+      TreeChangedError,
+    )
   })
 })
 
@@ -259,9 +259,7 @@ describe('editMessageContent', () => {
         startedAt: 100,
         finishedAt: 110,
       },
-      reasoningDetails: [
-        { type: 'reasoning.text', text: 'original thought' },
-      ],
+      reasoningDetails: [{ type: 'reasoning.text', text: 'original thought' }],
       deleted: false,
     }
     await getDb().messages.put(row)
@@ -283,9 +281,7 @@ describe('editMessageContent', () => {
     expect(stored?.generation?.id).toBe('gen-1')
     expect(stored?.generation?.usage?.prompt_tokens).toBe(10)
     expect(stored?.generation?.model).toBe('openai/gpt-5')
-    expect(stored?.reasoningDetails).toEqual([
-      { type: 'reasoning.text', text: 'original thought' },
-    ])
+    expect(stored?.reasoningDetails).toEqual([{ type: 'reasoning.text', text: 'original thought' }])
   })
 
   it('editing a historical user message leaves descendants unchanged', async () => {
@@ -336,7 +332,7 @@ describe('editMessageContent', () => {
       createdAt: 2,
     })
     await getDb().chats.put({
-      ...(await getChat(chat.id) as Chat),
+      ...((await getChat(chat.id)) as Chat),
       lastUpdatedLeafId: assistant.id,
       lastBranchUpdatedAt: 50,
     })
@@ -373,7 +369,7 @@ describe('editMessageContent', () => {
       createdAt: 3,
     })
     await getDb().chats.put({
-      ...(await getChat(chat.id) as Chat),
+      ...((await getChat(chat.id)) as Chat),
       lastUpdatedLeafId: a2.id,
       lastBranchUpdatedAt: 50,
     })
@@ -527,7 +523,7 @@ describe('insertBetween', () => {
     expect(res.effects.cursorUpdates[res.messageId]).toBe(c.id)
   })
 
-  it("assigns X siblingIndex above any pre-existing variants at the same slot", async () => {
+  it('assigns X siblingIndex above any pre-existing variants at the same slot', async () => {
     const chat = await seedChat()
     const p = await putMessage(chat.id, {
       id: 'P',
@@ -918,9 +914,7 @@ describe('pasteImport', () => {
       chatId: chat.id,
       slot: { kind: 'after', messageId: 'L' },
       cursor: {},
-      messages: [
-        { role: 'assistant', content: [{ type: 'text', text: 'x' }] },
-      ],
+      messages: [{ role: 'assistant', content: [{ type: 'text', text: 'x' }] }],
       now: 5,
     })
     const first = await getDb().messages.get(res.newMessageIds[0] as MessageId)
@@ -1053,9 +1047,7 @@ describe('concurrency', () => {
       regenerateAssistant({ chatId: chat.id, messageId: a.id, now: 11 }),
     ])
     expect(r1.messageId).not.toBe(r2.messageId)
-    const rows = (await loadMessages(chat.id)).filter(
-      (r) => r.parentId === u.id && !r.deleted,
-    )
+    const rows = (await loadMessages(chat.id)).filter((r) => r.parentId === u.id && !r.deleted)
     const indices = rows.map((r) => r.siblingIndex).sort((x, y) => x - y)
     // Unique siblingIndex values — no overwrite.
     expect(new Set(indices).size).toBe(indices.length)

@@ -70,10 +70,7 @@ export async function putAttachment(row: Attachment): Promise<void> {
   await getDb().attachments.put(row)
 }
 
-export async function incRefs(
-  ctx: MutationContext,
-  ids: readonly AttachmentId[],
-): Promise<void> {
+export async function incRefs(ctx: MutationContext, ids: readonly AttachmentId[]): Promise<void> {
   if (ids.length === 0) return
   for (const id of ids) {
     const row = await ctx.getAttachment(id)
@@ -82,10 +79,7 @@ export async function incRefs(
   }
 }
 
-export async function decRefs(
-  ctx: MutationContext,
-  ids: readonly AttachmentId[],
-): Promise<void> {
+export async function decRefs(ctx: MutationContext, ids: readonly AttachmentId[]): Promise<void> {
   if (ids.length === 0) return
   for (const id of ids) {
     const row = await ctx.getAttachment(id)
@@ -111,39 +105,35 @@ export async function reapOrphanedAttachments(
   const now = opts.now ?? Date.now()
   const cutoff = now - olderThanMs
   const db = getDb()
-  return db.transaction(
-    'rw',
-    db.attachments,
-    db.messages,
-    db.drafts,
-    async () => {
-      const candidates = await db.attachments
-        .where('refCount')
-        .equals(0)
-        .filter((att) => att.createdAt < cutoff)
-        .toArray()
-      if (candidates.length === 0) return []
-      const ids = new Set(candidates.map((a) => a.id))
-      await db.messages.each((m) => {
-        if (m.attachmentRefs) {
-          for (const ref of m.attachmentRefs) ids.delete(ref)
-        }
-      })
-      await db.drafts.each((d) => {
-        if (d.attachmentRefs) {
-          for (const ref of d.attachmentRefs) ids.delete(ref)
-        }
-      })
-      const toDelete = [...ids]
-      for (const id of toDelete) await db.attachments.delete(id)
-      return toDelete
-    },
-  )
+  return db.transaction('rw', db.attachments, db.messages, db.drafts, async () => {
+    const candidates = await db.attachments
+      .where('refCount')
+      .equals(0)
+      .filter((att) => att.createdAt < cutoff)
+      .toArray()
+    if (candidates.length === 0) return []
+    const ids = new Set(candidates.map((a) => a.id))
+    await db.messages.each((m) => {
+      if (m.attachmentRefs) {
+        for (const ref of m.attachmentRefs) ids.delete(ref)
+      }
+    })
+    await db.drafts.each((d) => {
+      if (d.attachmentRefs) {
+        for (const ref of d.attachmentRefs) ids.delete(ref)
+      }
+    })
+    const toDelete = [...ids]
+    for (const id of toDelete) await db.attachments.delete(id)
+    return toDelete
+  })
 }
 
 // Quick lookup: count of live references across both tables. Not used on the
 // hot path — exists for the settings storage pane and tests.
-export async function countLiveRefs(id: AttachmentId): Promise<{ messages: number; drafts: number }> {
+export async function countLiveRefs(
+  id: AttachmentId,
+): Promise<{ messages: number; drafts: number }> {
   const db = getDb()
   let messages = 0
   let drafts = 0

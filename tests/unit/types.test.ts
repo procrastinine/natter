@@ -92,9 +92,9 @@ describe('Phase 0 type additions', () => {
       string | null
     >()
     expectTypeOf<Extract<MutationScope, { kind: 'draft' }>['chatId']>().toEqualTypeOf<string>()
-    expectTypeOf<Extract<MutationScope, { kind: 'attachment' }>['attachmentId']>().toEqualTypeOf<
-      string
-    >()
+    expectTypeOf<
+      Extract<MutationScope, { kind: 'attachment' }>['attachmentId']
+    >().toEqualTypeOf<string>()
   })
 
   it('Message.approval uses the MessageApproval union', () => {

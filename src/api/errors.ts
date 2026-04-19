@@ -69,9 +69,7 @@ function classifyStatus(
   if (status === 401) return { kind: 'unauthorized', retryable: false }
   if (status === 402) return { kind: 'payment_required', retryable: false }
   if (status === 403) {
-    const hasReasons =
-      body?.error?.metadata !== undefined &&
-      'reasons' in body.error.metadata
+    const hasReasons = body?.error?.metadata !== undefined && 'reasons' in body.error.metadata
     return hasReasons
       ? { kind: 'moderation', retryable: false }
       : { kind: 'unauthorized', retryable: false }
@@ -158,11 +156,7 @@ export function normalizeError(input: unknown, ctx: NormalizeCtx): ApiError {
 
   // No HTTP status, no user abort, no timeout: network or an opaque throw.
   const message =
-    input instanceof Error
-      ? input.message
-      : typeof input === 'string'
-        ? input
-        : 'Network error'
+    input instanceof Error ? input.message : typeof input === 'string' ? input : 'Network error'
   return new ApiError({
     kind: ctx.cause === 'network' ? 'network' : 'unknown',
     code: ctx.cause === 'network' ? 'NETWORK' : 'UNKNOWN',

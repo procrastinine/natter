@@ -10,9 +10,7 @@ import {
 import { ApiError } from '../../src/api/errors'
 import type { ConnectionProfile } from '../../src/core/types'
 
-function makeProfile(
-  overrides: Partial<ConnectionProfile> = {},
-): ConnectionProfile {
+function makeProfile(overrides: Partial<ConnectionProfile> = {}): ConnectionProfile {
   return {
     id: 'prof',
     name: 'OpenRouter',
@@ -47,9 +45,9 @@ describe('buildHeaders', () => {
 
   it('adds Content-Type: application/json only for POST', () => {
     expect(buildHeaders(makeProfile(), 'k')['Content-Type']).toBeUndefined()
-    expect(
-      buildHeaders(makeProfile(), 'k', { method: 'POST' })['Content-Type'],
-    ).toBe('application/json')
+    expect(buildHeaders(makeProfile(), 'k', { method: 'POST' })['Content-Type']).toBe(
+      'application/json',
+    )
   })
 
   it('adds X-OpenRouter-Categories from profile.appCategories', () => {
@@ -168,9 +166,7 @@ describe('fetchWithRetry (GET)', () => {
   })
 
   it('returns the final non-ok response after exhausting attempts', async () => {
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValue(new Response('', { status: 503 }))
+    const fetchMock = vi.fn().mockResolvedValue(new Response('', { status: 503 }))
     vi.stubGlobal('fetch', fetchMock)
     const res = await fetchWithRetry(
       'https://x',
@@ -182,9 +178,7 @@ describe('fetchWithRetry (GET)', () => {
   })
 
   it('does not retry on non-retryable statuses (400, 404)', async () => {
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValue(new Response('', { status: 404 }))
+    const fetchMock = vi.fn().mockResolvedValue(new Response('', { status: 404 }))
     vi.stubGlobal('fetch', fetchMock)
     const res = await fetchWithRetry(
       'https://x',
@@ -201,14 +195,12 @@ describe('fetchWithRetry (GET)', () => {
       vi.fn(() => Promise.reject(new TypeError('fetch failed'))),
     )
     await expect(
-      fetchWithRetry(
-        'https://x',
-        { method: 'GET' },
-        { retry: { attempts: 2, backoffMs: 1 } },
-      ),
+      fetchWithRetry('https://x', { method: 'GET' }, { retry: { attempts: 2, backoffMs: 1 } }),
     ).rejects.toBeInstanceOf(ApiError)
     // fetch was called twice total — not three, not one.
-    expect((globalThis.fetch as unknown as { mock: { calls: unknown[] } }).mock.calls.length).toBe(2)
+    expect((globalThis.fetch as unknown as { mock: { calls: unknown[] } }).mock.calls.length).toBe(
+      2,
+    )
   })
 
   it('computes exponential backoff capped at 5000ms', () => {
@@ -221,10 +213,7 @@ describe('fetchWithRetry (GET)', () => {
 })
 
 describe('fetchWithKeyFallback', () => {
-  function response(
-    status: number,
-    headers: Record<string, string> = {},
-  ): Response {
+  function response(status: number, headers: Record<string, string> = {}): Response {
     return new Response('', { status, headers })
   }
 
@@ -235,13 +224,10 @@ describe('fetchWithKeyFallback', () => {
       .mockResolvedValueOnce(response(401))
       .mockResolvedValueOnce(response(200))
     vi.stubGlobal('fetch', fetchMock)
-    const result = await fetchWithKeyFallback(
-      ['k1', 'k2', 'k3'],
-      (key) => ({
-        url: 'https://x',
-        init: { headers: { Authorization: `Bearer ${key}` } },
-      }),
-    )
+    const result = await fetchWithKeyFallback(['k1', 'k2', 'k3'], (key) => ({
+      url: 'https://x',
+      init: { headers: { Authorization: `Bearer ${key}` } },
+    }))
     expect(result.response.status).toBe(200)
     expect(result.keyIndex).toBe(2)
     expect(fetchMock).toHaveBeenCalledTimes(3)
@@ -250,23 +236,16 @@ describe('fetchWithKeyFallback', () => {
       const auth = (init.headers as Record<string, string>).Authorization
       return auth
     })
-    expect(keysSent).toEqual([
-      'Bearer k1',
-      'Bearer k2',
-      'Bearer k3',
-    ])
+    expect(keysSent).toEqual(['Bearer k1', 'Bearer k2', 'Bearer k3'])
   })
 
   it('stops immediately on a non-rotating status (e.g. 500) and returns it', async () => {
     const fetchMock = vi.fn().mockResolvedValue(response(500))
     vi.stubGlobal('fetch', fetchMock)
-    const result = await fetchWithKeyFallback(
-      ['k1', 'k2'],
-      (key) => ({
-        url: 'https://x',
-        init: { headers: { Authorization: `Bearer ${key}` } },
-      }),
-    )
+    const result = await fetchWithKeyFallback(['k1', 'k2'], (key) => ({
+      url: 'https://x',
+      init: { headers: { Authorization: `Bearer ${key}` } },
+    }))
     expect(result.response.status).toBe(500)
     expect(result.keyIndex).toBe(0)
     expect(fetchMock).toHaveBeenCalledTimes(1)
@@ -322,9 +301,9 @@ describe('fetchWithKeyFallback', () => {
   })
 
   it('throws when given an empty key list', async () => {
-    await expect(
-      fetchWithKeyFallback([], () => ({ url: 'https://x', init: {} })),
-    ).rejects.toThrow(/at least one key/)
+    await expect(fetchWithKeyFallback([], () => ({ url: 'https://x', init: {} }))).rejects.toThrow(
+      /at least one key/,
+    )
   })
 })
 

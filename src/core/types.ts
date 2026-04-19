@@ -71,7 +71,11 @@ export type EffortLevel = 'xhigh' | 'high' | 'medium' | 'low' | 'minimal' | 'non
 
 export type VerbosityLevel = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 
-export type ReasoningMode = 'off' | 'enabled' | 'effort' | 'budget'
+// `default` = don't emit the `reasoning` field, let the provider decide.
+// `off` = explicit `reasoning.enabled: false`.
+// `enabled` = explicit `reasoning.enabled: true` with no effort/budget.
+// `effort` / `budget` = the two dimensional knobs when supported.
+export type ReasoningMode = 'default' | 'off' | 'enabled' | 'effort' | 'budget'
 
 export type ReasoningCarryForward = 'off' | 'plaintext' | 'encrypted' | 'auto'
 
@@ -197,6 +201,7 @@ export type PercentileBucket = {
   p50?: number
   p75?: number
   p90?: number
+  p95?: number
   p99?: number
 }
 
@@ -261,6 +266,12 @@ export interface TraceMetadata {
 export interface AnthropicCacheSettings {
   mode: 'off' | 'automatic' | 'manual'
   ttl: '5m' | '1h'
+  // Message index to place the final cache breakpoint at. Negative values
+  // count back from the latest turn: -2 caches up to the second-to-last
+  // message (so regenerating the last assistant turn is a cache hit), -1
+  // caches through the last message. Positive values: pin exactly the first
+  // N messages. 0 is a no-op (equivalent to mode=off). Default -2.
+  breakpointIndex?: number
 }
 
 export type CacheControl = { type: 'ephemeral'; ttl?: '1h' }
@@ -273,6 +284,16 @@ export interface ContextStrategy {
   kind: ContextStrategyKind
   reservedForCompletion: number
   onOverflow: OnOverflow
+  // Pin the first N user+assistant pairs at the top of the chat. The
+  // sliding-window path always keeps as-many-recent-as-fit; the user's
+  // knob is whether to ALSO keep a handful of anchor turns at the start
+  // (useful for lore / setup / important early context). 0 = pure
+  // sliding window (drop oldest).
+  keepFirstPairs?: number
+  // When true, send OpenRouter's `plugins: [{id: 'context-compression'}]`
+  // alongside client-side trimming. Server-side middle-out compresses what
+  // remains after we trim locally.
+  useOpenRouterMiddleOut?: boolean
 }
 
 export interface ChatSettings {
@@ -287,6 +308,16 @@ export interface ChatSettings {
   reasoning: ReasoningSettings
   verbosity?: VerbosityLevel
   maxCompletionTokens?: number
+  // User-imposed ceiling on prompt tokens. Never exceeds the model's own
+  // cap, but lets the user trim down for cost / latency / behaviour. When
+  // undefined, we use the model's advertised cap.
+  customMaxContext?: number
+  // When true, route only to providers that support every set parameter
+  // (wire: `provider.require_parameters: true`) and restrict the UI to the
+  // intersection of retained-provider capabilities. Default false: show the
+  // union so UI controls are discoverable; providers silently drop
+  // parameters they don't support.
+  strictProviderRouting?: boolean
   contextStrategy: ContextStrategy
   allowFallbacks: boolean
   mediaContextStrategy: MediaContextStrategy
@@ -714,8 +745,8 @@ export interface ModelEndpoint {
 }
 
 export interface ModelsQuery {
-  outputModalities?: string[]
-  supportedParameters?: string[]
+  outputModalities?: readonly string[]
+  supportedParameters?: readonly string[]
 }
 
 // ---------------------------------------------------------------------------

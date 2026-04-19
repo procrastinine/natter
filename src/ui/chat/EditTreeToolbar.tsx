@@ -13,11 +13,7 @@ export function EditTreeToolbar() {
   const setCascadeDelete = useUiStore((s) => s.setCascadeDelete)
   if (!editTreeMode) return null
   return (
-    <div
-      data-ui="edit-tree-toolbar"
-      role="toolbar"
-      aria-label="Edit tree mode"
-    >
+    <div data-ui="edit-tree-toolbar" role="toolbar" aria-label="Edit tree mode">
       <label data-ui="edit-tree-cascade">
         <input
           type="checkbox"

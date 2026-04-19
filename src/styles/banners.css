@@ -5,11 +5,11 @@
  * See plan/10-ui.md §10.20.
  */
 
-[data-ui='banner'],
-[data-ui='notice-banner'],
-[data-ui='warning-banner'],
-[data-ui='blocking-banner'],
-[data-ui='tip-callout'] {
+[data-ui="banner"],
+[data-ui="notice-banner"],
+[data-ui="warning-banner"],
+[data-ui="blocking-banner"],
+[data-ui="tip-callout"] {
   display: flex;
   align-items: flex-start;
   gap: var(--space-3);
@@ -22,22 +22,22 @@
   margin-bottom: var(--banner-stack-gap);
 }
 
-[data-tone='info'] {
+[data-tone="info"] {
   background: var(--color-banner-info-bg);
   border-left: 3px solid var(--color-info);
 }
 
-[data-tone='success'] {
+[data-tone="success"] {
   background: var(--color-banner-success-bg);
   border-left: 3px solid var(--color-success);
 }
 
-[data-tone='warning'] {
+[data-tone="warning"] {
   background: var(--color-banner-warning-bg);
   border-left: 3px solid var(--color-warning);
 }
 
-[data-tone='danger'] {
+[data-tone="danger"] {
   background: var(--color-banner-danger-bg);
   border-left: 3px solid var(--color-danger);
 }

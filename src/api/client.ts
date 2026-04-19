@@ -47,9 +47,10 @@ export function buildHeaders(
 // fired" AFTER fetch throws — fetch itself only exposes a single AbortError.
 // Forwarding both sources into one controller and keeping the source refs
 // gives us the introspection we need.
-function linkSignals(
-  sources: Array<AbortSignal | undefined>,
-): { signal: AbortSignal; dispose: () => void } {
+function linkSignals(sources: Array<AbortSignal | undefined>): {
+  signal: AbortSignal
+  dispose: () => void
+} {
   const controller = new AbortController()
   const disposers: Array<() => void> = []
   for (const source of sources) {
@@ -80,10 +81,7 @@ export async function fetchWithTimeout(
 ): Promise<Response> {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS
   const timeoutCtl = new AbortController()
-  const timer =
-    timeoutMs > 0
-      ? setTimeout(() => timeoutCtl.abort(), timeoutMs)
-      : undefined
+  const timer = timeoutMs > 0 ? setTimeout(() => timeoutCtl.abort(), timeoutMs) : undefined
   const link = linkSignals([opts.signal, timeoutCtl.signal])
   try {
     return await fetch(url, { ...init, signal: link.signal })

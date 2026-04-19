@@ -13,25 +13,19 @@
 // reasoning is discarded (it describes the meta-instruction, not the
 // original turn).
 
-import { activePath, cursorKeyOf } from '../core/active-path'
-import { readGlobalPreferences } from '../core/global-settings'
-import type { ChatCompletionsTransformOptions } from '../core/transforms'
-import { toChatCompletions } from '../core/transforms'
-import type {
-  ChatId,
-  ConnectionProfile,
-  ContentItem,
-  Message,
-  MessageId,
-} from '../core/types'
 import { chatCompletions } from '../api/chat-completions'
 import { ApiError } from '../api/errors'
 import { splitChatStream } from '../api/stream-transforms'
 import type { ChatStreamChunk } from '../api/types'
+import { activePath, cursorKeyOf } from '../core/active-path'
+import { readGlobalPreferences } from '../core/global-settings'
+import type { ChatCompletionsTransformOptions } from '../core/transforms'
+import { toChatCompletions } from '../core/transforms'
+import type { ChatId, ConnectionProfile, ContentItem, Message, MessageId } from '../core/types'
 import { newId } from '../lib/ulid'
-import { getBrowserRepository } from '../store/browser-repo'
 import { postEvent } from '../store/broadcast'
-import { getChat, loadChatMessages } from '../store/chats'
+import { getBrowserRepository } from '../store/browser-repo'
+import { dismissAbortReason, getChat, loadChatMessages } from '../store/chats'
 import { useChatStore } from '../store/zustand/chatStore'
 import { useStreamStore } from '../store/zustand/streamStore'
 
@@ -50,9 +44,7 @@ export interface ContinueInPlaceInput {
   }) => AsyncIterable<ChatStreamChunk>
 }
 
-export async function continueAssistantInPlace(
-  input: ContinueInPlaceInput,
-): Promise<void> {
+export async function continueAssistantInPlace(input: ContinueInPlaceInput): Promise<void> {
   const now = input.now ?? Date.now
   const repo = getBrowserRepository()
   const chat = await getChat(input.chatId)
@@ -61,9 +53,7 @@ export async function continueAssistantInPlace(
   }
   const target = await repo.getMessage(input.targetMessageId)
   if (!target || target.chatId !== input.chatId || target.deleted) {
-    throw new Error(
-      `continue: target ${input.targetMessageId} unavailable`,
-    )
+    throw new Error(`continue: target ${input.targetMessageId} unavailable`)
   }
   if (target.role !== 'assistant') {
     throw new Error('continue: target must be an assistant message')
@@ -76,9 +66,7 @@ export async function continueAssistantInPlace(
   let cur: Message | undefined = target
   while (cur) {
     cursor[cursorKeyOf(cur.parentId)] = cur.id
-    cur = cur.parentId
-      ? await repo.getMessage(cur.parentId)
-      : undefined
+    cur = cur.parentId ? await repo.getMessage(cur.parentId) : undefined
   }
   const allMessages = await loadChatMessages(input.chatId)
   const path = activePath(allMessages, cursor)
@@ -113,11 +101,7 @@ export async function continueAssistantInPlace(
   const transformOpts: ChatCompletionsTransformOptions = {
     stream: true,
   }
-  const { wire, requestedModel } = toChatCompletions(
-    settingsForContinue,
-    upstream,
-    transformOpts,
-  )
+  const { wire, requestedModel } = toChatCompletions(settingsForContinue, upstream, transformOpts)
   void requestedModel
 
   const streamId = newId()
@@ -125,11 +109,9 @@ export async function continueAssistantInPlace(
   const userSignal = input.signal
   if (userSignal?.aborted) abortController.abort(userSignal.reason)
   else
-    userSignal?.addEventListener(
-      'abort',
-      () => abortController.abort(userSignal.reason),
-      { once: true },
-    )
+    userSignal?.addEventListener('abort', () => abortController.abort(userSignal.reason), {
+      once: true,
+    })
 
   useStreamStore.getState().setActive({
     streamId,
@@ -163,26 +145,21 @@ export async function continueAssistantInPlace(
 
   const flush = async (final: boolean) => {
     const combined = baseText + buffer
-    await repo.runMutation(
-      [{ kind: 'message', messageId: target.id }],
-      async (ctx) => {
-        const current = await ctx.getMessage(target.id)
-        if (!current) return
-        const nextContent: ContentItem[] = appendTextOnto(
-          current.content,
-          // The delta-since-last-flush is what we haven't written yet;
-          // but `current.content` already has everything from prior
-          // flushes, so compute the tail from buffer and merge.
-          combined,
-        )
-        await ctx.putMessage({ ...current, content: nextContent })
-      },
-    )
+    await repo.runMutation([{ kind: 'message', messageId: target.id }], async (ctx) => {
+      const current = await ctx.getMessage(target.id)
+      if (!current) return
+      const nextContent: ContentItem[] = appendTextOnto(
+        current.content,
+        // The delta-since-last-flush is what we haven't written yet;
+        // but `current.content` already has everything from prior
+        // flushes, so compute the tail from buffer and merge.
+        combined,
+      )
+      await ctx.putMessage({ ...current, content: nextContent })
+    })
     lastFlushedAt = now()
     lastFlushedLen = buffer.length
-    useStreamStore
-      .getState()
-      .updateTextLen(streamId, combined.length)
+    useStreamStore.getState().updateTextLen(streamId, combined.length)
     postEvent({
       kind: 'stream-tokens',
       chatId: input.chatId,
@@ -207,14 +184,16 @@ export async function continueAssistantInPlace(
         break
       }
       // Flush every ~200ms or 4KB of growth.
-      if (
-        now() - lastFlushedAt >= 200 ||
-        buffer.length - lastFlushedLen >= 4096
-      ) {
+      if (now() - lastFlushedAt >= 200 || buffer.length - lastFlushedLen >= 4096) {
         await flush(false)
       }
     }
     await flush(true)
+    // Continue succeeded — clear the previous abort banner since the
+    // response is now whole. The original generation metadata (usage /
+    // model / reasoning) is preserved by flush(); only the abortReason
+    // and error flags go.
+    await dismissAbortReason(target.id)
   } catch (err) {
     if (abortController.signal.aborted) {
       await flush(true)
@@ -244,10 +223,7 @@ function existingTextOf(message: Message): string {
   return out
 }
 
-function appendTextOnto(
-  content: readonly ContentItem[],
-  fullText: string,
-): ContentItem[] {
+function appendTextOnto(content: readonly ContentItem[], fullText: string): ContentItem[] {
   // Rewrite the first text/output_text item with the full combined
   // text, drop any subsequent plain text items that were part of the
   // prior partial (they get merged into the first), keep non-text

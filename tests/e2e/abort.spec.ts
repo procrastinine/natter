@@ -21,14 +21,13 @@ test.beforeEach(async ({ page }) => {
   await seedFirstRun(page)
 })
 
-test('clicking abort mid-stream persists abortReason="user" and shows the interrupted row', async ({ page }) => {
+test('clicking abort mid-stream persists abortReason="user" and shows the interrupted row', async ({
+  page,
+}) => {
   // Hold the fetch open long enough for us to abort after the first chunk.
   await mockChatCompletions(page, {
     delayMs: 1500,
-    body: buildSseBody([
-      { id: 'abort-mid', content: 'before-abort' },
-      { finish: 'stop' },
-    ]),
+    body: buildSseBody([{ id: 'abort-mid', content: 'before-abort' }, { finish: 'stop' }]),
   })
   await createChatAndOpen(page)
   await sendMessage(page, 'slow please')

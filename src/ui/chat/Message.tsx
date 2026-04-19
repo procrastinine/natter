@@ -1,24 +1,16 @@
-import { Component, memo, useCallback, useState, type ReactNode } from 'react'
+import { Component, memo, type ReactNode, useCallback, useState } from 'react'
 import { groupByParent } from '../../core/active-path'
-import type {
-  ChatId,
-  CursorMap,
-  Message as MessageRow,
-  ReasoningDetail,
-} from '../../core/types'
+import type { ChatId, CursorMap, Message as MessageRow, ReasoningDetail } from '../../core/types'
+import { dismissAbortReason } from '../../store/chats'
+import { useUiStore } from '../../store/zustand/uiStore'
 import { BranchControls } from './BranchControls'
 import { InlineEditor, plaintextOf } from './InlineEditor'
-import {
-  MessageActions,
-  MessageEditTreeActions,
-  type InsertSlot,
-} from './MessageActions'
+import { type InsertSlot, MessageActions, MessageEditTreeActions } from './MessageActions'
 import { MessageContent } from './MessageContent'
 import { MessageHeader } from './MessageHeader'
 import { MessageInfo } from './MessageInfo'
 import { ProfileGlyph } from './ProfileGlyph'
 import { ReasoningBlock } from './ReasoningBlock'
-import { useUiStore } from '../../store/zustand/uiStore'
 
 export interface MessageProps {
   chatId: ChatId
@@ -34,6 +26,10 @@ export interface MessageProps {
   // assistant reply that the user just edited in this session — surfaces
   // the "stale reply?" hint under the NEXT assistant (§10.6 Edit action).
   staleReplyHint?: boolean
+  // When true, this message is being trimmed out of the outgoing request
+  // by the current context-truncation settings. The profile glyph picks
+  // up a dashed ring to surface the exclusion visually.
+  excludedFromContext?: boolean
   // Structural op handlers. Threaded from the list so `<Message>` can stay
   // presentational except for its own edit-swap state.
   onEditInPlace: (text: string, reasoning?: ReasoningDetail[]) => Promise<void>
@@ -65,6 +61,7 @@ export const Message = memo(
     prev.hasConnection === next.hasConnection &&
     prev.roleMismatch === next.roleMismatch &&
     prev.staleReplyHint === next.staleReplyHint &&
+    prev.excludedFromContext === next.excludedFromContext &&
     prev.onEditInPlace === next.onEditInPlace &&
     prev.onEditAndSend === next.onEditAndSend &&
     prev.onRegenerate === next.onRegenerate &&
@@ -82,6 +79,7 @@ function MessageInner({
   hasConnection,
   roleMismatch,
   staleReplyHint,
+  excludedFromContext,
   onEditInPlace,
   onEditAndSend,
   onRegenerate,
@@ -115,9 +113,7 @@ function MessageInner({
     [onEditAndSend],
   )
   const byParent = groupByParent(messages)
-  const siblings = (byParent.get(message.parentId) ?? []).filter(
-    (m) => !m.deleted,
-  )
+  const siblings = (byParent.get(message.parentId) ?? []).filter((m) => !m.deleted)
   const editTreeMode = useUiStore((s) => s.editTreeMode)
 
   return (
@@ -130,7 +126,10 @@ function MessageInner({
       data-has-error={error ? 'true' : 'false'}
       data-has-reasoning={reasoning.length > 0 ? 'true' : 'false'}
     >
-      <ProfileGlyph role={message.role} />
+      <ProfileGlyph
+        role={message.role}
+        {...(excludedFromContext ? { excluded: true } : {})}
+      />
       <div data-ui="message-body-column">
         <MessageHeader message={message} />
         {reasoning.length > 0 ? <ReasoningBlock details={reasoning} /> : null}
@@ -143,35 +142,33 @@ function MessageInner({
               ? {
                   onSaveAndSend: handleSaveAndSend,
                   saveAndSendDisabled: !hasConnection,
-                  saveAndSendDisabledReason:
-                    'Add a connection to send messages.',
+                  saveAndSendDisabledReason: 'Add a connection to send messages.',
                 }
               : {})}
-            {...(message.reasoningDetails &&
-            message.reasoningDetails.length > 0
+            {...(message.reasoningDetails && message.reasoningDetails.length > 0
               ? { initialReasoning: message.reasoningDetails }
               : {})}
             ariaLabel={`Edit ${message.role} message`}
           />
         ) : (
-          <MessageContent
-            content={message.content}
-            streaming={streaming ?? false}
-          />
+          <MessageContent content={message.content} streaming={streaming ?? false} />
         )}
         {error ? (
           <div data-ui="message-error" data-role="error">
-            <strong>Error{error.statusCode ? ` ${error.statusCode}` : ''}:</strong>{' '}
-            {error.message}
+            <strong>Error{error.statusCode ? ` ${error.statusCode}` : ''}:</strong> {error.message}
+            <button
+              type="button"
+              data-ui="message-error-dismiss"
+              onClick={() => void dismissAbortReason(message.id)}
+              aria-label="Dismiss error"
+              title="Dismiss"
+            >
+              ×
+            </button>
           </div>
         ) : null}
         {abortReason && !error ? (
-          <div
-            data-ui="message-error"
-            data-role="abort"
-            data-reason={abortReason}
-            role="status"
-          >
+          <div data-ui="message-error" data-role="abort" data-reason={abortReason} role="status">
             <span>
               {abortReason === 'user'
                 ? 'Cancelled — partial response kept above. Continue to resume.'
@@ -183,25 +180,26 @@ function MessageInner({
                 data-ui="message-continue"
                 onClick={() => void onContinue()}
                 disabled={!hasConnection}
-                title={
-                  !hasConnection
-                    ? 'Add a connection to continue.'
-                    : 'Continue this response'
-                }
+                title={!hasConnection ? 'Add a connection to continue.' : 'Continue this response'}
               >
                 Continue
               </button>
             ) : null}
+            <button
+              type="button"
+              data-ui="message-error-dismiss"
+              onClick={() => void dismissAbortReason(message.id)}
+              aria-label="Dismiss banner"
+              title="Dismiss"
+            >
+              ×
+            </button>
           </div>
         ) : null}
-{null}
+        {null}
         <div data-ui="message-action-row">
           {siblings.length > 1 ? (
-            <BranchControls
-              chatId={chatId}
-              message={message}
-              messages={messages}
-            />
+            <BranchControls chatId={chatId} message={message} messages={messages} />
           ) : (
             <span data-ui="message-action-row-spacer" />
           )}
@@ -230,10 +228,7 @@ function MessageInner({
           />
         ) : null}
         {showInfo ? (
-          <MessageInfo
-            message={message}
-            {...(staleReplyHint ? { staleReplyHint: true } : {})}
-          />
+          <MessageInfo message={message} {...(staleReplyHint ? { staleReplyHint: true } : {})} />
         ) : null}
       </div>
     </article>
@@ -249,10 +244,7 @@ interface MessageErrorBoundaryState {
   error: Error | null
 }
 
-class MessageErrorBoundary extends Component<
-  MessageErrorBoundaryProps,
-  MessageErrorBoundaryState
-> {
+class MessageErrorBoundary extends Component<MessageErrorBoundaryProps, MessageErrorBoundaryState> {
   override state: MessageErrorBoundaryState = { error: null }
 
   static getDerivedStateFromError(error: Error): MessageErrorBoundaryState {

@@ -1,10 +1,8 @@
 import { describe, expect, it } from 'vitest'
-import { splitChatStream, type StreamLaneEvent } from '../../src/api/stream-transforms'
+import { type StreamLaneEvent, splitChatStream } from '../../src/api/stream-transforms'
 import type { ChatStreamChunk } from '../../src/api/types'
 
-async function* fromChunks(
-  chunks: ChatStreamChunk[],
-): AsyncGenerator<ChatStreamChunk> {
+async function* fromChunks(chunks: ChatStreamChunk[]): AsyncGenerator<ChatStreamChunk> {
   for (const c of chunks) yield c
 }
 
@@ -139,9 +137,7 @@ describe('splitChatStream', () => {
             {
               delta: {
                 reasoning: 'thinking…',
-                reasoning_details: [
-                  { type: 'reasoning.text', index: 0, text: 'thinking…' },
-                ],
+                reasoning_details: [{ type: 'reasoning.text', index: 0, text: 'thinking…' }],
               },
             },
           ],
@@ -163,9 +159,7 @@ describe('splitChatStream', () => {
         result: {
           id: 'g1',
           model: 'm',
-          choices: [
-            { finish_reason: 'stop', message: { content: 'hello' } },
-          ],
+          choices: [{ finish_reason: 'stop', message: { content: 'hello' } }],
           usage: { prompt_tokens: 1, completion_tokens: 1 },
         },
       },

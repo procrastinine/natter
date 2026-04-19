@@ -19,17 +19,15 @@ test.beforeEach(async ({ page }) => {
   await seedFirstRun(page)
 })
 
-test('a single crashed Message renders a replacement; peers remain interactive', async ({ page }) => {
+test('a single crashed Message renders a replacement; peers remain interactive', async ({
+  page,
+}) => {
   await mockChatCompletions(page, {
-    body: buildSseBody([
-      { id: 'boundary', content: 'ok-1', finish: 'stop' },
-    ]),
+    body: buildSseBody([{ id: 'boundary', content: 'ok-1', finish: 'stop' }]),
   })
   await createChatAndOpen(page)
   await sendMessage(page, 'hello one')
-  await expect(
-    page.locator('[data-ui="message"][data-role="assistant"]').first(),
-  ).toBeVisible()
+  await expect(page.locator('[data-ui="message"][data-role="assistant"]').first()).toBeVisible()
 
   const chatId = await firstChatId(page)
   // Toggle debugCrash=true on the first assistant row. The raw IDB write
@@ -74,22 +72,29 @@ test('a single crashed Message renders a replacement; peers remain interactive',
 
   // The user row still renders normally.
   await expect(
-    page.locator('[data-ui="message"][data-role="user"]').first().locator('[data-ui="message-body"]'),
+    page
+      .locator('[data-ui="message"][data-role="user"]')
+      .first()
+      .locator('[data-ui="message-body"]'),
   ).toHaveText('hello one')
 
   // Composer still works: queue a second mock, send, see a new assistant row.
   await mockChatCompletions(page, {
-    body: buildSseBody([
-      { id: 'boundary-2', content: 'ok-2', finish: 'stop' },
-    ]),
+    body: buildSseBody([{ id: 'boundary-2', content: 'ok-2', finish: 'stop' }]),
   })
   await sendMessage(page, 'second')
   // After the crash, the message list still receives + renders new rows.
   // There will be: user "hello one", crashed block, user "second", assistant "ok-2".
   await expect(
-    page.locator('[data-ui="message"][data-role="user"]').nth(1).locator('[data-ui="message-body"]'),
+    page
+      .locator('[data-ui="message"][data-role="user"]')
+      .nth(1)
+      .locator('[data-ui="message-body"]'),
   ).toHaveText('second')
   await expect(
-    page.locator('[data-ui="message"][data-role="assistant"]').last().locator('[data-ui="message-body"]'),
+    page
+      .locator('[data-ui="message"][data-role="assistant"]')
+      .last()
+      .locator('[data-ui="message-body"]'),
   ).toHaveText('ok-2')
 })

@@ -1,10 +1,6 @@
 import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import {
-  __resetBroadcastForTests,
-  type BroadcastEvent,
-  onEvent,
-} from '../../src/store/broadcast'
+import { __resetBroadcastForTests, type BroadcastEvent, onEvent } from '../../src/store/broadcast'
 import { __resetDbForTests, openDb } from '../../src/store/db'
 import {
   clearEndpointsCacheForProfile,
@@ -25,11 +21,7 @@ import {
   putCachedPrivacyPolicy,
   putCachedProviders,
 } from '../../src/store/privacy-cache'
-import {
-  deleteSetting,
-  getSetting,
-  setSetting,
-} from '../../src/store/settings'
+import { deleteSetting, getSetting, setSetting } from '../../src/store/settings'
 
 const DB_NAME = 'natter'
 

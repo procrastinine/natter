@@ -15,12 +15,8 @@ describe('normalizeError', () => {
   })
 
   it('classifies 401 as unauthorized, 402 as payment_required', () => {
-    expect(
-      normalizeError({}, { midStream: false, httpStatus: 401 }).kind,
-    ).toBe('unauthorized')
-    expect(
-      normalizeError({}, { midStream: false, httpStatus: 402 }).kind,
-    ).toBe('payment_required')
+    expect(normalizeError({}, { midStream: false, httpStatus: 401 }).kind).toBe('unauthorized')
+    expect(normalizeError({}, { midStream: false, httpStatus: 402 }).kind).toBe('payment_required')
   })
 
   it('splits 403 into moderation (with metadata.reasons) vs unauthorized (without)', () => {
@@ -79,10 +75,7 @@ describe('normalizeError', () => {
   })
 
   it('mid-stream chunk with error.code gets classified and tagged midStream', () => {
-    const err = normalizeError(
-      { error: { code: 429, message: 'slow down' } },
-      { midStream: true },
-    )
+    const err = normalizeError({ error: { code: 429, message: 'slow down' } }, { midStream: true })
     expect(err.kind).toBe('rate_limited')
     expect(err.midStream).toBe(true)
     expect(err.httpStatus).toBe(429)

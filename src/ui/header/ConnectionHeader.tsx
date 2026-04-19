@@ -1,20 +1,15 @@
 import { useLiveQuery } from 'dexie-react-hooks'
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import type {
-  ConnectionKind,
-  ConnectionProfile,
-  KeyRecord,
-  ProfileId,
-} from '../../core/types'
-import { getDb } from '../../store/db'
 import { runFirstRunSeed } from '../../core/defaults'
+import type { ConnectionKind, ConnectionProfile, KeyRecord, ProfileId } from '../../core/types'
+import { getDb } from '../../store/db'
+import { createKey } from '../../store/keys'
 import {
   bumpProfileLastUsedAt,
   createProfile,
   deleteProfile,
   updateProfile,
 } from '../../store/profiles'
-import { createKey } from '../../store/keys'
 import { ChevronIcon, CloseIcon } from '../icons/Icon'
 
 interface HeaderState {
@@ -44,7 +39,7 @@ async function loadHeaderState(activeId: ProfileId | null): Promise<HeaderState>
     .sort((a, b) => (b.lastUsedAt ?? 0) - (a.lastUsedAt ?? 0))
   const found = activeId ? live.find((p) => p.id === activeId) : undefined
   const profile = found ?? live[0] ?? null
-  const keyRecord = profile ? (await db.keys.get(profile.apiKeyRef)) ?? null : null
+  const keyRecord = profile ? ((await db.keys.get(profile.apiKeyRef)) ?? null) : null
   return { profile, profiles: live, keyRecord }
 }
 
@@ -79,14 +74,12 @@ function kindRequiresKey(kind: ConnectionKind): boolean {
 const PLACEHOLDER_KEY = '••••••••••••••••'
 
 export function ConnectionHeader() {
-  const [activeId, setActiveId] = useState<ProfileId | null>(() =>
-    readActiveProfileId(),
-  )
-  const state = useLiveQuery(
-    () => loadHeaderState(activeId),
-    [activeId],
-    { profile: null, profiles: [], keyRecord: null },
-  )
+  const [activeId, setActiveId] = useState<ProfileId | null>(() => readActiveProfileId())
+  const state = useLiveQuery(() => loadHeaderState(activeId), [activeId], {
+    profile: null,
+    profiles: [],
+    keyRecord: null,
+  })
   const [open, setOpen] = useState(false)
   const [editing, setEditing] = useState(false)
   const [setupOpen, setSetupOpen] = useState(false)
@@ -98,14 +91,11 @@ export function ConnectionHeader() {
     setEditing(false)
   }, [state.profile?.id])
 
-  const switchProfile = useCallback(
-    async (id: ProfileId) => {
-      writeActiveProfileId(id)
-      setActiveId(id)
-      await bumpProfileLastUsedAt(id)
-    },
-    [],
-  )
+  const switchProfile = useCallback(async (id: ProfileId) => {
+    writeActiveProfileId(id)
+    setActiveId(id)
+    await bumpProfileLastUsedAt(id)
+  }, [])
 
   if (!hasConnection || !state.profile) {
     return (
@@ -117,25 +107,18 @@ export function ConnectionHeader() {
         <div data-ui="connection-row">
           <span data-ui="connection-status-dot" data-state="unset" aria-hidden="true" />
           <span data-ui="connection-empty">No connection configured</span>
-          <button
-            type="button"
-            data-ui="connection-add"
-            onClick={() => setSetupOpen(true)}
-          >
+          <button type="button" data-ui="connection-add" onClick={() => setSetupOpen(true)}>
             Add connection
           </button>
         </div>
-        {setupOpen ? (
-          <ConnectionSetupModal onClose={() => setSetupOpen(false)} />
-        ) : null}
+        {setupOpen ? <ConnectionSetupModal onClose={() => setSetupOpen(false)} /> : null}
       </section>
     )
   }
 
   const { profile, profiles, keyRecord } = state
-  const status: 'ready' | 'no-key' = keyRecord || !kindRequiresKey(profile.kind)
-    ? 'ready'
-    : 'no-key'
+  const status: 'ready' | 'no-key' =
+    keyRecord || !kindRequiresKey(profile.kind) ? 'ready' : 'no-key'
 
   return (
     <section
@@ -173,9 +156,7 @@ export function ConnectionHeader() {
           }
           aria-hidden="true"
         />
-        <span data-ui="connection-status-text">
-          {status === 'ready' ? 'ready' : 'no key'}
-        </span>
+        <span data-ui="connection-status-text">{status === 'ready' ? 'ready' : 'no key'}</span>
       </button>
       {open ? (
         <div data-ui="connection-detail" id="connection-header-detail">
@@ -206,9 +187,7 @@ export function ConnectionHeader() {
           )}
         </div>
       ) : null}
-      {setupOpen ? (
-        <ConnectionSetupModal onClose={() => setSetupOpen(false)} />
-      ) : null}
+      {setupOpen ? <ConnectionSetupModal onClose={() => setSetupOpen(false)} /> : null}
     </section>
   )
 }
@@ -220,12 +199,7 @@ interface ProfileSwitcherProps {
   onCreateNew: () => void
 }
 
-function ProfileSwitcher({
-  profiles,
-  activeId,
-  onSwitch,
-  onCreateNew,
-}: ProfileSwitcherProps) {
+function ProfileSwitcher({ profiles, activeId, onSwitch, onCreateNew }: ProfileSwitcherProps) {
   return (
     <div data-ui="connection-switcher">
       <label htmlFor="connection-profile-select">Profile</label>
@@ -300,13 +274,7 @@ interface ConnectionEditorProps {
   onDeleted: () => void
 }
 
-function ConnectionEditor({
-  profile,
-  hasKey,
-  onDone,
-  onCancel,
-  onDeleted,
-}: ConnectionEditorProps) {
+function ConnectionEditor({ profile, hasKey, onDone, onCancel, onDeleted }: ConnectionEditorProps) {
   const [name, setName] = useState(profile.name)
   const [kind, setKind] = useState<ConnectionKind>(profile.kind)
   const [baseUrl, setBaseUrl] = useState(profile.baseUrl)
@@ -320,7 +288,7 @@ function ConnectionEditor({
   const trimmedKey = keyDraft.trim()
   const lockedBaseUrl = KIND_LOCKED_BASE_URL[kind]
   const baseUrlIsLocked = lockedBaseUrl !== null
-  const effectiveBaseUrl = baseUrlIsLocked ? lockedBaseUrl ?? '' : baseUrl
+  const effectiveBaseUrl = baseUrlIsLocked ? (lockedBaseUrl ?? '') : baseUrl
   const trimmedBaseUrl = effectiveBaseUrl.trim()
   const trimmedName = name.trim()
   const baseUrlValid = useMemo(() => isValidHttpUrl(trimmedBaseUrl), [trimmedBaseUrl])
@@ -336,10 +304,8 @@ function ConnectionEditor({
     kindChanged ||
     effectiveBaseUrl !== profile.baseUrl ||
     trimmedKey.length > 0
-  const keyMissing =
-    requiresKey && trimmedKey.length === 0 && !allowEmptyKey
-  const canSave =
-    baseUrlValid && trimmedName.length > 0 && dirty && !keyMissing && !busy
+  const keyMissing = requiresKey && trimmedKey.length === 0 && !allowEmptyKey
+  const canSave = baseUrlValid && trimmedName.length > 0 && dirty && !keyMissing && !busy
 
   const submit = useCallback(async () => {
     if (!canSave) return
@@ -405,15 +371,7 @@ function ConnectionEditor({
     } finally {
       setBusy(false)
     }
-  }, [
-    baseUrlValid,
-    keyMissing,
-    saveAsName,
-    trimmedKey,
-    kind,
-    trimmedBaseUrl,
-    onDone,
-  ])
+  }, [baseUrlValid, keyMissing, saveAsName, trimmedKey, kind, trimmedBaseUrl, onDone])
 
   const submitDelete = useCallback(async () => {
     if (!window.confirm(`Delete connection "${profile.name}"? This cannot be undone.`)) {
@@ -487,9 +445,7 @@ function ConnectionEditor({
           readOnly={baseUrlIsLocked}
         />
         {baseUrlIsLocked ? (
-          <span data-ui="helper">
-            Fixed for this provider. Switch to "Custom" to change it.
-          </span>
+          <span data-ui="helper">Fixed for this provider. Switch to "Custom" to change it.</span>
         ) : trimmedBaseUrl.length > 0 && !baseUrlValid ? (
           <span data-ui="helper" data-validation="invalid">
             Enter a full URL starting with http:// or https://.
@@ -591,11 +547,7 @@ function ConnectionEditor({
             >
               Cancel
             </button>
-            <button
-              type="submit"
-              data-ui="connection-edit-save"
-              disabled={!canSave}
-            >
+            <button type="submit" data-ui="connection-edit-save" disabled={!canSave}>
               {busy ? 'Saving…' : 'Save'}
             </button>
           </>
@@ -694,9 +646,8 @@ function ConnectionSetupModal({ onClose }: ConnectionSetupModalProps) {
         <div data-ui="settings-section">
           <h3>OpenRouter</h3>
           <p data-ui="helper">
-            Paste an OpenRouter API key. The first connection is created
-            automatically; you can add more from the connection header dropdown
-            once it's set up.
+            Paste an OpenRouter API key. The first connection is created automatically; you can add
+            more from the connection header dropdown once it's set up.
           </p>
           <div data-ui="field-group">
             <label htmlFor="connection-setup-key">API key</label>
@@ -717,11 +668,7 @@ function ConnectionSetupModal({ onClose }: ConnectionSetupModalProps) {
               {error}
             </span>
           ) : null}
-          <button
-            type="submit"
-            data-ui="connection-setup-submit"
-            disabled={busy || !trimmed}
-          >
+          <button type="submit" data-ui="connection-setup-submit" disabled={busy || !trimmed}>
             {busy ? 'Saving…' : 'Save'}
           </button>
         </footer>

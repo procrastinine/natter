@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import type { Chat } from '../../core/types'
 import { estimateTokensByTokenizer } from '../../core/tokens'
+import type { Chat } from '../../core/types'
 import { updateChatSettings } from '../../store/chats'
 
 export interface SystemPromptEditorProps {
@@ -13,9 +13,7 @@ const TOAST_STORAGE_KEY = 'natter:system-prompt-toast-shown'
 
 export function SystemPromptEditor({ chat }: SystemPromptEditorProps) {
   const [draft, setDraft] = useState(chat.settings.systemPrompt)
-  const [estimateText, setEstimateText] = useState(() =>
-    chat.settings.systemPrompt,
-  )
+  const [estimateText, setEstimateText] = useState(() => chat.settings.systemPrompt)
   const [toastVisible, setToastVisible] = useState(false)
   // Reset local draft whenever the upstream chat row swaps (chat navigation).
   const lastChatIdRef = useRef(chat.id)
@@ -37,10 +35,7 @@ export function SystemPromptEditor({ chat }: SystemPromptEditorProps) {
     const id = setTimeout(async () => {
       const saved = await updateChatSettings(chat.id, { systemPrompt: draft })
       if (saved) {
-        if (
-          typeof window !== 'undefined' &&
-          !window.sessionStorage.getItem(TOAST_STORAGE_KEY)
-        ) {
+        if (typeof window !== 'undefined' && !window.sessionStorage.getItem(TOAST_STORAGE_KEY)) {
           window.sessionStorage.setItem(TOAST_STORAGE_KEY, '1')
           setToastVisible(true)
           window.setTimeout(() => setToastVisible(false), 4000)
@@ -49,17 +44,14 @@ export function SystemPromptEditor({ chat }: SystemPromptEditorProps) {
     }, SAVE_DEBOUNCE_MS)
     return () => clearTimeout(id)
   }, [draft, chat.id, chat.settings.systemPrompt])
-  const tokens = useMemo(
-    () => estimateTokensByTokenizer(estimateText, null),
-    [estimateText],
-  )
+  const tokens = useMemo(() => estimateTokensByTokenizer(estimateText, null), [estimateText])
   return (
     <div data-ui="settings-section">
       <h3>System prompt</h3>
       {toastVisible ? (
         <div data-ui="settings-toast" role="status">
-          System prompt updated — it takes effect on your next send. Earlier
-          responses used the previous prompt.
+          System prompt updated — it takes effect on your next send. Earlier responses used the
+          previous prompt.
         </div>
       ) : null}
       <div data-ui="field-group">

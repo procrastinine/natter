@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from 'react'
+import { type ReactNode, useState } from 'react'
 
 export interface MessageStreamOverflowProps {
   totalChars: number
@@ -28,14 +28,10 @@ export function MessageStreamOverflow({
       <div data-overflow="truncated">{truncatedChildren}</div>
       <div data-ui="stream-overflow" data-state="truncated">
         <span>
-          This message is {totalChars.toLocaleString()} characters long and
-          was truncated for performance.
+          This message is {totalChars.toLocaleString()} characters long and was truncated for
+          performance.
         </span>
-        <button
-          type="button"
-          data-ui="stream-overflow-reveal"
-          onClick={() => setRevealed(true)}
-        >
+        <button type="button" data-ui="stream-overflow-reveal" onClick={() => setRevealed(true)}>
           Show full
         </button>
       </div>

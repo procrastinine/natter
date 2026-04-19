@@ -8,9 +8,9 @@
 // flatten-export (with attachments, tool calls, and per-branch options)
 // lands in plan/12-features §12.13.
 
+import { getChat, loadChatMessages } from '../store/chats'
 import { activePath } from './active-path'
 import type { ChatId, CursorMap, Message } from './types'
-import { loadChatMessages, getChat } from '../store/chats'
 
 function flattenMessageText(msg: Message): string {
   return msg.content
@@ -34,10 +34,7 @@ export async function exportChatAsTxt(
   chatId: ChatId,
   cursor: CursorMap = {},
 ): Promise<{ filename: string; content: string }> {
-  const [chat, messages] = await Promise.all([
-    getChat(chatId),
-    loadChatMessages(chatId),
-  ])
+  const [chat, messages] = await Promise.all([getChat(chatId), loadChatMessages(chatId)])
   const path = activePath(messages, cursor)
   const title = chat?.title?.trim().length ? chat.title : 'Untitled chat'
   const header = `# ${title}\n\n`

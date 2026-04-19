@@ -8,7 +8,7 @@
 //   per §8.4.9.
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { pasteImport, type PasteImportSlot } from '../../core/messages'
+import { type PasteImportSlot, pasteImport } from '../../core/messages'
 import type { ChatId, ContentItem, CursorMap, MessageRole } from '../../core/types'
 import { CloseIcon, TrashIcon } from '../icons/Icon'
 
@@ -81,8 +81,7 @@ export function ImportModal({
   const addRow = useCallback(() => {
     setRows((prev) => {
       const last = prev[prev.length - 1] as Row | undefined
-      const nextRole: MessageRole =
-        last?.role === 'user' ? 'assistant' : 'user'
+      const nextRole: MessageRole = last?.role === 'user' ? 'assistant' : 'user'
       return [...prev, { role: nextRole, text: '' }]
     })
   }, [])
@@ -111,9 +110,7 @@ export function ImportModal({
       let effectiveChatId: ChatId | null = chatId
       if (effectiveChatId === null) {
         if (!materializeChat) {
-          throw new Error(
-            'import: no chat to write into and no materializeChat callback',
-          )
+          throw new Error('import: no chat to write into and no materializeChat callback')
         }
         effectiveChatId = await materializeChat()
       }
@@ -129,11 +126,7 @@ export function ImportModal({
       onDone?.()
       onClose()
     } catch (err) {
-      setError(
-        err instanceof Error
-          ? `Import failed: ${err.message}`
-          : 'Import failed.',
-      )
+      setError(err instanceof Error ? `Import failed: ${err.message}` : 'Import failed.')
     } finally {
       setBusy(false)
     }
@@ -149,12 +142,7 @@ export function ImportModal({
         if (e.target === e.currentTarget) onClose()
       }}
     >
-      <div
-        data-ui="import-modal"
-        role="dialog"
-        aria-modal="true"
-        aria-label="Import messages"
-      >
+      <div data-ui="import-modal" role="dialog" aria-modal="true" aria-label="Import messages">
         <div data-ui="import-modal-header">
           <h2>Import messages</h2>
           <button
@@ -175,11 +163,7 @@ export function ImportModal({
         ) : null}
         <div data-ui="import-modal-rows">
           {rows.map((row, i) => (
-            <div
-              key={i}
-              data-ui="import-modal-row"
-              data-role={row.role}
-            >
+            <div key={i} data-ui="import-modal-row" data-role={row.role}>
               <div data-ui="import-modal-row-head">
                 <label>
                   Role
@@ -190,9 +174,7 @@ export function ImportModal({
                     onChange={(e) =>
                       setRows((prev) =>
                         prev.map((r, idx) =>
-                          idx === i
-                            ? { ...r, role: e.target.value as MessageRole }
-                            : r,
+                          idx === i ? { ...r, role: e.target.value as MessageRole } : r,
                         ),
                       )
                     }
@@ -222,9 +204,7 @@ export function ImportModal({
                 value={row.text}
                 onChange={(e) =>
                   setRows((prev) =>
-                    prev.map((r, idx) =>
-                      idx === i ? { ...r, text: e.target.value } : r,
-                    ),
+                    prev.map((r, idx) => (idx === i ? { ...r, text: e.target.value } : r)),
                   )
                 }
                 placeholder="Paste or type the message text…"
@@ -249,12 +229,7 @@ export function ImportModal({
             + Add another message to this chain
           </button>
           <span data-ui="import-modal-spacer" />
-          <button
-            type="button"
-            data-ui="import-modal-cancel"
-            onClick={onClose}
-            disabled={busy}
-          >
+          <button type="button" data-ui="import-modal-cancel" onClick={onClose} disabled={busy}>
             Cancel
           </button>
           <button

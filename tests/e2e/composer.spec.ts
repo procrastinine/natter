@@ -73,7 +73,9 @@ test('Send is disabled while a stream owns the active placeholder', async ({ pag
   // And the abort button surfaces while streaming.
   await expect(page.locator('[data-ui="abort"]')).toBeVisible()
   // After the stream finishes, Send unlocks (once input has text again).
-  await expect(page.locator('[data-ui="message"][data-role="assistant"]')).toBeVisible({ timeout: 5000 })
+  await expect(page.locator('[data-ui="message"][data-role="assistant"]')).toBeVisible({
+    timeout: 5000,
+  })
   await input.fill('next')
   await expect(send).toBeEnabled()
 })

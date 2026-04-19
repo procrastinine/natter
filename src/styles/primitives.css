@@ -40,7 +40,7 @@ button:active:not(:disabled) {
 }
 
 button:disabled,
-button[data-state='disabled'] {
+button[data-state="disabled"] {
   opacity: var(--opacity-disabled);
   cursor: not-allowed;
 }
@@ -69,7 +69,7 @@ textarea {
   line-height: var(--line-height-body);
 }
 
-[data-ui='chip'] {
+[data-ui="chip"] {
   display: inline-flex;
   align-items: center;
   gap: var(--space-2);
@@ -82,7 +82,7 @@ textarea {
   line-height: 1;
 }
 
-[data-ui='tooltip'] {
+[data-ui="tooltip"] {
   position: absolute;
   background: var(--color-fg-primary);
   color: var(--color-fg-inverse);
@@ -93,7 +93,7 @@ textarea {
   pointer-events: none;
 }
 
-[data-ui='toast'] {
+[data-ui="toast"] {
   padding: var(--space-3) var(--space-5);
   background: var(--color-bg-surface-1);
   border: 1px solid var(--color-border-default);
@@ -101,7 +101,7 @@ textarea {
   box-shadow: var(--shadow-md);
 }
 
-[data-ui='menu'] {
+[data-ui="menu"] {
   background: var(--color-bg-surface-1);
   border: 1px solid var(--color-border-default);
   border-radius: var(--radius-md);

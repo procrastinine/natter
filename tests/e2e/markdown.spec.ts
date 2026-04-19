@@ -35,9 +35,7 @@ test('renders headings, paragraphs, lists, tables, and blockquotes from a single
     '> quoted line',
   ].join('\n')
   await mockChatCompletions(page, {
-    body: buildSseBody([
-      { id: 'md', content: markdown, finish: 'stop' },
-    ]),
+    body: buildSseBody([{ id: 'md', content: markdown, finish: 'stop' }]),
   })
   await createChatAndOpen(page)
   await sendMessage(page, 'give me everything')
@@ -49,42 +47,30 @@ test('renders headings, paragraphs, lists, tables, and blockquotes from a single
   await expect(body.locator('blockquote')).toHaveText(/quoted line/)
 })
 
-test('renders a streamed code fence with a copy/download toolbar once closed', async ({
-  page,
-}) => {
+test('renders a streamed code fence with a copy/download toolbar once closed', async ({ page }) => {
   const code = '```ts\nconst x = 1\n```'
   await mockChatCompletions(page, {
-    body: buildSseBody([
-      { id: 'code', content: code, finish: 'stop' },
-    ]),
+    body: buildSseBody([{ id: 'code', content: code, finish: 'stop' }]),
   })
   await createChatAndOpen(page)
   await sendMessage(page, 'show code')
-  const assistant = page
-    .locator('[data-ui="message"][data-role="assistant"]')
-    .first()
+  const assistant = page.locator('[data-ui="message"][data-role="assistant"]').first()
   await expect(assistant.locator('pre')).toContainText('const x = 1')
 })
 
-test('blocked images from unlisted origins render a blocked-image stub', async ({
-  page,
-}) => {
+test('blocked images from unlisted origins render a blocked-image stub', async ({ page }) => {
   const md = '![evil pixel](https://tracker.example.com/pixel.gif)'
   await mockChatCompletions(page, {
     body: buildSseBody([{ id: 'img', content: md, finish: 'stop' }]),
   })
   await createChatAndOpen(page)
   await sendMessage(page, 'trick me')
-  const assistant = page
-    .locator('[data-ui="message"][data-role="assistant"]')
-    .first()
+  const assistant = page.locator('[data-ui="message"][data-role="assistant"]').first()
   await expect(assistant.locator('img[src*="tracker.example.com"]')).toHaveCount(0)
   await expect(assistant).toContainText(/Blocked image from/i)
 })
 
-test('external links get target="_blank" rel="noopener noreferrer"', async ({
-  page,
-}) => {
+test('external links get target="_blank" rel="noopener noreferrer"', async ({ page }) => {
   await mockChatCompletions(page, {
     body: buildSseBody([
       {
@@ -96,9 +82,7 @@ test('external links get target="_blank" rel="noopener noreferrer"', async ({
   })
   await createChatAndOpen(page)
   await sendMessage(page, 'give a link')
-  const assistant = page
-    .locator('[data-ui="message"][data-role="assistant"]')
-    .first()
+  const assistant = page.locator('[data-ui="message"][data-role="assistant"]').first()
   const anchor = assistant.locator('a[href^="https://example.com"]').first()
   await expect(anchor).toBeVisible()
   expect(await anchor.getAttribute('target')).toBe('_blank')

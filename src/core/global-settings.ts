@@ -27,13 +27,7 @@ export type ChatMaxWidth = number | 'full'
 // Font family preference — applied globally via `--font-sans` on
 // :root. `'system'` defers to the OS's native UI font; the other
 // values pick a common webfont stack shipped with the OS.
-export type FontFamilyChoice =
-  | 'system'
-  | 'sans-serif'
-  | 'serif'
-  | 'monospace'
-  | 'inter'
-  | 'georgia'
+export type FontFamilyChoice = 'system' | 'sans-serif' | 'serif' | 'monospace' | 'inter' | 'georgia'
 
 // Base body font-size in CSS pixels, driving `--font-size-md`. Other
 // typographic tokens scale relative to the base so bumping this lifts
@@ -56,6 +50,13 @@ export interface GlobalPreferences {
   continuePrompt: string
   fontFamily: FontFamilyChoice
   baseFontSize: BaseFontSize
+  // Workspace-wide pinned model ids. Model picker shows these at the top.
+  // Seeded with sane defaults on first read; the user can pin/unpin any
+  // model and reorder pins.
+  pinnedModels: string[]
+  // Most-recently-used model ids (most-recent first). Drives the Recent
+  // list in the picker. Capped at 20 entries.
+  recentModels: string[]
   // Jump to the bottom when a chat opens. When false, the scroll
   // position starts wherever the browser's default places it (top
   // for fresh mounts). Independent of `autoScrollOnStream` so you
@@ -69,19 +70,27 @@ export interface GlobalPreferences {
   autoScrollOnStream: boolean
 }
 
-export const DEFAULT_GLOBAL_PREFERENCES: Readonly<GlobalPreferences> =
-  Object.freeze({
-    theme: 'system',
-    sendShortcut: 'enter',
-    userProfilePicture: 'default-person',
-    assistantProfilePicture: 'default-robot',
-    chatMaxWidth: 920,
-    continuePrompt: DEFAULT_CONTINUE_PROMPT,
-    fontFamily: 'system',
-    baseFontSize: 15,
-    autoScrollOnOpen: true,
-    autoScrollOnStream: true,
-  })
+export const DEFAULT_PINNED_MODELS: readonly string[] = Object.freeze([
+  'openai/gpt-5.4',
+  'anthropic/claude-opus-4.7',
+  'google/gemini-3.1-pro-preview',
+  'google/gemini-3.1-flash-lite-preview',
+])
+
+export const DEFAULT_GLOBAL_PREFERENCES: Readonly<GlobalPreferences> = Object.freeze({
+  theme: 'system',
+  sendShortcut: 'enter',
+  userProfilePicture: 'default-person',
+  assistantProfilePicture: 'default-robot',
+  chatMaxWidth: 920,
+  continuePrompt: DEFAULT_CONTINUE_PROMPT,
+  fontFamily: 'system',
+  baseFontSize: 15,
+  autoScrollOnOpen: true,
+  autoScrollOnStream: true,
+  pinnedModels: [...DEFAULT_PINNED_MODELS],
+  recentModels: [],
+})
 
 const THEME_KEY = 'global:theme'
 const SEND_SHORTCUT_KEY = 'global:send-shortcut'
@@ -93,6 +102,8 @@ const FONT_FAMILY_KEY = 'global:font-family'
 const BASE_FONT_SIZE_KEY = 'global:base-font-size'
 const AUTO_SCROLL_OPEN_KEY = 'global:auto-scroll-open'
 const AUTO_SCROLL_STREAM_KEY = 'global:auto-scroll-stream'
+const PINNED_MODELS_KEY = 'global:pinned-models'
+const RECENT_MODELS_KEY = 'global:recent-models'
 // Legacy single-flag key — used for migration so existing installs
 // don't suddenly flip to the default. Read on boot, split into the
 // two new keys, then retired.
@@ -106,8 +117,7 @@ export const FONT_FAMILY_OPTIONS: ReadonlyArray<{
   {
     value: 'system',
     label: 'System',
-    stack:
-      'system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif',
+    stack: 'system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif',
   },
   {
     value: 'sans-serif',
@@ -122,14 +132,12 @@ export const FONT_FAMILY_OPTIONS: ReadonlyArray<{
   {
     value: 'monospace',
     label: 'Monospace (Menlo / Consolas)',
-    stack:
-      '"SF Mono", Menlo, Consolas, "Liberation Mono", "Courier New", monospace',
+    stack: '"SF Mono", Menlo, Consolas, "Liberation Mono", "Courier New", monospace',
   },
   {
     value: 'inter',
     label: 'Inter (if installed)',
-    stack:
-      '"Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+    stack: '"Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
   },
   {
     value: 'georgia',
@@ -138,9 +146,7 @@ export const FONT_FAMILY_OPTIONS: ReadonlyArray<{
   },
 ]
 
-export const BASE_FONT_SIZE_OPTIONS: readonly BaseFontSize[] = [
-  13, 14, 15, 16, 17, 18,
-]
+export const BASE_FONT_SIZE_OPTIONS: readonly BaseFontSize[] = [13, 14, 15, 16, 17, 18]
 
 function fontFamilyOrDefault(value: unknown): FontFamilyChoice {
   const allowed = new Set(FONT_FAMILY_OPTIONS.map((f) => f.value))
@@ -150,37 +156,32 @@ function fontFamilyOrDefault(value: unknown): FontFamilyChoice {
 }
 
 function baseFontSizeOrDefault(value: unknown): BaseFontSize {
-  return typeof value === 'number' &&
-    (BASE_FONT_SIZE_OPTIONS as readonly number[]).includes(value)
+  return typeof value === 'number' && (BASE_FONT_SIZE_OPTIONS as readonly number[]).includes(value)
     ? (value as BaseFontSize)
     : DEFAULT_GLOBAL_PREFERENCES.baseFontSize
 }
 
-const ALLOWED_THEMES: readonly ThemePreference[] = [
-  'system',
-  'light',
-  'dark',
-  'high-contrast',
-]
+const ALLOWED_THEMES: readonly ThemePreference[] = ['system', 'light', 'dark', 'high-contrast']
 
 const ALLOWED_SHORTCUTS: readonly SendShortcut[] = ['enter', 'cmd-enter']
 
-const ALLOWED_PICTURES: readonly ProfilePictureRef[] = [
-  'default-person',
-  'default-robot',
-]
+const ALLOWED_PICTURES: readonly ProfilePictureRef[] = ['default-person', 'default-robot']
 
-function pictureOrDefault(
-  value: unknown,
-  fallback: ProfilePictureRef,
-): ProfilePictureRef {
+function pictureOrDefault(value: unknown, fallback: ProfilePictureRef): ProfilePictureRef {
   return ALLOWED_PICTURES.includes(value as ProfilePictureRef)
     ? (value as ProfilePictureRef)
     : fallback
 }
 
 const ALLOWED_CHAT_MAX_WIDTHS: readonly ChatMaxWidth[] = [
-  640, 720, 840, 920, 1040, 1200, 1440, 'full',
+  640,
+  720,
+  840,
+  920,
+  1040,
+  1200,
+  1440,
+  'full',
 ]
 
 function chatMaxWidthOrDefault(value: unknown): ChatMaxWidth {
@@ -206,6 +207,8 @@ export async function readGlobalPreferences(): Promise<GlobalPreferences> {
     autoScrollOpen,
     autoScrollStream,
     legacyAutoScroll,
+    pinned,
+    recent,
   ] = await Promise.all([
     getSetting<ThemePreference>(THEME_KEY),
     getSetting<SendShortcut>(SEND_SHORTCUT_KEY),
@@ -218,6 +221,8 @@ export async function readGlobalPreferences(): Promise<GlobalPreferences> {
     getSetting<boolean>(AUTO_SCROLL_OPEN_KEY),
     getSetting<boolean>(AUTO_SCROLL_STREAM_KEY),
     getSetting<boolean>(LEGACY_AUTO_SCROLL_KEY),
+    getSetting<string[]>(PINNED_MODELS_KEY),
+    getSetting<string[]>(RECENT_MODELS_KEY),
   ])
   return {
     theme: ALLOWED_THEMES.includes(theme as ThemePreference)
@@ -226,10 +231,7 @@ export async function readGlobalPreferences(): Promise<GlobalPreferences> {
     sendShortcut: ALLOWED_SHORTCUTS.includes(sendShortcut as SendShortcut)
       ? (sendShortcut as SendShortcut)
       : DEFAULT_GLOBAL_PREFERENCES.sendShortcut,
-    userProfilePicture: pictureOrDefault(
-      userPic,
-      DEFAULT_GLOBAL_PREFERENCES.userProfilePicture,
-    ),
+    userProfilePicture: pictureOrDefault(userPic, DEFAULT_GLOBAL_PREFERENCES.userProfilePicture),
     assistantProfilePicture: pictureOrDefault(
       asstPic,
       DEFAULT_GLOBAL_PREFERENCES.assistantProfilePicture,
@@ -253,7 +255,28 @@ export async function readGlobalPreferences(): Promise<GlobalPreferences> {
         : typeof legacyAutoScroll === 'boolean'
           ? legacyAutoScroll
           : DEFAULT_GLOBAL_PREFERENCES.autoScrollOnStream,
+    pinnedModels: Array.isArray(pinned) ? pinned.filter((x) => typeof x === 'string') : [...DEFAULT_PINNED_MODELS],
+    recentModels: Array.isArray(recent) ? recent.filter((x) => typeof x === 'string') : [],
   }
+}
+
+export async function writePinnedModels(value: readonly string[]): Promise<void> {
+  await setSetting(PINNED_MODELS_KEY, [...value])
+}
+
+export async function writeRecentModels(value: readonly string[]): Promise<void> {
+  await setSetting(RECENT_MODELS_KEY, [...value])
+}
+
+// Move `modelId` to the head of the recent-models list, deduped, capped at
+// 20 entries. Used by the send pipeline to keep the picker's Recent tab
+// ordered by actual usage.
+export async function bumpRecentModel(modelId: string): Promise<void> {
+  if (!modelId) return
+  const current = (await readGlobalPreferences()).recentModels
+  const deduped = current.filter((id) => id !== modelId)
+  deduped.unshift(modelId)
+  await writeRecentModels(deduped.slice(0, 20))
 }
 
 export async function writeTheme(theme: ThemePreference): Promise<void> {
@@ -264,15 +287,11 @@ export async function writeSendShortcut(value: SendShortcut): Promise<void> {
   await setSetting(SEND_SHORTCUT_KEY, value)
 }
 
-export async function writeUserProfilePicture(
-  value: ProfilePictureRef,
-): Promise<void> {
+export async function writeUserProfilePicture(value: ProfilePictureRef): Promise<void> {
   await setSetting(USER_PIC_KEY, value)
 }
 
-export async function writeAssistantProfilePicture(
-  value: ProfilePictureRef,
-): Promise<void> {
+export async function writeAssistantProfilePicture(value: ProfilePictureRef): Promise<void> {
   await setSetting(ASSISTANT_PIC_KEY, value)
 }
 

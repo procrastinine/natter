@@ -52,9 +52,7 @@ export function normalizeMutationScopes(scopes: readonly MutationScope[]): Mutat
   for (const scope of scopes) {
     keyed.set(scopeResourceName(scope), scope)
   }
-  return [...keyed.entries()]
-    .sort(([a], [b]) => compareScopeKeys(a, b))
-    .map(([, scope]) => scope)
+  return [...keyed.entries()].sort(([a], [b]) => compareScopeKeys(a, b)).map(([, scope]) => scope)
 }
 
 export function assertAcquireOrder(resourceName: string): void {
@@ -92,10 +90,7 @@ export async function withTrackedScopes<T>(
   }
 }
 
-async function withFallbackLock<T>(
-  resourceName: string,
-  fn: () => Promise<T> | T,
-): Promise<T> {
+async function withFallbackLock<T>(resourceName: string, fn: () => Promise<T> | T): Promise<T> {
   const prior = FALLBACK_QUEUES.get(resourceName) ?? Promise.resolve()
   let release!: () => void
   const gate = new Promise<void>((resolve) => {
@@ -114,10 +109,7 @@ async function withFallbackLock<T>(
   }
 }
 
-async function withSingleScopeLock<T>(
-  resourceName: string,
-  fn: () => Promise<T> | T,
-): Promise<T> {
+async function withSingleScopeLock<T>(resourceName: string, fn: () => Promise<T> | T): Promise<T> {
   if (typeof navigator !== 'undefined' && 'locks' in navigator && navigator.locks) {
     return navigator.locks.request(resourceName, async () => fn())
   }

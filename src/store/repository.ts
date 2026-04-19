@@ -40,11 +40,7 @@ export interface ChatMetaPatchOptions {
 
 export interface MutationContext {
   getChat(chatId: ChatId): Promise<Chat | undefined>
-  patchChatMeta(
-    chatId: ChatId,
-    patch: Partial<Chat>,
-    options?: ChatMetaPatchOptions,
-  ): void
+  patchChatMeta(chatId: ChatId, patch: Partial<Chat>, options?: ChatMetaPatchOptions): void
   patchChatSummary(chatId: ChatId, patch: Partial<Chat>): void
   getMessage(messageId: MessageId): Promise<Message | undefined>
   listMessages(chatId: ChatId): Promise<Message[]>

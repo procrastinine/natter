@@ -22,9 +22,7 @@ test('streaming text keeps the scroll region in follow state; scrolling up flips
   // Big output so the scroll region actually overflows.
   const huge = 'x'.repeat(12_000)
   await mockChatCompletions(page, {
-    body: buildSseBody([
-      { id: 'big-1', content: huge, finish: 'stop' },
-    ]),
+    body: buildSseBody([{ id: 'big-1', content: huge, finish: 'stop' }]),
   })
   await createChatAndOpen(page)
   await sendMessage(page, 'fill the viewport')

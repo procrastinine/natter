@@ -152,10 +152,10 @@ describe('tokens.css required tokens', () => {
 describe('themes.css required selectors', () => {
   const source = readFileSync(THEMES_PATH, 'utf8')
   it('defines [data-theme="dark"] overrides', () => {
-    expect(source).toMatch(/\[data-theme='dark'\]/)
+    expect(source).toMatch(/\[data-theme=["']dark["']\]/)
   })
   it('defines [data-theme="high-contrast"] overrides', () => {
-    expect(source).toMatch(/\[data-theme='high-contrast'\]/)
+    expect(source).toMatch(/\[data-theme=["']high-contrast["']\]/)
   })
   it('ships an automatic dark fallback under prefers-color-scheme', () => {
     expect(source).toMatch(/@media\s*\(prefers-color-scheme:\s*dark\)/)

@@ -18,7 +18,7 @@
 
 import type { KeyId, KeyRecord } from '../core/types'
 import { newId } from '../lib/ulid'
-import { postEvent, onEvent } from './broadcast'
+import { onEvent, postEvent } from './broadcast'
 import { getDb } from './db'
 import { getSetting, setSetting } from './settings'
 
@@ -96,10 +96,7 @@ export async function getOrCreateInstallSecret(): Promise<string> {
   return fresh
 }
 
-async function deriveWrapperKey(
-  passphraseOrSecret: string,
-  salt: Uint8Array,
-): Promise<CryptoKey> {
+async function deriveWrapperKey(passphraseOrSecret: string, salt: Uint8Array): Promise<CryptoKey> {
   const material = await crypto.subtle.importKey(
     'raw',
     new TextEncoder().encode(passphraseOrSecret),
@@ -148,8 +145,7 @@ export async function createKey(input: CreateKeyInput): Promise<KeyRecord> {
   ensureBroadcastHook()
   const salt = randomBytes(16)
   const iv = randomBytes(12)
-  const wrapperSecret =
-    input.passphrase ?? (await getOrCreateInstallSecret())
+  const wrapperSecret = input.passphrase ?? (await getOrCreateInstallSecret())
   const wrapperKey = await deriveWrapperKey(wrapperSecret, salt)
   const ciphertextBuffer = await crypto.subtle.encrypt(
     { name: 'AES-GCM', iv: iv as BufferSource },
@@ -195,10 +191,7 @@ export interface ResolveKeyOptions {
 // fetch() and drops the reference. For install-secret keys, no passphrase
 // prompt is needed. For passphrase keys, we require `opts.passphrase` on the
 // FIRST decrypt per tab; subsequent calls reuse the in-memory derived wrapper.
-export async function resolveKey(
-  keyId: KeyId,
-  opts: ResolveKeyOptions = {},
-): Promise<string> {
+export async function resolveKey(keyId: KeyId, opts: ResolveKeyOptions = {}): Promise<string> {
   ensureBroadcastHook()
   const record = await getKey(keyId)
   if (!record) throw new KeyMissingError(keyId)
@@ -209,10 +202,7 @@ export async function resolveKey(
   return new TextDecoder().decode(plaintextBuffer)
 }
 
-async function resolveWrapperKey(
-  record: KeyRecord,
-  opts: ResolveKeyOptions,
-): Promise<CryptoKey> {
+async function resolveWrapperKey(record: KeyRecord, opts: ResolveKeyOptions): Promise<CryptoKey> {
   const cached = derivedKeyCache.get(record.id)
   if (cached) return cached
   const salt = base64ToBytes(record.salt)
@@ -259,9 +249,7 @@ export interface ChangePassphraseInput {
 // install-secret mode). Unlock the old ciphertext first; derive a fresh salt;
 // re-encrypt; write back; broadcast `key-rotated` so other tabs drop cached
 // wrappers per §9.3.4.
-export async function changePassphrase(
-  input: ChangePassphraseInput,
-): Promise<KeyRecord> {
+export async function changePassphrase(input: ChangePassphraseInput): Promise<KeyRecord> {
   ensureBroadcastHook()
   const plaintext = await resolveKey(input.keyId, {
     ...(input.oldPassphrase !== undefined ? { passphrase: input.oldPassphrase } : {}),
@@ -270,8 +258,7 @@ export async function changePassphrase(
   if (!existing) throw new KeyMissingError(input.keyId)
   const salt = randomBytes(16)
   const iv = randomBytes(12)
-  const wrapperSecret =
-    input.newPassphrase ?? (await getOrCreateInstallSecret())
+  const wrapperSecret = input.newPassphrase ?? (await getOrCreateInstallSecret())
   const wrapperKey = await deriveWrapperKey(wrapperSecret, salt)
   const ciphertextBuffer = await crypto.subtle.encrypt(
     { name: 'AES-GCM', iv: iv as BufferSource },
@@ -285,8 +272,7 @@ export async function changePassphrase(
     salt: bytesToBase64(salt),
   }
   if (input.newPassphrase !== undefined) {
-    next.passphraseHint =
-      input.newPassphraseHint ?? existing.passphraseHint ?? ''
+    next.passphraseHint = input.newPassphraseHint ?? existing.passphraseHint ?? ''
   } else {
     delete next.passphraseHint
   }

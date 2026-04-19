@@ -16,6 +16,7 @@
 // (and exercised by unit tests) but not consumed by `useChat` until later
 // phases.
 
+import { type ApiError, normalizeError } from './errors'
 import type {
   ChatCompletionChoiceWire,
   ChatCompletionChunkWire,
@@ -23,7 +24,6 @@ import type {
   ChatCompletionUsageWire,
   ChatStreamChunk,
 } from './types'
-import { type ApiError, normalizeError } from './errors'
 
 export type StreamLaneEvent =
   | { lane: 'text'; text: string; chunkId?: string }

@@ -30,9 +30,7 @@ export interface CreatePresetInput {
   lastUsedAt?: number
 }
 
-export async function createPreset(
-  input: CreatePresetInput,
-): Promise<ChatPreset> {
+export async function createPreset(input: CreatePresetInput): Promise<ChatPreset> {
   const db = getDb()
   const profile = await db.profiles.get(input.connectionProfileId)
   if (!profile) throw new ProfileMissingError(input.connectionProfileId)
@@ -52,15 +50,11 @@ export async function createPreset(
   return preset
 }
 
-export async function getPreset(
-  presetId: PresetId,
-): Promise<ChatPreset | undefined> {
+export async function getPreset(presetId: PresetId): Promise<ChatPreset | undefined> {
   return getDb().presets.get(presetId)
 }
 
-export async function listPresets(
-  opts: { includeArchived?: boolean } = {},
-): Promise<ChatPreset[]> {
+export async function listPresets(opts: { includeArchived?: boolean } = {}): Promise<ChatPreset[]> {
   const rows = await getDb().presets.toArray()
   return opts.includeArchived ? rows : rows.filter((p) => p.archived !== true)
 }
@@ -116,26 +110,17 @@ export async function duplicatePreset(
   return copy
 }
 
-export async function archivePreset(
-  presetId: PresetId,
-  now = Date.now(),
-): Promise<void> {
+export async function archivePreset(presetId: PresetId, now = Date.now()): Promise<void> {
   await updatePreset(presetId, { archived: true }, { now })
 }
 
-export async function unarchivePreset(
-  presetId: PresetId,
-  now = Date.now(),
-): Promise<void> {
+export async function unarchivePreset(presetId: PresetId, now = Date.now()): Promise<void> {
   await updatePreset(presetId, { archived: false }, { now })
 }
 
 // Delete a preset. Chats that were created from this preset keep their
 // settings; their `presetId` breadcrumb is cleared. See §9.2.B.
-export async function deletePreset(
-  presetId: PresetId,
-  opts: { now?: number } = {},
-): Promise<void> {
+export async function deletePreset(presetId: PresetId, opts: { now?: number } = {}): Promise<void> {
   const db = getDb()
   const existing = await db.presets.get(presetId)
   if (!existing) throw new PresetMissingError(presetId)
@@ -156,10 +141,7 @@ export async function deletePreset(
   postEvent({ kind: 'preset-deleted', presetId })
 }
 
-export async function bumpPresetLastUsedAt(
-  presetId: PresetId,
-  now = Date.now(),
-): Promise<void> {
+export async function bumpPresetLastUsedAt(presetId: PresetId, now = Date.now()): Promise<void> {
   const db = getDb()
   const existing = await db.presets.get(presetId)
   if (!existing) return

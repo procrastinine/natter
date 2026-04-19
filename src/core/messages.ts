@@ -1,3 +1,17 @@
+import { newId } from '../lib/ulid'
+import { decRefs, diffAttachmentRefs, incRefs } from '../store/attachments'
+import { getBrowserRepository } from '../store/browser-repo'
+import type { MutationContext, WorkspaceMutationResult } from '../store/repository'
+import { cursorKeyOf, groupByParent, indexById } from './active-path'
+import { cloneForExplicitBranch } from './branching'
+import {
+  cascadeSoftDelete,
+  collectTurnChain,
+  nextSiblingIndex,
+  softDeleteWithSplice,
+  TreeChangedError,
+  turnHeadOf,
+} from './tree-ops'
 import type {
   AttachmentId,
   ChatId,
@@ -11,20 +25,6 @@ import type {
   MutationScope,
   TurnId,
 } from './types'
-import { cursorKeyOf, groupByParent, indexById } from './active-path'
-import { cloneForExplicitBranch } from './branching'
-import {
-  TreeChangedError,
-  cascadeSoftDelete,
-  collectTurnChain,
-  nextSiblingIndex,
-  softDeleteWithSplice,
-  turnHeadOf,
-} from './tree-ops'
-import { newId } from '../lib/ulid'
-import { decRefs, diffAttachmentRefs, incRefs } from '../store/attachments'
-import { getBrowserRepository } from '../store/browser-repo'
-import type { MutationContext, WorkspaceMutationResult } from '../store/repository'
 
 export interface StructuralEffects {
   cursorUpdates: CursorMap
@@ -52,10 +52,7 @@ function emptyEffects(): StructuralEffects {
   }
 }
 
-function versionsFor<T>(
-  result: WorkspaceMutationResult<T>,
-  chatId: ChatId,
-): ChatVersions {
+function versionsFor<T>(result: WorkspaceMutationResult<T>, chatId: ChatId): ChatVersions {
   return result.chatVersions[chatId] ?? ZERO_VERSIONS
 }
 
@@ -106,10 +103,7 @@ function withAttachmentRefs<T extends object>(
   return next
 }
 
-function resolveActiveLeafId(
-  messages: readonly Message[],
-  cursor: CursorMap,
-): MessageId | null {
+function resolveActiveLeafId(messages: readonly Message[], cursor: CursorMap): MessageId | null {
   const byParent = groupByParent(messages)
   const byId = indexById(messages)
   let parentId: MessageId | null = null
@@ -192,18 +186,13 @@ function collectPairFollowers(
     const kids = (byParent.get(currentId) ?? []).filter((kid) => !kid.deleted)
     if (kids.length === 0) break
     const pinnedId = cursor[cursorKeyOf(currentId)]
-    const pinned =
-      pinnedId !== undefined
-        ? kids.find((kid) => kid.id === pinnedId)
-        : undefined
+    const pinned = pinnedId !== undefined ? kids.find((kid) => kid.id === pinnedId) : undefined
     // Fallback when there is no cursor entry at this fork (fresh chat
     // open, or user deleted before swiping). Pick the first assistant/
     // tool/system child at turnIndex=0. Mirror the §8.3 default rule:
     // without a cursor we still need a deterministic pick so delete-pair
     // works on freshly-opened chats.
-    const fallback = kids.find(
-      (kid) => kid.turnIndex === 0 && kid.role !== 'user',
-    )
+    const fallback = kids.find((kid) => kid.turnIndex === 0 && kid.role !== 'user')
     const next = pinned ?? fallback
     if (!next || next.role === 'user') break
     result.push(next)
@@ -285,7 +274,13 @@ function collectPasteImportScopes(
   if (slot.kind === 'before') {
     return dedupeScopes([
       ...scopes,
-      ...collectInsertBetweenScopes(chatId, messages, target.parentId, target.id, newMessageIds[0] as MessageId),
+      ...collectInsertBetweenScopes(
+        chatId,
+        messages,
+        target.parentId,
+        target.id,
+        newMessageIds[0] as MessageId,
+      ),
     ])
   }
 
@@ -302,7 +297,13 @@ function collectPasteImportScopes(
 
   return dedupeScopes([
     ...scopes,
-    ...collectInsertBetweenScopes(chatId, messages, target.id, activeDescendant.id, newMessageIds[0] as MessageId),
+    ...collectInsertBetweenScopes(
+      chatId,
+      messages,
+      target.id,
+      activeDescendant.id,
+      newMessageIds[0] as MessageId,
+    ),
   ])
 }
 
@@ -314,7 +315,9 @@ function collectDeleteScopes(
 ): MutationScope[] {
   const byParent = groupByParent(messages)
   const byId = indexById(messages)
-  const idsToDelete = new Set(members.filter((member) => !member.deleted).map((member) => member.id))
+  const idsToDelete = new Set(
+    members.filter((member) => !member.deleted).map((member) => member.id),
+  )
   if (cascade) {
     const stack = [...idsToDelete]
     while (stack.length > 0) {
@@ -420,20 +423,23 @@ export async function sendUserMessage(
     ]),
     async (ctx) => {
       const effects = emptyEffects()
-      const row: Message = withAttachmentRefs({
-        id: messageId,
-        chatId,
-        parentId,
-        siblingIndex: nextSiblingIndex(groupByParent(await ctx.listMessages(chatId)), parentId),
-        turnId,
-        turnIndex: 0,
-        createdAt: now,
-        role,
-        origin,
-        content: structuredClone(content),
-        nodeVersion: 0,
-        deleted: false,
-      }, attachmentRefs)
+      const row: Message = withAttachmentRefs(
+        {
+          id: messageId,
+          chatId,
+          parentId,
+          siblingIndex: nextSiblingIndex(groupByParent(await ctx.listMessages(chatId)), parentId),
+          turnId,
+          turnIndex: 0,
+          createdAt: now,
+          role,
+          origin,
+          content: structuredClone(content),
+          nodeVersion: 0,
+          deleted: false,
+        },
+        attachmentRefs,
+      )
       await ctx.putMessage(row)
       await incRefs(ctx, attachmentRefs ?? [])
       effects.newMessageIds.push(messageId)
@@ -512,10 +518,7 @@ export async function editMessageContent(
   }
   const { toInc, toDec } = diffAttachmentRefs(target.attachmentRefs, input.attachmentRefs)
   const result = await repo.runMutation(
-    dedupeScopes([
-      messageScope(input.messageId),
-      ...attachmentScopes([...toInc, ...toDec]),
-    ]),
+    dedupeScopes([messageScope(input.messageId), ...attachmentScopes([...toInc, ...toDec])]),
     async (ctx) => {
       const current = await ctx.getMessage(input.messageId)
       if (!current || current.chatId !== input.chatId || current.deleted) {
@@ -660,20 +663,25 @@ export async function insertSibling(
         throw new TreeChangedError(input.chatId, `insert-sibling target ${target.id} unavailable`)
       }
       const all = await ctx.listMessages(input.chatId)
-      await ctx.putMessage(withAttachmentRefs({
-        id: messageId,
-        chatId: input.chatId,
-        parentId: current.parentId,
-        siblingIndex: nextSiblingIndex(groupByParent(all), current.parentId),
-        turnId: newId(),
-        turnIndex: 0,
-        createdAt: input.now ?? Date.now(),
-        role: input.role ?? current.role,
-        origin: input.origin ?? 'imported',
-        content: structuredClone(input.content),
-        nodeVersion: 0,
-        deleted: false,
-      }, input.attachmentRefs))
+      await ctx.putMessage(
+        withAttachmentRefs(
+          {
+            id: messageId,
+            chatId: input.chatId,
+            parentId: current.parentId,
+            siblingIndex: nextSiblingIndex(groupByParent(all), current.parentId),
+            turnId: newId(),
+            turnIndex: 0,
+            createdAt: input.now ?? Date.now(),
+            role: input.role ?? current.role,
+            origin: input.origin ?? 'imported',
+            content: structuredClone(input.content),
+            nodeVersion: 0,
+            deleted: false,
+          },
+          input.attachmentRefs,
+        ),
+      )
       await incRefs(ctx, input.attachmentRefs ?? [])
       const effects = emptyEffects()
       effects.newMessageIds.push(messageId)
@@ -746,7 +754,10 @@ export async function appendAsChild(
   const repo = getBrowserRepository()
   const parent = await repo.getMessage(input.parentMessageId)
   if (!parent || parent.chatId !== input.chatId || parent.deleted) {
-    throw new TreeChangedError(input.chatId, `append-as-child parent ${input.parentMessageId} unavailable`)
+    throw new TreeChangedError(
+      input.chatId,
+      `append-as-child parent ${input.parentMessageId} unavailable`,
+    )
   }
   const messageId = newId()
   const result = await repo.runMutation(
@@ -762,20 +773,25 @@ export async function appendAsChild(
         throw new TreeChangedError(input.chatId, `append-as-child parent ${parent.id} unavailable`)
       }
       const all = await ctx.listMessages(input.chatId)
-      await ctx.putMessage(withAttachmentRefs({
-        id: messageId,
-        chatId: input.chatId,
-        parentId: current.id,
-        siblingIndex: nextSiblingIndex(groupByParent(all), current.id),
-        turnId: newId(),
-        turnIndex: 0,
-        createdAt: input.now ?? Date.now(),
-        role: input.role,
-        origin: input.origin ?? 'imported',
-        content: structuredClone(input.content),
-        nodeVersion: 0,
-        deleted: false,
-      }, input.attachmentRefs))
+      await ctx.putMessage(
+        withAttachmentRefs(
+          {
+            id: messageId,
+            chatId: input.chatId,
+            parentId: current.id,
+            siblingIndex: nextSiblingIndex(groupByParent(all), current.id),
+            turnId: newId(),
+            turnIndex: 0,
+            createdAt: input.now ?? Date.now(),
+            role: input.role,
+            origin: input.origin ?? 'imported',
+            content: structuredClone(input.content),
+            nodeVersion: 0,
+            deleted: false,
+          },
+          input.attachmentRefs,
+        ),
+      )
       await incRefs(ctx, input.attachmentRefs ?? [])
       const effects = emptyEffects()
       effects.newMessageIds.push(messageId)
@@ -843,20 +859,23 @@ export async function pasteImport(
       const spec = input.messages[i] as PasteImportMessageInput
       const id = newMessageIds[i] as MessageId
       const all = await ctx.listMessages(input.chatId)
-      const row: Message = withAttachmentRefs({
-        id,
-        chatId: input.chatId,
-        parentId: tail.id,
-        siblingIndex: nextSiblingIndex(groupByParent(all), tail.id),
-        turnId: newId(),
-        turnIndex: 0,
-        createdAt: input.now ?? Date.now(),
-        role: spec.role,
-        origin: 'imported',
-        content: structuredClone(spec.content),
-        nodeVersion: 0,
-        deleted: false,
-      }, spec.attachmentRefs)
+      const row: Message = withAttachmentRefs(
+        {
+          id,
+          chatId: input.chatId,
+          parentId: tail.id,
+          siblingIndex: nextSiblingIndex(groupByParent(all), tail.id),
+          turnId: newId(),
+          turnIndex: 0,
+          createdAt: input.now ?? Date.now(),
+          role: spec.role,
+          origin: 'imported',
+          content: structuredClone(spec.content),
+          nodeVersion: 0,
+          deleted: false,
+        },
+        spec.attachmentRefs,
+      )
       await ctx.putMessage(row)
       await incRefs(ctx, spec.attachmentRefs ?? [])
       effects.newMessageIds.push(id)
@@ -887,20 +906,23 @@ async function createFirstImported(
   if (slot.kind === 'at-end') {
     const all = await ctx.listMessages(chatId)
     const leaf = resolveActiveLeafId(all, cursor)
-    const row: Message = withAttachmentRefs({
-      id: messageId,
-      chatId,
-      parentId: leaf,
-      siblingIndex: nextSiblingIndex(groupByParent(all), leaf),
-      turnId: newId(),
-      turnIndex: 0,
-      createdAt: now,
-      role: spec.role,
-      origin: 'imported',
-      content: structuredClone(spec.content),
-      nodeVersion: 0,
-      deleted: false,
-    }, spec.attachmentRefs)
+    const row: Message = withAttachmentRefs(
+      {
+        id: messageId,
+        chatId,
+        parentId: leaf,
+        siblingIndex: nextSiblingIndex(groupByParent(all), leaf),
+        turnId: newId(),
+        turnIndex: 0,
+        createdAt: now,
+        role: spec.role,
+        origin: 'imported',
+        content: structuredClone(spec.content),
+        nodeVersion: 0,
+        deleted: false,
+      },
+      spec.attachmentRefs,
+    )
     await ctx.putMessage(row)
     await incRefs(ctx, spec.attachmentRefs ?? [])
     effects.newMessageIds.push(row.id)
@@ -915,20 +937,23 @@ async function createFirstImported(
 
   if (slot.kind === 'sibling') {
     const all = await ctx.listMessages(chatId)
-    const row: Message = withAttachmentRefs({
-      id: messageId,
-      chatId,
-      parentId: target.parentId,
-      siblingIndex: nextSiblingIndex(groupByParent(all), target.parentId),
-      turnId: newId(),
-      turnIndex: 0,
-      createdAt: now,
-      role: spec.role,
-      origin: 'imported',
-      content: structuredClone(spec.content),
-      nodeVersion: 0,
-      deleted: false,
-    }, spec.attachmentRefs)
+    const row: Message = withAttachmentRefs(
+      {
+        id: messageId,
+        chatId,
+        parentId: target.parentId,
+        siblingIndex: nextSiblingIndex(groupByParent(all), target.parentId),
+        turnId: newId(),
+        turnIndex: 0,
+        createdAt: now,
+        role: spec.role,
+        origin: 'imported',
+        content: structuredClone(spec.content),
+        nodeVersion: 0,
+        deleted: false,
+      },
+      spec.attachmentRefs,
+    )
     await ctx.putMessage(row)
     await incRefs(ctx, spec.attachmentRefs ?? [])
     effects.newMessageIds.push(row.id)
@@ -983,20 +1008,23 @@ async function createFirstImported(
   }
 
   const all = await ctx.listMessages(chatId)
-  const row: Message = withAttachmentRefs({
-    id: messageId,
-    chatId,
-    parentId: target.id,
-    siblingIndex: nextSiblingIndex(groupByParent(all), target.id),
-    turnId: newId(),
-    turnIndex: 0,
-    createdAt: now,
-    role: spec.role,
-    origin: 'imported',
-    content: structuredClone(spec.content),
-    nodeVersion: 0,
-    deleted: false,
-  }, spec.attachmentRefs)
+  const row: Message = withAttachmentRefs(
+    {
+      id: messageId,
+      chatId,
+      parentId: target.id,
+      siblingIndex: nextSiblingIndex(groupByParent(all), target.id),
+      turnId: newId(),
+      turnIndex: 0,
+      createdAt: now,
+      role: spec.role,
+      origin: 'imported',
+      content: structuredClone(spec.content),
+      nodeVersion: 0,
+      deleted: false,
+    },
+    spec.attachmentRefs,
+  )
   await ctx.putMessage(row)
   await incRefs(ctx, spec.attachmentRefs ?? [])
   effects.newMessageIds.push(row.id)
@@ -1032,20 +1060,23 @@ async function insertBetweenInner(
 
   const all = await ctx.listMessages(chatId)
   const byParent = groupByParent(all)
-  const row: Message = withAttachmentRefs({
-    id: spec.id,
-    chatId,
-    parentId,
-    siblingIndex: nextSiblingIndex(byParent, parentId),
-    turnId: newId(),
-    turnIndex: 0,
-    createdAt: spec.createdAt,
-    role: spec.role,
-    origin: spec.origin,
-    content: structuredClone(spec.content),
-    nodeVersion: 0,
-    deleted: false,
-  }, spec.attachmentRefs)
+  const row: Message = withAttachmentRefs(
+    {
+      id: spec.id,
+      chatId,
+      parentId,
+      siblingIndex: nextSiblingIndex(byParent, parentId),
+      turnId: newId(),
+      turnIndex: 0,
+      createdAt: spec.createdAt,
+      role: spec.role,
+      origin: spec.origin,
+      content: structuredClone(spec.content),
+      nodeVersion: 0,
+      deleted: false,
+    },
+    spec.attachmentRefs,
+  )
   await ctx.putMessage(row)
   await incRefs(ctx, spec.attachmentRefs ?? [])
 
@@ -1151,10 +1182,7 @@ export async function deleteSingleMessage(
   const byId = indexById(all)
   const target = byId.get(input.messageId)
   if (!target || target.deleted) {
-    throw new TreeChangedError(
-      input.chatId,
-      `delete-single target ${input.messageId} unavailable`,
-    )
+    throw new TreeChangedError(input.chatId, `delete-single target ${input.messageId} unavailable`)
   }
   const members: Message[] = [target]
   const result = await repo.runMutation(
@@ -1200,9 +1228,7 @@ export interface SwipeInput {
   cursor: CursorMap
 }
 
-export function swipe(
-  input: SwipeInput,
-): { cursorUpdates: CursorMap; chosenSiblingId: MessageId } {
+export function swipe(input: SwipeInput): { cursorUpdates: CursorMap; chosenSiblingId: MessageId } {
   const { messages, targetId, direction, cursor } = input
   const byParent = groupByParent(messages)
   const byId = indexById(messages)

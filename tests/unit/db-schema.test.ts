@@ -1,12 +1,7 @@
 import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import {
-  __resetDbForTests,
-  createDbForTests,
-  openDb,
-  registerSchema,
-} from '../../src/store/db'
 import type { NatterDb } from '../../src/store/db'
+import { __resetDbForTests, createDbForTests, openDb, registerSchema } from '../../src/store/db'
 
 // Unique DB name per test so migrations start from a clean slate. We delete
 // any pre-existing data at the top of each test so repeated runs don't pick
@@ -158,9 +153,7 @@ describe('Dexie migrations', () => {
       createdAt: 1,
       updatedAt: 1,
     })
-    await v1
-      .table<MinimalSetting>('settings')
-      .put({ key: 'schemaTag', value: 'preexisting' })
+    await v1.table<MinimalSetting>('settings').put({ key: 'schemaTag', value: 'preexisting' })
     v1.close()
 
     const up = new Dexie(name)

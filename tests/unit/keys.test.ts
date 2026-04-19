@@ -1,10 +1,6 @@
 import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import {
-  __resetBroadcastForTests,
-  onEvent,
-  type BroadcastEvent,
-} from '../../src/store/broadcast'
+import { __resetBroadcastForTests, type BroadcastEvent, onEvent } from '../../src/store/broadcast'
 import { __resetDbForTests, openDb } from '../../src/store/db'
 import {
   __resetKeyCacheForTests,
@@ -85,9 +81,9 @@ describe('createKey + resolveKey (passphrase mode)', () => {
     // expensive PBKDF2 + AES-GCM decrypt — otherwise the cached wrapper from
     // createKey would satisfy the resolveKey call without a derivation round.
     __resetKeyCacheForTests()
-    await expect(
-      resolveKey(record.id, { passphrase: 'wrong' }),
-    ).rejects.toBeInstanceOf(WrongPassphraseError)
+    await expect(resolveKey(record.id, { passphrase: 'wrong' })).rejects.toBeInstanceOf(
+      WrongPassphraseError,
+    )
     // Ensure no plaintext leaked through the return channel.
     await expect(
       resolveKey(record.id, { passphrase: 'wrong' }).catch(() => 'error-caught'),
@@ -101,9 +97,7 @@ describe('createKey + resolveKey (passphrase mode)', () => {
       passphrase: 'pp',
     })
     __resetKeyCacheForTests()
-    await expect(resolveKey(record.id)).rejects.toBeInstanceOf(
-      PassphraseRequiredError,
-    )
+    await expect(resolveKey(record.id)).rejects.toBeInstanceOf(PassphraseRequiredError)
   })
 })
 
@@ -154,9 +148,9 @@ describe('changePassphrase', () => {
     expect(seen.some((ev) => ev.kind === 'key-rotated' && ev.keyId === record.id)).toBe(true)
 
     __resetKeyCacheForTests()
-    await expect(
-      resolveKey(record.id, { passphrase: 'old-one' }),
-    ).rejects.toBeInstanceOf(WrongPassphraseError)
+    await expect(resolveKey(record.id, { passphrase: 'old-one' })).rejects.toBeInstanceOf(
+      WrongPassphraseError,
+    )
     const plaintext = await resolveKey(record.id, { passphrase: 'new-one' })
     expect(plaintext).toBe('sk-or-v1-rotated')
   })

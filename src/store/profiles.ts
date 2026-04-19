@@ -10,7 +10,7 @@ import type { ConnectionKind, ConnectionProfile, KeyId, ProfileId } from '../cor
 import { newId } from '../lib/ulid'
 import { postEvent } from './broadcast'
 import { getDb } from './db'
-import { clearModelsCacheForProfile, clearEndpointsCacheForProfile } from './models-cache'
+import { clearEndpointsCacheForProfile, clearModelsCacheForProfile } from './models-cache'
 import { clearPrivacyPoliciesForProfile, clearProvidersForProfile } from './privacy-cache'
 
 export class ProfileMissingError extends Error {
@@ -27,9 +27,7 @@ export class ProfileInUseError extends Error {
   readonly presetIds: ProfileId[]
   readonly chatIds: string[]
   constructor(profileId: ProfileId, presetIds: ProfileId[], chatIds: string[]) {
-    super(
-      `ProfileInUse:${profileId}:presets=${presetIds.length}:chats=${chatIds.length}`,
-    )
+    super(`ProfileInUse:${profileId}:presets=${presetIds.length}:chats=${chatIds.length}`)
     this.name = 'ProfileInUseError'
     this.profileId = profileId
     this.presetIds = presetIds
@@ -100,9 +98,7 @@ function kindDefaults(
   }
 }
 
-export async function createProfile(
-  input: CreateProfileInput,
-): Promise<ConnectionProfile> {
+export async function createProfile(input: CreateProfileInput): Promise<ConnectionProfile> {
   const now = input.now ?? Date.now()
   const defaults = kindDefaults(input.kind, input.baseUrl)
   const profile: ConnectionProfile = {
@@ -116,12 +112,9 @@ export async function createProfile(
     appUrl: input.appUrl ?? '',
     usesResponsesApiByDefault:
       input.usesResponsesApiByDefault ?? defaults.usesResponsesApiByDefault,
-    supportsEndpointsApi:
-      input.supportsEndpointsApi ?? defaults.supportsEndpointsApi,
-    supportsGenerationApi:
-      input.supportsGenerationApi ?? defaults.supportsGenerationApi,
-    supportsPrivacyScrape:
-      input.supportsPrivacyScrape ?? defaults.supportsPrivacyScrape,
+    supportsEndpointsApi: input.supportsEndpointsApi ?? defaults.supportsEndpointsApi,
+    supportsGenerationApi: input.supportsGenerationApi ?? defaults.supportsGenerationApi,
+    supportsPrivacyScrape: input.supportsPrivacyScrape ?? defaults.supportsPrivacyScrape,
     createdAt: now,
     updatedAt: now,
   }
@@ -141,9 +134,7 @@ export async function createProfile(
   return profile
 }
 
-export async function getProfile(
-  profileId: ProfileId,
-): Promise<ConnectionProfile | undefined> {
+export async function getProfile(profileId: ProfileId): Promise<ConnectionProfile | undefined> {
   return getDb().profiles.get(profileId)
 }
 
@@ -168,9 +159,14 @@ export async function updateProfile(
   const existing = await db.profiles.get(profileId)
   if (!existing) throw new ProfileMissingError(profileId)
   const now = opts.now ?? Date.now()
-  const baseUrlChanged =
-    patch.baseUrl !== undefined && patch.baseUrl !== existing.baseUrl
-  const next: ConnectionProfile = { ...existing, ...patch, id: existing.id, createdAt: existing.createdAt, updatedAt: now }
+  const baseUrlChanged = patch.baseUrl !== undefined && patch.baseUrl !== existing.baseUrl
+  const next: ConnectionProfile = {
+    ...existing,
+    ...patch,
+    id: existing.id,
+    createdAt: existing.createdAt,
+    updatedAt: now,
+  }
   await db.profiles.put(next)
   if (baseUrlChanged) {
     await invalidateCachesForProfile(profileId)
@@ -211,24 +207,15 @@ export async function duplicateProfile(
   return copy
 }
 
-export async function archiveProfile(
-  profileId: ProfileId,
-  now = Date.now(),
-): Promise<void> {
+export async function archiveProfile(profileId: ProfileId, now = Date.now()): Promise<void> {
   await updateProfile(profileId, { archived: true }, { now })
 }
 
-export async function unarchiveProfile(
-  profileId: ProfileId,
-  now = Date.now(),
-): Promise<void> {
+export async function unarchiveProfile(profileId: ProfileId, now = Date.now()): Promise<void> {
   await updateProfile(profileId, { archived: false }, { now })
 }
 
-export async function bumpProfileLastUsedAt(
-  profileId: ProfileId,
-  now = Date.now(),
-): Promise<void> {
+export async function bumpProfileLastUsedAt(profileId: ProfileId, now = Date.now()): Promise<void> {
   const db = getDb()
   const existing = await db.profiles.get(profileId)
   if (!existing) return
@@ -242,10 +229,7 @@ export async function profileDependents(
   profileId: ProfileId,
 ): Promise<{ presetIds: ProfileId[]; chatIds: string[] }> {
   const db = getDb()
-  const presets = await db.presets
-    .where('connectionProfileId')
-    .equals(profileId)
-    .toArray()
+  const presets = await db.presets.where('connectionProfileId').equals(profileId).toArray()
   const chats = await db.chats.toArray()
   return {
     presetIds: presets.filter((p) => p.archived !== true).map((p) => p.id),
@@ -289,18 +273,12 @@ export async function deleteProfile(
   await db.profiles.delete(profileId)
   await invalidateCachesForProfile(profileId)
   // Drop the primary KeyRecord iff no other profile still references it.
-  const otherRefs = await db.profiles
-    .filter((p) => p.apiKeyRef === existing.apiKeyRef)
-    .count()
+  const otherRefs = await db.profiles.filter((p) => p.apiKeyRef === existing.apiKeyRef).count()
   if (otherRefs === 0) await db.keys.delete(existing.apiKeyRef)
   postEvent({ kind: 'profile-deleted', profileId })
 }
 
-async function reassignDependents(
-  from: ProfileId,
-  to: ProfileId,
-  now: number,
-): Promise<void> {
+async function reassignDependents(from: ProfileId, to: ProfileId, now: number): Promise<void> {
   const db = getDb()
   const presets = await db.presets.where('connectionProfileId').equals(from).toArray()
   for (const preset of presets) {

@@ -1,11 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import {
-  chatHref,
-  homeHref,
-  newChatHref,
-  parseRoute,
-  routeToHref,
-} from '../../src/app/router'
+import { chatHref, homeHref, newChatHref, parseRoute, routeToHref } from '../../src/app/router'
 
 describe('parseRoute', () => {
   it('treats empty hash as home', () => {
@@ -52,9 +46,9 @@ describe('routeToHref / convenience helpers', () => {
     expect(chatHref('xyz')).toBe('#/chat/xyz')
     expect(chatHref('xyz', 'm1')).toBe('#/chat/xyz/message/m1')
     expect(routeToHref({ kind: 'chat', chatId: 'xyz' })).toBe('#/chat/xyz')
-    expect(
-      routeToHref({ kind: 'chat', chatId: 'xyz', pinnedMessageId: 'm1' }),
-    ).toBe('#/chat/xyz/message/m1')
+    expect(routeToHref({ kind: 'chat', chatId: 'xyz', pinnedMessageId: 'm1' })).toBe(
+      '#/chat/xyz/message/m1',
+    )
   })
 
   it('round-trips parse → render → parse', () => {

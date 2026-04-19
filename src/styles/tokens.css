@@ -40,6 +40,9 @@
   --color-accent-hover: #1d4ed8;
   --color-accent-active: #1e40af;
   --color-accent-contrast: #ffffff;
+  /* Light-blue tint for selected rows / subtle badges. RGB-based alpha
+   * blend keeps the hue family consistent with the accent. */
+  --color-accent-subtle: rgba(37, 99, 235, 0.12);
   --color-link: #1d4ed8;
   --color-link-hover: #1e3a8a;
   --color-success: #15803d;
@@ -75,10 +78,9 @@
   --color-selection: rgba(37, 99, 235, 0.25);
 
   /* --- Typography (§10.21.2) --- */
-  --font-sans: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto,
-    'Helvetica Neue', Arial, sans-serif;
-  --font-mono: ui-monospace, 'SF Mono', Menlo, Consolas, 'Liberation Mono',
-    monospace;
+  --font-sans:
+    ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
   --font-size-xs: 12px;
   --font-size-sm: 13px;
   --font-size-md: 15px;
@@ -162,7 +164,7 @@
   --content-fade-height: 24px;
 }
 
-[data-density='compact'] {
+[data-density="compact"] {
   --message-row-gap: 6px;
   --space-3: 6px;
   --space-4: 10px;

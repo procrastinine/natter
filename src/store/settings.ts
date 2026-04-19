@@ -4,8 +4,8 @@
 // preference, "don't show this again" dismissals, the onboarding state, etc.
 // Every write broadcasts `settings-mutated { key }` so other tabs can reload.
 
-import { getDb } from './db'
 import { postEvent } from './broadcast'
+import { getDb } from './db'
 
 export async function getSetting<T>(key: string): Promise<T | undefined> {
   const row = await getDb().settings.get(key)

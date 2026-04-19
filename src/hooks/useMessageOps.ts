@@ -13,6 +13,14 @@
 //      sibling under the existing user parent; old assistant stays as a
 //      swipe variant. One API call.
 
+import {
+  deletePair,
+  deleteSingleMessage,
+  deleteTurn,
+  deleteVariant,
+  editMessageContent,
+  insertSibling,
+} from '../core/messages'
 import type {
   ChatId,
   ConnectionProfile,
@@ -21,22 +29,14 @@ import type {
   MessageId,
   ReasoningDetail,
 } from '../core/types'
-import {
-  editMessageContent,
-  deletePair,
-  deleteSingleMessage,
-  deleteTurn,
-  deleteVariant,
-  insertSibling,
-} from '../core/messages'
 import { getBrowserRepository } from '../store/browser-repo'
-import { continueAssistantInPlace } from './useContinue'
-import { writeTextInto } from '../ui/chat/InlineEditor'
 import { getChat, loadChatMessages } from '../store/chats'
-import { getProfile, bumpProfileLastUsedAt } from '../store/profiles'
-import { bumpPresetLastUsedAt } from '../store/presets'
 import { resolveKey } from '../store/keys'
+import { bumpPresetLastUsedAt } from '../store/presets'
+import { bumpProfileLastUsedAt, getProfile } from '../store/profiles'
+import { writeTextInto } from '../ui/chat/InlineEditor'
 import type { SendTextResult } from './useChat'
+import { continueAssistantInPlace } from './useContinue'
 
 export interface MessageOpsContext {
   chatId: ChatId
@@ -69,24 +69,23 @@ export async function editInPlace(
   // still letting advanced users curate the reasoning carrier.
   if (reasoning !== undefined) {
     const repo = getBrowserRepository()
-    await repo.runMutation(
-      [{ kind: 'message', messageId: message.id }],
-      async (ctx) => {
-        const current = await ctx.getMessage(message.id)
-        if (!current) return
-        const next: Message = { ...current }
-        if (reasoning.length === 0) {
-          delete next.reasoningDetails
-        } else {
-          next.reasoningDetails = reasoning
-        }
-        await ctx.putMessage(next)
-      },
-    )
+    await repo.runMutation([{ kind: 'message', messageId: message.id }], async (ctx) => {
+      const current = await ctx.getMessage(message.id)
+      if (!current) return
+      const next: Message = { ...current }
+      if (reasoning.length === 0) {
+        delete next.reasoningDetails
+      } else {
+        next.reasoningDetails = reasoning
+      }
+      await ctx.putMessage(next)
+    })
   }
 }
 
-async function resolveActiveConnection(chatId: ChatId): Promise<
+async function resolveActiveConnection(
+  chatId: ChatId,
+): Promise<
   | { ok: true; profile: ConnectionProfile; apiKey: string; presetId?: string }
   | { ok: false; reason: string }
 > {
@@ -107,10 +106,7 @@ async function resolveActiveConnection(chatId: ChatId): Promise<
   } catch (err) {
     return {
       ok: false,
-      reason:
-        err instanceof Error
-          ? `resolveKey: ${err.message}`
-          : 'resolveKey-failed',
+      reason: err instanceof Error ? `resolveKey: ${err.message}` : 'resolveKey-failed',
     }
   }
 }
@@ -264,10 +260,7 @@ export async function deleteSingleOp(args: DeleteOpArgs) {
 // Collect the turn chain of the message plus its "pair partners" so the
 // undo-snapshot knows which rows to restore. Best-effort: callers use the
 // result only to stash the rows for a 5s undo toast.
-export async function snapshotForDelete(
-  chatId: ChatId,
-  messageId: MessageId,
-): Promise<Message[]> {
+export async function snapshotForDelete(chatId: ChatId, messageId: MessageId): Promise<Message[]> {
   const rows = await loadChatMessages(chatId)
   return rows.filter((row) => row.id === messageId || row.chatId === chatId)
 }

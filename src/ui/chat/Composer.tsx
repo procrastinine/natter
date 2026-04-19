@@ -1,11 +1,4 @@
-import {
-  useCallback,
-  useEffect,
-  useLayoutEffect,
-  useRef,
-  useState,
-  type ReactNode,
-} from 'react'
+import { type ReactNode, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import type { SendShortcut } from '../../core/global-settings'
 import { InsertIcon, StopIcon } from '../icons/Icon'
 
@@ -19,6 +12,10 @@ export interface ComposerProps {
   seed?: string | null
   onSeedConsumed?: () => void
   sendShortcut?: SendShortcut
+  // Live token usage surfaced next to the char count so the user sees
+  // context pressure without opening the Context tab. Undefined = don't
+  // render (e.g. no chat yet, no tokenizer).
+  tokenBudget?: { used: number; budget: number }
   // Optional floating accessory rendered inside the composer's positioning
   // context (e.g. the "Jump to latest" pill). Floats above the body
   // regardless of how tall the composer is dragged.
@@ -114,6 +111,20 @@ function clampFloorHeight(value: number): number {
   return Math.max(0, Math.min(COMPOSER_MAX_HEIGHT, value))
 }
 
+// Compact short-form for the composer's tok indicator so the
+// "used/budget" pair stays readable in a ~60px slot. Breakpoints match
+// the model-picker context column (`983k`, `1.0M`, `1.2M`, `200k`) so
+// the user sees the same shape in both places.
+function formatTokenCount(n: number): string {
+  if (!Number.isFinite(n) || n < 0) return '0'
+  if (n >= 1_000_000) {
+    const m = n / 1_000_000
+    return m >= 10 ? `${Math.round(m)}M` : `${m.toFixed(1)}M`
+  }
+  if (n >= 1000) return `${Math.round(n / 1000)}k`
+  return String(Math.round(n))
+}
+
 export function Composer({
   disabled,
   sendBlockedReason,
@@ -129,6 +140,7 @@ export function Composer({
   trailingUserMessage,
   autoSize = false,
   autoSizeVariant = 'normal',
+  tokenBudget,
 }: ComposerProps) {
   const [text, setText] = useState('')
   // In auto-size mode this is a minimum FLOOR (per-variant default).
@@ -211,18 +223,24 @@ export function Composer({
   // Drag the TOP edge of the composer to resize. Capture pointer to keep
   // the drag stable even if the cursor leaves the handle, and clamp against
   // composer min/max so the textarea stays usable.
-  const handlePointerDown = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
-    e.preventDefault()
-    e.currentTarget.setPointerCapture(e.pointerId)
-    dragStateRef.current = { startY: e.clientY, startHeight: height }
-  }, [height])
-  const handlePointerMove = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
-    const drag = dragStateRef.current
-    if (!drag) return
-    const delta = drag.startY - e.clientY
-    const next = drag.startHeight + delta
-    setHeight(autoSize ? clampFloorHeight(next) : clampFixedHeight(next))
-  }, [autoSize])
+  const handlePointerDown = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      e.preventDefault()
+      e.currentTarget.setPointerCapture(e.pointerId)
+      dragStateRef.current = { startY: e.clientY, startHeight: height }
+    },
+    [height],
+  )
+  const handlePointerMove = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      const drag = dragStateRef.current
+      if (!drag) return
+      const delta = drag.startY - e.clientY
+      const next = drag.startHeight + delta
+      setHeight(autoSize ? clampFloorHeight(next) : clampFixedHeight(next))
+    },
+    [autoSize],
+  )
   const handlePointerUp = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
     if (!dragStateRef.current) return
     e.currentTarget.releasePointerCapture(e.pointerId)
@@ -288,6 +306,22 @@ export function Composer({
           <span data-ui="token-counter" aria-live="polite">
             {text.trim().length} chars
           </span>
+          {tokenBudget ? (
+            <span
+              data-ui="token-counter"
+              data-warn={
+                tokenBudget.used > tokenBudget.budget
+                  ? 'danger'
+                  : tokenBudget.budget > 0 && tokenBudget.used / tokenBudget.budget > 0.75
+                    ? 'warn'
+                    : undefined
+              }
+              aria-live="polite"
+              title={`${tokenBudget.used.toLocaleString()} / ${tokenBudget.budget.toLocaleString()} tokens`}
+            >
+              {formatTokenCount(tokenBudget.used)}/{formatTokenCount(tokenBudget.budget)} tok
+            </span>
+          ) : null}
           {onImportAtEnd ? (
             <button
               type="button"
@@ -316,10 +350,7 @@ export function Composer({
               type="submit"
               data-ui="send"
               data-mode={emptyWithTrailingUser ? 'reply' : 'send'}
-              disabled={
-                sendBlocked ||
-                (text.trim() === '' && !emptyWithTrailingUser)
-              }
+              disabled={sendBlocked || (text.trim() === '' && !emptyWithTrailingUser)}
               title={
                 sendBlockedReason ??
                 (emptyWithTrailingUser

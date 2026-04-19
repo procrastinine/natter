@@ -27,12 +27,7 @@ interface BaseSvgProps extends Omit<SVGProps<SVGSVGElement>, 'width' | 'height'>
   children: ReactNode
 }
 
-function BaseSvg({
-  size = 18,
-  rotate = 0,
-  children,
-  ...rest
-}: BaseSvgProps) {
+function BaseSvg({ size = 18, rotate = 0, children, ...rest }: BaseSvgProps) {
   // Only emit `data-icon-rotate` when an icon actually rotates. Icons
   // without rotation skip the transition rule entirely (see icons.css)
   // so the browser doesn't track them as composited animation targets
@@ -153,11 +148,7 @@ export function ReloadIcon({ size = 18, ariaLabel }: IconProps) {
 // Slightly thicker stroke so the circle reads cleanly at small sizes.
 export function InfoIcon({ size = 18, ariaLabel }: IconProps) {
   return (
-    <BaseSvg
-      size={size}
-      strokeWidth={1.8}
-      {...(ariaLabel ? { 'aria-label': ariaLabel } : {})}
-    >
+    <BaseSvg size={size} strokeWidth={1.8} {...(ariaLabel ? { 'aria-label': ariaLabel } : {})}>
       <circle cx="12" cy="12" r="9" fill="none" />
       <line x1="12" y1="11" x2="12" y2="17" />
       <circle cx="12" cy="8" r="0.7" fill="currentColor" stroke="none" />
@@ -231,11 +222,7 @@ export function StopIcon({ size = 16, ariaLabel }: IconProps) {
 // Generic person silhouette — default user profile glyph. Filled.
 export function PersonIcon({ size = 18, ariaLabel }: IconProps) {
   return (
-    <BaseSvg
-      size={size}
-      strokeWidth={1.5}
-      {...(ariaLabel ? { 'aria-label': ariaLabel } : {})}
-    >
+    <BaseSvg size={size} strokeWidth={1.5} {...(ariaLabel ? { 'aria-label': ariaLabel } : {})}>
       <circle cx="12" cy="8.5" r="3.6" />
       <path d="M4.6 20a8 8 0 0 1 14.8 0" />
     </BaseSvg>
@@ -322,11 +309,7 @@ export function SendIcon({ size = 18, ariaLabel }: IconProps) {
 // Generic robot silhouette — default assistant profile glyph.
 export function RobotIcon({ size = 18, ariaLabel }: IconProps) {
   return (
-    <BaseSvg
-      size={size}
-      strokeWidth={1.5}
-      {...(ariaLabel ? { 'aria-label': ariaLabel } : {})}
-    >
+    <BaseSvg size={size} strokeWidth={1.5} {...(ariaLabel ? { 'aria-label': ariaLabel } : {})}>
       <rect x="5" y="8" width="14" height="11" rx="2.4" />
       <path d="M12 8V5" />
       <circle cx="12" cy="3.6" r="1" fill="currentColor" stroke="none" />

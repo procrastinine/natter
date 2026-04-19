@@ -38,9 +38,7 @@ describe('parseSSE', () => {
   })
 
   it('emits `:` comments as keepalives (used for hang detection)', async () => {
-    const r = responseFromChunks([
-      enc(': OPENROUTER PROCESSING\n\ndata: hi\n\n'),
-    ])
+    const r = responseFromChunks([enc(': OPENROUTER PROCESSING\n\ndata: hi\n\n')])
     const events = await collect(r)
     expect(events).toEqual([
       { kind: 'keepalive', comment: 'OPENROUTER PROCESSING' },
@@ -55,9 +53,7 @@ describe('parseSSE', () => {
   })
 
   it('terminates on [DONE] without emitting the sentinel', async () => {
-    const r = responseFromChunks([
-      enc('data: one\n\ndata: [DONE]\n\ndata: never\n\n'),
-    ])
+    const r = responseFromChunks([enc('data: one\n\ndata: [DONE]\n\ndata: never\n\n')])
     const events = await collect(r)
     expect(events).toEqual([{ kind: 'data', data: 'one' }])
   })
@@ -92,7 +88,9 @@ describe('parseSSE', () => {
   it('throws when the response has no body', async () => {
     const response = new Response(null)
     await expect(async () => {
-      for await (const _ of parseSSE(response)) { /* noop */ }
+      for await (const _ of parseSSE(response)) {
+        /* noop */
+      }
     }).rejects.toThrow(/no body/i)
   })
 })

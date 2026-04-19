@@ -60,9 +60,7 @@ function makeUser(overrides: Partial<Message> = {}): Message {
 describe('MessageHeader (quiet header — role + state pills only)', () => {
   it('shows the role label, capitalized', () => {
     const { container } = render(<MessageHeader message={makeAssistant()} />)
-    expect(container.querySelector('[data-ui="message-role"]')?.textContent).toBe(
-      'Assistant',
-    )
+    expect(container.querySelector('[data-ui="message-role"]')?.textContent).toBe('Assistant')
   })
 
   it('does NOT render model/tokens/cost chips inline (those belong in the info disclosure)', () => {
@@ -82,19 +80,14 @@ describe('MessageHeader (quiet header — role + state pills only)', () => {
 
   it('uses "User" for user messages', () => {
     const { container } = render(<MessageHeader message={makeUser()} />)
-    expect(container.querySelector('[data-ui="message-role"]')?.textContent).toBe(
-      'User',
-    )
+    expect(container.querySelector('[data-ui="message-role"]')?.textContent).toBe('User')
   })
 
   it('uses the role label as the header aria-label', () => {
     const { container } = render(<MessageHeader message={makeAssistant()} />)
-    const label = container
-      .querySelector('[data-ui="message-header"]')
-      ?.getAttribute('aria-label')
+    const label = container.querySelector('[data-ui="message-header"]')?.getAttribute('aria-label')
     expect(label).toBe('Assistant')
   })
-
 })
 
 describe('MessageInfo (revealed by ⓘ — full factual record)', () => {

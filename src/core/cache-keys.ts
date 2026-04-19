@@ -14,7 +14,7 @@ export function modelsCacheKey(query: ModelsQuery): string {
   return stableStringify(normalized)
 }
 
-function normalizeList(input: string[] | undefined): string[] {
+function normalizeList(input: readonly string[] | undefined): string[] {
   if (!input || input.length === 0) return []
   const unique = Array.from(new Set(input.map((s) => s.trim()).filter(Boolean)))
   unique.sort()

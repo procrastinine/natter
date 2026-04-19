@@ -29,9 +29,7 @@ export function ConfirmDeleteDialog({
   onConfirm,
   onCancel,
 }: ConfirmDeleteDialogProps) {
-  const [deletePair, setDeletePair] = useState<boolean>(
-    pairDisabled ? false : pairDefault,
-  )
+  const [deletePair, setDeletePair] = useState<boolean>(pairDisabled ? false : pairDefault)
   const [busy, setBusy] = useState(false)
   const confirmBtnRef = useRef<HTMLButtonElement | null>(null)
 
@@ -98,8 +96,8 @@ export function ConfirmDeleteDialog({
           <span>Also delete the paired user/assistant message</span>
           {pairDisabled ? (
             <span data-ui="confirm-delete-hint">
-              Disabled — this message has an adjacency warning, so
-              pair-delete would remove a healthy neighbor.
+              Disabled — this message has an adjacency warning, so pair-delete would remove a
+              healthy neighbor.
             </span>
           ) : null}
         </label>

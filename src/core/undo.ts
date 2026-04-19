@@ -11,14 +11,8 @@
 // matches the plan's 5s horizon — we don't try to undo edits that
 // happened after the user walked away.
 
-import type {
-  AttachmentId,
-  ChatId,
-  Message,
-  MessageId,
-  MutationScope,
-} from './types'
 import { getBrowserRepository } from '../store/browser-repo'
+import type { AttachmentId, ChatId, Message, MessageId, MutationScope } from './types'
 
 export interface StructuralSnapshot {
   chatId: ChatId
@@ -51,9 +45,7 @@ export async function snapshotMessages(
 // rows the op overwrote and removes any rows the op introduced. Runs
 // under the same `message:` + `children:` scopes the op claimed so
 // concurrent edits from another tab serialize cleanly.
-export async function applyStructuralSnapshot(
-  snapshot: StructuralSnapshot,
-): Promise<void> {
+export async function applyStructuralSnapshot(snapshot: StructuralSnapshot): Promise<void> {
   const repo = getBrowserRepository()
   const scopes: MutationScope[] = []
   const parentSlots = new Set<string>()

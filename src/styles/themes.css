@@ -8,11 +8,11 @@
  * Dark inherits via @media when no explicit theme is set.
  */
 
-[data-theme='light'] {
+[data-theme="light"] {
   color-scheme: light;
 }
 
-[data-theme='dark'] {
+[data-theme="dark"] {
   color-scheme: dark;
   --color-bg-app: #0b0d12;
   --color-bg-surface-1: #10131a;
@@ -41,6 +41,7 @@
   --color-accent-hover: #3b82f6;
   --color-accent-active: #2563eb;
   --color-accent-contrast: #0b1020;
+  --color-accent-subtle: rgba(96, 165, 250, 0.18);
   --color-link: #93c5fd;
   --color-link-hover: #bfdbfe;
   --color-success: #4ade80;
@@ -76,7 +77,7 @@
   --color-selection: rgba(96, 165, 250, 0.35);
 }
 
-[data-theme='high-contrast'] {
+[data-theme="high-contrast"] {
   color-scheme: dark;
   --color-bg-app: #000000;
   --color-bg-surface-1: #000000;

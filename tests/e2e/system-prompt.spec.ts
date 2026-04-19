@@ -20,9 +20,7 @@ test.beforeEach(async ({ page }) => {
   await seedFirstRun(page)
 })
 
-test('edited system prompt shows up in the NEXT /chat/completions body', async ({
-  page,
-}) => {
+test('edited system prompt shows up in the NEXT /chat/completions body', async ({ page }) => {
   // Track the wire body of every /chat/completions call.
   const bodies: string[] = []
   await page.route('**/api/v1/chat/completions', async (route, request) => {
@@ -38,9 +36,7 @@ test('edited system prompt shows up in the NEXT /chat/completions body', async (
 
   await createChatAndOpen(page)
   await sendMessage(page, 'first')
-  await expect(
-    page.locator('[data-ui="message"][data-role="assistant"]').first(),
-  ).toBeVisible()
+  await expect(page.locator('[data-ui="message"][data-role="assistant"]').first()).toBeVisible()
 
   await page.locator('[data-ui="settings-cog"]').click()
   const textarea = page.locator('[data-ui="system-prompt-textarea"]')
@@ -49,18 +45,14 @@ test('edited system prompt shows up in the NEXT /chat/completions body', async (
   await page.waitForTimeout(500)
   await page.locator('[data-ui="settings-pane-close"]').click()
   await sendMessage(page, 'second')
-  await expect(
-    page.locator('[data-ui="message"][data-role="assistant"]').nth(1),
-  ).toBeVisible()
+  await expect(page.locator('[data-ui="message"][data-role="assistant"]').nth(1)).toBeVisible()
 
   expect(bodies.length).toBeGreaterThanOrEqual(2)
   const firstBody = JSON.parse(bodies[0] ?? '{}')
   const secondBody = JSON.parse(bodies[1] ?? '{}')
 
   // First send had no system prompt.
-  const firstSystem = (firstBody.messages ?? []).find(
-    (m: { role: string }) => m.role === 'system',
-  )
+  const firstSystem = (firstBody.messages ?? []).find((m: { role: string }) => m.role === 'system')
   expect(firstSystem).toBeUndefined()
 
   // Second send carries the edited system prompt.
@@ -74,30 +66,22 @@ test('committing a system prompt bumps updatedAt + metaVersion and leaves branch
   page,
 }) => {
   await mockChatCompletions(page, {
-    body: buildSseBody([
-      { id: 'gen-1', content: 'ok', finish: 'stop' },
-    ]),
+    body: buildSseBody([{ id: 'gen-1', content: 'ok', finish: 'stop' }]),
   })
   await createChatAndOpen(page)
   await sendMessage(page, 'warm up')
-  await expect(
-    page.locator('[data-ui="message"][data-role="assistant"]').first(),
-  ).toBeVisible()
+  await expect(page.locator('[data-ui="message"][data-role="assistant"]').first()).toBeVisible()
   const chatId = await firstChatId(page)
   const before = await readChat(page, chatId)
   await page.locator('[data-ui="settings-cog"]').click()
   await page.locator('[data-ui="system-prompt-textarea"]').fill('System edit v1')
   await page.waitForTimeout(500)
   const after = await readChat(page, chatId)
-  expect(Number(after.metaVersion)).toBeGreaterThanOrEqual(
-    Number(before.metaVersion) + 1,
-  )
+  expect(Number(after.metaVersion)).toBeGreaterThanOrEqual(Number(before.metaVersion) + 1)
   expect(Number(after.updatedAt)).toBeGreaterThan(Number(before.updatedAt))
   // Branch state unchanged.
   expect(after.lastUpdatedLeafId).toBe(before.lastUpdatedLeafId)
-  expect(Number(after.lastBranchUpdatedAt)).toBe(
-    Number(before.lastBranchUpdatedAt),
-  )
+  expect(Number(after.lastBranchUpdatedAt)).toBe(Number(before.lastBranchUpdatedAt))
   const settings = after.settings as Record<string, unknown>
   expect(settings.systemPrompt).toBe('System edit v1')
 })
@@ -106,15 +90,11 @@ test('the one-off toast appears after the first edit and disappears on subsequen
   page,
 }) => {
   await mockChatCompletions(page, {
-    body: buildSseBody([
-      { id: 'gen-1', content: 'ok', finish: 'stop' },
-    ]),
+    body: buildSseBody([{ id: 'gen-1', content: 'ok', finish: 'stop' }]),
   })
   await createChatAndOpen(page)
   await sendMessage(page, 'initial')
-  await expect(
-    page.locator('[data-ui="message"][data-role="assistant"]').first(),
-  ).toBeVisible()
+  await expect(page.locator('[data-ui="message"][data-role="assistant"]').first()).toBeVisible()
   await page.locator('[data-ui="settings-cog"]').click()
   await page.locator('[data-ui="system-prompt-textarea"]').fill('First system prompt')
   await expect(page.locator('[data-ui="settings-toast"]')).toBeVisible({
@@ -124,9 +104,7 @@ test('the one-off toast appears after the first edit and disappears on subsequen
     /takes effect on your next send/i,
   )
   // Second edit in the same session shouldn't re-show the toast.
-  await page.locator('[data-ui="system-prompt-textarea"]').fill(
-    'First system prompt — appended',
-  )
+  await page.locator('[data-ui="system-prompt-textarea"]').fill('First system prompt — appended')
   await page.waitForTimeout(500)
   await expect(page.locator('[data-ui="settings-toast"]')).toBeHidden({
     timeout: 5000,

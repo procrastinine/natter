@@ -1,5 +1,5 @@
-import type { Message } from '../../core/types'
 import type { ProfilePictureRef } from '../../core/global-settings'
+import type { Message } from '../../core/types'
 import { PersonIcon, RobotIcon } from '../icons/Icon'
 
 export interface ProfileGlyphProps {
@@ -9,6 +9,10 @@ export interface ProfileGlyphProps {
   // generic person silhouette since they don't have a meaningful default.
   userPicture?: ProfilePictureRef
   assistantPicture?: ProfilePictureRef
+  // When true, the message will be trimmed out of the request by the
+  // current context-truncation settings. Surface a dashed ring so the
+  // user can see which turns aren't reaching the model.
+  excluded?: boolean
 }
 
 const ROLE_LABEL: Record<Message['role'], string> = {
@@ -37,6 +41,7 @@ export function ProfileGlyph({
   role,
   userPicture = 'default-person',
   assistantPicture = 'default-robot',
+  excluded,
 }: ProfileGlyphProps) {
   const picture = pictureForRole(role, userPicture, assistantPicture)
   return (
@@ -44,14 +49,12 @@ export function ProfileGlyph({
       data-ui="profile-glyph"
       data-role={role}
       data-picture={picture}
-      aria-label={ROLE_LABEL[role]}
+      data-excluded={excluded ? 'true' : undefined}
+      aria-label={excluded ? `${ROLE_LABEL[role]} (excluded from context)` : ROLE_LABEL[role]}
+      title={excluded ? 'Trimmed out of the request by context settings' : undefined}
       role="img"
     >
-      {picture === 'default-robot' ? (
-        <RobotIcon size={20} />
-      ) : (
-        <PersonIcon size={20} />
-      )}
+      {picture === 'default-robot' ? <RobotIcon size={20} /> : <PersonIcon size={20} />}
     </span>
   )
 }

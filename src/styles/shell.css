@@ -10,11 +10,11 @@
  * composer (reparented under the scroll region — see Shell.tsx) + the
  * eye toggle itself remain. The composer scrolls with content instead
  * of sticking to the viewport bottom. */
-[data-ui='app-shell'][data-focus-mode='on'] > [data-ui='sidebar'],
-[data-ui='app-shell'][data-focus-mode='on'] [data-ui='connection-header'],
-[data-ui='app-shell'][data-focus-mode='on'] [data-ui='chat-title-bar'],
-[data-ui='app-shell'][data-focus-mode='on'] [data-ui='edit-tree-toolbar'],
-[data-ui='app-shell'][data-focus-mode='on'] [data-ui='jump-to-latest'] {
+[data-ui="app-shell"][data-focus-mode="on"] > [data-ui="sidebar"],
+[data-ui="app-shell"][data-focus-mode="on"] [data-ui="connection-header"],
+[data-ui="app-shell"][data-focus-mode="on"] [data-ui="chat-title-bar"],
+[data-ui="app-shell"][data-focus-mode="on"] [data-ui="edit-tree-toolbar"],
+[data-ui="app-shell"][data-focus-mode="on"] [data-ui="jump-to-latest"] {
   display: none !important;
 }
 
@@ -24,7 +24,7 @@
  * transparent background so the composer-body's card reads as a
  * floating input and the scroll-region's padding doesn't leak an
  * awkward white rectangle around the edges. */
-[data-ui='app-shell'][data-focus-mode='on'] [data-ui='composer'] {
+[data-ui="app-shell"][data-focus-mode="on"] [data-ui="composer"] {
   border-top: none;
   background: transparent;
   padding: var(--space-6) 0;
@@ -35,9 +35,9 @@
  * override needs to keep the name or the main pane auto-places to a
  * junk cell and the content falls out of the layout (seen as right-
  * aligned / half-width prose). Keep only the `main` area. */
-[data-ui='app-shell'][data-focus-mode='on'] {
+[data-ui="app-shell"][data-focus-mode="on"] {
   grid-template-columns: 1fr;
-  grid-template-areas: 'main';
+  grid-template-areas: "main";
 }
 
 /* Floating eye toggle — fixed at the bottom-right so it survives the
@@ -46,7 +46,7 @@
  * right-padding keeps it clear of the scroll region's scrollbar when
  * focus mode is active (the scrollbar hugs the viewport edge since
  * there's no more chat-title-bar chrome inset). */
-[data-ui='focus-mode-toggle'] {
+[data-ui="focus-mode-toggle"] {
   position: fixed;
   right: var(--space-6);
   bottom: var(--space-6);
@@ -65,10 +65,20 @@
   box-shadow: var(--shadow-sm);
   transition:
     opacity var(--duration-fast) var(--ease-standard),
-    background var(--duration-fast) var(--ease-standard);
+    background var(--duration-fast) var(--ease-standard),
+    right var(--duration-fast) var(--ease-standard);
 }
 
-[data-ui='focus-mode-toggle']:hover {
+/* When the right-side chat-model panel is open, slide the eye toggle to
+ * its left edge so the two don't stack. We also lift it above the
+ * composer's Send button which lives at the bottom-right of the main
+ * pane — stacking two affordances in the same corner reads as
+ * duplicate-y visually even when they're technically different buttons. */
+[data-ui="app-shell"][data-chat-model-panel="open"] [data-ui="focus-mode-toggle"] {
+  right: calc(var(--settings-pane-width) + var(--space-4));
+}
+
+[data-ui="focus-mode-toggle"]:hover {
   opacity: 1;
   background: var(--color-bg-surface-2);
   color: var(--color-fg-primary);
@@ -78,14 +88,14 @@
  * bright accent button drawing the eye back to the chrome. The crossed-
  * eye glyph alone communicates "mode is on"; opacity goes to 0.55 so
  * the button nearly blends into the page until you hover for it. */
-[data-ui='focus-mode-toggle'][data-state='active'] {
+[data-ui="focus-mode-toggle"][data-state="active"] {
   opacity: 0.55;
   background: var(--color-bg-surface-1);
   color: var(--color-fg-muted);
   border-color: var(--color-border-subtle);
 }
 
-[data-ui='focus-mode-toggle'][data-state='active']:hover {
+[data-ui="focus-mode-toggle"][data-state="active"]:hover {
   opacity: 1;
   background: var(--color-bg-surface-2);
   color: var(--color-fg-primary);
@@ -96,33 +106,33 @@
  * scroll region and composer all stack inside main-pane. The chat-model panel
  * is an optional third column that COEXISTS with main (it does not dim or
  * disable it). */
-[data-ui='app-shell'] {
+[data-ui="app-shell"] {
   display: grid;
   grid-template-columns: var(--sidebar-width) 1fr;
   grid-template-rows: 1fr;
-  grid-template-areas: 'sidebar main';
+  grid-template-areas: "sidebar main";
   height: 100%;
   background: var(--color-bg-app);
   color: var(--color-fg-primary);
 }
 
-[data-ui='app-shell'][data-chat-model-panel='open'] {
+[data-ui="app-shell"][data-chat-model-panel="open"] {
   grid-template-columns: var(--sidebar-width) 1fr var(--settings-pane-width);
-  grid-template-areas: 'sidebar main chat-model';
+  grid-template-areas: "sidebar main chat-model";
 }
 
-[data-ui='app-shell'][data-sidebar='collapsed'] {
+[data-ui="app-shell"][data-sidebar="collapsed"] {
   grid-template-columns: var(--sidebar-width-collapsed) 1fr;
 }
 
-[data-ui='app-shell'][data-sidebar='collapsed'][data-chat-model-panel='open'] {
+[data-ui="app-shell"][data-sidebar="collapsed"][data-chat-model-panel="open"] {
   grid-template-columns:
     var(--sidebar-width-collapsed)
     1fr
     var(--settings-pane-width);
 }
 
-[data-ui='app-shell'] > [data-ui='chat-model-panel'] {
+[data-ui="app-shell"] > [data-ui="chat-model-panel"] {
   grid-area: chat-model;
   background: var(--color-bg-surface-1);
   border-left: 1px solid var(--color-border-subtle);
@@ -131,7 +141,7 @@
   overflow: hidden;
 }
 
-[data-ui='app-shell'] > [data-ui='sidebar'] {
+[data-ui="app-shell"] > [data-ui="sidebar"] {
   grid-area: sidebar;
   border-right: 1px solid var(--color-border-subtle);
   background: var(--color-bg-surface-1);
@@ -139,7 +149,7 @@
   padding: 0;
 }
 
-[data-ui='app-shell'] > [data-ui='main-pane'] {
+[data-ui="app-shell"] > [data-ui="main-pane"] {
   grid-area: main;
   display: flex;
   flex-direction: column;
@@ -149,7 +159,7 @@
   position: relative;
 }
 
-[data-ui='main-pane'] > [data-ui='chat-title-bar'] {
+[data-ui="main-pane"] > [data-ui="chat-title-bar"] {
   flex: 0 0 auto;
   display: flex;
   align-items: center;
@@ -167,8 +177,8 @@
   position: relative;
 }
 
-[data-ui='main-pane'] > [data-ui='scroll-region'],
-[data-ui='main-pane'] > [data-ui='message-list'] {
+[data-ui="main-pane"] > [data-ui="scroll-region"],
+[data-ui="main-pane"] > [data-ui="message-list"] {
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
@@ -177,15 +187,15 @@
   position: relative;
 }
 
-[data-ui='main-pane'] > [data-ui='composer'] {
+[data-ui="main-pane"] > [data-ui="composer"] {
   flex: 0 0 auto;
   border-top: 1px solid var(--color-border-subtle);
   background: var(--color-bg-surface-1);
   padding: var(--space-3) var(--space-5);
 }
 
-[data-ui='main-pane'] > [data-ui='empty-state'],
-[data-ui='main-pane'] > [data-ui='first-run'] {
+[data-ui="main-pane"] > [data-ui="empty-state"],
+[data-ui="main-pane"] > [data-ui="first-run"] {
   flex: 1 1 auto;
   display: flex;
   flex-direction: column;
@@ -197,14 +207,14 @@
   text-align: center;
 }
 
-[data-ui='empty-state'] h2 {
+[data-ui="empty-state"] h2 {
   color: var(--color-fg-primary);
   font-size: var(--font-size-xl);
   font-weight: var(--font-weight-semibold);
   margin: 0 0 var(--space-2);
 }
 
-[data-ui='sample-prompts'] {
+[data-ui="sample-prompts"] {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
   gap: var(--space-3);
@@ -212,7 +222,7 @@
   width: 100%;
 }
 
-[data-ui='sample-prompt'] {
+[data-ui="sample-prompt"] {
   background: var(--color-bg-surface-2);
   border: 1px solid var(--color-border-subtle);
   border-radius: var(--radius-md);
@@ -222,12 +232,12 @@
   transition: background var(--duration-fast) var(--ease-standard);
 }
 
-[data-ui='sample-prompt']:hover:not(:disabled) {
+[data-ui="sample-prompt"]:hover:not(:disabled) {
   background: var(--color-bg-hover);
   border-color: var(--color-border-default);
 }
 
-[data-ui='sample-prompt'] strong {
+[data-ui="sample-prompt"] strong {
   display: block;
   color: var(--color-fg-primary);
   font-size: var(--font-size-sm);
@@ -235,12 +245,12 @@
   margin-bottom: var(--space-1);
 }
 
-[data-ui='sample-prompt'] span {
+[data-ui="sample-prompt"] span {
   color: var(--color-fg-muted);
   font-size: var(--font-size-xs);
 }
 
-[data-ui='sample-prompts-dismiss'] {
+[data-ui="sample-prompts-dismiss"] {
   background: transparent;
   border: none;
   color: var(--color-fg-muted);
@@ -249,12 +259,12 @@
   padding: var(--space-2);
 }
 
-[data-ui='sample-prompts-dismiss']:hover {
+[data-ui="sample-prompts-dismiss"]:hover {
   color: var(--color-fg-secondary);
   background: transparent;
 }
 
-[data-ui='settings-overlay'] {
+[data-ui="settings-overlay"] {
   position: fixed;
   inset: 0;
   display: grid;
@@ -263,11 +273,11 @@
   z-index: var(--z-overlay);
 }
 
-[data-ui='settings-overlay'][hidden] {
+[data-ui="settings-overlay"][hidden] {
   display: none;
 }
 
-[data-ui='settings-overlay'] > [data-ui='settings-overlay-scrim'] {
+[data-ui="settings-overlay"] > [data-ui="settings-overlay-scrim"] {
   background: transparent;
 }
 
@@ -275,7 +285,7 @@
  * it always sits ~12 px above the textarea regardless of how tall the
  * composer is dragged. The button is rendered inside the composer's
  * positioning context. */
-[data-ui='composer'] > [data-ui='jump-to-latest'] {
+[data-ui="composer"] > [data-ui="jump-to-latest"] {
   position: absolute;
   bottom: calc(100% + var(--space-3));
   right: var(--space-5);
@@ -293,7 +303,7 @@
   z-index: var(--z-sidebar);
 }
 
-[data-ui='composer'] > [data-ui='jump-to-latest']:hover {
+[data-ui="composer"] > [data-ui="jump-to-latest"]:hover {
   background: var(--color-bg-hover);
   border-color: var(--color-border-strong);
 }

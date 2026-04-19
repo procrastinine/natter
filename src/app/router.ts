@@ -13,7 +13,7 @@
 // per plan/02-data-model.md §2.1 / §2.1.2 — the URL only carries the *target*
 // pin for opens; subsequent in-tab swipes update Zustand without touching URL.
 
-import { useSyncExternalStore, type MouseEvent } from 'react'
+import { type MouseEvent, useSyncExternalStore } from 'react'
 import type { ChatId, MessageId } from '../core/types'
 
 export type Route =
@@ -53,14 +53,9 @@ export function routeToHref(route: Route): string {
   }
 }
 
-export function chatHref(
-  chatId: ChatId,
-  pinnedMessageId?: MessageId,
-): string {
+export function chatHref(chatId: ChatId, pinnedMessageId?: MessageId): string {
   return routeToHref(
-    pinnedMessageId
-      ? { kind: 'chat', chatId, pinnedMessageId }
-      : { kind: 'chat', chatId },
+    pinnedMessageId ? { kind: 'chat', chatId, pinnedMessageId } : { kind: 'chat', chatId },
   )
 }
 
@@ -93,10 +88,7 @@ export function replaceRoute(href: string): void {
   window.history.replaceState(window.history.state, '', url.toString())
 }
 
-export function navigateToChat(
-  chatId: ChatId,
-  pinnedMessageId?: MessageId,
-): void {
+export function navigateToChat(chatId: ChatId, pinnedMessageId?: MessageId): void {
   navigate(chatHref(chatId, pinnedMessageId))
 }
 
@@ -137,11 +129,7 @@ function getServerSnapshot(): string {
 // React hook surface. Rerenders the consumer whenever the hash changes —
 // any number of components can call this; one window listener feeds them all.
 export function useRoute(): Route {
-  const hash = useSyncExternalStore(
-    subscribeHash,
-    getHashSnapshot,
-    getServerSnapshot,
-  )
+  const hash = useSyncExternalStore(subscribeHash, getHashSnapshot, getServerSnapshot)
   return parseRoute(hash)
 }
 

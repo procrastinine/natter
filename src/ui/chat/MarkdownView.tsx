@@ -1,17 +1,14 @@
-import { useLiveQuery } from 'dexie-react-hooks'
-import { useMemo } from 'react'
-import { Streamdown } from 'streamdown'
-import type { Components } from 'streamdown'
 import { createCjkPlugin } from '@streamdown/cjk'
 import { createCodePlugin } from '@streamdown/code'
 import { createMathPlugin } from '@streamdown/math'
 import { createMermaidPlugin } from '@streamdown/mermaid'
+import { useLiveQuery } from 'dexie-react-hooks'
+import { useMemo } from 'react'
+import type { Components } from 'streamdown'
+import { Streamdown } from 'streamdown'
 import { DEFAULT_IMAGE_ORIGINS, isImageOriginAllowed } from '../../core/image-allowlist'
-import {
-  DEFAULT_RENDERING_PREFS,
-  readRenderingPreferences,
-} from '../settings/RenderingSettings'
 import type { ShikiThemeChoice } from '../settings/RenderingSettings'
+import { DEFAULT_RENDERING_PREFS, readRenderingPreferences } from '../settings/RenderingSettings'
 
 export interface MarkdownViewProps {
   content: string
@@ -64,11 +61,7 @@ const components: Components = {
   },
 }
 
-export function MarkdownView({
-  content,
-  streaming = false,
-  allowImageOrigins,
-}: MarkdownViewProps) {
+export function MarkdownView({ content, streaming = false, allowImageOrigins }: MarkdownViewProps) {
   const allowed = useMemo(
     () => [...DEFAULT_IMAGE_ORIGINS, ...(allowImageOrigins ?? [])],
     [allowImageOrigins],
@@ -85,11 +78,7 @@ export function MarkdownView({
   // `@streamdown/code` (Shiki-backed) and rebuild the plugin whenever
   // the theme tuple changes so the Settings dropdown actually repaints
   // existing blocks.
-  const renderingPrefs = useLiveQuery(
-    readRenderingPreferences,
-    [],
-    DEFAULT_RENDERING_PREFS,
-  )
+  const renderingPrefs = useLiveQuery(readRenderingPreferences, [], DEFAULT_RENDERING_PREFS)
   const shikiTheme = useMemo<[ShikiThemeChoice, ShikiThemeChoice]>(
     () => [renderingPrefs.shikiLight, renderingPrefs.shikiDark],
     [renderingPrefs.shikiLight, renderingPrefs.shikiDark],
@@ -104,11 +93,7 @@ export function MarkdownView({
     [shikiTheme],
   )
   return (
-    <div
-      data-ui="markdown"
-      data-streaming={streaming ? 'true' : 'false'}
-      data-overflow="full"
-    >
+    <div data-ui="markdown" data-streaming={streaming ? 'true' : 'false'} data-overflow="full">
       <Streamdown
         mode={streaming ? 'streaming' : 'static'}
         plugins={plugins}

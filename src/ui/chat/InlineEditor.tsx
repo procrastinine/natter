@@ -9,12 +9,12 @@
 // action, Save & Send is the accent action for user messages.
 
 import {
+  type KeyboardEvent,
   useCallback,
   useEffect,
   useLayoutEffect,
   useRef,
   useState,
-  type KeyboardEvent,
 } from 'react'
 import type { ContentItem, ReasoningDetail } from '../../core/types'
 
@@ -40,16 +40,11 @@ const MAX_TEXTAREA_PX = 600
 // only edits text lanes; multi-modal content stays untouched when we commit.
 export function plaintextOf(content: readonly ContentItem[]): string {
   return content
-    .map((item) =>
-      item.type === 'text' || item.type === 'output_text' ? item.text : '',
-    )
+    .map((item) => (item.type === 'text' || item.type === 'output_text' ? item.text : ''))
     .join('')
 }
 
-export function writeTextInto(
-  prev: readonly ContentItem[],
-  nextText: string,
-): ContentItem[] {
+export function writeTextInto(prev: readonly ContentItem[], nextText: string): ContentItem[] {
   let replaced = false
   const out: ContentItem[] = []
   for (const item of prev) {
@@ -162,12 +157,7 @@ export function InlineEditor({
   }, [text])
 
   const run = useCallback(
-    async (
-      action: (
-        text: string,
-        reasoning?: ReasoningDetail[],
-      ) => void | Promise<void>,
-    ) => {
+    async (action: (text: string, reasoning?: ReasoningDetail[]) => void | Promise<void>) => {
       // Empty messages are allowed — both Save (in place) and Save & Send
       // commit whatever the user typed, including an empty string.
       // Messages may legitimately be empty (placeholder turn, deliberate
@@ -177,9 +167,7 @@ export function InlineEditor({
       if (busy) return
       setBusy(true)
       try {
-        const nextReasoning = initialReasoning
-          ? fromEditable(reasoning)
-          : undefined
+        const nextReasoning = initialReasoning ? fromEditable(reasoning) : undefined
         await action(trimmed, nextReasoning)
       } finally {
         setBusy(false)
@@ -229,9 +217,7 @@ export function InlineEditor({
     [commitSave, commitSaveAndSend, onCancel, onSaveAndSend, saveAndSendDisabled],
   )
 
-  const reasoningEditableCount = reasoning.filter(
-    (r) => r.kind !== 'encrypted',
-  ).length
+  const reasoningEditableCount = reasoning.filter((r) => r.kind !== 'encrypted').length
   const showReasoningSection = (initialReasoning?.length ?? 0) > 0
 
   return (
@@ -250,9 +236,7 @@ export function InlineEditor({
         <details
           data-ui="inline-editor-reasoning"
           open={reasoningOpen}
-          onToggle={(e) =>
-            setReasoningOpen((e.target as HTMLDetailsElement).open)
-          }
+          onToggle={(e) => setReasoningOpen((e.target as HTMLDetailsElement).open)}
         >
           <summary>
             Reasoning ({reasoning.length}
@@ -265,11 +249,7 @@ export function InlineEditor({
             {reasoning.map((row, i) => {
               if (row.kind === 'encrypted') {
                 return (
-                  <div
-                    key={i}
-                    data-ui="inline-editor-reasoning-row"
-                    data-kind="encrypted"
-                  >
+                  <div key={i} data-ui="inline-editor-reasoning-row" data-kind="encrypted">
                     <span data-ui="inline-editor-reasoning-label">
                       Encrypted reasoning #{row.index}
                     </span>
@@ -280,14 +260,9 @@ export function InlineEditor({
                 )
               }
               return (
-                <div
-                  key={i}
-                  data-ui="inline-editor-reasoning-row"
-                  data-kind={row.kind}
-                >
+                <div key={i} data-ui="inline-editor-reasoning-row" data-kind={row.kind}>
                   <span data-ui="inline-editor-reasoning-label">
-                    {row.kind === 'text' ? 'Reasoning' : 'Summary'} #
-                    {row.index}
+                    {row.kind === 'text' ? 'Reasoning' : 'Summary'} #{row.index}
                   </span>
                   <textarea
                     data-ui="inline-editor-reasoning-input"
@@ -344,7 +319,7 @@ export function InlineEditor({
             disabled={busy || saveAndSendDisabled}
             title={
               saveAndSendDisabled
-                ? saveAndSendDisabledReason ?? 'Send disabled'
+                ? (saveAndSendDisabledReason ?? 'Send disabled')
                 : 'Save as a new variant and send (⇧⌘⏎)'
             }
           >

@@ -1,26 +1,14 @@
 import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
+import type { Chat, KeyId, ProfileId } from '../../src/core/types'
 import { newId } from '../../src/lib/ulid'
-import {
-  __resetBroadcastForTests,
-  onEvent,
-  type BroadcastEvent,
-} from '../../src/store/broadcast'
+import { __resetBroadcastForTests, type BroadcastEvent, onEvent } from '../../src/store/broadcast'
 import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
-import {
-  __resetKeyCacheForTests,
-  createKey,
-  getKey,
-} from '../../src/store/keys'
-import {
-  putCachedEndpoints,
-  putCachedModels,
-} from '../../src/store/models-cache'
-import {
-  putCachedPrivacyPolicy,
-  putCachedProviders,
-} from '../../src/store/privacy-cache'
+import { __resetKeyCacheForTests, createKey, getKey } from '../../src/store/keys'
+import { putCachedEndpoints, putCachedModels } from '../../src/store/models-cache'
+import { createPreset } from '../../src/store/presets'
+import { putCachedPrivacyPolicy, putCachedProviders } from '../../src/store/privacy-cache'
 import {
   archiveProfile,
   bumpProfileLastUsedAt,
@@ -36,8 +24,6 @@ import {
   unarchiveProfile,
   updateProfile,
 } from '../../src/store/profiles'
-import { createPreset } from '../../src/store/presets'
-import type { Chat, KeyId, ProfileId } from '../../src/core/types'
 
 const DB_NAME = 'natter'
 

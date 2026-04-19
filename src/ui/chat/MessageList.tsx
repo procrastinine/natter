@@ -1,45 +1,39 @@
 import { useLiveQuery } from 'dexie-react-hooks'
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import {
-  activePath,
-  cursorKeyOf,
-  groupByParent,
-  indexById,
-} from '../../core/active-path'
-import { swipe } from '../../core/messages'
+import { navigateToChat } from '../../app/router'
+import { activePath, cursorKeyOf, groupByParent, indexById } from '../../core/active-path'
 import { resolveLastUpdatedBranchBelow } from '../../core/branch-resolve'
-import {
-  computeBranchTitle,
-  forkChatFromMessage,
-} from '../../core/chat-fork'
+import { computeBranchTitle, forkChatFromMessage } from '../../core/chat-fork'
+import { swipe } from '../../core/messages'
 import type {
   ChatId,
   CursorMap,
-  Message as MessageRow,
   MessageId,
   MessageRole,
+  Message as MessageRow,
   ReasoningDetail,
 } from '../../core/types'
-import { navigateToChat } from '../../app/router'
+import type { EffectiveCapability } from '../../core/capabilities'
+import { useChat } from '../../hooks/useChat'
 import {
+  continueFromMessage,
   editAndResend,
   editInPlace,
-  regenerateFromMessage,
-  continueFromMessage,
   type MessageOpsContext,
+  regenerateFromMessage,
 } from '../../hooks/useMessageOps'
-import { useChat } from '../../hooks/useChat'
+import { getChat, listChats, loadChatMessages } from '../../store/chats'
 import { getDb } from '../../store/db'
-import { listChats, loadChatMessages } from '../../store/chats'
 import { useChatStore } from '../../store/zustand/chatStore'
 import { useToastStore } from '../../store/zustand/toastStore'
-import { Message } from './Message'
 import { ImportModal } from './ImportModal'
+import { Message } from './Message'
 import type { InsertSlot } from './MessageActions'
 
 export interface MessageListProps {
   chatId: ChatId
   hasConnection: boolean
+  capability?: EffectiveCapability
 }
 
 // Stable reference so `useChatStore(selector)` doesn't allocate a fresh `{}`
@@ -68,6 +62,7 @@ function oppositeRole(role: MessageRole): MessageRole {
 export const MessageList = memo(function MessageList({
   chatId,
   hasConnection,
+  capability,
 }: MessageListProps) {
   const messages = useLiveQuery(() => loadChatMessages(chatId), [chatId], [])
   const cursor = useChatStore((state) => state.cursors[chatId] ?? EMPTY_CURSOR)
@@ -77,10 +72,7 @@ export const MessageList = memo(function MessageList({
   // message array; `path` additionally depends on the cursor.
   const byId = useMemo(() => indexById(messages ?? []), [messages])
   const byParent = useMemo(() => groupByParent(messages ?? []), [messages])
-  const path = useMemo(
-    () => activePath(messages ?? [], cursor),
-    [messages, cursor],
-  )
+  const path = useMemo(() => activePath(messages ?? [], cursor), [messages, cursor])
   const { sendFrom } = useChat()
   const pushToast = useToastStore((s) => s.push)
   const [insertTarget, setInsertTarget] = useState<InsertTarget | null>(null)
@@ -88,14 +80,9 @@ export const MessageList = memo(function MessageList({
   // tab session; used to surface the "stale reply?" hint under their
   // next assistant on the active path. The stale-session lives only in
   // memory — reloads wipe it per §10.6 "Edit action" session-local hint.
-  const [staleHintFor, setStaleHintFor] = useState<Set<MessageId>>(
-    () => new Set(),
-  )
+  const [staleHintFor, setStaleHintFor] = useState<Set<MessageId>>(() => new Set())
 
-  const opsCtx = useMemo<MessageOpsContext>(
-    () => ({ chatId, sendFrom }),
-    [chatId, sendFrom],
-  )
+  const opsCtx = useMemo<MessageOpsContext>(() => ({ chatId, sendFrom }), [chatId, sendFrom])
 
   // Track the focused message id via a ref; the DOM's `:focus-within` +
   // `data-message-id` tuple on each <article> tells us which message the
@@ -103,9 +90,7 @@ export const MessageList = memo(function MessageList({
   // just clicked" without forcing a controlled-selection state.
   const listRef = useRef<HTMLDivElement | null>(null)
   const focusedMessageId = useCallback((): MessageId | null => {
-    const el = listRef.current?.querySelector<HTMLElement>(
-      '[data-ui="message"]:focus-within',
-    )
+    const el = listRef.current?.querySelector<HTMLElement>('[data-ui="message"]:focus-within')
     return el?.getAttribute('data-message-id') ?? null
   }, [])
 
@@ -131,10 +116,7 @@ export const MessageList = memo(function MessageList({
       } catch (err) {
         pushToast({
           level: 'danger',
-          text:
-            err instanceof Error
-              ? `Send failed: ${err.message}`
-              : 'Send failed.',
+          text: err instanceof Error ? `Send failed: ${err.message}` : 'Send failed.',
         })
       }
     },
@@ -148,10 +130,7 @@ export const MessageList = memo(function MessageList({
       } catch (err) {
         pushToast({
           level: 'danger',
-          text:
-            err instanceof Error
-              ? `Regenerate failed: ${err.message}`
-              : 'Regenerate failed.',
+          text: err instanceof Error ? `Regenerate failed: ${err.message}` : 'Regenerate failed.',
         })
       }
     },
@@ -165,10 +144,7 @@ export const MessageList = memo(function MessageList({
       } catch (err) {
         pushToast({
           level: 'danger',
-          text:
-            err instanceof Error
-              ? `Continue failed: ${err.message}`
-              : 'Continue failed.',
+          text: err instanceof Error ? `Continue failed: ${err.message}` : 'Continue failed.',
         })
       }
     },
@@ -208,10 +184,7 @@ export const MessageList = memo(function MessageList({
       } catch (err) {
         pushToast({
           level: 'danger',
-          text:
-            err instanceof Error
-              ? `Fork failed: ${err.message}`
-              : 'Fork failed.',
+          text: err instanceof Error ? `Fork failed: ${err.message}` : 'Fork failed.',
         })
       }
     },
@@ -230,8 +203,7 @@ export const MessageList = memo(function MessageList({
     (messageId: MessageId, slot: InsertSlot) => {
       const target = (messages ?? []).find((m) => m.id === messageId)
       if (!target) return
-      const defaultRole =
-        slot === 'sibling' ? target.role : oppositeRole(target.role)
+      const defaultRole = slot === 'sibling' ? target.role : oppositeRole(target.role)
       setInsertTarget({ messageId, slot, defaultRole })
     },
     [messages],
@@ -263,20 +235,12 @@ export const MessageList = memo(function MessageList({
         const next: CursorMap = { ...base, ...cursorUpdates }
         const chosenId = cursorUpdates[cursorKeyOf(focused.parentId)]
         if (chosenId) {
-          resolveLastUpdatedBranchBelow(
-            { targetId: chosenId, byParent, byId },
-            next,
-          )
+          resolveLastUpdatedBranchBelow({ targetId: chosenId, byParent, byId }, next)
         }
         useChatStore.getState().setCursor(chatId, next)
         return
       }
-      if (
-        e.key === 'R' &&
-        e.shiftKey &&
-        (e.metaKey || e.ctrlKey) &&
-        focused.role === 'assistant'
-      ) {
+      if (e.key === 'R' && e.shiftKey && (e.metaKey || e.ctrlKey) && focused.role === 'assistant') {
         e.preventDefault()
         void handleRegenerate(focused)
       }
@@ -297,12 +261,17 @@ export const MessageList = memo(function MessageList({
     return set
   }, [path])
 
+  const chatRow = useLiveQuery(() => getChat(chatId), [chatId], undefined)
+  const excludedIds = useMemo(() => {
+    if (!chatRow) return new Set<MessageId>()
+    return computeExcludedIds(path, chatRow.settings, capability)
+  }, [path, chatRow, capability])
+
   return (
     <div data-ui="message-list" aria-live="polite" ref={listRef}>
       {path.map((m, idx) => {
         const prev = path[idx - 1]
-        const showStaleHint =
-          m.role === 'assistant' && prev && staleHintFor.has(prev.id)
+        const showStaleHint = m.role === 'assistant' && prev && staleHintFor.has(prev.id)
         return (
           <Message
             key={m.id}
@@ -311,9 +280,7 @@ export const MessageList = memo(function MessageList({
             messages={messages ?? []}
             cursor={cursor}
             hasConnection={hasConnection}
-            onEditInPlace={(text, reasoning) =>
-              handleEditInPlace(m, text, reasoning)
-            }
+            onEditInPlace={(text, reasoning) => handleEditInPlace(m, text, reasoning)}
             {...(m.role === 'user'
               ? {
                   onEditAndSend: (text: string) => handleEditAndSend(m, text),
@@ -334,6 +301,7 @@ export const MessageList = memo(function MessageList({
             onInsert={(slot: InsertSlot) => openInsert(m.id, slot)}
             {...(roleMismatchIdsOnPath.has(m.id) ? { roleMismatch: true } : {})}
             {...(showStaleHint ? { staleReplyHint: true } : {})}
+            {...(excludedIds.has(m.id) ? { excludedFromContext: true } : {})}
           />
         )
       })}
@@ -353,3 +321,67 @@ export const MessageList = memo(function MessageList({
     </div>
   )
 })
+
+// Compute which messages would be trimmed out of the next request given
+// the chat's context settings. Uses a chars/4 approximation — the real
+// tokenizer machinery lives in core/prompt-size but this runs per render
+// so cheap wins. Result drives the dashed-ring on profile glyphs.
+//
+// Algorithm:
+// - System prompt tokens are taken off the budget up front.
+// - The first `keepFirstPairs * 2` messages are pinned.
+// - We walk backward from the end, accumulating, until the budget
+//   overflows; everything we didn't touch is "excluded".
+function computeExcludedIds(
+  path: readonly MessageRow[],
+  settings: import('../../core/types').ChatSettings,
+  capability?: EffectiveCapability,
+): Set<MessageId> {
+  const out = new Set<MessageId>()
+  if (path.length === 0) return out
+  // Live provider cap beats stale defaults. Without capability we can't
+  // honestly compute exclusion, so we skip the trim-cost side (only
+  // hiddenFromContext messages are marked). The 128k fallback we used to
+  // carry here produced false "excluded" rings on 1M-context Gemini
+  // models whenever the chat grew past 128k.
+  const providerCap = capability?.maxPromptTokens ?? capability?.contextLength
+  const modelCap = settings.customMaxContext ?? providerCap
+  const maxCompletion = settings.maxCompletionTokens ?? 4096
+  const budget = modelCap !== undefined ? Math.max(0, modelCap - maxCompletion) : undefined
+  const strategy = settings.contextStrategy
+  const keepFirst = Math.max(0, (strategy.keepFirstPairs ?? 0) * 2)
+  const tokensFor = (m: MessageRow): number => {
+    let chars = 0
+    for (const item of m.content) {
+      if (item.type === 'text' || item.type === 'output_text') chars += item.text.length
+    }
+    return Math.ceil(chars / 4)
+  }
+  // User-hidden messages are unconditionally excluded — they don't occupy
+  // any budget either. Filter them out of the working set first.
+  const eligible = path.filter((m) => !m.hiddenFromContext)
+  for (const m of path) if (m.hiddenFromContext) out.add(m.id)
+  // No budget means we can't compute trim-based exclusion — only the
+  // hiddenFromContext set stays.
+  if (budget === undefined) return out
+
+  const sysTokens = Math.ceil(settings.systemPrompt.length / 4)
+  let spent = sysTokens
+  const kept = new Set<MessageId>()
+  for (let i = 0; i < Math.min(keepFirst, eligible.length); i += 1) {
+    const m = eligible[i]
+    if (!m) continue
+    spent += tokensFor(m)
+    kept.add(m.id)
+  }
+  for (let i = eligible.length - 1; i >= keepFirst; i -= 1) {
+    const m = eligible[i]
+    if (!m) continue
+    const cost = tokensFor(m)
+    if (spent + cost > budget) break
+    spent += cost
+    kept.add(m.id)
+  }
+  for (const m of eligible) if (!kept.has(m.id)) out.add(m.id)
+  return out
+}

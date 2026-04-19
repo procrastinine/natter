@@ -1,15 +1,11 @@
 import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
+import type { Chat, ChatSettings, PresetId, ProfileId } from '../../src/core/types'
 import { newId } from '../../src/lib/ulid'
-import {
-  __resetBroadcastForTests,
-  onEvent,
-  type BroadcastEvent,
-} from '../../src/store/broadcast'
+import { __resetBroadcastForTests, type BroadcastEvent, onEvent } from '../../src/store/broadcast'
 import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
 import { __resetKeyCacheForTests, createKey } from '../../src/store/keys'
-import { createProfile, ProfileMissingError } from '../../src/store/profiles'
 import {
   archivePreset,
   bumpPresetLastUsedAt,
@@ -24,7 +20,7 @@ import {
   unarchivePreset,
   updatePreset,
 } from '../../src/store/presets'
-import type { Chat, ChatSettings, PresetId, ProfileId } from '../../src/core/types'
+import { createProfile, ProfileMissingError } from '../../src/store/profiles'
 
 const DB_NAME = 'natter'
 
@@ -53,10 +49,7 @@ function settingsFor(profileId: ProfileId): ChatSettings {
   return s
 }
 
-async function seedChatReferencingPreset(
-  profileId: ProfileId,
-  presetId: PresetId,
-): Promise<Chat> {
+async function seedChatReferencingPreset(profileId: ProfileId, presetId: PresetId): Promise<Chat> {
   const db = await openDb()
   const chat: Chat = {
     id: newId(),
@@ -147,9 +140,7 @@ describe('updatePreset', () => {
   })
 
   it('rejects an update to a missing preset', async () => {
-    await expect(updatePreset('missing', { name: 'x' })).rejects.toBeInstanceOf(
-      PresetMissingError,
-    )
+    await expect(updatePreset('missing', { name: 'x' })).rejects.toBeInstanceOf(PresetMissingError)
   })
 })
 

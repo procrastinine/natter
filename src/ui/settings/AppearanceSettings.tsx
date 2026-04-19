@@ -5,22 +5,22 @@
 import { useLiveQuery } from 'dexie-react-hooks'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
-  BASE_FONT_SIZE_OPTIONS,
-  FONT_FAMILY_OPTIONS,
   applyBaseFontSizeToDocument,
   applyChatMaxWidthToDocument,
   applyFontFamilyToDocument,
   applyThemeToDocument,
+  BASE_FONT_SIZE_OPTIONS,
+  type BaseFontSize,
+  type ChatMaxWidth,
   DEFAULT_GLOBAL_PREFERENCES,
+  FONT_FAMILY_OPTIONS,
+  type FontFamilyChoice,
   readGlobalPreferences,
+  type ThemePreference,
   writeBaseFontSize,
   writeChatMaxWidth,
   writeFontFamily,
   writeTheme,
-  type BaseFontSize,
-  type ChatMaxWidth,
-  type FontFamilyChoice,
-  type ThemePreference,
 } from '../../core/global-settings'
 import { RenderingSettings } from './RenderingSettings'
 
@@ -52,11 +52,7 @@ function chatMaxWidthLabel(value: ChatMaxWidth): string {
 }
 
 export function AppearanceSettings() {
-  const prefs = useLiveQuery(
-    readGlobalPreferences,
-    [],
-    DEFAULT_GLOBAL_PREFERENCES,
-  )
+  const prefs = useLiveQuery(readGlobalPreferences, [], DEFAULT_GLOBAL_PREFERENCES)
 
   const onTheme = useCallback(async (value: ThemePreference) => {
     applyThemeToDocument(value)
@@ -73,9 +69,7 @@ export function AppearanceSettings() {
     await writeBaseFontSize(value)
   }, [])
 
-  const [position, setPosition] = useState<number>(() =>
-    sliderPositionFromPref(prefs.chatMaxWidth),
-  )
+  const [position, setPosition] = useState<number>(() => sliderPositionFromPref(prefs.chatMaxWidth))
   const lastPersistedRef = useRef<ChatMaxWidth>(prefs.chatMaxWidth)
   const persistTimerRef = useRef<number | null>(null)
   useEffect(() => {
@@ -124,9 +118,7 @@ export function AppearanceSettings() {
         <div data-ui="field-group">
           <label htmlFor="chat-max-width">
             Chat width{' '}
-            <span data-ui="field-value">
-              {chatMaxWidthLabel(prefFromSliderPosition(position))}
-            </span>
+            <span data-ui="field-value">{chatMaxWidthLabel(prefFromSliderPosition(position))}</span>
           </label>
           <input
             id="chat-max-width"
@@ -137,13 +129,10 @@ export function AppearanceSettings() {
             step={CHAT_WIDTH_STEP}
             value={position}
             onChange={(e) => onChatMaxWidth(e.target.value)}
-            onInput={(e) =>
-              onChatMaxWidth((e.target as HTMLInputElement).value)
-            }
+            onInput={(e) => onChatMaxWidth((e.target as HTMLInputElement).value)}
           />
           <span data-ui="helper">
-            Maximum width of the centered reading column. Drag to the right
-            edge for full width.
+            Maximum width of the centered reading column. Drag to the right edge for full width.
           </span>
         </div>
       </div>
@@ -155,9 +144,7 @@ export function AppearanceSettings() {
             id="font-family"
             data-ui="font-family-select"
             value={prefs.fontFamily}
-            onChange={(e) =>
-              void onFontFamily(e.target.value as FontFamilyChoice)
-            }
+            onChange={(e) => void onFontFamily(e.target.value as FontFamilyChoice)}
           >
             {FONT_FAMILY_OPTIONS.map((o) => (
               <option key={o.value} value={o.value}>
@@ -166,8 +153,8 @@ export function AppearanceSettings() {
             ))}
           </select>
           <span data-ui="helper">
-            Applies to the chat transcript, composer, and sidebar. Code
-            blocks keep the monospace family from the rendering theme.
+            Applies to the chat transcript, composer, and sidebar. Code blocks keep the monospace
+            family from the rendering theme.
           </span>
         </div>
         <div data-ui="field-group">
@@ -177,9 +164,7 @@ export function AppearanceSettings() {
             data-ui="base-font-size-select"
             value={prefs.baseFontSize}
             onChange={(e) =>
-              void onBaseFontSize(
-                Number.parseInt(e.target.value, 10) as BaseFontSize,
-              )
+              void onBaseFontSize(Number.parseInt(e.target.value, 10) as BaseFontSize)
             }
           >
             {BASE_FONT_SIZE_OPTIONS.map((v) => (
@@ -188,9 +173,7 @@ export function AppearanceSettings() {
               </option>
             ))}
           </select>
-          <span data-ui="helper">
-            Scales headings, chips, and helper text proportionally.
-          </span>
+          <span data-ui="helper">Scales headings, chips, and helper text proportionally.</span>
         </div>
       </div>
       <RenderingSettings />

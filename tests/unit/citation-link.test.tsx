@@ -19,12 +19,7 @@ describe('CitationLink', () => {
   it('renders file citations with a scroll-to-chunk handler', () => {
     const onScrollToFile = vi.fn()
     render(
-      <CitationLink
-        kind="file"
-        fileRef="doc-123"
-        chunkId="para-42"
-        onScrollToFile={onScrollToFile}
-      >
+      <CitationLink kind="file" fileRef="doc-123" chunkId="para-42" onScrollToFile={onScrollToFile}>
         see source
       </CitationLink>,
     )

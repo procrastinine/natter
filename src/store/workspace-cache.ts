@@ -1,6 +1,6 @@
 import type { Chat, ChatId, DraftRow, Message, MessageId } from '../core/types'
-import type { WorkspaceRepository } from './repository'
 import { getBrowserRepository } from './browser-repo'
+import type { WorkspaceRepository } from './repository'
 
 // Phase 0-4 read-side cache boundary. The current implementation is a thin
 // repository-backed facade so UI code can depend on one workspace surface

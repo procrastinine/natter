@@ -12,7 +12,7 @@
  * Tailwind is included once here so @layer rules inside the shared files resolve.
  */
 
-@import 'tailwindcss';
+@import "tailwindcss";
 
 /* Tailwind 4 auto-scans the project tree, but not node_modules. Streamdown's
  * compiled components (ul `list-disc`, strong `font-semibold`, tables, etc.)
@@ -42,31 +42,31 @@
   --color-primary-foreground: var(--color-accent-contrast);
 }
 
-@import '../styles/tokens.css';
-@import '../styles/themes.css';
-@import '../styles/motion.css';
+@import "../styles/tokens.css";
+@import "../styles/themes.css";
+@import "../styles/motion.css";
 
-@import '../styles/primitives.css';
-@import '../styles/icons.css';
-@import '../styles/forms.css';
-@import '../styles/modals.css';
+@import "../styles/primitives.css";
+@import "../styles/icons.css";
+@import "../styles/forms.css";
+@import "../styles/modals.css";
 
-@import '../styles/shell.css';
-@import '../styles/sidebar.css';
-@import '../styles/header.css';
-@import '../styles/messages.css';
-@import '../styles/branching.css';
-@import '../styles/composer.css';
-@import '../styles/reasoning.css';
-@import '../styles/tools.css';
-@import '../styles/settings-pane.css';
-@import '../styles/pickers.css';
-@import '../styles/privacy.css';
-@import '../styles/manager.css';
-@import '../styles/banners.css';
-@import '../styles/rendering.css';
+@import "../styles/shell.css";
+@import "../styles/sidebar.css";
+@import "../styles/header.css";
+@import "../styles/messages.css";
+@import "../styles/branching.css";
+@import "../styles/composer.css";
+@import "../styles/reasoning.css";
+@import "../styles/tools.css";
+@import "../styles/settings-pane.css";
+@import "../styles/pickers.css";
+@import "../styles/privacy.css";
+@import "../styles/manager.css";
+@import "../styles/banners.css";
+@import "../styles/rendering.css";
 
-@import '../styles/utilities.css';
+@import "../styles/utilities.css";
 
 html,
 body,

@@ -1,9 +1,8 @@
 import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
+import type { Chat, Message } from '../../src/core/types'
 import { newId } from '../../src/lib/ulid'
-import { __resetBroadcastForTests } from '../../src/store/broadcast'
-import { __resetBrowserRepositoryForTests, getBrowserRepository } from '../../src/store/browser-repo'
 import {
   buildAttachment,
   countLiveRefs,
@@ -14,8 +13,12 @@ import {
   reapOrphanedAttachments,
   sha256Hex,
 } from '../../src/store/attachments'
+import { __resetBroadcastForTests } from '../../src/store/broadcast'
+import {
+  __resetBrowserRepositoryForTests,
+  getBrowserRepository,
+} from '../../src/store/browser-repo'
 import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
-import type { Chat, Message } from '../../src/core/types'
 
 const DB_NAME = 'natter'
 

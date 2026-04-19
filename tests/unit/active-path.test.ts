@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest'
 import {
-  ROOT_CURSOR_KEY,
   activePath,
   cursorKeyOf,
   findLastUpdatedLeafId,
@@ -9,6 +8,7 @@ import {
   isOnPathToLeaf,
   liveLeaves,
   pickDefaultChild,
+  ROOT_CURSOR_KEY,
 } from '../../src/core/active-path'
 import type { CursorMap, Message, MessageId } from '../../src/core/types'
 
@@ -123,12 +123,7 @@ describe('activePath', () => {
 
   it('returns an empty path when the chat has no live messages', () => {
     expect(activePath([], {})).toEqual([])
-    expect(
-      activePath(
-        [mkMessage({ id: M(1), deleted: true })],
-        {},
-      ),
-    ).toEqual([])
+    expect(activePath([mkMessage({ id: M(1), deleted: true })], {})).toEqual([])
   })
 })
 
@@ -148,11 +143,7 @@ describe('liveLeaves / findLastUpdatedLeafId', () => {
 
   it('returns null for an empty chat or a fully-tombstoned chat', () => {
     expect(findLastUpdatedLeafId([])).toBeNull()
-    expect(
-      findLastUpdatedLeafId([
-        mkMessage({ id: M(1), deleted: true }),
-      ]),
-    ).toBeNull()
+    expect(findLastUpdatedLeafId([mkMessage({ id: M(1), deleted: true })])).toBeNull()
   })
 })
 

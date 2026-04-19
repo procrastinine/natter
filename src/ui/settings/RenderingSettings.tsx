@@ -29,23 +29,13 @@ export async function writeRenderingPreferences(
 }
 
 export function RenderingSettings() {
-  const prefs = useLiveQuery(
-    readRenderingPreferences,
-    [],
-    DEFAULT_RENDERING_PREFS,
-  )
-  const onLight = useCallback(
-    (value: ShikiThemeChoice) => {
-      void writeRenderingPreferences({ shikiLight: value })
-    },
-    [],
-  )
-  const onDark = useCallback(
-    (value: ShikiThemeChoice) => {
-      void writeRenderingPreferences({ shikiDark: value })
-    },
-    [],
-  )
+  const prefs = useLiveQuery(readRenderingPreferences, [], DEFAULT_RENDERING_PREFS)
+  const onLight = useCallback((value: ShikiThemeChoice) => {
+    void writeRenderingPreferences({ shikiLight: value })
+  }, [])
+  const onDark = useCallback((value: ShikiThemeChoice) => {
+    void writeRenderingPreferences({ shikiDark: value })
+  }, [])
   return (
     <div data-ui="settings-section" data-ui-section="rendering-settings">
       <h3>Rendering</h3>
@@ -85,9 +75,4 @@ export function RenderingSettings() {
   )
 }
 
-const THEME_CHOICES: ShikiThemeChoice[] = [
-  'github-light',
-  'github-dark',
-  'tokyo-night',
-  'dracula',
-]
+const THEME_CHOICES: ShikiThemeChoice[] = ['github-light', 'github-dark', 'tokyo-night', 'dracula']

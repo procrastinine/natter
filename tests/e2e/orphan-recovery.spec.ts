@@ -1,8 +1,5 @@
 import { expect, test } from '@playwright/test'
-import {
-  clearIndexedDb,
-  seedFirstRun,
-} from './helpers'
+import { clearIndexedDb, seedFirstRun } from './helpers'
 
 // The orphan sweep (Shell.tsx → recoverOrphans on mount) rescues any message
 // whose `generation.startedAt` is set without `finishedAt` by marking it
@@ -71,22 +68,28 @@ test('orphan in-flight message is marked tab-close on next mount', async ({ page
   // Reload so Shell.tsx's useEffect fires recoverOrphans.
   await page.reload()
   // Wait until recoverOrphans commits.
-  await page.waitForFunction(async (id) => {
-    const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const req = indexedDB.open('natter')
-      req.onsuccess = () => resolve(req.result)
-      req.onerror = () => reject(req.error)
-    })
-    try {
-      const row = await new Promise<{ generation?: { abortReason?: string } }>((resolve, reject) => {
-        const tx = db.transaction('messages', 'readonly')
-        const req = tx.objectStore('messages').get(id)
-        req.onsuccess = () => resolve(req.result as { generation?: { abortReason?: string } })
+  await page.waitForFunction(
+    async (id) => {
+      const db = await new Promise<IDBDatabase>((resolve, reject) => {
+        const req = indexedDB.open('natter')
+        req.onsuccess = () => resolve(req.result)
         req.onerror = () => reject(req.error)
       })
-      return row?.generation?.abortReason === 'tab-close'
-    } finally {
-      db.close()
-    }
-  }, orphanId, { timeout: 5000 })
+      try {
+        const row = await new Promise<{ generation?: { abortReason?: string } }>(
+          (resolve, reject) => {
+            const tx = db.transaction('messages', 'readonly')
+            const req = tx.objectStore('messages').get(id)
+            req.onsuccess = () => resolve(req.result as { generation?: { abortReason?: string } })
+            req.onerror = () => reject(req.error)
+          },
+        )
+        return row?.generation?.abortReason === 'tab-close'
+      } finally {
+        db.close()
+      }
+    },
+    orphanId,
+    { timeout: 5000 },
+  )
 })

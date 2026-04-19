@@ -25,9 +25,7 @@ export function MessageInfo({ message, staleReplyHint }: MessageInfoProps) {
       : undefined
   const completionTokens = usage?.completion_tokens
   const tokenPerSec =
-    elapsedSec && elapsedSec > 0 && completionTokens
-      ? completionTokens / elapsedSec
-      : undefined
+    elapsedSec && elapsedSec > 0 && completionTokens ? completionTokens / elapsedSec : undefined
   const rows: Array<[string, React.ReactNode]> = []
   rows.push(['Created', new Date(message.createdAt).toLocaleString()])
   if (message.editedAt) {
@@ -43,9 +41,7 @@ export function MessageInfo({ message, staleReplyHint }: MessageInfoProps) {
     rows.push([
       'Model',
       gen.requestedModel && gen.requestedModel !== gen.model ? (
-        <span title={`Requested ${gen.requestedModel} → served ${gen.model}`}>
-          {gen.model}
-        </span>
+        <span title={`Requested ${gen.requestedModel} → served ${gen.model}`}>{gen.model}</span>
       ) : (
         gen.model
       ),
@@ -86,10 +82,7 @@ export function MessageInfo({ message, staleReplyHint }: MessageInfoProps) {
     rows.push(['Delivery', gen.delivery])
   }
   if (staleReplyHint) {
-    rows.push([
-      'Note',
-      'Previous user message was edited after this reply — text may be stale.',
-    ])
+    rows.push(['Note', 'Previous user message was edited after this reply — text may be stale.'])
   }
   return (
     <dl data-ui="message-info">

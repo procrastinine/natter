@@ -1,47 +1,46 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
 import { useLiveQuery } from 'dexie-react-hooks'
-import type { ChatId, ChatPreset, ConnectionProfile, CursorMap } from '../core/types'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { activePath } from '../core/active-path'
+import { estimatePromptSize, tokenizerFromSettings } from '../core/prompt-size'
 import { cloneDefaultChatSettings } from '../core/defaults'
 import {
   applyBaseFontSizeToDocument,
   applyChatMaxWidthToDocument,
   applyFontFamilyToDocument,
   applyThemeToDocument,
+  bumpRecentModel,
   DEFAULT_GLOBAL_PREFERENCES,
   readGlobalPreferences,
 } from '../core/global-settings'
-import { recoverOrphans, useChat } from '../hooks/useChat'
+import type { ChatId, ChatPreset, ConnectionProfile, CursorMap } from '../core/types'
 import { useBranchUrlSync } from '../hooks/useBranchUrlSync'
-import { activePath } from '../core/active-path'
-import { loadChatMessages, refreshChatPreview } from '../store/chats'
+import { recoverOrphans, useChat } from '../hooks/useChat'
+import { useEndpoints } from '../hooks/useEndpoints'
 import { installChatPreviewMaintainer } from '../store/chat-preview-maintainer'
-import { resolveKey } from '../store/keys'
-import { pickMruPreset, bumpPresetLastUsedAt } from '../store/presets'
-import { getProfile, bumpProfileLastUsedAt } from '../store/profiles'
-import { createChat } from '../store/chats'
+import { createChat, loadChatMessages, refreshChatPreview } from '../store/chats'
 import { getDb } from '../store/db'
+import { resolveKey } from '../store/keys'
+import { bumpPresetLastUsedAt, pickMruPreset } from '../store/presets'
+import { bumpProfileLastUsedAt, getProfile } from '../store/profiles'
+import { useChatStore } from '../store/zustand/chatStore'
 import { useStreamStore } from '../store/zustand/streamStore'
-import { ChatList } from '../ui/sidebar/ChatList'
-import { ChevronIcon, CogIcon, NewChatIcon } from '../ui/icons/Icon'
-import { ChatHeader } from '../ui/chat/ChatHeader'
-import { Composer } from '../ui/chat/Composer'
-import { EmptyState } from '../ui/chat/EmptyState'
-import { MessageList } from '../ui/chat/MessageList'
-import {
-  ScrollRegion,
-  type ScrollRegionHandle,
-  type ScrollState,
-} from '../ui/chat/ScrollRegion'
-import { BannerTray } from '../ui/chat/BannerTray'
-import { EditTreeToolbar } from '../ui/chat/EditTreeToolbar'
-import { FocusModeToggle } from '../ui/chat/FocusModeToggle'
-import { ToastTray } from '../ui/chat/ToastTray'
-import { ImportModal } from '../ui/chat/ImportModal'
-import { ConnectionHeader } from '../ui/header/ConnectionHeader'
-import { ChatModelPanel } from '../ui/settings/ChatModelPanel'
-import { GlobalSettingsModal } from '../ui/settings/GlobalSettingsModal'
 import { useToastStore } from '../store/zustand/toastStore'
 import { useUiStore } from '../store/zustand/uiStore'
+import { BannerTray } from '../ui/chat/BannerTray'
+import { ChatHeader } from '../ui/chat/ChatHeader'
+import { Composer } from '../ui/chat/Composer'
+import { EditTreeToolbar } from '../ui/chat/EditTreeToolbar'
+import { EmptyState } from '../ui/chat/EmptyState'
+import { FocusModeToggle } from '../ui/chat/FocusModeToggle'
+import { ImportModal } from '../ui/chat/ImportModal'
+import { MessageList } from '../ui/chat/MessageList'
+import { ScrollRegion, type ScrollRegionHandle, type ScrollState } from '../ui/chat/ScrollRegion'
+import { ToastTray } from '../ui/chat/ToastTray'
+import { ConnectionHeader } from '../ui/header/ConnectionHeader'
+import { ChevronIcon, CogIcon, NewChatIcon } from '../ui/icons/Icon'
+import { ChatModelPanel } from '../ui/settings/ChatModelPanel'
+import { GlobalSettingsModal } from '../ui/settings/GlobalSettingsModal'
+import { ChatList } from '../ui/sidebar/ChatList'
 import {
   homeHref,
   makeAnchorClickHandler,
@@ -51,7 +50,6 @@ import {
   newChatHref,
   useRoute,
 } from './router'
-import { useChatStore } from '../store/zustand/chatStore'
 
 const SIDEBAR_COLLAPSED_STORAGE_KEY = 'natter:sidebar-collapsed'
 // Stable empty reference so useSyncExternalStore selectors don't allocate a
@@ -82,31 +80,70 @@ export function Shell() {
   const activeCursor = useChatStore((s) =>
     activeChatId ? (s.cursors[activeChatId] ?? EMPTY_CURSOR) : EMPTY_CURSOR,
   )
-  // Resolve the trailing message on the active path so the composer's
-  // Send button can switch to "Reply" when the chat ends on a user turn.
-  // The chat-row dependency keeps us live across mutations.
-  const trailingLeaf = useLiveQuery(
-    async () => {
-      if (!activeChatId) return null
-      const msgs = await loadChatMessages(activeChatId)
-      const path = activePath(msgs, activeCursor)
-      return path.at(-1) ?? null
-    },
-    [activeChatId, activeCursor],
-    null,
+  // Single subscriptions for the active chat's row + message set. Earlier
+  // there were three overlapping `useLiveQuery` calls (trailingLeaf,
+  // activeChatRow, tokenBudgetIndicator) each loading the chat/messages
+  // on its own. Now downstream derivations share one observable per
+  // table, cutting redundant IDB reads and observer lifecycles.
+  const activeChatRow = useLiveQuery(
+    async () => (activeChatId ? await getDb().chats.get(activeChatId) : undefined),
+    [activeChatId],
+    undefined,
   )
-  const trailingUserMessage =
-    trailingLeaf?.role === 'user' ? trailingLeaf : null
+  const activeMessages = useLiveQuery(
+    async () => (activeChatId ? await loadChatMessages(activeChatId) : []),
+    [activeChatId],
+    [],
+  )
+  const activeEndpoints = useEndpoints(
+    activeChatRow?.settings.profileId ?? null,
+    activeChatRow?.settings.model || null,
+    { strict: activeChatRow?.settings.strictProviderRouting === true },
+  )
+  const activeCapability = activeEndpoints.capability
+  const activePathMemo = useMemo(
+    () => activePath(activeMessages ?? [], activeCursor),
+    [activeMessages, activeCursor],
+  )
+  const trailingLeaf = useMemo(() => activePathMemo.at(-1) ?? null, [activePathMemo])
+  const trailingUserMessage = trailingLeaf?.role === 'user' ? trailingLeaf : null
+  // Token indicator for the composer. Shares `estimatePromptSize` with
+  // the Context tab's gauge, so the number the user sees in the composer
+  // matches the Context tab exactly — including the provider-calibrated
+  // baseline, the hiddenFromContext filtering, and the edit-aware
+  // fallback. Budget resolution:
+  //
+  //   1. Prefer the user's `customMaxContext` — it's explicit intent.
+  //   2. Otherwise use the provider-derived cap from live /endpoints.
+  //   3. If the capability hasn't loaded yet AND the user hasn't set a
+  //      custom cap, we return `undefined` so the Composer hides the
+  //      indicator entirely instead of collapsing to a bogus 128k
+  //      default. Transient flickers from "894k → 104k" during a model
+  //      switch were the bug driving this.
+  const tokenBudgetIndicator = useMemo(() => {
+    if (!activeChatRow) return undefined
+    const providerCap = activeCapability?.maxPromptTokens ?? activeCapability?.contextLength
+    const modelCap = activeChatRow.settings.customMaxContext ?? providerCap
+    if (modelCap === undefined) return undefined
+    const providerCompletionCap =
+      activeCapability?.maxCompletionTokens ?? activeCapability?.contextLength ?? modelCap
+    const maxCompletion =
+      activeChatRow.settings.maxCompletionTokens ?? Math.min(4096, providerCompletionCap)
+    const budget = Math.max(0, modelCap - maxCompletion)
+    const est = estimatePromptSize({
+      systemPrompt: activeChatRow.settings.systemPrompt,
+      activePathMessages: activePathMemo,
+      draftText: '',
+      tokenizer: tokenizerFromSettings(activeChatRow.settings, null),
+    })
+    return { used: est.total, budget }
+  }, [activeChatRow, activePathMemo, activeCapability])
   const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() => {
     if (typeof window === 'undefined') return false
     return window.localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === '1'
   })
   const scrollRef = useRef<ScrollRegionHandle>(null)
-  const prefs = useLiveQuery(
-    readGlobalPreferences,
-    [],
-    DEFAULT_GLOBAL_PREFERENCES,
-  )
+  const prefs = useLiveQuery(readGlobalPreferences, [], DEFAULT_GLOBAL_PREFERENCES)
 
   useEffect(() => {
     void recoverOrphans()
@@ -127,6 +164,32 @@ export function Shell() {
     })()
   }, [activeChatId])
 
+  // Auto-materialize a chat when the user lands on /new. Eager creation
+  // means the settings panel always has a real Chat row to edit, so every
+  // control on the right pane (model / context / generation) works before
+  // the first message is even typed. Empty chats are hidden from the
+  // sidebar (see ChatList — filters out rows with no previewText), so
+  // this doesn't litter the workspace with Untitled rows even if the
+  // user bails without sending.
+  useEffect(() => {
+    if (!onNewChatSurface) return
+    let cancelled = false
+    void (async () => {
+      const preset = await pickMruPreset()
+      if (cancelled) return
+      const seedSettings = preset ? preset.settings : cloneDefaultChatSettings()
+      const chat = await createChat({
+        settings: { ...seedSettings },
+        ...(preset ? { presetId: preset.id } : {}),
+      })
+      if (cancelled) return
+      navigateToChat(chat.id)
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [onNewChatSurface])
+
   useEffect(() => {
     applyThemeToDocument(prefs.theme)
   }, [prefs.theme])
@@ -143,16 +206,13 @@ export function Shell() {
     applyBaseFontSizeToDocument(prefs.baseFontSize)
   }, [prefs.baseFontSize])
 
-  useEffect(() => {
-    if (!activeChatId) setChatModelOpen(false)
-  }, [activeChatId])
+  // Persist the panel's open/closed state across route transitions —
+  // in particular, navigating to /new or between chats shouldn't auto-
+  // collapse the settings pane the user explicitly opened.
 
   useEffect(() => {
     if (typeof window === 'undefined') return
-    window.localStorage.setItem(
-      SIDEBAR_COLLAPSED_STORAGE_KEY,
-      sidebarCollapsed ? '1' : '0',
-    )
+    window.localStorage.setItem(SIDEBAR_COLLAPSED_STORAGE_KEY, sidebarCollapsed ? '1' : '0')
   }, [sidebarCollapsed])
 
   // Chat-not-found banner: if the route refers to a chat id that doesn't
@@ -162,7 +222,9 @@ export function Shell() {
   const routedChatExists = useLiveQuery(
     () =>
       activeChatId
-        ? getDb().chats.get(activeChatId).then((c) => !!c)
+        ? getDb()
+            .chats.get(activeChatId)
+            .then((c) => !!c)
         : Promise.resolve(true),
     [activeChatId],
     true,
@@ -182,19 +244,16 @@ export function Shell() {
     })
   }, [activeChatId, routedChatExists, pushBanner, clearBannersByKind])
 
-  const materializeChatFromComposer = useCallback(
-    async (text: string) => {
-      const preset = await pickMruPreset()
-      const settings = preset ? preset.settings : cloneDefaultChatSettings()
-      const chat = await createChat({
-        settings: { ...settings },
-        ...(preset ? { presetId: preset.id } : {}),
-      })
-      navigateToChat(chat.id)
-      return { chat, seedText: text }
-    },
-    [],
-  )
+  const materializeChatFromComposer = useCallback(async (text: string) => {
+    const preset = await pickMruPreset()
+    const settings = preset ? preset.settings : cloneDefaultChatSettings()
+    const chat = await createChat({
+      settings: { ...settings },
+      ...(preset ? { presetId: preset.id } : {}),
+    })
+    navigateToChat(chat.id)
+    return { chat, seedText: text }
+  }, [])
 
   const handleSubmit = useCallback(
     async (text: string) => {
@@ -205,7 +264,9 @@ export function Shell() {
         return
       }
       if (!chat.settings.profileId) {
-        console.error('send: chat.settings.profileId is empty — create the chat from a seeded preset')
+        console.error(
+          'send: chat.settings.profileId is empty — create the chat from a seeded preset',
+        )
         return
       }
       if (!chat.settings.model) {
@@ -240,6 +301,7 @@ export function Shell() {
       }
       await bumpProfileLastUsedAt(profile.id)
       if (chat.presetId) await bumpPresetLastUsedAt(chat.presetId)
+      await bumpRecentModel(chat.settings.model)
     },
     [activeChatId, send],
   )
@@ -275,6 +337,7 @@ export function Shell() {
       }
       await bumpProfileLastUsedAt(profile.id)
       if (chat.presetId) await bumpPresetLastUsedAt(chat.presetId)
+      await bumpRecentModel(chat.settings.model)
     },
     [materializeChatFromComposer, send],
   )
@@ -292,36 +355,21 @@ export function Shell() {
         e.preventDefault()
         setGlobalSettingsOpen((v) => !v)
       }
-      if (
-        e.key === '.' &&
-        (e.metaKey || e.ctrlKey) &&
-        streamingOnActiveChat
-      ) {
+      if (e.key === '.' && (e.metaKey || e.ctrlKey) && streamingOnActiveChat) {
         e.preventDefault()
         abort()
       }
       // Edit-tree mode toggle (§10.14). Works globally; scoped by chat only
       // because the mode visually affects rows — the store field itself is
       // app-wide.
-      if (
-        e.key === 'E' &&
-        e.shiftKey &&
-        (e.metaKey || e.ctrlKey) &&
-        !isTyping
-      ) {
+      if (e.key === 'E' && e.shiftKey && (e.metaKey || e.ctrlKey) && !isTyping) {
         e.preventDefault()
         setEditTreeMode(!useUiStore.getState().editTreeMode)
       }
       // Import-at-end modal shortcut (§10.14). Only meaningful on an active
       // chat; we swallow the keystroke either way so DevTools bindings
       // (`Ctrl+Shift+I`) don't stomp us.
-      if (
-        e.key === 'V' &&
-        e.shiftKey &&
-        (e.metaKey || e.ctrlKey) &&
-        activeChatId &&
-        !isTyping
-      ) {
+      if (e.key === 'V' && e.shiftKey && (e.metaKey || e.ctrlKey) && activeChatId && !isTyping) {
         e.preventDefault()
         setImportAtEndOpen(true)
       }
@@ -336,7 +384,12 @@ export function Shell() {
     return () => window.removeEventListener('keydown', onKey)
   }, [streamingOnActiveChat, abort, activeChatId, setEditTreeMode])
 
-  const showChatModelPanel = chatModelOpen && activeChatId
+  // Keep the panel slot reserved whenever the user opened it, regardless
+  // of whether a chat is active. On /new we still render the shell so the
+  // transition out of /new (after materializing a chat) doesn't make the
+  // panel jump in from nowhere. The panel component itself no-ops when
+  // chatId is null.
+  const showChatModelPanel = chatModelOpen
 
   return (
     <div
@@ -345,18 +398,10 @@ export function Shell() {
       data-sidebar={sidebarCollapsed ? 'collapsed' : 'expanded'}
       data-focus-mode={focusMode ? 'on' : 'off'}
     >
-      <aside
-        data-ui="sidebar"
-        data-collapsed={sidebarCollapsed}
-        aria-label="Chats"
-      >
+      <aside data-ui="sidebar" data-collapsed={sidebarCollapsed} aria-label="Chats">
         <div data-ui="sidebar-header">
           {sidebarCollapsed ? null : (
-            <a
-              data-ui="brand"
-              href={homeHref()}
-              onClick={makeAnchorClickHandler(homeHref())}
-            >
+            <a data-ui="brand" href={homeHref()} onClick={makeAnchorClickHandler(homeHref())}>
               natter
             </a>
           )}
@@ -368,10 +413,7 @@ export function Shell() {
             title={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
             onClick={() => setSidebarCollapsed((v) => !v)}
           >
-            <ChevronIcon
-              size={16}
-              rotate={sidebarCollapsed ? 0 : 180}
-            />
+            <ChevronIcon size={16} rotate={sidebarCollapsed ? 0 : 180} />
           </button>
           <a
             data-ui="icon-button"
@@ -385,10 +427,7 @@ export function Shell() {
             <NewChatIcon size={18} />
           </a>
         </div>
-        <ChatList
-          activeChatId={activeChatId}
-          collapsed={sidebarCollapsed}
-        />
+        <ChatList activeChatId={activeChatId} collapsed={sidebarCollapsed} />
         <div data-ui="sidebar-footer">
           <button
             type="button"
@@ -428,6 +467,7 @@ export function Shell() {
               <MessageList
                 chatId={activeChatId}
                 hasConnection={hasConnection}
+                {...(activeCapability ? { capability: activeCapability } : {})}
               />
               {focusMode ? (
                 <Composer
@@ -437,11 +477,14 @@ export function Shell() {
                   onAbort={abort}
                   autoSize
                   autoSizeVariant="focus"
-                  {...(hasConnection ? {} : { sendBlockedReason: 'Add a connection to send messages.' })}
+                  {...(hasConnection
+                    ? {}
+                    : { sendBlockedReason: 'Add a connection to send messages.' })}
                   seed={composerSeed}
                   onSeedConsumed={() => setComposerSeed(null)}
                   sendShortcut={prefs.sendShortcut}
                   onImportAtEnd={() => setImportAtEndOpen(true)}
+                  {...(tokenBudgetIndicator ? { tokenBudget: tokenBudgetIndicator } : {})}
                   trailingUserMessage={Boolean(trailingUserMessage)}
                   {...(trailingUserMessage && hasConnection
                     ? {
@@ -478,11 +521,14 @@ export function Shell() {
                 streaming={streamingOnActiveChat}
                 onAbort={abort}
                 autoSize
-                {...(hasConnection ? {} : { sendBlockedReason: 'Add a connection to send messages.' })}
+                {...(hasConnection
+                  ? {}
+                  : { sendBlockedReason: 'Add a connection to send messages.' })}
                 seed={composerSeed}
                 onSeedConsumed={() => setComposerSeed(null)}
                 sendShortcut={prefs.sendShortcut}
                 onImportAtEnd={() => setImportAtEndOpen(true)}
+                {...(tokenBudgetIndicator ? { tokenBudget: tokenBudgetIndicator } : {})}
                 trailingUserMessage={Boolean(trailingUserMessage)}
                 {...(trailingUserMessage && hasConnection
                   ? {
@@ -514,9 +560,7 @@ export function Shell() {
                     <button
                       type="button"
                       data-ui="jump-to-latest"
-                      onClick={() =>
-                        scrollRef.current?.scrollToBottom({ smooth: true })
-                      }
+                      onClick={() => scrollRef.current?.scrollToBottom({ smooth: true })}
                     >
                       ↓ Jump to latest
                     </button>
@@ -545,9 +589,7 @@ export function Shell() {
                 title="Model settings"
                 onClick={async () => {
                   const preset = await pickMruPreset()
-                  const settings = preset
-                    ? preset.settings
-                    : cloneDefaultChatSettings()
+                  const settings = preset ? preset.settings : cloneDefaultChatSettings()
                   const chat = await createChat({
                     settings: { ...settings },
                     ...(preset ? { presetId: preset.id } : {}),
@@ -563,27 +605,27 @@ export function Shell() {
             <Composer
               onSubmit={handleNewChatSubmit}
               autoSize
-              {...(hasConnection ? {} : { sendBlockedReason: 'Add a connection to send messages.' })}
+              {...(hasConnection
+                ? {}
+                : { sendBlockedReason: 'Add a connection to send messages.' })}
               seed={composerSeed}
               onSeedConsumed={() => setComposerSeed(null)}
               sendShortcut={prefs.sendShortcut}
               onImportAtEnd={() => setImportAtEndOpen(true)}
+              {...(tokenBudgetIndicator ? { tokenBudget: tokenBudgetIndicator } : {})}
             />
           </>
         ) : (
           <EmptyState onPick={(text) => setComposerSeed(text)} />
         )}
       </main>
-      {showChatModelPanel && activeChatId ? (
+      {showChatModelPanel ? (
         <ChatModelPanel
           chatId={activeChatId}
           onClose={() => setChatModelOpen(false)}
         />
       ) : null}
-      <GlobalSettingsModal
-        open={globalSettingsOpen}
-        onClose={() => setGlobalSettingsOpen(false)}
-      />
+      <GlobalSettingsModal open={globalSettingsOpen} onClose={() => setGlobalSettingsOpen(false)} />
       {importAtEndOpen && activeChatId ? (
         <ImportModal
           chatId={activeChatId}
@@ -602,9 +644,7 @@ export function Shell() {
             // Fire ONLY when the user clicks Import. Cancel leaves the
             // workspace untouched — no empty "untitled chat" rows.
             const preset = await pickMruPreset()
-            const settings = preset
-              ? preset.settings
-              : cloneDefaultChatSettings()
+            const settings = preset ? preset.settings : cloneDefaultChatSettings()
             const chat = await createChat({
               settings: { ...settings },
               ...(preset ? { presetId: preset.id } : {}),

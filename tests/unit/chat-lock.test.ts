@@ -1,6 +1,7 @@
 import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
+import type { Chat, Message } from '../../src/core/types'
 import { newId } from '../../src/lib/ulid'
 import { __resetBroadcastForTests, type BroadcastEvent, onEvent } from '../../src/store/broadcast'
 import {
@@ -10,7 +11,6 @@ import {
   resolveMutationTableNames,
 } from '../../src/store/browser-repo'
 import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
-import type { Chat, Message } from '../../src/core/types'
 
 const DB_NAME = 'natter'
 
@@ -171,7 +171,11 @@ describe('browser repository mutation executor', () => {
     })
 
     await repo.runMutation([{ kind: 'chat-meta', chatId: chat.id }], async (ctx) => {
-      ctx.patchChatMeta(chat.id, { lastViewedAt: 200 }, { touchVisibleState: false, broadcast: false })
+      ctx.patchChatMeta(
+        chat.id,
+        { lastViewedAt: 200 },
+        { touchVisibleState: false, broadcast: false },
+      )
     })
 
     unsub()

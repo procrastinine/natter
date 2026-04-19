@@ -36,11 +36,17 @@ test('second turn inlines the first user + assistant messages', async ({ page })
   await createChatAndOpen(page)
   await sendMessage(page, 'first')
   await expect(
-    page.locator('[data-ui="message"][data-role="assistant"]').first().locator('[data-ui="message-body"]'),
+    page
+      .locator('[data-ui="message"][data-role="assistant"]')
+      .first()
+      .locator('[data-ui="message-body"]'),
   ).toHaveText('AURORA')
   await sendMessage(page, 'second')
   await expect(
-    page.locator('[data-ui="message"][data-role="assistant"]').nth(1).locator('[data-ui="message-body"]'),
+    page
+      .locator('[data-ui="message"][data-role="assistant"]')
+      .nth(1)
+      .locator('[data-ui="message-body"]'),
   ).toHaveText('BOREALIS')
 
   expect(bodies).toHaveLength(2)
@@ -61,27 +67,37 @@ test('three-turn conversation carries the full history', async ({ page }) => {
     const reply = ['one', 'two', 'three'][turn - 1] ?? 'done'
     await route.fulfill({
       contentType: 'text/event-stream',
-      body: buildSseBody([
-        { id: `g-${turn}`, content: reply },
-        { finish: 'stop' },
-      ]),
+      body: buildSseBody([{ id: `g-${turn}`, content: reply }, { finish: 'stop' }]),
     })
   })
   await createChatAndOpen(page)
   await sendMessage(page, 'q1')
   await expect(
-    page.locator('[data-ui="message"][data-role="assistant"]').nth(0).locator('[data-ui="message-body"]'),
+    page
+      .locator('[data-ui="message"][data-role="assistant"]')
+      .nth(0)
+      .locator('[data-ui="message-body"]'),
   ).toHaveText('one')
   await sendMessage(page, 'q2')
   await expect(
-    page.locator('[data-ui="message"][data-role="assistant"]').nth(1).locator('[data-ui="message-body"]'),
+    page
+      .locator('[data-ui="message"][data-role="assistant"]')
+      .nth(1)
+      .locator('[data-ui="message-body"]'),
   ).toHaveText('two')
   await sendMessage(page, 'q3')
   await expect(
-    page.locator('[data-ui="message"][data-role="assistant"]').nth(2).locator('[data-ui="message-body"]'),
+    page
+      .locator('[data-ui="message"][data-role="assistant"]')
+      .nth(2)
+      .locator('[data-ui="message-body"]'),
   ).toHaveText('three')
   const third = bodies[2] as { messages: Array<{ role: string; content: string }> }
   expect(third.messages.map((m) => m.role)).toEqual([
-    'user', 'assistant', 'user', 'assistant', 'user',
+    'user',
+    'assistant',
+    'user',
+    'assistant',
+    'user',
   ])
 })

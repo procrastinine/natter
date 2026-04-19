@@ -1,7 +1,7 @@
 import { useLiveQuery } from 'dexie-react-hooks'
 import { useCallback, useState } from 'react'
-import { getSetting, setSetting } from '../../store/settings'
 import { DEFAULT_IMAGE_ORIGINS } from '../../core/image-allowlist'
+import { getSetting, setSetting } from '../../store/settings'
 import { TrashIcon } from '../icons/Icon'
 
 const STORAGE_KEY = 'image-allowlist'
@@ -66,8 +66,8 @@ export function ImageAllowlistPanel() {
     <div data-ui="settings-section">
       <h3>Image whitelist</h3>
       <p data-ui="helper">
-        Images from origins not on this whitelist are replaced with a
-        blocked-image stub. Built-in origins are always allowed.
+        Images from origins not on this whitelist are replaced with a blocked-image stub. Built-in
+        origins are always allowed.
       </p>
       <div data-ui="image-allowlist-add">
         <input
@@ -105,12 +105,7 @@ export function ImageAllowlistPanel() {
         </thead>
         <tbody>
           {DEFAULT_IMAGE_ORIGINS.map((origin) => (
-            <tr
-              key={origin}
-              data-ui="image-allowlist-row"
-              data-origin={origin}
-              data-builtin="true"
-            >
+            <tr key={origin} data-ui="image-allowlist-row" data-origin={origin} data-builtin="true">
               <td>
                 <code>{origin}</code>
               </td>

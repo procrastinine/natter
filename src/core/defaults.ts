@@ -4,10 +4,17 @@
 // See `plan/02-data-model.md §2.5` (settings precedence) and `plan/13-delivery.md §13.2.1`
 // for the fields Phase 0 requires.
 
-import type { ChatPreset, ChatSettings, ConnectionProfile, DataPolicy, KeyRecord, PrivacyPrefs } from './types'
 import { createKey } from '../store/keys'
 import { createPreset } from '../store/presets'
 import { createProfile } from '../store/profiles'
+import type {
+  ChatPreset,
+  ChatSettings,
+  ConnectionProfile,
+  DataPolicy,
+  KeyRecord,
+  PrivacyPrefs,
+} from './types'
 
 // First-run seed: ordered candidate model list consumed by `resolveDefaultModel`
 // when creating the seed ChatPreset for a new ConnectionProfile. See
@@ -157,17 +164,13 @@ export interface FirstRunSeedResult {
   preset: ChatPreset
 }
 
-export async function runFirstRunSeed(
-  input: FirstRunSeedInput,
-): Promise<FirstRunSeedResult> {
+export async function runFirstRunSeed(input: FirstRunSeedInput): Promise<FirstRunSeedResult> {
   const now = input.now ?? Date.now()
   const key = await createKey({
     name: input.keyName ?? 'OpenRouter',
     plaintextKey: input.apiKey,
     ...(input.passphrase !== undefined ? { passphrase: input.passphrase } : {}),
-    ...(input.passphraseHint !== undefined
-      ? { passphraseHint: input.passphraseHint }
-      : {}),
+    ...(input.passphraseHint !== undefined ? { passphraseHint: input.passphraseHint } : {}),
     now,
   })
   const profile = await createProfile({

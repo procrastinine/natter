@@ -1,17 +1,10 @@
 import { useLiveQuery } from 'dexie-react-hooks'
 import { useCallback, useEffect, useRef, useState } from 'react'
-import type { ChatId, CursorMap } from '../../core/types'
 import { exportChatAsTxt, triggerBrowserDownload } from '../../core/chat-export'
+import type { ChatId, CursorMap } from '../../core/types'
 import { getChat, setManualTitle } from '../../store/chats'
 import { useChatStore } from '../../store/zustand/chatStore'
-import {
-  CloseIcon,
-  CogIcon,
-  DownloadIcon,
-  EditTreeIcon,
-  InfoIcon,
-  PencilIcon,
-} from '../icons/Icon'
+import { CloseIcon, CogIcon, DownloadIcon, EditTreeIcon, InfoIcon, PencilIcon } from '../icons/Icon'
 
 // Stable empty reference so useChatStore's selector doesn't allocate a fresh
 // `{}` every render — React 19's useSyncExternalStore detects that as an
@@ -38,9 +31,7 @@ export function ChatHeader({
     [chatId],
     undefined,
   )
-  const cursor = useChatStore((s) =>
-    chatId ? s.cursors[chatId] ?? EMPTY_CURSOR : EMPTY_CURSOR,
-  )
+  const cursor = useChatStore((s) => (chatId ? (s.cursors[chatId] ?? EMPTY_CURSOR) : EMPTY_CURSOR))
   const [editing, setEditing] = useState(false)
   const [draftTitle, setDraftTitle] = useState('')
   const [showInfo, setShowInfo] = useState(false)
@@ -94,9 +85,7 @@ export function ChatHeader({
     triggerBrowserDownload(filename, content)
   }, [chat, cursor])
 
-  const displayTitle = chat?.title?.trim().length
-    ? chat.title
-    : 'Untitled chat'
+  const displayTitle = chat?.title?.trim().length ? chat.title : 'Untitled chat'
 
   // When no chat is active there's no title to edit, no streaming to abort,
   // and no chat-model panel to toggle — render nothing.
@@ -161,15 +150,9 @@ export function ChatHeader({
           type="button"
           data-ui="icon-button"
           data-role="chat-edit-tree"
-          aria-label={
-            editTreeActive ? 'Exit edit tree mode' : 'Enter edit tree mode'
-          }
+          aria-label={editTreeActive ? 'Exit edit tree mode' : 'Enter edit tree mode'}
           aria-pressed={editTreeActive ? true : false}
-          title={
-            editTreeActive
-              ? 'Exit edit tree mode (Esc)'
-              : 'Edit tree mode (⇧⌘E)'
-          }
+          title={editTreeActive ? 'Exit edit tree mode (Esc)' : 'Edit tree mode (⇧⌘E)'}
           onClick={onToggleEditTree}
           data-state={editTreeActive ? 'active' : undefined}
         >
@@ -209,11 +192,7 @@ export function ChatHeader({
         <CogIcon size={20} />
       </button>
       {showInfo ? (
-        <div
-          data-ui="chat-info-popover"
-          role="dialog"
-          aria-label="Chat info"
-        >
+        <div data-ui="chat-info-popover" role="dialog" aria-label="Chat info">
           <div data-ui="chat-info-popover-header">
             <span>Chat info</span>
             <button

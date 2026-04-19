@@ -4,7 +4,7 @@
  * See plan/10-ui.md §10.20.
  */
 
-[data-ui='sidebar'] {
+[data-ui="sidebar"] {
   color: var(--color-fg-primary);
   font-size: var(--font-size-md);
   display: flex;
@@ -14,7 +14,7 @@
   overflow: hidden;
 }
 
-[data-ui='sidebar-header'] {
+[data-ui="sidebar-header"] {
   display: flex;
   align-items: center;
   gap: var(--space-2);
@@ -28,9 +28,8 @@
  * of the UI so it reads as a logotype rather than a generic title. We use
  * a serif stack with tight tracking and slightly larger size to give it
  * weight without shouting. */
-[data-ui='brand'] {
-  font-family: 'Georgia', 'Iowan Old Style', 'Palatino', 'Times New Roman',
-    serif;
+[data-ui="brand"] {
+  font-family: "Georgia", "Iowan Old Style", "Palatino", "Times New Roman", serif;
   font-size: 22px;
   font-weight: 700;
   color: var(--color-fg-primary);
@@ -41,11 +40,11 @@
   flex: 1 1 auto;
 }
 
-[data-ui='brand']:hover {
+[data-ui="brand"]:hover {
   color: var(--color-accent);
 }
 
-[data-ui='sidebar-toggle'] {
+[data-ui="sidebar-toggle"] {
   background: transparent;
   border: 1px solid transparent;
   color: var(--color-fg-muted);
@@ -60,7 +59,7 @@
   justify-content: center;
 }
 
-[data-ui='sidebar-toggle']:hover {
+[data-ui="sidebar-toggle"]:hover {
   color: var(--color-fg-primary);
   background: var(--color-bg-hover);
 }
@@ -68,7 +67,7 @@
 /* New-chat affordance: the icon IS the affordance — no surrounding border or
  * background by default, since the icon's own paper rectangle would conflict
  * with another rectangle frame. Only a soft hover background. */
-[data-ui='new-chat'] {
+[data-ui="new-chat"] {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -82,12 +81,12 @@
   cursor: pointer;
 }
 
-[data-ui='new-chat']:hover {
+[data-ui="new-chat"]:hover {
   background: var(--color-bg-hover);
   color: var(--color-fg-primary);
 }
 
-[data-ui='new-chat-icon'] {
+[data-ui="new-chat-icon"] {
   display: block;
 }
 
@@ -96,14 +95,14 @@
  * highlight, not just over a pill around the text. The button is sized to
  * fill the footer; the footer itself has zero padding so the highlight
  * goes edge-to-edge of the sidebar width. */
-[data-ui='sidebar-footer'] {
+[data-ui="sidebar-footer"] {
   margin-top: auto;
   border-top: 1px solid var(--color-border-subtle);
   padding: 0;
   flex: 0 0 auto;
 }
 
-[data-ui='open-global-settings'] {
+[data-ui="open-global-settings"] {
   background: transparent;
   border: none;
   color: var(--color-fg-secondary);
@@ -119,7 +118,7 @@
   line-height: 1;
 }
 
-[data-ui='open-global-settings']:hover {
+[data-ui="open-global-settings"]:hover {
   background: var(--color-bg-hover);
   color: var(--color-fg-primary);
 }
@@ -133,7 +132,7 @@
  * Delete affordance is hover-only on the right side of the row.
  * ────────────────────────────────────────────────────────────────────── */
 
-[data-ui='chat-list'] {
+[data-ui="chat-list"] {
   list-style: none;
   margin: 0;
   padding: 0;
@@ -145,12 +144,12 @@
   border-top: 1px solid transparent;
 }
 
-[data-ui='chat-row'] {
+[data-ui="chat-row"] {
   position: relative;
   border-bottom: 1px solid var(--color-border-subtle);
 }
 
-[data-ui='chat-row-link'] {
+[data-ui="chat-row-link"] {
   display: flex;
   flex-direction: column;
   gap: 2px;
@@ -163,11 +162,11 @@
   min-width: 0;
 }
 
-[data-ui='chat-row-link']:hover {
+[data-ui="chat-row-link"]:hover {
   background: var(--color-bg-hover);
 }
 
-[data-ui='chat-row'][data-active='true'] > [data-ui='chat-row-link'] {
+[data-ui="chat-row"][data-active="true"] > [data-ui="chat-row-link"] {
   background: var(--color-bg-selected);
 }
 
@@ -176,7 +175,7 @@
  * too-cramped sm/13 size). Preview stays at sm so the second line stays
  * comfortably readable. Selection is signalled by the full-width tint,
  * not by type-size. */
-[data-ui='chat-row-title'] {
+[data-ui="chat-row-title"] {
   font-size: 14px;
   font-weight: var(--font-weight-medium);
   color: var(--color-fg-primary);
@@ -187,7 +186,7 @@
   min-width: 0;
 }
 
-[data-ui='chat-row-preview'] {
+[data-ui="chat-row-preview"] {
   font-size: var(--font-size-sm);
   color: var(--color-fg-muted);
   line-height: var(--line-height-tight);
@@ -197,16 +196,14 @@
   min-width: 0;
 }
 
-[data-ui='chat-row'][data-title-status='untitled']
-  [data-ui='chat-row-title'] {
+[data-ui="chat-row"][data-title-status="untitled"] [data-ui="chat-row-title"] {
   color: var(--color-fg-muted);
   font-style: italic;
   font-weight: var(--font-weight-regular);
 }
 
-[data-ui='chat-row'][data-title-status='pending']
-  [data-ui='chat-row-title']::after {
-  content: ' · titling…';
+[data-ui="chat-row"][data-title-status="pending"] [data-ui="chat-row-title"]::after {
+  content: " · titling…";
   color: var(--color-fg-muted);
   font-style: italic;
   font-size: var(--font-size-xs);
@@ -217,7 +214,7 @@
  * tint on hover. The button itself is positioned absolutely against the
  * row (which is `position: relative` above), so it sits centred on the
  * row's right edge regardless of two-line / one-line content. */
-[data-ui='chat-row-delete'] {
+[data-ui="chat-row-delete"] {
   position: absolute;
   top: 50%;
   right: var(--space-3);
@@ -237,12 +234,12 @@
   padding: 0;
 }
 
-[data-ui='chat-row']:hover [data-ui='chat-row-delete'],
-[data-ui='chat-row-delete']:focus-visible {
+[data-ui="chat-row"]:hover [data-ui="chat-row-delete"],
+[data-ui="chat-row-delete"]:focus-visible {
   opacity: 1;
 }
 
-[data-ui='chat-row-delete']:hover {
+[data-ui="chat-row-delete"]:hover {
   color: var(--color-danger);
   background: var(--color-bg-hover);
 }
@@ -251,19 +248,19 @@
  * Collapsed sidebar — narrow rail, hide labels, center icons.
  * ────────────────────────────────────────────────────────────────────── */
 
-[data-ui='sidebar'][data-collapsed='true'] [data-ui='sidebar-header'] {
+[data-ui="sidebar"][data-collapsed="true"] [data-ui="sidebar-header"] {
   flex-direction: column;
   gap: var(--space-1);
   padding: var(--space-2);
 }
 
-[data-ui='sidebar'][data-collapsed='true'] [data-ui='chat-row-link'] {
+[data-ui="sidebar"][data-collapsed="true"] [data-ui="chat-row-link"] {
   padding: var(--space-3) var(--space-2);
   align-items: center;
   text-align: center;
 }
 
-[data-ui='sidebar'][data-collapsed='true'] [data-ui='chat-row-title'] {
+[data-ui="sidebar"][data-collapsed="true"] [data-ui="chat-row-title"] {
   font-size: var(--font-size-xs);
   white-space: normal;
   word-break: break-word;
@@ -274,21 +271,19 @@
   overflow: hidden;
 }
 
-[data-ui='sidebar'][data-collapsed='true'] [data-ui='chat-row-preview'] {
+[data-ui="sidebar"][data-collapsed="true"] [data-ui="chat-row-preview"] {
   display: none;
 }
 
-[data-ui='sidebar'][data-collapsed='true'] [data-ui='chat-row-delete'] {
+[data-ui="sidebar"][data-collapsed="true"] [data-ui="chat-row-delete"] {
   display: none;
 }
 
-[data-ui='sidebar'][data-collapsed='true']
-  [data-ui='sidebar-footer'] {
+[data-ui="sidebar"][data-collapsed="true"] [data-ui="sidebar-footer"] {
   padding: var(--space-2);
 }
 
-[data-ui='sidebar'][data-collapsed='true']
-  [data-ui='open-global-settings'] {
+[data-ui="sidebar"][data-collapsed="true"] [data-ui="open-global-settings"] {
   justify-content: center;
   padding: var(--space-2);
 }

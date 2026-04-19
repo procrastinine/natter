@@ -6,8 +6,8 @@
 // single cache row per profile.
 
 import type { ProfileId } from '../core/types'
-import { type CachedPrivacyPolicyRow, type CachedProvidersRow, getDb } from './db'
 import { postEvent } from './broadcast'
+import { type CachedPrivacyPolicyRow, type CachedProvidersRow, getDb } from './db'
 
 export const PRIVACY_POLICY_TTL_MS = 24 * 60 * 60 * 1000
 export const PROVIDERS_TTL_MS = 24 * 60 * 60 * 1000

@@ -14,20 +14,14 @@
 // self-contained Chat, which is why it doesn't need to copy siblings
 // or descendants. See `plan/08-branching.md §8.1` + `§8.3`.
 
-import type {
-  AttachmentId,
-  Chat,
-  ChatId,
-  Message,
-  MessageId,
-} from './types'
-import { activePath, indexById } from './active-path'
-import { getDb } from '../store/db'
-import { createChat, loadChatMessages } from '../store/chats'
-import { incRefs } from '../store/attachments'
-import { getBrowserRepository } from '../store/browser-repo'
-import { postEvent } from '../store/broadcast'
 import { newId } from '../lib/ulid'
+import { incRefs } from '../store/attachments'
+import { postEvent } from '../store/broadcast'
+import { getBrowserRepository } from '../store/browser-repo'
+import { createChat, loadChatMessages } from '../store/chats'
+import { getDb } from '../store/db'
+import { activePath, indexById } from './active-path'
+import type { AttachmentId, Chat, ChatId, Message, MessageId } from './types'
 
 export interface ForkChatFromMessageInput {
   chatId: ChatId
@@ -68,10 +62,7 @@ export function collectAncestorsToMessage(
 // smallest positive integer making the title unique in the current chat
 // list. If the source chat has no title (titleStatus: 'untitled' or an
 // empty title), use the constant placeholder "Untitled chat".
-export function computeBranchTitle(
-  baseTitle: string,
-  existingTitles: readonly string[],
-): string {
+export function computeBranchTitle(baseTitle: string, existingTitles: readonly string[]): string {
   const base = baseTitle.trim() || 'Untitled chat'
   const taken = new Set(existingTitles.map((t) => t.trim()))
   let n = 1
@@ -132,9 +123,7 @@ export async function forkChatFromMessage(
   // to populate so the mutation executor allows the `putMessage` calls.
   const parentSlots = new Set<string>()
   for (const row of ancestors) {
-    const newParentId = row.parentId
-      ? (idMap.get(row.parentId) ?? null)
-      : null
+    const newParentId = row.parentId ? (idMap.get(row.parentId) ?? null) : null
     const key = newParentId ?? '__root__'
     if (parentSlots.has(key)) continue
     parentSlots.add(key)
@@ -151,9 +140,7 @@ export async function forkChatFromMessage(
     for (let i = 0; i < ancestors.length; i += 1) {
       const src = ancestors[i] as Message
       const id = idMap.get(src.id) as MessageId
-      const parentId = src.parentId
-        ? (idMap.get(src.parentId) ?? null)
-        : null
+      const parentId = src.parentId ? (idMap.get(src.parentId) ?? null) : null
       const clone: Message = {
         id,
         chatId: newChat.id,
