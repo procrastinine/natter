@@ -73,10 +73,34 @@
     "Chutes": {
       "training": false,
       "trainingOpenRouter": false,
-      "retainsPrompts": false,
+      "retainsPrompts": true,
       "canPublish": false,
       "termsOfServiceURL": "https://chutes.ai/tos",
       "privacyPolicyURL": "https://chutes.ai/privacy"
+    },
+    "Together": {
+      "training": false,
+      "trainingOpenRouter": false,
+      "retainsPrompts": false,
+      "canPublish": false,
+      "termsOfServiceURL": "https://www.together.ai/terms-of-service",
+      "privacyPolicyURL": "https://www.together.ai/privacy"
+    },
+    "Parasail": {
+      "training": false,
+      "trainingOpenRouter": false,
+      "retainsPrompts": false,
+      "canPublish": false,
+      "termsOfServiceURL": "https://www.parasail.io/legal/terms",
+      "privacyPolicyURL": "https://www.parasail.io/legal/privacy"
+    },
+    "Fireworks": {
+      "training": false,
+      "trainingOpenRouter": false,
+      "retainsPrompts": false,
+      "canPublish": false,
+      "termsOfServiceURL": "https://fireworks.ai/terms-of-service",
+      "privacyPolicyURL": "https://fireworks.ai/privacy-policy"
     },
     "DeepSeek": {
       "training": true,

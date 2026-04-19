@@ -10,6 +10,22 @@ export interface ProviderPreferenceRule {
   order: readonly string[]
 }
 
+// Known-good OSS-model hosts, in rough preference order. Used by every
+// open-weights model below (DeepSeek, Qwen, Llama, Mistral, Gemma, etc).
+// Chutes is deliberately excluded — it doesn't train on prompts, but per
+// user report (2026-04-19) it retains prompts for an unknown period, so
+// `data_policies.json` flags it `retainsPrompts: true` with no retentionDays.
+// Pareto dominates it whenever a clean host is available; the user can
+// still manually pin it via `onlyProviders` if they accept the tradeoff.
+// The user's curated list was: DeepInfra, Together, Novita, Parasail, Fireworks.
+const OSS_PREFERRED: readonly string[] = [
+  'DeepInfra',
+  'Together',
+  'Novita',
+  'Parasail',
+  'Fireworks',
+]
+
 // A small list, applied ONLY when Pareto leaves multiple endpoints. Add
 // rules as real tradeoff ties are discovered. Current rules:
 //
@@ -26,8 +42,45 @@ export interface ProviderPreferenceRule {
 //   - Gemini: AI Studio > Google (Vertex). AI Studio retains for 55 days
 //     without user IDs; Vertex is clean on retention but requires user
 //     IDs. Neither dominates; user preference breaks the tie.
-//   - DeepSeek: historically third-party hosts (DeepInfra, Novita,
-//     Chutes) are cleaner than DeepSeek direct (which trains on prompts).
+// Open-weights labs whose models route through the OSS_PREFERRED hosts.
+// Matched by the **author/lab segment** of the slug (everything before the
+// first `/`) — `deepseek/deepseek-r1`, `moonshotai/kimi-k2`,
+// `z-ai/glm-4.6`, etc. The author segment is the stable identifier; model
+// names within a lab churn faster than the lab itself.
+//
+// Not listed: anthropic, openai, google (proprietary; have their own rules);
+// cohere, x-ai, perplexity, nvidia, etc. (either not open-weights or their
+// OSS routing isn't worth a curated rule yet).
+const OSS_LABS: readonly string[] = [
+  'qwen',
+  'deepseek',
+  'moonshotai',
+  'z-ai',
+  'minimax',
+  'meta-llama',
+  'mistralai',
+]
+
+function ossRuleForLab(lab: string): ProviderPreferenceRule {
+  // `/^lab\//` anchors on the author segment. Anchoring avoids false
+  // positives like "qwen-plus" or "z-ai-hosted-gemini" appearing inside a
+  // longer slug. Periods, hyphens, and underscores in lab names are safe
+  // inside a JS regex character class but we keep the RegExp literal-ish
+  // since all listed labs are alphanumeric-plus-hyphen.
+  const escaped = lab.replace(/[-]/g, '\\-')
+  return { match: new RegExp(`^${escaped}/`), order: OSS_PREFERRED }
+}
+
+// A small list, applied ONLY when Pareto leaves multiple endpoints. The
+// proprietary-vendor rules (OpenAI, Anthropic, Gemini) encode manual
+// knowledge about dominance on a fixed provider set. The OSS-lab rules
+// steer open-weights models to the known-good host list.
+//
+// DeepSeek direct is NEVER listed as a preferred host. It trains on
+// prompts, so `data_policies.json` marks it `training: true` and it's
+// hard-denied before ordering ever runs. Chutes is NEVER listed either;
+// it retains for an unknown period (user report 2026-04-19) and gets
+// dominated by any clean host via Pareto.
 export const PROVIDER_PREFERENCE: readonly ProviderPreferenceRule[] = [
   { match: /^openai\//, order: ['Azure', 'OpenAI'] },
   {
@@ -35,7 +88,7 @@ export const PROVIDER_PREFERENCE: readonly ProviderPreferenceRule[] = [
     order: ['Amazon Bedrock', 'Google', 'Anthropic'],
   },
   { match: /^google\/gemini-/, order: ['Google AI Studio', 'Google'] },
-  { match: /^deepseek\//, order: ['DeepInfra', 'Novita', 'Chutes', 'DeepSeek'] },
+  ...OSS_LABS.map(ossRuleForLab),
 ]
 
 // Return the rule whose `match` fires on `model`, or `null`.
