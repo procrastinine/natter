@@ -35,14 +35,21 @@ export interface PrivacyScrapeResult {
   fetchedAt: number
 }
 
-// Build the scrape URL. Defaults to `openrouter.ai` (production site);
-// tests and a user-configured proxy can override via
-// `profile.privacyScrapeProxy`.
+// Build the scrape URL. The browser can't fetch `openrouter.ai/{model}/
+// providers` cross-origin (CORS), so the default is the relative proxy
+// path `/_or_scrape` — Vite's dev server proxies it, and a production
+// deploy is expected to provide an equivalent same-origin rewrite (or
+// the user sets `profile.privacyScrapeProxy` to a hosted CORS bouncer).
+// Without either, the scrape 404s in the browser and the filter falls
+// back to the curated `data_policies.json` table.
+export const DEFAULT_PRIVACY_SCRAPE_BASE = '/_or_scrape'
+
 export function privacyScrapeUrl(
   profile: ConnectionProfile,
   modelId: string,
 ): string {
-  const base = profile.privacyScrapeProxy?.replace(/\/+$/, '') ?? 'https://openrouter.ai'
+  const base =
+    profile.privacyScrapeProxy?.replace(/\/+$/, '') ?? DEFAULT_PRIVACY_SCRAPE_BASE
   // Model slugs contain a `/` — the URL path accepts it verbatim.
   return `${base}/${modelId}/providers`
 }

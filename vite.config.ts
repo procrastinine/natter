@@ -10,6 +10,20 @@ export default defineConfig({
   plugins: [react(), tailwindcss()],
   server: {
     port: 5173,
+    proxy: {
+      // `openrouter.ai/{model}/providers` doesn't serve CORS, so a
+      // browser-origin fetch is blocked. In dev we proxy it through
+      // Vite's own server so `/_or_scrape/*` becomes same-origin and
+      // the scrape can read the live HTML. `privacyScrapeUrl` uses
+      // `/_or_scrape` as its default base; production builds without a
+      // server-side proxy will 404 and the filter falls back to the
+      // curated `data_policies.json` table.
+      '/_or_scrape': {
+        target: 'https://openrouter.ai',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/_or_scrape/, ''),
+      },
+    },
   },
   build: {
     target: 'es2022',

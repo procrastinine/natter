@@ -205,9 +205,13 @@ describe('resolvePrivacyForSend', () => {
     expect(r.wire?.zeroEligible).toBe(true)
   })
 
-  it('merges user-supplied providerPrefs.ignore into autoIgnore', async () => {
+  it('uses providerPrefs.ignore verbatim when ignoreOverridesFilter is set', async () => {
+    // Unified allow/disallow: `ignoreOverridesFilter: true` signals the
+    // user has taken over — the wire uses `ignore` verbatim without
+    // re-layering autoIgnore. That lets them re-allow a filter-excluded
+    // row by simply leaving it out of `ignore` after touching the picker.
     const chat = makeChat({
-      providerPrefs: { ignore: ['Legacy Host'] },
+      providerPrefs: { ignore: ['Legacy Host'], ignoreOverridesFilter: true },
     })
     const profile = makeProfile()
     await putCachedEndpoints('prof-1', 'openai/gpt-5.4', {
@@ -250,6 +254,6 @@ describe('resolvePrivacyForSend', () => {
       fetchedAt: 0,
     })
     const r = await resolvePrivacyForSend({ chat, profile })
-    expect(r.wire?.ignore).toEqual(['Legacy Host', 'OpenAI'])
+    expect(r.wire?.ignore).toEqual(['Legacy Host'])
   })
 })

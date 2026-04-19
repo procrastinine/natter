@@ -54,12 +54,20 @@ describe('dominates', () => {
     expect(dominates(clean, unknownRetention)).toBe(true)
   })
 
-  it('unknown retention is strictly worse than any finite retention', () => {
-    expect(dominates(shortRetention, unknownRetention)).toBe(true)
+  it('same-tier policies do not dominate (e.g. both orange — userIDs+any retention)', () => {
+    // Per the 2026-04-19 tier-based dominance rule, two policies in the
+    // same tier don't dominate each other. `shortRetention` (30d +
+    // userIDs) and `unknownRetention` (indefinite + userIDs) are both
+    // orange — neither drops the other; preferred-ordering breaks the tie.
+    expect(dominates(shortRetention, unknownRetention)).toBe(false)
     expect(dominates(unknownRetention, shortRetention)).toBe(false)
   })
 
-  it('Vertex vs AI Studio: neither dominates (Gemini 3 case)', () => {
+  it('AI Studio dominates Vertex (yellow vs orange for Gemini)', () => {
+    // Per user spec 2026-04-19: when Pareto sees Google Vertex (orange,
+    // requires user IDs) next to Google AI Studio (yellow, 55d retention
+    // without user IDs), only AI Studio is kept by default. Users can
+    // re-enable Vertex via the picker.
     const aiStudio: DataPolicy = {
       ...clean,
       retainsPrompts: true,
@@ -70,7 +78,7 @@ describe('dominates', () => {
       ...clean,
       requiresUserIDs: true,
     }
-    expect(dominates(aiStudio, vertex)).toBe(false)
+    expect(dominates(aiStudio, vertex)).toBe(true)
     expect(dominates(vertex, aiStudio)).toBe(false)
   })
 

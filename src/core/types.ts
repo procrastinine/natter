@@ -213,6 +213,13 @@ export interface ProviderPreferences {
   zdr?: boolean
   only?: string[]
   ignore?: string[]
+  // True once the user clicks any provider checkbox. Signals that
+  // `ignore` is the authoritative disallowed list — the wire builder
+  // and picker both skip the filter's auto-exclusion when this is set.
+  // Stays set even when `ignore` happens to be empty (e.g. user
+  // re-enabled every filter-excluded row), so "touched" is distinct
+  // from "trust the filter." Reset clears it back to `false`.
+  ignoreOverridesFilter?: boolean
   quantizations?: string[]
   sort?: ProviderSort
   preferredMinThroughput?: number | PercentileBucket

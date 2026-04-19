@@ -35,6 +35,7 @@ import { EmptyState } from '../ui/chat/EmptyState'
 import { FocusModeToggle } from '../ui/chat/FocusModeToggle'
 import { ImportModal } from '../ui/chat/ImportModal'
 import { MessageList } from '../ui/chat/MessageList'
+import { ZeroEligibleModal } from '../ui/chat/ZeroEligibleModal'
 import { ScrollRegion, type ScrollRegionHandle, type ScrollState } from '../ui/chat/ScrollRegion'
 import { ToastTray } from '../ui/chat/ToastTray'
 import { ConnectionHeader } from '../ui/header/ConnectionHeader'
@@ -644,6 +645,7 @@ export function Shell() {
         />
       ) : null}
       <GlobalSettingsModal open={globalSettingsOpen} onClose={() => setGlobalSettingsOpen(false)} />
+      <ZeroEligibleModalHost />
       {importAtEndOpen && activeChatId ? (
         <ImportModal
           chatId={activeChatId}
@@ -678,6 +680,15 @@ export function Shell() {
       <FocusModeToggle />
     </div>
   )
+}
+
+// Tiny wrapper that only renders the modal when `zeroEligibleChatId` is
+// set. Having this as its own component lets Shell subscribe via
+// Zustand without forcing the modal to mount all the time.
+function ZeroEligibleModalHost() {
+  const chatId = useUiStore((s) => s.zeroEligibleChatId)
+  if (!chatId) return null
+  return <ZeroEligibleModal chatId={chatId} />
 }
 
 export type { ChatId, ChatPreset, ConnectionProfile }

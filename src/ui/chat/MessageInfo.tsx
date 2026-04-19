@@ -47,6 +47,17 @@ export function MessageInfo({ message, staleReplyHint }: MessageInfoProps) {
       ),
     ])
   }
+  // Resolved provider. Only present on OpenRouter — native providers
+  // don't surface it. Rendering here (instead of as a header chip)
+  // keeps the reading lane quiet; users who care click ⓘ.
+  if (gen?.provider) {
+    rows.push(['Provider', gen.provider])
+  }
+  if (gen?.requestedModels && gen.requestedModels.length > 1) {
+    // Fallback chain was consulted — e.g. requested [gpt-5.4, gpt-5.4-mini].
+    // Show the full chain so the user can see where the cascade landed.
+    rows.push(['Fallback chain', gen.requestedModels.join(' → ')])
+  }
   if (usage?.prompt_tokens !== undefined) {
     rows.push(['Prompt tokens', usage.prompt_tokens.toLocaleString()])
   }

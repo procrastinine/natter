@@ -12,34 +12,28 @@ export function synthesizeDataPolicy(raw: DataPolicy | null | undefined): DataPo
   return structuredClone(UNKNOWN_POLICY) as DataPolicy
 }
 
-// Four-dimensional dominance used by the privacy filter. `a` dominates `b` iff
-// `a` is weakly better on every dimension AND strictly better on at least one.
-// Mirrors the helpers in `plan/09-privacy.md §9.6`.
+// Tier-based dominance (per user spec 2026-04-19). `a` dominates `b` iff
+// `a` sits in a strictly better tier than `b` (green < yellow < orange <
+// red). Same-tier pairs don't dominate — the preferred-ordering
+// tiebreaker decides which comes first. This replaces the old
+// 4-dimensional check; the tier computation already folds
+// training/retention/user-IDs into a single axis, and the user wants the
+// filter to auto-exclude the worse tier by default (e.g. Google Vertex
+// orange drops out when Google AI Studio yellow is present).
 export function dominates(a: DataPolicy | undefined, b: DataPolicy | undefined): boolean {
   if (!a || !b) return false
-  const dims: Array<[number, number]> = [
-    [trainingRank(a), trainingRank(b)],
-    [trainingOrRank(a), trainingOrRank(b)],
-    [retentionRank(a), retentionRank(b)],
-    [userIdRank(a), userIdRank(b)],
-  ]
-  return dims.every(([x, y]) => x <= y) && dims.some(([x, y]) => x < y)
+  return tierRank(a) < tierRank(b)
 }
 
-function trainingRank(p: DataPolicy): 0 | 1 {
-  return p.training ? 1 : 0
-}
-
-function trainingOrRank(p: DataPolicy): 0 | 1 {
-  return p.trainingOpenRouter ? 1 : 0
-}
-
-function retentionRank(p: DataPolicy): number {
-  if (!p.retainsPrompts) return 0
-  if (p.retentionDays === undefined) return Number.POSITIVE_INFINITY
-  return p.retentionDays
-}
-
-function userIdRank(p: DataPolicy): 0 | 1 {
-  return p.requiresUserIDs ? 1 : 0
+// Mirrors `privacyTierForPolicy` in `privacy-filter.ts`. Lower rank =
+// more private; `dominates` returns true when the caller has a lower
+// rank than the comparison target.
+function tierRank(p: DataPolicy): number {
+  if (p.training || p.trainingOpenRouter) return 3
+  const userIds = p.requiresUserIDs === true
+  const retainsUnknownPeriod = p.retainsPrompts && p.retentionDays === undefined
+  if (retainsUnknownPeriod) return 2
+  if (userIds) return 2
+  if (p.retainsPrompts) return 1
+  return 0
 }

@@ -140,7 +140,10 @@ describe('filterEndpointsByPrivacy — Claude Opus 4.7 fixture', () => {
 })
 
 describe('filterEndpointsByPrivacy — Gemini fixture', () => {
-  it('AI Studio and Vertex both kept; ordering prefers AI Studio', () => {
+  it('AI Studio dominates Vertex (yellow vs orange) — only AI Studio kept', () => {
+    // Per user spec 2026-04-19: AI Studio (yellow: 55d retention, no
+    // user IDs) is a strictly better tier than Google Vertex (orange:
+    // requires user IDs). Pareto drops Vertex by default.
     const result = filterEndpointsByPrivacy({
       model: 'google/gemini-3.1-pro',
       endpoints: [ep('Google Vertex'), ep('Google AI Studio')],
@@ -150,15 +153,15 @@ describe('filterEndpointsByPrivacy — Gemini fixture', () => {
       },
       privacy: cloneDefaultPrivacyPrefs(),
     })
-    const kept = result.kept.map((k) => k.endpoint.provider_name).sort()
-    expect(kept).toEqual(['Google AI Studio', 'Google Vertex'])
-    // Preferred-ordering tiebreaker fires when kept.length > 1.
-    expect(result.orderedKeptNames).toEqual(['Google AI Studio', 'Google Vertex'])
+    const kept = result.kept.map((k) => k.endpoint.provider_name)
+    expect(kept).toEqual(['Google AI Studio'])
+    const vertex = result.excluded.find((e) => e.endpoint.provider_name === 'Google Vertex')
+    expect(vertex?.reasons).toContain('dominated')
   })
 
-  it('usePreferredOrdering=false preserves raw kept order', () => {
+  it('with Pareto off, both providers remain kept', () => {
     const prefs = cloneDefaultPrivacyPrefs()
-    prefs.usePreferredOrdering = false
+    prefs.paretoFilter = false
     const result = filterEndpointsByPrivacy({
       model: 'google/gemini-3.1-pro',
       endpoints: [ep('Google Vertex'), ep('Google AI Studio')],
@@ -168,7 +171,10 @@ describe('filterEndpointsByPrivacy — Gemini fixture', () => {
       },
       privacy: prefs,
     })
-    expect(result.orderedKeptNames).toEqual(['Google Vertex', 'Google AI Studio'])
+    const kept = result.kept.map((k) => k.endpoint.provider_name).sort()
+    expect(kept).toEqual(['Google AI Studio', 'Google Vertex'])
+    // Preferred ordering still runs — AI Studio before Vertex.
+    expect(result.orderedKeptNames).toEqual(['Google AI Studio', 'Google Vertex'])
   })
 })
 
@@ -200,14 +206,14 @@ describe('filterEndpointsByPrivacy — missing policies synthesize worst-case', 
       policies: {}, // empty — simulate scrape miss for both
       privacy: cloneDefaultPrivacyPrefs(),
     })
-    // Both resolve via the curated table (AI Studio: 55d/no-IDs;
-    // Google: clean-on-retention/requires-IDs). Neither dominates;
-    // both kept.
-    const kept = result.kept.map((k) => k.endpoint.provider_name).sort()
-    expect(kept).toEqual(['Google', 'Google AI Studio'])
-    // Neither was flagged synthesized because the curated table
-    // covered both.
-    for (const k of result.kept) expect(k.policySynthesized).toBe(false)
+    // Per tier-based dominance: AI Studio (yellow) dominates Google
+    // (orange, requires user IDs). AI Studio kept, Google auto-excluded
+    // but still renders with its curated (non-synthesized) policy.
+    const kept = result.kept.map((k) => k.endpoint.provider_name)
+    expect(kept).toEqual(['Google AI Studio'])
+    const google = result.excluded.find((e) => e.endpoint.provider_name === 'Google')
+    expect(google?.policySynthesized).toBe(false)
+    expect(google?.reasons).toContain('dominated')
   })
 })
 
@@ -229,8 +235,14 @@ describe('filterEndpointsByPrivacy — manual override layers', () => {
     expect(openai?.reasons).toContain('not-in-only-list')
   })
 
-  it('ignoreProviders removes a Pareto-survivor', () => {
+  it('ignoreProviders drops a Pareto-survivor (with Pareto off, proves user veto)', () => {
+    // With paretoFilter on, AI Studio would already dominate Vertex and
+    // Vertex wouldn't be in kept. Turn Pareto off so both survive, then
+    // ignoreProviders vetoes AI Studio — leaving Vertex as the sole
+    // kept endpoint. Under Pareto-on, see the Gemini fixture test —
+    // which asserts AI Studio alone stands.
     const prefs = cloneDefaultPrivacyPrefs()
+    prefs.paretoFilter = false
     prefs.ignoreProviders = ['Google AI Studio']
     const result = filterEndpointsByPrivacy({
       model: 'google/gemini-3.1-pro',
@@ -283,7 +295,27 @@ describe('filterEndpointsByPrivacy — zeroEligible signal', () => {
 })
 
 describe('buildWireProviderPrivacy', () => {
-  it('builds ignore union with the caller-supplied list', () => {
+  it('emits auto-ignore when the user has not touched the picker', () => {
+    // `existingIgnore` empty → wire falls back to the filter's exclusion
+    // set. Per the unified allow/disallow model, an empty caller list
+    // means "trust the filter."
+    const result = filterEndpointsByPrivacy({
+      model: 'openai/gpt-5.4',
+      endpoints: [ep('Azure'), ep('OpenAI')],
+      policies: { Azure: POLICY_CLEAN, OpenAI: POLICY_UNKNOWN_RETENTION },
+      privacy: cloneDefaultPrivacyPrefs(),
+    })
+    const wire = buildWireProviderPrivacy(result, cloneDefaultPrivacyPrefs(), {})
+    expect(wire.ignore).toEqual(['OpenAI'])
+    expect(wire.data_collection).toBe('deny')
+    expect(wire.zeroEligible).toBe(false)
+  })
+
+  it('treats caller-supplied existingIgnore as authoritative when userTouchedPicker=true', () => {
+    // `userTouchedPicker: true` signals the picker has the
+    // authoritative disallowed list; the wire uses it verbatim without
+    // re-layering the filter's auto-exclusion on top. Without the flag,
+    // existingIgnore is ignored (the filter's autoIgnore wins).
     const result = filterEndpointsByPrivacy({
       model: 'openai/gpt-5.4',
       endpoints: [ep('Azure'), ep('OpenAI')],
@@ -292,13 +324,18 @@ describe('buildWireProviderPrivacy', () => {
     })
     const wire = buildWireProviderPrivacy(result, cloneDefaultPrivacyPrefs(), {
       existingIgnore: ['Legacy Manual Ignore'],
+      userTouchedPicker: true,
     })
-    expect(wire.ignore).toEqual(['Legacy Manual Ignore', 'OpenAI'])
-    expect(wire.data_collection).toBe('deny') // DEFAULT_PRIVACY_PREFS.denyDataCollection = true
+    expect(wire.ignore).toEqual(['Legacy Manual Ignore'])
+    expect(wire.data_collection).toBe('deny')
     expect(wire.zeroEligible).toBe(false)
   })
 
-  it('emits only/order when the filter kept more than one provider', () => {
+  it('emits order when the filter kept more than one provider', () => {
+    // Disable Pareto so both Gemini providers survive — otherwise AI
+    // Studio dominates Vertex (yellow vs orange) and there's only one.
+    const prefs = cloneDefaultPrivacyPrefs()
+    prefs.paretoFilter = false
     const result = filterEndpointsByPrivacy({
       model: 'google/gemini-3.1-pro',
       endpoints: [ep('Google Vertex'), ep('Google AI Studio')],
@@ -306,9 +343,9 @@ describe('buildWireProviderPrivacy', () => {
         'Google Vertex': POLICY_VERTEX,
         'Google AI Studio': POLICY_AI_STUDIO,
       },
-      privacy: cloneDefaultPrivacyPrefs(),
+      privacy: prefs,
     })
-    const wire = buildWireProviderPrivacy(result, cloneDefaultPrivacyPrefs())
+    const wire = buildWireProviderPrivacy(result, prefs)
     expect(wire.order).toEqual(['Google AI Studio', 'Google Vertex'])
   })
 
@@ -368,17 +405,28 @@ describe('privacyTierForPolicy', () => {
     expect(privacyTierForPolicy(POLICY_SHORT_RETENTION)).toBe('orange')
   })
 
-  it('orange for retention > 90 days', () => {
+  it('yellow for finite retention without user IDs', () => {
+    // Per user spec 2026-04-19: retained for a set period AND no user IDs
+    // → yellow. Was tested as orange pre-spec; keep the assertion aligned
+    // with the current tier rules.
     const policy: DataPolicy = {
       ...POLICY_CLEAN,
       retainsPrompts: true,
       retentionDays: 120,
     }
-    expect(privacyTierForPolicy(policy)).toBe('orange')
+    expect(privacyTierForPolicy(policy)).toBe('yellow')
   })
 
-  it('red for unknown retention period', () => {
-    expect(privacyTierForPolicy(POLICY_UNKNOWN_RETENTION)).toBe('red')
+  it('orange for unknown (indefinite) retention period', () => {
+    // POLICY_UNKNOWN_RETENTION is retainsPrompts: true + retentionDays
+    // undefined + requiresUserIDs: true. Either of the last two alone
+    // would be orange; together still orange.
+    expect(privacyTierForPolicy(POLICY_UNKNOWN_RETENTION)).toBe('orange')
+  })
+
+  it('red for training: true (even if hard-denied pre-render)', () => {
+    const policy: DataPolicy = { ...POLICY_CLEAN, training: true }
+    expect(privacyTierForPolicy(policy)).toBe('red')
   })
 
   it('red when policy data was synthesized', () => {

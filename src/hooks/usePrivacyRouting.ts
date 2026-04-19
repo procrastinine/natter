@@ -5,7 +5,7 @@
 // Separated from `usePrivacyPolicies` so the policy layer can be tested
 // in isolation from the filter wiring.
 
-import { useMemo } from 'react'
+import { useCallback, useMemo } from 'react'
 import type { EffectiveCapability } from '../core/capabilities'
 import type { EndpointsDescriptor } from '../api/providers'
 import type { Chat, ModelEndpoint } from '../core/types'
@@ -29,6 +29,9 @@ export interface UsePrivacyRoutingResult {
   error: string | null
   scrapeApplicable: boolean
   isFreeModel: boolean
+  // Refreshes both `/endpoints` and the privacy scrape in one call so the
+  // picker's reload button can freshen everything it depends on.
+  refresh: () => void
 }
 
 export function usePrivacyRouting(chat: Chat): UsePrivacyRoutingResult {
@@ -52,13 +55,24 @@ export function usePrivacyRouting(chat: Chat): UsePrivacyRoutingResult {
 
   const wire = useMemo<WireProviderPrivacy | null>(() => {
     if (!filter) return null
-    const existingIgnore = chat.settings.providerPrefs?.ignore
-    return buildWireProviderPrivacy(
-      filter,
-      chat.settings.privacy,
-      existingIgnore ? { existingIgnore } : {},
-    )
-  }, [filter, chat.settings.privacy, chat.settings.providerPrefs?.ignore])
+    const prefs = chat.settings.providerPrefs
+    const userTouched = prefs?.ignoreOverridesFilter === true
+    const opts: { existingIgnore?: readonly string[]; userTouchedPicker?: boolean } = {
+      userTouchedPicker: userTouched,
+    }
+    if (prefs?.ignore) opts.existingIgnore = prefs.ignore
+    return buildWireProviderPrivacy(filter, chat.settings.privacy, opts)
+  }, [
+    filter,
+    chat.settings.privacy,
+    chat.settings.providerPrefs?.ignore,
+    chat.settings.providerPrefs?.ignoreOverridesFilter,
+  ])
+
+  const refresh = useCallback(() => {
+    ep.refresh()
+    pol.refresh()
+  }, [ep, pol])
 
   return {
     filter,
@@ -71,5 +85,6 @@ export function usePrivacyRouting(chat: Chat): UsePrivacyRoutingResult {
     error: ep.error ?? pol.error,
     scrapeApplicable: pol.scrapeApplicable,
     isFreeModel: pol.isFreeModel,
+    refresh,
   }
 }

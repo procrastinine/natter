@@ -37,9 +37,13 @@ function makeProfile(overrides: Partial<ConnectionProfile> = {}): ConnectionProf
 }
 
 describe('privacyScrapeUrl', () => {
-  it('uses openrouter.ai by default', () => {
+  it('uses the /_or_scrape dev proxy path by default', () => {
+    // Browsers can't fetch openrouter.ai/{model}/providers cross-origin
+    // (no CORS header). The default is the relative proxy path that
+    // Vite's dev server rewrites to openrouter.ai. Tests never hit the
+    // network; this just pins the contract.
     expect(privacyScrapeUrl(makeProfile(), 'openai/gpt-5.4')).toBe(
-      'https://openrouter.ai/openai/gpt-5.4/providers',
+      '/_or_scrape/openai/gpt-5.4/providers',
     )
   })
 

@@ -38,6 +38,7 @@ import { CachingPanel } from './CachingPanel'
 import { ContextPanel } from './ContextPanel'
 import { ModelPicker } from './ModelPicker'
 import { ParamForm } from './ParamForm'
+import { PrivacySection } from './PrivacySection'
 import { ProviderPicker } from './ProviderPicker'
 
 export interface ChatModelPanelProps {
@@ -149,6 +150,7 @@ export function ChatModelPanel({ chatId, onClose }: ChatModelPanelProps) {
               onPickForPreset={handleModelPickForPreset}
             />
             {isOpenRouter ? <ProviderPicker chat={chat} /> : null}
+            {isOpenRouter ? <PrivacySection chat={chat} /> : null}
           </>
         ) : null}
         {tab === 'context' ? (

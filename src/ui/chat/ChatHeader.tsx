@@ -5,6 +5,7 @@ import type { ChatId, CursorMap } from '../../core/types'
 import { getChat, setManualTitle } from '../../store/chats'
 import { useChatStore } from '../../store/zustand/chatStore'
 import { CloseIcon, CogIcon, DownloadIcon, EditTreeIcon, InfoIcon, PencilIcon } from '../icons/Icon'
+import { HeaderPrivacyBadge } from './HeaderPrivacyBadge'
 
 // Stable empty reference so useChatStore's selector doesn't allocate a fresh
 // `{}` every render — React 19's useSyncExternalStore detects that as an
@@ -159,6 +160,7 @@ export function ChatHeader({
           <EditTreeIcon size={18} />
         </button>
       ) : null}
+      <HeaderPrivacyBadge chatId={chat.id} />
       <button
         type="button"
         data-ui="icon-button"

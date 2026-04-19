@@ -71,10 +71,11 @@ export async function resolvePrivacyForSend(
     policies,
     privacy: chat.settings.privacy,
   })
-  const wire = buildWireProviderPrivacy(filter, chat.settings.privacy, {
-    ...(chat.settings.providerPrefs?.ignore
-      ? { existingIgnore: chat.settings.providerPrefs.ignore }
-      : {}),
-  })
+  const prefs = chat.settings.providerPrefs
+  const wireOpts: { existingIgnore?: readonly string[]; userTouchedPicker?: boolean } = {
+    userTouchedPicker: prefs?.ignoreOverridesFilter === true,
+  }
+  if (prefs?.ignore) wireOpts.existingIgnore = prefs.ignore
+  const wire = buildWireProviderPrivacy(filter, chat.settings.privacy, wireOpts)
   return { wire, filter, applicable: true }
 }

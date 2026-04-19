@@ -185,19 +185,25 @@ export function privacyTierForPolicy(
   policy: DataPolicy | undefined,
   opts: { synthesized?: boolean } = {},
 ): PrivacyTier {
+  // Tier mapping (per user spec 2026-04-19):
+  //   red    = trains on prompts (hard-denied, but we still render the
+  //            row + lock so the user can see why)
+  //   orange = retains indefinitely OR requires user IDs
+  //   yellow = retains prompts for a finite set period (no user IDs)
+  //   green  = no retention, no user IDs
+  //   red (synthesized) = we couldn't resolve a policy at all, so assume
+  //            the worst
+  //   unavailable = genuinely no policy data provided (direct-provider
+  //            rows)
   if (opts.synthesized) return 'red'
   if (!policy) return 'unavailable'
+  if (policy.training || policy.trainingOpenRouter) return 'red'
   const userIds = policy.requiresUserIDs === true
-  if (!policy.retainsPrompts && !userIds) return 'green'
-  // Unknown-period retention is the worst; flag red before looking at finite days.
-  if (policy.retainsPrompts && policy.retentionDays === undefined) return 'red'
-  if (policy.retainsPrompts && (policy.retentionDays ?? 0) > 90) return 'orange'
-  if (policy.retainsPrompts && userIds && (policy.retentionDays ?? 0) <= 90) {
-    // Finite retention + user IDs is explicitly the orange band.
-    return 'orange'
-  }
-  // Finite short retention OR user IDs alone => yellow/clock.
-  if (policy.retainsPrompts || userIds) return 'yellow'
+  const retainsUnknownPeriod =
+    policy.retainsPrompts && policy.retentionDays === undefined
+  if (retainsUnknownPeriod) return 'orange'
+  if (userIds) return 'orange'
+  if (policy.retainsPrompts) return 'yellow'
   return 'green'
 }
 
@@ -218,14 +224,21 @@ export interface WireProviderPrivacy {
 export function buildWireProviderPrivacy(
   result: PrivacyFilterResult,
   privacy: PrivacyPrefs,
-  opts: { existingIgnore?: readonly string[] } = {},
+  opts: {
+    existingIgnore?: readonly string[]
+    userTouchedPicker?: boolean
+  } = {},
 ): WireProviderPrivacy {
+  // Unified "allowed vs disallowed" model: if the user has touched the
+  // picker, `existingIgnore` is the authoritative set of disallowed
+  // providers — the wire does NOT re-layer the filter's auto-exclusion
+  // on top. When the user hasn't touched (default), fall back to
+  // `autoIgnore` so the request matches what the picker shows.
+  const userTookOver = opts.userTouchedPicker === true
   const autoIgnore = result.excluded.map((e) => e.endpoint.provider_name)
-  const mergedIgnore = uniqueStrings([
-    ...(opts.existingIgnore ?? []),
-    ...autoIgnore,
-    ...privacy.ignoreProviders,
-  ])
+  const mergedIgnore = userTookOver
+    ? uniqueStrings([...(opts.existingIgnore ?? []), ...privacy.ignoreProviders])
+    : uniqueStrings([...autoIgnore, ...privacy.ignoreProviders])
   const wire: WireProviderPrivacy = {
     zeroEligible: result.zeroEligible,
   }
