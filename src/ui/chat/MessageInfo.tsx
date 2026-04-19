@@ -2,12 +2,19 @@ import type { Message as MessageRow } from '../../core/types'
 
 export interface MessageInfoProps {
   message: MessageRow
+  // Set to true when the previous message on the active path was a user
+  // message that got edited after this assistant was generated — the
+  // factual-record (tokens, cost, text) is still the original but the
+  // reply may look stale relative to the edited question. See §10.6
+  // "stale reply?" hint. Surfaced as a row in the info panel so the
+  // reading lane stays calm.
+  staleReplyHint?: boolean
 }
 
 // Detail panel revealed via the ⓘ button on each message. Contains the
 // metadata we used to dump as always-visible chips (model, timestamps,
 // token breakdown, cost). Quiet two-column layout, no badges.
-export function MessageInfo({ message }: MessageInfoProps) {
+export function MessageInfo({ message, staleReplyHint }: MessageInfoProps) {
   const gen = message.generation
   const usage = gen?.usage
   const start = gen?.startedAt
@@ -23,6 +30,15 @@ export function MessageInfo({ message }: MessageInfoProps) {
       : undefined
   const rows: Array<[string, React.ReactNode]> = []
   rows.push(['Created', new Date(message.createdAt).toLocaleString()])
+  if (message.editedAt) {
+    rows.push([
+      'Edited',
+      `${new Date(message.editedAt).toLocaleString()} (original token count and cost unchanged)`,
+    ])
+  }
+  if (message.origin === 'imported') {
+    rows.push(['Origin', 'Imported from another source'])
+  }
   if (gen?.model) {
     rows.push([
       'Model',
@@ -68,6 +84,12 @@ export function MessageInfo({ message }: MessageInfoProps) {
   }
   if (gen?.delivery) {
     rows.push(['Delivery', gen.delivery])
+  }
+  if (staleReplyHint) {
+    rows.push([
+      'Note',
+      'Previous user message was edited after this reply — text may be stale.',
+    ])
   }
   return (
     <dl data-ui="message-info">

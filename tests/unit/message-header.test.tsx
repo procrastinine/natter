@@ -73,14 +73,11 @@ describe('MessageHeader (quiet header — role + state pills only)', () => {
     expect(container.querySelector('[data-ui="message-timestamp"]')).toBeNull()
   })
 
-  it('shows "edited" badge with the factual-record tooltip when editedAt is set', () => {
-    const msg = makeAssistant({ editedAt: Date.now() - 10_000 })
+  it('does NOT render inline "edited" or "imported" pills (they live in the info disclosure)', () => {
+    const msg = makeAssistant({ editedAt: Date.now() - 10_000, origin: 'imported' })
     const { container } = render(<MessageHeader message={msg} />)
-    const badge = container.querySelector('[data-ui="message-edited"]')
-    expect(badge?.textContent).toBe('edited')
-    expect(badge?.getAttribute('title')).toMatch(
-      /Edited in place — original token count and cost unchanged\./,
-    )
+    expect(container.querySelector('[data-ui="message-edited"]')).toBeNull()
+    expect(container.querySelector('[data-ui="message-imported"]')).toBeNull()
   })
 
   it('uses "User" for user messages', () => {
@@ -98,11 +95,6 @@ describe('MessageHeader (quiet header — role + state pills only)', () => {
     expect(label).toBe('Assistant')
   })
 
-  it('adds an "imported" badge when origin === "imported"', () => {
-    const msg = makeAssistant({ origin: 'imported' })
-    const { container } = render(<MessageHeader message={msg} />)
-    expect(container.querySelector('[data-ui="message-imported"]')).toBeTruthy()
-  })
 })
 
 describe('MessageInfo (revealed by ⓘ — full factual record)', () => {

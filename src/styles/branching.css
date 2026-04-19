@@ -1,6 +1,905 @@
 /*
  * branching.css — swipe controls, variant ghost card, edit-tree toolbar, tree view.
  * Owns: [data-ui='branch-controls'|'variant-ghost'|'edit-tree-toolbar'|'branch-tree'|
- *              'branch-node'].
- * Filled in Phase 8.
+ *              'branch-node'|'inline-editor'|'import-modal'|'toast-tray'|
+ *              'banner-tray'].
+ * Wired out in Phase 8.1 per plan/08-branching.md.
  */
+
+/* BranchControls sits in the shared action row (see Message.tsx) so
+ * it aligns with the trailing icon buttons. No top margin here — the
+ * row owns vertical spacing. */
+[data-ui='branch-controls'] {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  font-size: var(--font-size-sm);
+  color: var(--color-fg-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+[data-ui='branch-arrow'],
+[data-ui='branch-count'] {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 22px;
+  min-width: 20px;
+  padding: 0 2px;
+  color: var(--color-fg-muted);
+  text-decoration: none;
+  border-radius: var(--radius-sm);
+  line-height: 1;
+}
+
+[data-ui='branch-count'] {
+  padding: 0 var(--space-1);
+}
+
+[data-ui='branch-arrow'] {
+  font-size: 18px;
+  font-weight: var(--font-weight-medium);
+}
+
+/* The first/last arrows use doubled chevrons (« »); shrink slightly
+ * so they don't overwhelm the single-step arrows. */
+[data-ui='branch-arrow'][data-role='first'],
+[data-ui='branch-arrow'][data-role='last'] {
+  font-size: 15px;
+}
+
+/* Disabled arrows at the extreme ends — rendered as <span> (no href)
+ * so middle-click / Cmd-click don't open a new tab to a no-op URL. */
+[data-ui='branch-arrow'][data-state='disabled'] {
+  color: var(--color-fg-disabled, var(--color-border-default));
+  cursor: default;
+  pointer-events: none;
+  opacity: 0.4;
+}
+
+[data-ui='branch-count-editor'] {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  height: 28px;
+  padding: 0 var(--space-2);
+  font-size: var(--font-size-sm);
+  font-variant-numeric: tabular-nums;
+}
+
+[data-ui='branch-count-input'] {
+  font: inherit;
+  width: 3em;
+  min-width: 2em;
+  padding: 0 var(--space-1);
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-surface-1);
+  color: var(--color-fg-primary);
+  text-align: center;
+}
+
+[data-ui='branch-count-of'] {
+  color: var(--color-fg-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+[data-ui='branch-arrow']:hover,
+[data-ui='branch-count']:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-fg-primary);
+}
+
+[data-ui='branch-count'] {
+  font-family: var(--font-mono);
+}
+
+/* Inline editor — textarea swap-in. Wrapped as a card with a hairline
+ * divider and an edge-to-edge button bar at the bottom (mirrors the
+ * composer Send slot). */
+[data-ui='inline-editor'] {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  background: var(--color-bg-surface-1);
+}
+
+[data-ui='inline-editor-input'] {
+  font: inherit;
+  width: 100%;
+  min-height: 10rem;
+  max-height: 600px;
+  padding: var(--space-3);
+  background: var(--color-bg-surface-1);
+  border: none;
+  border-radius: 0;
+  resize: none;
+  outline: none;
+}
+
+/* Suppress the browser-default focus outline. The wrapping
+ * `[data-ui='inline-editor']` card already signals edit mode, and the
+ * blinking text cursor is a sufficient keyboard-focus cue. The default
+ * outline sits 2px inset from the textarea's border-box, so its bottom
+ * stroke lands flush with the action row below — on user-message
+ * editors it visually merges with the accent-blue Save & Send and reads
+ * as a stray "blue bar" over Cancel, which stays there as long as the
+ * textarea retains focus (disappearing only when a button is actively
+ * pressed and the textarea blurs). Must override `:focus` /
+ * `:focus-visible` explicitly because the user-agent stylesheet
+ * reapplies `outline: auto` on those states. */
+[data-ui='inline-editor-input']:focus,
+[data-ui='inline-editor-input']:focus-visible {
+  outline: none;
+}
+
+[data-ui='inline-editor-reasoning'] {
+  border-top: 1px solid var(--color-border-subtle);
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--font-size-sm);
+  background: var(--color-bg-surface-2);
+}
+
+[data-ui='inline-editor-reasoning'] summary {
+  cursor: pointer;
+  color: var(--color-fg-muted);
+  user-select: none;
+}
+
+[data-ui='inline-editor-reasoning-list'] {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  margin-top: var(--space-2);
+}
+
+[data-ui='inline-editor-reasoning-row'] {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+[data-ui='inline-editor-reasoning-label'] {
+  font-size: var(--font-size-xs);
+  color: var(--color-fg-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+[data-ui='inline-editor-reasoning-input'] {
+  font: inherit;
+  min-height: 4rem;
+  padding: var(--space-2);
+  background: var(--color-bg-surface-1);
+}
+
+[data-ui='inline-editor-reasoning-readonly'] {
+  font-size: var(--font-size-xs);
+  color: var(--color-fg-muted);
+  font-family: var(--font-mono);
+}
+
+[data-ui='inline-editor-actions'] {
+  display: flex;
+  border-top: 1px solid var(--color-border-subtle);
+}
+
+[data-ui='inline-editor-button'] {
+  flex: 1 1 0;
+  padding: var(--space-2) var(--space-3);
+  border: none;
+  border-radius: 0;
+  background: var(--color-bg-surface-1);
+  color: var(--color-fg-primary);
+  cursor: pointer;
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
+  /* Drop the default focus ring — the dialog is a self-contained
+   * cluster of three buttons; the blue outline was reading as a
+   * stray "bar" on hover-after-click. We still want a keyboard focus
+   * cue, but a subtle inset shadow is less distracting than a
+   * pixel-wide outline wrapping a flush-edge button. */
+  outline: none;
+}
+
+[data-ui='inline-editor-button']:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 2px var(--color-border-focus);
+}
+
+[data-ui='inline-editor-button']:hover:not(:disabled) {
+  background: var(--color-bg-hover);
+}
+
+[data-ui='inline-editor-button']:active:not(:disabled) {
+  background: var(--color-bg-active);
+}
+
+[data-ui='inline-editor-button'][data-role='cancel'] {
+  color: var(--color-fg-muted);
+}
+
+[data-ui='inline-editor-button'][data-role='save'] {
+  background: var(--color-bg-surface-2);
+  color: var(--color-fg-primary);
+}
+
+[data-ui='inline-editor-button'][data-role='save']:hover:not(:disabled) {
+  background: color-mix(
+    in srgb,
+    var(--color-accent) 14%,
+    var(--color-bg-surface-2)
+  );
+  color: var(--color-fg-primary);
+}
+
+[data-ui='inline-editor-button'][data-role='save-send'] {
+  background: var(--color-accent);
+  color: var(--color-accent-contrast);
+}
+
+[data-ui='inline-editor-button'][data-role='save-send']:hover:not(:disabled) {
+  background: var(--color-accent-hover);
+}
+
+[data-ui='inline-editor-button']:disabled {
+  opacity: var(--opacity-disabled);
+  cursor: not-allowed;
+}
+
+[data-ui='message-role-mismatch'] {
+  font-size: var(--font-size-xs);
+  color: var(--color-warning);
+  background: var(--color-banner-warning-bg);
+  border-radius: var(--radius-pill);
+  padding: 0 var(--space-2);
+  cursor: help;
+  font-style: italic;
+}
+
+/* Abort banner continue button — abort banner itself is styled in messages.css. */
+
+/* Edit-tree toolbar — row directly under the title bar. */
+[data-ui='edit-tree-toolbar'] {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-4);
+  background: var(--color-banner-info-bg);
+  border-bottom: 1px solid var(--color-border-subtle);
+  font-size: var(--font-size-sm);
+}
+
+[data-ui='edit-tree-mode-badge'] {
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-pill);
+  background: var(--color-accent);
+  color: var(--color-accent-contrast);
+  font-weight: var(--font-weight-semibold);
+  font-size: var(--font-size-xs);
+}
+
+[data-ui='edit-tree-cascade'] {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--color-fg-primary);
+  cursor: pointer;
+}
+
+[data-ui='edit-tree-spacer'] {
+  flex: 1 1 auto;
+}
+
+/* Toast tray — bottom-right stack, auto-dismiss. */
+[data-ui='toast-tray'] {
+  position: fixed;
+  right: var(--space-5);
+  bottom: var(--space-5);
+  z-index: var(--z-toast, 100);
+  display: flex;
+  flex-direction: column-reverse;
+  gap: var(--space-2);
+  pointer-events: none;
+  max-width: 360px;
+}
+
+[data-ui='toast-tray'] [data-ui='toast'] {
+  pointer-events: auto;
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  background: var(--color-bg-surface-1);
+  border: 1px solid var(--color-border-default);
+  border-left-width: 3px;
+  box-shadow: var(--shadow-md);
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--font-size-sm);
+  border-radius: var(--radius-sm);
+}
+
+[data-ui='toast-tray'] [data-ui='toast'][data-tone='info'] {
+  border-left-color: var(--color-info);
+}
+[data-ui='toast-tray'] [data-ui='toast'][data-tone='success'] {
+  border-left-color: var(--color-success);
+}
+[data-ui='toast-tray'] [data-ui='toast'][data-tone='warning'] {
+  border-left-color: var(--color-warning);
+}
+[data-ui='toast-tray'] [data-ui='toast'][data-tone='danger'] {
+  border-left-color: var(--color-danger);
+}
+
+[data-ui='toast-text'] {
+  flex: 1 1 auto;
+  color: var(--color-fg-primary);
+}
+
+[data-ui='toast-undo'],
+[data-ui='toast-dismiss'] {
+  background: transparent;
+  border: none;
+  padding: var(--space-1) var(--space-2);
+  cursor: pointer;
+  color: var(--color-fg-muted);
+  font-size: var(--font-size-xs);
+}
+
+[data-ui='toast-undo'] {
+  color: var(--color-accent);
+  font-weight: var(--font-weight-semibold);
+}
+
+[data-ui='toast-dismiss'] {
+  font-size: var(--font-size-md);
+  line-height: 1;
+}
+
+/* Banner tray — inline above the message list. */
+[data-ui='banner-tray'] {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  padding-bottom: 0;
+}
+
+[data-ui='banner'] {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+[data-ui='banner-spacer'] {
+  flex: 1 1 auto;
+}
+
+[data-ui='banner-primary'],
+[data-ui='banner-secondary'] {
+  font-size: var(--font-size-xs);
+  padding: var(--space-1) var(--space-3);
+}
+
+[data-ui='banner-dismiss'] {
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  font-size: var(--font-size-md);
+  color: var(--color-fg-muted);
+}
+
+/* Import modal — plaintext-only in 8.1. */
+[data-ui='import-modal-overlay'] {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--color-backdrop-scrim);
+  z-index: var(--z-overlay);
+  padding: var(--space-5);
+}
+
+[data-ui='import-modal'] {
+  background: var(--color-bg-surface-1);
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-overlay);
+  width: min(640px, calc(100vw - var(--space-8)));
+  max-height: 85vh;
+  overflow: auto;
+  padding: var(--space-5);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+[data-ui='import-modal-header'] {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+[data-ui='import-modal-header'] h2 {
+  margin: 0;
+  font-size: var(--font-size-lg);
+  font-weight: var(--font-weight-semibold);
+  flex: 1 1 auto;
+}
+
+[data-ui='import-modal-slot'] {
+  margin: 0;
+  font-size: var(--font-size-sm);
+  color: var(--color-fg-muted);
+}
+
+[data-ui='import-modal-rows'] {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+[data-ui='import-modal-row'] {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+/* Faint separator between stacked chain rows so the user can still tell
+ * them apart. No outer box — the row is just role + textarea stacked. */
+[data-ui='import-modal-row'] + [data-ui='import-modal-row'] {
+  border-top: 1px dashed var(--color-border-subtle);
+  padding-top: var(--space-3);
+}
+
+[data-ui='import-modal-row-head'] {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+[data-ui='import-modal-row-head'] label {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--font-size-sm);
+  color: var(--color-fg-muted);
+}
+
+[data-ui='import-modal-remove'] {
+  margin-left: auto;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--color-danger);
+  padding: var(--space-1);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-sm);
+  width: 26px;
+  height: 26px;
+}
+
+[data-ui='import-modal-remove']:hover {
+  background: var(--color-banner-danger-bg);
+  border-color: color-mix(
+    in srgb,
+    var(--color-danger) 40%,
+    var(--color-border-subtle)
+  );
+}
+
+[data-ui='import-modal-text'] {
+  width: 100%;
+  min-height: 6rem;
+  resize: vertical;
+  font: inherit;
+}
+
+[data-ui='import-modal-footer'] {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+[data-ui='import-modal-spacer'] {
+  flex: 1 1 auto;
+}
+
+[data-ui='import-modal-submit'] {
+  background: var(--color-accent);
+  color: var(--color-accent-contrast);
+  border-color: var(--color-accent);
+}
+
+[data-ui='import-modal-submit']:hover:not(:disabled) {
+  background: var(--color-accent-hover);
+}
+
+[data-ui='import-modal-error'] {
+  margin: 0;
+  color: var(--color-danger);
+  font-size: var(--font-size-sm);
+}
+
+/* Branch tree view — indent-based tree. */
+[data-ui='branch-tree-overlay'] {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--color-backdrop-scrim);
+  z-index: var(--z-overlay);
+  padding: var(--space-5);
+}
+
+[data-ui='branch-tree'] {
+  background: var(--color-bg-surface-1);
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-overlay);
+  width: min(720px, calc(100vw - var(--space-8)));
+  max-height: 85vh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+[data-ui='branch-tree-header'] {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-5);
+  border-bottom: 1px solid var(--color-border-subtle);
+}
+
+[data-ui='branch-tree-header'] h2 {
+  margin: 0;
+  font-size: var(--font-size-lg);
+  font-weight: var(--font-weight-semibold);
+}
+
+[data-ui='branch-tree-search'] {
+  flex: 1 1 auto;
+}
+
+[data-ui='branch-tree-list'] {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  overflow-y: auto;
+}
+
+[data-ui='branch-tree-row'] {
+  padding: var(--space-1) var(--space-5);
+}
+
+[data-ui='branch-tree-row'][data-active='true'] [data-ui='branch-tree-node'] {
+  background: var(--color-bg-surface-2);
+  font-weight: var(--font-weight-semibold);
+}
+
+[data-ui='branch-tree-row'][data-depth='0'] [data-ui='branch-tree-node'] {
+  padding-left: 0;
+}
+[data-ui='branch-tree-row'][data-depth='1'] [data-ui='branch-tree-node'] {
+  padding-left: var(--space-4);
+}
+[data-ui='branch-tree-row'][data-depth='2'] [data-ui='branch-tree-node'] {
+  padding-left: calc(var(--space-4) * 2);
+}
+[data-ui='branch-tree-row'][data-depth='3'] [data-ui='branch-tree-node'] {
+  padding-left: calc(var(--space-4) * 3);
+}
+
+[data-ui='branch-tree-node'] {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+  color: inherit;
+  text-decoration: none;
+}
+
+[data-ui='branch-tree-node']:hover {
+  background: var(--color-bg-hover);
+}
+
+[data-ui='branch-tree-role'] {
+  font-size: var(--font-size-xs);
+  color: var(--color-fg-muted);
+  font-variant-caps: all-small-caps;
+  min-width: 60px;
+}
+
+[data-ui='branch-tree-preview'] {
+  flex: 1 1 auto;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--color-fg-primary);
+}
+
+[data-ui='branch-tree-variants'] {
+  font-size: var(--font-size-xs);
+  color: var(--color-fg-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+[data-ui='branch-tree-empty'] {
+  padding: var(--space-5);
+  text-align: center;
+  color: var(--color-fg-muted);
+}
+
+[data-ui='icon-button-hint'] {
+  font-size: var(--font-size-xs);
+  margin-left: var(--space-1);
+  color: var(--color-fg-muted);
+}
+
+/* Edit-tree mode action buttons — plain text buttons the user can read
+ * at a glance ("Insert before", "Delete turn"). Sit in the same row as
+ * the info disclosure; wrap if the row gets tight. Insert = success
+ * green, Delete = danger red, mirrored to read as opposites.
+ *
+ * Carry a subtle tinted fill in the resting state (the tone's banner
+ * background) so they look like buttons, not quiet text; hover deepens
+ * the tint and the border so the click affordance is obvious. */
+[data-ui='edit-tree-action'] {
+  font: inherit;
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-medium);
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-surface-2);
+  color: var(--color-fg-primary);
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    background var(--duration-fast) var(--ease-standard),
+    border-color var(--duration-fast) var(--ease-standard),
+    color var(--duration-fast) var(--ease-standard);
+}
+
+[data-ui='edit-tree-action']:hover:not(:disabled) {
+  background: var(--color-bg-hover);
+  border-color: var(--color-border-default);
+}
+
+[data-ui='edit-tree-action']:active:not(:disabled) {
+  background: var(--color-bg-active);
+}
+
+[data-ui='edit-tree-action'][data-tone='success'] {
+  color: var(--color-success);
+  background: var(--color-banner-success-bg);
+  border-color: color-mix(
+    in srgb,
+    var(--color-success) 35%,
+    var(--color-border-subtle)
+  );
+}
+
+[data-ui='edit-tree-action'][data-tone='success']:hover:not(:disabled) {
+  background: color-mix(
+    in srgb,
+    var(--color-success) 22%,
+    var(--color-bg-surface-1)
+  );
+  border-color: var(--color-success);
+  color: color-mix(in srgb, var(--color-success) 80%, #000);
+}
+
+[data-ui='edit-tree-action'][data-tone='danger'] {
+  color: var(--color-danger);
+  background: var(--color-banner-danger-bg);
+  border-color: color-mix(
+    in srgb,
+    var(--color-danger) 35%,
+    var(--color-border-subtle)
+  );
+}
+
+[data-ui='edit-tree-action'][data-tone='danger']:hover:not(:disabled) {
+  background: color-mix(
+    in srgb,
+    var(--color-danger) 22%,
+    var(--color-bg-surface-1)
+  );
+  border-color: var(--color-danger);
+  color: color-mix(in srgb, var(--color-danger) 80%, #000);
+}
+
+/* Tree-edit structural row — sits BELOW the message-action-row so the
+ * variant arrows + k/N label on the top line don't collide with these
+ * text-labeled buttons on narrow viewports. Insert group hugs the
+ * leading edge; delete group hugs the trailing edge so the destructive
+ * ops are physically separated from the additive ones. Wraps when even
+ * this row runs out of room. */
+[data-ui='message-edit-tree-row'] {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin-top: var(--space-2);
+  flex-wrap: wrap;
+  row-gap: var(--space-2);
+}
+
+[data-ui='edit-tree-group'] {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+[data-ui='edit-tree-group'][data-side='deletes'] {
+  justify-content: flex-end;
+}
+
+/* Confirm-delete dialog — small centered modal with a preview quote,
+ * a pair checkbox, and Cancel / Delete buttons. The Delete button is
+ * danger-tinted. */
+[data-ui='confirm-delete-overlay'] {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--color-backdrop-scrim);
+  z-index: var(--z-overlay);
+  padding: var(--space-5);
+}
+
+[data-ui='confirm-delete'] {
+  background: var(--color-bg-surface-1);
+  /* No outer border — the shadow is enough to lift the dialog off the
+   * scrim, and the 1-px stroke was distracting from the red Delete
+   * button in the action bar. */
+  border: none;
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-overlay);
+  width: min(460px, calc(100vw - var(--space-8)));
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+[data-ui='confirm-delete-header'] {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--color-border-subtle);
+}
+
+[data-ui='confirm-delete-header'] h2 {
+  margin: 0;
+  font-size: var(--font-size-md);
+  font-weight: var(--font-weight-semibold);
+  flex: 1 1 auto;
+}
+
+[data-ui='confirm-delete-preview'] {
+  margin: var(--space-4);
+  padding: var(--space-2) var(--space-3);
+  border-left: 3px solid var(--color-border-subtle);
+  color: var(--color-fg-muted);
+  font-size: var(--font-size-sm);
+  font-style: italic;
+  max-height: 8em;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+[data-ui='confirm-delete-pair'] {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  column-gap: var(--space-2);
+  row-gap: var(--space-1);
+  align-items: start;
+  padding: 0 var(--space-4) var(--space-3);
+  color: var(--color-fg-primary);
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+}
+
+[data-ui='confirm-delete-pair'] > input[type='checkbox'] {
+  margin: 2px 0 0;
+  justify-self: start;
+  cursor: pointer;
+}
+
+[data-ui='confirm-delete-pair'] > span {
+  min-width: 0;
+}
+
+[data-ui='confirm-delete-hint'] {
+  grid-column: 2;
+  font-size: var(--font-size-xs);
+  color: var(--color-fg-muted);
+}
+
+[data-ui='confirm-delete-actions'] {
+  display: flex;
+  border-top: 1px solid var(--color-border-subtle);
+  overflow: hidden;
+  border-bottom-left-radius: var(--radius-md);
+  border-bottom-right-radius: var(--radius-md);
+}
+
+[data-ui='confirm-delete-button'] {
+  flex: 1 1 0;
+  padding: var(--space-2) var(--space-3);
+  border: none;
+  border-radius: 0;
+  background: var(--color-bg-surface-1);
+  color: var(--color-fg-primary);
+  cursor: pointer;
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
+  outline: none;
+}
+
+[data-ui='confirm-delete-button']:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 2px var(--color-border-focus);
+}
+
+[data-ui='confirm-delete-button']:hover:not(:disabled) {
+  background: var(--color-bg-hover);
+}
+
+[data-ui='confirm-delete-button'][data-role='cancel'] {
+  color: var(--color-fg-muted);
+}
+
+[data-ui='confirm-delete-button'][data-tone='danger'] {
+  background: var(--color-danger);
+  color: var(--color-fg-inverse);
+}
+
+[data-ui='confirm-delete-button'][data-tone='danger']:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--color-danger) 85%, #000);
+}
+
+/* Chat-title-bar Edit-tree toggle — when active, fill the button with
+ * the accent color so the user can tell the mode is on at a glance. */
+[data-ui='icon-button'][data-role='chat-edit-tree'][data-state='active'] {
+  background: var(--color-accent);
+  color: var(--color-accent-contrast);
+}
+
+/* Composer Import-at-end button — sits in the composer's bottom row
+ * flush next to the Send button. Square corners (the button fills the
+ * full row height, rounded corners would clip weirdly against the
+ * adjacent slots). Shaded a step darker than the action-row background
+ * so it reads as a proper affordance. */
+[data-ui='composer-import-at-end'] {
+  background: var(--color-bg-surface-2);
+  border: none;
+  border-left: 1px solid var(--color-border-subtle);
+  color: var(--color-fg-muted);
+  padding: 0 var(--space-4);
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+  align-self: stretch;
+  border-radius: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+[data-ui='composer-import-at-end']:hover:not(:disabled) {
+  background: var(--color-bg-hover);
+  color: var(--color-fg-primary);
+}

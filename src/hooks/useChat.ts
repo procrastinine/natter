@@ -89,6 +89,17 @@ export interface SendTextInput {
   now?: () => number
 }
 
+// "Open an assistant stream under an existing user (or other) message."
+// Used by edit-then-send (the user sibling already exists; we just need
+// a fresh assistant reply) and regenerate-after-branch flows. No user
+// message is created here.
+export interface SendFromMessageInput
+  extends Omit<SendTextInput, 'content'> {
+  // Any existing message on the active path; the assistant placeholder
+  // will be created as its child. Typically a user-role message.
+  parentMessageId: MessageId
+}
+
 export interface OpenStreamInput {
   connection: ConnectionProfile
   apiKey: string
@@ -111,7 +122,6 @@ export interface SendTextResult {
 // id, invalid invariants) throw.
 export async function sendText(input: SendTextInput): Promise<SendTextResult> {
   const now = input.now ?? Date.now
-  const repo = getBrowserRepository()
   const chat = await getChat(input.chatId)
   if (!chat) throw new Error(`sendText: chat not found: ${input.chatId}`)
 
@@ -128,19 +138,48 @@ export async function sendText(input: SendTextInput): Promise<SendTextResult> {
     ...userMsg.effects.cursorUpdates,
   })
 
+  return openAssistantStreamUnder({
+    ...input,
+    parentMessageId: userMsg.messageId,
+    userMessageId: userMsg.messageId,
+  })
+}
+
+// Edit-then-send / resend-from-existing-user entrypoint. The caller has
+// already created the user sibling (e.g. via `insertSibling` with
+// role:'user', origin:'user'); all that's left is to attach an assistant
+// placeholder under it and stream the reply. No user message is created.
+export async function sendFromMessage(
+  input: SendFromMessageInput,
+): Promise<SendTextResult> {
+  return openAssistantStreamUnder({
+    ...input,
+    parentMessageId: input.parentMessageId,
+    userMessageId: input.parentMessageId,
+  })
+}
+
+async function openAssistantStreamUnder(
+  input: SendFromMessageInput & { userMessageId: MessageId },
+): Promise<SendTextResult> {
+  const now = input.now ?? Date.now
+  const repo = getBrowserRepository()
+  const chat = await getChat(input.chatId)
+  if (!chat) throw new Error(`sendText: chat not found: ${input.chatId}`)
+
   const assistantId = newId()
   await repo.runMutation(
     [
       { kind: 'message', messageId: assistantId },
-      { kind: 'children', chatId: input.chatId, parentId: userMsg.messageId },
+      { kind: 'children', chatId: input.chatId, parentId: input.parentMessageId },
     ],
     async (ctx) => {
       const all = await ctx.listMessages(input.chatId)
       await ctx.putMessage({
         id: assistantId,
         chatId: input.chatId,
-        parentId: userMsg.messageId,
-        siblingIndex: nextSiblingIndex(groupByParent(all), userMsg.messageId),
+        parentId: input.parentMessageId,
+        siblingIndex: nextSiblingIndex(groupByParent(all), input.parentMessageId),
         turnId: newId(),
         turnIndex: 0,
         createdAt: now(),
@@ -164,15 +203,15 @@ export async function sendText(input: SendTextInput): Promise<SendTextResult> {
 
   useChatStore.getState().patchCursor(
     input.chatId,
-    cursorKeyOf(userMsg.messageId),
+    cursorKeyOf(input.parentMessageId),
     assistantId,
   )
 
+  const baseCursor = useChatStore.getState().getCursor(input.chatId) ?? {}
   const allMessages = await loadChatMessages(input.chatId)
   const nextCursor = {
-    ...cursor,
-    ...userMsg.effects.cursorUpdates,
-    [cursorKeyOf(userMsg.messageId)]: assistantId,
+    ...baseCursor,
+    [cursorKeyOf(input.parentMessageId)]: assistantId,
   }
   const path = activePath(allMessages, nextCursor)
 
@@ -295,7 +334,7 @@ export async function sendText(input: SendTextInput): Promise<SendTextResult> {
 
   const result: SendTextResult = {
     streamId,
-    userMessageId: userMsg.messageId,
+    userMessageId: input.userMessageId,
     assistantMessageId: assistantId,
     outcome,
   }
@@ -532,6 +571,9 @@ export async function recoverOrphans(now = Date.now()): Promise<number> {
 
 export interface UseChatApi {
   send: (input: Omit<SendTextInput, 'signal'>) => Promise<SendTextResult>
+  sendFrom: (
+    input: Omit<SendFromMessageInput, 'signal'>,
+  ) => Promise<SendTextResult>
   abort: () => void
   isStreaming: () => boolean
 }
@@ -552,11 +594,26 @@ export function useChat(): UseChatApi {
     }
   }, [])
 
+  const sendFrom = useCallback(
+    async (input: Omit<SendFromMessageInput, 'signal'>) => {
+      const ctl = new AbortController()
+      controllerRef.current = ctl
+      try {
+        const result = await sendFromMessage({ ...input, signal: ctl.signal })
+        streamIdRef.current = result.streamId
+        return result
+      } finally {
+        if (controllerRef.current === ctl) controllerRef.current = null
+      }
+    },
+    [],
+  )
+
   const abort = useCallback(() => {
     controllerRef.current?.abort()
   }, [])
 
   const isStreaming = useCallback(() => controllerRef.current !== null, [])
 
-  return { send, abort, isStreaming }
+  return { send, sendFrom, abort, isStreaming }
 }

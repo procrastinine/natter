@@ -1,9 +1,95 @@
 /*
  * shell.css — app frame, overlays, status bar, empty states, responsive shell.
  * Owns: [data-ui='app-shell'|'main-pane'|'settings-overlay'|'status-bar'|
- *              'empty-state'|'sample-prompts'].
+ *              'empty-state'|'sample-prompts'|'focus-mode-toggle'].
  * See plan/10-ui.md §10.20.
  */
+
+/* Focus / reading mode — when `data-focus-mode="on"` on the app-shell,
+ * every piece of chrome disappears so only the message list + the
+ * composer (reparented under the scroll region — see Shell.tsx) + the
+ * eye toggle itself remain. The composer scrolls with content instead
+ * of sticking to the viewport bottom. */
+[data-ui='app-shell'][data-focus-mode='on'] > [data-ui='sidebar'],
+[data-ui='app-shell'][data-focus-mode='on'] [data-ui='connection-header'],
+[data-ui='app-shell'][data-focus-mode='on'] [data-ui='chat-title-bar'],
+[data-ui='app-shell'][data-focus-mode='on'] [data-ui='edit-tree-toolbar'],
+[data-ui='app-shell'][data-focus-mode='on'] [data-ui='jump-to-latest'] {
+  display: none !important;
+}
+
+/* In focus mode the composer is rendered INSIDE the scroll region as
+ * the last item (see Shell.tsx). Strip the sticky-at-bottom chrome so
+ * it flows with the messages — no top-edge resize handle, no border,
+ * transparent background so the composer-body's card reads as a
+ * floating input and the scroll-region's padding doesn't leak an
+ * awkward white rectangle around the edges. */
+[data-ui='app-shell'][data-focus-mode='on'] [data-ui='composer'] {
+  border-top: none;
+  background: transparent;
+  padding: var(--space-6) 0;
+}
+
+/* With chrome hidden, the main pane is the entire viewport. The
+ * default rules reference `grid-area: main`, so the single-column
+ * override needs to keep the name or the main pane auto-places to a
+ * junk cell and the content falls out of the layout (seen as right-
+ * aligned / half-width prose). Keep only the `main` area. */
+[data-ui='app-shell'][data-focus-mode='on'] {
+  grid-template-columns: 1fr;
+  grid-template-areas: 'main';
+}
+
+/* Floating eye toggle — fixed at the bottom-right so it survives the
+ * chrome-hide switch. Circular, translucent at rest so it doesn't
+ * steal attention; more opaque on hover and when active. Extra
+ * right-padding keeps it clear of the scroll region's scrollbar when
+ * focus mode is active (the scrollbar hugs the viewport edge since
+ * there's no more chat-title-bar chrome inset). */
+[data-ui='focus-mode-toggle'] {
+  position: fixed;
+  right: var(--space-6);
+  bottom: var(--space-6);
+  z-index: var(--z-toast, 100);
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  border: 1px solid var(--color-border-subtle);
+  background: var(--color-bg-surface-1);
+  color: var(--color-fg-muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  opacity: 0.55;
+  box-shadow: var(--shadow-sm);
+  transition:
+    opacity var(--duration-fast) var(--ease-standard),
+    background var(--duration-fast) var(--ease-standard);
+}
+
+[data-ui='focus-mode-toggle']:hover {
+  opacity: 1;
+  background: var(--color-bg-surface-2);
+  color: var(--color-fg-primary);
+}
+
+/* Active state stays white and quiet — reading mode shouldn't have a
+ * bright accent button drawing the eye back to the chrome. The crossed-
+ * eye glyph alone communicates "mode is on"; opacity goes to 0.55 so
+ * the button nearly blends into the page until you hover for it. */
+[data-ui='focus-mode-toggle'][data-state='active'] {
+  opacity: 0.55;
+  background: var(--color-bg-surface-1);
+  color: var(--color-fg-muted);
+  border-color: var(--color-border-subtle);
+}
+
+[data-ui='focus-mode-toggle'][data-state='active']:hover {
+  opacity: 1;
+  background: var(--color-bg-surface-2);
+  color: var(--color-fg-primary);
+}
 
 /* New shell layout: a simple two-column grid (sidebar + main), no separate
  * header row at the top of the shell. The connection header, chat title row,

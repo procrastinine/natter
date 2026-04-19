@@ -78,6 +78,21 @@ export function navigate(href: string): void {
   window.location.hash = href
 }
 
+// Silent URL rewrite via `history.replaceState`. Does NOT fire a
+// hashchange (so downstream hooks won't react) and does NOT push a new
+// history entry. Used by the branch↔URL sync so swiping through
+// variants updates the address bar without spamming back-history, and
+// interior-message URLs (#/chat/id/message/<mid>) can redirect to the
+// branch leaf (#/chat/id/message/<leafId>) without the user seeing a
+// back button that undoes the auto-redirect.
+export function replaceRoute(href: string): void {
+  if (typeof window === 'undefined') return
+  if (window.location.hash === href) return
+  const url = new URL(window.location.href)
+  url.hash = href
+  window.history.replaceState(window.history.state, '', url.toString())
+}
+
 export function navigateToChat(
   chatId: ChatId,
   pinnedMessageId?: MessageId,

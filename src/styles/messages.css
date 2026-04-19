@@ -62,8 +62,10 @@
   width: var(--message-glyph-size);
   height: var(--message-glyph-size);
   border-radius: 50%;
-  background: var(--color-bg-surface-2);
-  color: var(--color-fg-secondary);
+  /* User glyph: match the previous assistant gray so user turns feel
+   * slightly weightier than helper roles (system/tool). */
+  background: var(--color-bg-surface-3);
+  color: var(--color-fg-primary);
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -71,9 +73,16 @@
   flex: 0 0 auto;
 }
 
+/* Assistant glyph: soft light-blue so the model's turn is visually
+ * distinct from the user's gray. The fill is a 20% accent mix with
+ * the surface so the tint stays quiet across themes. */
 [data-ui='profile-glyph'][data-role='assistant'] {
-  background: var(--color-bg-surface-3);
-  color: var(--color-fg-primary);
+  background: color-mix(
+    in srgb,
+    var(--color-accent) 20%,
+    var(--color-bg-surface-1)
+  );
+  color: color-mix(in srgb, var(--color-accent) 60%, #000);
 }
 
 [data-ui='profile-glyph'][data-role='system'] {
@@ -84,10 +93,6 @@
 [data-ui='profile-glyph'][data-role='tool'] {
   background: var(--color-bg-surface-2);
   color: var(--color-fg-muted);
-}
-
-[data-ui='message'][data-origin='imported'] [data-ui='profile-glyph'] {
-  border: 1px dashed var(--color-fg-muted);
 }
 
 /* Text column. The divider is a border on this element so it spans only
@@ -124,14 +129,6 @@
   font-size: var(--font-size-md);
   letter-spacing: -0.005em;
   text-transform: none;
-}
-
-[data-ui='message-edited'],
-[data-ui='message-imported'] {
-  font-size: var(--font-size-xs);
-  color: var(--color-fg-muted);
-  font-style: italic;
-  cursor: default;
 }
 
 /* Right-side header chips for assistant messages — model id + token count.
@@ -182,12 +179,28 @@
  * so the alignment doesn't drift across pairs.
  * ────────────────────────────────────────────────────────────────────── */
 
+/* Single row that holds BOTH branch-controls (left) and the icon
+ * buttons (right). Wrapper owns the top-margin; children contribute
+ * no vertical spacing so the two groups sit on exactly the same
+ * baseline. */
+[data-ui='message-action-row'] {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin-top: var(--space-3);
+  min-height: 22px;
+}
+
+[data-ui='message-action-row-spacer'] {
+  flex: 1 1 auto;
+}
+
 [data-ui='message-actions'] {
   display: flex;
   justify-content: flex-end;
   align-items: center;
   gap: var(--space-2);
-  margin-top: var(--space-3);
   font-size: var(--font-size-xs);
   color: var(--color-fg-muted);
 }

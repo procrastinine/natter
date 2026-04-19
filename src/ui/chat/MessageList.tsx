@@ -1,13 +1,45 @@
 import { useLiveQuery } from 'dexie-react-hooks'
-import { memo, useMemo } from 'react'
-import { activePath } from '../../core/active-path'
-import type { ChatId, CursorMap } from '../../core/types'
-import { loadChatMessages } from '../../store/chats'
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import {
+  activePath,
+  cursorKeyOf,
+  groupByParent,
+  indexById,
+} from '../../core/active-path'
+import { swipe } from '../../core/messages'
+import { resolveLastUpdatedBranchBelow } from '../../core/branch-resolve'
+import {
+  computeBranchTitle,
+  forkChatFromMessage,
+} from '../../core/chat-fork'
+import type {
+  ChatId,
+  CursorMap,
+  Message as MessageRow,
+  MessageId,
+  MessageRole,
+  ReasoningDetail,
+} from '../../core/types'
+import { navigateToChat } from '../../app/router'
+import {
+  editAndResend,
+  editInPlace,
+  regenerateFromMessage,
+  continueFromMessage,
+  type MessageOpsContext,
+} from '../../hooks/useMessageOps'
+import { useChat } from '../../hooks/useChat'
+import { getDb } from '../../store/db'
+import { listChats, loadChatMessages } from '../../store/chats'
 import { useChatStore } from '../../store/zustand/chatStore'
+import { useToastStore } from '../../store/zustand/toastStore'
 import { Message } from './Message'
+import { ImportModal } from './ImportModal'
+import type { InsertSlot } from './MessageActions'
 
 export interface MessageListProps {
   chatId: ChatId
+  hasConnection: boolean
 }
 
 // Stable reference so `useChatStore(selector)` doesn't allocate a fresh `{}`
@@ -15,25 +47,309 @@ export interface MessageListProps {
 // `useSyncExternalStore` (getSnapshot must return a stable value).
 const EMPTY_CURSOR: CursorMap = Object.freeze({}) as CursorMap
 
+interface InsertTarget {
+  messageId: MessageId
+  slot: InsertSlot
+  defaultRole: MessageRole
+}
+
+// Pick the conversational counterpart of a role. user↔assistant is the
+// natural "next line of dialogue" pairing; system / tool / developer
+// stay as themselves because their counterparts aren't well-defined.
+function oppositeRole(role: MessageRole): MessageRole {
+  if (role === 'user') return 'assistant'
+  if (role === 'assistant') return 'user'
+  return role
+}
+
 // Memoized at the list level so prefs changes (theme, send shortcut,
 // chat width) on the Shell don't cascade into a re-render of the
 // markdown-heavy children.
 export const MessageList = memo(function MessageList({
   chatId,
+  hasConnection,
 }: MessageListProps) {
   const messages = useLiveQuery(() => loadChatMessages(chatId), [chatId], [])
-  const cursor = useChatStore(
-    (state) => state.cursors[chatId] ?? EMPTY_CURSOR,
-  )
+  const cursor = useChatStore((state) => state.cursors[chatId] ?? EMPTY_CURSOR)
+  // Tree indices are O(N) over the message set — memoize so swipes /
+  // keyboard shortcuts (§10.6.1) don't rebuild them per keystroke. `byId`
+  // and `byParent` only change when the live-query refires with a new
+  // message array; `path` additionally depends on the cursor.
+  const byId = useMemo(() => indexById(messages ?? []), [messages])
+  const byParent = useMemo(() => groupByParent(messages ?? []), [messages])
   const path = useMemo(
     () => activePath(messages ?? [], cursor),
     [messages, cursor],
   )
+  const { sendFrom } = useChat()
+  const pushToast = useToastStore((s) => s.push)
+  const [insertTarget, setInsertTarget] = useState<InsertTarget | null>(null)
+  // Track the set of user-message ids whose content was edited in THIS
+  // tab session; used to surface the "stale reply?" hint under their
+  // next assistant on the active path. The stale-session lives only in
+  // memory — reloads wipe it per §10.6 "Edit action" session-local hint.
+  const [staleHintFor, setStaleHintFor] = useState<Set<MessageId>>(
+    () => new Set(),
+  )
+
+  const opsCtx = useMemo<MessageOpsContext>(
+    () => ({ chatId, sendFrom }),
+    [chatId, sendFrom],
+  )
+
+  // Track the focused message id via a ref; the DOM's `:focus-within` +
+  // `data-message-id` tuple on each <article> tells us which message the
+  // user is navigating. Keeps keyboard shortcuts tied to "the message you
+  // just clicked" without forcing a controlled-selection state.
+  const listRef = useRef<HTMLDivElement | null>(null)
+  const focusedMessageId = useCallback((): MessageId | null => {
+    const el = listRef.current?.querySelector<HTMLElement>(
+      '[data-ui="message"]:focus-within',
+    )
+    return el?.getAttribute('data-message-id') ?? null
+  }, [])
+
+  const handleEditInPlace = useCallback(
+    async (m: MessageRow, text: string, reasoning?: ReasoningDetail[]) => {
+      await editInPlace(chatId, m, text, reasoning)
+      if (m.role === 'user') {
+        setStaleHintFor((prev) => {
+          if (prev.has(m.id)) return prev
+          const next = new Set(prev)
+          next.add(m.id)
+          return next
+        })
+      }
+    },
+    [chatId],
+  )
+
+  const handleEditAndSend = useCallback(
+    async (m: MessageRow, text: string) => {
+      try {
+        await editAndResend(opsCtx, m, text)
+      } catch (err) {
+        pushToast({
+          level: 'danger',
+          text:
+            err instanceof Error
+              ? `Send failed: ${err.message}`
+              : 'Send failed.',
+        })
+      }
+    },
+    [opsCtx, pushToast],
+  )
+
+  const handleRegenerate = useCallback(
+    async (m: MessageRow) => {
+      try {
+        await regenerateFromMessage(opsCtx, m)
+      } catch (err) {
+        pushToast({
+          level: 'danger',
+          text:
+            err instanceof Error
+              ? `Regenerate failed: ${err.message}`
+              : 'Regenerate failed.',
+        })
+      }
+    },
+    [opsCtx, pushToast],
+  )
+
+  const handleContinue = useCallback(
+    async (m: MessageRow) => {
+      try {
+        await continueFromMessage(opsCtx, m)
+      } catch (err) {
+        pushToast({
+          level: 'danger',
+          text:
+            err instanceof Error
+              ? `Continue failed: ${err.message}`
+              : 'Continue failed.',
+        })
+      }
+    },
+    [opsCtx, pushToast],
+  )
+
+  const handleForkChat = useCallback(
+    async (m: MessageRow) => {
+      const sourceChat = await getDb().chats.get(chatId)
+      if (!sourceChat) {
+        pushToast({ level: 'danger', text: 'Chat not found.' })
+        return
+      }
+      const existing = await listChats()
+      const defaultTitle = computeBranchTitle(
+        sourceChat.title,
+        existing.map((c) => c.title),
+      )
+      const chosen =
+        typeof window !== 'undefined'
+          ? window.prompt('Name the new chat:', defaultTitle)
+          : defaultTitle
+      if (chosen === null) return
+      const title = chosen.trim() || defaultTitle
+      try {
+        const result = await forkChatFromMessage({
+          chatId,
+          messageId: m.id,
+          title,
+          cursor,
+        })
+        pushToast({
+          level: 'success',
+          text: `Forked to "${title}" (${result.messageCount} messages).`,
+        })
+        navigateToChat(result.chatId)
+      } catch (err) {
+        pushToast({
+          level: 'danger',
+          text:
+            err instanceof Error
+              ? `Fork failed: ${err.message}`
+              : 'Fork failed.',
+        })
+      }
+    },
+    [chatId, cursor, pushToast],
+  )
+
+  // Smart role defaults per the user's "insert should be smart" rule:
+  //   - sibling of M   → same role as M (siblings are variants)
+  //   - before M       → opposite of M (forms a conversation pair with M)
+  //   - after M        → opposite of M (the next turn in the dialogue).
+  //                      This also handles the "after the last message"
+  //                      case naturally: if the chat ends on user, we
+  //                      seed an assistant; if it ends on assistant, we
+  //                      seed a user.
+  const openInsert = useCallback(
+    (messageId: MessageId, slot: InsertSlot) => {
+      const target = (messages ?? []).find((m) => m.id === messageId)
+      if (!target) return
+      const defaultRole =
+        slot === 'sibling' ? target.role : oppositeRole(target.role)
+      setInsertTarget({ messageId, slot, defaultRole })
+    },
+    [messages],
+  )
+
+  // Keyboard affordances per §10.6 / §10.14. `[` / `]` swipe variants,
+  // `⇧⌘R` regenerates the focused assistant. Ignored while typing in a
+  // textarea/input so users don't fight with their composer.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.defaultPrevented) return
+      const activeTag = (document.activeElement?.tagName ?? '').toLowerCase()
+      const isTyping = activeTag === 'input' || activeTag === 'textarea'
+      if (isTyping) return
+      const focusedId = focusedMessageId()
+      if (!focusedId) return
+      const focused = byId.get(focusedId)
+      if (!focused) return
+      if (e.key === '[' || e.key === ']') {
+        e.preventDefault()
+        const direction = e.key === '[' ? -1 : 1
+        const base = useChatStore.getState().getCursor(chatId) ?? {}
+        const { cursorUpdates } = swipe({
+          messages: messages ?? [],
+          targetId: focusedId,
+          direction,
+          cursor: base,
+        })
+        const next: CursorMap = { ...base, ...cursorUpdates }
+        const chosenId = cursorUpdates[cursorKeyOf(focused.parentId)]
+        if (chosenId) {
+          resolveLastUpdatedBranchBelow(
+            { targetId: chosenId, byParent, byId },
+            next,
+          )
+        }
+        useChatStore.getState().setCursor(chatId, next)
+        return
+      }
+      if (
+        e.key === 'R' &&
+        e.shiftKey &&
+        (e.metaKey || e.ctrlKey) &&
+        focused.role === 'assistant'
+      ) {
+        e.preventDefault()
+        void handleRegenerate(focused)
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [chatId, messages, byId, byParent, focusedMessageId, handleRegenerate])
+
+  const roleMismatchIdsOnPath = useMemo(() => {
+    const set = new Set<MessageId>()
+    for (let i = 1; i < path.length; i += 1) {
+      const prev = path[i - 1] as MessageRow
+      const cur = path[i] as MessageRow
+      if (prev.role === cur.role) {
+        set.add(cur.id)
+      }
+    }
+    return set
+  }, [path])
+
   return (
-    <div data-ui="message-list" aria-live="polite">
-      {path.map((m) => (
-        <Message key={m.id} message={m} />
-      ))}
+    <div data-ui="message-list" aria-live="polite" ref={listRef}>
+      {path.map((m, idx) => {
+        const prev = path[idx - 1]
+        const showStaleHint =
+          m.role === 'assistant' && prev && staleHintFor.has(prev.id)
+        return (
+          <Message
+            key={m.id}
+            chatId={chatId}
+            message={m}
+            messages={messages ?? []}
+            cursor={cursor}
+            hasConnection={hasConnection}
+            onEditInPlace={(text, reasoning) =>
+              handleEditInPlace(m, text, reasoning)
+            }
+            {...(m.role === 'user'
+              ? {
+                  onEditAndSend: (text: string) => handleEditAndSend(m, text),
+                }
+              : {})}
+            {...(m.role === 'assistant'
+              ? {
+                  onRegenerate: () => handleRegenerate(m),
+                  // Continue is offered on EVERY assistant — completed,
+                  // aborted, or errored — so the user can extend any
+                  // response. Reasoning from the parent is preserved:
+                  // `continueFromMessage` creates a new CHILD, it does
+                  // not mutate the parent's `reasoningDetails`.
+                  onContinue: () => handleContinue(m),
+                }
+              : {})}
+            onForkChat={() => handleForkChat(m)}
+            onInsert={(slot: InsertSlot) => openInsert(m.id, slot)}
+            {...(roleMismatchIdsOnPath.has(m.id) ? { roleMismatch: true } : {})}
+            {...(showStaleHint ? { staleReplyHint: true } : {})}
+          />
+        )
+      })}
+      {insertTarget ? (
+        <ImportModal
+          chatId={chatId}
+          slot={{
+            kind: insertTarget.slot,
+            messageId: insertTarget.messageId,
+          }}
+          cursor={cursor}
+          defaultRole={insertTarget.defaultRole}
+          onClose={() => setInsertTarget(null)}
+          onDone={() => setInsertTarget(null)}
+        />
+      ) : null}
     </div>
   )
 })

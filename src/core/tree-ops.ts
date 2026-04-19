@@ -147,6 +147,11 @@ export async function softDeleteWithSplice(
     const newParentId = await firstLiveAncestor(node)
     for (const kid of kids) {
       if (deletedSet.has(kid.id)) continue
+      // Pre-tombstoned kids stay where they are — they are already dead
+      // and the UI never walks into them, so re-parenting them would
+      // only churn scopes (and fail the scope assertion because the
+      // scope-collector in messages.ts only declares LIVE kid scopes).
+      if (kid.deleted) continue
       reparented.push({
         id: kid.id,
         previousParentId: node.id,

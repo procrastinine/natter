@@ -15,21 +15,45 @@ export interface UiStoreState {
   sidebarCollapsed: boolean
   activeChatId: ChatId | null
   composerFullscreen: boolean
+  // Edit-tree mode toggle per §10.6.1. Applies globally across open chats
+  // because the user's mental model is "I'm editing the structure of the
+  // conversation I'm in"; switching chats re-uses the same mode.
+  editTreeMode: boolean
+  // Cascade-delete checkbox state inside Edit-tree toolbar. UI-local; resets
+  // whenever the mode toggles off per §10.6.1.
+  cascadeDelete: boolean
+  // "Reading mode" — hides every piece of UI chrome (sidebar, headers,
+  // composer, jump-to-latest) so only the message list + a small
+  // re-entry toggle remain visible. Toggled via the floating eye icon
+  // at the bottom-left of the viewport.
+  focusMode: boolean
   setTheme: (theme: ThemePreference) => void
   setSidebarCollapsed: (collapsed: boolean) => void
   setActiveChatId: (chatId: ChatId | null) => void
   setComposerFullscreen: (fullscreen: boolean) => void
+  setEditTreeMode: (on: boolean) => void
+  setCascadeDelete: (on: boolean) => void
+  setFocusMode: (on: boolean) => void
   reset: () => void
 }
 
 const INITIAL: Pick<
   UiStoreState,
-  'theme' | 'sidebarCollapsed' | 'activeChatId' | 'composerFullscreen'
+  | 'theme'
+  | 'sidebarCollapsed'
+  | 'activeChatId'
+  | 'composerFullscreen'
+  | 'editTreeMode'
+  | 'cascadeDelete'
+  | 'focusMode'
 > = {
   theme: 'system',
   sidebarCollapsed: false,
   activeChatId: null,
   composerFullscreen: false,
+  editTreeMode: false,
+  cascadeDelete: false,
+  focusMode: false,
 }
 
 export const useUiStore = create<UiStoreState>((set) => ({
@@ -38,5 +62,13 @@ export const useUiStore = create<UiStoreState>((set) => ({
   setSidebarCollapsed: (sidebarCollapsed) => set({ sidebarCollapsed }),
   setActiveChatId: (activeChatId) => set({ activeChatId }),
   setComposerFullscreen: (composerFullscreen) => set({ composerFullscreen }),
+  setEditTreeMode: (on) =>
+    set((state) => ({
+      editTreeMode: on,
+      // Exiting edit-tree mode always clears cascade (§10.6.1 "resets when the mode is toggled off").
+      cascadeDelete: on ? state.cascadeDelete : false,
+    })),
+  setCascadeDelete: (on) => set({ cascadeDelete: on }),
+  setFocusMode: (on) => set({ focusMode: on }),
   reset: () => set(INITIAL),
 }))

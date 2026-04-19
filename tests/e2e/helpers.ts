@@ -39,7 +39,7 @@ export async function seedFirstRun(page: Page, opts: SeedOptions = {}): Promise<
 // should follow with `sendMessage` (which materializes) or use
 // `createChatAndSend` for the combined flow.
 export async function createChatAndOpen(page: Page): Promise<void> {
-  await page.locator('[data-ui="new-chat"]').click()
+  await page.locator('[data-role="new-chat"]').click()
   await page.locator('[data-ui="composer"]').waitFor({ state: 'visible' })
 }
 

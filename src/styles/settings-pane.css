@@ -140,6 +140,42 @@
   line-height: var(--line-height-body);
 }
 
+[data-ui='continue-prompt'] {
+  min-height: 120px;
+  font-size: var(--font-size-sm);
+  line-height: var(--line-height-body);
+  resize: vertical;
+}
+
+[data-ui='toggle-row'] {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  cursor: pointer;
+  font-size: var(--font-size-sm);
+  color: var(--color-fg-primary);
+}
+
+/* Inline link-like action embedded inside a <label> (e.g. Reset to
+ * default next to a field name). Text-only, muted so it doesn't
+ * compete with the label itself. */
+[data-ui='field-inline-action'] {
+  background: transparent;
+  border: none;
+  padding: 0 var(--space-2);
+  margin-left: var(--space-2);
+  cursor: pointer;
+  color: var(--color-accent);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-regular);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+[data-ui='field-inline-action']:hover {
+  color: var(--color-accent-hover);
+}
+
 [data-ui='system-prompt-token-estimate'] {
   align-self: flex-end;
   color: var(--color-fg-muted);

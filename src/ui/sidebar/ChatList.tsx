@@ -1,5 +1,5 @@
 import { useLiveQuery } from 'dexie-react-hooks'
-import { useCallback } from 'react'
+import { memo, useCallback } from 'react'
 import type { Chat, ChatId } from '../../core/types'
 import { archiveChat } from '../../store/chats'
 import { getDb } from '../../store/db'
@@ -15,46 +15,24 @@ export interface ChatListProps {
   collapsed?: boolean
 }
 
-interface ChatRowData {
-  chat: Chat
-  preview: string
-}
-
-const PREVIEW_MAX_CHARS = 80
-
-async function loadChatRows(): Promise<ChatRowData[]> {
+// Loads the chat-row list only — never touches the `messages` table.
+// `chat.previewText` is populated by `refreshChatPreview` on the write
+// path (see src/store/chat-preview-maintainer.ts), so the sidebar stays
+// cheap even with thousands of chats. The daemon-mode equivalent will
+// implement the same read via the repository boundary; this module
+// doesn't couple to Dexie semantics beyond the live-query subscription.
+async function loadChatRows(): Promise<Chat[]> {
   const db = getDb()
   const rows = await db.chats.toArray()
-  const live = rows
+  return rows
     .filter((r) => !r.archived)
     .sort((a, b) => b.updatedAt - a.updatedAt)
-  // Pull the first user message for each chat to use as the preview line.
-  // For the V1 sidebar this is fine; once `chatBranchCache.previewText` is
-  // implemented (plan/02-data-model.md §2.10.4) we can swap to that for free.
-  const previews = await Promise.all(
-    live.map(async (chat) => {
-      const messages = await db.messages
-        .where('chatId')
-        .equals(chat.id)
-        .filter((m) => !m.deleted && m.role === 'user')
-        .toArray()
-      messages.sort((a, b) => a.createdAt - b.createdAt)
-      const first = messages[0]
-      const text = first
-        ? first.content
-            .map((p) => (p.type === 'text' || p.type === 'output_text' ? p.text : ''))
-            .join('')
-        : ''
-      const trimmed = text.replace(/\s+/g, ' ').trim()
-      return trimmed.length > PREVIEW_MAX_CHARS
-        ? `${trimmed.slice(0, PREVIEW_MAX_CHARS - 1)}…`
-        : trimmed
-    }),
-  )
-  return live.map((chat, i) => ({ chat, preview: previews[i] ?? '' }))
 }
 
-export function ChatList({ activeChatId, collapsed }: ChatListProps) {
+export const ChatList = memo(function ChatList({
+  activeChatId,
+  collapsed,
+}: ChatListProps) {
   const rows = useLiveQuery(loadChatRows, [], [])
   const handleDelete = useCallback(
     async (chat: Chat) => {
@@ -68,10 +46,11 @@ export function ChatList({ activeChatId, collapsed }: ChatListProps) {
   )
   return (
     <ul data-ui="chat-list">
-      {(rows ?? []).map(({ chat, preview }) => {
+      {(rows ?? []).map((chat) => {
         const displayTitle = chat.title?.trim().length
           ? chat.title
           : 'Untitled chat'
+        const preview = chat.previewText ?? ''
         const href = chatHref(chat.id)
         return (
           <li
@@ -111,4 +90,4 @@ export function ChatList({ activeChatId, collapsed }: ChatListProps) {
       })}
     </ul>
   )
-}
+})

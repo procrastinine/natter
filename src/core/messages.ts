@@ -192,9 +192,19 @@ function collectPairFollowers(
     const kids = (byParent.get(currentId) ?? []).filter((kid) => !kid.deleted)
     if (kids.length === 0) break
     const pinnedId = cursor[cursorKeyOf(currentId)]
-    const next =
-      (pinnedId !== undefined && kids.find((kid) => kid.id === pinnedId)) ??
-      (kids.find((kid) => kid.turnIndex === 0 && kid.role !== 'user') ?? null)
+    const pinned =
+      pinnedId !== undefined
+        ? kids.find((kid) => kid.id === pinnedId)
+        : undefined
+    // Fallback when there is no cursor entry at this fork (fresh chat
+    // open, or user deleted before swiping). Pick the first assistant/
+    // tool/system child at turnIndex=0. Mirror the §8.3 default rule:
+    // without a cursor we still need a deterministic pick so delete-pair
+    // works on freshly-opened chats.
+    const fallback = kids.find(
+      (kid) => kid.turnIndex === 0 && kid.role !== 'user',
+    )
+    const next = pinned ?? fallback
     if (!next || next.role === 'user') break
     result.push(next)
     let cursorId: MessageId = next.id
@@ -1116,6 +1126,37 @@ export async function deleteTurn(
   for (const variantHead of slotSiblings) {
     members.push(...collectTurnChain(variantHead, byParent))
   }
+  const result = await repo.runMutation(
+    collectDeleteScopes(input.chatId, all, members, input.cascade ?? false),
+    async (ctx) => {
+      const effects = emptyEffects()
+      await applyDelete(ctx, input.chatId, members, input.cascade ?? false, effects)
+      finalizeDelete(input.cursor, effects)
+      return { effects }
+    },
+  )
+  return { effects: result.value.effects, versions: versionsFor(result, input.chatId) }
+}
+
+// Tombstone exactly ONE message. Live direct children splice up to the
+// message's parent; tombstoned children stay in place (they're already
+// dead and re-parenting them has no user-visible effect). Used for the
+// "delete just this row" affordance when the user is cleaning up a
+// role-adjacency mismatch or explicitly opting out of pair-delete.
+export async function deleteSingleMessage(
+  input: DeleteInput,
+): Promise<{ effects: StructuralEffects; versions: ChatVersions }> {
+  const repo = getBrowserRepository()
+  const all = await repo.listMessages(input.chatId)
+  const byId = indexById(all)
+  const target = byId.get(input.messageId)
+  if (!target || target.deleted) {
+    throw new TreeChangedError(
+      input.chatId,
+      `delete-single target ${input.messageId} unavailable`,
+    )
+  }
+  const members: Message[] = [target]
   const result = await repo.runMutation(
     collectDeleteScopes(input.chatId, all, members, input.cascade ?? false),
     async (ctx) => {

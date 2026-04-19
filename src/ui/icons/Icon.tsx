@@ -242,6 +242,83 @@ export function PersonIcon({ size = 18, ariaLabel }: IconProps) {
   )
 }
 
+// Branch / fork — three dots connected by a Y-shaped path. Used on the
+// per-message "Branch this chat from here" action; there is NO per-
+// message in-tree branch action in Phase 8.1 (forking creates a new
+// chat, which is the user's mental model for "branch").
+export function BranchIcon({ size = 18, ariaLabel }: IconProps) {
+  return (
+    <BaseSvg size={size} {...(ariaLabel ? { 'aria-label': ariaLabel } : {})}>
+      <circle cx="6" cy="6" r="2" />
+      <circle cx="6" cy="18" r="2" />
+      <circle cx="18" cy="8" r="2" />
+      <path d="M6 8v8" />
+      <path d="M6 13c0-2 2-4 4-4h4" />
+    </BaseSvg>
+  )
+}
+
+// Eye — open eye used for the focus-mode toggle.
+export function EyeIcon({ size = 18, ariaLabel }: IconProps) {
+  return (
+    <BaseSvg size={size} {...(ariaLabel ? { 'aria-label': ariaLabel } : {})}>
+      <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z" />
+      <circle cx="12" cy="12" r="3" />
+    </BaseSvg>
+  )
+}
+
+// Eye-off — the open-eye with a slash, used when focus mode is ON so
+// the toggle reads as "turn off focus mode."
+export function EyeOffIcon({ size = 18, ariaLabel }: IconProps) {
+  return (
+    <BaseSvg size={size} {...(ariaLabel ? { 'aria-label': ariaLabel } : {})}>
+      <path d="M3 3l18 18" />
+      <path d="M10.6 10.6a3 3 0 0 0 3.8 3.8" />
+      <path d="M9.9 5.3A10 10 0 0 1 22 12a15 15 0 0 1-2.2 3" />
+      <path d="M6.1 6.1A15 15 0 0 0 2 12s3.5 7 10 7a10 10 0 0 0 4.5-1.1" />
+    </BaseSvg>
+  )
+}
+
+// Edit-tree — four connected nodes (parent + 3 children) for the
+// "Edit tree mode" toggle in the chat header. Distinct from the pencil
+// used by title-edit + per-message edit so the two modes don't blur.
+export function EditTreeIcon({ size = 18, ariaLabel }: IconProps) {
+  return (
+    <BaseSvg size={size} {...(ariaLabel ? { 'aria-label': ariaLabel } : {})}>
+      <circle cx="12" cy="5" r="1.8" />
+      <circle cx="5" cy="18" r="1.8" />
+      <circle cx="12" cy="18" r="1.8" />
+      <circle cx="19" cy="18" r="1.8" />
+      <path d="M12 7v3" />
+      <path d="M12 10H5v6" />
+      <path d="M12 10v6" />
+      <path d="M12 10h7v6" />
+    </BaseSvg>
+  )
+}
+
+// Insert marker — a small + with a divider, used for insert-before /
+// insert-after in Edit tree mode.
+export function InsertIcon({ size = 18, ariaLabel }: IconProps) {
+  return (
+    <BaseSvg size={size} {...(ariaLabel ? { 'aria-label': ariaLabel } : {})}>
+      <line x1="12" y1="4" x2="12" y2="20" />
+      <line x1="4" y1="12" x2="20" y2="12" />
+    </BaseSvg>
+  )
+}
+
+// Paper-plane arrow — Save & Send action on the inline editor.
+export function SendIcon({ size = 18, ariaLabel }: IconProps) {
+  return (
+    <BaseSvg size={size} {...(ariaLabel ? { 'aria-label': ariaLabel } : {})}>
+      <polygon points="3 20 20 12 3 4 7 12" fill="currentColor" stroke="none" />
+    </BaseSvg>
+  )
+}
+
 // Generic robot silhouette — default assistant profile glyph.
 export function RobotIcon({ size = 18, ariaLabel }: IconProps) {
   return (

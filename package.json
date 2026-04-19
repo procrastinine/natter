@@ -6,10 +6,10 @@
   "type": "module",
   "packageManager": "pnpm@10.21.0",
   "scripts": {
-    "dev": "vite",
+    "dev": "exec vite",
     "build": "tsc -b && vite build",
-    "preview": "vite preview",
-    "test": "vitest",
+    "preview": "exec vite preview",
+    "test": "exec vitest",
     "test:run": "vitest run",
     "e2e": "playwright test",
     "typecheck": "tsc -b --noEmit",

@@ -185,3 +185,49 @@ function sameSettingsFor(
   }
   return true
 }
+
+// Sidebar preview length cap. Kept here (not in ChatList) because the
+// write path owns the canonical truncation — readers just render what the
+// chat row carries, no length math in the UI.
+const PREVIEW_MAX_CHARS = 80
+
+// Recomputes `chat.previewText` from the earliest live user message and
+// writes it back if it changed. Idempotent — safe to over-call. Uses the
+// chat-meta scope so it plays nicely with concurrent sends/edits through
+// the repository boundary. `touchVisibleState: false` because this is a
+// derived cache, not a user-visible edit: it must not bump
+// `updatedAt` / `metaVersion` / `summaryVersion` (otherwise the sidebar
+// would reorder on every sidebar refresh, and meta-version-gated caches
+// would thrash).
+export async function refreshChatPreview(chatId: ChatId): Promise<void> {
+  const messages = await loadChatMessages(chatId)
+  let earliest: Message | undefined
+  for (const m of messages) {
+    if (m.deleted || m.role !== 'user') continue
+    if (!earliest || m.createdAt < earliest.createdAt) earliest = m
+  }
+  let plain = ''
+  if (earliest) {
+    const parts: string[] = []
+    for (const p of earliest.content) {
+      if (p.type === 'text' || p.type === 'output_text') parts.push(p.text)
+    }
+    plain = parts.join('')
+  }
+  const trimmed = plain.replace(/\s+/g, ' ').trim()
+  const preview =
+    trimmed.length > PREVIEW_MAX_CHARS
+      ? `${trimmed.slice(0, PREVIEW_MAX_CHARS - 1)}…`
+      : trimmed
+  const repo = getBrowserRepository()
+  await repo.runMutation([{ kind: 'chat-meta', chatId }], async (ctx) => {
+    const chat = await ctx.getChat(chatId)
+    if (!chat) return
+    if (chat.previewText === preview) return
+    ctx.patchChatMeta(
+      chatId,
+      { previewText: preview },
+      { touchVisibleState: false, broadcast: false },
+    )
+  })
+}

@@ -1,14 +1,14 @@
 import { useEffect, useState } from 'react'
 import { CloseIcon } from '../icons/Icon'
+import { AppearanceSettings } from './AppearanceSettings'
 import { GeneralSettings } from './GeneralSettings'
 import { ImageAllowlistPanel } from './ImageAllowlistPanel'
-import { RenderingSettings } from './RenderingSettings'
 
-export type GlobalSettingsTab = 'general' | 'rendering' | 'images'
+export type GlobalSettingsTab = 'general' | 'appearance' | 'images'
 
 const TAB_LABELS: Record<GlobalSettingsTab, string> = {
   general: 'General',
-  rendering: 'Rendering',
+  appearance: 'Appearance',
   images: 'Images',
 }
 
@@ -59,7 +59,7 @@ export function GlobalSettingsModal({ open, onClose }: GlobalSettingsModalProps)
           </button>
         </header>
         <div role="tablist" data-ui="settings-tabs">
-          {(['general', 'rendering', 'images'] as const).map((value) => (
+          {(['general', 'appearance', 'images'] as const).map((value) => (
             <button
               key={value}
               type="button"
@@ -75,7 +75,7 @@ export function GlobalSettingsModal({ open, onClose }: GlobalSettingsModalProps)
         </div>
         <div role="tabpanel" data-ui="settings-panel" data-active-tab={tab}>
           {tab === 'general' ? <GeneralSettings /> : null}
-          {tab === 'rendering' ? <RenderingSettings /> : null}
+          {tab === 'appearance' ? <AppearanceSettings /> : null}
           {tab === 'images' ? <ImageAllowlistPanel /> : null}
         </div>
       </section>

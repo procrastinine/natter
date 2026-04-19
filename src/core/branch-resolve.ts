@@ -11,13 +11,44 @@
 // can merge it into Zustand atomically after the IDB transaction (if any) has
 // committed.
 
-import { cursorKeyOf, pickDefaultChild } from './active-path'
+import { cursorKeyOf, indexById, pickDefaultChild } from './active-path'
 import type { CursorMap, Message, MessageId } from './types'
 
 export interface ResolveBranchInput {
   targetId: MessageId
   byParent: Map<MessageId | null, Message[]>
   byId: Map<MessageId, Message>
+}
+
+// Seed the cursor so the given messageId lands on the active path.
+// Walks upward from the target writing `cursor[parent] = child` entries
+// at every fork (so the upstream ancestors point at this chain), then
+// falls through to `resolveLastUpdatedBranchBelow` to fill in the
+// descendant chain below the target. Pure view-state mutation — same
+// contract as the helper above.
+export function seedCursorAtMessage(
+  messages: readonly Message[],
+  targetId: MessageId,
+  cursor: CursorMap,
+): void {
+  const byId = indexById(messages)
+  let cur: Message | undefined = byId.get(targetId)
+  if (!cur) return
+  while (cur) {
+    const parentId: MessageId | null = cur.parentId
+    cursor[cursorKeyOf(parentId)] = cur.id
+    cur = parentId ? byId.get(parentId) : undefined
+  }
+  const byParent = new Map<MessageId | null, Message[]>()
+  for (const m of messages) {
+    const bucket = byParent.get(m.parentId)
+    if (bucket) bucket.push(m)
+    else byParent.set(m.parentId, [m])
+  }
+  for (const bucket of byParent.values()) {
+    bucket.sort((a, b) => a.siblingIndex - b.siblingIndex)
+  }
+  resolveLastUpdatedBranchBelow({ targetId, byParent, byId }, cursor)
 }
 
 // §8.4.3.1 fork rule:

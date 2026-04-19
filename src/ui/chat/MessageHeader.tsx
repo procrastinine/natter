@@ -25,19 +25,6 @@ export function MessageHeader({ message }: MessageHeaderProps) {
   return (
     <header data-ui="message-header" aria-label={ROLE_LABEL[message.role]}>
       <span data-ui="message-role">{ROLE_LABEL[message.role]}</span>
-      {message.editedAt ? (
-        <span
-          data-ui="message-edited"
-          title="Edited in place — original token count and cost unchanged."
-        >
-          edited
-        </span>
-      ) : null}
-      {message.origin === 'imported' ? (
-        <span data-ui="message-imported" title="Imported from another source">
-          imported
-        </span>
-      ) : null}
       <span data-ui="message-header-spacer" />
       {model ? (
         <span

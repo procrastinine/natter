@@ -107,7 +107,9 @@
 /* Action row sits flush at the bottom of the card. Hairline divider
  * separates it from the textarea so the input and the action surface
  * are visually distinct. White background (different from the gray
- * textarea). Send button fills the bottom-right corner. */
+ * textarea). Send button fills the bottom-right corner. Height kept
+ * compact so the composer — especially in auto-size mode (normal view)
+ * — doesn't dominate the bottom of the main pane. */
 [data-ui='composer-actions'] {
   display: flex;
   align-items: stretch;
@@ -115,7 +117,7 @@
   padding: 0 0 0 var(--space-4);
   background: var(--color-bg-surface-1);
   border-top: 1px solid var(--color-border-subtle);
-  min-height: 36px;
+  min-height: 30px;
 }
 
 [data-ui='composer-disabled-reason'] {
@@ -144,7 +146,15 @@
  * configured send shortcut) submits, so the button is mostly visual
  * confirmation that the action exists. */
 [data-ui='send'] {
-  background: var(--color-accent);
+  /* Slight inner shade on top so the send button reads the same way
+   * every other affordance does (they all have shading; a flat accent
+   * felt out of place). Gradient is very subtle — a 6% darken on the
+   * top edge transitioning to the accent at the bottom. */
+  background: linear-gradient(
+    to bottom,
+    color-mix(in srgb, var(--color-accent) 92%, #000) 0%,
+    var(--color-accent) 60%
+  );
   color: var(--color-accent-contrast);
   border: none;
   border-radius: 0;
@@ -158,10 +168,16 @@
   align-items: center;
   justify-content: center;
   gap: var(--space-2);
+  box-shadow: inset 0 1px 0
+    color-mix(in srgb, var(--color-accent-contrast) 20%, transparent);
 }
 
 [data-ui='send']:hover:not(:disabled) {
-  background: var(--color-accent-hover);
+  background: linear-gradient(
+    to bottom,
+    color-mix(in srgb, var(--color-accent-hover) 92%, #000) 0%,
+    var(--color-accent-hover) 60%
+  );
 }
 
 [data-ui='send']:disabled {

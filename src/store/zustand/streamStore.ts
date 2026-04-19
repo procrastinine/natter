@@ -20,6 +20,11 @@ export interface StreamStoreState {
   activeByStreamId: Record<string, ActiveStream>
   isActive: (streamId: string) => boolean
   isTargetActive: (chatId: ChatId, messageId?: MessageId) => boolean
+  // Short-circuiting membership test for "is ANY stream running for this
+  // chat?". Used on the hot path (Shell re-renders on every stream token
+  // update) so we avoid allocating an array via `Object.values()` — the
+  // allocation is discarded immediately and adds GC pressure.
+  hasStreamForChat: (chatId: ChatId) => boolean
   getActive: (streamId: string) => ActiveStream | undefined
   listByChat: (chatId: ChatId) => ActiveStream[]
   setActive: (stream: ActiveStream) => void
@@ -31,10 +36,21 @@ export interface StreamStoreState {
 export const useStreamStore = create<StreamStoreState>((set, get) => ({
   activeByStreamId: {},
   isActive: (streamId) => get().activeByStreamId[streamId] !== undefined,
-  isTargetActive: (chatId, messageId) =>
-    Object.values(get().activeByStreamId).some(
-      (stream) => stream.chatId === chatId && stream.messageId === messageId,
-    ),
+  isTargetActive: (chatId, messageId) => {
+    const map = get().activeByStreamId
+    for (const id in map) {
+      const stream = map[id]!
+      if (stream.chatId === chatId && stream.messageId === messageId) return true
+    }
+    return false
+  },
+  hasStreamForChat: (chatId) => {
+    const map = get().activeByStreamId
+    for (const id in map) {
+      if (map[id]!.chatId === chatId) return true
+    }
+    return false
+  },
   getActive: (streamId) => get().activeByStreamId[streamId],
   listByChat: (chatId) =>
     Object.values(get().activeByStreamId).filter((stream) => stream.chatId === chatId),

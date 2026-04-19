@@ -1,6 +1,13 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type ReactNode,
+} from 'react'
 import type { SendShortcut } from '../../core/global-settings'
-import { StopIcon } from '../icons/Icon'
+import { InsertIcon, StopIcon } from '../icons/Icon'
 
 export interface ComposerProps {
   // Disables the textarea entirely (e.g. while a stream owns the chat).
@@ -23,6 +30,56 @@ export interface ComposerProps {
   // alongside where the user's hand is anyway.
   streaming?: boolean
   onAbort?: () => void
+  // "Import at end" button handler (§10.7). Opens the import modal
+  // pre-scoped to "end of active path." Rendered only when provided.
+  onImportAtEnd?: () => void
+  // Reply-to-trailing-user handler. When the active path ends with a
+  // user message and the composer text is empty, pressing Send triggers
+  // this instead of creating a new user message — it just fires an
+  // assistant completion under the existing trailing user.
+  onReplyToTrailingUser?: () => void | Promise<void>
+  // Whether the active path currently ends with a user message. When
+  // true and the composer text is empty, the Send button switches to
+  // "Reply" and calls `onReplyToTrailingUser` on click.
+  trailingUserMessage?: boolean
+  // When true, the textarea starts at the variant's default height
+  // and auto-grows with content up to the variant's auto-grow cap. The
+  // drag handle remains visible; dragging sets a MINIMUM floor that
+  // content can still grow past (see `useLayoutEffect` below for the
+  // `max(content, floor)` semantics).
+  autoSize?: boolean
+  // Which auto-size profile to use when `autoSize` is true. Different
+  // surfaces have different natural sizes:
+  //   - `'normal'` (default): compact — start at one line, cap at
+  //     ~10 lines. Optimized to leave room for the message list.
+  //   - `'focus'`: generous — start taller, cap roughly doubled. In
+  //     focus mode the composer IS the bottom of the reading lane
+  //     (scrolls with content, no sticky footer), so a bigger default
+  //     and a bigger ceiling are useful for drafting.
+  // Each variant has its own localStorage key for the floor so user
+  // drags in one mode don't leak into the other.
+  autoSizeVariant?: AutoSizeVariant
+}
+
+type AutoSizeVariant = 'normal' | 'focus'
+
+interface AutoSizeProfile {
+  defaultFloor: number
+  autoGrowMax: number
+  storageKey: string
+}
+
+const AUTO_SIZE_PROFILES: Record<AutoSizeVariant, AutoSizeProfile> = {
+  normal: {
+    defaultFloor: 0,
+    autoGrowMax: 240,
+    storageKey: 'natter:composer-floor',
+  },
+  focus: {
+    defaultFloor: 200,
+    autoGrowMax: 480,
+    storageKey: 'natter:composer-floor-focus',
+  },
 }
 
 const COMPOSER_HEIGHT_STORAGE_KEY = 'natter:composer-height'
@@ -36,11 +93,25 @@ function readSavedHeight(): number {
   if (!raw) return COMPOSER_DEFAULT_HEIGHT
   const parsed = Number.parseInt(raw, 10)
   if (!Number.isFinite(parsed)) return COMPOSER_DEFAULT_HEIGHT
-  return clampHeight(parsed)
+  return clampFixedHeight(parsed)
 }
 
-function clampHeight(value: number): number {
+function readSavedFloor(variant: AutoSizeVariant): number {
+  const profile = AUTO_SIZE_PROFILES[variant]
+  if (typeof window === 'undefined') return profile.defaultFloor
+  const raw = window.localStorage.getItem(profile.storageKey)
+  if (!raw) return profile.defaultFloor
+  const parsed = Number.parseInt(raw, 10)
+  if (!Number.isFinite(parsed)) return profile.defaultFloor
+  return clampFloorHeight(parsed)
+}
+
+function clampFixedHeight(value: number): number {
   return Math.min(COMPOSER_MAX_HEIGHT, Math.max(COMPOSER_MIN_HEIGHT, value))
+}
+
+function clampFloorHeight(value: number): number {
+  return Math.max(0, Math.min(COMPOSER_MAX_HEIGHT, value))
 }
 
 export function Composer({
@@ -53,9 +124,21 @@ export function Composer({
   floatingAccessory,
   streaming = false,
   onAbort,
+  onImportAtEnd,
+  onReplyToTrailingUser,
+  trailingUserMessage,
+  autoSize = false,
+  autoSizeVariant = 'normal',
 }: ComposerProps) {
   const [text, setText] = useState('')
-  const [height, setHeight] = useState<number>(() => readSavedHeight())
+  // In auto-size mode this is a minimum FLOOR (per-variant default).
+  // In fixed mode it's the absolute textarea height. Drag updates it
+  // in both modes; persistence uses separate localStorage keys
+  // per variant so a value written in one doesn't leak into the other.
+  const [height, setHeight] = useState<number>(() =>
+    autoSize ? readSavedFloor(autoSizeVariant) : readSavedHeight(),
+  )
+  const profile = AUTO_SIZE_PROFILES[autoSizeVariant]
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
   const dragStateRef = useRef<{ startY: number; startHeight: number } | null>(null)
   useEffect(() => {
@@ -73,28 +156,57 @@ export function Composer({
   }, [seed, onSeedConsumed])
   useEffect(() => {
     if (typeof window === 'undefined') return
-    window.localStorage.setItem(
-      COMPOSER_HEIGHT_STORAGE_KEY,
-      String(Math.round(height)),
-    )
-  }, [height])
+    const key = autoSize ? profile.storageKey : COMPOSER_HEIGHT_STORAGE_KEY
+    window.localStorage.setItem(key, String(Math.round(height)))
+  }, [autoSize, profile.storageKey, height])
   // Drive the textarea height imperatively (via the DOM ref). The visual
-  // size is dynamic — drag-updated and persisted — so it can't live in a
-  // stylesheet, and the project's style-discipline contract forbids inline
-  // JSX style attributes.
-  useEffect(() => {
+  // size is dynamic — either drag-updated+persisted or content-driven —
+  // so it can't live in a stylesheet, and the project's style-discipline
+  // contract forbids inline JSX style attributes. useLayoutEffect so the
+  // height lands before paint (prevents a one-frame tall flash during
+  // keystrokes in auto-size mode).
+  //
+  // Auto-size semantics: `height` acts as a MINIMUM floor set by the
+  // drag handle. The textarea auto-grows from one line up to
+  // COMPOSER_AUTO_SIZE_MAX as content arrives; whichever is taller of
+  // (content-auto-grown, floor) wins. So:
+  //   - empty + no drag (floor=0) → 1 line
+  //   - empty + dragged to 200px → 200px (floor wins)
+  //   - typed 15 lines + dragged to 200 → 240 (cap, content wins)
+  //   - dragged back to 0 → collapses to whatever content needs
+  useLayoutEffect(() => {
     const el = textareaRef.current
     if (!el) return
+    if (autoSize) {
+      el.style.height = 'auto'
+      const contentHeight = Math.min(el.scrollHeight, profile.autoGrowMax)
+      const effective = Math.max(contentHeight, height)
+      el.style.height = `${effective}px`
+      return
+    }
     el.style.height = `${height}px`
-  }, [height])
+  }, [autoSize, profile.autoGrowMax, height, text])
   const sendBlocked = Boolean(sendBlockedReason) || disabled
+  const trimmed = text.trim()
+  const emptyWithTrailingUser =
+    trimmed.length === 0 && Boolean(trailingUserMessage) && Boolean(onReplyToTrailingUser)
   const send = useCallback(async () => {
-    const trimmed = text.trim()
-    if (!trimmed || sendBlocked) return
+    if (sendBlocked) return
+    if (text.trim().length === 0) {
+      if (emptyWithTrailingUser && onReplyToTrailingUser) {
+        await onReplyToTrailingUser()
+      }
+      return
+    }
+    const out = text.trim()
     setText('')
-    await onSubmit(trimmed)
-  }, [text, sendBlocked, onSubmit])
-  const sendButtonLabel = sendShortcut === 'cmd-enter' ? 'Send ⌘⏎' : 'Send ⏎'
+    await onSubmit(out)
+  }, [text, sendBlocked, emptyWithTrailingUser, onReplyToTrailingUser, onSubmit])
+  const sendButtonLabel = emptyWithTrailingUser
+    ? 'Reply ⏎'
+    : sendShortcut === 'cmd-enter'
+      ? 'Send ⌘⏎'
+      : 'Send ⏎'
 
   // Drag the TOP edge of the composer to resize. Capture pointer to keep
   // the drag stable even if the cursor leaves the handle, and clamp against
@@ -108,8 +220,9 @@ export function Composer({
     const drag = dragStateRef.current
     if (!drag) return
     const delta = drag.startY - e.clientY
-    setHeight(clampHeight(drag.startHeight + delta))
-  }, [])
+    const next = drag.startHeight + delta
+    setHeight(autoSize ? clampFloorHeight(next) : clampFixedHeight(next))
+  }, [autoSize])
   const handlePointerUp = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
     if (!dragStateRef.current) return
     e.currentTarget.releasePointerCapture(e.pointerId)
@@ -119,6 +232,7 @@ export function Composer({
   return (
     <form
       data-ui="composer"
+      data-autosize={autoSize ? 'true' : 'false'}
       onSubmit={(e) => {
         e.preventDefault()
         void send()
@@ -129,7 +243,11 @@ export function Composer({
         role="separator"
         aria-orientation="horizontal"
         aria-label="Resize composer"
-        title="Drag to resize"
+        title={
+          autoSize
+            ? 'Drag to set a minimum height (content still auto-grows above it)'
+            : 'Drag to resize'
+        }
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
@@ -144,6 +262,7 @@ export function Composer({
           onChange={(e) => setText(e.target.value)}
           placeholder="Ask anything…"
           disabled={disabled}
+          rows={autoSize ? 1 : undefined}
           onKeyDown={(e) => {
             if (e.key !== 'Enter') return
             const isCmd = e.metaKey || e.ctrlKey
@@ -169,6 +288,18 @@ export function Composer({
           <span data-ui="token-counter" aria-live="polite">
             {text.trim().length} chars
           </span>
+          {onImportAtEnd ? (
+            <button
+              type="button"
+              data-ui="composer-import-at-end"
+              onClick={onImportAtEnd}
+              aria-label="Import messages at the end of the chat"
+              title="Import at end (⇧⌘V)"
+            >
+              <InsertIcon size={14} />
+              <span>Import</span>
+            </button>
+          ) : null}
           {streaming && onAbort ? (
             <button
               type="button"
@@ -184,8 +315,17 @@ export function Composer({
             <button
               type="submit"
               data-ui="send"
-              disabled={sendBlocked || text.trim() === ''}
-              title={sendBlockedReason ?? undefined}
+              data-mode={emptyWithTrailingUser ? 'reply' : 'send'}
+              disabled={
+                sendBlocked ||
+                (text.trim() === '' && !emptyWithTrailingUser)
+              }
+              title={
+                sendBlockedReason ??
+                (emptyWithTrailingUser
+                  ? 'Generate an assistant reply for the trailing user message'
+                  : undefined)
+              }
             >
               {sendButtonLabel}
             </button>

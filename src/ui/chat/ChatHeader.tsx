@@ -8,6 +8,7 @@ import {
   CloseIcon,
   CogIcon,
   DownloadIcon,
+  EditTreeIcon,
   InfoIcon,
   PencilIcon,
 } from '../icons/Icon'
@@ -21,12 +22,16 @@ export interface ChatHeaderProps {
   chatId: ChatId | null
   settingsOpen: boolean
   onToggleSettings: () => void
+  editTreeActive?: boolean
+  onToggleEditTree?: () => void
 }
 
 export function ChatHeader({
   chatId,
   settingsOpen,
   onToggleSettings,
+  editTreeActive,
+  onToggleEditTree,
 }: ChatHeaderProps) {
   const chat = useLiveQuery(
     () => (chatId ? getChat(chatId) : Promise.resolve(undefined)),
@@ -151,6 +156,26 @@ export function ChatHeader({
         </div>
       )}
       <span data-ui="header-spacer" />
+      {onToggleEditTree ? (
+        <button
+          type="button"
+          data-ui="icon-button"
+          data-role="chat-edit-tree"
+          aria-label={
+            editTreeActive ? 'Exit edit tree mode' : 'Enter edit tree mode'
+          }
+          aria-pressed={editTreeActive ? true : false}
+          title={
+            editTreeActive
+              ? 'Exit edit tree mode (Esc)'
+              : 'Edit tree mode (⇧⌘E)'
+          }
+          onClick={onToggleEditTree}
+          data-state={editTreeActive ? 'active' : undefined}
+        >
+          <EditTreeIcon size={18} />
+        </button>
+      ) : null}
       <button
         type="button"
         data-ui="icon-button"
