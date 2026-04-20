@@ -44,7 +44,7 @@ describe('defaults', () => {
         "reasoning": {
           "carryForward": "auto",
           "exclude": false,
-          "mode": "enabled",
+          "mode": "default",
           "summary": "auto",
         },
         "sampling": {},
@@ -98,8 +98,8 @@ describe('defaults', () => {
     expect(a).not.toBe(b)
     expect(a.reasoning).not.toBe(b.reasoning)
     a.reasoning.mode = 'off'
-    expect(b.reasoning.mode).toBe('enabled')
-    expect(DEFAULT_CHAT_SETTINGS.reasoning.mode).toBe('enabled')
+    expect(b.reasoning.mode).toBe('default')
+    expect(DEFAULT_CHAT_SETTINGS.reasoning.mode).toBe('default')
   })
 
   it('cloneDefaultPrivacyPrefs yields an independent copy', () => {

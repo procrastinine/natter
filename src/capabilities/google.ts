@@ -16,8 +16,6 @@ const GEMINI_3_PARAMS = [
   'response_format',
   'tools',
   'tool_choice',
-  'thinking',
-  'reasoning',
   'cache_control',
 ]
 
@@ -93,6 +91,38 @@ export const GOOGLE_CAPABILITIES: CapabilityTable = {
       pricing: { prompt: '0.00000125', completion: '0.00001' },
       architecture: {
         inputModalities: ['text', 'image', 'audio', 'video', 'file'],
+        outputModalities: ['text'],
+      },
+    },
+  },
+  'gemini-2.5-flash': {
+    id: 'gemini-2.5-flash',
+    name: 'Gemini 2.5 Flash',
+    family: 'google',
+    capability: {
+      supportedParameters: GEMINI_LEGACY_PARAMS,
+      streaming: 'supported',
+      contextLength: 1_000_000,
+      maxCompletionTokens: 65_536,
+      pricing: { prompt: '0.00000015', completion: '0.0000006' },
+      architecture: {
+        inputModalities: ['text', 'image', 'audio', 'video', 'file'],
+        outputModalities: ['text'],
+      },
+    },
+  },
+  'gemini-2.5-flash-lite': {
+    id: 'gemini-2.5-flash-lite',
+    name: 'Gemini 2.5 Flash Lite',
+    family: 'google',
+    capability: {
+      supportedParameters: GEMINI_LEGACY_PARAMS,
+      streaming: 'supported',
+      contextLength: 1_000_000,
+      maxCompletionTokens: 65_536,
+      pricing: { prompt: '0.00000005', completion: '0.0000003' },
+      architecture: {
+        inputModalities: ['text', 'image', 'audio', 'video'],
         outputModalities: ['text'],
       },
     },

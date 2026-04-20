@@ -499,40 +499,6 @@
   font-style: italic;
 }
 
-[data-ui="connection-edit-delete"] {
-  background: transparent;
-  border: 1px solid var(--color-border-default);
-  color: var(--color-danger);
-  padding: var(--space-2) var(--space-4);
-  border-radius: var(--radius-sm);
-  font-size: var(--font-size-sm);
-  cursor: pointer;
-}
-
-[data-ui="connection-edit-delete"]:hover:not(:disabled) {
-  background: var(--color-banner-danger-bg);
-  border-color: var(--color-danger);
-}
-
-[data-ui="connection-save-as"] {
-  background: transparent;
-  border: 1px solid var(--color-border-default);
-  color: var(--color-fg-primary);
-  padding: var(--space-2) var(--space-4);
-  border-radius: var(--radius-sm);
-  font-size: var(--font-size-sm);
-  cursor: pointer;
-}
-
-[data-ui="connection-save-as"]:hover:not(:disabled) {
-  background: var(--color-bg-hover);
-  border-color: var(--color-border-strong);
-}
-
-[data-ui="connection-actions-spacer"] {
-  flex: 1 1 auto;
-}
-
 [data-ui="connection-fields"] {
   display: grid;
   grid-template-columns: 70px 1fr;
@@ -599,18 +565,28 @@
 }
 
 [data-ui="connection-edit"],
-[data-ui="connection-edit-cancel"] {
-  background: transparent;
+[data-ui="connection-test"],
+[data-ui="connection-edit-cancel"],
+[data-ui="connection-delete"] {
+  appearance: none;
+  background: var(--color-bg-surface-1);
   border: 1px solid var(--color-border-default);
   color: var(--color-fg-primary);
   padding: var(--space-2) var(--space-4);
   border-radius: var(--radius-sm);
   font-size: var(--font-size-sm);
   cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, white 24%, transparent);
 }
 
 [data-ui="connection-edit"]:hover,
-[data-ui="connection-edit-cancel"]:hover:not(:disabled) {
+[data-ui="connection-test"]:hover:not(:disabled),
+[data-ui="connection-edit-cancel"]:hover:not(:disabled),
+[data-ui="connection-delete"]:hover:not(:disabled) {
   background: var(--color-bg-hover);
   border-color: var(--color-border-strong);
 }
@@ -629,8 +605,11 @@
   background: var(--color-accent-hover);
 }
 
+[data-ui="connection-edit"]:disabled,
+[data-ui="connection-test"]:disabled,
 [data-ui="connection-edit-save"]:disabled,
-[data-ui="connection-edit-cancel"]:disabled {
+[data-ui="connection-edit-cancel"]:disabled,
+[data-ui="connection-delete"]:disabled {
   opacity: var(--opacity-disabled);
   cursor: not-allowed;
 }
@@ -681,8 +660,64 @@
   color: var(--color-fg-muted);
 }
 
-[data-ui="connection-editor"] [data-ui="helper"][data-validation="invalid"] {
+[data-ui="connection-editor"] [data-ui="helper"][data-validation="invalid"],
+[data-ui="connection-viewer"] [data-ui="helper"][data-validation="invalid"],
+[data-ui="connection-setup-modal"] [data-ui="helper"][data-validation="invalid"] {
   color: var(--color-danger);
+}
+
+[data-ui="connection-editor"] [data-ui="helper"][data-validation="ok"],
+[data-ui="connection-viewer"] [data-ui="helper"][data-validation="ok"],
+[data-ui="connection-setup-modal"] [data-ui="helper"][data-validation="ok"] {
+  color: var(--color-success);
+}
+
+[data-ui="connection-viewer"] {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+[data-ui="connection-actions"] {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+
+[data-ui="connection-actions-leading"],
+[data-ui="connection-actions-trailing"] {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+[data-role="connection-delete"] {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  background-color: var(--color-bg-surface-1);
+  background-image: none;
+  border-color: color-mix(in srgb, var(--color-danger) 12%, var(--color-border-default));
+  color: var(--color-danger);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, white 24%, transparent);
+}
+
+[data-role="connection-delete"]:hover:not(:disabled) {
+  background-color: rgb(255, 245, 245);
+  background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.44), rgba(185, 28, 28, 0.1));
+  border-color: color-mix(in srgb, var(--color-danger) 20%, var(--color-border-strong));
+}
+
+[data-role="connection-delete"]:active:not(:disabled) {
+  background-color: rgb(255, 238, 238);
+  background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.32), rgba(185, 28, 28, 0.14));
+  border-color: color-mix(in srgb, var(--color-danger) 24%, var(--color-border-strong));
+}
+
+[data-role="connection-delete"] [data-icon] {
+  stroke-width: 1.4;
 }
 
 /* ─────────────────────────────────────────────────────────────────────────

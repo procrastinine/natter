@@ -202,6 +202,15 @@ export async function resolveKey(keyId: KeyId, opts: ResolveKeyOptions = {}): Pr
   return new TextDecoder().decode(plaintextBuffer)
 }
 
+export async function resolveKeyIfPresent(
+  keyId: KeyId,
+  opts: ResolveKeyOptions = {},
+): Promise<string | null> {
+  const record = await getKey(keyId)
+  if (!record) return null
+  return resolveKey(keyId, opts)
+}
+
 async function resolveWrapperKey(record: KeyRecord, opts: ResolveKeyOptions): Promise<CryptoKey> {
   const cached = derivedKeyCache.get(record.id)
   if (cached) return cached

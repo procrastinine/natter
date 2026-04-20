@@ -36,11 +36,38 @@ afterEach(() => {
 })
 
 describe('buildHeaders', () => {
-  it('includes required defaults: Authorization, HTTP-Referer, X-OpenRouter-Title', () => {
+  it('includes OpenRouter identity defaults for OpenRouter profiles', () => {
     const h = buildHeaders(makeProfile(), 'sk-or-test')
     expect(h.Authorization).toBe('Bearer sk-or-test')
     expect(h['HTTP-Referer']).toBe('http://localhost:5173')
     expect(h['X-OpenRouter-Title']).toBe('llm-api-frontend')
+  })
+
+  it('omits OpenRouter-only headers for direct-provider profiles', () => {
+    const h = buildHeaders(makeProfile({ kind: 'openai-compatible' }), 'sk-test')
+    expect(h.Authorization).toBe('Bearer sk-test')
+    expect(h['HTTP-Referer']).toBeUndefined()
+    expect(h['X-OpenRouter-Title']).toBeUndefined()
+    expect(h['X-OpenRouter-Categories']).toBeUndefined()
+  })
+
+  it('adds Anthropic browser-access opt-in for direct Anthropic requests', () => {
+    const h = buildHeaders(
+      makeProfile({ kind: 'anthropic', baseUrl: 'https://api.anthropic.com/v1' }),
+      'sk-ant-test',
+    )
+    expect(h.Authorization).toBe('Bearer sk-ant-test')
+    expect(h['anthropic-dangerous-direct-browser-access']).toBe('true')
+    expect(h['HTTP-Referer']).toBeUndefined()
+    expect(h['X-OpenRouter-Title']).toBeUndefined()
+  })
+
+  it('adds Anthropic browser-access opt-in for custom profiles pointed at api.anthropic.com', () => {
+    const h = buildHeaders(
+      makeProfile({ kind: 'custom', baseUrl: 'https://api.anthropic.com/v1' }),
+      'sk-ant-test',
+    )
+    expect(h['anthropic-dangerous-direct-browser-access']).toBe('true')
   })
 
   it('adds Content-Type: application/json only for POST', () => {
@@ -80,6 +107,11 @@ describe('buildHeaders', () => {
   it('omits HTTP-Referer when profile.appUrl is empty', () => {
     const h = buildHeaders(makeProfile({ appUrl: '' }), 'k')
     expect(h['HTTP-Referer']).toBeUndefined()
+  })
+
+  it('omits Authorization when the key is empty', () => {
+    const h = buildHeaders(makeProfile({ kind: 'llama-server' }), '')
+    expect(h.Authorization).toBeUndefined()
   })
 })
 

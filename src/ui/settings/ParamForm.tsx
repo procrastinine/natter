@@ -262,7 +262,23 @@ export function ParamForm({ chat, capability }: ParamFormProps) {
     }
   }, [capability, chat.id, chat.settings])
 
-  if (!capability) return null
+  if (!chat.settings.model) {
+    return (
+      <section data-ui="settings-section" data-ui-section="generation-empty">
+        <h3>Generation</h3>
+        <p data-ui="helper">Select a model first.</p>
+      </section>
+    )
+  }
+
+  if (!capability) {
+    return (
+      <section data-ui="settings-section" data-ui-section="generation-empty">
+        <h3>Generation</h3>
+        <p data-ui="helper">Waiting for model capability…</p>
+      </section>
+    )
+  }
 
   return (
     <div data-ui="param-form">

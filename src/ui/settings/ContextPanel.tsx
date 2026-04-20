@@ -62,6 +62,15 @@ export function ContextPanel({
     })
   }, [messages, cursor, chat.settings, draft, endpointTokenizer])
 
+  if (!chat.settings.model) {
+    return (
+      <section data-ui="settings-section" data-ui-section="context-control">
+        <h3>Context</h3>
+        <p data-ui="helper">Select a model first.</p>
+      </section>
+    )
+  }
+
   // Numeric caps drive every slider in this panel. Without a capability
   // we'd have to invent fallback numbers — last time those were 128k,
   // which briefly snapped 1M-context Gemini chats to a bogus ceiling and

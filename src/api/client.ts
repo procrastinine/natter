@@ -11,6 +11,15 @@ import type { CallOpts } from './types'
 export const DEFAULT_TIMEOUT_MS = 120_000
 const DEFAULT_RETRY_CAP_MS = 5_000
 
+function isAnthropicBrowserOriginProfile(profile: ConnectionProfile): boolean {
+  if (profile.kind === 'anthropic') return true
+  try {
+    return new URL(profile.baseUrl).host === 'api.anthropic.com'
+  } catch {
+    return false
+  }
+}
+
 // Merge order (later entries win): required defaults → profile.defaultHeaders
 // → opts.overrideHeaders. Profile can override a required default (rare —
 // e.g. custom auth scheme); per-call overrides are the escape hatch.
@@ -22,13 +31,20 @@ export function buildHeaders(
     method?: 'GET' | 'POST'
   } = {},
 ): Record<string, string> {
-  const headers: Record<string, string> = {
-    Authorization: `Bearer ${apiKey}`,
+  const headers: Record<string, string> = {}
+  if (apiKey) headers.Authorization = `Bearer ${apiKey}`
+  if (isAnthropicBrowserOriginProfile(profile)) {
+    // Anthropic blocks browser-origin preflights unless this opt-in header is
+    // present on the actual request. Sending it unconditionally is harmless in
+    // Node/daemon paths and keeps the browser app usable on localhost.
+    headers['anthropic-dangerous-direct-browser-access'] = 'true'
   }
-  if (profile.appUrl) headers['HTTP-Referer'] = profile.appUrl
-  if (profile.appTitle) headers['X-OpenRouter-Title'] = profile.appTitle
-  if (profile.appCategories?.length) {
-    headers['X-OpenRouter-Categories'] = profile.appCategories.join(',')
+  if (profile.kind === 'openrouter') {
+    if (profile.appUrl) headers['HTTP-Referer'] = profile.appUrl
+    if (profile.appTitle) headers['X-OpenRouter-Title'] = profile.appTitle
+    if (profile.appCategories?.length) {
+      headers['X-OpenRouter-Categories'] = profile.appCategories.join(',')
+    }
   }
   if (opts.method === 'POST') headers['Content-Type'] = 'application/json'
   for (const [k, v] of Object.entries(profile.defaultHeaders)) {

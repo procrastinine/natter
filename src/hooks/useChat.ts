@@ -57,6 +57,13 @@ import { useStreamStore } from '../store/zustand/streamStore'
 export const FLUSH_INTERVAL_MS = 200
 export const FLUSH_TEXT_GROWTH_BYTES = 4096
 
+function rewriteCompatibleModelId(connection: ConnectionProfile, modelId: string): string {
+  if (connection.kind === 'anthropic') {
+    return modelId.replace(/(\d)\.(\d)(?=-|$)/g, '$1-$2')
+  }
+  return modelId
+}
+
 // Per-stream mutable state. Mirrors the §6.2 `ActiveStream` fields that apply
 // at the Phase 7 scope. Reasoning / tool-call reducers are in place so later
 // phases can extend without changing the lifecycle.
@@ -251,6 +258,7 @@ async function openAssistantStreamUnder(
   } else {
     const transformOpts: ChatCompletionsTransformOptions = {
       stream: true,
+      rewriteSlug: (slug) => rewriteCompatibleModelId(input.connection, slug),
       ...(input.capabilities ? { capabilities: input.capabilities } : {}),
       ...(input.transform ?? {}),
     }

@@ -36,9 +36,18 @@ import { getProfile } from '../store/profiles'
 // `useModels` in ModelPicker uses this exact query; useEndpoints looks up
 // the already-cached row keyed off the same signature so we don't double-
 // fetch just to read a context length for non-OpenRouter connections.
-const CAPABILITY_LOOKUP_QUERY = {
+const OPENROUTER_CAPABILITY_LOOKUP_QUERY = {
   outputModalities: ['text', 'image', 'audio', 'file', 'video'],
 } as const
+
+const DIRECT_CAPABILITY_LOOKUP_QUERY = {} as const
+
+function idsEquivalent(left: string, right: string): boolean {
+  return (
+    left.replace(/(\d)[.-](\d)(?=-|$)/g, '$1:$2') ===
+    right.replace(/(\d)[.-](\d)(?=-|$)/g, '$1:$2')
+  )
+}
 
 export interface UseEndpointsResult {
   descriptor: EndpointsDescriptor | null
@@ -136,14 +145,21 @@ export function useEndpoints(
   // want an actionable banner, not a permanently-spinning Context tab).
   const liveModelsRow = useLiveQuery(
     () =>
-      profileId ? getCachedModels(profileId, CAPABILITY_LOOKUP_QUERY) : Promise.resolve(undefined),
-    [profileId],
+      profileId
+        ? getCachedModels(
+            profileId,
+            profile?.kind === 'openrouter'
+              ? OPENROUTER_CAPABILITY_LOOKUP_QUERY
+              : DIRECT_CAPABILITY_LOOKUP_QUERY,
+          )
+        : Promise.resolve(undefined),
+    [profileId, profile?.kind],
     undefined,
   )
   const liveEntry = useMemo<ModelListEntry | null>(() => {
     if (!liveModelsRow || !modelId) return null
     const rows = normalizeModelsResponse(liveModelsRow.payload)
-    return rows.find((r) => r.id === modelId) ?? null
+    return rows.find((r) => idsEquivalent(r.id, modelId)) ?? null
   }, [liveModelsRow, modelId])
   const modelAvailable = useMemo<boolean | null>(() => {
     if (!profileId || !modelId) return null
@@ -157,6 +173,9 @@ export function useEndpoints(
       return effectiveCapabilityFromEndpoints(modelId, endpoints, { strict })
     }
     if (!enabled) {
+      if (profile.kind === 'llama-server' && modelAvailable === false) {
+        return null
+      }
       const bundled = resolveBundledCapability(profile, modelId)
       const merged: CapabilityDescriptor = { ...bundled }
       if (liveEntry?.contextLength !== undefined) {
@@ -174,7 +193,7 @@ export function useEndpoints(
       return effectiveCapabilityFromDescriptor(modelId, merged)
     }
     return null
-  }, [profile, modelId, endpoints, strict, enabled, liveEntry])
+  }, [profile, modelId, endpoints, strict, enabled, liveEntry, modelAvailable])
 
   const fetchedAt = cachedRow?.fetchedAt ?? null
   const offline = error !== null && fetchedAt !== null

@@ -1,16 +1,23 @@
 import { useLiveQuery } from 'dexie-react-hooks'
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import { chatCompletionsOnce } from '../../api/chat-completions'
+import { fetchModels } from '../../api/models'
+import { normalizeModelsResponse } from '../../api/providers'
 import { probeLlamaServer } from '../../api/probe'
-import { runFirstRunSeed } from '../../core/defaults'
+import { resolveBundledCapability } from '../../capabilities'
+import { toChatCompletions } from '../../core/transforms'
+import { cloneDefaultChatSettings } from '../../core/defaults'
 import type {
   ChatId,
   ConnectionKind,
   ConnectionProfile,
-  KeyRecord,
+  Message,
   ProfileId,
 } from '../../core/types'
+import { newId } from '../../lib/ulid'
 import { updateChatSettings } from '../../store/chats'
-import { createKey, getKey } from '../../store/keys'
+import { createKey, getKey, resolveKey } from '../../store/keys'
+import { createPreset } from '../../store/presets'
 import {
   bumpProfileLastUsedAt,
   createProfile,
@@ -18,22 +25,28 @@ import {
   listProfiles,
   updateProfile,
 } from '../../store/profiles'
-import { ChevronIcon, CloseIcon } from '../icons/Icon'
+import { ChevronIcon, CloseIcon, TrashIcon } from '../icons/Icon'
 
 interface HeaderState {
   profile: ConnectionProfile | null
   profiles: ConnectionProfile[]
-  keyRecord: KeyRecord | null
+  hasKey: boolean
+}
+
+type ProbeState =
+  | { kind: 'idle' }
+  | { kind: 'running' }
+  | { kind: 'ok'; message: string }
+  | { kind: 'fail'; message: string }
+
+interface ConnectionSaveResult {
+  profileId: ProfileId
+  activate: boolean
+  resetModel: boolean
 }
 
 const ACTIVE_PROFILE_KEY = 'natter:active-profile-id'
 
-// Workspace-active profile id — the connection the user last clicked in the
-// header. New chats created via `/new` or the composer seed from this so
-// "I switched to llama-server, next chat should be on llama-server" works
-// even when the MRU preset is pinned to a different connection. Stored in
-// localStorage (UI preference, per-origin/browser); daemon mode will replace
-// this with its own preference store behind the same function signatures.
 export function readActiveProfileId(): ProfileId | null {
   if (typeof window === 'undefined') return null
   return (window.localStorage.getItem(ACTIVE_PROFILE_KEY) ?? null) as ProfileId | null
@@ -45,13 +58,6 @@ export function writeActiveProfileId(id: ProfileId | null): void {
   else window.localStorage.removeItem(ACTIVE_PROFILE_KEY)
 }
 
-// When a chat is open, the header represents the chat's pinned connection
-// (`chat.settings.profileId`) rather than the workspace-default MRU. A chat
-// created on OpenRouter keeps using OpenRouter even after the user adds a
-// llama-server profile; showing the workspace default would falsely imply
-// this chat lives on llama-server. Switching via the dropdown rewires the
-// chat's profileId and bumps the workspace default at the same time, which
-// matches how users read "connection" — "the connection for this chat."
 async function loadHeaderState(
   activeId: ProfileId | null,
   chatProfileId: ProfileId | null,
@@ -62,8 +68,8 @@ async function loadHeaderState(
   const chatProfile = chatProfileId ? live.find((p) => p.id === chatProfileId) : undefined
   const fallback = activeId ? live.find((p) => p.id === activeId) : undefined
   const profile = chatProfile ?? fallback ?? live[0] ?? null
-  const keyRecord = profile ? ((await getKey(profile.apiKeyRef)) ?? null) : null
-  return { profile, profiles: live, keyRecord }
+  const hasKey = profile ? ((await getKey(profile.apiKeyRef)) ?? null) !== null : false
+  return { profile, profiles: live, hasKey }
 }
 
 const KIND_LABEL: Record<ConnectionKind, string> = {
@@ -75,6 +81,15 @@ const KIND_LABEL: Record<ConnectionKind, string> = {
   custom: 'Custom (OpenAI-compatible)',
 }
 
+const KIND_DEFAULT_NAME: Record<ConnectionKind, string> = {
+  openrouter: 'OpenRouter',
+  'openai-compatible': 'OpenAI',
+  anthropic: 'Anthropic',
+  google: 'Google',
+  'llama-server': 'llama-server',
+  custom: 'Custom',
+}
+
 const KIND_ORDER: readonly ConnectionKind[] = [
   'openrouter',
   'openai-compatible',
@@ -84,14 +99,11 @@ const KIND_ORDER: readonly ConnectionKind[] = [
   'custom',
 ]
 
-// Only the four hosted providers lock to a canonical base URL. Local-
-// server kinds (llama-server) and 'custom' both keep the URL visible
-// because the user needs to point us at their machine.
 const KIND_LOCKED_BASE_URL: Record<ConnectionKind, string | null> = {
   openrouter: 'https://openrouter.ai/api/v1',
   'openai-compatible': 'https://api.openai.com/v1',
   anthropic: 'https://api.anthropic.com/v1',
-  google: 'https://generativelanguage.googleapis.com/v1beta',
+  google: 'https://generativelanguage.googleapis.com/v1beta/openai',
   'llama-server': null,
   custom: null,
 }
@@ -100,7 +112,7 @@ const KIND_DEFAULT_BASE_URL: Record<ConnectionKind, string> = {
   openrouter: 'https://openrouter.ai/api/v1',
   'openai-compatible': 'https://api.openai.com/v1',
   anthropic: 'https://api.anthropic.com/v1',
-  google: 'https://generativelanguage.googleapis.com/v1beta',
+  google: 'https://generativelanguage.googleapis.com/v1beta/openai',
   'llama-server': 'http://127.0.0.1:8080/v1',
   custom: '',
 }
@@ -111,12 +123,185 @@ function kindRequiresKey(kind: ConnectionKind): boolean {
 
 const PLACEHOLDER_KEY = '••••••••••••••••'
 
+const PROBE_MODEL_CANDIDATES: Record<ConnectionKind, readonly string[]> = {
+  openrouter: ['anthropic/claude-haiku-4.5', 'openai/gpt-4o-mini'],
+  'openai-compatible': ['gpt-4o-mini', 'gpt-4.1-mini', 'gpt-4o'],
+  anthropic: ['claude-haiku-4-5', 'claude-sonnet-4-5', 'claude-opus-4-1-20250805'],
+  google: ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.5-pro'],
+  'llama-server': [],
+  custom: [],
+}
+
+function hostFor(url: string): string {
+  try {
+    return new URL(url).host
+  } catch {
+    return url
+  }
+}
+
+function isValidHttpUrl(value: string): boolean {
+  if (!value) return false
+  try {
+    const parsed = new URL(value)
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:'
+  } catch {
+    return false
+  }
+}
+
+function nextBaseUrlForKind(
+  currentKind: ConnectionKind,
+  nextKind: ConnectionKind,
+  currentBaseUrl: string,
+): string {
+  const nextLock = KIND_LOCKED_BASE_URL[nextKind]
+  if (nextLock !== null) return nextLock
+  return KIND_LOCKED_BASE_URL[currentKind] !== null ? KIND_DEFAULT_BASE_URL[nextKind] : currentBaseUrl
+}
+
+function buildProbeProfile(kind: ConnectionKind, name: string, baseUrl: string): ConnectionProfile {
+  const now = Date.now()
+  return {
+    id: `probe:${kind}:${name}`,
+    name,
+    kind,
+    baseUrl,
+    apiKeyRef: 'probe-key',
+    defaultHeaders: {},
+    appTitle: 'llm-api-frontend',
+    appUrl: '',
+    usesResponsesApiByDefault: false,
+    supportsEndpointsApi: false,
+    supportsGenerationApi: false,
+    supportsPrivacyScrape: false,
+    createdAt: now,
+    updatedAt: now,
+  }
+}
+
+function normalizeProbeModelId(kind: ConnectionKind, modelId: string): string {
+  if (kind === 'google' && modelId.startsWith('models/')) {
+    return modelId.slice('models/'.length)
+  }
+  if (kind === 'anthropic') {
+    return modelId.replace(/-\d{8}$/u, '').replace(/(\d)\.(\d)(?=-|$)/g, '$1-$2')
+  }
+  return modelId
+}
+
+function pickProbeModel(kind: ConnectionKind, modelIds: string[]): string {
+  const candidates = PROBE_MODEL_CANDIDATES[kind]
+  for (const candidate of candidates) {
+    const hit = modelIds.find((modelId) => normalizeProbeModelId(kind, modelId) === candidate)
+    if (hit) return hit
+  }
+  return modelIds[0] ?? candidates[0] ?? ''
+}
+
+function probeUserMessage(): Message {
+  return {
+    id: 'probe-user',
+    chatId: 'probe-chat',
+    parentId: null,
+    siblingIndex: 0,
+    turnId: 'probe-turn',
+    turnIndex: 0,
+    role: 'user',
+    origin: 'user',
+    content: [{ type: 'text', text: 'Reply with the single word ok.' }],
+    createdAt: 1,
+    nodeVersion: 0,
+    deleted: false,
+  }
+}
+
+function keyErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+async function runConnectionTest(opts: {
+  kind: ConnectionKind
+  name: string
+  baseUrl: string
+  apiKey: string | null
+}): Promise<ProbeState> {
+  if (!isValidHttpUrl(opts.baseUrl)) {
+    return { kind: 'fail', message: 'Enter a full URL starting with http:// or https://.' }
+  }
+  if (opts.kind === 'llama-server') {
+    const result = await probeLlamaServer({ baseUrl: opts.baseUrl }, { timeoutMs: 3_000 })
+    if (result.kind === 'ok') {
+      const tpl = result.props.chatTemplate
+      const ctx = result.props.defaultContextLength
+      const model = result.props.modelPath
+      const bits = [
+        model ? model.split('/').pop() : null,
+        ctx ? `ctx ${ctx}` : null,
+        tpl ? 'template detected' : null,
+      ]
+      return {
+        kind: 'ok',
+        message: `Reached llama-server in ${result.elapsedMs}ms — ${bits.filter(Boolean).join(' · ') || 'OK'}`,
+      }
+    }
+    return {
+      kind: 'fail',
+      message: `${result.message} (${result.rootUrl}/props)`,
+    }
+  }
+  if (kindRequiresKey(opts.kind) && !opts.apiKey) {
+    return { kind: 'fail', message: 'Set an API key before testing this profile.' }
+  }
+  const started = performance.now()
+  try {
+    const probeProfile = buildProbeProfile(opts.kind, opts.name, opts.baseUrl)
+    let modelIds: string[] = []
+    try {
+      const payload = await fetchModels(
+        {
+          profile: probeProfile,
+          apiKey: opts.apiKey ?? '',
+        },
+        {},
+        { timeoutMs: 3_000 },
+      )
+      modelIds = normalizeModelsResponse(payload).map((row) =>
+        normalizeProbeModelId(opts.kind, row.id),
+      )
+    } catch {
+      // Some OpenAI-compatible layers (notably Anthropic) accept chat
+      // completions but do not provide a bearer-authenticated /models list.
+      // The actual test path is a tiny completion below, so model discovery
+      // failures are advisory rather than fatal here.
+    }
+    const model = pickProbeModel(opts.kind, modelIds)
+    if (!model) {
+      return {
+        kind: 'fail',
+        message: 'Could not choose a model to test.',
+      }
+    }
+    const settings = cloneDefaultChatSettings()
+    settings.profileId = probeProfile.id
+    settings.model = model
+    const capability = resolveBundledCapability(probeProfile, model)
+    const { wire } = toChatCompletions(settings, [probeUserMessage()], {
+      capabilities: capability,
+      stream: false,
+    })
+    await chatCompletionsOnce({ profile: probeProfile, apiKey: opts.apiKey ?? '' }, wire)
+    const elapsedMs = Math.round(performance.now() - started)
+    return {
+      kind: 'ok',
+      message: `Completed test chat in ${elapsedMs}ms — ${model}`,
+    }
+  } catch (error) {
+    return { kind: 'fail', message: keyErrorMessage(error) }
+  }
+}
+
 export interface ConnectionHeaderProps {
-  // When a chat is open, the header represents that chat's connection. The
-  // chat's `settings.profileId` is the source of truth; swapping the
-  // dropdown rewires the chat AND bumps the workspace default so the next
-  // "New chat" lands on the same connection. Home / "New chat" surfaces
-  // pass `null` and the header falls back to workspace-default MRU.
   activeChatId?: ChatId | null
   activeChatProfileId?: ProfileId | null
 }
@@ -132,41 +317,94 @@ export function ConnectionHeader({
     {
       profile: null,
       profiles: [],
-      keyRecord: null,
+      hasKey: false,
     },
   )
   const [open, setOpen] = useState(false)
   const [editing, setEditing] = useState(false)
   const [setupOpen, setSetupOpen] = useState(false)
+  const [probeState, setProbeState] = useState<ProbeState>({ kind: 'idle' })
+  const [deleteBusy, setDeleteBusy] = useState(false)
+  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false)
   const hasConnection = state.profile !== null
 
-  // Whenever the active profile changes we drop out of edit mode so the form
-  // doesn't carry a stale draft against a different connection.
   useEffect(() => {
     setEditing(false)
+    setProbeState({ kind: 'idle' })
+    setDeleteConfirmOpen(false)
   }, [state.profile?.id])
 
-  const switchProfile = useCallback(
-    async (id: ProfileId) => {
+  const activateProfile = useCallback(
+    async (id: ProfileId, opts: { resetModel?: boolean } = {}) => {
       writeActiveProfileId(id)
       setActiveId(id)
       await bumpProfileLastUsedAt(id)
-      // If a chat is open, rewire its pinned connection too — otherwise
-      // the header would flip but the chat's panels and send-path would
-      // keep hitting the old profile, which is exactly the
-      // "header says llama-server but the chat is still OpenRouter" bug.
-      // Deselect the model at the same time: the old model is almost
-      // certainly not served by the new connection (gemini isn't on
-      // llama-server, gemma isn't on OpenRouter), so carrying it forward
-      // produces the "Waiting for model capability…" dead-state. The
-      // auto-select effect below will re-pick when the new profile has
-      // exactly one model.
-      if (activeChatId) {
-        await updateChatSettings(activeChatId, { profileId: id, model: '' })
-      }
+      if (!activeChatId) return
+      const patch: { profileId: ProfileId; model?: string } = { profileId: id }
+      if (opts.resetModel) patch.model = ''
+      await updateChatSettings(activeChatId, patch)
     },
     [activeChatId],
   )
+
+  const switchProfile = useCallback(
+    async (id: ProfileId) => {
+      await activateProfile(id, { resetModel: true })
+    },
+    [activateProfile],
+  )
+
+  const applySaveResult = useCallback(
+    async (result: ConnectionSaveResult) => {
+      setEditing(false)
+      setSetupOpen(false)
+      if (result.activate) {
+        await activateProfile(result.profileId, { resetModel: result.resetModel })
+        return
+      }
+      if (activeChatId && activeChatProfileId === result.profileId && result.resetModel) {
+        await updateChatSettings(activeChatId, { model: '' })
+      }
+    },
+    [activateProfile, activeChatId, activeChatProfileId],
+  )
+
+  const deleteCurrentProfile = useCallback(async () => {
+    const profile = state.profile
+    if (!profile) return
+    setDeleteBusy(true)
+    try {
+      await deleteProfile(profile.id, { force: true })
+      setEditing(false)
+      setDeleteConfirmOpen(false)
+      writeActiveProfileId(null)
+      setActiveId(null)
+    } finally {
+      setDeleteBusy(false)
+    }
+  }, [state.profile])
+
+  const runSavedProfileTest = useCallback(async () => {
+    const profile = state.profile
+    if (!profile) return
+    setProbeState({ kind: 'running' })
+    try {
+      let apiKey: string | null = null
+      if (kindRequiresKey(profile.kind)) {
+        apiKey = await resolveKey(profile.apiKeyRef)
+      }
+      setProbeState(
+        await runConnectionTest({
+          kind: profile.kind,
+          name: profile.name,
+          baseUrl: profile.baseUrl,
+          apiKey,
+        }),
+      )
+    } catch (error) {
+      setProbeState({ kind: 'fail', message: keyErrorMessage(error) })
+    }
+  }, [state.profile])
 
   if (!hasConnection || !state.profile) {
     return (
@@ -182,14 +420,19 @@ export function ConnectionHeader({
             Add connection
           </button>
         </div>
-        {setupOpen ? <ConnectionSetupModal onClose={() => setSetupOpen(false)} /> : null}
+        {setupOpen ? (
+          <ConnectionSetupModal
+            hasExistingConnections={false}
+            onClose={() => setSetupOpen(false)}
+            onSaved={applySaveResult}
+          />
+        ) : null}
       </section>
     )
   }
 
-  const { profile, profiles, keyRecord } = state
-  const status: 'ready' | 'no-key' =
-    keyRecord || !kindRequiresKey(profile.kind) ? 'ready' : 'no-key'
+  const { profile, profiles, hasKey } = state
+  const status: 'ready' | 'no-key' = hasKey || !kindRequiresKey(profile.kind) ? 'ready' : 'no-key'
 
   return (
     <section
@@ -224,7 +467,7 @@ export function ConnectionHeader({
             status === 'ready'
               ? kindRequiresKey(profile.kind)
                 ? 'Key on file'
-                : 'Custom endpoint — no key required'
+                : 'No key required'
               : 'No key — sends are blocked'
           }
           aria-hidden="true"
@@ -242,25 +485,40 @@ export function ConnectionHeader({
           {editing ? (
             <ConnectionEditor
               profile={profile}
-              hasKey={Boolean(keyRecord)}
-              onDone={() => setEditing(false)}
+              hasKey={hasKey}
+              deleteBusy={deleteBusy}
+              onDone={applySaveResult}
               onCancel={() => setEditing(false)}
-              onDeleted={() => {
-                setEditing(false)
-                writeActiveProfileId(null)
-                setActiveId(null)
-              }}
+              onDelete={() => setDeleteConfirmOpen(true)}
             />
           ) : (
             <ConnectionViewer
               profile={profile}
-              hasKey={Boolean(keyRecord)}
+              hasKey={hasKey}
+              deleteBusy={deleteBusy}
+              probeState={probeState}
               onEdit={() => setEditing(true)}
+              onTest={runSavedProfileTest}
+              onDelete={() => setDeleteConfirmOpen(true)}
             />
           )}
         </div>
       ) : null}
-      {setupOpen ? <ConnectionSetupModal onClose={() => setSetupOpen(false)} /> : null}
+      {setupOpen ? (
+        <ConnectionSetupModal
+          hasExistingConnections={profiles.length > 0}
+          onClose={() => setSetupOpen(false)}
+          onSaved={applySaveResult}
+        />
+      ) : null}
+      {deleteConfirmOpen ? (
+        <ConnectionDeleteDialog
+          profileName={profile.name}
+          busy={deleteBusy}
+          onCancel={() => setDeleteConfirmOpen(false)}
+          onConfirm={deleteCurrentProfile}
+        />
+      ) : null}
     </section>
   )
 }
@@ -294,8 +552,82 @@ function ProfileSwitcher({ profiles, activeId, onSwitch, onCreateNew }: ProfileS
         onClick={onCreateNew}
         title="Add a new connection profile"
       >
-        + New
+        + New profile
       </button>
+    </div>
+  )
+}
+
+function ConnectionDeleteDialog({
+  profileName,
+  busy,
+  onCancel,
+  onConfirm,
+}: {
+  profileName: string
+  busy: boolean
+  onCancel: () => void
+  onConfirm: () => void | Promise<void>
+}) {
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        onCancel()
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onCancel])
+
+  return (
+    <div
+      data-ui="confirm-delete-overlay"
+      role="presentation"
+      onClick={(event) => {
+        if (event.target === event.currentTarget) onCancel()
+      }}
+    >
+      <div data-ui="confirm-delete" role="dialog" aria-modal="true" aria-labelledby="delete-connection-title">
+        <div data-ui="confirm-delete-header">
+          <h2 id="delete-connection-title">Delete connection?</h2>
+          <button
+            type="button"
+            data-ui="icon-button"
+            data-size="sm"
+            data-role="confirm-delete-close"
+            aria-label="Cancel delete"
+            onClick={onCancel}
+            disabled={busy}
+          >
+            <CloseIcon size={14} />
+          </button>
+        </div>
+        <blockquote data-ui="confirm-delete-preview">
+          Delete <strong>{profileName}</strong>? This cannot be undone.
+        </blockquote>
+        <div data-ui="confirm-delete-actions">
+          <button
+            type="button"
+            data-ui="confirm-delete-button"
+            data-role="cancel"
+            onClick={onCancel}
+            disabled={busy}
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            data-ui="confirm-delete-button"
+            data-role="confirm"
+            data-tone="danger"
+            onClick={() => void onConfirm()}
+            disabled={busy}
+          >
+            {busy ? 'Deleting…' : 'Delete'}
+          </button>
+        </div>
+      </div>
     </div>
   )
 }
@@ -303,194 +635,225 @@ function ProfileSwitcher({ profiles, activeId, onSwitch, onCreateNew }: ProfileS
 interface ConnectionViewerProps {
   profile: ConnectionProfile
   hasKey: boolean
+  deleteBusy: boolean
+  probeState: ProbeState
   onEdit: () => void
+  onTest: () => void | Promise<void>
+  onDelete: () => void | Promise<void>
 }
 
-function ConnectionViewer({ profile, hasKey, onEdit }: ConnectionViewerProps) {
+function ConnectionViewer({
+  profile,
+  hasKey,
+  deleteBusy,
+  probeState,
+  onEdit,
+  onTest,
+  onDelete,
+}: ConnectionViewerProps) {
   const requiresKey = kindRequiresKey(profile.kind)
   const baseUrlIsLocked = KIND_LOCKED_BASE_URL[profile.kind] !== null
+
   return (
-    <dl data-ui="connection-fields">
-      <div>
-        <dt>Provider</dt>
-        <dd>{KIND_LABEL[profile.kind]}</dd>
-      </div>
-      {baseUrlIsLocked ? null : (
+    <div data-ui="connection-viewer">
+      <dl data-ui="connection-fields">
         <div>
-          <dt>Base URL</dt>
+          <dt>Provider</dt>
+          <dd>{KIND_LABEL[profile.kind]}</dd>
+        </div>
+        {baseUrlIsLocked ? null : (
+          <div>
+            <dt>Base URL</dt>
+            <dd>
+              <code>{profile.baseUrl}</code>
+            </dd>
+          </div>
+        )}
+        <div>
+          <dt>API key</dt>
           <dd>
-            <code>{profile.baseUrl}</code>
+            {hasKey ? (
+              <code>{PLACEHOLDER_KEY}</code>
+            ) : requiresKey ? (
+              <span data-ui="connection-key-missing">not set</span>
+            ) : (
+              <span data-ui="connection-key-optional">none — custom endpoint</span>
+            )}
           </dd>
         </div>
-      )}
-      <div>
-        <dt>API key</dt>
-        <dd data-ui="connection-key-row">
-          {hasKey ? (
-            <code>{PLACEHOLDER_KEY}</code>
-          ) : requiresKey ? (
-            <span data-ui="connection-key-missing">not set</span>
-          ) : (
-            <span data-ui="connection-key-optional">none — custom endpoint</span>
-          )}
+      </dl>
+      <div data-ui="connection-actions">
+        <div data-ui="connection-actions-leading">
           <button type="button" data-ui="connection-edit" onClick={onEdit}>
             Edit
           </button>
-        </dd>
+          <button type="button" data-ui="connection-test" onClick={() => void onTest()}>
+            {probeState.kind === 'running' ? 'Testing…' : 'Test'}
+          </button>
+        </div>
+        <div data-ui="connection-actions-trailing">
+          <button
+            type="button"
+            data-ui="connection-delete"
+            data-role="connection-delete"
+            onClick={() => void onDelete()}
+            disabled={deleteBusy}
+            aria-label="Delete connection"
+            title="Delete connection"
+          >
+            <TrashIcon size={13} />
+          </button>
+        </div>
       </div>
-    </dl>
+      <ConnectionProbeMessage state={probeState} />
+    </div>
   )
 }
 
 interface ConnectionEditorProps {
   profile: ConnectionProfile
   hasKey: boolean
-  onDone: () => void
+  deleteBusy: boolean
+  onDone: (result: ConnectionSaveResult) => void | Promise<void>
   onCancel: () => void
-  onDeleted: () => void
+  onDelete: () => void | Promise<void>
 }
 
-function ConnectionEditor({ profile, hasKey, onDone, onCancel, onDeleted }: ConnectionEditorProps) {
+function ConnectionEditor({
+  profile,
+  hasKey,
+  deleteBusy,
+  onDone,
+  onCancel,
+  onDelete,
+}: ConnectionEditorProps) {
   const [name, setName] = useState(profile.name)
   const [kind, setKind] = useState<ConnectionKind>(profile.kind)
   const [baseUrl, setBaseUrl] = useState(profile.baseUrl)
   const [keyDraft, setKeyDraft] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  // The Save-as-new flow lets the user pick a new name without dropping the
-  // existing profile.
-  const [saveAsName, setSaveAsName] = useState('')
-  const [saveAsOpen, setSaveAsOpen] = useState(false)
+  const [probeState, setProbeState] = useState<ProbeState>({ kind: 'idle' })
+
   const trimmedKey = keyDraft.trim()
+  const trimmedName = name.trim()
+  const originalName = profile.name.trim()
+  const saveAsNew = trimmedName !== originalName
   const lockedBaseUrl = KIND_LOCKED_BASE_URL[kind]
   const baseUrlIsLocked = lockedBaseUrl !== null
   const effectiveBaseUrl = baseUrlIsLocked ? (lockedBaseUrl ?? '') : baseUrl
   const trimmedBaseUrl = effectiveBaseUrl.trim()
-  const trimmedName = name.trim()
   const baseUrlValid = useMemo(() => isValidHttpUrl(trimmedBaseUrl), [trimmedBaseUrl])
   const requiresKey = kindRequiresKey(kind)
-  const kindChanged = kind !== profile.kind
-  // Per the user's rule: "Leave empty to keep existing key" only applies if
-  // the provider is unchanged and the kind requires a key. If the user
-  // switched provider, the existing key may not even be valid for the new
-  // provider, so they must paste a fresh one (or save Custom without one).
-  const allowEmptyKey = !kindChanged && hasKey && requiresKey
   const dirty =
-    name !== profile.name ||
-    kindChanged ||
-    effectiveBaseUrl !== profile.baseUrl ||
+    trimmedName !== originalName ||
+    kind !== profile.kind ||
+    trimmedBaseUrl !== profile.baseUrl ||
     trimmedKey.length > 0
-  const keyMissing = requiresKey && trimmedKey.length === 0 && !allowEmptyKey
-  const canSave = baseUrlValid && trimmedName.length > 0 && dirty && !keyMissing && !busy
+  const canSave = baseUrlValid && trimmedName.length > 0 && dirty && !busy
+
+  useEffect(() => {
+    setProbeState({ kind: 'idle' })
+  }, [trimmedName, kind, trimmedBaseUrl, trimmedKey])
+
+  const runProbe = useCallback(async () => {
+    setProbeState({ kind: 'running' })
+    try {
+      let apiKey: string | null = null
+      if (trimmedKey.length > 0) {
+        apiKey = trimmedKey
+      } else if (!saveAsNew && hasKey && kindRequiresKey(kind)) {
+        apiKey = await resolveKey(profile.apiKeyRef)
+      }
+      setProbeState(
+        await runConnectionTest({
+          kind,
+          name: trimmedName || profile.name,
+          baseUrl: trimmedBaseUrl,
+          apiKey,
+        }),
+      )
+    } catch (probeError) {
+      setProbeState({ kind: 'fail', message: keyErrorMessage(probeError) })
+    }
+  }, [trimmedKey, saveAsNew, hasKey, kind, profile.apiKeyRef, profile.name, trimmedName, trimmedBaseUrl])
+
+  const keyPlaceholder = saveAsNew
+    ? requiresKey
+      ? 'Optional — leave empty to save without a key'
+      : 'Optional — leave empty for no key'
+    : hasKey
+      ? 'Leave empty to keep existing key'
+      : requiresKey
+        ? 'Optional — this profile currently has no key'
+        : 'Optional — leave empty for no key'
+
+  const keyHelper = saveAsNew
+    ? requiresKey
+      ? 'New name creates a new profile. Leave the key empty to save it with no key.'
+      : 'New name creates a new profile. Custom and local endpoints can save without a key.'
+    : hasKey
+      ? 'Saving in place. Leave the key empty to keep the existing key.'
+      : requiresKey
+        ? 'Saving in place. This profile stays no-key until you paste one.'
+        : 'Custom and local endpoints can save without a key.'
 
   const submit = useCallback(async () => {
     if (!canSave) return
     setBusy(true)
     setError(null)
     try {
-      await updateProfile(profile.id, {
-        name: trimmedName,
-        kind,
-        baseUrl: trimmedBaseUrl,
-      })
-      if (trimmedKey.length > 0) {
-        // createKey is an upsert keyed on id; reusing apiKeyRef rotates the
-        // ciphertext under the same logical key so every profile + chat that
-        // references this id picks up the new secret automatically.
-        await createKey({
-          id: profile.apiKeyRef,
-          name: profile.name,
-          plaintextKey: trimmedKey,
+      const resetModel = kind !== profile.kind || trimmedBaseUrl !== profile.baseUrl
+      if (saveAsNew) {
+        const apiKeyRef =
+          trimmedKey.length > 0
+            ? (
+                await createKey({
+                  name: trimmedName,
+                  plaintextKey: trimmedKey,
+                })
+              ).id
+            : newId()
+        const created = await createProfile({
+          name: trimmedName,
+          kind,
+          baseUrl: trimmedBaseUrl,
+          apiKeyRef,
         })
+        await onDone({ profileId: created.id, activate: true, resetModel })
+      } else {
+        await updateProfile(profile.id, {
+          name: trimmedName,
+          kind,
+          baseUrl: trimmedBaseUrl,
+        })
+        if (trimmedKey.length > 0) {
+          await createKey({
+            id: profile.apiKeyRef,
+            name: trimmedName,
+            plaintextKey: trimmedKey,
+          })
+        }
+        await onDone({ profileId: profile.id, activate: false, resetModel })
       }
-      onDone()
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+    } catch (submitError) {
+      setError(keyErrorMessage(submitError))
     } finally {
       setBusy(false)
     }
   }, [
     canSave,
-    profile.id,
-    profile.apiKeyRef,
-    profile.name,
-    trimmedName,
     kind,
+    onDone,
+    profile.apiKeyRef,
+    profile.baseUrl,
+    profile.id,
+    profile.kind,
+    saveAsNew,
     trimmedBaseUrl,
     trimmedKey,
-    onDone,
+    trimmedName,
   ])
-
-  const submitSaveAs = useCallback(async () => {
-    const trimmedSaveAsName = saveAsName.trim()
-    if (!trimmedSaveAsName || !baseUrlValid || keyMissing) return
-    setBusy(true)
-    setError(null)
-    try {
-      // Always create a fresh key for save-as-new (we don't share the key id
-      // with the original profile, since the user typically uses save-as to
-      // diverge into a separate workspace).
-      const created = await createKey({
-        name: trimmedSaveAsName,
-        plaintextKey: trimmedKey,
-      })
-      const newProfile = await createProfile({
-        name: trimmedSaveAsName,
-        kind,
-        baseUrl: trimmedBaseUrl,
-        apiKeyRef: created.id,
-      })
-      writeActiveProfileId(newProfile.id)
-      onDone()
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setBusy(false)
-    }
-  }, [baseUrlValid, keyMissing, saveAsName, trimmedKey, kind, trimmedBaseUrl, onDone])
-
-  const submitDelete = useCallback(async () => {
-    if (!window.confirm(`Delete connection "${profile.name}"? This cannot be undone.`)) {
-      return
-    }
-    setBusy(true)
-    setError(null)
-    try {
-      await deleteProfile(profile.id, { force: true })
-      onDeleted()
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setBusy(false)
-    }
-  }, [profile.id, profile.name, onDeleted])
-
-  // Track probe state so the user gets feedback on a live test against
-  // whatever baseUrl is currently in the form (not the saved one — the
-  // user typically clicks Test BEFORE saving to verify the URL works).
-  const [probeState, setProbeState] = useState<
-    { kind: 'idle' }
-    | { kind: 'running' }
-    | { kind: 'ok'; message: string }
-    | { kind: 'fail'; message: string }
-  >({ kind: 'idle' })
-  const runProbe = useCallback(async () => {
-    if (!baseUrlValid) return
-    setProbeState({ kind: 'running' })
-    const result = await probeLlamaServer({ baseUrl: trimmedBaseUrl }, { timeoutMs: 3_000 })
-    if (result.kind === 'ok') {
-      const tpl = result.props.chatTemplate
-      const ctx = result.props.defaultContextLength
-      const model = result.props.modelPath
-      const bits = [model ? model.split('/').pop() : null, ctx ? `ctx ${ctx}` : null, tpl ? 'template detected' : null]
-      setProbeState({
-        kind: 'ok',
-        message: `Reached llama-server in ${result.elapsedMs}ms — ${bits.filter(Boolean).join(' · ') || 'OK'}`,
-      })
-    } else {
-      setProbeState({ kind: 'fail', message: `${result.message} (${result.rootUrl}/props)` })
-    }
-  }, [baseUrlValid, trimmedBaseUrl])
 
   return (
     <form
@@ -500,58 +863,162 @@ function ConnectionEditor({ profile, hasKey, onDone, onCancel, onDeleted }: Conn
         void submit()
       }}
     >
+      <ConnectionFormFields
+        prefix="connection-edit"
+        name={name}
+        kind={kind}
+        baseUrl={effectiveBaseUrl}
+        baseUrlValid={baseUrlValid}
+        trimmedBaseUrl={trimmedBaseUrl}
+        keyDraft={keyDraft}
+        keyPlaceholder={keyPlaceholder}
+        keyHelper={keyHelper}
+        requiresKey={requiresKey}
+        onNameChange={setName}
+        onKindChange={(next) => {
+          setKind(next)
+          const nextLock = KIND_LOCKED_BASE_URL[next]
+          if (nextLock !== null) {
+            setBaseUrl(nextLock)
+            return
+          }
+          setBaseUrl(nextBaseUrlForKind(kind, next, baseUrl))
+        }}
+        onBaseUrlChange={setBaseUrl}
+        onKeyChange={setKeyDraft}
+      />
+      <div data-ui="connection-actions">
+        <div data-ui="connection-actions-leading">
+          <button
+            type="button"
+            data-ui="connection-test"
+            onClick={() => void runProbe()}
+            disabled={busy || !baseUrlValid}
+          >
+            {probeState.kind === 'running' ? 'Testing…' : 'Test'}
+          </button>
+        </div>
+        <div data-ui="connection-actions-trailing">
+          <button
+            type="button"
+            data-ui="connection-delete"
+            data-role="connection-delete"
+            onClick={() => void onDelete()}
+            disabled={busy || deleteBusy}
+            aria-label="Delete connection"
+            title="Delete connection"
+          >
+            <TrashIcon size={13} />
+          </button>
+          <button
+            type="button"
+            data-ui="connection-edit-cancel"
+            onClick={onCancel}
+            disabled={busy}
+          >
+            Cancel
+          </button>
+          <button type="submit" data-ui="connection-edit-save" disabled={!canSave}>
+            {busy ? 'Saving…' : 'Save'}
+          </button>
+        </div>
+      </div>
+      <ConnectionProbeMessage state={probeState} />
+      {error ? (
+        <p data-ui="helper" data-validation="invalid" role="alert">
+          {error}
+        </p>
+      ) : null}
+    </form>
+  )
+}
+
+function ConnectionProbeMessage({ state }: { state: ProbeState }) {
+  if (state.kind === 'idle' || state.kind === 'running') return null
+  return (
+    <p
+      data-ui="helper"
+      data-validation={state.kind === 'ok' ? 'ok' : 'invalid'}
+      role={state.kind === 'fail' ? 'status' : undefined}
+    >
+      {state.message}
+    </p>
+  )
+}
+
+interface ConnectionFormFieldsProps {
+  prefix: 'connection-edit' | 'connection-setup'
+  name: string
+  kind: ConnectionKind
+  baseUrl: string
+  baseUrlValid: boolean
+  trimmedBaseUrl: string
+  keyDraft: string
+  keyPlaceholder: string
+  keyHelper: string
+  requiresKey: boolean
+  onNameChange: (value: string) => void
+  onKindChange: (value: ConnectionKind) => void
+  onBaseUrlChange: (value: string) => void
+  onKeyChange: (value: string) => void
+}
+
+function ConnectionFormFields({
+  prefix,
+  name,
+  kind,
+  baseUrl,
+  baseUrlValid,
+  trimmedBaseUrl,
+  keyDraft,
+  keyPlaceholder,
+  keyHelper,
+  requiresKey,
+  onNameChange,
+  onKindChange,
+  onBaseUrlChange,
+  onKeyChange,
+}: ConnectionFormFieldsProps) {
+  const baseUrlIsLocked = KIND_LOCKED_BASE_URL[kind] !== null
+
+  return (
+    <>
       <div data-ui="field-group">
-        <label htmlFor="connection-edit-name">Name</label>
+        <label htmlFor={`${prefix}-name`}>Name</label>
         <input
-          id="connection-edit-name"
-          data-ui="connection-edit-name"
+          id={`${prefix}-name`}
+          data-ui={`${prefix}-name`}
           type="text"
           value={name}
-          onChange={(e) => setName(e.target.value)}
+          onChange={(e) => onNameChange(e.target.value)}
           maxLength={80}
         />
       </div>
       <div data-ui="field-group">
-        <label htmlFor="connection-edit-kind">Provider</label>
+        <label htmlFor={`${prefix}-kind`}>Provider</label>
         <select
-          id="connection-edit-kind"
-          data-ui="connection-edit-kind"
+          id={`${prefix}-kind`}
+          data-ui={`${prefix}-kind`}
           value={kind}
-          onChange={(e) => {
-            const next = e.target.value as ConnectionKind
-            const prevLock = KIND_LOCKED_BASE_URL[kind]
-            setKind(next)
-            const nextLock = KIND_LOCKED_BASE_URL[next]
-            if (nextLock !== null) {
-              // Snap base URL to the canonical endpoint for the new
-              // provider so the locked field stays consistent.
-              setBaseUrl(nextLock)
-            } else if (prevLock !== null) {
-              // Previous kind was locked; swap to the default for the
-              // new kind instead of carrying an irrelevant URL like
-              // https://openrouter.ai/api/v1 over to a llama-server
-              // profile.
-              setBaseUrl(KIND_DEFAULT_BASE_URL[next])
-            }
-          }}
+          onChange={(e) => onKindChange(e.target.value as ConnectionKind)}
         >
-          {KIND_ORDER.map((k) => (
-            <option key={k} value={k}>
-              {KIND_LABEL[k]}
+          {KIND_ORDER.map((value) => (
+            <option key={value} value={value}>
+              {KIND_LABEL[value]}
             </option>
           ))}
         </select>
       </div>
       {baseUrlIsLocked ? null : (
         <div data-ui="field-group">
-          <label htmlFor="connection-edit-base-url">Base URL</label>
+          <label htmlFor={`${prefix}-base-url`}>Base URL</label>
           <input
-            id="connection-edit-base-url"
-            data-ui="connection-edit-base-url"
+            id={`${prefix}-base-url`}
+            data-ui={`${prefix}-base-url`}
             type="text"
             inputMode="url"
-            value={effectiveBaseUrl}
-            onChange={(e) => setBaseUrl(e.target.value)}
+            value={baseUrl}
+            onChange={(e) => onBaseUrlChange(e.target.value)}
             aria-invalid={trimmedBaseUrl.length > 0 && !baseUrlValid}
           />
           {trimmedBaseUrl.length > 0 && !baseUrlValid ? (
@@ -562,163 +1029,67 @@ function ConnectionEditor({ profile, hasKey, onDone, onCancel, onDeleted }: Conn
         </div>
       )}
       <div data-ui="field-group">
-        <label htmlFor="connection-edit-key">
+        <label htmlFor={`${prefix}-key`}>
           API key{!requiresKey ? <em> (optional)</em> : null}
         </label>
         <input
-          id="connection-edit-key"
-          data-ui="connection-edit-key"
+          id={`${prefix}-key`}
+          data-ui={`${prefix}-key`}
           type="password"
           autoComplete="off"
           spellCheck={false}
-          placeholder={
-            allowEmptyKey
-              ? 'Leave empty to keep existing key'
-              : requiresKey
-                ? 'Paste API key'
-                : 'Optional — leave empty for no key'
-          }
+          placeholder={keyPlaceholder}
           value={keyDraft}
-          onChange={(e) => setKeyDraft(e.target.value)}
+          onChange={(e) => onKeyChange(e.target.value)}
         />
-        <span data-ui="helper">
-          {requiresKey
-            ? 'The key is stored locally and never displayed back, even to you.'
-            : 'Custom endpoints can save without a key (e.g. local servers).'}
-        </span>
+        <span data-ui="helper">{keyHelper}</span>
       </div>
-      {kind === 'llama-server' ? (
-        <div data-ui="field-group">
-          <button
-            type="button"
-            data-ui="connection-edit-probe"
-            onClick={() => void runProbe()}
-            disabled={!baseUrlValid || probeState.kind === 'running'}
-          >
-            {probeState.kind === 'running' ? 'Testing…' : 'Test connection'}
-          </button>
-          {probeState.kind === 'ok' ? (
-            <span data-ui="helper" data-validation="ok">
-              {probeState.message}
-            </span>
-          ) : probeState.kind === 'fail' ? (
-            <span data-ui="helper" data-validation="invalid" role="status">
-              {probeState.message}
-            </span>
-          ) : (
-            <span data-ui="helper">
-              GETs <code>/props</code> on the server root to confirm reachability and read the GGUF's
-              chat template.
-            </span>
-          )}
-        </div>
-      ) : null}
-      {error ? (
-        <p data-ui="helper" data-validation="invalid" role="alert">
-          {error}
-        </p>
-      ) : null}
-      {saveAsOpen ? (
-        <div data-ui="field-group">
-          <label htmlFor="connection-save-as-name">New profile name</label>
-          <input
-            id="connection-save-as-name"
-            data-ui="connection-save-as-name"
-            type="text"
-            placeholder="e.g. OpenRouter (work key)"
-            value={saveAsName}
-            onChange={(e) => setSaveAsName(e.target.value)}
-            maxLength={80}
-          />
-        </div>
-      ) : null}
-      <div data-ui="connection-actions">
-        <button
-          type="button"
-          data-ui="connection-edit-delete"
-          onClick={() => void submitDelete()}
-          disabled={busy}
-        >
-          Delete
-        </button>
-        <span data-ui="connection-actions-spacer" />
-        {saveAsOpen ? (
-          <>
-            <button
-              type="button"
-              data-ui="connection-edit-cancel"
-              onClick={() => setSaveAsOpen(false)}
-              disabled={busy}
-            >
-              Cancel save-as
-            </button>
-            <button
-              type="button"
-              data-ui="connection-edit-save"
-              onClick={() => void submitSaveAs()}
-              disabled={busy || !saveAsName.trim() || !baseUrlValid || keyMissing}
-            >
-              {busy ? 'Saving…' : 'Save as new'}
-            </button>
-          </>
-        ) : (
-          <>
-            <button
-              type="button"
-              data-ui="connection-save-as"
-              onClick={() => {
-                setSaveAsName(`${profile.name} (copy)`)
-                setSaveAsOpen(true)
-              }}
-              disabled={busy}
-            >
-              Save as new…
-            </button>
-            <button
-              type="button"
-              data-ui="connection-edit-cancel"
-              onClick={onCancel}
-              disabled={busy}
-            >
-              Cancel
-            </button>
-            <button type="submit" data-ui="connection-edit-save" disabled={!canSave}>
-              {busy ? 'Saving…' : 'Save'}
-            </button>
-          </>
-        )}
-      </div>
-    </form>
+    </>
   )
 }
 
-function hostFor(url: string): string {
-  try {
-    return new URL(url).host
-  } catch {
-    return url
-  }
-}
-
-function isValidHttpUrl(value: string): boolean {
-  if (!value) return false
-  try {
-    const parsed = new URL(value)
-    return parsed.protocol === 'http:' || parsed.protocol === 'https:'
-  } catch {
-    return false
-  }
-}
-
 interface ConnectionSetupModalProps {
+  hasExistingConnections: boolean
   onClose: () => void
+  onSaved: (result: ConnectionSaveResult) => void | Promise<void>
 }
 
-function ConnectionSetupModal({ onClose }: ConnectionSetupModalProps) {
-  const [apiKey, setApiKey] = useState('')
+function ConnectionSetupModal({
+  hasExistingConnections,
+  onClose,
+  onSaved,
+}: ConnectionSetupModalProps) {
+  const [name, setName] = useState(KIND_DEFAULT_NAME.openrouter)
+  const [kind, setKind] = useState<ConnectionKind>('openrouter')
+  const [baseUrl, setBaseUrl] = useState(KIND_DEFAULT_BASE_URL.openrouter)
+  const [keyDraft, setKeyDraft] = useState('')
+  const [nameTouched, setNameTouched] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const trimmed = apiKey.trim()
+  const [probeState, setProbeState] = useState<ProbeState>({ kind: 'idle' })
+
+  const trimmedName = name.trim()
+  const trimmedKey = keyDraft.trim()
+  const lockedBaseUrl = KIND_LOCKED_BASE_URL[kind]
+  const baseUrlIsLocked = lockedBaseUrl !== null
+  const effectiveBaseUrl = baseUrlIsLocked ? (lockedBaseUrl ?? '') : baseUrl
+  const trimmedBaseUrl = effectiveBaseUrl.trim()
+  const baseUrlValid = useMemo(() => isValidHttpUrl(trimmedBaseUrl), [trimmedBaseUrl])
+  const requiresKey = kindRequiresKey(kind)
+  const mustProvideKey = requiresKey && !hasExistingConnections
+  const canSave =
+    baseUrlValid && trimmedName.length > 0 && (!mustProvideKey || trimmedKey.length > 0) && !busy
+  const keyPlaceholder = mustProvideKey
+    ? 'Paste API key'
+    : requiresKey
+      ? 'Optional — leave empty to save without a key'
+      : 'Optional — leave empty for no key'
+  const keyHelper = mustProvideKey
+    ? 'The first hosted connection must include a key so the app can talk to it.'
+    : requiresKey
+      ? 'Hosted providers can save without a key, but sends and tests stay blocked until you add one.'
+      : 'Custom and local endpoints can save without a key.'
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
@@ -729,22 +1100,78 @@ function ConnectionSetupModal({ onClose }: ConnectionSetupModalProps) {
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [onClose])
+
+  useEffect(() => {
+    setProbeState({ kind: 'idle' })
+  }, [trimmedName, kind, trimmedBaseUrl, trimmedKey])
+
+  const onKindChange = useCallback(
+    (next: ConnectionKind) => {
+      const previousDefault = KIND_DEFAULT_NAME[kind]
+      setKind(next)
+      const nextLock = KIND_LOCKED_BASE_URL[next]
+      setBaseUrl(nextLock ?? nextBaseUrlForKind(kind, next, baseUrl))
+      if (!nameTouched || name.trim() === previousDefault) {
+        setName(KIND_DEFAULT_NAME[next])
+      }
+    },
+    [baseUrl, kind, name, nameTouched],
+  )
+
+  const runProbe = useCallback(async () => {
+    setProbeState({ kind: 'running' })
+    setProbeState(
+      await runConnectionTest({
+        kind,
+        name: trimmedName || KIND_DEFAULT_NAME[kind],
+        baseUrl: trimmedBaseUrl,
+        apiKey: trimmedKey.length > 0 ? trimmedKey : null,
+      }),
+    )
+  }, [kind, trimmedName, trimmedBaseUrl, trimmedKey])
+
   const submit = useCallback(async () => {
-    if (!trimmed || busy) return
+    if (!canSave) return
     setBusy(true)
     setError(null)
     try {
-      await runFirstRunSeed({
-        apiKey: trimmed,
-        model: 'google/gemini-3.1-flash-lite-preview',
+      const now = Date.now()
+      const apiKeyRef =
+        trimmedKey.length > 0
+          ? (
+              await createKey({
+                name: trimmedName,
+                plaintextKey: trimmedKey,
+                now,
+              })
+            ).id
+          : newId()
+      const profile = await createProfile({
+        name: trimmedName,
+        kind,
+        baseUrl: trimmedBaseUrl,
+        apiKeyRef,
+        now,
       })
-      onClose()
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      if (!hasExistingConnections) {
+        const settings = cloneDefaultChatSettings()
+        settings.profileId = profile.id
+        await createPreset({
+          name: `${profile.name} default`,
+          connectionProfileId: profile.id,
+          settings,
+          lastUsedAt: now,
+          now,
+        })
+      }
+      await onSaved({ profileId: profile.id, activate: true, resetModel: true })
+    } catch (submitError) {
+      setError(keyErrorMessage(submitError))
     } finally {
       setBusy(false)
     }
-  }, [trimmed, busy, onClose])
+  }, [canSave, hasExistingConnections, kind, onSaved, trimmedBaseUrl, trimmedKey, trimmedName])
+
   return (
     <div
       data-ui="connection-setup-overlay"
@@ -779,34 +1206,57 @@ function ConnectionSetupModal({ onClose }: ConnectionSetupModalProps) {
           </button>
         </header>
         <div data-ui="settings-section">
-          <h3>OpenRouter</h3>
-          <p data-ui="helper">
-            Paste an OpenRouter API key. The first connection is created automatically; you can add
-            more from the connection header dropdown once it's set up.
-          </p>
-          <div data-ui="field-group">
-            <label htmlFor="connection-setup-key">API key</label>
-            <input
-              id="connection-setup-key"
-              data-ui="connection-setup-key"
-              type="password"
-              autoComplete="off"
-              spellCheck={false}
-              value={apiKey}
-              onChange={(e) => setApiKey(e.target.value)}
-            />
+          <ConnectionFormFields
+            prefix="connection-setup"
+            name={name}
+            kind={kind}
+            baseUrl={effectiveBaseUrl}
+            baseUrlValid={baseUrlValid}
+            trimmedBaseUrl={trimmedBaseUrl}
+            keyDraft={keyDraft}
+            keyPlaceholder={keyPlaceholder}
+            keyHelper={keyHelper}
+            requiresKey={requiresKey}
+            onNameChange={(value) => {
+              setName(value)
+              setNameTouched(true)
+            }}
+            onKindChange={onKindChange}
+            onBaseUrlChange={setBaseUrl}
+            onKeyChange={setKeyDraft}
+          />
+          <div data-ui="connection-actions">
+            <div data-ui="connection-actions-leading">
+              <button
+                type="button"
+                data-ui="connection-test"
+                onClick={() => void runProbe()}
+                disabled={busy || !baseUrlValid}
+              >
+                {probeState.kind === 'running' ? 'Testing…' : 'Test'}
+              </button>
+            </div>
+            <div data-ui="connection-actions-trailing">
+              <button
+                type="button"
+                data-ui="connection-edit-cancel"
+                onClick={onClose}
+                disabled={busy}
+              >
+                Cancel
+              </button>
+              <button type="submit" data-ui="connection-setup-submit" disabled={!canSave}>
+                {busy ? 'Saving…' : 'Save'}
+              </button>
+            </div>
           </div>
-        </div>
-        <footer>
+          <ConnectionProbeMessage state={probeState} />
           {error ? (
             <span data-ui="helper" data-validation="invalid" role="alert">
               {error}
             </span>
           ) : null}
-          <button type="submit" data-ui="connection-setup-submit" disabled={busy || !trimmed}>
-            {busy ? 'Saving…' : 'Save'}
-          </button>
-        </footer>
+        </div>
       </form>
     </div>
   )

@@ -19,8 +19,9 @@ import { fetchModels, type ModelsQueryString } from '../api/models'
 import { type ModelListEntry, normalizeModelsResponse } from '../api/providers'
 import { listBundledEntries } from '../capabilities'
 import type { ConnectionProfile, ModelsQuery, ProfileId } from '../core/types'
-import { resolveKey } from '../store/keys'
+import { resolveKeyIfPresent } from '../store/keys'
 import {
+  clearCachedModels,
   dedupedModelsFetch,
   getCachedModels,
   isFresh,
@@ -40,6 +41,16 @@ export interface UseModelsResult {
   offline: boolean
   error: string | null
   refresh: () => void
+}
+
+function canonicalCompatId(modelId: string): string {
+  return modelId.replace(/(\d)[.-](\d)(?=-|$)/g, '$1:$2')
+}
+
+function compatIdMatches(a: string, b: string): boolean {
+  const left = canonicalCompatId(a)
+  const right = canonicalCompatId(b)
+  return left === right || left.startsWith(`${right}-`) || right.startsWith(`${left}-`)
 }
 
 function toQueryString(query: ModelsQuery): ModelsQueryString {
@@ -96,6 +107,10 @@ export function useModels(
         await dedupedModelsFetch(profile.id, query, () => loadModelsPayload(profile, query))
       } catch (err) {
         if (cancelled) return
+        if (profile.kind === 'llama-server') {
+          await clearCachedModels(profile.id, query)
+          if (cancelled) return
+        }
         setError(err instanceof Error ? err.message : 'refresh failed')
       } finally {
         if (!cancelled) setInFlight(false)
@@ -127,7 +142,7 @@ export function useModels(
 }
 
 async function loadModelsPayload(profile: ConnectionProfile, query: ModelsQuery): Promise<unknown> {
-  const apiKey = await resolveKey(profile.apiKeyRef)
+  const apiKey = (await resolveKeyIfPresent(profile.apiKeyRef)) ?? ''
   return fetchModels({ profile, apiKey }, toQueryString(query))
 }
 
@@ -149,7 +164,11 @@ function mergeBundledModels(profile: ConnectionProfile, live: ModelListEntry[]):
   const out: ModelListEntry[] = []
   const seen = new Set<string>()
   for (const entry of bundled) {
-    const hit = liveById.get(entry.id) ?? liveBySuffix.get(entry.id) ?? null
+    const hit =
+      liveById.get(entry.id) ??
+      liveBySuffix.get(entry.id) ??
+      live.find((row) => compatIdMatches(row.id, entry.id)) ??
+      null
     const merged: ModelListEntry = hit
       ? {
           ...hit,

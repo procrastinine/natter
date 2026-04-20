@@ -43,6 +43,15 @@ export async function clearModelsCacheForProfile(profileId: ProfileId): Promise<
   postEvent({ kind: 'models-refreshed', profileId })
 }
 
+export async function clearCachedModels(
+  profileId: ProfileId,
+  query: ModelsQuery,
+): Promise<void> {
+  const queryKey = modelsCacheKey(query)
+  await getDb().models.delete([profileId, queryKey])
+  postEvent({ kind: 'models-refreshed', profileId })
+}
+
 export async function getCachedEndpoints(
   profileId: ProfileId,
   modelId: string,

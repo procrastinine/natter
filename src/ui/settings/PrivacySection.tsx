@@ -4,13 +4,12 @@
 // axes the picker itself can't surface:
 //   - `paretoFilter` — turn off the tier-based auto-exclusion
 //   - `zdrOnly` — route only through ZDR-tagged endpoints
-//   - `allowFallbacks` — OpenRouter auto-cascade when the first choice
-//     returns 5xx or is rate-limited
-// These all live in `chat.settings.privacy` / `providerPrefs`. Hidden
-// entirely on non-OpenRouter connections because none apply there.
+//   - `allowFallbacks` — provider-only retry within the current allowed set
+// These live in `chat.settings.privacy` / `chat.settings.allowFallbacks`.
+// Hidden entirely on non-OpenRouter connections because none apply there.
 
 import { useCallback } from 'react'
-import type { Chat, ProviderPreferences } from '../../core/types'
+import type { Chat } from '../../core/types'
 import { updateChatSettings } from '../../store/chats'
 
 export interface PrivacySectionProps {
@@ -47,8 +46,12 @@ export function PrivacySection({ chat }: PrivacySectionProps) {
   )
   const setAllowFallbacks = useCallback(
     (on: boolean) => {
-      const next: ProviderPreferences = { ...prefs, allowFallbacks: on }
-      void updateChatSettings(chat.id, { providerPrefs: next })
+      const nextPrefs = { ...prefs } as typeof prefs & { allowFallbacks?: boolean }
+      delete nextPrefs.allowFallbacks
+      void updateChatSettings(chat.id, {
+        allowFallbacks: on,
+        providerPrefs: nextPrefs,
+      })
     },
     [chat.id, prefs],
   )
@@ -113,14 +116,16 @@ export function PrivacySection({ chat }: PrivacySectionProps) {
           <label data-ui="privacy-toggle">
             <input
               type="checkbox"
-              checked={prefs.allowFallbacks !== false}
+              checked={chat.settings.allowFallbacks !== false}
               onChange={(e) => setAllowFallbacks(e.target.checked)}
             />
             <span>
-              <strong>Allow fallbacks</strong>
+              <strong>Allow provider fallbacks</strong>
               <span data-ui="helper">
-                OpenRouter can cascade to the next allowed provider on 5xx /
-                rate-limit. Off = fail fast to the first choice.
+                Retry another allowed provider for this same model when the
+                first eligible provider fails or rate-limits. Never bypasses
+                your allowed, ignored, or privacy-filtered provider set. Off =
+                fail on the first eligible provider.
               </span>
             </span>
           </label>

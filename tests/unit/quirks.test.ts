@@ -22,6 +22,11 @@ describe('quirks registry', () => {
     expect(a.adaptiveReasoningOnly).toBe(true)
   })
 
+  it('treats Anthropic compatibility ids with hyphens as the same model', () => {
+    expect(quirksFor('anthropic/claude-opus-4-7')).toEqual(quirksFor('anthropic/claude-opus-4.7'))
+    expect(allowedEffortFor('claude-sonnet-4-6')).toEqual([])
+  })
+
   it('adaptive-only models narrow allowedEffort to []', () => {
     expect(allowedEffortFor('anthropic/claude-opus-4.7')).toEqual([])
     expect(allowedEffortFor('claude-sonnet-4.6')).toEqual([])

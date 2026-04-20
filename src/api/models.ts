@@ -21,19 +21,27 @@ export interface DiscoveryContext {
 }
 
 function modelsUrl(profile: ConnectionProfile, query: ModelsQueryString): string {
-  const base = profile.baseUrl.replace(/\/+$/, '')
+  const base = normalizedBaseUrl(profile)
   const search = stringifyQuery(query)
   return search ? `${base}/models?${search}` : `${base}/models`
 }
 
 function endpointsUrl(profile: ConnectionProfile, modelId: string): string {
-  const base = profile.baseUrl.replace(/\/+$/, '')
+  const base = normalizedBaseUrl(profile)
   return `${base}/models/${modelId}/endpoints`
 }
 
 function providersUrl(profile: ConnectionProfile): string {
-  const base = profile.baseUrl.replace(/\/+$/, '')
+  const base = normalizedBaseUrl(profile)
   return `${base}/providers`
+}
+
+function normalizedBaseUrl(profile: ConnectionProfile): string {
+  const base = profile.baseUrl.replace(/\/+$/, '')
+  if (profile.kind === 'google' && !/\/openai$/i.test(base)) {
+    return `${base}/openai`
+  }
+  return base
 }
 
 export interface ModelsQueryString {

@@ -45,13 +45,25 @@ function stripPrefix(modelId: string): string {
   return slash >= 0 ? modelId.slice(slash + 1) : modelId
 }
 
+function canonicalCompatId(modelId: string): string {
+  return stripPrefix(modelId).replace(/(\d)[.-](\d)(?=-|$)/g, '$1:$2')
+}
+
+function compatIdMatches(a: string, b: string): boolean {
+  const left = canonicalCompatId(a)
+  const right = canonicalCompatId(b)
+  return left === right || left.startsWith(`${right}-`) || right.startsWith(`${left}-`)
+}
+
 export function lookupBundledEntry(
   kind: ConnectionKind,
   modelId: string,
 ): BundledModelEntry | undefined {
   const table = tableFor(kind)
   if (!table) return undefined
-  return table[modelId] ?? table[stripPrefix(modelId)]
+  const direct = table[modelId] ?? table[stripPrefix(modelId)]
+  if (direct) return direct
+  return Object.values(table).find((entry) => compatIdMatches(entry.id, modelId))
 }
 
 export function listBundledEntries(kind: ConnectionKind): BundledModelEntry[] {

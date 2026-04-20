@@ -167,17 +167,23 @@ const REGISTRY: Record<string, QuirksEntry> = {
 
 const REGISTRY_KEYS_BY_LENGTH = Object.keys(REGISTRY).sort((a, b) => b.length - a.length)
 
+function canonicalCompatId(modelId: string): string {
+  return modelId.replace(/(\d)[.-](\d)(?=-|$)/g, '$1:$2')
+}
+
 // Strip the provider prefix ("anthropic/claude-opus-4.7" → "claude-opus-4.7")
 // and then scan the registry for the longest matching key.
 function normalizeModelId(modelId: string): string {
   const slash = modelId.indexOf('/')
-  return slash >= 0 ? modelId.slice(slash + 1) : modelId
+  const stripped = slash >= 0 ? modelId.slice(slash + 1) : modelId
+  return canonicalCompatId(stripped)
 }
 
 export function quirksFor(modelId: string): QuirksEntry {
   const normalized = normalizeModelId(modelId)
   for (const key of REGISTRY_KEYS_BY_LENGTH) {
-    if (normalized === key || normalized.startsWith(`${key}-`)) {
+    const normalizedKey = canonicalCompatId(key)
+    if (normalized === normalizedKey || normalized.startsWith(`${normalizedKey}-`)) {
       const entry = REGISTRY[key]
       if (entry) return entry
     }

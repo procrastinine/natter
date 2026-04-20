@@ -44,6 +44,13 @@ export interface ContinueInPlaceInput {
   }) => AsyncIterable<ChatStreamChunk>
 }
 
+function rewriteCompatibleModelId(connection: ConnectionProfile, modelId: string): string {
+  if (connection.kind === 'anthropic') {
+    return modelId.replace(/(\d)\.(\d)(?=-|$)/g, '$1-$2')
+  }
+  return modelId
+}
+
 export async function continueAssistantInPlace(input: ContinueInPlaceInput): Promise<void> {
   const now = input.now ?? Date.now
   const repo = getBrowserRepository()
@@ -100,6 +107,7 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
 
   const transformOpts: ChatCompletionsTransformOptions = {
     stream: true,
+    rewriteSlug: (slug) => rewriteCompatibleModelId(input.connection, slug),
   }
   const { wire, requestedModel } = toChatCompletions(settingsForContinue, upstream, transformOpts)
   void requestedModel

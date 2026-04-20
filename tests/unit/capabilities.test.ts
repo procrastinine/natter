@@ -181,6 +181,79 @@ describe('resolveBundledCapability', () => {
     // Override does not wipe the bundled completion pricing:
     expect(cap.pricing?.completion).toBe('0.00001')
   })
+
+  it('matches Anthropic compatibility ids that use hyphens instead of dots', () => {
+    const cap = resolveBundledCapability(
+      {
+        id: 'p',
+        name: 'Anthropic',
+        kind: 'anthropic',
+        baseUrl: 'https://api.anthropic.com/v1',
+        apiKeyRef: 'k',
+        defaultHeaders: {},
+        appTitle: '',
+        appUrl: '',
+        usesResponsesApiByDefault: false,
+        supportsEndpointsApi: false,
+        supportsGenerationApi: false,
+        supportsPrivacyScrape: false,
+        createdAt: 0,
+        updatedAt: 0,
+      },
+      'claude-opus-4-7',
+    )
+    expect(cap.supportedParameters).toContain('thinking')
+    expect(cap.maxCompletionTokens).toBe(32000)
+  })
+
+  it('matches versioned Anthropic compatibility ids instead of falling back to custom defaults', () => {
+    const cap = resolveBundledCapability(
+      {
+        id: 'p',
+        name: 'Anthropic',
+        kind: 'anthropic',
+        baseUrl: 'https://api.anthropic.com/v1',
+        apiKeyRef: 'k',
+        defaultHeaders: {},
+        appTitle: '',
+        appUrl: '',
+        usesResponsesApiByDefault: false,
+        supportsEndpointsApi: false,
+        supportsGenerationApi: false,
+        supportsPrivacyScrape: false,
+        createdAt: 0,
+        updatedAt: 0,
+      },
+      'claude-haiku-4-5-20251001',
+    )
+    expect(cap.supportedParameters).not.toContain('reasoning')
+    expect(cap.supportedParameters).toContain('stop_sequences')
+    expect(cap.maxCompletionTokens).toBe(8192)
+  })
+
+  it('does not advertise unsupported reasoning controls on Google direct', () => {
+    const cap = resolveBundledCapability(
+      {
+        id: 'p',
+        name: 'Google',
+        kind: 'google',
+        baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',
+        apiKeyRef: 'k',
+        defaultHeaders: {},
+        appTitle: '',
+        appUrl: '',
+        usesResponsesApiByDefault: false,
+        supportsEndpointsApi: false,
+        supportsGenerationApi: false,
+        supportsPrivacyScrape: false,
+        createdAt: 0,
+        updatedAt: 0,
+      },
+      'gemini-2.5-flash',
+    )
+    expect(cap.supportedParameters).not.toContain('reasoning')
+    expect(cap.supportedParameters).not.toContain('thinking')
+  })
 })
 
 describe('validateChatSettings', () => {

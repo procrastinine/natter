@@ -26,7 +26,6 @@ describe('Phase 0 type additions', () => {
 
   it('ProviderPreferences covers routing + sort + budget axes', () => {
     expectTypeOf<ProviderPreferences['order']>().toEqualTypeOf<string[] | undefined>()
-    expectTypeOf<ProviderPreferences['allowFallbacks']>().toEqualTypeOf<boolean | undefined>()
     expectTypeOf<ProviderPreferences['requireParameters']>().toEqualTypeOf<boolean | undefined>()
     expectTypeOf<ProviderPreferences['dataCollection']>().toEqualTypeOf<
       'allow' | 'deny' | undefined

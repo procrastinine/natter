@@ -376,9 +376,9 @@ function buildProviderBlock(
     if (privacy.zdr) base.zdr = privacy.zdr
   }
   // `allowFallbacks` is a top-level ChatSettings knob (stored separately
-  // from `providerPrefs` because it's not a routing preference — it's a
-  // "may my request be served by the model I didn't pick?" decision).
-  // Emit it unconditionally when the user has set one.
+  // from `providerPrefs` because it's not a provider preference — it's a
+  // "may OpenRouter retry another allowed provider for this model?"
+  // decision).
   if (settings.allowFallbacks === false) base.allow_fallbacks = false
   if (isFreeModel(settings.model)) {
     // Free-model exception. OpenRouter ignores these fields on `*:free`
@@ -398,7 +398,6 @@ function toWireProviderPrefs(
 ): Record<string, unknown> {
   const wire: Record<string, unknown> = {}
   if (prefs.order) wire.order = [...prefs.order]
-  if (prefs.allowFallbacks !== undefined) wire.allow_fallbacks = prefs.allowFallbacks
   if (prefs.requireParameters !== undefined) {
     wire.require_parameters = prefs.requireParameters
   }

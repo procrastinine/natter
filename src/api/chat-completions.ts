@@ -31,8 +31,16 @@ export interface ChatCompletionsContext {
 }
 
 function chatCompletionsUrl(profile: ConnectionProfile): string {
-  const base = profile.baseUrl.replace(/\/+$/, '')
+  const base = normalizedBaseUrl(profile)
   return `${base}/chat/completions`
+}
+
+function normalizedBaseUrl(profile: ConnectionProfile): string {
+  const base = profile.baseUrl.replace(/\/+$/, '')
+  if (profile.kind === 'google' && !/\/openai$/i.test(base)) {
+    return `${base}/openai`
+  }
+  return base
 }
 
 async function dispatch(

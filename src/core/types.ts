@@ -232,7 +232,6 @@ export type PercentileBucket = {
 
 export interface ProviderPreferences {
   order?: string[]
-  allowFallbacks?: boolean
   requireParameters?: boolean
   dataCollection?: 'allow' | 'deny'
   zdr?: boolean

@@ -31,7 +31,7 @@ import type {
 } from '../core/types'
 import { getBrowserRepository } from '../store/browser-repo'
 import { getChat, loadChatMessages } from '../store/chats'
-import { resolveKey } from '../store/keys'
+import { resolveKeyIfPresent } from '../store/keys'
 import { bumpPresetLastUsedAt } from '../store/presets'
 import { bumpProfileLastUsedAt, getProfile } from '../store/profiles'
 import { writeTextInto } from '../ui/chat/InlineEditor'
@@ -96,7 +96,10 @@ async function resolveActiveConnection(
   const profile = await getProfile(chat.settings.profileId)
   if (!profile) return { ok: false, reason: 'profile-missing' }
   try {
-    const apiKey = await resolveKey(profile.apiKeyRef)
+    const apiKey = (await resolveKeyIfPresent(profile.apiKeyRef)) ?? ''
+    if (profile.kind !== 'custom' && profile.kind !== 'llama-server' && !apiKey) {
+      return { ok: false, reason: 'missing-key' }
+    }
     return {
       ok: true,
       profile,
@@ -128,21 +131,15 @@ export async function editAndResend(
     role: originalUser.role,
     origin: 'user',
   })
-  try {
-    const result = await ctx.sendFrom({
-      chatId: ctx.chatId,
-      connection: conn.profile,
-      apiKey: conn.apiKey,
-      parentMessageId: inserted.messageId,
-    })
-    await bumpProfileLastUsedAt(conn.profile.id)
-    if (conn.presetId) await bumpPresetLastUsedAt(conn.presetId)
-    return result
-  } catch (err) {
-    // The user sibling has already landed; leave it in place — the user
-    // can retry "Regenerate" on it. Surface the original error.
-    throw err
-  }
+  const result = await ctx.sendFrom({
+    chatId: ctx.chatId,
+    connection: conn.profile,
+    apiKey: conn.apiKey,
+    parentMessageId: inserted.messageId,
+  })
+  await bumpProfileLastUsedAt(conn.profile.id)
+  if (conn.presetId) await bumpPresetLastUsedAt(conn.presetId)
+  return result
 }
 
 export async function regenerateFromMessage(

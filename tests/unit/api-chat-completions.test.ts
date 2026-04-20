@@ -197,6 +197,40 @@ describe('chatCompletions', () => {
       }
     }).rejects.toBeInstanceOf(ApiError)
   })
+
+  it('normalizes legacy Google compatibility profiles onto /openai/chat/completions', async () => {
+    const fetchMock = vi.fn(() =>
+      Promise.resolve(
+        jsonResponse({
+          id: 'gen-g',
+          choices: [{ finish_reason: 'stop', message: { content: 'hi' } }],
+        }),
+      ),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+    await chatCompletionsOnce(
+      {
+        profile: makeProfile({
+          kind: 'google',
+          baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+        }),
+        apiKey: 'gemini-key',
+      },
+      {
+        model: 'gemini-3-flash-preview',
+        messages: [],
+        stream: true,
+      },
+    )
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    const firstCall = fetchMock.mock.calls[0]
+    expect(firstCall).toBeDefined()
+    const [url, init] = firstCall as unknown as [string, RequestInit | undefined]
+    expect(url).toBe('https://generativelanguage.googleapis.com/v1beta/openai/chat/completions')
+    const headers = init?.headers as Record<string, string>
+    expect(headers.Authorization).toBe('Bearer gemini-key')
+    expect(headers['X-OpenRouter-Title']).toBeUndefined()
+  })
 })
 
 describe('chatCompletionsOnce', () => {

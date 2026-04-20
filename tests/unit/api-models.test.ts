@@ -157,6 +157,22 @@ describe('fetch adapters', () => {
     expect(headers.Authorization).toBe('Bearer sk-test')
   })
 
+  it('normalizes legacy Google compatibility profiles onto /openai/models', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(jsonResponse({ data: [] }))
+    await fetchModels({
+      profile: makeProfile({
+        kind: 'google',
+        baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+      }),
+      apiKey: 'gemini-key',
+    })
+    const [url, init] = fetchSpy.mock.calls[0] ?? []
+    expect(url).toBe('https://generativelanguage.googleapis.com/v1beta/openai/models')
+    const headers = (init as RequestInit).headers as Record<string, string>
+    expect(headers.Authorization).toBe('Bearer gemini-key')
+    expect(headers['X-OpenRouter-Title']).toBeUndefined()
+  })
+
   it('fetchEndpoints uses the model id in the URL', async () => {
     const fetchSpy = vi
       .spyOn(globalThis, 'fetch')

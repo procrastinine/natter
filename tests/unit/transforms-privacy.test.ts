@@ -1,6 +1,7 @@
 // Privacy-related transform behavior:
 //   - Free-model exception strips provider.{data_collection,zdr,only,ignore,order}
 //   - allowFallbacks:false surfaces as provider.allow_fallbacks:false
+//   - legacy providerPrefs.allowFallbacks is ignored
 //   - Pre-computed privacy wire fragments merge into the provider block
 //
 // See `plan/05-transforms-and-quirks.md` privacy-free-strip note and
@@ -79,6 +80,18 @@ describe('toChatCompletions — privacy wire fragment', () => {
     const settings = makeSettings({
       model: 'openai/gpt-5.4',
       allowFallbacks: true,
+    })
+    const { wire } = toChatCompletions(settings, [], { stream: false })
+    expect(wire.provider).toBeUndefined()
+  })
+
+  it('ignores legacy providerPrefs.allowFallbacks when top-level allowFallbacks is true', () => {
+    const settings = makeSettings({
+      model: 'openai/gpt-5.4',
+      allowFallbacks: true,
+      providerPrefs: {
+        allowFallbacks: false,
+      } as unknown as NonNullable<ChatSettings['providerPrefs']>,
     })
     const { wire } = toChatCompletions(settings, [], { stream: false })
     expect(wire.provider).toBeUndefined()

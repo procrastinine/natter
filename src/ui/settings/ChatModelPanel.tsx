@@ -124,8 +124,10 @@ export function ChatModelPanel({ chatId, onClose }: ChatModelPanelProps) {
   //    a connection switch). Shows a generic prompt.
   // When `modelAvailable === null` we're still loading /models and suppress
   // the banner to avoid flicker.
-  const noModel = !chat.settings.model
-  const unavailableModel = modelAvailable === false ? chat.settings.model : null
+  const noModel =
+    !chat.settings.model || (profile?.kind === 'llama-server' && modelAvailable === false)
+  const unavailableModel =
+    modelAvailable === false && profile?.kind !== 'llama-server' ? chat.settings.model : null
 
   return (
     <aside data-ui="chat-model-panel" role="complementary" aria-label="Chat model settings">
@@ -171,6 +173,7 @@ export function ChatModelPanel({ chatId, onClose }: ChatModelPanelProps) {
           <>
             <ModelPicker
               chat={chat}
+              profileKind={profile?.kind ?? 'custom'}
               onPick={handleModelPick}
               onPickForPreset={handleModelPickForPreset}
             />

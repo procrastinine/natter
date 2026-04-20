@@ -57,7 +57,7 @@ export const DEFAULT_CHAT_SETTINGS: Readonly<ChatSettings> = Object.freeze({
   systemRole: 'system',
   sampling: Object.freeze({}),
   reasoning: Object.freeze<ChatSettings['reasoning']>({
-    mode: 'enabled',
+    mode: 'default',
     exclude: false,
     summary: 'auto',
     carryForward: 'auto',

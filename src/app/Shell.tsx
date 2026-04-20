@@ -1,9 +1,8 @@
 import { useLiveQuery } from 'dexie-react-hooks'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { normalizeModelsResponse } from '../api/providers'
 import { activePath } from '../core/active-path'
-import { estimatePromptSize, tokenizerFromSettings } from '../core/prompt-size'
 import { cloneDefaultChatSettings } from '../core/defaults'
-import { resolvePrivacyForSend } from '../core/privacy-request'
 import {
   applyBaseFontSizeToDocument,
   applyChatMaxWidthToDocument,
@@ -13,12 +12,13 @@ import {
   DEFAULT_GLOBAL_PREFERENCES,
   readGlobalPreferences,
 } from '../core/global-settings'
+import { resolvePrivacyForSend } from '../core/privacy-request'
+import { estimatePromptSize, tokenizerFromSettings } from '../core/prompt-size'
 import type { Chat, ChatId, ChatPreset, ConnectionProfile, CursorMap } from '../core/types'
 import { useBranchUrlSync } from '../hooks/useBranchUrlSync'
 import { recoverOrphans, useChat } from '../hooks/useChat'
 import { useEndpoints } from '../hooks/useEndpoints'
 import { useModels } from '../hooks/useModels'
-import { normalizeModelsResponse } from '../api/providers'
 import { installChatPreviewMaintainer } from '../store/chat-preview-maintainer'
 import {
   createChat,
@@ -27,7 +27,7 @@ import {
   refreshChatPreview,
   updateChatSettings,
 } from '../store/chats'
-import { resolveKey } from '../store/keys'
+import { resolveKeyIfPresent } from '../store/keys'
 import { getCachedModels } from '../store/models-cache'
 import { bumpPresetLastUsedAt, pickMruPreset } from '../store/presets'
 import { bumpProfileLastUsedAt, countProfiles, getProfile } from '../store/profiles'
@@ -43,9 +43,9 @@ import { EmptyState } from '../ui/chat/EmptyState'
 import { FocusModeToggle } from '../ui/chat/FocusModeToggle'
 import { ImportModal } from '../ui/chat/ImportModal'
 import { MessageList } from '../ui/chat/MessageList'
-import { ZeroEligibleModal } from '../ui/chat/ZeroEligibleModal'
 import { ScrollRegion, type ScrollRegionHandle, type ScrollState } from '../ui/chat/ScrollRegion'
 import { ToastTray } from '../ui/chat/ToastTray'
+import { ZeroEligibleModal } from '../ui/chat/ZeroEligibleModal'
 import { ConnectionHeader, readActiveProfileId } from '../ui/header/ConnectionHeader'
 import { ChevronIcon, CogIcon, NewChatIcon } from '../ui/icons/Icon'
 import { ChatModelPanel } from '../ui/settings/ChatModelPanel'
@@ -71,6 +71,10 @@ const EMPTY_CURSOR: CursorMap = Object.freeze({}) as CursorMap
 const MODEL_AUTOSELECT_QUERY = {
   outputModalities: ['text', 'image', 'audio', 'file', 'video'],
 } as const
+
+function profileRequiresKey(kind: ConnectionProfile['kind']): boolean {
+  return kind !== 'custom' && kind !== 'llama-server'
+}
 
 // Seed settings for a new chat: start from the MRU preset (if any), then
 // override `profileId` with the user's most-specific recent intent —
@@ -372,9 +376,13 @@ export function Shell() {
         console.error('send: connection profile missing', { profileId: chat.settings.profileId })
         return
       }
-      let apiKey: string
+      let apiKey = ''
       try {
-        apiKey = await resolveKey(profile.apiKeyRef)
+        apiKey = (await resolveKeyIfPresent(profile.apiKeyRef)) ?? ''
+        if (profileRequiresKey(profile.kind) && !apiKey) {
+          console.error('send: resolveKey failed', new Error('missing key'))
+          return
+        }
       } catch (err) {
         console.error('send: resolveKey failed', err)
         return
@@ -419,9 +427,13 @@ export function Shell() {
         console.error('send: connection profile missing', { profileId: chat.settings.profileId })
         return
       }
-      let apiKey: string
+      let apiKey = ''
       try {
-        apiKey = await resolveKey(profile.apiKeyRef)
+        apiKey = (await resolveKeyIfPresent(profile.apiKeyRef)) ?? ''
+        if (profileRequiresKey(profile.kind) && !apiKey) {
+          console.error('send: resolveKey failed', new Error('missing key'))
+          return
+        }
       } catch (err) {
         console.error('send: resolveKey failed', err)
         return
@@ -608,7 +620,8 @@ export function Shell() {
                           const profile = await getProfile(chat.settings.profileId)
                           if (!profile) return
                           try {
-                            const apiKey = await resolveKey(profile.apiKeyRef)
+                            const apiKey = (await resolveKeyIfPresent(profile.apiKeyRef)) ?? ''
+                            if (profileRequiresKey(profile.kind) && !apiKey) return
                             await sendFrom({
                               chatId: activeChatId,
                               connection: profile,
@@ -652,7 +665,8 @@ export function Shell() {
                         const profile = await getProfile(chat.settings.profileId)
                         if (!profile) return
                         try {
-                          const apiKey = await resolveKey(profile.apiKeyRef)
+                          const apiKey = (await resolveKeyIfPresent(profile.apiKeyRef)) ?? ''
+                          if (profileRequiresKey(profile.kind) && !apiKey) return
                           await sendFrom({
                             chatId: activeChatId,
                             connection: profile,

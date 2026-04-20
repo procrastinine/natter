@@ -32,7 +32,7 @@ import {
   readGlobalPreferences,
   writePinnedModels,
 } from '../../core/global-settings'
-import type { Chat } from '../../core/types'
+import type { Chat, ConnectionKind } from '../../core/types'
 import { useModels } from '../../hooks/useModels'
 
 // Below this threshold, we collapse to a plain list. OpenRouter's ~350
@@ -40,19 +40,22 @@ import { useModels } from '../../hooks/useModels'
 // llama.cpp with one or two loaded models falls below.
 const COMPACT_MODEL_COUNT = 10
 
-const MODELS_QUERY = {
+const OPENROUTER_MODELS_QUERY = {
   query: { outputModalities: ['text', 'image', 'audio', 'file', 'video'] },
 } as const
+
+const DIRECT_MODELS_QUERY = {} as const
 
 type PickerTab = 'recent' | 'all'
 
 export interface ModelPickerProps {
   chat: Chat
+  profileKind: ConnectionKind
   onPick: (modelId: string) => void | Promise<void>
   onPickForPreset?: (modelId: string) => void | Promise<void>
 }
 
-export function ModelPicker({ chat, onPick, onPickForPreset }: ModelPickerProps) {
+export function ModelPicker({ chat, profileKind, onPick, onPickForPreset }: ModelPickerProps) {
   const [tab, setTab] = useState<PickerTab>('recent')
   const [searchRaw, setSearchRaw] = useState('')
   const search = useDeferredValue(searchRaw)
@@ -67,7 +70,8 @@ export function ModelPicker({ chat, onPick, onPickForPreset }: ModelPickerProps)
     lastSearchRef.current = search
   }, [search])
 
-  const { models, loading, refresh } = useModels(chat.settings.profileId, MODELS_QUERY)
+  const modelsQuery = profileKind === 'openrouter' ? OPENROUTER_MODELS_QUERY : DIRECT_MODELS_QUERY
+  const { models, loading, refresh } = useModels(chat.settings.profileId, modelsQuery)
   const currentModel = chat.settings.model
   const compact = models.length > 0 && models.length <= COMPACT_MODEL_COUNT
 
@@ -97,13 +101,28 @@ export function ModelPicker({ chat, onPick, onPickForPreset }: ModelPickerProps)
     return out
   }, [models, search])
 
+  const hasRecentRows = useMemo(() => {
+    const ids = new Set(filtered.map((row) => row.id))
+    return recents.some((id) => ids.has(id))
+  }, [filtered, recents])
+
+  useEffect(() => {
+    if (compact) return
+    if (search.trim() !== '') return
+    if (tab !== 'recent') return
+    if (!hasRecentRows) {
+      setTab('all')
+    }
+  }, [compact, search, tab, hasRecentRows])
+
   const listRows = useMemo(() => {
     const byId = new Map(filtered.map((m) => [m.id, m]))
     const out: ModelListEntry[] = []
     const seen = new Set<string>()
-    // The currently-selected model always leads the list so the user can
-    // see what they're using even when scrolled deep into Recent or All.
-    if (currentModel) {
+    // OpenRouter lists are large enough that hoisting the current model is
+    // useful. On smaller direct-provider lists it just scrambles the natural
+    // order and makes refreshes look unstable.
+    if (profileKind === 'openrouter' && currentModel) {
       const m = byId.get(currentModel)
       if (m) {
         out.push(m)
@@ -149,7 +168,7 @@ export function ModelPicker({ chat, onPick, onPickForPreset }: ModelPickerProps)
       }
     }
     return out
-  }, [compact, filtered, pinnedModels, recents, tab, search, currentModel])
+  }, [compact, filtered, pinnedModels, recents, tab, search, currentModel, profileKind])
 
   const listRef = useRef<HTMLDivElement | null>(null)
   const rowVirtualizer = useVirtualizer({
