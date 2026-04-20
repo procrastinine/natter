@@ -27,24 +27,28 @@ import { activePath } from '../../core/active-path'
 import type { EffectiveCapability } from '../../core/capabilities'
 import { estimatePromptSize, tokenizerFromSettings } from '../../core/prompt-size'
 import type { Chat } from '../../core/types'
-import { loadChatMessages, updateChatSettings } from '../../store/chats'
-import { getDb } from '../../store/db'
+import { getChatDraft, loadChatMessages, updateChatSettings } from '../../store/chats'
 import { useChatStore } from '../../store/zustand/chatStore'
 
 export interface ContextPanelProps {
   chat: Chat
   capability: EffectiveCapability | null
   endpointTokenizer: string | null | undefined
+  // Middle-out is an OpenRouter plugin (`plugins:[{id:'context-compression'}]`);
+  // the checkbox only makes sense on an OpenRouter connection.
+  showMiddleOut?: boolean
 }
 
-export function ContextPanel({ chat, capability, endpointTokenizer }: ContextPanelProps) {
+export function ContextPanel({
+  chat,
+  capability,
+  endpointTokenizer,
+  showMiddleOut = false,
+}: ContextPanelProps) {
   const messages = useLiveQuery(() => loadChatMessages(chat.id), [chat.id], [])
   const cursor = useChatStore((s) => s.cursors[chat.id] ?? EMPTY_CURSOR)
   const draft = useLiveQuery(
-    () =>
-      getDb()
-        .drafts.get(chat.id)
-        .then((d) => d?.text ?? ''),
+    () => getChatDraft(chat.id).then((d) => d?.text ?? ''),
     [chat.id],
     '',
   )
@@ -209,17 +213,19 @@ export function ContextPanel({ chat, capability, endpointTokenizer }: ContextPan
         />
       </label>
 
-      <label data-ui="toggle-row">
-        <input
-          type="checkbox"
-          checked={useMiddleOut}
-          onChange={(e) => updateStrategy({ useOpenRouterMiddleOut: e.target.checked })}
-        />
-        <span>
-          Use OpenRouter middle-out compression
-          <InfoHintSpan text="After local trimming, send plugins:[{id:'context-compression'}] so OpenRouter compresses any remaining middle-of-chat messages." />
-        </span>
-      </label>
+      {showMiddleOut ? (
+        <label data-ui="toggle-row">
+          <input
+            type="checkbox"
+            checked={useMiddleOut}
+            onChange={(e) => updateStrategy({ useOpenRouterMiddleOut: e.target.checked })}
+          />
+          <span>
+            Use OpenRouter middle-out compression
+            <InfoHintSpan text="After local trimming, send plugins:[{id:'context-compression'}] so OpenRouter compresses any remaining middle-of-chat messages." />
+          </span>
+        </label>
+      ) : null}
     </section>
   )
 }

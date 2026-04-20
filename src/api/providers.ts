@@ -203,7 +203,19 @@ export function normalizeModelsResponse(raw: unknown): ModelListEntry[] {
     if (description) entry.description = description
     const created = asNumber(obj['created'])
     if (created !== undefined) entry.created = created
-    const cl = asNumber(obj['context_length'])
+    // OpenRouter returns `context_length` at the top level; llama.cpp /v1/models
+    // tucks it under `meta.n_ctx_train` (training context); Ollama uses
+    // `model_info.general.context_length` or similar. Try each so local
+    // servers get a real numeric cap instead of the permissive default.
+    let cl = asNumber(obj['context_length'])
+    if (cl === undefined) {
+      const meta = asRecord(obj['meta'])
+      cl = asNumber(meta?.['n_ctx_train']) ?? asNumber(meta?.['n_ctx'])
+    }
+    if (cl === undefined) {
+      const mi = asRecord(obj['model_info'])
+      cl = asNumber(mi?.['context_length'])
+    }
     if (cl !== undefined) entry.contextLength = cl
     const arch = asRecord(obj['architecture'])
     if (arch) {

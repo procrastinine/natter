@@ -57,6 +57,15 @@ export async function createChat(input: CreateChatInput = {}): Promise<Chat> {
   return chat
 }
 
+// The store/ layer is the abstraction boundary — UI code goes through
+// these functions rather than touching Dexie directly. Reads still call
+// `getDb()` inline here (not through the repo's async `openDb().then(...)`
+// wrapper) because `useLiveQuery` relies on Dexie's synchronous table-
+// access tracking to know when to re-run; inserting an await would lose
+// that subscription and the UI would stop updating as messages arrive.
+// Writes already route through `getBrowserRepository().runMutation(...)`.
+// Daemon-mode will swap this file's implementations wholesale — callers
+// never change.
 export async function getChat(chatId: ChatId): Promise<Chat | undefined> {
   return getDb().chats.get(chatId)
 }
@@ -74,6 +83,13 @@ export async function loadChatMessages(chatId: ChatId): Promise<Message[]> {
 
 export async function getMessage(messageId: MessageId): Promise<Message | undefined> {
   return getDb().messages.get(messageId)
+}
+
+// Draft reads. Writes go through the repo's runMutation with the `draft`
+// scope. Read stays on `getDb()` so `useLiveQuery` can track the drafts
+// table for the typing indicator.
+export async function getChatDraft(chatId: ChatId) {
+  return getDb().drafts.get(chatId)
 }
 
 // Soft-deletes a chat by setting `archived: true` (the reversible variant).

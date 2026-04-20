@@ -23,7 +23,6 @@ import {
   regenerateFromMessage,
 } from '../../hooks/useMessageOps'
 import { getChat, listChats, loadChatMessages } from '../../store/chats'
-import { getDb } from '../../store/db'
 import { useChatStore } from '../../store/zustand/chatStore'
 import { useToastStore } from '../../store/zustand/toastStore'
 import { ImportModal } from './ImportModal'
@@ -153,7 +152,7 @@ export const MessageList = memo(function MessageList({
 
   const handleForkChat = useCallback(
     async (m: MessageRow) => {
-      const sourceChat = await getDb().chats.get(chatId)
+      const sourceChat = await getChat(chatId)
       if (!sourceChat) {
         pushToast({ level: 'danger', text: 'Chat not found.' })
         return

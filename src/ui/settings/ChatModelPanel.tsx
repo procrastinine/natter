@@ -20,7 +20,7 @@
 
 import { useLiveQuery } from 'dexie-react-hooks'
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import type { Chat, ChatId, ChatPreset } from '../../core/types'
+import type { Chat, ChatId, ChatPreset, ConnectionKind } from '../../core/types'
 import type { EffectiveCapability } from '../../core/capabilities'
 import { useEndpoints } from '../../hooks/useEndpoints'
 import { getChat, setChatPreset, updateChatSettings } from '../../store/chats'
@@ -36,6 +36,7 @@ import { useToastStore } from '../../store/zustand/toastStore'
 import { CloseIcon } from '../icons/Icon'
 import { CachingPanel } from './CachingPanel'
 import { ContextPanel } from './ContextPanel'
+import { LlamaServerSection } from './LlamaServerSection'
 import { ModelPicker } from './ModelPicker'
 import { ParamForm } from './ParamForm'
 import { PrivacySection } from './PrivacySection'
@@ -67,7 +68,7 @@ export function ChatModelPanel({ chatId, onClose }: ChatModelPanelProps) {
     [chat?.presetId],
     undefined,
   )
-  const { capability, descriptor } = useEndpoints(
+  const { capability, descriptor, modelAvailable } = useEndpoints(
     chat?.settings.profileId ?? null,
     chat?.settings.model || null,
     { strict: chat?.settings.strictProviderRouting === true },
@@ -116,10 +117,34 @@ export function ChatModelPanel({ chatId, onClose }: ChatModelPanelProps) {
 
   const isOpenRouter = profile?.kind === 'openrouter'
 
+  // Two distinct "no usable model" states, one banner either way:
+  // 1. The chat has a model but the current connection doesn't serve it
+  //    (e.g., gemma on an OpenRouter connection). Shows what's wrong.
+  // 2. The chat has no model at all (fresh chat, or we just cleared it on
+  //    a connection switch). Shows a generic prompt.
+  // When `modelAvailable === null` we're still loading /models and suppress
+  // the banner to avoid flicker.
+  const noModel = !chat.settings.model
+  const unavailableModel = modelAvailable === false ? chat.settings.model : null
+
   return (
     <aside data-ui="chat-model-panel" role="complementary" aria-label="Chat model settings">
       <PanelHeader onClose={onClose} title="Chat settings" />
       <PresetBreadcrumb chat={chat} preset={preset ?? undefined} />
+      {unavailableModel ? (
+        <div data-ui="notice-banner" role="status" data-tone="warning">
+          <span>
+            <strong>{unavailableModel}</strong> isn't served on{' '}
+            <em>{profile?.name ?? 'this connection'}</em>. Pick a different model below.
+          </span>
+        </div>
+      ) : noModel ? (
+        <div data-ui="notice-banner" role="status" data-tone="info">
+          <span>
+            Pick a model for <em>{profile?.name ?? 'this connection'}</em>.
+          </span>
+        </div>
+      ) : null}
       <div role="tablist" data-ui="settings-tabs" data-ui-panel-tabs>
         {(
           [
@@ -151,10 +176,19 @@ export function ChatModelPanel({ chatId, onClose }: ChatModelPanelProps) {
             />
             {isOpenRouter ? <ProviderPicker chat={chat} /> : null}
             {isOpenRouter ? <PrivacySection chat={chat} /> : null}
+            {profile?.kind === 'llama-server' ? (
+              <LlamaServerSection chat={chat} profile={profile} />
+            ) : null}
           </>
         ) : null}
         {tab === 'context' ? (
-          <ContextTab chat={chat} capability={capability} endpointTokenizer={endpointTokenizer} />
+          <ContextTab
+            chat={chat}
+            capability={capability}
+            endpointTokenizer={endpointTokenizer}
+            isOpenRouter={isOpenRouter}
+            connectionKind={profile?.kind ?? 'custom'}
+          />
         ) : null}
         {tab === 'generation' ? (
           <ParamForm
@@ -415,10 +449,14 @@ function ContextTab({
   chat,
   capability,
   endpointTokenizer,
+  isOpenRouter,
+  connectionKind,
 }: {
   chat: Chat
   capability: EffectiveCapability | null
   endpointTokenizer: string | null
+  isOpenRouter: boolean
+  connectionKind: ConnectionKind
 }) {
   return (
     <>
@@ -426,8 +464,9 @@ function ContextTab({
         chat={chat}
         capability={capability}
         endpointTokenizer={endpointTokenizer}
+        showMiddleOut={isOpenRouter}
       />
-      <CachingPanel chat={chat} capability={capability} />
+      <CachingPanel chat={chat} capability={capability} connectionKind={connectionKind} />
     </>
   )
 }

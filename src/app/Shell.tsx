@@ -13,16 +13,24 @@ import {
   DEFAULT_GLOBAL_PREFERENCES,
   readGlobalPreferences,
 } from '../core/global-settings'
-import type { ChatId, ChatPreset, ConnectionProfile, CursorMap } from '../core/types'
+import type { Chat, ChatId, ChatPreset, ConnectionProfile, CursorMap } from '../core/types'
 import { useBranchUrlSync } from '../hooks/useBranchUrlSync'
 import { recoverOrphans, useChat } from '../hooks/useChat'
 import { useEndpoints } from '../hooks/useEndpoints'
+import { useModels } from '../hooks/useModels'
+import { normalizeModelsResponse } from '../api/providers'
 import { installChatPreviewMaintainer } from '../store/chat-preview-maintainer'
-import { createChat, loadChatMessages, refreshChatPreview } from '../store/chats'
-import { getDb } from '../store/db'
+import {
+  createChat,
+  getChat,
+  loadChatMessages,
+  refreshChatPreview,
+  updateChatSettings,
+} from '../store/chats'
 import { resolveKey } from '../store/keys'
+import { getCachedModels } from '../store/models-cache'
 import { bumpPresetLastUsedAt, pickMruPreset } from '../store/presets'
-import { bumpProfileLastUsedAt, getProfile } from '../store/profiles'
+import { bumpProfileLastUsedAt, countProfiles, getProfile } from '../store/profiles'
 import { useChatStore } from '../store/zustand/chatStore'
 import { useStreamStore } from '../store/zustand/streamStore'
 import { useToastStore } from '../store/zustand/toastStore'
@@ -38,7 +46,7 @@ import { MessageList } from '../ui/chat/MessageList'
 import { ZeroEligibleModal } from '../ui/chat/ZeroEligibleModal'
 import { ScrollRegion, type ScrollRegionHandle, type ScrollState } from '../ui/chat/ScrollRegion'
 import { ToastTray } from '../ui/chat/ToastTray'
-import { ConnectionHeader } from '../ui/header/ConnectionHeader'
+import { ConnectionHeader, readActiveProfileId } from '../ui/header/ConnectionHeader'
 import { ChevronIcon, CogIcon, NewChatIcon } from '../ui/icons/Icon'
 import { ChatModelPanel } from '../ui/settings/ChatModelPanel'
 import { GlobalSettingsModal } from '../ui/settings/GlobalSettingsModal'
@@ -57,6 +65,34 @@ const SIDEBAR_COLLAPSED_STORAGE_KEY = 'natter:sidebar-collapsed'
 // Stable empty reference so useSyncExternalStore selectors don't allocate a
 // fresh `{}` each render (React 19 flags that as infinite re-render).
 const EMPTY_CURSOR: CursorMap = Object.freeze({}) as CursorMap
+// Matches ModelPicker's MODELS_QUERY — the cache row is keyed on the query
+// signature, so reusing the same one here means the picker and the
+// auto-selector share a single /models fetch instead of triggering two.
+const MODEL_AUTOSELECT_QUERY = {
+  outputModalities: ['text', 'image', 'audio', 'file', 'video'],
+} as const
+
+// Seed settings for a new chat: start from the MRU preset (if any), then
+// override `profileId` with the user's most-specific recent intent —
+//   1. the currently-displayed chat's connection (highest signal — "I'm
+//      reading an OpenRouter thread, new chat should stay on OpenRouter"),
+//   2. else the workspace-active connection (last header dropdown pick),
+//   3. else whatever the preset carried.
+// If the chosen profileId differs from the preset's, clear the model —
+// the preset's model is almost certainly not served on the new connection,
+// and the Shell-level auto-selector will fill it in if the new connection
+// has exactly one model.
+function seedSettingsForNewChat(
+  presetSettings: Chat['settings'] | undefined,
+  preferredProfileId: string | null,
+): Chat['settings'] {
+  const base = presetSettings ? { ...presetSettings } : cloneDefaultChatSettings()
+  const targetId = preferredProfileId ?? base.profileId
+  if (targetId && targetId !== base.profileId) {
+    return { ...base, profileId: targetId, model: '' }
+  }
+  return base
+}
 
 export function Shell() {
   const route = useRoute()
@@ -67,7 +103,11 @@ export function Shell() {
   const streamingOnActiveChat = useStreamStore((s) =>
     activeChatId ? s.hasStreamForChat(activeChatId) : false,
   )
-  const profileCount = useLiveQuery(() => getDb().profiles.count(), [], 0)
+  const profileCount = useLiveQuery(
+    () => countProfiles({ includeArchived: true }),
+    [],
+    0,
+  )
   const hasConnection = profileCount > 0
   const [chatModelOpen, setChatModelOpen] = useState(false)
   const [globalSettingsOpen, setGlobalSettingsOpen] = useState(false)
@@ -88,7 +128,7 @@ export function Shell() {
   // on its own. Now downstream derivations share one observable per
   // table, cutting redundant IDB reads and observer lifecycles.
   const activeChatRow = useLiveQuery(
-    async () => (activeChatId ? await getDb().chats.get(activeChatId) : undefined),
+    async () => (activeChatId ? await getChat(activeChatId) : undefined),
     [activeChatId],
     undefined,
   )
@@ -103,6 +143,54 @@ export function Shell() {
     { strict: activeChatRow?.settings.strictProviderRouting === true },
   )
   const activeCapability = activeEndpoints.capability
+  // Keep the chat's model coherent with its connection: if the connection
+  // serves exactly one model and the chat has no model picked, auto-select
+  // it. This kicks in right after `switchProfile` clears the model on a
+  // connection switch (e.g., OpenRouter → llama-server auto-picks gemma
+  // because llama-server's /v1/models only returns one entry). For
+  // connections with many models the chat stays unselected until the user
+  // picks, and the Chat Settings panel surfaces a "select a model" banner.
+  //
+  // `useModels` powers the fetch half — mounting it here triggers a /v1/models
+  // request for whichever profile the chat points at, whether or not the
+  // Model tab is open. For the read half we go through `useLiveQuery` →
+  // `getCachedModels` keyed on the CURRENT profileId directly (rather than
+  // reading `useModels.models` which is a derived, slightly-delayed view).
+  // This avoids a race where the chat's profileId has already flipped to
+  // test-or but the cached row is still the old llama-server list, which
+  // would auto-pick gemma back onto the OpenRouter chat.
+  const activeProfileId = activeChatRow?.settings.profileId ?? null
+  useModels(activeProfileId, {
+    query: MODEL_AUTOSELECT_QUERY,
+    enabled: !!activeChatRow && !activeChatRow.settings.model,
+  })
+  const autoSelectRow = useLiveQuery(
+    () =>
+      activeProfileId
+        ? getCachedModels(activeProfileId, MODEL_AUTOSELECT_QUERY)
+        : Promise.resolve(undefined),
+    [activeProfileId],
+    undefined,
+  )
+  useEffect(() => {
+    if (!activeChatRow) return
+    if (activeChatRow.settings.model) return
+    if (!autoSelectRow) return
+    if (autoSelectRow.profileId !== activeChatRow.settings.profileId) return
+    const rows = normalizeModelsResponse(autoSelectRow.payload)
+    if (rows.length !== 1) return
+    const only = rows[0]
+    if (!only) return
+    void (async () => {
+      // Re-read through the store layer (not getDb directly) so this lookup
+      // migrates cleanly to the daemon WorkspaceRepository — whichever backend
+      // is wired up, getChat() returns the same Chat shape.
+      const latest = await getChat(activeChatRow.id)
+      if (!latest || latest.settings.model) return
+      if (latest.settings.profileId !== activeChatRow.settings.profileId) return
+      await updateChatSettings(activeChatRow.id, { model: only.id })
+    })()
+  }, [activeChatRow, autoSelectRow])
   const activePathMemo = useMemo(
     () => activePath(activeMessages ?? [], activeCursor),
     [activeMessages, activeCursor],
@@ -159,7 +247,7 @@ export function Shell() {
   useEffect(() => {
     if (!activeChatId) return
     void (async () => {
-      const chat = await getDb().chats.get(activeChatId)
+      const chat = await getChat(activeChatId)
       if (!chat) return
       if (chat.previewText !== undefined) return
       await refreshChatPreview(activeChatId)
@@ -179,9 +267,12 @@ export function Shell() {
     void (async () => {
       const preset = await pickMruPreset()
       if (cancelled) return
-      const seedSettings = preset ? preset.settings : cloneDefaultChatSettings()
+      const seedSettings = seedSettingsForNewChat(
+        preset?.settings,
+        activeChatRow?.settings.profileId ?? readActiveProfileId(),
+      )
       const chat = await createChat({
-        settings: { ...seedSettings },
+        settings: seedSettings,
         ...(preset ? { presetId: preset.id } : {}),
       })
       if (cancelled) return
@@ -222,12 +313,7 @@ export function Shell() {
   // surface the banner per §10.13.1 Route table. Live-query guarantees we
   // re-evaluate when the chats table changes.
   const routedChatExists = useLiveQuery(
-    () =>
-      activeChatId
-        ? getDb()
-            .chats.get(activeChatId)
-            .then((c) => !!c)
-        : Promise.resolve(true),
+    () => (activeChatId ? getChat(activeChatId).then((c) => !!c) : Promise.resolve(true)),
     [activeChatId],
     true,
   )
@@ -246,21 +332,27 @@ export function Shell() {
     })
   }, [activeChatId, routedChatExists, pushBanner, clearBannersByKind])
 
-  const materializeChatFromComposer = useCallback(async (text: string) => {
-    const preset = await pickMruPreset()
-    const settings = preset ? preset.settings : cloneDefaultChatSettings()
-    const chat = await createChat({
-      settings: { ...settings },
-      ...(preset ? { presetId: preset.id } : {}),
-    })
-    navigateToChat(chat.id)
-    return { chat, seedText: text }
-  }, [])
+  const materializeChatFromComposer = useCallback(
+    async (text: string) => {
+      const preset = await pickMruPreset()
+      const settings = seedSettingsForNewChat(
+        preset?.settings,
+        activeChatRow?.settings.profileId ?? readActiveProfileId(),
+      )
+      const chat = await createChat({
+        settings,
+        ...(preset ? { presetId: preset.id } : {}),
+      })
+      navigateToChat(chat.id)
+      return { chat, seedText: text }
+    },
+    [activeChatRow?.settings.profileId],
+  )
 
   const handleSubmit = useCallback(
     async (text: string) => {
       if (!activeChatId) return
-      const chat = await getDb().chats.get(activeChatId)
+      const chat = await getChat(activeChatId)
       if (!chat) {
         console.error('send: chat row missing', { chatId: activeChatId })
         return
@@ -461,7 +553,10 @@ export function Shell() {
         </div>
       </aside>
       <main data-ui="main-pane">
-        <ConnectionHeader />
+        <ConnectionHeader
+          activeChatId={activeChatId}
+          activeChatProfileId={activeChatRow?.settings.profileId ?? null}
+        />
         {activeChatId ? (
           <>
             <div data-ui="chat-title-bar">
@@ -508,7 +603,7 @@ export function Shell() {
                   {...(trailingUserMessage && hasConnection
                     ? {
                         onReplyToTrailingUser: async () => {
-                          const chat = await getDb().chats.get(activeChatId)
+                          const chat = await getChat(activeChatId)
                           if (!chat) return
                           const profile = await getProfile(chat.settings.profileId)
                           if (!profile) return
@@ -552,7 +647,7 @@ export function Shell() {
                 {...(trailingUserMessage && hasConnection
                   ? {
                       onReplyToTrailingUser: async () => {
-                        const chat = await getDb().chats.get(activeChatId)
+                        const chat = await getChat(activeChatId)
                         if (!chat) return
                         const profile = await getProfile(chat.settings.profileId)
                         if (!profile) return
@@ -608,9 +703,12 @@ export function Shell() {
                 title="Model settings"
                 onClick={async () => {
                   const preset = await pickMruPreset()
-                  const settings = preset ? preset.settings : cloneDefaultChatSettings()
+                  const settings = seedSettingsForNewChat(
+                    preset?.settings,
+                    activeChatRow?.settings.profileId ?? readActiveProfileId(),
+                  )
                   const chat = await createChat({
-                    settings: { ...settings },
+                    settings,
                     ...(preset ? { presetId: preset.id } : {}),
                   })
                   navigateToChat(chat.id)
@@ -664,9 +762,12 @@ export function Shell() {
             // Fire ONLY when the user clicks Import. Cancel leaves the
             // workspace untouched — no empty "untitled chat" rows.
             const preset = await pickMruPreset()
-            const settings = preset ? preset.settings : cloneDefaultChatSettings()
+            const settings = seedSettingsForNewChat(
+              preset?.settings,
+              activeChatRow?.settings.profileId ?? readActiveProfileId(),
+            )
             const chat = await createChat({
-              settings: { ...settings },
+              settings,
               ...(preset ? { presetId: preset.id } : {}),
             })
             navigateToChat(chat.id)

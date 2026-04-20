@@ -27,7 +27,7 @@ test('pencil opens the inline editor; Enter commits and sets titleStatus=manual'
   page,
 }) => {
   await createChatAndSend(page, 'establish a chat')
-  await page.locator('[data-ui="chat-title-edit"]').click()
+  await page.locator('[data-role="chat-title-edit"]').click()
   const editor = page.locator('[data-ui="chat-title-editor"]')
   await expect(editor).toBeFocused()
   await editor.fill('Branching deep-dive')
@@ -57,7 +57,7 @@ test('pencil opens the inline editor; Enter commits and sets titleStatus=manual'
 
 test('Escape cancels without persisting changes', async ({ page }) => {
   await createChatAndSend(page, 'seed')
-  await page.locator('[data-ui="chat-title-edit"]').click()
+  await page.locator('[data-role="chat-title-edit"]').click()
   const editor = page.locator('[data-ui="chat-title-editor"]')
   await editor.fill('should not save')
   await editor.press('Escape')
@@ -68,7 +68,7 @@ test('empty-after-trim is treated as a silent cancel (no error, editor closes)',
   page,
 }) => {
   await createChatAndSend(page, 'seed')
-  await page.locator('[data-ui="chat-title-edit"]').click()
+  await page.locator('[data-role="chat-title-edit"]').click()
   const editor = page.locator('[data-ui="chat-title-editor"]')
   await editor.fill('   ')
   await editor.press('Enter')
@@ -81,12 +81,12 @@ test('empty-after-trim is treated as a silent cancel (no error, editor closes)',
 test('committing an unchanged title is a silent no-op (no error banner)', async ({ page }) => {
   await createChatAndSend(page, 'seed')
   // First, set a title we control.
-  await page.locator('[data-ui="chat-title-edit"]').click()
+  await page.locator('[data-role="chat-title-edit"]').click()
   await page.locator('[data-ui="chat-title-editor"]').fill('Stable title')
   await page.locator('[data-ui="chat-title-editor"]').press('Enter')
   await expect(page.locator('[data-ui="chat-title-label"]')).toHaveText('Stable title')
   // Re-open and commit identical text — no error banner should appear.
-  await page.locator('[data-ui="chat-title-edit"]').click()
+  await page.locator('[data-role="chat-title-edit"]').click()
   await page.locator('[data-ui="chat-title-editor"]').press('Enter')
   await expect(page.locator('[data-ui="chat-title-error"]')).toHaveCount(0)
   await expect(page.locator('[data-ui="chat-title-label"]')).toHaveText('Stable title')
@@ -96,7 +96,7 @@ test('navigating to a different chat cancels any in-progress title edit', async 
   await createChatAndSend(page, 'first chat')
   await createChatAndSend(page, 'second chat')
   // Open the editor on the active (second) chat.
-  await page.locator('[data-ui="chat-title-edit"]').click()
+  await page.locator('[data-role="chat-title-edit"]').click()
   await page.locator('[data-ui="chat-title-editor"]').fill('half-typed title')
   // Click the OTHER chat row in the sidebar.
   const links = page.locator('[data-ui="chat-row-link"]')
@@ -126,7 +126,7 @@ test('title commit bumps updatedAt + metaVersion, leaves branch state untouched,
   const chatId = await firstChatId(page)
   const before = await readChat(page, chatId)
 
-  await page.locator('[data-ui="chat-title-edit"]').click()
+  await page.locator('[data-role="chat-title-edit"]').click()
   const editor = page.locator('[data-ui="chat-title-editor"]')
   await editor.fill('After send')
   await editor.press('Enter')

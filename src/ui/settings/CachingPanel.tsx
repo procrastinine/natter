@@ -15,13 +15,23 @@
 import { useCallback } from 'react'
 import type { EffectiveCapability } from '../../core/capabilities'
 import { cacheMinTokensFor } from '../../core/quirks'
-import type { AnthropicCacheSettings, Chat } from '../../core/types'
+import type { AnthropicCacheSettings, Chat, ConnectionKind } from '../../core/types'
 import { updateChatSettings } from '../../store/chats'
 
 export interface CachingPanelProps {
   chat: Chat
   capability: EffectiveCapability | null
+  // Caching breakpoints are provider-specific wire features: Anthropic's
+  // `cache_control` blocks, Gemini's manual cache, OpenRouter's header.
+  // Local / OpenAI-compatible servers (llama.cpp, vLLM, LM Studio, OpenAI
+  // proper) don't expose a user-facing caching surface, so we hide the
+  // panel entirely for those kinds rather than render controls that do
+  // nothing. Only the kinds that can actually produce a cache breakpoint
+  // are listed below.
+  connectionKind: ConnectionKind
 }
+
+const CACHE_CAPABLE_KINDS: readonly ConnectionKind[] = ['openrouter', 'anthropic', 'google']
 
 type Family = 'anthropic' | 'gemini' | 'openai' | 'unsupported'
 
@@ -48,7 +58,8 @@ function familyFor(chat: Chat, capability: EffectiveCapability | null): Family {
   return 'unsupported'
 }
 
-export function CachingPanel({ chat, capability }: CachingPanelProps) {
+export function CachingPanel({ chat, capability, connectionKind }: CachingPanelProps) {
+  if (!CACHE_CAPABLE_KINDS.includes(connectionKind)) return null
   const family = familyFor(chat, capability)
   const cache = chat.settings.anthropicCache
   const setCache = useCallback(

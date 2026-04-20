@@ -19,7 +19,7 @@ import type {
 describe('Phase 0 type additions', () => {
   it('ConnectionProfile carries the kind + managementApiKeyRef fields', () => {
     expectTypeOf<ConnectionProfile['kind']>().toEqualTypeOf<
-      'openrouter' | 'openai-compatible' | 'anthropic' | 'google' | 'custom'
+      'openrouter' | 'openai-compatible' | 'anthropic' | 'google' | 'llama-server' | 'custom'
     >()
     expectTypeOf<ConnectionProfile['managementApiKeyRef']>().toEqualTypeOf<string | undefined>()
   })

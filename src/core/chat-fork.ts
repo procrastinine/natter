@@ -18,8 +18,7 @@ import { newId } from '../lib/ulid'
 import { incRefs } from '../store/attachments'
 import { postEvent } from '../store/broadcast'
 import { getBrowserRepository } from '../store/browser-repo'
-import { createChat, loadChatMessages } from '../store/chats'
-import { getDb } from '../store/db'
+import { createChat, getChat, loadChatMessages } from '../store/chats'
 import { activePath, indexById } from './active-path'
 import type { AttachmentId, Chat, ChatId, Message, MessageId } from './types'
 
@@ -73,7 +72,7 @@ export function computeBranchTitle(baseTitle: string, existingTitles: readonly s
 export async function forkChatFromMessage(
   input: ForkChatFromMessageInput,
 ): Promise<ForkChatFromMessageResult> {
-  const source = await getDb().chats.get(input.chatId)
+  const source = await getChat(input.chatId)
   if (!source) throw new Error(`fork: source chat ${input.chatId} not found`)
   const allMessages = await loadChatMessages(input.chatId)
   const ancestors = collectAncestorsToMessage(allMessages, input.messageId)
@@ -99,7 +98,9 @@ export async function forkChatFromMessage(
     title: input.title,
     titleStatus: 'manual',
   }
-  await getDb().chats.update(newChat.id, titlePatch)
+  await getBrowserRepository().runMutation([{ kind: 'chat-meta', chatId: newChat.id }], (ctx) => {
+    ctx.patchChatMeta(newChat.id, titlePatch)
+  })
 
   // Assign each ancestor a fresh id; thread parentId through the chain.
   // Keep role, origin, content, reasoningDetails, toolCalls, phase,

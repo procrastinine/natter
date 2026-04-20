@@ -14,7 +14,7 @@ test.beforeEach(async ({ page }) => {
 
 test('orphan in-flight message is marked tab-close on next mount', async ({ page }) => {
   // Seed one chat so the sidebar + activeChatId selector have something to work with.
-  await page.locator('[data-ui="new-chat"]').click()
+  await page.locator('[data-role="new-chat"]').click()
   await expect(page.locator('[data-ui="composer"]')).toBeVisible()
 
   // Inject an orphan assistant message directly into the messages store.

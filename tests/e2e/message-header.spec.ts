@@ -53,7 +53,7 @@ test('assistant header shows the role label only; model + tokens + cost live in 
     'Assistant',
   )
   // Reveal the info disclosure and verify the full factual record is there.
-  await assistant.locator('[data-ui="message-action"][data-action="info"]').click()
+  await assistant.locator('[data-role="message-action"][data-action="info"]').click()
   const info = assistant.locator('[data-ui="message-info"]')
   await expect(info).toContainText('google/gemini-3.1-flash-lite-preview')
   await expect(info).toContainText('Prompt tokens')
@@ -71,13 +71,13 @@ test('user messages still get the role label, no model/tokens/cost anywhere', as
   await createChatAndOpen(page)
   await sendMessage(page, 'user message')
   const user = page.locator('[data-ui="message"][data-role="user"]').first()
-  await expect(user.locator('[data-ui="message-role"]')).toHaveText('You')
+  await expect(user.locator('[data-ui="message-role"]')).toHaveText('User')
   await expect(user.locator('[data-ui="message-model"]')).toHaveCount(0)
   await expect(user.locator('[data-ui="message-token-count"]')).toHaveCount(0)
   await expect(user.locator('[data-ui="message-cost"]')).toHaveCount(0)
   // Open info — user message still shows the timestamp via the disclosure
   // (no model/tokens/cost, since those are generation-side fields).
-  await user.locator('[data-ui="message-action"][data-action="info"]').click()
+  await user.locator('[data-role="message-action"][data-action="info"]').click()
   const info = user.locator('[data-ui="message-info"]')
   await expect(info).toContainText('Created')
   await expect(info).not.toContainText('Model')

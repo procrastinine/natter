@@ -32,13 +32,16 @@ export async function seedFirstRun(page: Page, opts: SeedOptions = {}): Promise<
 }
 
 // Navigate to the blank-chat surface (`#/new`) and wait for the composer to
-// render. NOTE: this does NOT create a `Chat` row on its own — by design.
-// Chat rows materialize on first send. Tests that need an actual row to exist
-// should follow with `sendMessage` (which materializes) or use
-// `createChatAndSend` for the combined flow.
+// render. The Shell eagerly materializes a Chat row on `/new` so the right-
+// side settings panel has something to edit — the row is hidden from the
+// sidebar until first send (previewText gates visibility). Awaiting the URL
+// to settle on `/#/chat/:id` before returning is load-bearing: otherwise
+// `fill()` can target the /new composer just before the eager-create
+// navigates, and the /chat composer mounts fresh with empty text.
 export async function createChatAndOpen(page: Page): Promise<void> {
   await page.locator('[data-role="new-chat"]').click()
   await page.locator('[data-ui="composer"]').waitFor({ state: 'visible' })
+  await page.waitForFunction(() => /^#\/chat\//.test(window.location.hash))
 }
 
 export async function sendMessage(page: Page, text: string): Promise<void> {

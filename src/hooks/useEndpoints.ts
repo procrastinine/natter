@@ -10,22 +10,35 @@
 import { useLiveQuery } from 'dexie-react-hooks'
 import { useEffect, useMemo, useState } from 'react'
 import { fetchEndpoints } from '../api/models'
-import { type EndpointsDescriptor, normalizeEndpointsResponse } from '../api/providers'
+import {
+  type EndpointsDescriptor,
+  type ModelListEntry,
+  normalizeEndpointsResponse,
+  normalizeModelsResponse,
+} from '../api/providers'
 import { resolveBundledCapability } from '../capabilities'
 import type { EffectiveCapability } from '../core/capabilities'
 import {
   effectiveCapabilityFromDescriptor,
   effectiveCapabilityFromEndpoints,
 } from '../core/capabilities'
-import type { ModelEndpoint, ProfileId } from '../core/types'
+import type { CapabilityDescriptor, ModelEndpoint, ProfileId } from '../core/types'
 import { resolveKey } from '../store/keys'
 import {
   dedupedEndpointsFetch,
   ENDPOINTS_TTL_MS,
   getCachedEndpoints,
+  getCachedModels,
   isFresh,
 } from '../store/models-cache'
 import { getProfile } from '../store/profiles'
+
+// `useModels` in ModelPicker uses this exact query; useEndpoints looks up
+// the already-cached row keyed off the same signature so we don't double-
+// fetch just to read a context length for non-OpenRouter connections.
+const CAPABILITY_LOOKUP_QUERY = {
+  outputModalities: ['text', 'image', 'audio', 'file', 'video'],
+} as const
 
 export interface UseEndpointsResult {
   descriptor: EndpointsDescriptor | null
@@ -35,6 +48,11 @@ export interface UseEndpointsResult {
   fetchedAt: number | null
   offline: boolean
   error: string | null
+  // `null` = we don't know yet (models list cold).
+  // `true`  = this modelId appears in the profile's /models list.
+  // `false` = /models is cached and this modelId is not in it — that's why
+  //           the Context tab has no capability, not a stale fetch.
+  modelAvailable: boolean | null
   refresh: () => void
 }
 
@@ -61,7 +79,12 @@ export function useEndpoints(
   const [error, setError] = useState<string | null>(null)
   const [inFlight, setInFlight] = useState(false)
   const [refreshToken, setRefreshToken] = useState(0)
-  const enabled = !!profile && !!modelId && profile.supportsEndpointsApi
+  // `supportsEndpointsApi` is a stored flag; require kind==='openrouter'
+  // too so a profile that was once OpenRouter and is now pointed at a
+  // local llama.cpp doesn't keep hitting /models/<id>/endpoints with the
+  // stale flag still set to true.
+  const enabled =
+    !!profile && !!modelId && profile.kind === 'openrouter' && profile.supportsEndpointsApi
 
   useEffect(() => {
     if (!enabled) return
@@ -103,18 +126,55 @@ export function useEndpoints(
     return descriptor?.endpoints ?? []
   }, [descriptor])
 
+  // The cached /models response drives two things: (a) a contextLength
+  // overlay on top of the bundled capability for non-OpenRouter kinds
+  // (llama.cpp advertises `meta.n_ctx_train` there), and (b) a
+  // model-availability signal for the panel. For OR we read it too so
+  // the panel can distinguish "waiting for /endpoints" from "this model
+  // simply isn't served on this connection" (e.g., a chat started on
+  // llama-server with gemma, now pointed at OR — OR returns 404 and we
+  // want an actionable banner, not a permanently-spinning Context tab).
+  const liveModelsRow = useLiveQuery(
+    () =>
+      profileId ? getCachedModels(profileId, CAPABILITY_LOOKUP_QUERY) : Promise.resolve(undefined),
+    [profileId],
+    undefined,
+  )
+  const liveEntry = useMemo<ModelListEntry | null>(() => {
+    if (!liveModelsRow || !modelId) return null
+    const rows = normalizeModelsResponse(liveModelsRow.payload)
+    return rows.find((r) => r.id === modelId) ?? null
+  }, [liveModelsRow, modelId])
+  const modelAvailable = useMemo<boolean | null>(() => {
+    if (!profileId || !modelId) return null
+    if (!liveModelsRow) return null
+    return liveEntry !== null
+  }, [profileId, modelId, liveModelsRow, liveEntry])
   const strict = opts.strict === true
   const capability = useMemo<EffectiveCapability | null>(() => {
     if (!profile || !modelId) return null
-    if (profile.supportsEndpointsApi && endpoints.length > 0) {
+    if (enabled && endpoints.length > 0) {
       return effectiveCapabilityFromEndpoints(modelId, endpoints, { strict })
     }
-    if (!profile.supportsEndpointsApi) {
-      const descriptor = resolveBundledCapability(profile, modelId)
-      return effectiveCapabilityFromDescriptor(modelId, descriptor)
+    if (!enabled) {
+      const bundled = resolveBundledCapability(profile, modelId)
+      const merged: CapabilityDescriptor = { ...bundled }
+      if (liveEntry?.contextLength !== undefined) {
+        merged.contextLength = liveEntry.contextLength
+        if (
+          merged.maxCompletionTokens === undefined ||
+          merged.maxCompletionTokens < liveEntry.contextLength
+        ) {
+          merged.maxCompletionTokens = Math.min(
+            liveEntry.contextLength,
+            Math.max(merged.maxCompletionTokens ?? 0, 4096),
+          )
+        }
+      }
+      return effectiveCapabilityFromDescriptor(modelId, merged)
     }
     return null
-  }, [profile, modelId, endpoints, strict])
+  }, [profile, modelId, endpoints, strict, enabled, liveEntry])
 
   const fetchedAt = cachedRow?.fetchedAt ?? null
   const offline = error !== null && fetchedAt !== null
@@ -128,6 +188,7 @@ export function useEndpoints(
     fetchedAt,
     offline,
     error,
+    modelAvailable,
     refresh: () => setRefreshToken((n) => n + 1),
   }
 }

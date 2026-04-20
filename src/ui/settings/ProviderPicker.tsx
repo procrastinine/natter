@@ -27,8 +27,7 @@ import type {
   SortBy,
 } from '../../core/types'
 import { usePrivacyRouting } from '../../hooks/usePrivacyRouting'
-import { loadChatMessages, updateChatSettings } from '../../store/chats'
-import { getDb } from '../../store/db'
+import { getChatDraft, loadChatMessages, updateChatSettings } from '../../store/chats'
 import { useChatStore } from '../../store/zustand/chatStore'
 import { LockIcon } from '../icons/Icon'
 import {
@@ -54,10 +53,7 @@ export function ProviderPicker({ chat }: ProviderPickerProps) {
   const messages = useLiveQuery(() => loadChatMessages(chat.id), [chat.id], [])
   const cursor = useChatStore((s) => s.cursors[chat.id] ?? EMPTY_CURSOR)
   const draft = useLiveQuery(
-    () =>
-      getDb()
-        .drafts.get(chat.id)
-        .then((d) => d?.text ?? ''),
+    () => getChatDraft(chat.id).then((d) => d?.text ?? ''),
     [chat.id],
     '',
   )

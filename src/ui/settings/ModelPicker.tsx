@@ -9,6 +9,12 @@
 // - List rows: single-line (id · pricing · context) with the current
 //   chat model highlighted. Virtualized via @tanstack/react-virtual so
 //   300+ OpenRouter rows stay fluid.
+//
+// For small, non-OpenRouter connections (local llama.cpp, a single OpenAI
+// key pointed at one model) the extra scaffolding is noise. When the live
+// list is short the picker collapses to a plain list: no Recent/All
+// tabs, no "shift-click pins on preset" footer, no search box. Pin stars
+// stay (pins are workspace-wide).
 
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { useLiveQuery } from 'dexie-react-hooks'
@@ -28,6 +34,11 @@ import {
 } from '../../core/global-settings'
 import type { Chat } from '../../core/types'
 import { useModels } from '../../hooks/useModels'
+
+// Below this threshold, we collapse to a plain list. OpenRouter's ~350
+// models and OpenAI direct's ~20 bundled entries stay above it; a local
+// llama.cpp with one or two loaded models falls below.
+const COMPACT_MODEL_COUNT = 10
 
 const MODELS_QUERY = {
   query: { outputModalities: ['text', 'image', 'audio', 'file', 'video'] },
@@ -58,6 +69,7 @@ export function ModelPicker({ chat, onPick, onPickForPreset }: ModelPickerProps)
 
   const { models, loading, refresh } = useModels(chat.settings.profileId, MODELS_QUERY)
   const currentModel = chat.settings.model
+  const compact = models.length > 0 && models.length <= COMPACT_MODEL_COUNT
 
   // Pinned + recent model ids come from global prefs (workspace-wide).
   // Live queries poll prefs; `writePinnedModels` / `writeRecentModels`
@@ -98,6 +110,15 @@ export function ModelPicker({ chat, onPick, onPickForPreset }: ModelPickerProps)
         seen.add(currentModel)
       }
     }
+    // Compact mode is just the flat live list; no recents/pins sorting so
+    // a local server showing "1 of 1 · ⇧-click pins on preset" stops
+    // pretending it's OpenRouter with 350 models to navigate.
+    if (compact) {
+      for (const m of filtered) {
+        if (!seen.has(m.id)) out.push(m)
+      }
+      return out
+    }
     if (tab === 'recent' && search.trim() === '') {
       for (const id of recents) {
         const m = byId.get(id)
@@ -128,7 +149,7 @@ export function ModelPicker({ chat, onPick, onPickForPreset }: ModelPickerProps)
       }
     }
     return out
-  }, [filtered, pinnedModels, recents, tab, search, currentModel])
+  }, [compact, filtered, pinnedModels, recents, tab, search, currentModel])
 
   const listRef = useRef<HTMLDivElement | null>(null)
   const rowVirtualizer = useVirtualizer({
@@ -176,14 +197,14 @@ export function ModelPicker({ chat, onPick, onPickForPreset }: ModelPickerProps)
   )
 
   return (
-    <div data-ui="model-picker">
+    <div data-ui="model-picker" data-compact={compact ? 'true' : undefined}>
       <div data-ui="model-picker-search">
         <input
           data-ui="model-picker-search-input"
           type="search"
           value={searchRaw}
           onChange={(e) => setSearchRaw(e.target.value)}
-          placeholder="Search models…"
+          placeholder={compact ? 'Filter…' : 'Search models…'}
           aria-label="Search models"
         />
         <button
@@ -197,20 +218,22 @@ export function ModelPicker({ chat, onPick, onPickForPreset }: ModelPickerProps)
           <ReloadIcon />
         </button>
       </div>
-      <div data-ui="model-picker-tabs" role="tablist">
-        {(['recent', 'all'] as const).map((t) => (
-          <button
-            key={t}
-            type="button"
-            role="tab"
-            data-ui="picker-tab"
-            aria-selected={tab === t}
-            onClick={() => setTab(t)}
-          >
-            {t === 'recent' ? 'Recent' : 'All'}
-          </button>
-        ))}
-      </div>
+      {compact ? null : (
+        <div data-ui="model-picker-tabs" role="tablist">
+          {(['recent', 'all'] as const).map((t) => (
+            <button
+              key={t}
+              type="button"
+              role="tab"
+              data-ui="picker-tab"
+              aria-selected={tab === t}
+              onClick={() => setTab(t)}
+            >
+              {t === 'recent' ? 'Recent' : 'All'}
+            </button>
+          ))}
+        </div>
+      )}
       <div data-ui="model-picker-list" ref={listRef}>
         {listRows.length === 0 ? (
           <p data-ui="helper">{loading ? 'Loading…' : 'No matches.'}</p>
@@ -291,7 +314,9 @@ export function ModelPicker({ chat, onPick, onPickForPreset }: ModelPickerProps)
       </div>
       <footer data-ui="model-picker-footer">
         <span data-ui="helper">
-          {listRows.length} of {models.length} · ⇧-click pins on preset
+          {compact
+            ? `${models.length} model${models.length === 1 ? '' : 's'} detected`
+            : `${listRows.length} of ${models.length} · ⇧-click pins on preset`}
         </span>
       </footer>
     </div>

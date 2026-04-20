@@ -48,7 +48,13 @@ export type UserIdMode = 'omit' | 'stable-hash' | 'chat-id'
 
 export type ServiceTier = 'auto' | 'default' | 'flex' | 'priority' | 'scale'
 
-export type ConnectionKind = 'openrouter' | 'openai-compatible' | 'anthropic' | 'google' | 'custom'
+export type ConnectionKind =
+  | 'openrouter'
+  | 'openai-compatible'
+  | 'anthropic'
+  | 'google'
+  | 'llama-server'
+  | 'custom'
 
 // ---------------------------------------------------------------------------
 // Sampling / reasoning / verbosity
@@ -66,6 +72,25 @@ export type SamplingKey =
   | 'seed'
   | 'logprobs'
   | 'top_logprobs'
+  // llama.cpp-only knobs. These ride on /v1/chat/completions and
+  // /v1/completions to llama-server. They're surfaced by
+  // `capabilities/llama-server.ts` and only render on llama-server
+  // profiles; other backends reject them.
+  | 'typical_p'
+  | 'repeat_penalty'
+  | 'repeat_last_n'
+  | 'dynatemp_range'
+  | 'dynatemp_exponent'
+  | 'mirostat'
+  | 'mirostat_tau'
+  | 'mirostat_eta'
+  | 'xtc_probability'
+  | 'xtc_threshold'
+  | 'dry_multiplier'
+  | 'dry_base'
+  | 'dry_allowed_length'
+  | 'dry_penalty_last_n'
+  | 'n_keep'
 
 export type EffortLevel = 'xhigh' | 'high' | 'medium' | 'low' | 'minimal' | 'none'
 
@@ -351,6 +376,61 @@ export interface ChatSettings {
   metadata?: Record<string, string>
   trace?: TraceMetadata
   serviceTier?: ServiceTier
+  // llama-server only — reuse the server-side KV cache across requests.
+  // The wire default (when omitted) is true. Set false to force a fresh
+  // prompt evaluation (useful when the shared prefix changed and the
+  // server's slot-similarity heuristic is too permissive).
+  cachePrompt?: boolean
+  // llama-server only — which wire protocol to use. 'chat' posts to
+  // /v1/chat/completions (server-side template application); 'text' posts
+  // to /v1/completions with a pre-rendered prompt string. Undefined on
+  // non-llama profiles. See `capabilities/llama-server.ts`.
+  protocol?: 'chat' | 'text'
+  // Template id for protocol='text'. 'default' uses the server's own template
+  // via /apply-template; named ids (chatml, llama3, llama4, gemma, mistral,
+  // deepseek, vicuna, alpaca, commandr, phi) are rendered client-side from
+  // the bundled `TEXT_TEMPLATES` map; 'raw' concatenates messages verbatim
+  // with no separators (user keeps full control of the prompt); 'custom'
+  // uses the fields in `customTextTemplate`.
+  textTemplate?: TextTemplateId
+  // Only read when `textTemplate === 'custom'`. The shape matches the
+  // bundled templates so the renderer can use one code path. Empty strings
+  // are legitimate (any prefix/suffix may be omitted).
+  customTextTemplate?: TextTemplateConfig
+}
+
+export type TextTemplateId =
+  | 'default'
+  | 'chatml'
+  | 'llama3'
+  | 'llama4'
+  | 'gemma'
+  | 'mistral'
+  | 'mistral-v7'
+  | 'deepseek'
+  | 'vicuna'
+  | 'alpaca'
+  | 'commandr'
+  | 'phi'
+  | 'raw'
+  | 'custom'
+
+// Shape of a client-rendered text-completion template. Each role gets a
+// prefix inserted BEFORE the role's content and a suffix AFTER. `bos` is
+// prepended ONCE at the start of the whole prompt. `stop` is added to the
+// request's stop[] array so the server halts at the next turn boundary.
+//
+// See `SillyTavern/default/content/presets/instruct/*.json` for the
+// schema we modeled this on (ours is trimmed to the essentials).
+export interface TextTemplateConfig {
+  userPrefix: string
+  userSuffix: string
+  assistantPrefix: string
+  assistantSuffix: string
+  systemPrefix: string
+  systemSuffix: string
+  bos: string
+  stop: string[]
 }
 
 export interface ComposeOverrides {
@@ -547,7 +627,7 @@ export interface GenerationMeta {
   requestedModel: string
   requestedModels?: string[]
   provider?: string
-  apiUsed: 'chat' | 'responses'
+  apiUsed: 'chat' | 'responses' | 'completion'
   delivery: DeliveryMethod
   usage?: ChatUsage
   cost?: number

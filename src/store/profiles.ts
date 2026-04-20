@@ -88,6 +88,7 @@ function kindDefaults(
     }
     case 'anthropic':
     case 'google':
+    case 'llama-server':
     case 'custom':
       return {
         usesResponsesApiByDefault: false,
@@ -145,11 +146,27 @@ export async function listProfiles(
   return opts.includeArchived ? rows : rows.filter((p) => p.archived !== true)
 }
 
+// Count non-archived profiles. Cheaper than `listProfiles().length` when
+// used for reactive "is a connection configured?" checks that don't need
+// the row contents. Goes through the store layer so daemon-mode can wire a
+// COUNT query behind the same signature.
+export async function countProfiles(
+  opts: { includeArchived?: boolean } = {},
+): Promise<number> {
+  const rows = await getDb().profiles.toArray()
+  return opts.includeArchived ? rows.length : rows.filter((p) => p.archived !== true).length
+}
+
 // Shallow patch of a profile. Honors two implicit cache-invalidation rules:
 // (1) changing `baseUrl` drops /models, /endpoints, /privacyPolicies, and
 //     /providers caches for this profile (§9.2.A: "Changing baseUrl flushes
-//     cached endpoints/models/providers/privacyPolicies/presetResolutions"), and
-// (2) `updatedAt` is bumped on any successful change.
+//     cached endpoints/models/providers/privacyPolicies/presetResolutions"),
+// (2) `updatedAt` is bumped on any successful change, and
+// (3) changing `kind` re-applies kindDefaults() for the capability flags —
+//     otherwise the old kind's flags persist (e.g. a profile switched from
+//     openrouter to custom would keep `supportsEndpointsApi: true` and spam
+//     /models/<id>/endpoints against a local server that doesn't implement it).
+//     Callers can still override any flag by including it in `patch`.
 export async function updateProfile(
   profileId: ProfileId,
   patch: Partial<Omit<ConnectionProfile, 'id' | 'createdAt'>>,
@@ -160,15 +177,34 @@ export async function updateProfile(
   if (!existing) throw new ProfileMissingError(profileId)
   const now = opts.now ?? Date.now()
   const baseUrlChanged = patch.baseUrl !== undefined && patch.baseUrl !== existing.baseUrl
+  const kindChanged = patch.kind !== undefined && patch.kind !== existing.kind
+  const kindOverrides: Partial<ConnectionProfile> = {}
+  if (kindChanged) {
+    const effectiveBaseUrl = patch.baseUrl ?? existing.baseUrl
+    const defaults = kindDefaults(patch.kind as ConnectionKind, effectiveBaseUrl)
+    if (patch.usesResponsesApiByDefault === undefined) {
+      kindOverrides.usesResponsesApiByDefault = defaults.usesResponsesApiByDefault
+    }
+    if (patch.supportsEndpointsApi === undefined) {
+      kindOverrides.supportsEndpointsApi = defaults.supportsEndpointsApi
+    }
+    if (patch.supportsGenerationApi === undefined) {
+      kindOverrides.supportsGenerationApi = defaults.supportsGenerationApi
+    }
+    if (patch.supportsPrivacyScrape === undefined) {
+      kindOverrides.supportsPrivacyScrape = defaults.supportsPrivacyScrape
+    }
+  }
   const next: ConnectionProfile = {
     ...existing,
     ...patch,
+    ...kindOverrides,
     id: existing.id,
     createdAt: existing.createdAt,
     updatedAt: now,
   }
   await db.profiles.put(next)
-  if (baseUrlChanged) {
+  if (baseUrlChanged || kindChanged) {
     await invalidateCachesForProfile(profileId)
   }
   postEvent({ kind: 'profile-mutated', profileId })

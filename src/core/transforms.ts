@@ -19,8 +19,10 @@
 //   have to retouch transform callers.)
 
 import type { ChatCompletionRequestWire } from '../api/types'
+import type { TextCompletionRequestWire } from '../api/text-completions'
 import { isFreeModel } from './model-predicates'
 import type { WireProviderPrivacy } from './privacy-filter'
+import { renderTextPrompt } from './text-templates'
 import type {
   CapabilityDescriptor,
   ChatSettings,
@@ -28,6 +30,7 @@ import type {
   Message,
   MessageRole,
   SamplingKey,
+  TextTemplateConfig,
 } from './types'
 
 export interface ChatCompletionsTransformOptions {
@@ -82,6 +85,22 @@ const SAMPLING_WIRE_KEY: Readonly<Record<SamplingKey, string>> = Object.freeze({
   seed: 'seed',
   logprobs: 'logprobs',
   top_logprobs: 'top_logprobs',
+  // llama.cpp-only keys. Wire names match llama-server's expected JSON.
+  typical_p: 'typical_p',
+  repeat_penalty: 'repeat_penalty',
+  repeat_last_n: 'repeat_last_n',
+  dynatemp_range: 'dynatemp_range',
+  dynatemp_exponent: 'dynatemp_exponent',
+  mirostat: 'mirostat',
+  mirostat_tau: 'mirostat_tau',
+  mirostat_eta: 'mirostat_eta',
+  xtc_probability: 'xtc_probability',
+  xtc_threshold: 'xtc_threshold',
+  dry_multiplier: 'dry_multiplier',
+  dry_base: 'dry_base',
+  dry_allowed_length: 'dry_allowed_length',
+  dry_penalty_last_n: 'dry_penalty_last_n',
+  n_keep: 'n_keep',
 })
 
 // Translate a `ContentItem[]` into chat-completions wire content parts. For
@@ -181,6 +200,13 @@ export function toChatCompletions(
   if (settings.logitBias && gate('logit_bias')) {
     wire.logit_bias = { ...settings.logitBias }
   }
+  // llama-server KV-cache reuse. Only emit when explicitly disabled —
+  // the server's default is true, so omitting the field keeps the
+  // existing behavior for every non-llama backend (they just ignore
+  // the key because it's not in their supportedParameters).
+  if (settings.cachePrompt === false && gate('cache_prompt')) {
+    wire.cache_prompt = false
+  }
   if (settings.modalities && settings.modalities.length > 0 && gate('modalities')) {
     wire.modalities = [...settings.modalities]
   }
@@ -219,6 +245,98 @@ export function toChatCompletions(
   }
 
   return { wire, requestedModel }
+}
+
+// ---------------------------------------------------------------------------
+// Text completions (llama-server protocol='text')
+// ---------------------------------------------------------------------------
+
+export interface TextCompletionsTransformOptions {
+  capabilities?: CapabilityDescriptor
+  stream?: boolean
+  // Resolved template config for the branch. When the chat's selected
+  // template id is 'default', the caller is responsible for calling
+  // `applyServerTemplate()` and passing the returned prompt via
+  // `prerenderedPrompt` — this transform doesn't do the server round-trip.
+  template: TextTemplateConfig | null
+  // Escape hatch for the 'default' template: skip client-side rendering
+  // and use this prompt string as-is.
+  prerenderedPrompt?: string
+}
+
+export interface TextCompletionsTransformResult {
+  wire: TextCompletionRequestWire
+  requestedModel: string
+}
+
+export function toTextCompletions(
+  settings: ChatSettings,
+  path: readonly Message[],
+  opts: TextCompletionsTransformOptions,
+): TextCompletionsTransformResult {
+  const requestedModel = settings.model
+  const streaming = opts.stream !== false
+  const caps = opts.capabilities
+  const supported = caps?.supportedParameters
+
+  const prompt =
+    opts.prerenderedPrompt ??
+    (opts.template
+      ? renderTextPrompt(opts.template, settings.systemPrompt, path)
+      : fallbackRawPrompt(settings.systemPrompt, path))
+
+  const wire: TextCompletionRequestWire = {
+    model: requestedModel,
+    prompt,
+  }
+  if (streaming) wire.stream = true
+
+  const gate = (param: string): boolean => {
+    if (!supported) return true
+    return supported.includes(param)
+  }
+
+  for (const [key, value] of Object.entries(settings.sampling)) {
+    if (value === undefined) continue
+    const wireKey = SAMPLING_WIRE_KEY[key as SamplingKey] ?? key
+    if (!gate(wireKey)) continue
+    wire[wireKey] = value
+  }
+
+  // Merge template stop sequences with user-specified stops. Template
+  // stops are critical (they tell the server where the turn ends), so
+  // they always ship even when `settings.stop` is empty.
+  const templateStops = opts.template?.stop ?? []
+  const userStops = settings.stop ?? []
+  const merged = Array.from(new Set([...userStops, ...templateStops]))
+  if (merged.length > 0 && gate('stop')) {
+    wire.stop = merged
+  }
+  if (settings.maxCompletionTokens !== undefined && gate('max_completion_tokens')) {
+    wire.max_completion_tokens = settings.maxCompletionTokens
+  }
+  if (settings.logitBias && gate('logit_bias')) {
+    wire.logit_bias = { ...settings.logitBias }
+  }
+  if (settings.cachePrompt === false && gate('cache_prompt')) {
+    wire.cache_prompt = false
+  }
+
+  return { wire, requestedModel }
+}
+
+// Walk the branch without a template (protocol='text' + raw fallback).
+// System message first, then every user/assistant turn concatenated
+// verbatim, and finally an empty string to let the model continue.
+function fallbackRawPrompt(systemPrompt: string, path: readonly Message[]): string {
+  const parts: string[] = []
+  if (systemPrompt.length > 0) parts.push(systemPrompt)
+  for (const msg of path) {
+    for (const item of msg.content) {
+      if (item.type === 'text' || item.type === 'output_text') parts.push(item.text)
+    }
+  }
+  return parts.join('')
 }
 
 function toWireResponseFormat(format: ChatSettings['responseFormat']): unknown {

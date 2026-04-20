@@ -24,13 +24,16 @@
 import { useCallback, useRef } from 'react'
 import { chatCompletions } from '../api/chat-completions'
 import { ApiError } from '../api/errors'
+import { applyServerTemplate } from '../api/probe'
 import { type StreamLaneEvent, splitChatStream } from '../api/stream-transforms'
+import { textCompletions } from '../api/text-completions'
 import type { ChatStreamChunk } from '../api/types'
 import { activePath, cursorKeyOf, groupByParent } from '../core/active-path'
 import { sendUserMessage } from '../core/messages'
 import type { ChatCompletionsTransformOptions } from '../core/transforms'
-import { toChatCompletions } from '../core/transforms'
+import { toChatCompletions, toTextCompletions } from '../core/transforms'
 import { nextSiblingIndex } from '../core/tree-ops'
+import { resolveTextTemplate } from '../core/text-templates'
 import type {
   AbortReason,
   CapabilityDescriptor,
@@ -161,6 +164,10 @@ async function openAssistantStreamUnder(
   const chat = await getChat(input.chatId)
   if (!chat) throw new Error(`sendText: chat not found: ${input.chatId}`)
 
+  const useTextProtocol =
+    chat.settings.protocol === 'text' && input.connection.kind === 'llama-server'
+  const apiUsed: 'chat' | 'completion' = useTextProtocol ? 'completion' : 'chat'
+
   const assistantId = newId()
   await repo.runMutation(
     [
@@ -186,7 +193,7 @@ async function openAssistantStreamUnder(
           id: '',
           model: chat.settings.model,
           requestedModel: chat.settings.model,
-          apiUsed: 'chat',
+          apiUsed,
           delivery: 'streaming',
           costSource: 'stream',
           startedAt: now(),
@@ -205,16 +212,52 @@ async function openAssistantStreamUnder(
   }
   const path = activePath(allMessages, nextCursor)
 
-  const transformOpts: ChatCompletionsTransformOptions = {
-    stream: true,
-    ...(input.capabilities ? { capabilities: input.capabilities } : {}),
-    ...(input.transform ?? {}),
+  const outboundPath = path.filter((m) => m.id !== assistantId)
+
+  let wire: Record<string, unknown>
+  let requestedModel: string
+  if (useTextProtocol) {
+    const templateId = chat.settings.textTemplate ?? 'chatml'
+    const template = resolveTextTemplate(templateId, chat.settings.customTextTemplate)
+    let prerenderedPrompt: string | undefined
+    if (templateId === 'default') {
+      // Round-trip through the server's own Jinja template.
+      const messages: Array<{ role: string; content: string }> = []
+      if (chat.settings.systemPrompt.length > 0) {
+        messages.push({ role: 'system', content: chat.settings.systemPrompt })
+      }
+      for (const m of outboundPath) {
+        const text = m.content
+          .filter((c) => c.type === 'text' || c.type === 'output_text')
+          .map((c) => ('text' in c ? c.text : ''))
+          .join('')
+        messages.push({ role: m.role, content: text })
+      }
+      prerenderedPrompt = await applyServerTemplate(
+        input.connection,
+        messages,
+        input.signal ? { signal: input.signal } : {},
+      )
+    }
+    const textOpts: Parameters<typeof toTextCompletions>[2] = {
+      stream: true,
+      template,
+      ...(input.capabilities ? { capabilities: input.capabilities } : {}),
+      ...(prerenderedPrompt !== undefined ? { prerenderedPrompt } : {}),
+    }
+    const tResult = toTextCompletions(chat.settings, outboundPath, textOpts)
+    wire = tResult.wire as unknown as Record<string, unknown>
+    requestedModel = tResult.requestedModel
+  } else {
+    const transformOpts: ChatCompletionsTransformOptions = {
+      stream: true,
+      ...(input.capabilities ? { capabilities: input.capabilities } : {}),
+      ...(input.transform ?? {}),
+    }
+    const cResult = toChatCompletions(chat.settings, outboundPath, transformOpts)
+    wire = cResult.wire as unknown as Record<string, unknown>
+    requestedModel = cResult.requestedModel
   }
-  const { wire, requestedModel } = toChatCompletions(
-    chat.settings,
-    path.filter((m) => m.id !== assistantId),
-    transformOpts,
-  )
 
   const streamId = newId()
   const abortController = new AbortController()
@@ -251,12 +294,19 @@ async function openAssistantStreamUnder(
 
   const openStream =
     input.openStream ??
-    ((open) =>
-      chatCompletions(
-        { profile: open.connection, apiKey: open.apiKey },
-        open.wireBody as Parameters<typeof chatCompletions>[1],
-        { signal: open.signal },
-      ))
+    (useTextProtocol
+      ? (open) =>
+          textCompletions(
+            { profile: open.connection, apiKey: open.apiKey },
+            open.wireBody as Parameters<typeof textCompletions>[1],
+            { signal: open.signal },
+          )
+      : (open) =>
+          chatCompletions(
+            { profile: open.connection, apiKey: open.apiKey },
+            open.wireBody as Parameters<typeof chatCompletions>[1],
+            { signal: open.signal },
+          ))
 
   let outcome: 'done' | 'error' | 'abort' = 'done'
   let abortReason: AbortReason | undefined

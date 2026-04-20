@@ -57,24 +57,30 @@ test('input clears after a successful send', async ({ page }) => {
   expect(await input.inputValue()).toBe('')
 })
 
-test('Send is disabled while a stream owns the active placeholder', async ({ page }) => {
-  // Hold the fetch open with a 1.5s delay so the stream is unambiguously
-  // active when we probe Send.
+test('the composer swaps Send for Abort while a stream owns the active placeholder', async ({
+  page,
+}) => {
+  // Hold the fetch open so both "mid-stream" assertions land while the
+  // stream is still active. The Composer renders *either* Send *or* Abort
+  // (not Send-disabled next to Abort), so the test asserts Send is gone
+  // and Abort is there — not Send-disabled. An earlier version of this
+  // test expected `Send.toBeDisabled()`, which times out under parallel
+  // CPU pressure because Playwright polls a locator that no longer exists
+  // in the DOM; the UI and the test had drifted.
   await mockChatCompletions(page, {
-    delayMs: 1500,
+    delayMs: 3000,
     body: buildSseBody([{ id: 'g', content: 'slow', finish: 'stop' }]),
   })
   const input = page.locator('[data-ui="composer-input"]')
   await input.fill('please wait')
   const send = page.locator('[data-ui="send"]')
   await send.click()
-  // Send should flip to disabled within the lifetime of the in-flight stream.
-  await expect(send).toBeDisabled()
-  // And the abort button surfaces while streaming.
+  // Mid-stream: Send is swapped out for Abort.
   await expect(page.locator('[data-ui="abort"]')).toBeVisible()
-  // After the stream finishes, Send unlocks (once input has text again).
+  await expect(send).toHaveCount(0)
+  // After the stream finishes, Send comes back and is enabled with new input.
   await expect(page.locator('[data-ui="message"][data-role="assistant"]')).toBeVisible({
-    timeout: 5000,
+    timeout: 10_000,
   })
   await input.fill('next')
   await expect(send).toBeEnabled()

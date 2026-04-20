@@ -2,8 +2,7 @@ import { useLiveQuery } from 'dexie-react-hooks'
 import { memo, useCallback } from 'react'
 import { chatHref, makeAnchorClickHandler, navigateHome } from '../../app/router'
 import type { Chat, ChatId } from '../../core/types'
-import { archiveChat } from '../../store/chats'
-import { getDb } from '../../store/db'
+import { archiveChat, listChats } from '../../store/chats'
 import { TrashIcon } from '../icons/Icon'
 
 export interface ChatListProps {
@@ -18,8 +17,7 @@ export interface ChatListProps {
 // implement the same read via the repository boundary; this module
 // doesn't couple to Dexie semantics beyond the live-query subscription.
 async function loadChatRows(): Promise<Chat[]> {
-  const db = getDb()
-  const rows = await db.chats.toArray()
+  const rows = await listChats()
   return rows.filter((r) => !r.archived).sort((a, b) => b.updatedAt - a.updatedAt)
 }
 
@@ -34,9 +32,14 @@ function isEmptyDraft(chat: Chat): boolean {
 
 export const ChatList = memo(function ChatList({ activeChatId, collapsed }: ChatListProps) {
   const rows = useLiveQuery(loadChatRows, [], [])
-  const visibleRows = (rows ?? []).filter(
-    (chat) => chat.id === activeChatId || !isEmptyDraft(chat),
-  )
+  // Hide empty drafts — even the currently-active one. The /new surface
+  // eagerly materializes a chat row so the right-hand settings panel has
+  // something to edit, but the sidebar should stay quiet until the user
+  // actually sends the first message. An earlier `chat.id === activeChatId`
+  // escape-hatch surfaced every eager chat as an "Untitled chat" row the
+  // moment the user clicked New chat, violating the "rows materialize on
+  // first send" contract (see tests/e2e/sidebar.spec.ts).
+  const visibleRows = (rows ?? []).filter((chat) => !isEmptyDraft(chat))
   const handleDelete = useCallback(
     async (chat: Chat) => {
       const label = chat.title?.trim().length ? chat.title : 'this untitled chat'

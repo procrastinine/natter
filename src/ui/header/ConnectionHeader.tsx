@@ -1,13 +1,21 @@
 import { useLiveQuery } from 'dexie-react-hooks'
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import { probeLlamaServer } from '../../api/probe'
 import { runFirstRunSeed } from '../../core/defaults'
-import type { ConnectionKind, ConnectionProfile, KeyRecord, ProfileId } from '../../core/types'
-import { getDb } from '../../store/db'
-import { createKey } from '../../store/keys'
+import type {
+  ChatId,
+  ConnectionKind,
+  ConnectionProfile,
+  KeyRecord,
+  ProfileId,
+} from '../../core/types'
+import { updateChatSettings } from '../../store/chats'
+import { createKey, getKey } from '../../store/keys'
 import {
   bumpProfileLastUsedAt,
   createProfile,
   deleteProfile,
+  listProfiles,
   updateProfile,
 } from '../../store/profiles'
 import { ChevronIcon, CloseIcon } from '../icons/Icon'
@@ -20,26 +28,41 @@ interface HeaderState {
 
 const ACTIVE_PROFILE_KEY = 'natter:active-profile-id'
 
-function readActiveProfileId(): ProfileId | null {
+// Workspace-active profile id — the connection the user last clicked in the
+// header. New chats created via `/new` or the composer seed from this so
+// "I switched to llama-server, next chat should be on llama-server" works
+// even when the MRU preset is pinned to a different connection. Stored in
+// localStorage (UI preference, per-origin/browser); daemon mode will replace
+// this with its own preference store behind the same function signatures.
+export function readActiveProfileId(): ProfileId | null {
   if (typeof window === 'undefined') return null
   return (window.localStorage.getItem(ACTIVE_PROFILE_KEY) ?? null) as ProfileId | null
 }
 
-function writeActiveProfileId(id: ProfileId | null): void {
+export function writeActiveProfileId(id: ProfileId | null): void {
   if (typeof window === 'undefined') return
   if (id) window.localStorage.setItem(ACTIVE_PROFILE_KEY, id)
   else window.localStorage.removeItem(ACTIVE_PROFILE_KEY)
 }
 
-async function loadHeaderState(activeId: ProfileId | null): Promise<HeaderState> {
-  const db = getDb()
-  const all = await db.profiles.toArray()
-  const live = all
-    .filter((p) => !p.archived)
-    .sort((a, b) => (b.lastUsedAt ?? 0) - (a.lastUsedAt ?? 0))
-  const found = activeId ? live.find((p) => p.id === activeId) : undefined
-  const profile = found ?? live[0] ?? null
-  const keyRecord = profile ? ((await db.keys.get(profile.apiKeyRef)) ?? null) : null
+// When a chat is open, the header represents the chat's pinned connection
+// (`chat.settings.profileId`) rather than the workspace-default MRU. A chat
+// created on OpenRouter keeps using OpenRouter even after the user adds a
+// llama-server profile; showing the workspace default would falsely imply
+// this chat lives on llama-server. Switching via the dropdown rewires the
+// chat's profileId and bumps the workspace default at the same time, which
+// matches how users read "connection" — "the connection for this chat."
+async function loadHeaderState(
+  activeId: ProfileId | null,
+  chatProfileId: ProfileId | null,
+): Promise<HeaderState> {
+  const live = (await listProfiles()).sort(
+    (a, b) => (b.lastUsedAt ?? 0) - (a.lastUsedAt ?? 0),
+  )
+  const chatProfile = chatProfileId ? live.find((p) => p.id === chatProfileId) : undefined
+  const fallback = activeId ? live.find((p) => p.id === activeId) : undefined
+  const profile = chatProfile ?? fallback ?? live[0] ?? null
+  const keyRecord = profile ? ((await getKey(profile.apiKeyRef)) ?? null) : null
   return { profile, profiles: live, keyRecord }
 }
 
@@ -48,6 +71,7 @@ const KIND_LABEL: Record<ConnectionKind, string> = {
   'openai-compatible': 'OpenAI',
   anthropic: 'Anthropic',
   google: 'Google',
+  'llama-server': 'llama-server (local)',
   custom: 'Custom (OpenAI-compatible)',
 }
 
@@ -56,30 +80,61 @@ const KIND_ORDER: readonly ConnectionKind[] = [
   'openai-compatible',
   'anthropic',
   'google',
+  'llama-server',
   'custom',
 ]
 
+// Only the four hosted providers lock to a canonical base URL. Local-
+// server kinds (llama-server) and 'custom' both keep the URL visible
+// because the user needs to point us at their machine.
 const KIND_LOCKED_BASE_URL: Record<ConnectionKind, string | null> = {
   openrouter: 'https://openrouter.ai/api/v1',
   'openai-compatible': 'https://api.openai.com/v1',
   anthropic: 'https://api.anthropic.com/v1',
   google: 'https://generativelanguage.googleapis.com/v1beta',
+  'llama-server': null,
   custom: null,
 }
 
+const KIND_DEFAULT_BASE_URL: Record<ConnectionKind, string> = {
+  openrouter: 'https://openrouter.ai/api/v1',
+  'openai-compatible': 'https://api.openai.com/v1',
+  anthropic: 'https://api.anthropic.com/v1',
+  google: 'https://generativelanguage.googleapis.com/v1beta',
+  'llama-server': 'http://127.0.0.1:8080/v1',
+  custom: '',
+}
+
 function kindRequiresKey(kind: ConnectionKind): boolean {
-  return kind !== 'custom'
+  return kind !== 'custom' && kind !== 'llama-server'
 }
 
 const PLACEHOLDER_KEY = '••••••••••••••••'
 
-export function ConnectionHeader() {
+export interface ConnectionHeaderProps {
+  // When a chat is open, the header represents that chat's connection. The
+  // chat's `settings.profileId` is the source of truth; swapping the
+  // dropdown rewires the chat AND bumps the workspace default so the next
+  // "New chat" lands on the same connection. Home / "New chat" surfaces
+  // pass `null` and the header falls back to workspace-default MRU.
+  activeChatId?: ChatId | null
+  activeChatProfileId?: ProfileId | null
+}
+
+export function ConnectionHeader({
+  activeChatId = null,
+  activeChatProfileId = null,
+}: ConnectionHeaderProps = {}) {
   const [activeId, setActiveId] = useState<ProfileId | null>(() => readActiveProfileId())
-  const state = useLiveQuery(() => loadHeaderState(activeId), [activeId], {
-    profile: null,
-    profiles: [],
-    keyRecord: null,
-  })
+  const state = useLiveQuery(
+    () => loadHeaderState(activeId, activeChatProfileId),
+    [activeId, activeChatProfileId],
+    {
+      profile: null,
+      profiles: [],
+      keyRecord: null,
+    },
+  )
   const [open, setOpen] = useState(false)
   const [editing, setEditing] = useState(false)
   const [setupOpen, setSetupOpen] = useState(false)
@@ -91,11 +146,27 @@ export function ConnectionHeader() {
     setEditing(false)
   }, [state.profile?.id])
 
-  const switchProfile = useCallback(async (id: ProfileId) => {
-    writeActiveProfileId(id)
-    setActiveId(id)
-    await bumpProfileLastUsedAt(id)
-  }, [])
+  const switchProfile = useCallback(
+    async (id: ProfileId) => {
+      writeActiveProfileId(id)
+      setActiveId(id)
+      await bumpProfileLastUsedAt(id)
+      // If a chat is open, rewire its pinned connection too — otherwise
+      // the header would flip but the chat's panels and send-path would
+      // keep hitting the old profile, which is exactly the
+      // "header says llama-server but the chat is still OpenRouter" bug.
+      // Deselect the model at the same time: the old model is almost
+      // certainly not served by the new connection (gemini isn't on
+      // llama-server, gemma isn't on OpenRouter), so carrying it forward
+      // produces the "Waiting for model capability…" dead-state. The
+      // auto-select effect below will re-pick when the new profile has
+      // exactly one model.
+      if (activeChatId) {
+        await updateChatSettings(activeChatId, { profileId: id, model: '' })
+      }
+    },
+    [activeChatId],
+  )
 
   if (!hasConnection || !state.profile) {
     return (
@@ -140,9 +211,11 @@ export function ConnectionHeader() {
         <span data-ui="connection-name" title={profile.name}>
           {profile.name}
         </span>
-        <span data-ui="connection-baseurl" title={profile.baseUrl}>
-          {hostFor(profile.baseUrl)}
-        </span>
+        {KIND_LOCKED_BASE_URL[profile.kind] !== null ? null : (
+          <span data-ui="connection-baseurl" title={profile.baseUrl}>
+            {hostFor(profile.baseUrl)}
+          </span>
+        )}
         <span data-ui="connection-row-spacer" />
         <span
           data-ui="connection-status-dot"
@@ -235,18 +308,21 @@ interface ConnectionViewerProps {
 
 function ConnectionViewer({ profile, hasKey, onEdit }: ConnectionViewerProps) {
   const requiresKey = kindRequiresKey(profile.kind)
+  const baseUrlIsLocked = KIND_LOCKED_BASE_URL[profile.kind] !== null
   return (
     <dl data-ui="connection-fields">
       <div>
         <dt>Provider</dt>
         <dd>{KIND_LABEL[profile.kind]}</dd>
       </div>
-      <div>
-        <dt>Base URL</dt>
-        <dd>
-          <code>{profile.baseUrl}</code>
-        </dd>
-      </div>
+      {baseUrlIsLocked ? null : (
+        <div>
+          <dt>Base URL</dt>
+          <dd>
+            <code>{profile.baseUrl}</code>
+          </dd>
+        </div>
+      )}
       <div>
         <dt>API key</dt>
         <dd data-ui="connection-key-row">
@@ -389,6 +465,33 @@ function ConnectionEditor({ profile, hasKey, onDone, onCancel, onDeleted }: Conn
     }
   }, [profile.id, profile.name, onDeleted])
 
+  // Track probe state so the user gets feedback on a live test against
+  // whatever baseUrl is currently in the form (not the saved one — the
+  // user typically clicks Test BEFORE saving to verify the URL works).
+  const [probeState, setProbeState] = useState<
+    { kind: 'idle' }
+    | { kind: 'running' }
+    | { kind: 'ok'; message: string }
+    | { kind: 'fail'; message: string }
+  >({ kind: 'idle' })
+  const runProbe = useCallback(async () => {
+    if (!baseUrlValid) return
+    setProbeState({ kind: 'running' })
+    const result = await probeLlamaServer({ baseUrl: trimmedBaseUrl }, { timeoutMs: 3_000 })
+    if (result.kind === 'ok') {
+      const tpl = result.props.chatTemplate
+      const ctx = result.props.defaultContextLength
+      const model = result.props.modelPath
+      const bits = [model ? model.split('/').pop() : null, ctx ? `ctx ${ctx}` : null, tpl ? 'template detected' : null]
+      setProbeState({
+        kind: 'ok',
+        message: `Reached llama-server in ${result.elapsedMs}ms — ${bits.filter(Boolean).join(' · ') || 'OK'}`,
+      })
+    } else {
+      setProbeState({ kind: 'fail', message: `${result.message} (${result.rootUrl}/props)` })
+    }
+  }, [baseUrlValid, trimmedBaseUrl])
+
   return (
     <form
       data-ui="connection-editor"
@@ -416,12 +519,19 @@ function ConnectionEditor({ profile, hasKey, onDone, onCancel, onDeleted }: Conn
           value={kind}
           onChange={(e) => {
             const next = e.target.value as ConnectionKind
+            const prevLock = KIND_LOCKED_BASE_URL[kind]
             setKind(next)
-            const lock = KIND_LOCKED_BASE_URL[next]
-            if (lock !== null) {
+            const nextLock = KIND_LOCKED_BASE_URL[next]
+            if (nextLock !== null) {
               // Snap base URL to the canonical endpoint for the new
               // provider so the locked field stays consistent.
-              setBaseUrl(lock)
+              setBaseUrl(nextLock)
+            } else if (prevLock !== null) {
+              // Previous kind was locked; swap to the default for the
+              // new kind instead of carrying an irrelevant URL like
+              // https://openrouter.ai/api/v1 over to a llama-server
+              // profile.
+              setBaseUrl(KIND_DEFAULT_BASE_URL[next])
             }
           }}
         >
@@ -432,26 +542,25 @@ function ConnectionEditor({ profile, hasKey, onDone, onCancel, onDeleted }: Conn
           ))}
         </select>
       </div>
-      <div data-ui="field-group">
-        <label htmlFor="connection-edit-base-url">Base URL</label>
-        <input
-          id="connection-edit-base-url"
-          data-ui="connection-edit-base-url"
-          type="text"
-          inputMode="url"
-          value={effectiveBaseUrl}
-          onChange={(e) => setBaseUrl(e.target.value)}
-          aria-invalid={trimmedBaseUrl.length > 0 && !baseUrlValid}
-          readOnly={baseUrlIsLocked}
-        />
-        {baseUrlIsLocked ? (
-          <span data-ui="helper">Fixed for this provider. Switch to "Custom" to change it.</span>
-        ) : trimmedBaseUrl.length > 0 && !baseUrlValid ? (
-          <span data-ui="helper" data-validation="invalid">
-            Enter a full URL starting with http:// or https://.
-          </span>
-        ) : null}
-      </div>
+      {baseUrlIsLocked ? null : (
+        <div data-ui="field-group">
+          <label htmlFor="connection-edit-base-url">Base URL</label>
+          <input
+            id="connection-edit-base-url"
+            data-ui="connection-edit-base-url"
+            type="text"
+            inputMode="url"
+            value={effectiveBaseUrl}
+            onChange={(e) => setBaseUrl(e.target.value)}
+            aria-invalid={trimmedBaseUrl.length > 0 && !baseUrlValid}
+          />
+          {trimmedBaseUrl.length > 0 && !baseUrlValid ? (
+            <span data-ui="helper" data-validation="invalid">
+              Enter a full URL starting with http:// or https://.
+            </span>
+          ) : null}
+        </div>
+      )}
       <div data-ui="field-group">
         <label htmlFor="connection-edit-key">
           API key{!requiresKey ? <em> (optional)</em> : null}
@@ -478,6 +587,32 @@ function ConnectionEditor({ profile, hasKey, onDone, onCancel, onDeleted }: Conn
             : 'Custom endpoints can save without a key (e.g. local servers).'}
         </span>
       </div>
+      {kind === 'llama-server' ? (
+        <div data-ui="field-group">
+          <button
+            type="button"
+            data-ui="connection-edit-probe"
+            onClick={() => void runProbe()}
+            disabled={!baseUrlValid || probeState.kind === 'running'}
+          >
+            {probeState.kind === 'running' ? 'Testing…' : 'Test connection'}
+          </button>
+          {probeState.kind === 'ok' ? (
+            <span data-ui="helper" data-validation="ok">
+              {probeState.message}
+            </span>
+          ) : probeState.kind === 'fail' ? (
+            <span data-ui="helper" data-validation="invalid" role="status">
+              {probeState.message}
+            </span>
+          ) : (
+            <span data-ui="helper">
+              GETs <code>/props</code> on the server root to confirm reachability and read the GGUF's
+              chat template.
+            </span>
+          )}
+        </div>
+      ) : null}
       {error ? (
         <p data-ui="helper" data-validation="invalid" role="alert">
           {error}

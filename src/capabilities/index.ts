@@ -13,6 +13,7 @@ import type { CapabilityDescriptor, ConnectionKind, ConnectionProfile } from '..
 import { ANTHROPIC_CAPABILITIES } from './anthropic'
 import { DEFAULT_CUSTOM_CAPABILITY } from './custom'
 import { GOOGLE_CAPABILITIES } from './google'
+import { DEFAULT_LLAMA_SERVER_CAPABILITY } from './llama-server'
 import { OPENAI_CAPABILITIES } from './openai'
 import type { BundledModelEntry, CapabilityTable } from './types'
 
@@ -25,9 +26,18 @@ export function tableFor(kind: ConnectionKind): CapabilityTable | null {
     case 'google':
       return GOOGLE_CAPABILITIES
     case 'openrouter':
+    case 'llama-server':
     case 'custom':
       return null
   }
+}
+
+// Baseline descriptor for a profile when no bundled row matches. For
+// `llama-server` this is the llama.cpp superset (mirostat, dry_*, xtc_*,
+// etc.); for `custom` it's the permissive OAI-ish set; every other kind
+// falls through to the bundled tables above.
+function defaultCapabilityFor(kind: ConnectionKind): CapabilityDescriptor {
+  return kind === 'llama-server' ? DEFAULT_LLAMA_SERVER_CAPABILITY : DEFAULT_CUSTOM_CAPABILITY
 }
 
 function stripPrefix(modelId: string): string {
@@ -75,7 +85,7 @@ export function resolveBundledCapability(
   modelId: string,
 ): CapabilityDescriptor {
   const entry = lookupBundledEntry(profile.kind, modelId)
-  const base = entry?.capability ?? DEFAULT_CUSTOM_CAPABILITY
+  const base = entry?.capability ?? defaultCapabilityFor(profile.kind)
   const override = profile.capabilityOverrides?.[modelId]
   return mergeCapability(base, override)
 }

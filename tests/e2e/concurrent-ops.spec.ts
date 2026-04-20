@@ -38,7 +38,7 @@ test('two tabs streaming different chats run in parallel without aborting each o
   await mockChatCompletions(second, {
     body: buildSseBody([{ id: 'b', content: 'tab-b-reply', finish: 'stop' }]),
   })
-  await second.locator('[data-ui="new-chat"]').click()
+  await second.locator('[data-role="new-chat"]').click()
   await second.locator('[data-ui="composer"]').waitFor({ state: 'visible' })
   await second.locator('[data-ui="composer-input"]').fill('hello-B')
   await second.locator('[data-ui="send"]').click()

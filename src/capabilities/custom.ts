@@ -49,6 +49,13 @@ export const PERMISSIVE_PARAMETERS: readonly string[] = [
 export const DEFAULT_CUSTOM_CAPABILITY: CapabilityDescriptor = {
   supportedParameters: [...PERMISSIVE_PARAMETERS],
   streaming: 'supported',
+  // Custom endpoints rarely advertise their context window in an easy-to-
+  // parse form; llama.cpp's /v1/models returns `meta.n_ctx_train` but
+  // OpenAI-compatible clients don't read it. 8k is a safe baseline that
+  // keeps the Context tab functional — the user can widen it in
+  // capabilityOverrides or via the slider.
+  contextLength: 8192,
+  maxCompletionTokens: 4096,
   architecture: {
     inputModalities: ['text'],
     outputModalities: ['text'],

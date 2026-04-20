@@ -120,7 +120,7 @@ test('Send button is disabled with a "configure a connection" tooltip when no pr
   page,
 }) => {
   // Navigate to #/new to expose the composer without a configured connection.
-  await page.locator('[data-ui="new-chat"]').click()
+  await page.locator('[data-role="new-chat"]').click()
   await expect(page.locator('[data-ui="composer-input"]')).toBeVisible()
   await page.locator('[data-ui="composer-input"]').fill('hi')
   const send = page.locator('[data-ui="send"]')

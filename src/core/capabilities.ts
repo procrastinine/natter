@@ -248,6 +248,21 @@ const SAMPLING_PARAM_WIRE: Record<SamplingKey, string> = {
   seed: 'seed',
   logprobs: 'logprobs',
   top_logprobs: 'top_logprobs',
+  typical_p: 'typical_p',
+  repeat_penalty: 'repeat_penalty',
+  repeat_last_n: 'repeat_last_n',
+  dynatemp_range: 'dynatemp_range',
+  dynatemp_exponent: 'dynatemp_exponent',
+  mirostat: 'mirostat',
+  mirostat_tau: 'mirostat_tau',
+  mirostat_eta: 'mirostat_eta',
+  xtc_probability: 'xtc_probability',
+  xtc_threshold: 'xtc_threshold',
+  dry_multiplier: 'dry_multiplier',
+  dry_base: 'dry_base',
+  dry_allowed_length: 'dry_allowed_length',
+  dry_penalty_last_n: 'dry_penalty_last_n',
+  n_keep: 'n_keep',
 }
 
 function isSamplingKey(k: string): k is SamplingKey {
