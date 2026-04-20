@@ -138,7 +138,12 @@ function* splitChoiceDelta(
       : undefined
     if (reasoningText !== undefined || reasoningDetails !== undefined) {
       const event: StreamLaneEvent & { lane: 'reasoning' } = { lane: 'reasoning' }
-      if (reasoningText !== undefined) event.textDelta = reasoningText
+      if (
+        reasoningText !== undefined &&
+        !reasoningDetailsMirrorText(reasoningText, reasoningDetails)
+      ) {
+        event.textDelta = reasoningText
+      }
       if (reasoningDetails !== undefined) event.details = reasoningDetails
       if (chunkId !== undefined) event.chunkId = chunkId
       yield event
@@ -228,6 +233,25 @@ function* splitBufferedResult(
   // payload so Phase-8+ consumers can parse the full message shape.
   const choice = result.choices?.[0]
   const messageText = typeof choice?.message?.content === 'string' ? choice.message.content : ''
+  const reasoningText =
+    typeof choice?.message?.reasoning === 'string' && choice.message.reasoning.length > 0
+      ? choice.message.reasoning
+      : undefined
+  const reasoningDetails = Array.isArray(choice?.message?.reasoning_details)
+    ? choice.message.reasoning_details
+    : undefined
+  if (reasoningText !== undefined || reasoningDetails !== undefined) {
+    const event: StreamLaneEvent & { lane: 'reasoning' } = { lane: 'reasoning' }
+    if (
+      reasoningText !== undefined &&
+      !reasoningDetailsMirrorText(reasoningText, reasoningDetails)
+    ) {
+      event.textDelta = reasoningText
+    }
+    if (reasoningDetails !== undefined) event.details = reasoningDetails
+    if (typeof result.id === 'string') event.chunkId = result.id
+    yield event
+  }
   if (messageText.length > 0) {
     yield {
       lane: 'text',
@@ -249,4 +273,18 @@ function* splitBufferedResult(
       ...(typeof result.id === 'string' ? { chunkId: result.id } : {}),
     }
   }
+}
+
+function reasoningDetailsMirrorText(reasoningText: string, details: unknown[] | undefined): boolean {
+  if (!details || details.length === 0) return false
+  let merged = ''
+  let sawText = false
+  for (const raw of details) {
+    if (!raw || typeof raw !== 'object') continue
+    const detail = raw as { type?: unknown; text?: unknown }
+    if (detail.type !== 'reasoning.text' || typeof detail.text !== 'string') continue
+    merged += detail.text
+    sawText = true
+  }
+  return sawText && merged === reasoningText
 }

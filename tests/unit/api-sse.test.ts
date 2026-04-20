@@ -93,4 +93,55 @@ describe('parseSSE', () => {
       }
     }).rejects.toThrow(/no body/i)
   })
+
+  it('aborts an already-open stream when the caller signal fires mid-read', async () => {
+    const controller = new AbortController()
+    const response = new Response(
+      new ReadableStream<Uint8Array>({
+        start(stream) {
+          stream.enqueue(enc('data: one\n\n'))
+        },
+      }),
+      { headers: { 'content-type': 'text/event-stream' } },
+    )
+    const seen: SSEEvent[] = []
+    await expect(async () => {
+      for await (const ev of parseSSE(response, { signal: controller.signal })) {
+        seen.push(ev)
+        controller.abort()
+      }
+    }).rejects.toThrow(/abort/i)
+    expect(seen).toEqual([{ kind: 'data', data: 'one' }])
+  })
+
+  it('maps a post-abort reader rejection back to AbortError', async () => {
+    const controller = new AbortController()
+    let cancelCalled = false
+    const reader = {
+      read: () =>
+        new Promise<ReadableStreamReadResult<Uint8Array>>((_, reject) => {
+          controller.signal.addEventListener(
+            'abort',
+            () => reject(new TypeError('terminated')),
+            { once: true },
+          )
+        }),
+      cancel: async () => {
+        cancelCalled = true
+      },
+    }
+    const response = {
+      body: {
+        getReader: () => reader,
+      },
+    } as unknown as Response
+    await expect(async () => {
+      const iter = parseSSE(response, { signal: controller.signal })
+      controller.abort()
+      for await (const _ of iter) {
+        /* noop */
+      }
+    }).rejects.toThrow(/abort/i)
+    expect(cancelCalled).toBe(true)
+  })
 })

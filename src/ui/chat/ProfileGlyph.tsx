@@ -13,6 +13,7 @@ export interface ProfileGlyphProps {
   // current context-truncation settings. Surface a dashed ring so the
   // user can see which turns aren't reaching the model.
   excluded?: boolean
+  decorative?: boolean
 }
 
 const ROLE_LABEL: Record<Message['role'], string> = {
@@ -42,17 +43,23 @@ export function ProfileGlyph({
   userPicture = 'default-person',
   assistantPicture = 'default-robot',
   excluded,
+  decorative = false,
 }: ProfileGlyphProps) {
   const picture = pictureForRole(role, userPicture, assistantPicture)
+  const ariaLabel = excluded ? `${ROLE_LABEL[role]} (excluded from context)` : ROLE_LABEL[role]
   return (
     <span
       data-ui="profile-glyph"
       data-role={role}
       data-picture={picture}
       data-excluded={excluded ? 'true' : undefined}
-      aria-label={excluded ? `${ROLE_LABEL[role]} (excluded from context)` : ROLE_LABEL[role]}
-      title={excluded ? 'Trimmed out of the request by context settings' : undefined}
-      role="img"
+      {...(decorative
+        ? { 'aria-hidden': true as const }
+        : {
+            'aria-label': ariaLabel,
+            title: excluded ? 'Trimmed out of the request by context settings' : undefined,
+            role: 'img' as const,
+          })}
     >
       {picture === 'default-robot' ? <RobotIcon size={20} /> : <PersonIcon size={20} />}
     </span>

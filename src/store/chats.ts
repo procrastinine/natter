@@ -12,6 +12,16 @@ import { postEvent } from './broadcast'
 import { getBrowserRepository } from './browser-repo'
 import { getDb, openDb } from './db'
 
+type OptionalKeys<T> = {
+  [K in keyof T]-?: {} extends Pick<T, K> ? K : never
+}[keyof T]
+
+type ChatSettingsPatch = {
+  [K in keyof ChatSettings]?: K extends OptionalKeys<ChatSettings>
+    ? ChatSettings[K] | undefined
+    : ChatSettings[K]
+}
+
 export interface CreateChatInput {
   id?: ChatId
   title?: string
@@ -219,7 +229,7 @@ export async function setChatPreset(
 
 export async function updateChatSettings(
   chatId: ChatId,
-  patch: Partial<ChatSettings>,
+  patch: ChatSettingsPatch,
   now = Date.now(),
 ): Promise<boolean> {
   const keys = Object.keys(patch) as Array<keyof ChatSettings>
@@ -229,7 +239,12 @@ export async function updateChatSettings(
   await repo.runMutation([{ kind: 'chat-meta', chatId }], async (ctx) => {
     const chat = await ctx.getChat(chatId)
     if (!chat) return
-    const nextSettings = { ...chat.settings, ...patch }
+    const nextSettings = { ...chat.settings } as ChatSettings
+    for (const key of keys) {
+      const value = patch[key]
+      if (value === undefined) delete (nextSettings as Partial<ChatSettings>)[key]
+      else (nextSettings as Record<keyof ChatSettings, unknown>)[key] = value
+    }
     if (sameSettingsFor(chat.settings, nextSettings, keys)) return
     changed = true
     ctx.patchChatMeta(chatId, {

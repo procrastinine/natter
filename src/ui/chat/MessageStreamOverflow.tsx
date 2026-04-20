@@ -1,40 +1,74 @@
-import { type ReactNode, useState } from 'react'
+import type { ReactNode } from 'react'
+
+export type MessageCollapseMode = 'full' | 'compact' | 'peek'
+
+export interface MessageCollapseProfile {
+  defaultMode: MessageCollapseMode
+  modes: readonly MessageCollapseMode[]
+  oversized: boolean
+}
 
 export interface MessageStreamOverflowProps {
-  totalChars: number
-  truncatedChildren: ReactNode
+  collapseMode: MessageCollapseMode
   fullChildren: ReactNode
-  threshold?: number
+  compactChildren: ReactNode
+  peekChildren: ReactNode
 }
 
 export const DEFAULT_OVERFLOW_THRESHOLD = 20_000
+export const LONG_MESSAGE_THRESHOLD = 4_000
 
-// Renders a "show full" affordance when the stream lane grew past the
-// oversized threshold. See plan/10-ui.md §10.19.7 "Show full oversized stream
-// lane" and plan/11-rendering.md §11.10.
-export function MessageStreamOverflow({
-  totalChars,
-  truncatedChildren,
-  fullChildren,
-  threshold = DEFAULT_OVERFLOW_THRESHOLD,
-}: MessageStreamOverflowProps) {
-  const [revealed, setRevealed] = useState(false)
-  const oversized = totalChars > threshold
-  if (!oversized || revealed) {
-    return <>{fullChildren}</>
+// The user wants avatar-driven collapse states instead of a separate
+// "show full" banner:
+// - short messages:        full <-> peek
+// - long messages:         full -> compact -> peek -> full
+// - truly oversized rows:  start in compact to protect render cost
+export function collapseProfileFor(totalChars: number): MessageCollapseProfile {
+  if (totalChars <= 0) {
+    return { defaultMode: 'full', modes: ['full'], oversized: false }
   }
-  return (
-    <>
-      <div data-overflow="truncated">{truncatedChildren}</div>
-      <div data-ui="stream-overflow" data-state="truncated">
-        <span>
-          This message is {totalChars.toLocaleString()} characters long and was truncated for
-          performance.
-        </span>
-        <button type="button" data-ui="stream-overflow-reveal" onClick={() => setRevealed(true)}>
-          Show full
-        </button>
-      </div>
-    </>
-  )
+  if (totalChars > DEFAULT_OVERFLOW_THRESHOLD) {
+    return {
+      defaultMode: 'compact',
+      modes: ['full', 'compact', 'peek'],
+      oversized: true,
+    }
+  }
+  if (totalChars > LONG_MESSAGE_THRESHOLD) {
+    return {
+      defaultMode: 'full',
+      modes: ['full', 'compact', 'peek'],
+      oversized: false,
+    }
+  }
+  return {
+    defaultMode: 'full',
+    modes: ['full', 'peek'],
+    oversized: false,
+  }
+}
+
+export function nextCollapseMode(
+  current: MessageCollapseMode,
+  modes: readonly MessageCollapseMode[],
+): MessageCollapseMode {
+  if (modes.length === 0) return 'full'
+  const idx = modes.indexOf(current)
+  if (idx < 0) return modes[0] ?? 'full'
+  return modes[(idx + 1) % modes.length] ?? modes[0] ?? 'full'
+}
+
+export function MessageStreamOverflow({
+  collapseMode,
+  fullChildren,
+  compactChildren,
+  peekChildren,
+}: MessageStreamOverflowProps) {
+  if (collapseMode === 'peek') {
+    return <>{peekChildren}</>
+  }
+  if (collapseMode === 'compact') {
+    return <>{compactChildren}</>
+  }
+  return <>{fullChildren}</>
 }

@@ -78,3 +78,37 @@ test('aborting before any chunk arrives still persists the placeholder', async (
   expect(assistant.generation.abortReason).toBe('user')
   expect(typeof assistant.generation.finishedAt).toBe('number')
 })
+
+test('stop also aborts continue-in-place streams on existing assistant messages', async ({
+  page,
+}) => {
+  let requestCount = 0
+  await page.route('**/api/v1/chat/completions', async (route) => {
+    requestCount += 1
+    if (requestCount === 1) {
+      await route.fulfill({
+        status: 200,
+        contentType: 'text/event-stream',
+        body: buildSseBody([{ id: 'seed', content: 'ready', finish: 'stop' }]),
+      })
+      return
+    }
+    await new Promise((r) => setTimeout(r, 1500))
+    await route.fulfill({
+      status: 200,
+      contentType: 'text/event-stream',
+      body: buildSseBody([{ id: 'continue', content: ' plus-more', finish: 'stop' }]),
+    })
+  })
+  await createChatAndOpen(page)
+  await sendMessage(page, 'hello')
+  const assistant = page.locator('[data-ui="message"][data-role="assistant"]').first()
+  await expect(assistant).toContainText('ready')
+  await assistant.locator('[data-action="continue"]').click()
+  await expect(page.locator('[data-ui="abort"]')).toBeVisible()
+  await page.locator('[data-ui="abort"]').click()
+  await expect(page.locator('[data-ui="abort"]')).toBeHidden()
+  await page.waitForTimeout(1800)
+  await expect(assistant).toContainText('ready')
+  await expect(assistant).not.toContainText('plus-more')
+})

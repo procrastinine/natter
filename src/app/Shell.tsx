@@ -29,7 +29,7 @@ import {
 } from '../store/chats'
 import { resolveKeyIfPresent } from '../store/keys'
 import { getCachedModels } from '../store/models-cache'
-import { bumpPresetLastUsedAt, pickMruPreset } from '../store/presets'
+import { bumpPresetLastUsedAt, getPreset, pickPreferredPreset } from '../store/presets'
 import { bumpProfileLastUsedAt, countProfiles, getProfile } from '../store/profiles'
 import { useChatStore } from '../store/zustand/chatStore'
 import { useStreamStore } from '../store/zustand/streamStore'
@@ -46,7 +46,11 @@ import { MessageList } from '../ui/chat/MessageList'
 import { ScrollRegion, type ScrollRegionHandle, type ScrollState } from '../ui/chat/ScrollRegion'
 import { ToastTray } from '../ui/chat/ToastTray'
 import { ZeroEligibleModal } from '../ui/chat/ZeroEligibleModal'
-import { ConnectionHeader, readActiveProfileId } from '../ui/header/ConnectionHeader'
+import {
+  ConnectionHeader,
+  readActiveSeedState,
+  writeActiveSeedState,
+} from '../ui/header/ConnectionHeader'
 import { ChevronIcon, CogIcon, NewChatIcon } from '../ui/icons/Icon'
 import { ChatModelPanel } from '../ui/settings/ChatModelPanel'
 import { GlobalSettingsModal } from '../ui/settings/GlobalSettingsModal'
@@ -76,12 +80,13 @@ function profileRequiresKey(kind: ConnectionProfile['kind']): boolean {
   return kind !== 'custom' && kind !== 'llama-server'
 }
 
-// Seed settings for a new chat: start from the MRU preset (if any), then
-// override `profileId` with the user's most-specific recent intent —
-//   1. the currently-displayed chat's connection (highest signal — "I'm
-//      reading an OpenRouter thread, new chat should stay on OpenRouter"),
-//   2. else the workspace-active connection (last header dropdown pick),
-//   3. else whatever the preset carried.
+// Seed settings for a new chat from this tab's remembered default first,
+// then fall back to the workspace-global MRU preset. The remembered seed
+// tracks the most recently viewed chat in this tab (including preset-backed
+// chats with no local edits), plus explicit new-chat/profile-switch actions.
+// We still override `profileId` with the preferred profile so an explicit
+// connection choice can win even when we had to fall back to a different
+// preset for the rest of the seed settings.
 // If the chosen profileId differs from the preset's, clear the model —
 // the preset's model is almost certainly not served on the new connection,
 // and the Shell-level auto-selector will fill it in if the new connection
@@ -103,7 +108,7 @@ export function Shell() {
   const activeChatId = route.kind === 'chat' ? route.chatId : null
   const onNewChatSurface = route.kind === 'new'
   useBranchUrlSync(activeChatId)
-  const { send, sendFrom, abort } = useChat()
+  const { send, sendFrom } = useChat()
   const streamingOnActiveChat = useStreamStore((s) =>
     activeChatId ? s.hasStreamForChat(activeChatId) : false,
   )
@@ -136,15 +141,22 @@ export function Shell() {
     [activeChatId],
     undefined,
   )
+  const chatSnapshotCacheRef = useRef(new Map<ChatId, Chat>())
+  useEffect(() => {
+    if (!activeChatRow) return
+    chatSnapshotCacheRef.current.set(activeChatRow.id, activeChatRow)
+  }, [activeChatRow])
+  const resolvedActiveChatRow =
+    activeChatRow ?? (activeChatId ? chatSnapshotCacheRef.current.get(activeChatId) : undefined)
   const activeMessages = useLiveQuery(
     async () => (activeChatId ? await loadChatMessages(activeChatId) : []),
     [activeChatId],
     [],
   )
   const activeEndpoints = useEndpoints(
-    activeChatRow?.settings.profileId ?? null,
-    activeChatRow?.settings.model || null,
-    { strict: activeChatRow?.settings.strictProviderRouting === true },
+    resolvedActiveChatRow?.settings.profileId ?? null,
+    resolvedActiveChatRow?.settings.model || null,
+    { strict: resolvedActiveChatRow?.settings.strictProviderRouting === true },
   )
   const activeCapability = activeEndpoints.capability
   // Keep the chat's model coherent with its connection: if the connection
@@ -163,10 +175,10 @@ export function Shell() {
   // This avoids a race where the chat's profileId has already flipped to
   // test-or but the cached row is still the old llama-server list, which
   // would auto-pick gemma back onto the OpenRouter chat.
-  const activeProfileId = activeChatRow?.settings.profileId ?? null
+  const activeProfileId = resolvedActiveChatRow?.settings.profileId ?? null
   useModels(activeProfileId, {
     query: MODEL_AUTOSELECT_QUERY,
-    enabled: !!activeChatRow && !activeChatRow.settings.model,
+    enabled: !!resolvedActiveChatRow && !resolvedActiveChatRow.settings.model,
   })
   const autoSelectRow = useLiveQuery(
     () =>
@@ -177,10 +189,10 @@ export function Shell() {
     undefined,
   )
   useEffect(() => {
-    if (!activeChatRow) return
-    if (activeChatRow.settings.model) return
+    if (!resolvedActiveChatRow) return
+    if (resolvedActiveChatRow.settings.model) return
     if (!autoSelectRow) return
-    if (autoSelectRow.profileId !== activeChatRow.settings.profileId) return
+    if (autoSelectRow.profileId !== resolvedActiveChatRow.settings.profileId) return
     const rows = normalizeModelsResponse(autoSelectRow.payload)
     if (rows.length !== 1) return
     const only = rows[0]
@@ -189,12 +201,12 @@ export function Shell() {
       // Re-read through the store layer (not getDb directly) so this lookup
       // migrates cleanly to the daemon WorkspaceRepository — whichever backend
       // is wired up, getChat() returns the same Chat shape.
-      const latest = await getChat(activeChatRow.id)
+      const latest = await getChat(resolvedActiveChatRow.id)
       if (!latest || latest.settings.model) return
-      if (latest.settings.profileId !== activeChatRow.settings.profileId) return
-      await updateChatSettings(activeChatRow.id, { model: only.id })
+      if (latest.settings.profileId !== resolvedActiveChatRow.settings.profileId) return
+      await updateChatSettings(resolvedActiveChatRow.id, { model: only.id })
     })()
-  }, [activeChatRow, autoSelectRow])
+  }, [resolvedActiveChatRow, autoSelectRow])
   const activePathMemo = useMemo(
     () => activePath(activeMessages ?? [], activeCursor),
     [activeMessages, activeCursor],
@@ -215,29 +227,33 @@ export function Shell() {
   //      default. Transient flickers from "894k → 104k" during a model
   //      switch were the bug driving this.
   const tokenBudgetIndicator = useMemo(() => {
-    if (!activeChatRow) return undefined
+    if (!resolvedActiveChatRow) return undefined
     const providerCap = activeCapability?.maxPromptTokens ?? activeCapability?.contextLength
-    const modelCap = activeChatRow.settings.customMaxContext ?? providerCap
+    const modelCap = resolvedActiveChatRow.settings.customMaxContext ?? providerCap
     if (modelCap === undefined) return undefined
     const providerCompletionCap =
       activeCapability?.maxCompletionTokens ?? activeCapability?.contextLength ?? modelCap
     const maxCompletion =
-      activeChatRow.settings.maxCompletionTokens ?? Math.min(4096, providerCompletionCap)
+      resolvedActiveChatRow.settings.maxCompletionTokens ?? Math.min(4096, providerCompletionCap)
     const budget = Math.max(0, modelCap - maxCompletion)
     const est = estimatePromptSize({
-      systemPrompt: activeChatRow.settings.systemPrompt,
+      systemPrompt: resolvedActiveChatRow.settings.systemPrompt,
       activePathMessages: activePathMemo,
       draftText: '',
-      tokenizer: tokenizerFromSettings(activeChatRow.settings, null),
+      tokenizer: tokenizerFromSettings(resolvedActiveChatRow.settings, null),
     })
     return { used: est.total, budget }
-  }, [activeChatRow, activePathMemo, activeCapability])
+  }, [resolvedActiveChatRow, activePathMemo, activeCapability])
   const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() => {
     if (typeof window === 'undefined') return false
     return window.localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === '1'
   })
   const scrollRef = useRef<ScrollRegionHandle>(null)
   const prefs = useLiveQuery(readGlobalPreferences, [], DEFAULT_GLOBAL_PREFERENCES)
+  const abortActiveChat = useCallback(() => {
+    if (!activeChatId) return
+    useStreamStore.getState().abortChat(activeChatId)
+  }, [activeChatId])
 
   useEffect(() => {
     void recoverOrphans()
@@ -258,6 +274,46 @@ export function Shell() {
     })()
   }, [activeChatId])
 
+  const lastSeedSignatureRef = useRef<string>('')
+
+  useEffect(() => {
+    if (!resolvedActiveChatRow) return
+    const nextSeed = {
+      profileId: resolvedActiveChatRow.settings.profileId || null,
+      presetId: resolvedActiveChatRow.presetId ?? null,
+      settings: resolvedActiveChatRow.settings,
+    }
+    const signature = JSON.stringify({
+      presetId: nextSeed.presetId,
+      settings: nextSeed.settings,
+    })
+    if (signature === lastSeedSignatureRef.current) return
+    lastSeedSignatureRef.current = signature
+    writeActiveSeedState(nextSeed)
+  }, [resolvedActiveChatRow])
+
+  const resolveNewChatSeed = useCallback(async () => {
+    const remembered = readActiveSeedState()
+    const rememberedProfileId = remembered.settings?.profileId || remembered.profileId
+    const rememberedProfile = rememberedProfileId ? await getProfile(rememberedProfileId) : undefined
+    if (remembered.settings && rememberedProfile) {
+      const preset = remembered.presetId ? await getPreset(remembered.presetId) : undefined
+      return {
+        preset,
+        settings: structuredClone(remembered.settings) as Chat['settings'],
+      }
+    }
+    const preset = await pickPreferredPreset({
+      presetId: remembered.presetId,
+      profileId: rememberedProfile ? rememberedProfile.id : null,
+    })
+    const settings = seedSettingsForNewChat(preset?.settings, rememberedProfile ? rememberedProfile.id : null)
+    return {
+      preset,
+      settings,
+    }
+  }, [])
+
   // Auto-materialize a chat when the user lands on /new. Eager creation
   // means the settings panel always has a real Chat row to edit, so every
   // control on the right pane (model / context / generation) works before
@@ -269,14 +325,15 @@ export function Shell() {
     if (!onNewChatSurface) return
     let cancelled = false
     void (async () => {
-      const preset = await pickMruPreset()
+      const { preset, settings } = await resolveNewChatSeed()
       if (cancelled) return
-      const seedSettings = seedSettingsForNewChat(
-        preset?.settings,
-        activeChatRow?.settings.profileId ?? readActiveProfileId(),
-      )
+      writeActiveSeedState({
+        profileId: settings.profileId || null,
+        presetId: preset?.id ?? null,
+        settings,
+      })
       const chat = await createChat({
-        settings: seedSettings,
+        settings,
         ...(preset ? { presetId: preset.id } : {}),
       })
       if (cancelled) return
@@ -285,7 +342,7 @@ export function Shell() {
     return () => {
       cancelled = true
     }
-  }, [onNewChatSurface])
+  }, [onNewChatSurface, resolveNewChatSeed])
 
   useEffect(() => {
     applyThemeToDocument(prefs.theme)
@@ -338,11 +395,12 @@ export function Shell() {
 
   const materializeChatFromComposer = useCallback(
     async (text: string) => {
-      const preset = await pickMruPreset()
-      const settings = seedSettingsForNewChat(
-        preset?.settings,
-        activeChatRow?.settings.profileId ?? readActiveProfileId(),
-      )
+      const { preset, settings } = await resolveNewChatSeed()
+      writeActiveSeedState({
+        profileId: settings.profileId || null,
+        presetId: preset?.id ?? null,
+        settings,
+      })
       const chat = await createChat({
         settings,
         ...(preset ? { presetId: preset.id } : {}),
@@ -350,7 +408,7 @@ export function Shell() {
       navigateToChat(chat.id)
       return { chat, seedText: text }
     },
-    [activeChatRow?.settings.profileId],
+    [resolveNewChatSeed],
   )
 
   const handleSubmit = useCallback(
@@ -480,7 +538,7 @@ export function Shell() {
       }
       if (e.key === '.' && (e.metaKey || e.ctrlKey) && streamingOnActiveChat) {
         e.preventDefault()
-        abort()
+        abortActiveChat()
       }
       // Edit-tree mode toggle (§10.14). Works globally; scoped by chat only
       // because the mode visually affects rows — the store field itself is
@@ -505,7 +563,7 @@ export function Shell() {
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [streamingOnActiveChat, abort, activeChatId, setEditTreeMode])
+  }, [streamingOnActiveChat, abortActiveChat, activeChatId, setEditTreeMode])
 
   // Keep the panel slot reserved whenever the user opened it, regardless
   // of whether a chat is active. On /new we still render the shell so the
@@ -567,7 +625,7 @@ export function Shell() {
       <main data-ui="main-pane">
         <ConnectionHeader
           activeChatId={activeChatId}
-          activeChatProfileId={activeChatRow?.settings.profileId ?? null}
+          activeChatProfileId={resolvedActiveChatRow?.settings.profileId ?? null}
         />
         {activeChatId ? (
           <>
@@ -598,9 +656,8 @@ export function Shell() {
               {focusMode ? (
                 <Composer
                   onSubmit={handleSubmit}
-                  disabled={streamingOnActiveChat}
                   streaming={streamingOnActiveChat}
-                  onAbort={abort}
+                  onAbort={abortActiveChat}
                   autoSize
                   autoSizeVariant="focus"
                   {...(hasConnection
@@ -644,9 +701,8 @@ export function Shell() {
             {focusMode ? null : (
               <Composer
                 onSubmit={handleSubmit}
-                disabled={streamingOnActiveChat}
                 streaming={streamingOnActiveChat}
-                onAbort={abort}
+                onAbort={abortActiveChat}
                 autoSize
                 {...(hasConnection
                   ? {}
@@ -716,11 +772,12 @@ export function Shell() {
                 aria-label="Open model panel"
                 title="Model settings"
                 onClick={async () => {
-                  const preset = await pickMruPreset()
-                  const settings = seedSettingsForNewChat(
-                    preset?.settings,
-                    activeChatRow?.settings.profileId ?? readActiveProfileId(),
-                  )
+                  const { preset, settings } = await resolveNewChatSeed()
+                  writeActiveSeedState({
+                    profileId: settings.profileId || null,
+                    presetId: preset?.id ?? null,
+                    settings,
+                  })
                   const chat = await createChat({
                     settings,
                     ...(preset ? { presetId: preset.id } : {}),
@@ -753,6 +810,7 @@ export function Shell() {
       {showChatModelPanel ? (
         <ChatModelPanel
           chatId={activeChatId}
+          chatSnapshot={resolvedActiveChatRow ?? null}
           onClose={() => setChatModelOpen(false)}
         />
       ) : null}
@@ -775,11 +833,12 @@ export function Shell() {
           materializeChat={async () => {
             // Fire ONLY when the user clicks Import. Cancel leaves the
             // workspace untouched — no empty "untitled chat" rows.
-            const preset = await pickMruPreset()
-            const settings = seedSettingsForNewChat(
-              preset?.settings,
-              activeChatRow?.settings.profileId ?? readActiveProfileId(),
-            )
+            const { preset, settings } = await resolveNewChatSeed()
+            writeActiveSeedState({
+              profileId: settings.profileId || null,
+              presetId: preset?.id ?? null,
+              settings,
+            })
             const chat = await createChat({
               settings,
               ...(preset ? { presetId: preset.id } : {}),

@@ -426,18 +426,25 @@ function ReasoningSection({ chat, capability }: { chat: Chat; capability: Effect
 function VerbositySection({ chat, capability }: { chat: Chat; capability: EffectiveCapability }) {
   if (!capability.supportedParameters.has('verbosity')) return null
   const choices = capability.allowedVerbosity
-  const selected = chat.settings.verbosity
+  if (choices.length === 0) return null
+  const selected = chat.settings.verbosity ?? 'default'
+  const options: ReadonlyArray<'default' | VerbosityLevel> = ['default', ...choices]
   return (
     <section data-ui="settings-section" data-ui-section="verbosity">
       <h3>Verbosity</h3>
       <div data-ui="segmented">
-        {choices.map((v) => (
+        {options.map((v) => (
           <button
             key={v}
             type="button"
             data-ui="segmented-option"
             aria-pressed={selected === v}
-            onClick={() => void updateChatSettings(chat.id, { verbosity: v as VerbosityLevel })}
+            onClick={() =>
+              void updateChatSettings(
+                chat.id,
+                v === 'default' ? { verbosity: undefined } : { verbosity: v },
+              )
+            }
           >
             {v}
           </button>

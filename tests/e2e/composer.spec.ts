@@ -85,3 +85,26 @@ test('the composer swaps Send for Abort while a stream owns the active placehold
   await input.fill('next')
   await expect(send).toBeEnabled()
 })
+
+test('the composer stays editable while streaming but Enter does not send a second turn', async ({
+  page,
+}) => {
+  await mockChatCompletions(page, {
+    delayMs: 2000,
+    body: buildSseBody([{ id: 'g', content: 'slow', finish: 'stop' }]),
+  })
+  const input = page.locator('[data-ui="composer-input"]')
+  await input.fill('first turn')
+  await page.locator('[data-ui="send"]').click()
+  await expect(page.locator('[data-ui="abort"]')).toBeVisible()
+
+  await input.fill('draft during stream')
+  await expect(input).toHaveValue('draft during stream')
+  await input.press('Enter')
+  await expect(input).toHaveValue('draft during stream')
+  await expect(page.locator('[data-ui="message"][data-role="user"]')).toHaveCount(1)
+
+  await expect(page.locator('[data-ui="message"][data-role="assistant"]')).toBeVisible({
+    timeout: 10_000,
+  })
+})

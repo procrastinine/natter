@@ -19,8 +19,8 @@
 // tab (see ParamForm's own issues banner).
 
 import { useLiveQuery } from 'dexie-react-hooks'
-import { useCallback, useEffect, useMemo, useState } from 'react'
-import type { Chat, ChatId, ChatPreset, ConnectionKind } from '../../core/types'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { Chat, ChatId, ChatPreset, ConnectionKind, ConnectionProfile } from '../../core/types'
 import type { EffectiveCapability } from '../../core/capabilities'
 import { useEndpoints } from '../../hooks/useEndpoints'
 import { getChat, setChatPreset, updateChatSettings } from '../../store/chats'
@@ -47,27 +47,52 @@ export interface ChatModelPanelProps {
   // The panel renders a placeholder in that case; the rest of the wiring
   // already handles undefined chat / profile / preset.
   chatId: ChatId | null
+  chatSnapshot?: Chat | null
   onClose: () => void
 }
 
 type Tab = 'model' | 'context' | 'generation'
 
-export function ChatModelPanel({ chatId, onClose }: ChatModelPanelProps) {
-  const chat = useLiveQuery(
+export function ChatModelPanel({ chatId, chatSnapshot = null, onClose }: ChatModelPanelProps) {
+  const liveChat = useLiveQuery(
     async () => (chatId ? await getChat(chatId) : undefined),
     [chatId],
     undefined,
   )
-  const profile = useLiveQuery(
+  const chatCacheRef = useRef(new Map<ChatId, Chat>())
+  useEffect(() => {
+    if (!liveChat) return
+    chatCacheRef.current.set(liveChat.id, liveChat)
+  }, [liveChat])
+  const chat =
+    liveChat ?? chatSnapshot ?? (chatId ? chatCacheRef.current.get(chatId) : undefined)
+
+  const liveProfile = useLiveQuery(
     () => (chat ? getProfile(chat.settings.profileId) : Promise.resolve(undefined)),
     [chat?.settings.profileId],
     undefined,
   )
-  const preset = useLiveQuery(
+  const profileCacheRef = useRef(new Map<string, ConnectionProfile>())
+  useEffect(() => {
+    if (!liveProfile) return
+    profileCacheRef.current.set(liveProfile.id, liveProfile)
+  }, [liveProfile])
+  const profile =
+    liveProfile ??
+    (chat?.settings.profileId ? profileCacheRef.current.get(chat.settings.profileId) : undefined)
+
+  const livePreset = useLiveQuery(
     () => (chat?.presetId ? getPreset(chat.presetId) : Promise.resolve(undefined)),
     [chat?.presetId],
     undefined,
   )
+  const presetCacheRef = useRef(new Map<string, ChatPreset>())
+  useEffect(() => {
+    if (!livePreset) return
+    presetCacheRef.current.set(livePreset.id, livePreset)
+  }, [livePreset])
+  const preset =
+    livePreset ?? (chat?.presetId ? presetCacheRef.current.get(chat.presetId) : undefined)
   const { capability, descriptor, modelAvailable } = useEndpoints(
     chat?.settings.profileId ?? null,
     chat?.settings.model || null,

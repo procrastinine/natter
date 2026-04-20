@@ -10,13 +10,25 @@ export type SSEEvent =
   | { kind: 'data'; event?: string; data: string }
   | { kind: 'keepalive'; comment: string }
 
-export async function* parseSSE(response: Response): AsyncGenerator<SSEEvent> {
+export async function* parseSSE(
+  response: Response,
+  opts: { signal?: AbortSignal } = {},
+): AsyncGenerator<SSEEvent> {
   if (!response.body) throw new Error('parseSSE: response has no body')
+  const signal = opts.signal
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
   let buffer = ''
   let eventName: string | undefined
   let dataParts: string[] = []
+  let aborted = signal?.aborted ?? false
+  let abortReason = signal?.reason
+
+  const throwIfAborted = () => {
+    if (!aborted) return
+    if (abortReason instanceof Error) throw abortReason
+    throw new DOMException('aborted', 'AbortError')
+  }
 
   const flushEvent = (): SSEEvent | null => {
     if (dataParts.length === 0) {
@@ -32,9 +44,33 @@ export async function* parseSSE(response: Response): AsyncGenerator<SSEEvent> {
     return ev
   }
 
+  const onAbort = () => {
+    aborted = true
+    abortReason = signal?.reason
+    void reader.cancel(signal?.reason).catch(() => {})
+  }
+
   try {
+    if (signal && !signal.aborted) {
+      signal.addEventListener('abort', onAbort, { once: true })
+    } else if (aborted) {
+      onAbort()
+    }
     while (true) {
-      const { done, value } = await reader.read()
+      throwIfAborted()
+      let readResult: ReadableStreamReadResult<Uint8Array>
+      try {
+        readResult = await reader.read()
+      } catch (error) {
+        if (aborted || signal?.aborted) {
+          aborted = true
+          abortReason = signal?.reason
+          throwIfAborted()
+        }
+        throw error
+      }
+      const { done, value } = readResult
+      throwIfAborted()
       if (done) break
       buffer += decoder.decode(value, { stream: true })
 
@@ -80,6 +116,7 @@ export async function* parseSSE(response: Response): AsyncGenerator<SSEEvent> {
     const ev = flushEvent()
     if (ev && !(ev.kind === 'data' && ev.data === '[DONE]')) yield ev
   } finally {
+    signal?.removeEventListener('abort', onAbort)
     reader.cancel().catch(() => {})
   }
 }

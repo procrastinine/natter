@@ -1,14 +1,10 @@
+import { normalizeReasoningDetails } from '../../core/reasoning'
 import type { ReasoningDetail } from '../../core/types'
 
 export interface ReasoningBlockProps {
   details: ReasoningDetail[]
 }
 
-// Filter + partition: OpenRouter occasionally leaks tool-call signatures into
-// `reasoning_details[]` (CLAUDE.md cross-provider landmine). Drop those before
-// we try to read anything. Then partition by reasoning shape so a message that
-// returns BOTH `reasoning.text` and `reasoning.summary` (common on Claude) can
-// render each section cleanly.
 function partitionReasoning(details: ReasoningDetail[]): {
   text: Array<Extract<ReasoningDetail, { type: 'reasoning.text' }>>
   summary: Array<Extract<ReasoningDetail, { type: 'reasoning.summary' }>>
@@ -17,8 +13,7 @@ function partitionReasoning(details: ReasoningDetail[]): {
   const text: Array<Extract<ReasoningDetail, { type: 'reasoning.text' }>> = []
   const summary: Array<Extract<ReasoningDetail, { type: 'reasoning.summary' }>> = []
   const encrypted: Array<Extract<ReasoningDetail, { type: 'reasoning.encrypted' }>> = []
-  for (const entry of details) {
-    if (entry.id && entry.id.startsWith('tool_')) continue
+  for (const entry of normalizeReasoningDetails(details)) {
     if (entry.type === 'reasoning.text') text.push(entry)
     else if (entry.type === 'reasoning.summary') summary.push(entry)
     else if (entry.type === 'reasoning.encrypted') encrypted.push(entry)

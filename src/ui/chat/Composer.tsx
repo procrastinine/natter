@@ -3,7 +3,7 @@ import type { SendShortcut } from '../../core/global-settings'
 import { InsertIcon, StopIcon } from '../icons/Icon'
 
 export interface ComposerProps {
-  // Disables the textarea entirely (e.g. while a stream owns the chat).
+  // Disables the textarea entirely.
   disabled?: boolean
   // The textarea remains editable but Send is locked. Reason is rendered
   // beneath the composer and used as the Send-button tooltip.
@@ -198,7 +198,7 @@ export function Composer({
     }
     el.style.height = `${height}px`
   }, [autoSize, profile.autoGrowMax, height, text])
-  const sendBlocked = Boolean(sendBlockedReason) || disabled
+  const sendBlocked = Boolean(sendBlockedReason) || Boolean(disabled) || streaming
   const trimmed = text.trim()
   const emptyWithTrailingUser =
     trimmed.length === 0 && Boolean(trailingUserMessage) && Boolean(onReplyToTrailingUser)

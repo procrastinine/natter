@@ -10,7 +10,10 @@ import type { Page } from '@playwright/test'
 export interface SeedOptions {
   apiKey?: string
   model?: string
+  disablePrivacyFilter?: boolean
 }
+
+const DEFAULT_E2E_MODEL = 'google/gemini-3.1-flash-lite-preview:free'
 
 // Open the connection-setup modal from the connection header and submit a
 // stub key. `apiKey` defaults to a harmless placeholder because the
@@ -18,6 +21,7 @@ export interface SeedOptions {
 // needs the real key from `key.txt`.
 export async function seedFirstRun(page: Page, opts: SeedOptions = {}): Promise<void> {
   const apiKey = opts.apiKey ?? 'sk-or-v1-test-00000000000000000000000000000000000000000000'
+  const model = opts.model ?? DEFAULT_E2E_MODEL
   await page.goto('/')
   await page.locator('[data-ui="connection-add"]').click()
   const input = page.locator('[data-ui="connection-setup-key"]')
@@ -29,6 +33,79 @@ export async function seedFirstRun(page: Page, opts: SeedOptions = {}): Promise<
   await page
     .locator('[data-ui="connection-header"][data-state="configured"]')
     .waitFor({ state: 'visible' })
+  if (opts.disablePrivacyFilter === false) return
+  await page.evaluate(
+    async ({ model }) => {
+      const db = await new Promise<IDBDatabase>((resolve, reject) => {
+        const req = indexedDB.open('natter')
+        req.onsuccess = () => resolve(req.result)
+        req.onerror = () => reject(req.error)
+      })
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const tx = db.transaction(['presets', 'chats'], 'readwrite')
+          const presets = tx.objectStore('presets')
+          const chats = tx.objectStore('chats')
+          const presetsReq = presets.getAll()
+          presetsReq.onsuccess = () => {
+            for (const preset of presetsReq.result as Array<Record<string, unknown>>) {
+              const settings = (preset.settings ?? {}) as Record<string, unknown>
+              const privacy = (settings.privacy ?? {}) as Record<string, unknown>
+              preset.settings = {
+                ...settings,
+                ...(model ? { model } : {}),
+                privacy: { ...privacy, paretoFilter: false },
+              }
+              presets.put(preset)
+            }
+            const chatsReq = chats.getAll()
+            chatsReq.onsuccess = () => {
+              for (const chat of chatsReq.result as Array<Record<string, unknown>>) {
+                const settings = (chat.settings ?? {}) as Record<string, unknown>
+                const privacy = (settings.privacy ?? {}) as Record<string, unknown>
+                chat.settings = {
+                  ...settings,
+                  ...(model ? { model } : {}),
+                  privacy: { ...privacy, paretoFilter: false },
+                }
+                chats.put(chat)
+              }
+            }
+          }
+          tx.oncomplete = () => resolve()
+          tx.onerror = () => reject(tx.error)
+          tx.onabort = () => reject(tx.error)
+        })
+      } finally {
+        db.close()
+      }
+      const raw = window.sessionStorage.getItem('natter:active-seed')
+      if (!raw) return
+      try {
+        const parsed = JSON.parse(raw) as {
+          profileId?: string | null
+          presetId?: string | null
+          settings?: Record<string, unknown> | null
+        }
+        const settings = (parsed.settings ?? {}) as Record<string, unknown>
+        const privacy = (settings.privacy ?? {}) as Record<string, unknown>
+        window.sessionStorage.setItem(
+          'natter:active-seed',
+          JSON.stringify({
+            ...parsed,
+            settings: {
+              ...settings,
+              ...(model ? { model } : {}),
+              privacy: { ...privacy, paretoFilter: false },
+            },
+          }),
+        )
+      } catch {
+        // Ignore malformed session state in tests; IDB preset updates above are sufficient.
+      }
+    },
+    { model },
+  )
 }
 
 // Navigate to the blank-chat surface (`#/new`) and wait for the composer to

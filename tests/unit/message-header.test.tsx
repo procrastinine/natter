@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest'
 import type { Message } from '../../src/core/types'
 import { MessageHeader } from '../../src/ui/chat/MessageHeader'
 import { MessageInfo } from '../../src/ui/chat/MessageInfo'
+import { ReasoningBlock } from '../../src/ui/chat/ReasoningBlock'
 
 function makeAssistant(overrides: Partial<Message> = {}): Message {
   return {
@@ -34,6 +35,9 @@ function makeAssistant(overrides: Partial<Message> = {}): Message {
       cost: 0.0123,
       costSource: 'stream',
       startedAt: Date.now() - 60_000,
+      reasoningStartedAt: Date.now() - 58_000,
+      firstTextAt: Date.now() - 55_000,
+      finishedAt: Date.now() - 52_000,
     },
     ...overrides,
   }
@@ -91,7 +95,7 @@ describe('MessageHeader (quiet header — role + state pills only)', () => {
 })
 
 describe('MessageInfo (revealed by ⓘ — full factual record)', () => {
-  it('renders model, prompt+completion+reasoning+cache token counts, and cost', () => {
+  it('renders model, prompt+completion+answer+reasoning+cache token counts, timing, and cost', () => {
     const { container } = render(<MessageInfo message={makeAssistant()} />)
     const text = container.textContent ?? ''
     expect(text).toMatch(/anthropic\/claude-opus-4\.7/)
@@ -99,8 +103,12 @@ describe('MessageInfo (revealed by ⓘ — full factual record)', () => {
     expect(text).toMatch(/100/)
     expect(text).toMatch(/Completion tokens/)
     expect(text).toMatch(/412/)
+    expect(text).toMatch(/Answer tokens/)
+    expect(text).toMatch(/348/)
     expect(text).toMatch(/Reasoning tokens/)
     expect(text).toMatch(/64/)
+    expect(text).toMatch(/Reasoning time/)
+    expect(text).toMatch(/before answer/)
     expect(text).toMatch(/Cache read/)
     expect(text).toMatch(/24/)
     expect(text).toMatch(/Cost/)
@@ -120,5 +128,48 @@ describe('MessageInfo (revealed by ⓘ — full factual record)', () => {
     expect(text).not.toMatch(/Model/)
     expect(text).not.toMatch(/Cost/)
     expect(text).toMatch(/Created/)
+  })
+
+  it('falls back to reasoning chars when token breakdown is unavailable', () => {
+    const msg = makeAssistant({
+      reasoningDetails: [{ type: 'reasoning.encrypted', data: 'abcdef' }],
+    })
+    if (msg.generation?.usage?.completion_tokens_details) {
+      delete msg.generation.usage.completion_tokens_details.reasoning_tokens
+    }
+    const { container } = render(<MessageInfo message={msg} />)
+    expect(container.textContent).toMatch(/Reasoning chars/)
+    expect(container.textContent).toMatch(/encrypted 6/)
+  })
+
+  it('dedupes mirrored reasoning text when counting fallback reasoning chars', () => {
+    const msg = makeAssistant({
+      reasoningDetails: [
+        { type: 'reasoning.text', index: 0, text: 'Let' },
+        { type: 'reasoning.text', index: 0, text: 'Let me' },
+      ],
+    })
+    if (msg.generation?.usage?.completion_tokens_details) {
+      delete msg.generation.usage.completion_tokens_details.reasoning_tokens
+    }
+    const { container } = render(<MessageInfo message={msg} />)
+    expect(container.textContent).toMatch(/Reasoning chars/)
+    expect(container.textContent).toMatch(/text 6/)
+  })
+})
+
+describe('ReasoningBlock', () => {
+  it('dedupes mirrored Claude reasoning rows before rendering', () => {
+    const { container } = render(
+      <ReasoningBlock
+        details={[
+          { type: 'reasoning.text', index: 0, text: 'Let' },
+          { type: 'reasoning.text', index: 0, text: 'Let me' },
+        ]}
+      />,
+    )
+    expect(container.textContent).toMatch(/Reasoning \(1\)/)
+    expect(container.textContent).toMatch(/Let me/)
+    expect(container.textContent).not.toMatch(/LetLet me/)
   })
 })

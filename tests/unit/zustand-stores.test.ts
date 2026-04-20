@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { useChatStore } from '../../src/store/zustand/chatStore'
 import { useStreamStore } from '../../src/store/zustand/streamStore'
 import { useUiStore } from '../../src/store/zustand/uiStore'
@@ -76,6 +76,41 @@ describe('streamStore', () => {
     clearActive('S1')
     expect(isActive('S1')).toBe(false)
     expect(isActive('S2')).toBe(true)
+  })
+
+  it('abortChat calls the registered abort handlers for that chat only', () => {
+    const abortA = vi.fn()
+    const abortB = vi.fn()
+    const abortOther = vi.fn()
+    const { setActive, abortChat } = useStreamStore.getState()
+    setActive({
+      streamId: 'S1',
+      chatId: 'C1',
+      startedAt: 1,
+      ownerClientId: 'tab-a',
+      textLen: 0,
+      abort: abortA,
+    })
+    setActive({
+      streamId: 'S2',
+      chatId: 'C1',
+      startedAt: 2,
+      ownerClientId: 'tab-a',
+      textLen: 0,
+      abort: abortB,
+    })
+    setActive({
+      streamId: 'S3',
+      chatId: 'C2',
+      startedAt: 3,
+      ownerClientId: 'tab-a',
+      textLen: 0,
+      abort: abortOther,
+    })
+    expect(abortChat('C1')).toBe(2)
+    expect(abortA).toHaveBeenCalledTimes(1)
+    expect(abortB).toHaveBeenCalledTimes(1)
+    expect(abortOther).not.toHaveBeenCalled()
   })
 })
 

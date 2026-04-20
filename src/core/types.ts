@@ -632,6 +632,9 @@ export interface GenerationMeta {
   cost?: number
   costSource: 'stream' | 'generation-endpoint' | 'estimated'
   startedAt: number
+  firstTextAt?: number
+  reasoningStartedAt?: number
+  reasoningFinishedAt?: number
   finishedAt?: number
   finishReason?: FinishReason
   nativeFinishReason?: string

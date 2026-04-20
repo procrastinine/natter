@@ -114,6 +114,7 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
 
   const streamId = newId()
   const abortController = new AbortController()
+  const abortStream = () => abortController.abort()
   const userSignal = input.signal
   if (userSignal?.aborted) abortController.abort(userSignal.reason)
   else
@@ -128,6 +129,7 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
     startedAt: now(),
     ownerClientId: 'in-tab',
     textLen: existingTextOf(target).length,
+    abort: abortStream,
   })
   postEvent({
     kind: 'stream-started',

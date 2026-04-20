@@ -22,6 +22,7 @@ import type { Chat, ChatId, Message, MessageId, MessageRole } from '../../src/co
 import { newId } from '../../src/lib/ulid'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
+import { updateChatSettings } from '../../src/store/chats'
 
 const DB_NAME = 'natter'
 
@@ -141,6 +142,19 @@ describe('sendUserMessage', () => {
     expect(row?.parentId).not.toBeNull()
     // New leaf sits under the active-path leaf (not the root user message).
     expect(row?.parentId).not.toBe(root.id)
+  })
+})
+
+describe('updateChatSettings', () => {
+  it('removes optional top-level settings when patched to undefined', async () => {
+    const settings = cloneDefaultChatSettings()
+    settings.verbosity = 'high'
+    const chat = await seedChat({ settings })
+    const changed = await updateChatSettings(chat.id, { verbosity: undefined })
+    expect(changed).toBe(true)
+    const updated = await getChat(chat.id)
+    expect(updated?.settings.verbosity).toBeUndefined()
+    expect('verbosity' in (updated?.settings ?? {})).toBe(false)
   })
 })
 

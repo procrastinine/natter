@@ -30,6 +30,7 @@ import { textCompletions } from '../api/text-completions'
 import type { ChatStreamChunk } from '../api/types'
 import { activePath, cursorKeyOf, groupByParent } from '../core/active-path'
 import { sendUserMessage } from '../core/messages'
+import { mergeReasoningDetail } from '../core/reasoning'
 import type { ChatCompletionsTransformOptions } from '../core/transforms'
 import { toChatCompletions, toTextCompletions } from '../core/transforms'
 import { nextSiblingIndex } from '../core/tree-ops'
@@ -75,6 +76,9 @@ interface ChatAccumulator {
   provider?: string
   finishReason?: string
   usage?: ChatUsage
+  firstTextAt?: number
+  reasoningStartedAt?: number
+  reasoningFinishedAt?: number
   lastFlushedAt: number
   lastFlushedTextLen: number
   lastChunkReceivedAt: number
@@ -269,6 +273,7 @@ async function openAssistantStreamUnder(
 
   const streamId = newId()
   const abortController = new AbortController()
+  const abortStream = () => abortController.abort()
   const userSignal = input.signal
   if (userSignal?.aborted) abortController.abort(userSignal.reason)
   else
@@ -283,6 +288,7 @@ async function openAssistantStreamUnder(
     startedAt: now(),
     ownerClientId: 'in-tab',
     textLen: 0,
+    abort: abortStream,
   })
   postEvent({
     kind: 'stream-started',
@@ -328,8 +334,9 @@ async function openAssistantStreamUnder(
       signal: abortController.signal,
     })
     for await (const event of splitChatStream(chunkIter)) {
-      accumulator.lastChunkReceivedAt = now()
-      applyEvent(accumulator, event)
+      const eventNow = now()
+      accumulator.lastChunkReceivedAt = eventNow
+      applyEvent(accumulator, event, eventNow)
       if (event.lane === 'error') {
         outcome = 'error'
         streamError = event.error
@@ -347,7 +354,7 @@ async function openAssistantStreamUnder(
       }
     }
   } catch (err) {
-    if (abortController.signal.aborted) {
+    if (abortController.signal.aborted || userSignal?.aborted) {
       outcome = 'abort'
       abortReason = 'user'
     } else if (err instanceof ApiError && err.kind === 'network') {
@@ -396,31 +403,36 @@ async function openAssistantStreamUnder(
   return result
 }
 
-function applyEvent(acc: ChatAccumulator, event: StreamLaneEvent): void {
+function applyEvent(acc: ChatAccumulator, event: StreamLaneEvent, nowMs: number): void {
   switch (event.lane) {
     case 'text':
+      if (acc.firstTextAt === undefined) acc.firstTextAt = nowMs
       acc.textBuffer += event.text
       return
     case 'reasoning': {
       // Phase-7 reasoning reducer preserves the lane so the persisted
       // placeholder carries whatever the provider emitted. Details reduce by
       // `index` per §5.3.
+      if (acc.reasoningStartedAt === undefined) acc.reasoningStartedAt = nowMs
+      acc.reasoningFinishedAt = nowMs
       if (Array.isArray(event.details)) {
         for (const raw of event.details) {
           if (!raw || typeof raw !== 'object') continue
           const detail = raw as ReasoningDetail & { index?: number }
           const idx = typeof detail.index === 'number' ? detail.index : 0
           const existing = acc.reasoningByIndex.get(idx)
-          acc.reasoningByIndex.set(idx, mergeReasoning(existing, detail))
+          acc.reasoningByIndex.set(idx, mergeReasoningDetail(existing, detail))
         }
       }
       if (event.textDelta !== undefined) {
         const existing = acc.reasoningByIndex.get(0)
-        const next: ReasoningDetail =
-          existing && existing.type === 'reasoning.text'
-            ? { ...existing, text: (existing.text ?? '') + event.textDelta }
-            : { type: 'reasoning.text', index: 0, text: event.textDelta }
-        acc.reasoningByIndex.set(0, next)
+        acc.reasoningByIndex.set(
+          0,
+          mergeReasoningDetail(
+            existing,
+            { type: 'reasoning.text', index: 0, text: event.textDelta },
+          ),
+        )
       }
       return
     }
@@ -450,17 +462,6 @@ function applyEvent(acc: ChatAccumulator, event: StreamLaneEvent): void {
       // just add branches here.
       return
   }
-}
-
-function mergeReasoning(
-  existing: ReasoningDetail | undefined,
-  incoming: ReasoningDetail,
-): ReasoningDetail {
-  if (!existing) return incoming
-  if (existing.type === 'reasoning.text' && incoming.type === 'reasoning.text') {
-    return { ...existing, text: (existing.text ?? '') + (incoming.text ?? '') }
-  }
-  return incoming
 }
 
 function shouldFlush(acc: ChatAccumulator, nowMs: number): boolean {
@@ -572,6 +573,9 @@ function updatedGeneration(
   if (acc.provider) base.provider = acc.provider
   if (acc.usage) base.usage = acc.usage
   if (acc.usage?.cost !== undefined) base.cost = acc.usage.cost
+  if (acc.firstTextAt !== undefined) base.firstTextAt = acc.firstTextAt
+  if (acc.reasoningStartedAt !== undefined) base.reasoningStartedAt = acc.reasoningStartedAt
+  if (acc.reasoningFinishedAt !== undefined) base.reasoningFinishedAt = acc.reasoningFinishedAt
   if (acc.finishReason) base.finishReason = acc.finishReason as FinishReason
   if (opts.finishedAt !== undefined) base.finishedAt = opts.finishedAt
   return base
@@ -645,7 +649,13 @@ export function useChat(): UseChatApi {
   }, [])
 
   const abort = useCallback(() => {
-    controllerRef.current?.abort()
+    if (controllerRef.current) {
+      controllerRef.current.abort()
+      return
+    }
+    const streamId = streamIdRef.current
+    if (!streamId) return
+    useStreamStore.getState().abortStream(streamId)
   }, [])
 
   const isStreaming = useCallback(() => controllerRef.current !== null, [])

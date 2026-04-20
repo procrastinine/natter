@@ -14,6 +14,7 @@ export interface ActiveStream {
   startedAt: number
   ownerClientId: string
   textLen: number
+  abort?: () => void
 }
 
 export interface StreamStoreState {
@@ -29,6 +30,8 @@ export interface StreamStoreState {
   listByChat: (chatId: ChatId) => ActiveStream[]
   setActive: (stream: ActiveStream) => void
   updateTextLen: (streamId: string, textLen: number) => void
+  abortStream: (streamId: string) => boolean
+  abortChat: (chatId: ChatId) => number
   clearActive: (streamId: string) => void
   reset: () => void
 }
@@ -69,6 +72,23 @@ export const useStreamStore = create<StreamStoreState>((set, get) => ({
         },
       }
     }),
+  abortStream: (streamId) => {
+    const abort = get().activeByStreamId[streamId]?.abort
+    if (!abort) return false
+    abort()
+    return true
+  },
+  abortChat: (chatId) => {
+    let count = 0
+    const map = get().activeByStreamId
+    for (const id in map) {
+      const stream = map[id]
+      if (!stream || stream.chatId !== chatId || !stream.abort) continue
+      stream.abort()
+      count += 1
+    }
+    return count
+  },
   clearActive: (streamId) =>
     set((state) => {
       if (!(streamId in state.activeByStreamId)) return state

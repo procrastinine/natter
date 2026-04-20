@@ -1,16 +1,22 @@
-import { Component, memo, type ReactNode, useCallback, useState } from 'react'
+import { Component, memo, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { groupByParent } from '../../core/active-path'
+import { normalizeReasoningDetails } from '../../core/reasoning'
 import type { ChatId, CursorMap, Message as MessageRow, ReasoningDetail } from '../../core/types'
 import { dismissAbortReason } from '../../store/chats'
 import { useUiStore } from '../../store/zustand/uiStore'
 import { BranchControls } from './BranchControls'
 import { InlineEditor, plaintextOf } from './InlineEditor'
 import { type InsertSlot, MessageActions, MessageEditTreeActions } from './MessageActions'
-import { MessageContent } from './MessageContent'
+import { MessageContent, messageTextFromContent } from './MessageContent'
 import { MessageHeader } from './MessageHeader'
 import { MessageInfo } from './MessageInfo'
 import { ProfileGlyph } from './ProfileGlyph'
 import { ReasoningBlock } from './ReasoningBlock'
+import {
+  collapseProfileFor,
+  nextCollapseMode,
+  type MessageCollapseMode,
+} from './MessageStreamOverflow'
 
 export interface MessageProps {
   chatId: ChatId
@@ -93,9 +99,25 @@ function MessageInner({
   if (debug) {
     throw new Error('Message debug crash')
   }
-  const reasoning = message.reasoningDetails ?? []
+  const reasoning = useMemo(
+    () => normalizeReasoningDetails(message.reasoningDetails ?? []),
+    [message.reasoningDetails],
+  )
   const [showInfo, setShowInfo] = useState(false)
   const [editing, setEditing] = useState(false)
+  const text = useMemo(() => messageTextFromContent(message.content), [message.content])
+  const collapseProfile = useMemo(() => collapseProfileFor(text.length), [text.length])
+  const manualCollapseRef = useRef(false)
+  const [collapseMode, setCollapseMode] = useState<MessageCollapseMode>(collapseProfile.defaultMode)
+
+  useEffect(() => {
+    setCollapseMode((prev) => {
+      if (manualCollapseRef.current) {
+        return collapseProfile.modes.includes(prev) ? prev : collapseProfile.defaultMode
+      }
+      return collapseProfile.defaultMode
+    })
+  }, [collapseProfile.defaultMode, collapseProfile.modes])
 
   const handleSave = useCallback(
     async (text: string, reasoning?: ReasoningDetail[]) => {
@@ -115,6 +137,12 @@ function MessageInner({
   const byParent = groupByParent(messages)
   const siblings = (byParent.get(message.parentId) ?? []).filter((m) => !m.deleted)
   const editTreeMode = useUiStore((s) => s.editTreeMode)
+  const collapseEnabled = !editing && collapseProfile.modes.length > 1
+  const cycleCollapse = useCallback(() => {
+    if (!collapseEnabled) return
+    manualCollapseRef.current = true
+    setCollapseMode((prev) => nextCollapseMode(prev, collapseProfile.modes))
+  }, [collapseEnabled, collapseProfile.modes])
 
   return (
     <article
@@ -125,14 +153,28 @@ function MessageInner({
       data-editing={editing ? 'true' : 'false'}
       data-has-error={error ? 'true' : 'false'}
       data-has-reasoning={reasoning.length > 0 ? 'true' : 'false'}
+      data-collapse-mode={collapseMode}
     >
-      <ProfileGlyph
-        role={message.role}
-        {...(excludedFromContext ? { excluded: true } : {})}
-      />
+      <button
+        type="button"
+        data-ui="profile-glyph-button"
+        data-collapse-mode={collapseMode}
+        data-collapse-enabled={collapseEnabled ? 'true' : 'false'}
+        data-collapse-oversized={collapseProfile.oversized ? 'true' : undefined}
+        onClick={cycleCollapse}
+        disabled={!collapseEnabled}
+        aria-label={collapseButtonLabel(message.role, collapseMode, collapseProfile.modes.length)}
+        title={collapseButtonTitle(collapseMode, collapseProfile.modes.length, collapseProfile.oversized)}
+      >
+        <ProfileGlyph
+          role={message.role}
+          decorative
+          {...(excludedFromContext ? { excluded: true } : {})}
+        />
+      </button>
       <div data-ui="message-body-column">
         <MessageHeader message={message} />
-        {reasoning.length > 0 ? <ReasoningBlock details={reasoning} /> : null}
+        {collapseMode === 'full' && reasoning.length > 0 ? <ReasoningBlock details={reasoning} /> : null}
         {editing ? (
           <InlineEditor
             initial={plaintextOf(message.content)}
@@ -151,7 +193,11 @@ function MessageInner({
             ariaLabel={`Edit ${message.role} message`}
           />
         ) : (
-          <MessageContent content={message.content} streaming={streaming ?? false} />
+          <MessageContent
+            text={text}
+            streaming={streaming ?? false}
+            collapseMode={collapseMode}
+          />
         )}
         {error ? (
           <div data-ui="message-error" data-role="error">
@@ -233,6 +279,37 @@ function MessageInner({
       </div>
     </article>
   )
+}
+
+function collapseButtonLabel(
+  role: MessageRow['role'],
+  mode: MessageCollapseMode,
+  modeCount: number,
+): string {
+  const name = `${role} message`
+  if (modeCount <= 1) return `${name} avatar`
+  if (mode === 'full') {
+    return modeCount > 2 ? `Collapse ${name} to a compact preview` : `Collapse ${name} to a one-line preview`
+  }
+  if (mode === 'compact') {
+    return `Collapse ${name} to a one-line preview`
+  }
+  return `Expand ${name}`
+}
+
+function collapseButtonTitle(
+  mode: MessageCollapseMode,
+  modeCount: number,
+  oversized: boolean,
+): string {
+  if (modeCount <= 1) return oversized ? 'Oversized message preview' : 'Message avatar'
+  if (mode === 'full') {
+    return modeCount > 2 ? 'Collapse to a substantial preview' : 'Collapse to a one-line preview'
+  }
+  if (mode === 'compact') {
+    return 'Collapse further to a one-line preview'
+  }
+  return 'Expand back to the full message'
 }
 
 interface MessageErrorBoundaryProps {

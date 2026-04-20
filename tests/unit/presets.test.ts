@@ -15,6 +15,8 @@ import {
   exportPreset,
   getPreset,
   listPresets,
+  pickMruPresetForProfile,
+  pickPreferredPreset,
   PresetMissingError,
   pickMruPreset,
   unarchivePreset,
@@ -263,6 +265,66 @@ describe('pickMruPreset', () => {
 
   it('returns null when there are no presets at all', async () => {
     expect(await pickMruPreset()).toBeNull()
+  })
+
+  it('scopes MRU selection to a single profile when requested', async () => {
+    const a = await fakeProfileId('A')
+    const b = await fakeProfileId('B')
+    await createPreset({
+      name: 'a-old',
+      connectionProfileId: a,
+      settings: settingsFor(a),
+      lastUsedAt: 1000,
+    })
+    const aNew = await createPreset({
+      name: 'a-new',
+      connectionProfileId: a,
+      settings: settingsFor(a),
+      lastUsedAt: 5000,
+    })
+    await createPreset({
+      name: 'b-newest',
+      connectionProfileId: b,
+      settings: settingsFor(b),
+      lastUsedAt: 9000,
+    })
+    expect((await pickMruPresetForProfile(a))?.id).toBe(aNew.id)
+  })
+
+  it('prefers the last-viewed preset over workspace-global MRU', async () => {
+    const a = await fakeProfileId('A')
+    const b = await fakeProfileId('B')
+    const viewed = await createPreset({
+      name: 'viewed',
+      connectionProfileId: a,
+      settings: settingsFor(a),
+      lastUsedAt: 1000,
+    })
+    await createPreset({
+      name: 'global-mru',
+      connectionProfileId: b,
+      settings: settingsFor(b),
+      lastUsedAt: 9000,
+    })
+    expect((await pickPreferredPreset({ presetId: viewed.id, profileId: a }))?.id).toBe(viewed.id)
+  })
+
+  it('prefers the last-viewed profile over workspace-global MRU when preset is absent', async () => {
+    const a = await fakeProfileId('A')
+    const b = await fakeProfileId('B')
+    const scoped = await createPreset({
+      name: 'scoped',
+      connectionProfileId: a,
+      settings: settingsFor(a),
+      lastUsedAt: 1000,
+    })
+    await createPreset({
+      name: 'global-mru',
+      connectionProfileId: b,
+      settings: settingsFor(b),
+      lastUsedAt: 9000,
+    })
+    expect((await pickPreferredPreset({ profileId: a }))?.id).toBe(scoped.id)
   })
 })
 

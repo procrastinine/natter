@@ -1,4 +1,5 @@
-import type { Message as MessageRow } from '../../core/types'
+import { normalizeReasoningDetails } from '../../core/reasoning'
+import type { GenerationMeta, Message as MessageRow, ReasoningDetail } from '../../core/types'
 
 export interface MessageInfoProps {
   message: MessageRow
@@ -17,6 +18,7 @@ export interface MessageInfoProps {
 export function MessageInfo({ message, staleReplyHint }: MessageInfoProps) {
   const gen = message.generation
   const usage = gen?.usage
+  const normalizedReasoning = normalizeReasoningDetails(message.reasoningDetails ?? [])
   const start = gen?.startedAt
   const end = gen?.finishedAt
   const elapsedSec =
@@ -41,7 +43,9 @@ export function MessageInfo({ message, staleReplyHint }: MessageInfoProps) {
     rows.push([
       'Model',
       gen.requestedModel && gen.requestedModel !== gen.model ? (
-        <span title={`Requested ${gen.requestedModel} → served ${gen.model}`}>{gen.model}</span>
+        <span key="model-served" title={`Requested ${gen.requestedModel} → served ${gen.model}`}>
+          {gen.model}
+        </span>
       ) : (
         gen.model
       ),
@@ -65,8 +69,23 @@ export function MessageInfo({ message, staleReplyHint }: MessageInfoProps) {
     rows.push(['Completion tokens', usage.completion_tokens.toLocaleString()])
   }
   const reasoningTok = usage?.completion_tokens_details?.reasoning_tokens
+  const hasReasoningBreakout =
+    (typeof reasoningTok === 'number' && reasoningTok > 0) ||
+    normalizedReasoning.length > 0
+  const answerTokens =
+    hasReasoningBreakout && usage?.completion_tokens !== undefined && reasoningTok !== undefined
+      ? Math.max(0, usage.completion_tokens - reasoningTok)
+      : undefined
+  if (answerTokens !== undefined) {
+    rows.push(['Answer tokens', answerTokens.toLocaleString()])
+  }
   if (reasoningTok) {
     rows.push(['Reasoning tokens', reasoningTok.toLocaleString()])
+  } else {
+    const reasoningChars = summarizeReasoningChars(normalizedReasoning)
+    if (reasoningChars.total > 0) {
+      rows.push(['Reasoning chars', formatReasoningChars(reasoningChars)])
+    }
   }
   const cachedTok = usage?.prompt_tokens_details?.cached_tokens
   if (cachedTok) {
@@ -79,6 +98,10 @@ export function MessageInfo({ message, staleReplyHint }: MessageInfoProps) {
   if (gen?.cost !== undefined) {
     const prefix = gen.costSource === 'estimated' ? '≈ ' : ''
     rows.push(['Cost', `${prefix}$${gen.cost.toFixed(6)}`])
+  }
+  const reasoningTiming = reasoningTimingRow(gen)
+  if (reasoningTiming) {
+    rows.push(reasoningTiming)
   }
   if (elapsedSec !== undefined) {
     rows.push(['Latency', `${elapsedSec.toFixed(2)} s`])
@@ -105,4 +128,50 @@ export function MessageInfo({ message, staleReplyHint }: MessageInfoProps) {
       ))}
     </dl>
   )
+}
+
+function summarizeReasoningChars(details: ReasoningDetail[]): {
+  text: number
+  summary: number
+  encrypted: number
+  total: number
+} {
+  let text = 0
+  let summary = 0
+  let encrypted = 0
+  for (const detail of normalizeReasoningDetails(details)) {
+    if (detail.type === 'reasoning.text') text += detail.text?.length ?? 0
+    else if (detail.type === 'reasoning.summary') summary += detail.summary?.length ?? 0
+    else if (detail.type === 'reasoning.encrypted') encrypted += detail.data?.length ?? 0
+  }
+  return { text, summary, encrypted, total: text + summary + encrypted }
+}
+
+function formatReasoningChars(counts: {
+  text: number
+  summary: number
+  encrypted: number
+  total: number
+}): string {
+  const parts: string[] = []
+  if (counts.text > 0) parts.push(`text ${counts.text.toLocaleString()}`)
+  if (counts.summary > 0) parts.push(`summary ${counts.summary.toLocaleString()}`)
+  if (counts.encrypted > 0) parts.push(`encrypted ${counts.encrypted.toLocaleString()}`)
+  if (parts.length === 0) return counts.total.toLocaleString()
+  return `${counts.total.toLocaleString()} total (${parts.join(', ')})`
+}
+
+function reasoningTimingRow(gen: GenerationMeta | undefined): [string, string] | null {
+  if (!gen || gen.reasoningStartedAt === undefined) return null
+  const end =
+    gen.firstTextAt !== undefined && gen.firstTextAt >= gen.reasoningStartedAt
+      ? gen.firstTextAt
+      : gen.reasoningFinishedAt ?? gen.finishedAt
+  if (end === undefined || end <= gen.reasoningStartedAt) return null
+  const seconds = ((end - gen.reasoningStartedAt) / 1000).toFixed(2)
+  const value =
+    gen.firstTextAt !== undefined && gen.firstTextAt >= gen.reasoningStartedAt
+      ? `${seconds} s before answer`
+      : `${seconds} s`
+  return ['Reasoning time', value]
 }

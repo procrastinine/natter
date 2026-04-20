@@ -11,9 +11,10 @@
  * Owns: [data-ui='message-list'|'message'|'message-header'|'message-role'|
  *              'message-body'|'message-actions'|'message-action'|
  *              'message-info'|'message-info-row'|'profile-glyph'|
+ *              'profile-glyph-button'|'message-body-peek'|
  *              'inline-editor'|'message-edited'|'message-imported'|
  *              'message-error'|'message-crash'|'message-continue'|
- *              'stream-overflow'|'fallback-chip'].
+ *              'fallback-chip'].
  * See plan/10-ui.md §10.6.
  */
 
@@ -51,12 +52,30 @@
  * top-anchored position leaves the glyph floating above the label text.
  * Computation: negative top margin of (glyph - label-line) / 2 pulls the
  * glyph up by half the overhang. Label line-height = font-size-md * 1.5. */
-[data-ui="profile-glyph"] {
+[data-ui="profile-glyph-button"] {
+  appearance: none;
+  -webkit-appearance: none;
   grid-column: 1;
   justify-self: end;
   align-self: start;
+  position: sticky;
+  top: var(--space-3);
+  z-index: 1;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+  padding: 0;
   margin-right: var(--message-gutter);
   margin-top: calc((var(--font-size-md) * 1.5 - var(--message-glyph-size)) / 2);
+  cursor: pointer;
+  font: inherit;
+  line-height: 0;
+  color: inherit;
+  -webkit-tap-highlight-color: transparent;
+}
+
+[data-ui="profile-glyph"] {
   width: var(--message-glyph-size);
   height: var(--message-glyph-size);
   border-radius: 50%;
@@ -69,6 +88,36 @@
   justify-content: center;
   user-select: none;
   flex: 0 0 auto;
+}
+
+[data-ui="profile-glyph-button"]:disabled {
+  cursor: default;
+}
+
+[data-ui="profile-glyph-button"]:active {
+  background: transparent;
+}
+
+[data-ui="profile-glyph-button"]:focus-visible {
+  outline: none;
+}
+
+[data-ui="profile-glyph-button"]:focus-visible [data-ui="profile-glyph"] {
+  box-shadow: 0 0 0 var(--focus-ring-width) var(--color-border-focus);
+}
+
+[data-ui="profile-glyph-button"][data-collapse-enabled="true"]:hover [data-ui="profile-glyph"] {
+  box-shadow: inset 0 0 0 1px var(--color-border-default);
+}
+
+[data-ui="profile-glyph-button"][data-collapse-mode="compact"] [data-ui="profile-glyph"] {
+  box-shadow: inset 0 0 0 1.5px color-mix(in srgb, var(--color-accent) 35%, transparent);
+}
+
+[data-ui="profile-glyph-button"][data-collapse-mode="peek"] [data-ui="profile-glyph"] {
+  box-shadow:
+    inset 0 0 0 1.5px color-mix(in srgb, var(--color-accent) 50%, transparent),
+    inset 0 -8px 0 0 color-mix(in srgb, var(--color-accent) 14%, transparent);
 }
 
 /* Assistant glyph: soft light-blue so the model's turn is visually
@@ -310,31 +359,8 @@
   cursor: pointer;
 }
 
-[data-ui="stream-overflow"] {
-  margin-top: var(--space-3);
-  padding: var(--space-2) var(--space-3);
-  background: var(--color-bg-surface-2);
-  border: 1px dashed var(--color-border-default);
-  border-radius: var(--radius-sm);
-  font-size: var(--font-size-xs);
-  color: var(--color-fg-muted);
-  display: flex;
-  align-items: center;
-  gap: var(--space-3);
-}
-
-[data-ui="stream-overflow-reveal"] {
-  background: transparent;
-  border: 1px solid var(--color-border-default);
-  color: var(--color-fg-primary);
-  padding: var(--space-1) var(--space-3);
-  border-radius: var(--radius-sm);
-  font-size: var(--font-size-xs);
-  cursor: pointer;
-}
-
-[data-ui="message-body"][data-overflow="truncated"] {
-  max-height: 12em;
+[data-ui="message-body"][data-overflow="compact"] {
+  max-height: min(50vh, 32rem);
   overflow: hidden;
   position: relative;
   mask-image: linear-gradient(
@@ -343,4 +369,17 @@
     rgba(0, 0, 0, 1) calc(100% - var(--content-fade-height)),
     rgba(0, 0, 0, 0) 100%
   );
+}
+
+[data-ui="message-body"][data-overflow="peek"] {
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+[data-ui="message-body-peek"] {
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--color-fg-secondary);
 }

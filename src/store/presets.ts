@@ -148,20 +148,51 @@ export async function bumpPresetLastUsedAt(presetId: PresetId, now = Date.now())
   await db.presets.put({ ...existing, lastUsedAt: now })
 }
 
+function pickDefaultPreset(rows: ChatPreset[]): ChatPreset | null {
+  if (rows.length === 0) return null
+  const withLastUsed = rows.filter((p) => p.lastUsedAt !== undefined)
+  if (withLastUsed.length > 0) {
+    withLastUsed.sort((a, b) => (b.lastUsedAt ?? 0) - (a.lastUsedAt ?? 0))
+    return withLastUsed[0] ?? null
+  }
+  const sorted = [...rows].sort((a, b) => a.createdAt - b.createdAt)
+  return sorted[0] ?? null
+}
+
 // Selects the default preset for new chats per §9.2.1:
 //   1. Non-archived with greatest `lastUsedAt`.
 //   2. (Fresh install) first non-archived preset by `createdAt` ascending.
 //   3. `null` when no presets exist.
 export async function pickMruPreset(): Promise<ChatPreset | null> {
+  return pickDefaultPreset(await listPresets())
+}
+
+export async function pickMruPresetForProfile(profileId: ProfileId): Promise<ChatPreset | null> {
   const active = await listPresets()
-  if (active.length === 0) return null
-  const withLastUsed = active.filter((p) => p.lastUsedAt !== undefined)
-  if (withLastUsed.length > 0) {
-    withLastUsed.sort((a, b) => (b.lastUsedAt ?? 0) - (a.lastUsedAt ?? 0))
-    return withLastUsed[0] ?? null
+  return pickDefaultPreset(active.filter((p) => p.connectionProfileId === profileId))
+}
+
+export async function pickPreferredPreset(opts: {
+  presetId?: PresetId | null
+  profileId?: ProfileId | null
+} = {}): Promise<ChatPreset | null> {
+  if (opts.presetId) {
+    const preset = await getPreset(opts.presetId)
+    if (
+      preset &&
+      preset.archived !== true &&
+      (opts.profileId === undefined ||
+        opts.profileId === null ||
+        preset.connectionProfileId === opts.profileId)
+    ) {
+      return preset
+    }
   }
-  const sorted = [...active].sort((a, b) => a.createdAt - b.createdAt)
-  return sorted[0] ?? null
+  if (opts.profileId) {
+    const scoped = await pickMruPresetForProfile(opts.profileId)
+    if (scoped) return scoped
+  }
+  return pickMruPreset()
 }
 
 // Per-preset JSON export. Strips `lastUsedAt`/`archived` and includes a

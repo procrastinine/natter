@@ -11,13 +11,11 @@
 //    supports, leave them at "absent" so the ParamForm shows
 //    `default`. We avoid forcing a concrete value onto the user — the
 //    control is visible and they can opt in.
-// 3. For reasoning: if the model supports reasoning and the stored mode
-//    was `off`, keep it off. If the stored mode was undefined (pre-
-//    reasoning model), leave `mode: 'enabled'` which is the safe
-//    "adaptive" choice for modern reasoning models.
-// 4. Verbosity: if newly available, leave undefined — the user opts in.
-// 5. Caching: if the new model supports cache_control but the stored
-//    anthropicCache is `off`, leave it off (same reasoning as #3).
+// 3. Reasoning and verbosity stay absent unless the user already set
+//    them; newly-available controls should surface as `default`, not as
+//    an auto-selected concrete wire value.
+// 4. Caching: if the new model supports cache_control but the stored
+//    anthropicCache is `off`, leave it off.
 
 import type { EffectiveCapability } from './capabilities'
 import { validateChatSettings } from './capabilities'

@@ -190,6 +190,39 @@ describe('sendText — chat-completions streaming', () => {
     expect(assistant?.generation?.finishedAt).toBeDefined()
   })
 
+  it('keeps user abort classified as user when the transport throws a generic network error', async () => {
+    const chat = await createChat({ settings: chatSettings() })
+    const abort = new AbortController()
+    const result = await sendText({
+      chatId: chat.id,
+      connection: makeProfile(),
+      apiKey: 'sk-test',
+      content: [{ type: 'text', text: 'slow please' }],
+      signal: abort.signal,
+      openStream: () =>
+        (async function* () {
+          yield {
+            type: 'delta',
+            chunk: { id: 'gen-live-shape', choices: [{ delta: { content: 'slow ' } }] },
+          } as ChatStreamChunk
+          await Promise.resolve()
+          abort.abort()
+          throw new ApiError({
+            kind: 'network',
+            code: 'NETWORK',
+            message: 'terminated',
+            midStream: false,
+            retryable: true,
+          })
+        })(),
+    })
+    expect(result.outcome).toBe('abort')
+    const assistant = (await messagesFor(chat.id)).find((m) => m.role === 'assistant')
+    expect(assistant?.generation?.id).toBe('gen-live-shape')
+    expect(assistant?.generation?.abortReason).toBe('user')
+    expect(assistant?.content).toEqual([{ type: 'output_text', text: 'slow ' }])
+  })
+
   it('releases the stream store entry on completion', async () => {
     const chat = await createChat({ settings: chatSettings() })
     const before = Object.keys(useStreamStore.getState().activeByStreamId).length
@@ -209,6 +242,113 @@ describe('sendText — chat-completions streaming', () => {
     })
     const after = Object.keys(useStreamStore.getState().activeByStreamId).length
     expect(after).toBe(before)
+  })
+
+  it('dedupes mirrored reasoning payloads and stores separate reasoning timing', async () => {
+    const chat = await createChat({ settings: chatSettings() })
+    let tick = 1_000
+    await sendText({
+      chatId: chat.id,
+      connection: makeProfile(),
+      apiKey: 'sk-test',
+      content: [{ type: 'text', text: 'reason carefully' }],
+      openStream: () =>
+        stream(
+          {
+            type: 'delta',
+            chunk: {
+              choices: [
+                {
+                  delta: {
+                    reasoning: 'Let',
+                    reasoning_details: [{ type: 'reasoning.text', index: 0, text: 'Let' }],
+                  },
+                },
+              ],
+            },
+          },
+          {
+            type: 'delta',
+            chunk: {
+              choices: [
+                {
+                  delta: {
+                    reasoning: 'Let me',
+                    reasoning_details: [{ type: 'reasoning.text', index: 0, text: 'Let me' }],
+                    content: 'answer',
+                  },
+                  finish_reason: 'stop',
+                },
+              ],
+              usage: { prompt_tokens: 4, completion_tokens: 3, total_tokens: 7 },
+            },
+          },
+        ),
+      now: () => {
+        tick += 10
+        return tick
+      },
+    })
+    const assistant = (await messagesFor(chat.id)).find((m) => m.role === 'assistant')
+    expect(assistant?.reasoningDetails).toEqual([
+      {
+        type: 'reasoning.text',
+        index: 0,
+        text: 'Let me',
+      },
+    ])
+    expect(assistant?.generation?.reasoningStartedAt).toBeDefined()
+    expect(assistant?.generation?.firstTextAt).toBeDefined()
+    expect(assistant?.generation?.finishedAt).toBeDefined()
+    expect((assistant?.generation?.firstTextAt ?? 0) > (assistant?.generation?.reasoningStartedAt ?? 0)).toBe(true)
+    expect((assistant?.generation?.finishedAt ?? 0) >= (assistant?.generation?.firstTextAt ?? 0)).toBe(true)
+  })
+
+  it('merges overlapped mirrored reasoning fragments instead of re-appending them', async () => {
+    const chat = await createChat({ settings: chatSettings() })
+    await sendText({
+      chatId: chat.id,
+      connection: makeProfile(),
+      apiKey: 'sk-test',
+      content: [{ type: 'text', text: 'reason carefully' }],
+      openStream: () =>
+        stream(
+          {
+            type: 'delta',
+            chunk: {
+              choices: [
+                {
+                  delta: {
+                    reasoning: 'A ratio',
+                    reasoning_details: [{ type: 'reasoning.text', index: 0, text: 'A ratio' }],
+                  },
+                },
+              ],
+            },
+          },
+          {
+            type: 'delta',
+            chunk: {
+              choices: [
+                {
+                  delta: {
+                    reasoning: ' ratio of Gaussians',
+                  },
+                  finish_reason: 'stop',
+                },
+              ],
+            },
+          },
+        ),
+    })
+    const assistant = (await messagesFor(chat.id)).find((m) => m.role === 'assistant')
+    expect(assistant?.reasoningDetails).toEqual([
+      {
+        type: 'reasoning.text',
+        index: 0,
+        text: 'A ratio of Gaussians',
+      },
+    ])
   })
 })
 

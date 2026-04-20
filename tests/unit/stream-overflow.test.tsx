@@ -1,46 +1,79 @@
-import { fireEvent, render, screen } from '@testing-library/react'
+import { render } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
-import { MessageStreamOverflow } from '../../src/ui/chat/MessageStreamOverflow'
+import {
+  collapseProfileFor,
+  MessageStreamOverflow,
+  nextCollapseMode,
+} from '../../src/ui/chat/MessageStreamOverflow'
 
 describe('MessageStreamOverflow', () => {
-  it('renders the full children when under the threshold', () => {
+  it('renders the full children in full mode', () => {
     const { container } = render(
       <MessageStreamOverflow
-        totalChars={500}
-        truncatedChildren={<div>trunc</div>}
+        collapseMode="full"
         fullChildren={<div>full</div>}
-        threshold={2000}
+        compactChildren={<div>compact</div>}
+        peekChildren={<div>peek</div>}
       />,
     )
     expect(container.textContent).toBe('full')
-    expect(container.querySelector('[data-ui="stream-overflow"]')).toBeNull()
   })
 
-  it('shows the truncated children + "show full" affordance when over the threshold', () => {
-    render(
+  it('renders the compact children in compact mode', () => {
+    const { container } = render(
       <MessageStreamOverflow
-        totalChars={5000}
-        truncatedChildren={<div>trunc-sample</div>}
+        collapseMode="compact"
         fullChildren={<div>full-sample</div>}
-        threshold={2000}
+        compactChildren={<div>compact-sample</div>}
+        peekChildren={<div>peek-sample</div>}
       />,
     )
-    expect(screen.getByText('trunc-sample')).toBeTruthy()
-    expect(screen.queryByText('full-sample')).toBeNull()
-    expect(screen.getByText(/5,000 characters/)).toBeTruthy()
+    expect(container.textContent).toBe('compact-sample')
   })
 
-  it('switches to the full children after the reveal button is clicked', () => {
-    render(
+  it('renders the peek children in peek mode', () => {
+    const { container } = render(
       <MessageStreamOverflow
-        totalChars={5000}
-        truncatedChildren={<div>trunc-sample</div>}
+        collapseMode="peek"
         fullChildren={<div>full-sample</div>}
-        threshold={2000}
+        compactChildren={<div>compact-sample</div>}
+        peekChildren={<div>peek-sample</div>}
       />,
     )
-    fireEvent.click(screen.getByText('Show full'))
-    expect(screen.getByText('full-sample')).toBeTruthy()
-    expect(screen.queryByText('trunc-sample')).toBeNull()
+    expect(container.textContent).toBe('peek-sample')
+  })
+})
+
+describe('collapseProfileFor', () => {
+  it('keeps short messages on a simple full/peek cycle', () => {
+    expect(collapseProfileFor(500)).toEqual({
+      defaultMode: 'full',
+      modes: ['full', 'peek'],
+      oversized: false,
+    })
+  })
+
+  it('gives long messages a three-step cycle', () => {
+    expect(collapseProfileFor(6_000)).toEqual({
+      defaultMode: 'full',
+      modes: ['full', 'compact', 'peek'],
+      oversized: false,
+    })
+  })
+
+  it('auto-compacts truly oversized messages', () => {
+    expect(collapseProfileFor(25_000)).toEqual({
+      defaultMode: 'compact',
+      modes: ['full', 'compact', 'peek'],
+      oversized: true,
+    })
+  })
+})
+
+describe('nextCollapseMode', () => {
+  it('cycles through the available states', () => {
+    expect(nextCollapseMode('full', ['full', 'compact', 'peek'])).toBe('compact')
+    expect(nextCollapseMode('compact', ['full', 'compact', 'peek'])).toBe('peek')
+    expect(nextCollapseMode('peek', ['full', 'compact', 'peek'])).toBe('full')
   })
 })

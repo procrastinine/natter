@@ -9,7 +9,12 @@ import { __resetDbForTests, openDb } from '../../src/store/db'
 import { __resetKeyCacheForTests, createKey, getKey } from '../../src/store/keys'
 import { listPresets } from '../../src/store/presets'
 import { createProfile, getProfile, listProfiles } from '../../src/store/profiles'
-import { ConnectionHeader, writeActiveProfileId } from '../../src/ui/header/ConnectionHeader'
+import * as profileStore from '../../src/store/profiles'
+import {
+  ConnectionHeader,
+  readActiveProfileId,
+  writeActiveProfileId,
+} from '../../src/ui/header/ConnectionHeader'
 
 const DB_NAME = 'natter'
 
@@ -214,5 +219,69 @@ describe('ConnectionHeader', () => {
       throw new Error('expected copied profile to exist')
     }
     expect(await getKey(copy.apiKeyRef)).toBeUndefined()
+  })
+
+  it('shows the active chat profile while viewed, then falls back to the remembered tab default', async () => {
+    const a = await seedProfile({ name: 'OpenRouter A' })
+    const b = await seedProfile({ name: 'OpenRouter B' })
+    writeActiveProfileId(b.id)
+    const { rerender } = render(<ConnectionHeader activeChatProfileId={a.id} />)
+    await waitFor(() => {
+      expect(screen.getByText('OpenRouter A')).toBeTruthy()
+    })
+    expect(readActiveProfileId()).toBe(b.id)
+    rerender(<ConnectionHeader activeChatProfileId={null} />)
+    await waitFor(() => {
+      expect(screen.getByText('OpenRouter B')).toBeTruthy()
+    })
+  })
+
+  it('keeps the previous header state visible while the next profile load is still resolving', async () => {
+    const a = await seedProfile({
+      name: 'llama A',
+      kind: 'llama-server',
+      baseUrl: 'http://127.0.0.1:8080/v1',
+      key: null,
+    })
+    const b = await seedProfile({
+      name: 'llama B',
+      kind: 'llama-server',
+      baseUrl: 'http://127.0.0.1:8081/v1',
+      key: null,
+    })
+    writeActiveProfileId(b.id)
+    const listProfilesActual = profileStore.listProfiles
+    let resolveBlockedRows!: (value: Awaited<ReturnType<typeof listProfilesActual>>) => void
+    const blockedRows = new Promise<Awaited<ReturnType<typeof listProfilesActual>>>((resolve) => {
+      resolveBlockedRows = resolve
+    })
+    const spy = vi.spyOn(profileStore, 'listProfiles')
+    let blockNextLoad = false
+    spy.mockImplementation(() => {
+      if (blockNextLoad) {
+        blockNextLoad = false
+        return blockedRows
+      }
+      return listProfilesActual()
+    })
+
+    const { rerender } = render(<ConnectionHeader activeChatProfileId={a.id} />)
+    await waitFor(() => {
+      expect(screen.getByText('llama A')).toBeTruthy()
+    })
+
+    blockNextLoad = true
+    rerender(<ConnectionHeader activeChatProfileId={null} />)
+    expect(screen.queryByText('No connection configured')).toBeNull()
+    expect(screen.getByText('llama A')).toBeTruthy()
+
+    await waitFor(() => {
+      expect(spy).toHaveBeenCalledTimes(2)
+    })
+    resolveBlockedRows(await listProfilesActual())
+
+    await waitFor(() => {
+      expect(screen.getByText('llama B')).toBeTruthy()
+    })
   })
 })

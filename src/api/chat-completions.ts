@@ -100,7 +100,7 @@ export async function* chatCompletions(
     return
   }
 
-  for await (const ev of parseSSE(response)) {
+  for await (const ev of parseSSE(response, opts.signal ? { signal: opts.signal } : {})) {
     if (ev.kind === 'keepalive') {
       yield { type: 'keepalive', comment: ev.comment }
       continue

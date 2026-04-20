@@ -128,7 +128,7 @@ describe('splitChatStream', () => {
     ])
   })
 
-  it('forwards reasoning deltas (text + details)', async () => {
+  it('drops mirrored reasoning text when reasoning_details already carry the same delta', async () => {
     const source = fromChunks([
       {
         type: 'delta',
@@ -147,8 +147,31 @@ describe('splitChatStream', () => {
     const events = await collect(splitChatStream(source))
     expect(events.find((e) => e.lane === 'reasoning')).toEqual({
       lane: 'reasoning',
-      textDelta: 'thinking…',
       details: [{ type: 'reasoning.text', index: 0, text: 'thinking…' }],
+    })
+  })
+
+  it('preserves distinct reasoning text when details do not mirror it', async () => {
+    const source = fromChunks([
+      {
+        type: 'delta',
+        chunk: {
+          choices: [
+            {
+              delta: {
+                reasoning: 'thinking…',
+                reasoning_details: [{ type: 'reasoning.summary', summary: 'brief' }],
+              },
+            },
+          ],
+        },
+      },
+    ])
+    const events = await collect(splitChatStream(source))
+    expect(events.find((e) => e.lane === 'reasoning')).toEqual({
+      lane: 'reasoning',
+      textDelta: 'thinking…',
+      details: [{ type: 'reasoning.summary', summary: 'brief' }],
     })
   })
 
@@ -159,7 +182,16 @@ describe('splitChatStream', () => {
         result: {
           id: 'g1',
           model: 'm',
-          choices: [{ finish_reason: 'stop', message: { content: 'hello' } }],
+          choices: [
+            {
+              finish_reason: 'stop',
+              message: {
+                content: 'hello',
+                reasoning: 'thinking',
+                reasoning_details: [{ type: 'reasoning.text', text: 'thinking', index: 0 }],
+              },
+            },
+          ],
           usage: { prompt_tokens: 1, completion_tokens: 1 },
         },
       },
@@ -168,6 +200,7 @@ describe('splitChatStream', () => {
     expect(events).toMatchObject([
       { lane: 'meta', generationId: 'g1', model: 'm' },
       { lane: 'buffered' },
+      { lane: 'reasoning', details: [{ type: 'reasoning.text', text: 'thinking', index: 0 }] },
       { lane: 'text', text: 'hello' },
       { lane: 'finish', finishReason: 'stop' },
       { lane: 'usage', usage: { prompt_tokens: 1, completion_tokens: 1 } },

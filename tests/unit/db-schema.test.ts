@@ -71,7 +71,7 @@ describe('Dexie schema', () => {
   })
 })
 
-// Synthetic v2/v3 upgrades exercised through plain Dexie instances. We avoid
+// Synthetic post-schema upgrades exercised through plain Dexie instances. We avoid
 // subclassing (which trips "Type instantiation is excessively deep" under the
 // NatterDb branded Table types) and declare versions directly on the base Db.
 
@@ -92,7 +92,7 @@ function registerV1(db: Dexie): void {
 
 function registerV1Through3(db: Dexie): void {
   registerSchema(db)
-  db.version(3)
+  db.version(4)
     .stores({ profiles: 'id, name, kind, lastUsedAt, archived' })
     .upgrade(async (tx) => {
       await tx
@@ -102,7 +102,7 @@ function registerV1Through3(db: Dexie): void {
           if (row.appTitle === undefined) row.appTitle = 'Natter'
         })
     })
-  db.version(4)
+  db.version(5)
     .stores({ settings: '&key' })
     .upgrade(async (tx) => {
       const settings = tx.table<MinimalSetting>('settings')
@@ -123,7 +123,7 @@ describe('Dexie migrations', () => {
     const db = new Dexie(name)
     registerV1Through3(db)
     await db.open()
-    expect(db.verno).toBe(4)
+    expect(db.verno).toBe(5)
     expect(db.tables.map((t) => t.name).includes('settings')).toBe(true)
     const tag = await db.table<MinimalSetting>('settings').get('schemaTag')
     expect(tag).toBeUndefined()
@@ -159,17 +159,17 @@ describe('Dexie migrations', () => {
     const up = new Dexie(name)
     registerV1Through3(up)
     await up.open()
-    expect(up.verno).toBe(4)
+    expect(up.verno).toBe(5)
     const profile = await up.table<MinimalProfile>('profiles').get('P1')
-    expect(profile?.appTitle).toBe('CustomTitle') // preserved — v2 only fills undefined
+    expect(profile?.appTitle).toBe('CustomTitle') // preserved — synthetic bump only fills undefined
     const tag = await up.table<MinimalSetting>('settings').get('schemaTag')
-    expect(tag?.value).toBe('preexisting') // v3 only seeds when absent
+    expect(tag?.value).toBe('preexisting') // later synthetic bump only seeds when absent
     up.close()
 
     const reopen = new Dexie(name)
     registerV1Through3(reopen)
     await reopen.open()
-    expect(reopen.verno).toBe(4)
+    expect(reopen.verno).toBe(5)
     const tag2 = await reopen.table<MinimalSetting>('settings').get('schemaTag')
     expect(tag2?.value).toBe('preexisting')
     await reopen.delete()
@@ -188,7 +188,7 @@ describe('Dexie migrations', () => {
       baseUrl: 'https://example',
       apiKeyRef: 'K1',
       defaultHeaders: {},
-      // deliberately omit appTitle — v2 migration must set it
+      // deliberately omit appTitle — synthetic bump must set it
       appUrl: '',
       usesResponsesApiByDefault: false,
       supportsEndpointsApi: false,
@@ -203,7 +203,7 @@ describe('Dexie migrations', () => {
     registerV1Through3(up)
     await up.open()
     const row = await up.table<MinimalProfile>('profiles').get('P2')
-    expect(row?.appTitle).toBe('Natter') // v2 backfilled
+    expect(row?.appTitle).toBe('Natter') // synthetic bump backfilled
     await up.delete()
   })
 })

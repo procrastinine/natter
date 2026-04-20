@@ -1,5 +1,5 @@
 import { useLiveQuery } from 'dexie-react-hooks'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { chatCompletionsOnce } from '../../api/chat-completions'
 import { fetchModels } from '../../api/models'
 import { normalizeModelsResponse } from '../../api/providers'
@@ -12,6 +12,8 @@ import type {
   ConnectionKind,
   ConnectionProfile,
   Message,
+  PresetId,
+  ChatSettings,
   ProfileId,
 } from '../../core/types'
 import { newId } from '../../lib/ulid'
@@ -46,16 +48,75 @@ interface ConnectionSaveResult {
 }
 
 const ACTIVE_PROFILE_KEY = 'natter:active-profile-id'
+const ACTIVE_SEED_KEY = 'natter:active-seed'
+
+interface ActiveSeedState {
+  profileId: ProfileId | null
+  presetId: PresetId | null
+  settings: ChatSettings | null
+}
+
+function normalizeActiveSeedState(value: unknown): ActiveSeedState | null {
+  if (!value || typeof value !== 'object') return null
+  const candidate = value as { profileId?: unknown; presetId?: unknown; settings?: unknown }
+  const profileId = typeof candidate.profileId === 'string' ? (candidate.profileId as ProfileId) : null
+  const presetId = typeof candidate.presetId === 'string' ? (candidate.presetId as PresetId) : null
+  const settings =
+    candidate.settings && typeof candidate.settings === 'object'
+      ? (candidate.settings as ChatSettings)
+      : null
+  if (!profileId && !presetId && !settings) return null
+  return { profileId, presetId, settings }
+}
+
+export function readActiveSeedState(): ActiveSeedState {
+  if (typeof window === 'undefined') return { profileId: null, presetId: null, settings: null }
+  const raw = window.sessionStorage.getItem(ACTIVE_SEED_KEY)
+  if (raw) {
+    try {
+      const parsed = normalizeActiveSeedState(JSON.parse(raw))
+      if (parsed) return parsed
+    } catch {
+      // Fall through to legacy migration path.
+    }
+  }
+  const legacy = window.localStorage.getItem(ACTIVE_PROFILE_KEY)
+  return { profileId: (legacy ?? null) as ProfileId | null, presetId: null, settings: null }
+}
+
+export function writeActiveSeedState(state: ActiveSeedState): void {
+  if (typeof window === 'undefined') return
+  if (state.profileId || state.presetId || state.settings) {
+    window.sessionStorage.setItem(
+      ACTIVE_SEED_KEY,
+      JSON.stringify({
+        profileId: state.profileId ?? null,
+        presetId: state.presetId ?? null,
+        settings: state.settings ?? null,
+      }),
+    )
+  } else {
+    window.sessionStorage.removeItem(ACTIVE_SEED_KEY)
+  }
+  window.localStorage.removeItem(ACTIVE_PROFILE_KEY)
+}
 
 export function readActiveProfileId(): ProfileId | null {
-  if (typeof window === 'undefined') return null
-  return (window.localStorage.getItem(ACTIVE_PROFILE_KEY) ?? null) as ProfileId | null
+  const state = readActiveSeedState()
+  return state.settings?.profileId || state.profileId
 }
 
 export function writeActiveProfileId(id: ProfileId | null): void {
-  if (typeof window === 'undefined') return
-  if (id) window.localStorage.setItem(ACTIVE_PROFILE_KEY, id)
-  else window.localStorage.removeItem(ACTIVE_PROFILE_KEY)
+  if (!id) {
+    writeActiveSeedState({ profileId: null, presetId: null, settings: null })
+    return
+  }
+  const current = readActiveSeedState()
+  const nextSettings = current.settings ? structuredClone(current.settings) : cloneDefaultChatSettings()
+  const currentProfileId = current.settings?.profileId || current.profileId
+  nextSettings.profileId = id
+  if (currentProfileId && currentProfileId !== id) nextSettings.model = ''
+  writeActiveSeedState({ profileId: id, presetId: null, settings: nextSettings })
 }
 
 async function loadHeaderState(
@@ -311,15 +372,17 @@ export function ConnectionHeader({
   activeChatProfileId = null,
 }: ConnectionHeaderProps = {}) {
   const [activeId, setActiveId] = useState<ProfileId | null>(() => readActiveProfileId())
-  const state = useLiveQuery(
+  const liveState = useLiveQuery(
     () => loadHeaderState(activeId, activeChatProfileId),
     [activeId, activeChatProfileId],
-    {
-      profile: null,
-      profiles: [],
-      hasKey: false,
-    },
+    undefined,
   )
+  const stateCacheRef = useRef<HeaderState>({ profile: null, profiles: [], hasKey: false })
+  useEffect(() => {
+    if (liveState === undefined) return
+    stateCacheRef.current = liveState
+  }, [liveState])
+  const state = liveState ?? stateCacheRef.current
   const [open, setOpen] = useState(false)
   const [editing, setEditing] = useState(false)
   const [setupOpen, setSetupOpen] = useState(false)
