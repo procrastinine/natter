@@ -15,6 +15,7 @@
 // stream/response returns it (OpenRouter adds `cost` even on chat-completions,
 // though it's optional on vanilla OpenAI — treat missing cost as 0 for sums).
 
+import { safeServerTokens } from './token-guards'
 import type { ChatUsage, Message } from './types'
 
 export interface NormalizedUsage {
@@ -57,29 +58,37 @@ export function emptyUsage(): NormalizedUsage {
   return { ...ZERO_USAGE }
 }
 
+// `safeServerTokens` rejects negatives / NaN / Infinity / non-number and caps
+// implausibly large values at MAX_PLAUSIBLE_TOKENS. `?? 0` converts those
+// back to zero so `NormalizedUsage` fields are always finite non-negative.
+// `cost` stays raw but is gated on `Number.isFinite` so NaN can't poison sums.
+function safeCost(n: unknown): number {
+  return typeof n === 'number' && Number.isFinite(n) && n >= 0 ? n : 0
+}
+
 export function normalizeChatUsage(usage: ChatUsage | null | undefined): NormalizedUsage {
   if (!usage) return emptyUsage()
   return {
-    promptTokens: usage.prompt_tokens ?? 0,
-    completionTokens: usage.completion_tokens ?? 0,
-    totalTokens: usage.total_tokens ?? 0,
-    reasoningTokens: usage.completion_tokens_details?.reasoning_tokens ?? 0,
-    cachedTokens: usage.prompt_tokens_details?.cached_tokens ?? 0,
-    cacheCreationTokens: usage.cache_creation_input_tokens ?? 0,
-    cost: usage.cost ?? 0,
+    promptTokens: safeServerTokens(usage.prompt_tokens) ?? 0,
+    completionTokens: safeServerTokens(usage.completion_tokens) ?? 0,
+    totalTokens: safeServerTokens(usage.total_tokens) ?? 0,
+    reasoningTokens: safeServerTokens(usage.completion_tokens_details?.reasoning_tokens) ?? 0,
+    cachedTokens: safeServerTokens(usage.prompt_tokens_details?.cached_tokens) ?? 0,
+    cacheCreationTokens: safeServerTokens(usage.cache_creation_input_tokens) ?? 0,
+    cost: safeCost(usage.cost),
   }
 }
 
 export function normalizeResponsesUsage(usage: ResponsesUsage | null | undefined): NormalizedUsage {
   if (!usage) return emptyUsage()
   return {
-    promptTokens: usage.input_tokens ?? 0,
-    completionTokens: usage.output_tokens ?? 0,
-    totalTokens: usage.total_tokens ?? 0,
-    reasoningTokens: usage.output_tokens_details?.reasoning_tokens ?? 0,
-    cachedTokens: usage.input_tokens_details?.cached_tokens ?? 0,
+    promptTokens: safeServerTokens(usage.input_tokens) ?? 0,
+    completionTokens: safeServerTokens(usage.output_tokens) ?? 0,
+    totalTokens: safeServerTokens(usage.total_tokens) ?? 0,
+    reasoningTokens: safeServerTokens(usage.output_tokens_details?.reasoning_tokens) ?? 0,
+    cachedTokens: safeServerTokens(usage.input_tokens_details?.cached_tokens) ?? 0,
     cacheCreationTokens: 0,
-    cost: usage.cost ?? 0,
+    cost: safeCost(usage.cost),
   }
 }
 

@@ -888,6 +888,7 @@
   font-size: var(--font-size-xs);
   line-height: 1.5;
   white-space: normal;
+  transform: translateX(var(--info-panel-shift, 0px));
 }
 
 [data-ui="info-disclosure-panel"][data-align="end"] {

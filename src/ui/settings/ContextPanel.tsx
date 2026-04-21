@@ -26,9 +26,9 @@ import { useEffect, useMemo, useState } from 'react'
 import { activePath } from '../../core/active-path'
 import type { EffectiveCapability } from '../../core/capabilities'
 import {
-  UNLIMITED_CONTEXT,
   estimateSettingsPromptSize,
   type PromptSizeEstimate,
+  UNLIMITED_CONTEXT,
 } from '../../core/prompt-size'
 import type { Chat } from '../../core/types'
 import { getChatDraft, loadChatMessages, updateChatSettings } from '../../store/chats'
@@ -54,15 +54,22 @@ export function ContextPanel({
 }: ContextPanelProps) {
   const messages = useLiveQuery(() => loadChatMessages(chat.id), [chat.id], [])
   const cursor = useChatStore((s) => s.cursors[chat.id] ?? EMPTY_CURSOR)
-  const draft = useLiveQuery(
-    () => getChatDraft(chat.id).then((d) => d?.text ?? ''),
-    [chat.id],
-    '',
-  )
+  const draft = useLiveQuery(() => getChatDraft(chat.id).then((d) => d?.text ?? ''), [chat.id], '')
+  // Flatten capability to a single providerCap number so the memo's
+  // dependency array is primitive (capability objects can re-render the
+  // parent without changing their prompt-cap). `null` disables cutoff when
+  // capability hasn't loaded; once it does, the memo re-runs.
+  const providerCap = capability?.maxPromptTokens ?? capability?.contextLength ?? null
   const localEstimate = useMemo(() => {
     const path = activePath(messages, cursor)
-    return estimateSettingsPromptSize(chat.settings, path, draft ?? '', endpointTokenizer ?? null)
-  }, [messages, cursor, chat.settings, draft, endpointTokenizer])
+    return estimateSettingsPromptSize(
+      chat.settings,
+      path,
+      draft ?? '',
+      endpointTokenizer ?? null,
+      providerCap,
+    )
+  }, [messages, cursor, chat.settings, draft, endpointTokenizer, providerCap])
   const estimate = estimateOverride ?? localEstimate
 
   if (!chat.settings.model) {
@@ -126,8 +133,7 @@ export function ContextPanel({
     Number.isFinite(effectivePromptBudget) && effectivePromptBudget > 0
       ? usedTokens / (effectivePromptBudget as number)
       : 0
-  const overBudget =
-    Number.isFinite(effectivePromptBudget) && usedTokens > effectivePromptBudget
+  const overBudget = Number.isFinite(effectivePromptBudget) && usedTokens > effectivePromptBudget
   const warnLevel: 'ok' | 'warn' | 'danger' = overBudget
     ? 'danger'
     : budgetPct > 0.95
@@ -162,8 +168,8 @@ export function ContextPanel({
           <strong>{usedTokens.toLocaleString()}</strong>
           <span>
             {' '}
-            / {Number.isFinite(effectivePromptBudget) ? effectivePromptBudget.toLocaleString() : '∞'}
-            {' '}
+            /{' '}
+            {Number.isFinite(effectivePromptBudget) ? effectivePromptBudget.toLocaleString() : '∞'}{' '}
             tokens
           </span>
           {overBudget ? <span data-tone="danger"> · over budget</span> : null}
@@ -224,7 +230,9 @@ export function ContextPanel({
 
       <NumberSlider
         label="Max completion"
-        value={storedMaxCompletionRaw === UNLIMITED_CONTEXT ? UNLIMITED_CONTEXT : storedMaxCompletion}
+        value={
+          storedMaxCompletionRaw === UNLIMITED_CONTEXT ? UNLIMITED_CONTEXT : storedMaxCompletion
+        }
         min={1}
         max={modelCompletionCap}
         allowUnlimited
@@ -251,8 +259,7 @@ export function ContextPanel({
           step={1}
           onChange={(e) => {
             const n = Number(e.target.value)
-            if (Number.isFinite(n) && n >= 0)
-              updateStrategy({ keepFirstPairs: Math.floor(n) })
+            if (Number.isFinite(n) && n >= 0) updateStrategy({ keepFirstPairs: Math.floor(n) })
           }}
         />
       </label>

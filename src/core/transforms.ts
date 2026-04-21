@@ -1088,7 +1088,9 @@ export function toGeminiNative(
     generationConfig.temperature = settings.sampling.temperature
   if (settings.sampling.top_p !== undefined) generationConfig.topP = settings.sampling.top_p
   if (settings.sampling.top_k !== undefined) generationConfig.topK = settings.sampling.top_k
-  if (settings.maxCompletionTokens !== undefined) {
+  if (settings.maxCompletionTokens !== undefined && settings.maxCompletionTokens >= 0) {
+    // -1 is our local "unlimited" sentinel; never send it on the wire.
+    // Matches the chat-completions gate above.
     generationConfig.maxOutputTokens = settings.maxCompletionTokens
   }
   if (settings.stop && settings.stop.length > 0) {

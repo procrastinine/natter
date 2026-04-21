@@ -1,4 +1,4 @@
-import { type CSSProperties, type ReactNode, useEffect, useId, useLayoutEffect, useRef, useState } from 'react'
+import { type ReactNode, useEffect, useId, useLayoutEffect, useRef, useState } from 'react'
 
 export function InfoDisclosure({
   title,
@@ -10,7 +10,6 @@ export function InfoDisclosure({
   align?: 'start' | 'end'
 }) {
   const [open, setOpen] = useState(false)
-  const [panelShiftPx, setPanelShiftPx] = useState(0)
   const rootRef = useRef<HTMLSpanElement | null>(null)
   const panelRef = useRef<HTMLDivElement | null>(null)
   const panelId = useId()
@@ -34,15 +33,18 @@ export function InfoDisclosure({
     }
   }, [open])
 
+  // Dynamic viewport-clamp shift — we measure the panel's bounding rect
+  // after render and push it inward if it's overflowing either edge. The
+  // shift writes to the `--info-panel-shift` CSS variable so the stylesheet
+  // owns the `transform`; the style-discipline test forbids inline JSX
+  // style attributes.
   useLayoutEffect(() => {
-    if (!open) {
-      setPanelShiftPx(0)
-      return
-    }
+    if (!open) return
+    const panel = panelRef.current
+    if (!panel) return
 
     const clampIntoViewport = () => {
-      const panel = panelRef.current
-      if (!panel) return
+      panel.style.setProperty('--info-panel-shift', '0px')
       const rect = panel.getBoundingClientRect()
       const margin = 12
       let shift = 0
@@ -52,7 +54,7 @@ export function InfoDisclosure({
       if (rect.left + shift < margin) {
         shift += margin - (rect.left + shift)
       }
-      setPanelShiftPx(Math.round(shift))
+      panel.style.setProperty('--info-panel-shift', `${Math.round(shift)}px`)
     }
 
     clampIntoViewport()
@@ -62,12 +64,7 @@ export function InfoDisclosure({
       window.removeEventListener('resize', clampIntoViewport)
       window.removeEventListener('scroll', clampIntoViewport, true)
     }
-  }, [open, align, title, children])
-
-  const panelStyle =
-    panelShiftPx === 0
-      ? undefined
-      : ({ transform: `translateX(${panelShiftPx}px)` } satisfies CSSProperties)
+  }, [open])
 
   return (
     <span data-ui="info-disclosure" data-align={align} ref={rootRef}>
@@ -97,7 +94,6 @@ export function InfoDisclosure({
           data-ui="info-disclosure-panel"
           data-align={align}
           role="note"
-          style={panelStyle}
         >
           {children ?? title}
         </div>

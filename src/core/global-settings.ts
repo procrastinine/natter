@@ -34,6 +34,23 @@ export type FontFamilyChoice = 'system' | 'sans-serif' | 'serif' | 'monospace' |
 // headers and chips too.
 export type BaseFontSize = 13 | 14 | 15 | 16 | 17 | 18
 
+// Which tier of the chars-per-token calibration ladder to use at
+// estimate time. Controls `charsPerToken()` in `core/token-calibration.ts`.
+//
+//   - 'adaptive' (default): per-chat → global → family anchor. The
+//     learning pipeline runs as designed.
+//   - 'global-only': skip per-chat even if samples exist; use the
+//     cross-workspace global rollup. Useful if the user doesn't trust
+//     their own chat's drift.
+//   - 'family-defaults-only': ignore learned calibration entirely; use
+//     the per-family anchor from RATIO_BOUNDS. Useful if something went
+//     wrong with calibration and the user wants a known baseline.
+//
+// Sample ingestion still runs regardless — the toggle only affects
+// consumption. Users can flip back to 'adaptive' later and their
+// accumulated samples are still there.
+export type TokenCalibrationMode = 'adaptive' | 'global-only' | 'family-defaults-only'
+
 // System prompt injected on Continue (see `src/hooks/useContinue.ts`).
 // Kept as a global preference so the user can tune the exact wording
 // the model sees — some models respond better to "continue writing",
@@ -68,6 +85,9 @@ export interface GlobalPreferences {
   // sentinel is visible); scrolling up into `pinned` always stops
   // the yank regardless of this flag.
   autoScrollOnStream: boolean
+  // Which tier of the chars-per-token calibration ladder to consume at
+  // estimate time. Ingest is unaffected — samples keep accumulating.
+  tokenCalibrationMode: TokenCalibrationMode
 }
 
 export const DEFAULT_PINNED_MODELS: readonly string[] = Object.freeze([
@@ -90,6 +110,7 @@ export const DEFAULT_GLOBAL_PREFERENCES: Readonly<GlobalPreferences> = Object.fr
   autoScrollOnStream: true,
   pinnedModels: [...DEFAULT_PINNED_MODELS],
   recentModels: [],
+  tokenCalibrationMode: 'adaptive',
 })
 
 const THEME_KEY = 'global:theme'
@@ -104,6 +125,7 @@ const AUTO_SCROLL_OPEN_KEY = 'global:auto-scroll-open'
 const AUTO_SCROLL_STREAM_KEY = 'global:auto-scroll-stream'
 const PINNED_MODELS_KEY = 'global:pinned-models'
 const RECENT_MODELS_KEY = 'global:recent-models'
+const TOKEN_CALIBRATION_MODE_KEY = 'global:token-calibration-mode'
 // Legacy single-flag key — used for migration so existing installs
 // don't suddenly flip to the default. Read on boot, split into the
 // two new keys, then retired.
@@ -194,6 +216,18 @@ function chatMaxWidthOrDefault(value: unknown): ChatMaxWidth {
 
 export const CHAT_MAX_WIDTH_OPTIONS = ALLOWED_CHAT_MAX_WIDTHS
 
+const ALLOWED_CALIBRATION_MODES: readonly TokenCalibrationMode[] = [
+  'adaptive',
+  'global-only',
+  'family-defaults-only',
+]
+
+function calibrationModeOrDefault(value: unknown): TokenCalibrationMode {
+  return ALLOWED_CALIBRATION_MODES.includes(value as TokenCalibrationMode)
+    ? (value as TokenCalibrationMode)
+    : DEFAULT_GLOBAL_PREFERENCES.tokenCalibrationMode
+}
+
 export async function readGlobalPreferences(): Promise<GlobalPreferences> {
   const [
     theme,
@@ -209,6 +243,7 @@ export async function readGlobalPreferences(): Promise<GlobalPreferences> {
     legacyAutoScroll,
     pinned,
     recent,
+    tokenCalibrationMode,
   ] = await Promise.all([
     getSetting<ThemePreference>(THEME_KEY),
     getSetting<SendShortcut>(SEND_SHORTCUT_KEY),
@@ -223,6 +258,7 @@ export async function readGlobalPreferences(): Promise<GlobalPreferences> {
     getSetting<boolean>(LEGACY_AUTO_SCROLL_KEY),
     getSetting<string[]>(PINNED_MODELS_KEY),
     getSetting<string[]>(RECENT_MODELS_KEY),
+    getSetting<TokenCalibrationMode>(TOKEN_CALIBRATION_MODE_KEY),
   ])
   return {
     theme: ALLOWED_THEMES.includes(theme as ThemePreference)
@@ -257,7 +293,12 @@ export async function readGlobalPreferences(): Promise<GlobalPreferences> {
           : DEFAULT_GLOBAL_PREFERENCES.autoScrollOnStream,
     pinnedModels: Array.isArray(pinned) ? pinned.filter((x) => typeof x === 'string') : [...DEFAULT_PINNED_MODELS],
     recentModels: Array.isArray(recent) ? recent.filter((x) => typeof x === 'string') : [],
+    tokenCalibrationMode: calibrationModeOrDefault(tokenCalibrationMode),
   }
+}
+
+export async function writeTokenCalibrationMode(value: TokenCalibrationMode): Promise<void> {
+  await setSetting(TOKEN_CALIBRATION_MODE_KEY, value)
 }
 
 export async function writePinnedModels(value: readonly string[]): Promise<void> {

@@ -125,6 +125,73 @@ describe('normalizeResponsesUsage (Responses API shape)', () => {
   })
 })
 
+describe('normalizeChatUsage — robustness guards', () => {
+  it('coerces negative token fields to 0', () => {
+    const u: ChatUsage = {
+      prompt_tokens: -500 as unknown as number,
+      completion_tokens: 200,
+      total_tokens: 300,
+    }
+    const n = normalizeChatUsage(u)
+    expect(n.promptTokens).toBe(0)
+    expect(n.completionTokens).toBe(200)
+  })
+
+  it('coerces NaN/Infinity token fields to 0', () => {
+    const u: ChatUsage = {
+      prompt_tokens: Number.NaN as unknown as number,
+      completion_tokens: Number.POSITIVE_INFINITY as unknown as number,
+      total_tokens: 300,
+    }
+    const n = normalizeChatUsage(u)
+    expect(n.promptTokens).toBe(0)
+    expect(n.completionTokens).toBe(0)
+    expect(Number.isFinite(n.totalTokens)).toBe(true)
+  })
+
+  it('caps gigantic token fields at MAX_PLAUSIBLE_TOKENS', () => {
+    const u: ChatUsage = {
+      prompt_tokens: 1e12,
+      completion_tokens: 10,
+      total_tokens: 1e12,
+    }
+    const n = normalizeChatUsage(u)
+    expect(n.promptTokens).toBeLessThanOrEqual(100_000_000)
+    expect(n.totalTokens).toBeLessThanOrEqual(100_000_000)
+  })
+
+  it('rejects negative and NaN cost', () => {
+    const u1 = normalizeChatUsage({
+      prompt_tokens: 1,
+      completion_tokens: 1,
+      total_tokens: 2,
+      cost: -1,
+    })
+    const u2 = normalizeChatUsage({
+      prompt_tokens: 1,
+      completion_tokens: 1,
+      total_tokens: 2,
+      cost: Number.NaN as unknown as number,
+    })
+    expect(u1.cost).toBe(0)
+    expect(u2.cost).toBe(0)
+  })
+})
+
+describe('normalizeResponsesUsage — robustness guards', () => {
+  it('coerces negative / NaN / Infinity token fields to 0', () => {
+    const u: ResponsesUsage = {
+      input_tokens: -100 as unknown as number,
+      output_tokens: Number.NaN as unknown as number,
+      total_tokens: Number.POSITIVE_INFINITY as unknown as number,
+    }
+    const n = normalizeResponsesUsage(u)
+    expect(n.promptTokens).toBe(0)
+    expect(n.completionTokens).toBe(0)
+    expect(n.totalTokens).toBe(0)
+  })
+})
+
 describe('aggregateChatCost', () => {
   it('sums generation.cost across non-deleted messages', () => {
     const messages: Message[] = [

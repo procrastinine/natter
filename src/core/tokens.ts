@@ -5,6 +5,8 @@
 // so the UI context gauge is safer to under-fill. `usage.*_tokens` in the response
 // is authoritative and always wins during reconciliation.
 
+import { clampTokens, safeContent, safeLen, safeServerTokens } from './token-guards'
+
 export type TokenizerFamily =
   | 'claude'
   | 'gpt'
@@ -53,9 +55,11 @@ export function charPerToken(family: TokenizerFamily): number {
 
 // Rough token count for a text blob. Uses `Math.ceil` so the trailing partial
 // token is counted — matches the "slightly over-report" discipline in §14.15.
-export function estimateTokens(text: string, family: TokenizerFamily): number {
-  if (text.length === 0) return 0
-  return Math.ceil(text.length / CHAR_PER_TOKEN[family])
+// Defensive against null/undefined/non-string input via `safeLen`.
+export function estimateTokens(text: unknown, family: TokenizerFamily): number {
+  const len = safeLen(text)
+  if (len === 0) return 0
+  return clampTokens(Math.ceil(len / CHAR_PER_TOKEN[family]))
 }
 
 // Convenience: estimate using a raw `architecture.tokenizer` string directly.
@@ -101,15 +105,17 @@ export interface PromptEstimateOptions {
 // artifacts in rehydrated-legacy rows collapse first.
 const SIGNATURE_TOKEN_GUARD = 16
 
-export function estimateReasoningEchoTokens(
-  messages: readonly Message[],
+export function estimateReasoningEchoTokensForMessage(
+  message: Message,
   opts: PromptEstimateOptions,
 ): number {
-  let total = 0
-  for (const message of messages) {
-    if (message.role !== 'assistant') continue
-    if (!message.reasoningDetails || message.reasoningDetails.length === 0) continue
+  if (message.role !== 'assistant') return 0
+  if (!message.reasoningDetails || message.reasoningDetails.length === 0) return 0
 
+  // Whole body wrapped: a corrupt rehydrated row with `reasoningDetails`
+  // items of unexpected shape would otherwise crash the gauge. We prefer a
+  // conservative 0 estimate over a UI-wide break.
+  try {
     // Deduplicate first: covers the "scalar + details both stored on
     // legacy chats" edge case called out in the 1390685 fix.
     const normalized = normalizeReasoningDetails(message.reasoningDetails)
@@ -132,8 +138,9 @@ export function estimateReasoningEchoTokens(
     // roughly the same count as they were emitted). Without it we fall
     // back to the conservative `data.length / 3` byte-cap estimate, which
     // over-reports by ~1.8x for base64-ish blobs.
-    const providerReasoningTokens =
-      message.generation?.usage?.completion_tokens_details?.reasoning_tokens
+    const providerReasoningTokens = safeServerTokens(
+      message.generation?.usage?.completion_tokens_details?.reasoning_tokens,
+    )
 
     let encryptedCharCost = 0
     let visibleCost = 0
@@ -151,23 +158,31 @@ export function estimateReasoningEchoTokens(
       } else if (d.type === 'reasoning.summary') {
         if (typeof d.summary === 'string') visibleCost += estimateTokens(d.summary, opts.family)
       } else if (d.type === 'reasoning.encrypted') {
-        if (typeof d.data === 'string') encryptedCharCost += Math.ceil(d.data.length / 3)
+        // Cap raw byte-length contribution; a 10MB blob would otherwise
+        // balloon to ~3.3M tokens and poison both the gauge and budget math.
+        encryptedCharCost += clampTokens(Math.ceil(safeLen(d.data) / 3))
       }
     }
 
-    if (
-      encryptedCharCost > 0 &&
-      typeof providerReasoningTokens === 'number' &&
-      providerReasoningTokens > 0
-    ) {
+    if (encryptedCharCost > 0 && providerReasoningTokens !== undefined) {
       // Authoritative clamp: echoing encrypted reasoning costs AT MOST
       // what the provider charged as reasoning_tokens on the original
       // turn. Usually lands within a few percent of the true echo cost.
-      total += Math.min(encryptedCharCost, providerReasoningTokens)
-    } else {
-      total += encryptedCharCost
+      return clampTokens(Math.min(encryptedCharCost, providerReasoningTokens) + visibleCost)
     }
-    total += visibleCost
+    return clampTokens(encryptedCharCost + visibleCost)
+  } catch {
+    return 0
+  }
+}
+
+export function estimateReasoningEchoTokens(
+  messages: readonly Message[],
+  opts: PromptEstimateOptions,
+): number {
+  let total = 0
+  for (const message of messages) {
+    total += estimateReasoningEchoTokensForMessage(message, opts)
   }
   return total
 }
@@ -181,15 +196,15 @@ export function estimatePromptTokens(
   opts: PromptEstimateOptions,
 ): number {
   let total = 0
-  if (systemPrompt.length > 0) total += estimateTokens(systemPrompt, opts.family)
+  if (safeLen(systemPrompt) > 0) total += estimateTokens(systemPrompt, opts.family)
   for (const message of messages) {
     if (message.hiddenFromContext === true || message.deleted) continue
-    for (const item of message.content) {
+    for (const item of safeContent(message.content)) {
       if (item.type === 'text' || item.type === 'output_text') {
         total += estimateTokens(item.text, opts.family)
       }
     }
   }
   total += estimateReasoningEchoTokens(messages, opts)
-  return total
+  return clampTokens(total)
 }

@@ -96,7 +96,9 @@ describe('toGeminiNative — envelope + URL', () => {
 
 describe('toGeminiNative — thinkingConfig (Gemini 3)', () => {
   it('maps effort → thinkingLevel on Gemini 3.x', () => {
-    const cases: Array<[NonNullable<ChatSettings['reasoning']['effort']>, 'minimal' | 'low' | 'medium' | 'high']> = [
+    const cases: Array<
+      [NonNullable<ChatSettings['reasoning']['effort']>, 'minimal' | 'low' | 'medium' | 'high']
+    > = [
       ['none', 'minimal'],
       ['minimal', 'minimal'],
       ['low', 'low'],
@@ -189,7 +191,16 @@ describe('toGeminiNative — thinkingConfig (Gemini 2.5)', () => {
     ]
     for (const [effort, expected] of cases) {
       const { wire } = toGeminiNative(
-        { ...g25(), reasoning: { mode: 'enabled', effort, exclude: false, summary: 'off', include: { encrypted: true, summary: false, text: false } } },
+        {
+          ...g25(),
+          reasoning: {
+            mode: 'enabled',
+            effort,
+            exclude: false,
+            summary: 'off',
+            include: { encrypted: true, summary: false, text: false },
+          },
+        },
         [user('u1', 'hi')],
       )
       expect(wire.generationConfig?.thinkingConfig?.thinkingBudget).toBe(expected)
@@ -240,7 +251,10 @@ describe('toGeminiNative — reasoning echo (thoughtSignature on LAST part)', ()
     expect(wire.contents).toHaveLength(3)
     const modelTurn = wire.contents[1]!
     expect(modelTurn.role).toBe('model')
-    const lastPart = modelTurn.parts[modelTurn.parts.length - 1]! as { text?: string; thoughtSignature?: string }
+    const lastPart = modelTurn.parts[modelTurn.parts.length - 1]! as {
+      text?: string
+      thoughtSignature?: string
+    }
     expect(lastPart.thoughtSignature).toBe('SIG_BLOB')
     expect(lastPart.text).toBe('The answer is 42.')
   })
@@ -249,7 +263,10 @@ describe('toGeminiNative — reasoning echo (thoughtSignature on LAST part)', ()
     const details: ReasoningDetail[] = [
       { type: 'reasoning.encrypted', id: 'r_e', data: 'SIG_BLOB', format: 'google-gemini-v1' },
     ]
-    const path: Message[] = [user('u1', 'q'), assistant('a1', 'answer', { reasoningDetails: details })]
+    const path: Message[] = [
+      user('u1', 'q'),
+      assistant('a1', 'answer', { reasoningDetails: details }),
+    ]
     const { wire } = toGeminiNative(
       settings({
         reasoning: {
@@ -270,7 +287,10 @@ describe('toGeminiNative — reasoning echo (thoughtSignature on LAST part)', ()
     const details: ReasoningDetail[] = [
       { type: 'reasoning.encrypted', id: 'r_e', data: 'SIG_BLOB', format: 'openai-responses-v1' },
     ]
-    const path: Message[] = [user('u1', 'q'), assistant('a1', 'answer', { reasoningDetails: details })]
+    const path: Message[] = [
+      user('u1', 'q'),
+      assistant('a1', 'answer', { reasoningDetails: details }),
+    ]
     const { wire } = toGeminiNative(
       settings({
         reasoning: {
@@ -293,7 +313,10 @@ describe('toGeminiNative — reasoning echo (thoughtSignature on LAST part)', ()
     const details: ReasoningDetail[] = [
       { type: 'reasoning.summary', id: 'r_s', summary: 'I was thinking about X.' },
     ]
-    const path: Message[] = [user('u1', 'q'), assistant('a1', 'answer', { reasoningDetails: details })]
+    const path: Message[] = [
+      user('u1', 'q'),
+      assistant('a1', 'answer', { reasoningDetails: details }),
+    ]
     const { wire } = toGeminiNative(
       settings({
         reasoning: {
@@ -322,7 +345,10 @@ describe('toGeminiNative — reasoning echo (thoughtSignature on LAST part)', ()
         text: 'Summary of thinking',
       },
     ]
-    const path: Message[] = [user('u1', 'q'), assistant('a1', 'answer', { reasoningDetails: details })]
+    const path: Message[] = [
+      user('u1', 'q'),
+      assistant('a1', 'answer', { reasoningDetails: details }),
+    ]
     const { wire } = toGeminiNative(
       settings({
         reasoning: {
@@ -395,10 +421,9 @@ describe('toGeminiNative — tool calls + tool results', () => {
 
 describe('toGeminiNative — response format', () => {
   it('json_object → responseMimeType: application/json', () => {
-    const { wire } = toGeminiNative(
-      settings({ responseFormat: { type: 'json_object' } }),
-      [user('u1', 'hi')],
-    )
+    const { wire } = toGeminiNative(settings({ responseFormat: { type: 'json_object' } }), [
+      user('u1', 'hi'),
+    ])
     expect(wire.generationConfig?.responseMimeType).toBe('application/json')
   })
 
@@ -429,10 +454,7 @@ describe('toGeminiNative — sampling + stops + cachedContent', () => {
   })
 
   it('stop[] → stopSequences', () => {
-    const { wire } = toGeminiNative(
-      settings({ stop: ['STOP1', 'STOP2'] }),
-      [user('u1', 'hi')],
-    )
+    const { wire } = toGeminiNative(settings({ stop: ['STOP1', 'STOP2'] }), [user('u1', 'hi')])
     expect(wire.generationConfig?.stopSequences).toEqual(['STOP1', 'STOP2'])
   })
 
@@ -442,5 +464,26 @@ describe('toGeminiNative — sampling + stops + cachedContent', () => {
       [user('u1', 'hi')],
     )
     expect(wire.cachedContent).toBe('cachedContents/abc123')
+  })
+
+  it('maxCompletionTokens = -1 does NOT write maxOutputTokens (unlimited sentinel)', () => {
+    const { wire } = toGeminiNative(settings({ maxCompletionTokens: -1 }), [user('u1', 'hi')])
+    expect(wire.generationConfig?.maxOutputTokens).toBeUndefined()
+  })
+
+  it('maxCompletionTokens = 0 writes maxOutputTokens = 0', () => {
+    // 0 is semantically meaningful (no output) and should pass through.
+    const { wire } = toGeminiNative(settings({ maxCompletionTokens: 0 }), [user('u1', 'hi')])
+    expect(wire.generationConfig?.maxOutputTokens).toBe(0)
+  })
+
+  it('maxCompletionTokens = 1024 writes maxOutputTokens = 1024', () => {
+    const { wire } = toGeminiNative(settings({ maxCompletionTokens: 1024 }), [user('u1', 'hi')])
+    expect(wire.generationConfig?.maxOutputTokens).toBe(1024)
+  })
+
+  it('maxCompletionTokens = undefined does NOT write maxOutputTokens', () => {
+    const { wire } = toGeminiNative(settings(), [user('u1', 'hi')])
+    expect(wire.generationConfig?.maxOutputTokens).toBeUndefined()
   })
 })

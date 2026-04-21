@@ -4,6 +4,12 @@ import { getBrowserRepository } from '../store/browser-repo'
 import type { MutationContext, WorkspaceMutationResult } from '../store/repository'
 import { cursorKeyOf, groupByParent, indexById } from './active-path'
 import { cloneForExplicitBranch } from './branching'
+import { readGlobalPreferences } from './global-settings'
+import {
+  calibrationFieldsForCreate,
+  calibrationFieldsForEdit,
+  readTokenCalibrationGlobal,
+} from './token-calibration'
 import {
   cascadeSoftDelete,
   collectTurnChain,
@@ -415,6 +421,25 @@ export async function sendUserMessage(
   const parentId = resolveActiveLeafId(all, cursor)
   const messageId = newId()
   const turnId = newId()
+  // Pre-fetch chat + global calibration outside the mutation — both are
+  // read-only reference data and we don't want to hold them under the
+  // scope lock. Chat lookup may miss for brand-new chats (first message)
+  // in which case calibration falls through to hardcoded tiers.
+  const chatForRatio = await repo.getChat(chatId)
+  const [globalCal, prefs] = await Promise.all([
+    readTokenCalibrationGlobal(),
+    readGlobalPreferences(),
+  ])
+  const modelId = chatForRatio?.settings.model ?? ''
+  const calibrationFields = modelId
+    ? calibrationFieldsForCreate(
+        content,
+        modelId,
+        chatForRatio,
+        globalCal,
+        prefs.tokenCalibrationMode,
+      )
+    : null
   const result = await repo.runMutation(
     dedupeScopes([
       messageScope(messageId),
@@ -437,6 +462,7 @@ export async function sendUserMessage(
           content: structuredClone(content),
           nodeVersion: 0,
           deleted: false,
+          ...(calibrationFields ?? {}),
         },
         attachmentRefs,
       )
@@ -517,6 +543,25 @@ export async function editMessageContent(
     throw new TreeChangedError(input.chatId, `edit target ${input.messageId} unavailable`)
   }
   const { toInc, toDec } = diffAttachmentRefs(target.attachmentRefs, input.attachmentRefs)
+  // Pre-fetch chat + global calibration outside the mutation to avoid
+  // holding scope locks while reading other tables. Edits update the
+  // cache under the CURRENT chat model, not `originalModelId`.
+  const chatForRatio = await repo.getChat(input.chatId)
+  const [globalCal, prefs] = await Promise.all([
+    readTokenCalibrationGlobal(),
+    readGlobalPreferences(),
+  ])
+  const currentModelId = chatForRatio?.settings.model ?? ''
+  const calibrationPatch = currentModelId
+    ? calibrationFieldsForEdit(
+        input.content,
+        target.originalCharCount,
+        currentModelId,
+        chatForRatio,
+        globalCal,
+        prefs.tokenCalibrationMode,
+      )
+    : null
   const result = await repo.runMutation(
     dedupeScopes([messageScope(input.messageId), ...attachmentScopes([...toInc, ...toDec])]),
     async (ctx) => {
@@ -528,6 +573,7 @@ export async function editMessageContent(
         ...current,
         content: structuredClone(input.content),
         editedAt: input.now ?? Date.now(),
+        ...(calibrationPatch ?? {}),
       }
       if (input.attachmentRefs !== undefined) {
         if (input.attachmentRefs.length > 0) next.attachmentRefs = [...input.attachmentRefs]

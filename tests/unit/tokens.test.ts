@@ -78,6 +78,13 @@ describe('estimateTokens', () => {
     const text = 'a'.repeat(10_000)
     expect(estimateTokens(text, 'gpt')).toBeGreaterThan(estimateTokens(text, 'gemini'))
   })
+
+  it('returns 0 for null / undefined / non-string input (no throw)', () => {
+    expect(estimateTokens(null as unknown as string, 'gpt')).toBe(0)
+    expect(estimateTokens(undefined as unknown as string, 'gpt')).toBe(0)
+    expect(estimateTokens(42 as unknown as string, 'gpt')).toBe(0)
+    expect(estimateTokens({} as unknown as string, 'gpt')).toBe(0)
+  })
 })
 
 describe('estimateTokensByTokenizer', () => {

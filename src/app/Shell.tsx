@@ -2,6 +2,7 @@ import { useLiveQuery } from 'dexie-react-hooks'
 import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
 import { normalizeModelsResponse } from '../api/providers'
 import { activePath } from '../core/active-path'
+import { computeCutoffPlan } from '../core/context-cutoff'
 import { cloneDefaultChatSettings } from '../core/defaults'
 import {
   applyBaseFontSizeToDocument,
@@ -14,10 +15,10 @@ import {
 } from '../core/global-settings'
 import { resolvePrivacyForSend } from '../core/privacy-request'
 import {
-  UNLIMITED_CONTEXT,
-  estimatePromptSize,
+  estimateSettingsPromptSize,
   type PromptSizeEstimateInput,
   tokenizerFromSettings,
+  UNLIMITED_CONTEXT,
 } from '../core/prompt-size'
 import { quirksFor } from '../core/quirks'
 import type { Chat, ChatId, ChatPreset, ConnectionProfile, CursorMap } from '../core/types'
@@ -96,19 +97,11 @@ async function computeNeededTokensForSend(
     const messages = await loadChatMessages(chat.id)
     const cursor = useChatStore.getState().cursors[chat.id] ?? EMPTY_CURSOR
     const path = activePath(messages, cursor)
-    const quirks = quirksFor(chat.settings.model)
-    const input: Parameters<typeof estimatePromptSize>[0] = {
-      systemPrompt: chat.settings.systemPrompt,
-      activePathMessages: path,
-      draftText,
-      tokenizer: tokenizerFromSettings(chat.settings, null),
-      reasoningInclude: chat.settings.reasoning.include,
-      reasoningExcluded: chat.settings.reasoning.exclude === true,
-    }
-    if (quirks.reasoningPreservationFormat !== undefined) {
-      input.reasoningPreservationFormat = quirks.reasoningPreservationFormat
-    }
-    const est = estimatePromptSize(input)
+    // Routes through `estimateSettingsPromptSize` so the head+tail cutoff
+    // applies when the user set `customMaxContext` — providers whose
+    // `max_prompt_tokens` is below the TRIMMED prompt size stay filtered;
+    // providers that can fit the trimmed size stay eligible.
+    const est = estimateSettingsPromptSize(chat.settings, path, draftText, null)
     const reserveRaw = chat.settings.maxCompletionTokens
     const reserve = reserveRaw === UNLIMITED_CONTEXT ? 0 : (reserveRaw ?? 0)
     return est.total + reserve
@@ -154,11 +147,7 @@ export function Shell() {
   const streamingOnActiveChat = useStreamStore((s) =>
     activeChatId ? s.hasStreamForChat(activeChatId) : false,
   )
-  const profileCount = useLiveQuery(
-    () => countProfiles({ includeArchived: true }),
-    [],
-    0,
-  )
+  const profileCount = useLiveQuery(() => countProfiles({ includeArchived: true }), [], 0)
   const hasConnection = profileCount > 0
   const [chatModelOpen, setChatModelOpen] = useState(false)
   const [globalSettingsOpen, setGlobalSettingsOpen] = useState(false)
@@ -264,14 +253,36 @@ export function Shell() {
           .join('|')
       : '',
   )
+  // Pre-cut the active path via the head+tail cutoff so the composer
+  // gauge reflects what will actually be sent (matches the Context-tab
+  // gauge). `providerCap` lets the cutoff resolve even when the user
+  // hasn't typed a `customMaxContext`; null until capability loads, then
+  // the memo re-runs.
+  const composerProviderCap =
+    activeCapability?.maxPromptTokens ?? activeCapability?.contextLength ?? null
   const tokenEstimateInput = useMemo<PromptSizeEstimateInput | null>(() => {
     if (!resolvedActiveChatRow) return null
     const quirks = quirksFor(resolvedActiveChatRow.settings.model)
+    const tokenizer = tokenizerFromSettings(resolvedActiveChatRow.settings, null)
+    const cutPlan = computeCutoffPlan({
+      messages: activePathMemo,
+      settings: resolvedActiveChatRow.settings,
+      tokenizer,
+      providerCap: composerProviderCap,
+      reasoningOpts: {
+        family: tokenizer,
+        reasoningInclude: resolvedActiveChatRow.settings.reasoning.include,
+        reasoningExcluded: resolvedActiveChatRow.settings.reasoning.exclude === true,
+        ...(quirks.reasoningPreservationFormat !== undefined
+          ? { reasoningPreservationFormat: quirks.reasoningPreservationFormat }
+          : {}),
+      },
+    })
     const input: PromptSizeEstimateInput = {
       systemPrompt: resolvedActiveChatRow.settings.systemPrompt,
-      activePathMessages: activePathMemo,
+      activePathMessages: cutPlan.kept,
       draftText: '',
-      tokenizer: tokenizerFromSettings(resolvedActiveChatRow.settings, null),
+      tokenizer,
       reasoningInclude: resolvedActiveChatRow.settings.reasoning.include,
       reasoningExcluded: resolvedActiveChatRow.settings.reasoning.exclude === true,
     }
@@ -279,7 +290,7 @@ export function Shell() {
       input.reasoningPreservationFormat = quirks.reasoningPreservationFormat
     }
     return input
-  }, [resolvedActiveChatRow, activePathMemo])
+  }, [resolvedActiveChatRow, activePathMemo, composerProviderCap])
   const deferredTokenEstimateInput = useDeferredValue(tokenEstimateInput)
   const tokenEstimate = useStreamStablePromptEstimate(
     resolvedActiveChatRow?.id,
@@ -379,7 +390,9 @@ export function Shell() {
   const resolveNewChatSeed = useCallback(async () => {
     const remembered = readActiveSeedState()
     const rememberedProfileId = remembered.settings?.profileId || remembered.profileId
-    const rememberedProfile = rememberedProfileId ? await getProfile(rememberedProfileId) : undefined
+    const rememberedProfile = rememberedProfileId
+      ? await getProfile(rememberedProfileId)
+      : undefined
     if (remembered.settings && rememberedProfile) {
       const preset = remembered.presetId ? await getPreset(remembered.presetId) : undefined
       return {
@@ -391,7 +404,10 @@ export function Shell() {
       presetId: remembered.presetId,
       profileId: rememberedProfile ? rememberedProfile.id : null,
     })
-    const settings = seedSettingsForNewChat(preset?.settings, rememberedProfile ? rememberedProfile.id : null)
+    const settings = seedSettingsForNewChat(
+      preset?.settings,
+      rememberedProfile ? rememberedProfile.id : null,
+    )
     return {
       preset,
       settings,

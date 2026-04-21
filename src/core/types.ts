@@ -544,6 +544,34 @@ export interface Chat {
   // thousands of chats). Optional for backward-compat with pre-existing
   // chat rows; legacy rows are lazily backfilled on first open.
   previewText?: string
+  // Per-model running-sum calibration for chars-per-token. Keyed by the
+  // full model ID (with provider prefix, e.g. `openai/gpt-4o`). Updated
+  // on every successful stream completion in this chat. Optional for
+  // backcompat — absence falls through to global + hardcoded tiers.
+  tokenCalibration?: Record<string, TokenCalibrationSample>
+}
+
+// One per (chat, model) pair. Running sums — new samples add directly.
+// Ratio at any point is `totalTextChars / totalTextTokens`; that ratio is
+// automatically weighted by sample size (a 300-token completion
+// contributes 60× more than a 5-token user message), so no explicit
+// weighting is needed.
+export interface TokenCalibrationSample {
+  totalTextChars: number
+  totalTextTokens: number
+  sampleCount: number
+  lastRatio?: number
+  updatedAt: number
+}
+
+// Global calibration rollup. Stored in the settings table under key
+// `tokenCalibrationGlobal`. Updated incrementally per send so the cost
+// is O(1) per sample, not O(totalChats). See `plan/03-storage.md` for
+// the settings-table contract.
+export interface GlobalTokenCalibration {
+  version: 1
+  updatedAt: number
+  byModel: Record<string, TokenCalibrationSample>
 }
 
 export interface ChatFolder {
@@ -728,6 +756,35 @@ export interface Message {
   pinCache?: boolean
   hiddenFromContext?: boolean
   deleted: boolean
+
+  // ---- Token-calibration fields (Phase B) ----
+  // All optional for backcompat; rehydrated old rows fall through to the
+  // fresh/cross-model path. See `plan/token-counting-audit.md` Phase B.
+
+  // Character count at message creation (text content only, no media). For
+  // assistant messages in the inline-`<think>` family, also includes the
+  // lifted reasoning-text chars — those were billed as completion tokens on
+  // the wire, so calibration should see them. Encrypted / signed reasoning
+  // (out-of-band reasoning_tokens) is NOT included. Immutable once set.
+  originalCharCount?: number
+  // Text-token estimate at creation time using the then-current calibration
+  // ratio. Used for same-model delta estimates. Immutable once set.
+  originalTokenEstimate?: number
+  // Model ID at creation time, e.g. `openai/gpt-4o`. Lets us detect model
+  // switches that invalidate the original estimate and flip to fresh path.
+  // Immutable once set.
+  originalModelId?: string
+  // Running delta from `originalCharCount` after in-place edits (+/-).
+  // Starts at 0; updated on every edit. Stays 0 if the message is never
+  // edited.
+  charCountDelta?: number
+  // Cached text-token estimate under the chat's CURRENT model + calibration
+  // ratio at time of last write. Gauge path prefers this over fresh; only
+  // stale until the next edit of THIS message (or discrete refresh event).
+  cachedTokenEstimate?: number
+  // Cached attachment cost (image / PDF / file heuristic) for the message's
+  // current content array. Invalidated only when media items change.
+  cachedMediaTokens?: number
 }
 
 // ---------------------------------------------------------------------------

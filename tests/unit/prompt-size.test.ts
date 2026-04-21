@@ -18,7 +18,12 @@ function makeMessage(partial: Partial<Message> & { role: MessageRole; text?: str
   const content = partial.content
     ? partial.content
     : partial.text !== undefined
-      ? [{ type: partial.role === 'assistant' ? 'output_text' : 'text', text: partial.text } as const]
+      ? [
+          {
+            type: partial.role === 'assistant' ? 'output_text' : 'text',
+            text: partial.text,
+          } as const,
+        ]
       : []
   return {
     id: partial.id ?? `msg-${Math.random().toString(36).slice(2, 8)}`,
@@ -88,9 +93,7 @@ describe('estimatePromptSize — fallback branch', () => {
     expect(est.systemTokens).toBeGreaterThan(0)
     expect(est.historyTokens).toBeGreaterThan(0)
     expect(est.draftTokens).toBeGreaterThan(0)
-    expect(est.total).toBe(
-      est.systemTokens + est.historyTokens + est.draftTokens + est.mediaTokens,
-    )
+    expect(est.total).toBe(est.systemTokens + est.historyTokens + est.draftTokens + est.mediaTokens)
   })
 
   it('skips hiddenFromContext messages in both branches', () => {
@@ -132,7 +135,8 @@ describe('estimatePromptSize — fallback branch', () => {
     expect(est.historyTokens).toBeLessThan(20)
   })
 
-  it('accumulates media tokens per image/output_image (258 each)', () => {
+  it('accumulates media tokens per image using fallback when dimensions unknown', () => {
+    // Without an attachment resolver, images fall back to ~1024 * 1.05 = 1076.
     const path = [
       makeMessage({
         role: 'user',
@@ -149,7 +153,145 @@ describe('estimatePromptSize — fallback branch', () => {
       draftText: '',
       tokenizer: DEFAULT_TOKENIZER,
     })
-    expect(est.mediaTokens).toBe(258 * 2)
+    // 2 images × (1024 × 1.05 → ceil = 1076) = 2152
+    expect(est.mediaTokens).toBe(1076 * 2)
+  })
+
+  it('uses OpenAI dims-based formula when attachment dims are known', () => {
+    // (512 × 512) / 512 + 85 = 512 + 85 = 597 × 1.05 → 627
+    const path = [
+      makeMessage({
+        role: 'user',
+        content: [{ type: 'image_url', attachmentId: 'att-1' }] as Message['content'],
+      }),
+    ]
+    const est = estimatePromptSize({
+      systemPrompt: '',
+      activePathMessages: path,
+      draftText: '',
+      tokenizer: DEFAULT_TOKENIZER,
+      attachmentResolver: (id) => {
+        if (id === 'att-1')
+          return {
+            id: 'att-1',
+            contentHash: '',
+            kind: 'image',
+            mime: 'image/png',
+            filename: 'x.png',
+            sizeBytes: 0,
+            createdAt: 1,
+            blob: new Blob(),
+            dimensions: { width: 512, height: 512 },
+            refCount: 1,
+          }
+        return undefined
+      },
+    })
+    expect(est.mediaTokens).toBe(627)
+  })
+
+  it('uses Claude dims-based formula when family = claude', () => {
+    // (512 × 512) / 750 = 349.52 → ceil = 350 × 1.05 → 368
+    const path = [
+      makeMessage({
+        role: 'user',
+        content: [{ type: 'image_url', attachmentId: 'att-1' }] as Message['content'],
+      }),
+    ]
+    const est = estimatePromptSize({
+      systemPrompt: '',
+      activePathMessages: path,
+      draftText: '',
+      tokenizer: 'claude',
+      attachmentResolver: (id) => {
+        if (id === 'att-1')
+          return {
+            id: 'att-1',
+            contentHash: '',
+            kind: 'image',
+            mime: 'image/png',
+            filename: 'x.png',
+            sizeBytes: 0,
+            createdAt: 1,
+            blob: new Blob(),
+            dimensions: { width: 512, height: 512 },
+            refCount: 1,
+          }
+        return undefined
+      },
+    })
+    // (512*512)/750 = 349.52 → ceil 350 × 1.05 = 367.5 → ceil 368
+    expect(est.mediaTokens).toBe(368)
+  })
+
+  it('PDF attachment: pages × per-family rate (GPT = 1500)', () => {
+    // 3 pages × 1500 × 1.05 = 4725
+    const path = [
+      makeMessage({
+        role: 'user',
+        content: [
+          { type: 'file', attachmentId: 'pdf-1', filename: 'doc.pdf', mime: 'application/pdf' },
+        ] as Message['content'],
+      }),
+    ]
+    const est = estimatePromptSize({
+      systemPrompt: '',
+      activePathMessages: path,
+      draftText: '',
+      tokenizer: DEFAULT_TOKENIZER,
+      attachmentResolver: (id) => {
+        if (id === 'pdf-1')
+          return {
+            id: 'pdf-1',
+            contentHash: '',
+            kind: 'pdf',
+            mime: 'application/pdf',
+            filename: 'doc.pdf',
+            sizeBytes: 200_000,
+            createdAt: 1,
+            blob: new Blob(),
+            pageCount: 3,
+            refCount: 1,
+          }
+        return undefined
+      },
+    })
+    expect(est.mediaTokens).toBe(4725)
+  })
+
+  it('PDF ContentItem without resolver uses pdf fallback (1 page × 1500 × 1.05)', () => {
+    const path = [
+      makeMessage({
+        role: 'user',
+        content: [
+          { type: 'file', filename: 'doc.pdf', mime: 'application/pdf' },
+        ] as Message['content'],
+      }),
+    ]
+    const est = estimatePromptSize({
+      systemPrompt: '',
+      activePathMessages: path,
+      draftText: '',
+      tokenizer: DEFAULT_TOKENIZER,
+    })
+    // 1 × 1500 × 1.05 = 1575
+    expect(est.mediaTokens).toBe(1575)
+  })
+
+  it('non-PDF file falls back to GENERIC_FILE_TOKEN_FALLBACK (1000)', () => {
+    const path = [
+      makeMessage({
+        role: 'user',
+        content: [{ type: 'file', filename: 'data.csv', mime: 'text/csv' }] as Message['content'],
+      }),
+    ]
+    const est = estimatePromptSize({
+      systemPrompt: '',
+      activePathMessages: path,
+      draftText: '',
+      tokenizer: DEFAULT_TOKENIZER,
+    })
+    expect(est.mediaTokens).toBe(1000)
   })
 })
 
@@ -347,9 +489,7 @@ describe('estimatePromptSize — reasoning echo accounting', () => {
       makeMessage({
         role: 'assistant',
         text: 'reply',
-        reasoningDetails: [
-          { type: 'reasoning.summary', summary: 'A'.repeat(70) },
-        ],
+        reasoningDetails: [{ type: 'reasoning.summary', summary: 'A'.repeat(70) }],
       } as never),
     ]
     const est = estimatePromptSize({
@@ -359,6 +499,159 @@ describe('estimatePromptSize — reasoning echo accounting', () => {
       tokenizer: DEFAULT_TOKENIZER,
     })
     expect(est.reasoningTokens).toBe(0)
+  })
+})
+
+describe('estimatePromptSize — per-message cache (Phase B)', () => {
+  it('uses cachedTokenEstimate when same model', () => {
+    // Message has 35 chars of text (→ 10 tokens via 3.5 cpt fresh), but
+    // cachedTokenEstimate = 999. With currentModelId matching, cache wins.
+    const m: Message = {
+      ...makeMessage({ role: 'user', text: 'a'.repeat(35) }),
+      originalCharCount: 35,
+      originalTokenEstimate: 10,
+      originalModelId: 'openai/gpt-4o',
+      charCountDelta: 0,
+      cachedTokenEstimate: 999,
+      cachedMediaTokens: 0,
+    }
+    const est = estimatePromptSize({
+      systemPrompt: '',
+      activePathMessages: [m],
+      draftText: '',
+      tokenizer: DEFAULT_TOKENIZER,
+      currentModelId: 'openai/gpt-4o',
+    })
+    expect(est.historyTokens).toBe(999)
+  })
+
+  it('ignores cache when originalModelId differs from currentModelId', () => {
+    // Message was created under gpt-4o but chat switched to claude.
+    const m: Message = {
+      ...makeMessage({ role: 'user', text: 'a'.repeat(35) }),
+      originalCharCount: 35,
+      originalTokenEstimate: 999,
+      originalModelId: 'openai/gpt-4o',
+      charCountDelta: 0,
+      cachedTokenEstimate: 999,
+    }
+    const est = estimatePromptSize({
+      systemPrompt: '',
+      activePathMessages: [m],
+      draftText: '',
+      tokenizer: DEFAULT_TOKENIZER,
+      currentModelId: 'anthropic/claude-opus-4.7',
+    })
+    // Fresh path: 35 chars / 3.5 = 10 tokens.
+    expect(est.historyTokens).toBe(10)
+  })
+
+  it('uses cache when originalModelId is absent (pre-Phase-B row)', () => {
+    const m: Message = {
+      ...makeMessage({ role: 'user', text: 'a'.repeat(35) }),
+      cachedTokenEstimate: 500,
+      // No originalModelId — treat as "same model" and use cache.
+    }
+    const est = estimatePromptSize({
+      systemPrompt: '',
+      activePathMessages: [m],
+      draftText: '',
+      tokenizer: DEFAULT_TOKENIZER,
+      currentModelId: 'openai/gpt-4o',
+    })
+    expect(est.historyTokens).toBe(500)
+  })
+
+  it('uses fresh path when currentModelId is omitted AND no cache present', () => {
+    const m: Message = {
+      ...makeMessage({ role: 'user', text: 'a'.repeat(35) }),
+      // No cached fields at all — old row.
+    }
+    const est = estimatePromptSize({
+      systemPrompt: '',
+      activePathMessages: [m],
+      draftText: '',
+      tokenizer: DEFAULT_TOKENIZER,
+    })
+    expect(est.historyTokens).toBe(10) // fresh: 35/3.5
+  })
+})
+
+describe('estimatePromptSize — robustness guards', () => {
+  it('does not crash when a message.content is null/undefined (corrupt row)', () => {
+    const path = [
+      makeMessage({ role: 'user', text: 'hi' }),
+      {
+        ...makeMessage({ role: 'assistant', text: 'ok' }),
+        content: null as unknown as Message['content'],
+      },
+    ]
+    expect(() =>
+      estimatePromptSize({
+        systemPrompt: '',
+        activePathMessages: path,
+        draftText: '',
+        tokenizer: DEFAULT_TOKENIZER,
+      }),
+    ).not.toThrow()
+  })
+
+  it('treats negative baseline prompt_tokens as invalid (fallback wins)', () => {
+    const path = [
+      makeMessage({ role: 'user', text: 'hello world hello world' }),
+      makeMessage({
+        role: 'assistant',
+        text: 'there',
+        generation: withUsage(-500),
+      }),
+    ]
+    const est = estimatePromptSize({
+      systemPrompt: '',
+      activePathMessages: path,
+      draftText: '',
+      tokenizer: DEFAULT_TOKENIZER,
+    })
+    // Baseline rejected → fallback path: a small count from char heuristic.
+    expect(est.historyTokens).toBeGreaterThan(0)
+    expect(est.historyTokens).toBeLessThan(100)
+  })
+
+  it('caps a corrupt gigantic baseline at MAX_PLAUSIBLE_TOKENS', () => {
+    const path = [
+      makeMessage({ role: 'user', text: 'hello' }),
+      makeMessage({
+        role: 'assistant',
+        text: 'ok',
+        generation: withUsage(1e12),
+      }),
+    ]
+    const est = estimatePromptSize({
+      systemPrompt: '',
+      activePathMessages: path,
+      draftText: '',
+      tokenizer: DEFAULT_TOKENIZER,
+    })
+    expect(est.historyTokens).toBeLessThanOrEqual(100_000_000)
+    expect(est.total).toBeLessThanOrEqual(100_000_000)
+  })
+
+  it('caps NaN/Infinity baseline by returning undefined (fallback)', () => {
+    const path = [
+      makeMessage({ role: 'user', text: 'hello' }),
+      makeMessage({
+        role: 'assistant',
+        text: 'ok',
+        generation: withUsage(Number.NaN as unknown as number),
+      }),
+    ]
+    const est = estimatePromptSize({
+      systemPrompt: '',
+      activePathMessages: path,
+      draftText: '',
+      tokenizer: DEFAULT_TOKENIZER,
+    })
+    expect(Number.isFinite(est.historyTokens)).toBe(true)
+    expect(Number.isFinite(est.total)).toBe(true)
   })
 })
 
@@ -389,15 +682,13 @@ describe('tokenizerFromSettings', () => {
   })
 
   it('falls back to the model id keyword when no endpoint tokenizer', () => {
-    expect(
-      tokenizerFromSettings({ model: 'anthropic/claude-opus-4.7' } as never, null),
-    ).toBe('claude')
-    expect(
-      tokenizerFromSettings({ model: 'google/gemini-3.1-flash' } as never, null),
-    ).toBe('gemini')
+    expect(tokenizerFromSettings({ model: 'anthropic/claude-opus-4.7' } as never, null)).toBe(
+      'claude',
+    )
+    expect(tokenizerFromSettings({ model: 'google/gemini-3.1-flash' } as never, null)).toBe(
+      'gemini',
+    )
     expect(tokenizerFromSettings({ model: 'openai/gpt-5.4' } as never, null)).toBe('gpt')
-    expect(
-      tokenizerFromSettings({ model: 'unknown/weird' } as never, null),
-    ).toBe('unknown')
+    expect(tokenizerFromSettings({ model: 'unknown/weird' } as never, null)).toBe('unknown')
   })
 })

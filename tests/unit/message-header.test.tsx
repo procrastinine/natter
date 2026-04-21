@@ -158,6 +158,59 @@ describe('MessageInfo (revealed by ⓘ — full factual record)', () => {
   })
 })
 
+describe('MessageInfo — Phase B calibration fields', () => {
+  it('shows Current chars + Estimated tokens when original fields are populated', () => {
+    const { container } = render(
+      <MessageInfo
+        message={{
+          ...makeAssistant(),
+          originalCharCount: 200,
+          originalTokenEstimate: 57,
+          originalModelId: 'anthropic/claude-opus-4.7',
+          charCountDelta: 0,
+          cachedTokenEstimate: 57,
+          cachedMediaTokens: 0,
+        }}
+      />,
+    )
+    expect(container.textContent).toMatch(/Current chars/)
+    expect(container.textContent).toMatch(/200/)
+    expect(container.textContent).toMatch(/Estimated tokens/)
+    expect(container.textContent).toMatch(/57 text/)
+  })
+
+  it('shows Edit delta only when charCountDelta is non-zero', () => {
+    const { container } = render(
+      <MessageInfo
+        message={{
+          ...makeAssistant(),
+          originalCharCount: 200,
+          originalTokenEstimate: 57,
+          originalModelId: 'anthropic/claude-opus-4.7',
+          charCountDelta: 37,
+          cachedTokenEstimate: 68,
+          cachedMediaTokens: 0,
+        }}
+      />,
+    )
+    expect(container.textContent).toMatch(/Edit delta/)
+    expect(container.textContent).toMatch(/\+37 chars/)
+  })
+
+  it('falls back to fresh chars + family-anchor estimate when calibration fields are absent', () => {
+    // Pre-Phase-B row: no originalCharCount / cachedTokenEstimate.
+    // But MessageInfo still derives chars from content + applies family
+    // anchor so the number is visible.
+    const msg = makeAssistant()
+    msg.content = [{ type: 'text', text: 'A'.repeat(35) }]
+    const { container } = render(<MessageInfo message={msg} />)
+    expect(container.textContent).toMatch(/Current chars/)
+    expect(container.textContent).toMatch(/Estimated tokens \(~\)/)
+    // No delta row — message wasn't edited.
+    expect(container.textContent).not.toMatch(/Edit delta/)
+  })
+})
+
 describe('ReasoningBlock', () => {
   it('dedupes mirrored Claude reasoning rows before rendering', () => {
     const { container } = render(

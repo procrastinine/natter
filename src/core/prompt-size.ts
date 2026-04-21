@@ -6,10 +6,13 @@
 // the truncation preview — the authoritative token count comes from the
 // stream's `usage.prompt_tokens`.
 //
-// The estimate covers the active path, the system prompt, and the
-// composer draft. Attachments are approximated by a flat 258 tokens per
-// image and their file sizes for docs — same approximations used
-// elsewhere when we don't have a precise image-token helper yet.
+// The estimate covers the active path, the system prompt, and the composer
+// draft. Attachments flow through LibreChat-style per-family heuristics in
+// `./media-tokens.ts` (image: `(w*h)/512 + 85` OpenAI, `(w*h)/750` Claude;
+// PDF: pages × per-family rate; all × 1.05 safety margin). Callers that
+// have an attachment table pass `attachmentResolver` to unlock
+// dimensions / page-count / bytes aware estimates; without it we fall
+// back to conservative family-specific constants.
 //
 // Reasoning echo: when an assistant message carries `reasoningDetails[]`,
 // the next turn echoes the subset allowed by the chat's `ReasoningInclude`
@@ -20,21 +23,37 @@
 // reasoning row drops its contribution from the gauge.
 
 import { activePath } from './active-path'
-import { quirksFor } from './quirks'
+import { computeCutoffPlan } from './context-cutoff'
 import {
-  type PromptEstimateOptions,
+  GENERIC_FILE_TOKEN_FALLBACK,
+  imageTokenEstimate,
+  type PdfMeta,
+  pdfTokenEstimate,
+} from './media-tokens'
+import { quirksFor } from './quirks'
+import { clampTokens, safeContent, safeServerTokens } from './token-guards'
+import {
   estimateReasoningEchoTokens,
   estimateTokens,
+  type PromptEstimateOptions,
   type TokenizerFamily,
   tokenizerFamily,
 } from './tokens'
 import type {
+  Attachment,
+  AttachmentId,
   ChatSettings,
-  ContentItem,
   Message,
   ReasoningFormat,
   ReasoningInclude,
 } from './types'
+
+// Optional attachment resolver — when the caller can look up attachments
+// (e.g. the Context panel in a page that has the attachment table loaded),
+// pass this so image/PDF estimates use real dimensions / byte counts /
+// page counts. Callers that don't have an attachment table (e.g. the
+// compose-time check) fall through to the fallback heuristics.
+export type AttachmentResolver = (id: AttachmentId) => Attachment | undefined
 
 export interface PromptSizeEstimateInput {
   systemPrompt: string
@@ -48,6 +67,14 @@ export interface PromptSizeEstimateInput {
   reasoningInclude?: ReasoningInclude
   reasoningPreservationFormat?: ReasoningFormat
   reasoningExcluded?: boolean
+  // Optional — unlocks attachment-aware image / PDF heuristics. Callers
+  // without the attachment table fall through to the fallback values.
+  attachmentResolver?: AttachmentResolver
+  // Optional — the chat's CURRENT model ID. When present, per-message
+  // `cachedTokenEstimate` / `cachedMediaTokens` are trusted only when
+  // the message's `originalModelId` matches (or is undefined, for
+  // pre-Phase-B rows). When absent, the cache is used whenever present.
+  currentModelId?: string
 }
 
 export interface PromptSizeEstimate {
@@ -59,33 +86,91 @@ export interface PromptSizeEstimate {
   total: number
 }
 
-const IMAGE_TOKEN_ESTIMATE = 258 // OpenAI "low-detail" image cost as a placeholder.
-
-function mediaTokenCountFor(content: readonly ContentItem[]): number {
+function mediaTokenCountFor(
+  content: unknown,
+  family: TokenizerFamily,
+  resolver?: AttachmentResolver,
+): number {
   let tokens = 0
-  for (const item of content) {
+  for (const item of safeContent(content)) {
     if (item.type === 'image_url' || item.type === 'output_image') {
-      tokens += IMAGE_TOKEN_ESTIMATE
+      const att = item.attachmentId ? resolver?.(item.attachmentId) : undefined
+      tokens += imageTokenEstimate(family, {
+        ...(att?.dimensions?.width !== undefined ? { width: att.dimensions.width } : {}),
+        ...(att?.dimensions?.height !== undefined ? { height: att.dimensions.height } : {}),
+      })
     }
     if (item.type === 'file') {
-      // One token per 3 bytes is a conservative cap for PDF/file upload
-      // estimates until the upstream provider returns a better number.
-      const bytes = 0 // We don't have the actual size handy here; treat
-      // files as ~1000 tokens each for the rough gauge.
-      tokens += bytes > 0 ? Math.ceil(bytes / 3) : 1000
+      const att = item.attachmentId ? resolver?.(item.attachmentId) : undefined
+      if (att?.kind === 'pdf') {
+        const meta: PdfMeta = {}
+        if (att.pageCount !== undefined) meta.pageCount = att.pageCount
+        if (att.sizeBytes !== undefined) meta.sizeBytes = att.sizeBytes
+        tokens += pdfTokenEstimate(family, meta)
+      } else if (item.mime === 'application/pdf') {
+        // We don't have the attachment resolved but the ContentItem
+        // itself tells us it's a PDF. Use the fallback heuristic.
+        tokens += pdfTokenEstimate(family, {})
+      } else {
+        tokens += GENERIC_FILE_TOKEN_FALLBACK
+      }
     }
   }
   return tokens
 }
 
-function plainTextOf(content: readonly ContentItem[]): string {
+function plainTextOf(content: unknown): string {
   let out = ''
-  for (const item of content) {
+  for (const item of safeContent(content)) {
     if (item.type === 'text' || item.type === 'output_text') {
-      out += item.text
+      if (typeof item.text === 'string') out += item.text
     }
   }
   return out
+}
+
+// Whether a cached per-message estimate can be trusted. When the caller
+// knows the chat's `currentModelId`, cache is valid only if the message's
+// `originalModelId` matches (or is undefined — Phase B backcompat).
+function cacheEligibleFor(m: Message, currentModelId: string | undefined): boolean {
+  if (currentModelId === undefined) return true
+  if (m.originalModelId === undefined) return true
+  return m.originalModelId === currentModelId
+}
+
+// Per-message text-token estimate. Prefers `cachedTokenEstimate` when
+// model/family matches; falls back to fresh char-based estimate.
+function textTokensForMessage(
+  m: Message,
+  family: TokenizerFamily,
+  currentModelId: string | undefined,
+): number {
+  if (
+    cacheEligibleFor(m, currentModelId) &&
+    typeof m.cachedTokenEstimate === 'number' &&
+    Number.isFinite(m.cachedTokenEstimate)
+  ) {
+    return m.cachedTokenEstimate
+  }
+  return estimateTokens(plainTextOf(m.content), family)
+}
+
+// Per-message media-token estimate. Prefers `cachedMediaTokens` when
+// model/family matches; falls back to attachment-aware / fallback heuristic.
+function mediaTokensForMessage(
+  m: Message,
+  family: TokenizerFamily,
+  currentModelId: string | undefined,
+  resolver: AttachmentResolver | undefined,
+): number {
+  if (
+    cacheEligibleFor(m, currentModelId) &&
+    typeof m.cachedMediaTokens === 'number' &&
+    Number.isFinite(m.cachedMediaTokens)
+  ) {
+    return m.cachedMediaTokens
+  }
+  return mediaTokenCountFor(m.content, family, resolver)
 }
 
 export function estimatePromptSize(input: PromptSizeEstimateInput): PromptSizeEstimate {
@@ -104,26 +189,29 @@ export function estimatePromptSize(input: PromptSizeEstimateInput): PromptSizeEs
   for (const m of input.activePathMessages) {
     if (m.deleted || m.hiddenFromContext) continue
     visiblePath.push(m)
-    fallbackHistory += estimateTokens(plainTextOf(m.content), family)
-    fallbackMedia += mediaTokenCountFor(m.content)
+    fallbackHistory += textTokensForMessage(m, family, input.currentModelId)
+    fallbackMedia += mediaTokensForMessage(
+      m,
+      family,
+      input.currentModelId,
+      input.attachmentResolver,
+    )
   }
 
   // Provider-calibrated estimate — use the LATEST reported usage on the
   // active path as a baseline, then estimate only the deltas after it.
+  // `safeServerTokens` rejects negatives / NaN / non-number so a malicious
+  // or buggy server can't poison the baseline.
   let baselineIdx = -1
   let baselinePromptTokens: number | undefined
   for (let i = input.activePathMessages.length - 1; i >= 0; i -= 1) {
     const m = input.activePathMessages[i]
     if (!m || m.deleted || m.hiddenFromContext) continue
-    const usage = m.generation?.usage
-    if (
-      m.role === 'assistant' &&
-      usage &&
-      typeof usage.prompt_tokens === 'number' &&
-      usage.prompt_tokens > 0
-    ) {
+    if (m.role !== 'assistant') continue
+    const validated = safeServerTokens(m.generation?.usage?.prompt_tokens)
+    if (validated !== undefined && validated > 0) {
       baselineIdx = i
-      baselinePromptTokens = usage.prompt_tokens
+      baselinePromptTokens = validated
       break
     }
   }
@@ -135,14 +223,19 @@ export function estimatePromptSize(input: PromptSizeEstimateInput): PromptSizeEs
     let media = 0
     const baseline = input.activePathMessages[baselineIdx]
     if (baseline && !baseline.deleted && !baseline.hiddenFromContext) {
-      h += estimateTokens(plainTextOf(baseline.content), family)
-      media += mediaTokenCountFor(baseline.content)
+      h += textTokensForMessage(baseline, family, input.currentModelId)
+      media += mediaTokensForMessage(
+        baseline,
+        family,
+        input.currentModelId,
+        input.attachmentResolver,
+      )
     }
     for (let i = baselineIdx + 1; i < input.activePathMessages.length; i += 1) {
       const m = input.activePathMessages[i]
       if (!m || m.deleted || m.hiddenFromContext) continue
-      h += estimateTokens(plainTextOf(m.content), family)
-      media += mediaTokenCountFor(m.content)
+      h += textTokensForMessage(m, family, input.currentModelId)
+      media += mediaTokensForMessage(m, family, input.currentModelId, input.attachmentResolver)
     }
     calibratedHistory = h
     calibratedMedia = media
@@ -172,12 +265,12 @@ export function estimatePromptSize(input: PromptSizeEstimateInput): PromptSizeEs
   }
 
   return {
-    systemTokens,
-    historyTokens,
-    draftTokens,
-    mediaTokens,
-    reasoningTokens,
-    total: systemTokens + historyTokens + draftTokens + mediaTokens + reasoningTokens,
+    systemTokens: clampTokens(systemTokens),
+    historyTokens: clampTokens(historyTokens),
+    draftTokens: clampTokens(draftTokens),
+    mediaTokens: clampTokens(mediaTokens),
+    reasoningTokens: clampTokens(reasoningTokens),
+    total: clampTokens(systemTokens + historyTokens + draftTokens + mediaTokens + reasoningTokens),
   }
 }
 
@@ -214,15 +307,63 @@ export function estimateSettingsPromptSize(
   activePathMessages: Message[],
   draftText: string,
   endpointTokenizer: string | null | undefined,
+  // Provider/model cap — when provided AND the user hasn't set an explicit
+  // `customMaxContext`, this becomes the cutoff used by the head+tail trim.
+  // Pass `null` to skip cutoff entirely unless the user set `customMaxContext`
+  // themselves (e.g. the send pipeline when capability hasn't loaded).
+  providerCap: number | null = null,
+  attachmentResolver?: AttachmentResolver,
 ): PromptSizeEstimate {
   const quirks = quirksFor(settings.model)
-  const input: PromptSizeEstimateInput = {
-    systemPrompt: settings.systemPrompt,
-    activePathMessages,
-    draftText,
-    tokenizer: tokenizerFromSettings(settings, endpointTokenizer ?? null),
+  const tokenizer = tokenizerFromSettings(settings, endpointTokenizer ?? null)
+
+  const reasoningOpts: PromptEstimateOptions = {
+    family: tokenizer,
     reasoningInclude: settings.reasoning.include,
     reasoningExcluded: settings.reasoning.exclude === true,
+  }
+  if (quirks.reasoningPreservationFormat !== undefined) {
+    reasoningOpts.reasoningPreservationFormat = quirks.reasoningPreservationFormat
+  }
+
+  const plan = computeCutoffPlan({
+    messages: activePathMessages,
+    settings,
+    tokenizer,
+    providerCap,
+    draftText,
+    reasoningOpts,
+    ...(attachmentResolver !== undefined ? { attachmentResolver } : {}),
+    currentModelId: settings.model,
+  })
+
+  // When cutoff excluded any message, the calibrated trick (which subtracts
+  // baseline `prompt_tokens` − systemTokens to get history tokens) is no
+  // longer valid — that baseline was measured against a superset path.
+  // Return the plan's char-based numbers directly.
+  if (plan.applied) {
+    return {
+      systemTokens: plan.systemTokens,
+      historyTokens: plan.historyTextTokens,
+      draftTokens: plan.draftTokens,
+      mediaTokens: plan.historyMediaTokens,
+      reasoningTokens: plan.historyReasoningTokens,
+      total: plan.total,
+    }
+  }
+
+  // Nothing was trimmed → the kept path equals the visible path, so the
+  // old calibrated estimator is still valid and more accurate for models
+  // whose char-ratio is a poor fit.
+  const input: PromptSizeEstimateInput = {
+    systemPrompt: settings.systemPrompt,
+    activePathMessages: plan.kept,
+    draftText,
+    tokenizer,
+    reasoningInclude: settings.reasoning.include,
+    reasoningExcluded: settings.reasoning.exclude === true,
+    ...(attachmentResolver !== undefined ? { attachmentResolver } : {}),
+    currentModelId: settings.model,
   }
   if (quirks.reasoningPreservationFormat !== undefined) {
     input.reasoningPreservationFormat = quirks.reasoningPreservationFormat

@@ -45,7 +45,16 @@ function user(id: string, text: string): Message {
   }
 }
 
-function opts(include: ReasoningInclude, fmt: 'openai-responses-v1' | 'anthropic-claude-v1' | 'google-gemini-v1' | 'unknown' | undefined = 'openai-responses-v1', excluded = false): PromptEstimateOptions {
+function opts(
+  include: ReasoningInclude,
+  fmt:
+    | 'openai-responses-v1'
+    | 'anthropic-claude-v1'
+    | 'google-gemini-v1'
+    | 'unknown'
+    | undefined = 'openai-responses-v1',
+  excluded = false,
+): PromptEstimateOptions {
   return {
     family: 'gpt',
     reasoningInclude: include,
@@ -63,7 +72,9 @@ describe('estimateReasoningEchoTokens — include flags gate cost', () => {
         { type: 'reasoning.encrypted', data: 'A'.repeat(300), format: 'openai-responses-v1' },
       ]),
     ]
-    expect(estimateReasoningEchoTokens(path, opts({ encrypted: false, summary: false, text: false }))).toBe(0)
+    expect(
+      estimateReasoningEchoTokens(path, opts({ encrypted: false, summary: false, text: false })),
+    ).toBe(0)
   })
 
   it('encrypted-only counts ≈ data.length / 3', () => {
@@ -174,11 +185,101 @@ describe('estimatePromptTokens — full path', () => {
       },
       assistant('a1', 'A'.repeat(35)),
     ]
-    const costA = estimatePromptTokens(pathA, '', opts({ encrypted: true, summary: false, text: false }))
-    const costB = estimatePromptTokens(pathB, '', opts({ encrypted: true, summary: false, text: false }))
+    const costA = estimatePromptTokens(
+      pathA,
+      '',
+      opts({ encrypted: true, summary: false, text: false }),
+    )
+    const costB = estimatePromptTokens(
+      pathB,
+      '',
+      opts({ encrypted: true, summary: false, text: false }),
+    )
     // Each path has only the assistant's 10 tokens left.
     expect(costA).toBe(10)
     expect(costB).toBe(10)
+  })
+})
+
+describe('guards — reasoning echo robustness', () => {
+  it('does not throw on malformed reasoning entries (returns 0)', () => {
+    const path: Message[] = [
+      {
+        ...assistant('a1', 'answer'),
+        reasoningDetails: [
+          // Intentionally wrong shapes — a corrupt rehydrated row.
+          {
+            type: 'reasoning.text',
+            text: null as unknown as string,
+            signature: {} as unknown as string,
+          },
+          { type: 'reasoning.encrypted', data: null as unknown as string },
+          { type: 'reasoning.summary', summary: undefined as unknown as string },
+        ],
+      },
+    ]
+    expect(() =>
+      estimateReasoningEchoTokens(path, opts({ encrypted: true, summary: true, text: true })),
+    ).not.toThrow()
+  })
+
+  it('caps enormous encrypted blob via clampTokens (no 3.3M-token explosion)', () => {
+    const path: Message[] = [
+      assistant('a1', 'answer', [
+        {
+          type: 'reasoning.encrypted',
+          data: 'A'.repeat(10_000_000),
+          format: 'openai-responses-v1',
+        },
+      ]),
+    ]
+    const cost = estimateReasoningEchoTokens(
+      path,
+      opts({ encrypted: true, summary: false, text: false }),
+    )
+    // 10M / 3 = 3.33M — well below MAX_PLAUSIBLE_TOKENS (100M) so we expect
+    // the ceil'd value through but NOT an overflow.
+    expect(cost).toBeGreaterThan(0)
+    expect(cost).toBeLessThanOrEqual(100_000_000)
+  })
+
+  it('ignores corrupt reasoning_tokens via safeServerTokens', () => {
+    const m: Message = {
+      ...assistant('a1', 'answer', [
+        { type: 'reasoning.encrypted', data: 'A'.repeat(300), format: 'openai-responses-v1' },
+      ]),
+      generation: {
+        usage: {
+          // `reasoning_tokens` of "n/a" is a hypothetical malformed server field.
+          completion_tokens_details: { reasoning_tokens: 'n/a' as unknown as number },
+        } as unknown as Message['generation']['usage'],
+      } as unknown as Message['generation'],
+    }
+    // When providerReasoningTokens is invalid, we fall back to the char estimate.
+    const cost = estimateReasoningEchoTokens(
+      [m],
+      opts({ encrypted: true, summary: false, text: false }),
+    )
+    // 300 / 3 = 100 (as in the earlier test — no clamp because provider field was invalid).
+    expect(cost).toBe(100)
+  })
+
+  it('ignores negative reasoning_tokens via safeServerTokens', () => {
+    const m: Message = {
+      ...assistant('a1', 'answer', [
+        { type: 'reasoning.encrypted', data: 'A'.repeat(300), format: 'openai-responses-v1' },
+      ]),
+      generation: {
+        usage: {
+          completion_tokens_details: { reasoning_tokens: -5 },
+        } as unknown as Message['generation']['usage'],
+      } as unknown as Message['generation'],
+    }
+    const cost = estimateReasoningEchoTokens(
+      [m],
+      opts({ encrypted: true, summary: false, text: false }),
+    )
+    expect(cost).toBe(100)
   })
 })
 

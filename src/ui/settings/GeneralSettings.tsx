@@ -8,11 +8,14 @@ import {
   DEFAULT_GLOBAL_PREFERENCES,
   readGlobalPreferences,
   type SendShortcut,
+  type TokenCalibrationMode,
   writeAutoScrollOnOpen,
   writeAutoScrollOnStream,
   writeContinuePrompt,
   writeSendShortcut,
+  writeTokenCalibrationMode,
 } from '../../core/global-settings'
+import { TokenCalibrationSettings } from './TokenCalibrationSettings'
 
 const SHORTCUT_OPTIONS: ReadonlyArray<{ value: SendShortcut; label: string }> = [
   { value: 'enter', label: 'Enter sends · Shift+Enter inserts a newline' },
@@ -29,6 +32,9 @@ export function GeneralSettings() {
   }, [])
   const onAutoScrollOnStream = useCallback(async (value: boolean) => {
     await writeAutoScrollOnStream(value)
+  }, [])
+  const onTokenCalibrationMode = useCallback(async (value: TokenCalibrationMode) => {
+    await writeTokenCalibrationMode(value)
   }, [])
 
   const [continueDraft, setContinueDraft] = useState<string>(prefs.continuePrompt)
@@ -146,6 +152,10 @@ export function GeneralSettings() {
           </span>
         </div>
       </div>
+      <TokenCalibrationSettings
+        mode={prefs.tokenCalibrationMode}
+        onModeChange={onTokenCalibrationMode}
+      />
     </>
   )
 }

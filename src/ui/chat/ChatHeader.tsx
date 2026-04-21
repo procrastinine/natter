@@ -4,8 +4,14 @@ import { exportChatAsTxt, triggerBrowserDownload } from '../../core/chat-export'
 import type { ChatId, CursorMap } from '../../core/types'
 import { getChat, setManualTitle } from '../../store/chats'
 import { useChatStore } from '../../store/zustand/chatStore'
+import type { TokenCalibrationSample } from '../../core/types'
 import { CloseIcon, CogIcon, DownloadIcon, EditTreeIcon, InfoIcon, PencilIcon } from '../icons/Icon'
 import { HeaderPrivacyBadge } from './HeaderPrivacyBadge'
+
+function formatCalibrationRatio(sample: TokenCalibrationSample): string {
+  if (sample.totalTextTokens <= 0) return '—'
+  return (sample.totalTextChars / sample.totalTextTokens).toFixed(2)
+}
 
 // Stable empty reference so useChatStore's selector doesn't allocate a fresh
 // `{}` every render — React 19's useSyncExternalStore detects that as an
@@ -232,6 +238,19 @@ export function ChatHeader({
               <dt>Model</dt>
               <dd>{chat.settings.model || '—'}</dd>
             </div>
+            {Object.entries(chat.tokenCalibration ?? {})
+              .sort(([a], [b]) => a.localeCompare(b))
+              .map(([modelId, sample]) => (
+                <div key={`cal-${modelId}`}>
+                  <dt title={`Learned chars/token ratio for ${modelId}`}>
+                    Calib {modelId}
+                  </dt>
+                  <dd>
+                    {formatCalibrationRatio(sample)} c/tok · {sample.sampleCount.toLocaleString()}{' '}
+                    sample{sample.sampleCount === 1 ? '' : 's'}
+                  </dd>
+                </div>
+              ))}
           </dl>
         </div>
       ) : null}

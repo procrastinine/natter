@@ -1,4 +1,9 @@
 import { normalizeReasoningDetails } from '../../core/reasoning'
+import {
+  messageTextCharCount,
+  RATIO_BOUNDS,
+  tokenizerFamilyForModel,
+} from '../../core/token-calibration'
 import type { GenerationMeta, Message as MessageRow, ReasoningDetail } from '../../core/types'
 
 export interface MessageInfoProps {
@@ -99,6 +104,44 @@ export function MessageInfo({ message, staleReplyHint }: MessageInfoProps) {
     const prefix = gen.costSource === 'estimated' ? '≈ ' : ''
     rows.push(['Cost', `${prefix}$${gen.cost.toFixed(6)}`])
   }
+  // Phase B calibration readout. ALWAYS computed so pre-Phase-B rows
+  // (no originalCharCount) still show an estimate — the UI reads the
+  // current content and derives chars on the fly. Cached values are
+  // preferred when present; else we fall back to a family-anchor fresh
+  // estimate. (The gauge path uses the full tiered resolver with chat +
+  // global calibration; MessageInfo is a lighter display surface with
+  // no access to those tables, so it uses the family anchor.)
+  const contentChars = messageTextCharCount(message.content)
+  const displayChars =
+    typeof message.originalCharCount === 'number'
+      ? message.originalCharCount +
+        (typeof message.charCountDelta === 'number' ? message.charCountDelta : 0)
+      : contentChars
+  if (displayChars > 0) {
+    rows.push(['Current chars', displayChars.toLocaleString()])
+  }
+  if (
+    typeof message.charCountDelta === 'number' &&
+    message.charCountDelta !== 0 &&
+    typeof message.originalCharCount === 'number' &&
+    message.originalCharCount > 0
+  ) {
+    const sign = message.charCountDelta > 0 ? '+' : ''
+    rows.push([
+      'Edit delta',
+      `${sign}${message.charCountDelta.toLocaleString()} chars (orig ${message.originalCharCount.toLocaleString()})`,
+    ])
+  }
+  const displayTextTokens = computeDisplayTextTokens(message, displayChars)
+  if (displayTextTokens > 0) {
+    const parts = [`${displayTextTokens.toLocaleString()} text`]
+    if (typeof message.cachedMediaTokens === 'number' && message.cachedMediaTokens > 0) {
+      parts.push(`+${message.cachedMediaTokens.toLocaleString()} media`)
+    }
+    const label =
+      typeof message.cachedTokenEstimate === 'number' ? 'Estimated tokens' : 'Estimated tokens (~)'
+    rows.push([label, parts.join(' ')])
+  }
   const reasoningTiming = reasoningTimingRow(gen)
   if (reasoningTiming) {
     rows.push(reasoningTiming)
@@ -159,6 +202,26 @@ function formatReasoningChars(counts: {
   if (counts.encrypted > 0) parts.push(`encrypted ${counts.encrypted.toLocaleString()}`)
   if (parts.length === 0) return counts.total.toLocaleString()
   return `${counts.total.toLocaleString()} total (${parts.join(', ')})`
+}
+
+// Compute the text-token count to display in MessageInfo. Prefers the
+// cached estimate (which was written under the current calibration ratio
+// at the time) but falls back to a family-anchor fresh estimate for
+// pre-Phase-B rows. The `~` hint in the label signals it's a coarse
+// fallback estimate in that case.
+function computeDisplayTextTokens(message: MessageRow, displayChars: number): number {
+  if (
+    typeof message.cachedTokenEstimate === 'number' &&
+    Number.isFinite(message.cachedTokenEstimate) &&
+    message.cachedTokenEstimate > 0
+  ) {
+    return message.cachedTokenEstimate
+  }
+  if (displayChars <= 0) return 0
+  const modelId = message.originalModelId ?? message.generation?.model ?? ''
+  const family = modelId ? tokenizerFamilyForModel(modelId) : 'unknown'
+  const ratio = RATIO_BOUNDS[family].anchor
+  return Math.ceil(displayChars / ratio)
 }
 
 function reasoningTimingRow(gen: GenerationMeta | undefined): [string, string] | null {

@@ -29,13 +29,26 @@ import { type StreamLaneEvent, splitChatStream } from '../api/stream-transforms'
 import { textCompletions } from '../api/text-completions'
 import type { ChatStreamChunk } from '../api/types'
 import { activePath, cursorKeyOf, groupByParent } from '../core/active-path'
+import { applyContextCutoff, messageCost } from '../core/context-cutoff'
 import { sendUserMessage } from '../core/messages'
+import { tokenizerFromSettings } from '../core/prompt-size'
+import { quirksFor } from '../core/quirks'
+import { readGlobalPreferences } from '../core/global-settings'
+import {
+  addSampleToChat,
+  addSampleToGlobal,
+  calibrationFieldsForCreate,
+  deriveCompletionSample,
+  derivePromptSample,
+  readTokenCalibrationGlobal,
+} from '../core/token-calibration'
 import {
   findMergeTargetIndex,
   mergeReasoningDetail,
   normalizeIncomingReasoningDetail,
 } from '../core/reasoning'
 import { resolveTextTemplate } from '../core/text-templates'
+import type { PromptEstimateOptions } from '../core/tokens'
 import type { ChatCompletionsTransformOptions } from '../core/transforms'
 import { toChatCompletions, toTextCompletions } from '../core/transforms'
 import { nextSiblingIndex } from '../core/tree-ops'
@@ -235,7 +248,32 @@ async function openAssistantStreamUnder(
   }
   const path = activePath(allMessages, nextCursor)
 
-  const outboundPath = path.filter((m) => m.id !== assistantId)
+  const rawOutboundPath = path.filter((m) => m.id !== assistantId)
+
+  // Apply head+tail message cutoff before composing the wire. The user's
+  // just-persisted message is already in `rawOutboundPath`, so draftText
+  // is empty here (no separate upcoming-prompt term to subtract). When
+  // `customMaxContext` is unset AND no provider cap is known the cutoff
+  // resolves to Infinity and returns the full path verbatim.
+  const outboundCapCandidate =
+    input.capabilities?.maxPromptTokens ?? input.capabilities?.contextLength
+  const outboundQuirks = quirksFor(chat.settings.model)
+  const outboundTokenizer = tokenizerFromSettings(chat.settings, null)
+  const outboundReasoningOpts: PromptEstimateOptions = {
+    family: outboundTokenizer,
+    reasoningInclude: chat.settings.reasoning.include,
+    reasoningExcluded: chat.settings.reasoning.exclude === true,
+  }
+  if (outboundQuirks.reasoningPreservationFormat !== undefined) {
+    outboundReasoningOpts.reasoningPreservationFormat = outboundQuirks.reasoningPreservationFormat
+  }
+  const outboundPath = applyContextCutoff({
+    messages: rawOutboundPath,
+    settings: chat.settings,
+    tokenizer: outboundTokenizer,
+    providerCap: outboundCapCandidate ?? null,
+    reasoningOpts: outboundReasoningOpts,
+  })
 
   let wire: Record<string, unknown>
   let requestedModel: string
@@ -391,6 +429,13 @@ async function openAssistantStreamUnder(
       ...(abortReason ? { abortReason } : {}),
       ...(streamError ? { error: streamError } : {}),
       now: now(),
+      calibrationInputs: {
+        outboundPath,
+        systemPrompt: chat.settings.systemPrompt,
+        modelId: chat.settings.model,
+        family: outboundTokenizer,
+        ...(outboundReasoningOpts ? { reasoningOpts: outboundReasoningOpts } : {}),
+      },
     })
     useStreamStore.getState().clearActive(streamId)
     postEvent({
@@ -438,10 +483,7 @@ function applyEvent(acc: ChatAccumulator, event: StreamLaneEvent, nowMs: number)
       const mergeDetail = (incoming: ReasoningDetail) => {
         const target = findMergeTargetIndex(acc.reasoningList, incoming)
         if (target >= 0) {
-          acc.reasoningList[target] = mergeReasoningDetail(
-            acc.reasoningList[target],
-            incoming,
-          )
+          acc.reasoningList[target] = mergeReasoningDetail(acc.reasoningList[target], incoming)
         } else {
           acc.reasoningList.push(incoming)
         }
@@ -568,10 +610,61 @@ interface FinalizeContext extends FlushContext {
   abortReason?: AbortReason
   error?: ApiError
   now: number
+  // Token-calibration inputs — present when the send can produce a
+  // calibration sample on success. When omitted, calibration is skipped
+  // (e.g., text-protocol / llama-server, where we don't get usage).
+  calibrationInputs?: {
+    outboundPath: readonly Message[]
+    systemPrompt: string
+    modelId: string
+    family: import('../core/tokens').TokenizerFamily
+    reasoningOpts?: PromptEstimateOptions
+  }
 }
 
 async function finalize(ctx: FinalizeContext): Promise<void> {
-  const { repo, messageId, accumulator, requestedModel, outcome, abortReason, error, now } = ctx
+  const {
+    repo,
+    chatId,
+    messageId,
+    accumulator,
+    requestedModel,
+    outcome,
+    abortReason,
+    error,
+    now,
+    calibrationInputs,
+  } = ctx
+
+  // Pre-compute calibration fields for the assistant row. On a successful
+  // `done`, we populate `originalCharCount` / `originalTokenEstimate` /
+  // `originalModelId` / `cachedTokenEstimate` so the next gauge tick can
+  // read the cache directly instead of re-multiplying chars × ratio.
+  // Media tokens on an assistant message are always 0 (the model doesn't
+  // emit images/PDFs as regular content items), so we don't compute a
+  // media cache.
+  let assistantCalibrationFields: ReturnType<typeof calibrationFieldsForCreate> | null = null
+  if (outcome === 'done' && calibrationInputs) {
+    try {
+      const finalContent = [{ type: 'output_text' as const, text: accumulator.textBuffer }]
+      const [chatForRatio, globalCal, prefs] = await Promise.all([
+        repo.getChat(chatId),
+        readTokenCalibrationGlobal(),
+        readGlobalPreferences(),
+      ])
+      assistantCalibrationFields = calibrationFieldsForCreate(
+        finalContent,
+        calibrationInputs.modelId,
+        chatForRatio,
+        globalCal,
+        prefs.tokenCalibrationMode,
+      )
+    } catch {
+      assistantCalibrationFields = null
+    }
+  }
+
+  let persistedAssistant: Message | null = null
   await repo.runMutation([{ kind: 'message', messageId }], async (inner) => {
     const current = await inner.getMessage(messageId)
     if (!current) return
@@ -595,10 +688,119 @@ async function finalize(ctx: FinalizeContext): Promise<void> {
       ...current,
       content: [{ type: 'output_text', text: accumulator.textBuffer }],
       generation,
+      ...(assistantCalibrationFields ?? {}),
     }
     if (reasoning.length > 0) next.reasoningDetails = reasoning
     await inner.putMessage(next)
+    persistedAssistant = next
   })
+
+  // Token calibration — happens AFTER the assistant message is persisted
+  // so we have the final content + reasoningDetails + usage. Skips on
+  // anything other than a clean `done`, because error/abort streams don't
+  // have reliable usage from the server.
+  if (
+    outcome === 'done' &&
+    calibrationInputs &&
+    persistedAssistant !== null &&
+    accumulator.usage
+  ) {
+    try {
+      await ingestCalibrationSample({
+        repo,
+        chatId,
+        assistantMessage: persistedAssistant,
+        usage: accumulator.usage,
+        calibrationInputs,
+      })
+    } catch {
+      // Non-fatal: calibration failure must not surface to the user.
+    }
+  }
+}
+
+async function ingestCalibrationSample(args: {
+  repo: ReturnType<typeof getBrowserRepository>
+  chatId: ChatId
+  assistantMessage: Message
+  usage: ChatUsage
+  calibrationInputs: NonNullable<FinalizeContext['calibrationInputs']>
+}): Promise<void> {
+  const { repo, chatId, assistantMessage, usage, calibrationInputs } = args
+
+  // Sum media tokens across the outbound path using the same heuristic
+  // the gauge uses. Attachment resolver is omitted here — the send
+  // pipeline doesn't have an attachment table loaded. Fallback values
+  // still give a usable overhead estimate; samples whose ratio drifts
+  // outside family bounds are rejected at ingest time.
+  let mediaTokens = 0
+  for (const m of calibrationInputs.outboundPath) {
+    const cost = messageCost(m, { family: calibrationInputs.family })
+    mediaTokens += cost.media
+  }
+
+  const promptSample = derivePromptSample({
+    sentPath: calibrationInputs.outboundPath,
+    systemPrompt: calibrationInputs.systemPrompt,
+    usage,
+    family: calibrationInputs.family,
+    modelId: calibrationInputs.modelId,
+    mediaTokens,
+    ...(calibrationInputs.reasoningOpts
+      ? { reasoningEchoOpts: calibrationInputs.reasoningOpts }
+      : {}),
+  })
+  const completionSample = deriveCompletionSample({
+    assistantMessage,
+    usage,
+    family: calibrationInputs.family,
+  })
+
+  if (promptSample === null && completionSample === null) return
+
+  // Step 1: apply per-chat samples in memory. `patchChatMeta` with
+  // `touchVisibleState: false` writes into the hidden meta patch so we
+  // don't bump `metaVersion` / trigger a sidebar broadcast just for a
+  // calibration delta.
+  const acceptedSamples: Array<{ chars: number; tokens: number }> = []
+  await repo.runMutation([{ kind: 'chat-meta', chatId }], async (inner) => {
+    const chat = await inner.getChat(chatId)
+    if (!chat) return
+    const staged = {
+      tokenCalibration: { ...(chat.tokenCalibration ?? {}) },
+    } as { tokenCalibration: Record<string, import('../core/types').TokenCalibrationSample> }
+    if (promptSample !== null) {
+      const outcome = addSampleToChat(
+        staged,
+        calibrationInputs.modelId,
+        promptSample.chars,
+        promptSample.tokens,
+      )
+      if (outcome.accepted) acceptedSamples.push(promptSample)
+    }
+    if (completionSample !== null) {
+      const outcome = addSampleToChat(
+        staged,
+        calibrationInputs.modelId,
+        completionSample.chars,
+        completionSample.tokens,
+      )
+      if (outcome.accepted) acceptedSamples.push(completionSample)
+    }
+    if (acceptedSamples.length > 0) {
+      inner.patchChatMeta(
+        chatId,
+        { tokenCalibration: staged.tokenCalibration },
+        { touchVisibleState: false, broadcast: false },
+      )
+    }
+  })
+
+  // Step 2: roll up to global AFTER the chat mutation closes — separate
+  // transaction on the settings table.
+  for (const s of acceptedSamples) {
+    await addSampleToGlobal(calibrationInputs.modelId, s.chars, s.tokens)
+  }
 }
 
 function collectReasoning(acc: ChatAccumulator): ReasoningDetail[] {
@@ -608,17 +810,10 @@ function collectReasoning(acc: ChatAccumulator): ReasoningDetail[] {
   return acc.reasoningList.slice()
 }
 
-function upsertReasoningRow(
-  acc: ChatAccumulator,
-  tag: string,
-  incoming: ReasoningDetail,
-): void {
+function upsertReasoningRow(acc: ChatAccumulator, tag: string, incoming: ReasoningDetail): void {
   const existing = acc.reasoningRowByTag.get(tag)
   if (existing !== undefined) {
-    acc.reasoningList[existing] = mergeReasoningDetail(
-      acc.reasoningList[existing],
-      incoming,
-    )
+    acc.reasoningList[existing] = mergeReasoningDetail(acc.reasoningList[existing], incoming)
     return
   }
   acc.reasoningList.push(incoming)

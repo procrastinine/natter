@@ -555,6 +555,138 @@ describe('sendText — chat-completions streaming', () => {
   })
 })
 
+describe('sendText — token calibration sample ingest', () => {
+  it('writes a per-model chat.tokenCalibration sample on successful stream', async () => {
+    // 600-char user message so the prompt char count clears MIN_SAMPLE_CHARS.
+    const userText = 'a'.repeat(600)
+    const chat = await createChat({
+      settings: chatSettings({ model: 'openai/gpt-4o', systemPrompt: '' }),
+    })
+    // 600 chars → ~190 tokens at 3.15 c/t; choose prompt_tokens that land
+    // inside GPT family bounds [2.5, 5.0]. 600/180 = 3.33 → accepted.
+    await sendText({
+      chatId: chat.id,
+      connection: makeProfile(),
+      apiKey: 'sk-test',
+      content: [{ type: 'text', text: userText }],
+      openStream: () =>
+        stream(
+          { type: 'delta', chunk: { id: 'g', choices: [{ delta: { content: 'X'.repeat(300) } }] } },
+          {
+            type: 'delta',
+            chunk: {
+              choices: [{ delta: {}, finish_reason: 'stop' }],
+              usage: {
+                prompt_tokens: 180,
+                completion_tokens: 90,
+                total_tokens: 270,
+              },
+            },
+          },
+        ),
+    })
+    const chatRow = await getBrowserRepository().getChat(chat.id)
+    expect(chatRow?.tokenCalibration).toBeDefined()
+    const sample = chatRow?.tokenCalibration?.['openai/gpt-4o']
+    expect(sample).toBeDefined()
+    expect(sample?.sampleCount).toBeGreaterThanOrEqual(1)
+    expect(sample?.totalTextTokens).toBeGreaterThan(0)
+    // Within-bounds ratio.
+    const ratio = (sample?.totalTextChars ?? 0) / (sample?.totalTextTokens ?? 1)
+    expect(ratio).toBeGreaterThanOrEqual(2.5)
+    expect(ratio).toBeLessThanOrEqual(5.0)
+  })
+
+  it('does not calibrate on an errored stream (no usage / bad signal)', async () => {
+    const chat = await createChat({
+      settings: chatSettings({ model: 'openai/gpt-4o', systemPrompt: '' }),
+    })
+    await sendText({
+      chatId: chat.id,
+      connection: makeProfile(),
+      apiKey: 'sk-test',
+      content: [{ type: 'text', text: 'a'.repeat(600) }],
+      openStream: () =>
+        stream(
+          { type: 'delta', chunk: { choices: [{ delta: { content: 'partial' } }] } },
+          {
+            type: 'delta',
+            chunk: { error: { code: 429, message: 'rate limited' } },
+          },
+        ),
+    })
+    const chatRow = await getBrowserRepository().getChat(chat.id)
+    // Calibration is skipped on non-done outcome.
+    expect(chatRow?.tokenCalibration?.['openai/gpt-4o']).toBeUndefined()
+  })
+
+  it('populates per-message calibration fields on user + assistant messages', async () => {
+    const chat = await createChat({
+      settings: chatSettings({ model: 'openai/gpt-4o', systemPrompt: '' }),
+    })
+    const userText = 'a'.repeat(60)
+    await sendText({
+      chatId: chat.id,
+      connection: makeProfile(),
+      apiKey: 'sk-test',
+      content: [{ type: 'text', text: userText }],
+      openStream: () =>
+        stream(
+          { type: 'delta', chunk: { choices: [{ delta: { content: 'X'.repeat(100) } }] } },
+          {
+            type: 'delta',
+            chunk: {
+              choices: [{ delta: {}, finish_reason: 'stop' }],
+              usage: { prompt_tokens: 30, completion_tokens: 30, total_tokens: 60 },
+            },
+          },
+        ),
+    })
+    const all = liveMessagesSortedByCreated(await messagesFor(chat.id))
+    const [user, assistant] = all as [Message, Message]
+    // User message fields
+    expect(user.originalCharCount).toBe(60)
+    expect(user.originalModelId).toBe('openai/gpt-4o')
+    expect(user.charCountDelta).toBe(0)
+    expect(user.cachedTokenEstimate).toBeGreaterThan(0)
+    // Assistant message fields (populated on finalize for a successful done)
+    expect(assistant.originalCharCount).toBe(100)
+    expect(assistant.originalModelId).toBe('openai/gpt-4o')
+    expect(assistant.cachedTokenEstimate).toBeGreaterThan(0)
+  })
+
+  it('skips the sample when the implied ratio is outside family bounds', async () => {
+    const chat = await createChat({
+      settings: chatSettings({ model: 'openai/gpt-4o', systemPrompt: '' }),
+    })
+    // 100 chars / 10 prompt_tokens = ratio 10 — way above GPT hi (5.0).
+    // Rejected at ingest time; nothing persisted to tokenCalibration.
+    await sendText({
+      chatId: chat.id,
+      connection: makeProfile(),
+      apiKey: 'sk-test',
+      content: [{ type: 'text', text: 'a'.repeat(100) }],
+      openStream: () =>
+        stream(
+          { type: 'delta', chunk: { choices: [{ delta: { content: 'ok' } }] } },
+          {
+            type: 'delta',
+            chunk: {
+              choices: [{ delta: {}, finish_reason: 'stop' }],
+              usage: { prompt_tokens: 10, completion_tokens: 1, total_tokens: 11 },
+            },
+          },
+        ),
+    })
+    const chatRow = await getBrowserRepository().getChat(chat.id)
+    // Neither prompt nor completion sample should land: both too short /
+    // ratio out of bounds (completion 2 chars / 1 token is also outside).
+    const s = chatRow?.tokenCalibration?.['openai/gpt-4o']
+    // If we accept nothing, field either stays undefined OR sampleCount=0.
+    expect(s?.sampleCount ?? 0).toBe(0)
+  })
+})
+
 describe('recoverOrphans', () => {
   it('marks messages with startedAt-but-no-finishedAt as tab-close aborts', async () => {
     const chat = await createChat({ settings: chatSettings() })
