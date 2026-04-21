@@ -196,7 +196,14 @@ export function promptEstimateInputSignature(
     reasoningExcluded: input.reasoningExcluded ?? false,
     activePathMessages: input.activePathMessages.map((message) =>
       frozenMessageIds.has(message.id)
-        ? { id: message.id, frozen: true }
+        ? {
+            id: message.id,
+            frozen: true,
+            editedAt: message.editedAt ?? null,
+            hiddenFromContext: message.hiddenFromContext === true,
+            deleted: message.deleted,
+            parentId: message.parentId,
+          }
         : { id: message.id, nodeVersion: message.nodeVersion },
     ),
   })

@@ -141,4 +141,40 @@ describe('useStreamStablePromptEstimate', () => {
     expect(result.current).not.toEqual(frozen)
     expect((result.current?.total ?? 0)).toBeGreaterThan(frozen?.total ?? 0)
   })
+
+  it('updates during a stream when the streamed message itself changes via a discrete visibility toggle', () => {
+    const user = makeMessage({
+      id: 'U1',
+      role: 'user',
+      origin: 'user',
+      content: [{ type: 'text', text: 'hello there' }],
+      nodeVersion: 0,
+    })
+    const streamingAssistant = makeMessage({
+      id: 'A1',
+      parentId: 'U1',
+      content: [{ type: 'output_text', text: 'short' }],
+      nodeVersion: 2,
+    })
+
+    const { result, rerender } = renderHook(
+      ({ input, streamActivityKey }) =>
+        useStreamStablePromptEstimate('C1', input, streamActivityKey),
+      {
+        initialProps: {
+          input: makeInput([user, streamingAssistant]),
+          streamActivityKey: 'm:A1',
+        },
+      },
+    )
+
+    const frozen = result.current
+    rerender({
+      input: makeInput([{ ...user }, { ...streamingAssistant, hiddenFromContext: true, nodeVersion: 3 }]),
+      streamActivityKey: 'm:A1',
+    })
+
+    expect(result.current).not.toEqual(frozen)
+    expect((result.current?.total ?? 0)).toBeLessThan(frozen?.total ?? Number.POSITIVE_INFINITY)
+  })
 })

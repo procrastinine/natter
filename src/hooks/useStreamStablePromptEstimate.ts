@@ -39,7 +39,6 @@ export function useStreamStablePromptEstimate(
     () => (input ? promptEstimateInputSignature(input, frozenMessageIds) : ''),
     [input, frozenMessageIds],
   )
-  const liveEstimate = useMemo(() => (input ? estimatePromptSize(input) : null), [input])
   const cacheRef = useRef<CachedEstimate>({
     chatId: null,
     signature: '',
@@ -48,19 +47,16 @@ export function useStreamStablePromptEstimate(
 
   return useMemo(() => {
     const nextChatId = chatId ?? null
-    if (!input || !liveEstimate) {
+    if (!input) {
       cacheRef.current = { chatId: nextChatId, signature: '', value: null }
       return null
     }
-    if (streamActivityKey.length === 0) {
-      cacheRef.current = { chatId: nextChatId, signature, value: liveEstimate }
-      return liveEstimate
-    }
     const cached = cacheRef.current
-    if (cached.chatId === nextChatId && cached.signature === signature && cached.value) {
+    if (streamActivityKey.length > 0 && cached.chatId === nextChatId && cached.signature === signature) {
       return cached.value
     }
-    cacheRef.current = { chatId: nextChatId, signature, value: liveEstimate }
-    return liveEstimate
-  }, [chatId, input, liveEstimate, signature, streamActivityKey])
+    const nextValue = estimatePromptSize(input)
+    cacheRef.current = { chatId: nextChatId, signature, value: nextValue }
+    return nextValue
+  }, [chatId, input, signature, streamActivityKey])
 }
