@@ -30,6 +30,7 @@ import type { UsePrivacyRoutingResult } from '../../hooks/usePrivacyRouting'
 import { getChatDraft, loadChatMessages, updateChatSettings } from '../../store/chats'
 import { useChatStore } from '../../store/zustand/chatStore'
 import { LockIcon } from '../icons/Icon'
+import { InfoDisclosure } from './InfoDisclosure'
 import {
   buildPickerRows,
   reasonsToTooltip,
@@ -200,13 +201,7 @@ export function ProviderPicker({ chat, routing, neededTokens: neededTokensOverri
           />
           <span>
             Strict mode
-            <span
-              data-ui="info-hint"
-              aria-label="Only route to providers that support every set parameter. Unchecked: send all parameters; providers ignore unsupported ones."
-              title="Only route to providers that support every set parameter. Unchecked: send all parameters; providers ignore unsupported ones."
-            >
-              <InfoGlyph />
-            </span>
+            <InfoDisclosure title="Only route to providers that support every set parameter. Unchecked: send all parameters; providers ignore unsupported ones." />
           </span>
         </label>
         <label data-ui="provider-picker-sort">
@@ -369,6 +364,7 @@ function ProviderRow({
       ]
         .filter(Boolean)
         .join('\n\n')
+  const detailsTitle = providerDetailsTooltip(row)
 
   return (
     <li
@@ -429,7 +425,7 @@ function ProviderRow({
             data-compact
             aria-pressed={expanded}
             aria-label="Show details"
-            title="Show details"
+            title={detailsTitle}
             onClick={() => setExpanded((v) => !v)}
           >
             <InfoGlyph />
@@ -470,6 +466,26 @@ function PrivacyLock({ tier, title }: { tier: string; title: string }) {
 }
 
 function ProviderDetails({ row }: { row: PickerRow }) {
+  const rows = providerDetailRows(row)
+  return (
+    <dl data-ui="provider-picker-details">
+      {rows.map(([k, v]) => (
+        <div key={k}>
+          <dt>{k}</dt>
+          <dd>{v}</dd>
+        </div>
+      ))}
+    </dl>
+  )
+}
+
+function providerDetailsTooltip(row: PickerRow): string {
+  return providerDetailRows(row)
+    .map(([key, value]) => `${key}: ${value}`)
+    .join('\n')
+}
+
+function providerDetailRows(row: PickerRow): Array<[string, string]> {
   const { endpoint, policy, policySynthesized } = row
   const rows: Array<[string, string]> = []
   rows.push(['Provider', endpoint.provider_name])
@@ -523,16 +539,7 @@ function ProviderDetails({ row }: { row: PickerRow }) {
     if (policy.requiresUserIDs) rows.push(['User IDs', 'required'])
     if (policySynthesized) rows.push(['Source', 'worst-case (live data missing)'])
   }
-  return (
-    <dl data-ui="provider-picker-details">
-      {rows.map(([k, v]) => (
-        <div key={k}>
-          <dt>{k}</dt>
-          <dd>{v}</dd>
-        </div>
-      ))}
-    </dl>
-  )
+  return rows
 }
 
 function InfoGlyph() {

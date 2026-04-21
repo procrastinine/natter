@@ -11,6 +11,7 @@
 import { useCallback } from 'react'
 import type { Chat } from '../../core/types'
 import { updateChatSettings } from '../../store/chats'
+import { InfoDisclosure } from './InfoDisclosure'
 
 export interface PrivacySectionProps {
   chat: Chat
@@ -69,12 +70,10 @@ export function PrivacySection({ chat }: PrivacySectionProps) {
               checked={privacy.paretoFilter === true}
               onChange={(e) => setPareto(e.target.checked)}
             />
-            <span>
-              <strong>Pareto filter</strong>
-              <span data-ui="helper">
-                Auto-exclude providers dominated by a stricter sibling (e.g. Google
-                Vertex when Google AI Studio is available). Off: every non-training
-                provider is offered; you pick manually.
+            <span data-ui="privacy-toggle-copy">
+              <span data-ui="privacy-toggle-title">
+                <strong>Pareto filter</strong>
+                <InfoDisclosure title="Auto-exclude providers dominated by a stricter sibling, such as Google Vertex when Google AI Studio is also available. Turn this off to offer every non-training provider and pick manually." />
               </span>
             </span>
           </label>
@@ -86,11 +85,10 @@ export function PrivacySection({ chat }: PrivacySectionProps) {
               checked={privacy.denyDataCollection === true}
               onChange={(e) => setDenyCollection(e.target.checked)}
             />
-            <span>
-              <strong>Deny data collection</strong>
-              <span data-ui="helper">
-                Asks OpenRouter to refuse any provider that would collect prompt
-                data. Applies even when Pareto is off.
+            <span data-ui="privacy-toggle-copy">
+              <span data-ui="privacy-toggle-title">
+                <strong>Deny data collection</strong>
+                <InfoDisclosure title="Ask OpenRouter to refuse any provider that would collect prompt data. This still applies even when the Pareto filter is off." />
               </span>
             </span>
           </label>
@@ -102,12 +100,10 @@ export function PrivacySection({ chat }: PrivacySectionProps) {
               checked={privacy.zdrOnly === true}
               onChange={(e) => setZdr(e.target.checked)}
             />
-            <span>
-              <strong>ZDR-only routing</strong>
-              <span data-ui="helper">
-                Route only to endpoints OpenRouter flags as Zero Data Retention.
-                Narrower than Pareto — can leave zero eligible providers for some
-                models.
+            <span data-ui="privacy-toggle-copy">
+              <span data-ui="privacy-toggle-title">
+                <strong>ZDR-only routing</strong>
+                <InfoDisclosure title="Route only to endpoints OpenRouter flags as Zero Data Retention. This is narrower than the Pareto filter and can leave some models with zero eligible providers." />
               </span>
             </span>
           </label>
@@ -119,13 +115,10 @@ export function PrivacySection({ chat }: PrivacySectionProps) {
               checked={chat.settings.allowFallbacks !== false}
               onChange={(e) => setAllowFallbacks(e.target.checked)}
             />
-            <span>
-              <strong>Allow provider fallbacks</strong>
-              <span data-ui="helper">
-                Retry another allowed provider for this same model when the
-                first eligible provider fails or rate-limits. Never bypasses
-                your allowed, ignored, or privacy-filtered provider set. Off =
-                fail on the first eligible provider.
+            <span data-ui="privacy-toggle-copy">
+              <span data-ui="privacy-toggle-title">
+                <strong>Allow provider fallbacks</strong>
+                <InfoDisclosure title="Retry another allowed provider for the same model when the first eligible provider fails or rate-limits. This never bypasses your allowed, ignored, or privacy-filtered provider set. Turn it off to fail on the first eligible provider." />
               </span>
             </span>
           </label>

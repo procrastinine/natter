@@ -31,6 +31,7 @@ import type {
   VerbosityLevel,
 } from '../../core/types'
 import { updateChatSettings } from '../../store/chats'
+import { InfoDisclosure } from './InfoDisclosure'
 import { SystemPromptEditor } from './SystemPromptEditor'
 
 export interface ParamFormProps {
@@ -683,8 +684,8 @@ export function ApiModeSection({
   return (
     <section data-ui="settings-section" data-ui-section="api-mode">
       <h3>
-        API mode{' '}
-        <InfoHint text="Responses preserves encrypted reasoning and `phase` metadata across turns. Chat completions is simpler and universal. Default is picked per model." />
+        API Mode{' '}
+        <InfoDisclosure title="Responses preserves encrypted reasoning and `phase` metadata across turns. Chat completions is simpler and universal. Default is picked per model." />
       </h3>
       <div data-ui="field-group" data-ui-field>
         <div data-ui="segmented">
@@ -968,7 +969,7 @@ function SamplingInput({
     <div data-ui="sampling-field" data-invalid={invalid ? 'true' : undefined}>
       <span data-ui="sampling-field-label">
         {spec.label}
-        <InfoHint text={spec.hint} />
+        <InfoDisclosure title={spec.hint} />
       </span>
       <input
         data-ui="sampling-field-input"
@@ -989,25 +990,6 @@ function SamplingInput({
       />
       {invalid ? <span data-ui="sampling-field-error">{invalid}</span> : null}
     </div>
-  )
-}
-
-function InfoHint({ text }: { text: string }) {
-  return (
-    <button
-      type="button"
-      data-ui="info-hint"
-      aria-label={text}
-      title={text}
-      tabIndex={-1}
-      onClick={(e) => e.preventDefault()}
-    >
-      <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false" width="14" height="14">
-        <circle cx="8" cy="8" r="7" fill="none" stroke="currentColor" strokeWidth="1.25" />
-        <circle cx="8" cy="4.5" r="0.9" fill="currentColor" />
-        <path d="M8 6.8v5" stroke="currentColor" strokeWidth="1.25" strokeLinecap="round" />
-      </svg>
-    </button>
   )
 }
 

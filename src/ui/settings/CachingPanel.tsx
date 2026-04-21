@@ -17,6 +17,7 @@ import type { EffectiveCapability } from '../../core/capabilities'
 import { cacheMinTokensFor } from '../../core/quirks'
 import type { AnthropicCacheSettings, Chat, ConnectionKind } from '../../core/types'
 import { updateChatSettings } from '../../store/chats'
+import { InfoDisclosure } from './InfoDisclosure'
 
 export interface CachingPanelProps {
   chat: Chat
@@ -89,31 +90,28 @@ export function CachingPanel({ chat, capability, connectionKind }: CachingPanelP
   return (
     <div data-ui="settings-section" data-ui-section={`caching-${family}`}>
       <h3>Caching</h3>
-      <div data-ui="field-group" data-ui-field>
-        <span>Mode</span>
-        <div data-ui="segmented">
-          {(['off', 'on'] as const).map((m) => {
-            const mode = m === 'off' ? 'off' : family === 'anthropic' ? 'automatic' : 'manual'
-            const pressed = m === 'off' ? cache.mode === 'off' : cache.mode !== 'off'
-            return (
-              <button
-                key={m}
-                type="button"
-                data-ui="segmented-option"
-                aria-pressed={pressed}
-                onClick={() => setCache({ mode })}
-              >
-                {m}
-              </button>
-            )
-          })}
-        </div>
+      <div data-ui="segmented">
+        {(['off', 'on'] as const).map((m) => {
+          const mode = m === 'off' ? 'off' : family === 'anthropic' ? 'automatic' : 'manual'
+          const pressed = m === 'off' ? cache.mode === 'off' : cache.mode !== 'off'
+          return (
+            <button
+              key={m}
+              type="button"
+              data-ui="segmented-option"
+              aria-pressed={pressed}
+              onClick={() => setCache({ mode })}
+            >
+              {m}
+            </button>
+          )
+        })}
       </div>
       {cacheEnabled && family === 'anthropic' ? (
         <div data-ui="field-group" data-ui-field>
           <span>
             TTL
-            <InfoHintSpan text="Anthropic caches expire after the selected idle time. 1h costs slightly more but survives between turns." />
+            <InfoDisclosure title="Anthropic caches expire after the selected idle time. 1h costs slightly more but survives between turns." />
           </span>
           <div data-ui="segmented">
             {(['5m', '1h'] as const).map((ttl) => (
@@ -131,15 +129,10 @@ export function CachingPanel({ chat, capability, connectionKind }: CachingPanelP
         </div>
       ) : null}
       {cacheEnabled ? (
-        <label data-ui="field-group" data-ui-field>
+        <label data-ui="field-group" data-ui-field data-ui-inline-number-row>
           <span>
             Breakpoint
-            <InfoHintSpan
-              text={
-                'Negative: how far back from the latest message to cache. -2 (default) caches up to the message before last, so regenerating the last assistant turn is a cache hit. -1 caches through the last message. Positive: pin exactly the first N messages.'
-              }
-            />
-            <span data-ui="field-value">{breakpointIndex}</span>
+            <InfoDisclosure title="Negative: how far back from the latest message to cache. -2 (default) caches up to the message before last, so regenerating the last assistant turn is a cache hit. -1 caches through the last message. Positive: pin exactly the first N messages." />
           </span>
           <input
             type="number"
@@ -158,17 +151,5 @@ export function CachingPanel({ chat, capability, connectionKind }: CachingPanelP
         </p>
       ) : null}
     </div>
-  )
-}
-
-function InfoHintSpan({ text }: { text: string }) {
-  return (
-    <span data-ui="info-hint" title={text} aria-label={text}>
-      <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false" width="13" height="13">
-        <circle cx="8" cy="8" r="7" fill="none" stroke="currentColor" strokeWidth="1.25" />
-        <circle cx="8" cy="4.5" r="0.9" fill="currentColor" />
-        <path d="M8 6.8v5" stroke="currentColor" strokeWidth="1.25" strokeLinecap="round" />
-      </svg>
-    </span>
   )
 }

@@ -31,6 +31,7 @@ import {
   DEFAULT_PINNED_MODELS,
   readGlobalPreferences,
   writePinnedModels,
+  writeRecentModels,
 } from '../../core/global-settings'
 import type { Chat, ConnectionKind } from '../../core/types'
 import { useModels } from '../../hooks/useModels'
@@ -204,6 +205,10 @@ export function ModelPicker({ chat, profileKind, onPick, onPickForPreset }: Mode
     [],
   )
 
+  const clearRecentHistory = useCallback(async () => {
+    await writeRecentModels([])
+  }, [])
+
   const handlePick = useCallback(
     (modelId: string, withShift: boolean) => {
       if (withShift && onPickForPreset) {
@@ -238,19 +243,30 @@ export function ModelPicker({ chat, profileKind, onPick, onPickForPreset }: Mode
         </button>
       </div>
       {compact ? null : (
-        <div data-ui="model-picker-tabs" role="tablist">
-          {(['recent', 'all'] as const).map((t) => (
+        <div data-ui="model-picker-tabs">
+          <div data-ui="model-picker-tablist" role="tablist">
+            {(['recent', 'all'] as const).map((t) => (
+              <button
+                key={t}
+                type="button"
+                role="tab"
+                data-ui="picker-tab"
+                aria-selected={tab === t}
+                onClick={() => setTab(t)}
+              >
+                {t === 'recent' ? 'Recent' : 'All'}
+              </button>
+            ))}
+          </div>
+          {tab === 'recent' && recents.length > 0 ? (
             <button
-              key={t}
               type="button"
-              role="tab"
-              data-ui="picker-tab"
-              aria-selected={tab === t}
-              onClick={() => setTab(t)}
+              data-ui="picker-tab-action"
+              onClick={() => void clearRecentHistory()}
             >
-              {t === 'recent' ? 'Recent' : 'All'}
+              Clear history
             </button>
-          ))}
+          ) : null}
         </div>
       )}
       <div data-ui="model-picker-list" ref={listRef}>

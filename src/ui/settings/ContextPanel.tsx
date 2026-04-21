@@ -33,6 +33,7 @@ import {
 import type { Chat } from '../../core/types'
 import { getChatDraft, loadChatMessages, updateChatSettings } from '../../store/chats'
 import { useChatStore } from '../../store/zustand/chatStore'
+import { InfoDisclosure } from './InfoDisclosure'
 
 export interface ContextPanelProps {
   chat: Chat
@@ -67,7 +68,6 @@ export function ContextPanel({
   if (!chat.settings.model) {
     return (
       <section data-ui="settings-section" data-ui-section="context-control">
-        <h3>Context</h3>
         <p data-ui="helper">Select a model first.</p>
       </section>
     )
@@ -87,7 +87,6 @@ export function ContextPanel({
   ) {
     return (
       <section data-ui="settings-section" data-ui-section="context-control">
-        <h3>Context</h3>
         <p data-ui="helper">Waiting for model capability…</p>
       </section>
     )
@@ -100,7 +99,6 @@ export function ContextPanel({
   if (modelCap === undefined || modelPromptCap === undefined || modelCompletionCap === undefined) {
     return (
       <section data-ui="settings-section" data-ui-section="context-control">
-        <h3>Context</h3>
         <p data-ui="helper">Waiting for model capability…</p>
       </section>
     )
@@ -143,7 +141,6 @@ export function ContextPanel({
 
   return (
     <section data-ui="settings-section" data-ui-section="context-control">
-      <h3>Context</h3>
       <div
         data-ui="context-gauge"
         data-warn-level={warnLevel}
@@ -242,10 +239,10 @@ export function ContextPanel({
         }}
       />
 
-      <label data-ui="field-group" data-ui-field>
+      <label data-ui="field-group" data-ui-field data-ui-inline-number-row>
         <span>
           Keep first N pairs
-          <InfoHintSpan text="Pin the first N user+assistant pairs at the top of the chat. Later turns are dropped from the middle to fit the budget; the most recent turns always stay. 0 = plain sliding window (drop oldest)." />
+          <InfoDisclosure title="Pin the first N user+assistant pairs at the top of the chat. Later turns are dropped from the middle to fit the budget; the most recent turns always stay. 0 = plain sliding window (drop oldest)." />
         </span>
         <input
           type="number"
@@ -269,7 +266,7 @@ export function ContextPanel({
           />
           <span>
             Use OpenRouter middle-out compression
-            <InfoHintSpan text="After local trimming, send plugins:[{id:'context-compression'}] so OpenRouter compresses any remaining middle-of-chat messages." />
+            <InfoDisclosure title="After local trimming, send plugins:[{id:'context-compression'}] so OpenRouter compresses any remaining middle-of-chat messages." />
           </span>
         </label>
       ) : null}
@@ -392,17 +389,5 @@ function NumberSlider({
 }
 
 const SLIDER_COMMIT_DEBOUNCE_MS = 200
-
-function InfoHintSpan({ text }: { text: string }) {
-  return (
-    <span data-ui="info-hint" title={text} aria-label={text}>
-      <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false" width="13" height="13">
-        <circle cx="8" cy="8" r="7" fill="none" stroke="currentColor" strokeWidth="1.25" />
-        <circle cx="8" cy="4.5" r="0.9" fill="currentColor" />
-        <path d="M8 6.8v5" stroke="currentColor" strokeWidth="1.25" strokeLinecap="round" />
-      </svg>
-    </span>
-  )
-}
 
 const EMPTY_CURSOR = Object.freeze({}) as Readonly<Record<string, string>>

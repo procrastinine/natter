@@ -158,13 +158,6 @@ export function ChatModelPanel({ chatId, chatSnapshot = null, onClose }: ChatMod
   }, [chat, promptEstimate])
   const [tab, setTab] = useState<Tab>('model')
 
-  // Opening the pane resets to Model & Provider — that's the "cog click =
-  // see which model this chat is using" muscle memory (mirrors the
-  // default-tab-on-open rule from §10.9).
-  useEffect(() => {
-    setTab('model')
-  }, [chatId])
-
   const handleModelPick = useCallback(
     async (modelId: string) => {
       if (!chat) return
@@ -259,6 +252,13 @@ export function ChatModelPanel({ chatId, chatSnapshot = null, onClose }: ChatMod
               onPick={handleModelPick}
               onPickForPreset={handleModelPickForPreset}
             />
+            {capability ? (
+              <ApiModeSection
+                chat={chat}
+                capability={capability}
+                profile={profile ?? null}
+              />
+            ) : null}
             {isOpenRouter ? (
               <ProviderPicker
                 chat={chat}
@@ -269,13 +269,6 @@ export function ChatModelPanel({ chatId, chatSnapshot = null, onClose }: ChatMod
             {isOpenRouter ? <PrivacySection chat={chat} /> : null}
             {profile?.kind === 'llama-server' ? (
               <LlamaServerSection chat={chat} profile={profile} />
-            ) : null}
-            {capability ? (
-              <ApiModeSection
-                chat={chat}
-                capability={capability}
-                profile={profile ?? null}
-              />
             ) : null}
           </>
         ) : null}

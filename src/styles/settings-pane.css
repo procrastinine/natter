@@ -111,6 +111,34 @@
   gap: var(--space-2);
 }
 
+[data-ui="field-group"][data-ui-inline-number-row] {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 84px;
+  gap: var(--space-2);
+  align-items: center;
+}
+
+[data-ui="field-group"][data-ui-inline-number-row] > span {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-width: 0;
+  font-size: var(--font-size-sm);
+  color: var(--color-fg-primary);
+}
+
+[data-ui="field-group"][data-ui-inline-number-row] > input[type='number'] {
+  width: 100%;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  padding: 2px var(--space-1);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-surface-1);
+  color: var(--color-fg-primary);
+}
+
 /* Rendering's two code-theme dropdowns are visually paired; render them
  * stacked with extra breathing room between them so the labels don't run
  * up against each other. */
