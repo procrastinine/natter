@@ -14,6 +14,7 @@ import type {
   ReasoningDetail,
 } from '../../core/types'
 import type { EffectiveCapability } from '../../core/capabilities'
+import { UNLIMITED_CONTEXT } from '../../core/prompt-size'
 import { useChat } from '../../hooks/useChat'
 import {
   continueFromMessage,
@@ -298,6 +299,7 @@ export const MessageList = memo(function MessageList({
               : {})}
             onForkChat={() => handleForkChat(m)}
             onInsert={(slot: InsertSlot) => openInsert(m.id, slot)}
+            {...(capability ? { capability } : {})}
             {...(roleMismatchIdsOnPath.has(m.id) ? { roleMismatch: true } : {})}
             {...(showStaleHint ? { staleReplyHint: true } : {})}
             {...(excludedIds.has(m.id) ? { excludedFromContext: true } : {})}
@@ -344,8 +346,16 @@ function computeExcludedIds(
   // carry here produced false "excluded" rings on 1M-context Gemini
   // models whenever the chat grew past 128k.
   const providerCap = capability?.maxPromptTokens ?? capability?.contextLength
-  const modelCap = settings.customMaxContext ?? providerCap
-  const maxCompletion = settings.maxCompletionTokens ?? 4096
+  const customMaxStored = settings.customMaxContext
+  // `-1` means the user opted out of the local cap; no trim markers.
+  if (customMaxStored === UNLIMITED_CONTEXT) {
+    for (const m of path) if (m.hiddenFromContext) out.add(m.id)
+    return out
+  }
+  const modelCap = customMaxStored ?? providerCap
+  const maxCompletionStored = settings.maxCompletionTokens
+  const maxCompletion =
+    maxCompletionStored === UNLIMITED_CONTEXT ? 0 : (maxCompletionStored ?? 4096)
   const budget = modelCap !== undefined ? Math.max(0, modelCap - maxCompletion) : undefined
   const strategy = settings.contextStrategy
   const keepFirst = Math.max(0, (strategy.keepFirstPairs ?? 0) * 2)

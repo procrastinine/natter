@@ -1,8 +1,21 @@
-import { Component, memo, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import {
+  Component,
+  memo,
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
 import { groupByParent } from '../../core/active-path'
+import type { EffectiveCapability } from '../../core/capabilities'
 import { normalizeReasoningDetails } from '../../core/reasoning'
+import { detectStaleReasoning, staleReasoningBannerText } from '../../core/stale-reasoning'
 import type { ChatId, CursorMap, Message as MessageRow, ReasoningDetail } from '../../core/types'
-import { dismissAbortReason } from '../../store/chats'
+import { dismissAbortReason, updateChatSettings } from '../../store/chats'
+import { useStreamStore } from '../../store/zustand/streamStore'
+import { useToastStore } from '../../store/zustand/toastStore'
 import { useUiStore } from '../../store/zustand/uiStore'
 import { BranchControls } from './BranchControls'
 import { InlineEditor, plaintextOf } from './InlineEditor'
@@ -10,13 +23,13 @@ import { type InsertSlot, MessageActions, MessageEditTreeActions } from './Messa
 import { MessageContent, messageTextFromContent } from './MessageContent'
 import { MessageHeader } from './MessageHeader'
 import { MessageInfo } from './MessageInfo'
-import { ProfileGlyph } from './ProfileGlyph'
-import { ReasoningBlock } from './ReasoningBlock'
 import {
   collapseProfileFor,
-  nextCollapseMode,
   type MessageCollapseMode,
+  nextCollapseMode,
 } from './MessageStreamOverflow'
+import { ProfileGlyph } from './ProfileGlyph'
+import { ReasoningBlock } from './ReasoningBlock'
 
 export interface MessageProps {
   chatId: ChatId
@@ -25,6 +38,11 @@ export interface MessageProps {
   cursor: CursorMap
   streaming?: boolean
   hasConnection: boolean
+  // Effective capability for the chat's current model. Threaded from the
+  // list so the message can surface capability-dependent affordances like
+  // the hidden-reasoning footer on o-series/chat-completions turns without
+  // redoing the /endpoints fetch per message.
+  capability?: EffectiveCapability
   // Whether this message sits immediately before a message of the same role
   // on the active path — surfaces the adjacency-warning badge (§10.6).
   roleMismatch?: boolean
@@ -65,6 +83,7 @@ export const Message = memo(
     prev.cursor === next.cursor &&
     prev.streaming === next.streaming &&
     prev.hasConnection === next.hasConnection &&
+    prev.capability === next.capability &&
     prev.roleMismatch === next.roleMismatch &&
     prev.staleReplyHint === next.staleReplyHint &&
     prev.excludedFromContext === next.excludedFromContext &&
@@ -83,6 +102,7 @@ function MessageInner({
   cursor,
   streaming,
   hasConnection,
+  capability,
   roleMismatch,
   staleReplyHint,
   excludedFromContext,
@@ -106,6 +126,111 @@ function MessageInner({
   const [showInfo, setShowInfo] = useState(false)
   const [editing, setEditing] = useState(false)
   const text = useMemo(() => messageTextFromContent(message.content), [message.content])
+  // Streaming state is tracked per-message (messageId) in the ephemeral
+  // stream store. Prop `streaming` is the authoritative fallback when a
+  // caller passes it in; otherwise we check the store. Either way, the
+  // resolved value drives auto-expand/collapse for the reasoning block.
+  const storeStreaming = useStreamStore((s) =>
+    message.role === 'assistant' ? s.isTargetActive(chatId, message.id) : false,
+  )
+  const isStreaming = streaming === true || storeStreaming
+  const hasContent = text.length > 0
+  // Hidden-reasoning footer: only applies to assistant turns on a route that
+  // hides reasoning. `apiUsed === 'responses'` means reasoning IS returned
+  // (or could be, via summary+encrypted). The footer is explicitly for chat-
+  // completions where the model reasons silently.
+  const gen = message.generation
+  const apiUsed = gen?.apiUsed
+  const showHiddenReasoningFooter =
+    message.role === 'assistant' &&
+    !editing &&
+    reasoning.length === 0 &&
+    capability?.quirks.hiddenReasoningOnChatApi === true &&
+    apiUsed === 'chat'
+  const canSwitchToResponses = Boolean(onRegenerate && hasConnection)
+  const handleSwitchToResponses = useCallback(async () => {
+    await updateChatSettings(chatId, { api: 'responses' })
+    if (onRegenerate) await onRegenerate()
+  }, [chatId, onRegenerate])
+
+  // Stale-reasoning detection. When a fresh assistant error matches the
+  // "preserved reasoning got rejected" pattern, push a banner with actions
+  // to retry without carry-forward and to copy the error. The banner is the
+  // canonical surface (see plan/13 §Phase 11.1); the inline error row still
+  // shows the raw message so the user has context either way.
+  const pushBanner = useToastStore((s) => s.pushBanner)
+  const clearBannersByKind = useToastStore((s) => s.clearBannersByKind)
+  const dismissBanner = useToastStore((s) => s.dismissBanner)
+  const staleProvider = useMemo(() => {
+    if (!error) return null
+    const hadReasoning =
+      (message.reasoningDetails?.length ?? 0) > 0 ||
+      messages.some((m) => m.id !== message.id && (m.reasoningDetails?.length ?? 0) > 0)
+    return detectStaleReasoning(
+      {
+        message: error.message,
+        ...(error.statusCode !== undefined ? { statusCode: error.statusCode } : {}),
+      },
+      { hadReasoningDetails: hadReasoning },
+    )
+  }, [error, message.reasoningDetails, message.id, messages])
+  const handleRetryWithoutReasoning = useCallback(async () => {
+    await updateChatSettings(chatId, {
+      reasoning: {
+        mode: 'default',
+        exclude: false,
+        summary: 'auto',
+        include: { encrypted: false, summary: false, text: false },
+      },
+    })
+    if (onRegenerate) await onRegenerate()
+  }, [chatId, onRegenerate])
+  const handleCopyError = useCallback(() => {
+    if (!error) return
+    const payload = JSON.stringify(
+      {
+        messageId: message.id,
+        code: error.code,
+        message: error.message,
+        statusCode: error.statusCode,
+      },
+      null,
+      2,
+    )
+    if (typeof navigator !== 'undefined' && navigator.clipboard) {
+      void navigator.clipboard.writeText(payload)
+    }
+  }, [error, message.id])
+  useEffect(() => {
+    if (!staleProvider) return
+    // One banner per error id. We key on the message id so subsequent
+    // swipes back to the same failed leaf don't stack a second banner.
+    clearBannersByKind('stale-reasoning')
+    const bannerId = pushBanner({
+      kind: 'stale-reasoning',
+      text: staleReasoningBannerText(staleProvider),
+      primary: {
+        label: 'Retry without preserved reasoning',
+        action: handleRetryWithoutReasoning,
+      },
+      secondary: {
+        label: 'Copy error',
+        action: () => {
+          handleCopyError()
+        },
+      },
+    })
+    return () => {
+      dismissBanner(bannerId)
+    }
+  }, [
+    staleProvider,
+    pushBanner,
+    clearBannersByKind,
+    dismissBanner,
+    handleRetryWithoutReasoning,
+    handleCopyError,
+  ])
   const collapseProfile = useMemo(() => collapseProfileFor(text.length), [text.length])
   const manualCollapseRef = useRef(false)
   const [collapseMode, setCollapseMode] = useState<MessageCollapseMode>(collapseProfile.defaultMode)
@@ -125,6 +250,19 @@ function MessageInner({
       setEditing(false)
     },
     [onEditInPlace],
+  )
+  // Per-block hide toggle. `reasoning` is the normalized view, so indices
+  // here map 1:1 to the stored list for clean data (post-Phase-11 fix);
+  // legacy duplicates get cleaned up as a side effect of the first toggle.
+  const handleToggleReasoningHidden = useCallback(
+    (detailIndex: number) => {
+      if (detailIndex < 0 || detailIndex >= reasoning.length) return
+      const next = reasoning.map((d, i) =>
+        i === detailIndex ? { ...d, hidden: !d.hidden } : d,
+      )
+      void onEditInPlace(text, next)
+    },
+    [reasoning, text, onEditInPlace],
   )
   const handleSaveAndSend = useCallback(
     async (text: string) => {
@@ -164,7 +302,11 @@ function MessageInner({
         onClick={cycleCollapse}
         disabled={!collapseEnabled}
         aria-label={collapseButtonLabel(message.role, collapseMode, collapseProfile.modes.length)}
-        title={collapseButtonTitle(collapseMode, collapseProfile.modes.length, collapseProfile.oversized)}
+        title={collapseButtonTitle(
+          collapseMode,
+          collapseProfile.modes.length,
+          collapseProfile.oversized,
+        )}
       >
         <ProfileGlyph
           role={message.role}
@@ -174,7 +316,34 @@ function MessageInner({
       </button>
       <div data-ui="message-body-column">
         <MessageHeader message={message} />
-        {collapseMode === 'full' && reasoning.length > 0 ? <ReasoningBlock details={reasoning} /> : null}
+        {collapseMode === 'full' && reasoning.length > 0 ? (
+          <ReasoningBlock
+            details={reasoning}
+            streaming={isStreaming}
+            hasContent={hasContent}
+            {...(message.role === 'assistant' && !editing
+              ? { onToggleHidden: handleToggleReasoningHidden }
+              : {})}
+          />
+        ) : null}
+        {collapseMode === 'full' && showHiddenReasoningFooter ? (
+          <div data-ui="message-hidden-reasoning" role="status">
+            <span>
+              <strong>{gen?.model ?? 'This model'}</strong> reasoned internally; content wasn't
+              returned in this API mode.
+            </span>
+            {canSwitchToResponses ? (
+              <button
+                type="button"
+                data-ui="message-hidden-reasoning-action"
+                onClick={() => void handleSwitchToResponses()}
+                title="Switch this chat to the Responses API and regenerate"
+              >
+                Switch to Responses API
+              </button>
+            ) : null}
+          </div>
+        ) : null}
         {editing ? (
           <InlineEditor
             initial={plaintextOf(message.content)}
@@ -187,17 +356,13 @@ function MessageInner({
                   saveAndSendDisabledReason: 'Add a connection to send messages.',
                 }
               : {})}
-            {...(message.reasoningDetails && message.reasoningDetails.length > 0
-              ? { initialReasoning: message.reasoningDetails }
+            {...(message.role === 'assistant'
+              ? { initialReasoning: message.reasoningDetails ?? [] }
               : {})}
             ariaLabel={`Edit ${message.role} message`}
           />
         ) : (
-          <MessageContent
-            text={text}
-            streaming={streaming ?? false}
-            collapseMode={collapseMode}
-          />
+          <MessageContent text={text} streaming={streaming ?? false} collapseMode={collapseMode} />
         )}
         {error ? (
           <div data-ui="message-error" data-role="error">
@@ -289,7 +454,9 @@ function collapseButtonLabel(
   const name = `${role} message`
   if (modeCount <= 1) return `${name} avatar`
   if (mode === 'full') {
-    return modeCount > 2 ? `Collapse ${name} to a compact preview` : `Collapse ${name} to a one-line preview`
+    return modeCount > 2
+      ? `Collapse ${name} to a compact preview`
+      : `Collapse ${name} to a one-line preview`
   }
   if (mode === 'compact') {
     return `Collapse ${name} to a one-line preview`

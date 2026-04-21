@@ -69,17 +69,37 @@ function autosize(el: HTMLTextAreaElement | null): void {
 }
 
 type EditableReasoning =
-  | { kind: 'text'; text: string; index: number; original: ReasoningDetail }
-  | { kind: 'summary'; summary: string; index: number; original: ReasoningDetail }
-  | { kind: 'encrypted'; index: number; original: ReasoningDetail; bytes: number }
+  | {
+      kind: 'text'
+      text: string
+      index: number
+      hidden: boolean
+      original: ReasoningDetail | null
+    }
+  | {
+      kind: 'summary'
+      summary: string
+      index: number
+      hidden: boolean
+      original: ReasoningDetail | null
+    }
+  | {
+      kind: 'encrypted'
+      index: number
+      hidden: boolean
+      original: ReasoningDetail
+      bytes: number
+    }
 
 function toEditable(list: ReasoningDetail[]): EditableReasoning[] {
   return list.map((detail, i) => {
+    const hidden = detail.hidden === true
     if (detail.type === 'reasoning.text') {
       return {
         kind: 'text',
         text: detail.text ?? '',
         index: detail.index ?? i,
+        hidden,
         original: detail,
       }
     }
@@ -88,12 +108,14 @@ function toEditable(list: ReasoningDetail[]): EditableReasoning[] {
         kind: 'summary',
         summary: detail.summary,
         index: detail.index ?? i,
+        hidden,
         original: detail,
       }
     }
     return {
       kind: 'encrypted',
       index: detail.index ?? i,
+      hidden,
       original: detail,
       bytes: new Blob([detail.data ?? '']).size,
     }
@@ -103,20 +125,30 @@ function toEditable(list: ReasoningDetail[]): EditableReasoning[] {
 function fromEditable(list: EditableReasoning[]): ReasoningDetail[] {
   return list.map((row) => {
     if (row.kind === 'text') {
+      // `original` is null for rows the user added via "Add reasoning entry".
+      // Synthesize a minimal reasoning.text detail with the current index so
+      // downstream merge/filter logic treats it like any other entry.
+      const base = row.original ?? { type: 'reasoning.text', index: row.index }
       return {
-        ...row.original,
+        ...base,
         type: 'reasoning.text',
         text: row.text,
+        hidden: row.hidden || undefined,
       } as ReasoningDetail
     }
     if (row.kind === 'summary') {
+      const base = row.original ?? { type: 'reasoning.summary', index: row.index, summary: '' }
       return {
-        ...row.original,
+        ...base,
         type: 'reasoning.summary',
         summary: row.summary,
+        hidden: row.hidden || undefined,
       } as ReasoningDetail
     }
-    return row.original
+    return {
+      ...row.original,
+      hidden: row.hidden || undefined,
+    } as ReasoningDetail
   })
 }
 
@@ -217,8 +249,26 @@ export function InlineEditor({
     [commitSave, commitSaveAndSend, onCancel, onSaveAndSend, saveAndSendDisabled],
   )
 
-  const reasoningEditableCount = reasoning.filter((r) => r.kind !== 'encrypted').length
-  const showReasoningSection = (initialReasoning?.length ?? 0) > 0
+  const showReasoningSection = initialReasoning !== undefined
+  const nextReasoningIndex = () => {
+    const indices = reasoning.map((r) => r.index)
+    return indices.length === 0 ? 0 : Math.max(...indices) + 1
+  }
+  const addReasoningRow = (kind: 'text' | 'summary') => {
+    const idx = nextReasoningIndex()
+    setReasoning((prev) =>
+      kind === 'text'
+        ? [...prev, { kind: 'text', text: '', index: idx, hidden: false, original: null }]
+        : [...prev, { kind: 'summary', summary: '', index: idx, hidden: false, original: null }],
+    )
+    setReasoningOpen(true)
+  }
+  const deleteRow = (rowIndex: number) => {
+    setReasoning((prev) => prev.filter((_, i) => i !== rowIndex))
+  }
+  const toggleHidden = (rowIndex: number) => {
+    setReasoning((prev) => prev.map((r, i) => (i === rowIndex ? { ...r, hidden: !r.hidden } : r)))
+  }
 
   return (
     <div data-ui="inline-editor">
@@ -235,58 +285,36 @@ export function InlineEditor({
       {showReasoningSection ? (
         <details
           data-ui="inline-editor-reasoning"
-          open={reasoningOpen}
+          open={reasoningOpen || reasoning.length === 0}
           onToggle={(e) => setReasoningOpen((e.target as HTMLDetailsElement).open)}
         >
-          <summary>
-            Reasoning ({reasoning.length}
-            {reasoningEditableCount < reasoning.length
-              ? `, ${reasoning.length - reasoningEditableCount} read-only`
-              : ''}
-            )
-          </summary>
+          <summary>Reasoning ({reasoning.length})</summary>
           <div data-ui="inline-editor-reasoning-list">
-            {reasoning.map((row, i) => {
-              if (row.kind === 'encrypted') {
-                return (
-                  <div key={i} data-ui="inline-editor-reasoning-row" data-kind="encrypted">
-                    <span data-ui="inline-editor-reasoning-label">
-                      Encrypted reasoning #{row.index}
-                    </span>
-                    <span data-ui="inline-editor-reasoning-readonly">
-                      {row.bytes} bytes (read-only)
-                    </span>
-                  </div>
-                )
-              }
-              return (
-                <div key={i} data-ui="inline-editor-reasoning-row" data-kind={row.kind}>
-                  <span data-ui="inline-editor-reasoning-label">
-                    {row.kind === 'text' ? 'Reasoning' : 'Summary'} #{row.index}
-                  </span>
-                  <textarea
-                    data-ui="inline-editor-reasoning-input"
-                    value={row.kind === 'text' ? row.text : row.summary}
-                    onChange={(e) => {
-                      const next = e.target.value
-                      setReasoning((prev) =>
-                        prev.map((p, idx) =>
-                          idx === i
-                            ? row.kind === 'text'
-                              ? { ...row, text: next }
-                              : { ...row, summary: next }
-                            : p,
-                        ),
-                      )
-                    }}
-                    rows={4}
-                    disabled={busy}
-                    aria-label={`Edit reasoning entry ${row.index}`}
-                  />
-                </div>
-              )
-            })}
+            {reasoning.map((row, i) => (
+              <ReasoningEditorRow
+                key={i}
+                row={row}
+                busy={busy}
+                onChangeText={(next) =>
+                  setReasoning((prev) =>
+                    prev.map((p, idx) =>
+                      idx === i && p.kind === 'text' ? { ...p, text: next } : p,
+                    ),
+                  )
+                }
+                onChangeSummary={(next) =>
+                  setReasoning((prev) =>
+                    prev.map((p, idx) =>
+                      idx === i && p.kind === 'summary' ? { ...p, summary: next } : p,
+                    ),
+                  )
+                }
+                onToggleHidden={() => toggleHidden(i)}
+                onDelete={() => deleteRow(i)}
+              />
+            ))}
           </div>
+          <AddReasoningEntry busy={busy} onAdd={addReasoningRow} />
         </details>
       ) : null}
       <div data-ui="inline-editor-actions" ref={actionsRef}>
@@ -328,5 +356,163 @@ export function InlineEditor({
         ) : null}
       </div>
     </div>
+  )
+}
+
+function ReasoningEditorRow({
+  row,
+  busy,
+  onChangeText,
+  onChangeSummary,
+  onToggleHidden,
+  onDelete,
+}: {
+  row: EditableReasoning
+  busy: boolean
+  onChangeText: (next: string) => void
+  onChangeSummary: (next: string) => void
+  onToggleHidden: () => void
+  onDelete: () => void
+}) {
+  const label =
+    row.kind === 'encrypted'
+      ? `Encrypted #${row.index}`
+      : row.kind === 'summary'
+        ? `Summary #${row.index}`
+        : `Reasoning text #${row.index}`
+  return (
+    <div
+      data-ui="inline-editor-reasoning-row"
+      data-kind={row.kind}
+      data-hidden={row.hidden ? 'true' : undefined}
+    >
+      <div data-ui="inline-editor-reasoning-row-header">
+        <span data-ui="inline-editor-reasoning-label">{label}</span>
+        <div data-ui="inline-editor-reasoning-row-actions">
+          <button
+            type="button"
+            data-ui="icon-button"
+            data-compact
+            data-pressed={row.hidden ? 'true' : undefined}
+            onClick={onToggleHidden}
+            disabled={busy}
+            aria-label={row.hidden ? 'Unhide reasoning entry' : 'Hide reasoning entry'}
+            title={
+              row.hidden
+                ? 'Hidden — preserved on disk, not sent on next turn. Click to unhide.'
+                : 'Hide this reasoning entry (kept on disk, skipped on echo).'
+            }
+          >
+            {row.hidden ? <EyeOffIcon /> : <EyeIcon />}
+          </button>
+          <button
+            type="button"
+            data-ui="icon-button"
+            data-compact
+            data-tone="danger"
+            onClick={onDelete}
+            disabled={busy}
+            aria-label="Delete reasoning entry"
+            title="Delete this reasoning entry"
+          >
+            <TrashSmallIcon />
+          </button>
+        </div>
+      </div>
+      {row.kind === 'encrypted' ? (
+        <span data-ui="inline-editor-reasoning-readonly">{row.bytes} bytes (read-only)</span>
+      ) : (
+        <textarea
+          data-ui="inline-editor-reasoning-input"
+          value={row.kind === 'text' ? row.text : row.summary}
+          onChange={(e) =>
+            row.kind === 'text' ? onChangeText(e.target.value) : onChangeSummary(e.target.value)
+          }
+          rows={4}
+          disabled={busy || row.hidden}
+          aria-label={`Edit ${label}`}
+        />
+      )}
+    </div>
+  )
+}
+
+function AddReasoningEntry({
+  busy,
+  onAdd,
+}: {
+  busy: boolean
+  onAdd: (kind: 'text' | 'summary') => void
+}) {
+  const [kind, setKind] = useState<'text' | 'summary'>('text')
+  return (
+    <div data-ui="inline-editor-reasoning-add">
+      <select
+        data-ui="inline-editor-reasoning-kind"
+        value={kind}
+        onChange={(e) => setKind(e.target.value as 'text' | 'summary')}
+        disabled={busy}
+        aria-label="New reasoning kind"
+      >
+        <option value="text">Reasoning text</option>
+        <option value="summary">Summary</option>
+      </select>
+      <button
+        type="button"
+        data-ui="inline-editor-reasoning-add-button"
+        onClick={() => onAdd(kind)}
+        disabled={busy}
+      >
+        + Add reasoning entry
+      </button>
+    </div>
+  )
+}
+
+function EyeIcon() {
+  return (
+    <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false" width="13" height="13">
+      <path
+        d="M1.5 8s2.5-4.5 6.5-4.5S14.5 8 14.5 8 12 12.5 8 12.5 1.5 8 1.5 8z"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <circle cx="8" cy="8" r="2" fill="none" stroke="currentColor" strokeWidth="1.2" />
+    </svg>
+  )
+}
+
+function EyeOffIcon() {
+  return (
+    <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false" width="13" height="13">
+      <path
+        d="M1.5 8s2.5-4.5 6.5-4.5S14.5 8 14.5 8 12 12.5 8 12.5 1.5 8 1.5 8z"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        opacity="0.55"
+      />
+      <path d="M2 2l12 12" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
+    </svg>
+  )
+}
+
+function TrashSmallIcon() {
+  return (
+    <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false" width="13" height="13">
+      <path
+        d="M3 4.5h10M6.5 4.5V3a1 1 0 0 1 1-1h1a1 1 0 0 1 1 1v1.5M4 4.5l.7 8.5a1 1 0 0 0 1 .9h4.6a1 1 0 0 0 1-.9l.7-8.5M6.8 7v4M9.2 7v4"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
   )
 }

@@ -30,11 +30,15 @@ import { textCompletions } from '../api/text-completions'
 import type { ChatStreamChunk } from '../api/types'
 import { activePath, cursorKeyOf, groupByParent } from '../core/active-path'
 import { sendUserMessage } from '../core/messages'
-import { mergeReasoningDetail } from '../core/reasoning'
+import {
+  findMergeTargetIndex,
+  mergeReasoningDetail,
+  normalizeIncomingReasoningDetail,
+} from '../core/reasoning'
+import { resolveTextTemplate } from '../core/text-templates'
 import type { ChatCompletionsTransformOptions } from '../core/transforms'
 import { toChatCompletions, toTextCompletions } from '../core/transforms'
 import { nextSiblingIndex } from '../core/tree-ops'
-import { resolveTextTemplate } from '../core/text-templates'
 import type {
   AbortReason,
   CapabilityDescriptor,
@@ -70,7 +74,15 @@ function rewriteCompatibleModelId(connection: ConnectionProfile, modelId: string
 // phases can extend without changing the lifecycle.
 interface ChatAccumulator {
   textBuffer: string
-  reasoningByIndex: Map<number, ReasoningDetail>
+  // Ordered list of reasoning details accumulated so far. Streaming deltas
+  // from Responses / Gemini-native lanes write into a specific row via the
+  // `reasoningRowByTag` index (which encodes outputIndex + summaryIndex for
+  // summary deltas so each summary PART is its own row). Chat-completions
+  // `reasoning_details[]` entries go through `findMergeTargetIndex` so OR's
+  // Gemini path — which emits multiple distinct summaries all at `index: 0`
+  // — produces one row per summary instead of collapsing into one.
+  reasoningList: ReasoningDetail[]
+  reasoningRowByTag: Map<string, number>
   generationId?: string
   model?: string
   provider?: string
@@ -300,7 +312,8 @@ async function openAssistantStreamUnder(
 
   const accumulator: ChatAccumulator = {
     textBuffer: '',
-    reasoningByIndex: new Map(),
+    reasoningList: [],
+    reasoningRowByTag: new Map(),
     lastFlushedAt: now(),
     lastFlushedTextLen: 0,
     lastChunkReceivedAt: now(),
@@ -411,28 +424,80 @@ function applyEvent(acc: ChatAccumulator, event: StreamLaneEvent, nowMs: number)
       return
     case 'reasoning': {
       // Phase-7 reasoning reducer preserves the lane so the persisted
-      // placeholder carries whatever the provider emitted. Details reduce by
-      // `index` per §5.3.
+      // placeholder carries whatever the provider emitted. Rows are keyed
+      // two ways:
+      //   - `reasoning_details[]` chunks, `textDelta`, and `encryptedDelta`
+      //     route through `findMergeTargetIndex` (content-aware by index
+      //     for text/encrypted; no identity match for summary so distinct
+      //     summaries stay separate even when OR reuses `index: 0`).
+      //   - `summaryDelta` routes through a tag table keyed by
+      //     (outputIndex, summaryIndex) — each summary PART becomes its
+      //     own row, and consecutive deltas for the SAME part concatenate.
       if (acc.reasoningStartedAt === undefined) acc.reasoningStartedAt = nowMs
       acc.reasoningFinishedAt = nowMs
+      const outputIndex = event.outputIndex ?? 0
+      const mergeDetail = (incoming: ReasoningDetail) => {
+        const target = findMergeTargetIndex(acc.reasoningList, incoming)
+        if (target >= 0) {
+          acc.reasoningList[target] = mergeReasoningDetail(
+            acc.reasoningList[target],
+            incoming,
+          )
+        } else {
+          acc.reasoningList.push(incoming)
+        }
+      }
       if (Array.isArray(event.details)) {
         for (const raw of event.details) {
           if (!raw || typeof raw !== 'object') continue
-          const detail = raw as ReasoningDetail & { index?: number }
-          const idx = typeof detail.index === 'number' ? detail.index : 0
-          const existing = acc.reasoningByIndex.get(idx)
-          acc.reasoningByIndex.set(idx, mergeReasoningDetail(existing, detail))
+          const detail = normalizeIncomingReasoningDetail(
+            raw as ReasoningDetail & { index?: number },
+          ) as ReasoningDetail & { index?: number }
+          if (detail.id?.startsWith('tool_')) continue
+          mergeDetail(detail)
         }
       }
       if (event.textDelta !== undefined) {
-        const existing = acc.reasoningByIndex.get(0)
-        acc.reasoningByIndex.set(
-          0,
-          mergeReasoningDetail(
-            existing,
-            { type: 'reasoning.text', index: 0, text: event.textDelta },
-          ),
-        )
+        mergeDetail({
+          type: 'reasoning.text',
+          index: outputIndex,
+          text: event.textDelta,
+        })
+      }
+      if (event.summaryDelta !== undefined) {
+        // Responses + Gemini-native splitters emit `summaryDelta` for
+        // visible reasoning summaries (distinct from the encrypted
+        // carrier). Each summary PART within a reasoning item is its own
+        // row — key by (outputIndex, summaryIndex) so multi-part summaries
+        // don't collide. Subsequent deltas for the SAME part merge via
+        // the tag table so `mergeReasoningDetail` concatenates the text.
+        const summaryIndex = event.summaryIndex ?? 0
+        upsertReasoningRow(acc, `sum#${outputIndex}#${summaryIndex}`, {
+          type: 'reasoning.summary',
+          index: outputIndex,
+          summary: event.summaryDelta,
+        })
+      }
+      if (event.encryptedDelta !== undefined) {
+        // `replaceEncrypted: true` (the default from Responses /
+        // Gemini-native) means the NEW blob is authoritative (OpenAI's
+        // grows-between-added-and-done; Gemini emits the final one on
+        // the last part). Use a tag so we overwrite the same row rather
+        // than letting `findMergeTargetIndex` drop the delta when it
+        // doesn't match the existing blob byte-for-byte.
+        const tag = `enc#${outputIndex}`
+        const existing = acc.reasoningRowByTag.get(tag)
+        const replacement: ReasoningDetail = {
+          type: 'reasoning.encrypted',
+          index: outputIndex,
+          data: event.encryptedDelta,
+        }
+        if (existing !== undefined) {
+          acc.reasoningList[existing] = replacement
+        } else {
+          acc.reasoningList.push(replacement)
+          acc.reasoningRowByTag.set(tag, acc.reasoningList.length - 1)
+        }
       }
       return
     }
@@ -546,9 +611,27 @@ async function finalize(ctx: FinalizeContext): Promise<void> {
 }
 
 function collectReasoning(acc: ChatAccumulator): ReasoningDetail[] {
-  return Array.from(acc.reasoningByIndex.entries())
-    .sort(([a], [b]) => a - b)
-    .map(([, value]) => value)
+  // Return in insertion order — the list already reflects the stream's
+  // natural lane ordering, and per-row merges kept identity through
+  // `findMergeTargetIndex` / the tag table.
+  return acc.reasoningList.slice()
+}
+
+function upsertReasoningRow(
+  acc: ChatAccumulator,
+  tag: string,
+  incoming: ReasoningDetail,
+): void {
+  const existing = acc.reasoningRowByTag.get(tag)
+  if (existing !== undefined) {
+    acc.reasoningList[existing] = mergeReasoningDetail(
+      acc.reasoningList[existing],
+      incoming,
+    )
+    return
+  }
+  acc.reasoningList.push(incoming)
+  acc.reasoningRowByTag.set(tag, acc.reasoningList.length - 1)
 }
 
 function updatedGeneration(

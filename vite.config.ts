@@ -35,6 +35,10 @@ export default defineConfig({
     include: [
       'tests/unit/**/*.{test,spec}.{ts,tsx}',
       'tests/integration/**/*.{test,spec}.{ts,tsx}',
+      // Phase 11+: `tests/live/**/*.live.test.ts` are gated by `LIVE=1`
+      // via `describe.skipIf(!LIVE)`. They're discovered by vitest so
+      // callers can pass a single file path, but skipped by default.
+      'tests/live/**/*.{test,spec}.{ts,tsx}',
     ],
     globals: false,
     css: false,

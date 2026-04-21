@@ -1,5 +1,5 @@
-import { render, screen } from '@testing-library/react'
-import { describe, expect, it } from 'vitest'
+import { fireEvent, render, screen } from '@testing-library/react'
+import { describe, expect, it, vi } from 'vitest'
 import type { ReasoningDetail } from '../../src/core/types'
 import { ReasoningBlock } from '../../src/ui/chat/ReasoningBlock'
 
@@ -98,5 +98,84 @@ describe('ReasoningBlock', () => {
       },
     ]
     expect(() => render(<ReasoningBlock details={details} />)).not.toThrow()
+  })
+
+  it('auto-expands while streaming with no content yet', () => {
+    const details: ReasoningDetail[] = [
+      { type: 'reasoning.summary', summary: 'streaming…', id: 's-1' },
+    ]
+    const { container } = render(<ReasoningBlock details={details} streaming hasContent={false} />)
+    const outer = container.querySelector('details[data-ui="reasoning"]') as HTMLDetailsElement
+    expect(outer.open).toBe(true)
+    // `data-streaming` used to attach a blinking-caret ::after to the panel
+    // via motion.css; we removed the attribute so reasoning never blinks
+    // (content area still gets the caret via its own data-streaming).
+    expect(outer.getAttribute('data-streaming')).toBeNull()
+  })
+
+  it('surfaces a lock badge + byte count when encrypted reasoning is present', () => {
+    const bytes = 'A'.repeat(2048)
+    const details: ReasoningDetail[] = [{ type: 'reasoning.encrypted', data: bytes, id: 'e-1' }]
+    const { container } = render(<ReasoningBlock details={details} />)
+    const lock = container.querySelector('[data-ui="reasoning-lock"]')
+    expect(lock).toBeTruthy()
+    expect(lock?.getAttribute('title')).toMatch(/2\.0 KB/)
+  })
+
+  it('renders Summary, Details, Encrypted as separate nested disclosures', () => {
+    const details: ReasoningDetail[] = [
+      { type: 'reasoning.summary', summary: 'sum', id: 's-1' },
+      { type: 'reasoning.text', text: 'text', id: 't-1' },
+      { type: 'reasoning.encrypted', data: 'AAAA', id: 'e-1' },
+    ]
+    const { container } = render(<ReasoningBlock details={details} />)
+    const sections = container.querySelectorAll('[data-ui="reasoning-section"]')
+    expect(sections).toHaveLength(3)
+    const kinds = Array.from(sections).map((el) => el.getAttribute('data-reasoning-kind'))
+    expect(kinds).toEqual(['summary', 'text', 'encrypted'])
+  })
+
+  it('renders a hide button per row when onToggleHidden is supplied and routes the click with the stored detail index', () => {
+    const details: ReasoningDetail[] = [
+      { type: 'reasoning.summary', summary: 'first', id: 's-1' },
+      { type: 'reasoning.summary', summary: 'second', id: 's-2' },
+      { type: 'reasoning.text', text: 'third', id: 't-1' },
+    ]
+    const onToggle = vi.fn()
+    const { container } = render(
+      <ReasoningBlock details={details} onToggleHidden={onToggle} />,
+    )
+    openSummary(container)
+    const hideButtons = container.querySelectorAll('[data-ui="reasoning-row-hide"]')
+    expect(hideButtons).toHaveLength(3)
+    fireEvent.click(hideButtons[1] as HTMLElement)
+    expect(onToggle).toHaveBeenCalledWith(1)
+    fireEvent.click(hideButtons[2] as HTMLElement)
+    expect(onToggle).toHaveBeenLastCalledWith(2)
+  })
+
+  it('marks hidden rows with data-hidden + EyeOff icon', () => {
+    const details: ReasoningDetail[] = [
+      { type: 'reasoning.summary', summary: 'visible', id: 's-1' },
+      { type: 'reasoning.summary', summary: 'gone', id: 's-2', hidden: true },
+    ]
+    const { container } = render(<ReasoningBlock details={details} onToggleHidden={() => {}} />)
+    openSummary(container)
+    const rows = container.querySelectorAll('[data-ui="reasoning-row"]')
+    expect(rows[0]?.getAttribute('data-hidden')).toBeNull()
+    expect(rows[1]?.getAttribute('data-hidden')).toBe('true')
+    const pressedButtons = container.querySelectorAll(
+      '[data-ui="reasoning-row-hide"][data-pressed="true"]',
+    )
+    expect(pressedButtons).toHaveLength(1)
+  })
+
+  it('hides the eye button when onToggleHidden is not supplied', () => {
+    const details: ReasoningDetail[] = [
+      { type: 'reasoning.summary', summary: 'read only', id: 's-1' },
+    ]
+    const { container } = render(<ReasoningBlock details={details} />)
+    openSummary(container)
+    expect(container.querySelector('[data-ui="reasoning-row-hide"]')).toBeNull()
   })
 })

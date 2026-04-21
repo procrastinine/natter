@@ -13,9 +13,23 @@
 // doesn't leave dangling knobs that will 400 on send.
 
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { chooseApi, isResponsesCapable } from '../../core/api-choice'
 import type { EffectiveCapability } from '../../core/capabilities'
 import { validateChatSettings } from '../../core/capabilities'
-import type { Chat, EffortLevel, SamplingKey, VerbosityLevel } from '../../core/types'
+import {
+  emitsEncryptedReasoningFor,
+  responsesSupportFor,
+} from '../../core/quirks'
+import type {
+  ApiVariant,
+  Chat,
+  ConnectionProfile,
+  EffortLevel,
+  ReasoningInclude,
+  ReasoningSummary,
+  SamplingKey,
+  VerbosityLevel,
+} from '../../core/types'
 import { updateChatSettings } from '../../store/chats'
 import { SystemPromptEditor } from './SystemPromptEditor'
 
@@ -208,7 +222,7 @@ const SAMPLING_FIELDS: SamplingSpec[] = [
     label: 'DRY multiplier',
     min: 0,
     max: 5,
-    hint: 'DRY (Don\'t Repeat Yourself) penalty multiplier. 0 disables.',
+    hint: "DRY (Don't Repeat Yourself) penalty multiplier. 0 disables.",
   },
   {
     key: 'dry_base',
@@ -320,7 +334,13 @@ function SamplingSection({ chat, capability }: { chat: Chat; capability: Effecti
   )
 }
 
-function ReasoningSection({ chat, capability }: { chat: Chat; capability: EffectiveCapability }) {
+function ReasoningSection({
+  chat,
+  capability,
+}: {
+  chat: Chat
+  capability: EffectiveCapability
+}) {
   const hasReasoning =
     capability.supportedParameters.has('reasoning') ||
     capability.supportedParameters.has('thinking') ||
@@ -328,11 +348,6 @@ function ReasoningSection({ chat, capability }: { chat: Chat; capability: Effect
   if (!hasReasoning) return null
   const adaptiveOnly = capability.quirks.adaptiveReasoningOnly === true
   const effortChoices = adaptiveOnly ? [] : capability.allowedEffort
-  // For adaptive-only models (Claude 4.7), the model controls reasoning
-  // entirely — no knobs to expose. Rather than showing a useless block with
-  // a single "off" toggle and an explanatory paragraph, hide the whole
-  // section.
-  if (adaptiveOnly) return null
   // OpenAI o-series returns reasoning opaquely — control rendering stays
   // the same, but the user won't see tokens in the response. Hide the
   // whole section for hidden-reasoning models to avoid implying the
@@ -353,72 +368,274 @@ function ReasoningSection({ chat, capability }: { chat: Chat; capability: Effect
   return (
     <section data-ui="settings-section" data-ui-section="reasoning">
       <h3>Reasoning</h3>
-      <div data-ui="field-group" data-ui-field>
-        <span>Mode</span>
-        <div data-ui="segmented">
-          {modes.map((m) => (
-            <button
-              key={m}
-              type="button"
-              data-ui="segmented-option"
-              aria-pressed={r.mode === m}
-              onClick={() => updateReasoning({ mode: m })}
-            >
-              {m}
-            </button>
-          ))}
+      {adaptiveOnly ? (
+        // Claude 4.6/4.7: the model picks its own effort. Exposing Mode +
+        // Effort would mislead the user into thinking their clicks matter.
+        // We still render the section header + the include/summary sub-
+        // controls below (they DO matter — Anthropic returns signed reasoning
+        // text that can be echoed on the next turn).
+        <div data-ui="field-group" data-ui-field>
+          <span data-ui="helper">This model decides reasoning effort automatically.</span>
+        </div>
+      ) : (
+        <>
+          <div data-ui="field-group" data-ui-field>
+            <span>Mode</span>
+            <div data-ui="segmented">
+              {modes.map((m) => (
+                <button
+                  key={m}
+                  type="button"
+                  data-ui="segmented-option"
+                  aria-pressed={r.mode === m}
+                  onClick={() => updateReasoning({ mode: m })}
+                >
+                  {m}
+                </button>
+              ))}
+            </div>
+          </div>
+          {r.mode === 'effort' && effortChoices.length > 0 ? (
+            <div data-ui="field-group" data-ui-field>
+              <span>Effort</span>
+              <div data-ui="segmented">
+                {effortChoices.map((e) => (
+                  <button
+                    key={e}
+                    type="button"
+                    data-ui="segmented-option"
+                    aria-pressed={r.effort === e}
+                    onClick={() => updateReasoning({ effort: e as EffortLevel })}
+                  >
+                    {e}
+                  </button>
+                ))}
+              </div>
+            </div>
+          ) : null}
+          {r.mode === 'budget' ? (
+            <div data-ui="field-group" data-ui-field data-ui-slider-row>
+              <span data-ui="slider-label">Max reasoning tokens</span>
+              <input
+                data-ui="slider"
+                type="range"
+                min={0}
+                max={capability.maxCompletionTokens ?? 32000}
+                step={1}
+                value={Math.min(
+                  capability.maxCompletionTokens ?? 32000,
+                  Math.max(0, r.maxTokens ?? 0),
+                )}
+                onChange={(e) => updateReasoning({ maxTokens: Number(e.target.value) })}
+              />
+              <input
+                data-ui="slider-number"
+                type="number"
+                min={0}
+                max={capability.maxCompletionTokens ?? 32000}
+                value={r.maxTokens ?? ''}
+                placeholder="0"
+                onChange={(e) => {
+                  const raw = e.target.value
+                  if (raw === '') return
+                  const n = Number(raw)
+                  if (Number.isFinite(n) && n >= 0) updateReasoning({ maxTokens: Math.floor(n) })
+                }}
+              />
+            </div>
+          ) : null}
+        </>
+      )}
+      <ReasoningSummaryControl chat={chat} capability={capability} />
+    </section>
+  )
+}
+
+const SUMMARY_VALUES: readonly ('off' | 'auto' | 'concise' | 'detailed')[] = [
+  'off',
+  'auto',
+  'concise',
+  'detailed',
+]
+
+function ReasoningSummaryControl({
+  chat,
+  capability,
+}: {
+  chat: Chat
+  capability: EffectiveCapability
+}) {
+  // Summary-output is a request flag asking the provider to surface the
+  // visible reasoning summary. The provider decides whether to honor it;
+  // on chat-completions against most models it's ignored, on OpenAI
+  // Responses + Gemini native it's honored. Render whenever reasoning is
+  // a supported parameter — the user can decide what to ask for.
+  const hasSummarySupport =
+    capability.supportedParameters.has('reasoning') ||
+    capability.supportedParameters.has('thinking')
+  if (!hasSummarySupport) return null
+  const r = chat.settings.reasoning
+  const selected = r.summary ?? 'off'
+  return (
+    <div data-ui="field-group" data-ui-field>
+      <span>Summary output</span>
+      <div data-ui="segmented">
+        {SUMMARY_VALUES.map((v) => (
+          <button
+            key={v}
+            type="button"
+            data-ui="segmented-option"
+            aria-pressed={selected === v}
+            onClick={() =>
+              void updateChatSettings(chat.id, {
+                reasoning: { ...r, summary: v as ReasoningSummary },
+              })
+            }
+          >
+            {v}
+          </button>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+// Three independent checkboxes: encrypted / visible summary / visible text.
+// User directive: all three are ALWAYS clickable (a mid-chat model swap may
+// bring history from another family that the current model can still
+// consume). The only gate is the encrypted checkbox: we hide it entirely
+// when the model doesn't emit encrypted reasoning (unknown format, Gemini
+// 2.5, etc.) — no disabled-with-tooltip.
+//
+// Filter-side safety: `filterReasoningForInclude` silent-drops incompatible
+// formats before sending, with a console.warn. The UI just lets users pick.
+//
+// Lives on the Context tab (see `ChatModelPanel` — tabs 2026-04).
+export function ReasoningIncludeControls({
+  chat,
+  capability,
+}: {
+  chat: Chat
+  capability: EffectiveCapability
+}) {
+  // Only surface this control when the model actually has a reasoning param.
+  // Otherwise include flags are a no-op.
+  const hasReasoning =
+    capability.supportedParameters.has('reasoning') ||
+    capability.supportedParameters.has('thinking') ||
+    capability.supportedParameters.has('include_reasoning')
+  if (!hasReasoning) return null
+  const r = chat.settings.reasoning
+  const include = r.include
+  const emitsEncrypted = emitsEncryptedReasoningFor(chat.settings.model) === 'always'
+  const updateInclude = (patch: Partial<ReasoningInclude>) =>
+    void updateChatSettings(chat.id, {
+      reasoning: { ...r, include: { ...include, ...patch } },
+    })
+  return (
+    <section data-ui="settings-section" data-ui-section="reasoning-include">
+      <h3>Include in next turn</h3>
+      <div data-ui="field-group" data-ui-field data-ui-group="reasoning-include">
+        <div data-ui="reasoning-include-group">
+          {emitsEncrypted ? (
+            <label data-ui="reasoning-checkbox">
+              <input
+                type="checkbox"
+                checked={include.encrypted}
+                onChange={(e) => updateInclude({ encrypted: e.target.checked })}
+              />
+              <span>Encrypted reasoning</span>
+            </label>
+          ) : null}
+          <label data-ui="reasoning-checkbox">
+            <input
+              type="checkbox"
+              checked={include.summary}
+              onChange={(e) => updateInclude({ summary: e.target.checked })}
+            />
+            <span>Visible summary</span>
+          </label>
+          <label data-ui="reasoning-checkbox">
+            <input
+              type="checkbox"
+              checked={include.text}
+              onChange={(e) => updateInclude({ text: e.target.checked })}
+            />
+            <span>Visible text</span>
+          </label>
         </div>
       </div>
-      {r.mode === 'effort' && effortChoices.length > 0 ? (
-        <div data-ui="field-group" data-ui-field>
-          <span>Effort</span>
-          <div data-ui="segmented">
-            {effortChoices.map((e) => (
-              <button
-                key={e}
-                type="button"
-                data-ui="segmented-option"
-                aria-pressed={r.effort === e}
-                onClick={() => updateReasoning({ effort: e as EffortLevel })}
-              >
-                {e}
-              </button>
-            ))}
-          </div>
+    </section>
+  )
+}
+
+// API mode — Chat completions / Responses. Only renders when the model
+// supports BOTH transports AND the profile exposes /responses. On
+// Responses-only models (gpt-5.4-pro, 5.3-codex, *-pro, *-codex) we force
+// Responses and hide the toggle. On chat-only models (all Claude, Gemini,
+// DeepSeek, Qwen, *-chat-latest) we force Chat and hide the toggle.
+// Gemini (native) connections pick transport at the connection level.
+//
+// Lives on the Model tab. Exported for use in `ChatModelPanel`.
+export function ApiModeSection({
+  chat,
+  capability,
+  profile,
+}: {
+  chat: Chat
+  capability: EffectiveCapability
+  profile: ConnectionProfile | null
+}) {
+  if (!profile) return null
+  // Gemini native picks transport at the connection level — nothing per-chat.
+  if (profile.kind === 'google' && profile.geminiMode !== 'openai-compat') return null
+  if (!isResponsesCapable(profile)) return null
+  const support = responsesSupportFor(chat.settings.model)
+  // Hide toggle unless the model has a genuine choice.
+  if (support !== 'both') return null
+  const route = chooseApi(profile, chat.settings, [], capability)
+  const resolvedKind: 'chat' | 'responses' =
+    route.kind === 'responses' ? 'responses' : 'chat'
+  const requiresPhaseEcho = capability.quirks.requiresPhaseEcho === true
+  const pinTo = (target: 'chat' | 'responses') => {
+    if (target === 'chat' && requiresPhaseEcho) {
+      if (
+        typeof window !== 'undefined' &&
+        !window.confirm(
+          'This model relies on the Responses API to preserve `phase` metadata across turns. Dropping it can cause the model to stop early mid-answer. Switch anyway?',
+        )
+      ) {
+        return
+      }
+    }
+    void updateChatSettings(chat.id, { api: target as ApiVariant })
+  }
+  return (
+    <section data-ui="settings-section" data-ui-section="api-mode">
+      <h3>
+        API mode{' '}
+        <InfoHint text="Responses preserves encrypted reasoning and `phase` metadata across turns. Chat completions is simpler and universal. Default is picked per model." />
+      </h3>
+      <div data-ui="field-group" data-ui-field>
+        <div data-ui="segmented">
+          <button
+            type="button"
+            data-ui="segmented-option"
+            aria-pressed={resolvedKind === 'chat'}
+            onClick={() => pinTo('chat')}
+          >
+            Chat completions
+          </button>
+          <button
+            type="button"
+            data-ui="segmented-option"
+            aria-pressed={resolvedKind === 'responses'}
+            onClick={() => pinTo('responses')}
+          >
+            Responses
+          </button>
         </div>
-      ) : null}
-      {r.mode === 'budget' ? (
-        <div data-ui="field-group" data-ui-field data-ui-slider-row>
-          <span data-ui="slider-label">Max reasoning tokens</span>
-          <input
-            data-ui="slider"
-            type="range"
-            min={0}
-            max={capability.maxCompletionTokens ?? 32000}
-            step={1}
-            value={Math.min(
-              capability.maxCompletionTokens ?? 32000,
-              Math.max(0, r.maxTokens ?? 0),
-            )}
-            onChange={(e) => updateReasoning({ maxTokens: Number(e.target.value) })}
-          />
-          <input
-            data-ui="slider-number"
-            type="number"
-            min={0}
-            max={capability.maxCompletionTokens ?? 32000}
-            value={r.maxTokens ?? ''}
-            placeholder="0"
-            onChange={(e) => {
-              const raw = e.target.value
-              if (raw === '') return
-              const n = Number(raw)
-              if (Number.isFinite(n) && n >= 0)
-                updateReasoning({ maxTokens: Math.floor(n) })
-            }}
-          />
-        </div>
-      ) : null}
+      </div>
     </section>
   )
 }
@@ -578,11 +795,7 @@ function LogitBiasSection({ chat, capability }: { chat: Chat; capability: Effect
       {open ? (
         <div data-ui="field-group">
           <div data-ui="logit-bias-toolbar">
-            <button
-              type="button"
-              data-ui="logit-bias-btn"
-              onClick={() => fileRef.current?.click()}
-            >
+            <button type="button" data-ui="logit-bias-btn" onClick={() => fileRef.current?.click()}>
               Upload
             </button>
             <input
@@ -639,11 +852,7 @@ function placeholderForSpec(spec: SamplingSpec): string {
   // into the placeholder — readable text wins over literal bounds.
   if (spec.max > 1000 && spec.integer) return `${spec.min}-${spec.max}`
   const formatNum = (n: number) =>
-    spec.integer
-      ? String(n)
-      : Number.isInteger(n)
-        ? n.toFixed(1)
-        : String(n)
+    spec.integer ? String(n) : Number.isInteger(n) ? n.toFixed(1) : String(n)
   return `${formatNum(spec.min)}-${formatNum(spec.max)}`
 }
 

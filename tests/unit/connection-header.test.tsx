@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import 'fake-indexeddb/auto'
 import Dexie from 'dexie'
 import { IDBFactory } from 'fake-indexeddb'
@@ -57,6 +57,11 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
+  // Unmount the React tree BEFORE resetting the DB. The header's
+  // observable queries hold a live Dexie handle; if we close the DB while
+  // those are still resolving, vitest flags a `DatabaseClosedError`
+  // unhandled rejection. Cleanup first cancels the subscriptions.
+  cleanup()
   vi.restoreAllMocks()
   await resetAll()
 })

@@ -27,7 +27,7 @@ export interface Toast {
   createdAt: number
 }
 
-export type BannerKind = 'chat-not-found' | 'mutation-conflict' | 'stale-edit'
+export type BannerKind = 'chat-not-found' | 'mutation-conflict' | 'stale-edit' | 'stale-reasoning'
 
 export interface Banner {
   id: string

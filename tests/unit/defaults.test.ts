@@ -42,8 +42,12 @@ describe('defaults', () => {
         },
         "profileId": "",
         "reasoning": {
-          "carryForward": "auto",
           "exclude": false,
+          "include": {
+            "encrypted": true,
+            "summary": false,
+            "text": false,
+          },
           "mode": "default",
           "summary": "auto",
         },

@@ -37,6 +37,7 @@ function makeMessage(partial: Partial<Message> & { role: MessageRole; text?: str
       ? { hiddenFromContext: partial.hiddenFromContext }
       : {}),
     ...(partial.generation ? { generation: partial.generation } : {}),
+    ...(partial.reasoningDetails ? { reasoningDetails: partial.reasoningDetails } : {}),
   }
 }
 
@@ -275,6 +276,89 @@ describe('estimatePromptSize — calibrated branch', () => {
     // Hidden baseline must not anchor the estimate; fallback-only path
     // stays small.
     expect(est.historyTokens).toBeLessThan(30)
+  })
+})
+
+describe('estimatePromptSize — reasoning echo accounting', () => {
+  it('adds reasoning.encrypted bytes/3 when include.encrypted is on AND format matches', () => {
+    const path = [
+      makeMessage({ role: 'user', text: 'hi' }),
+      makeMessage({
+        role: 'assistant',
+        text: 'reply',
+        reasoningDetails: [
+          { type: 'reasoning.encrypted', data: 'A'.repeat(300), format: 'openai-responses-v1' },
+        ],
+      } as never),
+    ]
+    const withInclude = estimatePromptSize({
+      systemPrompt: '',
+      activePathMessages: path,
+      draftText: '',
+      tokenizer: DEFAULT_TOKENIZER,
+      reasoningInclude: { encrypted: true, summary: false, text: false },
+      reasoningPreservationFormat: 'openai-responses-v1',
+    })
+    const withoutInclude = estimatePromptSize({
+      systemPrompt: '',
+      activePathMessages: path,
+      draftText: '',
+      tokenizer: DEFAULT_TOKENIZER,
+      reasoningInclude: { encrypted: false, summary: false, text: false },
+      reasoningPreservationFormat: 'openai-responses-v1',
+    })
+    expect(withInclude.reasoningTokens).toBe(100) // 300 bytes / 3
+    expect(withoutInclude.reasoningTokens).toBe(0)
+    expect(withInclude.total - withoutInclude.total).toBe(100)
+  })
+
+  it('skips reasoning blocks marked hidden: true even when include flag is on', () => {
+    const path = [
+      makeMessage({
+        role: 'assistant',
+        text: 'reply',
+        reasoningDetails: [
+          {
+            type: 'reasoning.summary',
+            summary: 'A'.repeat(70),
+            hidden: true,
+          },
+          {
+            type: 'reasoning.summary',
+            summary: 'B'.repeat(70),
+          },
+        ],
+      } as never),
+    ]
+    const est = estimatePromptSize({
+      systemPrompt: '',
+      activePathMessages: path,
+      draftText: '',
+      tokenizer: DEFAULT_TOKENIZER,
+      reasoningInclude: { encrypted: false, summary: true, text: false },
+      reasoningPreservationFormat: 'openai-responses-v1',
+    })
+    // Only the non-hidden summary counts (70 / 3.5 = 20).
+    expect(est.reasoningTokens).toBe(20)
+  })
+
+  it('omits reasoning tokens entirely when caller does not pass include flags', () => {
+    const path = [
+      makeMessage({
+        role: 'assistant',
+        text: 'reply',
+        reasoningDetails: [
+          { type: 'reasoning.summary', summary: 'A'.repeat(70) },
+        ],
+      } as never),
+    ]
+    const est = estimatePromptSize({
+      systemPrompt: '',
+      activePathMessages: path,
+      draftText: '',
+      tokenizer: DEFAULT_TOKENIZER,
+    })
+    expect(est.reasoningTokens).toBe(0)
   })
 })
 

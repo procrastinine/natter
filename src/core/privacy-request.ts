@@ -30,6 +30,12 @@ import { getCachedPrivacyPolicy } from '../store/privacy-cache'
 export interface ResolvePrivacyForSendInput {
   chat: Chat
   profile: ConnectionProfile
+  // Tokens we'd actually send to this model right now (visible text +
+  // media + reasoning echo + reserved completion). Provider endpoints
+  // whose context can't hold this number are added to `wire.ignore` as
+  // a transient filter — the user's persisted `providerPrefs.ignore`
+  // list is unchanged. Omit to skip the check entirely.
+  neededTokens?: number
 }
 
 export interface ResolvePrivacyForSendResult {
@@ -77,5 +83,25 @@ export async function resolvePrivacyForSend(
   }
   if (prefs?.ignore) wireOpts.existingIgnore = prefs.ignore
   const wire = buildWireProviderPrivacy(filter, chat.settings.privacy, wireOpts)
+  if (typeof input.neededTokens === 'number' && input.neededTokens > 0) {
+    const insufficient: string[] = []
+    for (const ep of endpoints) {
+      const cap = ep.max_prompt_tokens ?? ep.context_length
+      if (typeof cap === 'number' && cap > 0 && input.neededTokens > cap) {
+        insufficient.push(ep.provider_name)
+      }
+    }
+    if (insufficient.length > 0) {
+      // Merge into the existing wire.ignore — keep user prefs / privacy
+      // filter exclusions intact. The UI still shows the provider as
+      // "checked" because the settings row is unchanged; the grey badge
+      // + this transient ignore are what keep the send honest.
+      const base: { ignore?: string[] } = (wire ?? { ignore: [] }) as { ignore?: string[] }
+      const next = new Set<string>(base.ignore ?? [])
+      for (const name of insufficient) next.add(name)
+      const merged: WireProviderPrivacy = { ...(wire ?? {}), ignore: [...next] }
+      return { wire: merged, filter, applicable: true }
+    }
+  }
   return { wire, filter, applicable: true }
 }

@@ -6,6 +6,7 @@
 // so browser mode already matches the future daemon contract.
 
 import { cloneDefaultChatSettings } from '../core/defaults'
+import { normalizeReasoningSettings } from '../core/reasoning'
 import type { Chat, ChatId, ChatSettings, Message, MessageId, PresetId } from '../core/types'
 import { newId } from '../lib/ulid'
 import { postEvent } from './broadcast'
@@ -36,6 +37,7 @@ export interface CreateChatInput {
 export async function createChat(input: CreateChatInput = {}): Promise<Chat> {
   const db = await openDb()
   const now = input.now ?? Date.now()
+  const settings = normalizeChatSettings(input.settings ?? cloneDefaultChatSettings())
   const chat: Chat = {
     id: input.id ?? newId(),
     title: input.title ?? '',
@@ -47,7 +49,7 @@ export async function createChat(input: CreateChatInput = {}): Promise<Chat> {
     totalCostUsd: 0,
     metaVersion: 0,
     summaryVersion: 0,
-    settings: input.settings ?? cloneDefaultChatSettings(),
+    settings,
     lastUpdatedLeafId: null,
     lastBranchUpdatedAt: now,
     archived: false,
@@ -239,12 +241,18 @@ export async function updateChatSettings(
   await repo.runMutation([{ kind: 'chat-meta', chatId }], async (ctx) => {
     const chat = await ctx.getChat(chatId)
     if (!chat) return
-    const nextSettings = { ...chat.settings } as ChatSettings
+    let nextSettings = { ...chat.settings } as ChatSettings
     for (const key of keys) {
       const value = patch[key]
       if (value === undefined) delete (nextSettings as Partial<ChatSettings>)[key]
       else (nextSettings as Record<keyof ChatSettings, unknown>)[key] = value
     }
+    // Always apply the reasoning normalizer on write — partial reasoning
+    // patches (e.g. mode-only updates from the segmented control) can land
+    // here without an `include` block, and downstream readers (chooseApi,
+    // transforms) expect it. The normalizer is a no-op when the value is
+    // already well-formed, so this stays cheap.
+    nextSettings = normalizeChatSettings(nextSettings)
     if (sameSettingsFor(chat.settings, nextSettings, keys)) return
     changed = true
     ctx.patchChatMeta(chatId, {
@@ -253,6 +261,16 @@ export async function updateChatSettings(
     })
   })
   return changed
+}
+
+// Normalize fields that downstream readers assume are well-formed. Today this
+// is just `reasoning` (Phase 11 added required sub-fields after some chat
+// rows were already on disk); future additions go here too. Returns the
+// input verbatim when nothing needs rewriting so referential equality holds.
+function normalizeChatSettings(settings: ChatSettings): ChatSettings {
+  const reasoning = normalizeReasoningSettings(settings.reasoning)
+  if (reasoning === settings.reasoning) return settings
+  return { ...settings, reasoning }
 }
 
 function sameSettingsFor(

@@ -60,7 +60,7 @@ function settings(
     ...base,
     profileId: 'prof-s1',
     model,
-    reasoning: { mode: 'off', exclude: false, summary: 'off', carryForward: 'off' },
+    reasoning: { mode: 'off', exclude: false, summary: 'off', carryForward: 'off', include: { encrypted: false, summary: false, text: false } },
     ...overrides,
   }
 }

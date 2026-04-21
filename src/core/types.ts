@@ -102,9 +102,28 @@ export type VerbosityLevel = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 // `effort` / `budget` = the two dimensional knobs when supported.
 export type ReasoningMode = 'default' | 'off' | 'enabled' | 'effort' | 'budget'
 
+/** @deprecated Phase 11 replaces this with `ReasoningInclude`. Kept for one
+ *  release so legacy chat rows can round-trip through import/export. Readers
+ *  should prefer `include` and fall back to migrated values from here. */
 export type ReasoningCarryForward = 'off' | 'plaintext' | 'encrypted' | 'auto'
 
 export type ReasoningSummary = 'off' | 'auto' | 'concise' | 'detailed'
+
+/** Three independent flags — maps 1:1 to the three Phase-11.1 UI checkboxes.
+ *  - `encrypted`: round-trip the family-native opaque carrier
+ *    (OpenAI `encrypted_content`, Anthropic `signature`, Gemini
+ *    `thoughtSignature`, xAI Grok).
+ *  - `summary`: round-trip visible summary parts (OpenAI reasoning summaries,
+ *    Gemini `thought: true` parts).
+ *  - `text`: round-trip visible plaintext reasoning (Claude / DeepSeek / Qwen
+ *    / Gemma).
+ *  Each flag is independently gated by what the current route can actually
+ *  round-trip (see `plan/phase11-implementation.md §2`). */
+export interface ReasoningInclude {
+  encrypted: boolean
+  summary: boolean
+  text: boolean
+}
 
 export interface ReasoningSettings {
   mode: ReasoningMode
@@ -112,7 +131,10 @@ export interface ReasoningSettings {
   maxTokens?: number
   exclude: boolean
   summary?: ReasoningSummary
-  carryForward: ReasoningCarryForward
+  /** Authoritative carry-forward control since Phase 11. */
+  include: ReasoningInclude
+  /** @deprecated Use `include`. Preserved for import/export backcompat only. */
+  carryForward?: ReasoningCarryForward
 }
 
 export type ReasoningFormat =
@@ -131,6 +153,7 @@ export type ReasoningDetail =
       format?: ReasoningFormat
       text?: string
       signature?: string
+      hidden?: boolean
     }
   | {
       type: 'reasoning.summary'
@@ -138,6 +161,7 @@ export type ReasoningDetail =
       index?: number
       format?: ReasoningFormat
       summary: string
+      hidden?: boolean
     }
   | {
       type: 'reasoning.encrypted'
@@ -145,6 +169,7 @@ export type ReasoningDetail =
       index?: number
       format?: ReasoningFormat
       data: string
+      hidden?: boolean
     }
 
 // ---------------------------------------------------------------------------
@@ -396,6 +421,33 @@ export interface ChatSettings {
   // bundled templates so the renderer can use one code path. Empty strings
   // are legitimate (any prefix/suffix may be omitted).
   customTextTemplate?: TextTemplateConfig
+  // OpenAI Responses-API-specific knobs. Seeded from
+  // `ConnectionProfile.responsesDefaults` at new-chat creation. Only read
+  // on the `responses` route — chat-completions ignores the block entirely.
+  responses?: ResponsesChatSettings
+  // Gemini-specific knobs. Seeded from `ConnectionProfile.geminiDefaults`.
+  gemini?: GeminiChatSettings
+}
+
+export interface ResponsesChatSettings {
+  /** Emit `include: ['reasoning.encrypted_content']` on the request. Default
+   *  `true` when `reasoning.include.encrypted` is also `true`. Independent
+   *  escape hatch so the user can suppress the include without flipping the
+   *  per-chat reasoning checkbox. */
+  includeEncrypted: boolean
+  /** Pass through to OpenAI. Our default is `false` (stateless, privacy). */
+  store: boolean
+}
+
+export interface GeminiChatSettings {
+  /** Imported chats without `thoughtSignature` values on prior turns bypass
+   *  the 400-error validator when this is `true` (we pass
+   *  `"skip_thought_signature_validator"` as the signature). Default `false`
+   *  — surface a banner on first stale-reasoning rejection instead. */
+  allowImportedWithoutSignature?: boolean
+  /** When set, `cachedContents/<name>` passed as `cachedContent` on the
+   *  request. Phase 14 wires the management UI; preserved here for round-trip. */
+  cachedContentName?: string
 }
 
 export type TextTemplateId =
@@ -748,6 +800,24 @@ export interface ConnectionProfile {
   updatedAt: number
   lastUsedAt?: number
   archived?: boolean
+  /** Google Gemini transport selector. Only meaningful when `kind === 'google'`.
+   *  `native` (default) dispatches to `:generateContent` /
+   *  `:streamGenerateContent?alt=sse` with `x-goog-api-key`. `openai-compat`
+   *  falls back to Gemini's OpenAI-compatible shim at `/v1beta/openai/…`,
+   *  which strips `thoughtSignature` outside tool flows. See
+   *  `plan/phase11-implementation.md §1`. */
+  geminiMode?: 'native' | 'openai-compat'
+  /** Per-profile defaults copied into `chat.settings.responses` at new-chat
+   *  creation. Users edit these from the Connection editor; per-chat overrides
+   *  in `chat.settings.responses` win at send time. */
+  responsesDefaults?: {
+    store: boolean
+    includeEncrypted: boolean
+  }
+  /** Per-profile Gemini defaults copied into `chat.settings.gemini`. */
+  geminiDefaults?: {
+    allowImportedWithoutSignature: boolean
+  }
 }
 
 export interface ChatPreset {

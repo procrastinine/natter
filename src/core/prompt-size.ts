@@ -10,16 +10,43 @@
 // composer draft. Attachments are approximated by a flat 258 tokens per
 // image and their file sizes for docs — same approximations used
 // elsewhere when we don't have a precise image-token helper yet.
+//
+// Reasoning echo: when an assistant message carries `reasoningDetails[]`,
+// the next turn echoes the subset allowed by the chat's `ReasoningInclude`
+// flags (`encrypted` / `summary` / `text`) back in the wire. That costs
+// prompt tokens — `filterReasoningForInclude` + `estimateReasoningEchoTokens`
+// live in `core/tokens.ts` and `core/reasoning.ts` respectively. Per-block
+// `hidden: true` is honored inside the filter, so toggling the eye on a
+// reasoning row drops its contribution from the gauge.
 
 import { activePath } from './active-path'
-import { estimateTokens, type TokenizerFamily, tokenizerFamily } from './tokens'
-import type { ChatSettings, ContentItem, Message } from './types'
+import {
+  type PromptEstimateOptions,
+  estimateReasoningEchoTokens,
+  estimateTokens,
+  type TokenizerFamily,
+  tokenizerFamily,
+} from './tokens'
+import type {
+  ChatSettings,
+  ContentItem,
+  Message,
+  ReasoningFormat,
+  ReasoningInclude,
+} from './types'
 
 export interface PromptSizeEstimateInput {
   systemPrompt: string
   activePathMessages: Message[]
   draftText: string
   tokenizer: TokenizerFamily
+  // Caller opts in by passing these; when omitted, reasoning contributes
+  // zero to the total (backcompat with pre-Phase-11 callers). The Context
+  // panel and composer gauge always pass them so toggling the three
+  // Include checkboxes updates the number live.
+  reasoningInclude?: ReasoningInclude
+  reasoningPreservationFormat?: ReasoningFormat
+  reasoningExcluded?: boolean
 }
 
 export interface PromptSizeEstimate {
@@ -27,6 +54,7 @@ export interface PromptSizeEstimate {
   historyTokens: number
   draftTokens: number
   mediaTokens: number
+  reasoningTokens: number
   total: number
 }
 
@@ -71,39 +99,16 @@ export function estimatePromptSize(input: PromptSizeEstimateInput): PromptSizeEs
   // stay honest even when either side is stale.
   let fallbackHistory = 0
   let fallbackMedia = 0
+  const visiblePath: Message[] = []
   for (const m of input.activePathMessages) {
     if (m.deleted || m.hiddenFromContext) continue
+    visiblePath.push(m)
     fallbackHistory += estimateTokens(plainTextOf(m.content), family)
     fallbackMedia += mediaTokenCountFor(m.content)
   }
 
   // Provider-calibrated estimate — use the LATEST reported usage on the
   // active path as a baseline, then estimate only the deltas after it.
-  // Edge cases handled here:
-  //
-  //   1. No reported usage yet → fall back to pure per-message estimation.
-  //   2. The baseline is older than the current system prompt (system
-  //      edited post-send) → `promptTokens - systemTokens` could go
-  //      negative; clamp to 0.
-  //   3. The baseline message itself, OR any message before it, has been
-  //      edited after the request went out → `promptTokens` reflects the
-  //      OLD text. We can't detect this cheaply, so the calibrated
-  //      number may UNDERSHOOT if edits grew text. The fallback
-  //      (char-based) recomputes from current content, so max(fallback,
-  //      calibrated) is always conservative.
-  //   4. Hidden-from-context / deleted messages between baseline and
-  //      now are skipped, so we don't charge for text that won't ship.
-  //   5. The baseline's own completion content belongs to "history" for
-  //      the NEXT prompt (it's the assistant turn the provider is about
-  //      to see echoed back). We add that explicitly.
-  //   6. Media tokens attached to pre-baseline messages are folded into
-  //      `promptTokens` by the provider, so we only add media AFTER the
-  //      baseline to avoid double-counting.
-  //   7. When sending from an intermediate message, `activePathMessages`
-  //      contains only ancestors-and-self of that message, so the
-  //      baseline search naturally walks the right path.
-  //   8. If `promptTokens` is zero or negative (some error paths), we
-  //      skip it — that's clearly a non-answer.
   let baselineIdx = -1
   let baselinePromptTokens: number | undefined
   for (let i = input.activePathMessages.length - 1; i >= 0; i -= 1) {
@@ -146,13 +151,45 @@ export function estimatePromptSize(input: PromptSizeEstimateInput): PromptSizeEs
   const historyTokens = Math.max(calibratedHistory, fallbackHistory)
   const mediaTokens = Math.max(calibratedMedia, fallbackMedia)
   const draftTokens = estimateTokens(input.draftText, family)
+
+  // Reasoning echo is computed from visible path only (we already
+  // filtered hiddenFromContext + deleted). Each assistant message with
+  // `reasoningDetails[]` contributes the tokens whose `ReasoningInclude`
+  // flag is on AND whose `hidden` flag is off, gated further by
+  // preservation-format match for encrypted carriers.
+  let reasoningTokens = 0
+  if (input.reasoningInclude) {
+    const opts: PromptEstimateOptions = {
+      family,
+      reasoningInclude: input.reasoningInclude,
+      reasoningExcluded: input.reasoningExcluded ?? false,
+    }
+    if (input.reasoningPreservationFormat !== undefined) {
+      opts.reasoningPreservationFormat = input.reasoningPreservationFormat
+    }
+    reasoningTokens = estimateReasoningEchoTokens(visiblePath, opts)
+  }
+
   return {
     systemTokens,
     historyTokens,
     draftTokens,
     mediaTokens,
-    total: systemTokens + historyTokens + draftTokens + mediaTokens,
+    reasoningTokens,
+    total: systemTokens + historyTokens + draftTokens + mediaTokens + reasoningTokens,
   }
+}
+
+// Sentinel value for `customMaxContext` / `maxCompletionTokens` meaning
+// "no cap — rely on provider limits or OpenRouter middle-out compression."
+// The user types `-1` into the numeric input; we keep the stored value as
+// -1 so preset/chat round-tripping preserves intent, but budget math
+// treats it as `Infinity`.
+export const UNLIMITED_CONTEXT = -1
+
+export function resolveContextCap(stored: number | undefined, providerCap: number): number {
+  if (stored === UNLIMITED_CONTEXT) return Number.POSITIVE_INFINITY
+  return stored ?? providerCap
 }
 
 export function tokenizerFromSettings(

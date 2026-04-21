@@ -25,7 +25,13 @@ import { useLiveQuery } from 'dexie-react-hooks'
 import { useEffect, useMemo, useState } from 'react'
 import { activePath } from '../../core/active-path'
 import type { EffectiveCapability } from '../../core/capabilities'
-import { estimatePromptSize, tokenizerFromSettings } from '../../core/prompt-size'
+import {
+  UNLIMITED_CONTEXT,
+  estimatePromptSize,
+  resolveContextCap,
+  tokenizerFromSettings,
+} from '../../core/prompt-size'
+import { quirksFor } from '../../core/quirks'
 import type { Chat } from '../../core/types'
 import { getChatDraft, loadChatMessages, updateChatSettings } from '../../store/chats'
 import { useChatStore } from '../../store/zustand/chatStore'
@@ -54,12 +60,19 @@ export function ContextPanel({
   )
   const estimate = useMemo(() => {
     const path = activePath(messages, cursor)
-    return estimatePromptSize({
+    const quirks = quirksFor(chat.settings.model)
+    const input: Parameters<typeof estimatePromptSize>[0] = {
       systemPrompt: chat.settings.systemPrompt,
       activePathMessages: path,
       draftText: draft ?? '',
       tokenizer: tokenizerFromSettings(chat.settings, endpointTokenizer ?? null),
-    })
+      reasoningInclude: chat.settings.reasoning.include,
+      reasoningExcluded: chat.settings.reasoning.exclude === true,
+    }
+    if (quirks.reasoningPreservationFormat !== undefined) {
+      input.reasoningPreservationFormat = quirks.reasoningPreservationFormat
+    }
+    return estimatePromptSize(input)
   }, [messages, cursor, chat.settings, draft, endpointTokenizer])
 
   if (!chat.settings.model) {
@@ -103,17 +116,31 @@ export function ContextPanel({
       </section>
     )
   }
-  const customMax = chat.settings.customMaxContext ?? modelPromptCap
-  const effectiveMax = Math.min(customMax, modelPromptCap)
-  const storedMaxCompletion = chat.settings.maxCompletionTokens ?? Math.min(4096, modelCompletionCap)
+  const customMaxStored = chat.settings.customMaxContext
+  const customMaxUnlimited = customMaxStored === UNLIMITED_CONTEXT
+  const customMax = customMaxStored ?? modelPromptCap
+  const effectiveMax = customMaxUnlimited
+    ? Number.POSITIVE_INFINITY
+    : Math.min(customMax, modelPromptCap)
+  const storedMaxCompletionRaw = chat.settings.maxCompletionTokens
+  const storedMaxCompletion =
+    storedMaxCompletionRaw === UNLIMITED_CONTEXT
+      ? 0
+      : (storedMaxCompletionRaw ?? Math.min(4096, modelCompletionCap))
   const strategy = chat.settings.contextStrategy
   const keepFirstPairs = strategy.keepFirstPairs ?? 0
   const useMiddleOut = strategy.useOpenRouterMiddleOut === true
-  const effectivePromptBudget = Math.max(0, effectiveMax - storedMaxCompletion)
+  const effectivePromptBudget = Number.isFinite(effectiveMax)
+    ? Math.max(0, (effectiveMax as number) - storedMaxCompletion)
+    : Number.POSITIVE_INFINITY
 
   const usedTokens = estimate.total
-  const budgetPct = effectivePromptBudget > 0 ? usedTokens / effectivePromptBudget : 0
-  const overBudget = usedTokens > effectivePromptBudget
+  const budgetPct =
+    Number.isFinite(effectivePromptBudget) && effectivePromptBudget > 0
+      ? usedTokens / (effectivePromptBudget as number)
+      : 0
+  const overBudget =
+    Number.isFinite(effectivePromptBudget) && usedTokens > effectivePromptBudget
   const warnLevel: 'ok' | 'warn' | 'danger' = overBudget
     ? 'danger'
     : budgetPct > 0.95
@@ -147,7 +174,12 @@ export function ContextPanel({
         />
         <div data-ui="context-gauge-label">
           <strong>{usedTokens.toLocaleString()}</strong>
-          <span> / {effectivePromptBudget.toLocaleString()} tokens</span>
+          <span>
+            {' '}
+            / {Number.isFinite(effectivePromptBudget) ? effectivePromptBudget.toLocaleString() : '∞'}
+            {' '}
+            tokens
+          </span>
           {overBudget ? <span data-tone="danger"> · over budget</span> : null}
         </div>
       </div>
@@ -163,6 +195,11 @@ export function ContextPanel({
             <em>media</em> {estimate.mediaTokens.toLocaleString()}
           </span>
         ) : null}
+        {estimate.reasoningTokens > 0 ? (
+          <span title="Reasoning echoed back on the next turn, filtered by the Include checkboxes in the Context tab">
+            <em>reasoning</em> {estimate.reasoningTokens.toLocaleString()}
+          </span>
+        ) : null}
         {estimate.draftTokens > 0 ? (
           <span>
             <em>draft</em> {estimate.draftTokens.toLocaleString()}
@@ -175,10 +212,16 @@ export function ContextPanel({
 
       <NumberSlider
         label="Max context"
-        value={customMax}
+        value={customMaxUnlimited ? UNLIMITED_CONTEXT : customMax}
         min={1024}
         max={modelPromptCap}
+        allowUnlimited
+        unlimitedHint="Typing -1 disables the local cap (provider limits still apply; pair with middle-out compression for long chats)."
         onCommit={(v) => {
+          if (v === UNLIMITED_CONTEXT) {
+            void updateChatSettings(chat.id, { customMaxContext: UNLIMITED_CONTEXT })
+            return
+          }
           const next = Math.min(Math.max(1024, v), modelPromptCap)
           if (next >= modelPromptCap) {
             // Removing customMaxContext (rather than clamping to modelPromptCap)
@@ -195,10 +238,16 @@ export function ContextPanel({
 
       <NumberSlider
         label="Max completion"
-        value={storedMaxCompletion}
+        value={storedMaxCompletionRaw === UNLIMITED_CONTEXT ? UNLIMITED_CONTEXT : storedMaxCompletion}
         min={1}
         max={modelCompletionCap}
+        allowUnlimited
+        unlimitedHint="Typing -1 removes the local completion cap (provider limits still apply)."
         onCommit={(v) => {
+          if (v === UNLIMITED_CONTEXT) {
+            void updateChatSettings(chat.id, { maxCompletionTokens: UNLIMITED_CONTEXT })
+            return
+          }
           const next = Math.min(Math.max(1, v), modelCompletionCap)
           void updateChatSettings(chat.id, { maxCompletionTokens: next })
         }}
@@ -245,21 +294,34 @@ function NumberSlider({
   min,
   max,
   onCommit,
+  allowUnlimited = false,
+  unlimitedHint,
 }: {
   label: string
   value: number
   min: number
   max: number
   onCommit: (v: number) => void
+  // When true, the numeric input accepts `-1` as a sentinel for "no local
+  // cap" (`UNLIMITED_CONTEXT`). The slider visually sits at max but the
+  // stored value stays at -1 so preset round-trip preserves intent.
+  allowUnlimited?: boolean
+  unlimitedHint?: string
 }) {
-  const [draft, setDraft] = useState(String(value))
+  const isUnlimited = allowUnlimited && value === UNLIMITED_CONTEXT
+  const [draft, setDraft] = useState(isUnlimited ? '-1' : String(value))
   useEffect(() => {
-    setDraft(String(value))
-  }, [value])
+    setDraft(isUnlimited ? '-1' : String(value))
+  }, [isUnlimited, value])
   const commitFromDraft = () => {
     const n = Number(draft)
     if (!Number.isFinite(n)) {
-      setDraft(String(value))
+      setDraft(isUnlimited ? '-1' : String(value))
+      return
+    }
+    if (allowUnlimited && n <= UNLIMITED_CONTEXT) {
+      if (value !== UNLIMITED_CONTEXT) onCommit(UNLIMITED_CONTEXT)
+      setDraft('-1')
       return
     }
     const clamped = Math.min(Math.max(n, min), max)
@@ -274,31 +336,41 @@ function NumberSlider({
   // issues, which covers every model cap we'll see.
   return (
     <div data-ui="field-group" data-ui-field data-ui-slider-row>
-      <span data-ui="slider-label">{label}</span>
+      <span data-ui="slider-label">
+        {label}
+        {isUnlimited ? <span data-ui="slider-unlimited-badge"> · ∞</span> : null}
+      </span>
       <input
         data-ui="slider"
         type="range"
         min={min}
         max={max}
         step={1}
-        value={Math.min(max, Math.max(min, value))}
+        // Slider doesn't participate in the -1 sentinel: park it at `max`
+        // when unlimited so the track stays usable (nudging the slider
+        // exits unlimited mode via onChange → commit below).
+        value={isUnlimited ? max : Math.min(max, Math.max(min, value))}
         onChange={(e) => onCommit(Number(e.target.value))}
+        {...(isUnlimited ? { 'data-unlimited': 'true' } : {})}
       />
       <input
         data-ui="slider-number"
         type="number"
         value={draft}
-        min={min}
+        // Allow -1 via the text box by NOT clamping `min` when unlimited
+        // is on — browsers honor `min` and auto-correct.
+        {...(allowUnlimited ? {} : { min })}
         max={max}
         onChange={(e) => setDraft(e.target.value)}
         onBlur={commitFromDraft}
         onKeyDown={(e) => {
           if (e.key === 'Enter') (e.target as HTMLInputElement).blur()
           if (e.key === 'Escape') {
-            setDraft(String(value))
+            setDraft(isUnlimited ? '-1' : String(value))
             ;(e.target as HTMLInputElement).blur()
           }
         }}
+        {...(unlimitedHint && allowUnlimited ? { title: unlimitedHint } : {})}
       />
     </div>
   )

@@ -61,7 +61,7 @@ function liveSettings(): ChatSettings {
     // sometimes hedge on temperature: 0; that's fine.
     sampling: { temperature: 0 },
     maxCompletionTokens: 16,
-    reasoning: { mode: 'off', exclude: false, summary: 'off', carryForward: 'off' },
+    reasoning: { mode: 'off', exclude: false, summary: 'off', carryForward: 'off', include: { encrypted: false, summary: false, text: false } },
   }
 }
 
@@ -99,6 +99,7 @@ function liveReasoningSettings(model: string): ChatSettings {
       exclude: false,
       summary: 'off',
       carryForward: 'off',
+      include: { encrypted: false, summary: false, text: false },
     },
   }
 }
@@ -210,6 +211,7 @@ describe.skipIf(!RUN)('Phase 7 live OpenRouter chat-completions smoke', () => {
           exclude: false,
           summary: 'off',
           carryForward: 'off',
+          include: { encrypted: false, summary: false, text: false },
         },
         maxCompletionTokens: 512,
       },

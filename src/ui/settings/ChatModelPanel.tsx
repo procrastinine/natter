@@ -38,7 +38,7 @@ import { CachingPanel } from './CachingPanel'
 import { ContextPanel } from './ContextPanel'
 import { LlamaServerSection } from './LlamaServerSection'
 import { ModelPicker } from './ModelPicker'
-import { ParamForm } from './ParamForm'
+import { ApiModeSection, ParamForm, ReasoningIncludeControls } from './ParamForm'
 import { PrivacySection } from './PrivacySection'
 import { ProviderPicker } from './ProviderPicker'
 
@@ -206,6 +206,13 @@ export function ChatModelPanel({ chatId, chatSnapshot = null, onClose }: ChatMod
             {isOpenRouter ? <PrivacySection chat={chat} /> : null}
             {profile?.kind === 'llama-server' ? (
               <LlamaServerSection chat={chat} profile={profile} />
+            ) : null}
+            {capability ? (
+              <ApiModeSection
+                chat={chat}
+                capability={capability}
+                profile={profile ?? null}
+              />
             ) : null}
           </>
         ) : null}
@@ -494,6 +501,7 @@ function ContextTab({
         endpointTokenizer={endpointTokenizer}
         showMiddleOut={isOpenRouter}
       />
+      {capability ? <ReasoningIncludeControls chat={chat} capability={capability} /> : null}
       <CachingPanel chat={chat} capability={capability} connectionKind={connectionKind} />
     </>
   )

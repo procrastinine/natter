@@ -59,8 +59,19 @@ export const DEFAULT_CHAT_SETTINGS: Readonly<ChatSettings> = Object.freeze({
   reasoning: Object.freeze<ChatSettings['reasoning']>({
     mode: 'default',
     exclude: false,
+    // `summary: 'auto'` asks the provider for a human-readable summary.
+    // UI shows it; it's NOT echoed on the next turn (see `include` below).
     summary: 'auto',
-    carryForward: 'auto',
+    // Phase 11 default: round-trip ONLY the encrypted carry-forward carrier.
+    // `summary` + `text` are false by default — those only count when the
+    // user explicitly wants to resend visible reasoning (rare). Anthropic's
+    // carrier lives in a `reasoning.text` detail with `.signature`; the
+    // filter treats that as encrypted-gated automatically.
+    include: Object.freeze<ChatSettings['reasoning']['include']>({
+      encrypted: true,
+      summary: false,
+      text: false,
+    }),
   }),
   contextStrategy: Object.freeze<ChatSettings['contextStrategy']>({
     kind: 'sliding_window',

@@ -2,18 +2,19 @@ import { useLiveQuery } from 'dexie-react-hooks'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { chatCompletionsOnce } from '../../api/chat-completions'
 import { fetchModels } from '../../api/models'
-import { normalizeModelsResponse } from '../../api/providers'
 import { probeLlamaServer } from '../../api/probe'
+import { normalizeModelsResponse } from '../../api/providers'
 import { resolveBundledCapability } from '../../capabilities'
-import { toChatCompletions } from '../../core/transforms'
 import { cloneDefaultChatSettings } from '../../core/defaults'
+import { normalizeReasoningSettings } from '../../core/reasoning'
+import { toChatCompletions } from '../../core/transforms'
 import type {
   ChatId,
+  ChatSettings,
   ConnectionKind,
   ConnectionProfile,
   Message,
   PresetId,
-  ChatSettings,
   ProfileId,
 } from '../../core/types'
 import { newId } from '../../lib/ulid'
@@ -59,12 +60,19 @@ interface ActiveSeedState {
 function normalizeActiveSeedState(value: unknown): ActiveSeedState | null {
   if (!value || typeof value !== 'object') return null
   const candidate = value as { profileId?: unknown; presetId?: unknown; settings?: unknown }
-  const profileId = typeof candidate.profileId === 'string' ? (candidate.profileId as ProfileId) : null
+  const profileId =
+    typeof candidate.profileId === 'string' ? (candidate.profileId as ProfileId) : null
   const presetId = typeof candidate.presetId === 'string' ? (candidate.presetId as PresetId) : null
-  const settings =
+  const rawSettings =
     candidate.settings && typeof candidate.settings === 'object'
       ? (candidate.settings as ChatSettings)
       : null
+  // SessionStorage may contain settings authored by a pre-Phase-11 build that
+  // didn't have `reasoning.include` yet. Heal them on the way in so the seed
+  // can't carry a malformed shape into newly-created chats.
+  const settings = rawSettings
+    ? ({ ...rawSettings, reasoning: normalizeReasoningSettings(rawSettings.reasoning) } as ChatSettings)
+    : null
   if (!profileId && !presetId && !settings) return null
   return { profileId, presetId, settings }
 }
@@ -112,7 +120,9 @@ export function writeActiveProfileId(id: ProfileId | null): void {
     return
   }
   const current = readActiveSeedState()
-  const nextSettings = current.settings ? structuredClone(current.settings) : cloneDefaultChatSettings()
+  const nextSettings = current.settings
+    ? structuredClone(current.settings)
+    : cloneDefaultChatSettings()
   const currentProfileId = current.settings?.profileId || current.profileId
   nextSettings.profileId = id
   if (currentProfileId && currentProfileId !== id) nextSettings.model = ''
@@ -123,9 +133,7 @@ async function loadHeaderState(
   activeId: ProfileId | null,
   chatProfileId: ProfileId | null,
 ): Promise<HeaderState> {
-  const live = (await listProfiles()).sort(
-    (a, b) => (b.lastUsedAt ?? 0) - (a.lastUsedAt ?? 0),
-  )
+  const live = (await listProfiles()).sort((a, b) => (b.lastUsedAt ?? 0) - (a.lastUsedAt ?? 0))
   const chatProfile = chatProfileId ? live.find((p) => p.id === chatProfileId) : undefined
   const fallback = activeId ? live.find((p) => p.id === activeId) : undefined
   const profile = chatProfile ?? fallback ?? live[0] ?? null
@@ -218,7 +226,9 @@ function nextBaseUrlForKind(
 ): string {
   const nextLock = KIND_LOCKED_BASE_URL[nextKind]
   if (nextLock !== null) return nextLock
-  return KIND_LOCKED_BASE_URL[currentKind] !== null ? KIND_DEFAULT_BASE_URL[nextKind] : currentBaseUrl
+  return KIND_LOCKED_BASE_URL[currentKind] !== null
+    ? KIND_DEFAULT_BASE_URL[nextKind]
+    : currentBaseUrl
 }
 
 function buildProbeProfile(kind: ConnectionKind, name: string, baseUrl: string): ConnectionProfile {
@@ -395,7 +405,7 @@ export function ConnectionHeader({
     setEditing(false)
     setProbeState({ kind: 'idle' })
     setDeleteConfirmOpen(false)
-  }, [state.profile?.id])
+  }, [])
 
   const activateProfile = useCallback(
     async (id: ProfileId, opts: { resetModel?: boolean } = {}) => {
@@ -651,7 +661,12 @@ function ConnectionDeleteDialog({
         if (event.target === event.currentTarget) onCancel()
       }}
     >
-      <div data-ui="confirm-delete" role="dialog" aria-modal="true" aria-labelledby="delete-connection-title">
+      <div
+        data-ui="confirm-delete"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="delete-connection-title"
+      >
         <div data-ui="confirm-delete-header">
           <h2 id="delete-connection-title">Delete connection?</h2>
           <button
@@ -769,7 +784,189 @@ function ConnectionViewer({
         </div>
       </div>
       <ConnectionProbeMessage state={probeState} />
+      <ConnectionRoutingControls profile={profile} />
     </div>
+  )
+}
+
+// Per-kind API-routing controls that live directly on the connection.
+// Visible outside edit mode because they're transport preferences, not
+// identity fields — flipping them shouldn't force a Save cycle. Changes are
+// applied via updateProfile() immediately. See `plan/10-ui.md §10.17.5` and
+// `plan/phase11-implementation.md §6`.
+function ConnectionRoutingControls({ profile }: { profile: ConnectionProfile }) {
+  // OpenRouter doesn't have a user-facing routing choice: chat completions is
+  // the default, and Responses is auto-upgraded by the quirks registry when
+  // needed. Show a static note rather than a no-op toggle.
+  if (profile.kind === 'openrouter') {
+    return (
+      <details data-ui="connection-routing" data-kind="openrouter">
+        <summary>API routing</summary>
+        <p data-ui="helper">
+          OpenRouter uses chat completions by default. Responses is auto-upgraded for models that
+          need it (gpt-5.4 family, encrypted-reasoning preservation, server-tool outputs).
+        </p>
+      </details>
+    )
+  }
+  if (profile.kind === 'google') {
+    return <GoogleRoutingControls profile={profile} />
+  }
+  if (profile.kind === 'openai-compatible') {
+    return <OpenAIRoutingControls profile={profile} />
+  }
+  // anthropic / llama-server / custom: no routing choice at the connection
+  // level. Hide entirely rather than rendering an empty disclosure.
+  return null
+}
+
+function GoogleRoutingControls({ profile }: { profile: ConnectionProfile }) {
+  const mode = profile.geminiMode ?? 'native'
+  const allowImported = profile.geminiDefaults?.allowImportedWithoutSignature ?? false
+  return (
+    <details data-ui="connection-routing" data-kind="google" open>
+      <summary>API routing</summary>
+      <div data-ui="connection-routing-body">
+        <fieldset data-ui="connection-routing-radio-group">
+          <legend>Gemini mode</legend>
+          <label data-ui="connection-routing-radio">
+            <input
+              type="radio"
+              name={`gemini-mode-${profile.id}`}
+              value="native"
+              checked={mode === 'native'}
+              onChange={() => void updateProfile(profile.id, { geminiMode: 'native' })}
+            />
+            <span>
+              Native <em>(recommended)</em>
+            </span>
+          </label>
+          <label data-ui="connection-routing-radio">
+            <input
+              type="radio"
+              name={`gemini-mode-${profile.id}`}
+              value="openai-compat"
+              checked={mode === 'openai-compat'}
+              onChange={() => void updateProfile(profile.id, { geminiMode: 'openai-compat' })}
+            />
+            <span>OpenAI-compat</span>
+          </label>
+          <span data-ui="helper">
+            Native preserves <code>thoughtSignature</code> on every turn — required for multi-turn
+            reasoning round-trip on Gemini 3. OpenAI-compat only preserves signatures on
+            function-call turns.
+          </span>
+        </fieldset>
+        <details data-ui="connection-routing-advanced">
+          <summary>Advanced</summary>
+          <label data-ui="reasoning-checkbox">
+            <input
+              type="checkbox"
+              checked={allowImported}
+              onChange={(e) =>
+                void updateProfile(profile.id, {
+                  geminiDefaults: {
+                    allowImportedWithoutSignature: e.target.checked,
+                  },
+                })
+              }
+            />
+            <span>
+              Allow imported chats without <code>thoughtSignature</code>
+            </span>
+          </label>
+          <span data-ui="helper">
+            Substitutes <code>"skip_thought_signature_validator"</code> for missing signatures on
+            echoed turns so Gemini 3 doesn't 400 on chats imported from other frontends.
+          </span>
+        </details>
+      </div>
+    </details>
+  )
+}
+
+function OpenAIRoutingControls({ profile }: { profile: ConnectionProfile }) {
+  const usesResponses = profile.usesResponsesApiByDefault ?? false
+  const store = profile.responsesDefaults?.store ?? false
+  const includeEncrypted = profile.responsesDefaults?.includeEncrypted ?? true
+  return (
+    <details data-ui="connection-routing" data-kind="openai-compatible" open>
+      <summary>API routing</summary>
+      <div data-ui="connection-routing-body">
+        <fieldset data-ui="connection-routing-radio-group">
+          <legend>Default API</legend>
+          <label data-ui="connection-routing-radio">
+            <input
+              type="radio"
+              name={`openai-default-api-${profile.id}`}
+              value="responses"
+              checked={usesResponses}
+              onChange={() => void updateProfile(profile.id, { usesResponsesApiByDefault: true })}
+            />
+            <span>
+              Responses <em>(recommended)</em>
+            </span>
+          </label>
+          <label data-ui="connection-routing-radio">
+            <input
+              type="radio"
+              name={`openai-default-api-${profile.id}`}
+              value="chat"
+              checked={!usesResponses}
+              onChange={() => void updateProfile(profile.id, { usesResponsesApiByDefault: false })}
+            />
+            <span>Chat completions</span>
+          </label>
+          <span data-ui="helper">
+            Responses preserves encrypted reasoning across turns. Chat completions is cheaper on
+            request setup but drops encrypted_content.
+          </span>
+        </fieldset>
+        <details data-ui="connection-routing-advanced">
+          <summary>Advanced</summary>
+          <label data-ui="reasoning-checkbox">
+            <input
+              type="checkbox"
+              checked={store}
+              onChange={(e) =>
+                void updateProfile(profile.id, {
+                  responsesDefaults: {
+                    store: e.target.checked,
+                    includeEncrypted,
+                  },
+                })
+              }
+            />
+            <span>
+              Pass <code>store: true</code> upstream
+            </span>
+          </label>
+          <span data-ui="helper">
+            OpenAI retains the response for 30 days. Required for <code>previous_response_id</code>;
+            disabled by default for privacy.
+          </span>
+          <label data-ui="reasoning-checkbox">
+            <input
+              type="checkbox"
+              checked={includeEncrypted}
+              onChange={(e) =>
+                void updateProfile(profile.id, {
+                  responsesDefaults: {
+                    store,
+                    includeEncrypted: e.target.checked,
+                  },
+                })
+              }
+            />
+            <span>Include encrypted reasoning in requests</span>
+          </label>
+          <span data-ui="helper">
+            Sends <code>include: ["reasoning.encrypted_content"]</code> on all Responses calls.
+            Leave on unless you want to strip reasoning at the wire level.
+          </span>
+        </details>
+      </div>
+    </details>
   )
 }
 
@@ -817,7 +1014,7 @@ function ConnectionEditor({
 
   useEffect(() => {
     setProbeState({ kind: 'idle' })
-  }, [trimmedName, kind, trimmedBaseUrl, trimmedKey])
+  }, [])
 
   const runProbe = useCallback(async () => {
     setProbeState({ kind: 'running' })
@@ -839,7 +1036,16 @@ function ConnectionEditor({
     } catch (probeError) {
       setProbeState({ kind: 'fail', message: keyErrorMessage(probeError) })
     }
-  }, [trimmedKey, saveAsNew, hasKey, kind, profile.apiKeyRef, profile.name, trimmedName, trimmedBaseUrl])
+  }, [
+    trimmedKey,
+    saveAsNew,
+    hasKey,
+    kind,
+    profile.apiKeyRef,
+    profile.name,
+    trimmedName,
+    trimmedBaseUrl,
+  ])
 
   const keyPlaceholder = saveAsNew
     ? requiresKey
@@ -973,12 +1179,7 @@ function ConnectionEditor({
           >
             <TrashIcon size={13} />
           </button>
-          <button
-            type="button"
-            data-ui="connection-edit-cancel"
-            onClick={onCancel}
-            disabled={busy}
-          >
+          <button type="button" data-ui="connection-edit-cancel" onClick={onCancel} disabled={busy}>
             Cancel
           </button>
           <button type="submit" data-ui="connection-edit-save" disabled={!canSave}>
@@ -1092,9 +1293,7 @@ function ConnectionFormFields({
         </div>
       )}
       <div data-ui="field-group">
-        <label htmlFor={`${prefix}-key`}>
-          API key{!requiresKey ? <em> (optional)</em> : null}
-        </label>
+        <label htmlFor={`${prefix}-key`}>API key{!requiresKey ? <em> (optional)</em> : null}</label>
         <input
           id={`${prefix}-key`}
           data-ui={`${prefix}-key`}
@@ -1166,7 +1365,7 @@ function ConnectionSetupModal({
 
   useEffect(() => {
     setProbeState({ kind: 'idle' })
-  }, [trimmedName, kind, trimmedBaseUrl, trimmedKey])
+  }, [])
 
   const onKindChange = useCallback(
     (next: ConnectionKind) => {

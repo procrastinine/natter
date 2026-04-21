@@ -1,0 +1,54 @@
+import { describe, expect, it } from 'vitest'
+import { ApiError } from '../../src/api/errors'
+import {
+  detectStaleReasoning,
+  detectStaleReasoningFromApiError,
+  staleReasoningBannerText,
+} from '../../src/core/stale-reasoning'
+
+describe('detectStaleReasoning', () => {
+  it('recognizes OpenAI encrypted_content rejections', () => {
+    expect(detectStaleReasoning({ message: 'Invalid encrypted reasoning content' })).toBe('openai')
+    expect(
+      detectStaleReasoning({
+        message: 'The reasoning.encrypted_content attestation has expired',
+      }),
+    ).toBe('openai')
+  })
+
+  it('recognizes Gemini missing thought_signature rejections', () => {
+    expect(detectStaleReasoning({ message: 'missing a thought_signature' })).toBe('gemini')
+    expect(detectStaleReasoning({ message: 'Invalid thoughtSignature on part 0' })).toBe('gemini')
+  })
+
+  it('classifies a generic 400 as stale-reasoning only when reasoning was in flight', () => {
+    const err = { message: 'Bad request', statusCode: 400 }
+    expect(detectStaleReasoning(err, { hadReasoningDetails: true })).toBe('generic')
+    expect(detectStaleReasoning(err, { hadReasoningDetails: false })).toBeNull()
+    expect(detectStaleReasoning(err)).toBeNull()
+  })
+
+  it('returns null for unrelated errors', () => {
+    expect(detectStaleReasoning({ message: 'rate limit exceeded', statusCode: 429 })).toBeNull()
+    expect(detectStaleReasoning({ message: 'Invalid API key', statusCode: 401 })).toBeNull()
+    expect(detectStaleReasoning(null)).toBeNull()
+    expect(detectStaleReasoning(undefined)).toBeNull()
+  })
+
+  it('accepts ApiError instances via the convenience wrapper', () => {
+    const err = new ApiError({
+      kind: 'bad_request',
+      code: 'bad_request',
+      message: 'Invalid encrypted reasoning content',
+      midStream: false,
+      retryable: false,
+    })
+    expect(detectStaleReasoningFromApiError(err)).toBe('openai')
+  })
+
+  it('has a banner-text variant per provider', () => {
+    expect(staleReasoningBannerText('openai')).toMatch(/preserved reasoning/i)
+    expect(staleReasoningBannerText('gemini')).toMatch(/thoughtSignature/i)
+    expect(staleReasoningBannerText('generic')).toMatch(/rejected/i)
+  })
+})

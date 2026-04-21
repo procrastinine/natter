@@ -13,7 +13,12 @@ import {
   readGlobalPreferences,
 } from '../core/global-settings'
 import { resolvePrivacyForSend } from '../core/privacy-request'
-import { estimatePromptSize, tokenizerFromSettings } from '../core/prompt-size'
+import {
+  UNLIMITED_CONTEXT,
+  estimatePromptSize,
+  tokenizerFromSettings,
+} from '../core/prompt-size'
+import { quirksFor } from '../core/quirks'
 import type { Chat, ChatId, ChatPreset, ConnectionProfile, CursorMap } from '../core/types'
 import { useBranchUrlSync } from '../hooks/useBranchUrlSync'
 import { recoverOrphans, useChat } from '../hooks/useChat'
@@ -75,6 +80,41 @@ const EMPTY_CURSOR: CursorMap = Object.freeze({}) as CursorMap
 const MODEL_AUTOSELECT_QUERY = {
   outputModalities: ['text', 'image', 'audio', 'file', 'video'],
 } as const
+
+// Estimate the tokens we'd actually send on the next turn so
+// `resolvePrivacyForSend` can grey out providers whose endpoint capacity
+// can't hold the current prompt. Includes the composer draft + the
+// reserved completion budget + the reasoning echo gated by the chat's
+// Include flags. Never writes back — this is pure routing math.
+async function computeNeededTokensForSend(
+  chat: Chat,
+  draftText: string,
+): Promise<number | undefined> {
+  try {
+    const messages = await loadChatMessages(chat.id)
+    const cursor = useChatStore.getState().cursors[chat.id] ?? EMPTY_CURSOR
+    const path = activePath(messages, cursor)
+    const quirks = quirksFor(chat.settings.model)
+    const input: Parameters<typeof estimatePromptSize>[0] = {
+      systemPrompt: chat.settings.systemPrompt,
+      activePathMessages: path,
+      draftText,
+      tokenizer: tokenizerFromSettings(chat.settings, null),
+      reasoningInclude: chat.settings.reasoning.include,
+      reasoningExcluded: chat.settings.reasoning.exclude === true,
+    }
+    if (quirks.reasoningPreservationFormat !== undefined) {
+      input.reasoningPreservationFormat = quirks.reasoningPreservationFormat
+    }
+    const est = estimatePromptSize(input)
+    const reserveRaw = chat.settings.maxCompletionTokens
+    const reserve = reserveRaw === UNLIMITED_CONTEXT ? 0 : (reserveRaw ?? 0)
+    return est.total + reserve
+  } catch (err) {
+    console.error('computeNeededTokensForSend: failed', err)
+    return undefined
+  }
+}
 
 function profileRequiresKey(kind: ConnectionProfile['kind']): boolean {
   return kind !== 'custom' && kind !== 'llama-server'
@@ -229,19 +269,42 @@ export function Shell() {
   const tokenBudgetIndicator = useMemo(() => {
     if (!resolvedActiveChatRow) return undefined
     const providerCap = activeCapability?.maxPromptTokens ?? activeCapability?.contextLength
-    const modelCap = resolvedActiveChatRow.settings.customMaxContext ?? providerCap
-    if (modelCap === undefined) return undefined
+    const customMaxStored = resolvedActiveChatRow.settings.customMaxContext
+    // `-1` is the "no local cap" sentinel — hide the composer gauge budget
+    // (the label renders just the used count) rather than pretending the
+    // provider cap applies when the user explicitly opted out.
+    if (customMaxStored === UNLIMITED_CONTEXT) {
+      // Fall through with a large modelCap but we'll still cap it via max
+      // completion below; the composer checks `budget <= used ? undefined
+      // : budget - used` so we just feed an effectively unbounded number.
+    }
+    const modelCapRaw = customMaxStored === UNLIMITED_CONTEXT ? undefined : customMaxStored
+    const modelCap = modelCapRaw ?? providerCap
+    if (modelCap === undefined && customMaxStored !== UNLIMITED_CONTEXT) return undefined
     const providerCompletionCap =
-      activeCapability?.maxCompletionTokens ?? activeCapability?.contextLength ?? modelCap
+      activeCapability?.maxCompletionTokens ?? activeCapability?.contextLength ?? modelCap ?? 0
+    const maxCompletionStored = resolvedActiveChatRow.settings.maxCompletionTokens
     const maxCompletion =
-      resolvedActiveChatRow.settings.maxCompletionTokens ?? Math.min(4096, providerCompletionCap)
-    const budget = Math.max(0, modelCap - maxCompletion)
-    const est = estimatePromptSize({
+      maxCompletionStored === UNLIMITED_CONTEXT
+        ? 0
+        : (maxCompletionStored ?? Math.min(4096, providerCompletionCap))
+    const budget =
+      customMaxStored === UNLIMITED_CONTEXT
+        ? Number.POSITIVE_INFINITY
+        : Math.max(0, (modelCap ?? 0) - maxCompletion)
+    const quirks = quirksFor(resolvedActiveChatRow.settings.model)
+    const estInput: Parameters<typeof estimatePromptSize>[0] = {
       systemPrompt: resolvedActiveChatRow.settings.systemPrompt,
       activePathMessages: activePathMemo,
       draftText: '',
       tokenizer: tokenizerFromSettings(resolvedActiveChatRow.settings, null),
-    })
+      reasoningInclude: resolvedActiveChatRow.settings.reasoning.include,
+      reasoningExcluded: resolvedActiveChatRow.settings.reasoning.exclude === true,
+    }
+    if (quirks.reasoningPreservationFormat !== undefined) {
+      estInput.reasoningPreservationFormat = quirks.reasoningPreservationFormat
+    }
+    const est = estimatePromptSize(estInput)
     return { used: est.total, budget }
   }, [resolvedActiveChatRow, activePathMemo, activeCapability])
   const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() => {
@@ -445,7 +508,17 @@ export function Shell() {
         console.error('send: resolveKey failed', err)
         return
       }
-      const privacy = await resolvePrivacyForSend({ chat, profile })
+      // Compute the tokens we'd actually send right now so providers that
+      // can't fit the current prompt are transiently excluded from the
+      // wire's `provider.ignore` list. The picker UI keeps them checked
+      // (the user's persisted intent stands); send just skips them until
+      // the chat shrinks or the user switches models.
+      const neededTokens = await computeNeededTokensForSend(chat, text)
+      const privacy = await resolvePrivacyForSend({
+        chat,
+        profile,
+        ...(neededTokens !== undefined ? { neededTokens } : {}),
+      })
       if (privacy.filter?.zeroEligible) {
         // Every endpoint was hard-denied or Pareto-excluded for this
         // model. Surface the §10.13.1 modal so the user can pick a
@@ -496,7 +569,12 @@ export function Shell() {
         console.error('send: resolveKey failed', err)
         return
       }
-      const privacy = await resolvePrivacyForSend({ chat, profile })
+      const neededTokens = await computeNeededTokensForSend(chat, text)
+      const privacy = await resolvePrivacyForSend({
+        chat,
+        profile,
+        ...(neededTokens !== undefined ? { neededTokens } : {}),
+      })
       if (privacy.filter?.zeroEligible) {
         useUiStore.getState().setZeroEligibleChatId(chat.id)
         return

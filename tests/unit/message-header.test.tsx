@@ -168,7 +168,7 @@ describe('ReasoningBlock', () => {
         ]}
       />,
     )
-    expect(container.textContent).toMatch(/Reasoning \(1\)/)
+    expect(container.querySelector('[data-reasoning-count="1"]')).toBeTruthy()
     expect(container.textContent).toMatch(/Let me/)
     expect(container.textContent).not.toMatch(/LetLet me/)
   })

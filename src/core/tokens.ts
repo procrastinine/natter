@@ -65,3 +65,131 @@ export function estimateTokensByTokenizer(
 ): number {
   return estimateTokens(text, tokenizerFamily(tokenizerName))
 }
+
+// ---------------------------------------------------------------------------
+// Phase 11: reasoning-echo token accounting.
+// ---------------------------------------------------------------------------
+
+import { filterReasoningForInclude, normalizeReasoningDetails } from './reasoning'
+import type { Message, ReasoningFormat, ReasoningInclude } from './types'
+
+export interface PromptEstimateOptions {
+  family: TokenizerFamily
+  reasoningInclude: ReasoningInclude
+  reasoningPreservationFormat?: ReasoningFormat
+  // When `true`, the server won't return reasoning on the *current* turn
+  // (so there's nothing to echo on the *next* one). Forces visible-summary
+  // / visible-text echo cost to 0 regardless of include flags.
+  reasoningExcluded: boolean
+}
+
+// Rough token cost of the reasoning fragments we echo on the NEXT turn for
+// a given list of assistant messages. Call AFTER filtering the path for
+// `hiddenFromContext` / `deleted`. Mirrors the contract in
+// `plan/phase11-implementation.md §3`:
+//
+//   - reasoning.text.text (+ small signature overhead when present) → char-heuristic
+//   - reasoning.summary.summary → char-heuristic
+//   - reasoning.encrypted.data → upper bound ≈ bytes/3 (OpenAI encrypted_content
+//     tokens are accounted as prompt_tokens on the next call; exact ratio is
+//     model-dependent, this is a safe over-estimate)
+//
+// The estimate NEVER double-counts: we iterate `reasoningDetails[]` only
+// (storage never carries the scalar `reasoning` field — it was suppressed
+// by the splitter's de-dup fix in commit 1390685). We ALSO
+// `normalizeReasoningDetails` before estimating so any partial-overlap
+// artifacts in rehydrated-legacy rows collapse first.
+const SIGNATURE_TOKEN_GUARD = 16
+
+export function estimateReasoningEchoTokens(
+  messages: readonly Message[],
+  opts: PromptEstimateOptions,
+): number {
+  let total = 0
+  for (const message of messages) {
+    if (message.role !== 'assistant') continue
+    if (!message.reasoningDetails || message.reasoningDetails.length === 0) continue
+
+    // Deduplicate first: covers the "scalar + details both stored on
+    // legacy chats" edge case called out in the 1390685 fix.
+    const normalized = normalizeReasoningDetails(message.reasoningDetails)
+
+    // Apply the include matrix: if the user excluded reasoning entirely on
+    // THIS turn, visible summary/text don't count (nothing was returned).
+    const includeForEcho: ReasoningInclude = opts.reasoningExcluded
+      ? { encrypted: opts.reasoningInclude.encrypted, summary: false, text: false }
+      : opts.reasoningInclude
+    const kept = filterReasoningForInclude(
+      normalized,
+      includeForEcho,
+      opts.reasoningPreservationFormat,
+    )
+
+    // When the assistant message has `reasoning_tokens` from the provider,
+    // that number is our authoritative upper bound for the round-trip cost
+    // of echoing the ENCRYPTED blob (OpenAI's encrypted_content, xAI's
+    // encrypted reasoning, Anthropic's signed text — all tokenize back at
+    // roughly the same count as they were emitted). Without it we fall
+    // back to the conservative `data.length / 3` byte-cap estimate, which
+    // over-reports by ~1.8x for base64-ish blobs.
+    const providerReasoningTokens =
+      message.generation?.usage?.completion_tokens_details?.reasoning_tokens
+
+    let encryptedCharCost = 0
+    let visibleCost = 0
+    for (const d of kept) {
+      if (d.type === 'reasoning.text') {
+        if (typeof d.text === 'string') {
+          if (typeof d.signature === 'string' && d.signature.length > 0) {
+            // Anthropic signed text is the encrypted carrier; count it as
+            // encrypted-like so the `reasoning_tokens` clamp applies.
+            encryptedCharCost += estimateTokens(d.text, opts.family) + SIGNATURE_TOKEN_GUARD
+          } else {
+            visibleCost += estimateTokens(d.text, opts.family)
+          }
+        }
+      } else if (d.type === 'reasoning.summary') {
+        if (typeof d.summary === 'string') visibleCost += estimateTokens(d.summary, opts.family)
+      } else if (d.type === 'reasoning.encrypted') {
+        if (typeof d.data === 'string') encryptedCharCost += Math.ceil(d.data.length / 3)
+      }
+    }
+
+    if (
+      encryptedCharCost > 0 &&
+      typeof providerReasoningTokens === 'number' &&
+      providerReasoningTokens > 0
+    ) {
+      // Authoritative clamp: echoing encrypted reasoning costs AT MOST
+      // what the provider charged as reasoning_tokens on the original
+      // turn. Usually lands within a few percent of the true echo cost.
+      total += Math.min(encryptedCharCost, providerReasoningTokens)
+    } else {
+      total += encryptedCharCost
+    }
+    total += visibleCost
+  }
+  return total
+}
+
+// Convenience: estimate prompt-token cost of an entire path including
+// reasoning echo. Visible content + system prompt use the existing
+// `estimateTokens`; reasoning echo uses `estimateReasoningEchoTokens`.
+export function estimatePromptTokens(
+  messages: readonly Message[],
+  systemPrompt: string,
+  opts: PromptEstimateOptions,
+): number {
+  let total = 0
+  if (systemPrompt.length > 0) total += estimateTokens(systemPrompt, opts.family)
+  for (const message of messages) {
+    if (message.hiddenFromContext === true || message.deleted) continue
+    for (const item of message.content) {
+      if (item.type === 'text' || item.type === 'output_text') {
+        total += estimateTokens(item.text, opts.family)
+      }
+    }
+  }
+  total += estimateReasoningEchoTokens(messages, opts)
+  return total
+}

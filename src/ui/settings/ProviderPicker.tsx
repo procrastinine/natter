@@ -20,6 +20,7 @@ import { useLiveQuery } from 'dexie-react-hooks'
 import { useCallback, useMemo, useState } from 'react'
 import { activePath } from '../../core/active-path'
 import { estimatePromptSize, tokenizerFromSettings } from '../../core/prompt-size'
+import { quirksFor } from '../../core/quirks'
 import type {
   Chat,
   ModelEndpoint,
@@ -57,14 +58,26 @@ export function ProviderPicker({ chat }: ProviderPickerProps) {
     [chat.id],
     '',
   )
+  // Provider filter uses the CURRENT estimate (tokens we'd actually send
+  // right now, including reasoning echo) + the reserved completion budget.
+  // This means a provider whose context can't fit the user's declared
+  // `customMaxContext` ceiling is NOT filtered out if the live prompt is
+  // smaller — the user still gets the provider while the chat is short.
   const neededTokens = useMemo(() => {
     const path = activePath(messages, cursor)
-    const est = estimatePromptSize({
+    const quirks = quirksFor(chat.settings.model)
+    const input: Parameters<typeof estimatePromptSize>[0] = {
       systemPrompt: chat.settings.systemPrompt,
       activePathMessages: path,
       draftText: draft ?? '',
       tokenizer: tokenizerFromSettings(chat.settings, null),
-    })
+      reasoningInclude: chat.settings.reasoning.include,
+      reasoningExcluded: chat.settings.reasoning.exclude === true,
+    }
+    if (quirks.reasoningPreservationFormat !== undefined) {
+      input.reasoningPreservationFormat = quirks.reasoningPreservationFormat
+    }
+    const est = estimatePromptSize(input)
     const reserve = chat.settings.maxCompletionTokens ?? 0
     return est.total + reserve
   }, [messages, cursor, chat.settings, draft])
@@ -376,12 +389,23 @@ function ProviderRow({
     >
       <div data-ui="provider-picker-row-head">
         <label data-ui="provider-picker-toggle">
+          {/* Insufficient-context is purely presentational: the checkbox
+              reflects the user's persisted intent, the row grays out via
+              data-insufficient-context, and wire-time send skips these
+              endpoints. The user can still toggle (to silence the row or
+              to prepare for a shorter chat later) and we never write the
+              greyed-out state back to settings. */}
           <input
             type="checkbox"
-            checked={allowed && !insufficientContext}
-            disabled={insufficientContext}
+            checked={allowed}
             onChange={(e) => onToggle(e.target.checked)}
             aria-label={`Use ${endpoint.provider_name}`}
+            {...(insufficientContext
+              ? {
+                  title:
+                    "Checked but greyed out — this provider can't fit the current prompt. Send will skip it until the chat shrinks.",
+                }
+              : {})}
           />
           {row.state !== 'no-filter' ? (
             <PrivacyLock tier={row.tier} title={lockTitle} />

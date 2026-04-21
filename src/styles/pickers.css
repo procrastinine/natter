@@ -410,12 +410,16 @@
 }
 
 [data-ui="provider-picker-row"][data-insufficient-context="true"] {
+  /* Greyed but still interactive: the checkbox reflects the user's
+   * persisted intent, and wire-time send skips these rows automatically.
+   * Users can still toggle them (to silence or to prepare for a shorter
+   * chat later) — greying never writes back to settings. */
   opacity: 0.55;
 }
 
 [data-ui="provider-picker-row"][data-insufficient-context="true"]
   [data-ui="provider-picker-toggle"] {
-  cursor: not-allowed;
+  cursor: pointer;
 }
 
 [data-ui="provider-picker-stats"] [data-tone="danger"] {

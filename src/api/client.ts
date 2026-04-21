@@ -23,16 +23,30 @@ function isAnthropicBrowserOriginProfile(profile: ConnectionProfile): boolean {
 // Merge order (later entries win): required defaults → profile.defaultHeaders
 // → opts.overrideHeaders. Profile can override a required default (rare —
 // e.g. custom auth scheme); per-call overrides are the escape hatch.
+//
+// `authScheme` selects between `Authorization: Bearer` (default, for any
+// OpenAI-compatible endpoint including Gemini's `/v1beta/openai/…` shim) and
+// `x-goog-api-key` (only for the native Gemini transport — see Phase 11).
+// The transport adapter decides; `buildHeaders` does not infer it from the
+// profile's `kind` because the same Google profile can serve BOTH transports
+// depending on `geminiMode`.
 export function buildHeaders(
   profile: ConnectionProfile,
   apiKey: string,
   opts: {
     overrideHeaders?: Record<string, string>
     method?: 'GET' | 'POST'
+    authScheme?: 'bearer' | 'gemini-native'
   } = {},
 ): Record<string, string> {
   const headers: Record<string, string> = {}
-  if (apiKey) headers.Authorization = `Bearer ${apiKey}`
+  if (apiKey) {
+    if (opts.authScheme === 'gemini-native') {
+      headers['x-goog-api-key'] = apiKey
+    } else {
+      headers.Authorization = `Bearer ${apiKey}`
+    }
+  }
   if (isAnthropicBrowserOriginProfile(profile)) {
     // Anthropic blocks browser-origin preflights unless this opt-in header is
     // present on the actual request. Sending it unconditionally is harmless in

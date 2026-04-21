@@ -100,6 +100,58 @@
   line-height: var(--line-height-body);
 }
 
+[data-ui="reasoning-row"] {
+  display: flex;
+  flex-direction: row;
+  align-items: flex-start;
+  gap: var(--space-2);
+  justify-content: space-between;
+}
+
+[data-ui="reasoning-row-body"] {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+[data-ui="reasoning-row"][data-hidden="true"] > [data-ui="reasoning-row-body"] {
+  color: var(--color-fg-muted);
+  opacity: 0.6;
+  text-decoration: line-through;
+  text-decoration-thickness: 1px;
+}
+
+[data-ui="reasoning-row-hide"] {
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  margin: 0;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-fg-muted);
+  cursor: pointer;
+  transition: color var(--duration-fast) var(--ease-standard),
+    background-color var(--duration-fast) var(--ease-standard);
+}
+
+[data-ui="reasoning-row-hide"]:hover {
+  color: var(--color-fg-primary);
+  background: var(--color-bg-hover, rgba(127, 127, 127, 0.08));
+}
+
+[data-ui="reasoning-row-hide"][data-pressed="true"] {
+  color: var(--color-fg-primary);
+}
+
+[data-ui="reasoning-row-hide"]:focus-visible {
+  outline: 2px solid var(--color-accent-default);
+  outline-offset: 1px;
+}
+
 [data-ui="reasoning-section"][data-reasoning-kind="text"] p {
   font-family: var(--font-sans);
 }
@@ -114,4 +166,151 @@
   font-size: var(--font-size-xs);
   color: var(--color-fg-muted);
   font-style: italic;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+/* Nested disclosures inside the reasoning body. Summary / Details / Encrypted
+ * each live in their own <details>, so one panel surface can carry three
+ * different reasoning carriers without the user hunting through a wall of
+ * text. */
+[data-ui="reasoning-section"] {
+  border-top: 1px dashed var(--color-border-subtle);
+  padding-top: var(--space-3);
+}
+
+[data-ui="reasoning-section"]:first-child {
+  border-top: none;
+  padding-top: 0;
+}
+
+[data-ui="reasoning-section-summary"] {
+  cursor: pointer;
+  font-size: var(--font-size-xs);
+  color: var(--color-fg-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 0 0 var(--space-2);
+  list-style: none;
+  user-select: none;
+}
+
+[data-ui="reasoning-section-summary"]::-webkit-details-marker {
+  display: none;
+}
+
+[data-ui="reasoning-section-summary"]::before {
+  content: "";
+  display: inline-block;
+  width: 0;
+  height: 0;
+  margin-right: 4px;
+  border-top: 3px solid transparent;
+  border-bottom: 3px solid transparent;
+  border-left: 4px solid currentColor;
+  transform-origin: 25% 50%;
+  transition: transform var(--duration-fast) var(--ease-standard);
+}
+
+[data-ui="reasoning-section"][open] > [data-ui="reasoning-section-summary"]::before {
+  transform: rotate(90deg);
+}
+
+[data-ui="reasoning-section-body"] {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+[data-ui="reasoning-count"] {
+  font-size: var(--font-size-xs);
+  color: var(--color-fg-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+[data-ui="reasoning-lock"] {
+  display: inline-flex;
+  align-items: center;
+  color: var(--color-fg-muted);
+}
+
+[data-ui="reasoning-lock-icon"] {
+  display: inline-block;
+  vertical-align: -1px;
+}
+
+/* Phase chip on assistant header — small muted pill next to the model id.
+ * Rendered only on Responses-API turns (commentary | final_answer). */
+[data-ui="message-phase-chip"] {
+  font-size: var(--font-size-xs);
+  color: var(--color-fg-muted);
+  padding: 0 var(--space-2);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-surface-3);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+}
+
+[data-ui="message-phase-chip"][data-phase="final_answer"] {
+  color: var(--color-fg-secondary);
+}
+
+/* Hidden-reasoning footer: rendered instead of an empty reasoning panel when
+ * quirks.hiddenReasoningOnChatApi is true and the route is chat completions
+ * (e.g. OpenAI o-series via /chat/completions). */
+[data-ui="message-hidden-reasoning"] {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  margin: var(--space-2) 0;
+  font-size: var(--font-size-sm);
+  color: var(--color-fg-muted);
+  background: var(--color-bg-surface-2);
+  border: 1px dashed var(--color-border-subtle);
+  border-radius: var(--radius-sm);
+}
+
+[data-ui="message-hidden-reasoning-action"] {
+  margin-left: auto;
+  font-size: var(--font-size-sm);
+  color: var(--color-link);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  text-decoration: underline;
+  padding: 0;
+}
+
+[data-ui="message-hidden-reasoning-action"]:hover {
+  color: var(--color-link-hover);
+}
+
+/* Include-in-context checkboxes inside the reasoning settings section. */
+[data-ui="reasoning-include-group"] {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-2) 0;
+}
+
+[data-ui="reasoning-checkbox"] {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--font-size-sm);
+  color: var(--color-fg-primary);
+  cursor: pointer;
+  user-select: none;
+}
+
+[data-ui="reasoning-checkbox"][data-disabled="true"] {
+  color: var(--color-fg-muted);
+  cursor: help;
+}
+
+[data-ui="reasoning-checkbox"][data-disabled="true"] input {
+  cursor: not-allowed;
 }

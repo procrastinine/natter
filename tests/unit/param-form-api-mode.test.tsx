@@ -1,0 +1,224 @@
+import { fireEvent, render, screen } from '@testing-library/react'
+import 'fake-indexeddb/auto'
+import Dexie from 'dexie'
+import { IDBFactory } from 'fake-indexeddb'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { effectiveCapabilityFromEndpoints } from '../../src/core/capabilities'
+import { cloneDefaultChatSettings } from '../../src/core/defaults'
+import type { ConnectionProfile, ModelEndpoint } from '../../src/core/types'
+import { __resetBroadcastForTests } from '../../src/store/broadcast'
+import { createChat, getChat } from '../../src/store/chats'
+import { __resetDbForTests, openDb } from '../../src/store/db'
+import {
+  ApiModeSection,
+  ReasoningIncludeControls,
+} from '../../src/ui/settings/ParamForm'
+
+const DB_NAME = 'natter'
+
+function makeEndpoint(overrides: Partial<ModelEndpoint> = {}): ModelEndpoint {
+  return {
+    provider_name: 'OpenAI',
+    supported_parameters: ['reasoning', 'max_tokens'],
+    context_length: 128000,
+    pricing: {},
+    ...overrides,
+  }
+}
+
+function makeProfile(kind: ConnectionProfile['kind']): ConnectionProfile {
+  return {
+    id: 'prof-1',
+    name: 'test',
+    kind,
+    baseUrl: kind === 'openai-compatible' ? 'https://api.openai.com/v1' : 'https://x.y',
+    apiKeyRef: 'key-1',
+    defaultHeaders: {},
+    appTitle: 'test',
+    appUrl: '',
+    usesResponsesApiByDefault: kind === 'openai-compatible',
+    supportsEndpointsApi: kind === 'openrouter',
+    supportsGenerationApi: kind === 'openrouter',
+    supportsPrivacyScrape: kind === 'openrouter',
+    createdAt: 1,
+    updatedAt: 1,
+  }
+}
+
+async function resetAll() {
+  __resetBroadcastForTests()
+  __resetDbForTests()
+  await Dexie.delete(DB_NAME)
+}
+
+beforeEach(async () => {
+  ;(globalThis as unknown as { indexedDB: IDBFactory }).indexedDB = new IDBFactory()
+  await resetAll()
+  await openDb()
+})
+
+afterEach(async () => {
+  await resetAll()
+})
+
+describe('ApiModeSection — two-button toggle', () => {
+  it('renders Chat/Responses buttons for OpenAI-family model with Responses route selected', async () => {
+    // gpt-5.4-nano has responsesSupport: 'both'; on OR the new step 10
+    // resolves to Responses → Responses button aria-pressed.
+    const settings = cloneDefaultChatSettings()
+    settings.model = 'openai/gpt-5.4-nano'
+    const chat = await createChat({ settings })
+    const capability = effectiveCapabilityFromEndpoints(settings.model, [makeEndpoint()])
+    render(
+      <ApiModeSection
+        chat={chat}
+        capability={capability}
+        profile={makeProfile('openrouter')}
+      />,
+    )
+    const chatBtn = screen.getByRole('button', { name: 'Chat completions' })
+    const responsesBtn = screen.getByRole('button', { name: 'Responses' })
+    expect(chatBtn).toBeTruthy()
+    expect(responsesBtn).toBeTruthy()
+    // No "Auto" button — collapsed with the resolved option.
+    expect(screen.queryByRole('button', { name: /^Auto/ })).toBeNull()
+    expect(responsesBtn.getAttribute('aria-pressed')).toBe('true')
+    expect(chatBtn.getAttribute('aria-pressed')).toBe('false')
+  })
+
+  it('does not render for non-OpenAI models on OpenRouter (chat-only)', async () => {
+    const settings = cloneDefaultChatSettings()
+    settings.model = 'anthropic/claude-haiku-4.5'
+    const chat = await createChat({ settings })
+    const capability = effectiveCapabilityFromEndpoints(settings.model, [
+      makeEndpoint({ supported_parameters: ['reasoning'] }),
+    ])
+    const { container } = render(
+      <ApiModeSection
+        chat={chat}
+        capability={capability}
+        profile={makeProfile('openrouter')}
+      />,
+    )
+    expect(container.querySelector('[data-ui-section="api-mode"]')).toBeNull()
+  })
+
+  it('does not render on Google native (transport is a connection-level choice)', async () => {
+    const settings = cloneDefaultChatSettings()
+    settings.model = 'google/gemini-3.1-pro-preview'
+    const chat = await createChat({ settings })
+    const capability = effectiveCapabilityFromEndpoints(settings.model, [
+      makeEndpoint({ supported_parameters: ['reasoning'] }),
+    ])
+    const { container } = render(
+      <ApiModeSection
+        chat={chat}
+        capability={capability}
+        profile={makeProfile('google')}
+      />,
+    )
+    expect(container.querySelector('[data-ui-section="api-mode"]')).toBeNull()
+  })
+
+  it('persists the pin when the user clicks Chat completions', async () => {
+    const settings = cloneDefaultChatSettings()
+    // gpt-5.3: responsesSupport: 'both', preferApi: 'responses' (auto-picks
+    // Responses), but NO requiresPhaseEcho — so clicking Chat doesn't trip
+    // the phase-echo confirmation dialog.
+    settings.model = 'openai/gpt-5.3'
+    const chat = await createChat({ settings })
+    const capability = effectiveCapabilityFromEndpoints(settings.model, [makeEndpoint()])
+    render(
+      <ApiModeSection
+        chat={chat}
+        capability={capability}
+        profile={makeProfile('openrouter')}
+      />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Chat completions' }))
+    await new Promise((r) => setTimeout(r, 20))
+    const updated = await getChat(chat.id)
+    expect(updated?.settings.api).toBe('chat')
+  })
+
+  it('gates the Chat pin behind a confirm() dialog on phase-echo models', async () => {
+    // gpt-5.4-nano has requiresPhaseEcho — clicking Chat must trip the
+    // confirmation. We stub window.confirm to return true and verify the
+    // pin persists.
+    const settings = cloneDefaultChatSettings()
+    settings.model = 'openai/gpt-5.4-nano'
+    const chat = await createChat({ settings })
+    const capability = effectiveCapabilityFromEndpoints(settings.model, [makeEndpoint()])
+    const originalConfirm = window.confirm
+    let prompted = false
+    window.confirm = (() => {
+      prompted = true
+      return true
+    }) as typeof window.confirm
+    try {
+      render(
+        <ApiModeSection
+          chat={chat}
+          capability={capability}
+          profile={makeProfile('openrouter')}
+        />,
+      )
+      fireEvent.click(screen.getByRole('button', { name: 'Chat completions' }))
+      await new Promise((r) => setTimeout(r, 20))
+    } finally {
+      window.confirm = originalConfirm
+    }
+    expect(prompted).toBe(true)
+    const updated = await getChat(chat.id)
+    expect(updated?.settings.api).toBe('chat')
+  })
+})
+
+describe('ReasoningIncludeControls — three-checkbox gating', () => {
+  it('shows three checkboxes for OpenAI-family model (emits encrypted)', async () => {
+    const settings = cloneDefaultChatSettings()
+    settings.model = 'openai/gpt-5.4-nano'
+    const chat = await createChat({ settings })
+    const capability = effectiveCapabilityFromEndpoints(settings.model, [makeEndpoint()])
+    render(<ReasoningIncludeControls chat={chat} capability={capability} />)
+    expect(screen.getByLabelText(/Encrypted reasoning/)).toBeTruthy()
+    expect(screen.getByLabelText(/Visible summary/)).toBeTruthy()
+    expect(screen.getByLabelText(/Visible text/)).toBeTruthy()
+  })
+
+  it('hides the Encrypted checkbox when the model does not emit encrypted reasoning', async () => {
+    const settings = cloneDefaultChatSettings()
+    // Gemini 2.5 → emitsEncryptedReasoning: 'never' (per-user directive).
+    settings.model = 'google/gemini-2.5-flash'
+    const chat = await createChat({ settings })
+    const capability = effectiveCapabilityFromEndpoints(settings.model, [
+      makeEndpoint({ supported_parameters: ['reasoning'] }),
+    ])
+    render(<ReasoningIncludeControls chat={chat} capability={capability} />)
+    expect(screen.queryByLabelText(/Encrypted reasoning/)).toBeNull()
+    expect(screen.getByLabelText(/Visible summary/)).toBeTruthy()
+    expect(screen.getByLabelText(/Visible text/)).toBeTruthy()
+  })
+
+  it('hides the Encrypted checkbox for unknown-format models (DeepSeek / Qwen / Gemma)', async () => {
+    const settings = cloneDefaultChatSettings()
+    settings.model = 'deepseek/deepseek-v3.2'
+    const chat = await createChat({ settings })
+    const capability = effectiveCapabilityFromEndpoints(settings.model, [
+      makeEndpoint({ supported_parameters: ['reasoning'] }),
+    ])
+    render(<ReasoningIncludeControls chat={chat} capability={capability} />)
+    expect(screen.queryByLabelText(/Encrypted reasoning/)).toBeNull()
+  })
+
+  it('all shown checkboxes are clickable (no disabled gating per user directive)', async () => {
+    const settings = cloneDefaultChatSettings()
+    settings.model = 'openai/gpt-5.4-nano'
+    const chat = await createChat({ settings })
+    const capability = effectiveCapabilityFromEndpoints(settings.model, [makeEndpoint()])
+    render(<ReasoningIncludeControls chat={chat} capability={capability} />)
+    expect((screen.getByLabelText(/Encrypted reasoning/) as HTMLInputElement).disabled).toBe(false)
+    expect((screen.getByLabelText(/Visible summary/) as HTMLInputElement).disabled).toBe(false)
+    expect((screen.getByLabelText(/Visible text/) as HTMLInputElement).disabled).toBe(false)
+  })
+})

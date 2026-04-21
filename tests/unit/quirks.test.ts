@@ -48,10 +48,20 @@ describe('quirks registry', () => {
     expect(allowedVerbosityFor('claude-opus-4.6')).toContain('max')
   })
 
-  it('GPT-5.4 requires the Responses API', () => {
+  it('GPT-5.4 prefers Responses (both APIs accepted) and persists phase', () => {
+    // Live probes confirmed gpt-5.4 accepts /chat/completions too (phase drops
+    // without Responses, causing early stopping — hence preferApi +
+    // persistsResponsesPhase — but the model is not responses-only).
     const q = quirksFor('openai/gpt-5.4')
-    expect(q.requiresResponsesApi).toBe(true)
+    expect(q.preferApi).toBe('responses')
     expect(q.persistsResponsesPhase).toBe(true)
+    expect(q.requiresResponsesApi).toBeUndefined()
+  })
+
+  it('GPT-5.4-pro is responses-only', () => {
+    const q = quirksFor('openai/gpt-5.4-pro')
+    expect(q.requiresResponsesApi).toBe(true)
+    expect(q.responsesSupport).toBe('responses-only')
   })
 
   it('cacheMinTokens picks up per-variant floors', () => {
@@ -61,8 +71,29 @@ describe('quirks registry', () => {
     expect(cacheMinTokensFor('anthropic/claude-haiku-4.5')).toBe(4096)
   })
 
-  it('Gemini 3 allowedEffort excludes xhigh and none', () => {
-    expect(allowedEffortFor('google/gemini-3.1-pro')).toEqual(['minimal', 'low', 'medium', 'high'])
+  it('Gemini 3 Pro allowedEffort is low/medium/high (no minimal, no xhigh)', () => {
+    // Per Google's Vertex thinking docs: Gemini 3 Pro / 3.1 Pro have NO
+    // `minimal` level — only low/medium/high. Pro cannot be disabled.
+    expect(allowedEffortFor('google/gemini-3.1-pro-preview')).toEqual([
+      'low',
+      'medium',
+      'high',
+    ])
+    // Prefix match also catches -customtools variant.
+    expect(allowedEffortFor('google/gemini-3.1-pro-preview-customtools')).toEqual([
+      'low',
+      'medium',
+      'high',
+    ])
+  })
+
+  it('Gemini 3 Flash allowedEffort includes minimal', () => {
+    expect(allowedEffortFor('google/gemini-3.1-flash-lite-preview')).toEqual([
+      'minimal',
+      'low',
+      'medium',
+      'high',
+    ])
   })
 
   it('picks the longest matching prefix, not the first', () => {
@@ -75,33 +106,30 @@ describe('quirks registry', () => {
     expect(cacheMinTokensFor('mistral/large')).toBeUndefined()
   })
 
-  it('xAI Grok 3/4 allowedEffort narrows to low/medium/high', () => {
-    // Plan §5.5 bundled entry: jan cross-ref confirms /chat/completions
-    // rejects 'none' / 'minimal' / 'xhigh' on these models — upstream
-    // clamps silently, so we hide those buttons.
-    expect(allowedEffortFor('x-ai/grok-4')).toEqual(['low', 'medium', 'high'])
-    expect(allowedEffortFor('x-ai/grok-3')).toEqual(['low', 'medium', 'high'])
+  it('xAI Grok 4.x allowedEffort narrows to low/medium/high', () => {
+    // /chat/completions rejects 'none' / 'minimal' / 'xhigh' on these models
+    // — upstream clamps silently, so we hide those buttons.
+    expect(allowedEffortFor('x-ai/grok-4.20')).toEqual(['low', 'medium', 'high'])
+    expect(allowedEffortFor('x-ai/grok-4.1')).toEqual(['low', 'medium', 'high'])
   })
 
-  it('DeepSeek-R1 inline reasoning + narrowed effort', () => {
+  it('DeepSeek v3.2 inline reasoning + narrowed effort', () => {
     // Emits <think>…</think> inline; parser lifts to reasoning lane.
-    // allowedEffort matches plan §5.5 bundled entry.
-    const q = quirksFor('deepseek/deepseek-r1')
-    expect(q.reasoningInlineTags).toBe(true)
+    const q = quirksFor('deepseek/deepseek-v3.2')
+    expect(q.reasoningInlineTags).toEqual(['think'])
     expect(q.allowedEffort).toEqual(['low', 'medium', 'high'])
   })
 
-  it('Qwen3 inline reasoning + narrowed effort', () => {
-    const q = quirksFor('qwen/qwen3-coder')
-    expect(q.reasoningInlineTags).toBe(true)
+  it('Qwen3.6 inline reasoning + narrowed effort', () => {
+    const q = quirksFor('qwen/qwen3.6-plus')
+    expect(q.reasoningInlineTags).toEqual(['think'])
     expect(q.allowedEffort).toEqual(['low', 'medium', 'high'])
   })
 
-  it('Gemma inline tags but no effort narrowing (no reasoning knob)', () => {
-    const q = quirksFor('google/gemma-3-27b')
-    expect(q.reasoningInlineTags).toBe(true)
-    // Gemma has no reasoning parameter; effort list falls through to superset.
-    expect(q.allowedEffort).toBeUndefined()
+  it('Gemma 4 inline tags + effort narrowed', () => {
+    // gemma-4 keys on the whole family; any sub-variant matches.
+    const q = quirksFor('google/gemma-4-31b-it')
+    expect(q.reasoningInlineTags).toEqual(['thought', 'think'])
   })
 
   it('o-series reasoning is hidden but effort superset unchanged', () => {

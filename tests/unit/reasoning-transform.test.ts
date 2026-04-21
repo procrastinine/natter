@@ -23,6 +23,7 @@ function makeSettings(overrides: Partial<ChatSettings['reasoning']> & { mode: Re
     // test's wire output; force to 'off' unless a test explicitly opts in.
     summary: overrides.summary ?? 'off',
     carryForward: overrides.carryForward ?? 'auto',
+    include: overrides.include ?? { encrypted: false, summary: false, text: false },
     ...(overrides.effort !== undefined ? { effort: overrides.effort } : {}),
     ...(overrides.maxTokens !== undefined ? { maxTokens: overrides.maxTokens } : {}),
   }

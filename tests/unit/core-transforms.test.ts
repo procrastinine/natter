@@ -31,7 +31,7 @@ function settings(overrides: Partial<ChatSettings> = {}): ChatSettings {
     ...base,
     profileId: 'prof',
     model: 'anthropic/claude-haiku-4.5',
-    reasoning: { mode: 'off', exclude: false, summary: 'off', carryForward: 'off' },
+    reasoning: { mode: 'off', exclude: false, summary: 'off', carryForward: 'off', include: { encrypted: false, summary: false, text: false } },
     ...overrides,
   }
 }
@@ -124,7 +124,7 @@ describe('toChatCompletions', () => {
     const path = [textMessage({ id: 'u1', role: 'user', text: 'hi' })]
     const { wire } = toChatCompletions(
       settings({
-        reasoning: { mode: 'off', exclude: false, summary: 'off', carryForward: 'off' },
+        reasoning: { mode: 'off', exclude: false, summary: 'off', carryForward: 'off', include: { encrypted: false, summary: false, text: false } },
       }),
       path,
     )
@@ -135,7 +135,7 @@ describe('toChatCompletions', () => {
     const path = [textMessage({ id: 'u1', role: 'user', text: 'hi' })]
     const { wire } = toChatCompletions(
       settings({
-        reasoning: { mode: 'enabled', exclude: false, summary: 'off', carryForward: 'off' },
+        reasoning: { mode: 'enabled', exclude: false, summary: 'off', carryForward: 'off', include: { encrypted: false, summary: false, text: false } },
       }),
       path,
     )
@@ -146,7 +146,7 @@ describe('toChatCompletions', () => {
     const path = [textMessage({ id: 'u1', role: 'user', text: 'hi' })]
     const { wire } = toChatCompletions(
       settings({
-        reasoning: { mode: 'default', exclude: false, summary: 'off', carryForward: 'off' },
+        reasoning: { mode: 'default', exclude: false, summary: 'off', carryForward: 'off', include: { encrypted: false, summary: false, text: false } },
       }),
       path,
     )

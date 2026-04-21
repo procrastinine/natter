@@ -43,7 +43,7 @@ function chatSettings(overrides: Partial<ChatSettings> = {}): ChatSettings {
     ...base,
     profileId: 'prof',
     model: 'google/gemini-3.1-flash-lite-preview',
-    reasoning: { mode: 'off', exclude: false, summary: 'off', carryForward: 'off' },
+    reasoning: { mode: 'off', exclude: false, summary: 'off', carryForward: 'off', include: { encrypted: false, summary: false, text: false } },
     ...overrides,
   }
 }
@@ -302,6 +302,149 @@ describe('sendText — chat-completions streaming', () => {
     expect(assistant?.generation?.finishedAt).toBeDefined()
     expect((assistant?.generation?.firstTextAt ?? 0) > (assistant?.generation?.reasoningStartedAt ?? 0)).toBe(true)
     expect((assistant?.generation?.finishedAt ?? 0) >= (assistant?.generation?.firstTextAt ?? 0)).toBe(true)
+  })
+
+  it('preserves both reasoning.summary (relabeled from text) and reasoning.encrypted at same index (Gemini via OpenRouter)', async () => {
+    // Regression: OpenRouter's Gemini chat-completions stream emits BOTH
+    // `reasoning.text` (actually a summary — Gemini 3 never emits raw CoT)
+    // AND `reasoning.encrypted` (the thoughtSignature carrier) at `index: 0`
+    // in the SAME stream. Our on-ingest normalizer relabels the `.text`
+    // entry with format `google-gemini-v1` (and no `.signature`) to
+    // `.summary` so downstream Include-controls gate correctly. Live-probed
+    // 2026-04-20.
+    const chat = await createChat({ settings: chatSettings() })
+    await sendText({
+      chatId: chat.id,
+      connection: makeProfile(),
+      apiKey: 'sk-test',
+      content: [{ type: 'text', text: 'think carefully' }],
+      openStream: () =>
+        stream(
+          {
+            type: 'delta',
+            chunk: {
+              choices: [
+                {
+                  delta: {
+                    reasoning: '**Planning**\nI will solve step by step.',
+                    reasoning_details: [
+                      {
+                        type: 'reasoning.text',
+                        index: 0,
+                        format: 'google-gemini-v1',
+                        text: '**Planning**\nI will solve step by step.',
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
+          },
+          {
+            type: 'delta',
+            chunk: {
+              choices: [
+                {
+                  delta: {
+                    content: 'The answer is 9 + 10 + 11 = 30.',
+                    reasoning_details: [
+                      {
+                        type: 'reasoning.encrypted',
+                        index: 0,
+                        format: 'google-gemini-v1',
+                        data: 'sig-b64-blob',
+                      },
+                    ],
+                  },
+                  finish_reason: 'stop',
+                },
+              ],
+            },
+          },
+        ),
+    })
+    const assistant = (await messagesFor(chat.id)).find((m) => m.role === 'assistant')
+    const details = assistant?.reasoningDetails ?? []
+    // Normalizer should have rewritten `.text` → `.summary` because format
+    // is google-gemini-v1 and there's no `.signature` (Claude's signed text
+    // is the counter-example that keeps the .text label).
+    const summaryDetail = details.find((d) => d.type === 'reasoning.summary')
+    const encryptedDetail = details.find((d) => d.type === 'reasoning.encrypted')
+    expect(details.find((d) => d.type === 'reasoning.text')).toBeUndefined()
+    expect(summaryDetail?.summary).toBe('**Planning**\nI will solve step by step.')
+    expect(encryptedDetail?.data).toBe('sig-b64-blob')
+    expect(encryptedDetail?.format).toBe('google-gemini-v1')
+  })
+
+  it('preserves multiple distinct Gemini summary parts arriving at same index', async () => {
+    // Regression: OR repackages Gemini 3's multi-part thought summaries as
+    // `reasoning.text` entries all pinned at `index: 0`. Before the fix,
+    // `shareIdentity` matched them by index and the second summary merged
+    // into (and effectively overwrote) the first — the user watched later
+    // reasoning blocks replace earlier ones as the stream progressed.
+    const chat = await createChat({ settings: chatSettings() })
+    await sendText({
+      chatId: chat.id,
+      connection: makeProfile(),
+      apiKey: 'sk-test',
+      content: [{ type: 'text', text: 'think' }],
+      openStream: () =>
+        stream(
+          {
+            type: 'delta',
+            chunk: {
+              choices: [
+                {
+                  delta: {
+                    reasoning_details: [
+                      {
+                        type: 'reasoning.text',
+                        index: 0,
+                        format: 'google-gemini-v1',
+                        text: 'First thought: enumerate options.',
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
+          },
+          {
+            type: 'delta',
+            chunk: {
+              choices: [
+                {
+                  delta: {
+                    reasoning_details: [
+                      {
+                        type: 'reasoning.text',
+                        index: 0,
+                        format: 'google-gemini-v1',
+                        text: 'Second thought: pick the best.',
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
+          },
+          {
+            type: 'delta',
+            chunk: {
+              choices: [{ delta: { content: 'done' }, finish_reason: 'stop' }],
+            },
+          },
+        ),
+    })
+    const assistant = (await messagesFor(chat.id)).find((m) => m.role === 'assistant')
+    const summaries = (assistant?.reasoningDetails ?? []).filter(
+      (d) => d.type === 'reasoning.summary',
+    )
+    expect(summaries).toHaveLength(2)
+    expect(summaries.map((s) => s.type === 'reasoning.summary' && s.summary)).toEqual([
+      'First thought: enumerate options.',
+      'Second thought: pick the best.',
+    ])
   })
 
   it('merges overlapped mirrored reasoning fragments instead of re-appending them', async () => {
