@@ -34,6 +34,7 @@ export interface MessageProps {
   chatId: ChatId
   message: MessageRow
   branchMessages?: readonly MessageRow[]
+  branchTreeKey?: string
   hasAnyReasoningDetails: boolean
   hasSiblingVariants: boolean
   cursor: CursorMap
@@ -84,7 +85,7 @@ export const Message = memo(
   },
   (prev, next) =>
     prev.message === next.message &&
-    prev.branchMessages === next.branchMessages &&
+    prev.branchTreeKey === next.branchTreeKey &&
     prev.hasAnyReasoningDetails === next.hasAnyReasoningDetails &&
     prev.hasSiblingVariants === next.hasSiblingVariants &&
     prev.cursor === next.cursor &&
@@ -106,6 +107,7 @@ function MessageInner({
   chatId,
   message,
   branchMessages,
+  branchTreeKey,
   hasAnyReasoningDetails,
   hasSiblingVariants,
   cursor,
@@ -122,6 +124,7 @@ function MessageInner({
   onForkChat,
   onInsert,
 }: MessageProps) {
+  void branchTreeKey
   const error = message.generation?.error
   const abortReason = message.generation?.abortReason
   const debug = (message as unknown as { debugCrash?: boolean }).debugCrash

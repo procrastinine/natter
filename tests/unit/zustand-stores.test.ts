@@ -18,28 +18,20 @@ describe('streamStore', () => {
       chatId: 'C1',
       startedAt: 1,
       ownerClientId: 'tab-a',
-      textLen: 0,
     })
     expect(isActive('S1')).toBe(true)
     expect(getActive('S1')?.streamId).toBe('S1')
     expect(listByChat('C1').map((stream) => stream.streamId)).toEqual(['S1'])
   })
 
-  it('updateTextLen is a no-op when no stream is active for that id', () => {
-    const { updateTextLen, getActive } = useStreamStore.getState()
-    updateTextLen('ghost', 99)
-    expect(getActive('ghost')).toBeUndefined()
-  })
-
   it('supports multiple same-chat streams keyed independently', () => {
-    const { setActive, updateTextLen, getActive, isTargetActive } = useStreamStore.getState()
+    const { setActive, getActive, isTargetActive } = useStreamStore.getState()
     setActive({
       streamId: 'S1',
       chatId: 'C1',
       messageId: 'M1',
       startedAt: 1,
       ownerClientId: 'tab-a',
-      textLen: 0,
     })
     setActive({
       streamId: 'S2',
@@ -47,11 +39,9 @@ describe('streamStore', () => {
       messageId: 'M2',
       startedAt: 2,
       ownerClientId: 'tab-a',
-      textLen: 0,
     })
-    updateTextLen('S1', 128)
-    expect(getActive('S1')?.textLen).toBe(128)
-    expect(getActive('S2')?.textLen).toBe(0)
+    expect(getActive('S1')?.streamId).toBe('S1')
+    expect(getActive('S2')?.streamId).toBe('S2')
     expect(isTargetActive('C1', 'M1')).toBe(true)
     expect(isTargetActive('C1', 'M2')).toBe(true)
     expect(isTargetActive('C1', 'M3')).toBe(false)
@@ -64,14 +54,12 @@ describe('streamStore', () => {
       chatId: 'C1',
       startedAt: 1,
       ownerClientId: 'tab-a',
-      textLen: 0,
     })
     setActive({
       streamId: 'S2',
       chatId: 'C2',
       startedAt: 2,
       ownerClientId: 'tab-a',
-      textLen: 0,
     })
     clearActive('S1')
     expect(isActive('S1')).toBe(false)
@@ -88,7 +76,6 @@ describe('streamStore', () => {
       chatId: 'C1',
       startedAt: 1,
       ownerClientId: 'tab-a',
-      textLen: 0,
       abort: abortA,
     })
     setActive({
@@ -96,7 +83,6 @@ describe('streamStore', () => {
       chatId: 'C1',
       startedAt: 2,
       ownerClientId: 'tab-a',
-      textLen: 0,
       abort: abortB,
     })
     setActive({
@@ -104,7 +90,6 @@ describe('streamStore', () => {
       chatId: 'C2',
       startedAt: 3,
       ownerClientId: 'tab-a',
-      textLen: 0,
       abort: abortOther,
     })
     expect(abortChat('C1')).toBe(2)

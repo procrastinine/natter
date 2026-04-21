@@ -128,7 +128,6 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
     messageId: target.id,
     startedAt: now(),
     ownerClientId: 'in-tab',
-    textLen: existingTextOf(target).length,
     abort: abortStream,
   })
   postEvent({
@@ -139,6 +138,7 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
     ownerClientId: 'in-tab',
   })
 
+  let outcome: 'done' | 'error' | 'abort' = 'done'
   let buffer = ''
   const baseText = existingTextOf(target)
   const openStream =
@@ -165,19 +165,13 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
         // flushes, so compute the tail from buffer and merge.
         combined,
       )
-      await ctx.putMessage({ ...current, content: nextContent })
+      await ctx.putMessage(
+        { ...current, content: nextContent },
+        final ? undefined : { touchChatSummary: false, broadcast: false },
+      )
     })
     lastFlushedAt = now()
     lastFlushedLen = buffer.length
-    useStreamStore.getState().updateTextLen(streamId, combined.length)
-    postEvent({
-      kind: 'stream-tokens',
-      chatId: input.chatId,
-      streamId,
-      messageId: target.id,
-      textLen: combined.length,
-    })
-    void final
   }
 
   try {
@@ -191,6 +185,7 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
       if (event.lane === 'text') {
         buffer += event.text
       } else if (event.lane === 'error') {
+        outcome = 'error'
         break
       }
       // Flush every ~200ms or 4KB of growth.
@@ -203,13 +198,18 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
     // response is now whole. The original generation metadata (usage /
     // model / reasoning) is preserved by flush(); only the abortReason
     // and error flags go.
-    await dismissAbortReason(target.id)
+    if (outcome === 'done') {
+      await dismissAbortReason(target.id)
+    }
   } catch (err) {
     if (abortController.signal.aborted) {
+      outcome = 'abort'
       await flush(true)
     } else if (err instanceof ApiError) {
+      outcome = 'error'
       await flush(true)
     } else {
+      outcome = 'error'
       await flush(true)
       throw err
     }
@@ -220,7 +220,7 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
       chatId: input.chatId,
       streamId,
       messageId: target.id,
-      outcome: 'done',
+      outcome,
     })
   }
 }

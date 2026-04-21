@@ -18,6 +18,7 @@ import { withMutationLocks } from './locks'
 import type {
   ChatMutationSummary,
   MutationContext,
+  PutMessageOptions,
   WorkspaceMeta,
   WorkspaceMutationResult,
   WorkspaceRepository,
@@ -526,11 +527,13 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
             return rows.filter((row) => row.parentId === parentId)
           },
 
-          putMessage: async (message) => {
+          putMessage: async (message, options: PutMessageOptions = {}) => {
+            const { touchChatSummary = true, broadcast = touchChatSummary } = options
             const table = tx.table<Message, MessageId>('messages')
             const existing = await table.get(message.id)
             const chatId = existing?.chatId ?? message.chatId
-            const state = await ensureChatState(chatId)
+            const needsChatState = touchChatSummary || broadcast
+            const state = needsChatState ? await ensureChatState(chatId) : undefined
             const clone = cloneMessage(message)
 
             assertScope({ kind: 'message', messageId: clone.id })
@@ -541,17 +544,24 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
               const moved =
                 existing.parentId !== clone.parentId || existing.siblingIndex !== clone.siblingIndex
               const deletionChanged = existing.deleted !== clone.deleted
+              if (!touchChatSummary && (moved || deletionChanged)) {
+                throw new Error(`DeferredMessageWriteRequiresStableTree:${clone.id}`)
+              }
               if (moved || deletionChanged) {
                 assertScope({ kind: 'children', chatId, parentId: existing.parentId })
                 assertScope({ kind: 'children', chatId, parentId: clone.parentId })
               }
               const changed = stableStringify(existing) !== stableStringify(clone)
               if (!changed) return
-              await ensureMessageSnapshots(state)
+              if (touchChatSummary) {
+                await ensureMessageSnapshots(state as ChatMutationState)
+              }
               clone.nodeVersion = existing.nodeVersion + 1
               await table.put(clone)
               wroteWorkspaceState = true
-              replaceMessage(state.afterMessages ?? [], clone)
+              if (state?.afterMessages) {
+                replaceMessage(state.afterMessages, clone)
+              }
               if (moved || deletionChanged) {
                 await bumpChildList(chatId, existing.parentId)
                 if (existing.parentId !== clone.parentId) {
@@ -559,21 +569,30 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
                 }
               }
             } else {
-              await ensureMessageSnapshots(state)
+              if (!touchChatSummary) {
+                throw new Error(`DeferredMessageWriteRequiresExistingRow:${clone.id}`)
+              }
+              await ensureMessageSnapshots(state as ChatMutationState)
               assertScope({ kind: 'children', chatId, parentId: clone.parentId })
               if (clone.nodeVersion === undefined) clone.nodeVersion = 0
               await table.put(clone)
               wroteWorkspaceState = true
-              replaceMessage(state.afterMessages ?? [], clone)
+              if (state?.afterMessages) {
+                replaceMessage(state.afterMessages, clone)
+              }
               await bumpChildList(chatId, clone.parentId)
             }
 
-            state.summaryVersionDirty = true
-            state.messageSummaryDirty = true
-            state.broadcast = true
-            state.changedMessageIds.add(clone.id)
+            if (touchChatSummary && state) {
+              state.summaryVersionDirty = true
+              state.messageSummaryDirty = true
+              state.changedMessageIds.add(clone.id)
+            }
+            if (broadcast && state) {
+              state.broadcast = true
+              upsertAffected(state, { kind: 'message', chatId, messageId: clone.id })
+            }
             affectedMessageIds.add(clone.id)
-            upsertAffected(state, { kind: 'message', chatId, messageId: clone.id })
           },
 
           deleteMessage: async (messageId) => {

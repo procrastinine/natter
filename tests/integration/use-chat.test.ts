@@ -223,6 +223,66 @@ describe('sendText — chat-completions streaming', () => {
     expect(assistant?.content).toEqual([{ type: 'output_text', text: 'slow ' }])
   })
 
+  it('keeps chat summary frozen until the stream finishes', async () => {
+    const chat = await createChat({ settings: chatSettings() })
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    let markPaused!: () => void
+    const paused = new Promise<void>((resolve) => {
+      markPaused = resolve
+    })
+    let tick = 0
+
+    const sendPromise = sendText({
+      chatId: chat.id,
+      connection: makeProfile(),
+      apiKey: 'sk-test',
+      content: [{ type: 'text', text: 'hello world' }],
+      openStream: () =>
+        (async function* () {
+          yield {
+            type: 'delta',
+            chunk: { choices: [{ delta: { content: 'Partial ' } }] },
+          } as ChatStreamChunk
+          markPaused()
+          await gate
+          yield {
+            type: 'delta',
+            chunk: {
+              choices: [{ delta: { content: 'answer' }, finish_reason: 'stop' }],
+              usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5, cost: 0.0002 },
+            },
+          } as ChatStreamChunk
+        })(),
+      now: () => {
+        tick += 250
+        return tick
+      },
+    })
+
+    await paused
+
+    const midChat = await getBrowserRepository().getChat(chat.id)
+    const midAssistant = (await messagesFor(chat.id)).find((m) => m.role === 'assistant')
+    expect(midAssistant?.content).toEqual([{ type: 'output_text', text: 'Partial ' }])
+    expect(midChat?.wordCount).toBe(2)
+    expect(midChat?.totalCostUsd).toBe(0)
+
+    release()
+
+    const result = await sendPromise
+    expect(result.outcome).toBe('done')
+
+    const afterChat = await getBrowserRepository().getChat(chat.id)
+    const afterAssistant = (await messagesFor(chat.id)).find((m) => m.role === 'assistant')
+    expect(afterAssistant?.content).toEqual([{ type: 'output_text', text: 'Partial answer' }])
+    expect(afterChat?.summaryVersion).toBe((midChat?.summaryVersion ?? 0) + 1)
+    expect(afterChat?.wordCount).toBe(4)
+    expect(afterChat?.totalCostUsd).toBeCloseTo(0.0002)
+  })
+
   it('releases the stream store entry on completion', async () => {
     const chat = await createChat({ settings: chatSettings() })
     const before = Object.keys(useStreamStore.getState().activeByStreamId).length

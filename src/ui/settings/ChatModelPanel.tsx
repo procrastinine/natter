@@ -19,7 +19,7 @@
 // tab (see ParamForm's own issues banner).
 
 import { useLiveQuery } from 'dexie-react-hooks'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
 import { activePath } from '../../core/active-path'
 import type { Chat, ChatId, ChatPreset, ConnectionKind, ConnectionProfile } from '../../core/types'
 import type { EffectiveCapability } from '../../core/capabilities'
@@ -144,7 +144,12 @@ export function ChatModelPanel({ chatId, chatSnapshot = null, onClose }: ChatMod
     }
     return input
   }, [chat, messages, cursor, draft, endpointTokenizer, capability?.quirks])
-  const promptEstimate = useStreamStablePromptEstimate(chat?.id, promptEstimateInput, streamActivityKey)
+  const deferredPromptEstimateInput = useDeferredValue(promptEstimateInput)
+  const promptEstimate = useStreamStablePromptEstimate(
+    chat?.id,
+    deferredPromptEstimateInput,
+    streamActivityKey,
+  )
   const providerNeededTokens = useMemo(() => {
     if (!chat || !promptEstimate) return undefined
     const reserveRaw = chat.settings.maxCompletionTokens

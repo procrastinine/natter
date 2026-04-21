@@ -84,6 +84,15 @@ export const MessageList = memo(function MessageList({
     }
     return live
   }, [byParent])
+  const branchTreeKey = useMemo(
+    () =>
+      messages
+        .map((message) =>
+          `${message.id}:${message.parentId ?? 'root'}:${message.siblingIndex}:${message.deleted ? 1 : 0}`,
+        )
+        .join('|'),
+    [messages],
+  )
   const path = useMemo(() => activePath(messages, cursor), [messages, cursor])
   const hasAnyReasoningDetails = useMemo(
     () => messages.some((m) => (m.reasoningDetails?.length ?? 0) > 0),
@@ -287,7 +296,7 @@ export const MessageList = memo(function MessageList({
             chatId={chatId}
             message={m}
             {...(((liveSiblingsByParent.get(m.parentId)?.length ?? 0) > 1)
-              ? { branchMessages: messages }
+              ? { branchMessages: messages, branchTreeKey }
               : {})}
             hasAnyReasoningDetails={hasAnyReasoningDetails}
             hasSiblingVariants={(liveSiblingsByParent.get(m.parentId)?.length ?? 0) > 1}

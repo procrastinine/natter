@@ -1,5 +1,5 @@
 import { useLiveQuery } from 'dexie-react-hooks'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
 import { normalizeModelsResponse } from '../api/providers'
 import { activePath } from '../core/active-path'
 import { cloneDefaultChatSettings } from '../core/defaults'
@@ -280,9 +280,10 @@ export function Shell() {
     }
     return input
   }, [resolvedActiveChatRow, activePathMemo])
+  const deferredTokenEstimateInput = useDeferredValue(tokenEstimateInput)
   const tokenEstimate = useStreamStablePromptEstimate(
     resolvedActiveChatRow?.id,
-    tokenEstimateInput,
+    deferredTokenEstimateInput,
     streamActivityKey,
   )
   // Token indicator for the composer. Shares `estimatePromptSize` with

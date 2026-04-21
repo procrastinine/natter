@@ -46,13 +46,6 @@ export type BroadcastEvent =
       ownerClientId: string
     }
   | {
-      kind: 'stream-tokens'
-      chatId: ChatId
-      streamId: string
-      messageId?: string
-      textLen: number
-    }
-  | {
       kind: 'stream-ended'
       chatId: ChatId
       streamId: string

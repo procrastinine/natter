@@ -38,6 +38,11 @@ export interface ChatMetaPatchOptions {
   broadcast?: boolean
 }
 
+export interface PutMessageOptions {
+  touchChatSummary?: boolean
+  broadcast?: boolean
+}
+
 export interface MutationContext {
   getChat(chatId: ChatId): Promise<Chat | undefined>
   patchChatMeta(chatId: ChatId, patch: Partial<Chat>, options?: ChatMetaPatchOptions): void
@@ -45,7 +50,7 @@ export interface MutationContext {
   getMessage(messageId: MessageId): Promise<Message | undefined>
   listMessages(chatId: ChatId): Promise<Message[]>
   listChildren(chatId: ChatId, parentId: MessageId | null): Promise<Message[]>
-  putMessage(message: Message): Promise<void>
+  putMessage(message: Message, options?: PutMessageOptions): Promise<void>
   deleteMessage(messageId: MessageId): Promise<void>
   getChildList(chatId: ChatId, parentId: MessageId | null): Promise<ChildListState>
   bumpChildList(chatId: ChatId, parentId: MessageId | null, now?: number): Promise<ChildListState>

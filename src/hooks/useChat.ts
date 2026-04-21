@@ -299,7 +299,6 @@ async function openAssistantStreamUnder(
     messageId: assistantId,
     startedAt: now(),
     ownerClientId: 'in-tab',
-    textLen: 0,
     abort: abortStream,
   })
   postEvent({
@@ -547,7 +546,7 @@ interface FlushContext {
 }
 
 async function flushPartial(ctx: FlushContext): Promise<void> {
-  const { repo, chatId, streamId, messageId, accumulator, requestedModel } = ctx
+  const { repo, messageId, accumulator, requestedModel } = ctx
   await repo.runMutation([{ kind: 'message', messageId }], async (inner) => {
     const current = await inner.getMessage(messageId)
     if (!current) return
@@ -558,18 +557,10 @@ async function flushPartial(ctx: FlushContext): Promise<void> {
     }
     if (reasoning.length > 0) next.reasoningDetails = reasoning
     next.generation = updatedGeneration(current.generation, accumulator, requestedModel, {})
-    await inner.putMessage(next)
+    await inner.putMessage(next, { touchChatSummary: false, broadcast: false })
   })
   accumulator.lastFlushedAt = Date.now()
   accumulator.lastFlushedTextLen = accumulator.textBuffer.length
-  useStreamStore.getState().updateTextLen(streamId, accumulator.textBuffer.length)
-  postEvent({
-    kind: 'stream-tokens',
-    chatId,
-    streamId,
-    messageId,
-    textLen: accumulator.textBuffer.length,
-  })
 }
 
 interface FinalizeContext extends FlushContext {
