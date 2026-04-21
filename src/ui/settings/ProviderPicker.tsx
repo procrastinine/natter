@@ -19,15 +19,14 @@
 import { useLiveQuery } from 'dexie-react-hooks'
 import { useCallback, useMemo, useState } from 'react'
 import { activePath } from '../../core/active-path'
-import { estimatePromptSize, tokenizerFromSettings } from '../../core/prompt-size'
-import { quirksFor } from '../../core/quirks'
+import { estimateSettingsPromptSize, UNLIMITED_CONTEXT } from '../../core/prompt-size'
 import type {
   Chat,
   ModelEndpoint,
   ProviderPreferences,
   SortBy,
 } from '../../core/types'
-import { usePrivacyRouting } from '../../hooks/usePrivacyRouting'
+import type { UsePrivacyRoutingResult } from '../../hooks/usePrivacyRouting'
 import { getChatDraft, loadChatMessages, updateChatSettings } from '../../store/chats'
 import { useChatStore } from '../../store/zustand/chatStore'
 import { LockIcon } from '../icons/Icon'
@@ -40,12 +39,13 @@ import {
 
 export interface ProviderPickerProps {
   chat: Chat
+  routing: UsePrivacyRoutingResult
+  neededTokens?: number
 }
 
 const EMPTY_CURSOR = Object.freeze({}) as Readonly<Record<string, string>>
 
-export function ProviderPicker({ chat }: ProviderPickerProps) {
-  const routing = usePrivacyRouting(chat)
+export function ProviderPicker({ chat, routing, neededTokens: neededTokensOverride }: ProviderPickerProps) {
   const { endpoints, filter, loading, isFreeModel, scrapeApplicable, refresh } = routing
   const prefs = chat.settings.providerPrefs ?? {}
   const manualOrdered = useMemo(() => orderEndpoints(endpoints, prefs), [endpoints, prefs])
@@ -64,23 +64,13 @@ export function ProviderPicker({ chat }: ProviderPickerProps) {
   // `customMaxContext` ceiling is NOT filtered out if the live prompt is
   // smaller — the user still gets the provider while the chat is short.
   const neededTokens = useMemo(() => {
+    if (neededTokensOverride !== undefined) return neededTokensOverride
     const path = activePath(messages, cursor)
-    const quirks = quirksFor(chat.settings.model)
-    const input: Parameters<typeof estimatePromptSize>[0] = {
-      systemPrompt: chat.settings.systemPrompt,
-      activePathMessages: path,
-      draftText: draft ?? '',
-      tokenizer: tokenizerFromSettings(chat.settings, null),
-      reasoningInclude: chat.settings.reasoning.include,
-      reasoningExcluded: chat.settings.reasoning.exclude === true,
-    }
-    if (quirks.reasoningPreservationFormat !== undefined) {
-      input.reasoningPreservationFormat = quirks.reasoningPreservationFormat
-    }
-    const est = estimatePromptSize(input)
-    const reserve = chat.settings.maxCompletionTokens ?? 0
+    const est = estimateSettingsPromptSize(chat.settings, path, draft ?? '', routing.descriptor?.architecture?.tokenizer ?? null)
+    const reserveRaw = chat.settings.maxCompletionTokens
+    const reserve = reserveRaw === UNLIMITED_CONTEXT ? 0 : (reserveRaw ?? 0)
     return est.total + reserve
-  }, [messages, cursor, chat.settings, draft])
+  }, [neededTokensOverride, messages, cursor, chat.settings, draft, routing.descriptor?.architecture?.tokenizer])
 
   const updatePrefs = useCallback(
     (patch: Partial<ProviderPreferences>) => {

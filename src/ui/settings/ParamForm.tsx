@@ -261,6 +261,8 @@ const SAMPLING_FIELDS: SamplingSpec[] = [
   },
 ]
 
+const SETTINGS_SLIDER_COMMIT_DEBOUNCE_MS = 200
+
 export function ParamForm({ chat, capability }: ParamFormProps) {
   // Validate stored settings once the live cap lands. Re-run whenever the
   // cap identity changes — e.g. model swap. Silent: we just fix the values,
@@ -414,40 +416,108 @@ function ReasoningSection({
             </div>
           ) : null}
           {r.mode === 'budget' ? (
-            <div data-ui="field-group" data-ui-field data-ui-slider-row>
-              <span data-ui="slider-label">Max reasoning tokens</span>
-              <input
-                data-ui="slider"
-                type="range"
-                min={0}
-                max={capability.maxCompletionTokens ?? 32000}
-                step={1}
-                value={Math.min(
-                  capability.maxCompletionTokens ?? 32000,
-                  Math.max(0, r.maxTokens ?? 0),
-                )}
-                onChange={(e) => updateReasoning({ maxTokens: Number(e.target.value) })}
-              />
-              <input
-                data-ui="slider-number"
-                type="number"
-                min={0}
-                max={capability.maxCompletionTokens ?? 32000}
-                value={r.maxTokens ?? ''}
-                placeholder="0"
-                onChange={(e) => {
-                  const raw = e.target.value
-                  if (raw === '') return
-                  const n = Number(raw)
-                  if (Number.isFinite(n) && n >= 0) updateReasoning({ maxTokens: Math.floor(n) })
-                }}
-              />
-            </div>
+            <ReasoningBudgetControl
+              max={capability.maxCompletionTokens ?? 32000}
+              value={r.maxTokens}
+              onCommit={(next) => updateReasoning({ maxTokens: next })}
+            />
           ) : null}
         </>
       )}
       <ReasoningSummaryControl chat={chat} capability={capability} />
     </section>
+  )
+}
+
+function ReasoningBudgetControl({
+  max,
+  value,
+  onCommit,
+}: {
+  max: number
+  value: number | undefined
+  onCommit: (next: number) => void
+}) {
+  const committedSliderValue = Math.min(max, Math.max(0, value ?? 0))
+  const [draft, setDraft] = useState(value === undefined ? '' : String(value))
+  const [sliderValue, setSliderValue] = useState(committedSliderValue)
+
+  useEffect(() => {
+    setDraft(value === undefined ? '' : String(value))
+    setSliderValue(committedSliderValue)
+  }, [value, committedSliderValue])
+
+  const commitSliderDraft = () => {
+    const clamped = Math.min(max, Math.max(0, sliderValue))
+    if (clamped !== committedSliderValue) onCommit(clamped)
+  }
+
+  useEffect(() => {
+    if (sliderValue === committedSliderValue) return
+    const id = window.setTimeout(() => {
+      commitSliderDraft()
+    }, SETTINGS_SLIDER_COMMIT_DEBOUNCE_MS)
+    return () => window.clearTimeout(id)
+  }, [sliderValue, committedSliderValue])
+
+  const commitNumberDraft = () => {
+    const n = Number(draft)
+    if (!Number.isFinite(n) || n < 0) {
+      setDraft(value === undefined ? '' : String(value))
+      setSliderValue(committedSliderValue)
+      return
+    }
+    const clamped = Math.min(max, Math.floor(n))
+    if (clamped !== committedSliderValue) onCommit(clamped)
+    setDraft(String(clamped))
+    setSliderValue(clamped)
+  }
+
+  return (
+    <div data-ui="field-group" data-ui-field data-ui-slider-row>
+      <span data-ui="slider-label">Max reasoning tokens</span>
+      <input
+        data-ui="slider"
+        type="range"
+        min={0}
+        max={max}
+        step={1}
+        value={sliderValue}
+        onChange={(e) => {
+          const next = Number(e.target.value)
+          setSliderValue(next)
+          setDraft(String(next))
+        }}
+        onPointerUp={commitSliderDraft}
+        onBlur={commitSliderDraft}
+      />
+      <input
+        data-ui="slider-number"
+        type="number"
+        min={0}
+        max={max}
+        value={draft}
+        placeholder="0"
+        onChange={(e) => {
+          const raw = e.target.value
+          setDraft(raw)
+          if (raw === '') return
+          const n = Number(raw)
+          if (Number.isFinite(n) && n >= 0) {
+            setSliderValue(Math.min(max, Math.floor(n)))
+          }
+        }}
+        onBlur={commitNumberDraft}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') (e.target as HTMLInputElement).blur()
+          if (e.key === 'Escape') {
+            setDraft(value === undefined ? '' : String(value))
+            setSliderValue(committedSliderValue)
+            ;(e.target as HTMLInputElement).blur()
+          }
+        }}
+      />
+    </div>
   )
 }
 

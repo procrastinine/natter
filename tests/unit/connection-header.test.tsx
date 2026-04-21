@@ -63,6 +63,7 @@ afterEach(async () => {
   // unhandled rejection. Cleanup first cancels the subscriptions.
   cleanup()
   vi.restoreAllMocks()
+  await new Promise((resolve) => setTimeout(resolve, 0))
   await resetAll()
 })
 

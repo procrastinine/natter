@@ -1,5 +1,5 @@
 import { useLiveQuery } from 'dexie-react-hooks'
-import { useCallback } from 'react'
+import { createContext, useCallback, type ReactNode } from 'react'
 import { getSetting, setSetting } from '../../store/settings'
 
 export type ShikiThemeChoice = 'github-light' | 'github-dark' | 'tokyo-night' | 'dracula'
@@ -14,6 +14,10 @@ export const DEFAULT_RENDERING_PREFS: RenderingPreferences = {
   shikiDark: 'github-dark',
 }
 
+export const RenderingPreferencesContext = createContext<RenderingPreferences>(
+  DEFAULT_RENDERING_PREFS,
+)
+
 const STORAGE_KEY = 'rendering-preferences'
 
 export async function readRenderingPreferences(): Promise<RenderingPreferences> {
@@ -26,6 +30,15 @@ export async function writeRenderingPreferences(
 ): Promise<void> {
   const current = await readRenderingPreferences()
   await setSetting(STORAGE_KEY, { ...current, ...next })
+}
+
+export function RenderingPreferencesProvider({ children }: { children: ReactNode }) {
+  const prefs = useLiveQuery(readRenderingPreferences, [], DEFAULT_RENDERING_PREFS)
+  return (
+    <RenderingPreferencesContext.Provider value={prefs}>
+      {children}
+    </RenderingPreferencesContext.Provider>
+  )
 }
 
 export function RenderingSettings() {

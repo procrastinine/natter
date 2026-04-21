@@ -8,7 +8,6 @@ import {
   useRef,
   useState,
 } from 'react'
-import { groupByParent } from '../../core/active-path'
 import type { EffectiveCapability } from '../../core/capabilities'
 import { normalizeReasoningDetails } from '../../core/reasoning'
 import { detectStaleReasoning, staleReasoningBannerText } from '../../core/stale-reasoning'
@@ -34,7 +33,9 @@ import { ReasoningBlock } from './ReasoningBlock'
 export interface MessageProps {
   chatId: ChatId
   message: MessageRow
-  messages: readonly MessageRow[]
+  branchMessages?: readonly MessageRow[]
+  hasAnyReasoningDetails: boolean
+  hasSiblingVariants: boolean
   cursor: CursorMap
   streaming?: boolean
   hasConnection: boolean
@@ -56,12 +57,16 @@ export interface MessageProps {
   excludedFromContext?: boolean
   // Structural op handlers. Threaded from the list so `<Message>` can stay
   // presentational except for its own edit-swap state.
-  onEditInPlace: (text: string, reasoning?: ReasoningDetail[]) => Promise<void>
-  onEditAndSend?: (text: string) => Promise<void>
-  onRegenerate?: () => Promise<void>
-  onContinue?: () => Promise<void>
-  onForkChat?: () => Promise<void>
-  onInsert?: (slot: InsertSlot) => void
+  onEditInPlace: (
+    message: MessageRow,
+    text: string,
+    reasoning?: ReasoningDetail[],
+  ) => Promise<void>
+  onEditAndSend?: (message: MessageRow, text: string) => Promise<void>
+  onRegenerate?: (message: MessageRow) => Promise<void>
+  onContinue?: (message: MessageRow) => Promise<void>
+  onForkChat?: (message: MessageRow) => Promise<void>
+  onInsert?: (message: MessageRow, slot: InsertSlot) => void
 }
 
 // Memoized — the markdown render path (Streamdown + Shiki + KaTeX) is
@@ -79,7 +84,9 @@ export const Message = memo(
   },
   (prev, next) =>
     prev.message === next.message &&
-    prev.messages === next.messages &&
+    prev.branchMessages === next.branchMessages &&
+    prev.hasAnyReasoningDetails === next.hasAnyReasoningDetails &&
+    prev.hasSiblingVariants === next.hasSiblingVariants &&
     prev.cursor === next.cursor &&
     prev.streaming === next.streaming &&
     prev.hasConnection === next.hasConnection &&
@@ -98,7 +105,9 @@ export const Message = memo(
 function MessageInner({
   chatId,
   message,
-  messages,
+  branchMessages,
+  hasAnyReasoningDetails,
+  hasSiblingVariants,
   cursor,
   streaming,
   hasConnection,
@@ -150,8 +159,8 @@ function MessageInner({
   const canSwitchToResponses = Boolean(onRegenerate && hasConnection)
   const handleSwitchToResponses = useCallback(async () => {
     await updateChatSettings(chatId, { api: 'responses' })
-    if (onRegenerate) await onRegenerate()
-  }, [chatId, onRegenerate])
+    if (onRegenerate) await onRegenerate(message)
+  }, [chatId, message, onRegenerate])
 
   // Stale-reasoning detection. When a fresh assistant error matches the
   // "preserved reasoning got rejected" pattern, push a banner with actions
@@ -163,17 +172,14 @@ function MessageInner({
   const dismissBanner = useToastStore((s) => s.dismissBanner)
   const staleProvider = useMemo(() => {
     if (!error) return null
-    const hadReasoning =
-      (message.reasoningDetails?.length ?? 0) > 0 ||
-      messages.some((m) => m.id !== message.id && (m.reasoningDetails?.length ?? 0) > 0)
     return detectStaleReasoning(
       {
         message: error.message,
         ...(error.statusCode !== undefined ? { statusCode: error.statusCode } : {}),
       },
-      { hadReasoningDetails: hadReasoning },
+      { hadReasoningDetails: hasAnyReasoningDetails },
     )
-  }, [error, message.reasoningDetails, message.id, messages])
+  }, [error, hasAnyReasoningDetails])
   const handleRetryWithoutReasoning = useCallback(async () => {
     await updateChatSettings(chatId, {
       reasoning: {
@@ -183,8 +189,8 @@ function MessageInner({
         include: { encrypted: false, summary: false, text: false },
       },
     })
-    if (onRegenerate) await onRegenerate()
-  }, [chatId, onRegenerate])
+    if (onRegenerate) await onRegenerate(message)
+  }, [chatId, message, onRegenerate])
   const handleCopyError = useCallback(() => {
     if (!error) return
     const payload = JSON.stringify(
@@ -246,10 +252,10 @@ function MessageInner({
 
   const handleSave = useCallback(
     async (text: string, reasoning?: ReasoningDetail[]) => {
-      await onEditInPlace(text, reasoning)
+      await onEditInPlace(message, text, reasoning)
       setEditing(false)
     },
-    [onEditInPlace],
+    [message, onEditInPlace],
   )
   // Per-block hide toggle. `reasoning` is the normalized view, so indices
   // here map 1:1 to the stored list for clean data (post-Phase-11 fix);
@@ -260,20 +266,18 @@ function MessageInner({
       const next = reasoning.map((d, i) =>
         i === detailIndex ? { ...d, hidden: !d.hidden } : d,
       )
-      void onEditInPlace(text, next)
+      void onEditInPlace(message, text, next)
     },
-    [reasoning, text, onEditInPlace],
+    [message, reasoning, text, onEditInPlace],
   )
   const handleSaveAndSend = useCallback(
     async (text: string) => {
       if (!onEditAndSend) return
-      await onEditAndSend(text)
+      await onEditAndSend(message, text)
       setEditing(false)
     },
-    [onEditAndSend],
+    [message, onEditAndSend],
   )
-  const byParent = groupByParent(messages)
-  const siblings = (byParent.get(message.parentId) ?? []).filter((m) => !m.deleted)
   const editTreeMode = useUiStore((s) => s.editTreeMode)
   const collapseEnabled = !editing && collapseProfile.modes.length > 1
   const cycleCollapse = useCallback(() => {
@@ -281,6 +285,25 @@ function MessageInner({
     manualCollapseRef.current = true
     setCollapseMode((prev) => nextCollapseMode(prev, collapseProfile.modes))
   }, [collapseEnabled, collapseProfile.modes])
+  const handleRegenerate = useCallback(() => {
+    if (!onRegenerate) return
+    void onRegenerate(message)
+  }, [message, onRegenerate])
+  const handleContinue = useCallback(() => {
+    if (!onContinue) return
+    void onContinue(message)
+  }, [message, onContinue])
+  const handleForkChat = useCallback(() => {
+    if (!onForkChat) return
+    void onForkChat(message)
+  }, [message, onForkChat])
+  const handleInsert = useCallback(
+    (slot: InsertSlot) => {
+      if (!onInsert) return
+      onInsert(message, slot)
+    },
+    [message, onInsert],
+  )
 
   return (
     <article
@@ -389,7 +412,7 @@ function MessageInner({
               <button
                 type="button"
                 data-ui="message-continue"
-                onClick={() => void onContinue()}
+                onClick={handleContinue}
                 disabled={!hasConnection}
                 title={!hasConnection ? 'Add a connection to continue.' : 'Continue this response'}
               >
@@ -409,8 +432,8 @@ function MessageInner({
         ) : null}
         {null}
         <div data-ui="message-action-row">
-          {siblings.length > 1 ? (
-            <BranchControls chatId={chatId} message={message} messages={messages} />
+          {hasSiblingVariants && branchMessages ? (
+            <BranchControls chatId={chatId} message={message} messages={branchMessages} />
           ) : (
             <span data-ui="message-action-row-spacer" />
           )}
@@ -424,9 +447,9 @@ function MessageInner({
             onBeginEdit={() => setEditing(true)}
             hasConnection={hasConnection}
             {...(roleMismatch ? { roleMismatch: true } : {})}
-            {...(onRegenerate ? { onRegenerate } : {})}
-            {...(onContinue ? { onContinue } : {})}
-            {...(onForkChat ? { onForkChat } : {})}
+            {...(onRegenerate ? { onRegenerate: handleRegenerate } : {})}
+            {...(onContinue ? { onContinue: handleContinue } : {})}
+            {...(onForkChat ? { onForkChat: handleForkChat } : {})}
           />
         </div>
         {editTreeMode ? (
@@ -434,7 +457,7 @@ function MessageInner({
             chatId={chatId}
             cursor={cursor}
             message={message}
-            {...(onInsert ? { onInsert } : {})}
+            {...(onInsert ? { onInsert: handleInsert } : {})}
             {...(roleMismatch ? { roleMismatch: true } : {})}
           />
         ) : null}

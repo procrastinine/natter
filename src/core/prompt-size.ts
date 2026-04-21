@@ -20,6 +20,7 @@
 // reasoning row drops its contribution from the gauge.
 
 import { activePath } from './active-path'
+import { quirksFor } from './quirks'
 import {
   type PromptEstimateOptions,
   estimateReasoningEchoTokens,
@@ -178,6 +179,48 @@ export function estimatePromptSize(input: PromptSizeEstimateInput): PromptSizeEs
     reasoningTokens,
     total: systemTokens + historyTokens + draftTokens + mediaTokens + reasoningTokens,
   }
+}
+
+const EMPTY_FROZEN_MESSAGE_IDS = new Set<string>()
+
+export function promptEstimateInputSignature(
+  input: PromptSizeEstimateInput,
+  frozenMessageIds: ReadonlySet<string> = EMPTY_FROZEN_MESSAGE_IDS,
+): string {
+  return JSON.stringify({
+    systemPrompt: input.systemPrompt,
+    draftText: input.draftText,
+    tokenizer: input.tokenizer,
+    reasoningInclude: input.reasoningInclude ?? null,
+    reasoningPreservationFormat: input.reasoningPreservationFormat ?? null,
+    reasoningExcluded: input.reasoningExcluded ?? false,
+    activePathMessages: input.activePathMessages.map((message) =>
+      frozenMessageIds.has(message.id)
+        ? { id: message.id, frozen: true }
+        : { id: message.id, nodeVersion: message.nodeVersion },
+    ),
+  })
+}
+
+export function estimateSettingsPromptSize(
+  settings: ChatSettings,
+  activePathMessages: Message[],
+  draftText: string,
+  endpointTokenizer: string | null | undefined,
+): PromptSizeEstimate {
+  const quirks = quirksFor(settings.model)
+  const input: PromptSizeEstimateInput = {
+    systemPrompt: settings.systemPrompt,
+    activePathMessages,
+    draftText,
+    tokenizer: tokenizerFromSettings(settings, endpointTokenizer ?? null),
+    reasoningInclude: settings.reasoning.include,
+    reasoningExcluded: settings.reasoning.exclude === true,
+  }
+  if (quirks.reasoningPreservationFormat !== undefined) {
+    input.reasoningPreservationFormat = quirks.reasoningPreservationFormat
+  }
+  return estimatePromptSize(input)
 }
 
 // Sentinel value for `customMaxContext` / `maxCompletionTokens` meaning

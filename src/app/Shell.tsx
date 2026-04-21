@@ -16,6 +16,7 @@ import { resolvePrivacyForSend } from '../core/privacy-request'
 import {
   UNLIMITED_CONTEXT,
   estimatePromptSize,
+  type PromptSizeEstimateInput,
   tokenizerFromSettings,
 } from '../core/prompt-size'
 import { quirksFor } from '../core/quirks'
@@ -24,6 +25,7 @@ import { useBranchUrlSync } from '../hooks/useBranchUrlSync'
 import { recoverOrphans, useChat } from '../hooks/useChat'
 import { useEndpoints } from '../hooks/useEndpoints'
 import { useModels } from '../hooks/useModels'
+import { useStreamStablePromptEstimate } from '../hooks/useStreamStablePromptEstimate'
 import { installChatPreviewMaintainer } from '../store/chat-preview-maintainer'
 import {
   createChat,
@@ -253,6 +255,36 @@ export function Shell() {
   )
   const trailingLeaf = useMemo(() => activePathMemo.at(-1) ?? null, [activePathMemo])
   const trailingUserMessage = trailingLeaf?.role === 'user' ? trailingLeaf : null
+  const streamActivityKey = useStreamStore((s) =>
+    activeChatId
+      ? Object.values(s.activeByStreamId)
+          .filter((stream) => stream.chatId === activeChatId)
+          .map((stream) => (stream.messageId ? `m:${stream.messageId}` : `s:${stream.streamId}`))
+          .sort()
+          .join('|')
+      : '',
+  )
+  const tokenEstimateInput = useMemo<PromptSizeEstimateInput | null>(() => {
+    if (!resolvedActiveChatRow) return null
+    const quirks = quirksFor(resolvedActiveChatRow.settings.model)
+    const input: PromptSizeEstimateInput = {
+      systemPrompt: resolvedActiveChatRow.settings.systemPrompt,
+      activePathMessages: activePathMemo,
+      draftText: '',
+      tokenizer: tokenizerFromSettings(resolvedActiveChatRow.settings, null),
+      reasoningInclude: resolvedActiveChatRow.settings.reasoning.include,
+      reasoningExcluded: resolvedActiveChatRow.settings.reasoning.exclude === true,
+    }
+    if (quirks.reasoningPreservationFormat !== undefined) {
+      input.reasoningPreservationFormat = quirks.reasoningPreservationFormat
+    }
+    return input
+  }, [resolvedActiveChatRow, activePathMemo])
+  const tokenEstimate = useStreamStablePromptEstimate(
+    resolvedActiveChatRow?.id,
+    tokenEstimateInput,
+    streamActivityKey,
+  )
   // Token indicator for the composer. Shares `estimatePromptSize` with
   // the Context tab's gauge, so the number the user sees in the composer
   // matches the Context tab exactly — including the provider-calibrated
@@ -292,21 +324,9 @@ export function Shell() {
       customMaxStored === UNLIMITED_CONTEXT
         ? Number.POSITIVE_INFINITY
         : Math.max(0, (modelCap ?? 0) - maxCompletion)
-    const quirks = quirksFor(resolvedActiveChatRow.settings.model)
-    const estInput: Parameters<typeof estimatePromptSize>[0] = {
-      systemPrompt: resolvedActiveChatRow.settings.systemPrompt,
-      activePathMessages: activePathMemo,
-      draftText: '',
-      tokenizer: tokenizerFromSettings(resolvedActiveChatRow.settings, null),
-      reasoningInclude: resolvedActiveChatRow.settings.reasoning.include,
-      reasoningExcluded: resolvedActiveChatRow.settings.reasoning.exclude === true,
-    }
-    if (quirks.reasoningPreservationFormat !== undefined) {
-      estInput.reasoningPreservationFormat = quirks.reasoningPreservationFormat
-    }
-    const est = estimatePromptSize(estInput)
-    return { used: est.total, budget }
-  }, [resolvedActiveChatRow, activePathMemo, activeCapability])
+    if (!tokenEstimate) return undefined
+    return { used: tokenEstimate.total, budget }
+  }, [resolvedActiveChatRow, activeCapability, tokenEstimate])
   const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() => {
     if (typeof window === 'undefined') return false
     return window.localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === '1'
@@ -728,6 +748,7 @@ export function Shell() {
             >
               <MessageList
                 chatId={activeChatId}
+                chatSettings={resolvedActiveChatRow?.settings ?? cloneDefaultChatSettings()}
                 hasConnection={hasConnection}
                 {...(activeCapability ? { capability: activeCapability } : {})}
               />

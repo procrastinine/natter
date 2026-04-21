@@ -24,6 +24,7 @@ export interface UsePrivacyRoutingResult {
   endpoints: readonly ModelEndpoint[]
   descriptor: EndpointsDescriptor | null
   capability: EffectiveCapability | null
+  modelAvailable: boolean | null
   loading: boolean
   offline: boolean
   error: string | null
@@ -34,14 +35,16 @@ export interface UsePrivacyRoutingResult {
   refresh: () => void
 }
 
-export function usePrivacyRouting(chat: Chat): UsePrivacyRoutingResult {
-  const modelId = chat.settings.model || null
-  const ep = useEndpoints(chat.settings.profileId, modelId, {
-    strict: chat.settings.strictProviderRouting === true,
+export function usePrivacyRouting(chat: Chat | null | undefined): UsePrivacyRoutingResult {
+  const modelId = chat?.settings.model || null
+  const profileId = chat?.settings.profileId ?? null
+  const ep = useEndpoints(profileId, modelId, {
+    strict: chat?.settings.strictProviderRouting === true,
   })
-  const pol = usePrivacyPolicies(chat.settings.profileId, modelId)
+  const pol = usePrivacyPolicies(profileId, modelId)
 
   const filter = useMemo<PrivacyFilterResult | null>(() => {
+    if (!chat) return null
     if (!pol.scrapeApplicable) return null
     if (!modelId) return null
     if (ep.endpoints.length === 0) return null
@@ -51,9 +54,10 @@ export function usePrivacyRouting(chat: Chat): UsePrivacyRoutingResult {
       policies: pol.policies,
       privacy: chat.settings.privacy,
     })
-  }, [pol.scrapeApplicable, pol.policies, modelId, ep.endpoints, chat.settings.privacy])
+  }, [pol.scrapeApplicable, pol.policies, modelId, ep.endpoints, chat?.settings.privacy])
 
   const wire = useMemo<WireProviderPrivacy | null>(() => {
+    if (!chat) return null
     if (!filter) return null
     const prefs = chat.settings.providerPrefs
     const userTouched = prefs?.ignoreOverridesFilter === true
@@ -64,9 +68,9 @@ export function usePrivacyRouting(chat: Chat): UsePrivacyRoutingResult {
     return buildWireProviderPrivacy(filter, chat.settings.privacy, opts)
   }, [
     filter,
-    chat.settings.privacy,
-    chat.settings.providerPrefs?.ignore,
-    chat.settings.providerPrefs?.ignoreOverridesFilter,
+    chat?.settings.privacy,
+    chat?.settings.providerPrefs?.ignore,
+    chat?.settings.providerPrefs?.ignoreOverridesFilter,
   ])
 
   const refresh = useCallback(() => {
@@ -80,6 +84,7 @@ export function usePrivacyRouting(chat: Chat): UsePrivacyRoutingResult {
     endpoints: ep.endpoints,
     descriptor: ep.descriptor,
     capability: ep.capability,
+    modelAvailable: ep.modelAvailable,
     loading: ep.loading || pol.loading,
     offline: ep.offline || pol.offline,
     error: ep.error ?? pol.error,

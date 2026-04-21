@@ -27,11 +27,9 @@ import { activePath } from '../../core/active-path'
 import type { EffectiveCapability } from '../../core/capabilities'
 import {
   UNLIMITED_CONTEXT,
-  estimatePromptSize,
-  resolveContextCap,
-  tokenizerFromSettings,
+  estimateSettingsPromptSize,
+  type PromptSizeEstimate,
 } from '../../core/prompt-size'
-import { quirksFor } from '../../core/quirks'
 import type { Chat } from '../../core/types'
 import { getChatDraft, loadChatMessages, updateChatSettings } from '../../store/chats'
 import { useChatStore } from '../../store/zustand/chatStore'
@@ -40,6 +38,7 @@ export interface ContextPanelProps {
   chat: Chat
   capability: EffectiveCapability | null
   endpointTokenizer: string | null | undefined
+  estimateOverride?: PromptSizeEstimate | null
   // Middle-out is an OpenRouter plugin (`plugins:[{id:'context-compression'}]`);
   // the checkbox only makes sense on an OpenRouter connection.
   showMiddleOut?: boolean
@@ -49,6 +48,7 @@ export function ContextPanel({
   chat,
   capability,
   endpointTokenizer,
+  estimateOverride = null,
   showMiddleOut = false,
 }: ContextPanelProps) {
   const messages = useLiveQuery(() => loadChatMessages(chat.id), [chat.id], [])
@@ -58,22 +58,11 @@ export function ContextPanel({
     [chat.id],
     '',
   )
-  const estimate = useMemo(() => {
+  const localEstimate = useMemo(() => {
     const path = activePath(messages, cursor)
-    const quirks = quirksFor(chat.settings.model)
-    const input: Parameters<typeof estimatePromptSize>[0] = {
-      systemPrompt: chat.settings.systemPrompt,
-      activePathMessages: path,
-      draftText: draft ?? '',
-      tokenizer: tokenizerFromSettings(chat.settings, endpointTokenizer ?? null),
-      reasoningInclude: chat.settings.reasoning.include,
-      reasoningExcluded: chat.settings.reasoning.exclude === true,
-    }
-    if (quirks.reasoningPreservationFormat !== undefined) {
-      input.reasoningPreservationFormat = quirks.reasoningPreservationFormat
-    }
-    return estimatePromptSize(input)
+    return estimateSettingsPromptSize(chat.settings, path, draft ?? '', endpointTokenizer ?? null)
   }, [messages, cursor, chat.settings, draft, endpointTokenizer])
+  const estimate = estimateOverride ?? localEstimate
 
   if (!chat.settings.model) {
     return (
@@ -309,24 +298,44 @@ function NumberSlider({
   unlimitedHint?: string
 }) {
   const isUnlimited = allowUnlimited && value === UNLIMITED_CONTEXT
+  const committedSliderValue = isUnlimited ? max : Math.min(max, Math.max(min, value))
   const [draft, setDraft] = useState(isUnlimited ? '-1' : String(value))
+  const [sliderValue, setSliderValue] = useState(committedSliderValue)
   useEffect(() => {
     setDraft(isUnlimited ? '-1' : String(value))
-  }, [isUnlimited, value])
+    setSliderValue(committedSliderValue)
+  }, [isUnlimited, value, committedSliderValue])
+
+  const commitSliderDraft = () => {
+    const clamped = Math.min(Math.max(sliderValue, min), max)
+    if (clamped !== committedSliderValue) onCommit(clamped)
+  }
+
+  useEffect(() => {
+    if (sliderValue === committedSliderValue) return
+    const id = window.setTimeout(() => {
+      commitSliderDraft()
+    }, SLIDER_COMMIT_DEBOUNCE_MS)
+    return () => window.clearTimeout(id)
+  }, [sliderValue, committedSliderValue])
+
   const commitFromDraft = () => {
     const n = Number(draft)
     if (!Number.isFinite(n)) {
       setDraft(isUnlimited ? '-1' : String(value))
+      setSliderValue(committedSliderValue)
       return
     }
     if (allowUnlimited && n <= UNLIMITED_CONTEXT) {
       if (value !== UNLIMITED_CONTEXT) onCommit(UNLIMITED_CONTEXT)
       setDraft('-1')
+      setSliderValue(max)
       return
     }
     const clamped = Math.min(Math.max(n, min), max)
     if (clamped !== value) onCommit(clamped)
     setDraft(String(clamped))
+    setSliderValue(clamped)
   }
   // Step of 1 guarantees the slider hits both endpoints. Previous
   // implementation used `floor((max-min)/1000)` which left the top ~step
@@ -349,8 +358,14 @@ function NumberSlider({
         // Slider doesn't participate in the -1 sentinel: park it at `max`
         // when unlimited so the track stays usable (nudging the slider
         // exits unlimited mode via onChange → commit below).
-        value={isUnlimited ? max : Math.min(max, Math.max(min, value))}
-        onChange={(e) => onCommit(Number(e.target.value))}
+        value={sliderValue}
+        onChange={(e) => {
+          const next = Number(e.target.value)
+          setSliderValue(next)
+          setDraft(String(next))
+        }}
+        onPointerUp={commitSliderDraft}
+        onBlur={commitSliderDraft}
         {...(isUnlimited ? { 'data-unlimited': 'true' } : {})}
       />
       <input
@@ -375,6 +390,8 @@ function NumberSlider({
     </div>
   )
 }
+
+const SLIDER_COMMIT_DEBOUNCE_MS = 200
 
 function InfoHintSpan({ text }: { text: string }) {
   return (

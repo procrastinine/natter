@@ -77,3 +77,32 @@ describe('ParamForm verbosity reset', () => {
     })
   })
 })
+
+describe('ParamForm reasoning budget persistence', () => {
+  it('does not persist max reasoning tokens on every drag tick, only after the value settles', async () => {
+    const settings = cloneDefaultChatSettings()
+    settings.model = 'openai/gpt-5.4-nano'
+    settings.reasoning = { ...settings.reasoning, mode: 'budget', maxTokens: 64 }
+    const chat = await createChat({ settings })
+    const capability = effectiveCapabilityFromEndpoints(settings.model, [
+      makeEndpoint({
+        supported_parameters: ['reasoning', 'max_tokens'],
+        max_completion_tokens: 32000,
+      }),
+    ])
+    const { container } = render(<ParamForm chat={chat} capability={capability} />)
+
+    const slider = container.querySelector<HTMLInputElement>(
+      '[data-ui-section="reasoning"] [data-ui="slider"]',
+    )
+    expect(slider).toBeTruthy()
+    fireEvent.change(slider as HTMLInputElement, { target: { value: '2048' } })
+
+    expect((await getChat(chat.id))?.settings.reasoning.maxTokens).toBe(64)
+
+    await new Promise((resolve) => setTimeout(resolve, 250))
+    await waitFor(async () => {
+      expect((await getChat(chat.id))?.settings.reasoning.maxTokens).toBe(2048)
+    })
+  })
+})

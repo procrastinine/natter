@@ -7,6 +7,7 @@ import { computeBranchTitle, forkChatFromMessage } from '../../core/chat-fork'
 import { swipe } from '../../core/messages'
 import type {
   ChatId,
+  ChatSettings,
   CursorMap,
   MessageId,
   MessageRole,
@@ -32,6 +33,7 @@ import type { InsertSlot } from './MessageActions'
 
 export interface MessageListProps {
   chatId: ChatId
+  chatSettings: ChatSettings
   hasConnection: boolean
   capability?: EffectiveCapability
 }
@@ -61,18 +63,32 @@ function oppositeRole(role: MessageRole): MessageRole {
 // markdown-heavy children.
 export const MessageList = memo(function MessageList({
   chatId,
+  chatSettings,
   hasConnection,
   capability,
 }: MessageListProps) {
-  const messages = useLiveQuery(() => loadChatMessages(chatId), [chatId], [])
+  const liveMessages = useLiveQuery(() => loadChatMessages(chatId), [chatId], [])
+  const messages = useStableMessageRows(liveMessages ?? [])
   const cursor = useChatStore((state) => state.cursors[chatId] ?? EMPTY_CURSOR)
   // Tree indices are O(N) over the message set — memoize so swipes /
   // keyboard shortcuts (§10.6.1) don't rebuild them per keystroke. `byId`
   // and `byParent` only change when the live-query refires with a new
   // message array; `path` additionally depends on the cursor.
-  const byId = useMemo(() => indexById(messages ?? []), [messages])
-  const byParent = useMemo(() => groupByParent(messages ?? []), [messages])
-  const path = useMemo(() => activePath(messages ?? [], cursor), [messages, cursor])
+  const byId = useMemo(() => indexById(messages), [messages])
+  const byParent = useMemo(() => groupByParent(messages), [messages])
+  const liveSiblingsByParent = useMemo(() => {
+    const live = new Map<MessageId | null, MessageRow[]>()
+    for (const [parentId, kids] of byParent) {
+      const kept = kids.filter((kid) => !kid.deleted)
+      if (kept.length > 0) live.set(parentId, kept)
+    }
+    return live
+  }, [byParent])
+  const path = useMemo(() => activePath(messages, cursor), [messages, cursor])
+  const hasAnyReasoningDetails = useMemo(
+    () => messages.some((m) => (m.reasoningDetails?.length ?? 0) > 0),
+    [messages],
+  )
   const { sendFrom } = useChat()
   const pushToast = useToastStore((s) => s.push)
   const [insertTarget, setInsertTarget] = useState<InsertTarget | null>(null)
@@ -199,15 +215,10 @@ export const MessageList = memo(function MessageList({
   //                      case naturally: if the chat ends on user, we
   //                      seed an assistant; if it ends on assistant, we
   //                      seed a user.
-  const openInsert = useCallback(
-    (messageId: MessageId, slot: InsertSlot) => {
-      const target = (messages ?? []).find((m) => m.id === messageId)
-      if (!target) return
-      const defaultRole = slot === 'sibling' ? target.role : oppositeRole(target.role)
-      setInsertTarget({ messageId, slot, defaultRole })
-    },
-    [messages],
-  )
+  const openInsert = useCallback((target: MessageRow, slot: InsertSlot) => {
+    const defaultRole = slot === 'sibling' ? target.role : oppositeRole(target.role)
+    setInsertTarget({ messageId: target.id, slot, defaultRole })
+  }, [])
 
   // Keyboard affordances per §10.6 / §10.14. `[` / `]` swipe variants,
   // `⇧⌘R` regenerates the focused assistant. Ignored while typing in a
@@ -227,7 +238,7 @@ export const MessageList = memo(function MessageList({
         const direction = e.key === '[' ? -1 : 1
         const base = useChatStore.getState().getCursor(chatId) ?? {}
         const { cursorUpdates } = swipe({
-          messages: messages ?? [],
+          messages,
           targetId: focusedId,
           direction,
           cursor: base,
@@ -261,11 +272,9 @@ export const MessageList = memo(function MessageList({
     return set
   }, [path])
 
-  const chatRow = useLiveQuery(() => getChat(chatId), [chatId], undefined)
   const excludedIds = useMemo(() => {
-    if (!chatRow) return new Set<MessageId>()
-    return computeExcludedIds(path, chatRow.settings, capability)
-  }, [path, chatRow, capability])
+    return computeExcludedIds(path, chatSettings, capability)
+  }, [path, chatSettings, capability])
 
   return (
     <div data-ui="message-list" aria-live="polite" ref={listRef}>
@@ -277,28 +286,32 @@ export const MessageList = memo(function MessageList({
             key={m.id}
             chatId={chatId}
             message={m}
-            messages={messages ?? []}
+            {...(((liveSiblingsByParent.get(m.parentId)?.length ?? 0) > 1)
+              ? { branchMessages: messages }
+              : {})}
+            hasAnyReasoningDetails={hasAnyReasoningDetails}
+            hasSiblingVariants={(liveSiblingsByParent.get(m.parentId)?.length ?? 0) > 1}
             cursor={cursor}
             hasConnection={hasConnection}
-            onEditInPlace={(text, reasoning) => handleEditInPlace(m, text, reasoning)}
+            onEditInPlace={handleEditInPlace}
             {...(m.role === 'user'
               ? {
-                  onEditAndSend: (text: string) => handleEditAndSend(m, text),
+                  onEditAndSend: handleEditAndSend,
                 }
               : {})}
             {...(m.role === 'assistant'
               ? {
-                  onRegenerate: () => handleRegenerate(m),
+                  onRegenerate: handleRegenerate,
                   // Continue is offered on EVERY assistant — completed,
                   // aborted, or errored — so the user can extend any
                   // response. Reasoning from the parent is preserved:
                   // `continueFromMessage` creates a new CHILD, it does
                   // not mutate the parent's `reasoningDetails`.
-                  onContinue: () => handleContinue(m),
+                  onContinue: handleContinue,
                 }
               : {})}
-            onForkChat={() => handleForkChat(m)}
-            onInsert={(slot: InsertSlot) => openInsert(m.id, slot)}
+            onForkChat={handleForkChat}
+            onInsert={openInsert}
             {...(capability ? { capability } : {})}
             {...(roleMismatchIdsOnPath.has(m.id) ? { roleMismatch: true } : {})}
             {...(showStaleHint ? { staleReplyHint: true } : {})}
@@ -322,6 +335,35 @@ export const MessageList = memo(function MessageList({
     </div>
   )
 })
+
+function useStableMessageRows(messages: readonly MessageRow[]): readonly MessageRow[] {
+  const rowCacheRef = useRef(new Map<MessageId, { nodeVersion: number; message: MessageRow }>())
+  const arrayCacheRef = useRef<readonly MessageRow[]>([])
+
+  return useMemo(() => {
+    const nextCache = new Map<MessageId, { nodeVersion: number; message: MessageRow }>()
+    const nextRows = messages.map((message) => {
+      const cached = rowCacheRef.current.get(message.id)
+      if (cached && cached.nodeVersion === message.nodeVersion) {
+        nextCache.set(message.id, cached)
+        return cached.message
+      }
+      const next = { nodeVersion: message.nodeVersion, message }
+      nextCache.set(message.id, next)
+      return message
+    })
+    rowCacheRef.current = nextCache
+    const prevRows = arrayCacheRef.current
+    if (
+      prevRows.length === nextRows.length &&
+      prevRows.every((message, index) => message === nextRows[index])
+    ) {
+      return prevRows
+    }
+    arrayCacheRef.current = nextRows
+    return nextRows
+  }, [messages])
+}
 
 // Compute which messages would be trimmed out of the next request given
 // the chat's context settings. Uses a chars/4 approximation — the real

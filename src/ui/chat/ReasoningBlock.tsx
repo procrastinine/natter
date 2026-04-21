@@ -142,11 +142,9 @@ export function ReasoningBlock({
                 key={keyFor(entry, 'summary', idx)}
                 kind="summary"
                 hidden={entry.hidden === true}
-                onToggleHidden={
-                  canToggle
-                    ? () => onToggleHidden?.(entry.__detailIndex)
-                    : undefined
-                }
+                {...(canToggle
+                  ? { onToggleHidden: () => onToggleHidden?.(entry.__detailIndex) }
+                  : {})}
               >
                 {textOrFallback(entry.summary, 'Empty summary.')}
               </ReasoningRow>
@@ -160,11 +158,9 @@ export function ReasoningBlock({
                 key={keyFor(entry, 'text', idx)}
                 kind="text"
                 hidden={entry.hidden === true}
-                onToggleHidden={
-                  canToggle
-                    ? () => onToggleHidden?.(entry.__detailIndex)
-                    : undefined
-                }
+                {...(canToggle
+                  ? { onToggleHidden: () => onToggleHidden?.(entry.__detailIndex) }
+                  : {})}
               >
                 {textOrFallback(entry.text, 'Empty reasoning block.')}
               </ReasoningRow>
@@ -178,11 +174,9 @@ export function ReasoningBlock({
                 key={keyFor(entry, 'encrypted', idx)}
                 kind="encrypted"
                 hidden={entry.hidden === true}
-                onToggleHidden={
-                  canToggle
-                    ? () => onToggleHidden?.(entry.__detailIndex)
-                    : undefined
-                }
+                {...(canToggle
+                  ? { onToggleHidden: () => onToggleHidden?.(entry.__detailIndex) }
+                  : {})}
               >
                 <LockIcon />
                 <em>

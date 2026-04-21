@@ -20,10 +20,18 @@
 
 import { useLiveQuery } from 'dexie-react-hooks'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { activePath } from '../../core/active-path'
 import type { Chat, ChatId, ChatPreset, ConnectionKind, ConnectionProfile } from '../../core/types'
 import type { EffectiveCapability } from '../../core/capabilities'
-import { useEndpoints } from '../../hooks/useEndpoints'
-import { getChat, setChatPreset, updateChatSettings } from '../../store/chats'
+import {
+  type PromptSizeEstimateInput,
+  type PromptSizeEstimate,
+  tokenizerFromSettings,
+  UNLIMITED_CONTEXT,
+} from '../../core/prompt-size'
+import { usePrivacyRouting } from '../../hooks/usePrivacyRouting'
+import { useStreamStablePromptEstimate } from '../../hooks/useStreamStablePromptEstimate'
+import { getChat, getChatDraft, loadChatMessages, setChatPreset, updateChatSettings } from '../../store/chats'
 import {
   createPreset,
   deletePreset,
@@ -32,6 +40,8 @@ import {
   updatePreset,
 } from '../../store/presets'
 import { getProfile } from '../../store/profiles'
+import { useChatStore } from '../../store/zustand/chatStore'
+import { useStreamStore } from '../../store/zustand/streamStore'
 import { useToastStore } from '../../store/zustand/toastStore'
 import { CloseIcon } from '../icons/Icon'
 import { CachingPanel } from './CachingPanel'
@@ -52,6 +62,7 @@ export interface ChatModelPanelProps {
 }
 
 type Tab = 'model' | 'context' | 'generation'
+const EMPTY_CURSOR = Object.freeze({}) as Readonly<Record<string, string>>
 
 export function ChatModelPanel({ chatId, chatSnapshot = null, onClose }: ChatModelPanelProps) {
   const liveChat = useLiveQuery(
@@ -93,12 +104,53 @@ export function ChatModelPanel({ chatId, chatSnapshot = null, onClose }: ChatMod
   }, [livePreset])
   const preset =
     livePreset ?? (chat?.presetId ? presetCacheRef.current.get(chat.presetId) : undefined)
-  const { capability, descriptor, modelAvailable } = useEndpoints(
-    chat?.settings.profileId ?? null,
-    chat?.settings.model || null,
-    { strict: chat?.settings.strictProviderRouting === true },
-  )
+  const routing = usePrivacyRouting(chat)
+  const { capability, descriptor, modelAvailable } = routing
   const endpointTokenizer = descriptor?.architecture?.tokenizer ?? null
+  const messages = useLiveQuery(
+    () => (chat ? loadChatMessages(chat.id) : Promise.resolve([])),
+    [chat?.id],
+    [],
+  )
+  const draft = useLiveQuery(
+    () => (chat ? getChatDraft(chat.id).then((row) => row?.text ?? '') : Promise.resolve('')),
+    [chat?.id],
+    '',
+  )
+  const cursor = useChatStore((s) => (chat ? (s.cursors[chat.id] ?? EMPTY_CURSOR) : EMPTY_CURSOR))
+  const streamActivityKey = useStreamStore((s) =>
+    chat
+      ? Object.values(s.activeByStreamId)
+          .filter((stream) => stream.chatId === chat.id)
+          .map((stream) => (stream.messageId ? `m:${stream.messageId}` : `s:${stream.streamId}`))
+          .sort()
+          .join('|')
+      : '',
+  )
+  const promptEstimateInput = useMemo<PromptSizeEstimateInput | null>(() => {
+    if (!chat) return null
+    const path = activePath(messages, cursor)
+    const quirks = capability?.quirks
+    const input: PromptSizeEstimateInput = {
+      systemPrompt: chat.settings.systemPrompt,
+      activePathMessages: path,
+      draftText: draft ?? '',
+      tokenizer: tokenizerFromSettings(chat.settings, endpointTokenizer),
+      reasoningInclude: chat.settings.reasoning.include,
+      reasoningExcluded: chat.settings.reasoning.exclude === true,
+    }
+    if (quirks?.reasoningPreservationFormat !== undefined) {
+      input.reasoningPreservationFormat = quirks.reasoningPreservationFormat
+    }
+    return input
+  }, [chat, messages, cursor, draft, endpointTokenizer, capability?.quirks])
+  const promptEstimate = useStreamStablePromptEstimate(chat?.id, promptEstimateInput, streamActivityKey)
+  const providerNeededTokens = useMemo(() => {
+    if (!chat || !promptEstimate) return undefined
+    const reserveRaw = chat.settings.maxCompletionTokens
+    const reserve = reserveRaw === UNLIMITED_CONTEXT ? 0 : (reserveRaw ?? 0)
+    return promptEstimate.total + reserve
+  }, [chat, promptEstimate])
   const [tab, setTab] = useState<Tab>('model')
 
   // Opening the pane resets to Model & Provider — that's the "cog click =
@@ -202,7 +254,13 @@ export function ChatModelPanel({ chatId, chatSnapshot = null, onClose }: ChatMod
               onPick={handleModelPick}
               onPickForPreset={handleModelPickForPreset}
             />
-            {isOpenRouter ? <ProviderPicker chat={chat} /> : null}
+            {isOpenRouter ? (
+              <ProviderPicker
+                chat={chat}
+                routing={routing}
+                {...(providerNeededTokens !== undefined ? { neededTokens: providerNeededTokens } : {})}
+              />
+            ) : null}
             {isOpenRouter ? <PrivacySection chat={chat} /> : null}
             {profile?.kind === 'llama-server' ? (
               <LlamaServerSection chat={chat} profile={profile} />
@@ -221,6 +279,7 @@ export function ChatModelPanel({ chatId, chatSnapshot = null, onClose }: ChatMod
             chat={chat}
             capability={capability}
             endpointTokenizer={endpointTokenizer}
+            promptEstimate={promptEstimate}
             isOpenRouter={isOpenRouter}
             connectionKind={profile?.kind ?? 'custom'}
           />
@@ -277,7 +336,6 @@ function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | u
         ...target.settings,
         profileId: target.connectionProfileId,
       })
-      await updateChatSettings(chat.id, { ...target.settings, profileId: target.connectionProfileId })
       // presetId isn't inside settings; set via chats store directly
       await setChatPreset(chat.id, target.id)
       closePicker()
@@ -484,12 +542,14 @@ function ContextTab({
   chat,
   capability,
   endpointTokenizer,
+  promptEstimate,
   isOpenRouter,
   connectionKind,
 }: {
   chat: Chat
   capability: EffectiveCapability | null
   endpointTokenizer: string | null
+  promptEstimate: PromptSizeEstimate | null
   isOpenRouter: boolean
   connectionKind: ConnectionKind
 }) {
@@ -499,6 +559,7 @@ function ContextTab({
         chat={chat}
         capability={capability}
         endpointTokenizer={endpointTokenizer}
+        estimateOverride={promptEstimate}
         showMiddleOut={isOpenRouter}
       />
       {capability ? <ReasoningIncludeControls chat={chat} capability={capability} /> : null}

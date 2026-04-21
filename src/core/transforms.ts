@@ -43,6 +43,7 @@ import type {
   EffortLevel,
   Message,
   MessageRole,
+  ReasoningDetail,
   ReasoningFormat,
   SamplingKey,
   TextTemplateConfig,

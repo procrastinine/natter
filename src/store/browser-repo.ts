@@ -43,6 +43,7 @@ interface StoredWorkspaceMeta extends WorkspaceMeta {
 interface ChatMutationState {
   beforeChat: Chat
   beforeMessages?: Message[]
+  afterMessages?: Message[]
   visibleMetaPatch: Partial<Chat>
   hiddenMetaPatch: Partial<Chat>
   summaryPatch: Partial<Chat>
@@ -96,6 +97,22 @@ function changedPatch<Row extends object>(
 
 function cloneMessage(message: Message): Message {
   return structuredClone(message)
+}
+
+function replaceMessage(messages: Message[], nextMessage: Message): void {
+  const next = cloneMessage(nextMessage)
+  const index = messages.findIndex((message) => message.id === next.id)
+  if (index === -1) {
+    messages.push(next)
+    return
+  }
+  messages[index] = next
+}
+
+function removeMessage(messages: Message[], messageId: MessageId): void {
+  const index = messages.findIndex((message) => message.id === messageId)
+  if (index === -1) return
+  messages.splice(index, 1)
 }
 
 function countWords(items: readonly Message[]): number {
@@ -370,15 +387,26 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
           return state
         }
 
-        const ensureBeforeMessages = async (state: ChatMutationState): Promise<Message[]> => {
-          if (state.beforeMessages) return state.beforeMessages
-          const beforeMessages = await tx
+        const ensureMessageSnapshots = async (
+          state: ChatMutationState,
+        ): Promise<{ beforeMessages: Message[]; afterMessages: Message[] }> => {
+          if (state.beforeMessages && state.afterMessages) {
+            return {
+              beforeMessages: state.beforeMessages,
+              afterMessages: state.afterMessages,
+            }
+          }
+          const snapshot = await tx
             .table<Message, MessageId>('messages')
             .where('chatId')
             .equals(state.beforeChat.id)
             .toArray()
-          state.beforeMessages = beforeMessages.map(cloneMessage)
-          return state.beforeMessages
+          state.beforeMessages = snapshot.map(cloneMessage)
+          state.afterMessages = snapshot.map(cloneMessage)
+          return {
+            beforeMessages: state.beforeMessages,
+            afterMessages: state.afterMessages,
+          }
         }
 
         for (const scope of scopes) {
@@ -519,10 +547,11 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
               }
               const changed = stableStringify(existing) !== stableStringify(clone)
               if (!changed) return
-              await ensureBeforeMessages(state)
+              await ensureMessageSnapshots(state)
               clone.nodeVersion = existing.nodeVersion + 1
               await table.put(clone)
               wroteWorkspaceState = true
+              replaceMessage(state.afterMessages ?? [], clone)
               if (moved || deletionChanged) {
                 await bumpChildList(chatId, existing.parentId)
                 if (existing.parentId !== clone.parentId) {
@@ -530,11 +559,12 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
                 }
               }
             } else {
-              await ensureBeforeMessages(state)
+              await ensureMessageSnapshots(state)
               assertScope({ kind: 'children', chatId, parentId: clone.parentId })
               if (clone.nodeVersion === undefined) clone.nodeVersion = 0
               await table.put(clone)
               wroteWorkspaceState = true
+              replaceMessage(state.afterMessages ?? [], clone)
               await bumpChildList(chatId, clone.parentId)
             }
 
@@ -552,10 +582,11 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
             const existing = await table.get(messageId)
             if (!existing) return
             const state = await ensureChatState(existing.chatId)
-            await ensureBeforeMessages(state)
+            await ensureMessageSnapshots(state)
             assertScope({ kind: 'children', chatId: existing.chatId, parentId: existing.parentId })
             await table.delete(messageId)
             wroteWorkspaceState = true
+            removeMessage(state.afterMessages ?? [], messageId)
             await bumpChildList(existing.chatId, existing.parentId)
             state.summaryVersionDirty = true
             state.messageSummaryDirty = true
@@ -656,11 +687,9 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
           }
 
           if (state.messageSummaryDirty) {
-            const afterMessages = await tx
-              .table<Message, MessageId>('messages')
-              .where('chatId')
-              .equals(chatId)
-              .toArray()
+            const afterMessages =
+              state.afterMessages ??
+              (await tx.table<Message, MessageId>('messages').where('chatId').equals(chatId).toArray())
             const nextLeafId = findLastUpdatedLeafId(afterMessages)
             next.lastUpdatedLeafId = nextLeafId
             next.wordCount = countWords(buildBranchMessages(afterMessages, nextLeafId))

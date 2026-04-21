@@ -2,13 +2,12 @@ import { createCjkPlugin } from '@streamdown/cjk'
 import { createCodePlugin } from '@streamdown/code'
 import { createMathPlugin } from '@streamdown/math'
 import { createMermaidPlugin } from '@streamdown/mermaid'
-import { useLiveQuery } from 'dexie-react-hooks'
-import { useMemo } from 'react'
+import { useContext, useMemo } from 'react'
 import type { Components } from 'streamdown'
 import { Streamdown } from 'streamdown'
 import { DEFAULT_IMAGE_ORIGINS, isImageOriginAllowed } from '../../core/image-allowlist'
 import type { ShikiThemeChoice } from '../settings/RenderingSettings'
-import { DEFAULT_RENDERING_PREFS, readRenderingPreferences } from '../settings/RenderingSettings'
+import { RenderingPreferencesContext } from '../settings/RenderingSettings'
 
 export interface MarkdownViewProps {
   content: string
@@ -30,6 +29,8 @@ const cjkPlugin = createCjkPlugin()
 const mermaidPlugin = createMermaidPlugin({
   config: { securityLevel: 'strict' },
 })
+
+const pluginCache = new Map<string, ReturnType<typeof buildPlugins>>()
 
 function isExternalUrl(href: string | undefined): boolean {
   if (!href) return false
@@ -78,20 +79,12 @@ export function MarkdownView({ content, streaming = false, allowImageOrigins }: 
   // `@streamdown/code` (Shiki-backed) and rebuild the plugin whenever
   // the theme tuple changes so the Settings dropdown actually repaints
   // existing blocks.
-  const renderingPrefs = useLiveQuery(readRenderingPreferences, [], DEFAULT_RENDERING_PREFS)
+  const renderingPrefs = useContext(RenderingPreferencesContext)
   const shikiTheme = useMemo<[ShikiThemeChoice, ShikiThemeChoice]>(
     () => [renderingPrefs.shikiLight, renderingPrefs.shikiDark],
     [renderingPrefs.shikiLight, renderingPrefs.shikiDark],
   )
-  const plugins = useMemo(
-    () => ({
-      math: mathPlugin,
-      code: createCodePlugin({ themes: shikiTheme }),
-      cjk: cjkPlugin,
-      mermaid: mermaidPlugin,
-    }),
-    [shikiTheme],
-  )
+  const plugins = useMemo(() => getPlugins(shikiTheme), [shikiTheme])
   return (
     <div data-ui="markdown" data-streaming={streaming ? 'true' : 'false'} data-overflow="full">
       <Streamdown
@@ -104,6 +97,24 @@ export function MarkdownView({ content, streaming = false, allowImageOrigins }: 
       </Streamdown>
     </div>
   )
+}
+
+function buildPlugins(themes: [ShikiThemeChoice, ShikiThemeChoice]) {
+  return {
+    math: mathPlugin,
+    code: createCodePlugin({ themes }),
+    cjk: cjkPlugin,
+    mermaid: mermaidPlugin,
+  }
+}
+
+function getPlugins(themes: [ShikiThemeChoice, ShikiThemeChoice]) {
+  const key = themes.join('::')
+  const cached = pluginCache.get(key)
+  if (cached) return cached
+  const created = buildPlugins(themes)
+  pluginCache.set(key, created)
+  return created
 }
 
 // Pre-process images: any `![alt](url)` or `<img src="url">` pointing at a
