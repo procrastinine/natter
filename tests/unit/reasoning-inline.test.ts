@@ -137,4 +137,90 @@ describe('InlineReasoningLifter', () => {
     const out = drain(lifter, ['<hello>world</hello>'])
     expect(out).toEqual([{ kind: 'text', text: '<hello>world</hello>' }])
   })
+
+  it('auto-detect mode lifts MULTIPLE sequential <think> blocks (not just the first)', () => {
+    // Regression: previously auto-detect locked into 'content' after the
+    // first close, so a model emitting two reasoning sections would leak
+    // the second into the answer lane. After arming on the first block,
+    // the lifter scans for further open tags.
+    const lifter = createInlineReasoningLifter()
+    const out = drain(lifter, [
+      '<think>step 1</think>partial answer<think>step 2</think>final',
+    ])
+    expect(out).toEqual([
+      { kind: 'reasoning', text: 'step 1' },
+      { kind: 'text', text: 'partial answer' },
+      { kind: 'reasoning', text: 'step 2' },
+      { kind: 'text', text: 'final' },
+    ])
+  })
+
+  it('auto-detect mode does NOT lift mid-stream <think> when the stream did not start with one', () => {
+    // Symmetry: arming only happens after a real open at start. A model
+    // that quotes `<think>` mid-answer (e.g. explaining the syntax) keeps
+    // those characters in the content lane verbatim.
+    const lifter = createInlineReasoningLifter()
+    const out = drain(lifter, [
+      'Tags like <think>example</think> are used by DeepSeek.',
+    ])
+    expect(out).toEqual([
+      { kind: 'text', text: 'Tags like <think>example</think> are used by DeepSeek.' },
+    ])
+  })
+
+  it('handles three sibling reasoning blocks in auto-detect (chunked across feeds)', () => {
+    const lifter = createInlineReasoningLifter()
+    const out = drain(lifter, [
+      '<think>a</think>x',
+      '<think>b</think>y',
+      '<think>c</think>z',
+    ])
+    expect(out).toEqual([
+      { kind: 'reasoning', text: 'a' },
+      { kind: 'text', text: 'x' },
+      { kind: 'reasoning', text: 'b' },
+      { kind: 'text', text: 'y' },
+      { kind: 'reasoning', text: 'c' },
+      { kind: 'text', text: 'z' },
+    ])
+  })
+
+  it('empty <think></think> emits nothing for reasoning, content continues', () => {
+    const lifter = createInlineReasoningLifter()
+    const out = drain(lifter, ['<think></think>just an answer'])
+    expect(out).toEqual([{ kind: 'text', text: 'just an answer' }])
+  })
+
+  it('nested-looking tags: first </think> closes the outer block', () => {
+    // The lifter does NOT recurse on nested opens — first `</think>` ends
+    // the block. The inner `<think>` and trailing text become reasoning;
+    // the orphan `</think>` after the close is plain content.
+    const lifter = createInlineReasoningLifter()
+    const out = drain(lifter, ['<think>outer<think>inner</think>tail</think>done'])
+    expect(out).toEqual([
+      { kind: 'reasoning', text: 'outer<think>inner' },
+      { kind: 'text', text: 'tail</think>done' },
+    ])
+  })
+
+  it('orphan </think> with no preceding open is plain content (auto-detect)', () => {
+    const lifter = createInlineReasoningLifter()
+    const out = drain(lifter, ['answer with stray </think> in it'])
+    expect(out).toEqual([
+      { kind: 'text', text: 'answer with stray </think> in it' },
+    ])
+  })
+
+  it('explicit-mode also handles three sibling blocks (regression guard)', () => {
+    const lifter = createInlineReasoningLifter({ tags: ['think'], autoDetect: false })
+    const out = drain(lifter, ['<think>a</think>x<think>b</think>y<think>c</think>z'])
+    expect(out).toEqual([
+      { kind: 'reasoning', text: 'a' },
+      { kind: 'text', text: 'x' },
+      { kind: 'reasoning', text: 'b' },
+      { kind: 'text', text: 'y' },
+      { kind: 'reasoning', text: 'c' },
+      { kind: 'text', text: 'z' },
+    ])
+  })
 })

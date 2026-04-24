@@ -134,6 +134,16 @@ export interface ReasoningSettings {
   summary?: ReasoningSummary
   /** Authoritative carry-forward control since Phase 11. */
   include: ReasoningInclude
+  /**
+   * Universal-compatibility transport for plaintext reasoning carriers on the
+   * chat-completions route. When true, kept `reasoning.text` / `reasoning.summary`
+   * entries are rewritten into a single `<think>...</think>` block prepended to
+   * the assistant message content INSTEAD of being emitted in
+   * `reasoning_details[]`. `reasoning.encrypted` entries are opaque and ride the
+   * native carrier under `include.encrypted` regardless. Ignored on Responses
+   * and Gemini-native routes (those have structured reasoning channels).
+   */
+  echoAsThinkTags?: boolean
   /** @deprecated Use `include`. Preserved for import/export backcompat only. */
   carryForward?: ReasoningCarryForward
 }

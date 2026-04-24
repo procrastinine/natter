@@ -431,53 +431,11 @@ const REGISTRY: Record<string, QuirksEntry> = {
     emitsEncryptedReasoning: 'never',
   },
 
-  // Inline-tag reasoning (DeepSeek-R1, Qwen3, Gemma) — the stream parser
-  // lifts <think>…</think> into the reasoning lane. These models expose
-  // low/medium/high effort per plan §5.5; the rest of the FULL_EFFORT
-  // superset (none/minimal/xhigh) falls through to high server-side on
-  // most of their endpoints, so we hide those buttons rather than let
-  // users pick a no-op value. No encrypted carrier exists — `unknown` format
-  // means the carry-forward matrix drops encrypted entries silently.
-  // Current open-source / Chinese-lab thinking models (all emit
-  // `reasoning_details[]` with `format: "unknown"` on OpenRouter — no
-  // encrypted carrier). Entries key on the current flagship slug; legacy
-  // siblings (deepseek-r1, deepseek-v3.x, qwen3-next, gemma-3, kimi-k2 plain, glm-4.x,
-  // minimax-m1/m2/m2.5) are intentionally dropped since they're superseded.
-  'deepseek-v4': {
-    reasoningInlineTags: ['think'],
-    allowedEffort: ['high', 'xhigh'],
-    reasoningPreservationFormat: 'unknown',
-  },
-  'qwen3.6': {
-    reasoningInlineTags: ['think'],
-    allowedEffort: ['low', 'medium', 'high'],
-    reasoningPreservationFormat: 'unknown',
-  },
-  'gemma-4': {
-    reasoningInlineTags: ['thought', 'think'],
-    allowedEffort: ['low', 'medium', 'high'],
-    reasoningPreservationFormat: 'unknown',
-  },
-  'kimi-k2.6': {
-    reasoningInlineTags: ['think'],
-    allowedEffort: ['low', 'medium', 'high'],
-    reasoningPreservationFormat: 'unknown',
-  },
-  'glm-5.1': {
-    reasoningInlineTags: ['think'],
-    allowedEffort: ['low', 'medium', 'high'],
-    reasoningPreservationFormat: 'unknown',
-  },
-  'glm-5': {
-    reasoningInlineTags: ['think'],
-    allowedEffort: ['low', 'medium', 'high'],
-    reasoningPreservationFormat: 'unknown',
-  },
-  'minimax-m2.7': {
-    reasoningInlineTags: ['think'],
-    allowedEffort: ['low', 'medium', 'high'],
-    reasoningPreservationFormat: 'unknown',
-  },
+  // OSS / Chinese-lab thinking-model families fall through to a shared
+  // pattern below the registry — one entry per family was just six copies
+  // of the same fields. See `OSS_THINKING_FAMILIES` + the pattern fallback
+  // in `quirksFor`. Override individually here only when a slug deviates
+  // from the family default (e.g. a model that narrows effort differently).
 
   // xAI Grok 4.1 / 4.20 — real encrypted-reasoning carrier (`format:
   // xai-responses-v1`) with both `reasoning.summary` and
@@ -504,6 +462,46 @@ const REGISTRY: Record<string, QuirksEntry> = {
 
 const REGISTRY_KEYS_BY_LENGTH = Object.keys(REGISTRY).sort((a, b) => b.length - a.length)
 
+// OSS / Chinese-lab thinking-model FAMILIES — match by family root only so
+// future versions (`gemma-5`, `kimi-k3`, `qwen-4`, `deepseek-v5`, …) get the
+// same treatment the day they release without anyone touching this file.
+//
+// Behavior these models share:
+//   - emit `<think>…</think>` (or `<thought>…</thought>` for Gemma) inline in
+//     `delta.content` when accessed directly; OpenRouter pre-packages the
+//     same content into `reasoning_details[]` with `format: 'unknown'`.
+//   - no encrypted carry-forward carrier (carry-forward matrix drops
+//     `reasoning.encrypted` entries silently for `format: 'unknown'`).
+//   - effort enum honors low / medium / high; minimal / xhigh / none either
+//     no-op or fall through to high — so we narrow the UI to avoid no-op
+//     buttons. (FULL_EFFORT remains the safe default; this is a UX trim.)
+//
+// The lifter's auto-detect default already covers any *unknown* model that
+// happens to emit `<think>` — listing a family here only narrows the
+// effort UI and pins the inline-tag set explicitly. New families would
+// only need to be added if their tag name differs (Gemma's `<thought>`).
+// Pattern accepts the family name followed by either a separator (`-`, `_`),
+// a version digit / dot (`qwen3.6`, `qwen3`), or end-of-string. Catches every
+// versioning convention these labs ship under one expression.
+const OSS_THINKING_FAMILIES = ['deepseek', 'qwen', 'kimi', 'glm', 'minimax'] as const
+const OSS_THINKING_PATTERN = new RegExp(
+  `^(?:${OSS_THINKING_FAMILIES.join('|')})(?:[-_\\d.]|$)`,
+)
+
+const OSS_THINKING_DEFAULT: QuirksEntry = {
+  reasoningInlineTags: ['think'],
+  allowedEffort: ['low', 'medium', 'high'],
+  reasoningPreservationFormat: 'unknown',
+}
+
+// Gemma uses `<thought>` historically but accept both for safety against
+// post-Gemma-4 variants that may switch.
+const GEMMA_DEFAULT: QuirksEntry = {
+  ...OSS_THINKING_DEFAULT,
+  reasoningInlineTags: ['thought', 'think'],
+}
+const GEMMA_PATTERN = /^gemma(?:[-_\d.]|$)/
+
 export function quirksFor(modelId: string): QuirksEntry {
   const normalized = canonicalCompatModelId(modelId)
   for (const key of REGISTRY_KEYS_BY_LENGTH) {
@@ -513,6 +511,8 @@ export function quirksFor(modelId: string): QuirksEntry {
       if (entry) return entry
     }
   }
+  if (GEMMA_PATTERN.test(normalized)) return GEMMA_DEFAULT
+  if (OSS_THINKING_PATTERN.test(normalized)) return OSS_THINKING_DEFAULT
   return {}
 }
 

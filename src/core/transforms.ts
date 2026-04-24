@@ -237,13 +237,26 @@ function serializeChatMessage(
         // Fall back to wrapping summary+text in a single `<think>…</think>`
         // block prepended to assistant content. Models condition on it the
         // way they'd condition on their own prior inline reasoning.
-        const useThinkFallback =
-          !opts.reasoningPreservationFormat || opts.reasoningPreservationFormat === 'unknown'
+        //
+        // The user can also force this universal-compat mode via the
+        // `reasoning.echoAsThinkTags` checkbox even when the route HAS a
+        // native carrier — handy for OpenAI-compat shims, custom endpoints,
+        // and homogenizing multi-provider chats. Opaque carriers (encrypted
+        // blobs and Anthropic signed-text) keep riding `reasoning_details[]`
+        // either way; only plaintext text/summary becomes `<think>` content.
+        const knownFormat =
+          opts.reasoningPreservationFormat && opts.reasoningPreservationFormat !== 'unknown'
+        const useThinkFallback = !knownFormat || settings.reasoning.echoAsThinkTags === true
         if (useThinkFallback) {
-          const thinkBlock = wrapReasoningAsThinkTag(kept)
+          const plainKept = kept.filter((d) => !isOpaqueReasoningCarrier(d))
+          const opaqueKept = kept.filter((d) => isOpaqueReasoningCarrier(d))
+          const thinkBlock = wrapReasoningAsThinkTag(plainKept)
           if (thinkBlock) {
             const existing = typeof entry.content === 'string' ? entry.content : ''
             entry.content = existing.length > 0 ? `${thinkBlock}\n\n${existing}` : thinkBlock
+          }
+          if (opaqueKept.length > 0) {
+            entry.reasoning_details = opaqueKept.map(stripTmpReasoningId)
           }
         } else {
           entry.reasoning_details = kept.map(stripTmpReasoningId)
@@ -255,6 +268,20 @@ function serializeChatMessage(
     }
   }
   return entry
+}
+
+// `reasoning.encrypted` is opaque by definition. Anthropic's signed-text
+// carrier ALSO rides as opaque — `reasoning.text` with a non-empty
+// `.signature` is Anthropic's signed thinking block; the signature is what
+// the next turn validates, so we never tag-ify the text out from under it.
+// Used to split kept entries into "wrap as <think>" vs "keep on native
+// reasoning_details[]" buckets when the universal-compat path is active.
+function isOpaqueReasoningCarrier(d: ReasoningDetail): boolean {
+  if (d.type === 'reasoning.encrypted') return true
+  if (d.type === 'reasoning.text' && typeof d.signature === 'string' && d.signature.length > 0) {
+    return true
+  }
+  return false
 }
 
 // Assemble a single `<think>…</think>` block from summary + text entries
@@ -1273,28 +1300,37 @@ function messageToGeminiContents(
 
   if (message.role === 'assistant') {
     const parts: GeminiPart[] = []
-    // 1. Visible thought summary — only when `include.summary` is true.
-    //    Maps `reasoning.summary` details to `{text, thought: true}` parts.
-    if (message.reasoningDetails && include.summary) {
-      for (const d of message.reasoningDetails) {
-        if (d.type !== 'reasoning.summary') continue
-        if (d.id?.startsWith('tool_')) continue
-        if (typeof d.summary !== 'string' || d.summary.length === 0) continue
-        parts.push({ text: d.summary, thought: true })
+    // Visible thought summary + plaintext reasoning, coalesced into ONE
+    // `{text, thought: true}` part. Earlier passes pushed one part per
+    // `reasoning.summary` / `reasoning.text` entry, which produced a noisy
+    // multi-part echo when Gemini's stream had emitted N summary parts (one
+    // per `summaryIndex`) or when OR-repackaged Gemini split summary into
+    // multiple `reasoning.text` chunks. Concatenating into a single part
+    // matches Gemini's own typical "one thought, then answer" turn shape and
+    // mirrors the chat-completions wrapper's single-`<think>` behavior.
+    if (message.reasoningDetails && (include.summary || include.text)) {
+      const thoughtPieces: string[] = []
+      if (include.summary) {
+        for (const d of message.reasoningDetails) {
+          if (d.type !== 'reasoning.summary') continue
+          if (d.id?.startsWith('tool_')) continue
+          if (typeof d.summary !== 'string' || d.summary.length === 0) continue
+          thoughtPieces.push(d.summary)
+        }
       }
-    }
-    // 2. Visible plaintext reasoning — `include.text`. OpenRouter-repackaged
-    //    Gemini summary arrives as reasoning.text with format=google-gemini-v1.
-    //    Also emit those as thought:true parts.
-    if (message.reasoningDetails && include.text) {
-      for (const d of message.reasoningDetails) {
-        if (d.type !== 'reasoning.text') continue
-        if (d.id?.startsWith('tool_')) continue
-        if (typeof d.text !== 'string' || d.text.length === 0) continue
-        // Skip entries that are Anthropic-signature carriers — they're not
-        // plaintext reasoning, they ride as encrypted.
-        if (typeof d.signature === 'string' && d.signature.length > 0) continue
-        parts.push({ text: d.text, thought: true })
+      if (include.text) {
+        for (const d of message.reasoningDetails) {
+          if (d.type !== 'reasoning.text') continue
+          if (d.id?.startsWith('tool_')) continue
+          if (typeof d.text !== 'string' || d.text.length === 0) continue
+          // Skip entries that are Anthropic-signature carriers — they're not
+          // plaintext reasoning, they ride as encrypted.
+          if (typeof d.signature === 'string' && d.signature.length > 0) continue
+          thoughtPieces.push(d.text)
+        }
+      }
+      if (thoughtPieces.length > 0) {
+        parts.push({ text: thoughtPieces.join('\n\n'), thought: true })
       }
     }
 

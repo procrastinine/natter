@@ -75,6 +75,7 @@ export const DEFAULT_CHAT_SETTINGS: Readonly<ChatSettings> = Object.freeze({
       summary: false,
       text: false,
     }),
+    echoAsThinkTags: false,
   }),
   contextStrategy: Object.freeze<ChatSettings['contextStrategy']>({
     kind: 'sliding_window',

@@ -622,6 +622,13 @@ export function ReasoningIncludeControls({
     void updateChatSettings(chat.id, {
       reasoning: { ...r, include: { ...include, ...patch } },
     })
+  const echoAsThink = r.echoAsThinkTags === true
+  // Send-as-think is a chat-completions-only transport for plaintext carriers.
+  // Disable when there's nothing plaintext to wrap (both summary + text off).
+  const sendAsThinkDisabled = !include.summary && !include.text
+  const sendAsThinkTitle = sendAsThinkDisabled
+    ? 'No plaintext reasoning is being included — check Visible summary or Visible text first.'
+    : 'When on, kept summary + text are sent as a <think>…</think> block prepended to the assistant message body instead of reasoning_details. Encrypted carriers ride the native channel either way. Ignored on Responses + Gemini-native routes.'
   return (
     <section data-ui="settings-section" data-ui-section="reasoning-include">
       <h3>Include in next turn</h3>
@@ -652,6 +659,19 @@ export function ReasoningIncludeControls({
               onChange={(e) => updateInclude({ text: e.target.checked })}
             />
             <span>Visible text</span>
+          </label>
+          <label data-ui="reasoning-checkbox" title={sendAsThinkTitle}>
+            <input
+              type="checkbox"
+              checked={echoAsThink}
+              disabled={sendAsThinkDisabled}
+              onChange={(e) =>
+                void updateChatSettings(chat.id, {
+                  reasoning: { ...r, echoAsThinkTags: e.target.checked },
+                })
+              }
+            />
+            <span>Send as &lt;think&gt; tags</span>
           </label>
         </div>
       </div>

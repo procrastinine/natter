@@ -938,11 +938,18 @@ export async function* splitGeminiStream(
 ): AsyncGenerator<StreamLaneEvent> {
   let metaEmittedModel: string | undefined
   let metaEmittedGenerationId: string | undefined
-  // Gemini native has no wire-level `summary_index`; each `thought:true`
-  // part is a distinct summary. Assign a monotonically increasing counter
-  // so the accumulator can key each part into its own reasoning.summary
-  // row. Scoped to the whole stream (not per-frame) because Gemini may
-  // split a single response across multiple SSE frames.
+  // Gemini emits each thinking section as its own atomic `thought: true`
+  // part (one per SSE frame; verified against gemini-3-pro-preview live
+  // streams — sections like "**Defining the Core Idea**…" and
+  // "**Confirming the Transformation**…" arrive as separate parts).
+  //
+  // We coalesce them into a SINGLE `reasoning.summary` row so the UI shows
+  // one continuous Summary block, not one row per section. The shared
+  // `summaryIndex: 0` makes the accumulator (`putReasoningDetail` + the
+  // synthetic id `summary#0`) merge each part into the same row via
+  // `mergeReasoningText`. We track section count to prepend a `\n\n`
+  // separator on non-first parts so the joined text has clean breaks
+  // even on synthetic / probe inputs that don't already end with newlines.
   const counter = { summary: 0 }
 
   for await (const chunk of source) {
@@ -1050,11 +1057,16 @@ function* splitGeminiPart(
   if ('text' in part && typeof part.text === 'string') {
     if (part.text.length === 0) return
     if ((part as { thought?: boolean }).thought === true) {
+      // Coalesce all sections into one summary row (summaryIndex: 0). For
+      // sections after the first, prepend `\n\n` so the merged text has
+      // visible section breaks regardless of what the wire emitted.
+      const isFirst = counter.summary === 0
       yield {
         lane: 'reasoning',
-        summaryDelta: part.text,
-        summaryIndex: counter.summary++,
+        summaryDelta: isFirst ? part.text : `\n\n${part.text}`,
+        summaryIndex: 0,
       }
+      counter.summary += 1
     } else {
       yield { lane: 'text', text: part.text }
     }

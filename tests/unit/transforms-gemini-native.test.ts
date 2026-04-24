@@ -363,6 +363,75 @@ describe('toGeminiNative — reasoning echo (thoughtSignature on LAST part)', ()
     const modelTurn = wire.contents[1]!
     expect(modelTurn.parts[0]).toEqual({ text: 'Summary of thinking', thought: true })
   })
+
+  it('coalesces multiple reasoning.summary entries into ONE thought part', () => {
+    // Regression: Gemini's stream emits one reasoning.summary per
+    // `summary_index`. The earlier transform pushed N parts, producing a
+    // noisy multi-block echo on the next turn. Single-part is the expected
+    // shape — matches Gemini's own typical "one thought, then answer".
+    const details: ReasoningDetail[] = [
+      { type: 'reasoning.summary', id: 'r_s_0', summary: 'Step one.', index: 0 },
+      { type: 'reasoning.summary', id: 'r_s_1', summary: 'Step two.', index: 1 },
+      { type: 'reasoning.summary', id: 'r_s_2', summary: 'Step three.', index: 2 },
+    ]
+    const path: Message[] = [
+      user('u1', 'q'),
+      assistant('a1', 'answer', { reasoningDetails: details }),
+    ]
+    const { wire } = toGeminiNative(
+      settings({
+        reasoning: {
+          mode: 'enabled',
+          effort: 'low',
+          exclude: false,
+          summary: 'auto',
+          include: { encrypted: false, summary: true, text: false } as ReasoningInclude,
+        },
+      }),
+      path,
+    )
+    const modelTurn = wire.contents[1]!
+    const thoughtParts = modelTurn.parts.filter(
+      (p): p is { text: string; thought: true } =>
+        'text' in p && (p as { thought?: boolean }).thought === true,
+    )
+    expect(thoughtParts).toHaveLength(1)
+    expect(thoughtParts[0]?.text).toBe('Step one.\n\nStep two.\n\nStep three.')
+    expect(modelTurn.parts).toEqual([
+      { text: 'Step one.\n\nStep two.\n\nStep three.', thought: true },
+      { text: 'answer' },
+    ])
+  })
+
+  it('coalesces summary + plaintext text into ONE thought part when both include flags on', () => {
+    const details: ReasoningDetail[] = [
+      { type: 'reasoning.summary', id: 'r_s', summary: 'Brief summary.' },
+      { type: 'reasoning.text', id: 'r_t', text: 'Full chain of thought.' },
+    ]
+    const path: Message[] = [
+      user('u1', 'q'),
+      assistant('a1', 'answer', { reasoningDetails: details }),
+    ]
+    const { wire } = toGeminiNative(
+      settings({
+        reasoning: {
+          mode: 'enabled',
+          effort: 'low',
+          exclude: false,
+          summary: 'auto',
+          include: { encrypted: false, summary: true, text: true } as ReasoningInclude,
+        },
+      }),
+      path,
+    )
+    const modelTurn = wire.contents[1]!
+    const thoughtParts = modelTurn.parts.filter(
+      (p): p is { text: string; thought: true } =>
+        'text' in p && (p as { thought?: boolean }).thought === true,
+    )
+    expect(thoughtParts).toHaveLength(1)
+    expect(thoughtParts[0]?.text).toBe('Brief summary.\n\nFull chain of thought.')
+  })
 })
 
 describe('toGeminiNative — tool calls + tool results', () => {

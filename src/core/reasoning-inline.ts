@@ -66,6 +66,14 @@ export function createInlineReasoningLifter(
   let mode: Mode = disabled ? 'content' : autoDetect ? 'undecided' : 'content'
   let buffer = ''
   let activeTag: string | null = null
+  // Flips to `true` after the first auto-detected `<think>` open. Once the
+  // lifter has confirmed this model emits inline tags, subsequent open tags
+  // (after a close) should ALSO lift — without this flag, multi-block
+  // reasoning models like
+  // `<think>step 1</think>partial<think>step 2</think>final`
+  // would only lift the first block and leak the second into the content
+  // lane verbatim. Behavior collapses to the explicit-mode scan once armed.
+  let armedForMultiBlock = !autoDetect
 
   const maxOpenTagLen = Math.max(...tags.map((t) => t.length + 2), 2)
 
@@ -82,8 +90,10 @@ export function createInlineReasoningLifter(
         return out
       }
       if (mode === 'content') {
-        // Look for an open tag mid-content (lifter is explicit / non-auto).
-        if (!autoDetect) {
+        // Scan for a subsequent open tag when (a) this is explicit-mode,
+        // OR (b) we've already lifted at least one block in auto-detect
+        // mode (multi-block reasoning model — see `armedForMultiBlock`).
+        if (armedForMultiBlock) {
           const openIdx = findOpenTag(buffer, tags)
           if (openIdx.index >= 0) {
             if (openIdx.index > 0) {
@@ -118,6 +128,9 @@ export function createInlineReasoningLifter(
           buffer = buffer.slice(closeIdx + closeTag.length)
           mode = 'content'
           activeTag = null
+          // Confirm: this model uses inline tags. Any subsequent open tag
+          // anywhere in the stream should also lift.
+          armedForMultiBlock = true
           continue
         }
         const safeLen = findSafeReasoningPrefixLen(buffer, closeTag)

@@ -78,11 +78,17 @@ describe('splitGeminiStream — probe 8 (native stream w/ thoughtSignature)', ()
   })
 })
 
-describe('splitGeminiStream — assigns a per-thought-part summaryIndex', () => {
-  it('each thought:true part gets a monotonically increasing summaryIndex', async () => {
-    // Regression: previously every thought part emitted `summaryDelta`
-    // without an index, so the accumulator keyed them all under
-    // `reasoning.summary#0` and later parts overwrote earlier ones in the UI.
+describe('splitGeminiStream — coalesces thought:true parts into one summary row', () => {
+  it('all thought:true parts share summaryIndex: 0 with `\\n\\n` separators', async () => {
+    // Gemini emits each thinking section as its own atomic `thought: true`
+    // part. Earlier behavior assigned each a unique summaryIndex, which
+    // produced one reasoning.summary row per section in storage and one
+    // visual block per section in the UI. The user-facing complaint:
+    // separate paragraphs of the same logical reasoning got rendered as
+    // distinct blocks. Fix: coalesce to ONE row by sharing summaryIndex
+    // across all parts; the accumulator's mergeReasoningText concatenates
+    // them (with the `\n\n` we prepend on non-first parts) into a single
+    // continuous summary.
     const frames: GenerateContentResponseWire[] = [
       {
         candidates: [
@@ -109,7 +115,17 @@ describe('splitGeminiStream — assigns a per-thought-part summaryIndex', () => 
       (l): l is Extract<StreamLaneEvent, { lane: 'reasoning' }> =>
         l.lane === 'reasoning' && l.summaryDelta !== undefined,
     )
-    expect(summaries.map((s) => s.summaryIndex)).toEqual([0, 1, 2])
+    // All parts coalesce into summaryIndex: 0.
+    expect(summaries.map((s) => s.summaryIndex)).toEqual([0, 0, 0])
+    // First emits as-is; subsequent prepend `\n\n` so the merged row has
+    // section breaks even when the wire text didn't include trailing
+    // newlines (real Gemini sections often end with `\n\n\n` already, in
+    // which case the result is just extra blank lines — fine in markdown).
+    expect(summaries.map((s) => s.summaryDelta)).toEqual([
+      'Thought A',
+      '\n\nThought B',
+      '\n\nThought C',
+    ])
   })
 })
 
@@ -159,8 +175,9 @@ describe('splitGeminiStream — both summary + signature in one stream', () => {
     expect(summaries).toHaveLength(2)
     expect(summaries.map((s) => s.summaryDelta)).toEqual([
       '**Thinking step 1**',
-      '**Thinking step 2**',
+      '\n\n**Thinking step 2**',
     ])
+    expect(summaries.every((s) => s.summaryIndex === 0)).toBe(true)
 
     const texts = lanes.filter(
       (l): l is Extract<StreamLaneEvent, { lane: 'text' }> => l.lane === 'text',

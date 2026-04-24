@@ -49,6 +49,7 @@ describe('defaults', () => {
         },
         "profileId": "",
         "reasoning": {
+          "echoAsThinkTags": false,
           "exclude": false,
           "include": {
             "encrypted": true,

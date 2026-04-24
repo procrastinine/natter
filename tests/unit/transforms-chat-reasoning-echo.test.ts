@@ -447,3 +447,144 @@ describe('buildChatMessages / toChatCompletions — reasoning echo', () => {
     expect(echoed).not.toHaveProperty('phase')
   })
 })
+
+describe('echoAsThinkTags — universal-compat transport', () => {
+  function withEchoAsThink(
+    include: ReasoningInclude,
+    echoAsThinkTags: boolean,
+  ): ChatSettings {
+    const s = withInclude(include)
+    s.reasoning = { ...s.reasoning, echoAsThinkTags }
+    return s
+  }
+
+  it('forces <think> wrap on a known-format model when echoAsThinkTags is on', () => {
+    // Anthropic claude-v1 normally rides reasoning_details[]. With the user
+    // opt-in, plaintext text + summary become a single <think>…</think> block
+    // prepended to content.
+    const path: Message[] = [
+      userMessage('u1', 'hi'),
+      assistantWithReasoning('a1', 'reply', [
+        { type: 'reasoning.summary', id: 'r_s', summary: 'brief' },
+        { type: 'reasoning.text', id: 'r_t', text: 'verbose chain' },
+      ]),
+    ]
+    const messages = buildChatMessages(
+      withEchoAsThink({ encrypted: false, summary: true, text: true }, true),
+      path,
+      { reasoningPreservationFormat: 'anthropic-claude-v1' },
+    )
+    const echoed = messages[1] as Record<string, unknown>
+    expect(echoed).not.toHaveProperty('reasoning_details')
+    const content = echoed.content as string
+    expect(content).toMatch(/^<think>[\s\S]*<\/think>\n\nreply$/)
+    expect(content).toContain('Summary: brief')
+    expect(content).toContain('verbose chain')
+  })
+
+  it('keeps opaque encrypted carriers on reasoning_details[] when echoAsThinkTags is on', () => {
+    // Encrypted bytes are opaque — the universal-compat path must keep them
+    // riding the native channel even when text/summary become <think>.
+    const path: Message[] = [
+      userMessage('u1', 'hi'),
+      assistantWithReasoning('a1', 'reply', [
+        { type: 'reasoning.encrypted', id: 'r_e', data: 'blob', format: 'anthropic-claude-v1' },
+        { type: 'reasoning.summary', id: 'r_s', summary: 'brief' },
+      ]),
+    ]
+    const messages = buildChatMessages(
+      withEchoAsThink({ encrypted: true, summary: true, text: false }, true),
+      path,
+      {
+        reasoningPreservationFormat: 'anthropic-claude-v1',
+        acceptsAnthropicRedactedThinking: true,
+      },
+    )
+    const echoed = messages[1] as Record<string, unknown>
+    expect(echoed.reasoning_details).toEqual([
+      { type: 'reasoning.encrypted', id: 'r_e', data: 'blob', format: 'anthropic-claude-v1' },
+    ])
+    expect(echoed.content).toMatch(/<think>[\s\S]*Summary: brief[\s\S]*<\/think>/)
+  })
+
+  it('keeps Anthropic signed-text on reasoning_details[] (signature is opaque) when echoAsThinkTags is on', () => {
+    // reasoning.text with .signature is Anthropic's signed thinking block —
+    // the signature is what the next turn validates, so we never strip it
+    // out by tag-ifying the text.
+    const path: Message[] = [
+      userMessage('u1', 'hi'),
+      assistantWithReasoning('a1', 'reply', [
+        {
+          type: 'reasoning.text',
+          id: 'r_signed',
+          format: 'anthropic-claude-v1',
+          text: 'signed thought',
+          signature: 'sig-bytes',
+        },
+        { type: 'reasoning.text', id: 'r_plain', text: 'plain thought' },
+      ]),
+    ]
+    const messages = buildChatMessages(
+      withEchoAsThink({ encrypted: true, summary: false, text: true }, true),
+      path,
+      { reasoningPreservationFormat: 'anthropic-claude-v1' },
+    )
+    const echoed = messages[1] as Record<string, unknown>
+    expect(echoed.reasoning_details).toEqual([
+      {
+        type: 'reasoning.text',
+        id: 'r_signed',
+        format: 'anthropic-claude-v1',
+        text: 'signed thought',
+        signature: 'sig-bytes',
+      },
+    ])
+    const content = echoed.content as string
+    expect(content).toMatch(/<think>[\s\S]*plain thought[\s\S]*<\/think>/)
+    // Signed text was NOT also wrapped — would have duplicated bytes.
+    expect(content).not.toContain('signed thought')
+  })
+
+  it('with no plaintext to wrap, falls through to the native echo path', () => {
+    const path: Message[] = [
+      userMessage('u1', 'hi'),
+      assistantWithReasoning('a1', 'reply', [
+        { type: 'reasoning.encrypted', id: 'r_e', data: 'blob', format: 'anthropic-claude-v1' },
+      ]),
+    ]
+    const messages = buildChatMessages(
+      withEchoAsThink({ encrypted: true, summary: false, text: false }, true),
+      path,
+      {
+        reasoningPreservationFormat: 'anthropic-claude-v1',
+        acceptsAnthropicRedactedThinking: true,
+      },
+    )
+    const echoed = messages[1] as Record<string, unknown>
+    expect(echoed.content).toBe('reply')
+    expect(echoed.reasoning_details).toEqual([
+      { type: 'reasoning.encrypted', id: 'r_e', data: 'blob', format: 'anthropic-claude-v1' },
+    ])
+  })
+
+  it('echoAsThinkTags off (default) keeps the original native echo behavior', () => {
+    // Regression guard: untouched chats must serialize the same as before
+    // the flag landed.
+    const path: Message[] = [
+      userMessage('u1', 'hi'),
+      assistantWithReasoning('a1', 'reply', [
+        { type: 'reasoning.summary', id: 'r_s', summary: 'brief' },
+      ]),
+    ]
+    const messages = buildChatMessages(
+      withInclude({ encrypted: false, summary: true, text: false }),
+      path,
+      { reasoningPreservationFormat: 'anthropic-claude-v1' },
+    )
+    const echoed = messages[1] as Record<string, unknown>
+    expect(echoed.content).toBe('reply')
+    expect(echoed.reasoning_details).toEqual([
+      { type: 'reasoning.summary', id: 'r_s', summary: 'brief' },
+    ])
+  })
+})

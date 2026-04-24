@@ -731,7 +731,7 @@ describe('sendText — chat-completions streaming', () => {
     expect(encryptedDetail?.format).toBe('google-gemini-v1')
   })
 
-  it('preserves multiple distinct Gemini summary parts arriving at same index', async () => {
+  it('coalesces multiple Gemini summary parts into one row with a separator', async () => {
     // Regression: OR repackages Gemini 3's multi-part thought summaries as
     // `reasoning.text` entries all pinned at `index: 0`. Before the fix,
     // `shareIdentity` matched them by index and the second summary merged
@@ -795,11 +795,14 @@ describe('sendText — chat-completions streaming', () => {
     const summaries = (assistant?.reasoningDetails ?? []).filter(
       (d) => d.type === 'reasoning.summary',
     )
-    expect(summaries).toHaveLength(2)
-    expect(summaries.map((s) => s.type === 'reasoning.summary' && s.summary)).toEqual([
-      'First thought: enumerate options.',
-      'Second thought: pick the best.',
-    ])
+    // Coalesce: both Gemini-family summary parts merge into ONE row with a
+    // `\n\n` separator. The UI renders one continuous Summary block instead
+    // of one block per section. See `findMergeTargetIndex` + `mergeReasoningDetail`
+    // in `core/reasoning.ts`.
+    expect(summaries).toHaveLength(1)
+    expect(summaries[0]?.type === 'reasoning.summary' && summaries[0].summary).toBe(
+      'First thought: enumerate options.\n\nSecond thought: pick the best.',
+    )
   })
 
   it('merges overlapped mirrored reasoning fragments instead of re-appending them', async () => {

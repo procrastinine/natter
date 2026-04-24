@@ -113,23 +113,61 @@ describe('quirks registry', () => {
     expect(allowedEffortFor('x-ai/grok-4.1')).toEqual(['low', 'medium', 'high'])
   })
 
-  it('DeepSeek v4 inline reasoning + narrowed effort', () => {
-    // Emits <think>…</think> inline; parser lifts to reasoning lane.
-    const q = quirksFor('deepseek/deepseek-v4-pro')
-    expect(q.reasoningInlineTags).toEqual(['think'])
-    expect(q.allowedEffort).toEqual(['high', 'xhigh'])
+  // OSS thinking-model families fall through to the pattern-based default
+  // in `quirksFor` (see OSS_THINKING_FAMILIES + GEMMA_PATTERN). Any current
+  // OR future version of these labs gets the same `<think>` lifting +
+  // low/medium/high effort + `unknown` preservation format without a per-
+  // version registry entry. Tests below cover the family root + a couple of
+  // hypothetical future versions to keep that contract stable.
+  it('DeepSeek family — pattern matches all versions', () => {
+    for (const slug of [
+      'deepseek/deepseek-v4-pro',
+      'deepseek/deepseek-v5',
+      'deepseek/deepseek-r1', // legacy slug still works
+    ]) {
+      const q = quirksFor(slug)
+      expect(q.reasoningInlineTags).toEqual(['think'])
+      expect(q.allowedEffort).toEqual(['low', 'medium', 'high'])
+      expect(q.reasoningPreservationFormat).toBe('unknown')
+    }
   })
 
-  it('Qwen3.6 inline reasoning + narrowed effort', () => {
-    const q = quirksFor('qwen/qwen3.6-plus')
-    expect(q.reasoningInlineTags).toEqual(['think'])
-    expect(q.allowedEffort).toEqual(['low', 'medium', 'high'])
+  it('Qwen family — pattern matches versions with no separator (qwen3, qwen3.6)', () => {
+    for (const slug of ['qwen/qwen3.6-plus', 'qwen/qwen-4', 'qwen/qwen3-thinking']) {
+      const q = quirksFor(slug)
+      expect(q.reasoningInlineTags).toEqual(['think'])
+      expect(q.allowedEffort).toEqual(['low', 'medium', 'high'])
+    }
   })
 
-  it('Gemma 4 inline tags + effort narrowed', () => {
-    // gemma-4 keys on the whole family; any sub-variant matches.
-    const q = quirksFor('google/gemma-4-31b-it')
-    expect(q.reasoningInlineTags).toEqual(['thought', 'think'])
+  it('Kimi / GLM / MiniMax families — pattern matches future versions', () => {
+    for (const slug of [
+      'moonshotai/kimi-k3', // hypothetical future version
+      'moonshotai/kimi-k2.6',
+      'zhipuai/glm-6',
+      'minimax/minimax-m3',
+    ]) {
+      const q = quirksFor(slug)
+      expect(q.reasoningInlineTags).toEqual(['think'])
+      expect(q.allowedEffort).toEqual(['low', 'medium', 'high'])
+    }
+  })
+
+  it('Gemma family — uses <thought> tag and matches future versions', () => {
+    for (const slug of ['google/gemma-4-31b-it', 'google/gemma-5', 'google/gemma-5-9b']) {
+      const q = quirksFor(slug)
+      expect(q.reasoningInlineTags).toEqual(['thought', 'think'])
+      expect(q.allowedEffort).toEqual(['low', 'medium', 'high'])
+    }
+  })
+
+  it('non-OSS-family slugs do NOT get the OSS default', () => {
+    // Negative cases — names that look similar but aren't in the family list.
+    expect(quirksFor('openai/gpt-5.4-pro').reasoningInlineTags).toBeUndefined()
+    expect(quirksFor('anthropic/claude-haiku-4.5').reasoningInlineTags).toBeUndefined()
+    // Pattern requires version-suffix (digit/separator/end) so a name that
+    // happens to start with a family prefix but continues into letters is safe.
+    expect(quirksFor('deepseekx/something').reasoningInlineTags).toBeUndefined()
   })
 
   it('o-series reasoning is hidden but effort superset unchanged', () => {

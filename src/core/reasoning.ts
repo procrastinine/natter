@@ -202,6 +202,14 @@ function warnIncompatibleFormat(stored: ReasoningFormat, target: ReasoningFormat
   )
 }
 
+function endsWithBlankLine(s: string | null | undefined): boolean {
+  return typeof s === 'string' && /\n\s*$/.test(s)
+}
+
+function startsWithBlankLine(s: string | null | undefined): boolean {
+  return typeof s === 'string' && /^\s*\n/.test(s)
+}
+
 export function mergeReasoningText(
   existingRaw: string | null | undefined,
   incomingRaw: string | null | undefined,
@@ -237,10 +245,30 @@ export function mergeReasoningDetail(
     // Incremental: Responses API sends `summary_text.delta` events that
     // append to a single summary row. Overlap-dedup via `mergeReasoningText`
     // so the merge is idempotent if the same chunk arrives twice.
+    //
+    // Gemini-family summaries: each thinking section arrives as its own
+    // entry (one per OpenRouter `reasoning_details[]` element OR one per
+    // native `thought:true` part), and we coalesce them into a single
+    // continuous Summary block. Inject a `\n\n` separator when both sides
+    // have content and neither already provides one — keeps section breaks
+    // visible even when the wire didn't include trailing newlines.
+    const isGeminiCoalesce =
+      existing.format === 'google-gemini-v1' && incoming.format === 'google-gemini-v1'
+    let mergedSummary = mergeReasoningText(existing.summary, incoming.summary)
+    if (
+      isGeminiCoalesce &&
+      mergedSummary === `${existing.summary ?? ''}${incoming.summary ?? ''}` &&
+      (existing.summary?.length ?? 0) > 0 &&
+      (incoming.summary?.length ?? 0) > 0 &&
+      !endsWithBlankLine(existing.summary) &&
+      !startsWithBlankLine(incoming.summary)
+    ) {
+      mergedSummary = `${existing.summary}\n\n${incoming.summary}`
+    }
     return {
       ...existing,
       ...incoming,
-      summary: mergeReasoningText(existing.summary, incoming.summary),
+      summary: mergedSummary,
     }
   }
   if (existing.type === 'reasoning.encrypted' && incoming.type === 'reasoning.encrypted') {
@@ -306,11 +334,20 @@ export function findMergeTargetIndex(
       continue
     }
     if (incoming.type === 'reasoning.summary' && existing.type === 'reasoning.summary') {
+      // Two Gemini-family summaries belong to the same logical reasoning
+      // row regardless of index: Gemini emits each thinking section as its
+      // own atomic part, and we want one continuous Summary in the UI, not
+      // one block per section. OpenRouter's Gemini path reuses index=0
+      // across all thought summaries; native-Gemini's path also keys
+      // everything under summaryIndex=0 (see splitGeminiPart). Either way
+      // these all coalesce.
+      if (existing.format === 'google-gemini-v1' && incoming.format === 'google-gemini-v1') {
+        return index
+      }
       // Backcompat: some older streams persisted successive snapshots of the
       // SAME OpenAI/OpenRouter summary as separate rows without a stable id.
       // Collapse obvious prefix/overlap growth when both rows sit on the same
-      // index. Distinct Gemini summaries at the same index still stay
-      // separate unless the text actually looks incremental.
+      // index.
       if (
         existing.index !== undefined &&
         incoming.index !== undefined &&
