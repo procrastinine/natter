@@ -8,7 +8,7 @@
 // can share a code path.
 
 import { useLiveQuery } from 'dexie-react-hooks'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { fetchEndpoints } from '../api/models'
 import {
   type EndpointsDescriptor,
@@ -88,6 +88,7 @@ export function useEndpoints(
   const [error, setError] = useState<string | null>(null)
   const [inFlight, setInFlight] = useState(false)
   const [refreshToken, setRefreshToken] = useState(0)
+  const handledRefreshTokenRef = useRef(0)
   // `supportsEndpointsApi` is a stored flag; require kind==='openrouter'
   // too so a profile that was once OpenRouter and is now pointed at a
   // local llama.cpp doesn't keep hitting /models/<id>/endpoints with the
@@ -100,8 +101,10 @@ export function useEndpoints(
     if (!profile || !modelId) return
     const fetchedAt = cachedRow?.fetchedAt
     const fresh = fetchedAt !== undefined && isFresh(fetchedAt, ENDPOINTS_TTL_MS)
-    if (fresh && refreshToken === 0) return
+    const forceRefresh = refreshToken !== handledRefreshTokenRef.current
+    if (fresh && !forceRefresh) return
     let cancelled = false
+    if (forceRefresh) handledRefreshTokenRef.current = refreshToken
     setInFlight(true)
     setError(null)
     ;(async () => {

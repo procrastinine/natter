@@ -7,15 +7,15 @@
 // shared in-flight Map so sibling mounts hit the network once.
 
 import { useLiveQuery } from 'dexie-react-hooks'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { fetchPrivacyScrape, readCachedPrivacyPayload } from '../api/privacy-scrape'
 import { isFreeModel } from '../core/model-predicates'
 import type { DataPolicy, ProfileId } from '../core/types'
 import { isFresh } from '../store/models-cache'
 import {
   dedupedPrivacyFetch,
+  EMPTY_PRIVACY_POLICY_RETRY_MS,
   getCachedPrivacyPolicy,
-  PARTIAL_PRIVACY_POLICY_TTL_MS,
   PRIVACY_POLICY_TTL_MS,
 } from '../store/privacy-cache'
 import { getProfile } from '../store/profiles'
@@ -54,6 +54,7 @@ export function usePrivacyPolicies(
   const [error, setError] = useState<string | null>(null)
   const [inFlight, setInFlight] = useState(false)
   const [refreshToken, setRefreshToken] = useState(0)
+  const handledRefreshTokenRef = useRef(0)
 
   const freeModel = modelId ? isFreeModel(modelId) : false
   const scrapeApplicable =
@@ -65,10 +66,18 @@ export function usePrivacyPolicies(
     const fetchedAt = cachedRow?.fetchedAt
     const cachedPayload = cachedRow ? readCachedPrivacyPayload(cachedRow.payload) : null
     const hasPolicies = cachedPayload ? Object.keys(cachedPayload.policies).length > 0 : false
-    const ttl = hasPolicies ? PRIVACY_POLICY_TTL_MS : PARTIAL_PRIVACY_POLICY_TTL_MS
-    const fresh = fetchedAt !== undefined && isFresh(fetchedAt, ttl)
-    if (fresh && refreshToken === 0) return
+    const forceRefresh = refreshToken !== handledRefreshTokenRef.current
+    const fullFresh = fetchedAt !== undefined && hasPolicies && isFresh(fetchedAt, PRIVACY_POLICY_TTL_MS)
+    const emptyFresh =
+      fetchedAt !== undefined && !hasPolicies && isFresh(fetchedAt, EMPTY_PRIVACY_POLICY_RETRY_MS)
+    if (!forceRefresh && fullFresh) return
+    if (!forceRefresh && emptyFresh) {
+      const delay = Math.max(0, EMPTY_PRIVACY_POLICY_RETRY_MS - (Date.now() - fetchedAt))
+      const timer = window.setTimeout(() => setRefreshToken((n) => n + 1), delay)
+      return () => window.clearTimeout(timer)
+    }
     let cancelled = false
+    if (forceRefresh) handledRefreshTokenRef.current = refreshToken
     setInFlight(true)
     setError(null)
     ;(async () => {
@@ -78,6 +87,9 @@ export function usePrivacyPolicies(
           // A user-configured `privacyScrapeProxy` lives on the profile
           // so it rides with `fetchPrivacyScrape` automatically.
           const result = await fetchPrivacyScrape({ profile }, modelId)
+          if (Object.keys(result.raw.policies).length === 0 && hasPolicies && cachedRow) {
+            return cachedRow.payload
+          }
           return result.raw
         })
       } catch (err) {
@@ -90,7 +102,7 @@ export function usePrivacyPolicies(
     return () => {
       cancelled = true
     }
-  }, [scrapeApplicable, profile, modelId, cachedRow?.fetchedAt, refreshToken])
+  }, [scrapeApplicable, profile, modelId, cachedRow, refreshToken])
 
   const policies = useMemo<Record<string, DataPolicy>>(() => {
     if (!cachedRow) return {}
@@ -100,7 +112,8 @@ export function usePrivacyPolicies(
 
   const fetchedAt = cachedRow?.fetchedAt ?? null
   const offline = error !== null
-  const loading = scrapeApplicable && inFlight && !cachedRow
+  const hasPolicies = Object.keys(policies).length > 0
+  const loading = scrapeApplicable && inFlight && !hasPolicies
 
   return {
     policies,

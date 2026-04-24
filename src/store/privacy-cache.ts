@@ -15,7 +15,7 @@ import {
 } from './db'
 
 export const PRIVACY_POLICY_TTL_MS = 24 * 60 * 60 * 1000
-export const PARTIAL_PRIVACY_POLICY_TTL_MS = 5 * 60 * 1000
+export const EMPTY_PRIVACY_POLICY_RETRY_MS = 2_000
 export const PROVIDERS_TTL_MS = 24 * 60 * 60 * 1000
 
 export async function getCachedPrivacyPolicy(

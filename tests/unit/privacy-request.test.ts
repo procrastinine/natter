@@ -270,6 +270,69 @@ describe('resolvePrivacyForSend', () => {
     expect(r.wire?.zeroEligible).toBe(false)
   })
 
+  it('refetches empty privacy-cache rows before request-time routing', async () => {
+    const chat = makeChat({ model: 'deepseek/deepseek-v4-flash' })
+    const profile = makeProfile()
+    await putCachedEndpoints('prof-1', 'deepseek/deepseek-v4-flash', {
+      id: 'deepseek/deepseek-v4-flash',
+      endpoints: [
+        {
+          provider_name: 'DeepSeek',
+          provider_slug: 'deepseek',
+          supported_parameters: ['temperature'],
+          context_length: 1048576,
+          pricing: {},
+        },
+        {
+          provider_name: 'DeepInfra',
+          provider_slug: 'deepinfra/fp4',
+          supported_parameters: ['temperature'],
+          context_length: 1048576,
+          pricing: {},
+        },
+      ],
+    })
+    await putCachedPrivacyPolicy(
+      'prof-1',
+      'deepseek/deepseek-v4-flash',
+      { policies: {}, fetchedAt: Date.now() },
+      Date.now(),
+    )
+    fetchPrivacyScrapeMock.mockResolvedValueOnce({
+      modelId: 'deepseek/deepseek-v4-flash',
+      policies: {},
+      raw: {
+        policies: {
+          deepseek: {
+            training: true,
+            trainingOpenRouter: false,
+            retainsPrompts: true,
+            canPublish: false,
+            termsOfServiceURL: '',
+            privacyPolicyURL: '',
+          },
+          'deepinfra/fp4': {
+            training: false,
+            trainingOpenRouter: false,
+            retainsPrompts: false,
+            canPublish: false,
+            termsOfServiceURL: '',
+            privacyPolicyURL: '',
+          },
+        },
+        fetchedAt: Date.now(),
+      },
+      fetchedAt: Date.now(),
+    })
+
+    const r = await resolvePrivacyForSend({ chat, profile })
+
+    expect(fetchPrivacyScrapeMock).toHaveBeenCalledTimes(1)
+    expect(r.filter?.kept.map((k) => k.endpoint.provider_name)).toEqual(['DeepInfra'])
+    expect(r.wire?.ignore).toContain('deepseek')
+    expect(r.wire?.ignore).not.toContain('deepinfra/fp4')
+  })
+
   it('flags zeroEligible when every endpoint is a trainer', async () => {
     const chat = makeChat({ model: 'example/x' })
     const profile = makeProfile()

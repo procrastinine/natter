@@ -37,7 +37,6 @@ import {
 import {
   dedupedPrivacyFetch,
   getCachedPrivacyPolicy,
-  PARTIAL_PRIVACY_POLICY_TTL_MS,
   PRIVACY_POLICY_TTL_MS,
 } from '../store/privacy-cache'
 
@@ -190,8 +189,7 @@ async function ensurePrivacyPolicies(input: {
   const hasCachedPolicies = Object.keys(cachedPolicies).length > 0
   if (!needsScrape) return { policies: cachedPolicies, offlineFallback: false }
 
-  const ttl = hasCachedPolicies ? PRIVACY_POLICY_TTL_MS : PARTIAL_PRIVACY_POLICY_TTL_MS
-  if (cached && isFresh(cached.fetchedAt, ttl)) {
+  if (cached && hasCachedPolicies && isFresh(cached.fetchedAt, PRIVACY_POLICY_TTL_MS)) {
     return { policies: cachedPolicies, offlineFallback: false }
   }
 
@@ -205,9 +203,12 @@ async function ensurePrivacyPolicies(input: {
           timeoutMs: SEND_DISCOVERY_TIMEOUT_MS,
         },
       )
+      if (Object.keys(result.raw.policies).length === 0 && hasCachedPolicies && cached) {
+        return cached.payload
+      }
       return result.raw
     })
-  } catch (err) {
+  } catch {
     if (hasCachedPolicies) return { policies: cachedPolicies, offlineFallback: false }
     return { policies: cachedPolicies, offlineFallback: true }
   }
