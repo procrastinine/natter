@@ -386,11 +386,11 @@ function MessageInner({
               ? {
                   onSaveAndSend: handleSaveAndSend,
                   saveAndSendDisabled: !hasConnection || generationBusy,
-                  saveAndSendDisabledReason: !hasConnection
-                    ? 'Add a connection to send messages.'
+                  ...(!hasConnection
+                    ? { saveAndSendDisabledReason: 'Add a connection to send messages.' }
                     : generationBusy
-                      ? 'A request is already running for this chat.'
-                      : undefined,
+                      ? { saveAndSendDisabledReason: 'A request is already running for this chat.' }
+                      : {}),
                 }
               : {})}
             {...(message.role === 'assistant'

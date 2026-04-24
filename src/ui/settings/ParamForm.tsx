@@ -33,7 +33,11 @@ import type {
 } from '../../core/types'
 import { updateChatSettings } from '../../store/chats'
 import { InfoDisclosure } from './InfoDisclosure'
-import { SystemPromptEditor } from './SystemPromptEditor'
+import {
+  ContinueSystemPromptEditor,
+  ContinueUserPromptEditor,
+  SystemPromptEditor,
+} from './PromptPresetEditor'
 
 export interface ParamFormProps {
   chat: Chat
@@ -288,6 +292,8 @@ export function ParamForm({ chat, capability }: ParamFormProps) {
           <p data-ui="helper">Select a model first.</p>
         </section>
         <SystemPromptEditor chat={chat} />
+        <ContinueSystemPromptEditor chat={chat} />
+        <ContinueUserPromptEditor chat={chat} />
       </div>
     )
   }
@@ -300,17 +306,23 @@ export function ParamForm({ chat, capability }: ParamFormProps) {
           <p data-ui="helper">Waiting for model capability…</p>
         </section>
         <SystemPromptEditor chat={chat} />
+        <ContinueSystemPromptEditor chat={chat} />
+        <ContinueUserPromptEditor chat={chat} />
       </div>
     )
   }
 
+  // Ordering per user spec: reasoning → verbosity, then prompt slots, then
+  // sampling. Continue prompts start collapsed; system prompt starts open.
   return (
     <div data-ui="param-form">
-      <SamplingSection chat={chat} capability={capability} />
       <ReasoningSection chat={chat} capability={capability} />
       <VerbositySection chat={chat} capability={capability} />
-      <StopSection chat={chat} capability={capability} />
       <SystemPromptEditor chat={chat} />
+      <ContinueSystemPromptEditor chat={chat} defaultCollapsed />
+      <ContinueUserPromptEditor chat={chat} defaultCollapsed />
+      <SamplingSection chat={chat} capability={capability} />
+      <StopSection chat={chat} capability={capability} />
     </div>
   )
 }

@@ -52,6 +52,10 @@ export type BaseFontSize = 13 | 14 | 15 | 16 | 17 | 18
 export type TokenCalibrationMode = 'adaptive' | 'global-only' | 'family-defaults-only'
 
 // Continue prompts injected by Continue-in-place (see `src/hooks/useContinue.ts`).
+// The actual prompts live on `chat.settings.continueSystemPrompt` /
+// `continueUserPrompt` (per-chat, preset-pinnable). These constants remain
+// the seed defaults for new chats and the reset-to-default target.
+//
 // `continueSystemPrompt` is a template. `[SYSTEM_PROMPT]` expands to the
 // original chat system prompt verbatim; if the placeholder is absent, the
 // original system prompt is not appended automatically.
@@ -77,8 +81,6 @@ export interface GlobalPreferences {
   userProfilePicture: ProfilePictureRef
   assistantProfilePicture: ProfilePictureRef
   chatMaxWidth: ChatMaxWidth
-  continueSystemPrompt: string
-  continueUserPrompt: string
   fontFamily: FontFamilyChoice
   baseFontSize: BaseFontSize
   // Workspace-wide pinned model ids. Model picker shows these at the top.
@@ -118,8 +120,6 @@ export const DEFAULT_GLOBAL_PREFERENCES: Readonly<GlobalPreferences> = Object.fr
   userProfilePicture: 'default-person',
   assistantProfilePicture: 'default-robot',
   chatMaxWidth: 920,
-  continueSystemPrompt: DEFAULT_CONTINUE_SYSTEM_PROMPT,
-  continueUserPrompt: DEFAULT_CONTINUE_USER_PROMPT,
   fontFamily: 'system',
   baseFontSize: 15,
   autoScrollOnOpen: true,
@@ -134,9 +134,6 @@ const SEND_SHORTCUT_KEY = 'global:send-shortcut'
 const USER_PIC_KEY = 'global:user-profile-picture'
 const ASSISTANT_PIC_KEY = 'global:assistant-profile-picture'
 const CHAT_MAX_WIDTH_KEY = 'global:chat-max-width'
-const CONTINUE_SYSTEM_PROMPT_KEY = 'global:continue-system-prompt'
-const CONTINUE_USER_PROMPT_KEY = 'global:continue-user-prompt'
-const LEGACY_CONTINUE_PROMPT_KEY = 'global:continue-prompt'
 const FONT_FAMILY_KEY = 'global:font-family'
 const BASE_FONT_SIZE_KEY = 'global:base-font-size'
 const AUTO_SCROLL_OPEN_KEY = 'global:auto-scroll-open'
@@ -253,9 +250,6 @@ export async function readGlobalPreferences(): Promise<GlobalPreferences> {
     userPic,
     asstPic,
     chatMaxWidth,
-    continueSystemPrompt,
-    continueUserPrompt,
-    legacyContinuePrompt,
     fontFamily,
     baseFontSize,
     autoScrollOpen,
@@ -270,9 +264,6 @@ export async function readGlobalPreferences(): Promise<GlobalPreferences> {
     getSetting<ProfilePictureRef>(USER_PIC_KEY),
     getSetting<ProfilePictureRef>(ASSISTANT_PIC_KEY),
     getSetting<ChatMaxWidth>(CHAT_MAX_WIDTH_KEY),
-    getSetting<string>(CONTINUE_SYSTEM_PROMPT_KEY),
-    getSetting<string>(CONTINUE_USER_PROMPT_KEY),
-    getSetting<string>(LEGACY_CONTINUE_PROMPT_KEY),
     getSetting<FontFamilyChoice>(FONT_FAMILY_KEY),
     getSetting<BaseFontSize>(BASE_FONT_SIZE_KEY),
     getSetting<boolean>(AUTO_SCROLL_OPEN_KEY),
@@ -295,18 +286,6 @@ export async function readGlobalPreferences(): Promise<GlobalPreferences> {
       DEFAULT_GLOBAL_PREFERENCES.assistantProfilePicture,
     ),
     chatMaxWidth: chatMaxWidthOrDefault(chatMaxWidth),
-    continueSystemPrompt:
-      typeof continueSystemPrompt === 'string'
-        ? continueSystemPrompt
-        : typeof legacyContinuePrompt === 'string'
-          ? legacyContinuePrompt
-          : DEFAULT_GLOBAL_PREFERENCES.continueSystemPrompt,
-    continueUserPrompt:
-      typeof continueUserPrompt === 'string'
-        ? continueUserPrompt
-        : typeof legacyContinuePrompt === 'string'
-          ? ''
-          : DEFAULT_GLOBAL_PREFERENCES.continueUserPrompt,
     fontFamily: fontFamilyOrDefault(fontFamily),
     baseFontSize: baseFontSizeOrDefault(baseFontSize),
     autoScrollOnOpen:
@@ -368,24 +347,6 @@ export async function writeAssistantProfilePicture(value: ProfilePictureRef): Pr
 
 export async function writeChatMaxWidth(value: ChatMaxWidth): Promise<void> {
   await setSetting(CHAT_MAX_WIDTH_KEY, value)
-}
-
-// Persist a custom continue system prompt. The empty string is meaningful:
-// it means "keep only the original chat system prompt".
-export async function writeContinueSystemPrompt(value: string): Promise<void> {
-  await setSetting(CONTINUE_SYSTEM_PROMPT_KEY, value)
-}
-
-// Persist a custom continue user prompt. The empty string is meaningful:
-// it means "use the legacy double-assistant continue shape".
-export async function writeContinueUserPrompt(value: string): Promise<void> {
-  await setSetting(CONTINUE_USER_PROMPT_KEY, value)
-}
-
-// Backwards-compatible alias for older tests/callers that still refer to the
-// former single continue prompt. This now maps to the system slot.
-export async function writeContinuePrompt(value: string): Promise<void> {
-  await writeContinueSystemPrompt(value)
 }
 
 export async function writeFontFamily(value: FontFamilyChoice): Promise<void> {

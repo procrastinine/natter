@@ -7,7 +7,15 @@
 // remote tabs only see the BroadcastChannel path and local tabs only see the
 // direct dispatch (their own BC instance ignores their own posts).
 
-import type { ChatId, FolderId, KeyId, PresetId, ProfileId, TagId } from '../core/types'
+import type {
+  ChatId,
+  FolderId,
+  KeyId,
+  PresetId,
+  ProfileId,
+  PromptPresetId,
+  TagId,
+} from '../core/types'
 import type { ChatMutationSummary } from './repository'
 
 export type EngineKind = 'daemon' | 'in-tab'
@@ -29,6 +37,8 @@ export type BroadcastEvent =
   | { kind: 'profile-deleted'; profileId: ProfileId }
   | { kind: 'preset-mutated'; presetId: PresetId }
   | { kind: 'preset-deleted'; presetId: PresetId }
+  | { kind: 'prompt-preset-mutated'; promptPresetId: PromptPresetId }
+  | { kind: 'prompt-preset-deleted'; promptPresetId: PromptPresetId }
   | { kind: 'folder-mutated'; folderId: FolderId }
   | { kind: 'folder-deleted'; folderId: FolderId }
   | { kind: 'tag-mutated'; tagId: TagId }

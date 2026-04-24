@@ -1,10 +1,6 @@
 import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type { ChatStreamChunk } from '../../src/api/types'
-import {
-  writeContinueSystemPrompt,
-  writeContinueUserPrompt,
-} from '../../src/core/global-settings'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import type { ChatSettings, ConnectionProfile, Message } from '../../src/core/types'
 import { continueAssistantInPlace } from '../../src/hooks/useContinue'
@@ -247,11 +243,11 @@ describe('send action routing', () => {
 
   it('continueAssistantInPlace does not add the original system prompt when the template has no placeholder in double-assistant mode', async () => {
     await warmOpenRouterPrivacy('openai/gpt-4o')
-    await writeContinueSystemPrompt('Continue exactly from the last assistant message.')
-    await writeContinueUserPrompt('')
     const chat = await createChat({
       settings: chatSettings({
         systemPrompt: 'ORIGINAL SYSTEM PROMPT SHOULD NOT APPEAR',
+        continueSystemPrompt: 'Continue exactly from the last assistant message.',
+        continueUserPrompt: '',
       }),
     })
     await sendText({
@@ -343,13 +339,12 @@ describe('send action routing', () => {
 
   it('continueAssistantInPlace expands [SYSTEM_PROMPT] verbatim inside the system template', async () => {
     await warmOpenRouterPrivacy('openai/gpt-4o')
-    await writeContinueSystemPrompt(
-      'Continue exactly from the last assistant message.\n\nThe original system prompt (for reference):\n```\n[SYSTEM_PROMPT]\n```',
-    )
-    await writeContinueUserPrompt('')
     const chat = await createChat({
       settings: chatSettings({
         systemPrompt: 'ORIGINAL SYSTEM PROMPT SHOULD APPEAR IN A CODE BLOCK',
+        continueSystemPrompt:
+          'Continue exactly from the last assistant message.\n\nThe original system prompt (for reference):\n```\n[SYSTEM_PROMPT]\n```',
+        continueUserPrompt: '',
       }),
     })
     await sendText({
@@ -404,11 +399,11 @@ describe('send action routing', () => {
 
   it('continueAssistantInPlace supports a synthetic user prompt with no system prompt when the template is blank', async () => {
     await warmOpenRouterPrivacy('openai/gpt-4o')
-    await writeContinueSystemPrompt('')
-    await writeContinueUserPrompt('Now only continue the last assistant message.')
     const chat = await createChat({
       settings: chatSettings({
         systemPrompt: 'ORIGINAL SYSTEM PROMPT SHOULD APPEAR',
+        continueSystemPrompt: '',
+        continueUserPrompt: 'Now only continue the last assistant message.',
       }),
     })
     await sendText({

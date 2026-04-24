@@ -21,7 +21,12 @@ import type {
   KeyRecord,
   Message,
   PresetResolution,
+  PromptPreset,
 } from '../core/types'
+import {
+  DEFAULT_CONTINUE_SYSTEM_PROMPT,
+  DEFAULT_CONTINUE_USER_PROMPT,
+} from '../core/global-settings'
 
 export interface CachedModelsRow {
   profileId: string
@@ -70,6 +75,7 @@ export class NatterDb extends Dexie {
   attachments!: Table<Attachment, string>
   profiles!: Table<ConnectionProfile, string>
   presets!: Table<ChatPreset, string>
+  promptPresets!: Table<PromptPreset, string>
   folders!: Table<ChatFolder, string>
   tags!: Table<ChatTag, string>
   chatBranchCache!: Table<ChatBranchCache, string>
@@ -256,6 +262,79 @@ export function registerSchema(db: Dexie): void {
           )
           if (result.changed) preset.settings = result.settings
         })
+    })
+
+  // v5: promptPresets table + move continue prompts from global settings onto
+  // each chat / ChatPreset. The legacy global keys are read once at upgrade
+  // time to preserve any user customization, then retired.
+  db.version(5)
+    .stores({
+      chats:
+        'id, updatedAt, createdAt, lastViewedAt, lastUpdatedLeafId, lastBranchUpdatedAt, wordCount, totalCostUsd, archived, pinned, presetId, folderId, *tags',
+      messages:
+        'id, chatId, parentId, turnId, [chatId+parentId], [chatId+createdAt], [chatId+turnId], [chatId+deleted]',
+      childLists: 'id, [chatId+parentId], updatedAt',
+      attachments: 'id, contentHash, refCount, createdAt',
+      profiles: 'id, name, kind, lastUsedAt, archived',
+      presets: 'id, name, connectionProfileId, lastUsedAt, archived',
+      promptPresets: 'id, kind, name, lastUsedAt',
+      folders: 'id, name, sortIndex, lastUsedAt',
+      tags: 'id, &nameLower, lastUsedAt',
+      chatBranchCache: '&chatId, branchLeafId, generatedAt',
+      keys: 'id, name',
+      settings: '&key',
+      models: '&[profileId+queryKey], fetchedAt',
+      endpoints: '&[profileId+modelId], fetchedAt',
+      privacyPolicies: '&[profileId+modelId], fetchedAt',
+      providers: '&profileId, fetchedAt',
+      generations: 'id, chatId, gen_id',
+      presetResolutions: '&[profileId+presetSlug], fetchedAt',
+      drafts: '&chatId, updatedAt',
+    })
+    .upgrade(async (tx) => {
+      const settings = tx.table<SettingsRow>('settings')
+      const legacySystem = await settings.get('global:continue-system-prompt')
+      const legacyUser = await settings.get('global:continue-user-prompt')
+      const legacySingle = await settings.get('global:continue-prompt')
+      const seedSystem =
+        typeof legacySystem?.value === 'string'
+          ? legacySystem.value
+          : typeof legacySingle?.value === 'string'
+            ? legacySingle.value
+            : DEFAULT_CONTINUE_SYSTEM_PROMPT
+      const seedUser =
+        typeof legacyUser?.value === 'string'
+          ? legacyUser.value
+          : typeof legacySingle?.value === 'string'
+            ? ''
+            : DEFAULT_CONTINUE_USER_PROMPT
+      await tx
+        .table<Chat>('chats')
+        .toCollection()
+        .modify((chat) => {
+          const s = chat.settings as Chat['settings'] & {
+            continueSystemPrompt?: string
+            continueUserPrompt?: string
+          }
+          if (typeof s.continueSystemPrompt !== 'string') s.continueSystemPrompt = seedSystem
+          if (typeof s.continueUserPrompt !== 'string') s.continueUserPrompt = seedUser
+        })
+      await tx
+        .table<ChatPreset>('presets')
+        .toCollection()
+        .modify((preset) => {
+          const s = preset.settings as ChatPreset['settings'] & {
+            continueSystemPrompt?: string
+            continueUserPrompt?: string
+          }
+          if (typeof s.continueSystemPrompt !== 'string') s.continueSystemPrompt = seedSystem
+          if (typeof s.continueUserPrompt !== 'string') s.continueUserPrompt = seedUser
+        })
+      await settings.where('key').anyOf([
+        'global:continue-system-prompt',
+        'global:continue-user-prompt',
+        'global:continue-prompt',
+      ]).delete()
     })
 }
 

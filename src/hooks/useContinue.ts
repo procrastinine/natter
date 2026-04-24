@@ -31,6 +31,8 @@ import {
   readGlobalPreferences,
   resolveContinueSystemPromptTemplate,
 } from '../core/global-settings'
+// `globalPrefs` is still read for token-calibration mode; continue prompts
+// moved to `chat.settings` in the prompt-preset refactor.
 import {
   calibrationFieldsForEdit,
   readTokenCalibrationGlobal,
@@ -153,16 +155,17 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
   const upstream = targetIdx >= 0 ? path.slice(0, targetIdx + 1) : path
 
   // Build the wire body as if we were sending a request that ends with
-  // the target assistant. Continue has two independent global prompt slots:
-  // a system override (which replaces the chat system prompt when non-empty)
-  // and a synthetic trailing user prompt (which avoids the double-assistant
-  // shape when non-empty). Either can be blank.
+  // the target assistant. Continue has two independent per-chat prompt slots
+  // (stored on chat.settings, preset-pinnable): a system override (which
+  // replaces the chat system prompt when non-empty) and a synthetic trailing
+  // user prompt (which avoids the double-assistant shape when non-empty).
+  // Either can be blank.
   const [globalPrefs, globalCalibration] = await Promise.all([
     readGlobalPreferences(),
     readTokenCalibrationGlobal(),
   ])
-  const continueSystemPrompt = globalPrefs.continueSystemPrompt
-  const continueUserPrompt = globalPrefs.continueUserPrompt
+  const continueSystemPrompt = chat.settings.continueSystemPrompt
+  const continueUserPrompt = chat.settings.continueUserPrompt
   const originalSystemPrompt = chat.settings.systemPrompt
   const settingsForContinue = {
     ...chat.settings,
@@ -215,12 +218,13 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
     const { route, geminiModelId, wire } = requestPlan
 
     const streamId = lifecycle.streamId
-    abortController = new AbortController()
-    const abortStream = () => abortController?.abort()
+    const controller = new AbortController()
+    abortController = controller
+    const abortStream = () => controller.abort()
     const userSignal = lifecycle.signal
-    if (userSignal.aborted) abortController.abort(userSignal.reason)
+    if (userSignal.aborted) controller.abort(userSignal.reason)
     else
-      userSignal.addEventListener('abort', () => abortController.abort(userSignal.reason), {
+      userSignal.addEventListener('abort', () => controller.abort(userSignal.reason), {
         once: true,
       })
 

@@ -230,7 +230,7 @@ describe('filterEndpointsByPrivacy — missing policies', () => {
     const rows = [...result.kept, ...result.excluded]
     expect(rows).toHaveLength(2)
     expect(rows.every((row) => row.policySynthesized === false)).toBe(true)
-    expect(rows.every((row) => row.policy.training === false)).toBe(true)
+    expect(rows.every((row) => row.policy?.training === false)).toBe(true)
   })
 })
 

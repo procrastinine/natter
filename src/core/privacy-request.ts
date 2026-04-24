@@ -43,9 +43,11 @@ import {
 const SEND_DISCOVERY_TIMEOUT_MS = 15_000
 
 export class PrivacyDiscoveryUnavailableError extends Error {
-  constructor(message: string, readonly cause?: unknown) {
+  override readonly cause?: unknown
+  constructor(message: string, cause?: unknown) {
     super(message)
     this.name = 'PrivacyDiscoveryUnavailableError'
+    if (cause !== undefined) this.cause = cause
   }
 }
 
@@ -88,7 +90,7 @@ export async function resolvePrivacyForSend(
     profile,
     modelId: chat.settings.model,
     endpoints,
-    signal: input.signal,
+    ...(input.signal ? { signal: input.signal } : {}),
   })
   const migrated = migrateLegacyProviderSettings(chat.settings, {
     model: chat.settings.model,

@@ -19,6 +19,7 @@ export type ToolDefinitionId = string
 export type KeyId = string
 export type ProfileId = string
 export type PresetId = string
+export type PromptPresetId = string
 export type FolderId = string
 export type TagId = string
 
@@ -357,7 +358,22 @@ export interface ChatSettings {
   model: string
   fallbackModels?: string[]
   systemPrompt: string
+  // Optional pin back to a PromptPreset (`kind: 'system'`). When set AND the
+  // preset still exists, the preset is the canonical source — edits to the
+  // preset propagate to `systemPrompt` via `prompt-presets.ts`. Editing the
+  // text locally clears the pin; deleting the preset clears the pin but
+  // preserves the last propagated text. See `plan/02-data-model.md §2.6b`.
+  systemPromptPresetId?: PromptPresetId
   systemRole: 'system' | 'developer'
+  // Continue-in-place overrides. Template; `[SYSTEM_PROMPT]` expands to the
+  // chat's own `systemPrompt` verbatim. Empty = send no system message
+  // during continue. See `core/global-settings.ts` for the template helper.
+  continueSystemPrompt: string
+  continueSystemPromptPresetId?: PromptPresetId
+  // Synthetic trailing user message appended during continue-in-place.
+  // Empty = fall back to the double-assistant shape (worse on some models).
+  continueUserPrompt: string
+  continueUserPromptPresetId?: PromptPresetId
   sampling: Partial<Record<SamplingKey, number>>
   stop?: string[]
   modalities?: Array<'text' | 'image' | 'audio'>
@@ -893,6 +909,23 @@ export interface ChatPreset {
   updatedAt: number
   lastUsedAt?: number
   archived?: boolean
+}
+
+// Prompt slot a PromptPreset fills. Each ChatSettings has one pin slot per
+// kind. Storage is keyed by `id` alone; `kind` filters the picker.
+export type PromptPresetKind = 'system' | 'continue-system' | 'continue-user'
+
+// A named, workspace-global prompt snapshot. Unlike ChatPreset (per-profile
+// bundle of the full ChatSettings), PromptPresets are kind-scoped and hold
+// just a label + text. See `plan/02-data-model.md §2.6b`.
+export interface PromptPreset {
+  id: PromptPresetId
+  kind: PromptPresetKind
+  name: string
+  text: string
+  createdAt: number
+  updatedAt: number
+  lastUsedAt?: number
 }
 
 export interface PresetResolution {

@@ -94,7 +94,11 @@ function withProviderPrefs(
   providerPrefs: ProviderPreferences | undefined,
   privacy: ChatSettings['privacy'],
 ): ChatSettings {
-  return { ...settings, privacy, providerPrefs: compactProviderPrefs(providerPrefs) }
+  const compacted = compactProviderPrefs(providerPrefs)
+  const next: ChatSettings = { ...settings, privacy }
+  if (compacted !== undefined) next.providerPrefs = compacted
+  else delete next.providerPrefs
+  return next
 }
 
 function normalizeProviderPrefs(

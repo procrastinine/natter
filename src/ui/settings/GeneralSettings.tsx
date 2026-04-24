@@ -1,20 +1,17 @@
 // General tab: behavior-only prefs. Everything aesthetic (theme,
-// layout, fonts, code rendering) lives under Appearance.
+// layout, fonts, code rendering) lives under Appearance. Continue prompts
+// moved to per-chat settings (see `PromptPresetEditor`) in the prompt-preset
+// refactor — they're no longer workspace-global.
 
 import { useLiveQuery } from 'dexie-react-hooks'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback } from 'react'
 import {
-  CONTINUE_SYSTEM_PROMPT_PLACEHOLDER,
-  DEFAULT_CONTINUE_SYSTEM_PROMPT,
-  DEFAULT_CONTINUE_USER_PROMPT,
   DEFAULT_GLOBAL_PREFERENCES,
   readGlobalPreferences,
   type SendShortcut,
   type TokenCalibrationMode,
   writeAutoScrollOnOpen,
   writeAutoScrollOnStream,
-  writeContinueSystemPrompt,
-  writeContinueUserPrompt,
   writeSendShortcut,
   writeTokenCalibrationMode,
 } from '../../core/global-settings'
@@ -38,70 +35,6 @@ export function GeneralSettings() {
   }, [])
   const onTokenCalibrationMode = useCallback(async (value: TokenCalibrationMode) => {
     await writeTokenCalibrationMode(value)
-  }, [])
-
-  const [continueSystemDraft, setContinueSystemDraft] = useState<string>(prefs.continueSystemPrompt)
-  const continueSystemLastPersistedRef = useRef<string>(prefs.continueSystemPrompt)
-  const continueSystemTimerRef = useRef<number | null>(null)
-  const [continueUserDraft, setContinueUserDraft] = useState<string>(prefs.continueUserPrompt)
-  const continueUserLastPersistedRef = useRef<string>(prefs.continueUserPrompt)
-  const continueUserTimerRef = useRef<number | null>(null)
-  useEffect(() => {
-    if (prefs.continueSystemPrompt === continueSystemLastPersistedRef.current) return
-    continueSystemLastPersistedRef.current = prefs.continueSystemPrompt
-    setContinueSystemDraft(prefs.continueSystemPrompt)
-  }, [prefs.continueSystemPrompt])
-  useEffect(() => {
-    if (prefs.continueUserPrompt === continueUserLastPersistedRef.current) return
-    continueUserLastPersistedRef.current = prefs.continueUserPrompt
-    setContinueUserDraft(prefs.continueUserPrompt)
-  }, [prefs.continueUserPrompt])
-  useEffect(
-    () => () => {
-      if (continueSystemTimerRef.current !== null) {
-        window.clearTimeout(continueSystemTimerRef.current)
-      }
-      if (continueUserTimerRef.current !== null) {
-        window.clearTimeout(continueUserTimerRef.current)
-      }
-    },
-    [],
-  )
-  const onContinueSystemPromptChange = useCallback((value: string) => {
-    setContinueSystemDraft(value)
-    if (continueSystemTimerRef.current !== null) {
-      window.clearTimeout(continueSystemTimerRef.current)
-    }
-    continueSystemTimerRef.current = window.setTimeout(() => {
-      continueSystemLastPersistedRef.current = value
-      void writeContinueSystemPrompt(value)
-    }, 300)
-  }, [])
-  const onContinueUserPromptChange = useCallback((value: string) => {
-    setContinueUserDraft(value)
-    if (continueUserTimerRef.current !== null) {
-      window.clearTimeout(continueUserTimerRef.current)
-    }
-    continueUserTimerRef.current = window.setTimeout(() => {
-      continueUserLastPersistedRef.current = value
-      void writeContinueUserPrompt(value)
-    }, 300)
-  }, [])
-  const onContinueSystemReset = useCallback(() => {
-    if (continueSystemTimerRef.current !== null) {
-      window.clearTimeout(continueSystemTimerRef.current)
-    }
-    setContinueSystemDraft(DEFAULT_CONTINUE_SYSTEM_PROMPT)
-    continueSystemLastPersistedRef.current = DEFAULT_CONTINUE_SYSTEM_PROMPT
-    void writeContinueSystemPrompt(DEFAULT_CONTINUE_SYSTEM_PROMPT)
-  }, [])
-  const onContinueUserReset = useCallback(() => {
-    if (continueUserTimerRef.current !== null) {
-      window.clearTimeout(continueUserTimerRef.current)
-    }
-    setContinueUserDraft(DEFAULT_CONTINUE_USER_PROMPT)
-    continueUserLastPersistedRef.current = DEFAULT_CONTINUE_USER_PROMPT
-    void writeContinueUserPrompt(DEFAULT_CONTINUE_USER_PROMPT)
   }, [])
 
   return (
@@ -155,69 +88,8 @@ export function GeneralSettings() {
             <span>Auto-scroll to the bottom during streams</span>
           </label>
           <span data-ui="helper">
-            When off, new tokens during a live stream don't pull the viewport down. You can still
-            jump to the latest reply via the floating chip.
-          </span>
-        </div>
-      </div>
-      <div data-ui="settings-section">
-        <h3>Continue</h3>
-        <div data-ui="field-group">
-          <label htmlFor="continue-system-prompt">
-            Continue system prompt
-            {continueSystemDraft !== DEFAULT_CONTINUE_SYSTEM_PROMPT ? (
-              <button
-                type="button"
-                data-ui="field-inline-action"
-                data-role="continue-system-reset"
-                onClick={onContinueSystemReset}
-                title="Restore the default continue system prompt"
-              >
-                Reset to default
-              </button>
-            ) : null}
-          </label>
-          <textarea
-            id="continue-system-prompt"
-            data-ui="continue-system-prompt"
-            value={continueSystemDraft}
-            onChange={(e) => onContinueSystemPromptChange(e.target.value)}
-            rows={4}
-            spellCheck
-          />
-          <span data-ui="helper">
-            This field is a template. <code>{CONTINUE_SYSTEM_PROMPT_PLACEHOLDER}</code> expands to
-            the original chat system prompt verbatim. If the placeholder is absent, the original
-            system prompt is not added. Leave the field blank to send no system prompt at all
-            during Continue.
-          </span>
-        </div>
-        <div data-ui="field-group">
-          <label htmlFor="continue-user-prompt">
-            Continue user prompt
-            {continueUserDraft !== DEFAULT_CONTINUE_USER_PROMPT ? (
-              <button
-                type="button"
-                data-ui="field-inline-action"
-                data-role="continue-user-reset"
-                onClick={onContinueUserReset}
-                title="Restore the default continue user prompt"
-              >
-                Reset to default
-              </button>
-            ) : null}
-          </label>
-          <textarea
-            id="continue-user-prompt"
-            data-ui="continue-user-prompt"
-            value={continueUserDraft}
-            onChange={(e) => onContinueUserPromptChange(e.target.value)}
-            rows={3}
-            spellCheck
-          />
-          <span data-ui="helper">
-            Appended as a synthetic trailing user turn during Continue. Leave blank to fall back to
-            the legacy double-assistant shape, which can perform poorly on some models.
+            When off, new tokens during a live stream don't pull the viewport. You can still jump
+            to the latest reply via the floating chip.
           </span>
         </div>
       </div>

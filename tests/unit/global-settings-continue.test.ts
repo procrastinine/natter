@@ -1,48 +1,17 @@
-import Dexie from 'dexie'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { describe, expect, it } from 'vitest'
 import {
   CONTINUE_SYSTEM_PROMPT_PLACEHOLDER,
-  DEFAULT_CONTINUE_SYSTEM_PROMPT,
-  DEFAULT_CONTINUE_USER_PROMPT,
-  readGlobalPreferences,
   resolveContinueSystemPromptTemplate,
 } from '../../src/core/global-settings'
-import { __resetBroadcastForTests } from '../../src/store/broadcast'
-import { __resetDbForTests, openDb } from '../../src/store/db'
-import { setSetting } from '../../src/store/settings'
 
-const DB_NAME = 'natter'
+// Continue prompts now live on `chat.settings.continueSystemPrompt` /
+// `continueUserPrompt` rather than on GlobalPreferences. The legacy global
+// keys migrate into each chat + ChatPreset via the v5 Dexie upgrade; that
+// migration is exercised in `tests/integration/continue-prompts-migration`.
+// What's left here is the pure template resolver, which still lives in
+// `core/global-settings.ts` because the seed defaults do too.
 
-async function resetAll() {
-  __resetDbForTests()
-  __resetBroadcastForTests()
-  await Dexie.delete(DB_NAME)
-}
-
-beforeEach(async () => {
-  await resetAll()
-  await openDb()
-})
-
-afterEach(async () => {
-  await resetAll()
-})
-
-describe('readGlobalPreferences — continue prompts', () => {
-  it('fresh defaults keep both continue prompt slots nonblank', async () => {
-    const prefs = await readGlobalPreferences()
-    expect(prefs.continueSystemPrompt).toBe(DEFAULT_CONTINUE_SYSTEM_PROMPT)
-    expect(prefs.continueUserPrompt).toBe(DEFAULT_CONTINUE_USER_PROMPT)
-    expect(prefs.continueSystemPrompt).toContain(CONTINUE_SYSTEM_PROMPT_PLACEHOLDER)
-  })
-
-  it('migrates the legacy single continue prompt into the system slot only', async () => {
-    await setSetting('global:continue-prompt', 'legacy continue prompt')
-    const prefs = await readGlobalPreferences()
-    expect(prefs.continueSystemPrompt).toBe('legacy continue prompt')
-    expect(prefs.continueUserPrompt).toBe('')
-  })
-
+describe('resolveContinueSystemPromptTemplate', () => {
   it('uses no system prompt when the template is blank', () => {
     expect(resolveContinueSystemPromptTemplate('', 'original system')).toBe('')
   })

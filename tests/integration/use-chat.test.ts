@@ -75,7 +75,6 @@ function makeLlamaServerProfile(): ConnectionProfile {
     name: 'llama-server',
     kind: 'llama-server',
     baseUrl: 'http://llama.test/v1',
-    apiKeyRef: undefined,
     usesResponsesApiByDefault: false,
     supportsEndpointsApi: false,
     supportsGenerationApi: false,

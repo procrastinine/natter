@@ -498,20 +498,18 @@ export function Shell() {
 
   const handleSubmit = useCallback(
     async (text: string) => {
-      if (!activeChatId) failSend('send: no active chat')
+      if (!activeChatId) return failSend('send: no active chat')
       const chat = await getChat(activeChatId)
-      if (!chat) {
-        failSend('send: chat row missing', { chatId: activeChatId })
-      }
+      if (!chat) return failSend('send: chat row missing', { chatId: activeChatId })
       if (!chat.settings.profileId) {
-        failSend('send: chat.settings.profileId is empty — create the chat from a seeded preset')
+        return failSend('send: chat.settings.profileId is empty — create the chat from a seeded preset')
       }
       if (!chat.settings.model) {
-        failSend('send: chat.settings.model is empty — no model selected')
+        return failSend('send: chat.settings.model is empty — no model selected')
       }
       const profile = await getProfile(chat.settings.profileId)
       if (!profile) {
-        failSend('send: connection profile missing', { profileId: chat.settings.profileId })
+        return failSend('send: connection profile missing', { profileId: chat.settings.profileId })
       }
       let apiKey = ''
       try {
@@ -520,7 +518,7 @@ export function Shell() {
           throw new Error('missing key')
         }
       } catch (err) {
-        failSend('send: resolveKey failed', err)
+        return failSend('send: resolveKey failed', err)
       }
       try {
         const result = await send({
@@ -533,7 +531,7 @@ export function Shell() {
           console.info('send: stream ended with outcome', result.outcome, result.error?.kind)
         }
       } catch (err) {
-        failSend('send: pipeline threw', err)
+        return failSend('send: pipeline threw', err)
       }
       await bumpProfileLastUsedAt(profile.id)
       if (chat.presetId) await bumpPresetLastUsedAt(chat.presetId)
@@ -545,11 +543,15 @@ export function Shell() {
   const handleNewChatSubmit = useCallback(
     async (text: string) => {
       const { preset, settings } = await resolveNewChatSeed()
-      if (!settings.profileId) failSend('send: chat.settings.profileId is empty — no profile selected')
-      if (!settings.model) failSend('send: chat.settings.model is empty — no model selected')
+      if (!settings.profileId) {
+        return failSend('send: chat.settings.profileId is empty — no profile selected')
+      }
+      if (!settings.model) {
+        return failSend('send: chat.settings.model is empty — no model selected')
+      }
       const profile = await getProfile(settings.profileId)
       if (!profile) {
-        failSend('send: connection profile missing', { profileId: settings.profileId })
+        return failSend('send: connection profile missing', { profileId: settings.profileId })
       }
       let apiKey = ''
       try {
@@ -558,7 +560,7 @@ export function Shell() {
           throw new Error('missing key')
         }
       } catch (err) {
-        failSend('send: resolveKey failed', err)
+        return failSend('send: resolveKey failed', err)
       }
       writeActiveSeedState({
         profileId: settings.profileId || null,
@@ -581,7 +583,7 @@ export function Shell() {
           console.info('send: stream ended with outcome', result.outcome, result.error?.kind)
         }
       } catch (err) {
-        failSend('send: pipeline threw', err)
+        return failSend('send: pipeline threw', err)
       }
       await bumpProfileLastUsedAt(profile.id)
       if (chat.presetId) await bumpPresetLastUsedAt(chat.presetId)

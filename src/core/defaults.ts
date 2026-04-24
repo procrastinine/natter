@@ -7,6 +7,7 @@
 import { createKey } from '../store/keys'
 import { createPreset } from '../store/presets'
 import { createProfile } from '../store/profiles'
+import { DEFAULT_CONTINUE_SYSTEM_PROMPT, DEFAULT_CONTINUE_USER_PROMPT } from './global-settings'
 import type {
   ChatPreset,
   ChatSettings,
@@ -55,6 +56,8 @@ export const DEFAULT_CHAT_SETTINGS: Readonly<ChatSettings> = Object.freeze({
   model: '',
   systemPrompt: '',
   systemRole: 'system',
+  continueSystemPrompt: DEFAULT_CONTINUE_SYSTEM_PROMPT,
+  continueUserPrompt: DEFAULT_CONTINUE_USER_PROMPT,
   sampling: Object.freeze({}),
   reasoning: Object.freeze<ChatSettings['reasoning']>({
     mode: 'default',
