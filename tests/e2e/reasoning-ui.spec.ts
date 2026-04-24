@@ -110,9 +110,11 @@ test('mirrored Claude reasoning renders once in the UI and shows reasoning time 
 
   const assistant = page.locator('[data-ui="message"][data-role="assistant"]').first()
   await assistant.locator('[data-ui="reasoning-summary"]').click()
-  await expect(assistant.locator('[data-ui="reasoning-section"][data-reasoning-kind="text"]')).toHaveText(
-    'Let me',
-  )
+  await expect(
+    assistant.locator(
+      '[data-ui="reasoning-section"][data-reasoning-kind="text"] [data-ui="reasoning-row-body"]',
+    ),
+  ).toHaveText('Let me')
   await assistant.locator('[data-role="message-action"][data-action="info"]').click()
   await expect(assistant.locator('[data-ui="message-info"]')).toContainText('Reasoning time')
   await expect(assistant.locator('[data-ui="message-info"]')).toContainText('1.10 s before answer')

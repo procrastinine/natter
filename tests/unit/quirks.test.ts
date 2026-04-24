@@ -113,11 +113,11 @@ describe('quirks registry', () => {
     expect(allowedEffortFor('x-ai/grok-4.1')).toEqual(['low', 'medium', 'high'])
   })
 
-  it('DeepSeek v3.2 inline reasoning + narrowed effort', () => {
+  it('DeepSeek v4 inline reasoning + narrowed effort', () => {
     // Emits <think>…</think> inline; parser lifts to reasoning lane.
-    const q = quirksFor('deepseek/deepseek-v3.2')
+    const q = quirksFor('deepseek/deepseek-v4-pro')
     expect(q.reasoningInlineTags).toEqual(['think'])
-    expect(q.allowedEffort).toEqual(['low', 'medium', 'high'])
+    expect(q.allowedEffort).toEqual(['high', 'xhigh'])
   })
 
   it('Qwen3.6 inline reasoning + narrowed effort', () => {

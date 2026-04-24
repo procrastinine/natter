@@ -1,14 +1,14 @@
 import { useLiveQuery } from 'dexie-react-hooks'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { chatCompletionsOnce } from '../../api/chat-completions'
+import { runAssistantRequestOnce } from '../../api/assistant-stream'
 import { fetchModels } from '../../api/models'
 import { probeLlamaServer } from '../../api/probe'
 import { normalizeModelsResponse } from '../../api/providers'
-import { resolveBundledCapability } from '../../capabilities'
 import { cloneDefaultChatSettings } from '../../core/defaults'
 import { normalizeReasoningSettings } from '../../core/reasoning'
-import { toChatCompletions } from '../../core/transforms'
+import { prepareAssistantRequestPlan } from '../../core/send-planning'
 import type {
+  Chat,
   ChatId,
   ChatSettings,
   ConnectionKind,
@@ -287,6 +287,28 @@ function probeUserMessage(): Message {
   }
 }
 
+function probeChat(settings: ChatSettings): Chat {
+  return {
+    id: 'probe-chat',
+    title: 'Connection probe',
+    titleStatus: 'manual',
+    createdAt: 1,
+    updatedAt: 1,
+    lastViewedAt: 1,
+    wordCount: 0,
+    totalCostUsd: 0,
+    metaVersion: 0,
+    summaryVersion: 0,
+    settings,
+    lastUpdatedLeafId: null,
+    lastBranchUpdatedAt: 1,
+    archived: false,
+    pinned: false,
+    folderId: null,
+    tags: [],
+  }
+}
+
 function keyErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
@@ -356,12 +378,19 @@ async function runConnectionTest(opts: {
     const settings = cloneDefaultChatSettings()
     settings.profileId = probeProfile.id
     settings.model = model
-    const capability = resolveBundledCapability(probeProfile, model)
-    const { wire } = toChatCompletions(settings, [probeUserMessage()], {
-      capabilities: capability,
+    const { requestPlan } = await prepareAssistantRequestPlan({
+      chat: probeChat(settings),
+      connection: probeProfile,
+      pathMessages: [probeUserMessage()],
+      settings,
       stream: false,
+      debugSource: 'connection-probe',
     })
-    await chatCompletionsOnce({ profile: probeProfile, apiKey: opts.apiKey ?? '' }, wire)
+    await runAssistantRequestOnce({
+      connection: probeProfile,
+      apiKey: opts.apiKey ?? '',
+      requestPlan,
+    })
     const elapsedMs = Math.round(performance.now() - started)
     return {
       kind: 'ok',

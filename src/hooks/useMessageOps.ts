@@ -34,6 +34,7 @@ import { getChat, loadChatMessages } from '../store/chats'
 import { resolveKeyIfPresent } from '../store/keys'
 import { bumpPresetLastUsedAt } from '../store/presets'
 import { bumpProfileLastUsedAt, getProfile } from '../store/profiles'
+import { useChatStore } from '../store/zustand/chatStore'
 import { writeTextInto } from '../ui/chat/InlineEditor'
 import type { SendTextResult } from './useChat'
 import { continueAssistantInPlace } from './useContinue'
@@ -130,6 +131,11 @@ export async function editAndResend(
     content: nextContent,
     role: originalUser.role,
     origin: 'user',
+  })
+  const existingCursor = useChatStore.getState().getCursor(ctx.chatId) ?? {}
+  useChatStore.getState().setCursor(ctx.chatId, {
+    ...existingCursor,
+    ...inserted.effects.cursorUpdates,
   })
   const result = await ctx.sendFrom({
     chatId: ctx.chatId,

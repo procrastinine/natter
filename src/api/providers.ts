@@ -10,6 +10,7 @@
 // we merge with bundled capability tables in the hooks layer.
 
 import type { ModelEndpoint, PercentileBucket } from '../core/types'
+import { normalizeDataPolicy } from './privacy-scrape'
 
 export interface ModelListEntry {
   id: string
@@ -116,6 +117,20 @@ export function normalizeEndpoint(raw: unknown): ModelEndpoint | null {
     context_length,
     pricing: normalizePricing(obj['pricing']) ?? {},
   }
+  const id = asString(obj['id'])
+  if (id) endpoint.id = id
+  const providerDisplayName = asString(obj['provider_display_name']) ?? asString(asRecord(obj['provider_info'])?.['displayName'])
+  if (providerDisplayName) endpoint.provider_display_name = providerDisplayName
+  const providerSlug =
+    asString(obj['provider_slug']) ??
+    asString(obj['tag']) ??
+    asString(asRecord(obj['provider_info'])?.['slug'])
+  if (providerSlug) endpoint.provider_slug = providerSlug
+  const providerModelId = asString(obj['provider_model_id'])
+  if (providerModelId) endpoint.provider_model_id = providerModelId
+  const rawPolicy = asRecord(obj['data_policy']) ?? asRecord(asRecord(obj['provider_info'])?.['dataPolicy'])
+  const dataPolicy = rawPolicy ? normalizeDataPolicy(rawPolicy) : null
+  if (dataPolicy) endpoint.data_policy = dataPolicy
   const mpt = asNumber(obj['max_prompt_tokens'])
   if (mpt !== undefined) endpoint.max_prompt_tokens = mpt
   const mct = asNumber(obj['max_completion_tokens'])

@@ -14,12 +14,13 @@ import {
   tierToLockLabel,
 } from '../../src/ui/settings/provider-picker-rows'
 
-function ep(provider_name: string): ModelEndpoint {
+function ep(provider_name: string, overrides: Partial<ModelEndpoint> = {}): ModelEndpoint {
   return {
     provider_name,
     supported_parameters: ['temperature'],
     context_length: 200_000,
     pricing: { prompt: '0.000001', completion: '0.000002' },
+    ...overrides,
   }
 }
 
@@ -145,6 +146,123 @@ describe('buildPickerRows', () => {
     expect(row!.state).toBe('auto-excluded')
     expect(row!.tier).toBe('unavailable')
     expect(row!.reasons).toEqual(['unknown-policy'])
+    expect(row!.policySynthesized).toBe(false)
+  })
+
+  it('treats manually re-allowed dominated providers as kept while preserving their lower tier', () => {
+    const fastRetain = ep('Fast Retain')
+    const filter: PrivacyFilterResult = {
+      kept: [],
+      excluded: [
+        {
+          endpoint: fastRetain,
+          policy: POLICY_UNKNOWN_RETENTION,
+          policySynthesized: false,
+          reasons: ['dominated'],
+        },
+      ],
+      orderedKeptNames: [],
+      zeroEligible: false,
+    }
+    const [row] = buildPickerRows([fastRetain], filter, {
+      providerPrefs: { ignore: [], ignoreOverridesFilter: true },
+    })
+    expect(row!.state).toBe('kept')
+    expect(row!.tier).toBe('orange')
+    expect(row!.reasons).toEqual([])
+  })
+
+  it('lets manual picker override even red privacy tiers', () => {
+    const trainer = ep('Training Host')
+    const filter: PrivacyFilterResult = {
+      kept: [],
+      excluded: [
+        {
+          endpoint: trainer,
+          policy: { ...POLICY_CLEAN, training: true },
+          policySynthesized: false,
+          reasons: ['training'],
+        },
+      ],
+      orderedKeptNames: [],
+      zeroEligible: true,
+    }
+    const [row] = buildPickerRows([trainer], filter, {
+      providerPrefs: { ignore: [], ignoreOverridesFilter: true },
+    })
+    expect(row!.state).toBe('kept')
+    expect(row!.tier).toBe('red')
+    expect(row!.reasons).toEqual([])
+  })
+
+  it('renders compatibility providerPrefs.only as a visible pinned set', () => {
+    const kept = ep('Allowed', { provider_slug: 'allowed' })
+    const outside = ep('Outside', { provider_slug: 'outside' })
+    const filter: PrivacyFilterResult = {
+      kept: [
+        { endpoint: kept, policy: POLICY_CLEAN, policySynthesized: false },
+        { endpoint: outside, policy: POLICY_CLEAN, policySynthesized: false },
+      ],
+      excluded: [],
+      orderedKeptNames: ['allowed', 'outside'],
+      zeroEligible: false,
+    }
+    const rows = buildPickerRows([kept, outside], filter, {
+      providerPrefs: { only: ['allowed'], ignoreOverridesFilter: true },
+    })
+    expect(rows.map((r) => [r.endpoint.provider_slug, r.state, r.reasons])).toEqual([
+      ['allowed', 'kept', []],
+      ['outside', 'auto-excluded', ['not-in-only-list']],
+    ])
+  })
+
+  it('keys rows by endpoint identity, not duplicate display name', () => {
+    const anth2 = ep('Anthropic', { provider_slug: 'anthropic/2' })
+    const anth = ep('Anthropic', { provider_slug: 'anthropic' })
+    const filter: PrivacyFilterResult = {
+      kept: [{ endpoint: anth, policy: POLICY_CLEAN, policySynthesized: false }],
+      excluded: [
+        {
+          endpoint: anth2,
+          policy: POLICY_UNKNOWN_RETENTION,
+          policySynthesized: false,
+          reasons: ['user-ignored'],
+        },
+      ],
+      orderedKeptNames: ['anthropic'],
+      zeroEligible: false,
+    }
+    const rows = buildPickerRows([anth2, anth], filter)
+    expect(rows.map((r) => r.endpoint.provider_slug)).toEqual(['anthropic/2', 'anthropic'])
+    expect(rows.map((r) => r.state)).toEqual(['auto-excluded', 'kept'])
+  })
+
+  it('uses exact slug refs for manual picker state while preserving legacy display refs', () => {
+    const anth2 = ep('Anthropic', { provider_slug: 'anthropic/2' })
+    const anth = ep('Anthropic', { provider_slug: 'anthropic' })
+    const filter: PrivacyFilterResult = {
+      kept: [
+        { endpoint: anth2, policy: POLICY_CLEAN, policySynthesized: false },
+        { endpoint: anth, policy: POLICY_CLEAN, policySynthesized: false },
+      ],
+      excluded: [],
+      orderedKeptNames: ['anthropic/2', 'anthropic'],
+      zeroEligible: false,
+    }
+    const exact = buildPickerRows([anth2, anth], filter, {
+      providerPrefs: { ignore: ['anthropic/2'], ignoreOverridesFilter: true },
+    })
+    expect(exact.map((r) => r.state)).toEqual(['auto-excluded', 'kept'])
+
+    const exactCollision = buildPickerRows([anth2, anth], filter, {
+      providerPrefs: { ignore: ['anthropic'], ignoreOverridesFilter: true },
+    })
+    expect(exactCollision.map((r) => r.state)).toEqual(['kept', 'auto-excluded'])
+
+    const legacy = buildPickerRows([anth2, anth], filter, {
+      providerPrefs: { ignore: ['Anthropic'], ignoreOverridesFilter: true },
+    })
+    expect(legacy.map((r) => r.state)).toEqual(['auto-excluded', 'auto-excluded'])
   })
 })
 

@@ -13,14 +13,33 @@
 // reasoning is discarded (it describes the meta-instruction, not the
 // original turn).
 
-import { chatCompletions } from '../api/chat-completions'
+import {
+  openAssistantRequestStream,
+  type AssistantStreamChunk,
+} from '../api/assistant-stream'
 import { ApiError } from '../api/errors'
-import { splitChatStream } from '../api/stream-transforms'
-import type { ChatStreamChunk } from '../api/types'
+import {
+  splitChatStream,
+  splitGeminiStream,
+  splitResponsesStream,
+  type StreamLaneEvent,
+} from '../api/stream-transforms'
+import type { GeminiStreamChunk } from '../api/gemini-types'
+import type { ChatStreamChunk, ResponsesStreamChunk } from '../api/types'
 import { activePath, cursorKeyOf } from '../core/active-path'
-import { readGlobalPreferences } from '../core/global-settings'
-import type { ChatCompletionsTransformOptions } from '../core/transforms'
-import { toChatCompletions } from '../core/transforms'
+import {
+  readGlobalPreferences,
+  resolveContinueSystemPromptTemplate,
+} from '../core/global-settings'
+import {
+  calibrationFieldsForEdit,
+  readTokenCalibrationGlobal,
+} from '../core/token-calibration'
+import {
+  type AssistantRequestPlan,
+  NoEligibleProvidersError,
+  prepareAssistantRequestPlan,
+} from '../core/send-planning'
 import type { ChatId, ConnectionProfile, ContentItem, Message, MessageId } from '../core/types'
 import { newId } from '../lib/ulid'
 import { postEvent } from '../store/broadcast'
@@ -28,6 +47,8 @@ import { getBrowserRepository } from '../store/browser-repo'
 import { dismissAbortReason, getChat, loadChatMessages } from '../store/chats'
 import { useChatStore } from '../store/zustand/chatStore'
 import { useStreamStore } from '../store/zustand/streamStore'
+import { useUiStore } from '../store/zustand/uiStore'
+import { markLifecycleTarget, startRequestLifecycle } from './requestLifecycle'
 
 export interface ContinueInPlaceInput {
   chatId: ChatId
@@ -41,14 +62,63 @@ export interface ContinueInPlaceInput {
     apiKey: string
     wireBody: Record<string, unknown>
     signal: AbortSignal
-  }) => AsyncIterable<ChatStreamChunk>
+    route?: AssistantRequestPlan['route']
+    geminiModelId?: string
+  }) => AsyncIterable<AssistantStreamChunk>
 }
 
-function rewriteCompatibleModelId(connection: ConnectionProfile, modelId: string): string {
-  if (connection.kind === 'anthropic') {
-    return modelId.replace(/(\d)\.(\d)(?=-|$)/g, '$1-$2')
+function throwWithZeroEligibleUi(chatId: ChatId, err: unknown): never {
+  if (err instanceof NoEligibleProvidersError) {
+    useUiStore.getState().setZeroEligibleChatId(chatId)
   }
-  return modelId
+  throw err
+}
+
+function devOnlyOpenStreamOverride(
+  openStream: ContinueInPlaceInput['openStream'],
+): ContinueInPlaceInput['openStream'] {
+  if (!openStream) return undefined
+  if ((import.meta as { env?: { DEV?: boolean } }).env?.DEV !== true) {
+    throw new Error('openStream override is dev-only; production sends must use assistant-stream')
+  }
+  return openStream
+}
+
+async function* laneStreamForRoute(
+  route: AssistantRequestPlan['route'],
+  source: AsyncIterable<AssistantStreamChunk>,
+): AsyncGenerator<StreamLaneEvent> {
+  const iterator = source[Symbol.asyncIterator]()
+  const first = await iterator.next()
+  if (first.done) return
+  const replay = {
+    async *[Symbol.asyncIterator]() {
+      yield first.value
+      for await (const chunk of { [Symbol.asyncIterator]: () => iterator }) yield chunk
+    },
+  }
+  const kind = (first.value as { type?: string }).type
+  if (kind === 'event') {
+    yield* splitResponsesStream(replay as AsyncIterable<ResponsesStreamChunk>)
+    return
+  }
+  if (kind === 'chunk') {
+    yield* splitGeminiStream(replay as AsyncIterable<GeminiStreamChunk>)
+    return
+  }
+  if (kind === 'delta') {
+    yield* splitChatStream(replay as AsyncIterable<ChatStreamChunk>)
+    return
+  }
+  if (route?.transport === 'openai-responses') {
+    yield* splitResponsesStream(replay as AsyncIterable<ResponsesStreamChunk>)
+    return
+  }
+  if (route?.transport === 'gemini-native') {
+    yield* splitGeminiStream(replay as AsyncIterable<GeminiStreamChunk>)
+    return
+  }
+  yield* splitChatStream(replay as AsyncIterable<ChatStreamChunk>)
 }
 
 export async function continueAssistantInPlace(input: ContinueInPlaceInput): Promise<void> {
@@ -83,105 +153,141 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
   const upstream = targetIdx >= 0 ? path.slice(0, targetIdx + 1) : path
 
   // Build the wire body as if we were sending a request that ends with
-  // the target assistant. The transform keeps the target's partial
-  // text as the tail assistant message. We then override the system
-  // prompt with the continuation instruction; the original prompt is
-  // appended underneath so the model retains the chat's character
-  // while following the continue directive.
-  //
-  // The continue prompt is a global setting (editable in GeneralSettings
-  // → Continue) so the user can tune the wording per model — some
-  // prefer "continue writing", others respond better to "resume".
-  const globalPrefs = await readGlobalPreferences()
-  const continueInstruction =
-    globalPrefs.continuePrompt.trim() ||
-    'Continue the chat from the last assistant message. Output only the continuation.'
-  const baseSystem = chat.settings.systemPrompt?.trim() ?? ''
-  const continueSystem = baseSystem
-    ? `${continueInstruction}\n\nOriginal system prompt follows:\n${baseSystem}`
-    : continueInstruction
+  // the target assistant. Continue has two independent global prompt slots:
+  // a system override (which replaces the chat system prompt when non-empty)
+  // and a synthetic trailing user prompt (which avoids the double-assistant
+  // shape when non-empty). Either can be blank.
+  const [globalPrefs, globalCalibration] = await Promise.all([
+    readGlobalPreferences(),
+    readTokenCalibrationGlobal(),
+  ])
+  const continueSystemPrompt = globalPrefs.continueSystemPrompt
+  const continueUserPrompt = globalPrefs.continueUserPrompt
+  const originalSystemPrompt = chat.settings.systemPrompt
   const settingsForContinue = {
     ...chat.settings,
-    systemPrompt: continueSystem,
+    systemPrompt: resolveContinueSystemPromptTemplate(
+      continueSystemPrompt,
+      originalSystemPrompt,
+    ),
   }
-
-  const transformOpts: ChatCompletionsTransformOptions = {
-    stream: true,
-    rewriteSlug: (slug) => rewriteCompatibleModelId(input.connection, slug),
-  }
-  const { wire, requestedModel } = toChatCompletions(settingsForContinue, upstream, transformOpts)
-  void requestedModel
-
-  const streamId = newId()
-  const abortController = new AbortController()
-  const abortStream = () => abortController.abort()
-  const userSignal = input.signal
-  if (userSignal?.aborted) abortController.abort(userSignal.reason)
-  else
-    userSignal?.addEventListener('abort', () => abortController.abort(userSignal.reason), {
-      once: true,
-    })
-
-  useStreamStore.getState().setActive({
-    streamId,
+  const continuePath =
+    continueUserPrompt.trim().length > 0
+      ? [
+          ...upstream,
+          {
+            id: `continue-user:${target.id}`,
+            chatId: input.chatId,
+            parentId: target.id,
+            siblingIndex: 0,
+            turnId: `continue-user:${target.turnId}`,
+            turnIndex: 0,
+            createdAt: target.createdAt,
+            role: 'user' as const,
+            origin: 'user' as const,
+            content: [{ type: 'text' as const, text: continueUserPrompt }],
+            nodeVersion: 0,
+            deleted: false,
+          },
+        ]
+      : upstream
+  const lifecycle = startRequestLifecycle({
     chatId: input.chatId,
-    messageId: target.id,
-    startedAt: now(),
-    ownerClientId: 'in-tab',
-    abort: abortStream,
-  })
-  postEvent({
-    kind: 'stream-started',
-    chatId: input.chatId,
-    streamId,
-    messageId: target.id,
-    ownerClientId: 'in-tab',
+    streamId: newId(),
+    ...(input.signal ? { userSignal: input.signal } : {}),
   })
 
   let outcome: 'done' | 'error' | 'abort' = 'done'
-  let buffer = ''
-  const baseText = existingTextOf(target)
-  const openStream =
-    input.openStream ??
-    ((open) =>
-      chatCompletions(
-        { profile: open.connection, apiKey: open.apiKey },
-        open.wireBody as Parameters<typeof chatCompletions>[1],
-        { signal: open.signal },
-      ))
-
-  let lastFlushedAt = now()
-  let lastFlushedLen = 0
-
-  const flush = async (final: boolean) => {
-    const combined = baseText + buffer
-    await repo.runMutation([{ kind: 'message', messageId: target.id }], async (ctx) => {
-      const current = await ctx.getMessage(target.id)
-      if (!current) return
-      const nextContent: ContentItem[] = appendTextOnto(
-        current.content,
-        // The delta-since-last-flush is what we haven't written yet;
-        // but `current.content` already has everything from prior
-        // flushes, so compute the tail from buffer and merge.
-        combined,
-      )
-      await ctx.putMessage(
-        { ...current, content: nextContent },
-        final ? undefined : { touchChatSummary: false, broadcast: false },
-      )
-    })
-    lastFlushedAt = now()
-    lastFlushedLen = buffer.length
-  }
-
+  let abortController: AbortController | null = null
+  let flush: (final: boolean) => Promise<void> = async () => {}
   try {
+    const requestPlan = await prepareAssistantRequestPlan({
+      chat,
+      connection: input.connection,
+      pathMessages: continuePath,
+      settings: settingsForContinue,
+      draftText: '',
+      debugSource: 'continue',
+      signal: lifecycle.signal,
+    })
+      .then((prepared) => prepared.requestPlan)
+      .catch((err) => throwWithZeroEligibleUi(input.chatId, err))
+    const { route, geminiModelId, wire } = requestPlan
+
+    const streamId = lifecycle.streamId
+    abortController = new AbortController()
+    const abortStream = () => abortController?.abort()
+    const userSignal = lifecycle.signal
+    if (userSignal.aborted) abortController.abort(userSignal.reason)
+    else
+      userSignal.addEventListener('abort', () => abortController.abort(userSignal.reason), {
+        once: true,
+      })
+
+    markLifecycleTarget({
+      chatId: input.chatId,
+      streamId,
+      messageId: target.id,
+      abort: abortStream,
+    })
+
+    let buffer = ''
+    const baseText = existingTextOf(target)
+    const openStream =
+      devOnlyOpenStreamOverride(input.openStream) ??
+      ((open) =>
+        openAssistantRequestStream({
+          connection: open.connection,
+          apiKey: open.apiKey,
+          requestPlan,
+          signal: open.signal,
+        }))
+
+    let lastFlushedAt = now()
+    let lastFlushedLen = 0
+
+    flush = async (final: boolean) => {
+      const combined = baseText + buffer
+      await repo.runMutation([{ kind: 'message', messageId: target.id }], async (ctx) => {
+        const current = await ctx.getMessage(target.id)
+        if (!current) return
+        const nextContent: ContentItem[] = appendTextOnto(
+          current.content,
+          // The delta-since-last-flush is what we haven't written yet;
+          // but `current.content` already has everything from prior
+          // flushes, so compute the tail from buffer and merge.
+          combined,
+        )
+        const calibrationPatch = chat.settings.model
+          ? calibrationFieldsForEdit(
+              nextContent,
+              current.originalCharCount,
+              current.originalModelId,
+              current.originalCalibrationKey,
+              chat.settings.model,
+              chat,
+              globalCalibration,
+              globalPrefs.tokenCalibrationMode,
+            )
+          : null
+        await ctx.putMessage(
+          { ...current, content: nextContent, ...(calibrationPatch ?? {}) },
+          final ? undefined : { touchChatSummary: false, broadcast: false },
+        )
+      })
+      lastFlushedAt = now()
+      lastFlushedLen = buffer.length
+    }
+
     const chunkIter = openStream({
       connection: input.connection,
       apiKey: input.apiKey,
       wireBody: wire as Record<string, unknown>,
       signal: abortController.signal,
+      ...(route ? { route } : {}),
+      ...(geminiModelId ? { geminiModelId } : {}),
     })
-    for await (const event of splitChatStream(chunkIter)) {
+    for await (const event of laneStreamForRoute(route, chunkIter)) {
       if (event.lane === 'text') {
         buffer += event.text
       } else if (event.lane === 'error') {
@@ -202,7 +308,7 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
       await dismissAbortReason(target.id)
     }
   } catch (err) {
-    if (abortController.signal.aborted) {
+    if (abortController?.signal.aborted || lifecycle.signal.aborted) {
       outcome = 'abort'
       await flush(true)
     } else if (err instanceof ApiError) {
@@ -214,14 +320,15 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
       throw err
     }
   } finally {
-    useStreamStore.getState().clearActive(streamId)
+    useStreamStore.getState().clearActive(lifecycle.streamId)
     postEvent({
       kind: 'stream-ended',
       chatId: input.chatId,
-      streamId,
+      streamId: lifecycle.streamId,
       messageId: target.id,
       outcome,
     })
+    lifecycle.end(outcome)
   }
 }
 

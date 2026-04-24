@@ -5,8 +5,9 @@
 //   1. Persist the user message (via messages.sendUserMessage) and an assistant
 //      placeholder (via continueAssistant-style append under the user) — both
 //      rows are durable BEFORE the fetch opens (`plan/13 §13.2.2 first-token-latency`).
-//   2. Compose the wire body from the active path via `toChatCompletions`.
-//   3. Open the stream. Feed chunks through `splitChatStream` into an
+//   2. Compose the wire body from the active path via `send-planning`.
+//   3. Open the stream through the single assistant dispatcher. Feed chunks
+//      through `splitChatStream` into an
 //      in-memory accumulator (text / reasoning / tool-calls / usage / meta).
 //   4. Periodically (every ~200ms or on 4KB text growth) flush the
 //      accumulator into the placeholder row via the scoped mutation executor.
@@ -22,18 +23,28 @@
 // callbacks; components call `sendText({chat, connection, ...})`.
 
 import { useCallback, useRef } from 'react'
-import { chatCompletions } from '../api/chat-completions'
+import {
+  openAssistantRequestStream,
+  type AssistantStreamChunk,
+} from '../api/assistant-stream'
 import { ApiError } from '../api/errors'
-import { applyServerTemplate } from '../api/probe'
-import { type StreamLaneEvent, splitChatStream } from '../api/stream-transforms'
-import { textCompletions } from '../api/text-completions'
-import type { ChatStreamChunk } from '../api/types'
+import {
+  type StreamLaneEvent,
+  splitChatStream,
+  splitGeminiStream,
+  splitResponsesStream,
+} from '../api/stream-transforms'
+import type { GeminiStreamChunk } from '../api/gemini-types'
+import type { ChatStreamChunk, ResponsesStreamChunk } from '../api/types'
 import { activePath, cursorKeyOf, groupByParent } from '../core/active-path'
-import { applyContextCutoff, messageCost } from '../core/context-cutoff'
+import { messageCost } from '../core/context-cutoff'
 import { sendUserMessage } from '../core/messages'
-import { tokenizerFromSettings } from '../core/prompt-size'
-import { quirksFor } from '../core/quirks'
 import { readGlobalPreferences } from '../core/global-settings'
+import {
+  NoEligibleProvidersError,
+  prepareAssistantRequestPlan,
+  type AssistantRequestPlan,
+} from '../core/send-planning'
 import {
   addSampleToChat,
   addSampleToGlobal,
@@ -47,10 +58,8 @@ import {
   mergeReasoningDetail,
   normalizeIncomingReasoningDetail,
 } from '../core/reasoning'
-import { resolveTextTemplate } from '../core/text-templates'
 import type { PromptEstimateOptions } from '../core/tokens'
 import type { ChatCompletionsTransformOptions } from '../core/transforms'
-import { toChatCompletions, toTextCompletions } from '../core/transforms'
 import { nextSiblingIndex } from '../core/tree-ops'
 import type {
   AbortReason,
@@ -66,20 +75,105 @@ import type {
   ReasoningDetail,
 } from '../core/types'
 import { newId } from '../lib/ulid'
+import { logStreamDebug, streamDebugEnabled } from '../lib/debug-streams'
 import { postEvent } from '../store/broadcast'
 import { getBrowserRepository } from '../store/browser-repo'
 import { getChat, loadChatMessages } from '../store/chats'
 import { useChatStore } from '../store/zustand/chatStore'
 import { useStreamStore } from '../store/zustand/streamStore'
+import { markLifecycleTarget, startRequestLifecycle } from './requestLifecycle'
+import { useUiStore } from '../store/zustand/uiStore'
 
 export const FLUSH_INTERVAL_MS = 200
 export const FLUSH_TEXT_GROWTH_BYTES = 4096
 
-function rewriteCompatibleModelId(connection: ConnectionProfile, modelId: string): string {
-  if (connection.kind === 'anthropic') {
-    return modelId.replace(/(\d)\.(\d)(?=-|$)/g, '$1-$2')
+function routeApiUsed(route: AssistantRequestPlan['route']): GenerationMeta['apiUsed'] {
+  if (route?.kind === 'responses') return 'responses'
+  if (route?.kind === 'gemini-generate') return 'gemini-native'
+  if (route?.kind === 'anthropic-messages') return 'anthropic-messages'
+  return 'chat'
+}
+
+function pendingUserMessage(input: {
+  chatId: ChatId
+  parentId: MessageId | null
+  siblingIndex: number
+  content: ContentItem[]
+  createdAt: number
+  messageId: MessageId
+  turnId: string
+}): Message {
+  return {
+    id: input.messageId,
+    chatId: input.chatId,
+    parentId: input.parentId,
+    siblingIndex: input.siblingIndex,
+    turnId: input.turnId,
+    turnIndex: 0,
+    createdAt: input.createdAt,
+    role: 'user',
+    origin: 'user',
+    content: input.content,
+    nodeVersion: 0,
+    deleted: false,
   }
-  return modelId
+}
+
+function throwWithZeroEligibleUi(chatId: ChatId, err: unknown): never {
+  if (err instanceof NoEligibleProvidersError) {
+    useUiStore.getState().setZeroEligibleChatId(chatId)
+  }
+  throw err
+}
+
+async function* laneStreamForRoute(
+  route: AssistantRequestPlan['route'],
+  source: AsyncIterable<OpenStreamChunk>,
+): AsyncGenerator<StreamLaneEvent> {
+  const iterator = source[Symbol.asyncIterator]()
+  const first = await iterator.next()
+  if (first.done) return
+  const replay = {
+    async *[Symbol.asyncIterator]() {
+      yield first.value
+      for await (const chunk of { [Symbol.asyncIterator]: () => iterator }) yield chunk
+    },
+  }
+
+  const transport = detectStreamTransport(first.value, route)
+  if (transport === 'openai-responses') {
+    yield* splitResponsesStream(replay as AsyncIterable<ResponsesStreamChunk>)
+    return
+  }
+  if (transport === 'gemini-native') {
+    yield* splitGeminiStream(replay as AsyncIterable<GeminiStreamChunk>)
+    return
+  }
+  yield* splitChatStream(replay as AsyncIterable<ChatStreamChunk>)
+}
+
+function detectStreamTransport(
+  chunk: OpenStreamChunk,
+  route: AssistantRequestPlan['route'],
+): NonNullable<AssistantRequestPlan['route']>['transport'] | 'openai-chat' {
+  if ((chunk as { type?: string }).type === 'event') return 'openai-responses'
+  if ((chunk as { type?: string }).type === 'chunk') return 'gemini-native'
+  if ((chunk as { type?: string }).type === 'delta') return 'openai-chat'
+  if ((chunk as { type?: string }).type === 'buffered_result') {
+    const result = (chunk as { result?: Record<string, unknown> }).result
+    if (result) {
+      if (Array.isArray((result as { output?: unknown[] }).output) || 'status' in result) {
+        return 'openai-responses'
+      }
+      if (Array.isArray((result as { candidates?: unknown[] }).candidates)) {
+        return 'gemini-native'
+      }
+      if (Array.isArray((result as { choices?: unknown[] }).choices)) return 'openai-chat'
+    }
+  }
+  if (route?.transport === 'openai-responses') return 'openai-responses'
+  if (route?.transport === 'gemini-native') return 'gemini-native'
+  return 'openai-chat'
 }
 
 // Per-stream mutable state. Mirrors the §6.2 `ActiveStream` fields that apply
@@ -88,14 +182,12 @@ function rewriteCompatibleModelId(connection: ConnectionProfile, modelId: string
 interface ChatAccumulator {
   textBuffer: string
   // Ordered list of reasoning details accumulated so far. Streaming deltas
-  // from Responses / Gemini-native lanes write into a specific row via the
-  // `reasoningRowByTag` index (which encodes outputIndex + summaryIndex for
-  // summary deltas so each summary PART is its own row). Chat-completions
-  // `reasoning_details[]` entries go through `findMergeTargetIndex` so OR's
-  // Gemini path — which emits multiple distinct summaries all at `index: 0`
-  // — produces one row per summary instead of collapsing into one.
+  // from Responses / Gemini-native lanes carry a stable synthetic id when
+  // possible, so incremental text/summary/encrypted fragments and buffered
+  // fallbacks all converge on the same row. Legacy chat-completions
+  // `reasoning_details[]` entries still go through `findMergeTargetIndex`.
   reasoningList: ReasoningDetail[]
-  reasoningRowByTag: Map<string, number>
+  reasoningRowById: Map<string, number>
   generationId?: string
   model?: string
   provider?: string
@@ -108,6 +200,7 @@ interface ChatAccumulator {
   lastFlushedTextLen: number
   lastChunkReceivedAt: number
   midStreamError?: ApiError
+  debugScope?: string
 }
 
 export interface SendTextInput {
@@ -120,7 +213,7 @@ export interface SendTextInput {
   // Injection seam for integration tests that want to mock the stream
   // generator instead of `fetch`. The default opens a real chat-completions
   // call; tests pass a replacement iterable.
-  openStream?: (input: OpenStreamInput) => AsyncIterable<ChatStreamChunk>
+  openStream?: (input: OpenStreamInput) => AsyncIterable<OpenStreamChunk>
   signal?: AbortSignal
   now?: () => number
 }
@@ -140,6 +233,20 @@ export interface OpenStreamInput {
   apiKey: string
   wireBody: Record<string, unknown>
   signal: AbortSignal
+  route?: AssistantRequestPlan['route']
+  geminiModelId?: string
+}
+
+type OpenStreamChunk = AssistantStreamChunk
+
+function devOnlyOpenStreamOverride(
+  openStream: SendTextInput['openStream'],
+): SendTextInput['openStream'] {
+  if (!openStream) return undefined
+  if ((import.meta as { env?: { DEV?: boolean } }).env?.DEV !== true) {
+    throw new Error('openStream override is dev-only; production sends must use assistant-stream')
+  }
+  return openStream
 }
 
 export interface SendTextResult {
@@ -157,27 +264,74 @@ export interface SendTextResult {
 // id, invalid invariants) throw.
 export async function sendText(input: SendTextInput): Promise<SendTextResult> {
   const now = input.now ?? Date.now
-  const chat = await getChat(input.chatId)
-  if (!chat) throw new Error(`sendText: chat not found: ${input.chatId}`)
-
-  const cursor = useChatStore.getState().getCursor(input.chatId) ?? {}
-
-  const userMsg = await sendUserMessage({
+  const lifecycle = startRequestLifecycle({
     chatId: input.chatId,
-    cursor,
-    content: input.content,
-    now: now(),
+    streamId: newId(),
+    ...(input.signal ? { userSignal: input.signal } : {}),
   })
-  useChatStore.getState().setCursor(input.chatId, {
-    ...cursor,
-    ...userMsg.effects.cursorUpdates,
-  })
+  try {
+    const chat = await getChat(input.chatId)
+    if (!chat) throw new Error(`sendText: chat not found: ${input.chatId}`)
 
-  return openAssistantStreamUnder({
-    ...input,
-    parentMessageId: userMsg.messageId,
-    userMessageId: userMsg.messageId,
-  })
+    const cursor = useChatStore.getState().getCursor(input.chatId) ?? {}
+    const allMessages = await loadChatMessages(input.chatId)
+    const path = activePath(allMessages, cursor)
+    const parentId = path.at(-1)?.id ?? null
+    const createdAt = now()
+    const userMessageId = newId()
+    const userTurnId = newId()
+    const pendingUser = pendingUserMessage({
+      chatId: input.chatId,
+      parentId,
+      siblingIndex: nextSiblingIndex(groupByParent(allMessages), parentId),
+      content: input.content,
+      createdAt,
+      messageId: userMessageId,
+      turnId: userTurnId,
+    })
+    let requestPlan: AssistantRequestPlan
+    try {
+      requestPlan = (
+        await prepareAssistantRequestPlan({
+          chat,
+          connection: input.connection,
+          pathMessages: [...path, pendingUser],
+          draftText: '',
+          debugSource: 'send',
+          ...(input.capabilities ? { capabilities: input.capabilities } : {}),
+          ...(input.transform ? { transform: input.transform } : {}),
+          signal: lifecycle.signal,
+        })
+      ).requestPlan
+    } catch (err) {
+      throwWithZeroEligibleUi(input.chatId, err)
+    }
+    if (lifecycle.signal.aborted) throw new DOMException('Request aborted.', 'AbortError')
+
+    const userMsg = await sendUserMessage({
+      chatId: input.chatId,
+      cursor,
+      content: input.content,
+      now: createdAt,
+      messageId: userMessageId,
+      turnId: userTurnId,
+    })
+    useChatStore.getState().setCursor(input.chatId, {
+      ...cursor,
+      ...userMsg.effects.cursorUpdates,
+    })
+
+    return await openAssistantStreamUnder({
+      ...input,
+      signal: lifecycle.signal,
+      streamId: lifecycle.streamId,
+      parentMessageId: userMsg.messageId,
+      userMessageId: userMsg.messageId,
+      requestPlan,
+    })
+  } finally {
+    lifecycle.end(lifecycle.signal.aborted ? 'abort' : 'error')
+  }
 }
 
 // Edit-then-send / resend-from-existing-user entrypoint. The caller has
@@ -185,24 +339,90 @@ export async function sendText(input: SendTextInput): Promise<SendTextResult> {
 // role:'user', origin:'user'); all that's left is to attach an assistant
 // placeholder under it and stream the reply. No user message is created.
 export async function sendFromMessage(input: SendFromMessageInput): Promise<SendTextResult> {
-  return openAssistantStreamUnder({
-    ...input,
-    parentMessageId: input.parentMessageId,
-    userMessageId: input.parentMessageId,
+  const lifecycle = startRequestLifecycle({
+    chatId: input.chatId,
+    streamId: newId(),
+    ...(input.signal ? { userSignal: input.signal } : {}),
   })
+  try {
+    const chat = await getChat(input.chatId)
+    if (!chat) throw new Error(`sendText: chat not found: ${input.chatId}`)
+    const repo = getBrowserRepository()
+    const parent = await repo.getMessage(input.parentMessageId)
+    if (!parent || parent.chatId !== input.chatId || parent.deleted) {
+      throw new Error(`sendFrom: parent ${input.parentMessageId} unavailable`)
+    }
+    const baseCursor = useChatStore.getState().getCursor(input.chatId) ?? {}
+    const cursor: Record<string, MessageId> = { ...baseCursor }
+    let cur: Message | undefined = parent
+    while (cur) {
+      cursor[cursorKeyOf(cur.parentId)] = cur.id
+      cur = cur.parentId ? await repo.getMessage(cur.parentId) : undefined
+    }
+    const allMessages = await loadChatMessages(input.chatId)
+    const path = activePath(allMessages, cursor)
+    const parentIdx = path.findIndex((m) => m.id === parent.id)
+    const rawOutboundPath = parentIdx >= 0 ? path.slice(0, parentIdx + 1) : path
+    let requestPlan: AssistantRequestPlan
+    try {
+      requestPlan = (
+        await prepareAssistantRequestPlan({
+          chat,
+          connection: input.connection,
+          pathMessages: rawOutboundPath,
+          draftText: '',
+          debugSource: 'send-from-message',
+          ...(input.capabilities ? { capabilities: input.capabilities } : {}),
+          ...(input.transform ? { transform: input.transform } : {}),
+          signal: lifecycle.signal,
+        })
+      ).requestPlan
+    } catch (err) {
+      throwWithZeroEligibleUi(input.chatId, err)
+    }
+    if (lifecycle.signal.aborted) throw new DOMException('Request aborted.', 'AbortError')
+    return await openAssistantStreamUnder({
+      ...input,
+      signal: lifecycle.signal,
+      streamId: lifecycle.streamId,
+      parentMessageId: input.parentMessageId,
+      userMessageId: input.parentMessageId,
+      requestPlan,
+    })
+  } finally {
+    lifecycle.end(lifecycle.signal.aborted ? 'abort' : 'error')
+  }
 }
 
 async function openAssistantStreamUnder(
-  input: SendFromMessageInput & { userMessageId: MessageId },
+  input: SendFromMessageInput & {
+    userMessageId: MessageId
+    requestPlan: AssistantRequestPlan
+    streamId?: string
+  },
 ): Promise<SendTextResult> {
   const now = input.now ?? Date.now
   const repo = getBrowserRepository()
   const chat = await getChat(input.chatId)
   if (!chat) throw new Error(`sendText: chat not found: ${input.chatId}`)
 
-  const useTextProtocol =
-    chat.settings.protocol === 'text' && input.connection.kind === 'llama-server'
-  const apiUsed: 'chat' | 'completion' = useTextProtocol ? 'completion' : 'chat'
+  const parent = await repo.getMessage(input.parentMessageId)
+  if (!parent || parent.chatId !== input.chatId || parent.deleted) {
+    throw new Error(`sendText: parent ${input.parentMessageId} unavailable`)
+  }
+  const requestPlan = input.requestPlan
+  const {
+    settings: requestSettings,
+    useTextProtocol,
+    route,
+    requestedModel,
+    geminiModelId,
+    wire,
+    outboundPath,
+    outboundTokenizer,
+    outboundReasoningOpts,
+  } = requestPlan
+  const placeholderApiUsed: 'chat' | 'completion' = useTextProtocol ? 'completion' : 'chat'
 
   const assistantId = newId()
   await repo.runMutation(
@@ -229,7 +449,7 @@ async function openAssistantStreamUnder(
           id: '',
           model: chat.settings.model,
           requestedModel: chat.settings.model,
-          apiUsed,
+          apiUsed: placeholderApiUsed,
           delivery: 'streaming',
           costSource: 'stream',
           startedAt: now(),
@@ -240,88 +460,8 @@ async function openAssistantStreamUnder(
 
   useChatStore.getState().patchCursor(input.chatId, cursorKeyOf(input.parentMessageId), assistantId)
 
-  const baseCursor = useChatStore.getState().getCursor(input.chatId) ?? {}
-  const allMessages = await loadChatMessages(input.chatId)
-  const nextCursor = {
-    ...baseCursor,
-    [cursorKeyOf(input.parentMessageId)]: assistantId,
-  }
-  const path = activePath(allMessages, nextCursor)
-
-  const rawOutboundPath = path.filter((m) => m.id !== assistantId)
-
-  // Apply head+tail message cutoff before composing the wire. The user's
-  // just-persisted message is already in `rawOutboundPath`, so draftText
-  // is empty here (no separate upcoming-prompt term to subtract). When
-  // `customMaxContext` is unset AND no provider cap is known the cutoff
-  // resolves to Infinity and returns the full path verbatim.
-  const outboundCapCandidate =
-    input.capabilities?.maxPromptTokens ?? input.capabilities?.contextLength
-  const outboundQuirks = quirksFor(chat.settings.model)
-  const outboundTokenizer = tokenizerFromSettings(chat.settings, null)
-  const outboundReasoningOpts: PromptEstimateOptions = {
-    family: outboundTokenizer,
-    reasoningInclude: chat.settings.reasoning.include,
-    reasoningExcluded: chat.settings.reasoning.exclude === true,
-  }
-  if (outboundQuirks.reasoningPreservationFormat !== undefined) {
-    outboundReasoningOpts.reasoningPreservationFormat = outboundQuirks.reasoningPreservationFormat
-  }
-  const outboundPath = applyContextCutoff({
-    messages: rawOutboundPath,
-    settings: chat.settings,
-    tokenizer: outboundTokenizer,
-    providerCap: outboundCapCandidate ?? null,
-    reasoningOpts: outboundReasoningOpts,
-  })
-
-  let wire: Record<string, unknown>
-  let requestedModel: string
-  if (useTextProtocol) {
-    const templateId = chat.settings.textTemplate ?? 'chatml'
-    const template = resolveTextTemplate(templateId, chat.settings.customTextTemplate)
-    let prerenderedPrompt: string | undefined
-    if (templateId === 'default') {
-      // Round-trip through the server's own Jinja template.
-      const messages: Array<{ role: string; content: string }> = []
-      if (chat.settings.systemPrompt.length > 0) {
-        messages.push({ role: 'system', content: chat.settings.systemPrompt })
-      }
-      for (const m of outboundPath) {
-        const text = m.content
-          .filter((c) => c.type === 'text' || c.type === 'output_text')
-          .map((c) => ('text' in c ? c.text : ''))
-          .join('')
-        messages.push({ role: m.role, content: text })
-      }
-      prerenderedPrompt = await applyServerTemplate(
-        input.connection,
-        messages,
-        input.signal ? { signal: input.signal } : {},
-      )
-    }
-    const textOpts: Parameters<typeof toTextCompletions>[2] = {
-      stream: true,
-      template,
-      ...(input.capabilities ? { capabilities: input.capabilities } : {}),
-      ...(prerenderedPrompt !== undefined ? { prerenderedPrompt } : {}),
-    }
-    const tResult = toTextCompletions(chat.settings, outboundPath, textOpts)
-    wire = tResult.wire as unknown as Record<string, unknown>
-    requestedModel = tResult.requestedModel
-  } else {
-    const transformOpts: ChatCompletionsTransformOptions = {
-      stream: true,
-      rewriteSlug: (slug) => rewriteCompatibleModelId(input.connection, slug),
-      ...(input.capabilities ? { capabilities: input.capabilities } : {}),
-      ...(input.transform ?? {}),
-    }
-    const cResult = toChatCompletions(chat.settings, outboundPath, transformOpts)
-    wire = cResult.wire as unknown as Record<string, unknown>
-    requestedModel = cResult.requestedModel
-  }
-
-  const streamId = newId()
+  const streamId = input.streamId ?? newId()
+  const debugScope = `send:${streamId}`
   const abortController = new AbortController()
   const abortStream = () => abortController.abort()
   const userSignal = input.signal
@@ -331,46 +471,69 @@ async function openAssistantStreamUnder(
       once: true,
     })
 
-  useStreamStore.getState().setActive({
-    streamId,
+  markLifecycleTarget({
     chatId: input.chatId,
+    streamId,
     messageId: assistantId,
-    startedAt: now(),
-    ownerClientId: 'in-tab',
     abort: abortStream,
-  })
-  postEvent({
-    kind: 'stream-started',
-    chatId: input.chatId,
-    streamId,
-    messageId: assistantId,
-    ownerClientId: 'in-tab',
   })
 
   const accumulator: ChatAccumulator = {
     textBuffer: '',
     reasoningList: [],
-    reasoningRowByTag: new Map(),
+    reasoningRowById: new Map(),
     lastFlushedAt: now(),
     lastFlushedTextLen: 0,
     lastChunkReceivedAt: now(),
+    ...(streamDebugEnabled(input.connection) ? { debugScope } : {}),
+  }
+
+  const resolvedApiUsed: GenerationMeta['apiUsed'] = useTextProtocol
+    ? 'completion'
+    : routeApiUsed(route)
+
+  await repo.runMutation([{ kind: 'message', messageId: assistantId }], async (ctx) => {
+    const current = await ctx.getMessage(assistantId)
+    if (!current?.generation) return
+    await ctx.putMessage(
+      {
+        ...current,
+        generation: {
+          ...current.generation,
+          requestedModel,
+          apiUsed: resolvedApiUsed,
+        },
+      },
+      { touchChatSummary: false, broadcast: false },
+    )
+  })
+
+  if (streamDebugEnabled(input.connection)) {
+    logStreamDebug(debugScope, 'send.open', {
+      streamId,
+      requestedModel,
+      connection: {
+        id: input.connection.id,
+        name: input.connection.name,
+        kind: input.connection.kind,
+        baseUrl: input.connection.baseUrl,
+      },
+      chatSettingsModel: requestSettings.model,
+      useTextProtocol,
+      route,
+      wireBody: wire,
+    })
   }
 
   const openStream =
-    input.openStream ??
-    (useTextProtocol
-      ? (open) =>
-          textCompletions(
-            { profile: open.connection, apiKey: open.apiKey },
-            open.wireBody as Parameters<typeof textCompletions>[1],
-            { signal: open.signal },
-          )
-      : (open) =>
-          chatCompletions(
-            { profile: open.connection, apiKey: open.apiKey },
-            open.wireBody as Parameters<typeof chatCompletions>[1],
-            { signal: open.signal },
-          ))
+    devOnlyOpenStreamOverride(input.openStream) ??
+    ((open) =>
+      openAssistantRequestStream({
+        connection: open.connection,
+        apiKey: open.apiKey,
+        requestPlan,
+        signal: open.signal,
+      }))
 
   let outcome: 'done' | 'error' | 'abort' = 'done'
   let abortReason: AbortReason | undefined
@@ -382,8 +545,10 @@ async function openAssistantStreamUnder(
       apiKey: input.apiKey,
       wireBody: wire as Record<string, unknown>,
       signal: abortController.signal,
+      ...(route ? { route } : {}),
+      ...(geminiModelId ? { geminiModelId } : {}),
     })
-    for await (const event of splitChatStream(chunkIter)) {
+    for await (const event of laneStreamForRoute(route, chunkIter)) {
       const eventNow = now()
       accumulator.lastChunkReceivedAt = eventNow
       applyEvent(accumulator, event, eventNow)
@@ -400,6 +565,7 @@ async function openAssistantStreamUnder(
           messageId: assistantId,
           accumulator,
           requestedModel,
+          apiUsed: resolvedApiUsed,
         })
       }
     }
@@ -425,14 +591,15 @@ async function openAssistantStreamUnder(
       messageId: assistantId,
       accumulator,
       requestedModel,
+      apiUsed: resolvedApiUsed,
       outcome,
       ...(abortReason ? { abortReason } : {}),
       ...(streamError ? { error: streamError } : {}),
       now: now(),
       calibrationInputs: {
         outboundPath,
-        systemPrompt: chat.settings.systemPrompt,
-        modelId: chat.settings.model,
+        systemPrompt: requestSettings.systemPrompt,
+        modelId: requestSettings.model,
         family: outboundTokenizer,
         ...(outboundReasoningOpts ? { reasoningOpts: outboundReasoningOpts } : {}),
       },
@@ -467,27 +634,14 @@ function applyEvent(acc: ChatAccumulator, event: StreamLaneEvent, nowMs: number)
       acc.textBuffer += event.text
       return
     case 'reasoning': {
-      // Phase-7 reasoning reducer preserves the lane so the persisted
-      // placeholder carries whatever the provider emitted. Rows are keyed
-      // two ways:
-      //   - `reasoning_details[]` chunks, `textDelta`, and `encryptedDelta`
-      //     route through `findMergeTargetIndex` (content-aware by index
-      //     for text/encrypted; no identity match for summary so distinct
-      //     summaries stay separate even when OR reuses `index: 0`).
-      //   - `summaryDelta` routes through a tag table keyed by
-      //     (outputIndex, summaryIndex) — each summary PART becomes its
-      //     own row, and consecutive deltas for the SAME part concatenate.
+      // Phase-7 reasoning reducer preserves whatever structure the provider
+      // emitted. Responses / Gemini-native deltas carry stable synthetic ids
+      // when possible so repeated flushes, mirrored buffered fallbacks, and
+      // incremental deltas all hit the same row instead of each surface
+      // inventing its own merge rule.
       if (acc.reasoningStartedAt === undefined) acc.reasoningStartedAt = nowMs
       acc.reasoningFinishedAt = nowMs
       const outputIndex = event.outputIndex ?? 0
-      const mergeDetail = (incoming: ReasoningDetail) => {
-        const target = findMergeTargetIndex(acc.reasoningList, incoming)
-        if (target >= 0) {
-          acc.reasoningList[target] = mergeReasoningDetail(acc.reasoningList[target], incoming)
-        } else {
-          acc.reasoningList.push(incoming)
-        }
-      }
       if (Array.isArray(event.details)) {
         for (const raw of event.details) {
           if (!raw || typeof raw !== 'object') continue
@@ -495,50 +649,41 @@ function applyEvent(acc: ChatAccumulator, event: StreamLaneEvent, nowMs: number)
             raw as ReasoningDetail & { index?: number },
           ) as ReasoningDetail & { index?: number }
           if (detail.id?.startsWith('tool_')) continue
-          mergeDetail(detail)
+          putReasoningDetail(acc, detail)
         }
       }
       if (event.textDelta !== undefined) {
-        mergeDetail({
+        const id = syntheticReasoningDetailId('reasoning.text', event)
+        putReasoningDetail(acc, {
           type: 'reasoning.text',
+          ...(id ? { id } : {}),
           index: outputIndex,
           text: event.textDelta,
         })
       }
       if (event.summaryDelta !== undefined) {
-        // Responses + Gemini-native splitters emit `summaryDelta` for
-        // visible reasoning summaries (distinct from the encrypted
-        // carrier). Each summary PART within a reasoning item is its own
-        // row — key by (outputIndex, summaryIndex) so multi-part summaries
-        // don't collide. Subsequent deltas for the SAME part merge via
-        // the tag table so `mergeReasoningDetail` concatenates the text.
-        const summaryIndex = event.summaryIndex ?? 0
-        upsertReasoningRow(acc, `sum#${outputIndex}#${summaryIndex}`, {
+        const id = syntheticReasoningDetailId('reasoning.summary', event)
+        putReasoningDetail(acc, {
           type: 'reasoning.summary',
+          ...(id ? { id } : {}),
           index: outputIndex,
           summary: event.summaryDelta,
         })
       }
       if (event.encryptedDelta !== undefined) {
-        // `replaceEncrypted: true` (the default from Responses /
-        // Gemini-native) means the NEW blob is authoritative (OpenAI's
-        // grows-between-added-and-done; Gemini emits the final one on
-        // the last part). Use a tag so we overwrite the same row rather
-        // than letting `findMergeTargetIndex` drop the delta when it
-        // doesn't match the existing blob byte-for-byte.
-        const tag = `enc#${outputIndex}`
-        const existing = acc.reasoningRowByTag.get(tag)
-        const replacement: ReasoningDetail = {
+        const id = syntheticReasoningDetailId('reasoning.encrypted', event)
+        putReasoningDetail(acc, {
           type: 'reasoning.encrypted',
+          ...(id ? { id } : {}),
           index: outputIndex,
           data: event.encryptedDelta,
-        }
-        if (existing !== undefined) {
-          acc.reasoningList[existing] = replacement
-        } else {
-          acc.reasoningList.push(replacement)
-          acc.reasoningRowByTag.set(tag, acc.reasoningList.length - 1)
-        }
+        })
+      }
+      if (acc.debugScope) {
+        logStreamDebug(acc.debugScope, 'reasoning.apply', {
+          event,
+          reasoningList: acc.reasoningList,
+        })
       }
       return
     }
@@ -585,10 +730,11 @@ interface FlushContext {
   messageId: MessageId
   accumulator: ChatAccumulator
   requestedModel: string
+  apiUsed: GenerationMeta['apiUsed']
 }
 
 async function flushPartial(ctx: FlushContext): Promise<void> {
-  const { repo, messageId, accumulator, requestedModel } = ctx
+  const { repo, messageId, accumulator, requestedModel, apiUsed } = ctx
   await repo.runMutation([{ kind: 'message', messageId }], async (inner) => {
     const current = await inner.getMessage(messageId)
     if (!current) return
@@ -598,8 +744,20 @@ async function flushPartial(ctx: FlushContext): Promise<void> {
       content: [{ type: 'output_text', text: accumulator.textBuffer }],
     }
     if (reasoning.length > 0) next.reasoningDetails = reasoning
-    next.generation = updatedGeneration(current.generation, accumulator, requestedModel, {})
+    next.generation = updatedGeneration(current.generation, accumulator, requestedModel, {
+      apiUsed,
+    })
     await inner.putMessage(next, { touchChatSummary: false, broadcast: false })
+    if (
+      accumulator.debugScope &&
+      (accumulator.textBuffer.length > 0 || (next.reasoningDetails?.length ?? 0) > 0)
+    ) {
+      logStreamDebug(accumulator.debugScope, 'message.flush', {
+        messageId,
+        reasoningDetails: next.reasoningDetails ?? [],
+        content: next.content,
+      })
+    }
   })
   accumulator.lastFlushedAt = Date.now()
   accumulator.lastFlushedTextLen = accumulator.textBuffer.length
@@ -629,6 +787,7 @@ async function finalize(ctx: FinalizeContext): Promise<void> {
     messageId,
     accumulator,
     requestedModel,
+    apiUsed,
     outcome,
     abortReason,
     error,
@@ -670,6 +829,7 @@ async function finalize(ctx: FinalizeContext): Promise<void> {
     if (!current) return
     const reasoning = collectReasoning(accumulator)
     const generation = updatedGeneration(current.generation, accumulator, requestedModel, {
+      apiUsed,
       finishedAt: now,
     })
     if (outcome === 'abort') {
@@ -692,6 +852,15 @@ async function finalize(ctx: FinalizeContext): Promise<void> {
     }
     if (reasoning.length > 0) next.reasoningDetails = reasoning
     await inner.putMessage(next)
+    if (accumulator.debugScope) {
+      logStreamDebug(accumulator.debugScope, 'message.finalize', {
+        messageId,
+        outcome,
+        reasoningDetails: next.reasoningDetails ?? [],
+        content: next.content,
+        generation: next.generation,
+      })
+    }
     persistedAssistant = next
   })
 
@@ -805,26 +974,58 @@ async function ingestCalibrationSample(args: {
 
 function collectReasoning(acc: ChatAccumulator): ReasoningDetail[] {
   // Return in insertion order — the list already reflects the stream's
-  // natural lane ordering, and per-row merges kept identity through
-  // `findMergeTargetIndex` / the tag table.
+  // natural lane ordering, and per-row merges kept identity through stable
+  // ids plus `findMergeTargetIndex` for legacy shapes.
   return acc.reasoningList.slice()
 }
 
-function upsertReasoningRow(acc: ChatAccumulator, tag: string, incoming: ReasoningDetail): void {
-  const existing = acc.reasoningRowByTag.get(tag)
-  if (existing !== undefined) {
-    acc.reasoningList[existing] = mergeReasoningDetail(acc.reasoningList[existing], incoming)
+function putReasoningDetail(acc: ChatAccumulator, incoming: ReasoningDetail): void {
+  if (incoming.id) {
+    const existing = acc.reasoningRowById.get(incoming.id)
+    if (existing !== undefined) {
+      acc.reasoningList[existing] = mergeReasoningDetail(acc.reasoningList[existing], incoming)
+      return
+    }
+  }
+  const target = findMergeTargetIndex(acc.reasoningList, incoming)
+  if (target >= 0) {
+    acc.reasoningList[target] = mergeReasoningDetail(acc.reasoningList[target], incoming)
+    if (incoming.id) acc.reasoningRowById.set(incoming.id, target)
     return
   }
   acc.reasoningList.push(incoming)
-  acc.reasoningRowByTag.set(tag, acc.reasoningList.length - 1)
+  if (incoming.id) acc.reasoningRowById.set(incoming.id, acc.reasoningList.length - 1)
+}
+
+function syntheticReasoningDetailId(
+  type: ReasoningDetail['type'],
+  event: Extract<StreamLaneEvent, { lane: 'reasoning' }>,
+): string | undefined {
+  if (type === 'reasoning.summary') {
+    if (event.itemId) return `summary#${event.itemId}#${event.summaryIndex ?? 0}`
+    if (event.summaryIndex !== undefined) {
+      return event.outputIndex !== undefined
+        ? `summary#${event.outputIndex}#${event.summaryIndex}`
+        : `summary#${event.summaryIndex}`
+    }
+    return event.outputIndex !== undefined ? `summary#${event.outputIndex}` : undefined
+  }
+  if (event.itemId) {
+    return type === 'reasoning.text' ? `text#${event.itemId}` : `encrypted#${event.itemId}`
+  }
+  if (event.outputIndex !== undefined) {
+    return type === 'reasoning.text'
+      ? `text#${event.outputIndex}`
+      : `encrypted#${event.outputIndex}`
+  }
+  return undefined
 }
 
 function updatedGeneration(
   existing: GenerationMeta | undefined,
   acc: ChatAccumulator,
   requestedModel: string,
-  opts: { finishedAt?: number },
+  opts: { apiUsed?: GenerationMeta['apiUsed']; finishedAt?: number },
 ): GenerationMeta {
   const base: GenerationMeta = existing
     ? { ...existing }
@@ -837,6 +1038,7 @@ function updatedGeneration(
         costSource: 'stream',
         startedAt: Date.now(),
       }
+  if (opts.apiUsed !== undefined) base.apiUsed = opts.apiUsed
   if (acc.generationId) base.id = acc.generationId
   if (acc.model) base.model = acc.model
   if (acc.provider) base.provider = acc.provider

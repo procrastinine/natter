@@ -4,14 +4,17 @@
 import { useLiveQuery } from 'dexie-react-hooks'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
-  DEFAULT_CONTINUE_PROMPT,
+  CONTINUE_SYSTEM_PROMPT_PLACEHOLDER,
+  DEFAULT_CONTINUE_SYSTEM_PROMPT,
+  DEFAULT_CONTINUE_USER_PROMPT,
   DEFAULT_GLOBAL_PREFERENCES,
   readGlobalPreferences,
   type SendShortcut,
   type TokenCalibrationMode,
   writeAutoScrollOnOpen,
   writeAutoScrollOnStream,
-  writeContinuePrompt,
+  writeContinueSystemPrompt,
+  writeContinueUserPrompt,
   writeSendShortcut,
   writeTokenCalibrationMode,
 } from '../../core/global-settings'
@@ -37,31 +40,68 @@ export function GeneralSettings() {
     await writeTokenCalibrationMode(value)
   }, [])
 
-  const [continueDraft, setContinueDraft] = useState<string>(prefs.continuePrompt)
-  const continueLastPersistedRef = useRef<string>(prefs.continuePrompt)
-  const continueTimerRef = useRef<number | null>(null)
+  const [continueSystemDraft, setContinueSystemDraft] = useState<string>(prefs.continueSystemPrompt)
+  const continueSystemLastPersistedRef = useRef<string>(prefs.continueSystemPrompt)
+  const continueSystemTimerRef = useRef<number | null>(null)
+  const [continueUserDraft, setContinueUserDraft] = useState<string>(prefs.continueUserPrompt)
+  const continueUserLastPersistedRef = useRef<string>(prefs.continueUserPrompt)
+  const continueUserTimerRef = useRef<number | null>(null)
   useEffect(() => {
-    if (prefs.continuePrompt === continueLastPersistedRef.current) return
-    continueLastPersistedRef.current = prefs.continuePrompt
-    setContinueDraft(prefs.continuePrompt)
-  }, [prefs.continuePrompt])
-  const onContinuePromptChange = useCallback((value: string) => {
-    setContinueDraft(value)
-    if (continueTimerRef.current !== null) {
-      window.clearTimeout(continueTimerRef.current)
+    if (prefs.continueSystemPrompt === continueSystemLastPersistedRef.current) return
+    continueSystemLastPersistedRef.current = prefs.continueSystemPrompt
+    setContinueSystemDraft(prefs.continueSystemPrompt)
+  }, [prefs.continueSystemPrompt])
+  useEffect(() => {
+    if (prefs.continueUserPrompt === continueUserLastPersistedRef.current) return
+    continueUserLastPersistedRef.current = prefs.continueUserPrompt
+    setContinueUserDraft(prefs.continueUserPrompt)
+  }, [prefs.continueUserPrompt])
+  useEffect(
+    () => () => {
+      if (continueSystemTimerRef.current !== null) {
+        window.clearTimeout(continueSystemTimerRef.current)
+      }
+      if (continueUserTimerRef.current !== null) {
+        window.clearTimeout(continueUserTimerRef.current)
+      }
+    },
+    [],
+  )
+  const onContinueSystemPromptChange = useCallback((value: string) => {
+    setContinueSystemDraft(value)
+    if (continueSystemTimerRef.current !== null) {
+      window.clearTimeout(continueSystemTimerRef.current)
     }
-    continueTimerRef.current = window.setTimeout(() => {
-      continueLastPersistedRef.current = value
-      void writeContinuePrompt(value)
+    continueSystemTimerRef.current = window.setTimeout(() => {
+      continueSystemLastPersistedRef.current = value
+      void writeContinueSystemPrompt(value)
     }, 300)
   }, [])
-  const onContinueReset = useCallback(() => {
-    if (continueTimerRef.current !== null) {
-      window.clearTimeout(continueTimerRef.current)
+  const onContinueUserPromptChange = useCallback((value: string) => {
+    setContinueUserDraft(value)
+    if (continueUserTimerRef.current !== null) {
+      window.clearTimeout(continueUserTimerRef.current)
     }
-    setContinueDraft(DEFAULT_CONTINUE_PROMPT)
-    continueLastPersistedRef.current = DEFAULT_CONTINUE_PROMPT
-    void writeContinuePrompt(DEFAULT_CONTINUE_PROMPT)
+    continueUserTimerRef.current = window.setTimeout(() => {
+      continueUserLastPersistedRef.current = value
+      void writeContinueUserPrompt(value)
+    }, 300)
+  }, [])
+  const onContinueSystemReset = useCallback(() => {
+    if (continueSystemTimerRef.current !== null) {
+      window.clearTimeout(continueSystemTimerRef.current)
+    }
+    setContinueSystemDraft(DEFAULT_CONTINUE_SYSTEM_PROMPT)
+    continueSystemLastPersistedRef.current = DEFAULT_CONTINUE_SYSTEM_PROMPT
+    void writeContinueSystemPrompt(DEFAULT_CONTINUE_SYSTEM_PROMPT)
+  }, [])
+  const onContinueUserReset = useCallback(() => {
+    if (continueUserTimerRef.current !== null) {
+      window.clearTimeout(continueUserTimerRef.current)
+    }
+    setContinueUserDraft(DEFAULT_CONTINUE_USER_PROMPT)
+    continueUserLastPersistedRef.current = DEFAULT_CONTINUE_USER_PROMPT
+    void writeContinueUserPrompt(DEFAULT_CONTINUE_USER_PROMPT)
   }, [])
 
   return (
@@ -123,32 +163,61 @@ export function GeneralSettings() {
       <div data-ui="settings-section">
         <h3>Continue</h3>
         <div data-ui="field-group">
-          <label htmlFor="continue-prompt">
-            Continue-as-assistant system prompt
-            {continueDraft !== DEFAULT_CONTINUE_PROMPT ? (
+          <label htmlFor="continue-system-prompt">
+            Continue system prompt
+            {continueSystemDraft !== DEFAULT_CONTINUE_SYSTEM_PROMPT ? (
               <button
                 type="button"
                 data-ui="field-inline-action"
-                data-role="continue-reset"
-                onClick={onContinueReset}
-                title="Restore the default continue prompt"
+                data-role="continue-system-reset"
+                onClick={onContinueSystemReset}
+                title="Restore the default continue system prompt"
               >
                 Reset to default
               </button>
             ) : null}
           </label>
           <textarea
-            id="continue-prompt"
-            data-ui="continue-prompt"
-            value={continueDraft}
-            onChange={(e) => onContinuePromptChange(e.target.value)}
-            rows={5}
+            id="continue-system-prompt"
+            data-ui="continue-system-prompt"
+            value={continueSystemDraft}
+            onChange={(e) => onContinueSystemPromptChange(e.target.value)}
+            rows={4}
             spellCheck
           />
           <span data-ui="helper">
-            Injected as the system prompt when you hit Continue on an assistant message. The
-            original chat system prompt is appended underneath so the assistant retains its
-            character.
+            This field is a template. <code>{CONTINUE_SYSTEM_PROMPT_PLACEHOLDER}</code> expands to
+            the original chat system prompt verbatim. If the placeholder is absent, the original
+            system prompt is not added. Leave the field blank to send no system prompt at all
+            during Continue.
+          </span>
+        </div>
+        <div data-ui="field-group">
+          <label htmlFor="continue-user-prompt">
+            Continue user prompt
+            {continueUserDraft !== DEFAULT_CONTINUE_USER_PROMPT ? (
+              <button
+                type="button"
+                data-ui="field-inline-action"
+                data-role="continue-user-reset"
+                onClick={onContinueUserReset}
+                title="Restore the default continue user prompt"
+              >
+                Reset to default
+              </button>
+            ) : null}
+          </label>
+          <textarea
+            id="continue-user-prompt"
+            data-ui="continue-user-prompt"
+            value={continueUserDraft}
+            onChange={(e) => onContinueUserPromptChange(e.target.value)}
+            rows={3}
+            spellCheck
+          />
+          <span data-ui="helper">
+            Appended as a synthetic trailing user turn during Continue. Leave blank to fall back to
+            the legacy double-assistant shape, which can perform poorly on some models.
           </span>
         </div>
       </div>

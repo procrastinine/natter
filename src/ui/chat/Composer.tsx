@@ -9,6 +9,7 @@ export interface ComposerProps {
   // beneath the composer and used as the Send-button tooltip.
   sendBlockedReason?: string
   onSubmit: (text: string) => void | Promise<void>
+  onDraftChange?: (text: string) => void
   seed?: string | null
   onSeedConsumed?: () => void
   sendShortcut?: SendShortcut
@@ -129,6 +130,7 @@ export function Composer({
   disabled,
   sendBlockedReason,
   onSubmit,
+  onDraftChange,
   seed,
   onSeedConsumed,
   sendShortcut = 'enter',
@@ -143,6 +145,7 @@ export function Composer({
   tokenBudget,
 }: ComposerProps) {
   const [text, setText] = useState('')
+  const [submitting, setSubmitting] = useState(false)
   // In auto-size mode this is a minimum FLOOR (per-variant default).
   // In fixed mode it's the absolute textarea height. Drag updates it
   // in both modes; persistence uses separate localStorage keys
@@ -167,6 +170,9 @@ export function Composer({
     }
   }, [seed, onSeedConsumed])
   useEffect(() => {
+    onDraftChange?.(text)
+  }, [text, onDraftChange])
+  useEffect(() => {
     if (typeof window === 'undefined') return
     const key = autoSize ? profile.storageKey : COMPOSER_HEIGHT_STORAGE_KEY
     window.localStorage.setItem(key, String(Math.round(height)))
@@ -186,6 +192,7 @@ export function Composer({
   //   - empty + dragged to 200px → 200px (floor wins)
   //   - typed 15 lines + dragged to 200 → 240 (cap, content wins)
   //   - dragged back to 0 → collapses to whatever content needs
+  // biome-ignore lint/correctness/useExhaustiveDependencies: text changes alter textarea scrollHeight.
   useLayoutEffect(() => {
     const el = textareaRef.current
     if (!el) return
@@ -198,7 +205,7 @@ export function Composer({
     }
     el.style.height = `${height}px`
   }, [autoSize, profile.autoGrowMax, height, text])
-  const sendBlocked = Boolean(sendBlockedReason) || Boolean(disabled) || streaming
+  const sendBlocked = Boolean(sendBlockedReason) || Boolean(disabled) || streaming || submitting
   const trimmed = text.trim()
   const emptyWithTrailingUser =
     trimmed.length === 0 && Boolean(trailingUserMessage) && Boolean(onReplyToTrailingUser)
@@ -206,13 +213,28 @@ export function Composer({
     if (sendBlocked) return
     if (text.trim().length === 0) {
       if (emptyWithTrailingUser && onReplyToTrailingUser) {
-        await onReplyToTrailingUser()
+        setSubmitting(true)
+        try {
+          await onReplyToTrailingUser()
+        } catch (err) {
+          console.error('composer reply failed', err)
+        } finally {
+          setSubmitting(false)
+        }
       }
       return
     }
     const out = text.trim()
     setText('')
-    await onSubmit(out)
+    setSubmitting(true)
+    try {
+      await onSubmit(out)
+    } catch (err) {
+      setText((current) => (current.length === 0 ? out : current))
+      console.error('composer submit failed', err)
+    } finally {
+      setSubmitting(false)
+    }
   }, [text, sendBlocked, emptyWithTrailingUser, onReplyToTrailingUser, onSubmit])
   const sendButtonLabel = emptyWithTrailingUser
     ? 'Reply ⏎'
@@ -246,6 +268,18 @@ export function Composer({
     e.currentTarget.releasePointerCapture(e.pointerId)
     dragStateRef.current = null
   }, [])
+  const handleResizeKeyDown = useCallback(
+    (e: React.KeyboardEvent<HTMLHRElement>) => {
+      if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return
+      e.preventDefault()
+      const step = e.shiftKey ? 40 : 10
+      const delta = e.key === 'ArrowUp' ? step : -step
+      setHeight((current) =>
+        autoSize ? clampFloorHeight(current + delta) : clampFixedHeight(current + delta),
+      )
+    },
+    [autoSize],
+  )
 
   return (
     <form
@@ -256,11 +290,14 @@ export function Composer({
         void send()
       }}
     >
-      <div
+      <hr
         data-ui="composer-resize-handle"
-        role="separator"
         aria-orientation="horizontal"
         aria-label="Resize composer"
+        aria-valuemin={autoSize ? 0 : COMPOSER_MIN_HEIGHT}
+        aria-valuemax={COMPOSER_MAX_HEIGHT}
+        aria-valuenow={Math.round(height)}
+        tabIndex={0}
         title={
           autoSize
             ? 'Drag to set a minimum height (content still auto-grows above it)'
@@ -270,6 +307,7 @@ export function Composer({
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
         onPointerCancel={handlePointerUp}
+        onKeyDown={handleResizeKeyDown}
       />
       {floatingAccessory ?? null}
       <div data-ui="composer-body">

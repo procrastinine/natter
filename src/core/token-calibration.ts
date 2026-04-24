@@ -1,15 +1,17 @@
-// Per-chat per-model chars-per-token calibration. See
+// Per-chat per-bucket chars-per-token calibration. See
 // `plan/token-counting-audit.md §Phase B` for the full design.
 //
 // Core insight: every successful send gives us two (charCount, promptTokens)
 // pairs — one for the prompt, one for the completion. Running-summing these
-// per (chat, model) yields an empirically-calibrated ratio that adapts to
-// the subject matter of each chat (code vs prose, English vs other
-// languages, etc.). We fall through four tiers when the higher tier is
-// missing or has insufficient samples:
+// per calibration bucket yields an empirically-calibrated ratio that adapts
+// to the subject matter of each chat (code vs prose, English vs other
+// languages, etc.). When a shared-tokenizer family is known, the bucket is
+// the family key; otherwise it is the canonicalized structural model key. We
+// fall through four tiers when the higher tier is missing or has insufficient
+// samples:
 //
-//   Tier 1: per-chat per-model running sums (chat.tokenCalibration[model])
-//   Tier 2: global per-model running sums (GlobalTokenCalibration.byModel)
+//   Tier 1: per-chat per-bucket running sums
+//   Tier 2: global per-bucket running sums
 //   Tier 3: hardcoded per-family anchor (RATIO_BOUNDS)
 //   Tier 4: family-bounds-aware generic fallback (3.8 for unknown)
 //
@@ -27,14 +29,21 @@
 //
 // Storage is backed by `store/settings.ts` (key `global:token-calibration`).
 // Per-chat samples ride on `chat.tokenCalibration` and are persisted as
-// part of the chat row. Reads/writes go through the normal repository
-// abstraction so daemon/SQLite backends work unchanged.
+// part of the chat row. Chat-level persistence goes through the workspace
+// repository; the global rollup goes through the settings-store boundary,
+// which can map to the daemon settings bag unchanged.
 
-import { getSetting, setSetting } from '../store/settings'
+import { getSetting, updateSetting } from '../store/settings'
+import {
+  bestGuessTokenizerFamilyKey,
+  structuralModelSlug,
+  tokenCalibrationKey,
+  tokenCalibrationKeyForStoredRecordKey,
+} from './model-ids'
 import { estimateReasoningEchoTokensForMessage } from './tokens'
 import { clampTokens, safeContent, safeLen, safeServerTokens } from './token-guards'
 import type { PromptEstimateOptions, TokenizerFamily } from './tokens'
-import { tokenizerFamily } from './tokens'
+import { charPerToken, tokenizerFamily } from './tokens'
 import type {
   ChatUsage,
   GlobalTokenCalibration,
@@ -64,7 +73,7 @@ export const OUTLIER_GATE_MIN_SAMPLES = 3
 // first sample; can be raised to 3 if we see instability.
 export const MIN_SAMPLES_CHAT = 1
 // Tier-2 (global) minimum. New chats need this many global samples for
-// the same model before they skip past the hardcoded tier.
+// the same calibration bucket before they skip past the hardcoded tier.
 export const MIN_SAMPLES_GLOBAL = 3
 
 // ---------------------------------------------------------------------------
@@ -114,6 +123,85 @@ export const FRAMING_PER_MESSAGE: Readonly<Record<TokenizerFamily, number>> = Ob
 // Resolver — tiered chars/token lookup with family-bounds clamp.
 // ---------------------------------------------------------------------------
 
+function finiteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value)
+}
+
+function sampleNumber(value: unknown): number {
+  return finiteNumber(value) ? value : 0
+}
+
+function normalizeStoredSample(sample: TokenCalibrationSample | undefined): TokenCalibrationSample | undefined {
+  if (!sample || typeof sample !== 'object') return undefined
+  return {
+    totalTextChars: sampleNumber(sample.totalTextChars),
+    totalTextTokens: sampleNumber(sample.totalTextTokens),
+    sampleCount: sampleNumber(sample.sampleCount),
+    ...(finiteNumber(sample.lastRatio) ? { lastRatio: sample.lastRatio } : {}),
+    updatedAt: sampleNumber(sample.updatedAt),
+  }
+}
+
+function emptyAggregatedSample(): TokenCalibrationSample {
+  return { totalTextChars: 0, totalTextTokens: 0, sampleCount: 0, updatedAt: 0 }
+}
+
+function aggregateSamplesForCalibrationKey(
+  samples: Record<string, TokenCalibrationSample> | undefined,
+  calibrationKey: string,
+): TokenCalibrationSample | undefined {
+  if (!samples) return undefined
+  let aggregate: TokenCalibrationSample | undefined
+  for (const [storedKey, storedSample] of Object.entries(samples)) {
+    if (tokenCalibrationKeyForStoredRecordKey(storedKey) !== calibrationKey) continue
+    const normalized = normalizeStoredSample(storedSample)
+    if (!normalized) continue
+    if (!aggregate) aggregate = emptyAggregatedSample()
+    aggregate.totalTextChars += normalized.totalTextChars
+    aggregate.totalTextTokens += normalized.totalTextTokens
+    aggregate.sampleCount += normalized.sampleCount
+    if (normalized.updatedAt >= aggregate.updatedAt) {
+      aggregate.updatedAt = normalized.updatedAt
+      if (finiteNumber(normalized.lastRatio)) aggregate.lastRatio = normalized.lastRatio
+      else delete aggregate.lastRatio
+    }
+  }
+  return aggregate
+}
+
+export function aggregateCalibrationSamples(
+  samples: Record<string, TokenCalibrationSample> | undefined,
+): Record<string, TokenCalibrationSample> {
+  if (!samples) return {}
+  const aggregated: Record<string, TokenCalibrationSample> = {}
+  for (const [storedKey, storedSample] of Object.entries(samples)) {
+    const bucketKey = tokenCalibrationKeyForStoredRecordKey(storedKey)
+    const normalized = normalizeStoredSample(storedSample)
+    if (!normalized) continue
+    let aggregate = aggregated[bucketKey]
+    if (!aggregate) {
+      aggregate = emptyAggregatedSample()
+      aggregated[bucketKey] = aggregate
+    }
+    aggregate.totalTextChars += normalized.totalTextChars
+    aggregate.totalTextTokens += normalized.totalTextTokens
+    aggregate.sampleCount += normalized.sampleCount
+    if (normalized.updatedAt >= aggregate.updatedAt) {
+      aggregate.updatedAt = normalized.updatedAt
+      if (finiteNumber(normalized.lastRatio)) aggregate.lastRatio = normalized.lastRatio
+      else delete aggregate.lastRatio
+    }
+  }
+  return aggregated
+}
+
+export function normalizedCalibrationSamples(
+  samples: Record<string, TokenCalibrationSample> | undefined,
+): Record<string, TokenCalibrationSample> | undefined {
+  if (!samples) return undefined
+  return aggregateCalibrationSamples(samples)
+}
+
 function ratioFromSample(sample: TokenCalibrationSample | undefined, minSamples: number):
   | number
   | undefined {
@@ -148,23 +236,30 @@ export type CalibrationMode = 'adaptive' | 'global-only' | 'family-defaults-only
 // `mode === undefined` behaves as 'adaptive' for backcompat.
 export function charsPerToken(
   modelId: string,
-  chat: { tokenCalibration?: Record<string, TokenCalibrationSample> } | null | undefined,
+  chat: { tokenCalibration?: Record<string, TokenCalibrationSample> | undefined } | null | undefined,
   global: GlobalTokenCalibration | null | undefined,
   mode: CalibrationMode | undefined = 'adaptive',
 ): number {
   const family = tokenizerFamilyForModel(modelId)
+  const calibrationKey = tokenCalibrationKey(modelId)
   const bounds = RATIO_BOUNDS[family]
 
   if (mode === 'family-defaults-only') return bounds.anchor
 
   // Tier 1: per-chat — skipped in 'global-only' mode.
   if (mode === 'adaptive') {
-    const chatRatio = ratioFromSample(chat?.tokenCalibration?.[modelId], MIN_SAMPLES_CHAT)
+    const chatRatio = ratioFromSample(
+      aggregateSamplesForCalibrationKey(chat?.tokenCalibration, calibrationKey),
+      MIN_SAMPLES_CHAT,
+    )
     if (chatRatio !== undefined) return clampToFamily(chatRatio, bounds)
   }
 
   // Tier 2: global.
-  const globalRatio = ratioFromSample(global?.byModel?.[modelId], MIN_SAMPLES_GLOBAL)
+  const globalRatio = ratioFromSample(
+    aggregateSamplesForCalibrationKey(global?.byModel, calibrationKey),
+    MIN_SAMPLES_GLOBAL,
+  )
   if (globalRatio !== undefined) return clampToFamily(globalRatio, bounds)
 
   // Tier 3: hardcoded anchor.
@@ -174,17 +269,42 @@ export function charsPerToken(
 // Pick the tokenizer family from a full model ID. Centralized so both the
 // ratio table lookup and the framing table lookup agree.
 export function tokenizerFamilyForModel(modelId: string): TokenizerFamily {
-  const normalized = modelId.toLowerCase()
-  // Check the known-prefix path first (avoids a Gemini-Lite model with
-  // "gpt" in the path falling into the wrong family).
-  if (normalized.includes('claude')) return 'claude'
-  if (normalized.includes('gpt') || normalized.includes('openai')) return 'gpt'
-  if (normalized.includes('gemini')) return 'gemini'
-  if (normalized.includes('deepseek')) return 'deepseek'
-  if (normalized.includes('qwen')) return 'qwen'
-  if (normalized.includes('llama')) return 'llama'
-  if (normalized.includes('mistral')) return 'mistral'
-  return tokenizerFamily(normalized) // last-chance match on raw keywords
+  const familyKey = bestGuessTokenizerFamilyKey(modelId)
+  if (familyKey) {
+    if (familyKey.startsWith('openai:')) return 'gpt'
+    if (familyKey.startsWith('google:')) return 'gemini'
+    if (familyKey.startsWith('oss:deepseek')) return 'deepseek'
+    if (familyKey.startsWith('oss:qwen')) return 'qwen'
+    if (familyKey.startsWith('oss:mistral')) return 'mistral'
+    if (familyKey.startsWith('oss:llama')) return 'llama'
+  }
+  const structural = structuralModelSlug(modelId).toLowerCase()
+  // Fallback path is intentionally strict for proprietary families:
+  // bare exact OpenAI models should come through `bestGuessTokenizerFamilyKey`,
+  // while lookalike fine-tunes like `GPT-5-Distill-Qwen...` should land on
+  // their underlying open-weights family instead of collapsing to GPT.
+  if (structural.startsWith('claude')) return 'claude'
+  if (
+    structural.startsWith('gemini') ||
+    structural.startsWith('gemma') ||
+    structural.startsWith('deep-research-pro-preview')
+  ) {
+    return 'gemini'
+  }
+  if (structural.includes('deepseek')) return 'deepseek'
+  if (structural.includes('qwen') || structural.includes('qwq')) return 'qwen'
+  if (structural.includes('llama')) return 'llama'
+  if (
+    structural.includes('mistral') ||
+    structural.includes('mixtral') ||
+    structural.includes('ministral') ||
+    structural.includes('codestral') ||
+    structural.includes('devstral') ||
+    structural.includes('pixtral')
+  ) {
+    return 'mistral'
+  }
+  return tokenizerFamily(structural) // last-chance match on raw keywords
 }
 
 // ---------------------------------------------------------------------------
@@ -281,20 +401,22 @@ export function applyValidatedSample(
 // `chat.tokenCalibration` in place. Caller is responsible for persisting
 // the chat row.
 export function addSampleToChat(
-  chat: { tokenCalibration?: Record<string, TokenCalibrationSample> },
+  chat: { tokenCalibration?: Record<string, TokenCalibrationSample> | undefined },
   modelId: string,
   chars: number,
   tokens: number,
   now: number = Date.now(),
 ): SampleIngestOutcome {
-  if (!chat.tokenCalibration) chat.tokenCalibration = {}
-  let sample = chat.tokenCalibration[modelId]
+  chat.tokenCalibration = normalizedCalibrationSamples(chat.tokenCalibration) ?? {}
+  const calibrationKey = tokenCalibrationKey(modelId)
+  let sample = chat.tokenCalibration[calibrationKey]
   if (!sample) {
     sample = emptySample()
-    chat.tokenCalibration[modelId] = sample
+    chat.tokenCalibration[calibrationKey] = sample
   }
 
-  const outcome = validateSample(modelId, chars, tokens, sample)
+  const currentSample = aggregateSamplesForCalibrationKey(chat.tokenCalibration, calibrationKey) ?? sample
+  const outcome = validateSample(modelId, chars, tokens, currentSample)
   if (!outcome.accepted) return outcome
 
   applyValidatedSample(sample, chars, tokens, now)
@@ -311,20 +433,34 @@ export async function addSampleToGlobal(
   now: number = Date.now(),
 ): Promise<void> {
   try {
-    const global = await readTokenCalibrationGlobal()
-    let globalSample = global.byModel[modelId]
-    if (!globalSample) {
-      globalSample = emptySample()
-      global.byModel[modelId] = globalSample
-    }
-    // Reuse the same validation as per-chat so bad samples don't
-    // infiltrate the global rollup either. We pass the existing sample
-    // for outlier-gate context.
-    const outcome = validateSample(modelId, chars, tokens, globalSample)
-    if (!outcome.accepted) return
-    applyValidatedSample(globalSample, chars, tokens, now)
-    global.updatedAt = now
-    await writeTokenCalibrationGlobal(global)
+    const calibrationKey = tokenCalibrationKey(modelId)
+    await updateSetting<GlobalTokenCalibration>(GLOBAL_KEY, (stored) => {
+      const global =
+        stored && typeof stored === 'object' && stored.version === 1
+          ? {
+              version: 1 as const,
+              updatedAt: finiteNumber(stored.updatedAt) ? stored.updatedAt : 0,
+              byModel:
+                stored.byModel && typeof stored.byModel === 'object'
+                  ? normalizedCalibrationSamples(stored.byModel) ?? {}
+                  : {},
+            }
+          : emptyGlobal()
+      let globalSample = global.byModel[calibrationKey]
+      if (!globalSample) {
+        globalSample = emptySample()
+        global.byModel[calibrationKey] = globalSample
+      }
+      // Reuse the same validation as per-chat so bad samples don't
+      // infiltrate the global rollup either. We pass the existing sample
+      // for outlier-gate context.
+      const currentSample = aggregateSamplesForCalibrationKey(global.byModel, calibrationKey) ?? globalSample
+      const outcome = validateSample(modelId, chars, tokens, currentSample)
+      if (!outcome.accepted) return global
+      applyValidatedSample(globalSample, chars, tokens, now)
+      global.updatedAt = now
+      return global
+    })
   } catch {
     // Non-fatal: per-chat sample still lands even if global rollup fails.
   }
@@ -334,7 +470,7 @@ export async function addSampleToGlobal(
 // rollup. The per-chat apply is synchronous (in-memory); the global
 // rollup is awaited. Caller is responsible for persisting the chat row.
 export async function addSampleToChatAndGlobal(
-  chat: { tokenCalibration?: Record<string, TokenCalibrationSample> },
+  chat: { tokenCalibration?: Record<string, TokenCalibrationSample> | undefined },
   modelId: string,
   chars: number,
   tokens: number,
@@ -367,18 +503,23 @@ export async function readTokenCalibrationGlobal(): Promise<GlobalTokenCalibrati
   return {
     version: 1,
     updatedAt: typeof raw.updatedAt === 'number' ? raw.updatedAt : 0,
-    byModel: raw.byModel && typeof raw.byModel === 'object' ? { ...raw.byModel } : {},
+    byModel:
+      raw.byModel && typeof raw.byModel === 'object' ? normalizedCalibrationSamples(raw.byModel) ?? {} : {},
   }
 }
 
 export async function writeTokenCalibrationGlobal(value: GlobalTokenCalibration): Promise<void> {
-  await setSetting(GLOBAL_KEY, value)
+  await updateSetting<GlobalTokenCalibration>(GLOBAL_KEY, () => ({
+    ...value,
+    byModel: normalizedCalibrationSamples(value.byModel) ?? {},
+  }))
 }
 
 // ---------------------------------------------------------------------------
-// Per-message estimate — the GAUGE-TIME path. Prefers the cache, falls
-// back to a fresh computation, back-writes on miss. O(N) additions, no
-// ratio multiplications per message.
+// Per-message estimate — the read-path used by gauges and send-time cutoff.
+// Prefers same-bucket delta math, recomputes explicit cross-model rows under
+// the current model ratio, and uses cached/family fallbacks for legacy or
+// missing-data rows. Never throws.
 // ---------------------------------------------------------------------------
 
 // Fresh char-based estimate for a message's current text content. Used
@@ -403,10 +544,107 @@ export function messageTextCharCount(content: unknown): number {
   return total
 }
 
+export function currentMessageTextCharCount(
+  message: Pick<Message, 'content' | 'originalCharCount' | 'charCountDelta'>,
+): number {
+  if (finiteNumber(message.originalCharCount)) {
+    const delta = finiteNumber(message.charCountDelta) ? message.charCountDelta : 0
+    return Math.max(0, message.originalCharCount + delta)
+  }
+  return messageTextCharCount(message.content)
+}
+
+export interface ReadPathTextTokenEstimateInput {
+  message: Pick<
+    Message,
+    | 'content'
+    | 'originalCharCount'
+    | 'originalCalibrationKey'
+    | 'originalModelId'
+    | 'originalTokenEstimate'
+    | 'charCountDelta'
+    | 'cachedTokenEstimate'
+  >
+  family: TokenizerFamily
+  currentModelId?: string | undefined
+  currentTextCharsPerToken?: number | undefined
+}
+
+function calibrationKeyForMessageEstimate(
+  message: Pick<Message, 'originalCalibrationKey' | 'originalModelId'>,
+): string | undefined {
+  if (typeof message.originalCalibrationKey === 'string' && message.originalCalibrationKey.length > 0) {
+    return message.originalCalibrationKey
+  }
+  if (typeof message.originalModelId === 'string' && message.originalModelId.length > 0) {
+    return tokenCalibrationKey(message.originalModelId)
+  }
+  return undefined
+}
+
+function sameCalibrationBucketForEstimate(
+  message: Pick<Message, 'originalCalibrationKey' | 'originalModelId'>,
+  currentCalibrationKey: string | undefined,
+): boolean {
+  return currentCalibrationKey !== undefined && calibrationKeyForMessageEstimate(message) === currentCalibrationKey
+}
+
+function cacheFallbackEligible(
+  message: Pick<Message, 'originalCalibrationKey' | 'originalModelId'>,
+  currentCalibrationKey: string | undefined,
+): boolean {
+  if (currentCalibrationKey === undefined) return true
+  const messageCalibrationKey = calibrationKeyForMessageEstimate(message)
+  if (messageCalibrationKey === undefined) return true
+  return messageCalibrationKey === currentCalibrationKey
+}
+
+function saneCachedTokenEstimate(value: unknown): value is number {
+  return finiteNumber(value) && value >= 0
+}
+
+function divergesTooFar(left: number, right: number): boolean {
+  if (left <= 0 || right <= 0) return false
+  return left > right * OUTLIER_FACTOR || right > left * OUTLIER_FACTOR
+}
+
+export function readPathTextTokenEstimate(input: ReadPathTextTokenEstimateInput): number {
+  const { message, family, currentModelId, currentTextCharsPerToken } = input
+  const currentChars = currentMessageTextCharCount(message)
+  const currentCalibrationKey = currentModelId ? tokenCalibrationKey(currentModelId) : undefined
+  if (
+    currentTextCharsPerToken !== undefined &&
+    Number.isFinite(currentTextCharsPerToken) &&
+    currentTextCharsPerToken > 0
+  ) {
+    const fresh = freshTokenEstimate(currentChars, currentTextCharsPerToken)
+    if (
+      sameCalibrationBucketForEstimate(message, currentCalibrationKey) &&
+      finiteNumber(message.originalTokenEstimate)
+    ) {
+      const delta = finiteNumber(message.charCountDelta) ? message.charCountDelta : 0
+      const deltaAdjusted = clampTokens(
+        message.originalTokenEstimate + Math.ceil(delta / currentTextCharsPerToken),
+      )
+      return divergesTooFar(deltaAdjusted, fresh) ? fresh : deltaAdjusted
+    }
+    return fresh
+  }
+
+  if (
+    cacheFallbackEligible(message, currentCalibrationKey) &&
+    saneCachedTokenEstimate(message.cachedTokenEstimate)
+  ) {
+    return message.cachedTokenEstimate
+  }
+
+  return freshTokenEstimate(currentChars, charPerToken(family))
+}
+
 // ---------------------------------------------------------------------------
 // Per-message calibration-field helpers. Called at create and edit time to
 // populate `originalCharCount`, `originalTokenEstimate`, `originalModelId`,
-// `charCountDelta`, `cachedTokenEstimate`. The caller computes
+// `originalCalibrationKey`, `charCountDelta`, `cachedTokenEstimate`. The caller computes
 // `cachedMediaTokens` via the media-tokens module directly (it depends on
 // attachment metadata the calibration module doesn't have).
 //
@@ -419,6 +657,7 @@ export interface CalibrationFieldsForCreate {
   originalCharCount: number
   originalTokenEstimate: number
   originalModelId: string
+  originalCalibrationKey: string
   charCountDelta: 0
   cachedTokenEstimate: number
 }
@@ -428,7 +667,7 @@ export interface CalibrationFieldsForCreate {
 export function calibrationFieldsForCreate(
   content: unknown,
   modelId: string,
-  chat: { tokenCalibration?: Record<string, TokenCalibrationSample> } | null | undefined,
+  chat: { tokenCalibration?: Record<string, TokenCalibrationSample> | undefined } | null | undefined,
   global: GlobalTokenCalibration | null | undefined,
   mode: CalibrationMode | undefined = 'adaptive',
 ): CalibrationFieldsForCreate {
@@ -439,12 +678,14 @@ export function calibrationFieldsForCreate(
     originalCharCount: chars,
     originalTokenEstimate: tokens,
     originalModelId: modelId,
+    originalCalibrationKey: tokenCalibrationKey(modelId),
     charCountDelta: 0,
     cachedTokenEstimate: tokens,
   }
 }
 
 export interface CalibrationFieldsForEdit {
+  originalCalibrationKey?: string
   charCountDelta: number
   cachedTokenEstimate: number
 }
@@ -452,8 +693,8 @@ export interface CalibrationFieldsForEdit {
 // Refresh calibration fields for an EDIT on an existing message. Updates
 // `charCountDelta` (relative to `originalCharCount` if present) and
 // recomputes `cachedTokenEstimate` using the CURRENT chat model's ratio.
-// `originalCharCount` / `originalTokenEstimate` / `originalModelId` stay
-// immutable per the Phase B design.
+// `originalCharCount` / `originalTokenEstimate` / `originalModelId` /
+// `originalCalibrationKey` stay immutable per the Phase B design.
 //
 // For old messages without `originalCharCount`, the fresh path runs and
 // `charCountDelta` stays 0 — the next gauge tick will self-heal via
@@ -461,8 +702,10 @@ export interface CalibrationFieldsForEdit {
 export function calibrationFieldsForEdit(
   currentContent: unknown,
   existingOriginalCharCount: number | undefined,
+  existingOriginalModelId: string | undefined,
+  existingOriginalCalibrationKey: string | undefined,
   currentChatModelId: string,
-  chat: { tokenCalibration?: Record<string, TokenCalibrationSample> } | null | undefined,
+  chat: { tokenCalibration?: Record<string, TokenCalibrationSample> | undefined } | null | undefined,
   global: GlobalTokenCalibration | null | undefined,
   mode: CalibrationMode | undefined = 'adaptive',
 ): CalibrationFieldsForEdit {
@@ -474,6 +717,9 @@ export function calibrationFieldsForEdit(
       ? chars - existingOriginalCharCount
       : 0
   return {
+    ...(!existingOriginalCalibrationKey && existingOriginalModelId
+      ? { originalCalibrationKey: tokenCalibrationKey(existingOriginalModelId) }
+      : {}),
     charCountDelta: delta,
     cachedTokenEstimate: tokens,
   }

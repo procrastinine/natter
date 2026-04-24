@@ -1,8 +1,9 @@
 import Dexie from 'dexie'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from '../../src/api/errors'
 import type { ChatStreamChunk } from '../../src/api/types'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
+import { tokenCalibrationKey } from '../../src/core/model-ids'
 import type { ChatSettings, ConnectionProfile, Message } from '../../src/core/types'
 import { recoverOrphans, sendText } from '../../src/hooks/useChat'
 import { newId } from '../../src/lib/ulid'
@@ -13,6 +14,7 @@ import {
 } from '../../src/store/browser-repo'
 import { createChat } from '../../src/store/chats'
 import { __resetDbForTests, openDb } from '../../src/store/db'
+import { putCachedEndpoints } from '../../src/store/models-cache'
 import { useChatStore } from '../../src/store/zustand/chatStore'
 import { useStreamStore } from '../../src/store/zustand/streamStore'
 
@@ -34,6 +36,50 @@ function makeProfile(): ConnectionProfile {
     supportsPrivacyScrape: true,
     createdAt: 1,
     updatedAt: 1,
+  }
+}
+
+function makeOpenAiProfile(): ConnectionProfile {
+  return {
+    ...makeProfile(),
+    id: 'prof-openai',
+    name: 'OpenAI',
+    kind: 'openai-compatible',
+    baseUrl: 'https://api.openai.com/v1',
+    usesResponsesApiByDefault: true,
+    supportsEndpointsApi: false,
+    supportsGenerationApi: false,
+    supportsPrivacyScrape: false,
+  }
+}
+
+function makeGoogleNativeProfile(): ConnectionProfile {
+  return {
+    ...makeProfile(),
+    id: 'prof-google',
+    name: 'Google',
+    kind: 'google',
+    baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+    usesResponsesApiByDefault: false,
+    supportsEndpointsApi: false,
+    supportsGenerationApi: false,
+    supportsPrivacyScrape: false,
+    geminiMode: 'native',
+  }
+}
+
+function makeLlamaServerProfile(): ConnectionProfile {
+  return {
+    ...makeProfile(),
+    id: 'prof-llama',
+    name: 'llama-server',
+    kind: 'llama-server',
+    baseUrl: 'http://llama.test/v1',
+    apiKeyRef: undefined,
+    usesResponsesApiByDefault: false,
+    supportsEndpointsApi: false,
+    supportsGenerationApi: false,
+    supportsPrivacyScrape: false,
   }
 }
 
@@ -60,9 +106,15 @@ async function reset() {
 beforeEach(async () => {
   await reset()
   await openDb()
+  await seedOpenRouterDiscovery('prof', [
+    'google/gemini-3.1-flash-lite-preview',
+    'openai/gpt-5.4',
+    'openai/gpt-4o',
+  ])
 })
 
 afterEach(async () => {
+  vi.unstubAllGlobals()
   await reset()
 })
 
@@ -74,11 +126,91 @@ function liveMessagesSortedByCreated(messages: Message[]): Message[] {
   return messages.filter((m) => !m.deleted).sort((a, b) => a.createdAt - b.createdAt)
 }
 
-async function* stream(...chunks: ChatStreamChunk[]): AsyncGenerator<ChatStreamChunk> {
+async function* stream<T>(...chunks: T[]): AsyncGenerator<T> {
   for (const c of chunks) yield c
 }
 
+async function seedOpenRouterDiscovery(profileId: string, models: readonly string[]): Promise<void> {
+  for (const modelId of models) {
+    await putCachedEndpoints(profileId, modelId, {
+      id: modelId,
+      endpoints: [
+        {
+          provider_name: 'Test Clean',
+          provider_slug: 'test-clean',
+          supported_parameters: ['temperature'],
+          context_length: 200000,
+          pricing: {},
+          data_policy: {
+            training: false,
+            training_openrouter: false,
+            retains_prompts: false,
+            can_publish: false,
+          },
+        },
+      ],
+    })
+  }
+}
+
 describe('sendText — chat-completions streaming', () => {
+  it('registers a pre-stream lifecycle so Stop can abort template preflight before rows are written', async () => {
+    const chat = await createChat({
+      settings: chatSettings({
+        profileId: 'prof-llama',
+        model: 'local-model',
+        protocol: 'text',
+        textTemplate: 'default',
+      }),
+    })
+    let markTemplateStarted!: () => void
+    const templateStarted = new Promise<void>((resolve) => {
+      markTemplateStarted = resolve
+    })
+    const fetchMock = vi.fn((_url: string | URL | Request, init?: RequestInit) => {
+      markTemplateStarted()
+      const signal = init?.signal
+      return new Promise<Response>((resolve, reject) => {
+        const rejectAbort = () => reject(new DOMException('aborted', 'AbortError'))
+        if (signal?.aborted) {
+          rejectAbort()
+          return
+        }
+        signal?.addEventListener('abort', rejectAbort, { once: true })
+        void resolve
+      })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const openStream = vi.fn(() =>
+      stream({
+        type: 'delta',
+        chunk: {
+          id: 'should-not-open',
+          choices: [{ delta: { content: 'nope' }, finish_reason: 'stop' }],
+        },
+      } as ChatStreamChunk),
+    )
+
+    const sendPromise = sendText({
+      chatId: chat.id,
+      connection: makeLlamaServerProfile(),
+      apiKey: '',
+      content: [{ type: 'text', text: 'hello' }],
+      openStream,
+    })
+    await templateStarted
+
+    const active = useStreamStore.getState().listByChat(chat.id)
+    expect(active).toHaveLength(1)
+    expect(active[0]?.messageId).toBeUndefined()
+    expect(await messagesFor(chat.id)).toEqual([])
+    expect(useStreamStore.getState().abortChat(chat.id)).toBe(1)
+    await expect(sendPromise).rejects.toMatchObject({ kind: 'abort' })
+    expect(openStream).not.toHaveBeenCalled()
+    expect(useStreamStore.getState().hasStreamForChat(chat.id)).toBe(false)
+    expect(await messagesFor(chat.id)).toEqual([])
+  })
+
   it('persists user message + assistant text; writes generation metadata', async () => {
     const chat = await createChat({ settings: chatSettings() })
     const result = await sendText({
@@ -123,6 +255,170 @@ describe('sendText — chat-completions streaming', () => {
     expect(assistant.generation?.finishReason).toBe('stop')
     expect(assistant.generation?.finishedAt).toBe(1000)
     expect(assistant.generation?.abortReason).toBeUndefined()
+  })
+
+  it('honors a user-pinned Responses route instead of silently using chat-completions', async () => {
+    const chat = await createChat({
+      settings: chatSettings({ model: 'openai/gpt-5.4', api: 'responses' }),
+    })
+    let seenWire: Record<string, unknown> | undefined
+    let seenRouteKind: string | undefined
+    const result = await sendText({
+      chatId: chat.id,
+      connection: makeProfile(),
+      apiKey: 'sk-test',
+      content: [{ type: 'text', text: 'hello' }],
+      openStream: (open) => {
+        seenWire = open.wireBody
+        seenRouteKind = open.route?.kind
+        return stream(
+          {
+            type: 'event',
+            event: {
+              type: 'response.created',
+              response: { id: 'resp_1', model: 'openai/gpt-5.4', status: 'in_progress' },
+            },
+          },
+          {
+            type: 'event',
+            event: {
+              type: 'response.output_text.delta',
+              output_index: 0,
+              content_index: 0,
+              delta: 'Hi there',
+            },
+          },
+          {
+            type: 'event',
+            event: {
+              type: 'response.completed',
+              response: {
+                id: 'resp_1',
+                model: 'openai/gpt-5.4',
+                status: 'completed',
+                usage: { input_tokens: 3, output_tokens: 2, total_tokens: 5 },
+              },
+            },
+          },
+        )
+      },
+      now: () => 1000,
+    })
+    expect(result.outcome).toBe('done')
+    expect(seenRouteKind).toBe('responses')
+    expect(seenWire).toMatchObject({
+      model: 'openai/gpt-5.4',
+      stream: true,
+      input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hello' }] }],
+    })
+    expect(seenWire).not.toHaveProperty('messages')
+    const assistant = (await messagesFor(chat.id)).find((m) => m.role === 'assistant')
+    expect(assistant?.content).toEqual([{ type: 'output_text', text: 'Hi there' }])
+    expect(assistant?.generation?.apiUsed).toBe('responses')
+    expect(assistant?.generation?.id).toBe('resp_1')
+  })
+
+  it('uses Responses on OpenAI direct when the profile default says Responses', async () => {
+    const chat = await createChat({
+      settings: chatSettings({ model: 'gpt-4o', api: 'auto' }),
+    })
+    let seenRouteKind: string | undefined
+    let seenWire: Record<string, unknown> | undefined
+    const result = await sendText({
+      chatId: chat.id,
+      connection: makeOpenAiProfile(),
+      apiKey: 'sk-test',
+      content: [{ type: 'text', text: 'hello' }],
+      openStream: (open) => {
+        seenRouteKind = open.route?.kind
+        seenWire = open.wireBody
+        return stream(
+          {
+            type: 'event',
+            event: {
+              type: 'response.created',
+              response: { id: 'resp_oa', model: 'gpt-4o', status: 'in_progress' },
+            },
+          },
+          {
+            type: 'event',
+            event: {
+              type: 'response.output_text.delta',
+              output_index: 0,
+              content_index: 0,
+              delta: 'hi',
+            },
+          },
+          {
+            type: 'event',
+            event: {
+              type: 'response.completed',
+              response: {
+                id: 'resp_oa',
+                model: 'gpt-4o',
+                status: 'completed',
+                usage: { input_tokens: 2, output_tokens: 1, total_tokens: 3 },
+              },
+            },
+          },
+        )
+      },
+    })
+    expect(result.outcome).toBe('done')
+    expect(seenRouteKind).toBe('responses')
+    expect(seenWire).toHaveProperty('input')
+    expect(seenWire).not.toHaveProperty('messages')
+    const assistant = (await messagesFor(chat.id)).find((m) => m.role === 'assistant')
+    expect(assistant?.generation?.apiUsed).toBe('responses')
+  })
+
+  it('uses Gemini native on official Google profiles instead of chat-completions', async () => {
+    const chat = await createChat({
+      settings: chatSettings({ model: 'google/gemini-3.1-flash-lite-preview', api: 'auto' }),
+    })
+    let seenRouteKind: string | undefined
+    let seenWire: Record<string, unknown> | undefined
+    let seenGeminiModelId: string | undefined
+    const result = await sendText({
+      chatId: chat.id,
+      connection: makeGoogleNativeProfile(),
+      apiKey: 'sk-test',
+      content: [{ type: 'text', text: 'hello' }],
+      openStream: (open) => {
+        seenRouteKind = open.route?.kind
+        seenWire = open.wireBody
+        seenGeminiModelId = open.geminiModelId
+        return stream(
+          {
+            type: 'chunk',
+            chunk: {
+              responseId: 'gem_1',
+              modelVersion: 'gemini-3.1-flash-lite-preview',
+              candidates: [
+                {
+                  content: { role: 'model', parts: [{ text: 'hi' }] },
+                  finishReason: 'STOP',
+                },
+              ],
+              usageMetadata: {
+                promptTokenCount: 2,
+                candidatesTokenCount: 1,
+                totalTokenCount: 3,
+              },
+            },
+          },
+        )
+      },
+    })
+    expect(result.outcome).toBe('done')
+    expect(seenRouteKind).toBe('gemini-generate')
+    expect(seenGeminiModelId).toBe('gemini-3.1-flash-lite-preview')
+    expect(seenWire).toHaveProperty('contents')
+    expect(seenWire).not.toHaveProperty('messages')
+    expect(seenWire).not.toHaveProperty('input')
+    const assistant = (await messagesFor(chat.id)).find((m) => m.role === 'assistant')
+    expect(assistant?.generation?.apiUsed).toBe('gemini-native')
+    expect(assistant?.generation?.model).toBe('gemini-3.1-flash-lite-preview')
   })
 
   it('mid-stream error preserves received tokens and writes error metadata', async () => {
@@ -553,10 +849,113 @@ describe('sendText — chat-completions streaming', () => {
       },
     ])
   })
+
+  it('collapses copied OpenRouter GPT-5.4-style summary fragments into one summary row on chat-completions', async () => {
+    const chat = await createChat({
+      settings: chatSettings({
+        model: 'openai/gpt-5.4',
+        api: 'chat',
+        reasoning: {
+          mode: 'effort',
+          effort: 'xhigh',
+          exclude: false,
+          summary: 'auto',
+          include: { encrypted: true, summary: false, text: false },
+        },
+      }),
+    })
+    await sendText({
+      chatId: chat.id,
+      connection: makeProfile(),
+      apiKey: 'sk-test',
+      content: [{ type: 'text', text: 'Are most CJK characters 1 token in tokenizers?' }],
+      openStream: (open) => {
+        expect(open.route?.kind).toBe('chat-completions')
+        expect(open.wireBody).toMatchObject({
+          model: 'openai/gpt-5.4',
+          reasoning: { enabled: true, effort: 'xhigh', summary: 'auto' },
+        })
+        return stream(
+          {
+            type: 'delta',
+            chunk: {
+              choices: [
+                {
+                  delta: {
+                    reasoning: '**Explaining**\n\nI',
+                    reasoning_details: [
+                      {
+                        type: 'reasoning.summary',
+                        index: 0,
+                        format: 'azure-openai-responses-v1',
+                        summary: '**Explaining**\n\nI',
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
+          },
+          {
+            type: 'delta',
+            chunk: {
+              choices: [
+                {
+                  delta: {
+                    reasoning: ' need',
+                    reasoning_details: [
+                      {
+                        type: 'reasoning.summary',
+                        index: 0,
+                        format: 'azure-openai-responses-v1',
+                        summary: ' need',
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
+          },
+          {
+            type: 'delta',
+            chunk: {
+              choices: [
+                {
+                  delta: {
+                    reasoning: ' tokenizer',
+                    reasoning_details: [
+                      {
+                        type: 'reasoning.summary',
+                        index: 0,
+                        format: 'azure-openai-responses-v1',
+                        summary: ' tokenizer',
+                      },
+                    ],
+                    content: 'Short answer: often, but not always.',
+                  },
+                  finish_reason: 'stop',
+                },
+              ],
+              usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 },
+            },
+          },
+        )
+      },
+    })
+    const assistant = (await messagesFor(chat.id)).find((m) => m.role === 'assistant')
+    expect(assistant?.reasoningDetails).toEqual([
+      {
+        type: 'reasoning.summary',
+        index: 0,
+        format: 'azure-openai-responses-v1',
+        summary: '**Explaining**\n\nI need tokenizer',
+      },
+    ])
+  })
 })
 
 describe('sendText — token calibration sample ingest', () => {
-  it('writes a per-model chat.tokenCalibration sample on successful stream', async () => {
+  it('writes a family-aware chat.tokenCalibration sample on successful stream', async () => {
     // 600-char user message so the prompt char count clears MIN_SAMPLE_CHARS.
     const userText = 'a'.repeat(600)
     const chat = await createChat({
@@ -587,7 +986,7 @@ describe('sendText — token calibration sample ingest', () => {
     })
     const chatRow = await getBrowserRepository().getChat(chat.id)
     expect(chatRow?.tokenCalibration).toBeDefined()
-    const sample = chatRow?.tokenCalibration?.['openai/gpt-4o']
+    const sample = chatRow?.tokenCalibration?.[tokenCalibrationKey('openai/gpt-4o')]
     expect(sample).toBeDefined()
     expect(sample?.sampleCount).toBeGreaterThanOrEqual(1)
     expect(sample?.totalTextTokens).toBeGreaterThan(0)
@@ -617,7 +1016,7 @@ describe('sendText — token calibration sample ingest', () => {
     })
     const chatRow = await getBrowserRepository().getChat(chat.id)
     // Calibration is skipped on non-done outcome.
-    expect(chatRow?.tokenCalibration?.['openai/gpt-4o']).toBeUndefined()
+    expect(chatRow?.tokenCalibration?.[tokenCalibrationKey('openai/gpt-4o')]).toBeUndefined()
   })
 
   it('populates per-message calibration fields on user + assistant messages', async () => {
@@ -647,11 +1046,13 @@ describe('sendText — token calibration sample ingest', () => {
     // User message fields
     expect(user.originalCharCount).toBe(60)
     expect(user.originalModelId).toBe('openai/gpt-4o')
+    expect(user.originalCalibrationKey).toBe(tokenCalibrationKey('openai/gpt-4o'))
     expect(user.charCountDelta).toBe(0)
     expect(user.cachedTokenEstimate).toBeGreaterThan(0)
     // Assistant message fields (populated on finalize for a successful done)
     expect(assistant.originalCharCount).toBe(100)
     expect(assistant.originalModelId).toBe('openai/gpt-4o')
+    expect(assistant.originalCalibrationKey).toBe(tokenCalibrationKey('openai/gpt-4o'))
     expect(assistant.cachedTokenEstimate).toBeGreaterThan(0)
   })
 
@@ -681,7 +1082,7 @@ describe('sendText — token calibration sample ingest', () => {
     const chatRow = await getBrowserRepository().getChat(chat.id)
     // Neither prompt nor completion sample should land: both too short /
     // ratio out of bounds (completion 2 chars / 1 token is also outside).
-    const s = chatRow?.tokenCalibration?.['openai/gpt-4o']
+    const s = chatRow?.tokenCalibration?.[tokenCalibrationKey('openai/gpt-4o')]
     // If we accept nothing, field either stays undefined OR sampleCount=0.
     expect(s?.sampleCount ?? 0).toBe(0)
   })

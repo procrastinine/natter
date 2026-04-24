@@ -22,6 +22,7 @@ import {
   FULL_VERBOSITY,
   quirksFor,
 } from './quirks'
+import { providerRoutingRef } from './provider-identity'
 import type {
   CapabilityDescriptor,
   ChatSettings,
@@ -182,7 +183,7 @@ export function effectiveCapabilityFromEndpoints(
   if (maxCompletionTokens !== undefined) cap.maxCompletionTokens = maxCompletionTokens
   if (Object.keys(pricingMin).length > 0) cap.pricingMin = pricingMin
   if (Object.keys(pricingRangeObj).length > 0) cap.pricingRange = pricingRangeObj
-  if (endpoints.length === 1 && endpoints[0]) cap.singleProviderPin = endpoints[0].provider_name
+  if (endpoints.length === 1 && endpoints[0]) cap.singleProviderPin = providerRoutingRef(endpoints[0])
   return cap
 }
 

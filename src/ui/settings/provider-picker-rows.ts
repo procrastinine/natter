@@ -13,7 +13,11 @@ import {
   type PrivacyFilterResult,
   type PrivacyTier,
 } from '../../core/privacy-filter'
-import type { DataPolicy, ModelEndpoint } from '../../core/types'
+import {
+  endpointMatchesAnyProviderRef,
+  providerEndpointKey,
+} from '../../core/provider-identity'
+import type { DataPolicy, ModelEndpoint, PrivacyPrefs, ProviderPreferences } from '../../core/types'
 
 export type PickerRowState = 'kept' | 'auto-excluded' | 'no-filter'
 
@@ -26,11 +30,18 @@ export interface PickerRow {
   policySynthesized: boolean
 }
 
+export interface BuildPickerRowsOptions {
+  providerPrefs?: ProviderPreferences | undefined
+  privacy?: PrivacyPrefs | undefined
+}
+
 export function buildPickerRows(
   endpoints: readonly ModelEndpoint[],
   filter: PrivacyFilterResult | null,
+  opts: BuildPickerRowsOptions = {},
 ): PickerRow[] {
-  // Index the filter result by provider_name so row assembly is O(n).
+  // Index the filter result by endpoint identity so duplicate display
+  // names (for example two Anthropic endpoints) stay distinct.
   // `excluded` wins over `kept` on collision (a name shouldn't appear in
   // both, but if it did the exclusion state is the one that matters — it
   // would mean the send is blocked, not the row kept).
@@ -45,14 +56,15 @@ export function buildPickerRows(
     }))
   }
   const kept = new Map<string, (typeof filter.kept)[number]>()
-  for (const k of filter.kept) kept.set(k.endpoint.provider_name, k)
+  for (const k of filter.kept) kept.set(providerEndpointKey(k.endpoint), k)
   const excluded = new Map<string, (typeof filter.excluded)[number]>()
-  for (const e of filter.excluded) excluded.set(e.endpoint.provider_name, e)
+  for (const e of filter.excluded) excluded.set(providerEndpointKey(e.endpoint), e)
 
   return endpoints.map((ep) => {
-    const ex = excluded.get(ep.provider_name)
+    const key = providerEndpointKey(ep)
+    const ex = excluded.get(key)
     if (ex) {
-      return {
+      const row: PickerRow = {
         endpoint: ep,
         state: 'auto-excluded',
         policy: ex.policy,
@@ -60,10 +72,11 @@ export function buildPickerRows(
         reasons: ex.reasons,
         policySynthesized: ex.policySynthesized,
       }
+      return applyManualPickerState(row, opts, endpoints)
     }
-    const k = kept.get(ep.provider_name)
+    const k = kept.get(key)
     if (k) {
-      return {
+      const row: PickerRow = {
         endpoint: ep,
         state: 'kept',
         policy: k.policy,
@@ -71,19 +84,45 @@ export function buildPickerRows(
         reasons: [],
         policySynthesized: k.policySynthesized,
       }
+      return applyManualPickerState(row, opts, endpoints)
     }
     // An endpoint that made it into `endpoints` but not into `kept` or
     // `excluded` means the filter skipped it — shouldn't happen, but
     // render it as unavailable rather than crashing.
-    return {
+    const row: PickerRow = {
       endpoint: ep,
       state: 'auto-excluded',
       policy: undefined,
       tier: 'unavailable',
       reasons: ['unknown-policy'],
-      policySynthesized: true,
+      policySynthesized: false,
     }
+    return applyManualPickerState(row, opts, endpoints)
   })
+}
+
+function applyManualPickerState(
+  row: PickerRow,
+  opts: BuildPickerRowsOptions,
+  endpoints: readonly ModelEndpoint[],
+): PickerRow {
+  const providerPrefs = opts.providerPrefs
+  const userTouchedPicker = providerPrefs?.ignoreOverridesFilter === true
+  if (!userTouchedPicker) return row
+
+  const ignoredByPicker = endpointMatchesAnyProviderRef(row.endpoint, providerPrefs.ignore, endpoints)
+  if (ignoredByPicker) {
+    return { ...row, state: 'auto-excluded', reasons: ['user-ignored'] }
+  }
+  if (
+    providerPrefs.only &&
+    providerPrefs.only.length > 0 &&
+    !endpointMatchesAnyProviderRef(row.endpoint, providerPrefs.only, endpoints)
+  ) {
+    return { ...row, state: 'auto-excluded', reasons: ['not-in-only-list'] }
+  }
+
+  return { ...row, state: 'kept', reasons: [] }
 }
 
 // One-line reason label for the picker row. Full tooltip text comes from
@@ -141,7 +180,7 @@ export function tierToLockLabel(tier: PrivacyTier): string {
     case 'orange':
       return 'Retains indefinitely or requires user IDs'
     case 'red':
-      return 'Trains on prompts or privacy data missing'
+      return 'Trains on prompts'
     case 'open':
       return 'No privacy filter (free model or direct provider)'
     case 'unavailable':

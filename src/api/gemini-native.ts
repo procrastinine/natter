@@ -38,7 +38,7 @@ function normalizeModelId(raw: string): string {
 }
 
 function geminiUrl(profile: ConnectionProfile, model: string, stream: boolean): string {
-  const base = profile.baseUrl.replace(/\/+$/, '')
+  const base = profile.baseUrl.replace(/\/+$/, '').replace(/\/openai$/u, '')
   const modelId = normalizeModelId(model)
   const method = stream ? ':streamGenerateContent?alt=sse' : ':generateContent'
   return `${base}/models/${modelId}${method}`

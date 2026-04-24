@@ -26,6 +26,7 @@ import {
 } from '../../hooks/useMessageOps'
 import { getChat, listChats, loadChatMessages } from '../../store/chats'
 import { useChatStore } from '../../store/zustand/chatStore'
+import { useStreamStore } from '../../store/zustand/streamStore'
 import { useToastStore } from '../../store/zustand/toastStore'
 import { ImportModal } from './ImportModal'
 import { Message } from './Message'
@@ -70,6 +71,10 @@ export const MessageList = memo(function MessageList({
   const liveMessages = useLiveQuery(() => loadChatMessages(chatId), [chatId], [])
   const messages = useStableMessageRows(liveMessages ?? [])
   const cursor = useChatStore((state) => state.cursors[chatId] ?? EMPTY_CURSOR)
+  const streamGenerationBusy = useStreamStore((state) => state.hasStreamForChat(chatId))
+  const [localGenerationBusy, setLocalGenerationBusy] = useState(false)
+  const localGenerationBusyRef = useRef(false)
+  const generationBusy = streamGenerationBusy || localGenerationBusy
   // Tree indices are O(N) over the message set — memoize so swipes /
   // keyboard shortcuts (§10.6.1) don't rebuild them per keystroke. `byId`
   // and `byParent` only change when the live-query refires with a new
@@ -136,6 +141,9 @@ export const MessageList = memo(function MessageList({
 
   const handleEditAndSend = useCallback(
     async (m: MessageRow, text: string) => {
+      if (localGenerationBusyRef.current || useStreamStore.getState().hasStreamForChat(chatId)) return
+      localGenerationBusyRef.current = true
+      setLocalGenerationBusy(true)
       try {
         await editAndResend(opsCtx, m, text)
       } catch (err) {
@@ -143,13 +151,19 @@ export const MessageList = memo(function MessageList({
           level: 'danger',
           text: err instanceof Error ? `Send failed: ${err.message}` : 'Send failed.',
         })
+      } finally {
+        localGenerationBusyRef.current = false
+        setLocalGenerationBusy(false)
       }
     },
-    [opsCtx, pushToast],
+    [chatId, opsCtx, pushToast],
   )
 
   const handleRegenerate = useCallback(
     async (m: MessageRow) => {
+      if (localGenerationBusyRef.current || useStreamStore.getState().hasStreamForChat(chatId)) return
+      localGenerationBusyRef.current = true
+      setLocalGenerationBusy(true)
       try {
         await regenerateFromMessage(opsCtx, m)
       } catch (err) {
@@ -157,13 +171,19 @@ export const MessageList = memo(function MessageList({
           level: 'danger',
           text: err instanceof Error ? `Regenerate failed: ${err.message}` : 'Regenerate failed.',
         })
+      } finally {
+        localGenerationBusyRef.current = false
+        setLocalGenerationBusy(false)
       }
     },
-    [opsCtx, pushToast],
+    [chatId, opsCtx, pushToast],
   )
 
   const handleContinue = useCallback(
     async (m: MessageRow) => {
+      if (localGenerationBusyRef.current || useStreamStore.getState().hasStreamForChat(chatId)) return
+      localGenerationBusyRef.current = true
+      setLocalGenerationBusy(true)
       try {
         await continueFromMessage(opsCtx, m)
       } catch (err) {
@@ -171,9 +191,12 @@ export const MessageList = memo(function MessageList({
           level: 'danger',
           text: err instanceof Error ? `Continue failed: ${err.message}` : 'Continue failed.',
         })
+      } finally {
+        localGenerationBusyRef.current = false
+        setLocalGenerationBusy(false)
       }
     },
-    [opsCtx, pushToast],
+    [chatId, opsCtx, pushToast],
   )
 
   const handleForkChat = useCallback(
@@ -302,6 +325,7 @@ export const MessageList = memo(function MessageList({
             hasSiblingVariants={(liveSiblingsByParent.get(m.parentId)?.length ?? 0) > 1}
             cursor={cursor}
             hasConnection={hasConnection}
+            generationBusy={generationBusy}
             onEditInPlace={handleEditInPlace}
             {...(m.role === 'user'
               ? {

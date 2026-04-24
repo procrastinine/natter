@@ -1,6 +1,6 @@
 // Live-fixture parser tests. These consume HTML pages captured via
 //   curl https://openrouter.ai/{model}/providers > tests/fixtures/privacy-scrape/<file>.html
-// on 2026-04-19, and assert that `parsePrivacyPage` extracts the expected
+// on 2026-04-19 / 2026-04-24, and assert that `parsePrivacyPage` extracts the expected
 // provider → policy pairs. See `plan/09-privacy.md §9.4 / §9.6` for the
 // data_policy shape and the domination outcomes these fixtures witness.
 //
@@ -81,12 +81,9 @@ describe('parsePrivacyPage — Gemini 2.5 Pro live fixture', () => {
   })
 
   // The page serializes Vertex as regional variants:
-  // "Google Vertex (Global)", "Google Vertex (US)", etc. The JSON
-  // `/endpoints` API collapses these to a single "Google" row, so the
-  // filter relies on the curated `data_policies.json` fallback to
-  // resolve "Google" → clean-retention-with-user-IDs (see
-  // `privacy-filter.test.ts` "curated fallback fills gaps"). Here we
-  // only assert the scrape correctly extracts the regional names.
+  // "Google Vertex (Global)", "Google Vertex (US)", etc. The parser
+  // must emit those live names verbatim; the filter no longer replaces
+  // missing live rows with a hardcoded provider-policy table.
   it('emits regional Vertex variants verbatim (names match the HTML)', () => {
     const keys = Object.keys(policies)
     const vertexKeys = keys.filter((k) => k.startsWith('Google Vertex'))

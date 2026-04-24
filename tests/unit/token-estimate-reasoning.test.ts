@@ -252,8 +252,8 @@ describe('guards — reasoning echo robustness', () => {
         usage: {
           // `reasoning_tokens` of "n/a" is a hypothetical malformed server field.
           completion_tokens_details: { reasoning_tokens: 'n/a' as unknown as number },
-        } as unknown as Message['generation']['usage'],
-      } as unknown as Message['generation'],
+        } as unknown as NonNullable<Message['generation']>['usage'],
+      } as unknown as NonNullable<Message['generation']>,
     }
     // When providerReasoningTokens is invalid, we fall back to the char estimate.
     const cost = estimateReasoningEchoTokens(
@@ -272,8 +272,8 @@ describe('guards — reasoning echo robustness', () => {
       generation: {
         usage: {
           completion_tokens_details: { reasoning_tokens: -5 },
-        } as unknown as Message['generation']['usage'],
-      } as unknown as Message['generation'],
+        } as unknown as NonNullable<Message['generation']>['usage'],
+      } as unknown as NonNullable<Message['generation']>,
     }
     const cost = estimateReasoningEchoTokens(
       [m],

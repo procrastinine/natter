@@ -22,6 +22,7 @@
 //      `plan/phase11-probes/`.
 
 import type { ConnectionProfile } from '../core/types'
+import { logStreamDebug, startStreamDebug, type StreamDebugTrace } from '../lib/debug-streams'
 import { buildHeaders, fetchWithTimeout } from './client'
 import { normalizeError } from './errors'
 import { parseSSE } from './sse'
@@ -47,11 +48,18 @@ async function dispatch(
   ctx: ResponsesContext,
   req: ResponsesRequestWire,
   opts: CallOpts,
-): Promise<Response> {
+): Promise<{ response: Response; debugTrace: StreamDebugTrace | null }> {
   const url = responsesUrl(ctx.profile)
   const headers = buildHeaders(ctx.profile, ctx.apiKey, {
     method: 'POST',
     ...(opts.overrideHeaders ? { overrideHeaders: opts.overrideHeaders } : {}),
+  })
+  const debugTrace = startStreamDebug({
+    adapter: 'responses',
+    profile: ctx.profile,
+    url,
+    request: req,
+    headers,
   })
   const init: RequestInit = {
     method: 'POST',
@@ -71,7 +79,12 @@ async function dispatch(
       httpStatus: response.status,
     })
   }
-  return response
+  logStreamDebug(debugTrace, 'response.head', {
+    status: response.status,
+    contentType: response.headers.get('content-type'),
+    generationId: response.headers.get('x-generation-id') ?? undefined,
+  })
+  return { response, debugTrace }
 }
 
 export async function* responses(
@@ -84,12 +97,13 @@ export async function* responses(
       'responses: request body must have stream:true — use responsesOnce for non-streaming',
     )
   }
-  const response = await dispatch(ctx, req, opts)
+  const { response, debugTrace } = await dispatch(ctx, req, opts)
   const generationId = response.headers.get('x-generation-id') ?? undefined
   const contentType = response.headers.get('content-type') ?? ''
 
   if (!/text\/event-stream/i.test(contentType)) {
     const result = (await response.json()) as ResponsesResultWire
+    logStreamDebug(debugTrace, 'buffered_result', result)
     yield generationId
       ? { type: 'buffered_result', result, generationId }
       : { type: 'buffered_result', result }
@@ -102,12 +116,14 @@ export async function* responses(
       continue
     }
     try {
+      logStreamDebug(debugTrace, 'sse.raw', { event: ev.event, data: ev.data })
       const raw = JSON.parse(ev.data) as Record<string, unknown>
       // Accept either the inline `type` field (canonical — OpenAI and
       // OpenRouter both include it) or the SSE `event:` name as a fallback.
       if (typeof raw.type !== 'string' && typeof ev.event === 'string') {
         raw.type = ev.event
       }
+      logStreamDebug(debugTrace, 'sse.parsed', raw)
       yield generationId
         ? { type: 'event', event: raw as ResponsesEventWire, generationId }
         : { type: 'event', event: raw as ResponsesEventWire }
@@ -126,6 +142,8 @@ export async function responsesOnce(
   opts: CallOpts = {},
 ): Promise<ResponsesResultWire> {
   const body: ResponsesRequestWire = { ...req, stream: false }
-  const response = await dispatch(ctx, body, opts)
-  return (await response.json()) as ResponsesResultWire
+  const { response, debugTrace } = await dispatch(ctx, body, opts)
+  const result = (await response.json()) as ResponsesResultWire
+  logStreamDebug(debugTrace, 'once.result', result)
+  return result
 }

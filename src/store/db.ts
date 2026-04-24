@@ -5,6 +5,9 @@
 // and close it when they're done.
 
 import Dexie, { type Table } from 'dexie'
+import { normalizeEndpointsResponse } from '../api/providers'
+import { readCachedPrivacyPayload } from '../api/privacy-scrape'
+import { migrateLegacyProviderSettings } from '../core/provider-settings-migration'
 import type {
   Attachment,
   Chat,
@@ -198,6 +201,84 @@ export function registerSchema(db: Dexie): void {
       presetResolutions: '&[profileId+presetSlug], fetchedAt',
       drafts: '&chatId, updatedAt',
     })
+
+  db.version(4)
+    .stores({
+      chats:
+        'id, updatedAt, createdAt, lastViewedAt, lastUpdatedLeafId, lastBranchUpdatedAt, wordCount, totalCostUsd, archived, pinned, presetId, folderId, *tags',
+      messages:
+        'id, chatId, parentId, turnId, [chatId+parentId], [chatId+createdAt], [chatId+turnId], [chatId+deleted]',
+      childLists: 'id, [chatId+parentId], updatedAt',
+      attachments: 'id, contentHash, refCount, createdAt',
+      profiles: 'id, name, kind, lastUsedAt, archived',
+      presets: 'id, name, connectionProfileId, lastUsedAt, archived',
+      folders: 'id, name, sortIndex, lastUsedAt',
+      tags: 'id, &nameLower, lastUsedAt',
+      chatBranchCache: '&chatId, branchLeafId, generatedAt',
+      keys: 'id, name',
+      settings: '&key',
+      models: '&[profileId+queryKey], fetchedAt',
+      endpoints: '&[profileId+modelId], fetchedAt',
+      privacyPolicies: '&[profileId+modelId], fetchedAt',
+      providers: '&profileId, fetchedAt',
+      generations: 'id, chatId, gen_id',
+      presetResolutions: '&[profileId+presetSlug], fetchedAt',
+      drafts: '&chatId, updatedAt',
+    })
+    .upgrade(async (tx) => {
+      const endpointsRows = await tx.table<CachedEndpointsRow>('endpoints').toArray()
+      const privacyRows = await tx.table<CachedPrivacyPolicyRow>('privacyPolicies').toArray()
+      const endpointsByKey = new Map<string, CachedEndpointsRow>()
+      const privacyByKey = new Map<string, CachedPrivacyPolicyRow>()
+      for (const row of endpointsRows) endpointsByKey.set(providerCacheKey(row.profileId, row.modelId), row)
+      for (const row of privacyRows) privacyByKey.set(providerCacheKey(row.profileId, row.modelId), row)
+
+      await tx
+        .table<Chat>('chats')
+        .toCollection()
+        .modify((chat) => {
+          const result = migrateSettingsRow(chat.settings, chat.settings.profileId, chat.settings.model, {
+            endpointsByKey,
+            privacyByKey,
+          })
+          if (result.changed) chat.settings = result.settings
+        })
+
+      await tx
+        .table<ChatPreset>('presets')
+        .toCollection()
+        .modify((preset) => {
+          const result = migrateSettingsRow(
+            preset.settings,
+            preset.connectionProfileId,
+            preset.settings.model,
+            { endpointsByKey, privacyByKey },
+          )
+          if (result.changed) preset.settings = result.settings
+        })
+    })
+}
+
+function migrateSettingsRow(
+  settings: Chat['settings'],
+  profileId: string,
+  modelId: string,
+  caches: {
+    endpointsByKey: ReadonlyMap<string, CachedEndpointsRow>
+    privacyByKey: ReadonlyMap<string, CachedPrivacyPolicyRow>
+  },
+): ReturnType<typeof migrateLegacyProviderSettings> {
+  const key = providerCacheKey(profileId, modelId)
+  const endpoints = normalizeEndpointsResponse(caches.endpointsByKey.get(key)?.payload)?.endpoints
+  const policies = readCachedPrivacyPayload(caches.privacyByKey.get(key)?.payload)?.policies
+  const context: Parameters<typeof migrateLegacyProviderSettings>[1] = { model: modelId }
+  if (endpoints) context.endpoints = endpoints
+  if (policies) context.policies = policies
+  return migrateLegacyProviderSettings(settings, context)
+}
+
+function providerCacheKey(profileId: string, modelId: string): string {
+  return `${profileId}\u0000${modelId}`
 }
 
 export function childListKey(chatId: string, parentId: string | null): string {
@@ -205,6 +286,7 @@ export function childListKey(chatId: string, parentId: string | null): string {
 }
 
 let singleton: NatterDb | null = null
+let providerSettingsBackfillPromise: Promise<void> | null = null
 
 export function getDb(): NatterDb {
   if (!singleton) singleton = new NatterDb()
@@ -216,6 +298,11 @@ export function getDb(): NatterDb {
 export async function openDb(): Promise<NatterDb> {
   const db = getDb()
   if (!db.isOpen()) await db.open()
+  providerSettingsBackfillPromise ??= backfillProviderSettings(db).catch((err) => {
+    providerSettingsBackfillPromise = null
+    throw err
+  })
+  await providerSettingsBackfillPromise
   return db
 }
 
@@ -225,6 +312,7 @@ export function __resetDbForTests(): void {
     singleton.close()
     singleton = null
   }
+  providerSettingsBackfillPromise = null
 }
 
 // Mint a uniquely-named Dexie instance for integration tests that want to
@@ -232,4 +320,67 @@ export function __resetDbForTests(): void {
 // Caller is responsible for `await db.delete()` on teardown.
 export function createDbForTests(name: string): NatterDb {
   return new NatterDb(name)
+}
+
+export async function backfillProviderSettingsForModel(
+  profileId: string,
+  modelId: string,
+): Promise<void> {
+  await runProviderSettingsBackfill(getDb(), { profileId, modelId })
+}
+
+async function backfillProviderSettings(db: NatterDb): Promise<void> {
+  await runProviderSettingsBackfill(db)
+}
+
+async function runProviderSettingsBackfill(
+  db: NatterDb,
+  scope?: { profileId: string; modelId: string },
+): Promise<void> {
+  const [endpointsRows, privacyRows] = await Promise.all([
+    scope
+      ? db.endpoints.where('[profileId+modelId]').equals([scope.profileId, scope.modelId]).toArray()
+      : db.endpoints.toArray(),
+    scope
+      ? db.privacyPolicies.where('[profileId+modelId]').equals([scope.profileId, scope.modelId]).toArray()
+      : db.privacyPolicies.toArray(),
+  ])
+  const endpointsByKey = new Map<string, CachedEndpointsRow>()
+  const privacyByKey = new Map<string, CachedPrivacyPolicyRow>()
+  for (const row of endpointsRows) endpointsByKey.set(providerCacheKey(row.profileId, row.modelId), row)
+  for (const row of privacyRows) privacyByKey.set(providerCacheKey(row.profileId, row.modelId), row)
+
+  await db.transaction('rw', db.chats, db.presets, async () => {
+    const chats = scope
+      ? db.chats
+          .filter(
+            (chat) =>
+              chat.settings.profileId === scope.profileId && chat.settings.model === scope.modelId,
+          )
+      : db.chats.toCollection()
+    const presets = scope
+      ? db.presets
+          .filter(
+            (preset) =>
+              preset.connectionProfileId === scope.profileId &&
+              preset.settings.model === scope.modelId,
+          )
+      : db.presets.toCollection()
+    await chats.modify((chat) => {
+      const result = migrateSettingsRow(chat.settings, chat.settings.profileId, chat.settings.model, {
+        endpointsByKey,
+        privacyByKey,
+      })
+      if (result.changed) chat.settings = result.settings
+    })
+    await presets.modify((preset) => {
+      const result = migrateSettingsRow(
+        preset.settings,
+        preset.connectionProfileId,
+        preset.settings.model,
+        { endpointsByKey, privacyByKey },
+      )
+      if (result.changed) preset.settings = result.settings
+    })
+  })
 }

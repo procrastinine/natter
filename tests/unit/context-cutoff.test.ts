@@ -11,6 +11,7 @@
 import { describe, expect, it } from 'vitest'
 import { applyContextCutoff, computeCutoffPlan } from '../../src/core/context-cutoff'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
+import { tokenCalibrationKey } from '../../src/core/model-ids'
 import type { ChatSettings, Message, MessageRole } from '../../src/core/types'
 
 const TOKENIZER = 'gpt' as const
@@ -464,6 +465,47 @@ describe('computeCutoffPlan — per-message cache (Phase B)', () => {
     expect(plan.historyTextTokens).toBe(999)
   })
 
+  it('uses originalTokenEstimate + edit delta when same-model calibration is provided', () => {
+    const m: Message = {
+      ...makeMessage('user', 'a'.repeat(70)),
+      originalCharCount: 35,
+      originalTokenEstimate: 10,
+      originalModelId: 'openai/gpt-4o',
+      charCountDelta: 35,
+      cachedTokenEstimate: 999,
+    }
+    const plan = computeCutoffPlan({
+      messages: [m],
+      settings: settings({}),
+      tokenizer: TOKENIZER,
+      providerCap: null,
+      currentModelId: 'openai/gpt-4o',
+      currentTextCharsPerToken: 3,
+    })
+    expect(plan.historyTextTokens).toBe(22)
+  })
+
+  it('treats exact model switches inside the same tokenizer family as same-bucket', () => {
+    const m: Message = {
+      ...makeMessage('user', 'a'.repeat(70)),
+      originalCharCount: 35,
+      originalTokenEstimate: 10,
+      originalModelId: 'google/gemini-2.5-pro-preview',
+      originalCalibrationKey: tokenCalibrationKey('google/gemini-2.5-pro-preview'),
+      charCountDelta: 35,
+      cachedTokenEstimate: 999,
+    }
+    const plan = computeCutoffPlan({
+      messages: [m],
+      settings: settings({}),
+      tokenizer: 'gemini',
+      providerCap: null,
+      currentModelId: 'google/gemini-2.5-pro-preview-05-06',
+      currentTextCharsPerToken: 3,
+    })
+    expect(plan.historyTextTokens).toBe(22)
+  })
+
   it('ignores cache when models differ (cross-model message)', () => {
     const m: Message = {
       ...makeMessage('user', 'a'.repeat(35)),
@@ -479,6 +521,42 @@ describe('computeCutoffPlan — per-message cache (Phase B)', () => {
     })
     // Fresh path: 35 / 3.5 = 10
     expect(plan.historyTextTokens).toBe(10)
+  })
+
+  it('recomputes cross-model rows against the current model ratio when provided', () => {
+    const m: Message = {
+      ...makeMessage('user', 'a'.repeat(35)),
+      originalCharCount: 35,
+      originalTokenEstimate: 10,
+      originalModelId: 'openai/gpt-4o',
+      charCountDelta: 0,
+      cachedTokenEstimate: 999,
+    }
+    const plan = computeCutoffPlan({
+      messages: [m],
+      settings: settings({}),
+      tokenizer: TOKENIZER,
+      providerCap: null,
+      currentModelId: 'anthropic/claude-opus-4.7',
+      currentTextCharsPerToken: 3,
+    })
+    expect(plan.historyTextTokens).toBe(12)
+  })
+
+  it('recomputes legacy cached rows against the current model ratio when provided', () => {
+    const m: Message = {
+      ...makeMessage('user', 'a'.repeat(35)),
+      cachedTokenEstimate: 999,
+    }
+    const plan = computeCutoffPlan({
+      messages: [m],
+      settings: settings({}),
+      tokenizer: TOKENIZER,
+      providerCap: null,
+      currentModelId: 'openai/gpt-4o',
+      currentTextCharsPerToken: 3,
+    })
+    expect(plan.historyTextTokens).toBe(12)
   })
 })
 

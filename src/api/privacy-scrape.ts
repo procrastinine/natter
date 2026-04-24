@@ -7,7 +7,8 @@
 // are embedded in the page's React flight payload (`__NEXT_DATA__` or
 // streamed `self.__next_f.push(...)` fragments, depending on the route).
 // We grep for `"data_policy"` JSON objects, pair each with the nearest
-// preceding provider name, and return a map keyed by provider name.
+// preceding provider name, and return a map keyed by every stable
+// provider ref we can recover (display/name plus slug when present).
 //
 // Fetch goes through the caller's ConnectionProfile so a user-configured
 // `privacyScrapeProxy` (e.g. CORS bouncer for the browser) can intercept.
@@ -25,9 +26,9 @@ export interface PrivacyScrapeContext {
 
 export interface PrivacyScrapeResult {
   modelId: string
-  // Keyed by `provider_name` as it appears in /endpoints (e.g. "Azure",
-  // "Google AI Studio"). Missing providers are absent — the filter
-  // layer synthesizes worst-case for them.
+  // Keyed by recovered provider refs: display/name plus provider_slug
+  // when the page exposes it. Missing providers are absent — the filter
+  // layer treats online misses as unavailable, not as a guessed policy.
   policies: Record<string, DataPolicy>
   // The raw scraped payload we persist in the cache row for replay /
   // regression tests. Shape-stable: `{ policies, fetchedAt }`.
@@ -40,8 +41,8 @@ export interface PrivacyScrapeResult {
 // path `/_or_scrape` — Vite's dev server proxies it, and a production
 // deploy is expected to provide an equivalent same-origin rewrite (or
 // the user sets `profile.privacyScrapeProxy` to a hosted CORS bouncer).
-// Without either, the scrape 404s in the browser and the filter falls
-// back to the curated `data_policies.json` table.
+// Without either, the scrape 404s in the browser and the filter can use
+// its explicit offline fallback instead of claiming live policy data.
 export const DEFAULT_PRIVACY_SCRAPE_BASE = '/_or_scrape'
 
 export function privacyScrapeUrl(
@@ -64,8 +65,9 @@ export async function fetchPrivacyScrape(
     method: 'GET',
     headers: { Accept: 'text/html,application/xhtml+xml' },
   }
-  const impl = ctx.fetchImpl
-    ? (u: string, i: RequestInit) => ctx.fetchImpl!(u, i)
+  const fetchImpl = ctx.fetchImpl
+  const impl = fetchImpl
+    ? (u: string, i: RequestInit) => fetchImpl(u, i)
     : (u: string, i: RequestInit) => fetchWithTimeout(u, i, opts)
   const response = await impl(url, init)
   if (!response.ok) {
@@ -99,8 +101,7 @@ export async function fetchPrivacyScrape(
 // and pair them up until we hit the next provider marker.
 //
 // This parser is conservative: if nothing recognizable is present it
-// returns an empty map, leaving the filter to synthesize worst-case
-// policies (same behavior as a provider that was never scraped).
+// returns an empty map, leaving the filter to mark policy unavailable.
 export function parsePrivacyPage(html: string): Record<string, DataPolicy> {
   const out: Record<string, DataPolicy> = {}
 
@@ -126,15 +127,13 @@ export function parsePrivacyPage(html: string): Record<string, DataPolicy> {
   // `scanProviderPairs` on the concatenation.
   const flightChunks: string[] = []
   const flightRe =
-    /self\.__next_f\.push\(\[\s*\d+\s*,\s*"((?:\\.|[^"\\])*)"\s*\]\)/g
+    /self\.__next_f\.push\(\[\s*\d+\s*,\s*(["'])((?:\\.|(?!\1)[^\\])*)\1\s*\]\)/g
   for (const match of html.matchAll(flightRe)) {
-    const raw = match[1]
+    const quote = match[1]
+    const raw = match[2]
     if (!raw) continue
-    try {
-      flightChunks.push(JSON.parse(`"${raw}"`))
-    } catch {
-      // Skip malformed chunks — other strategies may still find the policy.
-    }
+    const decoded = decodeFlightString(raw, quote)
+    if (decoded) flightChunks.push(decoded)
   }
   if (flightChunks.length) {
     const merged = flightChunks.join('')
@@ -143,12 +142,29 @@ export function parsePrivacyPage(html: string): Record<string, DataPolicy> {
   // Also run the scan on the raw HTML so tests that drop the data in
   // a `<script>window.__X__ = [...]</script>` block still work.
   scanProviderPairs(html, out)
+  scanProviderPairs(unescapeEmbeddedJsonQuotes(html), out)
 
   return out
 }
 
+function decodeFlightString(raw: string, quote: string | undefined): string | null {
+  try {
+    if (quote === '"') return JSON.parse(`"${raw}"`) as string
+    const normalized = raw.replace(/\\'/g, "'").replace(/"/g, '\\"')
+    return JSON.parse(`"${normalized}"`) as string
+  } catch {
+    // Skip malformed chunks — other strategies may still find the policy.
+    return null
+  }
+}
+
+function unescapeEmbeddedJsonQuotes(text: string): string {
+  if (!text.includes('\\"') && !text.includes('\\u0022')) return text
+  return text.replace(/\\"/g, '"').replace(/\\u0022/g, '"')
+}
+
 // Walk `text` pairing each provider-name marker with the first
-// `data_policy:{...}` that appears BEFORE the next provider marker.
+// `data_policy:{...}` / `dataPolicy:{...}` that appears BEFORE the next provider marker.
 // The live RSC stream serializes records as
 //   "..."provider_display_name":"X","provider_slug":"x",..."data_policy":{...},"pricing":{...}..."
 // with hundreds of chars between the marker and the policy object.
@@ -157,7 +173,8 @@ function scanProviderPairs(text: string, out: Record<string, DataPolicy>): void 
   // is the current RSC field (as of 2026-04); `provider_name` is the JSON API
   // field (same value); `"name"` is kept as a weaker fallback for other
   // pages that might shape the data differently.
-  const markerRe = /"(provider_display_name|provider_name)"\s*:\s*"([^"]+)"/g
+  const markerRe =
+    /"(provider_display_name|provider_name|providerDisplayName|providerName)"\s*:\s*"([^"]+)"/g
   const markers: Array<{ pos: number; name: string }> = []
   for (const m of text.matchAll(markerRe)) {
     if (m.index === undefined) continue
@@ -168,7 +185,7 @@ function scanProviderPairs(text: string, out: Record<string, DataPolicy>): void 
     if (!marker) continue
     const nextPos = markers[i + 1]?.pos ?? text.length
     const segment = text.slice(marker.pos, nextPos)
-    const dpIdx = segment.indexOf('"data_policy"')
+    const dpIdx = policyMarkerIndex(segment)
     if (dpIdx < 0) continue
     const objStart = segment.indexOf('{', dpIdx)
     if (objStart < 0) continue
@@ -179,8 +196,29 @@ function scanProviderPairs(text: string, out: Record<string, DataPolicy>): void 
     if (!parsed) continue
     const policy = normalizeDataPolicy(parsed)
     if (!policy) continue
-    if (!(marker.name in out)) out[marker.name] = policy
+    const keys = [marker.name, ...providerSlugKeys(segment)]
+    for (const key of keys) {
+      if (!(key in out)) out[key] = policy
+    }
   }
+}
+
+function providerSlugKeys(segment: string): string[] {
+  const keys: string[] = []
+  const slugRe = /"(provider_slug|providerSlug)"\s*:\s*"([^"]+)"/g
+  for (const match of segment.matchAll(slugRe)) {
+    const value = match[2]?.trim()
+    if (value && !keys.includes(value)) keys.push(value)
+  }
+  return keys
+}
+
+function policyMarkerIndex(segment: string): number {
+  const snake = segment.indexOf('"data_policy"')
+  const camel = segment.indexOf('"dataPolicy"')
+  if (snake < 0) return camel
+  if (camel < 0) return snake
+  return Math.min(snake, camel)
 }
 
 // Return the index of the closing `}` that matches the `{` at `start`.
@@ -189,16 +227,16 @@ function scanProviderPairs(text: string, out: Record<string, DataPolicy>): void 
 function balancedJsonEnd(text: string, start: number): number {
   let depth = 0
   let inString = false
-  let escape = false
+  let escaped = false
   for (let i = start; i < text.length; i += 1) {
     const ch = text[i]
     if (inString) {
-      if (escape) {
-        escape = false
+      if (escaped) {
+        escaped = false
         continue
       }
       if (ch === '\\') {
-        escape = true
+        escaped = true
         continue
       }
       if (ch === '"') inString = false
@@ -222,28 +260,38 @@ function balancedJsonEnd(text: string, start: number): number {
 function absorbPolicy(obj: unknown, out: Record<string, DataPolicy>): void {
   if (!obj || typeof obj !== 'object') return
   const rec = obj as Record<string, unknown>
-  const name = pickProviderName(rec)
-  const dp = rec['data_policy'] ?? rec['dataPolicy']
-  if (!name || !dp || typeof dp !== 'object') return
+  const names = pickProviderNames(rec)
+  const dp = rec.data_policy ?? rec.dataPolicy
+  if (names.length === 0 || !dp || typeof dp !== 'object') return
   const policy = normalizeDataPolicy(dp as Record<string, unknown>)
   if (!policy) return
   // First occurrence wins; later duplicates are skipped so tests can be
   // deterministic when the same provider appears in multiple chunks.
-  if (!(name in out)) out[name] = policy
+  for (const name of names) {
+    if (!(name in out)) out[name] = policy
+  }
 }
 
-function pickProviderName(rec: Record<string, unknown>): string | null {
+function pickProviderNames(rec: Record<string, unknown>): string[] {
   const candidates = [
-    rec['provider_name'],
-    rec['providerName'],
-    rec['name'],
-    rec['display_name'],
-    rec['displayName'],
+    rec.provider_name,
+    rec.providerName,
+    rec.provider_display_name,
+    rec.providerDisplayName,
+    rec.provider_slug,
+    rec.providerSlug,
+    rec.name,
+    rec.display_name,
+    rec.displayName,
   ]
+  const out: string[] = []
   for (const cand of candidates) {
-    if (typeof cand === 'string' && cand.trim().length > 0) return cand.trim()
+    if (typeof cand !== 'string') continue
+    const trimmed = cand.trim()
+    if (!trimmed || out.includes(trimmed)) continue
+    out.push(trimmed)
   }
-  return null
+  return out
 }
 
 // Walk a parsed JSON structure looking for `{name, data_policy}` pairs.
@@ -262,29 +310,29 @@ function walkForPolicies(node: unknown, out: Record<string, DataPolicy>): void {
 // Coerce a raw `data_policy` object into our `DataPolicy` shape. We drop
 // fields we don't understand so tests survive future OpenRouter fields.
 export function normalizeDataPolicy(raw: Record<string, unknown>): DataPolicy | null {
-  const training = asBool(raw['training'])
+  const training = asBool(raw.training)
   const trainingOpenRouter =
-    asBool(raw['training_openrouter']) ??
-    asBool(raw['trainingOpenRouter']) ??
+    asBool(raw.training_openrouter) ??
+    asBool(raw.trainingOpenRouter) ??
     // Some scrape variants nest it under "openrouter" / "openrouter_training".
-    asBool(raw['openrouter_training']) ??
-    asBool(raw['trainsOnOpenRouter'])
+    asBool(raw.openrouter_training) ??
+    asBool(raw.trainsOnOpenRouter)
   const retainsPrompts =
-    asBool(raw['retains_prompts']) ??
-    asBool(raw['retainsPrompts']) ??
-    asBool(raw['retains'])
+    asBool(raw.retains_prompts) ??
+    asBool(raw.retainsPrompts) ??
+    asBool(raw.retains)
   const canPublish =
-    asBool(raw['can_publish']) ?? asBool(raw['canPublish']) ?? asBool(raw['publishes'])
+    asBool(raw.can_publish) ?? asBool(raw.canPublish) ?? asBool(raw.publishes)
   const requiresUserIDs =
-    asBool(raw['requires_user_ids']) ??
-    asBool(raw['requiresUserIDs']) ??
-    asBool(raw['requiresUserIds']) ??
-    asBool(raw['user_ids_required'])
+    asBool(raw.requires_user_ids) ??
+    asBool(raw.requiresUserIDs) ??
+    asBool(raw.requiresUserIds) ??
+    asBool(raw.user_ids_required)
   const retentionDays = asPositiveInt(
-    raw['retention_days'] ?? raw['retentionDays'] ?? raw['retention'],
+    raw.retention_days ?? raw.retentionDays ?? raw.retention,
   )
-  const tos = asString(raw['terms_of_service_url'] ?? raw['termsOfServiceURL'] ?? raw['tos'])
-  const pp = asString(raw['privacy_policy_url'] ?? raw['privacyPolicyURL'] ?? raw['privacy'])
+  const tos = asString(raw.terms_of_service_url ?? raw.termsOfServiceURL ?? raw.tos)
+  const pp = asString(raw.privacy_policy_url ?? raw.privacyPolicyURL ?? raw.privacy)
 
   if (training === undefined && retainsPrompts === undefined && canPublish === undefined) {
     return null
@@ -352,8 +400,8 @@ export function readCachedPrivacyPayload(
 ): CachedPrivacyPayload | null {
   if (!raw || typeof raw !== 'object') return null
   const rec = raw as Record<string, unknown>
-  const policies = rec['policies']
-  const fetchedAt = rec['fetchedAt']
+  const policies = rec.policies
+  const fetchedAt = rec.fetchedAt
   if (!policies || typeof policies !== 'object') return null
   const out: Record<string, DataPolicy> = {}
   for (const [k, v] of Object.entries(policies)) {

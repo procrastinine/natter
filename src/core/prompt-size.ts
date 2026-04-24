@@ -31,6 +31,11 @@ import {
   pdfTokenEstimate,
 } from './media-tokens'
 import { quirksFor } from './quirks'
+import {
+  charsPerToken,
+  readPathTextTokenEstimate,
+  type CalibrationMode,
+} from './token-calibration'
 import { clampTokens, safeContent, safeServerTokens } from './token-guards'
 import {
   estimateReasoningEchoTokens,
@@ -43,9 +48,11 @@ import type {
   Attachment,
   AttachmentId,
   ChatSettings,
+  GlobalTokenCalibration,
   Message,
   ReasoningFormat,
   ReasoningInclude,
+  TokenCalibrationSample,
 } from './types'
 
 // Optional attachment resolver — when the caller can look up attachments
@@ -71,10 +78,22 @@ export interface PromptSizeEstimateInput {
   // without the attachment table fall through to the fallback values.
   attachmentResolver?: AttachmentResolver
   // Optional — the chat's CURRENT model ID. When present, per-message
-  // `cachedTokenEstimate` / `cachedMediaTokens` are trusted only when
-  // the message's `originalModelId` matches (or is undefined, for
-  // pre-Phase-B rows). When absent, the cache is used whenever present.
+  // token estimates can choose between same-bucket delta tracking and
+  // cross-model fresh recompute. When absent, the read path falls back
+  // to the cached estimate when it exists.
   currentModelId?: string
+  // Optional — resolved chars/token ratio for the CURRENT model under the
+  // caller's chosen calibration mode (per-chat → global → family anchor).
+  // When present, same-bucket rows use original-token + edit-delta math and
+  // other-model rows recompute fresh under this model. When absent, we fall
+  // back to the message cache or to the family anchor.
+  currentTextCharsPerToken?: number
+}
+
+export interface TokenEstimateCalibrationContext {
+  chatTokenCalibration?: Record<string, TokenCalibrationSample> | undefined
+  globalCalibration?: GlobalTokenCalibration | null | undefined
+  mode?: CalibrationMode | undefined
 }
 
 export interface PromptSizeEstimate {
@@ -119,19 +138,9 @@ function mediaTokenCountFor(
   return tokens
 }
 
-function plainTextOf(content: unknown): string {
-  let out = ''
-  for (const item of safeContent(content)) {
-    if (item.type === 'text' || item.type === 'output_text') {
-      if (typeof item.text === 'string') out += item.text
-    }
-  }
-  return out
-}
-
-// Whether a cached per-message estimate can be trusted. When the caller
-// knows the chat's `currentModelId`, cache is valid only if the message's
-// `originalModelId` matches (or is undefined — Phase B backcompat).
+// Whether a cached per-message media estimate can be trusted. We keep this
+// exact-model keyed: media cost is cheap to recompute and the raw model id
+// still matters for the rest of the send path.
 function cacheEligibleFor(m: Message, currentModelId: string | undefined): boolean {
   if (currentModelId === undefined) return true
   if (m.originalModelId === undefined) return true
@@ -144,15 +153,14 @@ function textTokensForMessage(
   m: Message,
   family: TokenizerFamily,
   currentModelId: string | undefined,
+  currentTextCharsPerToken: number | undefined,
 ): number {
-  if (
-    cacheEligibleFor(m, currentModelId) &&
-    typeof m.cachedTokenEstimate === 'number' &&
-    Number.isFinite(m.cachedTokenEstimate)
-  ) {
-    return m.cachedTokenEstimate
-  }
-  return estimateTokens(plainTextOf(m.content), family)
+  return readPathTextTokenEstimate({
+    message: m,
+    family,
+    currentModelId,
+    currentTextCharsPerToken,
+  })
 }
 
 // Per-message media-token estimate. Prefers `cachedMediaTokens` when
@@ -189,7 +197,12 @@ export function estimatePromptSize(input: PromptSizeEstimateInput): PromptSizeEs
   for (const m of input.activePathMessages) {
     if (m.deleted || m.hiddenFromContext) continue
     visiblePath.push(m)
-    fallbackHistory += textTokensForMessage(m, family, input.currentModelId)
+    fallbackHistory += textTokensForMessage(
+      m,
+      family,
+      input.currentModelId,
+      input.currentTextCharsPerToken,
+    )
     fallbackMedia += mediaTokensForMessage(
       m,
       family,
@@ -223,7 +236,12 @@ export function estimatePromptSize(input: PromptSizeEstimateInput): PromptSizeEs
     let media = 0
     const baseline = input.activePathMessages[baselineIdx]
     if (baseline && !baseline.deleted && !baseline.hiddenFromContext) {
-      h += textTokensForMessage(baseline, family, input.currentModelId)
+      h += textTokensForMessage(
+        baseline,
+        family,
+        input.currentModelId,
+        input.currentTextCharsPerToken,
+      )
       media += mediaTokensForMessage(
         baseline,
         family,
@@ -234,7 +252,7 @@ export function estimatePromptSize(input: PromptSizeEstimateInput): PromptSizeEs
     for (let i = baselineIdx + 1; i < input.activePathMessages.length; i += 1) {
       const m = input.activePathMessages[i]
       if (!m || m.deleted || m.hiddenFromContext) continue
-      h += textTokensForMessage(m, family, input.currentModelId)
+      h += textTokensForMessage(m, family, input.currentModelId, input.currentTextCharsPerToken)
       media += mediaTokensForMessage(m, family, input.currentModelId, input.attachmentResolver)
     }
     calibratedHistory = h
@@ -284,6 +302,8 @@ export function promptEstimateInputSignature(
     systemPrompt: input.systemPrompt,
     draftText: input.draftText,
     tokenizer: input.tokenizer,
+    currentModelId: input.currentModelId ?? null,
+    currentTextCharsPerToken: input.currentTextCharsPerToken ?? null,
     reasoningInclude: input.reasoningInclude ?? null,
     reasoningPreservationFormat: input.reasoningPreservationFormat ?? null,
     reasoningExcluded: input.reasoningExcluded ?? false,
@@ -313,9 +333,19 @@ export function estimateSettingsPromptSize(
   // themselves (e.g. the send pipeline when capability hasn't loaded).
   providerCap: number | null = null,
   attachmentResolver?: AttachmentResolver,
+  calibration?: TokenEstimateCalibrationContext,
 ): PromptSizeEstimate {
   const quirks = quirksFor(settings.model)
   const tokenizer = tokenizerFromSettings(settings, endpointTokenizer ?? null)
+  const currentTextCharsPerToken =
+    calibration && settings.model
+      ? charsPerToken(
+          settings.model,
+          { tokenCalibration: calibration.chatTokenCalibration },
+          calibration.globalCalibration ?? null,
+          calibration.mode,
+        )
+      : undefined
 
   const reasoningOpts: PromptEstimateOptions = {
     family: tokenizer,
@@ -335,6 +365,7 @@ export function estimateSettingsPromptSize(
     reasoningOpts,
     ...(attachmentResolver !== undefined ? { attachmentResolver } : {}),
     currentModelId: settings.model,
+    ...(currentTextCharsPerToken !== undefined ? { currentTextCharsPerToken } : {}),
   })
 
   // When cutoff excluded any message, the calibrated trick (which subtracts
@@ -364,6 +395,7 @@ export function estimateSettingsPromptSize(
     reasoningExcluded: settings.reasoning.exclude === true,
     ...(attachmentResolver !== undefined ? { attachmentResolver } : {}),
     currentModelId: settings.model,
+    ...(currentTextCharsPerToken !== undefined ? { currentTextCharsPerToken } : {}),
   }
   if (quirks.reasoningPreservationFormat !== undefined) {
     input.reasoningPreservationFormat = quirks.reasoningPreservationFormat

@@ -5,7 +5,7 @@ import { IDBFactory } from 'fake-indexeddb'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { effectiveCapabilityFromEndpoints } from '../../src/core/capabilities'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
-import type { ConnectionProfile, ModelEndpoint } from '../../src/core/types'
+import type { ConnectionProfile, Message, ModelEndpoint } from '../../src/core/types'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import { createChat, getChat } from '../../src/store/chats'
 import { __resetDbForTests, openDb } from '../../src/store/db'
@@ -171,6 +171,48 @@ describe('ApiModeSection — two-button toggle', () => {
     expect(prompted).toBe(true)
     const updated = await getChat(chat.id)
     expect(updated?.settings.api).toBe('chat')
+  })
+
+  it('uses the active path when deciding the resolved route', async () => {
+    const settings = cloneDefaultChatSettings()
+    settings.model = 'openai/gpt-5.4-nano'
+    const chat = await createChat({ settings })
+    const capability = effectiveCapabilityFromEndpoints(settings.model, [makeEndpoint()])
+    const path: readonly Message[] = [
+      {
+        id: 'm1',
+        chatId: chat.id,
+        parentId: null,
+        siblingIndex: 0,
+        turnId: 't1',
+        turnIndex: 0,
+        createdAt: 1,
+        role: 'assistant',
+        origin: 'generated',
+        content: [{ type: 'output_text', text: 'hi' }],
+        nodeVersion: 0,
+        deleted: false,
+        reasoningDetails: [
+          {
+            type: 'reasoning.encrypted',
+            data: 'opaque',
+            format: 'openai-responses-v1',
+          },
+        ],
+      },
+    ]
+    render(
+      <ApiModeSection
+        chat={chat}
+        capability={capability}
+        profile={makeProfile('openrouter')}
+        activePathMessages={path}
+      />,
+    )
+    const chatBtn = screen.getByRole('button', { name: 'Chat completions' })
+    const responsesBtn = screen.getByRole('button', { name: 'Responses' })
+    expect(responsesBtn.getAttribute('aria-pressed')).toBe('true')
+    expect(chatBtn.getAttribute('aria-pressed')).toBe('false')
   })
 })
 

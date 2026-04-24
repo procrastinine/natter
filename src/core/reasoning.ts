@@ -135,9 +135,15 @@ const OPENAI_RESPONSES_FAMILY: ReadonlySet<ReasoningFormat> = new Set<ReasoningF
   'azure-openai-responses-v1',
 ])
 
+export function isOpenAiResponsesFamilyFormat(
+  fmt: ReasoningFormat | undefined,
+): fmt is ReasoningFormat {
+  return fmt !== undefined && OPENAI_RESPONSES_FAMILY.has(fmt)
+}
+
 function formatsCompatible(stored: ReasoningFormat, target: ReasoningFormat): boolean {
   if (stored === target) return true
-  if (OPENAI_RESPONSES_FAMILY.has(stored) && OPENAI_RESPONSES_FAMILY.has(target)) return true
+  if (isOpenAiResponsesFamilyFormat(stored) && isOpenAiResponsesFamilyFormat(target)) return true
   return false
 }
 
@@ -255,7 +261,7 @@ export function normalizeReasoningDetails(details: ReasoningDetail[]): Reasoning
     }
     normalized.push(detail)
   }
-  return normalized
+  return dropMirroredOpenAiSummaryText(normalized)
 }
 
 // On-ingest relabel: OpenRouter returns Gemini 3 thought SUMMARIES tagged
@@ -300,7 +306,26 @@ export function findMergeTargetIndex(
       continue
     }
     if (incoming.type === 'reasoning.summary' && existing.type === 'reasoning.summary') {
-      if (existing.summary === incoming.summary) return index
+      // Backcompat: some older streams persisted successive snapshots of the
+      // SAME OpenAI/OpenRouter summary as separate rows without a stable id.
+      // Collapse obvious prefix/overlap growth when both rows sit on the same
+      // index. Distinct Gemini summaries at the same index still stay
+      // separate unless the text actually looks incremental.
+      if (
+        existing.index !== undefined &&
+        incoming.index !== undefined &&
+        existing.index === incoming.index
+      ) {
+        if (
+          isOpenAiResponsesFamilyFormat(existing.format) &&
+          isOpenAiResponsesFamilyFormat(incoming.format)
+        ) {
+          return index
+        }
+        const merged = mergeReasoningText(existing.summary, incoming.summary)
+        const appended = `${existing.summary}${incoming.summary}`
+        if (merged !== appended) return index
+      }
       continue
     }
     if (incoming.type === 'reasoning.encrypted' && existing.type === 'reasoning.encrypted') {
@@ -324,4 +349,23 @@ function shareIdentity(existing: ReasoningDetail, incoming: ReasoningDetail): bo
     incoming.index !== undefined &&
     existing.index === incoming.index
   )
+}
+
+function dropMirroredOpenAiSummaryText(details: ReasoningDetail[]): ReasoningDetail[] {
+  const openAiSummaries = details.filter(
+    (detail): detail is Extract<ReasoningDetail, { type: 'reasoning.summary' }> =>
+      detail.type === 'reasoning.summary' && isOpenAiResponsesFamilyFormat(detail.format),
+  )
+  if (openAiSummaries.length === 0) return details
+  return details.filter((detail) => {
+    if (detail.type !== 'reasoning.text') return true
+    if (typeof detail.signature === 'string' && detail.signature.length > 0) return true
+    return !openAiSummaries.some(
+      (summary) =>
+        summary.summary === detail.text &&
+        summary.index !== undefined &&
+        detail.index !== undefined &&
+        summary.index === detail.index,
+    )
+  })
 }

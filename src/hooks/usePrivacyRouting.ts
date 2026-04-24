@@ -46,6 +46,7 @@ export function usePrivacyRouting(chat: Chat | null | undefined): UsePrivacyRout
   const filter = useMemo<PrivacyFilterResult | null>(() => {
     if (!chat) return null
     if (!pol.scrapeApplicable) return null
+    if (pol.loading) return null
     if (!modelId) return null
     if (ep.endpoints.length === 0) return null
     return filterEndpointsByPrivacy({
@@ -53,23 +54,41 @@ export function usePrivacyRouting(chat: Chat | null | undefined): UsePrivacyRout
       endpoints: ep.endpoints,
       policies: pol.policies,
       privacy: chat.settings.privacy,
+      missingPolicyMode: pol.error ? 'offline-worst-case' : 'unavailable',
     })
-  }, [pol.scrapeApplicable, pol.policies, modelId, ep.endpoints, chat?.settings.privacy])
+  }, [
+    pol.scrapeApplicable,
+    pol.loading,
+    pol.error,
+    pol.policies,
+    modelId,
+    ep.endpoints,
+    chat?.settings.privacy,
+  ])
 
   const wire = useMemo<WireProviderPrivacy | null>(() => {
     if (!chat) return null
     if (!filter) return null
     const prefs = chat.settings.providerPrefs
     const userTouched = prefs?.ignoreOverridesFilter === true
-    const opts: { existingIgnore?: readonly string[]; userTouchedPicker?: boolean } = {
+    const opts: {
+      existingIgnore?: readonly string[]
+      existingOnly?: readonly string[]
+      existingOrder?: readonly string[]
+      userTouchedPicker?: boolean
+    } = {
       userTouchedPicker: userTouched,
     }
     if (prefs?.ignore) opts.existingIgnore = prefs.ignore
+    if (prefs?.only) opts.existingOnly = prefs.only
+    if (prefs?.order) opts.existingOrder = prefs.order
     return buildWireProviderPrivacy(filter, chat.settings.privacy, opts)
   }, [
     filter,
     chat?.settings.privacy,
     chat?.settings.providerPrefs?.ignore,
+    chat?.settings.providerPrefs?.only,
+    chat?.settings.providerPrefs?.order,
     chat?.settings.providerPrefs?.ignoreOverridesFilter,
   ])
 

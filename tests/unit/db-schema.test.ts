@@ -1,5 +1,7 @@
 import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { cloneDefaultChatSettings } from '../../src/core/defaults'
+import type { Chat, ChatPreset } from '../../src/core/types'
 import type { NatterDb } from '../../src/store/db'
 import { __resetDbForTests, createDbForTests, openDb, registerSchema } from '../../src/store/db'
 
@@ -92,7 +94,7 @@ function registerV1(db: Dexie): void {
 
 function registerV1Through3(db: Dexie): void {
   registerSchema(db)
-  db.version(4)
+  db.version(5)
     .stores({ profiles: 'id, name, kind, lastUsedAt, archived' })
     .upgrade(async (tx) => {
       await tx
@@ -102,13 +104,38 @@ function registerV1Through3(db: Dexie): void {
           if (row.appTitle === undefined) row.appTitle = 'Natter'
         })
     })
-  db.version(5)
+  db.version(6)
     .stores({ settings: '&key' })
     .upgrade(async (tx) => {
       const settings = tx.table<MinimalSetting>('settings')
       const existing = await settings.get('schemaTag')
       if (!existing) await settings.put({ key: 'schemaTag', value: 'v3' })
     })
+}
+
+function registerLegacyProviderPrefsV3(db: Dexie): void {
+  db.version(3).stores({
+    chats:
+      'id, updatedAt, createdAt, lastViewedAt, lastUpdatedLeafId, lastBranchUpdatedAt, wordCount, totalCostUsd, archived, pinned, presetId, folderId, *tags',
+    messages:
+      'id, chatId, parentId, turnId, [chatId+parentId], [chatId+createdAt], [chatId+turnId], [chatId+deleted]',
+    childLists: 'id, [chatId+parentId], updatedAt',
+    attachments: 'id, contentHash, refCount, createdAt',
+    profiles: 'id, name, kind, lastUsedAt, archived',
+    presets: 'id, name, connectionProfileId, lastUsedAt, archived',
+    folders: 'id, name, sortIndex, lastUsedAt',
+    tags: 'id, &nameLower, lastUsedAt',
+    chatBranchCache: '&chatId, branchLeafId, generatedAt',
+    keys: 'id, name',
+    settings: '&key',
+    models: '&[profileId+queryKey], fetchedAt',
+    endpoints: '&[profileId+modelId], fetchedAt',
+    privacyPolicies: '&[profileId+modelId], fetchedAt',
+    providers: '&profileId, fetchedAt',
+    generations: 'id, chatId, gen_id',
+    presetResolutions: '&[profileId+presetSlug], fetchedAt',
+    drafts: '&chatId, updatedAt',
+  })
 }
 
 describe('Dexie migrations', () => {
@@ -123,7 +150,7 @@ describe('Dexie migrations', () => {
     const db = new Dexie(name)
     registerV1Through3(db)
     await db.open()
-    expect(db.verno).toBe(5)
+    expect(db.verno).toBe(6)
     expect(db.tables.map((t) => t.name).includes('settings')).toBe(true)
     const tag = await db.table<MinimalSetting>('settings').get('schemaTag')
     expect(tag).toBeUndefined()
@@ -159,7 +186,7 @@ describe('Dexie migrations', () => {
     const up = new Dexie(name)
     registerV1Through3(up)
     await up.open()
-    expect(up.verno).toBe(5)
+    expect(up.verno).toBe(6)
     const profile = await up.table<MinimalProfile>('profiles').get('P1')
     expect(profile?.appTitle).toBe('CustomTitle') // preserved — synthetic bump only fills undefined
     const tag = await up.table<MinimalSetting>('settings').get('schemaTag')
@@ -169,7 +196,7 @@ describe('Dexie migrations', () => {
     const reopen = new Dexie(name)
     registerV1Through3(reopen)
     await reopen.open()
-    expect(reopen.verno).toBe(5)
+    expect(reopen.verno).toBe(6)
     const tag2 = await reopen.table<MinimalSetting>('settings').get('schemaTag')
     expect(tag2?.value).toBe('preexisting')
     await reopen.delete()
@@ -206,4 +233,103 @@ describe('Dexie migrations', () => {
     expect(row?.appTitle).toBe('Natter') // synthetic bump backfilled
     await up.delete()
   })
+
+  it('migrates legacy privacy provider refs on chats and presets into providerPrefs', async () => {
+    const name = `natter-test-provider-mig-${Math.random().toString(36).slice(2)}`
+    await Dexie.delete(name)
+    const profileId = 'profile-1'
+    const modelId = 'anthropic/claude-opus-4.7'
+    const baseSettings = {
+      ...cloneDefaultChatSettings(),
+      profileId,
+      model: modelId,
+      privacy: {
+        ...cloneDefaultChatSettings().privacy,
+        ignoreProviders: ['Anthropic'],
+        onlyProviders: [],
+      },
+    }
+
+    const v3 = new Dexie(name)
+    registerLegacyProviderPrefsV3(v3)
+    await v3.open()
+    await v3.table('endpoints').put({
+      profileId,
+      modelId,
+      fetchedAt: 1,
+      payload: {
+        data: {
+          id: modelId,
+          endpoints: [
+            legacyEndpoint('Amazon Bedrock', 'amazon-bedrock', {}),
+            legacyEndpoint('Anthropic', 'anthropic', { requiresUserIDs: true }),
+            legacyEndpoint('Anthropic', 'anthropic/2', { requiresUserIDs: true }),
+          ],
+        },
+      },
+    })
+    await v3.table<Chat>('chats').put({
+      id: 'chat-1',
+      title: '',
+      titleStatus: 'untitled',
+      createdAt: 1,
+      updatedAt: 1,
+      lastViewedAt: 1,
+      wordCount: 0,
+      totalCostUsd: 0,
+      metaVersion: 0,
+      summaryVersion: 0,
+      settings: structuredClone(baseSettings),
+      lastUpdatedLeafId: null,
+      lastBranchUpdatedAt: 1,
+      archived: false,
+      pinned: false,
+      folderId: null,
+      tags: [],
+    })
+    await v3.table<ChatPreset>('presets').put({
+      id: 'preset-1',
+      name: 'Preset',
+      connectionProfileId: profileId,
+      settings: structuredClone(baseSettings),
+      createdAt: 1,
+      updatedAt: 1,
+    })
+    v3.close()
+
+    const migrated = createDbForTests(name)
+    await migrated.open()
+    const chat = await migrated.chats.get('chat-1')
+    const preset = await migrated.presets.get('preset-1')
+    expect(chat?.settings.privacy.ignoreProviders).toEqual([])
+    expect(chat?.settings.privacy.onlyProviders).toEqual([])
+    expect(chat?.settings.providerPrefs?.ignoreOverridesFilter).toBe(true)
+    expect(chat?.settings.providerPrefs?.ignore).toEqual(['anthropic', 'anthropic/2'])
+    expect(preset?.settings.privacy.ignoreProviders).toEqual([])
+    expect(preset?.settings.providerPrefs?.ignore).toEqual(['anthropic', 'anthropic/2'])
+    await migrated.delete()
+  })
 })
+
+function legacyEndpoint(
+  provider_name: string,
+  tag: string,
+  policyOverrides: Record<string, unknown>,
+): Record<string, unknown> {
+  return {
+    provider_name,
+    tag,
+    supported_parameters: ['provider', 'temperature'],
+    context_length: 200_000,
+    pricing: {},
+    data_policy: {
+      training: false,
+      trainingOpenRouter: false,
+      retainsPrompts: false,
+      canPublish: false,
+      termsOfServiceURL: '',
+      privacyPolicyURL: '',
+      ...policyOverrides,
+    },
+  }
+}

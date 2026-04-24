@@ -159,6 +159,38 @@ describe('parsePrivacyPage', () => {
     expect(policies.Anthropic?.retentionDays).toBe(30)
   })
 
+  it('picks up policies from live-style RSC flight chunks', () => {
+    const chunk =
+      '3:["$","endpoint",null,{"provider_display_name":"Live Provider","provider_slug":"live-provider","dataPolicy":{"training":false,"trainingOpenRouter":false,"retainsPrompts":false,"canPublish":false}}]'
+    const html = `<script>self.__next_f.push([1,${JSON.stringify(chunk)}])</script>`
+    const policies = parsePrivacyPage(html)
+    expect(policies['Live Provider']?.training).toBe(false)
+    expect(policies['live-provider']?.training).toBe(false)
+    expect(policies['Live Provider']?.trainingOpenRouter).toBe(false)
+    expect(policies['Live Provider']?.retainsPrompts).toBe(false)
+  })
+
+  it('picks up escaped provider JSON when the flight scan cannot decode it', () => {
+    const html = String.raw`
+      <script>
+        window.__RSC_SNAPSHOT__ = "{\"provider_display_name\":\"Escaped Provider\",\"data_policy\":{\"training\":false,\"training_openrouter\":false,\"retains_prompts\":false,\"can_publish\":false}}";
+      </script>
+    `
+    const policies = parsePrivacyPage(html)
+    expect(policies['Escaped Provider']?.training).toBe(false)
+    expect(policies['Escaped Provider']?.trainingOpenRouter).toBe(false)
+    expect(policies['Escaped Provider']?.retainsPrompts).toBe(false)
+  })
+
+  it('keeps the /endpoints provider_name key when displayName differs', () => {
+    const chunk =
+      '3:["$","endpoint",null,{"provider_name":"Provider Canonical","provider_info":{"displayName":"provider.example","dataPolicy":{"training":false,"trainingOpenRouter":false,"retainsPrompts":false,"canPublish":false}},"provider_display_name":"provider.example","data_policy":{"training":false,"trainingOpenRouter":false,"retainsPrompts":false,"canPublish":false}}]'
+    const html = `<script>self.__next_f.push([1,${JSON.stringify(chunk)}])</script>`
+    const policies = parsePrivacyPage(html)
+    expect(policies['Provider Canonical']?.training).toBe(false)
+    expect(policies['Provider Canonical']?.retainsPrompts).toBe(false)
+  })
+
   it('first occurrence wins when a provider appears in multiple chunks', () => {
     const html = `
       <script>{"provider_name":"Azure","data_policy":{"training":false,"retains_prompts":false,"can_publish":false}}</script>

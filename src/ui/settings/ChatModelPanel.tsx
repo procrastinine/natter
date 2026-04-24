@@ -127,13 +127,13 @@ export function ChatModelPanel({ chatId, chatSnapshot = null, onClose }: ChatMod
           .join('|')
       : '',
   )
+  const activePathMessages = useMemo(() => activePath(messages, cursor), [messages, cursor])
   const promptEstimateInput = useMemo<PromptSizeEstimateInput | null>(() => {
     if (!chat) return null
-    const path = activePath(messages, cursor)
     const quirks = capability?.quirks
     const input: PromptSizeEstimateInput = {
       systemPrompt: chat.settings.systemPrompt,
-      activePathMessages: path,
+      activePathMessages,
       draftText: draft ?? '',
       tokenizer: tokenizerFromSettings(chat.settings, endpointTokenizer),
       reasoningInclude: chat.settings.reasoning.include,
@@ -143,7 +143,7 @@ export function ChatModelPanel({ chatId, chatSnapshot = null, onClose }: ChatMod
       input.reasoningPreservationFormat = quirks.reasoningPreservationFormat
     }
     return input
-  }, [chat, messages, cursor, draft, endpointTokenizer, capability?.quirks])
+  }, [chat, activePathMessages, draft, endpointTokenizer, capability?.quirks])
   const deferredPromptEstimateInput = useDeferredValue(promptEstimateInput)
   const promptEstimate = useStreamStablePromptEstimate(
     chat?.id,
@@ -257,6 +257,7 @@ export function ChatModelPanel({ chatId, chatSnapshot = null, onClose }: ChatMod
                 chat={chat}
                 capability={capability}
                 profile={profile ?? null}
+                activePathMessages={activePathMessages}
               />
             ) : null}
             {isOpenRouter ? (

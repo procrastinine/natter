@@ -10,8 +10,10 @@
 // - freshTokenEstimate() is pure — covers div-by-zero + clamp.
 
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { tokenCalibrationKey } from '../../src/core/model-ids'
 import {
   addSampleToChatAndGlobal,
+  aggregateCalibrationSamples,
   applyValidatedSample,
   calibrationFieldsForCreate,
   calibrationFieldsForEdit,
@@ -52,6 +54,15 @@ vi.mock('../../src/store/settings', () => {
     async setSetting<T>(key: string, value: T): Promise<void> {
       state.set(key, value)
     },
+    async updateSetting<T>(
+      key: string,
+      updater: (current: T | undefined) => T | undefined | Promise<T | undefined>,
+    ): Promise<T | undefined> {
+      const next = await updater(state.get(key) as T | undefined)
+      if (next === undefined) state.delete(key)
+      else state.set(key, next)
+      return next
+    },
     async deleteSetting(key: string): Promise<void> {
       state.delete(key)
     },
@@ -79,6 +90,28 @@ describe('tokenizerFamilyForModel', () => {
     expect(tokenizerFamilyForModel('deepseek/deepseek-r1')).toBe('deepseek')
     expect(tokenizerFamilyForModel('qwen/qwen3-72b')).toBe('qwen')
     expect(tokenizerFamilyForModel('mistralai/mistral-large')).toBe('mistral')
+  })
+
+  it('best-guesses exact bare official ids and family-level fine-tunes', () => {
+    expect(tokenizerFamilyForModel('gpt-5.4')).toBe('gpt')
+    expect(tokenizerFamilyForModel('gpt-5.4@openai')).toBe('gpt')
+    expect(tokenizerFamilyForModel('openai_gpt_5')).toBe('gpt')
+    expect(tokenizerFamilyForModel('gemma-3-somefinetune')).toBe('gemini')
+  })
+
+  it('stays strict on lookalikes that should not be collapsed', () => {
+    expect(tokenizerFamilyForModel('gpt-5.4-llama')).toBe('llama')
+    expect(tokenizerFamilyForModel('asdfmodel')).toBe('unknown')
+  })
+
+  it('uses real Hugging Face lookalikes as adversarial exclusions', () => {
+    expect(
+      tokenizerFamilyForModel(
+        'mradermacher/Mistral-Nemo-2407-12B-Thinking-Claude-Gemini-GPT5.2-Uncensored-HERETIC-GGUF',
+      ),
+    ).toBe('mistral')
+    expect(tokenizerFamilyForModel('Jackrong/GPT-5-Distill-Qwen3-4B-Instruct-GGUF')).toBe('qwen')
+    expect(tokenizerFamilyForModel('Jackrong/GPT-5-Distill-llama3.2-3B-Instruct')).toBe('llama')
   })
 
   it('returns unknown for unrecognized ids', () => {
@@ -252,6 +285,43 @@ describe('charsPerToken — calibration mode', () => {
     )
   })
 
+  it('reads legacy exact-model rows through the resolved family bucket', () => {
+    const chat = {
+      tokenCalibration: {
+        'google/gemini-2.5-pro-preview-05-06': {
+          totalTextChars: 4800,
+          totalTextTokens: 1200,
+          sampleCount: 2,
+          updatedAt: 0,
+        },
+      },
+    }
+    expect(charsPerToken('google/gemini-3.1-pro-preview', chat, null, 'adaptive')).toBeCloseTo(4.0, 5)
+  })
+
+  it('aggregates mixed stored keys onto the display bucket', () => {
+    const aggregated = aggregateCalibrationSamples({
+      'moonshotai/kimi-k2.6': {
+        totalTextChars: 300,
+        totalTextTokens: 100,
+        sampleCount: 1,
+        updatedAt: 10,
+      },
+      'oss:kimi-k2': {
+        totalTextChars: 600,
+        totalTextTokens: 200,
+        sampleCount: 2,
+        updatedAt: 20,
+      },
+    })
+    expect(aggregated['oss:kimi-k2']).toEqual({
+      totalTextChars: 900,
+      totalTextTokens: 300,
+      sampleCount: 3,
+      updatedAt: 20,
+    })
+  })
+
   it("'global-only' skips per-chat and uses global", () => {
     expect(
       charsPerToken('openai/gpt-4o', chatWithSample, globalWithSample, 'global-only'),
@@ -385,7 +455,7 @@ describe('addSampleToChatAndGlobal', () => {
     const chat = { tokenCalibration: {} } as Pick<Chat, 'tokenCalibration'>
     const outcome = await addSampleToChatAndGlobal(chat, 'openai/gpt-4o', 350, 100, 1_000)
     expect(outcome.accepted).toBe(true)
-    expect(chat.tokenCalibration?.['openai/gpt-4o']).toEqual({
+    expect(chat.tokenCalibration?.[tokenCalibrationKey('openai/gpt-4o')]).toEqual({
       totalTextChars: 350,
       totalTextTokens: 100,
       sampleCount: 1,
@@ -393,7 +463,7 @@ describe('addSampleToChatAndGlobal', () => {
       updatedAt: 1_000,
     })
     const global = await readTokenCalibrationGlobal()
-    expect(global.byModel['openai/gpt-4o']).toEqual({
+    expect(global.byModel[tokenCalibrationKey('openai/gpt-4o')]).toEqual({
       totalTextChars: 350,
       totalTextTokens: 100,
       sampleCount: 1,
@@ -406,7 +476,7 @@ describe('addSampleToChatAndGlobal', () => {
     const chat = { tokenCalibration: {} } as Pick<Chat, 'tokenCalibration'>
     const outcome = await addSampleToChatAndGlobal(chat, 'openai/gpt-4o', 10, 100)
     expect(outcome.accepted).toBe(false)
-    expect(chat.tokenCalibration?.['openai/gpt-4o']?.sampleCount ?? 0).toBe(0)
+    expect(chat.tokenCalibration?.[tokenCalibrationKey('openai/gpt-4o')]?.sampleCount ?? 0).toBe(0)
   })
 
   it('accumulates across multiple calls', async () => {
@@ -414,7 +484,7 @@ describe('addSampleToChatAndGlobal', () => {
     await addSampleToChatAndGlobal(chat, 'openai/gpt-4o', 350, 100, 1_000)
     await addSampleToChatAndGlobal(chat, 'openai/gpt-4o', 1_400, 400, 2_000)
     // 350+1400 = 1750 chars, 100+400 = 500 tokens, 2 samples.
-    expect(chat.tokenCalibration?.['openai/gpt-4o']).toMatchObject({
+    expect(chat.tokenCalibration?.[tokenCalibrationKey('openai/gpt-4o')]).toMatchObject({
       totalTextChars: 1_750,
       totalTextTokens: 500,
       sampleCount: 2,
@@ -700,6 +770,7 @@ describe('calibrationFieldsForCreate', () => {
     expect(fields.originalCharCount).toBe(35)
     expect(fields.originalTokenEstimate).toBe(10)
     expect(fields.originalModelId).toBe('openai/gpt-4o')
+    expect(fields.originalCalibrationKey).toBe(tokenCalibrationKey('openai/gpt-4o'))
     expect(fields.charCountDelta).toBe(0)
     expect(fields.cachedTokenEstimate).toBe(10)
   })
@@ -733,6 +804,8 @@ describe('calibrationFieldsForEdit', () => {
     const patch = calibrationFieldsForEdit(
       [{ type: 'text', text: 'a'.repeat(70) }],
       35,
+      undefined,
+      undefined,
       'openai/gpt-4o',
       null,
       null,
@@ -744,6 +817,8 @@ describe('calibrationFieldsForEdit', () => {
   it('delta = 0 when original is missing (pre-Phase-B row)', () => {
     const patch = calibrationFieldsForEdit(
       [{ type: 'text', text: 'a'.repeat(35) }],
+      undefined,
+      undefined,
       undefined,
       'openai/gpt-4o',
       null,
@@ -759,12 +834,27 @@ describe('calibrationFieldsForEdit', () => {
     const patch = calibrationFieldsForEdit(
       [{ type: 'text', text: 'a'.repeat(30) }],
       35,
+      undefined,
+      undefined,
       'anthropic/claude-opus-4.7',
       null,
       null,
     )
     // 30 / 3.0 = 10
     expect(patch.cachedTokenEstimate).toBe(10)
+  })
+
+  it('backfills originalCalibrationKey on edit when originalModelId exists', () => {
+    const patch = calibrationFieldsForEdit(
+      [{ type: 'text', text: 'a'.repeat(35) }],
+      35,
+      'google/gemini-2.5-pro-preview',
+      undefined,
+      'google/gemini-2.5-pro-preview-05-06',
+      null,
+      null,
+    )
+    expect(patch.originalCalibrationKey).toBe(tokenCalibrationKey('google/gemini-2.5-pro-preview'))
   })
 })
 
@@ -786,7 +876,7 @@ describe('persistence round-trip', () => {
     await writeTokenCalibrationGlobal(value)
     const readBack = await readTokenCalibrationGlobal()
     expect(readBack.version).toBe(1)
-    expect(readBack.byModel['openai/gpt-4o']?.sampleCount).toBe(4)
+    expect(readBack.byModel[tokenCalibrationKey('openai/gpt-4o')]?.sampleCount).toBe(4)
   })
 
   it('reads empty when no settings key is set', async () => {
@@ -804,5 +894,27 @@ describe('persistence round-trip', () => {
     const read = await readTokenCalibrationGlobal()
     expect(read.version).toBe(1)
     expect(Object.keys(read.byModel).length).toBe(0)
+  })
+
+  it('normalizes legacy exact-model global rows onto bucket keys on read', async () => {
+    await writeTokenCalibrationGlobal({
+      version: 1,
+      updatedAt: 7,
+      byModel: {
+        'moonshotai/kimi-k2.6': {
+          totalTextChars: 300,
+          totalTextTokens: 100,
+          sampleCount: 1,
+          updatedAt: 7,
+        },
+      },
+    })
+    const readBack = await readTokenCalibrationGlobal()
+    expect(readBack.byModel['oss:kimi-k2']).toMatchObject({
+      totalTextChars: 300,
+      totalTextTokens: 100,
+      sampleCount: 1,
+    })
+    expect(readBack.byModel['moonshotai/kimi-k2.6']).toBeUndefined()
   })
 })

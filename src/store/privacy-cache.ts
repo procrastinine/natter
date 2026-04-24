@@ -7,9 +7,15 @@
 
 import type { ProfileId } from '../core/types'
 import { postEvent } from './broadcast'
-import { type CachedPrivacyPolicyRow, type CachedProvidersRow, getDb } from './db'
+import {
+  backfillProviderSettingsForModel,
+  type CachedPrivacyPolicyRow,
+  type CachedProvidersRow,
+  getDb,
+} from './db'
 
 export const PRIVACY_POLICY_TTL_MS = 24 * 60 * 60 * 1000
+export const PARTIAL_PRIVACY_POLICY_TTL_MS = 5 * 60 * 1000
 export const PROVIDERS_TTL_MS = 24 * 60 * 60 * 1000
 
 export async function getCachedPrivacyPolicy(
@@ -26,6 +32,7 @@ export async function putCachedPrivacyPolicy(
   fetchedAt: number = Date.now(),
 ): Promise<void> {
   await getDb().privacyPolicies.put({ profileId, modelId, fetchedAt, payload })
+  await backfillProviderSettingsForModel(profileId, modelId)
   postEvent({ kind: 'privacy-refreshed', profileId, modelId })
 }
 

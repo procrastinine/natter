@@ -68,6 +68,10 @@ export interface ChatCompletionsTransformOptions {
   // merged with `settings.providerPrefs` before the wire `provider`
   // block is built. See `plan/09-privacy.md §9.9`.
   privacy?: WireProviderPrivacy
+  // OpenRouter-specific provider routing. This must be explicitly enabled by
+  // the request planner so direct/custom OpenAI-compatible endpoints never see
+  // OpenRouter's `provider` extension.
+  allowProviderRouting?: boolean
   // The carrier format the current route can round-trip for reasoning echo
   // (e.g. `anthropic-claude-v1` when sending to Claude; `openai-responses-v1`
   // for OpenAI Responses). Determined by `caps.quirks.reasoningPreservationFormat`
@@ -361,11 +365,10 @@ export function toChatCompletions(
     wire.verbosity = settings.verbosity
   }
 
-  // Provider preferences (OpenRouter-specific). For Phase 7 we pass them
-  // through only when the endpoint advertises the `provider` key; other
-  // providers would reject it. In practice direct endpoints lack `/endpoints`
-  // data so `supported` is undefined and the knob ships.
-  if (gate('provider')) {
+  // Provider preferences are OpenRouter-specific. The planner must opt in;
+  // otherwise direct/custom endpoints never receive OpenRouter's extension
+  // even when settings happen to contain provider prefs.
+  if (opts.allowProviderRouting === true && gate('provider')) {
     const providerBlock = buildProviderBlock(settings, opts.privacy)
     if (providerBlock) wire.provider = providerBlock
   }
@@ -503,10 +506,10 @@ function buildProviderBlock(
   const base = settings.providerPrefs ? toWireProviderPrefs(settings.providerPrefs) : {}
   if (privacy) {
     // Auto-ignore wins additively: user-ignored + Pareto-excluded + hard-
-    // denied are unioned. `only` from the filter replaces the user's
-    // `only` (the filter already applied it and trimmed to kept-set
-    // survivors; sending both would be redundant). `order` follows the
-    // same rule. `data_collection` / `zdr` come from `privacy.*`.
+    // denied are unioned. `only` / `order` from the resolver are already
+    // normalized to routing refs (including any user-set provider prefs),
+    // so they replace raw stored settings instead of leaking display names.
+    // `data_collection` / `zdr` come from `privacy.*`.
     if (privacy.ignore) base.ignore = privacy.ignore
     if (privacy.only) base.only = privacy.only
     if (privacy.order) base.order = privacy.order
@@ -539,8 +542,6 @@ function toWireProviderPrefs(
   if (prefs.requireParameters !== undefined) {
     wire.require_parameters = prefs.requireParameters
   }
-  if (prefs.dataCollection) wire.data_collection = prefs.dataCollection
-  if (prefs.zdr !== undefined) wire.zdr = prefs.zdr
   if (prefs.only) wire.only = [...prefs.only]
   if (prefs.ignore) wire.ignore = [...prefs.ignore]
   if (prefs.quantizations) wire.quantizations = [...prefs.quantizations]
@@ -587,6 +588,8 @@ export interface ResponsesTransformOptions {
   capabilities?: CapabilityDescriptor
   stream?: boolean
   rewriteSlug?: (slug: string) => string
+  privacy?: WireProviderPrivacy
+  allowProviderRouting?: boolean
   // Informs the reasoning-carry-forward filter about which encrypted format the
   // current route round-trips. For Responses the map is:
   //   OpenAI direct       → `openai-responses-v1`
@@ -686,6 +689,11 @@ export function toResponses(
 
   if (gate('verbosity') && settings.verbosity !== undefined) {
     wire.text = { verbosity: settings.verbosity }
+  }
+
+  if (opts.allowProviderRouting === true && gate('provider')) {
+    const providerBlock = buildProviderBlock(settings, opts.privacy)
+    if (providerBlock) wire.provider = providerBlock
   }
 
   // `include: ['reasoning.encrypted_content']` — required for stateless

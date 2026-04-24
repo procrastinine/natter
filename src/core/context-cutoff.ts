@@ -41,6 +41,7 @@ import {
   pdfTokenEstimate,
 } from './media-tokens'
 import { type AttachmentResolver, resolveContextCap, UNLIMITED_CONTEXT } from './prompt-size'
+import { readPathTextTokenEstimate } from './token-calibration'
 import { clampTokens, safeContent } from './token-guards'
 import {
   estimateReasoningEchoTokensForMessage,
@@ -49,16 +50,6 @@ import {
   type TokenizerFamily,
 } from './tokens'
 import type { ChatSettings, Message, MessageId } from './types'
-
-function textTokensForContent(content: unknown, family: TokenizerFamily): number {
-  let tokens = 0
-  for (const item of safeContent(content)) {
-    if (item.type === 'text' || item.type === 'output_text') {
-      tokens += estimateTokens(item.text, family)
-    }
-  }
-  return tokens
-}
 
 function mediaTokensForContent(
   content: unknown,
@@ -98,10 +89,14 @@ export interface MessageCostOptions {
   // Optional — unlocks attachment-aware image / PDF heuristics. Without
   // it, media tokens fall back to constant values (see media-tokens.ts).
   attachmentResolver?: AttachmentResolver
-  // Optional — the chat's CURRENT model ID. Gates cache trust: a message
-  // whose `originalModelId` differs forces a fresh estimate. When omitted,
-  // cache is used whenever present.
+  // Optional — the chat's CURRENT model ID. Text-token estimation uses it to
+  // decide whether a message stays in the same calibration bucket; when
+  // omitted, the read path falls back to cache/fresh heuristics.
   currentModelId?: string
+  // Optional — resolved chars/token ratio for the CURRENT model. When
+  // present, same-bucket rows use original-token + edit-delta math and
+  // other-model rows recompute under this model.
+  currentTextCharsPerToken?: number
 }
 
 export interface MessageCost {
@@ -119,12 +114,12 @@ function cacheEligible(m: Message, currentModelId: string | undefined): boolean 
 
 export function messageCost(m: Message, opts: MessageCostOptions): MessageCost {
   const eligible = cacheEligible(m, opts.currentModelId)
-  const text =
-    eligible &&
-    typeof m.cachedTokenEstimate === 'number' &&
-    Number.isFinite(m.cachedTokenEstimate)
-      ? m.cachedTokenEstimate
-      : textTokensForContent(m.content, opts.family)
+  const text = readPathTextTokenEstimate({
+    message: m,
+    family: opts.family,
+    currentModelId: opts.currentModelId,
+    currentTextCharsPerToken: opts.currentTextCharsPerToken,
+  })
   const media =
     eligible && typeof m.cachedMediaTokens === 'number' && Number.isFinite(m.cachedMediaTokens)
       ? m.cachedMediaTokens
@@ -200,6 +195,7 @@ export interface CutoffPlanInput {
   // Optional — gates per-message cache trust. Threaded into messageCost
   // via MessageCostOptions.
   currentModelId?: string
+  currentTextCharsPerToken?: number
 }
 
 export interface CutoffPlan {
@@ -303,6 +299,9 @@ export function computeCutoffPlan(input: CutoffPlanInput): CutoffPlan {
   if (input.reasoningOpts) costOpts.reasoningOpts = input.reasoningOpts
   if (input.attachmentResolver) costOpts.attachmentResolver = input.attachmentResolver
   if (input.currentModelId !== undefined) costOpts.currentModelId = input.currentModelId
+  if (input.currentTextCharsPerToken !== undefined) {
+    costOpts.currentTextCharsPerToken = input.currentTextCharsPerToken
+  }
   const grouped = groupPath(visible, costOpts)
 
   const systemTokens =

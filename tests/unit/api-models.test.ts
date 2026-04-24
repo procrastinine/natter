@@ -44,8 +44,17 @@ describe('normalizeEndpoint', () => {
   it('normalizes a fully-populated row', () => {
     const normalized = normalizeEndpoint({
       provider_name: 'Azure',
+      provider_display_name: 'Microsoft Azure',
+      provider_slug: 'azure',
+      provider_model_id: 'gpt-5.4',
       supported_parameters: ['temperature'],
       context_length: 128000,
+      data_policy: {
+        training: false,
+        trainingOpenRouter: false,
+        retainsPrompts: false,
+        canPublish: false,
+      },
       max_prompt_tokens: 120000,
       max_completion_tokens: 16000,
       pricing: { prompt: '0.0000025', completion: '0.00001' },
@@ -59,11 +68,35 @@ describe('normalizeEndpoint', () => {
     })
     expect(normalized).toMatchObject({
       provider_name: 'Azure',
+      provider_display_name: 'Microsoft Azure',
+      provider_slug: 'azure',
+      provider_model_id: 'gpt-5.4',
       context_length: 128000,
+      data_policy: {
+        training: false,
+        trainingOpenRouter: false,
+        retainsPrompts: false,
+        canPublish: false,
+        termsOfServiceURL: '',
+        privacyPolicyURL: '',
+      },
       supports_implicit_caching: true,
       latency_last_30m: { p50: 1.2, p99: 5.4 },
     })
     expect(normalized?.architecture?.input_modalities).toEqual(['text', 'image'])
+  })
+
+  it('uses OpenRouter endpoint tag as provider_slug when provider_slug is absent', () => {
+    const normalized = normalizeEndpoint({
+      name: 'Anthropic | anthropic/claude-4.7-opus-20260416',
+      provider_name: 'Anthropic',
+      tag: 'anthropic/2',
+      supported_parameters: ['reasoning'],
+      context_length: 1_000_000,
+      pricing: { prompt: '0.000005', completion: '0.000025' },
+    })
+    expect(normalized?.provider_name).toBe('Anthropic')
+    expect(normalized?.provider_slug).toBe('anthropic/2')
   })
 })
 

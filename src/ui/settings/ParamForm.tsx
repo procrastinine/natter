@@ -25,6 +25,7 @@ import type {
   Chat,
   ConnectionProfile,
   EffortLevel,
+  Message,
   ReasoningInclude,
   ReasoningSummary,
   SamplingKey,
@@ -281,19 +282,25 @@ export function ParamForm({ chat, capability }: ParamFormProps) {
 
   if (!chat.settings.model) {
     return (
-      <section data-ui="settings-section" data-ui-section="generation-empty">
-        <h3>Generation</h3>
-        <p data-ui="helper">Select a model first.</p>
-      </section>
+      <div data-ui="param-form">
+        <section data-ui="settings-section" data-ui-section="generation-empty">
+          <h3>Generation</h3>
+          <p data-ui="helper">Select a model first.</p>
+        </section>
+        <SystemPromptEditor chat={chat} />
+      </div>
     )
   }
 
   if (!capability) {
     return (
-      <section data-ui="settings-section" data-ui-section="generation-empty">
-        <h3>Generation</h3>
-        <p data-ui="helper">Waiting for model capability…</p>
-      </section>
+      <div data-ui="param-form">
+        <section data-ui="settings-section" data-ui-section="generation-empty">
+          <h3>Generation</h3>
+          <p data-ui="helper">Waiting for model capability…</p>
+        </section>
+        <SystemPromptEditor chat={chat} />
+      </div>
     )
   }
 
@@ -652,10 +659,12 @@ export function ApiModeSection({
   chat,
   capability,
   profile,
+  activePathMessages = [],
 }: {
   chat: Chat
   capability: EffectiveCapability
   profile: ConnectionProfile | null
+  activePathMessages?: readonly Message[]
 }) {
   if (!profile) return null
   // Gemini native picks transport at the connection level — nothing per-chat.
@@ -664,7 +673,7 @@ export function ApiModeSection({
   const support = responsesSupportFor(chat.settings.model)
   // Hide toggle unless the model has a genuine choice.
   if (support !== 'both') return null
-  const route = chooseApi(profile, chat.settings, [], capability)
+  const route = chooseApi(profile, chat.settings, activePathMessages, capability)
   const resolvedKind: 'chat' | 'responses' =
     route.kind === 'responses' ? 'responses' : 'chat'
   const requiresPhaseEcho = capability.quirks.requiresPhaseEcho === true

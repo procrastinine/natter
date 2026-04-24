@@ -151,6 +151,43 @@ describe('splitChatStream', () => {
     })
   })
 
+  it('drops mirrored reasoning text when OpenAI-family reasoning.summary already carries the same delta', async () => {
+    const source = fromChunks([
+      {
+        type: 'delta',
+        chunk: {
+          choices: [
+            {
+              delta: {
+                reasoning: 'thinking…',
+                reasoning_details: [
+                  {
+                    type: 'reasoning.summary',
+                    index: 0,
+                    format: 'azure-openai-responses-v1',
+                    summary: 'thinking…',
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      },
+    ])
+    const events = await collect(splitChatStream(source))
+    expect(events.find((e) => e.lane === 'reasoning')).toEqual({
+      lane: 'reasoning',
+      details: [
+        {
+          type: 'reasoning.summary',
+          index: 0,
+          format: 'azure-openai-responses-v1',
+          summary: 'thinking…',
+        },
+      ],
+    })
+  })
+
   it('preserves distinct reasoning text when details do not mirror it', async () => {
     const source = fromChunks([
       {

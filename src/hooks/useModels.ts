@@ -18,6 +18,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { fetchModels, type ModelsQueryString } from '../api/models'
 import { type ModelListEntry, normalizeModelsResponse } from '../api/providers'
 import { listBundledEntries } from '../capabilities'
+import { canonicalCompatModelId, compatModelIdsMatch, structuralModelSlug } from '../core/model-ids'
 import type { ConnectionProfile, ModelsQuery, ProfileId } from '../core/types'
 import { resolveKeyIfPresent } from '../store/keys'
 import {
@@ -41,16 +42,6 @@ export interface UseModelsResult {
   offline: boolean
   error: string | null
   refresh: () => void
-}
-
-function canonicalCompatId(modelId: string): string {
-  return modelId.replace(/(\d)[.-](\d)(?=-|$)/g, '$1:$2')
-}
-
-function compatIdMatches(a: string, b: string): boolean {
-  const left = canonicalCompatId(a)
-  const right = canonicalCompatId(b)
-  return left === right || left.startsWith(`${right}-`) || right.startsWith(`${left}-`)
 }
 
 function toQueryString(query: ModelsQuery): ModelsQueryString {
@@ -157,9 +148,11 @@ function mergeBundledModels(profile: ConnectionProfile, live: ModelListEntry[]):
   if (bundled.length === 0) return live
   const liveById = new Map(live.map((m) => [m.id, m]))
   const liveBySuffix = new Map<string, ModelListEntry>()
+  const liveByCompat = new Map<string, ModelListEntry>()
   for (const row of live) {
-    const slash = row.id.indexOf('/')
-    if (slash >= 0) liveBySuffix.set(row.id.slice(slash + 1), row)
+    const suffix = structuralModelSlug(row.id)
+    if (suffix !== row.id) liveBySuffix.set(suffix, row)
+    liveByCompat.set(canonicalCompatModelId(row.id), row)
   }
   const out: ModelListEntry[] = []
   const seen = new Set<string>()
@@ -167,7 +160,8 @@ function mergeBundledModels(profile: ConnectionProfile, live: ModelListEntry[]):
     const hit =
       liveById.get(entry.id) ??
       liveBySuffix.get(entry.id) ??
-      live.find((row) => compatIdMatches(row.id, entry.id)) ??
+      liveByCompat.get(canonicalCompatModelId(entry.id)) ??
+      live.find((row) => compatModelIdsMatch(row.id, entry.id)) ??
       null
     const merged: ModelListEntry = hit
       ? {
@@ -218,6 +212,7 @@ function mergeBundledModels(profile: ConnectionProfile, live: ModelListEntry[]):
             : {}),
           supportedParameters: [...entry.capability.supportedParameters],
         }
+    if (seen.has(merged.id)) continue
     out.push(merged)
     seen.add(merged.id)
   }

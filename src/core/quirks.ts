@@ -12,11 +12,14 @@
 // - `cache_control` top-level vs per-block requirement per endpoint (Bedrock
 //   / Vertex need per-block)
 //
-// This registry narrows the capability set after it comes off the wire. It
-// is a lookup by model id prefix — the OpenRouter id ("anthropic/claude-
-// opus-4.7") and the bundled id ("claude-opus-4.7") both match.
+// This registry narrows the capability set after it comes off the wire. It is
+// fallback-only: OpenRouter model discovery, endpoint routing, and provider
+// privacy must still work if this table has no row for a new model. Model
+// identity comes from the shared cross-provider resolver in `model-ids.ts`, so
+// OpenRouter aliases and direct-provider ids do not drift apart.
 
 import type { EffortLevel, ReasoningFormat, VerbosityLevel } from './types'
+import { canonicalCompatModelId, canonicalModelSlug } from './model-ids'
 
 // Effort ordered low → high for left-to-right UI rendering. Validation /
 // transform code doesn't care about order — it just filters by set
@@ -438,11 +441,11 @@ const REGISTRY: Record<string, QuirksEntry> = {
   // Current open-source / Chinese-lab thinking models (all emit
   // `reasoning_details[]` with `format: "unknown"` on OpenRouter — no
   // encrypted carrier). Entries key on the current flagship slug; legacy
-  // siblings (deepseek-r1, qwen3-next, gemma-3, kimi-k2 plain, glm-4.x,
+  // siblings (deepseek-r1, deepseek-v3.x, qwen3-next, gemma-3, kimi-k2 plain, glm-4.x,
   // minimax-m1/m2/m2.5) are intentionally dropped since they're superseded.
-  'deepseek-v3.2': {
+  'deepseek-v4': {
     reasoningInlineTags: ['think'],
-    allowedEffort: ['low', 'medium', 'high'],
+    allowedEffort: ['high', 'xhigh'],
     reasoningPreservationFormat: 'unknown',
   },
   'qwen3.6': {
@@ -501,22 +504,10 @@ const REGISTRY: Record<string, QuirksEntry> = {
 
 const REGISTRY_KEYS_BY_LENGTH = Object.keys(REGISTRY).sort((a, b) => b.length - a.length)
 
-function canonicalCompatId(modelId: string): string {
-  return modelId.replace(/(\d)[.-](\d)(?=-|$)/g, '$1:$2')
-}
-
-// Strip the provider prefix ("anthropic/claude-opus-4.7" → "claude-opus-4.7")
-// and then scan the registry for the longest matching key.
-function normalizeModelId(modelId: string): string {
-  const slash = modelId.indexOf('/')
-  const stripped = slash >= 0 ? modelId.slice(slash + 1) : modelId
-  return canonicalCompatId(stripped)
-}
-
 export function quirksFor(modelId: string): QuirksEntry {
-  const normalized = normalizeModelId(modelId)
+  const normalized = canonicalCompatModelId(modelId)
   for (const key of REGISTRY_KEYS_BY_LENGTH) {
-    const normalizedKey = canonicalCompatId(key)
+    const normalizedKey = canonicalCompatModelId(key)
     if (normalized === normalizedKey || normalized.startsWith(`${normalizedKey}-`)) {
       const entry = REGISTRY[key]
       if (entry) return entry
@@ -559,18 +550,13 @@ function slugIsOpenAiResponsesFamily(stripped: string): boolean {
   return false
 }
 
-function strippedSlug(modelId: string): string {
-  const slash = modelId.indexOf('/')
-  return slash >= 0 ? modelId.slice(slash + 1) : modelId
-}
-
 // Effective `responsesSupport`. Registry wins; otherwise slug-heuristic for
 // OpenAI-family; otherwise `'chat-only'` (safest — don't show a toggle for
 // a model we don't know supports /responses).
 export function responsesSupportFor(modelId: string): 'responses-only' | 'chat-only' | 'both' {
   const q = quirksFor(modelId)
   if (q.responsesSupport) return q.responsesSupport
-  if (slugIsOpenAiResponsesFamily(strippedSlug(modelId).toLowerCase())) return 'both'
+  if (slugIsOpenAiResponsesFamily(canonicalModelSlug(modelId).toLowerCase())) return 'both'
   return 'chat-only'
 }
 

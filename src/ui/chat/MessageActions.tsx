@@ -62,6 +62,7 @@ export interface MessageActionsProps {
   // disabled with a tooltip so the user understands why the action
   // can't run right now.
   hasConnection: boolean
+  generationBusy?: boolean
   disabledReason?: string
   // Structural ops.
   onRegenerate?: () => void | Promise<void>
@@ -156,6 +157,7 @@ export function MessageActions(props: MessageActionsProps) {
     isEditing,
     onBeginEdit,
     hasConnection,
+    generationBusy = false,
     disabledReason,
     onRegenerate,
     onContinue,
@@ -198,6 +200,10 @@ export function MessageActions(props: MessageActionsProps) {
   }, [message.content, onCopy])
 
   const disabledTitle = disabledReason ?? 'Add a connection to send messages.'
+  const generationDisabled = !hasConnection || generationBusy
+  const generationDisabledTitle = !hasConnection
+    ? disabledTitle
+    : 'A request is already running for this chat.'
   const deleteLabel = 'Delete message'
   const deleteTooltip = 'Delete this message…'
 
@@ -246,9 +252,9 @@ export function MessageActions(props: MessageActionsProps) {
           data-role="message-action"
           data-action="regenerate"
           onClick={() => void onRegenerate()}
-          disabled={!hasConnection}
+          disabled={generationDisabled}
           aria-label="Regenerate response"
-          title={hasConnection ? 'Regenerate (⇧⌘R)' : disabledTitle}
+          title={!generationDisabled ? 'Regenerate (⇧⌘R)' : generationDisabledTitle}
         >
           <ReloadIcon size={14} />
         </button>
@@ -261,14 +267,14 @@ export function MessageActions(props: MessageActionsProps) {
           data-role="message-action"
           data-action="continue"
           onClick={() => void onContinue()}
-          disabled={!hasConnection}
+          disabled={generationDisabled}
           aria-label={abortReason ? 'Continue partial response' : 'Continue from here'}
           title={
-            hasConnection
+            !generationDisabled
               ? abortReason
                 ? 'Continue this partial response'
                 : 'Continue this assistant message'
-              : disabledTitle
+              : generationDisabledTitle
           }
         >
           <SendIcon size={14} />

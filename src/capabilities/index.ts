@@ -10,6 +10,7 @@
 // ConnectionProfile.capabilityOverrides wins on top of the resolved row.
 
 import type { CapabilityDescriptor, ConnectionKind, ConnectionProfile } from '../core/types'
+import { canonicalModelSlug, compatModelIdsMatch, structuralModelSlug } from '../core/model-ids'
 import { ANTHROPIC_CAPABILITIES } from './anthropic'
 import { DEFAULT_CUSTOM_CAPABILITY } from './custom'
 import { GOOGLE_CAPABILITIES } from './google'
@@ -40,30 +41,16 @@ function defaultCapabilityFor(kind: ConnectionKind): CapabilityDescriptor {
   return kind === 'llama-server' ? DEFAULT_LLAMA_SERVER_CAPABILITY : DEFAULT_CUSTOM_CAPABILITY
 }
 
-function stripPrefix(modelId: string): string {
-  const slash = modelId.indexOf('/')
-  return slash >= 0 ? modelId.slice(slash + 1) : modelId
-}
-
-function canonicalCompatId(modelId: string): string {
-  return stripPrefix(modelId).replace(/(\d)[.-](\d)(?=-|$)/g, '$1:$2')
-}
-
-function compatIdMatches(a: string, b: string): boolean {
-  const left = canonicalCompatId(a)
-  const right = canonicalCompatId(b)
-  return left === right || left.startsWith(`${right}-`) || right.startsWith(`${left}-`)
-}
-
 export function lookupBundledEntry(
   kind: ConnectionKind,
   modelId: string,
 ): BundledModelEntry | undefined {
   const table = tableFor(kind)
   if (!table) return undefined
-  const direct = table[modelId] ?? table[stripPrefix(modelId)]
+  const direct =
+    table[modelId] ?? table[structuralModelSlug(modelId)] ?? table[canonicalModelSlug(modelId)]
   if (direct) return direct
-  return Object.values(table).find((entry) => compatIdMatches(entry.id, modelId))
+  return Object.values(table).find((entry) => compatModelIdsMatch(entry.id, modelId))
 }
 
 export function listBundledEntries(kind: ConnectionKind): BundledModelEntry[] {

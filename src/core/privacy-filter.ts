@@ -3,7 +3,8 @@
 // Given the live `/endpoints` rows + scraped `data_policy` map for a model,
 // produce the final routing decision for a request:
 //
-//   1. Synthesize a worst-case policy for any endpoint missing data_policy.
+//   1. Resolve live per-endpoint policy from /endpoints or the OpenRouter
+//      providers scrape. Missing online policy is "unavailable", not guessed.
 //   2. Hard-deny — drop endpoints with training: true OR trainingOpenRouter: true.
 //   3. Apply user `onlyProviders` (scoped to the survivors of step 2).
 //   4. Pareto-dominance exclusion, IF `privacy.paretoFilter`.
@@ -18,9 +19,15 @@
 // and produces a decision. The scraper and hook layers feed it; the
 // request composer consumes `buildWireProviderPrefs`.
 
-import { curatedPolicyFor } from './data-policies-fallback'
 import { synthesizeDataPolicy } from './privacy'
-import { applyPreferredOrdering } from './preferred-providers'
+import { findPreferredRule } from './preferred-providers'
+import {
+  endpointMatchesAnyProviderRef,
+  endpointMatchesProviderRef,
+  providerPolicyLookupKeys,
+  providerRoutingRef,
+  resolveProviderRefsToRoutingRefs,
+} from './provider-identity'
 import type { DataPolicy, ModelEndpoint, PrivacyPrefs } from './types'
 import { dominates } from './privacy'
 
@@ -34,9 +41,10 @@ export type ExclusionReason =
 
 export interface FilteredEndpoint {
   endpoint: ModelEndpoint
-  policy: DataPolicy
-  // True when the raw policy map didn't have an entry and we synthesized
-  // a worst-case. The UI flags these with "privacy data unavailable."
+  policy: DataPolicy | undefined
+  // True only when the caller explicitly requested the offline safety
+  // fallback. Online misses remain `policy: undefined` so the UI doesn't
+  // claim a live policy says the provider trains.
   policySynthesized: boolean
 }
 
@@ -48,7 +56,9 @@ export interface PrivacyFilterResult {
   kept: FilteredEndpoint[]
   excluded: ExcludedEndpoint[]
   // The kept set ordered by the preferred-ordering rule for the model,
-  // with rule-named providers first. Use this for `provider.order` on the wire.
+  // with rule-named providers first. Values are provider routing refs
+  // (OpenRouter slugs when available). The legacy property name is kept
+  // so older call sites/tests don't need a schema migration.
   orderedKeptNames: string[]
   // True when hard-deny + onlyProviders + Pareto leaves zero providers.
   // The UI renders a zero-eligible modal; the request is blocked.
@@ -60,28 +70,32 @@ export interface PrivacyFilterInput {
   endpoints: readonly ModelEndpoint[]
   policies: Readonly<Record<string, DataPolicy | undefined>>
   privacy: PrivacyPrefs
+  missingPolicyMode?: 'unavailable' | 'offline-worst-case'
 }
 
 export function filterEndpointsByPrivacy(input: PrivacyFilterInput): PrivacyFilterResult {
   const { endpoints, policies, privacy } = input
 
-  // Step 1 — resolve the per-endpoint policy. Order of sources:
-  //   1. Live scrape (keyed by `provider_name` — which equals the HTML
-  //      `provider_display_name` when it matches the JSON API value)
-  //   2. Hand-curated fallback in `data_policies.json` (keyed by the
-  //      same `provider_name`), so regional variants like
-  //      "Google Vertex (Global)" in the scrape that collapse to "Google"
-  //      in `/endpoints` still resolve cleanly.
-  //   3. Worst-case synthetic — gets tagged `unknown-policy` and
-  //      hard-denied as `training`, so the endpoint is excluded by
-  //      default until live data arrives.
+  // Step 1 — resolve the per-endpoint policy. Prefer policy data embedded
+  // in the endpoint row, then lookup by every known identity (slug,
+  // display name, provider_name, provider_model_id, row id). This keeps
+  // duplicate display names distinct while preserving old name-keyed
+  // caches/settings. Do not use hardcoded provider policy guesses here:
+  // OpenRouter live data is authoritative when reachable.
   type AugmentedEndpoint = FilteredEndpoint
   const augmented: AugmentedEndpoint[] = endpoints.map((ep) => {
-    const raw = policies[ep.provider_name] ?? curatedPolicyFor(ep.provider_name)
+    const raw = resolveEndpointPolicy(ep, policies)
+    if (!raw && input.missingPolicyMode === 'offline-worst-case') {
+      return {
+        endpoint: ep,
+        policy: synthesizeDataPolicy(raw),
+        policySynthesized: true,
+      }
+    }
     return {
       endpoint: ep,
-      policy: synthesizeDataPolicy(raw),
-      policySynthesized: !raw,
+      policy: raw,
+      policySynthesized: false,
     }
   })
 
@@ -93,10 +107,14 @@ export function filterEndpointsByPrivacy(input: PrivacyFilterInput): PrivacyFilt
   }
 
   // Step 2 — hard-deny. Trainer endpoints are always excluded, whether or
-  // not Pareto is enabled. A synthesized worst-case policy gets both
-  // `unknown-policy` (so the UI can call it out) AND `training` (the fact
-  // that the filter acts on), so the tooltip stays accurate.
+  // not Pareto is enabled. Missing online policy is excluded as unknown
+  // policy, not as training. Only the explicit offline fallback gets a
+  // synthesized worst-case policy.
   for (const aug of augmented) {
+    if (!aug.policy) {
+      excludeWith(aug, 'unknown-policy')
+      continue
+    }
     if (aug.policySynthesized) excludeWith(aug, 'unknown-policy')
     if (aug.policy.training) excludeWith(aug, 'training')
     if (aug.policy.trainingOpenRouter) excludeWith(aug, 'training-openrouter')
@@ -106,11 +124,10 @@ export function filterEndpointsByPrivacy(input: PrivacyFilterInput): PrivacyFilt
   // Step 3 — `onlyProviders` narrows the denied-survivor set. Anything
   // outside the list gets flagged as `not-in-only-list`. The picker shows
   // these rows as "excluded by your pin."
-  const onlySet =
-    privacy.onlyProviders.length > 0 ? new Set(privacy.onlyProviders) : null
+  const onlyRefs = privacy.onlyProviders
   const scoped = afterDeny.filter((aug) => {
-    if (!onlySet) return true
-    if (onlySet.has(aug.endpoint.provider_name)) return true
+    if (onlyRefs.length === 0) return true
+    if (endpointMatchesAnyProviderRef(aug.endpoint, onlyRefs, endpoints)) return true
     excludeWith(aug, 'not-in-only-list')
     return false
   })
@@ -122,6 +139,7 @@ export function filterEndpointsByPrivacy(input: PrivacyFilterInput): PrivacyFilt
     const undominated = scoped.filter((aug) => {
       for (const other of scoped) {
         if (other === aug) continue
+        if (!other.policy || !aug.policy) continue
         if (dominates(other.policy, aug.policy)) return false
       }
       return true
@@ -135,11 +153,10 @@ export function filterEndpointsByPrivacy(input: PrivacyFilterInput): PrivacyFilt
   // Step 5 — user-driven ignore list runs after Pareto. It's *additive*
   // to `autoIgnore` at request time but it also changes what the picker
   // shows as "kept" (user's explicit veto wins visually too).
-  const ignoreSet =
-    privacy.ignoreProviders.length > 0 ? new Set(privacy.ignoreProviders) : null
-  if (ignoreSet) {
+  const ignoreRefs = privacy.ignoreProviders
+  if (ignoreRefs.length > 0) {
     kept = kept.filter((aug) => {
-      if (ignoreSet.has(aug.endpoint.provider_name)) {
+      if (endpointMatchesAnyProviderRef(aug.endpoint, ignoreRefs, endpoints)) {
         excludeWith(aug, 'user-ignored')
         return false
       }
@@ -148,10 +165,9 @@ export function filterEndpointsByPrivacy(input: PrivacyFilterInput): PrivacyFilt
   }
 
   // Step 6 — preferred ordering over the kept set. Never adds/removes.
-  const keptNames = kept.map((aug) => aug.endpoint.provider_name)
   const orderedKeptNames = privacy.usePreferredOrdering
-    ? applyPreferredOrdering(input.model, keptNames)
-    : [...keptNames]
+    ? orderKeptRoutingRefs(input.model, kept)
+    : kept.map((aug) => providerRoutingRef(aug.endpoint))
 
   const excluded: ExcludedEndpoint[] = []
   for (const aug of augmented) {
@@ -166,6 +182,39 @@ export function filterEndpointsByPrivacy(input: PrivacyFilterInput): PrivacyFilt
     orderedKeptNames,
     zeroEligible: kept.length === 0 && endpoints.length > 0,
   }
+}
+
+function resolveEndpointPolicy(
+  endpoint: ModelEndpoint,
+  policies: Readonly<Record<string, DataPolicy | undefined>>,
+): DataPolicy | undefined {
+  if (endpoint.data_policy) return endpoint.data_policy
+  for (const key of providerPolicyLookupKeys(endpoint)) {
+    const policy = policies[key]
+    if (policy) return policy
+  }
+  return undefined
+}
+
+function orderKeptRoutingRefs(model: string, kept: readonly FilteredEndpoint[]): string[] {
+  const rule = findPreferredRule(model)
+  if (!rule || kept.length <= 1) return kept.map((aug) => providerRoutingRef(aug.endpoint))
+  const keptEndpoints = kept.map((row) => row.endpoint)
+  const out: FilteredEndpoint[] = []
+  const used = new Set<FilteredEndpoint>()
+  for (const ref of rule.order) {
+    for (const aug of kept) {
+      if (used.has(aug)) continue
+      if (!endpointMatchesProviderRef(aug.endpoint, ref, keptEndpoints)) continue
+      used.add(aug)
+      out.push(aug)
+    }
+  }
+  for (const aug of kept) {
+    if (used.has(aug)) continue
+    out.push(aug)
+  }
+  return out.map((aug) => providerRoutingRef(aug.endpoint))
 }
 
 // Privacy-lock tier. See `plan/09-privacy.md §9.11`. Computed from the
@@ -226,31 +275,59 @@ export function buildWireProviderPrivacy(
   privacy: PrivacyPrefs,
   opts: {
     existingIgnore?: readonly string[]
+    existingOnly?: readonly string[]
+    existingOrder?: readonly string[]
     userTouchedPicker?: boolean
   } = {},
 ): WireProviderPrivacy {
   // Unified "allowed vs disallowed" model: if the user has touched the
   // picker, `existingIgnore` is the authoritative set of disallowed
-  // providers — the wire does NOT re-layer the filter's auto-exclusion
-  // on top. When the user hasn't touched (default), fall back to
-  // `autoIgnore` so the request matches what the picker shows.
+  // providers. The wire does NOT re-layer Pareto/dominated/training/
+  // unknown-policy auto-exclusion on top. When the user hasn't touched
+  // (default), fall back to `autoIgnore` so the request matches what the
+  // picker shows.
   const userTookOver = opts.userTouchedPicker === true
-  const autoIgnore = result.excluded.map((e) => e.endpoint.provider_name)
+  const allEndpoints = [
+    ...result.kept.map((row) => row.endpoint),
+    ...result.excluded.map((row) => row.endpoint),
+  ]
+  const autoIgnore = result.excluded.map((e) => providerRoutingRef(e.endpoint))
+  const existingIgnore = resolveProviderRefsToRoutingRefs(allEndpoints, opts.existingIgnore, {
+    preserveUnknown: true,
+  })
+  const existingOnly = resolveProviderRefsToRoutingRefs(allEndpoints, opts.existingOnly, {
+    preserveUnknown: true,
+  })
+  const existingOrder = resolveProviderRefsToRoutingRefs(allEndpoints, opts.existingOrder, {
+    preserveUnknown: true,
+  })
+  const privacyIgnore = userTookOver
+    ? []
+    : resolveProviderRefsToRoutingRefs(allEndpoints, privacy.ignoreProviders, {
+        preserveUnknown: true,
+      })
   const mergedIgnore = userTookOver
-    ? uniqueStrings([...(opts.existingIgnore ?? []), ...privacy.ignoreProviders])
-    : uniqueStrings([...autoIgnore, ...privacy.ignoreProviders])
+    ? uniqueStrings([...existingIgnore])
+    : uniqueStrings([...autoIgnore, ...privacyIgnore])
+  const allowedAfterManualOverride = userTookOver
+    ? allEndpoints.some((endpoint) => !endpointMatchesAnyProviderRef(endpoint, mergedIgnore, allEndpoints))
+    : false
   const wire: WireProviderPrivacy = {
-    zeroEligible: result.zeroEligible,
+    zeroEligible: userTookOver && allowedAfterManualOverride ? false : result.zeroEligible,
   }
   if (mergedIgnore.length > 0) wire.ignore = mergedIgnore
-  if (privacy.onlyProviders.length > 0) {
+  if (!userTookOver && privacy.onlyProviders.length > 0) {
     // When the user pins a set, echo the kept survivors (post-Pareto) so
     // the request matches what the UI shows. Using `onlyProviders`
     // verbatim would send providers that Pareto / hard-deny already
     // excluded, which would be surprising.
-    wire.only = result.kept.map((k) => k.endpoint.provider_name)
+    wire.only = result.kept.map((k) => providerRoutingRef(k.endpoint))
+  } else if (existingOnly.length > 0) {
+    wire.only = existingOnly
   }
-  if (result.orderedKeptNames.length > 1) {
+  if (existingOrder.length > 0) {
+    wire.order = existingOrder
+  } else if (result.orderedKeptNames.length > 1) {
     wire.order = [...result.orderedKeptNames]
   }
   if (privacy.denyDataCollection) wire.data_collection = 'deny'

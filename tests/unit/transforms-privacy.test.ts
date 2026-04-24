@@ -21,6 +21,7 @@ describe('toChatCompletions — privacy wire fragment', () => {
     const settings = makeSettings({ model: 'openai/gpt-5.4' })
     const { wire } = toChatCompletions(settings, [], {
       stream: false,
+      allowProviderRouting: true,
       privacy: {
         ignore: ['OpenAI'],
         order: ['Azure', 'Amazon Bedrock'],
@@ -39,6 +40,7 @@ describe('toChatCompletions — privacy wire fragment', () => {
     const settings = makeSettings({ model: 'deepseek/deepseek-r1:free' })
     const { wire } = toChatCompletions(settings, [], {
       stream: false,
+      allowProviderRouting: true,
       privacy: {
         ignore: ['OpenAI'],
         only: ['Chutes'],
@@ -60,9 +62,25 @@ describe('toChatCompletions — privacy wire fragment', () => {
     })
     const { wire } = toChatCompletions(settings, [], {
       stream: false,
+      allowProviderRouting: true,
       privacy: { ignore: ['A'], zeroEligible: false },
     })
     expect(wire.provider).toEqual({ allow_fallbacks: false })
+  })
+
+  it('does not emit OpenRouter provider routing unless explicitly enabled', () => {
+    const settings = makeSettings({
+      model: 'openai/gpt-5.4',
+      allowFallbacks: false,
+      providerPrefs: {
+        sort: 'price',
+      },
+    })
+    const { wire } = toChatCompletions(settings, [], {
+      stream: false,
+      privacy: { ignore: ['OpenAI'], data_collection: 'deny', zeroEligible: false },
+    })
+    expect(wire.provider).toBeUndefined()
   })
 
   it('allowFallbacks:false surfaces on the wire', () => {
@@ -70,7 +88,10 @@ describe('toChatCompletions — privacy wire fragment', () => {
       model: 'openai/gpt-5.4',
       allowFallbacks: false,
     })
-    const { wire } = toChatCompletions(settings, [], { stream: false })
+    const { wire } = toChatCompletions(settings, [], {
+      stream: false,
+      allowProviderRouting: true,
+    })
     expect(
       (wire.provider as Record<string, unknown> | undefined)?.allow_fallbacks,
     ).toBe(false)
@@ -81,7 +102,10 @@ describe('toChatCompletions — privacy wire fragment', () => {
       model: 'openai/gpt-5.4',
       allowFallbacks: true,
     })
-    const { wire } = toChatCompletions(settings, [], { stream: false })
+    const { wire } = toChatCompletions(settings, [], {
+      stream: false,
+      allowProviderRouting: true,
+    })
     expect(wire.provider).toBeUndefined()
   })
 
@@ -93,7 +117,10 @@ describe('toChatCompletions — privacy wire fragment', () => {
         allowFallbacks: false,
       } as unknown as NonNullable<ChatSettings['providerPrefs']>,
     })
-    const { wire } = toChatCompletions(settings, [], { stream: false })
+    const { wire } = toChatCompletions(settings, [], {
+      stream: false,
+      allowProviderRouting: true,
+    })
     expect(wire.provider).toBeUndefined()
   })
 
@@ -107,6 +134,7 @@ describe('toChatCompletions — privacy wire fragment', () => {
     })
     const { wire } = toChatCompletions(settings, [], {
       stream: false,
+      allowProviderRouting: true,
       privacy: { ignore: ['OpenAI'], data_collection: 'deny', zeroEligible: false },
     })
     expect(wire.provider).toMatchObject({
@@ -114,6 +142,44 @@ describe('toChatCompletions — privacy wire fragment', () => {
       quantizations: ['bf16'],
       ignore: ['OpenAI'],
       data_collection: 'deny',
+    })
+  })
+
+  it('does not emit hidden legacy providerPrefs privacy knobs', () => {
+    const settings = makeSettings({
+      model: 'openai/gpt-5.4',
+      providerPrefs: {
+        dataCollection: 'deny',
+        zdr: true,
+      },
+    })
+    const { wire } = toChatCompletions(settings, [], {
+      stream: false,
+      allowProviderRouting: true,
+    })
+    expect(wire.provider).toBeUndefined()
+  })
+
+  it('privacy resolver output replaces raw provider refs that need normalization', () => {
+    const settings = makeSettings({
+      model: 'anthropic/claude-opus-4.7',
+      providerPrefs: {
+        order: ['Anthropic'],
+        ignore: ['Anthropic'],
+      },
+    })
+    const { wire } = toChatCompletions(settings, [], {
+      stream: false,
+      allowProviderRouting: true,
+      privacy: {
+        order: ['anthropic/2', 'anthropic'],
+        ignore: ['anthropic/2'],
+        zeroEligible: false,
+      },
+    })
+    expect(wire.provider).toMatchObject({
+      order: ['anthropic/2', 'anthropic'],
+      ignore: ['anthropic/2'],
     })
   })
 })

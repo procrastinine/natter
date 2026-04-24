@@ -9,6 +9,7 @@ import {
   useState,
 } from 'react'
 import type { EffectiveCapability } from '../../core/capabilities'
+import { quirksFor } from '../../core/quirks'
 import { normalizeReasoningDetails } from '../../core/reasoning'
 import { detectStaleReasoning, staleReasoningBannerText } from '../../core/stale-reasoning'
 import type { ChatId, CursorMap, Message as MessageRow, ReasoningDetail } from '../../core/types'
@@ -40,10 +41,9 @@ export interface MessageProps {
   cursor: CursorMap
   streaming?: boolean
   hasConnection: boolean
-  // Effective capability for the chat's current model. Threaded from the
-  // list so the message can surface capability-dependent affordances like
-  // the hidden-reasoning footer on o-series/chat-completions turns without
-  // redoing the /endpoints fetch per message.
+  generationBusy?: boolean
+  // Effective capability for the chat's current model. Message-level quirks
+  // should still prefer the stored message generation model when available.
   capability?: EffectiveCapability
   // Whether this message sits immediately before a message of the same role
   // on the active path — surfaces the adjacency-warning badge (§10.6).
@@ -91,6 +91,7 @@ export const Message = memo(
     prev.cursor === next.cursor &&
     prev.streaming === next.streaming &&
     prev.hasConnection === next.hasConnection &&
+    prev.generationBusy === next.generationBusy &&
     prev.capability === next.capability &&
     prev.roleMismatch === next.roleMismatch &&
     prev.staleReplyHint === next.staleReplyHint &&
@@ -113,6 +114,7 @@ function MessageInner({
   cursor,
   streaming,
   hasConnection,
+  generationBusy = false,
   capability,
   roleMismatch,
   staleReplyHint,
@@ -147,19 +149,24 @@ function MessageInner({
   )
   const isStreaming = streaming === true || storeStreaming
   const hasContent = text.length > 0
+  const gen = message.generation
+  const messageModelQuirks = useMemo(
+    () => quirksFor(gen?.model ?? gen?.requestedModel ?? ''),
+    [gen?.model, gen?.requestedModel],
+  )
   // Hidden-reasoning footer: only applies to assistant turns on a route that
   // hides reasoning. `apiUsed === 'responses'` means reasoning IS returned
   // (or could be, via summary+encrypted). The footer is explicitly for chat-
   // completions where the model reasons silently.
-  const gen = message.generation
   const apiUsed = gen?.apiUsed
   const showHiddenReasoningFooter =
     message.role === 'assistant' &&
     !editing &&
     reasoning.length === 0 &&
-    capability?.quirks.hiddenReasoningOnChatApi === true &&
+    (messageModelQuirks.hiddenReasoningOnChatApi === true ||
+      capability?.quirks.hiddenReasoningOnChatApi === true) &&
     apiUsed === 'chat'
-  const canSwitchToResponses = Boolean(onRegenerate && hasConnection)
+  const canSwitchToResponses = Boolean(onRegenerate && hasConnection && !generationBusy)
   const handleSwitchToResponses = useCallback(async () => {
     await updateChatSettings(chatId, { api: 'responses' })
     if (onRegenerate) await onRegenerate(message)
@@ -378,8 +385,12 @@ function MessageInner({
             {...(message.role === 'user' && onEditAndSend
               ? {
                   onSaveAndSend: handleSaveAndSend,
-                  saveAndSendDisabled: !hasConnection,
-                  saveAndSendDisabledReason: 'Add a connection to send messages.',
+                  saveAndSendDisabled: !hasConnection || generationBusy,
+                  saveAndSendDisabledReason: !hasConnection
+                    ? 'Add a connection to send messages.'
+                    : generationBusy
+                      ? 'A request is already running for this chat.'
+                      : undefined,
                 }
               : {})}
             {...(message.role === 'assistant'
@@ -449,6 +460,7 @@ function MessageInner({
             isEditing={editing}
             onBeginEdit={() => setEditing(true)}
             hasConnection={hasConnection}
+            generationBusy={generationBusy}
             {...(roleMismatch ? { roleMismatch: true } : {})}
             {...(onRegenerate ? { onRegenerate: handleRegenerate } : {})}
             {...(onContinue ? { onContinue: handleContinue } : {})}

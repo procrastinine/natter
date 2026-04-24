@@ -1,6 +1,7 @@
 import { useLiveQuery } from 'dexie-react-hooks'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { exportChatAsTxt, triggerBrowserDownload } from '../../core/chat-export'
+import { aggregateCalibrationSamples } from '../../core/token-calibration'
 import type { ChatId, CursorMap } from '../../core/types'
 import { getChat, setManualTitle } from '../../store/chats'
 import { useChatStore } from '../../store/zustand/chatStore'
@@ -11,6 +12,12 @@ import { HeaderPrivacyBadge } from './HeaderPrivacyBadge'
 function formatCalibrationRatio(sample: TokenCalibrationSample): string {
   if (sample.totalTextTokens <= 0) return '—'
   return (sample.totalTextChars / sample.totalTextTokens).toFixed(2)
+}
+
+function calibrationEntries(
+  samples: Record<string, TokenCalibrationSample> | undefined,
+): Array<[string, TokenCalibrationSample]> {
+  return Object.entries(aggregateCalibrationSamples(samples)).sort(([a], [b]) => a.localeCompare(b))
 }
 
 // Stable empty reference so useChatStore's selector doesn't allocate a fresh
@@ -238,19 +245,17 @@ export function ChatHeader({
               <dt>Model</dt>
               <dd>{chat.settings.model || '—'}</dd>
             </div>
-            {Object.entries(chat.tokenCalibration ?? {})
-              .sort(([a], [b]) => a.localeCompare(b))
-              .map(([modelId, sample]) => (
-                <div key={`cal-${modelId}`}>
-                  <dt title={`Learned chars/token ratio for ${modelId}`}>
-                    Calib {modelId}
-                  </dt>
-                  <dd>
-                    {formatCalibrationRatio(sample)} c/tok · {sample.sampleCount.toLocaleString()}{' '}
-                    sample{sample.sampleCount === 1 ? '' : 's'}
-                  </dd>
-                </div>
-              ))}
+            {calibrationEntries(chat.tokenCalibration).map(([calibrationKey, sample]) => (
+              <div key={`cal-${calibrationKey}`}>
+                <dt title={`Learned chars/token ratio for ${calibrationKey}`}>
+                  Calib {calibrationKey}
+                </dt>
+                <dd>
+                  {formatCalibrationRatio(sample)} c/tok · {sample.sampleCount.toLocaleString()}{' '}
+                  sample{sample.sampleCount === 1 ? '' : 's'}
+                </dd>
+              </div>
+            ))}
           </dl>
         </div>
       ) : null}

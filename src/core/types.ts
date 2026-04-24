@@ -544,14 +544,16 @@ export interface Chat {
   // thousands of chats). Optional for backward-compat with pre-existing
   // chat rows; legacy rows are lazily backfilled on first open.
   previewText?: string
-  // Per-model running-sum calibration for chars-per-token. Keyed by the
-  // full model ID (with provider prefix, e.g. `openai/gpt-4o`). Updated
-  // on every successful stream completion in this chat. Optional for
-  // backcompat — absence falls through to global + hardcoded tiers.
+  // Running-sum calibration for chars-per-token. Keyed by the durable
+  // calibration bucket: shared-tokenizer family key when known, otherwise the
+  // canonicalized structural model key. Updated on every successful stream
+  // completion in this chat. Optional for backcompat — absence falls through
+  // to global + hardcoded tiers.
   tokenCalibration?: Record<string, TokenCalibrationSample>
 }
 
-// One per (chat, model) pair. Running sums — new samples add directly.
+// One per (chat, calibration-bucket) pair. Running sums — new samples add
+// directly.
 // Ratio at any point is `totalTextChars / totalTextTokens`; that ratio is
 // automatically weighted by sample size (a 300-token completion
 // contributes 60× more than a 5-token user message), so no explicit
@@ -571,6 +573,7 @@ export interface TokenCalibrationSample {
 export interface GlobalTokenCalibration {
   version: 1
   updatedAt: number
+  // Same keying contract as `Chat.tokenCalibration`.
   byModel: Record<string, TokenCalibrationSample>
 }
 
@@ -706,7 +709,7 @@ export interface GenerationMeta {
   requestedModel: string
   requestedModels?: string[]
   provider?: string
-  apiUsed: 'chat' | 'responses' | 'completion'
+  apiUsed: 'chat' | 'responses' | 'gemini-native' | 'anthropic-messages' | 'completion'
   delivery: DeliveryMethod
   usage?: ChatUsage
   cost?: number
@@ -768,12 +771,16 @@ export interface Message {
   // (out-of-band reasoning_tokens) is NOT included. Immutable once set.
   originalCharCount?: number
   // Text-token estimate at creation time using the then-current calibration
-  // ratio. Used for same-model delta estimates. Immutable once set.
+  // ratio. Used for same-bucket delta estimates. Immutable once set.
   originalTokenEstimate?: number
-  // Model ID at creation time, e.g. `openai/gpt-4o`. Lets us detect model
-  // switches that invalidate the original estimate and flip to fresh path.
-  // Immutable once set.
+  // Model ID at creation time, e.g. `openai/gpt-4o`. Exact provenance only;
+  // the calibration bucket is tracked separately.
   originalModelId?: string
+  // Calibration bucket at creation time. Usually the tokenizer-family key; if
+  // no family is known, the canonicalized structural model key. Preserving
+  // this separately keeps future family-table updates from changing the
+  // meaning of newly-created rows.
+  originalCalibrationKey?: string
   // Running delta from `originalCharCount` after in-place edits (+/-).
   // Starts at 0; updated on every edit. Stays 0 if the message is never
   // edited.
@@ -935,9 +942,14 @@ export interface ChatVersions {
 // ---------------------------------------------------------------------------
 
 export interface ModelEndpoint {
+  id?: string
   provider_name: string
+  provider_display_name?: string
+  provider_slug?: string
+  provider_model_id?: string
   supported_parameters: string[]
   context_length: number
+  data_policy?: DataPolicy
   max_prompt_tokens?: number
   max_completion_tokens?: number
   pricing: {

@@ -1,11 +1,13 @@
 import { render } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
-import type { Message } from '../../src/core/types'
+import { effectiveCapabilityFromEndpoints } from '../../src/core/capabilities'
+import type { Message as MessageRow, ModelEndpoint } from '../../src/core/types'
+import { Message as ChatMessage } from '../../src/ui/chat/Message'
 import { MessageHeader } from '../../src/ui/chat/MessageHeader'
 import { MessageInfo } from '../../src/ui/chat/MessageInfo'
 import { ReasoningBlock } from '../../src/ui/chat/ReasoningBlock'
 
-function makeAssistant(overrides: Partial<Message> = {}): Message {
+function makeAssistant(overrides: Partial<MessageRow> = {}): MessageRow {
   return {
     id: '01HAAAA',
     chatId: '01HCCCC',
@@ -43,7 +45,7 @@ function makeAssistant(overrides: Partial<Message> = {}): Message {
   }
 }
 
-function makeUser(overrides: Partial<Message> = {}): Message {
+function makeUser(overrides: Partial<MessageRow> = {}): MessageRow {
   return {
     id: '01HBBBB',
     chatId: '01HCCCC',
@@ -57,6 +59,16 @@ function makeUser(overrides: Partial<Message> = {}): Message {
     content: [{ type: 'text', text: 'say hi' }],
     nodeVersion: 1,
     deleted: false,
+    ...overrides,
+  }
+}
+
+function makeEndpoint(overrides: Partial<ModelEndpoint> = {}): ModelEndpoint {
+  return {
+    provider_name: 'OpenAI',
+    supported_parameters: ['reasoning', 'max_tokens'],
+    context_length: 128000,
+    pricing: {},
     ...overrides,
   }
 }
@@ -155,6 +167,39 @@ describe('MessageInfo (revealed by ⓘ — full factual record)', () => {
     const { container } = render(<MessageInfo message={msg} />)
     expect(container.textContent).toMatch(/Reasoning chars/)
     expect(container.textContent).toMatch(/text 6/)
+  })
+})
+
+describe('Message hidden-reasoning footer', () => {
+  it('uses the stored message model instead of the chat current-model capability', () => {
+    const base = makeAssistant()
+    const msg = makeAssistant({
+      generation: {
+        ...base.generation!,
+        model: 'openai/o3',
+        requestedModel: 'openai/o3',
+        apiUsed: 'chat',
+      },
+      reasoningDetails: [],
+    })
+    const currentCapability = effectiveCapabilityFromEndpoints('anthropic/claude-haiku-4.5', [
+      makeEndpoint({ supported_parameters: ['reasoning'] }),
+    ])
+    const { container } = render(
+      <ChatMessage
+        chatId={msg.chatId}
+        message={msg}
+        hasAnyReasoningDetails={false}
+        hasSiblingVariants={false}
+        cursor={{}}
+        hasConnection={false}
+        capability={currentCapability}
+        onEditInPlace={async () => {}}
+      />,
+    )
+    expect(container.querySelector('[data-ui="message-hidden-reasoning"]')?.textContent).toMatch(
+      /reasoned internally/i,
+    )
   })
 })
 

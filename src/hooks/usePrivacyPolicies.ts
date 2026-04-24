@@ -15,6 +15,7 @@ import { isFresh } from '../store/models-cache'
 import {
   dedupedPrivacyFetch,
   getCachedPrivacyPolicy,
+  PARTIAL_PRIVACY_POLICY_TTL_MS,
   PRIVACY_POLICY_TTL_MS,
 } from '../store/privacy-cache'
 import { getProfile } from '../store/profiles'
@@ -62,8 +63,10 @@ export function usePrivacyPolicies(
     if (!scrapeApplicable) return
     if (!profile || !modelId) return
     const fetchedAt = cachedRow?.fetchedAt
-    const fresh =
-      fetchedAt !== undefined && isFresh(fetchedAt, PRIVACY_POLICY_TTL_MS)
+    const cachedPayload = cachedRow ? readCachedPrivacyPayload(cachedRow.payload) : null
+    const hasPolicies = cachedPayload ? Object.keys(cachedPayload.policies).length > 0 : false
+    const ttl = hasPolicies ? PRIVACY_POLICY_TTL_MS : PARTIAL_PRIVACY_POLICY_TTL_MS
+    const fresh = fetchedAt !== undefined && isFresh(fetchedAt, ttl)
     if (fresh && refreshToken === 0) return
     let cancelled = false
     setInFlight(true)
@@ -96,7 +99,7 @@ export function usePrivacyPolicies(
   }, [cachedRow])
 
   const fetchedAt = cachedRow?.fetchedAt ?? null
-  const offline = error !== null && fetchedAt !== null
+  const offline = error !== null
   const loading = scrapeApplicable && inFlight && !cachedRow
 
   return {

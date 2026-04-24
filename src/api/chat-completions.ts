@@ -15,6 +15,7 @@
 // already-sent headers are not mutated.
 
 import type { ConnectionProfile } from '../core/types'
+import { logStreamDebug, startStreamDebug, type StreamDebugTrace } from '../lib/debug-streams'
 import { buildHeaders, fetchWithTimeout } from './client'
 import { normalizeError } from './errors'
 import { parseSSE } from './sse'
@@ -47,11 +48,18 @@ async function dispatch(
   ctx: ChatCompletionsContext,
   req: ChatCompletionRequestWire,
   opts: CallOpts,
-): Promise<Response> {
+): Promise<{ response: Response; debugTrace: StreamDebugTrace | null }> {
   const url = chatCompletionsUrl(ctx.profile)
   const headers = buildHeaders(ctx.profile, ctx.apiKey, {
     method: 'POST',
     ...(opts.overrideHeaders ? { overrideHeaders: opts.overrideHeaders } : {}),
+  })
+  const debugTrace = startStreamDebug({
+    adapter: 'chat-completions',
+    profile: ctx.profile,
+    url,
+    request: req,
+    headers,
   })
   const init: RequestInit = {
     method: 'POST',
@@ -71,7 +79,12 @@ async function dispatch(
       httpStatus: response.status,
     })
   }
-  return response
+  logStreamDebug(debugTrace, 'response.head', {
+    status: response.status,
+    contentType: response.headers.get('content-type'),
+    generationId: response.headers.get('x-generation-id') ?? undefined,
+  })
+  return { response, debugTrace }
 }
 
 export async function* chatCompletions(
@@ -84,7 +97,7 @@ export async function* chatCompletions(
       'chatCompletions: request body must have stream:true — use chatCompletionsOnce for non-streaming',
     )
   }
-  const response = await dispatch(ctx, req, opts)
+  const { response, debugTrace } = await dispatch(ctx, req, opts)
   const generationId = response.headers.get('x-generation-id') ?? undefined
   const contentType = response.headers.get('content-type') ?? ''
 
@@ -93,6 +106,7 @@ export async function* chatCompletions(
   // chunk so the rest of the app can keep one consumer shape.
   if (!/text\/event-stream/i.test(contentType)) {
     const result = (await response.json()) as ChatCompletionResultWire
+    logStreamDebug(debugTrace, 'buffered_result', result)
     const chunk: ChatStreamChunk = generationId
       ? { type: 'buffered_result', result, generationId }
       : { type: 'buffered_result', result }
@@ -106,8 +120,10 @@ export async function* chatCompletions(
       continue
     }
     try {
+      logStreamDebug(debugTrace, 'sse.raw', { event: ev.event, data: ev.data })
       const parsed = JSON.parse(ev.data) as Record<string, unknown>
       if (generationId && parsed.id === undefined) parsed.id = generationId
+      logStreamDebug(debugTrace, 'sse.parsed', parsed)
       const chunk: ChatStreamChunk = generationId
         ? { type: 'delta', chunk: parsed, generationId }
         : { type: 'delta', chunk: parsed }
@@ -129,6 +145,8 @@ export async function chatCompletionsOnce(
   opts: CallOpts = {},
 ): Promise<ChatCompletionResultWire> {
   const body: ChatCompletionRequestWire = { ...req, stream: false }
-  const response = await dispatch(ctx, body, opts)
-  return (await response.json()) as ChatCompletionResultWire
+  const { response, debugTrace } = await dispatch(ctx, body, opts)
+  const result = (await response.json()) as ChatCompletionResultWire
+  logStreamDebug(debugTrace, 'once.result', result)
+  return result
 }

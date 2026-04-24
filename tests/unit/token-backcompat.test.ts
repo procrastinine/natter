@@ -15,6 +15,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { computeCutoffPlan, messageCost } from '../../src/core/context-cutoff'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
+import { tokenCalibrationKey } from '../../src/core/model-ids'
 import { estimatePromptSize, estimateSettingsPromptSize } from '../../src/core/prompt-size'
 import {
   addSampleToChat,
@@ -23,7 +24,13 @@ import {
   charsPerToken,
   RATIO_BOUNDS,
 } from '../../src/core/token-calibration'
-import type { Chat, ChatSettings, Message, MessageRole } from '../../src/core/types'
+import type {
+  Chat,
+  ChatSettings,
+  Message,
+  MessageRole,
+  TokenCalibrationSample,
+} from '../../src/core/types'
 
 // Fake the settings store so we don't need Dexie.
 vi.mock('../../src/store/settings', () => {
@@ -34,6 +41,15 @@ vi.mock('../../src/store/settings', () => {
     },
     async setSetting<T>(key: string, value: T): Promise<void> {
       state.set(key, value)
+    },
+    async updateSetting<T>(
+      key: string,
+      updater: (current: T | undefined) => T | undefined | Promise<T | undefined>,
+    ): Promise<T | undefined> {
+      const next = await updater(state.get(key) as T | undefined)
+      if (next === undefined) state.delete(key)
+      else state.set(key, next)
+      return next
     },
     async deleteSetting(key: string): Promise<void> {
       state.delete(key)
@@ -212,12 +228,15 @@ describe('backcompat — calibration helpers tolerate legacy inputs', () => {
     // 11 chars / 3.5 = 4 (ceil)
     expect(fields.originalCharCount).toBe(11)
     expect(fields.originalTokenEstimate).toBe(4)
+    expect(fields.originalCalibrationKey).toBe(tokenCalibrationKey('openai/gpt-4o'))
   })
 
   it('calibrationFieldsForEdit with missing originalCharCount sets delta = 0', () => {
     const patch = calibrationFieldsForEdit(
       [{ type: 'text', text: 'x'.repeat(100) }],
       undefined, // legacy row — no original
+      undefined,
+      undefined,
       'openai/gpt-4o',
       null,
       null,
@@ -227,13 +246,14 @@ describe('backcompat — calibration helpers tolerate legacy inputs', () => {
   })
 
   it('addSampleToChat initializes tokenCalibration on legacy chat', () => {
-    const legacyChat: { tokenCalibration?: Record<string, unknown> } = {}
+    const legacyChat: { tokenCalibration?: Record<string, TokenCalibrationSample> | undefined } = {}
     const outcome = addSampleToChat(legacyChat, 'openai/gpt-4o', 350, 100, 1000)
     expect(outcome.accepted).toBe(true)
     expect(legacyChat.tokenCalibration).toBeDefined()
     expect(
-      (legacyChat.tokenCalibration as Record<string, { sampleCount: number }>)['openai/gpt-4o']
-        ?.sampleCount,
+      (legacyChat.tokenCalibration as Record<string, { sampleCount: number }>)[
+        tokenCalibrationKey('openai/gpt-4o')
+      ]?.sampleCount,
     ).toBe(1)
   })
 })

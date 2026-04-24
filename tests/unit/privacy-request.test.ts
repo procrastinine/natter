@@ -7,8 +7,13 @@
 // `src/core/privacy-request.ts`.
 
 import Dexie from 'dexie'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { resolvePrivacyForSend } from '../../src/core/privacy-request'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { fetchEndpoints } from '../../src/api/models'
+import { fetchPrivacyScrape } from '../../src/api/privacy-scrape'
+import {
+  PrivacyDiscoveryUnavailableError,
+  resolvePrivacyForSend,
+} from '../../src/core/privacy-request'
 import { cloneDefaultChatSettings, cloneDefaultPrivacyPrefs } from '../../src/core/defaults'
 import type { Chat, ConnectionProfile } from '../../src/core/types'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
@@ -18,6 +23,21 @@ import {
   __resetPrivacyInFlightForTests,
   putCachedPrivacyPolicy,
 } from '../../src/store/privacy-cache'
+
+vi.mock('../../src/api/models', async () => {
+  const actual = await vi.importActual<typeof import('../../src/api/models')>('../../src/api/models')
+  return { ...actual, fetchEndpoints: vi.fn() }
+})
+
+vi.mock('../../src/api/privacy-scrape', async () => {
+  const actual = await vi.importActual<typeof import('../../src/api/privacy-scrape')>(
+    '../../src/api/privacy-scrape',
+  )
+  return { ...actual, fetchPrivacyScrape: vi.fn() }
+})
+
+const fetchEndpointsMock = vi.mocked(fetchEndpoints)
+const fetchPrivacyScrapeMock = vi.mocked(fetchPrivacyScrape)
 
 const DB_NAME = 'natter'
 
@@ -29,6 +49,7 @@ async function resetAll() {
 }
 
 beforeEach(async () => {
+  vi.clearAllMocks()
   await resetAll()
   await openDb()
 })
@@ -100,13 +121,103 @@ describe('resolvePrivacyForSend', () => {
     expect(r.applicable).toBe(false)
   })
 
-  it('returns { applicable: true, wire: null } when endpoints cache is cold', async () => {
+  it('does not reuse the paid model privacy cache for a :free variant of the same base slug', async () => {
+    const profile = makeProfile()
+    await putCachedEndpoints('prof-1', 'google/gemma-3-12b-it', {
+      id: 'google/gemma-3-12b-it',
+      endpoints: [
+        {
+          provider_name: 'DeepInfra',
+          supported_parameters: ['temperature'],
+          context_length: 128000,
+          pricing: { prompt: '0.000001', completion: '0.000002' },
+        },
+      ],
+    })
+    await putCachedPrivacyPolicy('prof-1', 'google/gemma-3-12b-it', {
+      policies: {
+        DeepInfra: {
+          training: false,
+          trainingOpenRouter: false,
+          retainsPrompts: false,
+          canPublish: false,
+          termsOfServiceURL: '',
+          privacyPolicyURL: '',
+        },
+      },
+      fetchedAt: 0,
+    })
+    const chat = makeChat({ model: 'google/gemma-3-12b-it:free' })
+    const r = await resolvePrivacyForSend({ chat, profile })
+    expect(r.applicable).toBe(false)
+    expect(r.wire).toBeNull()
+    expect(r.filter).toBeNull()
+  })
+
+  it('fetches endpoints and privacy before sending when caches are cold', async () => {
+    fetchEndpointsMock.mockResolvedValueOnce({
+      id: 'openai/gpt-5.4',
+      endpoints: [
+        {
+          provider_name: 'Azure',
+          supported_parameters: ['temperature'],
+          context_length: 200000,
+          pricing: { prompt: '0.0000025', completion: '0.00001' },
+        },
+        {
+          provider_name: 'OpenAI',
+          supported_parameters: ['temperature'],
+          context_length: 200000,
+          pricing: { prompt: '0.0000025', completion: '0.00001' },
+        },
+      ],
+    })
+    fetchPrivacyScrapeMock.mockResolvedValueOnce({
+      modelId: 'openai/gpt-5.4',
+      policies: {},
+      raw: {
+        policies: {
+          Azure: {
+            training: false,
+            trainingOpenRouter: false,
+            retainsPrompts: false,
+            canPublish: false,
+            termsOfServiceURL: '',
+            privacyPolicyURL: '',
+          },
+          OpenAI: {
+            training: false,
+            trainingOpenRouter: false,
+            retainsPrompts: true,
+            requiresUserIDs: true,
+            canPublish: false,
+            termsOfServiceURL: '',
+            privacyPolicyURL: '',
+          },
+        },
+        fetchedAt: Date.now(),
+      },
+      fetchedAt: Date.now(),
+    })
     const chat = makeChat()
     const profile = makeProfile()
     const r = await resolvePrivacyForSend({ chat, profile })
     expect(r.applicable).toBe(true)
-    expect(r.wire).toBeNull()
-    expect(r.filter).toBeNull()
+    expect(fetchEndpointsMock).toHaveBeenCalledTimes(1)
+    expect(fetchPrivacyScrapeMock).toHaveBeenCalledTimes(1)
+    expect(r.filter?.kept.map((k) => k.endpoint.provider_name)).toEqual(['Azure'])
+    expect(r.wire?.ignore).toContain('OpenAI')
+    expect(r.wire?.data_collection).toBe('deny')
+  })
+
+  it('blocks instead of sending without privacy routing when cold endpoint discovery fails', async () => {
+    fetchEndpointsMock.mockRejectedValueOnce(new Error('network down'))
+    const chat = makeChat()
+    const profile = makeProfile()
+
+    await expect(resolvePrivacyForSend({ chat, profile })).rejects.toBeInstanceOf(
+      PrivacyDiscoveryUnavailableError,
+    )
   })
 
   it('runs the filter and builds a wire block when both caches are warm', async () => {
@@ -255,5 +366,57 @@ describe('resolvePrivacyForSend', () => {
     })
     const r = await resolvePrivacyForSend({ chat, profile })
     expect(r.wire?.ignore).toEqual(['Legacy Host'])
+  })
+
+  it('resolves duplicate provider display names to exact provider slugs on the wire', async () => {
+    const chat = makeChat({
+      model: 'anthropic/claude-opus-4.7',
+      providerPrefs: { ignore: ['anthropic/2'], ignoreOverridesFilter: true },
+    })
+    const profile = makeProfile()
+    await putCachedEndpoints('prof-1', 'anthropic/claude-opus-4.7', {
+      id: 'anthropic/claude-opus-4.7',
+      endpoints: [
+        {
+          provider_name: 'Anthropic',
+          provider_slug: 'anthropic/2',
+          supported_parameters: ['temperature'],
+          context_length: 200000,
+          pricing: {},
+        },
+        {
+          provider_name: 'Anthropic',
+          provider_slug: 'anthropic',
+          supported_parameters: ['temperature'],
+          context_length: 200000,
+          pricing: {},
+        },
+      ],
+    })
+    await putCachedPrivacyPolicy('prof-1', 'anthropic/claude-opus-4.7', {
+      policies: {
+        'anthropic/2': {
+          training: false,
+          trainingOpenRouter: false,
+          retainsPrompts: false,
+          canPublish: false,
+          termsOfServiceURL: '',
+          privacyPolicyURL: '',
+        },
+        anthropic: {
+          training: false,
+          trainingOpenRouter: false,
+          retainsPrompts: false,
+          canPublish: false,
+          termsOfServiceURL: '',
+          privacyPolicyURL: '',
+        },
+      },
+      fetchedAt: 0,
+    })
+    const r = await resolvePrivacyForSend({ chat, profile })
+    expect(r.wire?.ignore).toEqual(['anthropic/2'])
+    expect(r.wire?.ignore).not.toContain('Anthropic')
+    expect(r.wire?.order).toEqual(['anthropic/2', 'anthropic'])
   })
 })

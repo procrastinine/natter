@@ -1,31 +1,54 @@
-// Request-time privacy resolver. Reads the cached `/endpoints` + scraped
-// privacy policies for the active (profile, model), runs the filter,
+// Request-time privacy resolver. Ensures `/endpoints` + scraped privacy
+// policies are available for the active (profile, model), runs the filter,
 // and returns the wire `provider` fragment that `toChatCompletions`
 // merges with `settings.providerPrefs`.
 //
-// Unlike `usePrivacyRouting`, this is a plain async function suitable
-// for the send path — no React dependency. If the caches are cold, it
-// returns `null` and the caller falls back to sending without a
-// privacy-derived provider block (we never block a send on scrape
-// availability; the user might be on a fresh install or offline).
+// Unlike `usePrivacyRouting`, this is a plain async function suitable for
+// the send path -- no React dependency. It does not silently send through a
+// cold cache: OpenRouter sends either wait for live discovery, use an
+// already-cached fallback when refresh fails, or throw before the request is
+// fired if no provider list is available.
 //
 // OpenRouter-only by construction. Non-OpenRouter profiles get an early
 // null (the transform already gates on `gate('provider')`). Free models
 // also get a null so the free-model-strip logic in the transform does
 // not need to also be aware of the filter.
 
+import { fetchEndpoints } from '../api/models'
 import { normalizeEndpointsResponse } from '../api/providers'
-import { readCachedPrivacyPayload } from '../api/privacy-scrape'
+import { fetchPrivacyScrape, readCachedPrivacyPayload } from '../api/privacy-scrape'
 import { isFreeModel } from './model-predicates'
+import { providerRoutingRef } from './provider-identity'
+import { migrateLegacyProviderSettings } from './provider-settings-migration'
 import {
   buildWireProviderPrivacy,
   filterEndpointsByPrivacy,
   type PrivacyFilterResult,
   type WireProviderPrivacy,
 } from './privacy-filter'
-import type { Chat, ConnectionProfile } from './types'
-import { getCachedEndpoints } from '../store/models-cache'
-import { getCachedPrivacyPolicy } from '../store/privacy-cache'
+import type { Chat, ConnectionProfile, DataPolicy } from './types'
+import { resolveKeyIfPresent } from '../store/keys'
+import {
+  dedupedEndpointsFetch,
+  ENDPOINTS_TTL_MS,
+  getCachedEndpoints,
+  isFresh,
+} from '../store/models-cache'
+import {
+  dedupedPrivacyFetch,
+  getCachedPrivacyPolicy,
+  PARTIAL_PRIVACY_POLICY_TTL_MS,
+  PRIVACY_POLICY_TTL_MS,
+} from '../store/privacy-cache'
+
+const SEND_DISCOVERY_TIMEOUT_MS = 15_000
+
+export class PrivacyDiscoveryUnavailableError extends Error {
+  constructor(message: string, readonly cause?: unknown) {
+    super(message)
+    this.name = 'PrivacyDiscoveryUnavailableError'
+  }
+}
 
 export interface ResolvePrivacyForSendInput {
   chat: Chat
@@ -36,12 +59,14 @@ export interface ResolvePrivacyForSendInput {
   // a transient filter — the user's persisted `providerPrefs.ignore`
   // list is unchanged. Omit to skip the check entirely.
   neededTokens?: number
+  signal?: AbortSignal
 }
 
 export interface ResolvePrivacyForSendResult {
   wire: WireProviderPrivacy | null
   filter: PrivacyFilterResult | null
   applicable: boolean
+  contextIgnoredProviders: string[]
 }
 
 export async function resolvePrivacyForSend(
@@ -49,46 +74,55 @@ export async function resolvePrivacyForSend(
 ): Promise<ResolvePrivacyForSendResult> {
   const { chat, profile } = input
   if (profile.kind !== 'openrouter') {
-    return { wire: null, filter: null, applicable: false }
+    return { wire: null, filter: null, applicable: false, contextIgnoredProviders: [] }
   }
-  if (!chat.settings.model) return { wire: null, filter: null, applicable: false }
+  if (!chat.settings.model) {
+    return { wire: null, filter: null, applicable: false, contextIgnoredProviders: [] }
+  }
   if (isFreeModel(chat.settings.model)) {
-    return { wire: null, filter: null, applicable: false }
+    return { wire: null, filter: null, applicable: false, contextIgnoredProviders: [] }
   }
-  const [endpointsRow, policyRow] = await Promise.all([
-    getCachedEndpoints(chat.settings.profileId, chat.settings.model),
-    getCachedPrivacyPolicy(chat.settings.profileId, chat.settings.model),
-  ])
-  if (!endpointsRow) {
-    // Cold /endpoints cache — privacy filter cannot run. This happens
-    // on the very first send from a fresh install before the hook has
-    // finished fetching. Sending without the privacy wire fragment is
-    // safe because OpenRouter's account-level defaults still apply;
-    // the UI can correct on the next send.
-    return { wire: null, filter: null, applicable: true }
-  }
+  const endpointsRow = await ensureEndpointsRow(profile, chat.settings.model, input.signal)
   const descriptor = normalizeEndpointsResponse(endpointsRow.payload)
   const endpoints = descriptor?.endpoints ?? []
-  const policies =
-    readCachedPrivacyPayload(policyRow?.payload)?.policies ?? {}
-  const filter = filterEndpointsByPrivacy({
+  const policyResult = await ensurePrivacyPolicies({
+    profile,
+    modelId: chat.settings.model,
+    endpoints,
+    signal: input.signal,
+  })
+  const migrated = migrateLegacyProviderSettings(chat.settings, {
     model: chat.settings.model,
     endpoints,
-    policies,
-    privacy: chat.settings.privacy,
+    policies: policyResult.policies,
   })
-  const prefs = chat.settings.providerPrefs
-  const wireOpts: { existingIgnore?: readonly string[]; userTouchedPicker?: boolean } = {
+  const settings = migrated.settings
+  const filter = filterEndpointsByPrivacy({
+    model: settings.model,
+    endpoints,
+    policies: policyResult.policies,
+    privacy: settings.privacy,
+    ...(policyResult.offlineFallback ? { missingPolicyMode: 'offline-worst-case' } : {}),
+  })
+  const prefs = settings.providerPrefs
+  const wireOpts: {
+    existingIgnore?: readonly string[]
+    existingOnly?: readonly string[]
+    existingOrder?: readonly string[]
+    userTouchedPicker?: boolean
+  } = {
     userTouchedPicker: prefs?.ignoreOverridesFilter === true,
   }
   if (prefs?.ignore) wireOpts.existingIgnore = prefs.ignore
-  const wire = buildWireProviderPrivacy(filter, chat.settings.privacy, wireOpts)
+  if (prefs?.only) wireOpts.existingOnly = prefs.only
+  if (prefs?.order) wireOpts.existingOrder = prefs.order
+  const wire = buildWireProviderPrivacy(filter, settings.privacy, wireOpts)
   if (typeof input.neededTokens === 'number' && input.neededTokens > 0) {
     const insufficient: string[] = []
     for (const ep of endpoints) {
       const cap = ep.max_prompt_tokens ?? ep.context_length
       if (typeof cap === 'number' && cap > 0 && input.neededTokens > cap) {
-        insufficient.push(ep.provider_name)
+        insufficient.push(providerRoutingRef(ep))
       }
     }
     if (insufficient.length > 0) {
@@ -100,8 +134,85 @@ export async function resolvePrivacyForSend(
       const next = new Set<string>(base.ignore ?? [])
       for (const name of insufficient) next.add(name)
       const merged: WireProviderPrivacy = { ...(wire ?? {}), ignore: [...next] }
-      return { wire: merged, filter, applicable: true }
+      return {
+        wire: merged,
+        filter,
+        applicable: true,
+        contextIgnoredProviders: insufficient,
+      }
     }
   }
-  return { wire, filter, applicable: true }
+  return { wire, filter, applicable: true, contextIgnoredProviders: [] }
+}
+
+async function ensureEndpointsRow(
+  profile: ConnectionProfile,
+  modelId: string,
+  signal?: AbortSignal,
+) {
+  const cached = await getCachedEndpoints(profile.id, modelId)
+  if (cached && isFresh(cached.fetchedAt, ENDPOINTS_TTL_MS)) return cached
+  try {
+    await dedupedEndpointsFetch(profile.id, modelId, async () => {
+      const apiKey = (await resolveKeyIfPresent(profile.apiKeyRef)) ?? ''
+      return fetchEndpoints({ profile, apiKey }, modelId, {
+        ...(signal ? { signal } : {}),
+        timeoutMs: SEND_DISCOVERY_TIMEOUT_MS,
+      })
+    })
+  } catch (err) {
+    if (cached) return cached
+    throw new PrivacyDiscoveryUnavailableError(
+      'OpenRouter provider discovery failed before privacy routing could run.',
+      err,
+    )
+  }
+  const refreshed = await getCachedEndpoints(profile.id, modelId)
+  if (refreshed) return refreshed
+  if (cached) return cached
+  throw new PrivacyDiscoveryUnavailableError(
+    'OpenRouter provider discovery did not populate an endpoints cache row.',
+  )
+}
+
+async function ensurePrivacyPolicies(input: {
+  profile: ConnectionProfile
+  modelId: string
+  endpoints: readonly { data_policy?: DataPolicy }[]
+  signal?: AbortSignal
+}): Promise<{ policies: Record<string, DataPolicy>; offlineFallback: boolean }> {
+  const { profile, modelId, endpoints, signal } = input
+  const needsScrape =
+    profile.supportsPrivacyScrape !== false && endpoints.some((endpoint) => !endpoint.data_policy)
+  const cached = await getCachedPrivacyPolicy(profile.id, modelId)
+  const cachedPayload = cached ? readCachedPrivacyPayload(cached.payload) : null
+  const cachedPolicies = cachedPayload?.policies ?? {}
+  const hasCachedPolicies = Object.keys(cachedPolicies).length > 0
+  if (!needsScrape) return { policies: cachedPolicies, offlineFallback: false }
+
+  const ttl = hasCachedPolicies ? PRIVACY_POLICY_TTL_MS : PARTIAL_PRIVACY_POLICY_TTL_MS
+  if (cached && isFresh(cached.fetchedAt, ttl)) {
+    return { policies: cachedPolicies, offlineFallback: false }
+  }
+
+  try {
+    await dedupedPrivacyFetch(profile.id, modelId, async () => {
+      const result = await fetchPrivacyScrape(
+        { profile },
+        modelId,
+        {
+          ...(signal ? { signal } : {}),
+          timeoutMs: SEND_DISCOVERY_TIMEOUT_MS,
+        },
+      )
+      return result.raw
+    })
+  } catch (err) {
+    if (hasCachedPolicies) return { policies: cachedPolicies, offlineFallback: false }
+    return { policies: cachedPolicies, offlineFallback: true }
+  }
+
+  const refreshed = await getCachedPrivacyPolicy(profile.id, modelId)
+  const refreshedPayload = refreshed ? readCachedPrivacyPayload(refreshed.payload) : null
+  return { policies: refreshedPayload?.policies ?? {}, offlineFallback: false }
 }

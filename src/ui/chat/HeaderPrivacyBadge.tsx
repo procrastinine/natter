@@ -9,6 +9,7 @@
 import { useLiveQuery } from 'dexie-react-hooks'
 import { useEffect, useRef, useState } from 'react'
 import type { Chat, ChatId } from '../../core/types'
+import { providerDisplayLabel, providerEndpointKey } from '../../core/provider-identity'
 import { getChat } from '../../store/chats'
 import { usePrivacyRouting } from '../../hooks/usePrivacyRouting'
 import { CloseIcon, LockIcon, LockOpenIcon } from '../icons/Icon'
@@ -85,7 +86,12 @@ function Inner({ chat }: { chat: Chat }) {
   // While the filter is resolving for the first time on this
   // (profile, model) pair we render a muted lock rather than jump from
   // "unavailable" → real tier on arrival.
-  const rows = filter ? buildPickerRows(endpoints, filter) : []
+  const rows = filter
+    ? buildPickerRows(endpoints, filter, {
+        providerPrefs: chat.settings.providerPrefs,
+        privacy: chat.settings.privacy,
+      })
+    : []
   const kept = rows.filter((r) => r.state === 'kept')
   const badgeTier: PrivacyTier = kept.length > 0 ? worstTier(kept) : loading ? 'unavailable' : 'red'
   const label = kept.length === 0 && !loading
@@ -131,7 +137,11 @@ function Inner({ chat }: { chat: Chat }) {
             ) : (
               <ul data-ui="header-privacy-list">
                 {rows.map((r) => (
-                  <PopoverRow key={r.endpoint.provider_name} row={r} />
+                  <PopoverRow
+                    key={providerEndpointKey(r.endpoint)}
+                    row={r}
+                    endpoints={endpoints}
+                  />
                 ))}
               </ul>
             )}
@@ -142,7 +152,13 @@ function Inner({ chat }: { chat: Chat }) {
   )
 }
 
-function PopoverRow({ row }: { row: PickerRow }) {
+function PopoverRow({
+  row,
+  endpoints,
+}: {
+  row: PickerRow
+  endpoints: readonly PickerRow['endpoint'][]
+}) {
   const isKept = row.state === 'kept'
   const tip = isKept
     ? tierToLockLabel(row.tier)
@@ -159,7 +175,7 @@ function PopoverRow({ row }: { row: PickerRow }) {
       <span data-ui="header-privacy-row-lock" data-privacy-tier={row.tier}>
         <LockIcon size={12} />
       </span>
-      <span data-ui="header-privacy-row-name">{row.endpoint.provider_name}</span>
+      <span data-ui="header-privacy-row-name">{providerDisplayLabel(row.endpoint, endpoints)}</span>
       <span data-ui="header-privacy-row-state">{isKept ? 'in use' : 'excluded'}</span>
     </li>
   )

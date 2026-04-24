@@ -27,9 +27,20 @@ export function isPresetSlug(slug: string): boolean {
 // `Google Vertex` → `Google` has been observed in the wild, so we match both.
 export function isAnthropicOnBedrockOrVertex(
   model: string,
-  endpoint?: Pick<ModelEndpoint, 'provider_name'> | undefined,
+  endpoint?: Pick<ModelEndpoint, 'provider_name' | 'provider_display_name' | 'provider_slug'> | undefined,
 ): boolean {
   if (!/^anthropic\//.test(model)) return false
-  const name = endpoint?.provider_name
-  return name === 'Amazon Bedrock' || name === 'Google Vertex' || name === 'Google'
+  const refs = [
+    endpoint?.provider_name,
+    endpoint?.provider_display_name,
+    endpoint?.provider_slug,
+  ].map((value) => value?.trim().toLowerCase())
+  return refs.some(
+    (ref) =>
+      ref === 'amazon bedrock' ||
+      ref === 'amazon-bedrock' ||
+      ref === 'google vertex' ||
+      ref === 'google-vertex' ||
+      ref === 'google',
+  )
 }

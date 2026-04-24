@@ -26,6 +26,7 @@ import {
 } from '../../src/store/browser-repo'
 import { createChat } from '../../src/store/chats'
 import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
+import { putCachedEndpoints } from '../../src/store/models-cache'
 import { useChatStore } from '../../src/store/zustand/chatStore'
 import { useStreamStore } from '../../src/store/zustand/streamStore'
 
@@ -77,6 +78,14 @@ async function reset() {
 beforeEach(async () => {
   await reset()
   await openDb()
+  await seedOpenRouterDiscovery('prof-s1', [
+    'model-s1',
+    'model-s2',
+    'model-shared',
+    'orig-model',
+    'new-model',
+  ])
+  await seedOpenRouterDiscovery('prof-s2', ['model-s2', 'model-shared'])
 })
 
 afterEach(async () => {
@@ -107,6 +116,29 @@ async function getMessage(id: string): Promise<Message> {
   const row = await getBrowserRepository().getMessage(id)
   if (!row) throw new Error(`message ${id} missing`)
   return row
+}
+
+async function seedOpenRouterDiscovery(profileId: string, models: readonly string[]): Promise<void> {
+  for (const modelId of models) {
+    await putCachedEndpoints(profileId, modelId, {
+      id: modelId,
+      endpoints: [
+        {
+          provider_name: 'Test Clean',
+          provider_slug: 'test-clean',
+          supported_parameters: ['temperature'],
+          context_length: 200000,
+          pricing: {},
+          data_policy: {
+            training: false,
+            training_openrouter: false,
+            retains_prompts: false,
+            can_publish: false,
+          },
+        },
+      ],
+    })
+  }
 }
 
 interface SwitchAssertionInput {

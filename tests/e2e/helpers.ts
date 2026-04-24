@@ -7,6 +7,12 @@
 
 import type { Page } from '@playwright/test'
 
+export interface IndexedDbDump {
+  dbName: string
+  exportedAt?: string
+  stores: Record<string, unknown[]>
+}
+
 export interface SeedOptions {
   apiKey?: string
   model?: string
@@ -273,4 +279,35 @@ export async function clearIndexedDb(page: Page): Promise<void> {
       req.onblocked = () => resolve()
     })
   })
+}
+
+export async function importIndexedDbDump(page: Page, dump: IndexedDbDump): Promise<void> {
+  await page.goto('/')
+  await page.evaluate(async (dump) => {
+    const req = indexedDB.open(dump.dbName || 'natter')
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      req.onsuccess = () => resolve(req.result)
+      req.onerror = () => reject(req.error)
+    })
+    try {
+      const storeNames = Array.from(db.objectStoreNames)
+      const writableStores = Object.keys(dump.stores).filter((name) => storeNames.includes(name))
+      if (writableStores.length === 0) return
+      await new Promise<void>((resolve, reject) => {
+        const tx = db.transaction(writableStores, 'readwrite')
+        for (const storeName of writableStores) {
+          const store = tx.objectStore(storeName)
+          store.clear()
+          const rows = dump.stores[storeName] ?? []
+          for (const row of rows) store.put(row)
+        }
+        tx.oncomplete = () => resolve()
+        tx.onerror = () => reject(tx.error)
+        tx.onabort = () => reject(tx.error)
+      })
+    } finally {
+      db.close()
+    }
+  }, dump)
+  await page.reload()
 }

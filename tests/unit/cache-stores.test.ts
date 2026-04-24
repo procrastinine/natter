@@ -21,7 +21,7 @@ import {
   putCachedPrivacyPolicy,
   putCachedProviders,
 } from '../../src/store/privacy-cache'
-import { deleteSetting, getSetting, setSetting } from '../../src/store/settings'
+import { deleteSetting, getSetting, setSetting, updateSetting } from '../../src/store/settings'
 
 const DB_NAME = 'natter'
 
@@ -174,5 +174,15 @@ describe('settings', () => {
     unsub()
     expect(await getSetting('theme')).toBeUndefined()
     expect(seen).toEqual([{ kind: 'settings-mutated', key: 'theme' }])
+  })
+
+  it('updateSetting performs an atomic read-modify-write', async () => {
+    await setSetting('counter', 0)
+    await Promise.all(
+      Array.from({ length: 10 }, () =>
+        updateSetting<number>('counter', async (current) => (current ?? 0) + 1),
+      ),
+    )
+    expect(await getSetting<number>('counter')).toBe(10)
   })
 })

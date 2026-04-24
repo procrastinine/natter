@@ -20,7 +20,7 @@ test('streaming text keeps the scroll region in follow state; scrolling up flips
   page,
 }) => {
   // Big output so the scroll region actually overflows.
-  const huge = 'x'.repeat(12_000)
+  const huge = Array.from({ length: 800 }, (_, i) => `streamed line ${i}`).join('\n\n')
   await mockChatCompletions(page, {
     body: buildSseBody([{ id: 'big-1', content: huge, finish: 'stop' }]),
   })
@@ -31,9 +31,8 @@ test('streaming text keeps the scroll region in follow state; scrolling up flips
     timeout: 5000,
   })
 
-  await region.evaluate((el) => {
-    el.scrollTop = 0
-  })
+  await region.hover()
+  await page.mouse.wheel(0, -5000)
   await expect(region).toHaveAttribute('data-scroll-state', 'pinned', {
     timeout: 3000,
   })

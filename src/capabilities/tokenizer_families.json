@@ -1,0 +1,520 @@
+{
+  "families": [
+    {
+      "canonicalModelKeys": [
+        "google:gemma-2-27b-it",
+        "google:gemma-2-2b-it",
+        "google:gemma-2-9b-it"
+      ],
+      "key": "google:gemma2",
+      "shareLevel": "crosschecked"
+    },
+    {
+      "canonicalModelKeys": [
+        "google:deep-research-pro-preview-12-2025",
+        "google:gemini-2.0-flash",
+        "google:gemini-2.0-flash-001",
+        "google:gemini-2.0-flash-lite",
+        "google:gemini-2.0-flash-lite-001",
+        "google:gemini-2.5-flash",
+        "google:gemini-2.5-flash-lite",
+        "google:gemini-2.5-flash-lite-preview-09-2025",
+        "google:gemini-2.5-pro",
+        "google:gemini-2.5-pro-preview",
+        "google:gemini-2.5-pro-preview-05-06",
+        "google:gemini-3-flash-preview",
+        "google:gemini-3-pro-preview",
+        "google:gemini-3.1-flash-lite-preview",
+        "google:gemini-3.1-pro-preview",
+        "google:gemini-3.1-pro-preview-customtools",
+        "google:gemini-flash-latest",
+        "google:gemini-flash-lite-latest",
+        "google:gemini-pro-latest",
+        "google:gemma-3-12b-it",
+        "google:gemma-3-1b-it",
+        "google:gemma-3-27b-it",
+        "google:gemma-3-4b-it",
+        "google:gemma-3n-e2b-it",
+        "google:gemma-3n-e4b-it"
+      ],
+      "key": "google:gemma3",
+      "shareLevel": "official-or-crosschecked"
+    },
+    {
+      "canonicalModelKeys": [
+        "google:gemma-4-26b-a4b",
+        "google:gemma-4-26b-a4b-it",
+        "google:gemma-4-31b-it",
+        "google:gemma-4-e4b-it"
+      ],
+      "key": "google:gemma4",
+      "shareLevel": "pending-crosscheck"
+    },
+    {
+      "canonicalModelKeys": [
+        "openai:gpt-3.5-turbo",
+        "openai:gpt-3.5-turbo-0125",
+        "openai:gpt-3.5-turbo-0613",
+        "openai:gpt-3.5-turbo-1106",
+        "openai:gpt-3.5-turbo-16k",
+        "openai:gpt-3.5-turbo-instruct",
+        "openai:gpt-3.5-turbo-instruct-0914",
+        "openai:gpt-4",
+        "openai:gpt-4-0314",
+        "openai:gpt-4-0613",
+        "openai:gpt-4-1106-preview",
+        "openai:gpt-4-turbo",
+        "openai:gpt-4-turbo-2024-04-09",
+        "openai:gpt-4-turbo-preview"
+      ],
+      "key": "openai:cl100k_base",
+      "shareLevel": "official"
+    },
+    {
+      "canonicalModelKeys": [
+        "openai:gpt-4.1",
+        "openai:gpt-4.1-2025-04-14",
+        "openai:gpt-4.1-mini",
+        "openai:gpt-4.1-mini-2025-04-14",
+        "openai:gpt-4.1-nano",
+        "openai:gpt-4.1-nano-2025-04-14",
+        "openai:gpt-4o",
+        "openai:gpt-4o-2024-05-13",
+        "openai:gpt-4o-2024-08-06",
+        "openai:gpt-4o-2024-11-20",
+        "openai:gpt-4o-audio-preview",
+        "openai:gpt-4o-audio-preview-2024-12-17",
+        "openai:gpt-4o-audio-preview-2025-06-03",
+        "openai:gpt-4o-mini",
+        "openai:gpt-4o-mini-2024-07-18",
+        "openai:gpt-4o-mini-audio-preview",
+        "openai:gpt-4o-mini-audio-preview-2024-12-17",
+        "openai:gpt-4o-mini-realtime-preview",
+        "openai:gpt-4o-mini-realtime-preview-2024-12-17",
+        "openai:gpt-4o-mini-search-preview",
+        "openai:gpt-4o-mini-search-preview-2025-03-11",
+        "openai:gpt-4o-mini-transcribe",
+        "openai:gpt-4o-mini-transcribe-2025-03-20",
+        "openai:gpt-4o-mini-transcribe-2025-12-15",
+        "openai:gpt-4o-mini-tts",
+        "openai:gpt-4o-mini-tts-2025-03-20",
+        "openai:gpt-4o-mini-tts-2025-12-15",
+        "openai:gpt-4o-realtime-preview",
+        "openai:gpt-4o-realtime-preview-2024-12-17",
+        "openai:gpt-4o-realtime-preview-2025-06-03",
+        "openai:gpt-4o-search-preview",
+        "openai:gpt-4o-search-preview-2025-03-11",
+        "openai:gpt-4o-transcribe",
+        "openai:gpt-4o-transcribe-diarize",
+        "openai:gpt-5",
+        "openai:gpt-5-2025-08-07",
+        "openai:gpt-5-chat",
+        "openai:gpt-5-chat-latest",
+        "openai:gpt-5-codex",
+        "openai:gpt-5-image",
+        "openai:gpt-5-image-mini",
+        "openai:gpt-5-mini",
+        "openai:gpt-5-mini-2025-08-07",
+        "openai:gpt-5-nano",
+        "openai:gpt-5-nano-2025-08-07",
+        "openai:gpt-5-pro",
+        "openai:gpt-5-pro-2025-10-06",
+        "openai:gpt-5-search-api",
+        "openai:gpt-5-search-api-2025-10-14",
+        "openai:gpt-5.1",
+        "openai:gpt-5.1-2025-11-13",
+        "openai:gpt-5.1-chat",
+        "openai:gpt-5.1-chat-latest",
+        "openai:gpt-5.1-codex",
+        "openai:gpt-5.1-codex-max",
+        "openai:gpt-5.1-codex-mini",
+        "openai:gpt-5.2",
+        "openai:gpt-5.2-2025-12-11",
+        "openai:gpt-5.2-chat",
+        "openai:gpt-5.2-chat-latest",
+        "openai:gpt-5.2-codex",
+        "openai:gpt-5.2-pro",
+        "openai:gpt-5.2-pro-2025-12-11",
+        "openai:gpt-5.3-chat",
+        "openai:gpt-5.3-chat-latest",
+        "openai:gpt-5.3-codex",
+        "openai:gpt-5.4",
+        "openai:gpt-5.4-2026-03-05",
+        "openai:gpt-5.4-image-2",
+        "openai:gpt-5.4-mini",
+        "openai:gpt-5.4-mini-2026-03-17",
+        "openai:gpt-5.4-nano",
+        "openai:gpt-5.4-nano-2026-03-17",
+        "openai:gpt-5.4-pro",
+        "openai:gpt-5.4-pro-2026-03-05",
+        "openai:o1",
+        "openai:o1-2024-12-17",
+        "openai:o1-pro",
+        "openai:o1-pro-2025-03-19",
+        "openai:o3",
+        "openai:o3-2025-04-16",
+        "openai:o3-deep-research",
+        "openai:o3-mini",
+        "openai:o3-mini-2025-01-31",
+        "openai:o3-mini-high",
+        "openai:o3-pro",
+        "openai:o4-mini",
+        "openai:o4-mini-2025-04-16",
+        "openai:o4-mini-deep-research",
+        "openai:o4-mini-deep-research-2025-06-26",
+        "openai:o4-mini-high"
+      ],
+      "key": "openai:o200k_base",
+      "shareLevel": "official"
+    },
+    {
+      "canonicalModelKeys": [
+        "openai:gpt-oss-120b",
+        "openai:gpt-oss-20b",
+        "openai:gpt-oss-safeguard-20b"
+      ],
+      "key": "openai:o200k_harmony",
+      "shareLevel": "official"
+    },
+    {
+      "canonicalModelKeys": [
+        "z-ai:chatglm2-6b",
+        "z-ai:chatglm3-6b"
+      ],
+      "key": "oss:chatglm2-3",
+      "shareLevel": "exact"
+    },
+    {
+      "canonicalModelKeys": [
+        "qwen:codeqwen1.5-7b"
+      ],
+      "key": "oss:codeqwen1.5",
+      "shareLevel": "exact"
+    },
+    {
+      "canonicalModelKeys": [
+        "deepseek:deepseek-coder-v2",
+        "deepseek:deepseek-v2.5"
+      ],
+      "key": "oss:deepseek-coder-v2",
+      "shareLevel": "exact"
+    },
+    {
+      "canonicalModelKeys": [
+        "deepseek:deepseek-math-7b-instruct",
+        "deepseek:deepseek-v2"
+      ],
+      "key": "oss:deepseek-v2",
+      "shareLevel": "exact"
+    },
+    {
+      "canonicalModelKeys": [
+        "deepseek:deepseek-chat",
+        "deepseek:deepseek-chat-v3-0324",
+        "deepseek:deepseek-r1",
+        "deepseek:deepseek-r1-0528",
+        "deepseek:deepseek-r1-distill-llama-70b",
+        "deepseek:deepseek-v3",
+        "deepseek:deepseek-v3.2",
+        "deepseek:deepseek-v3.2-speciale",
+        "tngtech:deepseek-r1t2-chimera"
+      ],
+      "key": "oss:deepseek-v3-r1-v3.2",
+      "shareLevel": "effective"
+    },
+    {
+      "canonicalModelKeys": [
+        "deepseek:deepseek-chat-v3.1",
+        "deepseek:deepseek-v3.1",
+        "deepseek:deepseek-v3.1-terminus",
+        "deepseek:deepseek-v3.2-exp",
+        "nex-agi:deepseek-v3.1-nex-n1"
+      ],
+      "key": "oss:deepseek-v3.1-v3.2-exp",
+      "shareLevel": "effective"
+    },
+    {
+      "canonicalModelKeys": [
+        "anthracite-org:magnum-v4-72b",
+        "deepseek:deepseek-v4-flash",
+        "deepseek:deepseek-v4-pro"
+      ],
+      "key": "oss:deepseek-v4",
+      "shareLevel": "exact"
+    },
+    {
+      "canonicalModelKeys": [
+        "z-ai:glm-4-32b"
+      ],
+      "key": "oss:glm-4-32b",
+      "shareLevel": "exact"
+    },
+    {
+      "canonicalModelKeys": [
+        "z-ai:glm-4-9b"
+      ],
+      "key": "oss:glm-4-9b",
+      "shareLevel": "exact"
+    },
+    {
+      "canonicalModelKeys": [
+        "z-ai:glm-4.5",
+        "z-ai:glm-4.5-air",
+        "z-ai:glm-4.5v",
+        "z-ai:glm-4.6",
+        "z-ai:glm-4.6v",
+        "z-ai:glm-4.7",
+        "z-ai:glm-4.7-flash"
+      ],
+      "key": "oss:glm-4.5-4.7",
+      "shareLevel": "exact"
+    },
+    {
+      "canonicalModelKeys": [
+        "z-ai:glm-5",
+        "z-ai:glm-5-turbo",
+        "z-ai:glm-5.1",
+        "z-ai:glm-5v-turbo"
+      ],
+      "key": "oss:glm-5",
+      "shareLevel": "exact"
+    },
+    {
+      "canonicalModelKeys": [
+        "moonshotai:kimi-audio-7b"
+      ],
+      "key": "oss:kimi-audio",
+      "shareLevel": "exact"
+    },
+    {
+      "canonicalModelKeys": [
+        "moonshotai:kimi-k2",
+        "moonshotai:kimi-k2-0905",
+        "moonshotai:kimi-k2-thinking",
+        "moonshotai:kimi-k2.5",
+        "moonshotai:kimi-k2.6",
+        "moonshotai:kimi-vl-a3b-thinking"
+      ],
+      "key": "oss:kimi-k2",
+      "shareLevel": "exact"
+    },
+    {
+      "canonicalModelKeys": [
+        "meta-llama:llama-guard-4-12b"
+      ],
+      "key": "oss:llama-guard-4",
+      "shareLevel": "exact"
+    },
+    {
+      "canonicalModelKeys": [
+        "alfredpros:codellama-7b-instruct-solidity",
+        "meta-llama:codellama-34b-instruct",
+        "meta-llama:llama-2-7b-chat"
+      ],
+      "key": "oss:llama2",
+      "shareLevel": "exact"
+    },
+    {
+      "canonicalModelKeys": [
+        "aion-labs:aion-rp-llama-3.1-8b",
+        "deepseek:deepseek-r1-distill-llama-70b",
+        "deepseek:deepseek-r1-distill-llama-8b",
+        "meta-llama:llama-3-70b-instruct",
+        "meta-llama:llama-3-8b-instruct",
+        "meta-llama:llama-3.1-70b-instruct",
+        "meta-llama:llama-3.1-8b-instruct",
+        "meta-llama:llama-3.2-1b-instruct",
+        "meta-llama:llama-3.2-3b-instruct",
+        "meta-llama:llama-3.3-70b-instruct",
+        "meta-llama:llama-guard-3-8b",
+        "nousresearch:hermes-2-pro-llama-3-8b",
+        "nousresearch:hermes-3-llama-3.1-405b",
+        "nousresearch:hermes-3-llama-3.1-70b",
+        "nvidia:llama-3.1-nemotron-70b-instruct",
+        "nvidia:llama-3.3-nemotron-super-49b-v1.5"
+      ],
+      "key": "oss:llama3",
+      "shareLevel": "effective"
+    },
+    {
+      "canonicalModelKeys": [
+        "meta-llama:llama-3.2-11b-vision-instruct",
+        "meta-llama:llama-3.2-90b-vision-instruct"
+      ],
+      "key": "oss:llama3.2-vision",
+      "shareLevel": "exact"
+    },
+    {
+      "canonicalModelKeys": [
+        "meta-llama:llama-4-maverick",
+        "meta-llama:llama-4-maverick-17b-128e-instruct",
+        "meta-llama:llama-4-scout",
+        "meta-llama:llama-4-scout-17b-16e-instruct"
+      ],
+      "key": "oss:llama4",
+      "shareLevel": "exact"
+    },
+    {
+      "canonicalModelKeys": [
+        "minimax:minimax-m1"
+      ],
+      "key": "oss:minimax-m1",
+      "shareLevel": "exact"
+    },
+    {
+      "canonicalModelKeys": [
+        "minimax:minimax-01",
+        "minimax:minimax-m2",
+        "minimax:minimax-m2-her",
+        "minimax:minimax-m2.1",
+        "minimax:minimax-m2.5",
+        "minimax:minimax-m2.7"
+      ],
+      "key": "oss:minimax-m2",
+      "shareLevel": "exact"
+    },
+    {
+      "canonicalModelKeys": [
+        "minimax:synlogic-r1"
+      ],
+      "key": "oss:minimax-synlogic",
+      "shareLevel": "exact"
+    },
+    {
+      "canonicalModelKeys": [
+        "minimax:minimax-text-01",
+        "minimax:minimax-vl-01"
+      ],
+      "key": "oss:minimax-text-vl",
+      "shareLevel": "exact"
+    },
+    {
+      "canonicalModelKeys": [
+        "mistralai:codestral-22b-v0.1",
+        "mistralai:codestral-2508",
+        "mistralai:mathstral-7b-v0.1",
+        "mistralai:mistral-7b-instruct-v0.1",
+        "mistralai:mistral-7b-v0.1",
+        "mistralai:mixtral-8x22b-instruct",
+        "mistralai:mixtral-8x7b-instruct",
+        "mistralai:mixtral-8x7b-instruct-v0.1"
+      ],
+      "key": "oss:mistral-sentencepiece-v1",
+      "shareLevel": "exact"
+    },
+    {
+      "canonicalModelKeys": [
+        "mistralai:devstral-2",
+        "mistralai:ministral-14b-2512",
+        "mistralai:ministral-3b",
+        "mistralai:ministral-3b-2512",
+        "mistralai:mistral-large",
+        "mistralai:mistral-large-2407",
+        "mistralai:mistral-large-2411",
+        "mistralai:mistral-large-2512",
+        "mistralai:mistral-large-3.1",
+        "mistralai:mistral-small-2603",
+        "mistralai:mistral-small-4"
+      ],
+      "key": "oss:mistral-tekken-v1",
+      "shareLevel": "effective"
+    },
+    {
+      "canonicalModelKeys": [
+        "mistralai:devstral-2512",
+        "mistralai:devstral-medium",
+        "mistralai:devstral-small",
+        "mistralai:ministral-8b",
+        "mistralai:ministral-8b-2512",
+        "mistralai:mistral-medium-3",
+        "mistralai:mistral-medium-3.1",
+        "mistralai:mistral-nemo",
+        "mistralai:mistral-nemo-2407",
+        "mistralai:mistral-saba",
+        "mistralai:mistral-small-24b-instruct-2501",
+        "mistralai:mistral-small-3.1-24b-instruct",
+        "mistralai:mistral-small-3.2-24b-instruct",
+        "mistralai:mistral-small-creative",
+        "mistralai:pixtral-12b",
+        "mistralai:pixtral-large-2411",
+        "mistralai:voxtral-small",
+        "mistralai:voxtral-small-24b-2507"
+      ],
+      "key": "oss:mistral-tekken-v2",
+      "shareLevel": "effective"
+    },
+    {
+      "canonicalModelKeys": [
+        "qwen:qwen-14b",
+        "qwen:qwen-72b",
+        "qwen:qwen-7b"
+      ],
+      "key": "oss:qwen-legacy-tiktoken",
+      "shareLevel": "exact"
+    },
+    {
+      "canonicalModelKeys": [
+        "deepseek:deepseek-r1-distill-qwen-32b",
+        "qwen:qvq-72b-preview",
+        "qwen:qwen-2.5-72b-instruct",
+        "qwen:qwen-2.5-7b-instruct",
+        "qwen:qwen-2.5-coder-32b-instruct",
+        "qwen:qwen-max",
+        "qwen:qwen-plus",
+        "qwen:qwen-plus-2025-07-28",
+        "qwen:qwen-turbo",
+        "qwen:qwen-vl-max",
+        "qwen:qwen-vl-plus",
+        "qwen:qwen2.5-32b-instruct",
+        "qwen:qwen2.5-7b-instruct",
+        "qwen:qwen2.5-vl-72b-instruct",
+        "qwen:qwen3-14b",
+        "qwen:qwen3-235b-a22b",
+        "qwen:qwen3-235b-a22b-2507",
+        "qwen:qwen3-235b-a22b-thinking-2507",
+        "qwen:qwen3-30b-a3b",
+        "qwen:qwen3-30b-a3b-instruct-2507",
+        "qwen:qwen3-30b-a3b-thinking-2507",
+        "qwen:qwen3-32b",
+        "qwen:qwen3-8b",
+        "qwen:qwen3-coder",
+        "qwen:qwen3-coder-30b-a3b-instruct",
+        "qwen:qwen3-coder-flash",
+        "qwen:qwen3-coder-next",
+        "qwen:qwen3-coder-plus",
+        "qwen:qwen3-max",
+        "qwen:qwen3-max-thinking",
+        "qwen:qwen3-next-80b-a3b-instruct",
+        "qwen:qwen3-next-80b-a3b-thinking",
+        "qwen:qwen3-vl-235b-a22b-instruct",
+        "qwen:qwen3-vl-235b-a22b-thinking",
+        "qwen:qwen3-vl-30b-a3b-instruct",
+        "qwen:qwen3-vl-30b-a3b-thinking",
+        "qwen:qwen3-vl-32b-instruct",
+        "qwen:qwen3-vl-8b-instruct",
+        "qwen:qwen3-vl-8b-thinking",
+        "qwen:qwq-32b"
+      ],
+      "key": "oss:qwen-modern-bpe",
+      "shareLevel": "effective"
+    },
+    {
+      "canonicalModelKeys": [
+        "qwen:qwen3.5-122b-a10b",
+        "qwen:qwen3.5-27b",
+        "qwen:qwen3.5-35b-a3b",
+        "qwen:qwen3.5-397b-a17b",
+        "qwen:qwen3.5-9b",
+        "qwen:qwen3.5-flash-02-23",
+        "qwen:qwen3.5-plus-02-15",
+        "qwen:qwen3.6-27b",
+        "qwen:qwen3.6-35b-a3b",
+        "qwen:qwen3.6-plus"
+      ],
+      "key": "oss:qwen3.5-bpe",
+      "shareLevel": "effective"
+    }
+  ],
+  "generatedAt": "2026-04-24T15:21:41Z",
+  "schemaVersion": 1
+}

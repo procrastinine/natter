@@ -33,6 +33,8 @@
   left: 0;
   right: 0;
   height: 7px;
+  margin: 0;
+  border: 0;
   cursor: row-resize;
   background: transparent;
   z-index: 1;

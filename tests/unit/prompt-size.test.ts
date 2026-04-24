@@ -9,6 +9,7 @@
 // carefully to avoid negative values.
 
 import { describe, expect, it } from 'vitest'
+import { tokenCalibrationKey } from '../../src/core/model-ids'
 import { estimatePromptSize, tokenizerFromSettings } from '../../src/core/prompt-size'
 import type { ChatUsage, GenerationMeta, Message, MessageRole } from '../../src/core/types'
 
@@ -525,6 +526,47 @@ describe('estimatePromptSize — per-message cache (Phase B)', () => {
     expect(est.historyTokens).toBe(999)
   })
 
+  it('uses originalTokenEstimate + edit delta when same-model calibration is provided', () => {
+    const m: Message = {
+      ...makeMessage({ role: 'user', text: 'a'.repeat(70) }),
+      originalCharCount: 35,
+      originalTokenEstimate: 10,
+      originalModelId: 'openai/gpt-4o',
+      charCountDelta: 35,
+      cachedTokenEstimate: 999,
+    }
+    const est = estimatePromptSize({
+      systemPrompt: '',
+      activePathMessages: [m],
+      draftText: '',
+      tokenizer: DEFAULT_TOKENIZER,
+      currentModelId: 'openai/gpt-4o',
+      currentTextCharsPerToken: 3,
+    })
+    expect(est.historyTokens).toBe(22)
+  })
+
+  it('treats exact model switches inside the same tokenizer family as same-bucket', () => {
+    const m: Message = {
+      ...makeMessage({ role: 'user', text: 'a'.repeat(70) }),
+      originalCharCount: 35,
+      originalTokenEstimate: 10,
+      originalModelId: 'google/gemini-2.5-pro-preview',
+      originalCalibrationKey: tokenCalibrationKey('google/gemini-2.5-pro-preview'),
+      charCountDelta: 35,
+      cachedTokenEstimate: 999,
+    }
+    const est = estimatePromptSize({
+      systemPrompt: '',
+      activePathMessages: [m],
+      draftText: '',
+      tokenizer: 'gemini',
+      currentModelId: 'google/gemini-2.5-pro-preview-05-06',
+      currentTextCharsPerToken: 3,
+    })
+    expect(est.historyTokens).toBe(22)
+  })
+
   it('ignores cache when originalModelId differs from currentModelId', () => {
     // Message was created under gpt-4o but chat switched to claude.
     const m: Message = {
@@ -546,7 +588,27 @@ describe('estimatePromptSize — per-message cache (Phase B)', () => {
     expect(est.historyTokens).toBe(10)
   })
 
-  it('uses cache when originalModelId is absent (pre-Phase-B row)', () => {
+  it('recomputes cross-model rows against the current model ratio when provided', () => {
+    const m: Message = {
+      ...makeMessage({ role: 'user', text: 'a'.repeat(35) }),
+      originalCharCount: 35,
+      originalTokenEstimate: 10,
+      originalModelId: 'openai/gpt-4o',
+      charCountDelta: 0,
+      cachedTokenEstimate: 999,
+    }
+    const est = estimatePromptSize({
+      systemPrompt: '',
+      activePathMessages: [m],
+      draftText: '',
+      tokenizer: DEFAULT_TOKENIZER,
+      currentModelId: 'anthropic/claude-opus-4.7',
+      currentTextCharsPerToken: 3,
+    })
+    expect(est.historyTokens).toBe(12)
+  })
+
+  it('uses cache when originalModelId is absent and no current calibration ratio is available', () => {
     const m: Message = {
       ...makeMessage({ role: 'user', text: 'a'.repeat(35) }),
       cachedTokenEstimate: 500,
@@ -560,6 +622,22 @@ describe('estimatePromptSize — per-message cache (Phase B)', () => {
       currentModelId: 'openai/gpt-4o',
     })
     expect(est.historyTokens).toBe(500)
+  })
+
+  it('recomputes pre-Phase-B cached rows when a current calibration ratio is available', () => {
+    const m: Message = {
+      ...makeMessage({ role: 'user', text: 'a'.repeat(35) }),
+      cachedTokenEstimate: 500,
+    }
+    const est = estimatePromptSize({
+      systemPrompt: '',
+      activePathMessages: [m],
+      draftText: '',
+      tokenizer: DEFAULT_TOKENIZER,
+      currentModelId: 'openai/gpt-4o',
+      currentTextCharsPerToken: 3,
+    })
+    expect(est.historyTokens).toBe(12)
   })
 
   it('uses fresh path when currentModelId is omitted AND no cache present', () => {

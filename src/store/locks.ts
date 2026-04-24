@@ -116,6 +116,13 @@ async function withSingleScopeLock<T>(resourceName: string, fn: () => Promise<T>
   return withFallbackLock(resourceName, fn)
 }
 
+export async function withNamedLock<T>(
+  resourceName: string,
+  fn: () => Promise<T> | T,
+): Promise<T> {
+  return withSingleScopeLock(resourceName, fn)
+}
+
 export async function withMutationLocks<T>(
   scopes: readonly MutationScope[],
   fn: () => Promise<T> | T,

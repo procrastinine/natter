@@ -1,0 +1,732 @@
+{
+  "crosswalk": [
+    {
+      "anthropic": [
+        "claude-haiku-4-5-20251001"
+      ],
+      "google": [],
+      "openai": [],
+      "openrouter": [
+        "anthropic/claude-haiku-4.5"
+      ]
+    },
+    {
+      "anthropic": [
+        "claude-opus-4-20250514"
+      ],
+      "google": [],
+      "openai": [],
+      "openrouter": [
+        "anthropic/claude-opus-4"
+      ]
+    },
+    {
+      "anthropic": [
+        "claude-opus-4-1-20250805"
+      ],
+      "google": [],
+      "openai": [],
+      "openrouter": [
+        "anthropic/claude-opus-4.1"
+      ]
+    },
+    {
+      "anthropic": [
+        "claude-opus-4-5-20251101"
+      ],
+      "google": [],
+      "openai": [],
+      "openrouter": [
+        "anthropic/claude-opus-4.5"
+      ]
+    },
+    {
+      "anthropic": [
+        "claude-opus-4-6"
+      ],
+      "google": [],
+      "openai": [],
+      "openrouter": [
+        "anthropic/claude-opus-4.6"
+      ]
+    },
+    {
+      "anthropic": [
+        "claude-opus-4-7"
+      ],
+      "google": [],
+      "openai": [],
+      "openrouter": [
+        "anthropic/claude-opus-4.7"
+      ]
+    },
+    {
+      "anthropic": [
+        "claude-sonnet-4-20250514"
+      ],
+      "google": [],
+      "openai": [],
+      "openrouter": [
+        "anthropic/claude-sonnet-4"
+      ]
+    },
+    {
+      "anthropic": [
+        "claude-sonnet-4-5-20250929"
+      ],
+      "google": [],
+      "openai": [],
+      "openrouter": [
+        "anthropic/claude-sonnet-4.5"
+      ]
+    },
+    {
+      "anthropic": [
+        "claude-sonnet-4-6"
+      ],
+      "google": [],
+      "openai": [],
+      "openrouter": [
+        "anthropic/claude-sonnet-4.6"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [
+        "gemini-2.0-flash-001"
+      ],
+      "openai": [],
+      "openrouter": [
+        "google/gemini-2.0-flash-001"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [
+        "gemini-2.0-flash-lite-001"
+      ],
+      "openai": [],
+      "openrouter": [
+        "google/gemini-2.0-flash-lite-001"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [
+        "gemini-2.5-flash"
+      ],
+      "openai": [],
+      "openrouter": [
+        "google/gemini-2.5-flash"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [
+        "gemini-2.5-flash-image"
+      ],
+      "openai": [],
+      "openrouter": [
+        "google/gemini-2.5-flash-image"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [
+        "gemini-2.5-flash-lite"
+      ],
+      "openai": [],
+      "openrouter": [
+        "google/gemini-2.5-flash-lite"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [
+        "gemini-2.5-pro"
+      ],
+      "openai": [],
+      "openrouter": [
+        "google/gemini-2.5-pro"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [
+        "gemini-3-flash-preview"
+      ],
+      "openai": [],
+      "openrouter": [
+        "google/gemini-3-flash-preview"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [
+        "gemini-3-pro-image-preview"
+      ],
+      "openai": [],
+      "openrouter": [
+        "google/gemini-3-pro-image-preview"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [
+        "gemini-3.1-flash-image-preview"
+      ],
+      "openai": [],
+      "openrouter": [
+        "google/gemini-3.1-flash-image-preview"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [
+        "gemini-3.1-flash-lite-preview"
+      ],
+      "openai": [],
+      "openrouter": [
+        "google/gemini-3.1-flash-lite-preview"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [
+        "gemini-3.1-pro-preview"
+      ],
+      "openai": [],
+      "openrouter": [
+        "google/gemini-3.1-pro-preview"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [
+        "gemini-3.1-pro-preview-customtools"
+      ],
+      "openai": [],
+      "openrouter": [
+        "google/gemini-3.1-pro-preview-customtools"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [
+        "gemma-3-12b-it"
+      ],
+      "openai": [],
+      "openrouter": [
+        "google/gemma-3-12b-it",
+        "google/gemma-3-12b-it:free"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [
+        "gemma-3-27b-it"
+      ],
+      "openai": [],
+      "openrouter": [
+        "google/gemma-3-27b-it",
+        "google/gemma-3-27b-it:free"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [
+        "gemma-3-4b-it"
+      ],
+      "openai": [],
+      "openrouter": [
+        "google/gemma-3-4b-it",
+        "google/gemma-3-4b-it:free"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [
+        "gemma-3n-e2b-it"
+      ],
+      "openai": [],
+      "openrouter": [
+        "google/gemma-3n-e2b-it:free"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [
+        "gemma-3n-e4b-it"
+      ],
+      "openai": [],
+      "openrouter": [
+        "google/gemma-3n-e4b-it",
+        "google/gemma-3n-e4b-it:free"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [
+        "gemma-4-26b-a4b-it"
+      ],
+      "openai": [],
+      "openrouter": [
+        "google/gemma-4-26b-a4b-it",
+        "google/gemma-4-26b-a4b-it:free"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [
+        "gemma-4-31b-it"
+      ],
+      "openai": [],
+      "openrouter": [
+        "google/gemma-4-31b-it",
+        "google/gemma-4-31b-it:free"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [
+        "lyria-3-clip-preview"
+      ],
+      "openai": [],
+      "openrouter": [
+        "google/lyria-3-clip-preview"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [
+        "lyria-3-pro-preview"
+      ],
+      "openai": [],
+      "openrouter": [
+        "google/lyria-3-pro-preview"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [],
+      "openai": [
+        "gpt-3.5-turbo"
+      ],
+      "openrouter": [
+        "openai/gpt-3.5-turbo"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [],
+      "openai": [
+        "gpt-3.5-turbo-16k"
+      ],
+      "openrouter": [
+        "openai/gpt-3.5-turbo-16k"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [],
+      "openai": [
+        "gpt-3.5-turbo-instruct"
+      ],
+      "openrouter": [
+        "openai/gpt-3.5-turbo-instruct"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [],
+      "openai": [
+        "gpt-4"
+      ],
+      "openrouter": [
+        "openai/gpt-4"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [],
+      "openai": [
+        "gpt-4-turbo"
+      ],
+      "openrouter": [
+        "openai/gpt-4-turbo"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [],
+      "openai": [
+        "gpt-4.1"
+      ],
+      "openrouter": [
+        "openai/gpt-4.1"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [],
+      "openai": [
+        "gpt-4.1-mini"
+      ],
+      "openrouter": [
+        "openai/gpt-4.1-mini"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [],
+      "openai": [
+        "gpt-4.1-nano"
+      ],
+      "openrouter": [
+        "openai/gpt-4.1-nano"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [],
+      "openai": [
+        "gpt-4o"
+      ],
+      "openrouter": [
+        "openai/gpt-4o"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [],
+      "openai": [
+        "gpt-4o-2024-05-13"
+      ],
+      "openrouter": [
+        "openai/gpt-4o-2024-05-13"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [],
+      "openai": [
+        "gpt-4o-2024-08-06"
+      ],
+      "openrouter": [
+        "openai/gpt-4o-2024-08-06"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [],
+      "openai": [
+        "gpt-4o-2024-11-20"
+      ],
+      "openrouter": [
+        "openai/gpt-4o-2024-11-20"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [],
+      "openai": [
+        "gpt-4o-audio-preview"
+      ],
+      "openrouter": [
+        "openai/gpt-4o-audio-preview"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [],
+      "openai": [
+        "gpt-4o-mini"
+      ],
+      "openrouter": [
+        "openai/gpt-4o-mini"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [],
+      "openai": [
+        "gpt-4o-mini-2024-07-18"
+      ],
+      "openrouter": [
+        "openai/gpt-4o-mini-2024-07-18"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [],
+      "openai": [
+        "gpt-4o-mini-search-preview"
+      ],
+      "openrouter": [
+        "openai/gpt-4o-mini-search-preview"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [],
+      "openai": [
+        "gpt-4o-search-preview"
+      ],
+      "openrouter": [
+        "openai/gpt-4o-search-preview"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [],
+      "openai": [
+        "gpt-5"
+      ],
+      "openrouter": [
+        "openai/gpt-5"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [],
+      "openai": [
+        "gpt-5-codex"
+      ],
+      "openrouter": [
+        "openai/gpt-5-codex"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [],
+      "openai": [
+        "gpt-5-mini"
+      ],
+      "openrouter": [
+        "openai/gpt-5-mini"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [],
+      "openai": [
+        "gpt-5-nano"
+      ],
+      "openrouter": [
+        "openai/gpt-5-nano"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [],
+      "openai": [
+        "gpt-5-pro"
+      ],
+      "openrouter": [
+        "openai/gpt-5-pro"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [],
+      "openai": [
+        "gpt-5.1"
+      ],
+      "openrouter": [
+        "openai/gpt-5.1"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [],
+      "openai": [
+        "gpt-5.1-codex"
+      ],
+      "openrouter": [
+        "openai/gpt-5.1-codex"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [],
+      "openai": [
+        "gpt-5.1-codex-max"
+      ],
+      "openrouter": [
+        "openai/gpt-5.1-codex-max"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [],
+      "openai": [
+        "gpt-5.1-codex-mini"
+      ],
+      "openrouter": [
+        "openai/gpt-5.1-codex-mini"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [],
+      "openai": [
+        "gpt-5.2"
+      ],
+      "openrouter": [
+        "openai/gpt-5.2"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [],
+      "openai": [
+        "gpt-5.2-codex"
+      ],
+      "openrouter": [
+        "openai/gpt-5.2-codex"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [],
+      "openai": [
+        "gpt-5.2-pro"
+      ],
+      "openrouter": [
+        "openai/gpt-5.2-pro"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [],
+      "openai": [
+        "gpt-5.3-codex"
+      ],
+      "openrouter": [
+        "openai/gpt-5.3-codex"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [],
+      "openai": [
+        "gpt-5.4"
+      ],
+      "openrouter": [
+        "openai/gpt-5.4"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [],
+      "openai": [
+        "gpt-5.4-mini"
+      ],
+      "openrouter": [
+        "openai/gpt-5.4-mini"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [],
+      "openai": [
+        "gpt-5.4-nano"
+      ],
+      "openrouter": [
+        "openai/gpt-5.4-nano"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [],
+      "openai": [
+        "gpt-5.4-pro"
+      ],
+      "openrouter": [
+        "openai/gpt-5.4-pro"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [],
+      "openai": [
+        "gpt-audio"
+      ],
+      "openrouter": [
+        "openai/gpt-audio"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [],
+      "openai": [
+        "gpt-audio-mini"
+      ],
+      "openrouter": [
+        "openai/gpt-audio-mini"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [],
+      "openai": [
+        "o1"
+      ],
+      "openrouter": [
+        "openai/o1"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [],
+      "openai": [
+        "o1-pro"
+      ],
+      "openrouter": [
+        "openai/o1-pro"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [],
+      "openai": [
+        "o3"
+      ],
+      "openrouter": [
+        "openai/o3"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [],
+      "openai": [
+        "o3-mini"
+      ],
+      "openrouter": [
+        "openai/o3-mini"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [],
+      "openai": [
+        "o4-mini"
+      ],
+      "openrouter": [
+        "openai/o4-mini"
+      ]
+    },
+    {
+      "anthropic": [],
+      "google": [],
+      "openai": [
+        "o4-mini-deep-research"
+      ],
+      "openrouter": [
+        "openai/o4-mini-deep-research"
+      ]
+    }
+  ],
+  "generatedAt": "2026-04-24T15:21:41Z",
+  "schemaVersion": 1
+}

@@ -408,6 +408,8 @@ export interface SendUserMessageInput {
   origin?: MessageOrigin
   role?: MessageRole
   now?: number
+  messageId?: MessageId
+  turnId?: TurnId
 }
 
 export async function sendUserMessage(
@@ -419,8 +421,8 @@ export async function sendUserMessage(
   const origin = input.origin ?? 'user'
   const all = await repo.listMessages(chatId)
   const parentId = resolveActiveLeafId(all, cursor)
-  const messageId = newId()
-  const turnId = newId()
+  const messageId = input.messageId ?? newId()
+  const turnId = input.turnId ?? newId()
   // Pre-fetch chat + global calibration outside the mutation — both are
   // read-only reference data and we don't want to hold them under the
   // scope lock. Chat lookup may miss for brand-new chats (first message)
@@ -556,6 +558,8 @@ export async function editMessageContent(
     ? calibrationFieldsForEdit(
         input.content,
         target.originalCharCount,
+        target.originalModelId,
+        target.originalCalibrationKey,
         currentModelId,
         chatForRatio,
         globalCal,

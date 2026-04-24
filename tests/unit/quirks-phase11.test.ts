@@ -79,7 +79,7 @@ describe('reasoningPreservationFormat', () => {
   })
 
   it('DeepSeek / Qwen / Gemma → unknown', () => {
-    expect(reasoningPreservationFormatFor('deepseek/deepseek-v3.2')).toBe('unknown')
+    expect(reasoningPreservationFormatFor('deepseek/deepseek-v4-pro')).toBe('unknown')
     expect(reasoningPreservationFormatFor('qwen/qwen3.6-plus')).toBe('unknown')
     expect(reasoningPreservationFormatFor('google/gemma-4-31b-it')).toBe('unknown')
   })

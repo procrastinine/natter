@@ -69,6 +69,9 @@ describe('splitResponsesStream — streaming fixture (probe 5)', () => {
         l.lane === 'reasoning' && l.summaryDelta !== undefined,
     )
     expect(summaryDeltas.length).toBeGreaterThan(1)
+    expect(summaryDeltas.every((l) => typeof l.itemId === 'string')).toBe(true)
+    expect(summaryDeltas.every((l) => typeof l.summaryIndex === 'number')).toBe(true)
+    expect(new Set(summaryDeltas.map((l) => l.itemId)).size).toBe(1)
     const joinedSummary = summaryDeltas.map((l) => l.summaryDelta ?? '').join('')
     expect(joinedSummary).toMatch(/consecutive/i)
 
@@ -142,6 +145,9 @@ describe('splitResponsesStream — buffered result (probe 6)', () => {
     )
     expect(reasoning.some((r) => r.encryptedDelta?.startsWith('gAAA'))).toBe(true)
     expect(reasoning.some((r) => typeof r.summaryDelta === 'string')).toBe(true)
+    const bufferedSummary = reasoning.find((r) => typeof r.summaryDelta === 'string')
+    expect(bufferedSummary?.itemId).toBe(buffered.output?.[0]?.id)
+    expect(bufferedSummary?.summaryIndex).toBe(0)
 
     // Text lane emits the message content once.
     const text = lanes.filter((l) => l.lane === 'text')

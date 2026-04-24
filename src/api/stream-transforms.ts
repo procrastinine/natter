@@ -39,6 +39,7 @@ import {
   createInlineReasoningLifter,
   type InlineReasoningLifter,
 } from '../core/reasoning-inline'
+import { isOpenAiResponsesFamilyFormat } from '../core/reasoning'
 import type { MessagePhase } from '../core/types'
 
 // Lane-tagged events consumed by the message accumulator. Phase 7 defined the
@@ -50,7 +51,8 @@ import type { MessagePhase } from '../core/types'
 //   - `server-tool` — typed status events for web_search_call et al.
 //   - `phase` — emitted on `output_item.done` when the item carries a `phase`
 //     field; accumulator pins it on the corresponding `Message`.
-//   - `reasoning` gains `summaryDelta`, `encryptedDelta`, `outputIndex`.
+//   - `reasoning` gains `summaryDelta`, `encryptedDelta`, `outputIndex`,
+//     and provider `itemId` when the upstream exposes one.
 //   - `text` gains `outputIndex` + `contentIndex`.
 export type StreamLaneEvent =
   | { lane: 'text'; text: string; chunkId?: string; outputIndex?: number; contentIndex?: number }
@@ -67,12 +69,14 @@ export type StreamLaneEvent =
       details?: unknown[]
       chunkId?: string
       outputIndex?: number
+      itemId?: string
       // `summaryIndex` identifies which summary PART within a reasoning
       // item a `summaryDelta` belongs to. Responses wire exposes this as
       // `summary_index` on `reasoning_summary_text.delta`; Gemini native
       // assigns a per-response counter to each `thought:true` part. The
-      // accumulator keys summary rows by (outputIndex, summaryIndex) so
-      // multiple distinct summary parts in one item stay separate.
+      // accumulator uses `(itemId, summaryIndex)` when available so
+      // incremental deltas and buffered-result fallbacks all converge on the
+      // same summary row.
       summaryIndex?: number
     }
   | {
@@ -438,14 +442,32 @@ function reasoningDetailsMirrorText(reasoningText: string, details: unknown[] | 
   if (!details || details.length === 0) return false
   let merged = ''
   let sawText = false
+  let mergedSummary = ''
+  let sawOpenAiSummary = false
   for (const raw of details) {
     if (!raw || typeof raw !== 'object') continue
-    const detail = raw as { type?: unknown; text?: unknown }
-    if (detail.type !== 'reasoning.text' || typeof detail.text !== 'string') continue
-    merged += detail.text
-    sawText = true
+    const detail = raw as {
+      type?: unknown
+      text?: unknown
+      summary?: unknown
+      format?: unknown
+    }
+    if (detail.type === 'reasoning.text' && typeof detail.text === 'string') {
+      merged += detail.text
+      sawText = true
+      continue
+    }
+    if (
+      detail.type === 'reasoning.summary' &&
+      typeof detail.summary === 'string' &&
+      typeof detail.format === 'string' &&
+      isOpenAiResponsesFamilyFormat(detail.format as import('../core/types').ReasoningFormat)
+    ) {
+      mergedSummary += detail.summary
+      sawOpenAiSummary = true
+    }
   }
-  return sawText && merged === reasoningText
+  return (sawText && merged === reasoningText) || (sawOpenAiSummary && mergedSummary === reasoningText)
 }
 
 // ---------------------------------------------------------------------------
@@ -544,6 +566,7 @@ function* splitResponsesEvent(ev: ResponsesEventWire): Generator<StreamLaneEvent
           encryptedDelta: e.item.encrypted_content,
           replaceEncrypted: true,
           outputIndex: e.output_index,
+          ...(typeof e.item.id === 'string' ? { itemId: e.item.id } : {}),
         }
       }
       // Server-tool items get a `server-tool` event on add too.
@@ -575,6 +598,7 @@ function* splitResponsesEvent(ev: ResponsesEventWire): Generator<StreamLaneEvent
           encryptedDelta: e.item.encrypted_content,
           replaceEncrypted: true,
           outputIndex: e.output_index,
+          ...(typeof e.item.id === 'string' ? { itemId: e.item.id } : {}),
         }
       }
       // Phase metadata rides on message items. GPT-5.4 family REQUIRES
@@ -607,6 +631,7 @@ function* splitResponsesEvent(ev: ResponsesEventWire): Generator<StreamLaneEvent
         lane: 'reasoning',
         textDelta: e.delta,
         outputIndex: e.output_index,
+        itemId: e.item_id,
       }
       return
     }
@@ -620,6 +645,7 @@ function* splitResponsesEvent(ev: ResponsesEventWire): Generator<StreamLaneEvent
         lane: 'reasoning',
         summaryDelta: e.delta,
         outputIndex: e.output_index,
+        itemId: e.item_id,
         summaryIndex: e.summary_index,
       }
       return
@@ -814,15 +840,18 @@ function* splitBufferedResponsesResult(
           encryptedDelta: item.encrypted_content,
           replaceEncrypted: true,
           outputIndex: idx,
+          ...(typeof item.id === 'string' ? { itemId: item.id } : {}),
         }
       }
       if (Array.isArray(item.summary)) {
-        for (const s of item.summary) {
+        for (const [summaryIndex, s] of item.summary.entries()) {
           if (s && typeof s === 'object' && typeof (s as { text?: unknown }).text === 'string') {
             yield {
               lane: 'reasoning',
               summaryDelta: (s as { text: string }).text,
               outputIndex: idx,
+              ...(typeof item.id === 'string' ? { itemId: item.id } : {}),
+              summaryIndex,
             }
           }
         }

@@ -13,10 +13,10 @@ export interface ProviderPreferenceRule {
 // Known-good OSS-model hosts, in rough preference order. Used by every
 // open-weights model below (DeepSeek, Qwen, Llama, Mistral, Gemma, etc).
 // Chutes is deliberately excluded — it doesn't train on prompts, but per
-// user report (2026-04-19) it retains prompts for an unknown period, so
-// `data_policies.json` flags it `retainsPrompts: true` with no retentionDays.
-// Pareto dominates it whenever a clean host is available; the user can
-// still manually pin it via `onlyProviders` if they accept the tradeoff.
+// user report (2026-04-19) it retains prompts for an unknown period. Live
+// OpenRouter policy data should make Pareto dominate it whenever a clean
+// host is available; the user can still manually include it if they
+// accept the tradeoff.
 // The user's curated list was: DeepInfra, Together, Novita, Parasail, Fireworks.
 const OSS_PREFERRED: readonly string[] = [
   'DeepInfra',
@@ -77,10 +77,10 @@ function ossRuleForLab(lab: string): ProviderPreferenceRule {
 // steer open-weights models to the known-good host list.
 //
 // DeepSeek direct is NEVER listed as a preferred host. It trains on
-// prompts, so `data_policies.json` marks it `training: true` and it's
-// hard-denied before ordering ever runs. Chutes is NEVER listed either;
-// it retains for an unknown period (user report 2026-04-19) and gets
-// dominated by any clean host via Pareto.
+// prompts, so live policy data should hard-deny it before ordering ever
+// runs. Chutes is NEVER listed either; it retains for an unknown period
+// (user report 2026-04-19) and gets dominated by any clean host via
+// Pareto when live policy data is available.
 export const PROVIDER_PREFERENCE: readonly ProviderPreferenceRule[] = [
   { match: /^openai\//, order: ['Azure', 'OpenAI'] },
   {

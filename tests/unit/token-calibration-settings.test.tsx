@@ -14,6 +14,15 @@ vi.mock('../../src/store/settings', () => {
     async setSetting<T>(key: string, value: T): Promise<void> {
       state.set(key, value)
     },
+    async updateSetting<T>(
+      key: string,
+      updater: (current: T | undefined) => T | undefined | Promise<T | undefined>,
+    ): Promise<T | undefined> {
+      const next = await updater(state.get(key) as T | undefined)
+      if (next === undefined) state.delete(key)
+      else state.set(key, next)
+      return next
+    },
     async deleteSetting(key: string): Promise<void> {
       state.delete(key)
     },
@@ -28,7 +37,7 @@ vi.mock('../../src/store/settings', () => {
 vi.mock('dexie-react-hooks', () => {
   return {
     useLiveQuery: <T,>(
-      query: () => Promise<T>,
+      _query: () => Promise<T>,
       _deps: unknown[],
       initial: T,
     ): T | undefined => {

@@ -26,10 +26,15 @@ import { useEffect, useMemo, useState } from 'react'
 import { activePath } from '../../core/active-path'
 import type { EffectiveCapability } from '../../core/capabilities'
 import {
+  DEFAULT_GLOBAL_PREFERENCES,
+  readGlobalPreferences,
+} from '../../core/global-settings'
+import {
   estimateSettingsPromptSize,
   type PromptSizeEstimate,
   UNLIMITED_CONTEXT,
 } from '../../core/prompt-size'
+import { readTokenCalibrationGlobal } from '../../core/token-calibration'
 import type { Chat } from '../../core/types'
 import { getChatDraft, loadChatMessages, updateChatSettings } from '../../store/chats'
 import { useChatStore } from '../../store/zustand/chatStore'
@@ -52,15 +57,36 @@ export function ContextPanel({
   estimateOverride = null,
   showMiddleOut = false,
 }: ContextPanelProps) {
-  const messages = useLiveQuery(() => loadChatMessages(chat.id), [chat.id], [])
-  const cursor = useChatStore((s) => s.cursors[chat.id] ?? EMPTY_CURSOR)
-  const draft = useLiveQuery(() => getChatDraft(chat.id).then((d) => d?.text ?? ''), [chat.id], '')
+  const needsLocalEstimate = estimateOverride === null
+  const messages = useLiveQuery(
+    () => (needsLocalEstimate ? loadChatMessages(chat.id) : Promise.resolve([])),
+    [chat.id, needsLocalEstimate],
+    [],
+  )
+  const cursor = useChatStore((s) => (needsLocalEstimate ? (s.cursors[chat.id] ?? EMPTY_CURSOR) : EMPTY_CURSOR))
+  const draft = useLiveQuery(
+    () =>
+      needsLocalEstimate ? getChatDraft(chat.id).then((d) => d?.text ?? '') : Promise.resolve(''),
+    [chat.id, needsLocalEstimate],
+    '',
+  )
+  const prefs = useLiveQuery(
+    () => (needsLocalEstimate ? readGlobalPreferences() : Promise.resolve(DEFAULT_GLOBAL_PREFERENCES)),
+    [needsLocalEstimate],
+    DEFAULT_GLOBAL_PREFERENCES,
+  )
+  const globalCalibration = useLiveQuery(
+    () => (needsLocalEstimate ? readTokenCalibrationGlobal() : Promise.resolve(null)),
+    [needsLocalEstimate],
+    null,
+  )
   // Flatten capability to a single providerCap number so the memo's
   // dependency array is primitive (capability objects can re-render the
   // parent without changing their prompt-cap). `null` disables cutoff when
   // capability hasn't loaded; once it does, the memo re-runs.
   const providerCap = capability?.maxPromptTokens ?? capability?.contextLength ?? null
   const localEstimate = useMemo(() => {
+    if (!needsLocalEstimate) return null
     const path = activePath(messages, cursor)
     return estimateSettingsPromptSize(
       chat.settings,
@@ -68,8 +94,25 @@ export function ContextPanel({
       draft ?? '',
       endpointTokenizer ?? null,
       providerCap,
+      undefined,
+      {
+        chatTokenCalibration: chat.tokenCalibration,
+        globalCalibration,
+        mode: prefs.tokenCalibrationMode,
+      },
     )
-  }, [messages, cursor, chat.settings, draft, endpointTokenizer, providerCap])
+  }, [
+    needsLocalEstimate,
+    messages,
+    cursor,
+    chat.settings,
+    chat.tokenCalibration,
+    draft,
+    endpointTokenizer,
+    providerCap,
+    globalCalibration,
+    prefs.tokenCalibrationMode,
+  ])
   const estimate = estimateOverride ?? localEstimate
 
   if (!chat.settings.model) {
@@ -107,6 +150,13 @@ export function ContextPanel({
     return (
       <section data-ui="settings-section" data-ui-section="context-control">
         <p data-ui="helper">Waiting for model capability…</p>
+      </section>
+    )
+  }
+  if (!estimate) {
+    return (
+      <section data-ui="settings-section" data-ui-section="context-control">
+        <p data-ui="helper">Waiting for prompt estimate…</p>
       </section>
     )
   }

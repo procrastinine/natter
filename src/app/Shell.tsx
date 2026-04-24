@@ -13,14 +13,13 @@ import {
   DEFAULT_GLOBAL_PREFERENCES,
   readGlobalPreferences,
 } from '../core/global-settings'
-import { resolvePrivacyForSend } from '../core/privacy-request'
 import {
-  estimateSettingsPromptSize,
   type PromptSizeEstimateInput,
   tokenizerFromSettings,
   UNLIMITED_CONTEXT,
 } from '../core/prompt-size'
 import { quirksFor } from '../core/quirks'
+import { charsPerToken, readTokenCalibrationGlobal } from '../core/token-calibration'
 import type { Chat, ChatId, ChatPreset, ConnectionProfile, CursorMap } from '../core/types'
 import { useBranchUrlSync } from '../hooks/useBranchUrlSync'
 import { recoverOrphans, useChat } from '../hooks/useChat'
@@ -84,33 +83,6 @@ const MODEL_AUTOSELECT_QUERY = {
   outputModalities: ['text', 'image', 'audio', 'file', 'video'],
 } as const
 
-// Estimate the tokens we'd actually send on the next turn so
-// `resolvePrivacyForSend` can grey out providers whose endpoint capacity
-// can't hold the current prompt. Includes the composer draft + the
-// reserved completion budget + the reasoning echo gated by the chat's
-// Include flags. Never writes back — this is pure routing math.
-async function computeNeededTokensForSend(
-  chat: Chat,
-  draftText: string,
-): Promise<number | undefined> {
-  try {
-    const messages = await loadChatMessages(chat.id)
-    const cursor = useChatStore.getState().cursors[chat.id] ?? EMPTY_CURSOR
-    const path = activePath(messages, cursor)
-    // Routes through `estimateSettingsPromptSize` so the head+tail cutoff
-    // applies when the user set `customMaxContext` — providers whose
-    // `max_prompt_tokens` is below the TRIMMED prompt size stay filtered;
-    // providers that can fit the trimmed size stay eligible.
-    const est = estimateSettingsPromptSize(chat.settings, path, draftText, null)
-    const reserveRaw = chat.settings.maxCompletionTokens
-    const reserve = reserveRaw === UNLIMITED_CONTEXT ? 0 : (reserveRaw ?? 0)
-    return est.total + reserve
-  } catch (err) {
-    console.error('computeNeededTokensForSend: failed', err)
-    return undefined
-  }
-}
-
 function profileRequiresKey(kind: ConnectionProfile['kind']): boolean {
   return kind !== 'custom' && kind !== 'llama-server'
 }
@@ -152,12 +124,14 @@ export function Shell() {
   const [chatModelOpen, setChatModelOpen] = useState(false)
   const [globalSettingsOpen, setGlobalSettingsOpen] = useState(false)
   const [composerSeed, setComposerSeed] = useState<string | null>(null)
+  const [composerDraft, setComposerDraft] = useState('')
   const [scrollState, setScrollState] = useState<ScrollState>('follow')
   const [importAtEndOpen, setImportAtEndOpen] = useState(false)
   const editTreeMode = useUiStore((s) => s.editTreeMode)
   const setEditTreeMode = useUiStore((s) => s.setEditTreeMode)
   const focusMode = useUiStore((s) => s.focusMode)
   const pushBanner = useToastStore((s) => s.pushBanner)
+  const pushToast = useToastStore((s) => s.push)
   const clearBannersByKind = useToastStore((s) => s.clearBannersByKind)
   const activeCursor = useChatStore((s) =>
     activeChatId ? (s.cursors[activeChatId] ?? EMPTY_CURSOR) : EMPTY_CURSOR,
@@ -242,6 +216,8 @@ export function Shell() {
     () => activePath(activeMessages ?? [], activeCursor),
     [activeMessages, activeCursor],
   )
+  const prefs = useLiveQuery(readGlobalPreferences, [], DEFAULT_GLOBAL_PREFERENCES)
+  const globalCalibration = useLiveQuery(readTokenCalibrationGlobal, [], null)
   const trailingLeaf = useMemo(() => activePathMemo.at(-1) ?? null, [activePathMemo])
   const trailingUserMessage = trailingLeaf?.role === 'user' ? trailingLeaf : null
   const streamActivityKey = useStreamStore((s) =>
@@ -264,6 +240,14 @@ export function Shell() {
     if (!resolvedActiveChatRow) return null
     const quirks = quirksFor(resolvedActiveChatRow.settings.model)
     const tokenizer = tokenizerFromSettings(resolvedActiveChatRow.settings, null)
+    const currentTextCharsPerToken = resolvedActiveChatRow.settings.model
+      ? charsPerToken(
+          resolvedActiveChatRow.settings.model,
+          resolvedActiveChatRow,
+          globalCalibration,
+          prefs.tokenCalibrationMode,
+        )
+      : undefined
     const cutPlan = computeCutoffPlan({
       messages: activePathMemo,
       settings: resolvedActiveChatRow.settings,
@@ -277,20 +261,31 @@ export function Shell() {
           ? { reasoningPreservationFormat: quirks.reasoningPreservationFormat }
           : {}),
       },
+      currentModelId: resolvedActiveChatRow.settings.model,
+      ...(currentTextCharsPerToken !== undefined ? { currentTextCharsPerToken } : {}),
     })
     const input: PromptSizeEstimateInput = {
       systemPrompt: resolvedActiveChatRow.settings.systemPrompt,
       activePathMessages: cutPlan.kept,
-      draftText: '',
+      draftText: composerDraft,
       tokenizer,
       reasoningInclude: resolvedActiveChatRow.settings.reasoning.include,
       reasoningExcluded: resolvedActiveChatRow.settings.reasoning.exclude === true,
+      currentModelId: resolvedActiveChatRow.settings.model,
+      ...(currentTextCharsPerToken !== undefined ? { currentTextCharsPerToken } : {}),
     }
     if (quirks.reasoningPreservationFormat !== undefined) {
       input.reasoningPreservationFormat = quirks.reasoningPreservationFormat
     }
     return input
-  }, [resolvedActiveChatRow, activePathMemo, composerProviderCap])
+  }, [
+    resolvedActiveChatRow,
+    activePathMemo,
+    composerDraft,
+    composerProviderCap,
+    globalCalibration,
+    prefs.tokenCalibrationMode,
+  ])
   const deferredTokenEstimateInput = useDeferredValue(tokenEstimateInput)
   const tokenEstimate = useStreamStablePromptEstimate(
     resolvedActiveChatRow?.id,
@@ -344,7 +339,6 @@ export function Shell() {
     return window.localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === '1'
   })
   const scrollRef = useRef<ScrollRegionHandle>(null)
-  const prefs = useLiveQuery(readGlobalPreferences, [], DEFAULT_GLOBAL_PREFERENCES)
   const abortActiveChat = useCallback(() => {
     if (!activeChatId) return
     useStreamStore.getState().abortChat(activeChatId)
@@ -493,9 +487,79 @@ export function Shell() {
     })
   }, [activeChatId, routedChatExists, pushBanner, clearBannersByKind])
 
-  const materializeChatFromComposer = useCallback(
+  const failSend = useCallback(
+    (message: string, err?: unknown): never => {
+      console.error(message, err)
+      pushToast({ level: 'danger', text: message.replace(/^send: /, 'Send failed: ') })
+      throw err instanceof Error ? err : new Error(message)
+    },
+    [pushToast],
+  )
+
+  const handleSubmit = useCallback(
+    async (text: string) => {
+      if (!activeChatId) failSend('send: no active chat')
+      const chat = await getChat(activeChatId)
+      if (!chat) {
+        failSend('send: chat row missing', { chatId: activeChatId })
+      }
+      if (!chat.settings.profileId) {
+        failSend('send: chat.settings.profileId is empty — create the chat from a seeded preset')
+      }
+      if (!chat.settings.model) {
+        failSend('send: chat.settings.model is empty — no model selected')
+      }
+      const profile = await getProfile(chat.settings.profileId)
+      if (!profile) {
+        failSend('send: connection profile missing', { profileId: chat.settings.profileId })
+      }
+      let apiKey = ''
+      try {
+        apiKey = (await resolveKeyIfPresent(profile.apiKeyRef)) ?? ''
+        if (profileRequiresKey(profile.kind) && !apiKey) {
+          throw new Error('missing key')
+        }
+      } catch (err) {
+        failSend('send: resolveKey failed', err)
+      }
+      try {
+        const result = await send({
+          chatId: activeChatId,
+          connection: profile,
+          apiKey,
+          content: [{ type: 'text', text }],
+        })
+        if (result.outcome !== 'done') {
+          console.info('send: stream ended with outcome', result.outcome, result.error?.kind)
+        }
+      } catch (err) {
+        failSend('send: pipeline threw', err)
+      }
+      await bumpProfileLastUsedAt(profile.id)
+      if (chat.presetId) await bumpPresetLastUsedAt(chat.presetId)
+      await bumpRecentModel(chat.settings.model)
+    },
+    [activeChatId, failSend, send],
+  )
+
+  const handleNewChatSubmit = useCallback(
     async (text: string) => {
       const { preset, settings } = await resolveNewChatSeed()
+      if (!settings.profileId) failSend('send: chat.settings.profileId is empty — no profile selected')
+      if (!settings.model) failSend('send: chat.settings.model is empty — no model selected')
+      const profile = await getProfile(settings.profileId)
+      if (!profile) {
+        failSend('send: connection profile missing', { profileId: settings.profileId })
+      }
+      let apiKey = ''
+      try {
+        apiKey = (await resolveKeyIfPresent(profile.apiKeyRef)) ?? ''
+        if (profileRequiresKey(profile.kind) && !apiKey) {
+          throw new Error('missing key')
+        }
+      } catch (err) {
+        failSend('send: resolveKey failed', err)
+      }
       writeActiveSeedState({
         profileId: settings.profileId || null,
         presetId: preset?.id ?? null,
@@ -506,136 +570,24 @@ export function Shell() {
         ...(preset ? { presetId: preset.id } : {}),
       })
       navigateToChat(chat.id)
-      return { chat, seedText: text }
-    },
-    [resolveNewChatSeed],
-  )
-
-  const handleSubmit = useCallback(
-    async (text: string) => {
-      if (!activeChatId) return
-      const chat = await getChat(activeChatId)
-      if (!chat) {
-        console.error('send: chat row missing', { chatId: activeChatId })
-        return
-      }
-      if (!chat.settings.profileId) {
-        console.error(
-          'send: chat.settings.profileId is empty — create the chat from a seeded preset',
-        )
-        return
-      }
-      if (!chat.settings.model) {
-        console.error('send: chat.settings.model is empty — no model selected')
-        return
-      }
-      const profile = await getProfile(chat.settings.profileId)
-      if (!profile) {
-        console.error('send: connection profile missing', { profileId: chat.settings.profileId })
-        return
-      }
-      let apiKey = ''
-      try {
-        apiKey = (await resolveKeyIfPresent(profile.apiKeyRef)) ?? ''
-        if (profileRequiresKey(profile.kind) && !apiKey) {
-          console.error('send: resolveKey failed', new Error('missing key'))
-          return
-        }
-      } catch (err) {
-        console.error('send: resolveKey failed', err)
-        return
-      }
-      // Compute the tokens we'd actually send right now so providers that
-      // can't fit the current prompt are transiently excluded from the
-      // wire's `provider.ignore` list. The picker UI keeps them checked
-      // (the user's persisted intent stands); send just skips them until
-      // the chat shrinks or the user switches models.
-      const neededTokens = await computeNeededTokensForSend(chat, text)
-      const privacy = await resolvePrivacyForSend({
-        chat,
-        profile,
-        ...(neededTokens !== undefined ? { neededTokens } : {}),
-      })
-      if (privacy.filter?.zeroEligible) {
-        // Every endpoint was hard-denied or Pareto-excluded for this
-        // model. Surface the §10.13.1 modal so the user can pick a
-        // recovery action rather than silently sending to a training
-        // provider. The composer keeps the draft text in place so the
-        // modal can retry-send after the user resolves it.
-        useUiStore.getState().setZeroEligibleChatId(activeChatId)
-        return
-      }
-      try {
-        const result = await send({
-          chatId: activeChatId,
-          connection: profile,
-          apiKey,
-          content: [{ type: 'text', text }],
-          ...(privacy.wire ? { transform: { privacy: privacy.wire } } : {}),
-        })
-        if (result.outcome !== 'done') {
-          console.info('send: stream ended with outcome', result.outcome, result.error?.kind)
-        }
-      } catch (err) {
-        console.error('send: pipeline threw', err)
-        return
-      }
-      await bumpProfileLastUsedAt(profile.id)
-      if (chat.presetId) await bumpPresetLastUsedAt(chat.presetId)
-      await bumpRecentModel(chat.settings.model)
-    },
-    [activeChatId, send],
-  )
-
-  const handleNewChatSubmit = useCallback(
-    async (text: string) => {
-      const { chat } = await materializeChatFromComposer(text)
-      const profile = await getProfile(chat.settings.profileId)
-      if (!profile) {
-        console.error('send: connection profile missing', { profileId: chat.settings.profileId })
-        return
-      }
-      let apiKey = ''
-      try {
-        apiKey = (await resolveKeyIfPresent(profile.apiKeyRef)) ?? ''
-        if (profileRequiresKey(profile.kind) && !apiKey) {
-          console.error('send: resolveKey failed', new Error('missing key'))
-          return
-        }
-      } catch (err) {
-        console.error('send: resolveKey failed', err)
-        return
-      }
-      const neededTokens = await computeNeededTokensForSend(chat, text)
-      const privacy = await resolvePrivacyForSend({
-        chat,
-        profile,
-        ...(neededTokens !== undefined ? { neededTokens } : {}),
-      })
-      if (privacy.filter?.zeroEligible) {
-        useUiStore.getState().setZeroEligibleChatId(chat.id)
-        return
-      }
       try {
         const result = await send({
           chatId: chat.id,
           connection: profile,
           apiKey,
           content: [{ type: 'text', text }],
-          ...(privacy.wire ? { transform: { privacy: privacy.wire } } : {}),
         })
         if (result.outcome !== 'done') {
           console.info('send: stream ended with outcome', result.outcome, result.error?.kind)
         }
       } catch (err) {
-        console.error('send: pipeline threw', err)
-        return
+        failSend('send: pipeline threw', err)
       }
       await bumpProfileLastUsedAt(profile.id)
       if (chat.presetId) await bumpPresetLastUsedAt(chat.presetId)
       await bumpRecentModel(chat.settings.model)
     },
-    [materializeChatFromComposer, send],
+    [failSend, resolveNewChatSeed, send],
   )
 
   useEffect(() => {
@@ -781,6 +733,7 @@ export function Shell() {
                     : { sendBlockedReason: 'Add a connection to send messages.' })}
                   seed={composerSeed}
                   onSeedConsumed={() => setComposerSeed(null)}
+                  onDraftChange={setComposerDraft}
                   sendShortcut={prefs.sendShortcut}
                   onImportAtEnd={() => setImportAtEndOpen(true)}
                   {...(tokenBudgetIndicator ? { tokenBudget: tokenBudgetIndicator } : {})}
@@ -825,6 +778,7 @@ export function Shell() {
                   : { sendBlockedReason: 'Add a connection to send messages.' })}
                 seed={composerSeed}
                 onSeedConsumed={() => setComposerSeed(null)}
+                onDraftChange={setComposerDraft}
                 sendShortcut={prefs.sendShortcut}
                 onImportAtEnd={() => setImportAtEndOpen(true)}
                 {...(tokenBudgetIndicator ? { tokenBudget: tokenBudgetIndicator } : {})}
@@ -914,6 +868,7 @@ export function Shell() {
                 : { sendBlockedReason: 'Add a connection to send messages.' })}
               seed={composerSeed}
               onSeedConsumed={() => setComposerSeed(null)}
+              onDraftChange={setComposerDraft}
               sendShortcut={prefs.sendShortcut}
               onImportAtEnd={() => setImportAtEndOpen(true)}
               {...(tokenBudgetIndicator ? { tokenBudget: tokenBudgetIndicator } : {})}

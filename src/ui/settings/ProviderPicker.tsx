@@ -19,7 +19,20 @@
 import { useLiveQuery } from 'dexie-react-hooks'
 import { useCallback, useMemo, useState } from 'react'
 import { activePath } from '../../core/active-path'
+import {
+  DEFAULT_GLOBAL_PREFERENCES,
+  readGlobalPreferences,
+} from '../../core/global-settings'
 import { estimateSettingsPromptSize, UNLIMITED_CONTEXT } from '../../core/prompt-size'
+import {
+  endpointMatchesProviderRef,
+  providerDisplayLabel,
+  providerDisplayName,
+  providerEndpointKey,
+  providerRoutingRef,
+  resolveProviderRefsToRoutingRefs,
+} from '../../core/provider-identity'
+import { readTokenCalibrationGlobal } from '../../core/token-calibration'
 import type {
   Chat,
   ModelEndpoint,
@@ -50,14 +63,42 @@ export function ProviderPicker({ chat, routing, neededTokens: neededTokensOverri
   const { endpoints, filter, loading, isFreeModel, scrapeApplicable, refresh } = routing
   const prefs = chat.settings.providerPrefs ?? {}
   const manualOrdered = useMemo(() => orderEndpoints(endpoints, prefs), [endpoints, prefs])
-  const rows = useMemo(() => buildPickerRows(manualOrdered, filter), [manualOrdered, filter])
+  const rows = useMemo(
+    () =>
+      loading && scrapeApplicable && !filter
+        ? []
+        : buildPickerRows(manualOrdered, filter, {
+            providerPrefs: prefs,
+            privacy: chat.settings.privacy,
+          }),
+    [manualOrdered, filter, prefs, chat.settings.privacy, loading, scrapeApplicable],
+  )
+  const needsLocalNeededTokens = neededTokensOverride === undefined
 
-  const messages = useLiveQuery(() => loadChatMessages(chat.id), [chat.id], [])
-  const cursor = useChatStore((s) => s.cursors[chat.id] ?? EMPTY_CURSOR)
+  const messages = useLiveQuery(
+    () => (needsLocalNeededTokens ? loadChatMessages(chat.id) : Promise.resolve([])),
+    [chat.id, needsLocalNeededTokens],
+    [],
+  )
+  const cursor = useChatStore((s) =>
+    needsLocalNeededTokens ? (s.cursors[chat.id] ?? EMPTY_CURSOR) : EMPTY_CURSOR,
+  )
   const draft = useLiveQuery(
-    () => getChatDraft(chat.id).then((d) => d?.text ?? ''),
-    [chat.id],
+    () =>
+      needsLocalNeededTokens ? getChatDraft(chat.id).then((d) => d?.text ?? '') : Promise.resolve(''),
+    [chat.id, needsLocalNeededTokens],
     '',
+  )
+  const globalPrefs = useLiveQuery(
+    () =>
+      needsLocalNeededTokens ? readGlobalPreferences() : Promise.resolve(DEFAULT_GLOBAL_PREFERENCES),
+    [needsLocalNeededTokens],
+    DEFAULT_GLOBAL_PREFERENCES,
+  )
+  const globalCalibration = useLiveQuery(
+    () => (needsLocalNeededTokens ? readTokenCalibrationGlobal() : Promise.resolve(null)),
+    [needsLocalNeededTokens],
+    null,
   )
   // Provider filter uses the CURRENT estimate (tokens we'd actually send
   // right now, including reasoning echo) + the reserved completion budget.
@@ -67,22 +108,47 @@ export function ProviderPicker({ chat, routing, neededTokens: neededTokensOverri
   const neededTokens = useMemo(() => {
     if (neededTokensOverride !== undefined) return neededTokensOverride
     const path = activePath(messages, cursor)
-    const est = estimateSettingsPromptSize(chat.settings, path, draft ?? '', routing.descriptor?.architecture?.tokenizer ?? null)
+    const est = estimateSettingsPromptSize(
+      chat.settings,
+      path,
+      draft ?? '',
+      routing.descriptor?.architecture?.tokenizer ?? null,
+      null,
+      undefined,
+      {
+        chatTokenCalibration: chat.tokenCalibration,
+        globalCalibration,
+        mode: globalPrefs.tokenCalibrationMode,
+      },
+    )
     const reserveRaw = chat.settings.maxCompletionTokens
     const reserve = reserveRaw === UNLIMITED_CONTEXT ? 0 : (reserveRaw ?? 0)
     return est.total + reserve
-  }, [neededTokensOverride, messages, cursor, chat.settings, draft, routing.descriptor?.architecture?.tokenizer])
+  }, [
+    neededTokensOverride,
+    messages,
+    cursor,
+    chat.settings,
+    chat.tokenCalibration,
+    draft,
+    routing.descriptor?.architecture?.tokenizer,
+    globalCalibration,
+    globalPrefs.tokenCalibrationMode,
+  ])
 
   const updatePrefs = useCallback(
     (patch: Partial<ProviderPreferences>) => {
       const next: ProviderPreferences = { ...(chat.settings.providerPrefs ?? {}), ...patch }
+      delete next.dataCollection
+      delete next.zdr
+      if (patch.ignore !== undefined) delete next.only
       void updateChatSettings(chat.id, { providerPrefs: next })
     },
     [chat.id, chat.settings.providerPrefs],
   )
 
   const toggleProvider = useCallback(
-    (providerName: string, enabled: boolean) => {
+    (providerRef: string, enabled: boolean) => {
       // Unified allowed/disallowed model:
       //   - `prefs.ignoreOverridesFilter=true` means "user touched the
       //     picker; trust their `ignore` list verbatim."
@@ -93,29 +159,64 @@ export function ProviderPicker({ chat, routing, neededTokens: neededTokensOverri
       // only auto-excluded row yields `ignore=[]` but the Override flag
       // still pins us into user-authoritative mode.
       const alreadyTouched = prefs.ignoreOverridesFilter === true
+      const legacyPrivacyRefs =
+        chat.settings.privacy.ignoreProviders.length > 0 ||
+        chat.settings.privacy.onlyProviders.length > 0
       const base = alreadyTouched
-        ? new Set(prefs.ignore)
-        : new Set((filter?.excluded ?? []).map((e) => e.endpoint.provider_name))
-      if (enabled) base.delete(providerName)
-      else base.add(providerName)
-      updatePrefs({ ignore: [...base], ignoreOverridesFilter: true })
+        ? new Set(resolveProviderRefsToRoutingRefs(endpoints, prefs.ignore, { preserveUnknown: true }))
+        : new Set((filter?.excluded ?? []).map((e) => providerRoutingRef(e.endpoint)))
+      if (legacyPrivacyRefs) {
+        for (const ref of resolveProviderRefsToRoutingRefs(endpoints, chat.settings.privacy.ignoreProviders, {
+          preserveUnknown: true,
+        })) {
+          base.add(ref)
+        }
+        for (const row of filter?.excluded ?? []) {
+          if (row.reasons.includes('not-in-only-list')) base.add(providerRoutingRef(row.endpoint))
+        }
+      }
+      if (enabled) base.delete(providerRef)
+      else base.add(providerRef)
+      const nextPrefs: ProviderPreferences = {
+        ...(chat.settings.providerPrefs ?? {}),
+        ignore: [...base],
+        ignoreOverridesFilter: true,
+      }
+      delete nextPrefs.only
+      delete nextPrefs.dataCollection
+      delete nextPrefs.zdr
+      if (!legacyPrivacyRefs) {
+        void updateChatSettings(chat.id, { providerPrefs: nextPrefs })
+        return
+      }
+      void updateChatSettings(chat.id, {
+        providerPrefs: nextPrefs,
+        privacy: {
+          ...chat.settings.privacy,
+          ignoreProviders: [],
+          onlyProviders: [],
+        },
+      })
     },
-    [prefs.ignore, prefs.ignoreOverridesFilter, filter, updatePrefs],
+    [chat.id, chat.settings.providerPrefs, chat.settings.privacy, endpoints, prefs.ignore, prefs.ignoreOverridesFilter, filter],
   )
 
   const moveBy = useCallback(
-    (providerName: string, delta: 1 | -1) => {
-      const current = [...(prefs.order ?? manualOrdered.map((e) => e.provider_name))]
-      const idx = current.indexOf(providerName)
-      if (idx < 0) current.push(providerName)
-      const from = current.indexOf(providerName)
+    (providerRef: string, delta: 1 | -1) => {
+      const current =
+        prefs.order && prefs.order.length > 0
+          ? resolveProviderRefsToRoutingRefs(endpoints, prefs.order, { preserveUnknown: true })
+          : manualOrdered.map((e) => providerRoutingRef(e))
+      const idx = current.indexOf(providerRef)
+      if (idx < 0) current.push(providerRef)
+      const from = current.indexOf(providerRef)
       const to = Math.max(0, Math.min(current.length - 1, from + delta))
       if (from === to) return
       current.splice(from, 1)
-      current.splice(to, 0, providerName)
+      current.splice(to, 0, providerRef)
       updatePrefs({ order: current })
     },
-    [manualOrdered, prefs.order, updatePrefs],
+    [endpoints, manualOrdered, prefs.order, updatePrefs],
   )
 
   const setSort = useCallback(
@@ -228,24 +329,20 @@ export function ProviderPicker({ chat, routing, neededTokens: neededTokensOverri
             const epCap = row.endpoint.max_prompt_tokens ?? row.endpoint.context_length
             const insufficient =
               epCap !== undefined && epCap > 0 && neededTokens > epCap
-            // Allowed = ignoreOverridesFilter ? !prefs.ignore : kept.
-            // Two different sources of truth depending on whether the user
-            // has taken over from the filter. Insufficient-context always
-            // forces unchecked regardless.
-            const userTouched = prefs.ignoreOverridesFilter === true
-            const name = row.endpoint.provider_name
-            const allowed = userTouched
-              ? !(prefs.ignore ?? []).includes(name)
-              : row.state === 'kept'
+            const ref = providerRoutingRef(row.endpoint)
+            const key = providerEndpointKey(row.endpoint)
+            const label = providerDisplayLabel(row.endpoint, endpoints)
+            const allowed = row.state === 'kept'
             return (
               <ProviderRow
-                key={`${name}:${idx}`}
+                key={`${key}:${idx}`}
                 row={row}
+                label={label}
                 allowed={allowed}
                 insufficientContext={insufficient}
-                onToggle={(on) => toggleProvider(name, on)}
-                onMoveUp={() => moveBy(name, -1)}
-                onMoveDown={() => moveBy(name, 1)}
+                onToggle={(on) => toggleProvider(ref, on)}
+                onMoveUp={() => moveBy(ref, -1)}
+                onMoveDown={() => moveBy(ref, 1)}
               />
             )
           })}
@@ -289,25 +386,26 @@ function orderEndpoints(
   prefs: ProviderPreferences,
 ): ModelEndpoint[] {
   const order = prefs.order ?? []
-  const byName = new Map<string, ModelEndpoint>()
-  for (const ep of endpoints) byName.set(ep.provider_name, ep)
   const out: ModelEndpoint[] = []
   const seen = new Set<string>()
-  for (const name of order) {
-    const hit = byName.get(name)
-    if (hit && !seen.has(name)) {
-      out.push(hit)
-      seen.add(name)
+  for (const ref of order) {
+    for (const ep of endpoints) {
+      const key = providerEndpointKey(ep)
+      if (seen.has(key)) continue
+      if (!endpointMatchesProviderRef(ep, ref, endpoints)) continue
+      out.push(ep)
+      seen.add(key)
     }
   }
   for (const ep of endpoints) {
-    if (!seen.has(ep.provider_name)) out.push(ep)
+    if (!seen.has(providerEndpointKey(ep))) out.push(ep)
   }
   return out
 }
 
 function ProviderRow({
   row,
+  label,
   allowed,
   insufficientContext,
   onToggle,
@@ -315,6 +413,7 @@ function ProviderRow({
   onMoveDown,
 }: {
   row: PickerRow
+  label: string
   allowed: boolean
   insufficientContext: boolean
   onToggle: (enabled: boolean) => void
@@ -385,7 +484,7 @@ function ProviderRow({
             type="checkbox"
             checked={allowed}
             onChange={(e) => onToggle(e.target.checked)}
-            aria-label={`Use ${endpoint.provider_name}`}
+            aria-label={`Use ${label}`}
             {...(insufficientContext
               ? {
                   title:
@@ -396,7 +495,7 @@ function ProviderRow({
           {row.state !== 'no-filter' ? (
             <PrivacyLock tier={row.tier} title={lockTitle} />
           ) : null}
-          <span data-ui="provider-picker-name">{endpoint.provider_name}</span>
+          <span data-ui="provider-picker-name">{label}</span>
         </label>
         <div data-ui="provider-picker-row-actions">
           <button
@@ -488,7 +587,10 @@ function providerDetailsTooltip(row: PickerRow): string {
 function providerDetailRows(row: PickerRow): Array<[string, string]> {
   const { endpoint, policy, policySynthesized } = row
   const rows: Array<[string, string]> = []
-  rows.push(['Provider', endpoint.provider_name])
+  rows.push(['Provider', providerDisplayName(endpoint)])
+  const routingRef = providerRoutingRef(endpoint)
+  if (routingRef !== endpoint.provider_name) rows.push(['Routing ref', routingRef])
+  if (endpoint.provider_model_id) rows.push(['Provider model', endpoint.provider_model_id])
   if (endpoint.status) rows.push(['Status', endpoint.status])
   if (endpoint.context_length) rows.push(['Context', endpoint.context_length.toLocaleString()])
   if (endpoint.max_prompt_tokens)
@@ -537,7 +639,7 @@ function providerDetailRows(row: PickerRow): Array<[string, string]> {
         : 'none',
     ])
     if (policy.requiresUserIDs) rows.push(['User IDs', 'required'])
-    if (policySynthesized) rows.push(['Source', 'worst-case (live data missing)'])
+    if (policySynthesized) rows.push(['Source', 'offline fallback (privacy data unavailable)'])
   }
   return rows
 }

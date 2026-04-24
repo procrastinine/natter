@@ -2,7 +2,7 @@
 //   1. Mode control — "adaptive" (tier-1 per-chat → tier-2 global → tier-3
 //      family anchor), "global-only" (skip per-chat), or "family-defaults-only"
 //      (hardcoded anchor regardless of learned calibration).
-//   2. Global rollup readout — per-model chars/token + sample count,
+//   2. Global rollup readout — per-bucket chars/token + sample count,
 //      summed across every chat the user has sent.
 //   3. Reset action — wipes the global rollup. Per-chat samples are not
 //      touched; they'll repopulate the global on next send.
@@ -14,6 +14,7 @@ import { useLiveQuery } from 'dexie-react-hooks'
 import { useCallback } from 'react'
 import type { TokenCalibrationMode } from '../../core/global-settings'
 import {
+  aggregateCalibrationSamples,
   readTokenCalibrationGlobal,
   writeTokenCalibrationGlobal,
 } from '../../core/token-calibration'
@@ -54,7 +55,9 @@ export function TokenCalibrationSettings({
   onModeChange: (value: TokenCalibrationMode) => void | Promise<void>
 }) {
   const global = useLiveQuery(readTokenCalibrationGlobal, [], null)
-  const entries = Object.entries(global?.byModel ?? {}).sort(([a], [b]) => a.localeCompare(b))
+  const entries = Object.entries(aggregateCalibrationSamples(global?.byModel)).sort(([a], [b]) =>
+    a.localeCompare(b),
+  )
   const selectedHelper = MODE_OPTIONS.find((o) => o.value === mode)?.helper ?? ''
 
   const onReset = useCallback(async () => {
@@ -82,7 +85,7 @@ export function TokenCalibrationSettings({
         <span data-ui="helper">{selectedHelper}</span>
       </div>
       <div data-ui="field-group">
-        <label>Global per-model averages</label>
+        <label>Global calibration buckets</label>
         {entries.length === 0 ? (
           <span data-ui="helper">
             No cross-chat samples yet. The global rollup updates on every successful send.

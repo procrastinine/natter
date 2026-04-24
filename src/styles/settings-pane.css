@@ -210,9 +210,9 @@
   font-size: var(--font-size-xs);
 }
 
-/* Calibration panel — per-model chars/token readout. Two-column dl
+/* Calibration panel — calibration-bucket chars/token readout. Two-column dl
  * matching the "quiet two-column breakdown" pattern used in MessageInfo
- * and ContextPanel. Long model ids truncate with ellipsis so the row
+ * and ContextPanel. Long bucket ids truncate with ellipsis so the row
  * never wraps. */
 [data-ui="calibration-list"] {
   display: flex;
