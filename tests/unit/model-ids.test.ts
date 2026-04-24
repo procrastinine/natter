@@ -14,6 +14,9 @@ describe('model identity normalization', () => {
     expect(canonicalModelSlug('claude-opus-4-7')).toBe('claude-opus-4.7')
     expect(canonicalModelSlug('anthropic/claude-opus-4.7')).toBe('claude-opus-4.7')
     expect(compatModelIdsMatch('claude-opus-4-7', 'anthropic/claude-opus-4.7')).toBe(true)
+    expect(deterministicStructuralModelId('gpt-5.5')).toBe('openai:gpt-5.5')
+    expect(canonicalModelSlug('openai/gpt-5.5-pro')).toBe('gpt-5.5-pro')
+    expect(compatModelIdsMatch('gpt-5.5', 'openai/gpt-5.5')).toBe(true)
   })
 
   it('maps Anthropic dated ids onto the undated OpenRouter slug', () => {
