@@ -31,11 +31,11 @@ button {
     border-color var(--duration-fast) var(--ease-standard);
 }
 
-button:hover:not(:disabled) {
+button:not([data-ui$="-scrim"]):hover:not(:disabled) {
   background: var(--color-bg-hover);
 }
 
-button:active:not(:disabled) {
+button:not([data-ui$="-scrim"]):active:not(:disabled) {
   background: var(--color-bg-active);
 }
 
