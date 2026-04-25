@@ -14,8 +14,10 @@
 // request's allowed providers by this axis — auto-excluded entries don't
 // appear on the wire. The visible picker sorts every row by the same metric,
 // including blocked rows, so toggling a provider doesn't move it around.
-// Reset clears both `providerPrefs` (order/ignore/sort) and privacy-side
-// manual overrides (only/ignoreProviders) in one operation.
+// Bulk select/deselect writes the same manual ignore override as row clicks,
+// leaving sort/order intact. Reset clears both `providerPrefs`
+// (order/ignore/sort) and privacy-side manual overrides
+// (only/ignoreProviders) in one operation.
 
 import { useLiveQuery } from 'dexie-react-hooks'
 import { useCallback, useMemo, useState } from 'react'
@@ -275,6 +277,28 @@ export function ProviderPicker({
     })
   }, [chat.id, chat.settings.privacy])
 
+  const setAllProviders = useCallback(
+    (enabled: boolean) => {
+      const nextPrefs: ProviderPreferences = {
+        ...(chat.settings.providerPrefs ?? {}),
+        ignore: enabled ? [] : displayOrdered.map((endpoint) => providerRoutingRef(endpoint)),
+        ignoreOverridesFilter: true,
+      }
+      delete nextPrefs.only
+      delete nextPrefs.dataCollection
+      delete nextPrefs.zdr
+      void updateChatSettings(chat.id, {
+        providerPrefs: nextPrefs,
+        privacy: {
+          ...chat.settings.privacy,
+          ignoreProviders: [],
+          onlyProviders: [],
+        },
+      })
+    },
+    [chat.id, chat.settings.providerPrefs, chat.settings.privacy, displayOrdered],
+  )
+
   if (!chat.settings.model) return null
 
   const privacyOverrides =
@@ -383,6 +407,26 @@ export function ProviderPicker({
         </p>
       ) : null}
       <footer data-ui="provider-picker-footer">
+        <button
+          type="button"
+          data-ui="field-inline-action"
+          onClick={() => setAllProviders(true)}
+          disabled={rows.length === 0}
+          aria-disabled={rows.length === 0}
+          title={rows.length === 0 ? 'No providers to select' : 'Select all providers'}
+        >
+          Select all
+        </button>
+        <button
+          type="button"
+          data-ui="field-inline-action"
+          onClick={() => setAllProviders(false)}
+          disabled={rows.length === 0}
+          aria-disabled={rows.length === 0}
+          title={rows.length === 0 ? 'No providers to deselect' : 'Deselect all providers'}
+        >
+          Deselect all
+        </button>
         {/*
           Always shown so users can "reset to default" at any time,
           even from a state the picker wouldn't normally flag as
