@@ -20,7 +20,9 @@
 
 import { useLiveQuery } from 'dexie-react-hooks'
 import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
+import { probeLlamaServer, type LlamaServerProps } from '../../api/probe'
 import { activePath } from '../../core/active-path'
+import { isTextCompletionsSelectableFor } from '../../core/quirks'
 import type { Chat, ChatId, ChatPreset, ConnectionKind, ConnectionProfile } from '../../core/types'
 import type { EffectiveCapability } from '../../core/capabilities'
 import {
@@ -31,7 +33,13 @@ import {
 } from '../../core/prompt-size'
 import { usePrivacyRouting } from '../../hooks/usePrivacyRouting'
 import { useStreamStablePromptEstimate } from '../../hooks/useStreamStablePromptEstimate'
-import { getChat, getChatDraft, loadChatMessages, setChatPreset, updateChatSettings } from '../../store/chats'
+import {
+  getChat,
+  getChatDraft,
+  loadChatMessages,
+  setChatPreset,
+  updateChatSettings,
+} from '../../store/chats'
 import {
   createPreset,
   deletePreset,
@@ -75,8 +83,7 @@ export function ChatModelPanel({ chatId, chatSnapshot = null, onClose }: ChatMod
     if (!liveChat) return
     chatCacheRef.current.set(liveChat.id, liveChat)
   }, [liveChat])
-  const chat =
-    liveChat ?? chatSnapshot ?? (chatId ? chatCacheRef.current.get(chatId) : undefined)
+  const chat = liveChat ?? chatSnapshot ?? (chatId ? chatCacheRef.current.get(chatId) : undefined)
 
   const liveProfile = useLiveQuery(
     () => (chat ? getProfile(chat.settings.profileId) : Promise.resolve(undefined)),
@@ -91,6 +98,21 @@ export function ChatModelPanel({ chatId, chatSnapshot = null, onClose }: ChatMod
   const profile =
     liveProfile ??
     (chat?.settings.profileId ? profileCacheRef.current.get(chat.settings.profileId) : undefined)
+  const [llamaProps, setLlamaProps] = useState<LlamaServerProps | null>(null)
+  useEffect(() => {
+    if (profile?.kind !== 'llama-server') {
+      setLlamaProps(null)
+      return
+    }
+    let cancelled = false
+    void probeLlamaServer({ baseUrl: profile.baseUrl }).then((result) => {
+      if (cancelled) return
+      setLlamaProps(result.kind === 'ok' ? result.props : null)
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [profile?.kind, profile?.baseUrl])
 
   const livePreset = useLiveQuery(
     () => (chat?.presetId ? getPreset(chat.presetId) : Promise.resolve(undefined)),
@@ -191,6 +213,14 @@ export function ChatModelPanel({ chatId, chatSnapshot = null, onClose }: ChatMod
   }
 
   const isOpenRouter = profile?.kind === 'openrouter'
+  const textTemplateMode =
+    isOpenRouter &&
+    chat.settings.api === 'text' &&
+    isTextCompletionsSelectableFor(chat.settings.model)
+      ? 'openrouter'
+      : profile?.kind === 'llama-server' && (chat.settings.protocol ?? 'chat') === 'text'
+        ? 'llama-server'
+        : null
 
   // Two distinct "no usable model" states, one banner either way:
   // 1. The chat has a model but the current connection doesn't serve it
@@ -264,7 +294,9 @@ export function ChatModelPanel({ chatId, chatSnapshot = null, onClose }: ChatMod
               <ProviderPicker
                 chat={chat}
                 routing={routing}
-                {...(providerNeededTokens !== undefined ? { neededTokens: providerNeededTokens } : {})}
+                {...(providerNeededTokens !== undefined
+                  ? { neededTokens: providerNeededTokens }
+                  : {})}
               />
             ) : null}
             {isOpenRouter ? <PrivacySection chat={chat} /> : null}
@@ -289,6 +321,8 @@ export function ChatModelPanel({ chatId, chatSnapshot = null, onClose }: ChatMod
             capability={capability}
             endpointTokenizer={endpointTokenizer}
             prefillRecommendationEndpoints={routing.endpoints}
+            textTemplateMode={textTemplateMode}
+            llamaProps={llamaProps}
           />
         ) : null}
       </div>
@@ -373,24 +407,18 @@ function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | u
     closePicker()
   }, [chat.id, chat.settings, pushToast, closePicker])
 
-  const renamePreset = useCallback(
-    async (targetId: string, currentName: string) => {
-      const name = window.prompt('Rename preset:', currentName)
-      if (!name || !name.trim() || name === currentName) return
-      await updatePreset(targetId, { name: name.trim() })
-    },
-    [],
-  )
+  const renamePreset = useCallback(async (targetId: string, currentName: string) => {
+    const name = window.prompt('Rename preset:', currentName)
+    if (!name || !name.trim() || name === currentName) return
+    await updatePreset(targetId, { name: name.trim() })
+  }, [])
 
-  const deletePresetWithConfirm = useCallback(
-    async (targetId: string, name: string) => {
-      if (!window.confirm(`Delete preset "${name}"? Chats stay; their preset link will clear.`)) {
-        return
-      }
-      await deletePreset(targetId)
-    },
-    [],
-  )
+  const deletePresetWithConfirm = useCallback(async (targetId: string, name: string) => {
+    if (!window.confirm(`Delete preset "${name}"? Chats stay; their preset link will clear.`)) {
+      return
+    }
+    await deletePreset(targetId)
+  }, [])
 
   return (
     <div data-ui="preset-breadcrumb">
@@ -465,11 +493,7 @@ function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | u
             </ul>
           )}
           <div data-ui="preset-menu-footer">
-            <button
-              type="button"
-              data-ui="field-inline-action"
-              onClick={() => void saveAsNew()}
-            >
+            <button type="button" data-ui="field-inline-action" onClick={() => void saveAsNew()}>
               + Save as new…
             </button>
             <button
@@ -507,12 +531,7 @@ function TrashIcon() {
 function CloseGlyph() {
   return (
     <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false" width="13" height="13">
-      <path
-        d="M4 4l8 8M12 4l-8 8"
-        stroke="currentColor"
-        strokeWidth="1.4"
-        strokeLinecap="round"
-      />
+      <path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
     </svg>
   )
 }

@@ -5,19 +5,10 @@ import { readGlobalPreferences } from './global-settings'
 import { estimateSettingsPromptSize, tokenizerFromSettings, UNLIMITED_CONTEXT } from './prompt-size'
 import { resolvePrivacyForSend, type ResolvePrivacyForSendResult } from './privacy-request'
 import { providerDisplayName, providerRoutingRef } from './provider-identity'
-import { quirksFor } from './quirks'
-import {
-  charsPerToken,
-  readTokenCalibrationGlobal,
-} from './token-calibration'
+import { isTextCompletionsSelectableFor, quirksFor } from './quirks'
+import { charsPerToken, readTokenCalibrationGlobal } from './token-calibration'
 import type { PromptEstimateOptions } from './tokens'
-import type {
-  CapabilityDescriptor,
-  Chat,
-  ChatSettings,
-  ConnectionProfile,
-  Message,
-} from './types'
+import type { CapabilityDescriptor, Chat, ChatSettings, ConnectionProfile, Message } from './types'
 import type {
   ChatCompletionsTransformOptions,
   GeminiNativeTransformOptions,
@@ -25,7 +16,7 @@ import type {
 } from './transforms'
 import { toChatCompletions, toGeminiNative, toResponses, toTextCompletions } from './transforms'
 import { applyContextCutoff } from './context-cutoff'
-import { resolveTextTemplate } from './text-templates'
+import { resolveTextTemplateFromLibrary } from './text-templates'
 import { getCachedModels } from '../store/models-cache'
 import { normalizeModelsResponse } from '../api/providers'
 import { logRequestPlanDebug } from '../lib/debug-streams'
@@ -41,8 +32,7 @@ const DIRECT_CAPABILITY_LOOKUP_QUERY = {} as const
 
 function idsEquivalent(left: string, right: string): boolean {
   return (
-    left.replace(/(\d)[.-](\d)(?=-|$)/g, '$1:$2') ===
-    right.replace(/(\d)[.-](\d)(?=-|$)/g, '$1:$2')
+    left.replace(/(\d)[.-](\d)(?=-|$)/g, '$1:$2') === right.replace(/(\d)[.-](\d)(?=-|$)/g, '$1:$2')
   )
 }
 
@@ -60,10 +50,7 @@ export async function resolveRequestCapability(
     return undefined
   }
   const bundled = resolveBundledCapability(profile, modelId)
-  const cachedModels = await getCachedModels(
-    profile.id,
-    DIRECT_CAPABILITY_LOOKUP_QUERY,
-  )
+  const cachedModels = await getCachedModels(profile.id, DIRECT_CAPABILITY_LOOKUP_QUERY)
   if (!cachedModels) return bundled
   const liveEntry =
     normalizeModelsResponse(cachedModels.payload).find((row) => idsEquivalent(row.id, modelId)) ??
@@ -128,8 +115,7 @@ export async function resolveRequestPrivacyPlan(
   } catch (err) {
     console.error('resolveRequestPrivacyPlan: failed to estimate prompt size', err)
   }
-  const chatForRequest =
-    settings === input.chat.settings ? input.chat : { ...input.chat, settings }
+  const chatForRequest = settings === input.chat.settings ? input.chat : { ...input.chat, settings }
   const privacy = await resolvePrivacyForSend({
     chat: chatForRequest,
     profile: input.profile,
@@ -253,6 +239,7 @@ function logPreparedPlan(
       contextIgnored: privacyPlan.privacy.contextIgnoredProviders,
       privacy: summarizePrivacy(privacyPlan.privacy),
     },
+    request: requestPlan.wire,
     wireShape: summarizeWireShape(requestPlan.wire),
   })
 }
@@ -304,6 +291,8 @@ function summarizePrivacy(privacy: ResolvePrivacyForSendResult): unknown {
 }
 
 function summarizeWireShape(wire: Record<string, unknown>): unknown {
+  const prompt = textPreview(wire.prompt)
+  const instructions = textPreview(wire.instructions)
   return {
     hasProvider: wire.provider !== undefined,
     hasMessages: Array.isArray(wire.messages),
@@ -311,9 +300,21 @@ function summarizeWireShape(wire: Record<string, unknown>): unknown {
     hasInput: Array.isArray(wire.input),
     input: Array.isArray(wire.input) ? wire.input.length : undefined,
     hasPrompt: typeof wire.prompt === 'string',
+    ...(prompt ? { prompt } : {}),
     hasInstructions: typeof wire.instructions === 'string',
+    ...(instructions ? { instructions } : {}),
     hasSystemInstruction: wire.systemInstruction !== undefined,
     stream: wire.stream,
+  }
+}
+
+function textPreview(value: unknown): { length: number; preview: string } | undefined {
+  if (typeof value !== 'string') return undefined
+  const limit = 240
+  if (value.length <= limit) return { length: value.length, preview: value }
+  return {
+    length: value.length,
+    preview: `${value.slice(0, limit - 1)}…`,
   }
 }
 
@@ -322,8 +323,13 @@ export async function buildAssistantRequestPlan(
 ): Promise<AssistantRequestPlan> {
   const settings = input.settings ?? input.chat.settings
   const stream = input.stream ?? true
+  const useOpenRouterTextProtocol =
+    settings.api === 'text' &&
+    input.connection.kind === 'openrouter' &&
+    isTextCompletionsSelectableFor(settings.model)
   const useTextProtocol =
-    settings.protocol === 'text' && input.connection.kind === 'llama-server'
+    (settings.protocol === 'text' && input.connection.kind === 'llama-server') ||
+    useOpenRouterTextProtocol
 
   const outboundCapCandidate =
     input.capabilities?.maxPromptTokens ?? input.capabilities?.contextLength
@@ -334,12 +340,7 @@ export async function buildAssistantRequestPlan(
     readGlobalPreferences(),
   ])
   const currentTextCharsPerToken = settings.model
-    ? charsPerToken(
-        settings.model,
-        input.chat,
-        globalCalibration,
-        globalPrefs.tokenCalibrationMode,
-      )
+    ? charsPerToken(settings.model, input.chat, globalCalibration, globalPrefs.tokenCalibrationMode)
     : undefined
   const outboundReasoningOpts: PromptEstimateOptions = {
     family: outboundTokenizer,
@@ -347,8 +348,7 @@ export async function buildAssistantRequestPlan(
     reasoningExcluded: settings.reasoning.exclude === true,
   }
   if (outboundQuirks.reasoningPreservationFormat !== undefined) {
-    outboundReasoningOpts.reasoningPreservationFormat =
-      outboundQuirks.reasoningPreservationFormat
+    outboundReasoningOpts.reasoningPreservationFormat = outboundQuirks.reasoningPreservationFormat
   }
   const outboundPath = applyContextCutoff({
     messages: input.pathMessages,
@@ -366,10 +366,14 @@ export async function buildAssistantRequestPlan(
   let geminiModelId: string | undefined
 
   if (useTextProtocol) {
-    const templateId = settings.textTemplate ?? 'chatml'
-    const template = resolveTextTemplate(templateId, settings.customTextTemplate)
+    const requestedTemplateId = settings.textTemplate ?? 'chatml'
+    const templateId =
+      requestedTemplateId === 'default' && input.connection.kind !== 'llama-server'
+        ? 'chatml'
+        : requestedTemplateId
+    const template = await resolveTextTemplateFromLibrary(templateId, settings.customTextTemplate)
     let prerenderedPrompt: string | undefined
-    if (templateId === 'default') {
+    if (templateId === 'default' && input.connection.kind === 'llama-server') {
       const messages: Array<{ role: string; content: string }> = []
       if (settings.systemPrompt.length > 0) {
         messages.push({ role: 'system', content: settings.systemPrompt })
@@ -391,11 +395,20 @@ export async function buildAssistantRequestPlan(
       stream,
       template,
       ...(input.capabilities ? { capabilities: input.capabilities } : {}),
+      allowProviderRouting: input.connection.kind === 'openrouter',
+      ...(input.transform?.privacy ? { privacy: input.transform.privacy } : {}),
       ...(prerenderedPrompt !== undefined ? { prerenderedPrompt } : {}),
     }
     const result = toTextCompletions(settings, outboundPath, textOpts)
     wire = result.wire as unknown as Record<string, unknown>
     requestedModel = result.requestedModel
+    if (useOpenRouterTextProtocol) {
+      route = {
+        kind: 'text-completions',
+        transport: 'openai-text',
+        reason: 'user pinned Text completions',
+      }
+    }
   } else {
     route = chooseApi(input.connection, settings, outboundPath, {
       quirks: quirksFor(settings.model),
@@ -410,9 +423,7 @@ export async function buildAssistantRequestPlan(
         rewriteSlug,
         allowProviderRouting: input.connection.kind === 'openrouter',
         ...(input.capabilities ? { capabilities: input.capabilities } : {}),
-        ...(routeFormat !== undefined
-          ? { reasoningPreservationFormat: routeFormat }
-          : {}),
+        ...(routeFormat !== undefined ? { reasoningPreservationFormat: routeFormat } : {}),
         ...(input.transform?.privacy ? { privacy: input.transform.privacy } : {}),
       }
       const result = toResponses(settings, outboundPath, transformOpts)
@@ -423,9 +434,7 @@ export async function buildAssistantRequestPlan(
         stream,
         rewriteSlug,
         ...(input.capabilities ? { capabilities: input.capabilities } : {}),
-        ...(routeFormat !== undefined
-          ? { reasoningPreservationFormat: routeFormat }
-          : {}),
+        ...(routeFormat !== undefined ? { reasoningPreservationFormat: routeFormat } : {}),
       }
       const result = toGeminiNative(settings, outboundPath, transformOpts)
       wire = result.wire as unknown as Record<string, unknown>

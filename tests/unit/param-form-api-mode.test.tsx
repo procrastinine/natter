@@ -9,10 +9,7 @@ import type { ConnectionProfile, Message, ModelEndpoint } from '../../src/core/t
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import { createChat, getChat } from '../../src/store/chats'
 import { __resetDbForTests, openDb } from '../../src/store/db'
-import {
-  ApiModeSection,
-  ReasoningIncludeControls,
-} from '../../src/ui/settings/ParamForm'
+import { ApiModeSection, ReasoningIncludeControls } from '../../src/ui/settings/ParamForm'
 
 const DB_NAME = 'natter'
 
@@ -70,11 +67,7 @@ describe('ApiModeSection — two-button toggle', () => {
     const chat = await createChat({ settings })
     const capability = effectiveCapabilityFromEndpoints(settings.model, [makeEndpoint()])
     render(
-      <ApiModeSection
-        chat={chat}
-        capability={capability}
-        profile={makeProfile('openrouter')}
-      />,
+      <ApiModeSection chat={chat} capability={capability} profile={makeProfile('openrouter')} />,
     )
     const chatBtn = screen.getByRole('button', { name: 'Chat completions' })
     const responsesBtn = screen.getByRole('button', { name: 'Responses' })
@@ -86,21 +79,36 @@ describe('ApiModeSection — two-button toggle', () => {
     expect(chatBtn.getAttribute('aria-pressed')).toBe('false')
   })
 
-  it('does not render for non-OpenAI models on OpenRouter (chat-only)', async () => {
+  it('renders closed-source chat-native text mode as disabled on OpenRouter', async () => {
     const settings = cloneDefaultChatSettings()
     settings.model = 'anthropic/claude-haiku-4.5'
     const chat = await createChat({ settings })
     const capability = effectiveCapabilityFromEndpoints(settings.model, [
       makeEndpoint({ supported_parameters: ['reasoning'] }),
     ])
-    const { container } = render(
-      <ApiModeSection
-        chat={chat}
-        capability={capability}
-        profile={makeProfile('openrouter')}
-      />,
+    render(
+      <ApiModeSection chat={chat} capability={capability} profile={makeProfile('openrouter')} />,
     )
-    expect(container.querySelector('[data-ui-section="api-mode"]')).toBeNull()
+    const chatBtn = screen.getByRole('button', { name: 'Chat completions' })
+    const textBtn = screen.getByRole('button', { name: 'Text completions' })
+    expect(chatBtn.getAttribute('aria-pressed')).toBe('true')
+    expect(textBtn).toBeDisabled()
+  })
+
+  it('persists Text completions for OpenRouter open-weight models', async () => {
+    const settings = cloneDefaultChatSettings()
+    settings.model = 'meta-llama/llama-3.3-70b-instruct'
+    const chat = await createChat({ settings })
+    const capability = effectiveCapabilityFromEndpoints(settings.model, [
+      makeEndpoint({ provider_name: 'Nebius', supported_parameters: ['provider', 'max_tokens'] }),
+    ])
+    render(
+      <ApiModeSection chat={chat} capability={capability} profile={makeProfile('openrouter')} />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Text completions' }))
+    await new Promise((r) => setTimeout(r, 20))
+    const updated = await getChat(chat.id)
+    expect(updated?.settings.api).toBe('text')
   })
 
   it('does not render on Google native (transport is a connection-level choice)', async () => {
@@ -111,11 +119,7 @@ describe('ApiModeSection — two-button toggle', () => {
       makeEndpoint({ supported_parameters: ['reasoning'] }),
     ])
     const { container } = render(
-      <ApiModeSection
-        chat={chat}
-        capability={capability}
-        profile={makeProfile('google')}
-      />,
+      <ApiModeSection chat={chat} capability={capability} profile={makeProfile('google')} />,
     )
     expect(container.querySelector('[data-ui-section="api-mode"]')).toBeNull()
   })
@@ -129,11 +133,7 @@ describe('ApiModeSection — two-button toggle', () => {
     const chat = await createChat({ settings })
     const capability = effectiveCapabilityFromEndpoints(settings.model, [makeEndpoint()])
     render(
-      <ApiModeSection
-        chat={chat}
-        capability={capability}
-        profile={makeProfile('openrouter')}
-      />,
+      <ApiModeSection chat={chat} capability={capability} profile={makeProfile('openrouter')} />,
     )
     fireEvent.click(screen.getByRole('button', { name: 'Chat completions' }))
     await new Promise((r) => setTimeout(r, 20))
@@ -157,11 +157,7 @@ describe('ApiModeSection — two-button toggle', () => {
     }) as typeof window.confirm
     try {
       render(
-        <ApiModeSection
-          chat={chat}
-          capability={capability}
-          profile={makeProfile('openrouter')}
-        />,
+        <ApiModeSection chat={chat} capability={capability} profile={makeProfile('openrouter')} />,
       )
       fireEvent.click(screen.getByRole('button', { name: 'Chat completions' }))
       await new Promise((r) => setTimeout(r, 20))
@@ -262,5 +258,20 @@ describe('ReasoningIncludeControls — three-checkbox gating', () => {
     expect((screen.getByLabelText(/Encrypted reasoning/) as HTMLInputElement).disabled).toBe(false)
     expect((screen.getByLabelText(/Visible summary/) as HTMLInputElement).disabled).toBe(false)
     expect((screen.getByLabelText(/Visible text/) as HTMLInputElement).disabled).toBe(false)
+  })
+
+  it('locks Send as think on for text completions', async () => {
+    const settings = cloneDefaultChatSettings()
+    settings.model = 'meta-llama/llama-3.3-70b-instruct'
+    settings.api = 'text'
+    settings.reasoning.include = { encrypted: false, summary: false, text: false }
+    settings.reasoning.echoAsThinkTags = false
+    const chat = await createChat({ settings })
+    const capability = effectiveCapabilityFromEndpoints(settings.model, [makeEndpoint()])
+    render(<ReasoningIncludeControls chat={chat} capability={capability} />)
+
+    const sendAsThink = screen.getByLabelText(/Send as/) as HTMLInputElement
+    expect(sendAsThink.checked).toBe(true)
+    expect(sendAsThink.disabled).toBe(true)
   })
 })

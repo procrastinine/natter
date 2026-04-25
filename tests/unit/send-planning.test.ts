@@ -315,4 +315,63 @@ describe('resolveRequestPrivacyPlan', () => {
     expect(requestPlan.wire.provider).toBeUndefined()
     expect(requestPlan.route?.kind).toBe('chat-completions')
   })
+
+  it('builds OpenRouter text-completions plans with the same provider routing inputs', async () => {
+    const model = 'meta-llama/llama-3.3-70b-instruct'
+    const profile = makeProfile()
+    const chat = makeChat({
+      model,
+      api: 'text',
+      textTemplate: 'chatml',
+      maxCompletionTokens: 32,
+      allowFallbacks: false,
+      providerPrefs: { only: ['Nebius'] },
+      reasoning: {
+        ...cloneDefaultChatSettings().reasoning,
+        mode: 'off',
+      },
+    })
+    await putCachedEndpoints(profile.id, model, {
+      id: model,
+      endpoints: [
+        {
+          provider_name: 'Nebius',
+          provider_slug: 'nebius',
+          supported_parameters: ['provider', 'reasoning', 'max_tokens'],
+          context_length: 200000,
+          pricing: {},
+        },
+      ],
+    })
+    await putCachedPrivacyPolicy(profile.id, model, {
+      policies: {
+        Nebius: {
+          training: false,
+          trainingOpenRouter: false,
+          retainsPrompts: false,
+          canPublish: false,
+          termsOfServiceURL: '',
+          privacyPolicyURL: '',
+        },
+      },
+      fetchedAt: 0,
+    })
+
+    const { requestPlan } = await prepareAssistantRequestPlan({
+      chat,
+      connection: profile,
+      pathMessages: [makeMessage('hello')],
+      draftText: '',
+    })
+
+    expect(requestPlan.useTextProtocol).toBe(true)
+    expect(requestPlan.route?.kind).toBe('text-completions')
+    expect(requestPlan.wire.prompt).toContain('<|im_start|>user\nhello<|im_end|>')
+    expect(requestPlan.wire.max_tokens).toBe(32)
+    expect(requestPlan.wire.reasoning).toEqual({ enabled: false })
+    expect(requestPlan.wire.provider).toMatchObject({
+      only: ['Nebius'],
+      allow_fallbacks: false,
+    })
+  })
 })

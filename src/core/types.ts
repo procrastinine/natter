@@ -27,7 +27,7 @@ export type MessageRole = 'system' | 'user' | 'assistant' | 'tool' | 'developer'
 
 export type MessageOrigin = 'user' | 'generated' | 'imported' | 'continued' | 'prefill'
 
-export type ApiVariant = 'auto' | 'chat' | 'responses'
+export type ApiVariant = 'auto' | 'chat' | 'responses' | 'text'
 
 export type MessagePhase = 'commentary' | 'final_answer'
 
@@ -447,12 +447,14 @@ export interface ChatSettings {
   // to /v1/completions with a pre-rendered prompt string. Undefined on
   // non-llama profiles. See `capabilities/llama-server.ts`.
   protocol?: 'chat' | 'text'
-  // Template id for protocol='text'. 'default' uses the server's own template
-  // via /apply-template; named ids (chatml, llama3, llama4, gemma, mistral,
-  // deepseek, vicuna, alpaca, commandr, phi) are rendered client-side from
-  // the bundled `TEXT_TEMPLATES` map; 'raw' concatenates messages verbatim
-  // with no separators (user keeps full control of the prompt); 'custom'
-  // uses the fields in `customTextTemplate`.
+  // Template id for text-completions prompt rendering. For llama-server,
+  // 'default' delegates to the GGUF/server chat_template via /apply-template.
+  // OpenRouter has no per-model embedded template surface, so 'default' is
+  // not offered there and stale values fall back to a client-rendered template.
+  // Built-in ids and user-defined global-template ids are resolved through
+  // `core/text-templates.ts`; 'raw' is a Jinja-style plaintext continuation
+  // template; 'custom' remains a per-chat legacy escape hatch via
+  // `customTextTemplate`.
   textTemplate?: TextTemplateId
   // Only read when `textTemplate === 'custom'`. The shape matches the
   // bundled templates so the renderer can use one code path. Empty strings
@@ -487,30 +489,18 @@ export interface GeminiChatSettings {
   cachedContentName?: string
 }
 
-export type TextTemplateId =
-  | 'default'
-  | 'chatml'
-  | 'llama3'
-  | 'llama4'
-  | 'gemma'
-  | 'mistral'
-  | 'mistral-v7'
-  | 'deepseek'
-  | 'vicuna'
-  | 'alpaca'
-  | 'commandr'
-  | 'phi'
-  | 'raw'
-  | 'custom'
+export type TextTemplateId = string
 
-// Shape of a client-rendered text-completion template. Each role gets a
-// prefix inserted BEFORE the role's content and a suffix AFTER. `bos` is
-// prepended ONCE at the start of the whole prompt. `stop` is added to the
-// request's stop[] array so the server halts at the next turn boundary.
+// Shape of a client-rendered text-completion template. `template`, when set,
+// is the Jinja-style plaintext source rendered into the `/completions` prompt.
+// Prefix/suffix fields are kept so old saved templates and built-ins can
+// round-trip; UI edits save template source.
 //
 // See `SillyTavern/default/content/presets/instruct/*.json` for the
 // schema we modeled this on (ours is trimmed to the essentials).
 export interface TextTemplateConfig {
+  template?: string
+  includeSystemPrompt?: boolean
   userPrefix: string
   userSuffix: string
   assistantPrefix: string

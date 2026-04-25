@@ -28,7 +28,9 @@ test.beforeEach(async ({ page }) => {
   await page.goto('/')
   await clearIndexedDb(page)
   await page.evaluate(() =>
-    (window as unknown as { __debugStreams?: { enablePlans(): void } }).__debugStreams?.enablePlans(),
+    (
+      window as unknown as { __debugStreams?: { enablePlans(): void } }
+    ).__debugStreams?.enablePlans(),
   )
 })
 
@@ -94,8 +96,7 @@ test('GUI OpenRouter Responses GPT-5.4 xhigh reasoning and Continue stay on the 
     | { reasoningDetails?: Array<Record<string, unknown>> }
     | undefined
   const summaries =
-    storedAssistant?.reasoningDetails?.filter((detail) => detail.type === 'reasoning.summary') ??
-    []
+    storedAssistant?.reasoningDetails?.filter((detail) => detail.type === 'reasoning.summary') ?? []
   expect(summaries).toHaveLength(1)
   expect(summaries[0]?.summary).toContain('fragment-000 fragment-001 fragment-002')
   expect(summaries[0]?.summary).toContain('fragment-119')
@@ -106,6 +107,92 @@ test('GUI OpenRouter Responses GPT-5.4 xhigh reasoning and Continue stay on the 
   expect(sendPlan.payload.route).toMatchObject({ kind: 'responses' })
   expect(continuePlan.payload.route).toMatchObject({ kind: 'responses' })
   expect(sendPlan.payload.wireShape).toMatchObject({ hasInput: true, hasMessages: false })
+  expect(providerSummary(sendPlan).privacy).toMatchObject({ applicable: true })
+  expectNoConsoleProblems(consoleLines)
+})
+
+test('GUI OpenRouter Text completions posts /completions with a selected template', async ({
+  page,
+}) => {
+  const consoleLines = captureConsole(page)
+  const requests: CapturedRequest[] = []
+  await mockOpenRouterDiscovery(page, OR_CHAT_MODEL)
+  await mockOpenRouterTextCompletions(page, requests)
+
+  await seedFirstRun(page, { model: OR_CHAT_MODEL, disablePrivacyFilter: false })
+  await createChatAndOpen(page)
+  await openSettingsPanel(page)
+
+  const apiMode = page.locator('[data-ui-section="api-mode"]')
+  await apiMode.getByRole('button', { name: 'Text completions', exact: true }).click()
+  await page.locator('[data-ui="text-template-picker"]').selectOption('raw')
+  await page.evaluate(() =>
+    (
+      window as unknown as {
+        __debugStreams?: { clear(): void; clearPlans(): void; enable(): void }
+      }
+    ).__debugStreams?.enable(),
+  )
+  await page.evaluate(() =>
+    (
+      window as unknown as {
+        __debugStreams?: { clear(): void; clearPlans(): void; enable(): void }
+      }
+    ).__debugStreams?.clear(),
+  )
+  await page.evaluate(() =>
+    (
+      window as unknown as {
+        __debugStreams?: { clear(): void; clearPlans(): void; enable(): void }
+      }
+    ).__debugStreams?.clearPlans(),
+  )
+
+  const composer = page.locator('[data-ui="composer-input"]')
+  await composer.fill('OpenRouter text route check')
+  await composer.press('Enter')
+  await expect(page.locator('[data-ui="message"][data-role="assistant"]').first()).toContainText(
+    'openrouter text ok',
+  )
+
+  expect(requests).toHaveLength(1)
+  expect(requests[0]?.url).toBe('https://openrouter.ai/api/v1/completions')
+  expect(requests[0]?.body.model).toBe(OR_CHAT_MODEL)
+  expect(requests[0]?.body.prompt).toBe('OpenRouter text route check')
+  expect(requests[0]?.body.messages).toBeUndefined()
+  expect(requests[0]?.body.provider).toMatchObject({ data_collection: 'deny' })
+  const streamDump = await page.evaluate(
+    () =>
+      (
+        window as unknown as { __debugStreams?: { disable(): void; last(count?: number): string } }
+      ).__debugStreams?.last(20) ?? '',
+  )
+  expect(streamDump).toContain('[stream-debug]')
+  expect(streamDump).toContain('text-completions')
+  expect(streamDump).toContain('https://openrouter.ai/api/v1/completions')
+  expect(streamDump).toContain('OpenRouter text route check')
+  await page.evaluate(() =>
+    (
+      window as unknown as { __debugStreams?: { disable(): void; last(count?: number): string } }
+    ).__debugStreams?.disable(),
+  )
+
+  const plans = await requestPlans(page)
+  const sendPlan = findLastPlan(plans, 'send')
+  expect(sendPlan.payload.profile).toMatchObject({ kind: 'openrouter' })
+  expect(sendPlan.payload.route).toMatchObject({ kind: 'text-completions' })
+  expect(sendPlan.payload.useTextProtocol).toBe(true)
+  expect(sendPlan.payload.request).toMatchObject({
+    model: OR_CHAT_MODEL,
+    prompt: 'OpenRouter text route check',
+    stream: true,
+  })
+  expect((sendPlan.payload.request as Record<string, unknown>).messages).toBeUndefined()
+  expect(sendPlan.payload.wireShape).toMatchObject({
+    hasPrompt: true,
+    hasMessages: false,
+    prompt: { length: 27, preview: 'OpenRouter text route check' },
+  })
   expect(providerSummary(sendPlan).privacy).toMatchObject({ applicable: true })
   expectNoConsoleProblems(consoleLines)
 })
@@ -163,11 +250,7 @@ test('GUI edit Save & Send reuses provider planning for the edited branch', asyn
   const editPlan = findLastPlan(plans, 'send-from-message')
   const editProvider = providerSummary(editPlan).wire as { order?: string[]; ignore?: string[] }
   expect(editPlan.payload.wireShape).toMatchObject({ hasProvider: true, hasMessages: true })
-  expect(editProvider.order?.slice(0, 3)).toEqual([
-    'Budget Clean',
-    'Alpha ZDR',
-    'Tiny Context',
-  ])
+  expect(editProvider.order?.slice(0, 3)).toEqual(['Budget Clean', 'Alpha ZDR', 'Tiny Context'])
   expect(editProvider.ignore).toEqual(
     expect.arrayContaining(['Fast Retain', 'Training Host', 'Tiny Context', 'UserID Host']),
   )
@@ -362,7 +445,10 @@ test('GUI Google native sends generateContent without OpenRouter provider/privac
   expect(sendPlan.payload.route).toMatchObject({ kind: 'gemini-generate' })
   expect(providerSummary(sendPlan).wire).toBeNull()
   expect(providerSummary(sendPlan).privacy).toMatchObject({ applicable: false })
-  expect(sendPlan.payload.wireShape).toMatchObject({ hasProvider: false, hasSystemInstruction: false })
+  expect(sendPlan.payload.wireShape).toMatchObject({
+    hasProvider: false,
+    hasSystemInstruction: false,
+  })
   expectNoConsoleProblems(consoleLines)
 })
 
@@ -382,11 +468,9 @@ test('GUI llama-server text protocol posts /completions prompt through the unifi
     baseUrl: 'http://127.0.0.1:8080/v1',
   })
   await selectModelThroughSettings(page, LLAMA_MODEL)
-  await page.getByRole('radio', { name: 'Text completion' }).click()
-  await expect(page.getByRole('radio', { name: 'Text completion' })).toHaveAttribute(
-    'aria-checked',
-    'true',
-  )
+  const textProtocol = page.getByRole('button', { name: 'Text completion', exact: true })
+  await textProtocol.click()
+  await expect(textProtocol).toHaveAttribute('aria-pressed', 'true')
   await page.evaluate(() =>
     (window as unknown as { __debugStreams?: { clearPlans(): void } }).__debugStreams?.clearPlans(),
   )
@@ -446,11 +530,7 @@ async function selectModelThroughSettings(page: Page, modelId: string): Promise<
   await openSettingsPanel(page)
   await page.getByRole('tab', { name: 'Model' }).click()
   await page.locator('[data-ui="model-picker-search-input"]').fill(modelId)
-  await page
-    .locator('[data-ui="picker-row-pick"]')
-    .filter({ hasText: modelId })
-    .first()
-    .click()
+  await page.locator('[data-ui="picker-row-pick"]').filter({ hasText: modelId }).first().click()
 }
 
 async function addConnectionThroughGui(
@@ -486,8 +566,12 @@ async function waitForProviderOrder(page: Page, expected: string[]): Promise<voi
         const tx = db.transaction('chats', 'readonly')
         const req = tx.objectStore('chats').get(chatId)
         req.onsuccess = () => {
-          const row = req.result as { settings?: { providerPrefs?: { order?: string[] } } } | undefined
-          resolve(JSON.stringify(row?.settings?.providerPrefs?.order ?? []) === JSON.stringify(order))
+          const row = req.result as
+            | { settings?: { providerPrefs?: { order?: string[] } } }
+            | undefined
+          resolve(
+            JSON.stringify(row?.settings?.providerPrefs?.order ?? []) === JSON.stringify(order),
+          )
         }
         req.onerror = () => reject(req.error)
       })
@@ -607,10 +691,34 @@ async function mockChatCompletionsCapture(
   })
 }
 
-async function mockOpenRouterResponses(
+async function mockOpenRouterTextCompletions(
   page: Page,
   requests: CapturedRequest[],
 ): Promise<void> {
+  await page.route('https://openrouter.ai/api/v1/completions', async (route) => {
+    const body = parsePostBody(route.request().postData())
+    requests.push({ url: route.request().url(), body, headers: route.request().headers() })
+    await route.fulfill({
+      status: 200,
+      contentType: 'text/event-stream',
+      headers: { 'x-generation-id': 'adv-text-1' },
+      body: [
+        `data: ${JSON.stringify({
+          id: 'adv-text-1',
+          model: body.model,
+          provider: 'Alpha ZDR',
+          choices: [{ index: 0, text: 'openrouter text ok', finish_reason: 'stop' }],
+          usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
+        })}`,
+        '',
+        'data: [DONE]',
+        '',
+      ].join('\n'),
+    })
+  })
+}
+
+async function mockOpenRouterResponses(page: Page, requests: CapturedRequest[]): Promise<void> {
   await page.route('https://openrouter.ai/api/v1/responses', async (route) => {
     const body = parsePostBody(route.request().postData())
     requests.push({ url: route.request().url(), body, headers: route.request().headers() })
@@ -641,15 +749,18 @@ async function mockOpenRouterResponses(
 }
 
 async function mockGoogleModels(page: Page): Promise<void> {
-  await page.route('https://generativelanguage.googleapis.com/v1beta/openai/models**', async (route) => {
-    await route.fulfill({
-      status: 200,
-      contentType: 'application/json',
-      body: JSON.stringify({
-        data: [{ id: GOOGLE_MODEL, object: 'model', created: 0, owned_by: 'google' }],
-      }),
-    })
-  })
+  await page.route(
+    'https://generativelanguage.googleapis.com/v1beta/openai/models**',
+    async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          data: [{ id: GOOGLE_MODEL, object: 'model', created: 0, owned_by: 'google' }],
+        }),
+      })
+    },
+  )
 }
 
 async function mockGeminiNative(page: Page, requests: CapturedRequest[]): Promise<void> {
@@ -933,8 +1044,9 @@ function parsePostBody(raw: string | null): Record<string, unknown> {
 async function requestPlans(page: Page): Promise<PlanEntry[]> {
   return page.evaluate(
     () =>
-      (window as unknown as { __debugStreams?: { plans(): PlanEntry[] } }).__debugStreams?.plans() ??
-      [],
+      (
+        window as unknown as { __debugStreams?: { plans(): PlanEntry[] } }
+      ).__debugStreams?.plans() ?? [],
   ) as Promise<PlanEntry[]>
 }
 

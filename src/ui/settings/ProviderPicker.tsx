@@ -19,10 +19,7 @@
 import { useLiveQuery } from 'dexie-react-hooks'
 import { useCallback, useMemo, useState } from 'react'
 import { activePath } from '../../core/active-path'
-import {
-  DEFAULT_GLOBAL_PREFERENCES,
-  readGlobalPreferences,
-} from '../../core/global-settings'
+import { DEFAULT_GLOBAL_PREFERENCES, readGlobalPreferences } from '../../core/global-settings'
 import { estimateSettingsPromptSize, UNLIMITED_CONTEXT } from '../../core/prompt-size'
 import {
   endpointMatchesProviderRef,
@@ -33,12 +30,7 @@ import {
   resolveProviderRefsToRoutingRefs,
 } from '../../core/provider-identity'
 import { readTokenCalibrationGlobal } from '../../core/token-calibration'
-import type {
-  Chat,
-  ModelEndpoint,
-  ProviderPreferences,
-  SortBy,
-} from '../../core/types'
+import type { Chat, ModelEndpoint, ProviderPreferences, SortBy } from '../../core/types'
 import type { UsePrivacyRoutingResult } from '../../hooks/usePrivacyRouting'
 import { getChatDraft, loadChatMessages, updateChatSettings } from '../../store/chats'
 import { useChatStore } from '../../store/zustand/chatStore'
@@ -59,7 +51,11 @@ export interface ProviderPickerProps {
 
 const EMPTY_CURSOR = Object.freeze({}) as Readonly<Record<string, string>>
 
-export function ProviderPicker({ chat, routing, neededTokens: neededTokensOverride }: ProviderPickerProps) {
+export function ProviderPicker({
+  chat,
+  routing,
+  neededTokens: neededTokensOverride,
+}: ProviderPickerProps) {
   const { endpoints, filter, loading, isFreeModel, scrapeApplicable, refresh } = routing
   const prefs = chat.settings.providerPrefs ?? {}
   const manualOrdered = useMemo(() => orderEndpoints(endpoints, prefs), [endpoints, prefs])
@@ -85,13 +81,17 @@ export function ProviderPicker({ chat, routing, neededTokens: neededTokensOverri
   )
   const draft = useLiveQuery(
     () =>
-      needsLocalNeededTokens ? getChatDraft(chat.id).then((d) => d?.text ?? '') : Promise.resolve(''),
+      needsLocalNeededTokens
+        ? getChatDraft(chat.id).then((d) => d?.text ?? '')
+        : Promise.resolve(''),
     [chat.id, needsLocalNeededTokens],
     '',
   )
   const globalPrefs = useLiveQuery(
     () =>
-      needsLocalNeededTokens ? readGlobalPreferences() : Promise.resolve(DEFAULT_GLOBAL_PREFERENCES),
+      needsLocalNeededTokens
+        ? readGlobalPreferences()
+        : Promise.resolve(DEFAULT_GLOBAL_PREFERENCES),
     [needsLocalNeededTokens],
     DEFAULT_GLOBAL_PREFERENCES,
   )
@@ -163,12 +163,18 @@ export function ProviderPicker({ chat, routing, neededTokens: neededTokensOverri
         chat.settings.privacy.ignoreProviders.length > 0 ||
         chat.settings.privacy.onlyProviders.length > 0
       const base = alreadyTouched
-        ? new Set(resolveProviderRefsToRoutingRefs(endpoints, prefs.ignore, { preserveUnknown: true }))
+        ? new Set(
+            resolveProviderRefsToRoutingRefs(endpoints, prefs.ignore, { preserveUnknown: true }),
+          )
         : new Set((filter?.excluded ?? []).map((e) => providerRoutingRef(e.endpoint)))
       if (legacyPrivacyRefs) {
-        for (const ref of resolveProviderRefsToRoutingRefs(endpoints, chat.settings.privacy.ignoreProviders, {
-          preserveUnknown: true,
-        })) {
+        for (const ref of resolveProviderRefsToRoutingRefs(
+          endpoints,
+          chat.settings.privacy.ignoreProviders,
+          {
+            preserveUnknown: true,
+          },
+        )) {
           base.add(ref)
         }
         for (const row of filter?.excluded ?? []) {
@@ -198,7 +204,15 @@ export function ProviderPicker({ chat, routing, neededTokens: neededTokensOverri
         },
       })
     },
-    [chat.id, chat.settings.providerPrefs, chat.settings.privacy, endpoints, prefs.ignore, prefs.ignoreOverridesFilter, filter],
+    [
+      chat.id,
+      chat.settings.providerPrefs,
+      chat.settings.privacy,
+      endpoints,
+      prefs.ignore,
+      prefs.ignoreOverridesFilter,
+      filter,
+    ],
   )
 
   const moveBy = useCallback(
@@ -253,8 +267,7 @@ export function ProviderPicker({ chat, routing, neededTokens: neededTokensOverri
   if (!chat.settings.model) return null
 
   const privacyOverrides =
-    chat.settings.privacy.onlyProviders.length +
-    chat.settings.privacy.ignoreProviders.length
+    chat.settings.privacy.onlyProviders.length + chat.settings.privacy.ignoreProviders.length
   const hasOverrides =
     prefs.ignoreOverridesFilter === true ||
     (prefs.ignore?.length ?? 0) > 0 ||
@@ -320,22 +333,19 @@ export function ProviderPicker({ chat, routing, neededTokens: neededTokensOverri
         </label>
       </div>
       {rows.length === 0 ? (
-        <p data-ui="helper">
-          {loading ? 'Loading…' : 'No providers available for this model.'}
-        </p>
+        <p data-ui="helper">{loading ? 'Loading…' : 'No providers available for this model.'}</p>
       ) : (
         <ul data-ui="provider-picker-list">
-          {rows.map((row) => {
+          {rows.map((row, index) => {
             const epCap = row.endpoint.max_prompt_tokens ?? row.endpoint.context_length
-            const insufficient =
-              epCap !== undefined && epCap > 0 && neededTokens > epCap
+            const insufficient = epCap !== undefined && epCap > 0 && neededTokens > epCap
             const ref = providerRoutingRef(row.endpoint)
             const key = providerEndpointKey(row.endpoint)
             const label = providerDisplayLabel(row.endpoint, endpoints)
             const allowed = row.state === 'kept'
             return (
               <ProviderRow
-                key={key}
+                key={`${key}:${index}`}
                 row={row}
                 label={label}
                 allowed={allowed}
@@ -350,7 +360,8 @@ export function ProviderPicker({ chat, routing, neededTokens: neededTokensOverri
       )}
       {isFreeModel ? (
         <p data-ui="helper" data-tone="muted">
-          Privacy routing is ignored on <code>:free</code> models — OpenRouter picks a free provider.
+          Privacy routing is ignored on <code>:free</code> models — OpenRouter picks a free
+          provider.
         </p>
       ) : !scrapeApplicable ? (
         <p data-ui="helper" data-tone="muted">
@@ -432,9 +443,7 @@ function ProviderRow({
     return parts.join(' · ')
   }, [endpoint.pricing])
   const uptimeLabel =
-    endpoint.uptime_last_30m !== undefined
-      ? `${endpoint.uptime_last_30m.toFixed(1)}% up`
-      : ''
+    endpoint.uptime_last_30m !== undefined ? `${endpoint.uptime_last_30m.toFixed(1)}% up` : ''
   const throughput = endpoint.throughput_last_30m as
     | { p50?: number; tokensPerSecond?: number }
     | undefined
@@ -453,16 +462,15 @@ function ProviderRow({
   // itself stays a plain name + stats. Exclusion reasons and "No privacy
   // data available" used to render inline — that was clutter; they now
   // only surface on hover of the lock (or in the expanded details).
-  const lockTitle = row.state === 'no-filter'
-    ? ''
-    : [
-        tierToLockLabel(row.tier),
-        ...(row.state === 'auto-excluded'
-          ? [reasonsToTooltip(row.reasons, row.policy)]
-          : []),
-      ]
-        .filter(Boolean)
-        .join('\n\n')
+  const lockTitle =
+    row.state === 'no-filter'
+      ? ''
+      : [
+          tierToLockLabel(row.tier),
+          ...(row.state === 'auto-excluded' ? [reasonsToTooltip(row.reasons, row.policy)] : []),
+        ]
+          .filter(Boolean)
+          .join('\n\n')
   const detailsTitle = providerDetailsTooltip(row)
 
   return (
@@ -492,9 +500,7 @@ function ProviderRow({
                 }
               : {})}
           />
-          {row.state !== 'no-filter' ? (
-            <PrivacyLock tier={row.tier} title={lockTitle} />
-          ) : null}
+          {row.state !== 'no-filter' ? <PrivacyLock tier={row.tier} title={lockTitle} /> : null}
           <span data-ui="provider-picker-name">{label}</span>
         </label>
         <div data-ui="provider-picker-row-actions">
@@ -532,9 +538,7 @@ function ProviderRow({
         </div>
       </div>
       <div data-ui="provider-picker-row-stats">
-        {insufficientContext ? (
-          <span data-tone="danger">insufficient context</span>
-        ) : null}
+        {insufficientContext ? <span data-tone="danger">insufficient context</span> : null}
         {pricingLabel ? <span>{pricingLabel}</span> : null}
         {uptimeLabel ? <span>{uptimeLabel}</span> : null}
         {throughputLabel ? <span>{throughputLabel}</span> : null}
@@ -601,8 +605,7 @@ function providerDetailRows(row: PickerRow): Array<[string, string]> {
   const prompt = Number(endpoint.pricing.prompt)
   const completion = Number(endpoint.pricing.completion)
   if (Number.isFinite(prompt)) rows.push(['Input $/M', (prompt * 1_000_000).toFixed(3)])
-  if (Number.isFinite(completion))
-    rows.push(['Output $/M', (completion * 1_000_000).toFixed(3)])
+  if (Number.isFinite(completion)) rows.push(['Output $/M', (completion * 1_000_000).toFixed(3)])
   if (endpoint.quantization && endpoint.quantization !== 'unknown')
     rows.push(['Quantization', endpoint.quantization])
   if (endpoint.uptime_last_30m !== undefined)
@@ -622,8 +625,7 @@ function providerDetailRows(row: PickerRow): Array<[string, string]> {
     rows.push(['Latency p50', `${endpoint.latency_last_30m.p50.toFixed(0)}ms`])
   if (endpoint.latency_last_30m?.p95 !== undefined)
     rows.push(['Latency p95', `${endpoint.latency_last_30m.p95.toFixed(0)}ms`])
-  if (endpoint.architecture?.tokenizer)
-    rows.push(['Tokenizer', endpoint.architecture.tokenizer])
+  if (endpoint.architecture?.tokenizer) rows.push(['Tokenizer', endpoint.architecture.tokenizer])
   if (endpoint.supports_implicit_caching !== undefined) {
     rows.push(['Implicit caching', endpoint.supports_implicit_caching ? 'yes' : 'no'])
   }

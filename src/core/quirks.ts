@@ -29,11 +29,13 @@ import { canonicalCompatModelId, canonicalModelSlug } from './model-ids'
 //                    prefill works when reasoning is disabled on the wire.
 // `oss-reasoning-required` — model can't toggle reasoning off; prefill lands
 //                            in the <think> block rather than content.
-export type PrefillClass =
-  | 'native'
-  | 'unsupported'
-  | 'oss-toggleable'
-  | 'oss-reasoning-required'
+export type PrefillClass = 'native' | 'unsupported' | 'oss-toggleable' | 'oss-reasoning-required'
+
+export type TextCompletionsSupport =
+  | 'visible'
+  | 'accepted-reasoning-only'
+  | 'disabled-chat-native'
+  | 'unknown'
 
 // Effort ordered low → high for left-to-right UI rendering. Validation /
 // transform code doesn't care about order — it just filters by set
@@ -510,9 +512,7 @@ const REGISTRY_KEYS_BY_LENGTH = Object.keys(REGISTRY).sort((a, b) => b.length - 
 // a version digit / dot (`qwen3.6`, `qwen3`), or end-of-string. Catches every
 // versioning convention these labs ship under one expression.
 const OSS_THINKING_FAMILIES = ['deepseek', 'qwen', 'kimi', 'glm', 'minimax'] as const
-const OSS_THINKING_PATTERN = new RegExp(
-  `^(?:${OSS_THINKING_FAMILIES.join('|')})(?:[-_\\d.]|$)`,
-)
+const OSS_THINKING_PATTERN = new RegExp(`^(?:${OSS_THINKING_FAMILIES.join('|')})(?:[-_\\d.]|$)`)
 
 const OSS_THINKING_DEFAULT: QuirksEntry = {
   reasoningInlineTags: ['think'],
@@ -677,6 +677,71 @@ export function reasoningToggleableFor(modelId: string): boolean {
   if (slug.startsWith('gemini-')) return false
   if (REASONING_REQUIRED_MODELS.has(slug)) return false
   return true
+}
+
+// OpenRouter prompt/text mode support. Transport acceptance is not enough:
+// closed-source chat-native families often answer as chat models or refuse the
+// ChatML scaffold, and DeepSeek R1 text mode returns reasoning-only output.
+// Keep those disabled in the API-mode UI while letting open-weight and unknown
+// OSS-like families opt in.
+export function textCompletionsSupportFor(modelId: string): TextCompletionsSupport {
+  const slug = canonicalCompatModelId(modelId).toLowerCase()
+  if (!slug) return 'unknown'
+  if (/^deepseek-r1(?:$|-0528$)/u.test(slug)) return 'accepted-reasoning-only'
+  if (isClosedSourceChatNativeForTextCompletions(slug)) return 'disabled-chat-native'
+  if (isKnownOpenWeightTextFamily(slug)) return 'visible'
+  return 'unknown'
+}
+
+export function isTextCompletionsSelectableFor(modelId: string): boolean {
+  const support = textCompletionsSupportFor(modelId)
+  return support === 'visible' || support === 'unknown'
+}
+
+export function textCompletionsNeedsReasoningOffFor(modelId: string): boolean {
+  const slug = canonicalCompatModelId(modelId).toLowerCase()
+  if (!reasoningToggleableFor(modelId)) return false
+  return (
+    slug.startsWith('kimi-k2') ||
+    slug.startsWith('glm-5') ||
+    slug.startsWith('glm-4:7') ||
+    slug.startsWith('qwen3') ||
+    slug.startsWith('minimax-m2')
+  )
+}
+
+function isClosedSourceChatNativeForTextCompletions(slug: string): boolean {
+  if (slug.startsWith('claude-')) return true
+  if (slug.startsWith('gemini-')) return true
+  if (slug.startsWith('grok-')) return true
+  if (slug.startsWith('chatgpt-')) return true
+  if (/^o\d(?:$|-)/u.test(slug)) return true
+  if (slug.startsWith('gpt-') && !slug.startsWith('gpt-oss')) return true
+  return false
+}
+
+function isKnownOpenWeightTextFamily(slug: string): boolean {
+  return (
+    slug.startsWith('gpt-oss') ||
+    slug.startsWith('llama-') ||
+    slug.startsWith('gemma-') ||
+    slug.startsWith('deepseek-') ||
+    slug.startsWith('qwen') ||
+    slug.startsWith('qwq') ||
+    slug.startsWith('qvq') ||
+    slug.startsWith('glm-') ||
+    slug.startsWith('chatglm') ||
+    slug.startsWith('kimi-') ||
+    slug.startsWith('minimax-') ||
+    slug.startsWith('mistral-') ||
+    slug.startsWith('mixtral-') ||
+    slug.startsWith('ministral-') ||
+    slug.startsWith('codestral-') ||
+    slug.startsWith('devstral-') ||
+    slug.startsWith('pixtral-') ||
+    slug.startsWith('command-') ||
+    slug.startsWith('phi-')
+  )
 }
 
 // Strip sampling params that are gated behind `reasoning.effort === 'none'` on

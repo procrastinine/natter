@@ -2,6 +2,7 @@ import type { ConnectionProfile } from '../core/types'
 
 const STORAGE_KEY = 'natter.debug.streams'
 const PLAN_STORAGE_KEY = 'natter.debug.request_plans'
+const DEBUG_API_VERSION = 'request-plan-full-request-v1'
 const MAX_BUFFER_ENTRIES = 2000
 const MAX_PLAN_ENTRIES = 200
 const MAX_STRING_CHARS = 360
@@ -27,6 +28,7 @@ interface RequestPlanDebugEntry {
 }
 
 interface StreamDebugApi {
+  version(): string
   enable(): void
   disable(): void
   status(): { enabled: boolean; entries: number }
@@ -42,6 +44,8 @@ interface StreamDebugApi {
   lastPlans(count?: number): string
   copyPlans(): Promise<string>
   plans(): RequestPlanDebugEntry[]
+  lastPlan(): RequestPlanDebugEntry | null
+  lastRequest(): unknown | null
 }
 
 let seq = 0
@@ -101,9 +105,21 @@ function pushEntry(label: string, payload: unknown): void {
 }
 
 function pushPlanEntry(label: string, payload: unknown): void {
-  planBuffer.push({ label, payload })
+  planBuffer.push({ label, payload: cloneDebugPayload(payload) })
   if (planBuffer.length > MAX_PLAN_ENTRIES) {
     planBuffer.splice(0, planBuffer.length - MAX_PLAN_ENTRIES)
+  }
+}
+
+function cloneDebugPayload(payload: unknown): unknown {
+  try {
+    return structuredClone(payload)
+  } catch {
+    try {
+      return JSON.parse(JSON.stringify(payload)) as unknown
+    } catch {
+      return payload
+    }
   }
 }
 
@@ -274,7 +290,7 @@ export function logRequestPlanDebug(label: string, payload?: unknown): void {
   if (!requestPlanDebugEnabled()) return
   const summarized = sanitize(payload)
   const fullLabel = `[request-plan] ${label}`
-  pushPlanEntry(fullLabel, summarized)
+  pushPlanEntry(fullLabel, payload)
   // eslint-disable-next-line no-console
   console.debug(fullLabel, summarized)
 }
@@ -363,6 +379,9 @@ function planDump(entries: readonly RequestPlanDebugEntry[]): string {
 export function installDebugStreams(): void {
   if (typeof window === 'undefined') return
   const api: StreamDebugApi = {
+    version() {
+      return DEBUG_API_VERSION
+    },
     enable() {
       window.localStorage.setItem(STORAGE_KEY, '1')
       entryBuffer.splice(0, entryBuffer.length)
@@ -425,6 +444,22 @@ export function installDebugStreams(): void {
         payload: structuredClone(entry.payload),
       }))
     },
+    lastPlan() {
+      const entry = planBuffer.at(-1)
+      if (!entry) return null
+      return {
+        label: entry.label,
+        payload: cloneDebugPayload(entry.payload),
+      }
+    },
+    lastRequest() {
+      for (let index = planBuffer.length - 1; index >= 0; index -= 1) {
+        const entry = planBuffer[index]
+        const request = requestFromPlanPayload(entry?.payload)
+        if (request !== undefined) return cloneDebugPayload(request)
+      }
+      return null
+    },
   }
   ;(window as unknown as { __debugStreams: StreamDebugApi }).__debugStreams = api
   // eslint-disable-next-line no-console
@@ -432,4 +467,9 @@ export function installDebugStreams(): void {
     '%c[debug] window.__debugStreams.enable() — compact stream logging with buffer helpers (`dump()`, `last()`, `copy()`, `clear()`). Use `enablePlans()` for one-line request-plan logs.',
     'color:#888;font-style:italic',
   )
+}
+
+function requestFromPlanPayload(payload: unknown): unknown | undefined {
+  if (!payload || typeof payload !== 'object') return undefined
+  return (payload as { request?: unknown }).request
 }

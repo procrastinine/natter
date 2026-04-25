@@ -33,10 +33,7 @@ import type {
 } from '../api/types'
 import { isFreeModel } from './model-predicates'
 import type { WireProviderPrivacy } from './privacy-filter'
-import {
-  adjustGpt54SamplingGate,
-  quirksFor,
-} from './quirks'
+import { adjustGpt54SamplingGate, quirksFor } from './quirks'
 import { filterReasoningForInclude } from './reasoning'
 import { renderTextPrompt } from './text-templates'
 import type {
@@ -517,6 +514,8 @@ export function toChatCompletions(
 export interface TextCompletionsTransformOptions {
   capabilities?: CapabilityDescriptor
   stream?: boolean
+  privacy?: WireProviderPrivacy
+  allowProviderRouting?: boolean
   // Resolved template config for the branch. When the chat's selected
   // template id is 'default', the caller is responsible for calling
   // `applyServerTemplate()` and passing the returned prompt via
@@ -544,9 +543,7 @@ export function toTextCompletions(
 
   const prompt =
     opts.prerenderedPrompt ??
-    (opts.template
-      ? renderTextPrompt(opts.template, settings.systemPrompt, path)
-      : fallbackRawPrompt(settings.systemPrompt, path))
+    (opts.template ? renderTextPrompt(opts.template, settings, path) : fallbackRawPrompt(path))
 
   const wire: TextCompletionRequestWire = {
     model: requestedModel,
@@ -575,13 +572,10 @@ export function toTextCompletions(
   if (merged.length > 0 && gate('stop')) {
     wire.stop = merged
   }
-  if (
-    settings.maxCompletionTokens !== undefined &&
-    settings.maxCompletionTokens >= 0 &&
-    gate('max_completion_tokens')
-  ) {
-    // -1 is our local "unlimited" sentinel; never send it on the wire.
-    wire.max_completion_tokens = settings.maxCompletionTokens
+  if (settings.maxCompletionTokens !== undefined && settings.maxCompletionTokens >= 0) {
+    // /v1/completions uses max_tokens. OpenRouter endpoint metadata is
+    // chat-oriented here, so do not downgrade to max_completion_tokens.
+    wire.max_tokens = settings.maxCompletionTokens
   }
   if (settings.logitBias && gate('logit_bias')) {
     wire.logit_bias = { ...settings.logitBias }
@@ -589,17 +583,30 @@ export function toTextCompletions(
   if (settings.cachePrompt === false && gate('cache_prompt')) {
     wire.cache_prompt = false
   }
+  if (gate('reasoning')) {
+    const reasoning = buildReasoning(settings)
+    if (reasoning) wire.reasoning = reasoning
+  }
+  if (settings.verbosity && gate('verbosity')) {
+    wire.verbosity = settings.verbosity
+  }
+  if (settings.serviceTier && settings.serviceTier !== 'auto' && gate('service_tier')) {
+    wire.service_tier = settings.serviceTier
+  }
+  if (opts.allowProviderRouting === true && gate('provider')) {
+    const providerBlock = buildProviderBlock(settings, opts.privacy)
+    if (providerBlock) wire.provider = providerBlock
+  }
 
   return { wire, requestedModel }
 }
 
-// Walk the branch without a template (protocol='text' + raw fallback).
-// System message first, then every user/assistant turn concatenated
-// verbatim, and finally an empty string to let the model continue.
-function fallbackRawPrompt(systemPrompt: string, path: readonly Message[]): string {
+// Walk the visible branch without a template. This is a literal
+// continuation fallback, so the chat-level system prompt is not imported.
+function fallbackRawPrompt(path: readonly Message[]): string {
   const parts: string[] = []
-  if (systemPrompt.length > 0) parts.push(systemPrompt)
   for (const msg of path) {
+    if (msg.hiddenFromContext === true || msg.deleted) continue
     for (const item of msg.content) {
       if (item.type === 'text' || item.type === 'output_text') parts.push(item.text)
     }
@@ -1140,8 +1147,7 @@ const BUDGET_TABLE_GEMINI_2_5_FLASH_LITE: Partial<Record<EffortLevel, number>> =
 // Kept for back-compat with callers that passed a single table via
 // `GeminiNativeTransformOptions.thinkingBudgetByEffort`. New code should let
 // the transform pick the per-family table from `geminiFamily(modelId)`.
-const DEFAULT_THINKING_BUDGETS: Partial<Record<EffortLevel, number>> =
-  BUDGET_TABLE_GEMINI_2_5_FLASH
+const DEFAULT_THINKING_BUDGETS: Partial<Record<EffortLevel, number>> = BUDGET_TABLE_GEMINI_2_5_FLASH
 
 type GeminiFamily =
   | 'gemini-3-pro'
@@ -1337,9 +1343,7 @@ function mapEffortToThinkingLevelPro(effort: EffortLevel): 'low' | 'medium' | 'h
 
 // Gemini 3 Flash / 3.1 Flash(-Lite) — enum minimal/low/medium/high.
 // `minimal` is the soft-disable; `xhigh` clamps to `high`.
-function mapEffortToThinkingLevelFlash(
-  effort: EffortLevel,
-): 'minimal' | 'low' | 'medium' | 'high' {
+function mapEffortToThinkingLevelFlash(effort: EffortLevel): 'minimal' | 'low' | 'medium' | 'high' {
   switch (effort) {
     case 'none':
     case 'minimal':

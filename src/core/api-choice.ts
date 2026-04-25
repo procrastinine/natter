@@ -19,17 +19,23 @@
 //   - `caps`: the resolved capability descriptor, carrying the quirks entry
 //     (`reasoningPreservationFormat`, `preferApi`, `requiresResponsesApi`).
 
-import { responsesSupportFor } from './quirks'
+import { isTextCompletionsSelectableFor, responsesSupportFor } from './quirks'
 import { normalizeReasoningSettings } from './reasoning'
 import type { ApiVariant, ChatSettings, ConnectionProfile, Message, ReasoningFormat } from './types'
 
 export type ApiRouteKind =
   | 'chat-completions'
+  | 'text-completions'
   | 'responses'
   | 'gemini-generate'
   | 'anthropic-messages'
 
-export type ApiTransport = 'openai-chat' | 'openai-responses' | 'gemini-native' | 'anthropic'
+export type ApiTransport =
+  | 'openai-chat'
+  | 'openai-text'
+  | 'openai-responses'
+  | 'gemini-native'
+  | 'anthropic'
 
 export interface ApiRoute {
   kind: ApiRouteKind
@@ -68,6 +74,9 @@ export function chooseApi(
   // model that 404s on chat-completions (`responsesSupport: 'responses-only'`
   // or the legacy `requiresResponsesApi` flag).
   const responsesOnly = support === 'responses-only' || caps.quirks.requiresResponsesApi === true
+  if (pin === 'text' && canRunTextCompletions(profile, settings.model) && !responsesOnly) {
+    return openAiText('user pinned Text completions')
+  }
   if (pin === 'chat' && !responsesOnly) {
     return openAiChat('user pinned chat completions')
   }
@@ -157,6 +166,10 @@ function canRunResponses(profile: ConnectionProfile): boolean {
   )
 }
 
+function canRunTextCompletions(profile: ConnectionProfile, modelId: string): boolean {
+  return profile.kind === 'openrouter' && isTextCompletionsSelectableFor(modelId)
+}
+
 function isOpenAiResponsesFormat(fmt: ReasoningFormat | undefined): boolean {
   return (
     fmt === 'openai-responses-v1' ||
@@ -208,6 +221,10 @@ function openAiChat(reason: string): ApiRoute {
   return { kind: 'chat-completions', transport: 'openai-chat', reason }
 }
 
+function openAiText(reason: string): ApiRoute {
+  return { kind: 'text-completions', transport: 'openai-text', reason }
+}
+
 function openAiResponses(reason: string): ApiRoute {
   return { kind: 'responses', transport: 'openai-responses', reason }
 }
@@ -220,6 +237,10 @@ function geminiNative(reason: string): ApiRoute {
 // "API mode" segmented control's Responses button.
 export function isResponsesCapable(profile: ConnectionProfile): boolean {
   return canRunResponses(profile)
+}
+
+export function isTextCompletionsCapable(profile: ConnectionProfile, modelId: string): boolean {
+  return canRunTextCompletions(profile, modelId)
 }
 
 export function isGeminiNative(profile: ConnectionProfile): boolean {

@@ -12,6 +12,7 @@
 // reducers can keep their one shape.
 
 import type { ConnectionProfile } from '../core/types'
+import { logStreamDebug, startStreamDebug, type StreamDebugTrace } from '../lib/debug-streams'
 import { buildHeaders, fetchWithTimeout } from './client'
 import { normalizeError } from './errors'
 import { parseSSE } from './sse'
@@ -43,11 +44,18 @@ async function dispatch(
   ctx: TextCompletionsContext,
   req: TextCompletionRequestWire,
   opts: CallOpts,
-): Promise<Response> {
+): Promise<{ response: Response; debugTrace: StreamDebugTrace | null }> {
   const url = textCompletionsUrl(ctx.profile)
   const headers = buildHeaders(ctx.profile, ctx.apiKey, {
     method: 'POST',
     ...(opts.overrideHeaders ? { overrideHeaders: opts.overrideHeaders } : {}),
+  })
+  const debugTrace = startStreamDebug({
+    adapter: 'text-completions',
+    profile: ctx.profile,
+    url,
+    request: req,
+    headers,
   })
   const init: RequestInit = {
     method: 'POST',
@@ -64,7 +72,12 @@ async function dispatch(
     }))
     throw normalizeError(body, { midStream: false, httpStatus: response.status })
   }
-  return response
+  logStreamDebug(debugTrace, 'response.head', {
+    status: response.status,
+    contentType: response.headers.get('content-type'),
+    generationId: response.headers.get('x-generation-id') ?? undefined,
+  })
+  return { response, debugTrace }
 }
 
 interface TextCompletionChoiceWire {
@@ -117,12 +130,13 @@ export async function* textCompletions(
       'textCompletions: request body must have stream:true — use textCompletionsOnce for non-streaming',
     )
   }
-  const response = await dispatch(ctx, req, opts)
+  const { response, debugTrace } = await dispatch(ctx, req, opts)
   const generationId = response.headers.get('x-generation-id') ?? undefined
   const contentType = response.headers.get('content-type') ?? ''
 
   if (!/text\/event-stream/i.test(contentType)) {
     const body = (await response.json()) as TextCompletionChunkWire
+    logStreamDebug(debugTrace, 'buffered_result', body)
     const lifted = liftBufferedToChat(body)
     const chunk: ChatStreamChunk = generationId
       ? { type: 'buffered_result', result: lifted, generationId }
@@ -137,8 +151,10 @@ export async function* textCompletions(
       continue
     }
     try {
+      logStreamDebug(debugTrace, 'sse.raw', { event: ev.event, data: ev.data })
       const parsed = JSON.parse(ev.data) as TextCompletionChunkWire
       if (generationId && parsed.id === undefined) parsed.id = generationId
+      logStreamDebug(debugTrace, 'sse.parsed', parsed)
       const lifted = liftTextToDelta(parsed)
       const chunk: ChatStreamChunk = generationId
         ? { type: 'delta', chunk: lifted, generationId }
@@ -159,7 +175,8 @@ export async function textCompletionsOnce(
   opts: CallOpts = {},
 ): Promise<ChatCompletionResultWire> {
   const body: TextCompletionRequestWire = { ...req, stream: false }
-  const response = await dispatch(ctx, body, opts)
+  const { response, debugTrace } = await dispatch(ctx, body, opts)
   const result = (await response.json()) as TextCompletionChunkWire
+  logStreamDebug(debugTrace, 'once.result', result)
   return liftBufferedToChat(result)
 }

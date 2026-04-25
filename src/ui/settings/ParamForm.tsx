@@ -13,7 +13,8 @@
 // doesn't leave dangling knobs that will 400 on send.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { chooseApi, isResponsesCapable } from '../../core/api-choice'
+import type { LlamaServerProps } from '../../api/probe'
+import { chooseApi, isResponsesCapable, isTextCompletionsCapable } from '../../core/api-choice'
 import type { EffectiveCapability } from '../../core/capabilities'
 import { validateChatSettings } from '../../core/capabilities'
 import {
@@ -21,6 +22,7 @@ import {
   prefillClassFor,
   reasoningToggleableFor,
   responsesSupportFor,
+  textCompletionsSupportFor,
 } from '../../core/quirks'
 import type {
   ApiVariant,
@@ -42,6 +44,7 @@ import {
   ContinueUserPromptEditor,
   SystemPromptEditor,
 } from './PromptPresetEditor'
+import { TextTemplateSection } from './TextTemplateSection'
 
 export interface ParamFormProps {
   chat: Chat
@@ -50,6 +53,8 @@ export interface ParamFormProps {
   // deterministic tokenizer-aware ops) may want it. Unused today.
   endpointTokenizer?: string | null | undefined
   prefillRecommendationEndpoints?: readonly ModelEndpoint[] | undefined
+  textTemplateMode?: 'openrouter' | 'llama-server' | null | undefined
+  llamaProps?: LlamaServerProps | null | undefined
 }
 
 interface SamplingSpec {
@@ -278,6 +283,8 @@ export function ParamForm({
   chat,
   capability,
   prefillRecommendationEndpoints = [],
+  textTemplateMode = null,
+  llamaProps = null,
 }: ParamFormProps) {
   const prefillSupportedForModel = chat.settings.model
     ? prefillClassFor(chat.settings.model) !== 'unsupported'
@@ -350,7 +357,24 @@ export function ParamForm({
       {continuePrefill ? null : <ContinueSystemPromptEditor chat={chat} defaultCollapsed />}
       {continuePrefill ? null : <ContinueUserPromptEditor chat={chat} defaultCollapsed />}
       <SamplingSection chat={chat} capability={capability} />
-      <StopSection chat={chat} capability={capability} />
+      {textTemplateMode ? (
+        <TextTemplateSection
+          chat={chat}
+          mode={textTemplateMode}
+          llamaProps={llamaProps}
+          heading="Text completions template and stops"
+          requestStopControl={
+            <StopTextAreaControl
+              chat={chat}
+              capability={capability}
+              label="Additional stop sequences"
+              helper="Merged with the selected template stop sequences on the wire."
+            />
+          }
+        />
+      ) : (
+        <StopSection chat={chat} capability={capability} />
+      )}
     </div>
   )
 }
@@ -501,13 +525,7 @@ function SamplingSection({ chat, capability }: { chat: Chat; capability: Effecti
   )
 }
 
-function ReasoningSection({
-  chat,
-  capability,
-}: {
-  chat: Chat
-  capability: EffectiveCapability
-}) {
+function ReasoningSection({ chat, capability }: { chat: Chat; capability: EffectiveCapability }) {
   const hasReasoning =
     capability.supportedParameters.has('reasoning') ||
     capability.supportedParameters.has('thinking') ||
@@ -776,12 +794,16 @@ export function ReasoningIncludeControls({
       reasoning: { ...r, include: { ...include, ...patch } },
     })
   const echoAsThink = r.echoAsThinkTags === true
-  // Send-as-think is a chat-completions-only transport for plaintext carriers.
-  // Disable when there's nothing plaintext to wrap (both summary + text off).
-  const sendAsThinkDisabled = !include.summary && !include.text
-  const sendAsThinkTitle = sendAsThinkDisabled
-    ? 'No plaintext reasoning is being included — check Visible summary or Visible text first.'
-    : 'When on, kept summary + text are sent as a <think>…</think> block prepended to the assistant message body instead of reasoning_details. Encrypted carriers ride the native channel either way. Ignored on Responses + Gemini-native routes.'
+  const textCompletionsActive = chat.settings.api === 'text' || chat.settings.protocol === 'text'
+  // Text completions has no structured reasoning echo channel; carried
+  // plaintext reasoning belongs in the rendered prompt as <think> blocks.
+  const sendAsThinkDisabled = textCompletionsActive || (!include.summary && !include.text)
+  const sendAsThinkChecked = textCompletionsActive || echoAsThink
+  const sendAsThinkTitle = textCompletionsActive
+    ? 'Text completions always sends kept plaintext reasoning as <think> blocks in the rendered prompt.'
+    : sendAsThinkDisabled
+      ? 'No plaintext reasoning is being included — check Visible summary or Visible text first.'
+      : 'When on, kept summary + text are sent as a <think>…</think> block prepended to the assistant message body instead of reasoning_details. Encrypted carriers ride the native channel either way. Ignored on Responses + Gemini-native routes.'
   return (
     <section data-ui="settings-section" data-ui-section="reasoning-include">
       <h3>Include in next turn</h3>
@@ -813,16 +835,21 @@ export function ReasoningIncludeControls({
             />
             <span>Visible text</span>
           </label>
-          <label data-ui="reasoning-checkbox" title={sendAsThinkTitle}>
+          <label
+            data-ui="reasoning-checkbox"
+            data-disabled={sendAsThinkDisabled ? 'true' : undefined}
+            title={sendAsThinkTitle}
+          >
             <input
               type="checkbox"
-              checked={echoAsThink}
+              checked={sendAsThinkChecked}
               disabled={sendAsThinkDisabled}
-              onChange={(e) =>
+              onChange={(e) => {
+                if (textCompletionsActive) return
                 void updateChatSettings(chat.id, {
                   reasoning: { ...r, echoAsThinkTags: e.target.checked },
                 })
-              }
+              }}
             />
             <span>Send as &lt;think&gt; tags</span>
           </label>
@@ -832,12 +859,9 @@ export function ReasoningIncludeControls({
   )
 }
 
-// API mode — Chat completions / Responses. Only renders when the model
-// supports BOTH transports AND the profile exposes /responses. On
-// Responses-only models (gpt-5.4-pro, 5.3-codex, *-pro, *-codex) we force
-// Responses and hide the toggle. On chat-only models (all Claude, Gemini,
-// DeepSeek, Qwen, *-chat-latest) we force Chat and hide the toggle.
-// Gemini (native) connections pick transport at the connection level.
+// API mode — Chat completions / Responses / Text completions. Text
+// completions is an OpenRouter-only prompt-mode route; llama-server keeps its
+// separate protocol toggle because it also has a server-defined GGUF template.
 //
 // Lives on the Model tab. Exported for use in `ChatModelPanel`.
 export function ApiModeSection({
@@ -854,15 +878,22 @@ export function ApiModeSection({
   if (!profile) return null
   // Gemini native picks transport at the connection level — nothing per-chat.
   if (profile.kind === 'google' && profile.geminiMode !== 'openai-compat') return null
-  if (!isResponsesCapable(profile)) return null
   const support = responsesSupportFor(chat.settings.model)
-  // Hide toggle unless the model has a genuine choice.
-  if (support !== 'both') return null
+  const canResponses = isResponsesCapable(profile) && support === 'both'
+  const textSupport = textCompletionsSupportFor(chat.settings.model)
+  const canText = isTextCompletionsCapable(profile, chat.settings.model)
+  const showDisabledText =
+    profile.kind === 'openrouter' &&
+    support !== 'responses-only' &&
+    (textSupport === 'disabled-chat-native' || textSupport === 'accepted-reasoning-only')
+  // Hide toggle unless the model has a genuine choice or a disabled text
+  // option worth explaining.
+  if (!canResponses && !canText && !showDisabledText) return null
   const route = chooseApi(profile, chat.settings, activePathMessages, capability)
-  const resolvedKind: 'chat' | 'responses' =
-    route.kind === 'responses' ? 'responses' : 'chat'
+  const resolvedKind: 'chat' | 'responses' | 'text' =
+    route.kind === 'responses' ? 'responses' : route.kind === 'text-completions' ? 'text' : 'chat'
   const requiresPhaseEcho = capability.quirks.requiresPhaseEcho === true
-  const pinTo = (target: 'chat' | 'responses') => {
+  const pinTo = (target: 'chat' | 'responses' | 'text') => {
     if (target === 'chat' && requiresPhaseEcho) {
       if (
         typeof window !== 'undefined' &&
@@ -875,11 +906,17 @@ export function ApiModeSection({
     }
     void updateChatSettings(chat.id, { api: target as ApiVariant })
   }
+  const textDisabledReason =
+    textSupport === 'disabled-chat-native'
+      ? 'Text completions is disabled for closed-source chat-native families; use Chat completions or Responses.'
+      : textSupport === 'accepted-reasoning-only'
+        ? 'This model accepts prompt mode but returns reasoning-only output in live probes.'
+        : ''
   return (
     <section data-ui="settings-section" data-ui-section="api-mode">
       <h3>
         API Mode{' '}
-        <InfoDisclosure title="Responses preserves encrypted reasoning and `phase` metadata across turns. Chat completions is simpler and universal. Default is picked per model." />
+        <InfoDisclosure title="Responses preserves encrypted reasoning and `phase` metadata across turns. Text completions sends a single rendered prompt to /completions and is intended for OpenRouter-routed open-weight models." />
       </h3>
       <div data-ui="field-group" data-ui-field>
         <div data-ui="segmented">
@@ -891,14 +928,28 @@ export function ApiModeSection({
           >
             Chat completions
           </button>
-          <button
-            type="button"
-            data-ui="segmented-option"
-            aria-pressed={resolvedKind === 'responses'}
-            onClick={() => pinTo('responses')}
-          >
-            Responses
-          </button>
+          {canResponses ? (
+            <button
+              type="button"
+              data-ui="segmented-option"
+              aria-pressed={resolvedKind === 'responses'}
+              onClick={() => pinTo('responses')}
+            >
+              Responses
+            </button>
+          ) : null}
+          {canText || showDisabledText ? (
+            <button
+              type="button"
+              data-ui="segmented-option"
+              aria-pressed={resolvedKind === 'text'}
+              disabled={!canText}
+              title={textDisabledReason}
+              onClick={() => pinTo('text')}
+            >
+              Text completions
+            </button>
+          ) : null}
         </div>
       </div>
     </section>
@@ -942,18 +993,15 @@ function StopSection({ chat, capability }: { chat: Chat; capability: EffectiveCa
     capability.supportedParameters.has('stop_sequences')
   if (!hasStop) return null
   const values = chat.settings.stop ?? []
+  const setValues = (next: string[]) => {
+    const clean = sanitizeStopValues(next)
+    void updateChatSettings(chat.id, clean.length === 0 ? { stop: [] } : { stop: clean })
+  }
   const entries = values.map((value, index) => ({
     value,
     index,
     key: `${value}:${values.slice(0, index).filter((item) => item === value).length}`,
   }))
-  const setValues = (next: string[]) => {
-    const clean = next
-      .map((s) => s.trim())
-      .filter((s) => s.length > 0)
-      .slice(0, 4)
-    void updateChatSettings(chat.id, clean.length === 0 ? { stop: [] } : { stop: clean })
-  }
   return (
     <section data-ui="settings-section" data-ui-section="stop">
       <h3>Stop sequences</h3>
@@ -987,6 +1035,57 @@ function StopSection({ chat, capability }: { chat: Chat; capability: EffectiveCa
       </div>
     </section>
   )
+}
+
+function StopTextAreaControl({
+  chat,
+  capability,
+  label,
+  helper,
+}: {
+  chat: Chat
+  capability: EffectiveCapability
+  label: string
+  helper: string
+}) {
+  const hasStop =
+    capability.supportedParameters.has('stop') ||
+    capability.supportedParameters.has('stop_sequences')
+  if (!hasStop) return null
+  const values = chat.settings.stop ?? []
+  const text = values.join('\n')
+  const [draft, setDraft] = useState(text)
+  useEffect(() => {
+    setDraft(text)
+  }, [text])
+  const setValues = (next: string[]) => {
+    const clean = sanitizeStopValues(next)
+    void updateChatSettings(chat.id, clean.length === 0 ? { stop: [] } : { stop: clean })
+  }
+  const id = 'request-stop-sequences'
+  return (
+    <div data-ui="field-group">
+      <label htmlFor={id}>{label}</label>
+      <textarea
+        id={id}
+        rows={4}
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={() => {
+          if (draft === text) return
+          setValues(draft.split('\n'))
+        }}
+      />
+      <span data-ui="helper">{helper}</span>
+    </div>
+  )
+}
+
+function sanitizeStopValues(values: readonly string[]): string[] {
+  return values
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0)
+    .slice(0, 4)
 }
 
 function LogitBiasSection({ chat, capability }: { chat: Chat; capability: EffectiveCapability }) {
