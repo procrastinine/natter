@@ -11,6 +11,9 @@ test-results
 .env.*
 !.env.example
 
+# Generated local attachment corpus for Phase 12 experiments.
+tests/fixtures/attachments/
+
 .DS_Store
 *.log
 

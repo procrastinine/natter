@@ -1,10 +1,5 @@
 import { expect, test, type Page } from '@playwright/test'
-import {
-  buildSseBody,
-  clearIndexedDb,
-  createChatAndOpen,
-  seedFirstRun,
-} from './helpers'
+import { buildSseBody, clearIndexedDb, createChatAndOpen, seedFirstRun } from './helpers'
 
 const OSS_MODEL = 'qwen/qwen3-4b'
 const OPENAI_MODEL = 'gpt-4o-mini'
@@ -26,7 +21,11 @@ type PlanEntry = {
 test.beforeEach(async ({ page }) => {
   await page.goto('/')
   await clearIndexedDb(page)
-  await page.evaluate(() => (window as unknown as { __debugStreams?: { enablePlans(): void } }).__debugStreams?.enablePlans())
+  await page.evaluate(() =>
+    (
+      window as unknown as { __debugStreams?: { enablePlans(): void } }
+    ).__debugStreams?.enablePlans(),
+  )
 })
 
 test('GUI OpenRouter send, Continue, provider overrides, token-cap routing, and preset save stay on the unified planner', async ({
@@ -40,7 +39,9 @@ test('GUI OpenRouter send, Continue, provider overrides, token-cap routing, and 
   await seedFirstRun(page, { model: OSS_MODEL, disablePrivacyFilter: false })
   const profileId = await activeProfileId(page)
   await seedOpenRouterDiscovery(page, profileId, OSS_MODEL)
-  await page.evaluate(() => (window as unknown as { __debugStreams?: { clearPlans(): void } }).__debugStreams?.clearPlans())
+  await page.evaluate(() =>
+    (window as unknown as { __debugStreams?: { clearPlans(): void } }).__debugStreams?.clearPlans(),
+  )
 
   await createChatAndOpen(page)
   const composer = page.locator('[data-ui="composer-input"]')
@@ -50,7 +51,7 @@ test('GUI OpenRouter send, Continue, provider overrides, token-cap routing, and 
 
   await expect(page.getByLabel('Use Tiny Context')).toBeVisible()
 
-  await page.locator('[aria-label="Provider sort order"]').selectOption('price')
+  await page.getByRole('radio', { name: 'Throughput' }).click()
   const strict = page.locator('[data-ui="provider-picker-strict"] input')
   await strict.click()
   await expect(strict).toBeChecked()
@@ -83,7 +84,7 @@ test('GUI OpenRouter send, Continue, provider overrides, token-cap routing, and 
     const provider = req.body.provider as Record<string, unknown>
     expect(provider).toMatchObject({
       data_collection: 'deny',
-      sort: 'price',
+      sort: 'throughput',
       require_parameters: true,
     })
     expect(provider.ignore).toEqual(
@@ -103,7 +104,7 @@ test('GUI OpenRouter send, Continue, provider overrides, token-cap routing, and 
   const sendProvider = providerSummary(sendPlan)
   expect(sendProvider.wire).toMatchObject({
     data_collection: 'deny',
-    sort: 'price',
+    sort: 'throughput',
     require_parameters: true,
   })
   expect(sendProvider.contextIgnored).toEqual(['Tiny Context'])
@@ -135,7 +136,9 @@ test('GUI OpenAI-compatible send uses Responses and never carries OpenRouter pro
   await seedFirstRun(page, { model: OSS_MODEL, disablePrivacyFilter: false })
   await createChatAndOpen(page)
   await addOpenAiConnectionThroughGui(page)
-  await page.evaluate(() => (window as unknown as { __debugStreams?: { clearPlans(): void } }).__debugStreams?.clearPlans())
+  await page.evaluate(() =>
+    (window as unknown as { __debugStreams?: { clearPlans(): void } }).__debugStreams?.clearPlans(),
+  )
 
   await page.locator('[data-role="settings-cog"]').click()
   await expect(page.locator('[data-ui-section="provider-picker"]')).toHaveCount(0)
@@ -290,9 +293,7 @@ function buildResponsesSse(text: string): string {
       },
     },
   ]
-  return events
-    .map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n`)
-    .join('\n')
+  return events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n`).join('\n')
 }
 
 function parsePostBody(raw: string | null): Record<string, unknown> {
@@ -334,7 +335,14 @@ async function seedOpenRouterDiscovery(
   const endpointsPayload = openRouterEndpointsPayload(modelId)
   const privacyPayload = { policies: openRouterPolicies(), fetchedAt: Date.now() }
   await page.evaluate(
-    async ({ profileId, modelId, modelsQueryKey, modelsPayload, endpointsPayload, privacyPayload }) => {
+    async ({
+      profileId,
+      modelId,
+      modelsQueryKey,
+      modelsPayload,
+      endpointsPayload,
+      privacyPayload,
+    }) => {
       const now = Date.now()
       const db = await openNatterDb()
       try {
@@ -529,8 +537,9 @@ async function seedDirectModels(page: Page, profileId: string): Promise<void> {
 async function requestPlans(page: Page): Promise<PlanEntry[]> {
   return page.evaluate(
     () =>
-      (window as unknown as { __debugStreams?: { plans(): PlanEntry[] } }).__debugStreams?.plans() ??
-      [],
+      (
+        window as unknown as { __debugStreams?: { plans(): PlanEntry[] } }
+      ).__debugStreams?.plans() ?? [],
   ) as Promise<PlanEntry[]>
 }
 

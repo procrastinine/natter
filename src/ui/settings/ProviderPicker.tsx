@@ -10,9 +10,10 @@
 //   - no-filter: privacy filter doesn't apply (non-OpenRouter connection,
 //     or `:free` model). No padlock; plain endpoint list.
 //
-// Sort dropdown binds to `providerPrefs.sort`. OpenRouter sorts the
+// Routing-sort control binds to `providerPrefs.sort`. OpenRouter sorts the
 // request's allowed providers by this axis — auto-excluded entries don't
-// appear on the wire, so sort only reorders providers we actually keep.
+// appear on the wire. The visible picker sorts every row by the same metric,
+// including blocked rows, so toggling a provider doesn't move it around.
 // Reset clears both `providerPrefs` (order/ignore/sort) and privacy-side
 // manual overrides (only/ignoreProviders) in one operation.
 
@@ -50,6 +51,11 @@ export interface ProviderPickerProps {
 }
 
 const EMPTY_CURSOR = Object.freeze({}) as Readonly<Record<string, string>>
+const SORT_OPTIONS: ReadonlyArray<{ value: SortBy; label: string }> = [
+  { value: 'price', label: 'Price' },
+  { value: 'throughput', label: 'Throughput' },
+  { value: 'latency', label: 'Latency' },
+]
 
 export function ProviderPicker({
   chat,
@@ -58,16 +64,26 @@ export function ProviderPicker({
 }: ProviderPickerProps) {
   const { endpoints, filter, loading, isFreeModel, scrapeApplicable, refresh } = routing
   const prefs = chat.settings.providerPrefs ?? {}
+  const currentSort: SortBy =
+    typeof prefs.sort === 'string'
+      ? prefs.sort
+      : typeof prefs.sort === 'object' && prefs.sort !== null
+        ? prefs.sort.by
+        : 'price'
   const manualOrdered = useMemo(() => orderEndpoints(endpoints, prefs), [endpoints, prefs])
+  const displayOrdered = useMemo(
+    () => sortEndpointsByMetric(manualOrdered, currentSort),
+    [manualOrdered, currentSort],
+  )
   const rows = useMemo(
     () =>
       loading && scrapeApplicable && !filter
         ? []
-        : buildPickerRows(manualOrdered, filter, {
+        : buildPickerRows(displayOrdered, filter, {
             providerPrefs: prefs,
             privacy: chat.settings.privacy,
           }),
-    [manualOrdered, filter, prefs, chat.settings.privacy, loading, scrapeApplicable],
+    [displayOrdered, filter, prefs, chat.settings.privacy, loading, scrapeApplicable],
   )
   const needsLocalNeededTokens = neededTokensOverride === undefined
 
@@ -234,14 +250,9 @@ export function ProviderPicker({
   )
 
   const setSort = useCallback(
-    (sort: SortBy | 'default') => {
-      // 'default' drops the field entirely so OpenRouter picks its own
-      // ordering. Other values bind `providerPrefs.sort = scalar`. The
-      // `{by, partition}` object form exists on the type but the user
-      // asked for a simple three-way toggle — we don't surface partition.
+    (sort: SortBy) => {
       const next: ProviderPreferences = { ...(chat.settings.providerPrefs ?? {}) }
-      if (sort === 'default') delete next.sort
-      else next.sort = sort
+      next.sort = sort
       void updateChatSettings(chat.id, { providerPrefs: next })
     },
     [chat.id, chat.settings.providerPrefs],
@@ -274,13 +285,6 @@ export function ProviderPicker({
     (prefs.order?.length ?? 0) > 0 ||
     prefs.sort !== undefined ||
     privacyOverrides > 0
-
-  const currentSort: SortBy | 'default' =
-    typeof prefs.sort === 'string'
-      ? prefs.sort
-      : typeof prefs.sort === 'object' && prefs.sort !== null
-        ? prefs.sort.by
-        : 'default'
 
   return (
     <div data-ui="settings-section" data-ui-section="provider-picker">
@@ -318,19 +322,29 @@ export function ProviderPicker({
             <InfoDisclosure title="Only route to providers that support every set parameter. Unchecked: send all parameters; providers ignore unsupported ones." />
           </span>
         </label>
-        <label data-ui="provider-picker-sort">
-          <span>Sort</span>
-          <select
-            value={currentSort}
-            onChange={(e) => setSort(e.target.value as SortBy | 'default')}
-            aria-label="Provider sort order"
-          >
-            <option value="default">OpenRouter default</option>
-            <option value="price">Lowest price</option>
-            <option value="throughput">Highest throughput</option>
-            <option value="latency">Lowest latency</option>
-          </select>
-        </label>
+        <fieldset data-ui="provider-picker-sort">
+          <legend>Routing sort</legend>
+          <div data-ui="provider-picker-sort-toggle" aria-label="Provider routing sort">
+            {SORT_OPTIONS.map((option) => {
+              const selected = currentSort === option.value
+              return (
+                <label key={option.value} data-active={selected}>
+                  <input
+                    type="radio"
+                    name={`provider-sort-${chat.id}`}
+                    value={option.value}
+                    checked={selected}
+                    onChange={() => setSort(option.value)}
+                    onClick={() => {
+                      if (selected && prefs.sort === undefined) setSort(option.value)
+                    }}
+                  />
+                  {option.label}
+                </label>
+              )
+            })}
+          </div>
+        </fieldset>
       </div>
       {rows.length === 0 ? (
         <p data-ui="helper">{loading ? 'Loading…' : 'No providers available for this model.'}</p>
@@ -412,6 +426,51 @@ function orderEndpoints(
     if (!seen.has(providerEndpointKey(ep))) out.push(ep)
   }
   return out
+}
+
+function sortEndpointsByMetric(endpoints: readonly ModelEndpoint[], sort: SortBy): ModelEndpoint[] {
+  return endpoints
+    .map((endpoint, index) => ({ endpoint, index, value: endpointSortValue(endpoint, sort) }))
+    .sort((left, right) => {
+      if (left.value !== right.value) return left.value - right.value
+      return left.index - right.index
+    })
+    .map((entry) => entry.endpoint)
+}
+
+function endpointSortValue(endpoint: ModelEndpoint, sort: SortBy): number {
+  switch (sort) {
+    case 'price':
+      return endpointPrice(endpoint)
+    case 'throughput':
+      return -endpointThroughput(endpoint)
+    case 'latency':
+      return endpointLatency(endpoint)
+  }
+}
+
+function endpointPrice(endpoint: ModelEndpoint): number {
+  const prompt = Number(endpoint.pricing.prompt)
+  const completion = Number(endpoint.pricing.completion)
+  if (Number.isFinite(prompt) && Number.isFinite(completion)) return prompt + completion
+  if (Number.isFinite(prompt)) return prompt
+  if (Number.isFinite(completion)) return completion
+  return Number.POSITIVE_INFINITY
+}
+
+function endpointThroughput(endpoint: ModelEndpoint): number {
+  const throughput = endpoint.throughput_last_30m as
+    | { p50?: number; tokensPerSecond?: number }
+    | undefined
+  if (typeof throughput?.p50 === 'number') return throughput.p50
+  if (typeof throughput?.tokensPerSecond === 'number') return throughput.tokensPerSecond
+  return Number.NEGATIVE_INFINITY
+}
+
+function endpointLatency(endpoint: ModelEndpoint): number {
+  const latency = endpoint.latency_last_30m
+  if (typeof latency?.p50 === 'number') return latency.p50
+  return Number.POSITIVE_INFINITY
 }
 
 function ProviderRow({
