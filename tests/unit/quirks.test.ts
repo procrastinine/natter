@@ -5,7 +5,9 @@ import {
   cacheMinTokensFor,
   FULL_EFFORT,
   FULL_VERBOSITY,
+  prefillClassFor,
   quirksFor,
+  reasoningToggleableFor,
 } from '../../src/core/quirks'
 
 describe('quirks registry', () => {
@@ -111,6 +113,22 @@ describe('quirks registry', () => {
     // — upstream clamps silently, so we hide those buttons.
     expect(allowedEffortFor('x-ai/grok-4.20')).toEqual(['low', 'medium', 'high'])
     expect(allowedEffortFor('x-ai/grok-4.1')).toEqual(['low', 'medium', 'high'])
+  })
+
+  it('classifies assistant-prefill support by model family', () => {
+    expect(prefillClassFor('anthropic/claude-haiku-4.5')).toBe('native')
+    expect(prefillClassFor('anthropic/claude-opus-4.7')).toBe('unsupported')
+    expect(prefillClassFor('openai/gpt-5.4')).toBe('unsupported')
+    expect(prefillClassFor('openai/gpt-oss-120b')).toBe('unsupported')
+    expect(prefillClassFor('google/gemini-3.1-flash-lite-preview')).toBe('native')
+    expect(prefillClassFor('deepseek/deepseek-r1')).toBe('oss-reasoning-required')
+    expect(prefillClassFor('z-ai/glm-5.1')).toBe('oss-toggleable')
+  })
+
+  it('marks reasoning-required models as non-toggleable', () => {
+    expect(reasoningToggleableFor('deepseek/deepseek-r1')).toBe(false)
+    expect(reasoningToggleableFor('google/gemini-3.1-flash-lite-preview')).toBe(false)
+    expect(reasoningToggleableFor('z-ai/glm-5.1')).toBe(true)
   })
 
   // OSS thinking-model families fall through to the pattern-based default

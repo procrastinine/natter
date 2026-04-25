@@ -63,11 +63,21 @@ export interface MessageProps {
     text: string,
     reasoning?: ReasoningDetail[],
   ) => Promise<void>
-  onEditAndSend?: (message: MessageRow, text: string) => Promise<void>
+  onEditAndSend?: (
+    message: MessageRow,
+    text: string,
+    opts?: { prefillText?: string },
+  ) => Promise<void>
   onRegenerate?: (message: MessageRow) => Promise<void>
   onContinue?: (message: MessageRow) => Promise<void>
   onForkChat?: (message: MessageRow) => Promise<void>
   onInsert?: (message: MessageRow, slot: InsertSlot) => void
+  // Prefill UI plumbing — passes through to InlineEditor's Save & Send.
+  // `showPrefillButton` is true only when the chat's model class is not
+  // `unsupported`. `defaultPrefill` seeds the textarea on toggle-open.
+  showPrefillButton?: boolean
+  defaultPrefill?: string
+  prefillSettingsPrompt?: ReactNode
 }
 
 // Memoized — the markdown render path (Streamdown + Shiki + KaTeX) is
@@ -101,7 +111,10 @@ export const Message = memo(
     prev.onRegenerate === next.onRegenerate &&
     prev.onContinue === next.onContinue &&
     prev.onForkChat === next.onForkChat &&
-    prev.onInsert === next.onInsert,
+    prev.onInsert === next.onInsert &&
+    prev.showPrefillButton === next.showPrefillButton &&
+    prev.defaultPrefill === next.defaultPrefill &&
+    prev.prefillSettingsPrompt === next.prefillSettingsPrompt,
 )
 
 function MessageInner({
@@ -125,6 +138,9 @@ function MessageInner({
   onContinue,
   onForkChat,
   onInsert,
+  showPrefillButton,
+  defaultPrefill,
+  prefillSettingsPrompt,
 }: MessageProps) {
   void branchTreeKey
   const error = message.generation?.error
@@ -281,9 +297,9 @@ function MessageInner({
     [message, reasoning, text, onEditInPlace],
   )
   const handleSaveAndSend = useCallback(
-    async (text: string) => {
+    async (text: string, opts?: { prefillText?: string }) => {
       if (!onEditAndSend) return
-      await onEditAndSend(message, text)
+      await onEditAndSend(message, text, opts)
       setEditing(false)
     },
     [message, onEditAndSend],
@@ -386,6 +402,13 @@ function MessageInner({
               ? {
                   onSaveAndSend: handleSaveAndSend,
                   saveAndSendDisabled: !hasConnection || generationBusy,
+                  ...(showPrefillButton
+                    ? {
+                        showPrefillButton: true,
+                        defaultPrefill: defaultPrefill ?? '',
+                        prefillSettingsPrompt,
+                      }
+                    : {}),
                   ...(!hasConnection
                     ? { saveAndSendDisabledReason: 'Add a connection to send messages.' }
                     : generationBusy

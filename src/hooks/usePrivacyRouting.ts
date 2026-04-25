@@ -63,7 +63,7 @@ export function usePrivacyRouting(chat: Chat | null | undefined): UsePrivacyRout
     pol.policies,
     modelId,
     ep.endpoints,
-    chat?.settings.privacy,
+    chat,
   ])
 
   const wire = useMemo<WireProviderPrivacy | null>(() => {
@@ -83,14 +83,7 @@ export function usePrivacyRouting(chat: Chat | null | undefined): UsePrivacyRout
     if (prefs?.only) opts.existingOnly = prefs.only
     if (prefs?.order) opts.existingOrder = prefs.order
     return buildWireProviderPrivacy(filter, chat.settings.privacy, opts)
-  }, [
-    filter,
-    chat?.settings.privacy,
-    chat?.settings.providerPrefs?.ignore,
-    chat?.settings.providerPrefs?.only,
-    chat?.settings.providerPrefs?.order,
-    chat?.settings.providerPrefs?.ignoreOverridesFilter,
-  ])
+  }, [filter, chat])
 
   const refresh = useCallback(() => {
     ep.refresh()

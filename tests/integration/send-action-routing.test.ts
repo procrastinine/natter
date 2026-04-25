@@ -490,4 +490,114 @@ describe('send action routing', () => {
     const updated = await getBrowserRepository().getMessage(assistant.id)
     expect(updated?.content).toEqual([{ type: 'output_text', text: 'partial more' }])
   })
+
+  it('continueAssistantInPlace prefill mode skips continue prompts without auto-configuring settings', async () => {
+    const modelId = 'z-ai/glm-5.1'
+    await putCachedEndpoints('prof', modelId, {
+      id: modelId,
+      endpoints: [
+        {
+          provider_name: 'DeepInfra',
+          provider_slug: 'deepinfra',
+          supported_parameters: ['temperature', 'reasoning'],
+          context_length: 200000,
+          pricing: {},
+        },
+      ],
+    })
+    await putCachedPrivacyPolicy('prof', modelId, {
+      policies: {
+        DeepInfra: {
+          training: false,
+          trainingOpenRouter: false,
+          retainsPrompts: false,
+          canPublish: false,
+          termsOfServiceURL: '',
+          privacyPolicyURL: '',
+        },
+        deepinfra: {
+          training: false,
+          trainingOpenRouter: false,
+          retainsPrompts: false,
+          canPublish: false,
+          termsOfServiceURL: '',
+          privacyPolicyURL: '',
+        },
+      },
+      fetchedAt: 0,
+    })
+    const chat = await createChat({
+      settings: chatSettings({
+        model: modelId,
+        systemPrompt: 'ORIGINAL SYSTEM PROMPT',
+        continueSystemPrompt: 'CONTINUE SYSTEM PROMPT SHOULD NOT APPEAR',
+        continueUserPrompt: 'CONTINUE USER PROMPT SHOULD NOT APPEAR',
+        continuePrefill: true,
+        reasoning: {
+          mode: 'default',
+          exclude: false,
+          summary: 'off',
+          carryForward: 'off',
+          include: { encrypted: false, summary: false, text: false },
+        },
+      }),
+    })
+
+    await sendText({
+      chatId: chat.id,
+      connection: makeProfile(),
+      apiKey: 'sk-test',
+      content: [{ type: 'text', text: 'hello' }],
+      openStream: () =>
+        stream({
+          type: 'delta',
+          chunk: {
+            id: 'seed',
+            choices: [{ delta: { content: 'partial' }, finish_reason: 'stop' }],
+          },
+        } as ChatStreamChunk),
+    })
+    const rows = await messagesFor(chat.id)
+    const assistant = requireDefined(
+      rows.find((m) => m.role === 'assistant'),
+      'assistant message',
+    )
+
+    let seenWire: Record<string, unknown> | undefined
+    await continueAssistantInPlace({
+      chatId: chat.id,
+      targetMessageId: assistant.id,
+      connection: makeProfile(),
+      apiKey: 'sk-test',
+      openStream: (open) => {
+        seenWire = open.wireBody
+        return stream({
+          type: 'delta',
+          chunk: {
+            id: 'continue-prefill',
+            choices: [{ delta: { content: ' more' }, finish_reason: 'stop' }],
+          },
+        } as ChatStreamChunk)
+      },
+    })
+
+    expect(seenWire).toBeDefined()
+    expect((seenWire as { messages?: Array<{ role: string; content: string }> }).messages).toEqual([
+      { role: 'system', content: 'ORIGINAL SYSTEM PROMPT' },
+      { role: 'user', content: 'hello' },
+      { role: 'assistant', content: 'partial' },
+    ])
+    expect(JSON.stringify(seenWire)).not.toContain('CONTINUE SYSTEM PROMPT SHOULD NOT APPEAR')
+    expect(JSON.stringify(seenWire)).not.toContain('CONTINUE USER PROMPT SHOULD NOT APPEAR')
+    expect((seenWire as { reasoning?: unknown }).reasoning).toBeUndefined()
+    expect((seenWire as { provider?: { only?: string[] } }).provider?.only).toBeUndefined()
+    const storedChat = await getBrowserRepository().getChat(chat.id)
+    expect(storedChat?.settings.reasoning.mode).toBe('default')
+    expect(storedChat?.settings.providerPrefs?.only).toBeUndefined()
+    const finalRows = await messagesFor(chat.id)
+    expect(finalRows.filter((m) => m.role === 'assistant')).toHaveLength(1)
+    expect((await getBrowserRepository().getMessage(assistant.id))?.content).toEqual([
+      { type: 'output_text', text: 'partial more' },
+    ])
+  })
 })

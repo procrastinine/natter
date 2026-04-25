@@ -303,6 +303,34 @@ describe('validateChatSettings', () => {
     expect(result.issues.some((i) => i.field === 'reasoning.effort')).toBe(true)
   })
 
+  it('clamps reasoning.mode=off away from reasoning-required models', () => {
+    const s: ChatSettings = {
+      ...baseSettings(),
+      model: 'deepseek/deepseek-r1',
+      reasoning: { ...baseSettings().reasoning, mode: 'off' },
+    }
+    const ep = makeEndpoint({ supported_parameters: ['reasoning'] })
+    const cap = effectiveCapabilityFromEndpoints('deepseek/deepseek-r1', [ep])
+    const result = validateChatSettings(s, cap)
+    expect(result.changed).toBe(true)
+    expect(result.settings.reasoning.mode).toBe('enabled')
+    expect(result.issues.some((i) => i.field === 'reasoning.mode')).toBe(true)
+  })
+
+  it('clamps reasoning.mode=off away from Gemini models', () => {
+    const s: ChatSettings = {
+      ...baseSettings(),
+      model: 'google/gemini-3.1-flash-lite-preview',
+      reasoning: { ...baseSettings().reasoning, mode: 'off' },
+    }
+    const ep = makeEndpoint({ supported_parameters: ['reasoning'] })
+    const cap = effectiveCapabilityFromEndpoints('google/gemini-3.1-flash-lite-preview', [ep])
+    const result = validateChatSettings(s, cap)
+    expect(result.changed).toBe(true)
+    expect(result.settings.reasoning.mode).toBe('enabled')
+    expect(result.issues.some((i) => i.field === 'reasoning.mode')).toBe(true)
+  })
+
   it('drops verbosity when supported_parameters lacks it', () => {
     const s: ChatSettings = { ...baseSettings(), verbosity: 'high' }
     const ep = makeEndpoint({ supported_parameters: ['temperature'] })

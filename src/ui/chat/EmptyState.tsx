@@ -63,13 +63,12 @@ export function EmptyState({ onPick }: EmptyStateProps) {
         </button>
       ) : (
         <>
-          <div data-ui="sample-prompts" role="list">
+          <div data-ui="sample-prompts">
             {SAMPLE_PROMPTS.map((prompt) => (
               <button
                 type="button"
                 data-ui="sample-prompt"
                 key={prompt.title}
-                role="listitem"
                 onClick={() => onPick(prompt.body)}
               >
                 <strong>{prompt.title}</strong>

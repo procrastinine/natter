@@ -187,6 +187,71 @@ describe('toChatCompletions', () => {
     ])
   })
 
+  it('trims trailing whitespace from a trailing assistant prefill without mutating the row', () => {
+    const prefill = textMessage({
+      id: 'a1',
+      role: 'assistant',
+      text: 'Sure,\n\n',
+      origin: 'prefill',
+    })
+    const path = [textMessage({ id: 'u1', role: 'user', text: 'hi' }), prefill]
+    const { wire } = toChatCompletions(settings(), path)
+    expect(wire.messages).toEqual([
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', content: 'Sure,' },
+    ])
+    expect(prefill.content).toEqual([{ type: 'text', text: 'Sure,\n\n' }])
+  })
+
+  it('merges stored prefill + continuation assistant rows for follow-up wire context', () => {
+    const prefill = textMessage({
+      id: 'a1',
+      role: 'assistant',
+      text: 'Chapter',
+      origin: 'prefill',
+    })
+    const continuation = textMessage({
+      id: 'a2',
+      role: 'assistant',
+      text: ' One  ',
+      origin: 'generated',
+    })
+    const path = [
+      textMessage({ id: 'u1', role: 'user', text: 'write' }),
+      prefill,
+      continuation,
+      textMessage({ id: 'u2', role: 'user', text: 'continue' }),
+    ]
+    const { wire } = toChatCompletions(settings(), path)
+    expect(wire.messages).toEqual([
+      { role: 'user', content: 'write' },
+      { role: 'assistant', content: 'Chapter One' },
+      { role: 'user', content: 'continue' },
+    ])
+    expect((prefill as Message & { __prefill_dropped?: true }).__prefill_dropped).toBeUndefined()
+  })
+
+  it('does not silently override reasoning settings when a path ends in prefill', () => {
+    const path = [
+      textMessage({ id: 'u1', role: 'user', text: 'write' }),
+      textMessage({ id: 'a1', role: 'assistant', text: 'Chapter', origin: 'prefill' }),
+    ]
+    const { wire } = toChatCompletions(
+      settings({
+        model: 'z-ai/glm-5.1',
+        reasoning: {
+          mode: 'default',
+          exclude: false,
+          summary: 'off',
+          carryForward: 'off',
+          include: { encrypted: false, summary: false, text: false },
+        },
+      }),
+      path,
+    )
+    expect(wire.reasoning).toBeUndefined()
+  })
+
   it('respects opts.rewriteSlug without changing requestedModel', () => {
     const path = [textMessage({ id: 'u1', role: 'user', text: 'hi' })]
     const { wire, requestedModel } = toChatCompletions(

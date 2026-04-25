@@ -21,6 +21,7 @@ import {
   FULL_EFFORT,
   FULL_VERBOSITY,
   quirksFor,
+  reasoningToggleableFor,
 } from './quirks'
 import { providerRoutingRef } from './provider-identity'
 import type {
@@ -326,6 +327,22 @@ export function validateChatSettings(
       })
       changed = true
     }
+  }
+
+  if (
+    stored.reasoning.mode === 'off' &&
+    stored.model &&
+    !reasoningToggleableFor(stored.model)
+  ) {
+    nextReasoning = { ...nextReasoning, mode: 'enabled' }
+    issues.push({
+      kind: 'clamped-enum',
+      field: 'reasoning.mode',
+      reason: 'model requires reasoning; off is not supported',
+      previous: stored.reasoning.mode,
+      replacement: 'enabled',
+    })
+    changed = true
   }
 
   // Verbosity narrowing.

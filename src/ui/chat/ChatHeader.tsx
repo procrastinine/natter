@@ -50,10 +50,11 @@ export function ChatHeader({
   const [draftTitle, setDraftTitle] = useState('')
   const [showInfo, setShowInfo] = useState(false)
   const inputRef = useRef<HTMLInputElement | null>(null)
-  const titleLabelRef = useRef<HTMLSpanElement | null>(null)
+  const titleLabelRef = useRef<HTMLButtonElement | null>(null)
 
   // Cancel any in-progress title edit when the active chat changes — otherwise
   // the editor would stay open against the next chat's title (confusing).
+  // biome-ignore lint/correctness/useExhaustiveDependencies: chatId changes are the reset trigger; the effect does not need the value itself.
   useEffect(() => {
     setEditing(false)
     setDraftTitle('')
@@ -131,10 +132,10 @@ export function ChatHeader({
         />
       ) : (
         <div data-ui="chat-title" data-title-status={chat.titleStatus}>
-          <span
+          <button
+            type="button"
             ref={titleLabelRef}
             data-ui="chat-title-label"
-            tabIndex={0}
             onKeyDown={(e) => {
               if (e.key === 'F2' || e.key === 'Enter') {
                 e.preventDefault()
@@ -144,7 +145,7 @@ export function ChatHeader({
             onDoubleClick={beginEdit}
           >
             {displayTitle}
-          </span>
+          </button>
           <button
             type="button"
             data-ui="icon-button"

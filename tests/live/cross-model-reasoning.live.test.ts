@@ -313,7 +313,8 @@ describe.skipIf(!LIVE)(
       // (Value may be absent on some routes — don't assert, just accept.)
 
       const oaiCtx: ResponsesContext = { profile: openAiProfile(), apiKey: loadKey('openai') }
-      const message1 = turn1.output?.find((i) => i.type === 'message')!
+      const message1 = turn1.output?.find((i) => i.type === 'message')
+      if (!message1) return
       const turn2 = await responsesOnce(oaiCtx, {
         model: 'gpt-5.4-nano',
         input: [

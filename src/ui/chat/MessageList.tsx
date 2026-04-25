@@ -9,6 +9,7 @@ import type {
   ChatId,
   ChatSettings,
   CursorMap,
+  ModelEndpoint,
   MessageId,
   MessageRole,
   Message as MessageRow,
@@ -16,6 +17,7 @@ import type {
 } from '../../core/types'
 import type { EffectiveCapability } from '../../core/capabilities'
 import { UNLIMITED_CONTEXT } from '../../core/prompt-size'
+import { prefillClassFor } from '../../core/quirks'
 import { useChat } from '../../hooks/useChat'
 import {
   continueFromMessage,
@@ -31,12 +33,14 @@ import { useToastStore } from '../../store/zustand/toastStore'
 import { ImportModal } from './ImportModal'
 import { Message } from './Message'
 import type { InsertSlot } from './MessageActions'
+import { PrefillSettingsPrompt } from './PrefillSettingsPrompt'
 
 export interface MessageListProps {
   chatId: ChatId
   chatSettings: ChatSettings
   hasConnection: boolean
   capability?: EffectiveCapability
+  prefillRecommendationEndpoints?: readonly ModelEndpoint[]
 }
 
 // Stable reference so `useChatStore(selector)` doesn't allocate a fresh `{}`
@@ -67,6 +71,7 @@ export const MessageList = memo(function MessageList({
   chatSettings,
   hasConnection,
   capability,
+  prefillRecommendationEndpoints = [],
 }: MessageListProps) {
   const liveMessages = useLiveQuery(() => loadChatMessages(chatId), [chatId], [])
   const messages = useStableMessageRows(liveMessages ?? [])
@@ -114,6 +119,12 @@ export const MessageList = memo(function MessageList({
 
   const opsCtx = useMemo<MessageOpsContext>(() => ({ chatId, sendFrom }), [chatId, sendFrom])
 
+  // Prefill UI gating for the inline editor's "Save & Send" path. The
+  // button hides on `unsupported` models (Claude ≥ 4.6 / OpenAI / gpt-oss);
+  // on every other class it shows up next to Save & Send.
+  const prefillSupported = chatSettings.model
+    ? prefillClassFor(chatSettings.model) !== 'unsupported'
+    : false
   // Track the focused message id via a ref; the DOM's `:focus-within` +
   // `data-message-id` tuple on each <article> tells us which message the
   // user is navigating. Keeps keyboard shortcuts tied to "the message you
@@ -140,12 +151,20 @@ export const MessageList = memo(function MessageList({
   )
 
   const handleEditAndSend = useCallback(
-    async (m: MessageRow, text: string) => {
+    async (m: MessageRow, text: string, opts?: { prefillText?: string }) => {
       if (localGenerationBusyRef.current || useStreamStore.getState().hasStreamForChat(chatId)) return
       localGenerationBusyRef.current = true
       setLocalGenerationBusy(true)
       try {
-        await editAndResend(opsCtx, m, text)
+        const prefillText = opts?.prefillText ?? ''
+        await editAndResend(
+          opsCtx,
+          m,
+          text,
+          prefillText.length > 0
+            ? { prefillContent: [{ type: 'text', text: prefillText }] }
+            : {},
+        )
       } catch (err) {
         pushToast({
           level: 'danger',
@@ -330,6 +349,19 @@ export const MessageList = memo(function MessageList({
             {...(m.role === 'user'
               ? {
                   onEditAndSend: handleEditAndSend,
+                  ...(prefillSupported
+                    ? {
+                        showPrefillButton: true,
+                        defaultPrefill: chatSettings.defaultPrefill ?? '',
+                        prefillSettingsPrompt: (
+                          <PrefillSettingsPrompt
+                            chatId={chatId}
+                            settings={chatSettings}
+                            endpoints={prefillRecommendationEndpoints}
+                          />
+                        ),
+                      }
+                    : {}),
                 }
               : {})}
             {...(m.role === 'assistant'

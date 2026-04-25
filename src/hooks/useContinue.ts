@@ -1,11 +1,10 @@
 // Continue-in-place pipeline. See `plan/08-branching.md §8.4.8` (the
 // "continue partial response" op) but note the 8.1 implementation
-// differs from the plan's prefill-based sketch: we keep the existing
-// assistant row and append tokens to it, driven by a system-prompt
-// instruction to the model. Prefill isn't universally supported and
-// even where it is, models reason about the partial + instruction
-// differently per family — this approach works for every chat-
-// completions model we care about.
+// supports two request strategies. Default continue keeps the existing
+// assistant row and appends tokens to it, driven by a system-prompt
+// instruction to the model. Continue-prefill instead sends the existing
+// assistant row as the final assistant prefix on the wire, still appending
+// the returned continuation into that same stored row.
 //
 // The existing assistant's generation metadata (model, usage, cost,
 // reasoningDetails, responsesEchoItem) is NEVER touched: those fields
@@ -42,6 +41,7 @@ import {
   NoEligibleProvidersError,
   prepareAssistantRequestPlan,
 } from '../core/send-planning'
+import { prefillClassFor } from '../core/quirks'
 import type { ChatId, ConnectionProfile, ContentItem, Message, MessageId } from '../core/types'
 import { newId } from '../lib/ulid'
 import { postEvent } from '../store/broadcast'
@@ -164,36 +164,70 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
     readGlobalPreferences(),
     readTokenCalibrationGlobal(),
   ])
+  // Two continue strategies:
+  //
+  //   continuePrefill = true → real prefill turn. Don't override the system
+  //     prompt; don't append a synthetic continue-user turn. Just walk the
+  //     active path up through the target and mark the target as
+  //     `origin: 'prefill'` so the wire transform applies the trailing-
+  //     whitespace trim and treats the assistant content as the prefix the
+  //     model continues from. Hidden continue prompts (continueSystemPrompt /
+  //     continueUserPrompt) are unused.
+  //
+  //   continuePrefill = false → legacy continue-prompt mode (kept for
+  //     compat / models where prefill is unsupported). System prompt is
+  //     swapped for the continue-system template; the synthetic
+  //     continue-user trailing turn (if non-empty) avoids the double-
+  //     assistant shape.
+  const usePrefillContinue =
+    chat.settings.continuePrefill === true &&
+    prefillClassFor(chat.settings.model) !== 'unsupported'
   const continueSystemPrompt = chat.settings.continueSystemPrompt
   const continueUserPrompt = chat.settings.continueUserPrompt
   const originalSystemPrompt = chat.settings.systemPrompt
-  const settingsForContinue = {
-    ...chat.settings,
-    systemPrompt: resolveContinueSystemPromptTemplate(
-      continueSystemPrompt,
-      originalSystemPrompt,
-    ),
+  const settingsForContinue = usePrefillContinue
+    ? chat.settings
+    : {
+        ...chat.settings,
+        systemPrompt: resolveContinueSystemPromptTemplate(
+          continueSystemPrompt,
+          originalSystemPrompt,
+        ),
+      }
+  let continuePath: Message[]
+  if (usePrefillContinue) {
+    // Clone the trailing assistant turn with origin: 'prefill' so the
+    // transform's trailing-whitespace trim fires. The stored message stays
+    // `origin: 'generated'` — this clone is wire-only.
+    const tail = upstream.at(-1)
+    if (tail) {
+      const cloned: Message = { ...tail, origin: 'prefill' }
+      continuePath = [...upstream.slice(0, -1), cloned]
+    } else {
+      continuePath = upstream
+    }
+  } else {
+    continuePath =
+      continueUserPrompt.trim().length > 0
+        ? [
+            ...upstream,
+            {
+              id: `continue-user:${target.id}`,
+              chatId: input.chatId,
+              parentId: target.id,
+              siblingIndex: 0,
+              turnId: `continue-user:${target.turnId}`,
+              turnIndex: 0,
+              createdAt: target.createdAt,
+              role: 'user' as const,
+              origin: 'user' as const,
+              content: [{ type: 'text' as const, text: continueUserPrompt }],
+              nodeVersion: 0,
+              deleted: false,
+            },
+          ]
+        : upstream
   }
-  const continuePath =
-    continueUserPrompt.trim().length > 0
-      ? [
-          ...upstream,
-          {
-            id: `continue-user:${target.id}`,
-            chatId: input.chatId,
-            parentId: target.id,
-            siblingIndex: 0,
-            turnId: `continue-user:${target.turnId}`,
-            turnIndex: 0,
-            createdAt: target.createdAt,
-            role: 'user' as const,
-            origin: 'user' as const,
-            content: [{ type: 'text' as const, text: continueUserPrompt }],
-            nodeVersion: 0,
-            deleted: false,
-          },
-        ]
-      : upstream
   const lifecycle = startRequestLifecycle({
     chatId: input.chatId,
     streamId: newId(),

@@ -1,6 +1,6 @@
 import { type ReactNode, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import type { SendShortcut } from '../../core/global-settings'
-import { InsertIcon, StopIcon } from '../icons/Icon'
+import { InsertIcon, PrefillIcon, StopIcon } from '../icons/Icon'
 
 export interface ComposerProps {
   // Disables the textarea entirely.
@@ -8,7 +8,7 @@ export interface ComposerProps {
   // The textarea remains editable but Send is locked. Reason is rendered
   // beneath the composer and used as the Send-button tooltip.
   sendBlockedReason?: string
-  onSubmit: (text: string) => void | Promise<void>
+  onSubmit: (text: string, opts?: { prefillText?: string }) => void | Promise<void>
   onDraftChange?: (text: string) => void
   seed?: string | null
   onSeedConsumed?: () => void
@@ -40,6 +40,20 @@ export interface ComposerProps {
   // true and the composer text is empty, the Send button switches to
   // "Reply" and calls `onReplyToTrailingUser` on click.
   trailingUserMessage?: boolean
+  // Prefill button + textarea support. When `showPrefillButton` is true
+  // a "Prefill" button appears next to "Import"; toggling it reveals a
+  // second textarea below the main one. The text gets sent as
+  // `prefillContent` on submit. `defaultPrefill` seeds the prefill
+  // textarea each time the user opens it with an empty draft.
+  showPrefillButton?: boolean
+  defaultPrefill?: string
+  prefillScopeKey?: string | null
+  prefillSettingsPrompt?: ReactNode
+  // Fires whenever the prefill textarea changes (or is cleared). Mirrors
+  // `onDraftChange` for the main textarea so the token-budget estimate can
+  // include the prefill in its sum. Empty string when the prefill panel is
+  // closed (so the consumer can drop it from the count).
+  onPrefillDraftChange?: (text: string) => void
   // When true, the textarea starts at the variant's default height
   // and auto-grows with content up to the variant's auto-grow cap. The
   // drag handle remains visible; dragging sets a MINIMUM floor that
@@ -143,9 +157,22 @@ export function Composer({
   autoSize = false,
   autoSizeVariant = 'normal',
   tokenBudget,
+  showPrefillButton,
+  defaultPrefill,
+  prefillScopeKey,
+  prefillSettingsPrompt,
+  onPrefillDraftChange,
 }: ComposerProps) {
   const [text, setText] = useState('')
   const [submitting, setSubmitting] = useState(false)
+  const [prefillOpen, setPrefillOpen] = useState(false)
+  const [prefillText, setPrefillText] = useState(defaultPrefill ?? '')
+  // Track whether the prefill textarea has ever been opened so we don't
+  // accidentally re-seed on every open. Reset along with `defaultPrefill`
+  // changes so an updated default does seed the next opening.
+  const lastSeededDefaultRef = useRef<string | undefined>(defaultPrefill)
+  const lastPrefillScopeRef = useRef<string | null | undefined>(prefillScopeKey)
+  const prefillTextareaRef = useRef<HTMLTextAreaElement | null>(null)
   // In auto-size mode this is a minimum FLOOR (per-variant default).
   // In fixed mode it's the absolute textarea height. Drag updates it
   // in both modes; persistence uses separate localStorage keys
@@ -172,6 +199,53 @@ export function Composer({
   useEffect(() => {
     onDraftChange?.(text)
   }, [text, onDraftChange])
+  // Mirror prefill changes to the parent so the token-budget gauge reflects
+  // the combined input. Reports an empty string when the prefill panel is
+  // closed — even when the prefill draft has content, hidden = excluded.
+  useEffect(() => {
+    onPrefillDraftChange?.(prefillOpen ? prefillText : '')
+  }, [prefillOpen, prefillText, onPrefillDraftChange])
+  useEffect(() => {
+    if (lastPrefillScopeRef.current === prefillScopeKey) return
+    lastPrefillScopeRef.current = prefillScopeKey
+    lastSeededDefaultRef.current = defaultPrefill
+    setPrefillOpen(false)
+    setPrefillText(defaultPrefill ?? '')
+    onPrefillDraftChange?.('')
+  }, [prefillScopeKey, defaultPrefill, onPrefillDraftChange])
+  useEffect(() => {
+    if (showPrefillButton) return
+    setPrefillOpen(false)
+    setPrefillText(defaultPrefill ?? '')
+    onPrefillDraftChange?.('')
+  }, [showPrefillButton, defaultPrefill, onPrefillDraftChange])
+  // Re-seed the prefill textarea from `defaultPrefill` whenever the value
+  // changes (e.g. chat switch, settings edit) AND the user hasn't typed
+  // anything custom yet. Skip when the prefill area is open and the user
+  // has already entered text — clobbering their draft would be hostile.
+  useEffect(() => {
+    if (lastSeededDefaultRef.current === defaultPrefill) return
+    const previousDefault = lastSeededDefaultRef.current ?? ''
+    lastSeededDefaultRef.current = defaultPrefill
+    setPrefillText((prev) =>
+      !prefillOpen || prev.length === 0 || prev === previousDefault
+        ? (defaultPrefill ?? '')
+        : prev,
+    )
+  }, [defaultPrefill, prefillOpen])
+  // When the user closes prefill, reset the text to the chat's default so
+  // the next open isn't haunted by stale text. (Send already clears it.)
+  const togglePrefill = useCallback(async () => {
+    const next = !prefillOpen
+    if (next) {
+      // Seed from the chat's default if the user's prefill draft is empty.
+      setPrefillText((prev) => (prev.length === 0 ? (defaultPrefill ?? '') : prev))
+      setPrefillOpen(true)
+      requestAnimationFrame(() => prefillTextareaRef.current?.focus())
+    } else {
+      setPrefillOpen(false)
+    }
+  }, [prefillOpen, defaultPrefill])
   useEffect(() => {
     if (typeof window === 'undefined') return
     const key = autoSize ? profile.storageKey : COMPOSER_HEIGHT_STORAGE_KEY
@@ -225,17 +299,36 @@ export function Composer({
       return
     }
     const out = text.trim()
+    // Capture and clear the prefill text in the same render so a fast
+    // double-tap doesn't send the same prefill twice. Empty / whitespace-
+    // only prefill is treated as no prefill (the wire transform would trim
+    // trailing whitespace anyway, so an empty prefill turn would be a
+    // no-op-then-confuse-the-model).
+    const prefillOut = prefillOpen && prefillText.trim().length > 0 ? prefillText : ''
     setText('')
+    if (prefillOut.length > 0) {
+      setPrefillText(defaultPrefill ?? '')
+    }
     setSubmitting(true)
     try {
-      await onSubmit(out)
+      await onSubmit(out, prefillOut.length > 0 ? { prefillText: prefillOut } : undefined)
     } catch (err) {
       setText((current) => (current.length === 0 ? out : current))
+      if (prefillOut.length > 0) setPrefillText(prefillOut)
       console.error('composer submit failed', err)
     } finally {
       setSubmitting(false)
     }
-  }, [text, sendBlocked, emptyWithTrailingUser, onReplyToTrailingUser, onSubmit])
+  }, [
+    text,
+    sendBlocked,
+    emptyWithTrailingUser,
+    onReplyToTrailingUser,
+    onSubmit,
+    prefillOpen,
+    prefillText,
+    defaultPrefill,
+  ])
   const sendButtonLabel = emptyWithTrailingUser
     ? 'Reply ⏎'
     : sendShortcut === 'cmd-enter'
@@ -340,9 +433,24 @@ export function Composer({
             }
           }}
         />
+        {prefillOpen ? (
+          <>
+            {prefillSettingsPrompt}
+            <textarea
+              ref={prefillTextareaRef}
+              data-ui="composer-prefill"
+              value={prefillText}
+              onChange={(e) => setPrefillText(e.target.value)}
+              placeholder="Assistant prefill — the model continues from this text…"
+              disabled={disabled}
+              rows={3}
+              aria-label="Assistant prefill text"
+            />
+          </>
+        ) : null}
         <div data-ui="composer-actions">
           <span data-ui="token-counter" aria-live="polite">
-            {text.trim().length} chars
+            {text.trim().length + (prefillOpen ? prefillText.length : 0)} chars
           </span>
           {tokenBudget ? (
             <span
@@ -359,6 +467,24 @@ export function Composer({
             >
               {formatTokenCount(tokenBudget.used)}/{formatTokenCount(tokenBudget.budget)} tok
             </span>
+          ) : null}
+          {showPrefillButton ? (
+            <button
+              type="button"
+              data-ui="composer-prefill-toggle"
+              data-active={prefillOpen ? 'true' : undefined}
+              onClick={() => void togglePrefill()}
+              aria-label={prefillOpen ? 'Close prefill' : 'Open assistant prefill'}
+              aria-pressed={prefillOpen}
+              title={
+                prefillOpen
+                  ? 'Close prefill (assistant text editor)'
+                  : 'Add an assistant prefill — the model continues from your text'
+              }
+            >
+              <PrefillIcon size={14} />
+              <span>Prefill</span>
+            </button>
           ) : null}
           {onImportAtEnd ? (
             <button

@@ -18,7 +18,7 @@ import {
   tokenizerFromSettings,
   UNLIMITED_CONTEXT,
 } from '../core/prompt-size'
-import { quirksFor } from '../core/quirks'
+import { prefillClassFor, quirksFor } from '../core/quirks'
 import { charsPerToken, readTokenCalibrationGlobal } from '../core/token-calibration'
 import type { Chat, ChatId, ChatPreset, ConnectionProfile, CursorMap } from '../core/types'
 import { useBranchUrlSync } from '../hooks/useBranchUrlSync'
@@ -50,6 +50,7 @@ import { EmptyState } from '../ui/chat/EmptyState'
 import { FocusModeToggle } from '../ui/chat/FocusModeToggle'
 import { ImportModal } from '../ui/chat/ImportModal'
 import { MessageList } from '../ui/chat/MessageList'
+import { PrefillSettingsPrompt } from '../ui/chat/PrefillSettingsPrompt'
 import { ScrollRegion, type ScrollRegionHandle, type ScrollState } from '../ui/chat/ScrollRegion'
 import { ToastTray } from '../ui/chat/ToastTray'
 import { ZeroEligibleModal } from '../ui/chat/ZeroEligibleModal'
@@ -125,6 +126,7 @@ export function Shell() {
   const [globalSettingsOpen, setGlobalSettingsOpen] = useState(false)
   const [composerSeed, setComposerSeed] = useState<string | null>(null)
   const [composerDraft, setComposerDraft] = useState('')
+  const [composerPrefillDraft, setComposerPrefillDraft] = useState('')
   const [scrollState, setScrollState] = useState<ScrollState>('follow')
   const [importAtEndOpen, setImportAtEndOpen] = useState(false)
   const editTreeMode = useUiStore((s) => s.editTreeMode)
@@ -264,10 +266,17 @@ export function Shell() {
       currentModelId: resolvedActiveChatRow.settings.model,
       ...(currentTextCharsPerToken !== undefined ? { currentTextCharsPerToken } : {}),
     })
+    // Roll the prefill draft into `draftText` so the token gauge reflects
+    // both inputs the user is about to send. The wire transform sends the
+    // prefill as a separate assistant turn but token-wise it's just bytes;
+    // adding to draftText is the cheapest accurate accounting.
+    const combinedDraft = composerPrefillDraft.length > 0
+      ? `${composerDraft}\n${composerPrefillDraft}`
+      : composerDraft
     const input: PromptSizeEstimateInput = {
       systemPrompt: resolvedActiveChatRow.settings.systemPrompt,
       activePathMessages: cutPlan.kept,
-      draftText: composerDraft,
+      draftText: combinedDraft,
       tokenizer,
       reasoningInclude: resolvedActiveChatRow.settings.reasoning.include,
       reasoningExcluded: resolvedActiveChatRow.settings.reasoning.exclude === true,
@@ -282,6 +291,7 @@ export function Shell() {
     resolvedActiveChatRow,
     activePathMemo,
     composerDraft,
+    composerPrefillDraft,
     composerProviderCap,
     globalCalibration,
     prefs.tokenCalibrationMode,
@@ -496,8 +506,14 @@ export function Shell() {
     [pushToast],
   )
 
+  const activePrefillClass = resolvedActiveChatRow?.settings.model
+    ? prefillClassFor(resolvedActiveChatRow.settings.model)
+    : null
+  const showPrefillButton = activePrefillClass !== null && activePrefillClass !== 'unsupported'
+  const activeDefaultPrefill = resolvedActiveChatRow?.settings.defaultPrefill ?? ''
+
   const handleSubmit = useCallback(
-    async (text: string) => {
+    async (text: string, opts?: { prefillText?: string }) => {
       if (!activeChatId) return failSend('send: no active chat')
       const chat = await getChat(activeChatId)
       if (!chat) return failSend('send: chat row missing', { chatId: activeChatId })
@@ -521,11 +537,15 @@ export function Shell() {
         return failSend('send: resolveKey failed', err)
       }
       try {
+        const prefillText = opts?.prefillText ?? ''
         const result = await send({
           chatId: activeChatId,
           connection: profile,
           apiKey,
           content: [{ type: 'text', text }],
+          ...(prefillText.length > 0
+            ? { prefillContent: [{ type: 'text', text: prefillText }] }
+            : {}),
         })
         if (result.outcome !== 'done') {
           console.info('send: stream ended with outcome', result.outcome, result.error?.kind)
@@ -541,7 +561,7 @@ export function Shell() {
   )
 
   const handleNewChatSubmit = useCallback(
-    async (text: string) => {
+    async (text: string, opts?: { prefillText?: string }) => {
       const { preset, settings } = await resolveNewChatSeed()
       if (!settings.profileId) {
         return failSend('send: chat.settings.profileId is empty — no profile selected')
@@ -573,11 +593,15 @@ export function Shell() {
       })
       navigateToChat(chat.id)
       try {
+        const prefillText = opts?.prefillText ?? ''
         const result = await send({
           chatId: chat.id,
           connection: profile,
           apiKey,
           content: [{ type: 'text', text }],
+          ...(prefillText.length > 0
+            ? { prefillContent: [{ type: 'text', text: prefillText }] }
+            : {}),
         })
         if (result.outcome !== 'done') {
           console.info('send: stream ended with outcome', result.outcome, result.error?.kind)
@@ -722,6 +746,7 @@ export function Shell() {
                 chatSettings={resolvedActiveChatRow?.settings ?? cloneDefaultChatSettings()}
                 hasConnection={hasConnection}
                 {...(activeCapability ? { capability: activeCapability } : {})}
+                prefillRecommendationEndpoints={activeEndpoints.endpoints}
               />
               {focusMode ? (
                 <Composer
@@ -736,8 +761,23 @@ export function Shell() {
                   seed={composerSeed}
                   onSeedConsumed={() => setComposerSeed(null)}
                   onDraftChange={setComposerDraft}
+                  onPrefillDraftChange={setComposerPrefillDraft}
                   sendShortcut={prefs.sendShortcut}
                   onImportAtEnd={() => setImportAtEndOpen(true)}
+                  {...(showPrefillButton
+                    ? {
+                        showPrefillButton: true,
+                        defaultPrefill: activeDefaultPrefill,
+                        prefillScopeKey: activeChatId,
+                        prefillSettingsPrompt: resolvedActiveChatRow ? (
+                          <PrefillSettingsPrompt
+                            chatId={resolvedActiveChatRow.id}
+                            settings={resolvedActiveChatRow.settings}
+                            endpoints={activeEndpoints.endpoints}
+                          />
+                        ) : null,
+                      }
+                    : {})}
                   {...(tokenBudgetIndicator ? { tokenBudget: tokenBudgetIndicator } : {})}
                   trailingUserMessage={Boolean(trailingUserMessage)}
                   {...(trailingUserMessage && hasConnection
@@ -781,8 +821,23 @@ export function Shell() {
                 seed={composerSeed}
                 onSeedConsumed={() => setComposerSeed(null)}
                 onDraftChange={setComposerDraft}
+                onPrefillDraftChange={setComposerPrefillDraft}
                 sendShortcut={prefs.sendShortcut}
                 onImportAtEnd={() => setImportAtEndOpen(true)}
+                {...(showPrefillButton
+                  ? {
+                      showPrefillButton: true,
+                      defaultPrefill: activeDefaultPrefill,
+                      prefillScopeKey: activeChatId,
+                      prefillSettingsPrompt: resolvedActiveChatRow ? (
+                        <PrefillSettingsPrompt
+                          chatId={resolvedActiveChatRow.id}
+                          settings={resolvedActiveChatRow.settings}
+                          endpoints={activeEndpoints.endpoints}
+                        />
+                      ) : null,
+                    }
+                  : {})}
                 {...(tokenBudgetIndicator ? { tokenBudget: tokenBudgetIndicator } : {})}
                 trailingUserMessage={Boolean(trailingUserMessage)}
                 {...(trailingUserMessage && hasConnection
@@ -871,6 +926,7 @@ export function Shell() {
               seed={composerSeed}
               onSeedConsumed={() => setComposerSeed(null)}
               onDraftChange={setComposerDraft}
+              onPrefillDraftChange={setComposerPrefillDraft}
               sendShortcut={prefs.sendShortcut}
               onImportAtEnd={() => setImportAtEndOpen(true)}
               {...(tokenBudgetIndicator ? { tokenBudget: tokenBudgetIndicator } : {})}

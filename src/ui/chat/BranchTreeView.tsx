@@ -115,13 +115,14 @@ export function BranchTreeView({ chatId, messages, onClose }: BranchTreeViewProp
   }
 
   return (
-    <div
-      data-ui="branch-tree-overlay"
-      role="presentation"
-      onClick={(e) => {
-        if (e.target === e.currentTarget) onClose()
-      }}
-    >
+    <div data-ui="branch-tree-overlay">
+      <button
+        type="button"
+        data-ui="branch-tree-scrim"
+        aria-label="Close branch tree"
+        tabIndex={-1}
+        onClick={onClose}
+      />
       <div data-ui="branch-tree" role="dialog" aria-modal="true" aria-label="Branch tree">
         <div data-ui="branch-tree-header">
           <h2>Branch tree</h2>

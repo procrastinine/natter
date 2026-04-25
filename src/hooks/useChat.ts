@@ -119,6 +119,31 @@ function pendingUserMessage(input: {
   }
 }
 
+function pendingPrefillMessage(input: {
+  chatId: ChatId
+  parentId: MessageId | null
+  siblingIndex: number
+  content: ContentItem[]
+  createdAt: number
+  messageId: MessageId
+  turnId: string
+}): Message {
+  return {
+    id: input.messageId,
+    chatId: input.chatId,
+    parentId: input.parentId,
+    siblingIndex: input.siblingIndex,
+    turnId: input.turnId,
+    turnIndex: 1,
+    createdAt: input.createdAt,
+    role: 'assistant',
+    origin: 'prefill',
+    content: input.content,
+    nodeVersion: 0,
+    deleted: false,
+  }
+}
+
 function throwWithZeroEligibleUi(chatId: ChatId, err: unknown): never {
   if (err instanceof NoEligibleProvidersError) {
     useUiStore.getState().setZeroEligibleChatId(chatId)
@@ -180,6 +205,7 @@ function detectStreamTransport(
 // at the Phase 7 scope. Reasoning / tool-call reducers are in place so later
 // phases can extend without changing the lifecycle.
 interface ChatAccumulator {
+  initialContent: ContentItem[]
   textBuffer: string
   // Ordered list of reasoning details accumulated so far. Streaming deltas
   // from Responses / Gemini-native lanes carry a stable synthetic id when
@@ -216,12 +242,19 @@ export interface SendTextInput {
   openStream?: (input: OpenStreamInput) => AsyncIterable<OpenStreamChunk>
   signal?: AbortSignal
   now?: () => number
+  // Optional assistant-prefill content. The request planner sees it as a
+  // trailing assistant input, while storage creates one generated assistant
+  // row initialized with this content and appends streamed continuation
+  // tokens into that same row.
+  prefillContent?: ContentItem[]
 }
 
 // "Open an assistant stream under an existing user (or other) message."
 // Used by edit-then-send (the user sibling already exists; we just need
 // a fresh assistant reply) and regenerate-after-branch flows. No user
-// message is created here.
+// message is created here. `prefillContent` (inherited from SendTextInput)
+// is honored by adding a trailing assistant input to the request plan and
+// initializing the generated assistant row with that text.
 export interface SendFromMessageInput extends Omit<SendTextInput, 'content'> {
   // Any existing message on the active path; the assistant placeholder
   // will be created as its child. Typically a user-role message.
@@ -289,13 +322,29 @@ export async function sendText(input: SendTextInput): Promise<SendTextResult> {
       messageId: userMessageId,
       turnId: userTurnId,
     })
+    const hasPrefill = (input.prefillContent?.length ?? 0) > 0
+    const prefillMessageId = hasPrefill ? newId() : null
+    const pendingPrefill = hasPrefill
+      ? pendingPrefillMessage({
+          chatId: input.chatId,
+          parentId: userMessageId,
+          siblingIndex: 0,
+          content: input.prefillContent ?? [],
+          createdAt,
+          messageId: prefillMessageId as MessageId,
+          turnId: userTurnId,
+        })
+      : null
+    const plannedPath = pendingPrefill
+      ? [...path, pendingUser, pendingPrefill]
+      : [...path, pendingUser]
     let requestPlan: AssistantRequestPlan
     try {
       requestPlan = (
         await prepareAssistantRequestPlan({
           chat,
           connection: input.connection,
-          pathMessages: [...path, pendingUser],
+          pathMessages: plannedPath,
           draftText: '',
           debugSource: 'send',
           ...(input.capabilities ? { capabilities: input.capabilities } : {}),
@@ -316,10 +365,11 @@ export async function sendText(input: SendTextInput): Promise<SendTextResult> {
       messageId: userMessageId,
       turnId: userTurnId,
     })
-    useChatStore.getState().setCursor(input.chatId, {
+    const cursorAfterUser = {
       ...cursor,
       ...userMsg.effects.cursorUpdates,
-    })
+    }
+    useChatStore.getState().setCursor(input.chatId, cursorAfterUser)
 
     return await openAssistantStreamUnder({
       ...input,
@@ -327,6 +377,7 @@ export async function sendText(input: SendTextInput): Promise<SendTextResult> {
       streamId: lifecycle.streamId,
       parentMessageId: userMsg.messageId,
       userMessageId: userMsg.messageId,
+      ...(hasPrefill ? { initialAssistantContent: input.prefillContent ?? [] } : {}),
       requestPlan,
     })
   } finally {
@@ -363,13 +414,29 @@ export async function sendFromMessage(input: SendFromMessageInput): Promise<Send
     const path = activePath(allMessages, cursor)
     const parentIdx = path.findIndex((m) => m.id === parent.id)
     const rawOutboundPath = parentIdx >= 0 ? path.slice(0, parentIdx + 1) : path
+    const hasPrefill = (input.prefillContent?.length ?? 0) > 0
+    const prefillMessageId = hasPrefill ? newId() : null
+    const createdAt = (input.now ?? Date.now)()
+    const pendingPrefill =
+      hasPrefill && prefillMessageId
+        ? pendingPrefillMessage({
+            chatId: input.chatId,
+            parentId: input.parentMessageId,
+            siblingIndex: 0,
+            content: input.prefillContent ?? [],
+            createdAt,
+            messageId: prefillMessageId,
+            turnId: parent.turnId,
+          })
+        : null
+    const plannedPath = pendingPrefill ? [...rawOutboundPath, pendingPrefill] : rawOutboundPath
     let requestPlan: AssistantRequestPlan
     try {
       requestPlan = (
         await prepareAssistantRequestPlan({
           chat,
           connection: input.connection,
-          pathMessages: rawOutboundPath,
+          pathMessages: plannedPath,
           draftText: '',
           debugSource: 'send-from-message',
           ...(input.capabilities ? { capabilities: input.capabilities } : {}),
@@ -381,12 +448,14 @@ export async function sendFromMessage(input: SendFromMessageInput): Promise<Send
       throwWithZeroEligibleUi(input.chatId, err)
     }
     if (lifecycle.signal.aborted) throw new DOMException('Request aborted.', 'AbortError')
+
     return await openAssistantStreamUnder({
       ...input,
       signal: lifecycle.signal,
       streamId: lifecycle.streamId,
       parentMessageId: input.parentMessageId,
       userMessageId: input.parentMessageId,
+      ...(hasPrefill ? { initialAssistantContent: input.prefillContent ?? [] } : {}),
       requestPlan,
     })
   } finally {
@@ -399,6 +468,7 @@ async function openAssistantStreamUnder(
     userMessageId: MessageId
     requestPlan: AssistantRequestPlan
     streamId?: string
+    initialAssistantContent?: ContentItem[]
   },
 ): Promise<SendTextResult> {
   const now = input.now ?? Date.now
@@ -423,6 +493,8 @@ async function openAssistantStreamUnder(
     outboundReasoningOpts,
   } = requestPlan
   const placeholderApiUsed: 'chat' | 'completion' = useTextProtocol ? 'completion' : 'chat'
+  const initialAssistantContent = input.initialAssistantContent ?? []
+  const initialStoredContent = assistantContentWithStreamPrefix(initialAssistantContent, '')
 
   const assistantId = newId()
   await repo.runMutation(
@@ -442,7 +514,7 @@ async function openAssistantStreamUnder(
         createdAt: now(),
         role: 'assistant',
         origin: 'generated',
-        content: [],
+        content: structuredClone(initialStoredContent),
         nodeVersion: 0,
         deleted: false,
         generation: {
@@ -479,6 +551,7 @@ async function openAssistantStreamUnder(
   })
 
   const accumulator: ChatAccumulator = {
+    initialContent: initialAssistantContent,
     textBuffer: '',
     reasoningList: [],
     reasoningRowById: new Map(),
@@ -723,6 +796,23 @@ function shouldFlush(acc: ChatAccumulator, nowMs: number): boolean {
   return false
 }
 
+function assistantContentWithStreamPrefix(
+  initialContent: readonly ContentItem[],
+  streamedText: string,
+): ContentItem[] {
+  const prefix = initialContent
+    .filter(
+      (item): item is Extract<ContentItem, { type: 'text' | 'output_text' }> =>
+        item.type === 'text' || item.type === 'output_text',
+    )
+    .map((item) => item.text)
+    .join('')
+  const nonText = initialContent.filter(
+    (item) => item.type !== 'text' && item.type !== 'output_text',
+  )
+  return [{ type: 'output_text', text: `${prefix}${streamedText}` }, ...structuredClone(nonText)]
+}
+
 interface FlushContext {
   repo: ReturnType<typeof getBrowserRepository>
   chatId: ChatId
@@ -741,7 +831,10 @@ async function flushPartial(ctx: FlushContext): Promise<void> {
     const reasoning = collectReasoning(accumulator)
     const next: Message = {
       ...current,
-      content: [{ type: 'output_text', text: accumulator.textBuffer }],
+      content: assistantContentWithStreamPrefix(
+        accumulator.initialContent,
+        accumulator.textBuffer,
+      ),
     }
     if (reasoning.length > 0) next.reasoningDetails = reasoning
     next.generation = updatedGeneration(current.generation, accumulator, requestedModel, {
@@ -805,7 +898,10 @@ async function finalize(ctx: FinalizeContext): Promise<void> {
   let assistantCalibrationFields: ReturnType<typeof calibrationFieldsForCreate> | null = null
   if (outcome === 'done' && calibrationInputs) {
     try {
-      const finalContent = [{ type: 'output_text' as const, text: accumulator.textBuffer }]
+      const finalContent = assistantContentWithStreamPrefix(
+        accumulator.initialContent,
+        accumulator.textBuffer,
+      )
       const [chatForRatio, globalCal, prefs] = await Promise.all([
         repo.getChat(chatId),
         readTokenCalibrationGlobal(),
@@ -846,7 +942,10 @@ async function finalize(ctx: FinalizeContext): Promise<void> {
     }
     const next: Message = {
       ...current,
-      content: [{ type: 'output_text', text: accumulator.textBuffer }],
+      content: assistantContentWithStreamPrefix(
+        accumulator.initialContent,
+        accumulator.textBuffer,
+      ),
       generation,
       ...(assistantCalibrationFields ?? {}),
     }

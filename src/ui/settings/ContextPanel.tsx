@@ -22,7 +22,7 @@
 // re-clamps when the model changes.
 
 import { useLiveQuery } from 'dexie-react-hooks'
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { activePath } from '../../core/active-path'
 import type { EffectiveCapability } from '../../core/capabilities'
 import {
@@ -197,6 +197,7 @@ export function ContextPanel({
 
   return (
     <section data-ui="settings-section" data-ui-section="context-control">
+      {/* biome-ignore lint/a11y/useSemanticElements: this custom gauge needs an internal fill element that <meter> cannot provide. */}
       <div
         data-ui="context-gauge"
         data-warn-level={warnLevel}
@@ -360,10 +361,10 @@ function NumberSlider({
     setSliderValue(committedSliderValue)
   }, [isUnlimited, value, committedSliderValue])
 
-  const commitSliderDraft = () => {
+  const commitSliderDraft = useCallback(() => {
     const clamped = Math.min(Math.max(sliderValue, min), max)
     if (clamped !== committedSliderValue) onCommit(clamped)
-  }
+  }, [sliderValue, min, max, committedSliderValue, onCommit])
 
   useEffect(() => {
     if (sliderValue === committedSliderValue) return
@@ -371,7 +372,7 @@ function NumberSlider({
       commitSliderDraft()
     }, SLIDER_COMMIT_DEBOUNCE_MS)
     return () => window.clearTimeout(id)
-  }, [sliderValue, committedSliderValue])
+  }, [sliderValue, committedSliderValue, commitSliderDraft])
 
   const commitFromDraft = () => {
     const n = Number(draft)

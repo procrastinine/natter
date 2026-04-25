@@ -88,6 +88,7 @@ export function useBranchUrlSync(chatId: ChatId | null): void {
   }
 
   // On mount / chatId change / messages load: seed then write.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: chatId/messages changes intentionally trigger the ref-backed URL sync.
   useEffect(() => {
     seedCursorFromUrl.current?.()
     writeUrlFromCursor.current?.()

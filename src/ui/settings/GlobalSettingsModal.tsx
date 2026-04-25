@@ -38,10 +38,10 @@ export function GlobalSettingsModal({ open, onClose }: GlobalSettingsModalProps)
       aria-modal="true"
       aria-label="Global settings"
     >
-      <div
+      <button
+        type="button"
         data-ui="global-settings-scrim"
         onClick={onClose}
-        role="button"
         tabIndex={-1}
         aria-label="Close global settings"
       />

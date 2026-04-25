@@ -32,7 +32,7 @@ export function MessageHeader({ message }: MessageHeaderProps) {
   // rather than display "unset" noise.
   const phase = isAssistant && gen?.apiUsed === 'responses' ? message.phase : undefined
   return (
-    <header data-ui="message-header" aria-label={ROLE_LABEL[message.role]}>
+    <header data-ui="message-header">
       <span data-ui="message-role">{ROLE_LABEL[message.role]}</span>
       <span data-ui="message-header-spacer" />
       {phase ? (

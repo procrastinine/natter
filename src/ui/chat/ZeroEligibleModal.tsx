@@ -11,6 +11,7 @@
 // from a zero-eligible state other than the user's explicit choice.
 
 import { useLiveQuery } from 'dexie-react-hooks'
+import { useEffect, useRef } from 'react'
 import type { ChatId } from '../../core/types'
 import { getChat, updateChatSettings } from '../../store/chats'
 import { useUiStore } from '../../store/zustand/uiStore'
@@ -22,6 +23,10 @@ export interface ZeroEligibleModalProps {
 export function ZeroEligibleModal({ chatId }: ZeroEligibleModalProps) {
   const chat = useLiveQuery(() => getChat(chatId), [chatId], undefined)
   const dismiss = useUiStore((s) => s.setZeroEligibleChatId)
+  const okRef = useRef<HTMLButtonElement | null>(null)
+  useEffect(() => {
+    okRef.current?.focus()
+  }, [])
   if (!chat) return null
 
   const modelLabel = chat.settings.model || 'this model'
@@ -40,13 +45,14 @@ export function ZeroEligibleModal({ chatId }: ZeroEligibleModalProps) {
       role="dialog"
       aria-modal="true"
       aria-labelledby="zero-eligible-title"
-      onClick={(e) => {
-        // Click on the backdrop (not the dialog body) dismisses. The
-        // underlying chat stays in a zero-eligible state; the user can
-        // reopen the modal by trying to send again.
-        if (e.currentTarget === e.target) close()
-      }}
     >
+      <button
+        type="button"
+        data-ui="zero-eligible-scrim"
+        aria-label="Close provider warning"
+        tabIndex={-1}
+        onClick={close}
+      />
       <div data-ui="zero-eligible-dialog">
         <header data-ui="zero-eligible-header">
           <h2 id="zero-eligible-title">No providers match your privacy filter</h2>
@@ -71,10 +77,10 @@ export function ZeroEligibleModal({ chatId }: ZeroEligibleModalProps) {
             Show me the picker
           </button>
           <button
+            ref={okRef}
             type="button"
             data-ui="primary-button"
             onClick={close}
-            autoFocus
           >
             OK
           </button>

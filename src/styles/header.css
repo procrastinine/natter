@@ -21,6 +21,12 @@
 }
 
 [data-ui="chat-title-label"] {
+  appearance: none;
+  background: transparent;
+  border: 0;
+  padding: 0;
+  text-align: left;
+  font: inherit;
   font-weight: var(--font-weight-semibold);
   font-size: var(--font-size-md);
   color: var(--color-fg-primary);
@@ -736,8 +742,11 @@
 [data-ui="connection-setup-scrim"] {
   position: absolute;
   inset: 0;
+  border: 0;
+  padding: 0;
   background: var(--color-backdrop-scrim);
   backdrop-filter: var(--backdrop-blur-overlay);
+  cursor: default;
 }
 
 [data-ui="connection-setup-modal"] {

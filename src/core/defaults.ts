@@ -58,6 +58,8 @@ export const DEFAULT_CHAT_SETTINGS: Readonly<ChatSettings> = Object.freeze({
   systemRole: 'system',
   continueSystemPrompt: DEFAULT_CONTINUE_SYSTEM_PROMPT,
   continueUserPrompt: DEFAULT_CONTINUE_USER_PROMPT,
+  defaultPrefill: '',
+  continuePrefill: false,
   sampling: Object.freeze({}),
   reasoning: Object.freeze<ChatSettings['reasoning']>({
     mode: 'default',

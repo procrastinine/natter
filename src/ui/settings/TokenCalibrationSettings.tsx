@@ -85,7 +85,7 @@ export function TokenCalibrationSettings({
         <span data-ui="helper">{selectedHelper}</span>
       </div>
       <div data-ui="field-group">
-        <label>Global calibration buckets</label>
+        <span data-ui="field-label">Global calibration buckets</span>
         {entries.length === 0 ? (
           <span data-ui="helper">
             No cross-chat samples yet. The global rollup updates on every successful send.

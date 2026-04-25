@@ -25,6 +25,7 @@ describe('defaults', () => {
           "onOverflow": "ask",
           "reservedForCompletion": 512,
         },
+        "continuePrefill": false,
         "continueSystemPrompt": "Continue the chat from the last assistant message. The last assistant message is incomplete. Output only the continuation. Do not repeat prior content, do not add filler text, and do not restate the user question.
 
       The original system prompt (for reference):
@@ -32,6 +33,7 @@ describe('defaults', () => {
       [SYSTEM_PROMPT]
       \`\`\`",
         "continueUserPrompt": "Now please generate only the continuation of the last message, with zero filler text.",
+        "defaultPrefill": "",
         "enabledPluginIds": [],
         "enabledServerToolIds": [],
         "enabledToolIds": [],

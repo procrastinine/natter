@@ -325,7 +325,7 @@ export function ProviderPicker({ chat, routing, neededTokens: neededTokensOverri
         </p>
       ) : (
         <ul data-ui="provider-picker-list">
-          {rows.map((row, idx) => {
+          {rows.map((row) => {
             const epCap = row.endpoint.max_prompt_tokens ?? row.endpoint.context_length
             const insufficient =
               epCap !== undefined && epCap > 0 && neededTokens > epCap
@@ -335,7 +335,7 @@ export function ProviderPicker({ chat, routing, neededTokens: neededTokensOverri
             const allowed = row.state === 'kept'
             return (
               <ProviderRow
-                key={`${key}:${idx}`}
+                key={key}
                 row={row}
                 label={label}
                 allowed={allowed}
@@ -557,6 +557,7 @@ function PrivacyLock({ tier, title }: { tier: string; title: string }) {
       data-ui="provider-picker-lock"
       data-privacy-tier={tier}
       title={title}
+      role="img"
       aria-label={title}
     >
       <LockIcon size={13} />

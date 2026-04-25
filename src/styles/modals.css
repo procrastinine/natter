@@ -46,8 +46,11 @@
 [data-ui="global-settings-scrim"] {
   position: absolute;
   inset: 0;
+  border: 0;
+  padding: 0;
   background: var(--color-backdrop-scrim);
   backdrop-filter: var(--backdrop-blur-overlay);
+  cursor: default;
 }
 
 [data-ui="global-settings-modal"] {

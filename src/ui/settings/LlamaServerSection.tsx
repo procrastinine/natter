@@ -86,12 +86,13 @@ export function LlamaServerSection({ chat, profile }: LlamaServerSectionProps) {
     <section data-ui="settings-section" data-ui-section="llama-server">
       <h3>llama-server</h3>
       <div data-ui="field-group">
-        <label htmlFor="llama-protocol">Wire protocol</label>
-        <div role="radiogroup" aria-labelledby="llama-protocol" data-ui="segmented">
+        <span id="llama-protocol" data-ui="field-label">
+          Wire protocol
+        </span>
+        <div data-ui="segmented">
           <button
             type="button"
-            role="radio"
-            aria-checked={protocol === 'chat'}
+            aria-pressed={protocol === 'chat'}
             data-ui="segmented-option"
             data-active={protocol === 'chat'}
             onClick={() => setProtocol('chat')}
@@ -100,8 +101,7 @@ export function LlamaServerSection({ chat, profile }: LlamaServerSectionProps) {
           </button>
           <button
             type="button"
-            role="radio"
-            aria-checked={protocol === 'text'}
+            aria-pressed={protocol === 'text'}
             data-ui="segmented-option"
             data-active={protocol === 'text'}
             onClick={() => setProtocol('text')}
@@ -226,19 +226,21 @@ function CustomTemplateEditor({ chat }: { chat: Chat }) {
         onChange={(v) => patch({ systemSuffix: v })}
       />
       <div data-ui="field-group">
-        <label>Stop sequences (one per line)</label>
-        <textarea
-          rows={3}
-          value={stopDraft}
-          onChange={(e) => setStopDraft(e.target.value)}
-          onBlur={() => {
-            const stops = stopDraft
-              .split('\n')
-              .map((s) => s.trim())
-              .filter((s) => s.length > 0)
-            patch({ stop: stops })
-          }}
-        />
+        <label>
+          Stop sequences (one per line)
+          <textarea
+            rows={3}
+            value={stopDraft}
+            onChange={(e) => setStopDraft(e.target.value)}
+            onBlur={() => {
+              const stops = stopDraft
+                .split('\n')
+                .map((s) => s.trim())
+                .filter((s) => s.length > 0)
+              patch({ stop: stops })
+            }}
+          />
+        </label>
       </div>
     </div>
   )
@@ -259,15 +261,17 @@ function FieldRow({
   }, [value])
   return (
     <div data-ui="field-group">
-      <label>{label}</label>
-      <input
-        type="text"
-        value={draft}
-        onChange={(e) => setDraft(e.target.value)}
-        onBlur={() => {
-          if (draft !== value) onChange(draft)
-        }}
-      />
+      <label>
+        {label}
+        <input
+          type="text"
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onBlur={() => {
+            if (draft !== value) onChange(draft)
+          }}
+        />
+      </label>
     </div>
   )
 }

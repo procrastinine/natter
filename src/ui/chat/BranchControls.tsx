@@ -49,21 +49,8 @@ export function BranchControls({ chatId, message, messages }: BranchControlsProp
 
   const byParent = groupByParent(messages)
   const siblings = (byParent.get(message.parentId) ?? []).filter((m) => !m.deleted)
-  if (siblings.length < 2) return null
   const sorted = [...siblings].sort((a, b) => a.siblingIndex - b.siblingIndex)
   const idx = sorted.findIndex((s) => s.id === message.id)
-  if (idx < 0) return null
-  // Non-circular: prev/first are disabled at variant 1; next/last are
-  // disabled at variant N. Users who want wrap-around can still use
-  // the keyboard `[` `]` shortcuts which still cycle (matching the
-  // existing §8.4.3 contract).
-  const atStart = idx === 0
-  const atEnd = idx === sorted.length - 1
-  const prev = atStart ? null : (sorted[idx - 1] as Message)
-  const next = atEnd ? null : (sorted[idx + 1] as Message)
-  const first = sorted[0] as Message
-  const last = sorted[sorted.length - 1] as Message
-
   const jumpTo = useCallback(
     (targetId: string) => {
       const cursor = useChatStore.getState().getCursor(chatId) ?? {}
@@ -83,6 +70,19 @@ export function BranchControls({ chatId, message, messages }: BranchControlsProp
     },
     [chatId, message.parentId, byParent, messages],
   )
+
+  if (siblings.length < 2) return null
+  if (idx < 0) return null
+  // Non-circular: prev/first are disabled at variant 1; next/last are
+  // disabled at variant N. Users who want wrap-around can still use
+  // the keyboard `[` `]` shortcuts which still cycle (matching the
+  // existing §8.4.3 contract).
+  const atStart = idx === 0
+  const atEnd = idx === sorted.length - 1
+  const prev = atStart ? null : (sorted[idx - 1] as Message)
+  const next = atEnd ? null : (sorted[idx + 1] as Message)
+  const first = sorted[0] as Message
+  const last = sorted[sorted.length - 1] as Message
 
   const applyStep = (direction: -1 | 1) => {
     const cursor = useChatStore.getState().getCursor(chatId) ?? {}
@@ -178,14 +178,13 @@ export function BranchControls({ chatId, message, messages }: BranchControlsProp
   }
 
   return (
-    <div data-ui="branch-controls" aria-label="Variants">
+    <div data-ui="branch-controls">
       {atStart ? (
         <span
           data-ui="branch-arrow"
           data-role="first"
           data-state="disabled"
           aria-disabled="true"
-          aria-label="Already at first variant"
           title="Already at first variant"
         >
           «
@@ -209,7 +208,6 @@ export function BranchControls({ chatId, message, messages }: BranchControlsProp
           data-role="prev"
           data-state="disabled"
           aria-disabled="true"
-          aria-label="Already at first variant"
           title="Already at first variant"
         >
           ‹
@@ -275,7 +273,6 @@ export function BranchControls({ chatId, message, messages }: BranchControlsProp
           data-role="next"
           data-state="disabled"
           aria-disabled="true"
-          aria-label="Already at last variant"
           title="Already at last variant"
         >
           ›
@@ -299,7 +296,6 @@ export function BranchControls({ chatId, message, messages }: BranchControlsProp
           data-role="last"
           data-state="disabled"
           aria-disabled="true"
-          aria-label="Already at last variant"
           title="Already at last variant"
         >
           »

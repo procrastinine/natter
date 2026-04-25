@@ -108,21 +108,22 @@ function applyManualPickerState(
 ): PickerRow {
   const providerPrefs = opts.providerPrefs
   const userTouchedPicker = providerPrefs?.ignoreOverridesFilter === true
-  if (!userTouchedPicker) return row
+  const hasOnly = (providerPrefs?.only?.length ?? 0) > 0
+  if (!userTouchedPicker && !hasOnly) return row
 
-  const ignoredByPicker = endpointMatchesAnyProviderRef(row.endpoint, providerPrefs.ignore, endpoints)
+  const ignoredByPicker =
+    userTouchedPicker && endpointMatchesAnyProviderRef(row.endpoint, providerPrefs?.ignore, endpoints)
   if (ignoredByPicker) {
     return { ...row, state: 'auto-excluded', reasons: ['user-ignored'] }
   }
   if (
-    providerPrefs.only &&
-    providerPrefs.only.length > 0 &&
-    !endpointMatchesAnyProviderRef(row.endpoint, providerPrefs.only, endpoints)
+    hasOnly &&
+    !endpointMatchesAnyProviderRef(row.endpoint, providerPrefs?.only, endpoints)
   ) {
     return { ...row, state: 'auto-excluded', reasons: ['not-in-only-list'] }
   }
 
-  return { ...row, state: 'kept', reasons: [] }
+  return userTouchedPicker ? { ...row, state: 'kept', reasons: [] } : row
 }
 
 // One-line reason label for the picker row. Full tooltip text comes from

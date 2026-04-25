@@ -216,6 +216,27 @@ describe('buildPickerRows', () => {
     ])
   })
 
+  it('renders stored providerPrefs.only even before the picker override flag is set', () => {
+    const kept = ep('Allowed', { provider_slug: 'allowed' })
+    const outside = ep('Outside', { provider_slug: 'outside' })
+    const filter: PrivacyFilterResult = {
+      kept: [
+        { endpoint: kept, policy: POLICY_CLEAN, policySynthesized: false },
+        { endpoint: outside, policy: POLICY_CLEAN, policySynthesized: false },
+      ],
+      excluded: [],
+      orderedKeptNames: ['allowed', 'outside'],
+      zeroEligible: false,
+    }
+    const rows = buildPickerRows([kept, outside], filter, {
+      providerPrefs: { only: ['allowed'] },
+    })
+    expect(rows.map((r) => [r.endpoint.provider_slug, r.state, r.reasons])).toEqual([
+      ['allowed', 'kept', []],
+      ['outside', 'auto-excluded', ['not-in-only-list']],
+    ])
+  })
+
   it('keys rows by endpoint identity, not duplicate display name', () => {
     const anth2 = ep('Anthropic', { provider_slug: 'anthropic/2' })
     const anth = ep('Anthropic', { provider_slug: 'anthropic' })

@@ -10,6 +10,7 @@
 
 import {
   type KeyboardEvent,
+  type ReactNode,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -17,12 +18,13 @@ import {
   useState,
 } from 'react'
 import type { ContentItem, ReasoningDetail } from '../../core/types'
+import { PrefillIcon } from '../icons/Icon'
 
 export interface InlineEditorProps {
   initial: string
   onSave: (text: string, reasoning?: ReasoningDetail[]) => void | Promise<void>
   onCancel: () => void
-  onSaveAndSend?: (text: string) => void | Promise<void>
+  onSaveAndSend?: (text: string, opts?: { prefillText?: string }) => void | Promise<void>
   saveAndSendDisabled?: boolean
   saveAndSendDisabledReason?: string
   ariaLabel?: string
@@ -31,6 +33,13 @@ export interface InlineEditorProps {
   // passed back via onSave's second argument. Keep reference stable
   // across renders to avoid resetting the disclosure state.
   initialReasoning?: ReasoningDetail[]
+  // Prefill toggle for Save & Send. Only applied to user messages
+  // (assistants don't have a "send" path). Hidden when the model doesn't
+  // support prefill. Empty / whitespace-only prefill text is treated as
+  // "no prefill" (matches the composer's behavior).
+  showPrefillButton?: boolean
+  defaultPrefill?: string
+  prefillSettingsPrompt?: ReactNode
 }
 
 const MIN_TEXTAREA_ROWS = 6
@@ -161,6 +170,9 @@ export function InlineEditor({
   saveAndSendDisabledReason,
   ariaLabel,
   initialReasoning,
+  showPrefillButton,
+  defaultPrefill,
+  prefillSettingsPrompt,
 }: InlineEditorProps) {
   const [text, setText] = useState(initial)
   const [busy, setBusy] = useState(false)
@@ -168,8 +180,11 @@ export function InlineEditor({
   const [reasoning, setReasoning] = useState<EditableReasoning[]>(() =>
     toEditable(initialReasoning ?? []),
   )
+  const [prefillOpen, setPrefillOpen] = useState(false)
+  const [prefillText, setPrefillText] = useState(defaultPrefill ?? '')
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
   const actionsRef = useRef<HTMLDivElement | null>(null)
+  const prefillTextareaRef = useRef<HTMLTextAreaElement | null>(null)
 
   useEffect(() => {
     const el = textareaRef.current
@@ -184,6 +199,7 @@ export function InlineEditor({
     el.setSelectionRange(end, end)
     actionsRef.current?.scrollIntoView({ block: 'nearest', behavior: 'auto' })
   }, [])
+  // biome-ignore lint/correctness/useExhaustiveDependencies: text changes alter textarea scrollHeight.
   useLayoutEffect(() => {
     autosize(textareaRef.current)
   }, [text])
@@ -207,6 +223,15 @@ export function InlineEditor({
     },
     [text, busy, initialReasoning, reasoning],
   )
+  const togglePrefill = useCallback(async () => {
+    if (prefillOpen) {
+      setPrefillOpen(false)
+      return
+    }
+    setPrefillText((prev) => (prev.length === 0 ? (defaultPrefill ?? '') : prev))
+    setPrefillOpen(true)
+    requestAnimationFrame(() => prefillTextareaRef.current?.focus())
+  }, [prefillOpen, defaultPrefill])
   // No-op Save when nothing has changed — closes the editor without
   // touching IDB, without bumping `editedAt`, and (critically) without
   // flagging the "this reply may be stale" hint on downstream
@@ -227,8 +252,11 @@ export function InlineEditor({
   }, [isUnchanged, onCancel, run, onSave])
   const commitSaveAndSend = useCallback(() => {
     if (!onSaveAndSend || saveAndSendDisabled) return
-    return run((text) => onSaveAndSend(text))
-  }, [run, onSaveAndSend, saveAndSendDisabled])
+    const prefillOut = prefillOpen && prefillText.trim().length > 0 ? prefillText : ''
+    return run((next) =>
+      onSaveAndSend(next, prefillOut.length > 0 ? { prefillText: prefillOut } : undefined),
+    )
+  }, [run, onSaveAndSend, saveAndSendDisabled, prefillOpen, prefillText])
 
   const handleKey = useCallback(
     (e: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -282,6 +310,21 @@ export function InlineEditor({
         rows={MIN_TEXTAREA_ROWS}
         disabled={busy}
       />
+      {prefillOpen ? (
+        <>
+          {prefillSettingsPrompt}
+          <textarea
+            ref={prefillTextareaRef}
+            data-ui="inline-editor-prefill"
+            value={prefillText}
+            onChange={(e) => setPrefillText(e.target.value)}
+            placeholder="Assistant prefill — the model continues from this text…"
+            rows={3}
+            disabled={busy}
+            aria-label="Assistant prefill text"
+          />
+        </>
+      ) : null}
       {showReasoningSection ? (
         <details
           data-ui="inline-editor-reasoning"
@@ -292,7 +335,7 @@ export function InlineEditor({
           <div data-ui="inline-editor-reasoning-list">
             {reasoning.map((row, i) => (
               <ReasoningEditorRow
-                key={i}
+                key={`${row.kind}-${row.index}`}
                 row={row}
                 busy={busy}
                 onChangeText={(next) =>
@@ -328,6 +371,25 @@ export function InlineEditor({
         >
           Cancel
         </button>
+        {onSaveAndSend && showPrefillButton ? (
+          <button
+            type="button"
+            data-ui="inline-editor-button"
+            data-role="prefill"
+            data-active={prefillOpen ? 'true' : undefined}
+            onClick={() => void togglePrefill()}
+            disabled={busy}
+            aria-pressed={prefillOpen}
+            title={
+              prefillOpen
+                ? 'Close prefill'
+                : 'Add an assistant prefill — the model continues from your text on Save & Send'
+            }
+          >
+            <PrefillIcon size={14} />
+            <span>Prefill</span>
+          </button>
+        ) : null}
         <button
           type="button"
           data-ui="inline-editor-button"

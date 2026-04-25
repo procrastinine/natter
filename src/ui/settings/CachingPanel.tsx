@@ -60,7 +60,6 @@ function familyFor(chat: Chat, capability: EffectiveCapability | null): Family {
 }
 
 export function CachingPanel({ chat, capability, connectionKind }: CachingPanelProps) {
-  if (!CACHE_CAPABLE_KINDS.includes(connectionKind)) return null
   const family = familyFor(chat, capability)
   const cache = chat.settings.anthropicCache
   const setCache = useCallback(
@@ -76,6 +75,7 @@ export function CachingPanel({ chat, capability, connectionKind }: CachingPanelP
   // Hide the section entirely when there's nothing for the user to
   // configure — unsupported model, implicit caching (OpenAI), or no model
   // yet. Keeps the Context tab quiet.
+  if (!CACHE_CAPABLE_KINDS.includes(connectionKind)) return null
   if (!chat.settings.model) return null
   if (family === 'unsupported') return null
   if (family === 'openai') return null

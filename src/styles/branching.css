@@ -227,6 +227,48 @@
   color: var(--color-fg-primary);
 }
 
+[data-ui="inline-editor-button"][data-role="prefill"] {
+  color: var(--color-fg-muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+}
+
+[data-ui="inline-editor-button"][data-role="prefill"][data-active="true"] {
+  background: color-mix(in srgb, var(--color-accent) 14%, var(--color-bg-surface-1));
+  color: var(--color-fg-primary);
+}
+
+[data-ui="inline-editor-button"][data-role="prefill"][data-active="true"]:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--color-accent) 22%, var(--color-bg-surface-1));
+}
+
+[data-ui="inline-editor-prefill"] {
+  font: inherit;
+  width: 100%;
+  min-height: 5rem;
+  padding: var(--space-3);
+  background: var(--color-bg-surface-2);
+  border: none;
+  border-top: 1px solid var(--color-border-subtle);
+  border-radius: 0;
+  resize: none;
+  outline: none;
+  color: var(--color-fg-primary);
+  font-size: var(--font-size-sm);
+}
+
+[data-ui="inline-editor-prefill"]:focus,
+[data-ui="inline-editor-prefill"]:focus-visible {
+  outline: 2px solid var(--color-border-focus);
+  outline-offset: -2px;
+}
+
+[data-ui="inline-editor-prefill"]::placeholder {
+  color: var(--color-fg-muted);
+}
+
 [data-ui="inline-editor-button"][data-role="save"]:hover:not(:disabled) {
   background: color-mix(in srgb, var(--color-accent) 14%, var(--color-bg-surface-2));
   color: var(--color-fg-primary);
@@ -395,12 +437,24 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  background: var(--color-backdrop-scrim);
   z-index: var(--z-overlay);
   padding: var(--space-5);
 }
 
+[data-ui="import-modal-scrim"],
+[data-ui="branch-tree-scrim"],
+[data-ui="confirm-delete-scrim"] {
+  position: absolute;
+  inset: 0;
+  border: 0;
+  padding: 0;
+  background: var(--color-backdrop-scrim);
+  cursor: default;
+}
+
 [data-ui="import-modal"] {
+  position: relative;
+  z-index: 1;
   background: var(--color-bg-surface-1);
   border: 1px solid var(--color-border-default);
   border-radius: var(--radius-md);
@@ -526,12 +580,13 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  background: var(--color-backdrop-scrim);
   z-index: var(--z-overlay);
   padding: var(--space-5);
 }
 
 [data-ui="branch-tree"] {
+  position: relative;
+  z-index: 1;
   background: var(--color-bg-surface-1);
   border: 1px solid var(--color-border-default);
   border-radius: var(--radius-md);
@@ -731,12 +786,13 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  background: var(--color-backdrop-scrim);
   z-index: var(--z-overlay);
   padding: var(--space-5);
 }
 
 [data-ui="confirm-delete"] {
+  position: relative;
+  z-index: 1;
   background: var(--color-bg-surface-1);
   /* No outer border — the shadow is enough to lift the dialog off the
    * scrim, and the 1-px stroke was distracting from the red Delete
@@ -879,4 +935,36 @@
 [data-ui="composer-import-at-end"]:hover:not(:disabled) {
   background: var(--color-bg-hover);
   color: var(--color-fg-primary);
+}
+
+/* Prefill toggle — same shape as import-at-end so the action row reads as a
+ * uniform strip. Pressed state lights the button so the user knows the
+ * prefill textarea is open. */
+[data-ui="composer-prefill-toggle"] {
+  background: var(--color-bg-surface-2);
+  border: none;
+  border-left: 1px solid var(--color-border-subtle);
+  color: var(--color-fg-muted);
+  padding: 0 var(--space-4);
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+  align-self: stretch;
+  border-radius: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+[data-ui="composer-prefill-toggle"]:hover:not(:disabled) {
+  background: var(--color-bg-hover);
+  color: var(--color-fg-primary);
+}
+
+[data-ui="composer-prefill-toggle"][data-active="true"] {
+  background: color-mix(in srgb, var(--color-accent) 14%, var(--color-bg-surface-2));
+  color: var(--color-fg-primary);
+}
+
+[data-ui="composer-prefill-toggle"][data-active="true"]:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--color-accent) 22%, var(--color-bg-surface-2));
 }

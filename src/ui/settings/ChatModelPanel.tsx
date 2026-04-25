@@ -183,7 +183,7 @@ export function ChatModelPanel({ chatId, chatSnapshot = null, onClose }: ChatMod
 
   if (!chat) {
     return (
-      <aside data-ui="chat-model-panel" role="complementary" aria-label="Chat model settings">
+      <aside data-ui="chat-model-panel" aria-label="Chat model settings">
         <PanelHeader onClose={onClose} title="Model settings" />
         <div data-ui="settings-panel" />
       </aside>
@@ -205,7 +205,7 @@ export function ChatModelPanel({ chatId, chatSnapshot = null, onClose }: ChatMod
     modelAvailable === false && profile?.kind !== 'llama-server' ? chat.settings.model : null
 
   return (
-    <aside data-ui="chat-model-panel" role="complementary" aria-label="Chat model settings">
+    <aside data-ui="chat-model-panel" aria-label="Chat model settings">
       <PanelHeader onClose={onClose} title="Chat settings" />
       <PresetBreadcrumb chat={chat} preset={preset ?? undefined} />
       {unavailableModel ? (
@@ -288,6 +288,7 @@ export function ChatModelPanel({ chatId, chatSnapshot = null, onClose }: ChatMod
             chat={chat}
             capability={capability}
             endpointTokenizer={endpointTokenizer}
+            prefillRecommendationEndpoints={routing.endpoints}
           />
         ) : null}
       </div>
@@ -325,7 +326,7 @@ function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | u
     return !settingsMatch(chat.settings, preset.settings)
   }, [chat.settings, preset])
 
-  const closePicker = () => setPickerOpen(false)
+  const closePicker = useCallback(() => setPickerOpen(false), [])
 
   const loadPreset = useCallback(
     async (targetId: string) => {
@@ -339,7 +340,7 @@ function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | u
       await setChatPreset(chat.id, target.id)
       closePicker()
     },
-    [chat.id],
+    [chat.id, closePicker],
   )
 
   const saveToExisting = useCallback(
@@ -356,7 +357,7 @@ function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | u
       })
       closePicker()
     },
-    [chat.settings, pushToast],
+    [chat.settings, pushToast, closePicker],
   )
 
   const saveAsNew = useCallback(async () => {
@@ -370,7 +371,7 @@ function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | u
     await setChatPreset(chat.id, p.id)
     pushToast({ level: 'info', text: `Created preset "${p.name}".`, durationMs: 2500 })
     closePicker()
-  }, [chat.id, chat.settings, pushToast])
+  }, [chat.id, chat.settings, pushToast, closePicker])
 
   const renamePreset = useCallback(
     async (targetId: string, currentName: string) => {

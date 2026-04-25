@@ -92,9 +92,11 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
   // useLayoutEffect + behavior: 'auto' so the scroll position is set
   // before the browser paints — the chat renders already at the leaf.
   const didOpenRef = useRef(false)
+  // biome-ignore lint/correctness/useExhaustiveDependencies: resetKey is the explicit reset signal for this ref.
   useEffect(() => {
     didOpenRef.current = false
   }, [resetKey])
+  // biome-ignore lint/correctness/useExhaustiveDependencies: children changes are the content-load signal for measuring overflow.
   useLayoutEffect(() => {
     if (didOpenRef.current) return
     const container = containerRef.current
@@ -137,6 +139,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
   // user is at the bottom. Chat switches, content loads, and in-place
   // edits don't trigger this because `streamActive` is false in those
   // cases — the scroll position stays put.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: children changes are the stream-content signal for follow scrolling.
   useEffect(() => {
     if (!autoScrollOnStream) return
     if (!streamActive) return

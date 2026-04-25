@@ -48,6 +48,7 @@ export interface MessageOpsContext {
     connection: ConnectionProfile
     apiKey: string
     parentMessageId: MessageId
+    prefillContent?: ContentItem[]
   }) => Promise<SendTextResult>
 }
 
@@ -119,6 +120,7 @@ export async function editAndResend(
   ctx: MessageOpsContext,
   originalUser: Message,
   newText: string,
+  options: { prefillContent?: ContentItem[] } = {},
 ): Promise<SendTextResult> {
   const conn = await resolveActiveConnection(ctx.chatId)
   if (!conn.ok) {
@@ -137,11 +139,13 @@ export async function editAndResend(
     ...existingCursor,
     ...inserted.effects.cursorUpdates,
   })
+  const hasPrefill = (options.prefillContent?.length ?? 0) > 0
   const result = await ctx.sendFrom({
     chatId: ctx.chatId,
     connection: conn.profile,
     apiKey: conn.apiKey,
     parentMessageId: inserted.messageId,
+    ...(hasPrefill ? { prefillContent: options.prefillContent } : {}),
   })
   await bumpProfileLastUsedAt(conn.profile.id)
   if (conn.presetId) await bumpPresetLastUsedAt(conn.presetId)

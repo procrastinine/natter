@@ -10,6 +10,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { type PasteImportSlot, pasteImport } from '../../core/messages'
 import type { ChatId, ContentItem, CursorMap, MessageRole } from '../../core/types'
+import { newId } from '../../lib/ulid'
 import { CloseIcon, TrashIcon } from '../icons/Icon'
 
 export interface ImportModalProps {
@@ -33,6 +34,7 @@ export interface ImportModalProps {
 }
 
 interface Row {
+  id: string
   role: MessageRole
   text: string
 }
@@ -61,7 +63,7 @@ export function ImportModal({
   onClose,
   onDone,
 }: ImportModalProps) {
-  const [rows, setRows] = useState<Row[]>([{ role: defaultRole, text: '' }])
+  const [rows, setRows] = useState<Row[]>([{ id: newId(), role: defaultRole, text: '' }])
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
@@ -74,7 +76,7 @@ export function ImportModal({
       if (prev.length === 0) return prev
       const first = prev[0] as Row
       if (first.role === defaultRole) return prev
-      return [{ role: defaultRole, text: first.text }, ...prev.slice(1)]
+      return [{ ...first, role: defaultRole }, ...prev.slice(1)]
     })
   }, [defaultRole, isSiblingSlot])
 
@@ -82,7 +84,7 @@ export function ImportModal({
     setRows((prev) => {
       const last = prev[prev.length - 1] as Row | undefined
       const nextRole: MessageRole = last?.role === 'user' ? 'assistant' : 'user'
-      return [...prev, { role: nextRole, text: '' }]
+      return [...prev, { id: newId(), role: nextRole, text: '' }]
     })
   }, [])
 
@@ -135,13 +137,14 @@ export function ImportModal({
   const roleOptions = useMemo(() => ROLE_OPTIONS, [])
 
   return (
-    <div
-      data-ui="import-modal-overlay"
-      role="presentation"
-      onClick={(e) => {
-        if (e.target === e.currentTarget) onClose()
-      }}
-    >
+    <div data-ui="import-modal-overlay">
+      <button
+        type="button"
+        data-ui="import-modal-scrim"
+        aria-label="Close import modal"
+        tabIndex={-1}
+        onClick={onClose}
+      />
       <div data-ui="import-modal" role="dialog" aria-modal="true" aria-label="Import messages">
         <div data-ui="import-modal-header">
           <h2>Import messages</h2>
@@ -163,7 +166,7 @@ export function ImportModal({
         ) : null}
         <div data-ui="import-modal-rows">
           {rows.map((row, i) => (
-            <div key={i} data-ui="import-modal-row" data-role={row.role}>
+            <div key={row.id} data-ui="import-modal-row" data-role={row.role}>
               <div data-ui="import-modal-row-head">
                 <label>
                   Role

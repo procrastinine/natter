@@ -683,13 +683,14 @@ function ConnectionDeleteDialog({
   }, [onCancel])
 
   return (
-    <div
-      data-ui="confirm-delete-overlay"
-      role="presentation"
-      onClick={(event) => {
-        if (event.target === event.currentTarget) onCancel()
-      }}
-    >
+    <div data-ui="confirm-delete-overlay">
+      <button
+        type="button"
+        data-ui="confirm-delete-scrim"
+        aria-label="Cancel connection delete"
+        tabIndex={-1}
+        onClick={onCancel}
+      />
       <div
         data-ui="confirm-delete"
         role="dialog"
@@ -1470,10 +1471,10 @@ function ConnectionSetupModal({
       aria-modal="true"
       aria-label="Add connection"
     >
-      <div
+      <button
+        type="button"
         data-ui="connection-setup-scrim"
         onClick={onClose}
-        role="button"
         tabIndex={-1}
         aria-label="Close add-connection dialog"
       />

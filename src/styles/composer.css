@@ -106,6 +106,36 @@
   color: var(--color-fg-muted);
 }
 
+/* Prefill textarea sits BETWEEN the main input and the action row. Visually
+ * separated by a hairline divider so the "this is a different field" intent
+ * is unambiguous. Slightly different background tone from the main input so
+ * the eye picks up that this is the assistant-text channel. */
+[data-ui="composer-prefill"] {
+  width: 100%;
+  resize: none;
+  font: inherit;
+  padding: var(--space-3) var(--space-4);
+  box-sizing: border-box;
+  background: var(--color-bg-surface-1);
+  border: none;
+  border-top: 1px solid var(--color-border-subtle);
+  color: var(--color-fg-primary);
+  outline: none;
+  font-size: var(--font-size-sm);
+  line-height: var(--line-height-body);
+  min-height: 64px;
+}
+
+[data-ui="composer-prefill"]:focus,
+[data-ui="composer-prefill"]:focus-visible {
+  outline: 2px solid var(--color-border-focus);
+  outline-offset: -2px;
+}
+
+[data-ui="composer-prefill"]::placeholder {
+  color: var(--color-fg-muted);
+}
+
 /* Action row sits flush at the bottom of the card. Hairline divider
  * separates it from the textarea so the input and the action surface
  * are visually distinct. White background (different from the gray

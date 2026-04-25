@@ -75,10 +75,8 @@ export function ReasoningBlock({
   hasContent = false,
   onToggleHidden,
 }: ReasoningBlockProps) {
-  if (details.length === 0) return null
   const parts = partitionReasoning(details)
   const total = parts.text.length + parts.summary.length + parts.encrypted.length
-  if (total === 0) return null
   const format = reasoningFormatTag(parts)
   const canToggle = typeof onToggleHidden === 'function'
 
@@ -103,6 +101,8 @@ export function ReasoningBlock({
 
   const totalEncryptedBytes = parts.encrypted.reduce((acc, e) => acc + (e.data ?? '').length, 0)
 
+  if (details.length === 0 || total === 0) return null
+
   return (
     <details
       data-ui="reasoning"
@@ -118,13 +118,14 @@ export function ReasoningBlock({
     >
       <summary data-ui="reasoning-summary">
         <span data-ui="reasoning-title">Reasoning</span>
-        <span data-ui="reasoning-count" aria-label={`${total} entries`}>
+        <span data-ui="reasoning-count">
           · {total}
         </span>
         {totalEncryptedBytes > 0 ? (
           <span
             data-ui="reasoning-lock"
             title={`Encrypted reasoning preserved — ${formatBytes(totalEncryptedBytes)}`}
+            role="img"
             aria-label={`Encrypted reasoning preserved, ${formatBytes(totalEncryptedBytes)}`}
           >
             <LockIcon />

@@ -12,12 +12,14 @@
 // and a toast. This way moving from a low-cap model to a high-cap one
 // doesn't leave dangling knobs that will 400 on send.
 
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { chooseApi, isResponsesCapable } from '../../core/api-choice'
 import type { EffectiveCapability } from '../../core/capabilities'
 import { validateChatSettings } from '../../core/capabilities'
 import {
   emitsEncryptedReasoningFor,
+  prefillClassFor,
+  reasoningToggleableFor,
   responsesSupportFor,
 } from '../../core/quirks'
 import type {
@@ -26,12 +28,14 @@ import type {
   ConnectionProfile,
   EffortLevel,
   Message,
+  ModelEndpoint,
   ReasoningInclude,
   ReasoningSummary,
   SamplingKey,
   VerbosityLevel,
 } from '../../core/types'
 import { updateChatSettings } from '../../store/chats'
+import { PrefillSettingsPrompt } from '../chat/PrefillSettingsPrompt'
 import { InfoDisclosure } from './InfoDisclosure'
 import {
   ContinueSystemPromptEditor,
@@ -45,6 +49,7 @@ export interface ParamFormProps {
   // Preserved for forward-compat — future sampling fields (seed variance,
   // deterministic tokenizer-aware ops) may want it. Unused today.
   endpointTokenizer?: string | null | undefined
+  prefillRecommendationEndpoints?: readonly ModelEndpoint[] | undefined
 }
 
 interface SamplingSpec {
@@ -269,7 +274,16 @@ const SAMPLING_FIELDS: SamplingSpec[] = [
 
 const SETTINGS_SLIDER_COMMIT_DEBOUNCE_MS = 200
 
-export function ParamForm({ chat, capability }: ParamFormProps) {
+export function ParamForm({
+  chat,
+  capability,
+  prefillRecommendationEndpoints = [],
+}: ParamFormProps) {
+  const prefillSupportedForModel = chat.settings.model
+    ? prefillClassFor(chat.settings.model) !== 'unsupported'
+    : false
+  const continuePrefillStored = chat.settings.continuePrefill === true
+
   // Validate stored settings once the live cap lands. Re-run whenever the
   // cap identity changes — e.g. model swap. Silent: we just fix the values,
   // no user-visible banner (the UI re-renders with the clamped values).
@@ -283,6 +297,13 @@ export function ParamForm({ chat, capability }: ParamFormProps) {
       void updateChatSettings(chat.id, result.settings)
     }
   }, [capability, chat.id, chat.settings])
+
+  useEffect(() => {
+    if (!chat.settings.model) return
+    if (prefillSupportedForModel) return
+    if (!continuePrefillStored) return
+    void updateChatSettings(chat.id, { continuePrefill: false })
+  }, [chat.id, chat.settings.model, continuePrefillStored, prefillSupportedForModel])
 
   if (!chat.settings.model) {
     return (
@@ -314,16 +335,140 @@ export function ParamForm({ chat, capability }: ParamFormProps) {
 
   // Ordering per user spec: reasoning → verbosity, then prompt slots, then
   // sampling. Continue prompts start collapsed; system prompt starts open.
+  // Prefill block lives between the prompt slots and sampling so the user
+  // sees it as another prompt-like input. Continue prompts auto-hide when
+  // continuePrefill is on (their slots are unused in that mode).
+  const continuePrefill = prefillSupportedForModel && continuePrefillStored
   return (
     <div data-ui="param-form">
       <ReasoningSection chat={chat} capability={capability} />
       <VerbositySection chat={chat} capability={capability} />
       <SystemPromptEditor chat={chat} />
-      <ContinueSystemPromptEditor chat={chat} defaultCollapsed />
-      <ContinueUserPromptEditor chat={chat} defaultCollapsed />
+      {prefillSupportedForModel ? (
+        <PrefillSettingsSection chat={chat} endpoints={prefillRecommendationEndpoints} />
+      ) : null}
+      {continuePrefill ? null : <ContinueSystemPromptEditor chat={chat} defaultCollapsed />}
+      {continuePrefill ? null : <ContinueUserPromptEditor chat={chat} defaultCollapsed />}
       <SamplingSection chat={chat} capability={capability} />
       <StopSection chat={chat} capability={capability} />
     </div>
+  )
+}
+
+function PrefillSettingsSection({
+  chat,
+  endpoints,
+}: {
+  chat: Chat
+  endpoints: readonly ModelEndpoint[]
+}) {
+  const draft = chat.settings.defaultPrefill ?? ''
+  const continuePrefill = chat.settings.continuePrefill === true
+  const [expanded, setExpanded] = useState(false)
+  const lastPersistedRef = useRef(draft)
+  const [text, setText] = useState(draft)
+  const lastChatIdRef = useRef(chat.id)
+  // Resync on chat switch / external write.
+  useEffect(() => {
+    if (lastChatIdRef.current !== chat.id) {
+      lastChatIdRef.current = chat.id
+      lastPersistedRef.current = draft
+      setText(draft)
+      return
+    }
+    if (draft !== lastPersistedRef.current) {
+      lastPersistedRef.current = draft
+      setText(draft)
+    }
+  }, [chat.id, draft])
+  // Debounced save (300ms — matches the prompt-preset editor).
+  useEffect(() => {
+    if (text === lastPersistedRef.current) return
+    const id = window.setTimeout(() => {
+      lastPersistedRef.current = text
+      void updateChatSettings(chat.id, { defaultPrefill: text })
+    }, 300)
+    return () => window.clearTimeout(id)
+  }, [text, chat.id])
+  const toggleContinuePrefill = () =>
+    void updateChatSettings(chat.id, { continuePrefill: !continuePrefill })
+  return (
+    <section
+      data-ui="settings-section"
+      data-ui-section="prefill"
+      data-expanded={expanded ? 'true' : 'false'}
+    >
+      <div data-ui="prompt-slot-header">
+        <button
+          type="button"
+          data-ui="prompt-slot-toggle"
+          aria-expanded={expanded}
+          onClick={() => setExpanded((v) => !v)}
+        >
+          <PrefillChevronIcon expanded={expanded} />
+          <h3>Prefill</h3>
+        </button>
+      </div>
+      {expanded ? (
+        <>
+          <div data-ui="field-group">
+            <label htmlFor="default-prefill-textarea" data-ui="visually-hidden">
+              Default prefill text
+            </label>
+            <textarea
+              id="default-prefill-textarea"
+              data-ui="default-prefill-textarea"
+              value={text}
+              onChange={(e) => setText(e.target.value)}
+              placeholder='Default text for the prefill box. Example: "Chapter 1: The"'
+              rows={3}
+              spellCheck
+            />
+          </div>
+          <div data-ui="field-group" data-ui-field>
+            <label data-ui="checkbox-row">
+              <input
+                type="checkbox"
+                checked={continuePrefill}
+                onChange={toggleContinuePrefill}
+                data-ui="continue-prefill-toggle"
+              />
+              <span>Continue prefill</span>
+            </label>
+          </div>
+          {continuePrefill ? (
+            <PrefillSettingsPrompt
+              chatId={chat.id}
+              settings={chat.settings}
+              endpoints={endpoints}
+            />
+          ) : null}
+        </>
+      ) : null}
+    </section>
+  )
+}
+
+function PrefillChevronIcon({ expanded }: { expanded: boolean }) {
+  return (
+    <svg
+      data-ui="prompt-slot-chevron"
+      data-expanded={expanded ? 'true' : 'false'}
+      viewBox="0 0 12 12"
+      aria-hidden="true"
+      focusable="false"
+      width="10"
+      height="10"
+    >
+      <path
+        d="M4 2.5L8 6l-4 3.5"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.5"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
   )
 }
 
@@ -378,7 +523,15 @@ function ReasoningSection({
   const supportsReasoning =
     capability.supportedParameters.has('reasoning') ||
     capability.supportedParameters.has('thinking')
+  // Models in the P.7 reasoning-required list reject `reasoning.enabled:
+  // false` outright (or accept it silently while still emitting reasoning
+  // tokens). Hide the "off" mode so the UI doesn't offer a setting that
+  // 400s on the wire.
+  const reasoningToggleable = chat.settings.model
+    ? reasoningToggleableFor(chat.settings.model)
+    : true
   const modes = (['default', 'off', 'enabled', 'effort', 'budget'] as const).filter((m) => {
+    if (m === 'off') return reasoningToggleable
     if (m === 'effort') return effortChoices.length > 0
     if (m === 'budget') return supportsReasoning
     return true
@@ -467,10 +620,10 @@ function ReasoningBudgetControl({
     setSliderValue(committedSliderValue)
   }, [value, committedSliderValue])
 
-  const commitSliderDraft = () => {
+  const commitSliderDraft = useCallback(() => {
     const clamped = Math.min(max, Math.max(0, sliderValue))
     if (clamped !== committedSliderValue) onCommit(clamped)
-  }
+  }, [max, sliderValue, committedSliderValue, onCommit])
 
   useEffect(() => {
     if (sliderValue === committedSliderValue) return
@@ -478,7 +631,7 @@ function ReasoningBudgetControl({
       commitSliderDraft()
     }, SETTINGS_SLIDER_COMMIT_DEBOUNCE_MS)
     return () => window.clearTimeout(id)
-  }, [sliderValue, committedSliderValue])
+  }, [sliderValue, committedSliderValue, commitSliderDraft])
 
   const commitNumberDraft = () => {
     const n = Number(draft)
@@ -789,6 +942,11 @@ function StopSection({ chat, capability }: { chat: Chat; capability: EffectiveCa
     capability.supportedParameters.has('stop_sequences')
   if (!hasStop) return null
   const values = chat.settings.stop ?? []
+  const entries = values.map((value, index) => ({
+    value,
+    index,
+    key: `${value}:${values.slice(0, index).filter((item) => item === value).length}`,
+  }))
   const setValues = (next: string[]) => {
     const clean = next
       .map((s) => s.trim())
@@ -800,13 +958,13 @@ function StopSection({ chat, capability }: { chat: Chat; capability: EffectiveCa
     <section data-ui="settings-section" data-ui-section="stop">
       <h3>Stop sequences</h3>
       <div data-ui="chip-input">
-        {values.map((v, i) => (
-          <span key={`${v}-${i}`} data-ui="chip">
-            <code>{v}</code>
+        {entries.map((entry) => (
+          <span key={entry.key} data-ui="chip">
+            <code>{entry.value}</code>
             <button
               type="button"
-              aria-label={`Remove ${v}`}
-              onClick={() => setValues(values.filter((_, idx) => idx !== i))}
+              aria-label={`Remove ${entry.value}`}
+              onClick={() => setValues(values.filter((_, idx) => idx !== entry.index))}
             >
               ×
             </button>
@@ -835,7 +993,6 @@ function LogitBiasSection({ chat, capability }: { chat: Chat; capability: Effect
   const [open, setOpen] = useState(false)
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
   const fileRef = useRef<HTMLInputElement | null>(null)
-  if (!capability.supportedParameters.has('logit_bias')) return null
   const raw = useMemo(
     () => (chat.settings.logitBias ? JSON.stringify(chat.settings.logitBias, null, 2) : ''),
     [chat.settings.logitBias],
@@ -845,6 +1002,7 @@ function LogitBiasSection({ chat, capability }: { chat: Chat; capability: Effect
     setDraft(raw)
     setErrorMsg(null)
   }, [raw])
+  if (!capability.supportedParameters.has('logit_bias')) return null
   const commit = () => {
     if (draft.trim() === '') {
       void updateChatSettings(chat.id, { logitBias: {} })

@@ -21,6 +21,20 @@
 import type { EffortLevel, ReasoningFormat, VerbosityLevel } from './types'
 import { canonicalCompatModelId, canonicalModelSlug } from './model-ids'
 
+// Assistant-prefill classification. See `plan/prefill-research.md §P.8.1`.
+// `native`  — prefill works transparently (Claude < 4.6, Gemini).
+// `unsupported` — provider or model rejects prefill (Claude ≥ 4.6,
+//                 openai/gpt-oss-*, OpenAI GPT family).
+// `oss-toggleable` — default for hybrid thinking-capable OSS models;
+//                    prefill works when reasoning is disabled on the wire.
+// `oss-reasoning-required` — model can't toggle reasoning off; prefill lands
+//                            in the <think> block rather than content.
+export type PrefillClass =
+  | 'native'
+  | 'unsupported'
+  | 'oss-toggleable'
+  | 'oss-reasoning-required'
+
 // Effort ordered low → high for left-to-right UI rendering. Validation /
 // transform code doesn't care about order — it just filters by set
 // membership — but UI controls read the array verbatim so the visual
@@ -120,6 +134,18 @@ export interface QuirksEntry {
   //                      o1, o3, o3-mini, o4-mini.
   // Unset defaults to 'chat-only'.
   responsesSupport?: 'responses-only' | 'chat-only' | 'both'
+  // Assistant-prefill classification. Unset defaults to `oss-toggleable`
+  // (the permissive case for any model not explicitly listed). The three
+  // buckets that DO need an entry: `unsupported` for Claude ≥ 4.6 / gpt-oss /
+  // plain OpenAI GPT; `native` for Claude < 4.6 / Gemini; and
+  // `oss-reasoning-required` for the P.7 list (models whose reasoning can't
+  // be toggled off).
+  prefillClass?: PrefillClass
+  // True when the model's reasoning CANNOT be toggled off on the wire —
+  // either the endpoint rejects `reasoning.enabled: false` or it accepts it
+  // silently while still emitting reasoning tokens. Drives UI validation
+  // independently of prefill.
+  reasoningToggleable?: boolean
   // Whether the model emits an opaque encrypted-reasoning carrier that we
   // can echo on the next turn. Drives the "Encrypted reasoning" include
   // checkbox visibility.
@@ -576,6 +602,81 @@ export function emitsEncryptedReasoningFor(modelId: string): 'always' | 'tools-o
 // `inlineReasoningTagsFor` and passes it to `createInlineReasoningLifter`.
 export function inlineReasoningTagsFor(modelId: string): readonly string[] | undefined {
   return quirksFor(modelId).reasoningInlineTags
+}
+
+// ---------------------------------------------------------------------------
+// Prefill classification + reasoning-toggleable gate. See
+// `plan/prefill-research.md §P.7` and §P.8.1.
+// ---------------------------------------------------------------------------
+
+// Claude ≥ 4.6 dropped assistant-prefill on Anthropic direct AND via
+// OpenRouter (per live probe). Matches any family (`opus` / `sonnet` /
+// `haiku` / future) at version 4.6 or higher. Using >= 4.6 as a blanket
+// rule so new Claude releases inherit the right classification without
+// someone touching this file. The version separator is either `.` (raw)
+// or `:` (compat-normalized by `canonicalCompatModelId`), both accepted.
+const CLAUDE_NO_PREFILL_PATTERN =
+  /^claude-(?:opus|sonnet|haiku)-(?:[5-9](?:$|[-.:])|4[.:](?:[6-9]|\d{2,}))/
+
+// OpenAI GPT / o-series / chatgpt / gpt-oss all ignore assistant prefill —
+// `openai/gpt-oss-*` is harmony-blocked (every provider), and everything else
+// in the family returns a fresh answer (probe r1/r2). Safest blanket rule:
+// all OpenAI-family slugs. If a future OpenAI-family model starts honoring
+// prefill, add a registry entry for that slug with `prefillClass: 'native'`.
+const OPENAI_PREFILL_UNSUPPORTED_PATTERN = /^(?:gpt-|chatgpt-|o\d|gpt-oss)/
+
+// Models that reject `reasoning.enabled: false` outright OR accept it
+// silently while still emitting reasoning tokens (per the r12/r13 probe
+// sweep). Generic default is "toggleable"; only these are reasoning-locked
+// — prefill would land in the <think> block, and the reasoning "off" UI
+// option would be a no-op that trips HTTP 400 on the wire. Keys are the
+// slug form produced by `canonicalCompatModelId` (provider prefix stripped,
+// dots in versions normalized to `:`).
+const REASONING_REQUIRED_MODELS: ReadonlySet<string> = new Set([
+  'kimi-k2-thinking',
+  'deepseek-r1',
+  'deepseek-r1-0528',
+  'deepseek-r1-distill-llama-70b',
+  'deepseek-v3:2-speciale',
+  'minimax-m2',
+  'minimax-m2:1',
+  'minimax-m2:5',
+  'minimax-m2:7',
+  'qwen3-14b',
+  'qwen3-32b',
+  'qwen3-30b-a3b',
+  'qwen3-next-80b-a3b-thinking',
+  'qwen3-30b-a3b-thinking-2507',
+  'qwen3-235b-a22b-thinking-2507',
+])
+
+// Effective prefill classification. Registry wins; otherwise pattern rules
+// decide. Order matters: Claude + OpenAI unsupported comes before the
+// reasoning-required check since those probes only apply to OSS models.
+// `canonicalCompatModelId` returns the slug (provider prefix stripped),
+// with dots in version numbers normalized to `:`.
+export function prefillClassFor(modelId: string): PrefillClass {
+  const q = quirksFor(modelId)
+  if (q.prefillClass) return q.prefillClass
+  const slug = canonicalCompatModelId(modelId)
+  if (CLAUDE_NO_PREFILL_PATTERN.test(slug)) return 'unsupported'
+  if (OPENAI_PREFILL_UNSUPPORTED_PATTERN.test(slug)) return 'unsupported'
+  if (slug.startsWith('claude-')) return 'native'
+  if (slug.startsWith('gemini-')) return 'native'
+  if (REASONING_REQUIRED_MODELS.has(slug)) return 'oss-reasoning-required'
+  return 'oss-toggleable'
+}
+
+// Whether reasoning can be toggled off on the wire. Most models default
+// toggleable; Gemini and the P.7 reasoning-required list hide the "off"
+// mode because those endpoints reject or ignore disabled reasoning.
+export function reasoningToggleableFor(modelId: string): boolean {
+  const q = quirksFor(modelId)
+  if (q.reasoningToggleable !== undefined) return q.reasoningToggleable
+  const slug = canonicalCompatModelId(modelId)
+  if (slug.startsWith('gemini-')) return false
+  if (REASONING_REQUIRED_MODELS.has(slug)) return false
+  return true
 }
 
 // Strip sampling params that are gated behind `reasoning.effort === 'none'` on

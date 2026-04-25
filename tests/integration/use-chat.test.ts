@@ -82,6 +82,12 @@ function makeLlamaServerProfile(): ConnectionProfile {
   }
 }
 
+function requireDefined<T>(value: T | undefined, label: string): T {
+  expect(value).toBeDefined()
+  if (value === undefined) throw new Error(`${label} missing`)
+  return value
+}
+
 function chatSettings(overrides: Partial<ChatSettings> = {}): ChatSettings {
   const base = cloneDefaultChatSettings()
   return {
@@ -254,6 +260,148 @@ describe('sendText — chat-completions streaming', () => {
     expect(assistant.generation?.finishReason).toBe('stop')
     expect(assistant.generation?.finishedAt).toBe(1000)
     expect(assistant.generation?.abortReason).toBeUndefined()
+  })
+
+  it('sends assistant prefill through the unified request plan and stores the continuation below it', async () => {
+    const chat = await createChat({
+      settings: chatSettings({
+        reasoning: {
+          mode: 'default',
+          exclude: false,
+          summary: 'off',
+          carryForward: 'off',
+          include: { encrypted: false, summary: false, text: false },
+        },
+      }),
+    })
+    let seenWire: Record<string, unknown> | undefined
+    const result = await sendText({
+      chatId: chat.id,
+      connection: makeProfile(),
+      apiKey: 'sk-test',
+      content: [{ type: 'text', text: 'write the opener' }],
+      prefillContent: [{ type: 'text', text: 'Chapter' }],
+      capabilities: { supportedParameters: ['reasoning'], streaming: 'supported' },
+      openStream: (open) => {
+        seenWire = open.wireBody
+        return stream({
+          type: 'delta',
+          chunk: {
+            id: 'gen-prefill',
+            model: 'google/gemini-3.1-flash-lite-preview',
+            choices: [{ delta: { content: ' One' }, finish_reason: 'stop' }],
+          },
+        })
+      },
+      now: () => 1000,
+    })
+
+    expect(result.outcome).toBe('done')
+    expect(seenWire?.messages).toEqual([
+      { role: 'user', content: 'write the opener' },
+      { role: 'assistant', content: 'Chapter' },
+    ])
+    expect(seenWire?.reasoning).toBeUndefined()
+    const all = await messagesFor(chat.id)
+    const user = requireDefined(
+      all.find((m) => m.role === 'user' && m.origin === 'user'),
+      'user message',
+    )
+    const assistant = requireDefined(
+      all.find((m) => m.role === 'assistant' && m.origin === 'generated'),
+      'assistant continuation',
+    )
+    expect(all.filter((m) => m.role === 'assistant')).toHaveLength(1)
+    expect(assistant.parentId).toBe(user.id)
+    expect(assistant.content).toEqual([{ type: 'output_text', text: 'Chapter One' }])
+    expect((await getBrowserRepository().getChat(chat.id))?.settings.reasoning.mode).toBe(
+      'default',
+    )
+  })
+
+  it('does not auto-configure toggleable OSS prefill during request planning', async () => {
+    await seedOpenRouterDiscovery('prof', ['z-ai/glm-5.1'])
+    const chat = await createChat({
+      settings: chatSettings({
+        model: 'z-ai/glm-5.1',
+        reasoning: {
+          mode: 'default',
+          exclude: false,
+          summary: 'off',
+          carryForward: 'off',
+          include: { encrypted: false, summary: false, text: false },
+        },
+      }),
+    })
+    let seenWire: Record<string, unknown> | undefined
+    await sendText({
+      chatId: chat.id,
+      connection: makeProfile(),
+      apiKey: 'sk-test',
+      content: [{ type: 'text', text: 'write the opener' }],
+      prefillContent: [{ type: 'text', text: 'Chapter' }],
+      openStream: (open) => {
+        seenWire = open.wireBody
+        return stream({
+          type: 'delta',
+          chunk: {
+            id: 'gen-prefill-oss',
+            model: 'z-ai/glm-5.1',
+            choices: [{ delta: { content: ' One' }, finish_reason: 'stop' }],
+          },
+        })
+      },
+    })
+
+    expect(seenWire?.messages).toEqual([
+      { role: 'user', content: 'write the opener' },
+      { role: 'assistant', content: 'Chapter' },
+    ])
+    expect(seenWire?.reasoning).toBeUndefined()
+    expect((seenWire as { provider?: { only?: string[] } } | undefined)?.provider?.only).toBeUndefined()
+    const storedChat = await getBrowserRepository().getChat(chat.id)
+    expect(storedChat?.settings.reasoning.mode).toBe('default')
+    expect(storedChat?.settings.providerPrefs?.only).toBeUndefined()
+    const all = await messagesFor(chat.id)
+    expect(all.filter((m) => m.role === 'assistant')).toHaveLength(1)
+    expect(all.find((m) => m.role === 'assistant')?.content).toEqual([
+      { type: 'output_text', text: 'Chapter One' },
+    ])
+  })
+
+  it('keeps a failed prefill request on the single generated assistant row', async () => {
+    const chat = await createChat({ settings: chatSettings() })
+    const result = await sendText({
+      chatId: chat.id,
+      connection: makeProfile(),
+      apiKey: 'sk-test',
+      content: [{ type: 'text', text: 'write the opener' }],
+      prefillContent: [{ type: 'text', text: 'Chapter' }],
+      openStream: () => ({
+        [Symbol.asyncIterator]: () => ({
+          next: async () => {
+            throw new ApiError({
+              kind: 'bad_request',
+              httpStatus: 400,
+              code: 400,
+              message: 'Reasoning is mandatory for this endpoint and cannot be disabled',
+              midStream: false,
+              retryable: false,
+            })
+          },
+        }),
+      }),
+    })
+
+    expect(result.outcome).toBe('error')
+    const all = await messagesFor(chat.id)
+    const assistantRows = all.filter((m) => m.role === 'assistant')
+    expect(assistantRows).toHaveLength(1)
+    expect(assistantRows[0]?.origin).toBe('generated')
+    expect(assistantRows[0]?.content).toEqual([{ type: 'output_text', text: 'Chapter' }])
+    expect(assistantRows[0]?.generation?.error?.message).toBe(
+      'Reasoning is mandatory for this endpoint and cannot be disabled',
+    )
   })
 
   it('honors a user-pinned Responses route instead of silently using chat-completions', async () => {

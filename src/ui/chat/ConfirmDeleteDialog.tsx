@@ -59,13 +59,14 @@ export function ConfirmDeleteDialog({
   }, [busy, deletePair, onConfirm])
 
   return (
-    <div
-      data-ui="confirm-delete-overlay"
-      role="presentation"
-      onClick={(e) => {
-        if (e.target === e.currentTarget) onCancel()
-      }}
-    >
+    <div data-ui="confirm-delete-overlay">
+      <button
+        type="button"
+        data-ui="confirm-delete-scrim"
+        aria-label="Cancel delete"
+        tabIndex={-1}
+        onClick={onCancel}
+      />
       <div
         data-ui="confirm-delete"
         role="dialog"

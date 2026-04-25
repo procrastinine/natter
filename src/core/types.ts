@@ -384,6 +384,17 @@ export interface ChatSettings {
   // Empty = fall back to the double-assistant shape (worse on some models).
   continueUserPrompt: string
   continueUserPromptPresetId?: PromptPresetId
+  // Default prefill text seeded into the prefill box whenever the user opens
+  // prefill on this chat (composer or Edit-and-Send, NOT Continue). Blank
+  // means "start empty". Prefill research §P.8: shown above the continue
+  // prompts in the generation tab.
+  defaultPrefill?: string
+  // Continue-in-place mode. When true, Continue sends the history with the
+  // target assistant message as a real prefill (trailing `role: 'assistant'`,
+  // no synthetic double-assistant shape). When false (default), Continue
+  // uses the continueSystemPrompt + continueUserPrompt template flow. The
+  // continue-prompt textareas hide in settings when this is true.
+  continuePrefill?: boolean
   sampling: Partial<Record<SamplingKey, number>>
   stop?: string[]
   modalities?: Array<'text' | 'image' | 'audio'>

@@ -33,7 +33,10 @@ import type {
 } from '../api/types'
 import { isFreeModel } from './model-predicates'
 import type { WireProviderPrivacy } from './privacy-filter'
-import { adjustGpt54SamplingGate, quirksFor } from './quirks'
+import {
+  adjustGpt54SamplingGate,
+  quirksFor,
+} from './quirks'
 import { filterReasoningForInclude } from './reasoning'
 import { renderTextPrompt } from './text-templates'
 import type {
@@ -131,6 +134,102 @@ const SAMPLING_WIRE_KEY: Readonly<Record<SamplingKey, string>> = Object.freeze({
   n_keep: 'n_keep',
 })
 
+// Apply prefill-specific path rewrites before any wire serialization. See
+// `plan/prefill-research.md §P.8.5` (trailing-whitespace trim) and §P.8.6
+// (merge adjacent prefill+continuation assistant rows). Both are wire-only;
+// stored messages keep the user's content verbatim. Returns a new array
+// when changes apply, else the input array reference.
+function applyPrefillWireRewrites(path: readonly Message[]): readonly Message[] {
+  if (path.length === 0) return path
+  let mutated: Message[] | null = null
+  const dropped = new Set<number>()
+  for (let i = 0; i < path.length; i += 1) {
+    const current = path[i]
+    if (!current || current.role !== 'assistant' || current.origin !== 'prefill') continue
+    const next = path[i + 1]
+    if (!next || next.role !== 'assistant' || next.origin === 'prefill') continue
+    // Adjacent `prefill → continuation` pair. Merge them into one wire
+    // assistant turn on the wire; the upstream API requires strict role
+    // alternation and two adjacent assistant messages would be rejected.
+    const merged = mergePrefillIntoContinuation(current, next)
+    if (!mutated) mutated = path.slice()
+    mutated[i + 1] = merged
+    dropped.add(i)
+  }
+  let processed: readonly Message[] = mutated
+    ? mutated.filter((_m, index) => !dropped.has(index))
+    : path
+
+  // Trailing prefill turn — trim trailing whitespace on the last text part.
+  // Anthropic direct hard-rejects (400) on trailing whitespace, and trimming
+  // is harmless everywhere. Wire-only; stored content stays verbatim.
+  const tail = processed.at(-1)
+  if (tail && tail.role === 'assistant' && tail.origin === 'prefill') {
+    const trimmed = trimTrailingWhitespaceOnLastText(tail)
+    if (trimmed !== tail) {
+      processed = [...processed.slice(0, -1), trimmed]
+    }
+  }
+  return processed
+}
+
+function mergePrefillIntoContinuation(prefill: Message, continuation: Message): Message {
+  const prefillContent = prefill.content ?? []
+  const contContent = continuation.content ?? []
+  const prefillPrefix = prefillContent
+    .filter(
+      (item): item is Extract<ContentItem, { type: 'text' | 'output_text' }> =>
+        item.type === 'text' || item.type === 'output_text',
+    )
+    .map((item) => item.text)
+    .join('')
+  const prefillNonText = prefillContent.filter(
+    (item) => item.type !== 'text' && item.type !== 'output_text',
+  )
+
+  const mergedContent: ContentItem[] = []
+  mergedContent.push(...prefillNonText)
+
+  const firstContTextIdx = contContent.findIndex(
+    (item) => item.type === 'text' || item.type === 'output_text',
+  )
+  if (prefillPrefix.length === 0) {
+    mergedContent.push(...contContent)
+  } else if (firstContTextIdx < 0) {
+    mergedContent.push({ type: 'text', text: prefillPrefix })
+    mergedContent.push(...contContent)
+  } else {
+    for (let i = 0; i < contContent.length; i += 1) {
+      const item = contContent[i]
+      if (!item) continue
+      if (i === firstContTextIdx && (item.type === 'text' || item.type === 'output_text')) {
+        mergedContent.push({ ...item, text: prefillPrefix + item.text })
+      } else {
+        mergedContent.push(item)
+      }
+    }
+  }
+  return trimTrailingWhitespaceOnLastText({ ...continuation, content: mergedContent })
+}
+
+function trimTrailingWhitespaceOnLastText(message: Message): Message {
+  const items = message.content
+  if (!items || items.length === 0) return message
+  for (let i = items.length - 1; i >= 0; i -= 1) {
+    const item = items[i]
+    if (!item) continue
+    if (item.type === 'text' || item.type === 'output_text') {
+      const trimmed = item.text.replace(/[ \t\n\r]+$/, '')
+      if (trimmed === item.text) return message
+      const next = items.slice()
+      if (item.type === 'text') next[i] = { ...item, text: trimmed }
+      else next[i] = { ...item, text: trimmed }
+      return { ...message, content: next }
+    }
+  }
+  return message
+}
+
 // Translate a `ContentItem[]` into chat-completions wire content parts. For
 // text-only Phase 7 this is nearly identity; we preserve the typed shape so
 // later phases can bolt on image/audio/file/video without revisiting callers.
@@ -172,7 +271,8 @@ export function buildChatMessages(
   path: readonly Message[],
   opts: BuildChatMessagesOptions = {},
 ): unknown[] {
-  const visible = path.filter((m) => m.hiddenFromContext !== true && !m.deleted)
+  const rewritten = applyPrefillWireRewrites(path)
+  const visible = rewritten.filter((m) => m.hiddenFromContext !== true && !m.deleted)
   const messages: unknown[] = []
   const hasImportedSystem = visible.some((m) => m.role === 'system' || m.role === 'developer')
   if (!hasImportedSystem && settings.systemPrompt.length > 0) {
@@ -657,7 +757,8 @@ export function toResponses(
   const quirks = quirksFor(requestedModel)
   const preservationFormat = opts.reasoningPreservationFormat ?? quirks.reasoningPreservationFormat
 
-  const visible = path.filter((m) => m.hiddenFromContext !== true && !m.deleted)
+  const rewritten = applyPrefillWireRewrites(path)
+  const visible = rewritten.filter((m) => m.hiddenFromContext !== true && !m.deleted)
   const input: ResponsesInputItem[] = []
 
   // System prompt handling. The Responses API has a dedicated `instructions`
@@ -1088,7 +1189,8 @@ export function toGeminiNative(
   const quirks = quirksFor(requestedModel)
   const preservationFormat = opts.reasoningPreservationFormat ?? quirks.reasoningPreservationFormat
 
-  const visible = path.filter((m) => m.hiddenFromContext !== true && !m.deleted)
+  const prefillRewritten = applyPrefillWireRewrites(path)
+  const visible = prefillRewritten.filter((m) => m.hiddenFromContext !== true && !m.deleted)
   const contents: GeminiContent[] = []
 
   // System messages → `systemInstruction`. Any leading system/developer

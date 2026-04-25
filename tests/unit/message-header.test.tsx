@@ -99,9 +99,9 @@ describe('MessageHeader (quiet header — role + state pills only)', () => {
     expect(container.querySelector('[data-ui="message-role"]')?.textContent).toBe('User')
   })
 
-  it('uses the role label as the header aria-label', () => {
+  it('keeps the role label visible in the header', () => {
     const { container } = render(<MessageHeader message={makeAssistant()} />)
-    const label = container.querySelector('[data-ui="message-header"]')?.getAttribute('aria-label')
+    const label = container.querySelector('[data-ui="message-role"]')?.textContent
     expect(label).toBe('Assistant')
   })
 })
