@@ -73,4 +73,18 @@ describe('MarkdownView', () => {
     const md = '```ts\nconst x = 1\n// no closing fence'
     expect(() => render(<MarkdownView content={md} streaming />)).not.toThrow()
   })
+
+  it('leaves currency ranges with single dollar signs as text', () => {
+    const { container } = render(
+      <MarkdownView content="The usual price recommendation is $10 to $12 per month." />,
+    )
+    expect(container.textContent).toContain('$10 to $12')
+    expect(container.querySelector('.katex')).toBeNull()
+  })
+
+  it('still renders double-dollar inline math', () => {
+    const { container } = render(<MarkdownView content="Use $$E = mc^2$$ here." />)
+    expect(container.querySelector('.katex')).toBeTruthy()
+    expect(container.textContent).toContain('E=mc')
+  })
 })

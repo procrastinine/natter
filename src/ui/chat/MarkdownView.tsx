@@ -15,7 +15,7 @@ export interface MarkdownViewProps {
   allowImageOrigins?: string[]
 }
 
-const mathPlugin = createMathPlugin({ singleDollarTextMath: true })
+const mathPlugin = createMathPlugin({ singleDollarTextMath: false })
 
 // CJK plugin: adds remark plugins that make Chinese/Japanese/Korean text
 // respect proper emphasis, strikethrough, and autolink boundaries. No

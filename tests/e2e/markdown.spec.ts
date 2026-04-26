@@ -88,3 +88,18 @@ test('external links get target="_blank" rel="noopener noreferrer"', async ({ pa
   expect(await anchor.getAttribute('target')).toBe('_blank')
   expect(await anchor.getAttribute('rel')).toMatch(/noopener/)
 })
+
+test('keeps currency ranges out of math rendering while preserving double-dollar math', async ({
+  page,
+}) => {
+  const markdown = 'Recommend $10 to $12 per month.\n\nFor math, use $$E = mc^2$$.'
+  await mockChatCompletions(page, {
+    body: buildSseBody([{ id: 'money-math', content: markdown, finish: 'stop' }]),
+  })
+  await createChatAndOpen(page)
+  await sendMessage(page, 'compare prices')
+
+  const assistant = page.locator('[data-ui="message"][data-role="assistant"]').first()
+  await expect(assistant).toContainText('$10 to $12')
+  await expect(assistant.locator('.katex')).toHaveCount(1)
+})
