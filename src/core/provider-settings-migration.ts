@@ -6,12 +6,15 @@ import {
   providerRoutingRef,
   resolveProviderRefsToRoutingRefs,
 } from './provider-identity'
-import type { ChatSettings, DataPolicy, ModelEndpoint, ProviderPreferences } from './types'
+import type { ChatSettings, DataPolicy, ModelEndpoint, ProviderPreferences, SortBy } from './types'
+
+export const DEFAULT_OPENROUTER_PROVIDER_SORT: SortBy = 'price'
 
 export interface ProviderSettingsMigrationContext {
   model?: string
   endpoints?: readonly ModelEndpoint[]
   policies?: Readonly<Record<string, DataPolicy | undefined>>
+  defaultSort?: SortBy
 }
 
 export interface ProviderSettingsMigrationResult {
@@ -28,7 +31,11 @@ export function migrateLegacyProviderSettings(
   const legacyOnly = originalPrivacy.onlyProviders
   const endpoints = context.endpoints ?? []
   const hasLegacyPrivacyRefs = legacyIgnore.length > 0 || legacyOnly.length > 0
-  const normalizedPrefs = normalizeProviderPrefs(settings.providerPrefs, endpoints)
+  const normalizedPrefs = normalizeProviderPrefs(
+    settings.providerPrefs,
+    endpoints,
+    context.defaultSort ? { defaultSort: context.defaultSort } : {},
+  )
   let providerPrefs: ProviderPreferences = normalizedPrefs.prefs ?? {}
   let privacy = applyProviderPrefPrivacyPatch(settings.privacy, normalizedPrefs.privacyPatch)
   const changed = normalizedPrefs.changed || privacy !== settings.privacy
@@ -104,12 +111,17 @@ function withProviderPrefs(
 function normalizeProviderPrefs(
   prefs: ProviderPreferences | undefined,
   endpoints: readonly ModelEndpoint[],
+  opts: { defaultSort?: SortBy } = {},
 ): {
   prefs: ProviderPreferences | undefined
   changed: boolean
   privacyPatch: { denyDataCollection?: true; zdrOnly?: true }
 } {
-  if (!prefs) return { prefs, changed: false, privacyPatch: {} }
+  if (!prefs) {
+    return opts.defaultSort
+      ? { prefs: { sort: opts.defaultSort }, changed: true, privacyPatch: {} }
+      : { prefs, changed: false, privacyPatch: {} }
+  }
   let changed = false
   const next: ProviderPreferences = { ...prefs }
   const privacyPatch: { denyDataCollection?: true; zdrOnly?: true } = {}
@@ -151,7 +163,52 @@ function normalizeProviderPrefs(
       changed = true
     }
   }
+  const sortResult = normalizeProviderSort((prefs as { sort?: unknown }).sort, opts.defaultSort)
+  if (sortResult.changed) {
+    changed = true
+    if (sortResult.sort === undefined) delete next.sort
+    else next.sort = sortResult.sort
+  }
   return { prefs: changed ? compactProviderPrefs(next) : prefs, changed, privacyPatch }
+}
+
+function normalizeProviderSort(
+  value: unknown,
+  defaultSort: SortBy | undefined,
+): { sort: ProviderPreferences['sort'] | undefined; changed: boolean } {
+  if (value === undefined) {
+    return defaultSort
+      ? { sort: defaultSort, changed: true }
+      : { sort: undefined, changed: false }
+  }
+  const fallback = defaultSort ?? undefined
+  if (typeof value === 'string') {
+    const sort = normalizeSortBy(value)
+    if (sort) return { sort, changed: sort !== value }
+    return { sort: fallback, changed: true }
+  }
+  if (!value || typeof value !== 'object') {
+    return { sort: fallback, changed: true }
+  }
+  const raw = value as { by?: unknown; partition?: unknown }
+  const by = typeof raw.by === 'string' ? normalizeSortBy(raw.by) : undefined
+  if (!by) return { sort: fallback, changed: true }
+  const partition = raw.partition === 'none' ? 'none' : 'model'
+  if (partition === 'none') {
+    return {
+      sort: { by, partition },
+      changed: raw.by !== by || raw.partition !== partition || Object.keys(raw).length !== 2,
+    }
+  }
+  return { sort: by, changed: true }
+}
+
+function normalizeSortBy(value: string): SortBy | undefined {
+  const lowered = value.trim().toLowerCase()
+  if (lowered === 'price' || lowered === 'throughput' || lowered === 'latency') return lowered
+  if (lowered === 'nitro' || lowered === ':nitro') return 'throughput'
+  if (lowered === 'floor' || lowered === ':floor') return 'price'
+  return undefined
 }
 
 function effectiveIgnoredRoutingRefs(

@@ -22,7 +22,7 @@ import type { Chat, ChatId, Message, MessageId, MessageRole } from '../../src/co
 import { newId } from '../../src/lib/ulid'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
-import { updateChatSettings } from '../../src/store/chats'
+import { replaceChatSettings, updateChatSettings } from '../../src/store/chats'
 
 const DB_NAME = 'natter'
 
@@ -155,6 +155,22 @@ describe('updateChatSettings', () => {
     const updated = await getChat(chat.id)
     expect(updated?.settings.verbosity).toBeUndefined()
     expect('verbosity' in (updated?.settings ?? {})).toBe(false)
+  })
+
+  it('replaces the full settings snapshot when loading a preset', async () => {
+    const settings = cloneDefaultChatSettings()
+    settings.providerPrefs = { sort: 'throughput' }
+    settings.verbosity = 'high'
+    const chat = await seedChat({ settings })
+    const presetSettings = cloneDefaultChatSettings()
+    presetSettings.providerPrefs = { sort: 'price' }
+
+    const changed = await replaceChatSettings(chat.id, presetSettings)
+
+    expect(changed).toBe(true)
+    const updated = await getChat(chat.id)
+    expect(updated?.settings.providerPrefs).toEqual({ sort: 'price' })
+    expect(updated?.settings.verbosity).toBeUndefined()
   })
 })
 

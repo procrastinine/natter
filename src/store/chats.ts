@@ -379,6 +379,27 @@ export async function updateChatSettings(
   return changed
 }
 
+export async function replaceChatSettings(
+  chatId: ChatId,
+  settings: ChatSettings,
+  now = Date.now(),
+): Promise<boolean> {
+  const repo = getWorkspaceRepository()
+  let changed = false
+  await repo.runMutation([{ kind: 'chat-meta', chatId }], async (ctx) => {
+    const chat = await ctx.getChat(chatId)
+    if (!chat) return
+    const nextSettings = normalizeChatSettings(structuredClone(settings))
+    if (JSON.stringify(chat.settings) === JSON.stringify(nextSettings)) return
+    changed = true
+    ctx.patchChatMeta(chatId, {
+      settings: nextSettings,
+      updatedAt: now,
+    })
+  })
+  return changed
+}
+
 // Normalize fields that downstream readers assume are well-formed. Today this
 // is just `reasoning` (Phase 11 added required sub-fields after some chat
 // rows were already on disk); future additions go here too. Returns the

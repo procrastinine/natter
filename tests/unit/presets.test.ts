@@ -101,6 +101,7 @@ describe('createPreset', () => {
     })
     unsub()
     expect(preset.settings.profileId).toBe(profileId)
+    expect(preset.settings.providerPrefs).toEqual({ sort: 'price' })
     expect(seen).toContainEqual({ kind: 'preset-mutated', presetId: preset.id })
   })
 
@@ -137,8 +138,10 @@ describe('updatePreset', () => {
       settings: settingsFor(a),
     })
     const drifted = settingsFor('wrong')
+    delete drifted.providerPrefs
     const next = await updatePreset(preset.id, { settings: drifted })
     expect(next.settings.profileId).toBe(a)
+    expect(next.settings.providerPrefs).toEqual({ sort: 'price' })
   })
 
   it('rejects an update to a missing preset', async () => {

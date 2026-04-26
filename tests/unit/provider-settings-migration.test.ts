@@ -1,7 +1,10 @@
 import { describe, expect, it } from 'vitest'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import { filterEndpointsByPrivacy } from '../../src/core/privacy-filter'
-import { migrateLegacyProviderSettings } from '../../src/core/provider-settings-migration'
+import {
+  DEFAULT_OPENROUTER_PROVIDER_SORT,
+  migrateLegacyProviderSettings,
+} from '../../src/core/provider-settings-migration'
 import type { ChatSettings, DataPolicy, ModelEndpoint } from '../../src/core/types'
 import { buildPickerRows } from '../../src/ui/settings/provider-picker-rows'
 
@@ -173,5 +176,50 @@ describe('migrateLegacyProviderSettings', () => {
     expect(migrated.settings.providerPrefs?.dataCollection).toBeUndefined()
     expect(migrated.settings.providerPrefs?.zdr).toBeUndefined()
     expect(migrated.settings.providerPrefs?.sort).toBe('price')
+  })
+
+  it('adds the OpenRouter default provider sort when requested', () => {
+    const old = settings()
+
+    const migrated = migrateLegacyProviderSettings(old, {
+      defaultSort: DEFAULT_OPENROUTER_PROVIDER_SORT,
+    })
+
+    expect(migrated.changed).toBe(true)
+    expect(migrated.settings.providerPrefs).toEqual({ sort: 'price' })
+  })
+
+  it('canonicalizes legacy provider sort aliases without dropping partition:none', () => {
+    const nitro = migrateLegacyProviderSettings(
+      settings({
+        providerPrefs: { sort: 'nitro' } as unknown as NonNullable<ChatSettings['providerPrefs']>,
+      }),
+      { defaultSort: DEFAULT_OPENROUTER_PROVIDER_SORT },
+    )
+    expect(nitro.settings.providerPrefs?.sort).toBe('throughput')
+
+    const modelPartition = migrateLegacyProviderSettings(
+      settings({
+        providerPrefs: {
+          sort: { by: 'latency', partition: 'model' },
+        },
+      }),
+      { defaultSort: DEFAULT_OPENROUTER_PROVIDER_SORT },
+    )
+    expect(modelPartition.settings.providerPrefs?.sort).toBe('latency')
+
+    const globalPartition = migrateLegacyProviderSettings(
+      settings({
+        providerPrefs: {
+          sort: { by: 'throughput', partition: 'none' },
+        },
+      }),
+      { defaultSort: DEFAULT_OPENROUTER_PROVIDER_SORT },
+    )
+    expect(globalPartition.changed).toBe(false)
+    expect(globalPartition.settings.providerPrefs?.sort).toEqual({
+      by: 'throughput',
+      partition: 'none',
+    })
   })
 })

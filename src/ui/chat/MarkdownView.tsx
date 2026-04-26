@@ -90,7 +90,7 @@ export function MarkdownView({ content, streaming = false, allowImageOrigins }: 
     renderingPrefs.singleDollarTextMath ? 'on' : 'off'
   }`
   return (
-    <div data-ui="markdown" data-streaming={streaming ? 'true' : 'false'} data-overflow="full">
+    <div data-ui="markdown" data-overflow="full">
       <Streamdown
         key={rendererKey}
         mode={streaming ? 'streaming' : 'static'}

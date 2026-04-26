@@ -104,7 +104,7 @@ function registerV1(db: Dexie): void {
 
 function registerV1Through3(db: Dexie): void {
   registerSchema(db)
-  db.version(7)
+  db.version(8)
     .stores({ profiles: 'id, name, kind, lastUsedAt, archived' })
     .upgrade(async (tx) => {
       await tx
@@ -114,7 +114,7 @@ function registerV1Through3(db: Dexie): void {
           if (row.appTitle === undefined) row.appTitle = 'Natter'
         })
     })
-  db.version(8)
+  db.version(9)
     .stores({ settings: '&key' })
     .upgrade(async (tx) => {
       const settings = tx.table<MinimalSetting>('settings')
@@ -186,7 +186,7 @@ describe('Dexie migrations', () => {
     const db = new Dexie(name)
     registerV1Through3(db)
     await db.open()
-    expect(db.verno).toBe(8)
+    expect(db.verno).toBe(9)
     expect(db.tables.map((t) => t.name).includes('settings')).toBe(true)
     const tag = await db.table<MinimalSetting>('settings').get('schemaTag')
     expect(tag).toBeUndefined()
@@ -222,7 +222,7 @@ describe('Dexie migrations', () => {
     const up = new Dexie(name)
     registerV1Through3(up)
     await up.open()
-    expect(up.verno).toBe(8)
+    expect(up.verno).toBe(9)
     const profile = await up.table<MinimalProfile>('profiles').get('P1')
     expect(profile?.appTitle).toBe('CustomTitle') // preserved — synthetic bump only fills undefined
     const tag = await up.table<MinimalSetting>('settings').get('schemaTag')
@@ -232,7 +232,7 @@ describe('Dexie migrations', () => {
     const reopen = new Dexie(name)
     registerV1Through3(reopen)
     await reopen.open()
-    expect(reopen.verno).toBe(8)
+    expect(reopen.verno).toBe(9)
     const tag2 = await reopen.table<MinimalSetting>('settings').get('schemaTag')
     expect(tag2?.value).toBe('preexisting')
     await reopen.delete()
@@ -343,6 +343,129 @@ describe('Dexie migrations', () => {
     expect(chat?.settings.providerPrefs?.ignore).toEqual(['anthropic', 'anthropic/2'])
     expect(preset?.settings.privacy.ignoreProviders).toEqual([])
     expect(preset?.settings.providerPrefs?.ignore).toEqual(['anthropic', 'anthropic/2'])
+    await migrated.delete()
+  })
+
+  it('migrates missing OpenRouter provider sort on old chats and presets', async () => {
+    const name = `natter-test-provider-sort-mig-${Math.random().toString(36).slice(2)}`
+    await Dexie.delete(name)
+    const openRouterProfileId = 'profile-openrouter'
+    const directProfileId = 'profile-direct'
+    const baseSettings = cloneDefaultChatSettings()
+    baseSettings.profileId = openRouterProfileId
+    baseSettings.model = 'anthropic/claude-opus-4.7'
+    const directSettings = cloneDefaultChatSettings()
+    directSettings.profileId = directProfileId
+    directSettings.model = 'gpt-4o'
+
+    const legacy = new Dexie(name)
+    registerLegacyAttachmentsV5(legacy)
+    await legacy.open()
+    await legacy.table('profiles').bulkPut([
+      {
+        id: openRouterProfileId,
+        name: 'OpenRouter',
+        kind: 'openrouter',
+        baseUrl: 'https://openrouter.ai/api/v1',
+        apiKeyRef: 'K1',
+        defaultHeaders: {},
+        appTitle: 'Natter',
+        appUrl: '',
+        usesResponsesApiByDefault: false,
+        supportsEndpointsApi: true,
+        supportsGenerationApi: true,
+        supportsPrivacyScrape: true,
+        createdAt: 1,
+        updatedAt: 1,
+      },
+      {
+        id: directProfileId,
+        name: 'OpenAI',
+        kind: 'openai-compatible',
+        baseUrl: 'https://api.openai.com/v1',
+        apiKeyRef: 'K2',
+        defaultHeaders: {},
+        appTitle: 'Natter',
+        appUrl: '',
+        usesResponsesApiByDefault: true,
+        supportsEndpointsApi: false,
+        supportsGenerationApi: false,
+        supportsPrivacyScrape: false,
+        createdAt: 1,
+        updatedAt: 1,
+      },
+    ])
+    await legacy.table<Chat>('chats').bulkPut([
+      {
+        id: 'chat-or',
+        title: '',
+        titleStatus: 'untitled',
+        createdAt: 1,
+        updatedAt: 1,
+        lastViewedAt: 1,
+        wordCount: 0,
+        totalCostUsd: 0,
+        metaVersion: 0,
+        summaryVersion: 0,
+        settings: structuredClone(baseSettings),
+        lastUpdatedLeafId: null,
+        lastBranchUpdatedAt: 1,
+        archived: false,
+        pinned: false,
+        folderId: null,
+        tags: [],
+      },
+      {
+        id: 'chat-direct',
+        title: '',
+        titleStatus: 'untitled',
+        createdAt: 1,
+        updatedAt: 1,
+        lastViewedAt: 1,
+        wordCount: 0,
+        totalCostUsd: 0,
+        metaVersion: 0,
+        summaryVersion: 0,
+        settings: structuredClone(directSettings),
+        lastUpdatedLeafId: null,
+        lastBranchUpdatedAt: 1,
+        archived: false,
+        pinned: false,
+        folderId: null,
+        tags: [],
+      },
+    ])
+    await legacy.table<ChatPreset>('presets').bulkPut([
+      {
+        id: 'preset-or',
+        name: 'OpenRouter Preset',
+        connectionProfileId: openRouterProfileId,
+        settings: structuredClone(baseSettings),
+        createdAt: 1,
+        updatedAt: 1,
+      },
+      {
+        id: 'preset-direct',
+        name: 'Direct Preset',
+        connectionProfileId: directProfileId,
+        settings: structuredClone(directSettings),
+        createdAt: 1,
+        updatedAt: 1,
+      },
+    ])
+    legacy.close()
+
+    const migrated = createDbForTests(name)
+    await migrated.open()
+    const openRouterChat = await migrated.chats.get('chat-or')
+    const openRouterPreset = await migrated.presets.get('preset-or')
+    const directChat = await migrated.chats.get('chat-direct')
+    const directPreset = await migrated.presets.get('preset-direct')
+
+    expect(openRouterChat?.settings.providerPrefs).toEqual({ sort: 'price' })
+    expect(openRouterPreset?.settings.providerPrefs).toEqual({ sort: 'price' })
+    expect(directChat?.settings.providerPrefs).toBeUndefined()
+    expect(directPreset?.settings.providerPrefs).toBeUndefined()
     await migrated.delete()
   })
 

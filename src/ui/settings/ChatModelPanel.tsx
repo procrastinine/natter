@@ -39,6 +39,7 @@ import {
   getChat,
   getChatDraft,
   loadChatMessages,
+  replaceChatSettings,
   setChatPreset,
   updateChatSettings,
 } from '../../store/chats'
@@ -389,7 +390,7 @@ function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | u
     async (targetId: string) => {
       const target = await getPreset(targetId)
       if (!target) return
-      await updateChatSettings(chat.id, {
+      await replaceChatSettings(chat.id, {
         ...target.settings,
         profileId: target.connectionProfileId,
       })
@@ -565,13 +566,29 @@ function settingsMatch(a: Chat['settings'], b: Chat['settings']): boolean {
   // only needs a "roughly matches" signal for the "edited" dot.
   if (a.model !== b.model) return false
   if (a.systemPrompt !== b.systemPrompt) return false
-  if (JSON.stringify(a.sampling) !== JSON.stringify(b.sampling)) return false
-  if (JSON.stringify(a.reasoning) !== JSON.stringify(b.reasoning)) return false
+  if (stableSettingsString(a.sampling) !== stableSettingsString(b.sampling)) return false
+  if (stableSettingsString(a.reasoning) !== stableSettingsString(b.reasoning)) return false
   if (a.verbosity !== b.verbosity) return false
   if (a.maxCompletionTokens !== b.maxCompletionTokens) return false
-  if (JSON.stringify(a.anthropicCache) !== JSON.stringify(b.anthropicCache)) return false
-  if (JSON.stringify(a.providerPrefs ?? {}) !== JSON.stringify(b.providerPrefs ?? {})) return false
+  if (stableSettingsString(a.anthropicCache) !== stableSettingsString(b.anthropicCache)) return false
+  if (stableSettingsString(a.providerPrefs ?? {}) !== stableSettingsString(b.providerPrefs ?? {}))
+    return false
   return true
+}
+
+function stableSettingsString(value: unknown): string {
+  return JSON.stringify(sortObjectKeys(value))
+}
+
+function sortObjectKeys(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortObjectKeys)
+  if (!value || typeof value !== 'object') return value
+  const out: Record<string, unknown> = {}
+  for (const key of Object.keys(value).sort()) {
+    const child = (value as Record<string, unknown>)[key]
+    if (child !== undefined) out[key] = sortObjectKeys(child)
+  }
+  return out
 }
 
 // The Context tab bundles three related controls: the running token gauge,

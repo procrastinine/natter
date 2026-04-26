@@ -137,7 +137,6 @@ const REQUIRED_TOKENS = [
   '--opacity-disabled',
   '--opacity-muted',
   '--backdrop-blur-overlay',
-  '--stream-caret-width',
   '--content-fade-height',
 ]
 

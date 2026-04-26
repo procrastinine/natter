@@ -8,6 +8,10 @@
 
 import type { ChatPreset, ChatSettings, PresetId, ProfileId } from '../core/types'
 import { newId } from '../lib/ulid'
+import {
+  DEFAULT_OPENROUTER_PROVIDER_SORT,
+  migrateLegacyProviderSettings,
+} from '../core/provider-settings-migration'
 import { postEvent } from './broadcast'
 import { getDb } from './db'
 import { ProfileMissingError } from './profiles'
@@ -40,7 +44,7 @@ export async function createPreset(input: CreatePresetInput): Promise<ChatPreset
     name: input.name,
     connectionProfileId: input.connectionProfileId,
     // `settings.profileId` is kept in sync with `connectionProfileId` (§2.6a).
-    settings: { ...input.settings, profileId: input.connectionProfileId },
+    settings: normalizePresetSettings(input.settings, input.connectionProfileId, profile.kind),
     createdAt: now,
     updatedAt: now,
   }
@@ -76,12 +80,11 @@ export async function updatePreset(
     updatedAt: now,
   }
   // Keep `settings.profileId` aligned with `connectionProfileId`.
-  if (patch.connectionProfileId !== undefined) {
-    const profile = await db.profiles.get(patch.connectionProfileId)
-    if (!profile) throw new ProfileMissingError(patch.connectionProfileId)
-    next.settings = { ...next.settings, profileId: patch.connectionProfileId }
-  } else if (patch.settings) {
-    next.settings = { ...patch.settings, profileId: existing.connectionProfileId }
+  const targetProfileId = patch.connectionProfileId ?? existing.connectionProfileId
+  if (patch.connectionProfileId !== undefined || patch.settings) {
+    const targetProfile = await db.profiles.get(targetProfileId)
+    if (!targetProfile) throw new ProfileMissingError(targetProfileId)
+    next.settings = normalizePresetSettings(next.settings, targetProfileId, targetProfile.kind)
   }
   await db.presets.put(next)
   postEvent({ kind: 'preset-mutated', presetId })
@@ -108,6 +111,18 @@ export async function duplicatePreset(
   await getDb().presets.put(copy)
   postEvent({ kind: 'preset-mutated', presetId: copy.id })
   return copy
+}
+
+function normalizePresetSettings(
+  settings: ChatSettings,
+  profileId: ProfileId,
+  kind: string,
+): ChatSettings {
+  const aligned = { ...settings, profileId }
+  if (kind !== 'openrouter') return aligned
+  return migrateLegacyProviderSettings(aligned, {
+    defaultSort: DEFAULT_OPENROUTER_PROVIDER_SORT,
+  }).settings
 }
 
 export async function archivePreset(presetId: PresetId, now = Date.now()): Promise<void> {

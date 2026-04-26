@@ -13,7 +13,10 @@ import {
   DEFAULT_CONTINUE_SYSTEM_PROMPT,
   DEFAULT_CONTINUE_USER_PROMPT,
 } from '../core/global-settings'
-import { migrateLegacyProviderSettings } from '../core/provider-settings-migration'
+import {
+  DEFAULT_OPENROUTER_PROVIDER_SORT,
+  migrateLegacyProviderSettings,
+} from '../core/provider-settings-migration'
 import type {
   Attachment,
   AttachmentArtifact,
@@ -243,8 +246,10 @@ export function registerSchema(db: Dexie): void {
     .upgrade(async (tx) => {
       const endpointsRows = await tx.table<CachedEndpointsRow>('endpoints').toArray()
       const privacyRows = await tx.table<CachedPrivacyPolicyRow>('privacyPolicies').toArray()
+      const profiles = await tx.table<ConnectionProfile>('profiles').toArray()
       const endpointsByKey = new Map<string, CachedEndpointsRow>()
       const privacyByKey = new Map<string, CachedPrivacyPolicyRow>()
+      const profilesById = new Map(profiles.map((profile) => [profile.id, profile]))
       for (const row of endpointsRows)
         endpointsByKey.set(providerCacheKey(row.profileId, row.modelId), row)
       for (const row of privacyRows)
@@ -261,6 +266,7 @@ export function registerSchema(db: Dexie): void {
             {
               endpointsByKey,
               privacyByKey,
+              profilesById,
             },
           )
           if (result.changed) chat.settings = result.settings
@@ -274,7 +280,7 @@ export function registerSchema(db: Dexie): void {
             preset.settings,
             preset.connectionProfileId,
             preset.settings.model,
-            { endpointsByKey, privacyByKey },
+            { endpointsByKey, privacyByKey, profilesById },
           )
           if (result.changed) preset.settings = result.settings
         })
@@ -469,6 +475,82 @@ export function registerSchema(db: Dexie): void {
           row.refCount = refCounts.get(row.id) ?? 0
         })
     })
+
+  // v7: Provider routing sort became an explicit OpenRouter preset field.
+  // Backfill the default Price sort for old OpenRouter chats / presets and
+  // canonicalize legacy sort object aliases without changing table layout.
+  db.version(7)
+    .stores({
+      chats:
+        'id, updatedAt, createdAt, lastViewedAt, lastUpdatedLeafId, lastBranchUpdatedAt, wordCount, totalCostUsd, archived, pinned, presetId, folderId, *tags',
+      messages:
+        'id, chatId, parentId, turnId, [chatId+parentId], [chatId+createdAt], [chatId+turnId], [chatId+deleted]',
+      childLists: 'id, [chatId+parentId], updatedAt',
+      attachments: 'id, contentHash, kind, mime, origin, refCount, createdAt, updatedAt, deletedAt',
+      attachmentBlobs: 'id, attachmentId, role, contentHash, createdAt',
+      attachmentArtifacts: 'artifactId, attachmentId, kind, processorId, createdAt',
+      attachmentJobs:
+        'id, attachmentId, processorId, status, updatedAt, [attachmentId+processorId+inputHash]',
+      profiles: 'id, name, kind, lastUsedAt, archived',
+      presets: 'id, name, connectionProfileId, lastUsedAt, archived',
+      promptPresets: 'id, kind, name, lastUsedAt',
+      folders: 'id, name, sortIndex, lastUsedAt',
+      tags: 'id, &nameLower, lastUsedAt',
+      chatBranchCache: '&chatId, branchLeafId, generatedAt',
+      keys: 'id, name',
+      settings: '&key',
+      models: '&[profileId+queryKey], fetchedAt',
+      endpoints: '&[profileId+modelId], fetchedAt',
+      privacyPolicies: '&[profileId+modelId], fetchedAt',
+      providers: '&profileId, fetchedAt',
+      generations: 'id, chatId, gen_id',
+      presetResolutions: '&[profileId+presetSlug], fetchedAt',
+      drafts: '&chatId, updatedAt',
+    })
+    .upgrade(async (tx) => {
+      const [endpointsRows, privacyRows, profiles] = await Promise.all([
+        tx.table<CachedEndpointsRow>('endpoints').toArray(),
+        tx.table<CachedPrivacyPolicyRow>('privacyPolicies').toArray(),
+        tx.table<ConnectionProfile>('profiles').toArray(),
+      ])
+      const endpointsByKey = new Map<string, CachedEndpointsRow>()
+      const privacyByKey = new Map<string, CachedPrivacyPolicyRow>()
+      const profilesById = new Map(profiles.map((profile) => [profile.id, profile]))
+      for (const row of endpointsRows)
+        endpointsByKey.set(providerCacheKey(row.profileId, row.modelId), row)
+      for (const row of privacyRows)
+        privacyByKey.set(providerCacheKey(row.profileId, row.modelId), row)
+
+      await tx
+        .table<Chat>('chats')
+        .toCollection()
+        .modify((chat) => {
+          const result = migrateSettingsRow(
+            chat.settings,
+            chat.settings.profileId,
+            chat.settings.model,
+            {
+              endpointsByKey,
+              privacyByKey,
+              profilesById,
+            },
+          )
+          if (result.changed) chat.settings = result.settings
+        })
+
+      await tx
+        .table<ChatPreset>('presets')
+        .toCollection()
+        .modify((preset) => {
+          const result = migrateSettingsRow(
+            preset.settings,
+            preset.connectionProfileId,
+            preset.settings.model,
+            { endpointsByKey, privacyByKey, profilesById },
+          )
+          if (result.changed) preset.settings = result.settings
+        })
+    })
 }
 
 function migrateSettingsRow(
@@ -478,6 +560,7 @@ function migrateSettingsRow(
   caches: {
     endpointsByKey: ReadonlyMap<string, CachedEndpointsRow>
     privacyByKey: ReadonlyMap<string, CachedPrivacyPolicyRow>
+    profilesById?: ReadonlyMap<string, ConnectionProfile>
   },
 ): ReturnType<typeof migrateLegacyProviderSettings> {
   const key = providerCacheKey(profileId, modelId)
@@ -486,6 +569,9 @@ function migrateSettingsRow(
   const context: Parameters<typeof migrateLegacyProviderSettings>[1] = { model: modelId }
   if (endpoints) context.endpoints = endpoints
   if (policies) context.policies = policies
+  if (caches.profilesById?.get(profileId)?.kind === 'openrouter') {
+    context.defaultSort = DEFAULT_OPENROUTER_PROVIDER_SORT
+  }
   return migrateLegacyProviderSettings(settings, context)
 }
 
@@ -718,7 +804,7 @@ async function runProviderSettingsBackfill(
   db: NatterDb,
   scope?: { profileId: string; modelId: string },
 ): Promise<void> {
-  const [endpointsRows, privacyRows] = await Promise.all([
+  const [endpointsRows, privacyRows, profiles] = await Promise.all([
     scope
       ? db.endpoints.where('[profileId+modelId]').equals([scope.profileId, scope.modelId]).toArray()
       : db.endpoints.toArray(),
@@ -728,9 +814,11 @@ async function runProviderSettingsBackfill(
           .equals([scope.profileId, scope.modelId])
           .toArray()
       : db.privacyPolicies.toArray(),
+    scope ? db.profiles.where('id').equals(scope.profileId).toArray() : db.profiles.toArray(),
   ])
   const endpointsByKey = new Map<string, CachedEndpointsRow>()
   const privacyByKey = new Map<string, CachedPrivacyPolicyRow>()
+  const profilesById = new Map(profiles.map((profile) => [profile.id, profile]))
   for (const row of endpointsRows)
     endpointsByKey.set(providerCacheKey(row.profileId, row.modelId), row)
   for (const row of privacyRows) privacyByKey.set(providerCacheKey(row.profileId, row.modelId), row)
@@ -757,6 +845,7 @@ async function runProviderSettingsBackfill(
         {
           endpointsByKey,
           privacyByKey,
+          profilesById,
         },
       )
       if (result.changed) chat.settings = result.settings
@@ -766,7 +855,7 @@ async function runProviderSettingsBackfill(
         preset.settings,
         preset.connectionProfileId,
         preset.settings.model,
-        { endpointsByKey, privacyByKey },
+        { endpointsByKey, privacyByKey, profilesById },
       )
       if (result.changed) preset.settings = result.settings
     })

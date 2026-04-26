@@ -122,9 +122,7 @@ describe('Message active-stream overflow behavior', () => {
     expect(container.querySelector('[data-ui="message"]')?.getAttribute('data-collapse-mode')).toBe(
       'full',
     )
-    expect(container.querySelector('[data-ui="markdown"]')?.getAttribute('data-streaming')).toBe(
-      'true',
-    )
+    expect(container.querySelector('[data-ui="markdown"]')?.getAttribute('data-streaming')).toBeNull()
   })
 })
 

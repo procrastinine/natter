@@ -107,9 +107,6 @@ describe('ReasoningBlock', () => {
     const { container } = render(<ReasoningBlock details={details} streaming hasContent={false} />)
     const outer = container.querySelector('details[data-ui="reasoning"]') as HTMLDetailsElement
     expect(outer.open).toBe(true)
-    // `data-streaming` used to attach a blinking-caret ::after to the panel
-    // via motion.css; we removed the attribute so reasoning never blinks
-    // (content area still gets the caret via its own data-streaming).
     expect(outer.getAttribute('data-streaming')).toBeNull()
   })
 

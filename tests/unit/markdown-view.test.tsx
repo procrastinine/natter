@@ -27,9 +27,11 @@ describe('MarkdownView', () => {
     expect(anchor?.getAttribute('rel')).toMatch(/noopener/)
   })
 
-  it('renders streaming flag on the root when passed', () => {
+  it('keeps streaming mode off the root element', () => {
     const { container } = render(<MarkdownView content="streaming..." streaming />)
-    expect(container.querySelector('[data-ui="markdown"][data-streaming="true"]')).toBeTruthy()
+    expect(container.querySelector('[data-ui="markdown"]')?.getAttribute('data-streaming')).toBe(
+      null,
+    )
   })
 
   it('blocks images from unlisted origins with a visible fallback', () => {

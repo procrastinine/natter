@@ -647,4 +647,65 @@ describe('shell smoke render', () => {
       expect(readActiveSeedState().settings?.model).toBe('anthropic/claude-opus-4.7')
     })
   })
+
+  it('loading a preset replaces provider routing sort and clears the edited marker', async () => {
+    const key = await createKey({ name: 'OpenRouter', plaintextKey: 'sk-or-v1-test' })
+    const profile = await createProfile({
+      name: 'OpenRouter',
+      kind: 'openrouter',
+      baseUrl: 'https://openrouter.ai/api/v1',
+      apiKeyRef: key.id,
+    })
+
+    const presetASettings = cloneDefaultChatSettings()
+    presetASettings.profileId = profile.id
+    presetASettings.model = 'openai/gpt-4o-mini'
+    presetASettings.providerPrefs = { sort: 'throughput' }
+    const presetA = await createPreset({
+      name: 'Throughput preset',
+      connectionProfileId: profile.id,
+      settings: presetASettings,
+    })
+    const presetBSettings = cloneDefaultChatSettings()
+    presetBSettings.profileId = profile.id
+    presetBSettings.model = 'anthropic/claude-opus-4.7'
+    presetBSettings.providerPrefs = { sort: 'price' }
+    const presetB = await createPreset({
+      name: 'Price preset',
+      connectionProfileId: profile.id,
+      settings: presetBSettings,
+    })
+    const chat = await createChat({
+      settings: structuredClone(presetA.settings),
+      presetId: presetA.id,
+    })
+
+    window.location.hash = `#/chat/${chat.id}`
+    const { container } = render(<App />)
+    await waitFor(() => {
+      expect(container.querySelector('[data-role="settings-cog"]')).toBeInTheDocument()
+    })
+    fireEvent.click(container.querySelector('[data-role="settings-cog"]') as HTMLButtonElement)
+    await waitFor(() => {
+      expect(container.querySelector('[data-ui="preset-breadcrumb-button"]')).toBeInTheDocument()
+    })
+    fireEvent.click(
+      container.querySelector('[data-ui="preset-breadcrumb-button"]') as HTMLButtonElement,
+    )
+    let loadButton: HTMLButtonElement | undefined
+    await waitFor(() => {
+      loadButton = Array.from(
+        container.querySelectorAll<HTMLButtonElement>('[data-ui="preset-menu-load"]'),
+      ).find((button) => button.textContent?.includes('Price preset'))
+      expect(loadButton).toBeDefined()
+    })
+    fireEvent.click(loadButton as HTMLButtonElement)
+
+    await waitFor(async () => {
+      const row = await getDb().chats.get(chat.id)
+      expect(row?.presetId).toBe(presetB.id)
+      expect(row?.settings.providerPrefs).toEqual({ sort: 'price' })
+      expect(container.querySelector('[data-ui="preset-diverged"]')).toBeNull()
+    })
+  })
 })

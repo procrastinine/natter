@@ -1,6 +1,6 @@
 /*
  * motion.css — animations, transitions, reduced-motion overrides.
- * Owns: [data-animated], [data-streaming], [data-generating], [data-reduced-motion].
+ * Owns: [data-animated], [data-generating], [data-reduced-motion].
  * See plan/10-ui.md §10.21.4, §10.15.
  */
 
@@ -32,17 +32,6 @@
   }
 }
 
-[data-streaming="true"]::after {
-  content: "";
-  display: inline-block;
-  width: var(--stream-caret-width);
-  height: 1em;
-  margin-left: 2px;
-  background: currentColor;
-  vertical-align: -0.2em;
-  animation: natter-caret-blink 1s steps(2, end) infinite;
-}
-
 [data-animated="true"] {
   animation: natter-fade-in var(--duration-fast) var(--ease-standard);
 }
@@ -66,8 +55,7 @@ html {
   transition-duration: 0ms;
 }
 
-[data-reduced-motion="true"]::after,
-[data-reduced-motion="true"] [data-streaming="true"]::after {
+[data-reduced-motion="true"]::after {
   animation: none;
 }
 
@@ -82,9 +70,5 @@ html {
     animation-duration: 0ms;
     animation-iteration-count: 1;
     transition-duration: 0ms;
-  }
-  [data-streaming="true"]::after {
-    animation: none;
-    opacity: 0.6;
   }
 }

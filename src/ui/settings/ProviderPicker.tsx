@@ -15,14 +15,14 @@
 // appear on the wire. The visible picker sorts every row by the same metric,
 // including blocked rows, so toggling a provider doesn't move it around.
 // Bulk select/deselect writes the same manual ignore override as row clicks,
-// leaving sort/order intact. Reset clears both `providerPrefs`
-// (order/ignore/sort) and privacy-side manual overrides
-// (only/ignoreProviders) in one operation.
+// leaving sort/order intact. Reset clears provider order/ignore overrides and
+// privacy-side manual overrides while restoring the default Price sort.
 
 import { useLiveQuery } from 'dexie-react-hooks'
 import { useCallback, useMemo, useState } from 'react'
 import { activePath } from '../../core/active-path'
 import { DEFAULT_GLOBAL_PREFERENCES, readGlobalPreferences } from '../../core/global-settings'
+import { DEFAULT_OPENROUTER_PROVIDER_SORT } from '../../core/provider-settings-migration'
 import { estimateSettingsPromptSize, UNLIMITED_CONTEXT } from '../../core/prompt-size'
 import {
   endpointMatchesProviderRef,
@@ -72,7 +72,7 @@ export function ProviderPicker({
       ? prefs.sort
       : typeof prefs.sort === 'object' && prefs.sort !== null
         ? prefs.sort.by
-        : 'price'
+        : DEFAULT_OPENROUTER_PROVIDER_SORT
   const manualOrdered = useMemo(() => orderEndpoints(endpoints, prefs), [endpoints, prefs])
   const displayOrdered = useMemo(
     () => sortEndpointsByMetric(manualOrdered, currentSort),
@@ -270,9 +270,9 @@ export function ProviderPicker({
 
   const resetPrefs = useCallback(() => {
     // Reset clears every override this panel can produce: provider
-    // order, manual ignore, the user-touched flag, sort, privacy-side
+    // order, manual ignore, the user-touched flag, non-default sort, privacy-side
     // `onlyProviders` / `ignoreProviders`. After reset the picker falls
-    // back to the filter's default — kept providers checked,
+    // back to Price + the filter's default — kept providers checked,
     // auto-excluded providers unchecked.
     const nextPrivacy = {
       ...chat.settings.privacy,
@@ -280,7 +280,7 @@ export function ProviderPicker({
       ignoreProviders: [],
     }
     void updateChatSettings(chat.id, {
-      providerPrefs: {}, // clears ignore + ignoreOverridesFilter in one shot
+      providerPrefs: { sort: DEFAULT_OPENROUTER_PROVIDER_SORT },
       privacy: nextPrivacy,
     })
   }, [chat.id, chat.settings.privacy])
@@ -311,11 +311,14 @@ export function ProviderPicker({
 
   const privacyOverrides =
     chat.settings.privacy.onlyProviders.length + chat.settings.privacy.ignoreProviders.length
+  const sortOverridden =
+    prefs.sort !== undefined &&
+    JSON.stringify(prefs.sort) !== JSON.stringify(DEFAULT_OPENROUTER_PROVIDER_SORT)
   const hasOverrides =
     prefs.ignoreOverridesFilter === true ||
     (prefs.ignore?.length ?? 0) > 0 ||
     (prefs.order?.length ?? 0) > 0 ||
-    prefs.sort !== undefined ||
+    sortOverridden ||
     privacyOverrides > 0
 
   return (
