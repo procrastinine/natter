@@ -761,6 +761,13 @@ function messageTextChars(content: unknown): number {
   return total
 }
 
+function hasNonTextContent(content: unknown): boolean {
+  for (const item of safeContent(content)) {
+    if (item.type !== 'text' && item.type !== 'output_text') return true
+  }
+  return false
+}
+
 // Total char count across `reasoningDetails[]` EXCLUDING encrypted blobs.
 // See plan §`<think>`-tag models — inline reasoning chars ride with
 // completion chars when billed as completion_tokens.
@@ -776,18 +783,15 @@ function reasoningDetailsChars(message: Message): number {
   return total
 }
 
-// Approximate media cost for the sent-path's prompt sample. Mirrors the
-// heuristics used by the gauge/context-cutoff; we don't want the prompt
-// calibration ratio to absorb media overhead. Attachment resolver is
-// optional — without it, fallback values are used.
 export interface DerivePromptSampleInput {
   sentPath: readonly Message[]
   systemPrompt: string
   usage: ChatUsage
   family: TokenizerFamily
   modelId: string
-  mediaTokens: number // sum of per-message media estimates (call the
-  // existing gauge helper)
+  // Any nonzero media estimate means the turn is not text-only and cannot
+  // contribute a chars-per-token calibration sample.
+  mediaTokens: number
   reasoningEchoOpts?: PromptEstimateOptions
 }
 
@@ -796,10 +800,13 @@ export interface SamplePair {
   tokens: number
 }
 
-// Build the prompt sample (chars sent vs prompt_tokens minus overhead).
-// Returns `null` when inputs are insufficient to form a useful sample
-// (e.g. prompt_tokens missing or non-positive).
+// Build the prompt sample (chars sent vs prompt_tokens minus text-only
+// overhead). Returns `null` when inputs are insufficient to form a useful
+// sample, or when the sent path contains any non-text/file/image input.
 export function derivePromptSample(input: DerivePromptSampleInput): SamplePair | null {
+  if (input.mediaTokens > 0 || input.sentPath.some((m) => hasNonTextContent(m.content))) {
+    return null
+  }
   const promptTokens = safeServerTokens(input.usage.prompt_tokens)
   if (promptTokens === undefined || promptTokens <= 0) return null
 
@@ -817,8 +824,7 @@ export function derivePromptSample(input: DerivePromptSampleInput): SamplePair |
   // wrapper at the request level.
   const framingOverhead = FRAMING_PER_MESSAGE[input.family] * input.sentPath.length
 
-  const calibratedTextTokens =
-    promptTokens - input.mediaTokens - reasoningEchoHeuristic - framingOverhead
+  const calibratedTextTokens = promptTokens - reasoningEchoHeuristic - framingOverhead
   if (calibratedTextTokens <= 0) return null
 
   return { chars: sentTextChars, tokens: calibratedTextTokens }
@@ -843,6 +849,7 @@ export interface DeriveCompletionSampleInput {
 // Encrypted reasoning chars are never added to assistantChars (base64
 // bytes aren't tokenizable text).
 export function deriveCompletionSample(input: DeriveCompletionSampleInput): SamplePair | null {
+  if (hasNonTextContent(input.assistantMessage.content)) return null
   const completionTokens = safeServerTokens(input.usage.completion_tokens)
   if (completionTokens === undefined || completionTokens <= 0) return null
 

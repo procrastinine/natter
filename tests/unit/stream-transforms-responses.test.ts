@@ -239,6 +239,75 @@ describe('splitResponsesStream — server tools', () => {
     expect(serverTool.map((s) => s.status)).toEqual(['in_progress', 'searching', 'completed'])
     expect(serverTool.every((s) => s.itemType === 'web_search_call')).toBe(true)
   })
+
+  it('emits generated image output as a persistable content item', async () => {
+    const imageUrl = 'data:image/png;base64,abc123'
+    const events: ResponsesStreamChunk[] = [
+      {
+        type: 'event',
+        event: {
+          type: 'response.output_item.added',
+          output_index: 0,
+          item: { id: 'ig_1', type: 'image_generation_call', status: 'in_progress' },
+        },
+      },
+      {
+        type: 'event',
+        event: {
+          type: 'response.image_generation_call.completed',
+          output_index: 0,
+          item_id: 'ig_1',
+        },
+      },
+      {
+        type: 'event',
+        event: {
+          type: 'response.output_item.done',
+          output_index: 0,
+          item: {
+            id: 'ig_1',
+            type: 'image_generation_call',
+            status: 'completed',
+            result: imageUrl,
+          },
+        },
+      },
+    ]
+    const lanes = await collect(splitResponsesStream(asAsync(events)))
+    const content = lanes.find(
+      (l): l is Extract<StreamLaneEvent, { lane: 'content-item' }> =>
+        l.lane === 'content-item',
+    )
+    expect(content).toMatchObject({
+      outputIndex: 0,
+      itemId: 'ig_1',
+      item: { type: 'output_image', url: imageUrl },
+    })
+  })
+
+  it('wraps raw Responses image_generation_call base64 as a data URL', async () => {
+    const events: ResponsesStreamChunk[] = [
+      {
+        type: 'event',
+        event: {
+          type: 'response.output_item.done',
+          output_index: 0,
+          item: {
+            id: 'ig_1',
+            type: 'image_generation_call',
+            status: 'completed',
+            result: 'abc123',
+          },
+        },
+      },
+    ]
+    const lanes = await collect(splitResponsesStream(asAsync(events)))
+    const content = lanes.find(
+      (l): l is Extract<StreamLaneEvent, { lane: 'content-item' }> =>
+        l.lane === 'content-item',
+    )
+    expect(content?.item).toEqual({ type: 'output_image', url: 'data:image/png;base64,abc123' })
+  })
 })
 
 describe('splitResponsesStream — forward-compat', () => {

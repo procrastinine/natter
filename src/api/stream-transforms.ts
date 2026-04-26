@@ -40,7 +40,7 @@ import {
   type InlineReasoningLifter,
 } from '../core/reasoning-inline'
 import { isOpenAiResponsesFamilyFormat } from '../core/reasoning'
-import type { MessagePhase } from '../core/types'
+import type { ContentItem, MessagePhase } from '../core/types'
 
 // Lane-tagged events consumed by the message accumulator. Phase 7 defined the
 // chat-completions lanes (text / reasoning / tool-call / usage / finish / meta
@@ -101,6 +101,13 @@ export type StreamLaneEvent =
       itemId: string
       outputIndex: number
       partialImageB64?: string
+    }
+  | {
+      lane: 'content-item'
+      item: ContentItem
+      chunkId?: string
+      outputIndex?: number
+      itemId?: string
     }
   | {
       lane: 'output-item-added'
@@ -286,6 +293,11 @@ function* splitChoiceDelta(
         if (event) yield event
       }
     }
+    if (Array.isArray(delta.images)) {
+      for (const item of contentItemsFromChatImages(delta.images)) {
+        yield { lane: 'content-item', item, ...(chunkId !== undefined ? { chunkId } : {}) }
+      }
+    }
   }
   if (
     choice.finish_reason !== undefined &&
@@ -422,6 +434,15 @@ function* splitBufferedResult(
       }
     }
   }
+  if (Array.isArray(choice?.message?.images)) {
+    for (const item of contentItemsFromChatImages(choice.message.images)) {
+      yield {
+        lane: 'content-item',
+        item,
+        ...(typeof result.id === 'string' ? { chunkId: result.id } : {}),
+      }
+    }
+  }
   if (choice?.finish_reason) {
     yield {
       lane: 'finish',
@@ -468,6 +489,46 @@ function reasoningDetailsMirrorText(reasoningText: string, details: unknown[] | 
     }
   }
   return (sawText && merged === reasoningText) || (sawOpenAiSummary && mergedSummary === reasoningText)
+}
+
+function contentItemsFromChatImages(images: readonly unknown[]): ContentItem[] {
+  const out: ContentItem[] = []
+  for (const image of images) {
+    const url = imageUrlFromChatImage(image)
+    if (!url) continue
+    out.push({ type: 'output_image', url })
+  }
+  return out
+}
+
+function imageUrlFromChatImage(image: unknown): string | null {
+  if (typeof image === 'string') return normalizeImageUrlOrBase64(image)
+  if (!image || typeof image !== 'object') return null
+  const record = image as {
+    url?: unknown
+    image_url?: { url?: unknown } | unknown
+    b64_json?: unknown
+  }
+  if (typeof record.url === 'string') return normalizeImageUrlOrBase64(record.url)
+  if (
+    record.image_url &&
+    typeof record.image_url === 'object' &&
+    typeof (record.image_url as { url?: unknown }).url === 'string' &&
+    ((record.image_url as { url?: string }).url?.length ?? 0) > 0
+  ) {
+    return normalizeImageUrlOrBase64((record.image_url as { url: string }).url)
+  }
+  if (typeof record.b64_json === 'string' && record.b64_json.length > 0) {
+    return `data:image/png;base64,${record.b64_json}`
+  }
+  return null
+}
+
+function normalizeImageUrlOrBase64(value: string): string | null {
+  const trimmed = value.trim()
+  if (trimmed.length === 0) return null
+  if (/^(data:|https?:|blob:)/i.test(trimmed)) return trimmed
+  return `data:image/png;base64,${trimmed}`
 }
 
 // ---------------------------------------------------------------------------
@@ -608,6 +669,15 @@ function* splitResponsesEvent(ev: ResponsesEventWire): Generator<StreamLaneEvent
           lane: 'phase',
           phase: (e.item.phase as MessagePhase | null) ?? null,
           outputIndex: e.output_index,
+        }
+      }
+      const contentItem = contentItemFromResponsesOutputItem(e.item)
+      if (contentItem) {
+        yield {
+          lane: 'content-item',
+          item: contentItem,
+          outputIndex: e.output_index,
+          ...(typeof e.item.id === 'string' ? { itemId: e.item.id } : {}),
         }
       }
       return
@@ -870,6 +940,15 @@ function* splitBufferedResponsesResult(
         yield { lane: 'phase', phase: (item.phase as MessagePhase | null) ?? null, outputIndex: idx }
       }
     }
+    const contentItem = contentItemFromResponsesOutputItem(item)
+    if (contentItem) {
+      yield {
+        lane: 'content-item',
+        item: contentItem,
+        outputIndex: idx,
+        ...(typeof item.id === 'string' ? { itemId: item.id } : {}),
+      }
+    }
     yield { lane: 'output-item-done', outputIndex: idx, item }
   }
 
@@ -881,6 +960,18 @@ function* splitBufferedResponsesResult(
         ? (result.incomplete_details?.reason ?? 'length')
         : (result.status ?? 'stop')
   yield { lane: 'finish', finishReason }
+}
+
+function contentItemFromResponsesOutputItem(item: ResponsesInputItem): ContentItem | null {
+  if (item.type !== 'image_generation_call') return null
+  const result = (item as { result?: unknown }).result
+  if (typeof result !== 'string') return null
+  const url = normalizeImageUrlOrBase64(result)
+  if (!url) return null
+  const output: ContentItem = { type: 'output_image', url }
+  const prompt = (item as { prompt?: unknown }).prompt
+  if (typeof prompt === 'string' && prompt.length > 0) output.prompt = prompt
+  return output
 }
 
 // OpenAI Responses uses `input_tokens` / `output_tokens` / `output_tokens_details`,

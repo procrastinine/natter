@@ -298,6 +298,44 @@ describe('editMessageContent', () => {
     expect(stored?.reasoningDetails).toEqual([{ type: 'reasoning.text', text: 'original thought' }])
   })
 
+  it('preserves an explicit empty ref list when edited content still points at attachments', async () => {
+    const chat = await seedChat()
+    const row: Message = {
+      id: 'M',
+      chatId: chat.id,
+      parentId: null,
+      siblingIndex: 0,
+      turnId: 'T',
+      turnIndex: 0,
+      createdAt: 123,
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_image', attachmentId: 'att-generated' }],
+      attachmentRefs: [
+        {
+          refId: 'ref-generated',
+          attachmentId: 'att-generated',
+          includeInContext: true,
+          presentation: {},
+          createdAt: 123,
+          updatedAt: 123,
+        },
+      ],
+      nodeVersion: 0,
+      deleted: false,
+    }
+    await getDb().messages.put(row)
+    await editMessageContent({
+      chatId: chat.id,
+      messageId: 'M',
+      content: [{ type: 'output_image', attachmentId: 'att-generated' }],
+      attachmentRefs: [],
+      now: 500,
+    })
+    const stored = await getDb().messages.get('M')
+    expect(stored?.attachmentRefs).toEqual([])
+  })
+
   it('editing a historical user message leaves descendants unchanged', async () => {
     const chat = await seedChat()
     const user = await putMessage(chat.id, {

@@ -225,6 +225,21 @@ describe('toChatCompletions', () => {
     expect(wire.parallel_tool_calls).toBeUndefined()
   })
 
+  it('does not enable tools just because an OpenRouter model requests image output', () => {
+    const path = [textMessage({ id: 'u1', role: 'user', text: 'draw a red square' })]
+    const { wire } = toChatCompletions(
+      settings({
+        model: 'black-forest-labs/flux.2-klein-4b',
+        modalities: ['image'],
+      }),
+      path,
+    )
+    expect(wire.modalities).toEqual(['image'])
+    expect(wire.tools).toBeUndefined()
+    expect(wire.tool_choice).toBeUndefined()
+    expect(wire.parallel_tool_calls).toBeUndefined()
+  })
+
   it('serializes a trailing assistant prefill as an open assistant turn', () => {
     const path = [
       textMessage({ id: 'u1', role: 'user', text: 'hi' }),

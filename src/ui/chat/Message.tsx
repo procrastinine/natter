@@ -20,6 +20,12 @@ import type {
   ReasoningDetail,
 } from '../../core/types'
 import { dismissAbortReason, updateChatSettings } from '../../store/chats'
+import {
+  contentHasRawGeneratedImageOutput,
+  generatedImageOutputAttachmentIds,
+  migrateGeneratedImageOutputAttachments,
+  normalizeGeneratedImageOutputAttachmentRefs,
+} from '../../store/generated-images'
 import { useStreamStore } from '../../store/zustand/streamStore'
 import { useToastStore } from '../../store/zustand/toastStore'
 import { useUiStore } from '../../store/zustand/uiStore'
@@ -172,7 +178,18 @@ function MessageInner({
     message.role === 'assistant' ? s.isTargetActive(chatId, message.id) : false,
   )
   const isStreaming = streaming === true || storeStreaming
-  const hasContent = text.length > 0
+  const hasContent =
+    text.length > 0 ||
+    message.content.some((item) => item.type === 'output_image' || item.type === 'audio_output')
+  useEffect(() => {
+    if (contentHasRawGeneratedImageOutput(message.content)) {
+      void migrateGeneratedImageOutputAttachments(message.id)
+      return
+    }
+    if (generatedImageOutputAttachmentIds(message.content).size > 0) {
+      void normalizeGeneratedImageOutputAttachmentRefs(message.id)
+    }
+  }, [message.content, message.id])
   const gen = message.generation
   const messageModelQuirks = useMemo(
     () => quirksFor(gen?.model ?? gen?.requestedModel ?? ''),
@@ -436,7 +453,14 @@ function MessageInner({
             ariaLabel={`Edit ${message.role} message`}
           />
         ) : (
-          <MessageContent text={text} streaming={streaming ?? false} collapseMode={collapseMode} />
+          <MessageContent
+            content={message.content}
+            text={text}
+            streaming={streaming ?? false}
+            collapseMode={collapseMode}
+            messageId={message.id}
+            attachmentRefs={message.attachmentRefs}
+          />
         )}
         {!editing ? (
           <AttachmentRefChips refs={message.attachmentRefs} messageId={message.id} />

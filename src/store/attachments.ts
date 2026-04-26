@@ -204,6 +204,10 @@ export async function ingestAttachmentBytes(
     const existing = await findExistingAttachmentBundle(input.filename, contentHash)
     if (existing) return existing
   }
+  if (input.id !== undefined) {
+    const existing = await getAttachmentBundle(input.id)
+    if (existing) return existing
+  }
   const id = input.id ?? newId()
   const processed = await processAttachment({
     id,
@@ -215,6 +219,9 @@ export async function ingestAttachmentBytes(
     ...(input.now !== undefined ? { now: input.now } : {}),
   })
   const bundle = bundleFromProcessed(processed, input.blob)
+  if (input.id !== undefined) {
+    return putAttachmentBundleIfAbsent(bundle)
+  }
   await putAttachmentBundle(bundle)
   return bundle
 }
@@ -270,6 +277,16 @@ export async function createRemoteAttachment(
     processing: [],
     refCount: 0,
   }
+  if (input.id !== undefined) {
+    return (
+      await putAttachmentBundleIfAbsent({
+        attachment,
+        blobs: [],
+        artifacts: [],
+        jobs: [],
+      })
+    ).attachment
+  }
   await putAttachmentBundle({ attachment, blobs: [], artifacts: [], jobs: [] })
   return attachment
 }
@@ -279,12 +296,35 @@ export async function putAttachmentBundle(bundle: AttachmentBundle): Promise<voi
   await repo.runMutation(
     [{ kind: 'attachment', attachmentId: bundle.attachment.id }],
     async (ctx) => {
-      await ctx.putAttachment(bundle.attachment)
-      for (const blob of bundle.blobs) await ctx.putAttachmentBlob(blob)
-      for (const artifact of bundle.artifacts) await ctx.putAttachmentArtifact(artifact)
-      for (const job of bundle.jobs) await ctx.putAttachmentJob(job)
+      await writeAttachmentBundle(ctx, bundle)
     },
   )
+}
+
+async function putAttachmentBundleIfAbsent(bundle: AttachmentBundle): Promise<AttachmentBundle> {
+  const repo = getBrowserRepository()
+  let wrote = false
+  await repo.runMutation(
+    [{ kind: 'attachment', attachmentId: bundle.attachment.id }],
+    async (ctx) => {
+      const existing = await ctx.getAttachment(bundle.attachment.id)
+      if (existing) return
+      await writeAttachmentBundle(ctx, bundle)
+      wrote = true
+    },
+  )
+  if (wrote) return bundle
+  return (await getAttachmentBundle(bundle.attachment.id)) ?? bundle
+}
+
+async function writeAttachmentBundle(
+  ctx: MutationContext,
+  bundle: AttachmentBundle,
+): Promise<void> {
+  await ctx.putAttachment(bundle.attachment)
+  for (const blob of bundle.blobs) await ctx.putAttachmentBlob(blob)
+  for (const artifact of bundle.artifacts) await ctx.putAttachmentArtifact(artifact)
+  for (const job of bundle.jobs) await ctx.putAttachmentJob(job)
 }
 
 export async function getAttachmentBundle(

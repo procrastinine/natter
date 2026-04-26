@@ -98,6 +98,14 @@ function dedupeScopes(scopes: readonly MutationScope[]): MutationScope[] {
   return out
 }
 
+function isTextOnlyContent(content: readonly ContentItem[]): boolean {
+  return content.every((item) => item.type === 'text' || item.type === 'output_text')
+}
+
+function contentHasAttachmentIds(content: readonly ContentItem[]): boolean {
+  return content.some((item) => 'attachmentId' in item && Boolean(item.attachmentId))
+}
+
 function withAttachmentRefs<T extends object>(
   row: T,
   refs: readonly AttachmentRef[] | undefined,
@@ -446,15 +454,17 @@ export async function sendUserMessage(
     readGlobalPreferences(),
   ])
   const modelId = chatForRatio?.settings.model ?? ''
-  const calibrationFields = modelId
-    ? calibrationFieldsForCreate(
-        content,
-        modelId,
-        chatForRatio,
-        globalCal,
-        prefs.tokenCalibrationMode,
-      )
-    : null
+  const canCacheTextCalibration = (attachmentRefs?.length ?? 0) === 0 && isTextOnlyContent(content)
+  const calibrationFields =
+    modelId && canCacheTextCalibration
+      ? calibrationFieldsForCreate(
+          content,
+          modelId,
+          chatForRatio,
+          globalCal,
+          prefs.tokenCalibrationMode,
+        )
+      : null
   const result = await repo.runMutation(
     dedupeScopes([
       messageScope(messageId),
@@ -602,6 +612,8 @@ export async function editMessageContent(
             current.attachmentRefs,
           )
           if (withRefs.attachmentRefs) next.attachmentRefs = withRefs.attachmentRefs
+        } else if (contentHasAttachmentIds(input.content)) {
+          next.attachmentRefs = []
         } else delete next.attachmentRefs
       }
       await incRefs(ctx, toInc)

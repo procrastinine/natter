@@ -94,7 +94,13 @@ function chatSettings(overrides: Partial<ChatSettings> = {}): ChatSettings {
     ...base,
     profileId: 'prof',
     model: 'google/gemini-3.1-flash-lite-preview',
-    reasoning: { mode: 'off', exclude: false, summary: 'off', carryForward: 'off', include: { encrypted: false, summary: false, text: false } },
+    reasoning: {
+      mode: 'off',
+      exclude: false,
+      summary: 'off',
+      carryForward: 'off',
+      include: { encrypted: false, summary: false, text: false },
+    },
     ...overrides,
   }
 }
@@ -115,6 +121,7 @@ beforeEach(async () => {
     'google/gemini-3.1-flash-lite-preview',
     'openai/gpt-5.4',
     'openai/gpt-4o',
+    'black-forest-labs/flux.2-klein-4b',
   ])
 })
 
@@ -135,7 +142,10 @@ async function* stream<T>(...chunks: T[]): AsyncGenerator<T> {
   for (const c of chunks) yield c
 }
 
-async function seedOpenRouterDiscovery(profileId: string, models: readonly string[]): Promise<void> {
+async function seedOpenRouterDiscovery(
+  profileId: string,
+  models: readonly string[],
+): Promise<void> {
   for (const modelId of models) {
     await putCachedEndpoints(profileId, modelId, {
       id: modelId,
@@ -314,9 +324,7 @@ describe('sendText — chat-completions streaming', () => {
     expect(all.filter((m) => m.role === 'assistant')).toHaveLength(1)
     expect(assistant.parentId).toBe(user.id)
     expect(assistant.content).toEqual([{ type: 'output_text', text: 'Chapter One' }])
-    expect((await getBrowserRepository().getChat(chat.id))?.settings.reasoning.mode).toBe(
-      'default',
-    )
+    expect((await getBrowserRepository().getChat(chat.id))?.settings.reasoning.mode).toBe('default')
   })
 
   it('does not auto-configure toggleable OSS prefill during request planning', async () => {
@@ -358,7 +366,9 @@ describe('sendText — chat-completions streaming', () => {
       { role: 'assistant', content: 'Chapter' },
     ])
     expect(seenWire?.reasoning).toBeUndefined()
-    expect((seenWire as { provider?: { only?: string[] } } | undefined)?.provider?.only).toBeUndefined()
+    expect(
+      (seenWire as { provider?: { only?: string[] } } | undefined)?.provider?.only,
+    ).toBeUndefined()
     const storedChat = await getBrowserRepository().getChat(chat.id)
     expect(storedChat?.settings.reasoning.mode).toBe('default')
     expect(storedChat?.settings.providerPrefs?.only).toBeUndefined()
@@ -535,26 +545,24 @@ describe('sendText — chat-completions streaming', () => {
         seenRouteKind = open.route?.kind
         seenWire = open.wireBody
         seenGeminiModelId = open.geminiModelId
-        return stream(
-          {
-            type: 'chunk',
-            chunk: {
-              responseId: 'gem_1',
-              modelVersion: 'gemini-3.1-flash-lite-preview',
-              candidates: [
-                {
-                  content: { role: 'model', parts: [{ text: 'hi' }] },
-                  finishReason: 'STOP',
-                },
-              ],
-              usageMetadata: {
-                promptTokenCount: 2,
-                candidatesTokenCount: 1,
-                totalTokenCount: 3,
+        return stream({
+          type: 'chunk',
+          chunk: {
+            responseId: 'gem_1',
+            modelVersion: 'gemini-3.1-flash-lite-preview',
+            candidates: [
+              {
+                content: { role: 'model', parts: [{ text: 'hi' }] },
+                finishReason: 'STOP',
               },
+            ],
+            usageMetadata: {
+              promptTokenCount: 2,
+              candidatesTokenCount: 1,
+              totalTokenCount: 3,
             },
           },
-        )
+        })
       },
     })
     expect(result.outcome).toBe('done')
@@ -803,8 +811,12 @@ describe('sendText — chat-completions streaming', () => {
     expect(assistant?.generation?.reasoningStartedAt).toBeDefined()
     expect(assistant?.generation?.firstTextAt).toBeDefined()
     expect(assistant?.generation?.finishedAt).toBeDefined()
-    expect((assistant?.generation?.firstTextAt ?? 0) > (assistant?.generation?.reasoningStartedAt ?? 0)).toBe(true)
-    expect((assistant?.generation?.finishedAt ?? 0) >= (assistant?.generation?.firstTextAt ?? 0)).toBe(true)
+    expect(
+      (assistant?.generation?.firstTextAt ?? 0) > (assistant?.generation?.reasoningStartedAt ?? 0),
+    ).toBe(true)
+    expect(
+      (assistant?.generation?.finishedAt ?? 0) >= (assistant?.generation?.firstTextAt ?? 0),
+    ).toBe(true)
   })
 
   it('preserves both reasoning.summary (relabeled from text) and reasoning.encrypted at same index (Gemini via OpenRouter)', async () => {
@@ -1167,6 +1179,114 @@ describe('sendText — token calibration sample ingest', () => {
     const chatRow = await getBrowserRepository().getChat(chat.id)
     // Calibration is skipped on non-done outcome.
     expect(chatRow?.tokenCalibration?.[tokenCalibrationKey('openai/gpt-4o')]).toBeUndefined()
+  })
+
+  it('does not calibrate when the sent path includes non-text input', async () => {
+    const chat = await createChat({
+      settings: chatSettings({ model: 'openai/gpt-4o', systemPrompt: '' }),
+    })
+    await sendText({
+      chatId: chat.id,
+      connection: makeProfile(),
+      apiKey: 'sk-test',
+      content: [
+        { type: 'text', text: 'a'.repeat(600) },
+        { type: 'image_url', url: 'data:image/png;base64,abc123' },
+      ],
+      openStream: () =>
+        stream(
+          { type: 'delta', chunk: { id: 'g', choices: [{ delta: { content: 'X'.repeat(300) } }] } },
+          {
+            type: 'delta',
+            chunk: {
+              choices: [{ delta: {}, finish_reason: 'stop' }],
+              usage: {
+                prompt_tokens: 180,
+                completion_tokens: 90,
+                total_tokens: 270,
+              },
+            },
+          },
+        ),
+    })
+    const chatRow = await getBrowserRepository().getChat(chat.id)
+    expect(chatRow?.tokenCalibration?.[tokenCalibrationKey('openai/gpt-4o')]).toBeUndefined()
+    const [user, assistant] = liveMessagesSortedByCreated(await messagesFor(chat.id))
+    expect(user?.originalCalibrationKey).toBeUndefined()
+    expect(assistant?.originalCalibrationKey).toBeUndefined()
+  })
+
+  it('does not calibrate when the assistant output includes a generated image', async () => {
+    const chat = await createChat({
+      settings: chatSettings({ model: 'black-forest-labs/flux.2-klein-4b', systemPrompt: '' }),
+    })
+    const imageUrl =
+      'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII='
+    await sendText({
+      chatId: chat.id,
+      connection: makeProfile(),
+      apiKey: 'sk-test',
+      content: [{ type: 'text', text: 'a'.repeat(600) }],
+      openStream: () =>
+        stream(
+          {
+            type: 'delta',
+            chunk: {
+              id: 'g',
+              choices: [
+                {
+                  delta: {
+                    role: 'assistant',
+                    content: '',
+                    images: [{ type: 'image_url', image_url: { url: imageUrl } }],
+                  },
+                },
+              ],
+            },
+          },
+          {
+            type: 'delta',
+            chunk: {
+              choices: [{ delta: {}, finish_reason: 'stop' }],
+              usage: {
+                prompt_tokens: 180,
+                completion_tokens: 0,
+                total_tokens: 180,
+              },
+            },
+          },
+        ),
+    })
+    const chatRow = await getBrowserRepository().getChat(chat.id)
+    expect(
+      chatRow?.tokenCalibration?.[tokenCalibrationKey('black-forest-labs/flux.2-klein-4b')],
+    ).toBeUndefined()
+    const assistant = liveMessagesSortedByCreated(await messagesFor(chat.id)).find(
+      (message) => message.role === 'assistant',
+    )
+    const output = assistant?.content.find((item) => item.type === 'output_image')
+    expect(output).toMatchObject({ type: 'output_image' })
+    expect(output && 'url' in output ? output.url : undefined).toBeUndefined()
+    const attachmentId = output?.type === 'output_image' ? output.attachmentId : undefined
+    expect(attachmentId).toBeTruthy()
+    expect(assistant?.attachmentRefs).toHaveLength(1)
+    expect(assistant?.attachmentRefs?.[0]).toMatchObject({
+      attachmentId,
+      includeInContext: true,
+    })
+    const bundle = attachmentId
+      ? await getBrowserRepository().getAttachmentBundle(attachmentId)
+      : undefined
+    expect(bundle?.attachment).toMatchObject({
+      id: attachmentId,
+      kind: 'image',
+      mime: 'image/png',
+      origin: 'generated-output',
+      storage: { kind: 'local-blob' },
+      refCount: 1,
+    })
+    expect(bundle?.blobs.some((blob) => blob.role === 'original')).toBe(true)
+    expect(assistant?.originalCalibrationKey).toBeUndefined()
   })
 
   it('populates per-message calibration fields on user + assistant messages', async () => {

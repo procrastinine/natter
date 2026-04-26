@@ -128,6 +128,32 @@ describe('splitChatStream', () => {
     ])
   })
 
+  it('emits OpenRouter chat image deltas as persistable content items', async () => {
+    const imageUrl = 'data:image/png;base64,abc123'
+    const source = fromChunks([
+      {
+        type: 'delta',
+        chunk: {
+          id: 'g1',
+          choices: [
+            {
+              delta: {
+                content: '',
+                images: [{ type: 'image_url', image_url: { url: imageUrl } }],
+              },
+            },
+          ],
+        },
+      },
+    ])
+    const events = await collect(splitChatStream(source))
+    expect(events.find((e) => e.lane === 'content-item')).toMatchObject({
+      lane: 'content-item',
+      chunkId: 'g1',
+      item: { type: 'output_image', url: imageUrl },
+    })
+  })
+
   it('drops mirrored reasoning text when reasoning_details already carry the same delta', async () => {
     const source = fromChunks([
       {
@@ -242,6 +268,33 @@ describe('splitChatStream', () => {
       { lane: 'finish', finishReason: 'stop' },
       { lane: 'usage', usage: { prompt_tokens: 1, completion_tokens: 1 } },
     ])
+  })
+
+  it('emits OpenRouter buffered message images as persistable content items', async () => {
+    const imageUrl = 'data:image/png;base64,abc123'
+    const source = fromChunks([
+      {
+        type: 'buffered_result',
+        result: {
+          id: 'g1',
+          choices: [
+            {
+              finish_reason: 'stop',
+              message: {
+                content: '',
+                images: [{ type: 'image_url', image_url: { url: imageUrl } }],
+              },
+            },
+          ],
+        },
+      },
+    ])
+    const events = await collect(splitChatStream(source))
+    expect(events.find((e) => e.lane === 'content-item')).toMatchObject({
+      lane: 'content-item',
+      chunkId: 'g1',
+      item: { type: 'output_image', url: imageUrl },
+    })
   })
 
   it('raises mid-stream error frames onto the error lane as ApiError', async () => {

@@ -1,6 +1,6 @@
 import { useLiveQuery } from 'dexie-react-hooks'
 import { useState } from 'react'
-import type { Attachment, AttachmentRef, ChatId, MessageId } from '../../core/types'
+import type { AttachmentRef, ChatId, MessageId } from '../../core/types'
 import {
   detachAttachmentRef,
   relinkAttachmentRef,
@@ -40,14 +40,19 @@ export function AttachmentRefChips({
       return new Map(entries)
     },
     [attachmentIds],
-    new Map<string, Attachment | undefined>(),
+    undefined,
   )
   const [replaceRefId, setReplaceRefId] = useState<string | null>(null)
   if (liveRefs.length === 0) return null
+  if (!attachments) return null
+  const visibleRefs = liveRefs.filter(
+    (ref) => attachments.get(ref.attachmentId)?.origin !== 'generated-output',
+  )
+  if (visibleRefs.length === 0) return null
 
   return (
     <div data-ui="attachment-chip-row">
-      {liveRefs.map((ref) => {
+      {visibleRefs.map((ref) => {
         const attachment = attachments.get(ref.attachmentId)
         const missing = attachment?.storage.kind === 'missing'
         const href = attachmentHref(ref.attachmentId)

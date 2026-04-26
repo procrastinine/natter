@@ -604,18 +604,36 @@ describe('derivePromptSample', () => {
     ).toBeNull()
   })
 
-  it('returns null when media/framing overhead exceeds prompt_tokens', () => {
-    // A pathological case: prompt_tokens = 10 but media = 50. Negative
-    // calibrated tokens → reject sample.
+  it('returns null when media tokens are present', () => {
     const sample = derivePromptSample({
       sentPath: [message('user', 'hi')],
       systemPrompt: '',
-      usage: { prompt_tokens: 10, completion_tokens: 0, total_tokens: 10 } as ChatUsage,
+      usage: { prompt_tokens: 100, completion_tokens: 0, total_tokens: 100 } as ChatUsage,
       family: 'gpt',
       modelId: 'openai/gpt-4o',
       mediaTokens: 50,
     })
     expect(sample).toBeNull()
+  })
+
+  it('returns null when any sent message includes non-text content', () => {
+    const userWithImage: Message = {
+      ...message('user', 'describe this'),
+      content: [
+        { type: 'text', text: 'describe this' },
+        { type: 'image_url', url: 'data:image/png;base64,abc' },
+      ],
+    }
+    expect(
+      derivePromptSample({
+        sentPath: [userWithImage],
+        systemPrompt: '',
+        usage: { prompt_tokens: 100, completion_tokens: 0, total_tokens: 100 } as ChatUsage,
+        family: 'gpt',
+        modelId: 'openai/gpt-4o',
+        mediaTokens: 0,
+      }),
+    ).toBeNull()
   })
 })
 
@@ -706,6 +724,20 @@ describe('deriveCompletionSample', () => {
           total_tokens: 50,
           completion_tokens_details: { reasoning_tokens: 50 },
         } as ChatUsage,
+        family: 'gpt',
+      }),
+    ).toBeNull()
+  })
+
+  it('returns null when the assistant output includes generated non-text content', () => {
+    const withImage: Message = {
+      ...assistant(''),
+      content: [{ type: 'output_image', url: 'data:image/png;base64,abc' }],
+    }
+    expect(
+      deriveCompletionSample({
+        assistantMessage: withImage,
+        usage: { prompt_tokens: 0, completion_tokens: 100, total_tokens: 100 } as ChatUsage,
         family: 'gpt',
       }),
     ).toBeNull()

@@ -32,6 +32,7 @@ export interface ChatCompletionRequestWire {
 export interface ChatCompletionDeltaWire {
   role?: string
   content?: string | null
+  images?: unknown[]
   reasoning?: string | null
   reasoning_details?: unknown[]
   tool_calls?: unknown[]
@@ -41,6 +42,7 @@ export interface ChatCompletionDeltaWire {
 export interface ChatCompletionMessageWire {
   role?: string
   content?: string | null
+  images?: unknown[]
   reasoning?: string | null
   reasoning_details?: unknown[]
   tool_calls?: unknown[]

@@ -229,6 +229,78 @@ describe('estimatePromptSize — fallback branch', () => {
     expect(est.mediaTokens).toBe(627)
   })
 
+  it('uses assistant generated-image attachment refs as context source of truth', () => {
+    const resolver = (id: string) =>
+      id === 'att-generated'
+        ? storedAttachment({
+            id: 'att-generated',
+            contentHash: '',
+            kind: 'image',
+            mime: 'image/png',
+            filename: 'generated.png',
+            sizeBytes: 0,
+            dimensions: { width: 512, height: 512 },
+          })
+        : undefined
+    const included = makeMessage({
+      role: 'assistant',
+      content: [{ type: 'output_image', attachmentId: 'att-generated' }] as Message['content'],
+      attachmentRefs: [attachmentRef('att-generated')],
+    })
+    const hiddenRef = { ...attachmentRef('att-generated'), includeInContext: false }
+    const hidden = makeMessage({
+      role: 'assistant',
+      content: [{ type: 'output_image', attachmentId: 'att-generated' }] as Message['content'],
+      attachmentRefs: [hiddenRef],
+    })
+    const detached = makeMessage({
+      role: 'assistant',
+      content: [{ type: 'output_image', attachmentId: 'att-generated' }] as Message['content'],
+    })
+    detached.attachmentRefs = []
+    const legacy = makeMessage({
+      role: 'assistant',
+      content: [{ type: 'output_image', attachmentId: 'att-generated' }] as Message['content'],
+    })
+
+    expect(
+      estimatePromptSize({
+        systemPrompt: '',
+        activePathMessages: [included],
+        draftText: '',
+        tokenizer: DEFAULT_TOKENIZER,
+        attachmentResolver: resolver,
+      }).mediaTokens,
+    ).toBe(627)
+    expect(
+      estimatePromptSize({
+        systemPrompt: '',
+        activePathMessages: [hidden],
+        draftText: '',
+        tokenizer: DEFAULT_TOKENIZER,
+        attachmentResolver: resolver,
+      }).mediaTokens,
+    ).toBe(0)
+    expect(
+      estimatePromptSize({
+        systemPrompt: '',
+        activePathMessages: [detached],
+        draftText: '',
+        tokenizer: DEFAULT_TOKENIZER,
+        attachmentResolver: resolver,
+      }).mediaTokens,
+    ).toBe(0)
+    expect(
+      estimatePromptSize({
+        systemPrompt: '',
+        activePathMessages: [legacy],
+        draftText: '',
+        tokenizer: DEFAULT_TOKENIZER,
+        attachmentResolver: resolver,
+      }).mediaTokens,
+    ).toBe(627)
+  })
+
   it('uses normalized stored dimensions and default cap for large attachment refs', () => {
     const path = [
       makeMessage({
@@ -641,24 +713,18 @@ describe('estimatePromptSize — calibrated branch', () => {
         generation: withUsage(1000),
       }),
     ]
-    const input = buildSettingsPromptSizeEstimateInput(
-      settings,
-      path,
-      '',
-      null,
-      null,
-      (id) =>
-        id === 'att-1'
-          ? storedAttachment({
-              id: 'att-1',
-              contentHash: '',
-              kind: 'image',
-              mime: 'image/png',
-              filename: 'cat.png',
-              sizeBytes: 0,
-              dimensions: { width: 512, height: 512 },
-            })
-          : undefined,
+    const input = buildSettingsPromptSizeEstimateInput(settings, path, '', null, null, (id) =>
+      id === 'att-1'
+        ? storedAttachment({
+            id: 'att-1',
+            contentHash: '',
+            kind: 'image',
+            mime: 'image/png',
+            filename: 'cat.png',
+            sizeBytes: 0,
+            dimensions: { width: 512, height: 512 },
+          })
+        : undefined,
     )
     const est = estimatePromptSize(input)
     expect(input.disablePromptUsageBaseline).toBe(true)

@@ -94,6 +94,19 @@ describe('toResponses — envelope', () => {
     ])
     expect(wire.instructions).toBe('You are helpful.')
   })
+
+  it('does not enable hosted tools for image-capable models unless tool settings say so', () => {
+    const { wire } = toResponses(
+      settings({
+        model: 'openai/gpt-5-image-mini',
+        modalities: ['image', 'text'],
+      }),
+      [user('u1', 'draw a red square')],
+    )
+    expect(wire.tools).toBeUndefined()
+    expect(wire.tool_choice).toBeUndefined()
+    expect(wire.parallel_tool_calls).toBeUndefined()
+  })
 })
 
 describe('toResponses — reasoning echo', () => {

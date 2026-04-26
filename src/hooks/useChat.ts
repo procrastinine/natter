@@ -34,7 +34,6 @@ import {
 import type { GeminiStreamChunk } from '../api/gemini-types'
 import type { ChatStreamChunk, ResponsesStreamChunk } from '../api/types'
 import { activePath, cursorKeyOf, groupByParent } from '../core/active-path'
-import { messageCost } from '../core/context-cutoff'
 import { sendUserMessage } from '../core/messages'
 import { readGlobalPreferences } from '../core/global-settings'
 import {
@@ -77,6 +76,11 @@ import { logStreamDebug, streamDebugEnabled } from '../lib/debug-streams'
 import { postEvent } from '../store/broadcast'
 import { getBrowserRepository } from '../store/browser-repo'
 import { getChat, loadChatMessages } from '../store/chats'
+import {
+  materializeGeneratedImageOutputAttachments,
+  mergeGeneratedImageAttachmentRefs,
+} from '../store/generated-images'
+import { attachmentScopes, incRefs } from '../store/attachments'
 import { useChatStore } from '../store/zustand/chatStore'
 import { useStreamStore } from '../store/zustand/streamStore'
 import { markLifecycleTarget, startRequestLifecycle } from './requestLifecycle'
@@ -221,6 +225,7 @@ interface ChatAccumulator {
   provider?: string
   finishReason?: string
   usage?: ChatUsage
+  generatedContent: ContentItem[]
   firstTextAt?: number
   reasoningStartedAt?: number
   reasoningFinishedAt?: number
@@ -501,6 +506,9 @@ async function openAssistantStreamUnder(
   const placeholderApiUsed: 'chat' | 'completion' = useTextProtocol ? 'completion' : 'chat'
   const initialAssistantContent = input.initialAssistantContent ?? []
   const initialStoredContent = assistantContentWithStreamPrefix(initialAssistantContent, '')
+  const hasNonTextOutbound = outboundPath.some((message) =>
+    message.content.some(isNonTextContentItem),
+  )
 
   const assistantId = newId()
   await repo.runMutation(
@@ -561,6 +569,7 @@ async function openAssistantStreamUnder(
     textBuffer: '',
     reasoningList: [],
     reasoningRowById: new Map(),
+    generatedContent: [],
     lastFlushedAt: now(),
     lastFlushedTextLen: 0,
     lastChunkReceivedAt: now(),
@@ -675,7 +684,9 @@ async function openAssistantStreamUnder(
       ...(abortReason ? { abortReason } : {}),
       ...(streamError ? { error: streamError } : {}),
       now: now(),
-      ...(hasAttachmentContext
+      ...(hasAttachmentContext ||
+      hasNonTextOutbound ||
+      accumulator.generatedContent.some(isNonTextContentItem)
         ? {}
         : {
             calibrationInputs: {
@@ -781,6 +792,9 @@ function applyEvent(acc: ChatAccumulator, event: StreamLaneEvent, nowMs: number)
       if (event.model) acc.model = event.model
       if (event.provider) acc.provider = event.provider
       return
+    case 'content-item':
+      acc.generatedContent.push(structuredClone(event.item))
+      return
     case 'error':
       acc.midStreamError = event.error
       return
@@ -809,6 +823,7 @@ function shouldFlush(acc: ChatAccumulator, nowMs: number): boolean {
 function assistantContentWithStreamPrefix(
   initialContent: readonly ContentItem[],
   streamedText: string,
+  generatedContent: readonly ContentItem[] = [],
 ): ContentItem[] {
   const prefix = initialContent
     .filter(
@@ -820,7 +835,11 @@ function assistantContentWithStreamPrefix(
   const nonText = initialContent.filter(
     (item) => item.type !== 'text' && item.type !== 'output_text',
   )
-  return [{ type: 'output_text', text: `${prefix}${streamedText}` }, ...structuredClone(nonText)]
+  return [
+    { type: 'output_text', text: `${prefix}${streamedText}` },
+    ...structuredClone(nonText),
+    ...structuredClone(generatedContent),
+  ]
 }
 
 interface FlushContext {
@@ -841,7 +860,11 @@ async function flushPartial(ctx: FlushContext): Promise<void> {
     const reasoning = collectReasoning(accumulator)
     const next: Message = {
       ...current,
-      content: assistantContentWithStreamPrefix(accumulator.initialContent, accumulator.textBuffer),
+      content: assistantContentWithStreamPrefix(
+        accumulator.initialContent,
+        accumulator.textBuffer,
+        accumulator.generatedContent,
+      ),
     }
     if (reasoning.length > 0) next.reasoningDetails = reasoning
     next.generation = updatedGeneration(current.generation, accumulator, requestedModel, {
@@ -850,7 +873,9 @@ async function flushPartial(ctx: FlushContext): Promise<void> {
     await inner.putMessage(next, { touchChatSummary: false, broadcast: false })
     if (
       accumulator.debugScope &&
-      (accumulator.textBuffer.length > 0 || (next.reasoningDetails?.length ?? 0) > 0)
+      (accumulator.textBuffer.length > 0 ||
+        accumulator.generatedContent.length > 0 ||
+        (next.reasoningDetails?.length ?? 0) > 0)
     ) {
       logStreamDebug(accumulator.debugScope, 'message.flush', {
         messageId,
@@ -895,20 +920,27 @@ async function finalize(ctx: FinalizeContext): Promise<void> {
     calibrationInputs,
   } = ctx
 
+  const rawFinalContent = assistantContentWithStreamPrefix(
+    accumulator.initialContent,
+    accumulator.textBuffer,
+    accumulator.generatedContent,
+  )
+  const generatedImageAttachments = await materializeGeneratedImageOutputAttachments({
+    messageId,
+    content: rawFinalContent,
+    now,
+  })
+  const finalContent = generatedImageAttachments.content
+
   // Pre-compute calibration fields for the assistant row. On a successful
   // `done`, we populate `originalCharCount` / `originalTokenEstimate` /
   // `originalModelId` / `cachedTokenEstimate` so the next gauge tick can
   // read the cache directly instead of re-multiplying chars × ratio.
-  // Media tokens on an assistant message are always 0 (the model doesn't
-  // emit images/PDFs as regular content items), so we don't compute a
-  // media cache.
+  // This block only runs for text-only sends; multimodal input/output is
+  // excluded before `calibrationInputs` is passed into finalize.
   let assistantCalibrationFields: ReturnType<typeof calibrationFieldsForCreate> | null = null
   if (outcome === 'done' && calibrationInputs) {
     try {
-      const finalContent = assistantContentWithStreamPrefix(
-        accumulator.initialContent,
-        accumulator.textBuffer,
-      )
       const [chatForRatio, globalCal, prefs] = await Promise.all([
         repo.getChat(chatId),
         readTokenCalibrationGlobal(),
@@ -927,45 +959,59 @@ async function finalize(ctx: FinalizeContext): Promise<void> {
   }
 
   let persistedAssistant: Message | null = null
-  await repo.runMutation([{ kind: 'message', messageId }], async (inner) => {
-    const current = await inner.getMessage(messageId)
-    if (!current) return
-    const reasoning = collectReasoning(accumulator)
-    const generation = updatedGeneration(current.generation, accumulator, requestedModel, {
-      apiUsed,
-      finishedAt: now,
-    })
-    if (outcome === 'abort') {
-      generation.abortReason = abortReason ?? 'user'
-    }
-    const finalError = error ?? accumulator.midStreamError
-    if (finalError) {
-      generation.error = {
-        code: String(finalError.code),
-        message: finalError.message,
-        ...(finalError.httpStatus !== undefined ? { statusCode: finalError.httpStatus } : {}),
-        raw: finalError,
-      }
-    }
-    const next: Message = {
-      ...current,
-      content: assistantContentWithStreamPrefix(accumulator.initialContent, accumulator.textBuffer),
-      generation,
-      ...(assistantCalibrationFields ?? {}),
-    }
-    if (reasoning.length > 0) next.reasoningDetails = reasoning
-    await inner.putMessage(next)
-    if (accumulator.debugScope) {
-      logStreamDebug(accumulator.debugScope, 'message.finalize', {
-        messageId,
-        outcome,
-        reasoningDetails: next.reasoningDetails ?? [],
-        content: next.content,
-        generation: next.generation,
+  await repo.runMutation(
+    [{ kind: 'message', messageId }, ...attachmentScopes(generatedImageAttachments.newRefs)],
+    async (inner) => {
+      const current = await inner.getMessage(messageId)
+      if (!current) return
+      const reasoning = collectReasoning(accumulator)
+      const generation = updatedGeneration(current.generation, accumulator, requestedModel, {
+        apiUsed,
+        finishedAt: now,
       })
-    }
-    persistedAssistant = next
-  })
+      if (outcome === 'abort') {
+        generation.abortReason = abortReason ?? 'user'
+      }
+      const finalError = error ?? accumulator.midStreamError
+      if (finalError) {
+        generation.error = {
+          code: String(finalError.code),
+          message: finalError.message,
+          ...(finalError.httpStatus !== undefined ? { statusCode: finalError.httpStatus } : {}),
+          raw: finalError,
+        }
+      }
+      const next: Message = {
+        ...current,
+        content: finalContent,
+        generation,
+        ...(assistantCalibrationFields ?? {}),
+      }
+      if (generatedImageAttachments.newRefs.length > 0) {
+        const merged = mergeGeneratedImageAttachmentRefs(
+          current.attachmentRefs,
+          generatedImageAttachments.newRefs,
+          messageId,
+          now,
+        )
+        next.attachmentRefs = merged.refs
+        delete next.cachedMediaTokens
+        await incRefs(inner, merged.addedRefs)
+      }
+      if (reasoning.length > 0) next.reasoningDetails = reasoning
+      await inner.putMessage(next)
+      if (accumulator.debugScope) {
+        logStreamDebug(accumulator.debugScope, 'message.finalize', {
+          messageId,
+          outcome,
+          reasoningDetails: next.reasoningDetails ?? [],
+          content: next.content,
+          generation: next.generation,
+        })
+      }
+      persistedAssistant = next
+    },
+  )
 
   // Token calibration — happens AFTER the assistant message is persisted
   // so we have the final content + reasoningDetails + usage. Skips on
@@ -986,6 +1032,10 @@ async function finalize(ctx: FinalizeContext): Promise<void> {
   }
 }
 
+function isNonTextContentItem(item: ContentItem): boolean {
+  return item.type !== 'text' && item.type !== 'output_text'
+}
+
 async function ingestCalibrationSample(args: {
   repo: ReturnType<typeof getBrowserRepository>
   chatId: ChatId
@@ -994,16 +1044,11 @@ async function ingestCalibrationSample(args: {
   calibrationInputs: NonNullable<FinalizeContext['calibrationInputs']>
 }): Promise<void> {
   const { repo, chatId, assistantMessage, usage, calibrationInputs } = args
-
-  // Sum media tokens across the outbound path using the same heuristic
-  // the gauge uses. Attachment resolver is omitted here — the send
-  // pipeline doesn't have an attachment table loaded. Fallback values
-  // still give a usable overhead estimate; samples whose ratio drifts
-  // outside family bounds are rejected at ingest time.
-  let mediaTokens = 0
-  for (const m of calibrationInputs.outboundPath) {
-    const cost = messageCost(m, { family: calibrationInputs.family })
-    mediaTokens += cost.media
+  if (
+    calibrationInputs.outboundPath.some((message) => message.content.some(isNonTextContentItem)) ||
+    assistantMessage.content.some(isNonTextContentItem)
+  ) {
+    return
   }
 
   const promptSample = derivePromptSample({
@@ -1012,7 +1057,7 @@ async function ingestCalibrationSample(args: {
     usage,
     family: calibrationInputs.family,
     modelId: calibrationInputs.modelId,
-    mediaTokens,
+    mediaTokens: 0,
     ...(calibrationInputs.reasoningOpts
       ? { reasoningEchoOpts: calibrationInputs.reasoningOpts }
       : {}),

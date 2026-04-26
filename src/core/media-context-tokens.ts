@@ -55,9 +55,20 @@ export function mediaTokensForMessage(
   contextRefs: readonly AttachmentRef[] | undefined,
   options?: MediaTokenEstimateOptions,
 ): number {
-  const contentTokens = mediaTokensForContent(message.content, family, resolver, options)
+  const refsAreAuthoritative = message.attachmentRefs !== undefined
+  const visibleRefs = visibleAttachmentRefs(contextRefs ?? message.attachmentRefs)
+  const visibleIds = refsAreAuthoritative
+    ? new Set(visibleRefs.map((ref) => attachmentRefId(ref)))
+    : undefined
+  const contentTokens = mediaTokensForContentWithVisibility(
+    message.content,
+    family,
+    resolver,
+    visibleIds,
+    options,
+  )
   const idsInContent = attachmentIdsInContent(message.content)
-  const refTokens = visibleAttachmentRefs(contextRefs ?? message.attachmentRefs)
+  const refTokens = visibleRefs
     .filter((ref) => !idsInContent.has(attachmentRefId(ref)))
     .reduce(
       (sum, ref) =>
@@ -65,6 +76,32 @@ export function mediaTokensForMessage(
       0,
     )
   return contentTokens + refTokens
+}
+
+function mediaTokensForContentWithVisibility(
+  content: unknown,
+  family: TokenizerFamily,
+  resolver: AttachmentResolver | undefined,
+  visibleIds: ReadonlySet<AttachmentId> | undefined,
+  options: MediaTokenEstimateOptions | undefined,
+): number {
+  let tokens = 0
+  for (const item of safeContent(content)) {
+    const attachmentId = 'attachmentId' in item ? item.attachmentId : undefined
+    if (attachmentId && visibleIds && !visibleIds.has(attachmentId)) continue
+    if (item.type === 'image_url' || item.type === 'output_image') {
+      tokens += imageTokensForItem(item.attachmentId, family, resolver, options)
+    } else if (item.type === 'file') {
+      tokens += fileTokensForItem(item.attachmentId, item.mime, family, resolver)
+    } else if (
+      item.type === 'input_audio' ||
+      item.type === 'audio_output' ||
+      item.type === 'video_url'
+    ) {
+      tokens += genericMediaTokensForItem(item.attachmentId, resolver)
+    }
+  }
+  return tokens
 }
 
 export function mediaTokensForRefs(

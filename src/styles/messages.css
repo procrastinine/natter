@@ -225,6 +225,76 @@
   margin-bottom: 0;
 }
 
+[data-ui="message-output-images"] {
+  display: grid;
+  gap: var(--space-3);
+  margin-top: var(--space-3);
+}
+
+[data-ui="message-output-images"]:first-child {
+  margin-top: 0;
+}
+
+[data-ui="message-output-image"] {
+  --message-output-image-toggle-space: 36px;
+  margin: 0;
+  position: relative;
+  display: inline-flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  width: auto;
+  max-width: 100%;
+}
+
+[data-ui="message-output-image"] img {
+  display: block;
+  width: auto;
+  max-width: min(100%, 640px);
+  max-height: min(72vh, 720px);
+  object-fit: contain;
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-subtle);
+}
+
+[data-ui="message-output-image"][data-has-context-toggle="true"] img {
+  max-width: min(calc(100% - var(--message-output-image-toggle-space)), 640px);
+}
+
+[data-ui="message-output-image"][data-context="excluded"] img {
+  opacity: 0.58;
+}
+
+[data-ui="message-output-image-context-toggle"] {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  color: var(--color-fg-primary);
+  background: color-mix(in srgb, var(--color-bg-surface) 88%, transparent);
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-sm);
+  cursor: pointer;
+}
+
+[data-ui="message-output-image-context-toggle"]:hover {
+  background: var(--color-bg-surface);
+  border-color: var(--color-border-strong);
+}
+
+[data-ui="message-output-image-missing"] {
+  display: block;
+  width: min(100%, 320px);
+  aspect-ratio: 1;
+  border: 1px dashed var(--color-border-default);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-subtle);
+}
+
 /* ─────────────────────────────────────────────────────────────────────────
  * Action row — RIGHT-ALIGNED to the trailing edge of the text column.
  * Always visible, low-weight. Icon-only buttons (square 22 px hit areas
