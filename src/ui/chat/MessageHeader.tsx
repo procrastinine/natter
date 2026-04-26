@@ -31,9 +31,10 @@ export function MessageHeader({ message }: MessageHeaderProps) {
   // Chat-completions and Gemini turns never carry it; hide the chip entirely
   // rather than display "unset" noise.
   const phase = isAssistant && gen?.apiUsed === 'responses' ? message.phase : undefined
+  const roleLabel = ROLE_LABEL[message.role]
   return (
     <header data-ui="message-header">
-      <span data-ui="message-role">{ROLE_LABEL[message.role]}</span>
+      <span data-ui="message-role">{roleLabel}</span>
       <span data-ui="message-header-spacer" />
       {phase ? (
         <span

@@ -42,6 +42,7 @@ import type {
   ContentItem,
   EffortLevel,
   Message,
+  MessageId,
   MessageRole,
   ReasoningDetail,
   ReasoningFormat,
@@ -79,6 +80,8 @@ export interface ChatCompletionsTransformOptions {
   // are dropped on echo (plaintext / summary still flow per the include
   // flags). See `plan/phase11-implementation.md §2`.
   reasoningPreservationFormat?: ReasoningFormat
+  attachmentPartsByMessageId?: ReadonlyMap<MessageId, readonly unknown[]>
+  extraPlugins?: readonly unknown[]
 }
 
 export interface ChatCompletionsTransformResult {
@@ -230,9 +233,13 @@ function trimTrailingWhitespaceOnLastText(message: Message): Message {
 // Translate a `ContentItem[]` into chat-completions wire content parts. For
 // text-only Phase 7 this is nearly identity; we preserve the typed shape so
 // later phases can bolt on image/audio/file/video without revisiting callers.
-function serializeContent(items: ContentItem[]): unknown {
-  if (items.length === 0) return ''
-  if (items.length === 1 && (items[0]?.type === 'text' || items[0]?.type === 'output_text')) {
+function serializeContent(items: ContentItem[], extraParts: readonly unknown[] = []): unknown {
+  if (items.length === 0 && extraParts.length === 0) return ''
+  if (
+    extraParts.length === 0 &&
+    items.length === 1 &&
+    (items[0]?.type === 'text' || items[0]?.type === 'output_text')
+  ) {
     // Collapse a single text/output_text block to a plain string. OpenAI-
     // compatible endpoints accept both string and array content, and echoing
     // an assistant turn as a plain string is what upstreams expect for
@@ -249,6 +256,7 @@ function serializeContent(items: ContentItem[]): unknown {
     // Non-text items are Phase 7 out of scope. Skipping silently matches the
     // "capability gating drops optional fields; never throws" discipline.
   }
+  parts.push(...extraParts)
   return parts
 }
 
@@ -261,6 +269,7 @@ function toWireRole(role: MessageRole): string {
 export interface BuildChatMessagesOptions {
   reasoningPreservationFormat?: ReasoningFormat
   acceptsAnthropicRedactedThinking?: boolean
+  attachmentPartsByMessageId?: ReadonlyMap<MessageId, readonly unknown[]>
 }
 
 export function buildChatMessages(
@@ -303,9 +312,10 @@ function serializeChatMessage(
   settings: ChatSettings,
   opts: BuildChatMessagesOptions,
 ): Record<string, unknown> {
+  const attachmentParts = opts.attachmentPartsByMessageId?.get(message.id) ?? []
   const entry: Record<string, unknown> = {
     role: toWireRole(message.role),
-    content: serializeContent(message.content),
+    content: serializeContent(message.content, attachmentParts),
   }
 
   if (message.role === 'tool') {
@@ -427,6 +437,9 @@ export function toChatCompletions(
       ...(opts.reasoningPreservationFormat !== undefined
         ? { reasoningPreservationFormat: opts.reasoningPreservationFormat }
         : {}),
+      ...(opts.attachmentPartsByMessageId
+        ? { attachmentPartsByMessageId: opts.attachmentPartsByMessageId }
+        : {}),
     }),
   }
   if (streaming) wire.stream = true
@@ -502,6 +515,12 @@ export function toChatCompletions(
   // `off` is no-op.
   if (settings.contextStrategy.kind === 'middle_out_plugin' && gate('plugins')) {
     wire.plugins = [{ id: 'context-compression' }]
+  }
+  if (opts.extraPlugins && opts.extraPlugins.length > 0 && gate('plugins')) {
+    wire.plugins = [
+      ...((Array.isArray(wire.plugins) ? wire.plugins : []) as unknown[]),
+      ...opts.extraPlugins,
+    ]
   }
 
   return { wire, requestedModel }
@@ -1521,7 +1540,7 @@ function buildGeminiUserParts(items: ContentItem[]): GeminiPart[] {
       // Inline base64 URLs only for Phase 11; file-uri resolution is Phase 12.
       if (/^data:/.test(item.url)) {
         const match = /^data:([^;]+);base64,(.+)$/.exec(item.url)
-        if (match && match[1] && match[2]) {
+        if (match?.[1] && match[2]) {
           parts.push({ inlineData: { mimeType: match[1], data: match[2] } })
         }
       } else {

@@ -2,7 +2,10 @@ import type { Table, Transaction } from 'dexie'
 import { findLastUpdatedLeafId, indexById, isOnPathToLeaf } from '../core/active-path'
 import type {
   Attachment,
+  AttachmentArtifact,
+  AttachmentBlob,
   AttachmentId,
+  AttachmentJob,
   Chat,
   ChatId,
   ChatVersions,
@@ -12,11 +15,15 @@ import type {
   MessageId,
   MutationScope,
 } from '../core/types'
+import { normalizeAttachmentRefs } from './attachment-refs'
 import { postEvent } from './broadcast'
 import { childListKey, type NatterDb, openDb, type SettingsRow } from './db'
 import { withMutationLocks } from './locks'
 import type {
   ChatMutationSummary,
+  AttachmentBundle,
+  AttachmentSearchPage,
+  AttachmentSearchQuery,
   MutationContext,
   PutMessageOptions,
   WorkspaceMeta,
@@ -57,6 +64,9 @@ interface ChatMutationState {
 }
 
 type BrowserMutationTableName =
+  | 'attachmentArtifacts'
+  | 'attachmentBlobs'
+  | 'attachmentJobs'
   | 'attachments'
   | 'chats'
   | 'childLists'
@@ -65,6 +75,9 @@ type BrowserMutationTableName =
   | 'settings'
 
 const MUTATION_TABLE_ORDER: readonly BrowserMutationTableName[] = [
+  'attachmentArtifacts',
+  'attachmentBlobs',
+  'attachmentJobs',
   'attachments',
   'chats',
   'childLists',
@@ -97,7 +110,21 @@ function changedPatch<Row extends object>(
 }
 
 function cloneMessage(message: Message): Message {
-  return structuredClone(message)
+  const cloned = structuredClone(message)
+  cloned.attachmentRefs = normalizeAttachmentRefs(cloned.attachmentRefs, {
+    messageId: cloned.id,
+    createdAt: cloned.createdAt,
+  })
+  return cloned
+}
+
+function cloneDraft(draft: DraftRow): DraftRow {
+  const cloned = structuredClone(draft)
+  cloned.attachmentRefs = normalizeAttachmentRefs(cloned.attachmentRefs, {
+    draftChatId: cloned.chatId,
+    createdAt: cloned.updatedAt,
+  })
+  return cloned
 }
 
 function replaceMessage(messages: Message[], nextMessage: Message): void {
@@ -180,6 +207,44 @@ function stripSummaryPatch(patch: Partial<Chat>): Partial<Chat> {
   return next
 }
 
+function attachmentSearchText(
+  attachment: Attachment,
+  artifacts: readonly AttachmentArtifact[],
+): string {
+  return [
+    attachment.id,
+    attachment.contentHash,
+    attachment.kind,
+    attachment.mime,
+    attachment.filename,
+    attachment.extension,
+    attachment.origin,
+    attachment.sourceUrl,
+    attachment.storage.kind,
+    ...attachment.processing.map((state) => state.processorId),
+    ...artifacts.flatMap((artifact) => [
+      artifact.artifactId,
+      artifact.kind,
+      artifact.processorId,
+      artifact.kind === 'text' ? artifact.text : undefined,
+      artifact.kind === 'json' ? JSON.stringify(artifact.value) : undefined,
+    ]),
+  ]
+    .filter((value): value is string => typeof value === 'string' && value.length > 0)
+    .join('\n')
+    .toLowerCase()
+}
+
+function attachmentSorter(
+  sort: AttachmentSearchQuery['sort'],
+): (left: Attachment, right: Attachment) => number {
+  if (sort === 'created-asc') return (left, right) => left.createdAt - right.createdAt
+  if (sort === 'updated-desc') return (left, right) => right.updatedAt - left.updatedAt
+  if (sort === 'size-desc') return (left, right) => (right.sizeBytes ?? 0) - (left.sizeBytes ?? 0)
+  if (sort === 'size-asc') return (left, right) => (left.sizeBytes ?? 0) - (right.sizeBytes ?? 0)
+  return (left, right) => right.createdAt - left.createdAt
+}
+
 export function resolveMutationTableNames(
   scopes: readonly MutationScope[],
 ): BrowserMutationTableName[] {
@@ -187,6 +252,9 @@ export function resolveMutationTableNames(
   for (const scope of scopes) {
     switch (scope.kind) {
       case 'attachment':
+        names.add('attachmentArtifacts')
+        names.add('attachmentBlobs')
+        names.add('attachmentJobs')
         names.add('attachments')
         break
       case 'chat-meta':
@@ -218,6 +286,12 @@ function resolveMutationTables(
     switch (name) {
       case 'attachments':
         return db.attachments as Table<unknown, unknown>
+      case 'attachmentArtifacts':
+        return db.attachmentArtifacts as Table<unknown, unknown>
+      case 'attachmentBlobs':
+        return db.attachmentBlobs as Table<unknown, unknown>
+      case 'attachmentJobs':
+        return db.attachmentJobs as Table<unknown, unknown>
       case 'chats':
         return db.chats as Table<unknown, unknown>
       case 'childLists':
@@ -337,15 +411,100 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
   }
 
   async getMessage(messageId: MessageId): Promise<Message | undefined> {
-    return openDb().then((db) => db.messages.get(messageId))
+    return openDb().then(async (db) => {
+      const row = await db.messages.get(messageId)
+      return row ? cloneMessage(row) : undefined
+    })
   }
 
   async listMessages(chatId: ChatId): Promise<Message[]> {
-    return openDb().then((db) => db.messages.where('chatId').equals(chatId).toArray())
+    return openDb().then(async (db) =>
+      (await db.messages.where('chatId').equals(chatId).toArray()).map(cloneMessage),
+    )
+  }
+
+  async getAttachment(attachmentId: AttachmentId): Promise<Attachment | undefined> {
+    return openDb().then((db) => db.attachments.get(attachmentId))
+  }
+
+  async getAttachmentBundle(attachmentId: AttachmentId): Promise<AttachmentBundle | undefined> {
+    return openDb().then(async (db) => {
+      const attachment = await db.attachments.get(attachmentId)
+      if (!attachment) return undefined
+      const [blobs, artifacts, jobs] = await Promise.all([
+        db.attachmentBlobs.where('attachmentId').equals(attachmentId).toArray(),
+        db.attachmentArtifacts.where('attachmentId').equals(attachmentId).toArray(),
+        db.attachmentJobs.where('attachmentId').equals(attachmentId).toArray(),
+      ])
+      return { attachment, blobs, artifacts, jobs }
+    })
+  }
+
+  async getAttachmentBlob(blobId: string): Promise<AttachmentBlob | undefined> {
+    return openDb().then((db) => db.attachmentBlobs.get(blobId))
+  }
+
+  async searchAttachments(query: AttachmentSearchQuery = {}): Promise<AttachmentSearchPage> {
+    const db = await openDb()
+    const limit = query.limit ?? 100
+    const rows = await db.attachments.toArray()
+    const artifacts = await db.attachmentArtifacts.toArray()
+    const artifactsByAttachment = new Map<AttachmentId, AttachmentArtifact[]>()
+    for (const artifact of artifacts) {
+      const list = artifactsByAttachment.get(artifact.attachmentId) ?? []
+      list.push(artifact)
+      artifactsByAttachment.set(artifact.attachmentId, list)
+    }
+    const terms = query.query?.trim().toLowerCase().split(/\s+/).filter(Boolean) ?? []
+    const filtered = rows.filter((attachment) => {
+      const filters = query.filters
+      if (filters?.kind && attachment.kind !== filters.kind) return false
+      if (filters?.mime && attachment.mime !== filters.mime) return false
+      if (filters?.origin && attachment.origin !== filters.origin) return false
+      if (filters?.storageKind && attachment.storage.kind !== filters.storageKind) return false
+      if (
+        filters?.minSizeBytes !== undefined &&
+        (attachment.sizeBytes ?? 0) < filters.minSizeBytes
+      ) {
+        return false
+      }
+      if (
+        filters?.maxSizeBytes !== undefined &&
+        (attachment.sizeBytes ?? 0) > filters.maxSizeBytes
+      ) {
+        return false
+      }
+      if (filters?.minRefCount !== undefined && attachment.refCount < filters.minRefCount) {
+        return false
+      }
+      if (filters?.maxRefCount !== undefined && attachment.refCount > filters.maxRefCount) {
+        return false
+      }
+      if (terms.length === 0) return true
+      const haystack = attachmentSearchText(
+        attachment,
+        artifactsByAttachment.get(attachment.id) ?? [],
+      )
+      return terms.every((term) => haystack.includes(term))
+    })
+    filtered.sort(attachmentSorter(query.sort ?? 'created-desc'))
+    const start =
+      query.cursor === undefined
+        ? 0
+        : Math.max(
+            0,
+            filtered.findIndex((row) => row.id === query.cursor) + 1,
+          )
+    const page = filtered.slice(start, start + limit)
+    const nextCursor = filtered.length > start + limit ? page.at(-1)?.id : undefined
+    return nextCursor ? { rows: page, nextCursor } : { rows: page }
   }
 
   async getDraft(chatId: ChatId): Promise<DraftRow | undefined> {
-    return openDb().then((db) => db.drafts.get(chatId))
+    return openDb().then(async (db) => {
+      const row = await db.drafts.get(chatId)
+      return row ? cloneDraft(row) : undefined
+    })
   }
 
   async runMutation<T>(
@@ -506,10 +665,15 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
             upsertAffected(state, { kind: 'chat-meta', chatId })
           },
 
-          getMessage: async (messageId) => tx.table<Message, MessageId>('messages').get(messageId),
+          getMessage: async (messageId) => {
+            const row = await tx.table<Message, MessageId>('messages').get(messageId)
+            return row ? cloneMessage(row) : undefined
+          },
 
           listMessages: async (chatId) =>
-            tx.table<Message, MessageId>('messages').where('chatId').equals(chatId).toArray(),
+            (
+              await tx.table<Message, MessageId>('messages').where('chatId').equals(chatId).toArray()
+            ).map(cloneMessage),
 
           listChildren: async (chatId, parentId) => {
             const rows =
@@ -524,7 +688,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
                     .where('[chatId+parentId]')
                     .equals([chatId, parentId])
                     .toArray()
-            return rows.filter((row) => row.parentId === parentId)
+            return rows.filter((row) => row.parentId === parentId).map(cloneMessage)
           },
 
           putMessage: async (message, options: PutMessageOptions = {}) => {
@@ -650,19 +814,78 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
             const table = tx.table<Attachment, AttachmentId>('attachments')
             const existing = await table.get(attachmentId)
             if (!existing) return
+            await tx.table<AttachmentBlob, string>('attachmentBlobs').where('attachmentId').equals(attachmentId).delete()
+            await tx
+              .table<AttachmentArtifact, string>('attachmentArtifacts')
+              .where('attachmentId')
+              .equals(attachmentId)
+              .delete()
+            await tx.table<AttachmentJob, string>('attachmentJobs').where('attachmentId').equals(attachmentId).delete()
             await table.delete(attachmentId)
             wroteWorkspaceState = true
           },
 
-          getDraft: async (chatId) => tx.table<DraftRow, ChatId>('drafts').get(chatId),
+          getAttachmentBlob: async (blobId) =>
+            tx.table<AttachmentBlob, string>('attachmentBlobs').get(blobId),
+
+          putAttachmentBlob: async (blob) => {
+            assertScope({ kind: 'attachment', attachmentId: blob.attachmentId })
+            await tx.table<AttachmentBlob, string>('attachmentBlobs').put(blob)
+            wroteWorkspaceState = true
+          },
+
+          deleteAttachmentBlob: async (blobId) => {
+            const table = tx.table<AttachmentBlob, string>('attachmentBlobs')
+            const existing = await table.get(blobId)
+            if (!existing) return
+            assertScope({ kind: 'attachment', attachmentId: existing.attachmentId })
+            await table.delete(blobId)
+            wroteWorkspaceState = true
+          },
+
+          putAttachmentArtifact: async (artifact) => {
+            assertScope({ kind: 'attachment', attachmentId: artifact.attachmentId })
+            await tx.table<AttachmentArtifact, string>('attachmentArtifacts').put(artifact)
+            wroteWorkspaceState = true
+          },
+
+          deleteAttachmentArtifact: async (artifactId) => {
+            const table = tx.table<AttachmentArtifact, string>('attachmentArtifacts')
+            const existing = await table.get(artifactId)
+            if (!existing) return
+            assertScope({ kind: 'attachment', attachmentId: existing.attachmentId })
+            await table.delete(artifactId)
+            wroteWorkspaceState = true
+          },
+
+          putAttachmentJob: async (job) => {
+            assertScope({ kind: 'attachment', attachmentId: job.attachmentId })
+            await tx.table<AttachmentJob, string>('attachmentJobs').put(job)
+            wroteWorkspaceState = true
+          },
+
+          deleteAttachmentJob: async (jobId) => {
+            const table = tx.table<AttachmentJob, string>('attachmentJobs')
+            const existing = await table.get(jobId)
+            if (!existing) return
+            assertScope({ kind: 'attachment', attachmentId: existing.attachmentId })
+            await table.delete(jobId)
+            wroteWorkspaceState = true
+          },
+
+          getDraft: async (chatId) => {
+            const row = await tx.table<DraftRow, ChatId>('drafts').get(chatId)
+            return row ? cloneDraft(row) : undefined
+          },
 
           putDraft: async (draft) => {
             assertScope({ kind: 'draft', chatId: draft.chatId })
             const state = await ensureChatState(draft.chatId)
             const table = tx.table<DraftRow, ChatId>('drafts')
             const existing = await table.get(draft.chatId)
-            if (existing && stableStringify(existing) === stableStringify(draft)) return
-            await table.put(draft)
+            const normalized = cloneDraft(draft)
+            if (existing && stableStringify(cloneDraft(existing)) === stableStringify(normalized)) return
+            await table.put(normalized)
             wroteWorkspaceState = true
             state.broadcast = true
             upsertAffected(state, { kind: 'draft', chatId: draft.chatId })

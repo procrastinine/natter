@@ -309,6 +309,52 @@ export function InsertIcon({ size = 18, ariaLabel }: IconProps) {
   )
 }
 
+export function PaperclipIcon({ size = 18, ariaLabel }: IconProps) {
+  return (
+    <BaseSvg size={size} {...(ariaLabel ? { 'aria-label': ariaLabel } : {})}>
+      <path d="M21.4 11.6 12 21a6 6 0 0 1-8.5-8.5l9.8-9.8a4 4 0 0 1 5.7 5.7l-9.8 9.8a2 2 0 1 1-2.8-2.8l9.4-9.4" />
+    </BaseSvg>
+  )
+}
+
+export function DatabaseIcon({ size = 18, ariaLabel }: IconProps) {
+  return (
+    <BaseSvg size={size} {...(ariaLabel ? { 'aria-label': ariaLabel } : {})}>
+      <ellipse cx="12" cy="5" rx="7" ry="3" />
+      <path d="M5 5v6c0 1.7 3.1 3 7 3s7-1.3 7-3V5" />
+      <path d="M5 11v6c0 1.7 3.1 3 7 3s7-1.3 7-3v-6" />
+    </BaseSvg>
+  )
+}
+
+export function FileIcon({ size = 18, ariaLabel }: IconProps) {
+  return (
+    <BaseSvg size={size} {...(ariaLabel ? { 'aria-label': ariaLabel } : {})}>
+      <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" />
+      <path d="M14 3v5h5" />
+    </BaseSvg>
+  )
+}
+
+export function UploadIcon({ size = 18, ariaLabel }: IconProps) {
+  return (
+    <BaseSvg size={size} {...(ariaLabel ? { 'aria-label': ariaLabel } : {})}>
+      <path d="M12 21V9" />
+      <polyline points="7 14 12 9 17 14" />
+      <path d="M5 5h14" />
+    </BaseSvg>
+  )
+}
+
+export function SearchIcon({ size = 18, ariaLabel }: IconProps) {
+  return (
+    <BaseSvg size={size} {...(ariaLabel ? { 'aria-label': ariaLabel } : {})}>
+      <circle cx="11" cy="11" r="7" />
+      <path d="m20 20-3.5-3.5" />
+    </BaseSvg>
+  )
+}
+
 // Paper-plane arrow — Save & Send action on the inline editor.
 export function SendIcon({ size = 18, ariaLabel }: IconProps) {
   return (

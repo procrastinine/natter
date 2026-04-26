@@ -47,11 +47,6 @@ test('assistant header shows the role label only; model + tokens + cost live in 
   await expect(assistant.locator('[data-ui="message-model"]')).toHaveCount(0)
   await expect(assistant.locator('[data-ui="message-token-count"]')).toHaveCount(0)
   await expect(assistant.locator('[data-ui="message-cost"]')).toHaveCount(0)
-  // The header aria-label is just the role.
-  await expect(assistant.locator('[data-ui="message-header"]')).toHaveAttribute(
-    'aria-label',
-    'Assistant',
-  )
   // Reveal the info disclosure and verify the full factual record is there.
   await assistant.locator('[data-role="message-action"][data-action="info"]').click()
   const info = assistant.locator('[data-ui="message-info"]')

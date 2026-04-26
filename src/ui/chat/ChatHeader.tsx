@@ -166,7 +166,7 @@ export function ChatHeader({
           data-ui="icon-button"
           data-role="chat-edit-tree"
           aria-label={editTreeActive ? 'Exit edit tree mode' : 'Enter edit tree mode'}
-          aria-pressed={editTreeActive ? true : false}
+          aria-pressed={!!editTreeActive}
           title={editTreeActive ? 'Exit edit tree mode (Esc)' : 'Edit tree mode (⇧⌘E)'}
           onClick={onToggleEditTree}
           data-state={editTreeActive ? 'active' : undefined}

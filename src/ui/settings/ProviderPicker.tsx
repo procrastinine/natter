@@ -37,6 +37,7 @@ import type { Chat, ModelEndpoint, ProviderPreferences, SortBy } from '../../cor
 import type { UsePrivacyRoutingResult } from '../../hooks/usePrivacyRouting'
 import { getChatDraft, loadChatMessages, updateChatSettings } from '../../store/chats'
 import { useChatStore } from '../../store/zustand/chatStore'
+import { useAttachmentResolverForContext } from '../attachments/useAttachmentResolver'
 import { LockIcon } from '../icons/Icon'
 import { InfoDisclosure } from './InfoDisclosure'
 import {
@@ -98,12 +99,9 @@ export function ProviderPicker({
     needsLocalNeededTokens ? (s.cursors[chat.id] ?? EMPTY_CURSOR) : EMPTY_CURSOR,
   )
   const draft = useLiveQuery(
-    () =>
-      needsLocalNeededTokens
-        ? getChatDraft(chat.id).then((d) => d?.text ?? '')
-        : Promise.resolve(''),
+    () => (needsLocalNeededTokens ? getChatDraft(chat.id) : Promise.resolve(undefined)),
     [chat.id, needsLocalNeededTokens],
-    '',
+    undefined,
   )
   const globalPrefs = useLiveQuery(
     () =>
@@ -118,6 +116,16 @@ export function ProviderPicker({
     [needsLocalNeededTokens],
     null,
   )
+  const localPath = useMemo(
+    () => (needsLocalNeededTokens ? activePath(messages, cursor) : []),
+    [needsLocalNeededTokens, messages, cursor],
+  )
+  const attachmentResolver = useAttachmentResolverForContext({
+    settings: chat.settings,
+    messages: localPath,
+    draftAttachmentRefs: draft?.attachmentRefs,
+    enabled: needsLocalNeededTokens,
+  })
   // Provider filter uses the CURRENT estimate (tokens we'd actually send
   // right now, including reasoning echo) + the reserved completion budget.
   // This means a provider whose context can't fit the user's declared
@@ -125,31 +133,31 @@ export function ProviderPicker({
   // smaller — the user still gets the provider while the chat is short.
   const neededTokens = useMemo(() => {
     if (neededTokensOverride !== undefined) return neededTokensOverride
-    const path = activePath(messages, cursor)
     const est = estimateSettingsPromptSize(
       chat.settings,
-      path,
-      draft ?? '',
+      localPath,
+      draft?.text ?? '',
       routing.descriptor?.architecture?.tokenizer ?? null,
       null,
-      undefined,
+      attachmentResolver,
       {
         chatTokenCalibration: chat.tokenCalibration,
         globalCalibration,
         mode: globalPrefs.tokenCalibrationMode,
       },
+      draft?.attachmentRefs,
     )
     const reserveRaw = chat.settings.maxCompletionTokens
     const reserve = reserveRaw === UNLIMITED_CONTEXT ? 0 : (reserveRaw ?? 0)
     return est.total + reserve
   }, [
     neededTokensOverride,
-    messages,
-    cursor,
+    localPath,
     chat.settings,
     chat.tokenCalibration,
     draft,
     routing.descriptor?.architecture?.tokenizer,
+    attachmentResolver,
     globalCalibration,
     globalPrefs.tokenCalibrationMode,
   ])
@@ -348,7 +356,7 @@ export function ProviderPicker({
         </label>
         <fieldset data-ui="provider-picker-sort">
           <legend>Routing sort</legend>
-          <div data-ui="provider-picker-sort-toggle" aria-label="Provider routing sort">
+          <div data-ui="provider-picker-sort-toggle">
             {SORT_OPTIONS.map((option) => {
               const selected = currentSort === option.value
               return (
@@ -374,7 +382,7 @@ export function ProviderPicker({
         <p data-ui="helper">{loading ? 'Loading…' : 'No providers available for this model.'}</p>
       ) : (
         <ul data-ui="provider-picker-list">
-          {rows.map((row, index) => {
+          {rows.map((row) => {
             const epCap = row.endpoint.max_prompt_tokens ?? row.endpoint.context_length
             const insufficient = epCap !== undefined && epCap > 0 && neededTokens > epCap
             const ref = providerRoutingRef(row.endpoint)
@@ -383,7 +391,7 @@ export function ProviderPicker({
             const allowed = row.state === 'kept'
             return (
               <ProviderRow
-                key={`${key}:${index}`}
+                key={`${key}:${ref}`}
                 row={row}
                 label={label}
                 allowed={allowed}

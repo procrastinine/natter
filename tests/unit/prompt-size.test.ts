@@ -9,9 +9,21 @@
 // carefully to avoid negative values.
 
 import { describe, expect, it } from 'vitest'
+import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import { tokenCalibrationKey } from '../../src/core/model-ids'
-import { estimatePromptSize, tokenizerFromSettings } from '../../src/core/prompt-size'
-import type { ChatUsage, GenerationMeta, Message, MessageRole } from '../../src/core/types'
+import {
+  buildSettingsPromptSizeEstimateInput,
+  estimatePromptSize,
+  tokenizerFromSettings,
+} from '../../src/core/prompt-size'
+import type {
+  Attachment,
+  ChatUsage,
+  GenerationMeta,
+  Message,
+  MessageAttachmentRef,
+  MessageRole,
+} from '../../src/core/types'
 
 const DEFAULT_TOKENIZER = 'gpt' as const
 
@@ -44,6 +56,33 @@ function makeMessage(partial: Partial<Message> & { role: MessageRole; text?: str
       : {}),
     ...(partial.generation ? { generation: partial.generation } : {}),
     ...(partial.reasoningDetails ? { reasoningDetails: partial.reasoningDetails } : {}),
+    ...(partial.attachmentRefs ? { attachmentRefs: partial.attachmentRefs } : {}),
+  }
+}
+
+function storedAttachment(
+  partial: Partial<Attachment> & Pick<Attachment, 'id' | 'kind' | 'mime' | 'filename'>,
+): Attachment {
+  return {
+    origin: 'system-fixture',
+    createdAt: 1,
+    updatedAt: 1,
+    storage: { kind: 'local-blob', blobId: `${partial.id}:blob` },
+    artifacts: [],
+    processing: [],
+    refCount: 1,
+    ...partial,
+  }
+}
+
+function attachmentRef(attachmentId: string, createdAt = 1): MessageAttachmentRef {
+  return {
+    refId: `ref-${attachmentId}`,
+    attachmentId,
+    includeInContext: true,
+    presentation: {},
+    createdAt,
+    updatedAt: createdAt,
   }
 }
 
@@ -137,7 +176,8 @@ describe('estimatePromptSize — fallback branch', () => {
   })
 
   it('accumulates media tokens per image using fallback when dimensions unknown', () => {
-    // Without an attachment resolver, images fall back to ~1024 * 1.05 = 1076.
+    // Without an attachment resolver, images fall back through the LibreChat
+    // 1024-token base, then the OpenRouter default image cap applies.
     const path = [
       makeMessage({
         role: 'user',
@@ -154,8 +194,8 @@ describe('estimatePromptSize — fallback branch', () => {
       draftText: '',
       tokenizer: DEFAULT_TOKENIZER,
     })
-    // 2 images × (1024 × 1.05 → ceil = 1076) = 2152
-    expect(est.mediaTokens).toBe(1076 * 2)
+    // 2 images × 1000 default image cap = 2000.
+    expect(est.mediaTokens).toBe(1000 * 2)
   })
 
   it('uses OpenAI dims-based formula when attachment dims are known', () => {
@@ -172,23 +212,80 @@ describe('estimatePromptSize — fallback branch', () => {
       draftText: '',
       tokenizer: DEFAULT_TOKENIZER,
       attachmentResolver: (id) => {
-        if (id === 'att-1')
-          return {
+        if (id === 'att-1') {
+          return storedAttachment({
             id: 'att-1',
             contentHash: '',
             kind: 'image',
             mime: 'image/png',
             filename: 'x.png',
             sizeBytes: 0,
-            createdAt: 1,
-            blob: new Blob(),
             dimensions: { width: 512, height: 512 },
-            refCount: 1,
-          }
+          })
+        }
         return undefined
       },
     })
     expect(est.mediaTokens).toBe(627)
+  })
+
+  it('uses normalized stored dimensions and default cap for large attachment refs', () => {
+    const path = [
+      makeMessage({
+        role: 'user',
+        text: 'look',
+        attachmentRefs: [attachmentRef('att-large')],
+      }),
+    ]
+    const est = estimatePromptSize({
+      systemPrompt: '',
+      activePathMessages: path,
+      draftText: '',
+      tokenizer: DEFAULT_TOKENIZER,
+      attachmentResolver: (id) =>
+        id === 'att-large'
+          ? storedAttachment({
+              id: 'att-large',
+              contentHash: '',
+              kind: 'image',
+              mime: 'image/jpeg',
+              filename: 'large.jpg',
+              sizeBytes: 3_500_000,
+              dimensions: { width: 3500, height: 3500 },
+            })
+          : undefined,
+    })
+    expect(est.mediaTokens).toBe(1000)
+  })
+
+  it('threads currentModelId into large-image estimates for Kimi/Moonshot', () => {
+    const path = [
+      makeMessage({
+        role: 'user',
+        text: 'look',
+        attachmentRefs: [attachmentRef('att-large')],
+      }),
+    ]
+    const est = estimatePromptSize({
+      systemPrompt: '',
+      activePathMessages: path,
+      draftText: '',
+      tokenizer: 'unknown',
+      currentModelId: 'moonshotai/kimi-k2.6',
+      attachmentResolver: (id) =>
+        id === 'att-large'
+          ? storedAttachment({
+              id: 'att-large',
+              contentHash: '',
+              kind: 'image',
+              mime: 'image/jpeg',
+              filename: 'large.jpg',
+              sizeBytes: 3_500_000,
+              dimensions: { width: 3500, height: 3500 },
+            })
+          : undefined,
+    })
+    expect(est.mediaTokens).toBe(4000)
   })
 
   it('uses Claude dims-based formula when family = claude', () => {
@@ -205,19 +302,17 @@ describe('estimatePromptSize — fallback branch', () => {
       draftText: '',
       tokenizer: 'claude',
       attachmentResolver: (id) => {
-        if (id === 'att-1')
-          return {
+        if (id === 'att-1') {
+          return storedAttachment({
             id: 'att-1',
             contentHash: '',
             kind: 'image',
             mime: 'image/png',
             filename: 'x.png',
             sizeBytes: 0,
-            createdAt: 1,
-            blob: new Blob(),
             dimensions: { width: 512, height: 512 },
-            refCount: 1,
-          }
+          })
+        }
         return undefined
       },
     })
@@ -225,8 +320,8 @@ describe('estimatePromptSize — fallback branch', () => {
     expect(est.mediaTokens).toBe(368)
   })
 
-  it('PDF attachment: pages × per-family rate (GPT = 1500)', () => {
-    // 3 pages × 1500 × 1.05 = 4725
+  it('PDF attachment: OpenRouter file-parser tier uses 500/page', () => {
+    // 3 pages × 500 × 1.05 = 1575
     const path = [
       makeMessage({
         role: 'user',
@@ -241,26 +336,57 @@ describe('estimatePromptSize — fallback branch', () => {
       draftText: '',
       tokenizer: DEFAULT_TOKENIZER,
       attachmentResolver: (id) => {
-        if (id === 'pdf-1')
-          return {
+        if (id === 'pdf-1') {
+          return storedAttachment({
             id: 'pdf-1',
             contentHash: '',
             kind: 'pdf',
             mime: 'application/pdf',
             filename: 'doc.pdf',
             sizeBytes: 200_000,
-            createdAt: 1,
-            blob: new Blob(),
             pageCount: 3,
-            refCount: 1,
-          }
+          })
+        }
+        return undefined
+      },
+    })
+    expect(est.mediaTokens).toBe(1575)
+  })
+
+  it('PDF attachment: per-ref native tier uses native page cost', () => {
+    const nativeRef = attachmentRef('pdf-1')
+    nativeRef.presentation.pdfTier = 'native'
+    const path = [
+      makeMessage({
+        role: 'user',
+        text: 'read this',
+        attachmentRefs: [nativeRef],
+      }),
+    ]
+    const est = estimatePromptSize({
+      systemPrompt: '',
+      activePathMessages: path,
+      draftText: '',
+      tokenizer: DEFAULT_TOKENIZER,
+      attachmentResolver: (id) => {
+        if (id === 'pdf-1') {
+          return storedAttachment({
+            id: 'pdf-1',
+            contentHash: '',
+            kind: 'pdf',
+            mime: 'application/pdf',
+            filename: 'doc.pdf',
+            sizeBytes: 200_000,
+            pageCount: 3,
+          })
+        }
         return undefined
       },
     })
     expect(est.mediaTokens).toBe(4725)
   })
 
-  it('PDF ContentItem without resolver uses pdf fallback (1 page × 1500 × 1.05)', () => {
+  it('PDF ContentItem without resolver uses OpenRouter file-parser fallback', () => {
     const path = [
       makeMessage({
         role: 'user',
@@ -275,8 +401,8 @@ describe('estimatePromptSize — fallback branch', () => {
       draftText: '',
       tokenizer: DEFAULT_TOKENIZER,
     })
-    // 1 × 1500 × 1.05 = 1575
-    expect(est.mediaTokens).toBe(1575)
+    // 1 × 500 × 1.05 = 525
+    expect(est.mediaTokens).toBe(525)
   })
 
   it('non-PDF file falls back to GENERIC_FILE_TOKEN_FALLBACK (1000)', () => {
@@ -293,6 +419,46 @@ describe('estimatePromptSize — fallback branch', () => {
       tokenizer: DEFAULT_TOKENIZER,
     })
     expect(est.mediaTokens).toBe(1000)
+  })
+
+  it('applies chat-level Files Off to attachment refs', () => {
+    const path = [
+      makeMessage({
+        role: 'user',
+        text: 'look',
+        attachmentRefs: [attachmentRef('att-1')],
+      }),
+    ]
+    const attachmentResolver = (id: string) =>
+      id === 'att-1'
+        ? storedAttachment({
+            id: 'att-1',
+            contentHash: '',
+            kind: 'image',
+            mime: 'image/png',
+            filename: 'cat.png',
+            sizeBytes: 0,
+            dimensions: { width: 512, height: 512 },
+          })
+        : undefined
+    const on = estimatePromptSize({
+      systemPrompt: '',
+      activePathMessages: path,
+      draftText: '',
+      tokenizer: DEFAULT_TOKENIZER,
+      attachmentResolver,
+    })
+    const off = estimatePromptSize({
+      systemPrompt: '',
+      activePathMessages: path,
+      draftText: '',
+      tokenizer: DEFAULT_TOKENIZER,
+      mediaContextStrategy: 'drop-all',
+      attachmentResolver,
+    })
+    expect(on.mediaTokens).toBe(627)
+    expect(off.mediaTokens).toBe(0)
+    expect(on.total - off.total).toBe(627)
   })
 })
 
@@ -337,6 +503,168 @@ describe('estimatePromptSize — calibrated branch', () => {
     })
     // baseline + turn-1 echoed content + turn-2 user text
     expect(est.historyTokens).toBeGreaterThan(baselineTokens)
+  })
+
+  it('does not count pre-baseline attachment media once in chat and again in media', () => {
+    const baselineTokens = 1000
+    const path = [
+      makeMessage({
+        role: 'user',
+        text: 'look',
+        attachmentRefs: [attachmentRef('att-1')],
+      }),
+      makeMessage({
+        role: 'assistant',
+        text: 'response body',
+        generation: withUsage(baselineTokens),
+      }),
+    ]
+    const est = estimatePromptSize({
+      systemPrompt: '',
+      activePathMessages: path,
+      draftText: '',
+      tokenizer: DEFAULT_TOKENIZER,
+      attachmentResolver: (id) =>
+        id === 'att-1'
+          ? storedAttachment({
+              id: 'att-1',
+              contentHash: '',
+              kind: 'image',
+              mime: 'image/png',
+              filename: 'cat.png',
+              sizeBytes: 0,
+              dimensions: { width: 512, height: 512 },
+            })
+          : undefined,
+    })
+    expect(est.mediaTokens).toBe(627)
+    expect(est.historyTokens).toBeLessThan(baselineTokens)
+    expect(est.total).toBe(est.historyTokens + est.mediaTokens)
+  })
+
+  it('lets Files Off lower totals when an assistant baseline exists', () => {
+    const baselineTokens = 1000
+    const path = [
+      makeMessage({
+        role: 'user',
+        text: 'look',
+        attachmentRefs: [attachmentRef('att-1')],
+      }),
+      makeMessage({
+        role: 'assistant',
+        text: 'response body',
+        generation: withUsage(baselineTokens),
+      }),
+    ]
+    const attachmentResolver = (id: string) =>
+      id === 'att-1'
+        ? storedAttachment({
+            id: 'att-1',
+            contentHash: '',
+            kind: 'image',
+            mime: 'image/png',
+            filename: 'cat.png',
+            sizeBytes: 0,
+            dimensions: { width: 512, height: 512 },
+          })
+        : undefined
+    const on = estimatePromptSize({
+      systemPrompt: '',
+      activePathMessages: path,
+      draftText: '',
+      tokenizer: DEFAULT_TOKENIZER,
+      attachmentResolver,
+    })
+    const off = estimatePromptSize({
+      systemPrompt: '',
+      activePathMessages: path,
+      draftText: '',
+      tokenizer: DEFAULT_TOKENIZER,
+      mediaContextStrategy: 'drop-all',
+      attachmentResolver,
+    })
+    expect(on.mediaTokens).toBe(627)
+    expect(off.mediaTokens).toBe(0)
+    expect(on.total - off.total).toBe(627)
+  })
+
+  it('does not compensate hidden pre-baseline prompt media into chat tokens', () => {
+    const path = [
+      makeMessage({
+        role: 'user',
+        text: 'look',
+        attachmentRefs: [attachmentRef('att-1')],
+        hiddenFromContext: true,
+      }),
+      makeMessage({
+        role: 'assistant',
+        text: 'response body',
+        generation: withUsage(1000),
+      }),
+    ]
+    const est = estimatePromptSize({
+      systemPrompt: '',
+      activePathMessages: path,
+      draftText: '',
+      tokenizer: DEFAULT_TOKENIZER,
+      attachmentResolver: (id) =>
+        id === 'att-1'
+          ? storedAttachment({
+              id: 'att-1',
+              contentHash: '',
+              kind: 'image',
+              mime: 'image/png',
+              filename: 'cat.png',
+              sizeBytes: 0,
+              dimensions: { width: 512, height: 512 },
+            })
+          : undefined,
+    })
+    expect(est.mediaTokens).toBe(0)
+    expect(est.historyTokens).toBeLessThan(20)
+    expect(est.total).toBeLessThan(20)
+  })
+
+  it('settings estimate builder disables stale usage baseline when visibility hides media', () => {
+    const settings = cloneDefaultChatSettings()
+    settings.model = 'openai/gpt-4o'
+    const path = [
+      makeMessage({
+        role: 'user',
+        text: 'look',
+        attachmentRefs: [attachmentRef('att-1')],
+        hiddenFromContext: true,
+      }),
+      makeMessage({
+        role: 'assistant',
+        text: 'response body',
+        generation: withUsage(1000),
+      }),
+    ]
+    const input = buildSettingsPromptSizeEstimateInput(
+      settings,
+      path,
+      '',
+      null,
+      null,
+      (id) =>
+        id === 'att-1'
+          ? storedAttachment({
+              id: 'att-1',
+              contentHash: '',
+              kind: 'image',
+              mime: 'image/png',
+              filename: 'cat.png',
+              sizeBytes: 0,
+              dimensions: { width: 512, height: 512 },
+            })
+          : undefined,
+    )
+    const est = estimatePromptSize(input)
+    expect(input.disablePromptUsageBaseline).toBe(true)
+    expect(est.mediaTokens).toBe(0)
+    expect(est.historyTokens).toBeLessThan(20)
+    expect(est.total).toBeLessThan(20)
   })
 
   it('clamps promptTokens - systemTokens to 0 when system grew post-send', () => {
@@ -524,6 +852,56 @@ describe('estimatePromptSize — per-message cache (Phase B)', () => {
       currentModelId: 'openai/gpt-4o',
     })
     expect(est.historyTokens).toBe(999)
+  })
+
+  it('can disable per-character calibration/cache for attachment-bearing requests', () => {
+    const msg = {
+      ...makeMessage({
+        role: 'user',
+        text: 'a'.repeat(35),
+        attachmentRefs: [attachmentRef('att-1')],
+      }),
+      originalModelId: 'openai/gpt-4o',
+      originalTokenEstimate: 10,
+      originalCharCount: 35,
+      cachedTokenEstimate: 999,
+    }
+    const settings = cloneDefaultChatSettings()
+    settings.model = 'openai/gpt-4o'
+    const input = buildSettingsPromptSizeEstimateInput(
+      settings,
+      [msg],
+      '',
+      null,
+      null,
+      (id) =>
+        id === 'att-1'
+          ? storedAttachment({
+              id: 'att-1',
+              contentHash: '',
+              kind: 'image',
+              mime: 'image/png',
+              filename: 'cat.png',
+              sizeBytes: 0,
+              dimensions: { width: 512, height: 512 },
+            })
+          : undefined,
+      {
+        chatTokenCalibration: {
+          [tokenCalibrationKey('openai/gpt-4o')]: {
+            totalTextChars: 1,
+            totalTextTokens: 1,
+            sampleCount: 1,
+            updatedAt: 1,
+          },
+        },
+        mode: 'adaptive',
+      },
+    )
+    const est = estimatePromptSize(input)
+    expect(input.disableTextCalibration).toBe(true)
+    expect(est.historyTokens).toBeLessThan(999)
+    expect(est.mediaTokens).toBe(627)
   })
 
   it('uses originalTokenEstimate + edit delta when same-model calibration is provided', () => {

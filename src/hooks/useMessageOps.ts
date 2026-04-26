@@ -25,6 +25,7 @@ import type {
   ChatId,
   ConnectionProfile,
   ContentItem,
+  AttachmentRef,
   Message,
   MessageId,
   ReasoningDetail,
@@ -57,12 +58,14 @@ export async function editInPlace(
   message: Message,
   newText: string,
   reasoning?: ReasoningDetail[],
+  attachmentRefs?: AttachmentRef[],
 ): Promise<void> {
   const nextContent = writeTextInto(message.content, newText)
   await editMessageContent({
     chatId,
     messageId: message.id,
     content: nextContent,
+    ...(attachmentRefs ? { attachmentRefs } : {}),
   })
   // Reasoning edits bypass `editMessageContent` (that helper only
   // touches content). A separate scoped mutation updates
@@ -120,7 +123,7 @@ export async function editAndResend(
   ctx: MessageOpsContext,
   originalUser: Message,
   newText: string,
-  options: { prefillContent?: ContentItem[] } = {},
+  options: { prefillContent?: ContentItem[]; attachmentRefs?: AttachmentRef[] } = {},
 ): Promise<SendTextResult> {
   const conn = await resolveActiveConnection(ctx.chatId)
   if (!conn.ok) {
@@ -133,6 +136,7 @@ export async function editAndResend(
     content: nextContent,
     role: originalUser.role,
     origin: 'user',
+    ...(options.attachmentRefs ? { attachmentRefs: options.attachmentRefs } : {}),
   })
   const existingCursor = useChatStore.getState().getCursor(ctx.chatId) ?? {}
   useChatStore.getState().setCursor(ctx.chatId, {

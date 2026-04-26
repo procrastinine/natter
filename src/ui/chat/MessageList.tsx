@@ -11,6 +11,7 @@ import type {
   CursorMap,
   ModelEndpoint,
   MessageId,
+  MessageAttachmentRef,
   MessageRole,
   Message as MessageRow,
   ReasoningDetail,
@@ -97,8 +98,9 @@ export const MessageList = memo(function MessageList({
   const branchTreeKey = useMemo(
     () =>
       messages
-        .map((message) =>
-          `${message.id}:${message.parentId ?? 'root'}:${message.siblingIndex}:${message.deleted ? 1 : 0}`,
+        .map(
+          (message) =>
+            `${message.id}:${message.parentId ?? 'root'}:${message.siblingIndex}:${message.deleted ? 1 : 0}`,
         )
         .join('|'),
     [messages],
@@ -136,8 +138,13 @@ export const MessageList = memo(function MessageList({
   }, [])
 
   const handleEditInPlace = useCallback(
-    async (m: MessageRow, text: string, reasoning?: ReasoningDetail[]) => {
-      await editInPlace(chatId, m, text, reasoning)
+    async (
+      m: MessageRow,
+      text: string,
+      reasoning?: ReasoningDetail[],
+      attachmentRefs?: MessageAttachmentRef[],
+    ) => {
+      await editInPlace(chatId, m, text, reasoning, attachmentRefs)
       if (m.role === 'user') {
         setStaleHintFor((prev) => {
           if (prev.has(m.id)) return prev
@@ -151,20 +158,23 @@ export const MessageList = memo(function MessageList({
   )
 
   const handleEditAndSend = useCallback(
-    async (m: MessageRow, text: string, opts?: { prefillText?: string }) => {
-      if (localGenerationBusyRef.current || useStreamStore.getState().hasStreamForChat(chatId)) return
+    async (
+      m: MessageRow,
+      text: string,
+      opts?: { prefillText?: string; attachmentRefs?: MessageAttachmentRef[] },
+    ) => {
+      if (localGenerationBusyRef.current || useStreamStore.getState().hasStreamForChat(chatId))
+        return
       localGenerationBusyRef.current = true
       setLocalGenerationBusy(true)
       try {
         const prefillText = opts?.prefillText ?? ''
-        await editAndResend(
-          opsCtx,
-          m,
-          text,
-          prefillText.length > 0
+        await editAndResend(opsCtx, m, text, {
+          ...(prefillText.length > 0
             ? { prefillContent: [{ type: 'text', text: prefillText }] }
-            : {},
-        )
+            : {}),
+          ...(opts?.attachmentRefs ? { attachmentRefs: opts.attachmentRefs } : {}),
+        })
       } catch (err) {
         pushToast({
           level: 'danger',
@@ -180,7 +190,8 @@ export const MessageList = memo(function MessageList({
 
   const handleRegenerate = useCallback(
     async (m: MessageRow) => {
-      if (localGenerationBusyRef.current || useStreamStore.getState().hasStreamForChat(chatId)) return
+      if (localGenerationBusyRef.current || useStreamStore.getState().hasStreamForChat(chatId))
+        return
       localGenerationBusyRef.current = true
       setLocalGenerationBusy(true)
       try {
@@ -200,7 +211,8 @@ export const MessageList = memo(function MessageList({
 
   const handleContinue = useCallback(
     async (m: MessageRow) => {
-      if (localGenerationBusyRef.current || useStreamStore.getState().hasStreamForChat(chatId)) return
+      if (localGenerationBusyRef.current || useStreamStore.getState().hasStreamForChat(chatId))
+        return
       localGenerationBusyRef.current = true
       setLocalGenerationBusy(true)
       try {
@@ -337,7 +349,7 @@ export const MessageList = memo(function MessageList({
             key={m.id}
             chatId={chatId}
             message={m}
-            {...(((liveSiblingsByParent.get(m.parentId)?.length ?? 0) > 1)
+            {...((liveSiblingsByParent.get(m.parentId)?.length ?? 0) > 1
               ? { branchMessages: messages, branchTreeKey }
               : {})}
             hasAnyReasoningDetails={hasAnyReasoningDetails}

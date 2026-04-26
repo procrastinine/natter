@@ -46,6 +46,11 @@ export interface ScrollRegionHandle {
 
 const DEFAULT_THRESHOLD_PX = 48
 
+function scrollStateFromPosition(container: HTMLDivElement, threshold: number): ScrollState {
+  const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight
+  return distanceFromBottom <= threshold ? 'follow' : 'pinned'
+}
+
 // A scroll container with two independent auto-scroll behaviors:
 //
 //   - autoScrollOnOpen: on mount (or resetKey change), instantly position
@@ -59,9 +64,9 @@ const DEFAULT_THRESHOLD_PX = 48
 //     stream setting never fires on open, and the open setting doesn't
 //     influence stream-time behavior.
 //
-// We don't listen to `scroll`; we use a sentinel at the bottom of the
-// content tree plus IntersectionObserver so the work stays paint-budget
-// cheap during streams. The sentinel's visibility drives `state`.
+// A bottom sentinel plus IntersectionObserver tracks content-growth changes,
+// while a throttled scroll listener keeps Firefox and wheel-driven scrolls
+// honest when the container position changes before the observer reports.
 export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(function ScrollRegion(
   {
     children,
@@ -120,10 +125,8 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
     if (!container || !sentinel) return
     const threshold = pinThresholdPx ?? DEFAULT_THRESHOLD_PX
     const observer = new IntersectionObserver(
-      (entries) => {
-        const entry = entries[0]
-        if (!entry) return
-        setState(entry.isIntersecting ? 'follow' : 'pinned')
+      () => {
+        setState(scrollStateFromPosition(container, threshold))
       },
       {
         root: container,
@@ -133,6 +136,26 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
     )
     observer.observe(sentinel)
     return () => observer.disconnect()
+  }, [pinThresholdPx])
+
+  useEffect(() => {
+    const container = containerRef.current
+    if (!container) return
+    const threshold = pinThresholdPx ?? DEFAULT_THRESHOLD_PX
+    let frame: number | null = null
+    const updateFromScrollPosition = () => {
+      frame = null
+      setState(scrollStateFromPosition(container, threshold))
+    }
+    const onScroll = () => {
+      if (frame !== null) return
+      frame = requestAnimationFrame(updateFromScrollPosition)
+    }
+    container.addEventListener('scroll', onScroll, { passive: true })
+    return () => {
+      container.removeEventListener('scroll', onScroll)
+      if (frame !== null) cancelAnimationFrame(frame)
+    }
   }, [pinThresholdPx])
 
   // Stream-time follow. Fires ONLY while a stream is active AND the

@@ -22,13 +22,15 @@ import { useLiveQuery } from 'dexie-react-hooks'
 import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
 import { probeLlamaServer, type LlamaServerProps } from '../../api/probe'
 import { activePath } from '../../core/active-path'
+import { DEFAULT_GLOBAL_PREFERENCES, readGlobalPreferences } from '../../core/global-settings'
 import { isTextCompletionsSelectableFor } from '../../core/quirks'
+import { readTokenCalibrationGlobal } from '../../core/token-calibration'
 import type { Chat, ChatId, ChatPreset, ConnectionKind, ConnectionProfile } from '../../core/types'
 import type { EffectiveCapability } from '../../core/capabilities'
 import {
+  buildSettingsPromptSizeEstimateInput,
   type PromptSizeEstimateInput,
   type PromptSizeEstimate,
-  tokenizerFromSettings,
   UNLIMITED_CONTEXT,
 } from '../../core/prompt-size'
 import { usePrivacyRouting } from '../../hooks/usePrivacyRouting'
@@ -51,6 +53,7 @@ import { getProfile } from '../../store/profiles'
 import { useChatStore } from '../../store/zustand/chatStore'
 import { useStreamStore } from '../../store/zustand/streamStore'
 import { useToastStore } from '../../store/zustand/toastStore'
+import { useAttachmentResolverForContext } from '../attachments/useAttachmentResolver'
 import { CloseIcon } from '../icons/Icon'
 import { CachingPanel } from './CachingPanel'
 import { ContextPanel } from './ContextPanel'
@@ -135,10 +138,12 @@ export function ChatModelPanel({ chatId, chatSnapshot = null, onClose }: ChatMod
     [],
   )
   const draft = useLiveQuery(
-    () => (chat ? getChatDraft(chat.id).then((row) => row?.text ?? '') : Promise.resolve('')),
+    () => (chat ? getChatDraft(chat.id) : Promise.resolve(undefined)),
     [chat?.id],
-    '',
+    undefined,
   )
+  const prefs = useLiveQuery(readGlobalPreferences, [], DEFAULT_GLOBAL_PREFERENCES)
+  const globalCalibration = useLiveQuery(readTokenCalibrationGlobal, [], null)
   const cursor = useChatStore((s) => (chat ? (s.cursors[chat.id] ?? EMPTY_CURSOR) : EMPTY_CURSOR))
   const streamActivityKey = useStreamStore((s) =>
     chat
@@ -150,22 +155,38 @@ export function ChatModelPanel({ chatId, chatSnapshot = null, onClose }: ChatMod
       : '',
   )
   const activePathMessages = useMemo(() => activePath(messages, cursor), [messages, cursor])
+  const attachmentResolver = useAttachmentResolverForContext({
+    settings: chat?.settings,
+    messages: activePathMessages,
+    draftAttachmentRefs: draft?.attachmentRefs,
+    enabled: Boolean(chat),
+  })
   const promptEstimateInput = useMemo<PromptSizeEstimateInput | null>(() => {
     if (!chat) return null
-    const quirks = capability?.quirks
-    const input: PromptSizeEstimateInput = {
-      systemPrompt: chat.settings.systemPrompt,
+    return buildSettingsPromptSizeEstimateInput(
+      chat.settings,
       activePathMessages,
-      draftText: draft ?? '',
-      tokenizer: tokenizerFromSettings(chat.settings, endpointTokenizer),
-      reasoningInclude: chat.settings.reasoning.include,
-      reasoningExcluded: chat.settings.reasoning.exclude === true,
-    }
-    if (quirks?.reasoningPreservationFormat !== undefined) {
-      input.reasoningPreservationFormat = quirks.reasoningPreservationFormat
-    }
-    return input
-  }, [chat, activePathMessages, draft, endpointTokenizer, capability?.quirks])
+      draft?.text ?? '',
+      endpointTokenizer,
+      capability?.maxPromptTokens ?? capability?.contextLength ?? null,
+      attachmentResolver,
+      {
+        chatTokenCalibration: chat.tokenCalibration,
+        globalCalibration,
+        mode: prefs.tokenCalibrationMode,
+      },
+      draft?.attachmentRefs,
+    )
+  }, [
+    chat,
+    activePathMessages,
+    draft,
+    endpointTokenizer,
+    capability,
+    attachmentResolver,
+    globalCalibration,
+    prefs,
+  ])
   const deferredPromptEstimateInput = useDeferredValue(promptEstimateInput)
   const promptEstimate = useStreamStablePromptEstimate(
     chat?.id,
@@ -396,7 +417,7 @@ function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | u
 
   const saveAsNew = useCallback(async () => {
     const name = window.prompt('Name for new preset:')
-    if (!name || !name.trim()) return
+    if (!name?.trim()) return
     const p = await createPreset({
       name: name.trim(),
       connectionProfileId: chat.settings.profileId,
@@ -409,7 +430,7 @@ function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | u
 
   const renamePreset = useCallback(async (targetId: string, currentName: string) => {
     const name = window.prompt('Rename preset:', currentName)
-    if (!name || !name.trim() || name === currentName) return
+    if (!name?.trim() || name === currentName) return
     await updatePreset(targetId, { name: name.trim() })
   }, [])
 

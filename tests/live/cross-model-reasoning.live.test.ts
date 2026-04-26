@@ -23,7 +23,9 @@ const LIVE = process.env.LIVE === '1'
 
 function loadKey(name: 'openrouter' | 'openai' | 'google' | 'anthropic'): string {
   const raw = readFileSync(resolve(__dirname, '../../../keys.json'), 'utf8')
-  return (JSON.parse(raw) as Record<string, string>)[name]!
+  const key = (JSON.parse(raw) as Record<string, string>)[name]
+  if (!key) throw new Error(`keys.json missing ${name}`)
+  return key
 }
 
 function openAiProfile(): ConnectionProfile {
@@ -109,6 +111,7 @@ describe.skipIf(!LIVE)('live cross-model — OpenAI Responses (cross-variant, cr
     const reasoning1 = turn1.output?.find((i) => i.type === 'reasoning')
     const message1 = turn1.output?.find((i) => i.type === 'message')
     if (!reasoning1) return // model skipped reasoning — not interesting for this test
+    if (!message1) throw new Error('missing first-turn message item')
     expect(typeof reasoning1.encrypted_content).toBe('string')
 
     // Turn 2: gpt-5.4-mini receives the echoed reasoning item.
@@ -119,7 +122,7 @@ describe.skipIf(!LIVE)('live cross-model — OpenAI Responses (cross-variant, cr
         content: [{ type: 'input_text', text: 'Pick any integer. Give JUST the digit.' }],
       },
       reasoning1,
-      message1!,
+      message1,
       {
         type: 'message',
         role: 'user',
@@ -155,6 +158,7 @@ describe.skipIf(!LIVE)('live cross-model — OpenAI Responses (cross-variant, cr
     const reasoning1 = turn1.output?.find((i) => i.type === 'reasoning')
     const message1 = turn1.output?.find((i) => i.type === 'message')
     if (!reasoning1) return
+    if (!message1) throw new Error('missing first-turn message item')
 
     const turn2 = await responsesOnce(ctx, {
       model: 'o4-mini',
@@ -165,7 +169,7 @@ describe.skipIf(!LIVE)('live cross-model — OpenAI Responses (cross-variant, cr
           content: [{ type: 'input_text', text: 'Pick any color. One word.' }],
         },
         reasoning1,
-        message1!,
+        message1,
         {
           type: 'message',
           role: 'user',

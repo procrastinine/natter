@@ -23,10 +23,7 @@
 // callbacks; components call `sendText({chat, connection, ...})`.
 
 import { useCallback, useRef } from 'react'
-import {
-  openAssistantRequestStream,
-  type AssistantStreamChunk,
-} from '../api/assistant-stream'
+import { openAssistantRequestStream, type AssistantStreamChunk } from '../api/assistant-stream'
 import { ApiError } from '../api/errors'
 import {
   type StreamLaneEvent,
@@ -63,6 +60,7 @@ import type { ChatCompletionsTransformOptions } from '../core/transforms'
 import { nextSiblingIndex } from '../core/tree-ops'
 import type {
   AbortReason,
+  AttachmentRef,
   CapabilityDescriptor,
   ChatId,
   ChatUsage,
@@ -99,6 +97,7 @@ function pendingUserMessage(input: {
   parentId: MessageId | null
   siblingIndex: number
   content: ContentItem[]
+  attachmentRefs?: AttachmentRef[]
   createdAt: number
   messageId: MessageId
   turnId: string
@@ -114,6 +113,9 @@ function pendingUserMessage(input: {
     role: 'user',
     origin: 'user',
     content: input.content,
+    ...(input.attachmentRefs && input.attachmentRefs.length > 0
+      ? { attachmentRefs: structuredClone(input.attachmentRefs) }
+      : {}),
     nodeVersion: 0,
     deleted: false,
   }
@@ -234,6 +236,7 @@ export interface SendTextInput {
   connection: ConnectionProfile
   apiKey: string
   content: ContentItem[]
+  attachmentRefs?: AttachmentRef[]
   capabilities?: CapabilityDescriptor
   transform?: Partial<ChatCompletionsTransformOptions>
   // Injection seam for integration tests that want to mock the stream
@@ -318,6 +321,7 @@ export async function sendText(input: SendTextInput): Promise<SendTextResult> {
       parentId,
       siblingIndex: nextSiblingIndex(groupByParent(allMessages), parentId),
       content: input.content,
+      ...(input.attachmentRefs ? { attachmentRefs: input.attachmentRefs } : {}),
       createdAt,
       messageId: userMessageId,
       turnId: userTurnId,
@@ -361,6 +365,7 @@ export async function sendText(input: SendTextInput): Promise<SendTextResult> {
       chatId: input.chatId,
       cursor,
       content: input.content,
+      ...(input.attachmentRefs ? { attachmentRefs: input.attachmentRefs } : {}),
       now: createdAt,
       messageId: userMessageId,
       turnId: userTurnId,
@@ -491,6 +496,7 @@ async function openAssistantStreamUnder(
     outboundPath,
     outboundTokenizer,
     outboundReasoningOpts,
+    hasAttachmentContext,
   } = requestPlan
   const placeholderApiUsed: 'chat' | 'completion' = useTextProtocol ? 'completion' : 'chat'
   const initialAssistantContent = input.initialAssistantContent ?? []
@@ -669,13 +675,17 @@ async function openAssistantStreamUnder(
       ...(abortReason ? { abortReason } : {}),
       ...(streamError ? { error: streamError } : {}),
       now: now(),
-      calibrationInputs: {
-        outboundPath,
-        systemPrompt: requestSettings.systemPrompt,
-        modelId: requestSettings.model,
-        family: outboundTokenizer,
-        ...(outboundReasoningOpts ? { reasoningOpts: outboundReasoningOpts } : {}),
-      },
+      ...(hasAttachmentContext
+        ? {}
+        : {
+            calibrationInputs: {
+              outboundPath,
+              systemPrompt: requestSettings.systemPrompt,
+              modelId: requestSettings.model,
+              family: outboundTokenizer,
+              ...(outboundReasoningOpts ? { reasoningOpts: outboundReasoningOpts } : {}),
+            },
+          }),
     })
     useStreamStore.getState().clearActive(streamId)
     postEvent({
@@ -831,10 +841,7 @@ async function flushPartial(ctx: FlushContext): Promise<void> {
     const reasoning = collectReasoning(accumulator)
     const next: Message = {
       ...current,
-      content: assistantContentWithStreamPrefix(
-        accumulator.initialContent,
-        accumulator.textBuffer,
-      ),
+      content: assistantContentWithStreamPrefix(accumulator.initialContent, accumulator.textBuffer),
     }
     if (reasoning.length > 0) next.reasoningDetails = reasoning
     next.generation = updatedGeneration(current.generation, accumulator, requestedModel, {
@@ -942,10 +949,7 @@ async function finalize(ctx: FinalizeContext): Promise<void> {
     }
     const next: Message = {
       ...current,
-      content: assistantContentWithStreamPrefix(
-        accumulator.initialContent,
-        accumulator.textBuffer,
-      ),
+      content: assistantContentWithStreamPrefix(accumulator.initialContent, accumulator.textBuffer),
       generation,
       ...(assistantCalibrationFields ?? {}),
     }
@@ -967,12 +971,7 @@ async function finalize(ctx: FinalizeContext): Promise<void> {
   // so we have the final content + reasoningDetails + usage. Skips on
   // anything other than a clean `done`, because error/abort streams don't
   // have reliable usage from the server.
-  if (
-    outcome === 'done' &&
-    calibrationInputs &&
-    persistedAssistant !== null &&
-    accumulator.usage
-  ) {
+  if (outcome === 'done' && calibrationInputs && persistedAssistant !== null && accumulator.usage) {
     try {
       await ingestCalibrationSample({
         repo,

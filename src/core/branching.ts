@@ -57,7 +57,7 @@ export function cloneForExplicitBranch(source: Message, input: BranchExplicitInp
     deleted: false,
   }
   if (source.attachmentRefs !== undefined) {
-    cloned.attachmentRefs = [...source.attachmentRefs]
+    cloned.attachmentRefs = structuredClone(source.attachmentRefs)
   }
   if (source.pinCache !== undefined) {
     cloned.pinCache = source.pinCache

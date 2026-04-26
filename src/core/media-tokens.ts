@@ -1,11 +1,12 @@
 // Per-family media (image / PDF / file) token heuristics. Cribbed from
 // LibreChat's `packages/api/src/agents/client.ts:59-140` and grounded in
-// per-provider docs:
+// per-provider docs / observed OpenRouter billing:
 //
-//   - OpenAI vision: ~`(w*h)/512 + 85` tokens per image (documented in
-//     the vision guide; matches observed usage within a few percent).
-//   - Claude vision: ~`(w*h)/750` tokens per image (documented in the
-//     Claude vision guide).
+//   - Images: OpenRouter/providers do not bill the raw uploaded bitmap
+//     dimensions forever. They normalize the image before vision token
+//     accounting. We estimate against that normalized wire shape, then
+//     apply family formulas (`(w*h)/512 + 85` OpenAI-style, `(w*h)/750`
+//     Claude-style, midpoint for unknown OSS models).
 //   - Gemini vision: per-page non-dimensional billing; `258` is the
 //     conservative single-tile cost and matches what the OpenAI-compat
 //     shim charges. We use it as the fixed per-image estimate.
@@ -13,10 +14,11 @@
 //     (`attachment.pageCount`) or derived from `max(1, bytes / 75000)` —
 //     ~1 base64-encoded page per ~75KB is the LibreChat heuristic.
 //
-// All estimates get a 1.05 safety margin (LibreChat's default). Outputs
-// are clamped to [0, MAX_PLAUSIBLE_TOKENS/10] per-message — a single
-// attachment should never claim more than 10M tokens, even for absurd
-// dimensions.
+// All estimates get a 1.05 safety margin (LibreChat's default). Image
+// estimates are additionally capped at the observed OpenRouter/provider
+// normalized billing shape; other media is clamped to
+// [0, MAX_PLAUSIBLE_TOKENS/10] per-message so a single attachment never
+// claims more than 10M tokens.
 //
 // These are DEFAULTS for when calibration hasn't kicked in yet. Per-chat
 // per-model calibration (Phase B) adjusts the pure-text ratio but NOT
@@ -38,12 +40,23 @@ const MAX_PER_ATTACHMENT_TOKENS = MAX_PLAUSIBLE_TOKENS / 10
 // dimensioned estimate for common sizes (512x512 → ~600 tokens on GPT).
 const IMAGE_FALLBACK_TOKENS = 1024
 
+// OpenRouter/providers normalize large images before billing/vision
+// accounting. Observed billing for a 3500×3500 image is usually around
+// 1k tokens or less, with Kimi/Moonshot as an outlier around 4k. V1 still
+// sends original local bytes and lets the provider resize; these constants
+// model the effective provider-normalized shape so UI gauges, cutoff, and
+// send planning all agree.
+const OPENROUTER_IMAGE_NORMALIZED_MAX_EDGE = 1400
+const OPENROUTER_DEFAULT_IMAGE_TOKEN_CAP = 1000
+const OPENROUTER_KIMI_IMAGE_TOKEN_CAP = 4000
+
 // Fallback when PDF bytes / pageCount are both unknown — treat as one page.
 const PDF_FALLBACK_PAGES = 1
 
 export interface ImageMeta {
   width?: number
   height?: number
+  sizeBytes?: number
 }
 
 export interface PdfMeta {
@@ -62,28 +75,82 @@ export interface PdfMeta {
   extractedText?: string
 }
 
+export interface MediaTokenEstimateOptions {
+  modelId?: string
+}
+
 const IMAGE_PER_FAMILY: Record<TokenizerFamily, (meta: ImageMeta) => number> = {
-  // OpenAI vision: LibreChat `(w*h)/512 + 85`.
-  gpt: ({ width, height }) =>
-    width && height ? Math.ceil((width * height) / 512) + 85 : IMAGE_FALLBACK_TOKENS,
-  // Claude vision: `(w*h)/750`.
-  claude: ({ width, height }) =>
-    width && height ? Math.ceil((width * height) / 750) : IMAGE_FALLBACK_TOKENS,
+  // OpenAI-style vision over the normalized wire shape.
+  gpt: (meta) => {
+    const dims = normalizedImageDimensions(meta)
+    return dims
+      ? Math.ceil((dims.width * dims.height) / 512) + 85
+      : imageFallbackFromBytes(meta.sizeBytes)
+  },
+  // Claude-style vision over the normalized wire shape.
+  claude: (meta) => {
+    const dims = normalizedImageDimensions(meta)
+    return dims
+      ? Math.ceil((dims.width * dims.height) / 750)
+      : imageFallbackFromBytes(meta.sizeBytes)
+  },
   // Gemini bills per-tile at a near-fixed rate; 258 matches the
   // low-detail single-tile cost we were using previously.
   gemini: () => 258,
   // OSS families — use a midpoint formula. Tokenizer-dependent, so
   // call this advisory.
-  llama: ({ width, height }) =>
-    width && height ? Math.ceil((width * height) / 600) : IMAGE_FALLBACK_TOKENS,
-  mistral: ({ width, height }) =>
-    width && height ? Math.ceil((width * height) / 600) : IMAGE_FALLBACK_TOKENS,
-  deepseek: ({ width, height }) =>
-    width && height ? Math.ceil((width * height) / 600) : IMAGE_FALLBACK_TOKENS,
-  qwen: ({ width, height }) =>
-    width && height ? Math.ceil((width * height) / 600) : IMAGE_FALLBACK_TOKENS,
-  unknown: ({ width, height }) =>
-    width && height ? Math.ceil((width * height) / 600) : IMAGE_FALLBACK_TOKENS,
+  llama: (meta) => midpointImageEstimate(meta),
+  mistral: (meta) => midpointImageEstimate(meta),
+  deepseek: (meta) => midpointImageEstimate(meta),
+  qwen: (meta) => midpointImageEstimate(meta),
+  unknown: (meta) => midpointImageEstimate(meta),
+}
+
+function midpointImageEstimate(meta: ImageMeta): number {
+  const dims = normalizedImageDimensions(meta)
+  return dims ? Math.ceil((dims.width * dims.height) / 600) : imageFallbackFromBytes(meta.sizeBytes)
+}
+
+function kimiImageEstimate(meta: ImageMeta): number {
+  const dims = normalizedImageDimensions(meta)
+  return dims
+    ? Math.ceil((dims.width * dims.height) / 512) + 85
+    : imageFallbackFromBytes(meta.sizeBytes)
+}
+
+function normalizedImageDimensions(meta: ImageMeta): { width: number; height: number } | undefined {
+  const width = positiveFiniteDimension(meta.width)
+  const height = positiveFiniteDimension(meta.height)
+  if (width === undefined || height === undefined) return undefined
+  const maxEdge = Math.max(width, height)
+  if (maxEdge <= OPENROUTER_IMAGE_NORMALIZED_MAX_EDGE) return { width, height }
+  const scale = OPENROUTER_IMAGE_NORMALIZED_MAX_EDGE / maxEdge
+  return {
+    width: Math.max(1, Math.round(width * scale)),
+    height: Math.max(1, Math.round(height * scale)),
+  }
+}
+
+function positiveFiniteDimension(value: number | undefined): number | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return undefined
+  return Math.max(1, Math.round(value))
+}
+
+function imageFallbackFromBytes(sizeBytes: number | undefined): number {
+  if (!sizeBytes || sizeBytes <= 0) return IMAGE_FALLBACK_TOKENS
+  return Math.max(IMAGE_FALLBACK_TOKENS, Math.ceil(sizeBytes / 768))
+}
+
+function isKimiModel(modelId: string | undefined): boolean {
+  if (!modelId) return false
+  const normalized = modelId.toLowerCase().replace(/:(free|thinking)$/i, '')
+  return /(^|[/:])kimi([_.:-]|$)/.test(normalized)
+}
+
+function imageTokenCap(options: MediaTokenEstimateOptions | undefined): number {
+  return isKimiModel(options?.modelId)
+    ? OPENROUTER_KIMI_IMAGE_TOKEN_CAP
+    : OPENROUTER_DEFAULT_IMAGE_TOKEN_CAP
 }
 
 // Per-page cost (Tier 1 native passthrough — server renders each page as
@@ -105,9 +172,16 @@ const PDF_PER_PAGE_TIER1: Record<TokenizerFamily, number> = {
 // pass would skip.
 const PDF_PER_PAGE_TIER2 = 500
 
-export function imageTokenEstimate(family: TokenizerFamily, meta: ImageMeta = {}): number {
-  const raw = IMAGE_PER_FAMILY[family](meta) * SAFETY_MARGIN
-  return Math.min(Math.max(0, Math.ceil(raw)), MAX_PER_ATTACHMENT_TOKENS)
+export function imageTokenEstimate(
+  family: TokenizerFamily,
+  meta: ImageMeta = {},
+  options?: MediaTokenEstimateOptions,
+): number {
+  const base = isKimiModel(options?.modelId)
+    ? kimiImageEstimate(meta)
+    : IMAGE_PER_FAMILY[family](meta)
+  const raw = base * SAFETY_MARGIN
+  return Math.min(Math.max(0, Math.ceil(raw)), imageTokenCap(options), MAX_PER_ATTACHMENT_TOKENS)
 }
 
 export function pdfTokenEstimate(family: TokenizerFamily, meta: PdfMeta = {}): number {

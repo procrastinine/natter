@@ -31,7 +31,7 @@ export function migrateLegacyProviderSettings(
   const normalizedPrefs = normalizeProviderPrefs(settings.providerPrefs, endpoints)
   let providerPrefs: ProviderPreferences = normalizedPrefs.prefs ?? {}
   let privacy = applyProviderPrefPrivacyPatch(settings.privacy, normalizedPrefs.privacyPatch)
-  let changed = normalizedPrefs.changed || privacy !== settings.privacy
+  const changed = normalizedPrefs.changed || privacy !== settings.privacy
 
   if (!hasLegacyPrivacyRefs) {
     return changed

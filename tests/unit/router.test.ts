@@ -1,5 +1,13 @@
 import { describe, expect, it } from 'vitest'
-import { chatHref, homeHref, newChatHref, parseRoute, routeToHref } from '../../src/app/router'
+import {
+  attachmentHref,
+  chatHref,
+  homeHref,
+  newChatHref,
+  parseRoute,
+  routeToHref,
+  storageHref,
+} from '../../src/app/router'
 
 describe('parseRoute', () => {
   it('treats empty hash as home', () => {
@@ -32,6 +40,33 @@ describe('parseRoute', () => {
     expect(parseRoute('#/banana')).toMatchObject({ kind: 'unknown' })
     expect(parseRoute('#/chat')).toMatchObject({ kind: 'unknown' })
   })
+
+  it('parses storage management routes', () => {
+    expect(parseRoute('#/storage')).toEqual({
+      kind: 'storage',
+      storage: { section: 'overview' },
+    })
+    expect(parseRoute('#/storage/attachments')).toEqual({
+      kind: 'storage',
+      storage: { section: 'attachments' },
+    })
+    expect(parseRoute('#/storage/attachments/missing')).toEqual({
+      kind: 'storage',
+      storage: { section: 'attachments', filter: 'missing' },
+    })
+    expect(parseRoute('#/storage/attachments/unreferenced')).toEqual({
+      kind: 'storage',
+      storage: { section: 'attachments', filter: 'unreferenced' },
+    })
+    expect(parseRoute('#/storage/attachments/att%2F1')).toEqual({
+      kind: 'storage',
+      storage: { section: 'attachments', attachmentId: 'att/1' },
+    })
+    expect(parseRoute('#/storage/backups')).toEqual({
+      kind: 'storage',
+      storage: { section: 'backups' },
+    })
+  })
 })
 
 describe('routeToHref / convenience helpers', () => {
@@ -51,8 +86,32 @@ describe('routeToHref / convenience helpers', () => {
     )
   })
 
+  it('round-trips storage hrefs', () => {
+    expect(storageHref()).toBe('#/storage')
+    expect(storageHref({ section: 'attachments' })).toBe('#/storage/attachments')
+    expect(storageHref({ section: 'attachments', filter: 'missing' })).toBe(
+      '#/storage/attachments/missing',
+    )
+    expect(storageHref({ section: 'attachments', filter: 'unreferenced' })).toBe(
+      '#/storage/attachments/unreferenced',
+    )
+    expect(storageHref({ section: 'backups' })).toBe('#/storage/backups')
+    expect(attachmentHref('att/1')).toBe('#/storage/attachments/att%2F1')
+  })
+
   it('round-trips parse → render → parse', () => {
-    const cases = ['#/', '#/new', '#/chat/A', '#/chat/A/message/B']
+    const cases = [
+      '#/',
+      '#/new',
+      '#/chat/A',
+      '#/chat/A/message/B',
+      '#/storage',
+      '#/storage/attachments',
+      '#/storage/attachments/missing',
+      '#/storage/attachments/unreferenced',
+      '#/storage/attachments/A',
+      '#/storage/backups',
+    ]
     for (const raw of cases) {
       const route = parseRoute(raw)
       expect(routeToHref(route)).toBe(raw)

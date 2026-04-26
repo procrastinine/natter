@@ -17,14 +17,29 @@ import {
   useRef,
   useState,
 } from 'react'
-import type { ContentItem, ReasoningDetail } from '../../core/types'
-import { PrefillIcon } from '../icons/Icon'
+import type {
+  AttachmentRef,
+  ContentItem,
+  MessageAttachmentRef,
+  ReasoningDetail,
+} from '../../core/types'
+import { AttachmentDraftTray } from '../attachments/AttachmentDraftTray'
+import { AttachmentPicker } from '../attachments/AttachmentPicker'
+import { useAttachmentDrafts } from '../attachments/useAttachmentDrafts'
+import { DatabaseIcon, PaperclipIcon, PrefillIcon } from '../icons/Icon'
 
 export interface InlineEditorProps {
   initial: string
-  onSave: (text: string, reasoning?: ReasoningDetail[]) => void | Promise<void>
+  onSave: (
+    text: string,
+    reasoning?: ReasoningDetail[],
+    attachmentRefs?: MessageAttachmentRef[],
+  ) => void | Promise<void>
   onCancel: () => void
-  onSaveAndSend?: (text: string, opts?: { prefillText?: string }) => void | Promise<void>
+  onSaveAndSend?: (
+    text: string,
+    opts?: { prefillText?: string; attachmentRefs?: MessageAttachmentRef[] },
+  ) => void | Promise<void>
   saveAndSendDisabled?: boolean
   saveAndSendDisabledReason?: string
   ariaLabel?: string
@@ -33,6 +48,7 @@ export interface InlineEditorProps {
   // passed back via onSave's second argument. Keep reference stable
   // across renders to avoid resetting the disclosure state.
   initialReasoning?: ReasoningDetail[]
+  initialAttachmentRefs?: readonly AttachmentRef[] | undefined
   // Prefill toggle for Save & Send. Only applied to user messages
   // (assistants don't have a "send" path). Hidden when the model doesn't
   // support prefill. Empty / whitespace-only prefill text is treated as
@@ -170,6 +186,7 @@ export function InlineEditor({
   saveAndSendDisabledReason,
   ariaLabel,
   initialReasoning,
+  initialAttachmentRefs,
   showPrefillButton,
   defaultPrefill,
   prefillSettingsPrompt,
@@ -180,11 +197,26 @@ export function InlineEditor({
   const [reasoning, setReasoning] = useState<EditableReasoning[]>(() =>
     toEditable(initialReasoning ?? []),
   )
+  const attachments = useAttachmentDrafts(initialAttachmentRefs)
+  const {
+    initialAttachmentRefs: startingAttachmentRefs,
+    attachmentRefs,
+    attachmentRows,
+    uploads,
+    addAttachment,
+    replaceAttachment,
+    toggleAttachment,
+    removeAttachment,
+    ingestFiles,
+    dismissUpload,
+  } = attachments
+  const [pickerOpen, setPickerOpen] = useState(false)
   const [prefillOpen, setPrefillOpen] = useState(false)
   const [prefillText, setPrefillText] = useState(defaultPrefill ?? '')
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
   const actionsRef = useRef<HTMLDivElement | null>(null)
   const prefillTextareaRef = useRef<HTMLTextAreaElement | null>(null)
+  const uploadingAttachments = uploads.some((upload) => upload.state === 'uploading')
 
   useEffect(() => {
     const el = textareaRef.current
@@ -197,7 +229,9 @@ export function InlineEditor({
     el.focus({ preventScroll: true })
     const end = el.value.length
     el.setSelectionRange(end, end)
-    actionsRef.current?.scrollIntoView({ block: 'nearest', behavior: 'auto' })
+    if (typeof actionsRef.current?.scrollIntoView === 'function') {
+      actionsRef.current.scrollIntoView({ block: 'nearest', behavior: 'auto' })
+    }
   }, [])
   // biome-ignore lint/correctness/useExhaustiveDependencies: text changes alter textarea scrollHeight.
   useLayoutEffect(() => {
@@ -205,23 +239,29 @@ export function InlineEditor({
   }, [text])
 
   const run = useCallback(
-    async (action: (text: string, reasoning?: ReasoningDetail[]) => void | Promise<void>) => {
+    async (
+      action: (
+        text: string,
+        reasoning?: ReasoningDetail[],
+        attachmentRefs?: MessageAttachmentRef[],
+      ) => void | Promise<void>,
+    ) => {
       // Empty messages are allowed — both Save (in place) and Save & Send
       // commit whatever the user typed, including an empty string.
       // Messages may legitimately be empty (placeholder turn, deliberate
       // blank). The only place empty is blocked is the composer prompt
       // input, where "send empty" has no well-defined meaning.
       const trimmed = text.trim()
-      if (busy) return
+      if (busy || uploadingAttachments) return
       setBusy(true)
       try {
         const nextReasoning = initialReasoning ? fromEditable(reasoning) : undefined
-        await action(trimmed, nextReasoning)
+        await action(trimmed, nextReasoning, attachmentRefs)
       } finally {
         setBusy(false)
       }
     },
-    [text, busy, initialReasoning, reasoning],
+    [text, busy, uploadingAttachments, initialReasoning, reasoning, attachmentRefs],
   )
   const togglePrefill = useCallback(async () => {
     if (prefillOpen) {
@@ -239,10 +279,11 @@ export function InlineEditor({
   // the user may want to re-send even when the text is unchanged.
   const isUnchanged = useCallback(() => {
     if (text !== initial) return false
+    if (JSON.stringify(startingAttachmentRefs) !== JSON.stringify(attachmentRefs)) return false
     if (!initialReasoning) return true
     const nextReasoning = fromEditable(reasoning)
     return JSON.stringify(initialReasoning) === JSON.stringify(nextReasoning)
-  }, [text, initial, initialReasoning, reasoning])
+  }, [text, initial, initialReasoning, reasoning, startingAttachmentRefs, attachmentRefs])
   const commitSave = useCallback(() => {
     if (isUnchanged()) {
       onCancel()
@@ -253,8 +294,11 @@ export function InlineEditor({
   const commitSaveAndSend = useCallback(() => {
     if (!onSaveAndSend || saveAndSendDisabled) return
     const prefillOut = prefillOpen && prefillText.trim().length > 0 ? prefillText : ''
-    return run((next) =>
-      onSaveAndSend(next, prefillOut.length > 0 ? { prefillText: prefillOut } : undefined),
+    return run((next, _reasoning, attachmentRefs) =>
+      onSaveAndSend(next, {
+        ...(prefillOut.length > 0 ? { prefillText: prefillOut } : {}),
+        ...(attachmentRefs && attachmentRefs.length > 0 ? { attachmentRefs } : {}),
+      }),
     )
   }, [run, onSaveAndSend, saveAndSendDisabled, prefillOpen, prefillText])
 
@@ -360,7 +404,58 @@ export function InlineEditor({
           <AddReasoningEntry busy={busy} onAdd={addReasoningRow} />
         </details>
       ) : null}
+      {attachmentRefs.length > 0 || uploads.length > 0 ? (
+        <AttachmentDraftTray
+          refs={attachmentRefs}
+          attachments={attachmentRows}
+          uploads={uploads}
+          disabled={busy}
+          onToggle={toggleAttachment}
+          onRemove={removeAttachment}
+          onReplace={replaceAttachment}
+          onDismissUpload={dismissUpload}
+        />
+      ) : null}
       <div data-ui="inline-editor-actions" ref={actionsRef}>
+        <input
+          data-ui="attachment-hidden-input"
+          type="file"
+          multiple
+          onChange={(event) => {
+            const files = Array.from(event.currentTarget.files ?? [])
+            event.currentTarget.value = ''
+            if (files.length === 0) return
+            void ingestFiles(files)
+          }}
+        />
+        <button
+          type="button"
+          data-ui="inline-editor-button"
+          data-role="attach"
+          onClick={() =>
+            (
+              actionsRef.current?.querySelector(
+                '[data-ui="attachment-hidden-input"]',
+              ) as HTMLInputElement | null
+            )?.click()
+          }
+          disabled={busy || uploadingAttachments}
+          aria-label="Upload attachment"
+          title="Upload attachment"
+        >
+          <PaperclipIcon size={14} />
+        </button>
+        <button
+          type="button"
+          data-ui="inline-editor-button"
+          data-role="attach-existing"
+          onClick={() => setPickerOpen(true)}
+          disabled={busy}
+          aria-label="Use existing stored attachment"
+          title="Use existing stored attachment"
+        >
+          <DatabaseIcon size={14} />
+        </button>
         <button
           type="button"
           data-ui="inline-editor-button"
@@ -395,8 +490,8 @@ export function InlineEditor({
           data-ui="inline-editor-button"
           data-role="save"
           onClick={() => void commitSave()}
-          disabled={busy}
-          title="Save in place (⌘⏎)"
+          disabled={busy || uploadingAttachments}
+          title={uploadingAttachments ? 'Uploading attachments' : 'Save in place (⌘⏎)'}
         >
           Save
         </button>
@@ -406,17 +501,29 @@ export function InlineEditor({
             data-ui="inline-editor-button"
             data-role="save-send"
             onClick={() => void commitSaveAndSend()}
-            disabled={busy || saveAndSendDisabled}
+            disabled={busy || uploadingAttachments || saveAndSendDisabled}
             title={
-              saveAndSendDisabled
-                ? (saveAndSendDisabledReason ?? 'Send disabled')
-                : 'Save as a new variant and send (⇧⌘⏎)'
+              uploadingAttachments
+                ? 'Uploading attachments'
+                : saveAndSendDisabled
+                  ? (saveAndSendDisabledReason ?? 'Send disabled')
+                  : 'Save as a new variant and send (⇧⌘⏎)'
             }
           >
             Save &amp; Send
           </button>
         ) : null}
       </div>
+      {pickerOpen ? (
+        <AttachmentPicker
+          title="Use stored attachment"
+          onClose={() => setPickerOpen(false)}
+          onPick={(attachment) => {
+            addAttachment(attachment)
+            setPickerOpen(false)
+          }}
+        />
+      ) : null}
     </div>
   )
 }

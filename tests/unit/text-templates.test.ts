@@ -29,11 +29,17 @@ function msg(overrides: Partial<Message>): Message {
   }
 }
 
+function builtInTemplate(name: 'chatml' | 'raw') {
+  const template = TEXT_TEMPLATES[name]
+  if (!template) throw new Error(`missing built-in text template: ${name}`)
+  return template
+}
+
 describe('text-completions prompt templates', () => {
   it('renders raw as literal visible text without the chat system prompt', () => {
     const settings = cloneDefaultChatSettings()
     settings.systemPrompt = 'You are a helpful assistant.'
-    const prompt = renderTextPrompt(TEXT_TEMPLATES.raw!, settings, [
+    const prompt = renderTextPrompt(builtInTemplate('raw'), settings, [
       msg({ role: 'user', content: [{ type: 'text', text: 'Why did' }] }),
     ])
 
@@ -42,7 +48,7 @@ describe('text-completions prompt templates', () => {
 
   it('treats raw as a Jinja plaintext continuation template', () => {
     const settings = cloneDefaultChatSettings()
-    const prompt = renderTextPrompt(TEXT_TEMPLATES.raw!, settings, [
+    const prompt = renderTextPrompt(builtInTemplate('raw'), settings, [
       msg({ id: 'u1', role: 'user', content: [{ type: 'text', text: 'Why did' }] }),
       msg({
         id: 'a1',
@@ -107,8 +113,9 @@ describe('text-completions prompt templates', () => {
   })
 
   it('exposes built-ins as plaintext template source for user-owned copies', () => {
-    const source = templateSourceForConfig(TEXT_TEMPLATES.chatml!)
-    const copy = editableTextTemplateConfig(TEXT_TEMPLATES.chatml!)
+    const chatml = builtInTemplate('chatml')
+    const source = templateSourceForConfig(chatml)
+    const copy = editableTextTemplateConfig(chatml)
     expect(source).toContain('{% for message in messages %}')
     expect(source).toContain('<|im_start|>user')
     expect(copy.template).toBe(source)
@@ -118,7 +125,7 @@ describe('text-completions prompt templates', () => {
   it('renders a trailing assistant prefill as the open segment', () => {
     const settings = cloneDefaultChatSettings()
     settings.systemPrompt = 'Be brief.'
-    const prompt = renderTextPrompt(TEXT_TEMPLATES.chatml!, settings, [
+    const prompt = renderTextPrompt(builtInTemplate('chatml'), settings, [
       msg({ id: 'u1', role: 'user', content: [{ type: 'text', text: 'What is 2+2?' }] }),
       msg({
         id: 'p1',
@@ -139,7 +146,7 @@ describe('text-completions prompt templates', () => {
   it('automatically carries included plaintext reasoning as a sanitized think block', () => {
     const settings = cloneDefaultChatSettings()
     settings.reasoning.include = { encrypted: true, summary: true, text: true }
-    const prompt = renderTextPrompt(TEXT_TEMPLATES.chatml!, settings, [
+    const prompt = renderTextPrompt(builtInTemplate('chatml'), settings, [
       msg({
         id: 'a1',
         role: 'assistant',
@@ -172,7 +179,7 @@ describe('text-completions prompt templates', () => {
       settings,
       [msg({ role: 'user', content: [{ type: 'text', text: 'One plus one equals' }] })],
       {
-        template: TEXT_TEMPLATES.raw!,
+        template: builtInTemplate('raw'),
         allowProviderRouting: true,
         capabilities: {
           supportedParameters: ['provider', 'reasoning', 'max_tokens'],
@@ -200,7 +207,7 @@ describe('text-completions prompt templates', () => {
       settings,
       [msg({ role: 'user', content: [{ type: 'text', text: 'Why did' }] })],
       {
-        template: TEXT_TEMPLATES.raw!,
+        template: builtInTemplate('raw'),
         capabilities: {
           supportedParameters: ['max_completion_tokens'],
           streaming: 'supported',

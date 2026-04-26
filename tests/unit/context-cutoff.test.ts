@@ -12,7 +12,7 @@ import { describe, expect, it } from 'vitest'
 import { applyContextCutoff, computeCutoffPlan } from '../../src/core/context-cutoff'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import { tokenCalibrationKey } from '../../src/core/model-ids'
-import type { ChatSettings, Message, MessageRole } from '../../src/core/types'
+import type { Attachment, ChatSettings, Message, MessageRole } from '../../src/core/types'
 
 const TOKENIZER = 'gpt' as const
 
@@ -50,14 +50,30 @@ function makeMessage(role: MessageRole, text: string, partial: Partial<Message> 
   }
 }
 
+function storedAttachment(
+  partial: Partial<Attachment> & Pick<Attachment, 'id' | 'kind' | 'mime' | 'filename'>,
+): Attachment {
+  return {
+    origin: 'system-fixture',
+    createdAt: 1,
+    updatedAt: 1,
+    storage: { kind: 'local-blob', blobId: `${partial.id}:blob` },
+    artifacts: [],
+    processing: [],
+    refCount: 1,
+    ...partial,
+  }
+}
+
 function settings(overrides: {
   keepFirstPairs?: number
   customMaxContext?: number
   maxCompletionTokens?: number
   systemPrompt?: string
+  model?: string
 }): ChatSettings {
   const s = cloneDefaultChatSettings()
-  s.model = 'openai/gpt-4o-mini'
+  s.model = overrides.model ?? 'openai/gpt-4o-mini'
   s.profileId = 'profile-1'
   s.systemPrompt = overrides.systemPrompt ?? ''
   s.contextStrategy = {
@@ -383,19 +399,17 @@ describe('computeCutoffPlan — LibreChat-style media heuristics', () => {
       tokenizer: TOKENIZER,
       providerCap: null,
       attachmentResolver: (id) => {
-        if (id === 'att-1')
-          return {
+        if (id === 'att-1') {
+          return storedAttachment({
             id: 'att-1',
             contentHash: '',
             kind: 'image',
             mime: 'image/png',
             filename: 'x.png',
             sizeBytes: 0,
-            createdAt: 1,
-            blob: new Blob(),
             dimensions: { width: 512, height: 512 },
-            refCount: 1,
-          }
+          })
+        }
         return undefined
       },
     })
@@ -403,7 +417,7 @@ describe('computeCutoffPlan — LibreChat-style media heuristics', () => {
     expect(plan.historyMediaTokens).toBe(627)
   })
 
-  it('image with no resolver uses fallback (~1076 per image for GPT family)', () => {
+  it('image with no resolver uses default OpenRouter image cap', () => {
     const msgWithImage: Message = {
       ...makeMessage('user', ''),
       content: [{ type: 'image_url' }] as Message['content'],
@@ -414,10 +428,39 @@ describe('computeCutoffPlan — LibreChat-style media heuristics', () => {
       tokenizer: TOKENIZER,
       providerCap: null,
     })
-    expect(plan.historyMediaTokens).toBe(1076)
+    expect(plan.historyMediaTokens).toBe(1000)
   })
 
-  it('PDF attachment with pageCount uses pages × 1500 (GPT)', () => {
+  it('threads currentModelId into cutoff media costs for Kimi/Moonshot', () => {
+    const msgWithImage: Message = {
+      ...makeMessage('user', ''),
+      content: [{ type: 'image_url', attachmentId: 'att-1' }] as Message['content'],
+    }
+    const plan = computeCutoffPlan({
+      messages: [msgWithImage],
+      settings: settings({ model: 'moonshotai/kimi-k2.6' }),
+      tokenizer: 'unknown',
+      providerCap: null,
+      currentModelId: 'moonshotai/kimi-k2.6',
+      attachmentResolver: (id) => {
+        if (id === 'att-1') {
+          return storedAttachment({
+            id: 'att-1',
+            contentHash: '',
+            kind: 'image',
+            mime: 'image/jpeg',
+            filename: 'large.jpg',
+            sizeBytes: 3_500_000,
+            dimensions: { width: 3500, height: 3500 },
+          })
+        }
+        return undefined
+      },
+    })
+    expect(plan.historyMediaTokens).toBe(4000)
+  })
+
+  it('PDF attachment with pageCount uses OpenRouter file-parser tier', () => {
     const msg: Message = {
       ...makeMessage('user', ''),
       content: [
@@ -429,21 +472,19 @@ describe('computeCutoffPlan — LibreChat-style media heuristics', () => {
       settings: settings({}),
       tokenizer: TOKENIZER,
       providerCap: null,
-      attachmentResolver: () => ({
-        id: 'pdf-1',
-        contentHash: '',
-        kind: 'pdf',
-        mime: 'application/pdf',
-        filename: 'doc.pdf',
-        sizeBytes: 0,
-        createdAt: 1,
-        blob: new Blob(),
-        pageCount: 4,
-        refCount: 1,
-      }),
+      attachmentResolver: () =>
+        storedAttachment({
+          id: 'pdf-1',
+          contentHash: '',
+          kind: 'pdf',
+          mime: 'application/pdf',
+          filename: 'doc.pdf',
+          sizeBytes: 0,
+          pageCount: 4,
+        }),
     })
-    // 4 × 1500 × 1.05 = 6300
-    expect(plan.historyMediaTokens).toBe(6300)
+    // 4 × 500 × 1.05 = 2100
+    expect(plan.historyMediaTokens).toBe(2100)
   })
 })
 

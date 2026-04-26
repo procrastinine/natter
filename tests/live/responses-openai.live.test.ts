@@ -17,7 +17,9 @@ const LIVE = process.env.LIVE === '1'
 
 function loadKey(name: string): string {
   const raw = readFileSync(resolve(__dirname, '../../../keys.json'), 'utf8')
-  return (JSON.parse(raw) as Record<string, string>)[name]!
+  const key = (JSON.parse(raw) as Record<string, string>)[name]
+  if (!key) throw new Error(`keys.json missing ${name}`)
+  return key
 }
 
 async function drain(source: AsyncIterable<StreamLaneEvent>): Promise<StreamLaneEvent[]> {
@@ -169,6 +171,7 @@ describe.skipIf(!LIVE)('live — OpenAI direct Responses (gpt-5.4-nano)', () => 
     const m1 = turn1.output?.find((i) => i.type === 'message')
     expect(r1).toBeDefined()
     expect(m1).toBeDefined()
+    if (!r1 || !m1) throw new Error('missing first-turn echoed output items')
 
     const echoedInput: ResponsesInputItem[] = [
       {
@@ -181,8 +184,8 @@ describe.skipIf(!LIVE)('live — OpenAI direct Responses (gpt-5.4-nano)', () => 
           },
         ],
       },
-      r1!,
-      m1!,
+      r1,
+      m1,
       {
         type: 'message',
         role: 'user',

@@ -14,7 +14,7 @@ import { getBrowserRepository } from './browser-repo'
 import { getDb, openDb } from './db'
 
 type OptionalKeys<T> = {
-  [K in keyof T]-?: {} extends Pick<T, K> ? K : never
+  [K in keyof T]-?: Record<never, never> extends Pick<T, K> ? K : never
 }[keyof T]
 
 type ChatSettingsPatch = {

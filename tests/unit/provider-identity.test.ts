@@ -19,6 +19,12 @@ function ep(overrides: Partial<ModelEndpoint>): ModelEndpoint {
   }
 }
 
+function endpointAt(endpoints: readonly ModelEndpoint[], index: number): ModelEndpoint {
+  const endpoint = endpoints[index]
+  if (!endpoint) throw new Error(`missing endpoint at index ${index}`)
+  return endpoint
+}
+
 describe('provider identity helpers', () => {
   it('uses provider_slug as the canonical routing ref and endpoint key', () => {
     const endpoint = ep({
@@ -57,8 +63,8 @@ describe('provider identity helpers', () => {
       ep({ provider_slug: 'anthropic/2' }),
       ep({ provider_slug: 'anthropic' }),
     ]
-    expect(endpointMatchesProviderRef(endpoints[0]!, 'anthropic', endpoints)).toBe(false)
-    expect(endpointMatchesProviderRef(endpoints[1]!, 'anthropic', endpoints)).toBe(true)
+    expect(endpointMatchesProviderRef(endpointAt(endpoints, 0), 'anthropic', endpoints)).toBe(false)
+    expect(endpointMatchesProviderRef(endpointAt(endpoints, 1), 'anthropic', endpoints)).toBe(true)
     expect(resolveProviderRefsToRoutingRefs(endpoints, ['anthropic'])).toEqual(['anthropic'])
     expect(resolveProviderRefsToRoutingRefs(endpoints, ['Anthropic'])).toEqual([
       'anthropic/2',
@@ -68,7 +74,7 @@ describe('provider identity helpers', () => {
 
   it('disambiguates duplicate display labels with the endpoint key', () => {
     const endpoints = [ep({ provider_slug: 'anthropic/2' }), ep({ provider_slug: 'anthropic' })]
-    expect(providerDisplayLabel(endpoints[0]!, endpoints)).toBe('Anthropic (anthropic/2)')
-    expect(providerDisplayLabel(endpoints[1]!, endpoints)).toBe('Anthropic (anthropic)')
+    expect(providerDisplayLabel(endpointAt(endpoints, 0), endpoints)).toBe('Anthropic (anthropic/2)')
+    expect(providerDisplayLabel(endpointAt(endpoints, 1), endpoints)).toBe('Anthropic (anthropic)')
   })
 })

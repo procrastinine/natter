@@ -21,19 +21,48 @@ describe('imageTokenEstimate', () => {
     expect(imageTokenEstimate('gemini', { width: 1024, height: 1024 })).toBe(271)
   })
 
-  it('falls back to 1024 × 1.05 → 1076 when dims unknown', () => {
-    expect(imageTokenEstimate('gpt', {})).toBe(1076)
-    expect(imageTokenEstimate('claude', {})).toBe(1076)
+  it('falls back to 1024 × 1.05 and caps default OpenRouter images at 1000', () => {
+    expect(imageTokenEstimate('gpt', {})).toBe(1000)
+    expect(imageTokenEstimate('claude', {})).toBe(1000)
   })
 
   it('falls back when only one dim is known', () => {
-    expect(imageTokenEstimate('gpt', { width: 100 })).toBe(1076)
-    expect(imageTokenEstimate('gpt', { height: 100 })).toBe(1076)
+    expect(imageTokenEstimate('gpt', { width: 100 })).toBe(1000)
+    expect(imageTokenEstimate('gpt', { height: 100 })).toBe(1000)
   })
 
-  it('caps absurdly large dims at MAX_PER_ATTACHMENT_TOKENS (10M)', () => {
-    // 1M × 1M = 10^12; way above the per-attachment cap.
-    expect(imageTokenEstimate('gpt', { width: 1_000_000, height: 1_000_000 })).toBe(10_000_000)
+  it('normalizes large OpenRouter images before applying the default cap', () => {
+    // 3500 × 3500 is normalized to 1400 × 1400 before the OpenAI-style
+    // formula, then capped to the usual observed OpenRouter billing shape.
+    expect(imageTokenEstimate('gpt', { width: 3500, height: 3500 })).toBe(1000)
+  })
+
+  it('uses the Kimi/Moonshot cap for the observed 3500px outlier', () => {
+    expect(
+      imageTokenEstimate(
+        'unknown',
+        { width: 3500, height: 3500 },
+        { modelId: 'moonshotai/kimi-k2.6' },
+      ),
+    ).toBe(4000)
+  })
+
+  it('detects Kimi IDs with OpenRouter suffixes', () => {
+    expect(
+      imageTokenEstimate(
+        'unknown',
+        { width: 3500, height: 3500 },
+        { modelId: 'moonshotai/kimi-k2.6:free' },
+      ),
+    ).toBe(4000)
+  })
+
+  it('normalizes absurdly large dims instead of letting raw pixels dominate', () => {
+    expect(imageTokenEstimate('gpt', { width: 1_000_000, height: 1_000_000 })).toBe(1000)
+  })
+
+  it('caps absurd byte fallbacks at the OpenRouter image cap', () => {
+    expect(imageTokenEstimate('gpt', { sizeBytes: 10_000_000_000 })).toBe(1000)
   })
 })
 

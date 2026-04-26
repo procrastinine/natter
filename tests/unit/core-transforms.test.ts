@@ -31,7 +31,13 @@ function settings(overrides: Partial<ChatSettings> = {}): ChatSettings {
     ...base,
     profileId: 'prof',
     model: 'anthropic/claude-haiku-4.5',
-    reasoning: { mode: 'off', exclude: false, summary: 'off', carryForward: 'off', include: { encrypted: false, summary: false, text: false } },
+    reasoning: {
+      mode: 'off',
+      exclude: false,
+      summary: 'off',
+      carryForward: 'off',
+      include: { encrypted: false, summary: false, text: false },
+    },
     ...overrides,
   }
 }
@@ -47,6 +53,32 @@ describe('toChatCompletions', () => {
     // Reasoning.mode === 'off' emits an explicit enabled:false object so Claude
     // 4.x provider doesn't default-enable reasoning.
     expect(wire.reasoning).toEqual({ enabled: false })
+  })
+
+  it('appends prepared attachment parts to the owning message content', () => {
+    const path = [textMessage({ id: 'u1', role: 'user', text: 'describe this' })]
+    const { wire } = toChatCompletions(settings(), path, {
+      attachmentPartsByMessageId: new Map([
+        [
+          'u1',
+          [
+            { type: 'text', text: '[Attachment: cat.png; type=image; mime=image/png]' },
+            { type: 'image_url', image_url: { url: 'data:image/png;base64,abc' } },
+          ],
+        ],
+      ]),
+      extraPlugins: [{ id: 'file-parser', pdf: { engine: 'cloudflare-ai' } }],
+    })
+
+    expect(wire.messages[0]).toEqual({
+      role: 'user',
+      content: [
+        { type: 'text', text: 'describe this' },
+        { type: 'text', text: '[Attachment: cat.png; type=image; mime=image/png]' },
+        { type: 'image_url', image_url: { url: 'data:image/png;base64,abc' } },
+      ],
+    })
+    expect(wire.plugins).toEqual([{ id: 'file-parser', pdf: { engine: 'cloudflare-ai' } }])
   })
 
   it('prepends the system prompt when non-empty and absent from the path', () => {
@@ -124,7 +156,13 @@ describe('toChatCompletions', () => {
     const path = [textMessage({ id: 'u1', role: 'user', text: 'hi' })]
     const { wire } = toChatCompletions(
       settings({
-        reasoning: { mode: 'off', exclude: false, summary: 'off', carryForward: 'off', include: { encrypted: false, summary: false, text: false } },
+        reasoning: {
+          mode: 'off',
+          exclude: false,
+          summary: 'off',
+          carryForward: 'off',
+          include: { encrypted: false, summary: false, text: false },
+        },
       }),
       path,
     )
@@ -135,7 +173,13 @@ describe('toChatCompletions', () => {
     const path = [textMessage({ id: 'u1', role: 'user', text: 'hi' })]
     const { wire } = toChatCompletions(
       settings({
-        reasoning: { mode: 'enabled', exclude: false, summary: 'off', carryForward: 'off', include: { encrypted: false, summary: false, text: false } },
+        reasoning: {
+          mode: 'enabled',
+          exclude: false,
+          summary: 'off',
+          carryForward: 'off',
+          include: { encrypted: false, summary: false, text: false },
+        },
       }),
       path,
     )
@@ -146,7 +190,13 @@ describe('toChatCompletions', () => {
     const path = [textMessage({ id: 'u1', role: 'user', text: 'hi' })]
     const { wire } = toChatCompletions(
       settings({
-        reasoning: { mode: 'default', exclude: false, summary: 'off', carryForward: 'off', include: { encrypted: false, summary: false, text: false } },
+        reasoning: {
+          mode: 'default',
+          exclude: false,
+          summary: 'off',
+          carryForward: 'off',
+          include: { encrypted: false, summary: false, text: false },
+        },
       }),
       path,
     )

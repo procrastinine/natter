@@ -7,6 +7,12 @@
 //   #/new          → blank-chat surface (NO chat row created until first send)
 //   #/chat/<id>                   → open chat with no specific cursor pin
 //   #/chat/<id>/message/<msgId>   → open chat with cursor pinned at <msgId>
+//   #/storage                     → workspace/storage overview
+//   #/storage/attachments         → attachment manager
+//   #/storage/attachments/missing → missing attachment cleanup filter
+//   #/storage/attachments/unreferenced → unreferenced attachment cleanup filter
+//   #/storage/attachments/<id>    → attachment details permalink
+//   #/storage/backups             → backup / restore / raw dump surface
 //
 // The hash form is intentional: it works on static hosts without server config
 // and matches plan/01-architecture.md. Cursor pins persist in per-tab Zustand
@@ -14,20 +20,48 @@
 // pin for opens; subsequent in-tab swipes update Zustand without touching URL.
 
 import { type MouseEvent, useSyncExternalStore } from 'react'
-import type { ChatId, MessageId } from '../core/types'
+import type { AttachmentId, ChatId, MessageId } from '../core/types'
+
+export type StorageRoute =
+  | { section: 'overview' }
+  | { section: 'attachments'; filter?: 'missing' | 'unreferenced'; attachmentId?: AttachmentId }
+  | { section: 'backups' }
 
 export type Route =
   | { kind: 'home' }
   | { kind: 'new' }
   | { kind: 'chat'; chatId: ChatId; pinnedMessageId?: MessageId }
+  | { kind: 'storage'; storage: StorageRoute }
   | { kind: 'unknown'; raw: string }
 
 export function parseRoute(hash: string): Route {
   const stripped = hash.startsWith('#') ? hash.slice(1) : hash
-  const path = stripped.startsWith('/') ? stripped.slice(1) : stripped
+  const pathWithQuery = stripped.startsWith('/') ? stripped.slice(1) : stripped
+  const path = pathWithQuery.split('?', 1)[0] ?? ''
   if (path === '' || path === '/') return { kind: 'home' }
   const parts = path.split('/').filter(Boolean)
   if (parts.length === 1 && parts[0] === 'new') return { kind: 'new' }
+  if (parts[0] === 'storage') {
+    if (parts.length === 1) return { kind: 'storage', storage: { section: 'overview' } }
+    if (parts[1] === 'attachments') {
+      if (parts.length === 2) return { kind: 'storage', storage: { section: 'attachments' } }
+      if (parts[2] === 'missing') {
+        return { kind: 'storage', storage: { section: 'attachments', filter: 'missing' } }
+      }
+      if (parts[2] === 'unreferenced') {
+        return { kind: 'storage', storage: { section: 'attachments', filter: 'unreferenced' } }
+      }
+      if (parts[2] && parts.length === 3) {
+        return {
+          kind: 'storage',
+          storage: { section: 'attachments', attachmentId: decodeURIComponent(parts[2]) },
+        }
+      }
+    }
+    if (parts[1] === 'backups' && parts.length === 2) {
+      return { kind: 'storage', storage: { section: 'backups' } }
+    }
+  }
   if (parts[0] === 'chat' && parts[1]) {
     const chatId = parts[1]
     if (parts[2] === 'message' && parts[3]) {
@@ -48,6 +82,8 @@ export function routeToHref(route: Route): string {
       return route.pinnedMessageId
         ? `#/chat/${route.chatId}/message/${route.pinnedMessageId}`
         : `#/chat/${route.chatId}`
+    case 'storage':
+      return storageRouteToHref(route.storage)
     case 'unknown':
       return `#${route.raw.startsWith('/') ? route.raw : `/${route.raw}`}`
   }
@@ -65,6 +101,25 @@ export function homeHref(): string {
 
 export function newChatHref(): string {
   return routeToHref({ kind: 'new' })
+}
+
+export function storageHref(storage: StorageRoute = { section: 'overview' }): string {
+  return storageRouteToHref(storage)
+}
+
+export function attachmentHref(attachmentId: AttachmentId): string {
+  return storageRouteToHref({ section: 'attachments', attachmentId })
+}
+
+function storageRouteToHref(route: StorageRoute): string {
+  if (route.section === 'overview') return '#/storage'
+  if (route.section === 'backups') return '#/storage/backups'
+  if (route.attachmentId) {
+    return `#/storage/attachments/${encodeURIComponent(route.attachmentId)}`
+  }
+  if (route.filter === 'missing') return '#/storage/attachments/missing'
+  if (route.filter === 'unreferenced') return '#/storage/attachments/unreferenced'
+  return '#/storage/attachments'
 }
 
 export function navigate(href: string): void {

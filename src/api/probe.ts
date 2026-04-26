@@ -75,21 +75,21 @@ function asRecord(v: unknown): Record<string, unknown> {
 // both `chat_template` and `default_generation_settings`).
 export function parseLlamaServerProps(body: unknown): LlamaServerProps | null {
   const obj = asRecord(body)
-  const chatTemplate = asString(obj['chat_template'])
-  const defaultGenSettings = asRecord(obj['default_generation_settings'])
+  const chatTemplate = asString(obj.chat_template)
+  const defaultGenSettings = asRecord(obj.default_generation_settings)
   if (chatTemplate === null && Object.keys(defaultGenSettings).length === 0) {
     return null
   }
-  const modalities = asRecord(obj['modalities'])
+  const modalities = asRecord(obj.modalities)
   return {
-    modelPath: asString(obj['model_path']),
+    modelPath: asString(obj.model_path),
     chatTemplate,
-    chatTemplateCaps: asRecord(obj['chat_template_caps']),
-    modalities: { vision: asBool(modalities['vision']) },
-    isSleeping: asBool(obj['is_sleeping']),
-    defaultContextLength: asNumber(defaultGenSettings['n_ctx']),
-    buildInfo: asString(obj['build_info']),
-    totalSlots: asNumber(obj['total_slots']),
+    chatTemplateCaps: asRecord(obj.chat_template_caps),
+    modalities: { vision: asBool(modalities.vision) },
+    isSleeping: asBool(obj.is_sleeping),
+    defaultContextLength: asNumber(defaultGenSettings.n_ctx),
+    buildInfo: asString(obj.build_info),
+    totalSlots: asNumber(obj.total_slots),
   }
 }
 

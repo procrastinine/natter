@@ -5,41 +5,6 @@
  * See plan/10-ui.md §10.20.
  */
 
-/* Focus / reading mode — when `data-focus-mode="on"` on the app-shell,
- * every piece of chrome disappears so only the message list + the
- * composer (reparented under the scroll region — see Shell.tsx) + the
- * eye toggle itself remain. The composer scrolls with content instead
- * of sticking to the viewport bottom. */
-[data-ui="app-shell"][data-focus-mode="on"] > [data-ui="sidebar"],
-[data-ui="app-shell"][data-focus-mode="on"] [data-ui="connection-header"],
-[data-ui="app-shell"][data-focus-mode="on"] [data-ui="chat-title-bar"],
-[data-ui="app-shell"][data-focus-mode="on"] [data-ui="edit-tree-toolbar"],
-[data-ui="app-shell"][data-focus-mode="on"] [data-ui="jump-to-latest"] {
-  display: none !important;
-}
-
-/* In focus mode the composer is rendered INSIDE the scroll region as
- * the last item (see Shell.tsx). Strip the sticky-at-bottom chrome so
- * it flows with the messages — no top-edge resize handle, no border,
- * transparent background so the composer-body's card reads as a
- * floating input and the scroll-region's padding doesn't leak an
- * awkward white rectangle around the edges. */
-[data-ui="app-shell"][data-focus-mode="on"] [data-ui="composer"] {
-  border-top: none;
-  background: transparent;
-  padding: var(--space-6) 0;
-}
-
-/* With chrome hidden, the main pane is the entire viewport. The
- * default rules reference `grid-area: main`, so the single-column
- * override needs to keep the name or the main pane auto-places to a
- * junk cell and the content falls out of the layout (seen as right-
- * aligned / half-width prose). Keep only the `main` area. */
-[data-ui="app-shell"][data-focus-mode="on"] {
-  grid-template-columns: 1fr;
-  grid-template-areas: "main";
-}
-
 /* Floating eye toggle — fixed at the bottom-right so it survives the
  * chrome-hide switch. Circular, translucent at rest so it doesn't
  * steal attention; more opaque on hover and when active. Extra
@@ -82,6 +47,15 @@
   opacity: 1;
   background: var(--color-bg-surface-2);
   color: var(--color-fg-primary);
+}
+
+[data-ui="focus-mode-toggle"]:disabled,
+[data-ui="focus-mode-toggle"]:disabled:hover {
+  cursor: not-allowed;
+  opacity: 0.28;
+  background: var(--color-bg-surface-1);
+  color: var(--color-fg-muted);
+  border-color: var(--color-border-subtle);
 }
 
 /* Active state stays white and quiet — reading mode shouldn't have a
@@ -306,4 +280,39 @@
 [data-ui="composer"] > [data-ui="jump-to-latest"]:hover {
   background: var(--color-bg-hover);
   border-color: var(--color-border-strong);
+}
+
+/* Focus / reading mode — when `data-focus-mode="on"` on the app-shell,
+ * every piece of chrome disappears so only the message list + the
+ * composer (reparented under the scroll region — see Shell.tsx) + the
+ * eye toggle itself remain. The composer scrolls with content instead
+ * of sticking to the viewport bottom. */
+[data-ui="app-shell"][data-focus-mode="on"] > [data-ui="sidebar"],
+[data-ui="app-shell"][data-focus-mode="on"] [data-ui="connection-header"],
+[data-ui="app-shell"][data-focus-mode="on"] [data-ui="chat-title-bar"],
+[data-ui="app-shell"][data-focus-mode="on"] [data-ui="edit-tree-toolbar"],
+[data-ui="app-shell"][data-focus-mode="on"] [data-ui="jump-to-latest"] {
+  display: none;
+}
+
+/* In focus mode the composer is rendered INSIDE the scroll region as
+ * the last item (see Shell.tsx). Strip the sticky-at-bottom chrome so
+ * it flows with the messages — no top-edge resize handle, no border,
+ * transparent background so the composer-body's card reads as a
+ * floating input and the scroll-region's padding doesn't leak an
+ * awkward white rectangle around the edges. */
+[data-ui="app-shell"][data-focus-mode="on"] [data-ui="composer"] {
+  border-top: none;
+  background: transparent;
+  padding: var(--space-6) 0;
+}
+
+/* With chrome hidden, the main pane is the entire viewport. The
+ * default rules reference `grid-area: main`, so the single-column
+ * override needs to keep the name or the main pane auto-places to a
+ * junk cell and the content falls out of the layout (seen as right-
+ * aligned / half-width prose). Keep only the `main` area. */
+[data-ui="app-shell"][data-focus-mode="on"] {
+  grid-template-columns: 1fr;
+  grid-template-areas: "main";
 }

@@ -61,6 +61,11 @@
   height: 22px;
 }
 
+[data-ui="icon-button"][data-size="xs"] {
+  width: 20px;
+  height: 20px;
+}
+
 [data-ui="icon-button"][data-size="lg"] {
   width: 32px;
   height: 32px;

@@ -35,51 +35,25 @@
 // server-side plugin compresses what remains.
 
 import {
-  GENERIC_FILE_TOKEN_FALLBACK,
-  imageTokenEstimate,
-  type PdfMeta,
-  pdfTokenEstimate,
-} from './media-tokens'
-import { type AttachmentResolver, resolveContextCap, UNLIMITED_CONTEXT } from './prompt-size'
+  attachmentContextPolicyForSettings,
+  DRAFT_ATTACHMENT_CONTEXT_ID,
+  resolveAttachmentContextRefs,
+} from './attachments/context'
+import {
+  mediaTokensForMessage,
+  mediaTokensForRefs,
+  type AttachmentResolver,
+} from './media-context-tokens'
+import { resolveContextCap, UNLIMITED_CONTEXT } from './prompt-size'
 import { readPathTextTokenEstimate } from './token-calibration'
-import { clampTokens, safeContent } from './token-guards'
+import { clampTokens } from './token-guards'
 import {
   estimateReasoningEchoTokensForMessage,
   estimateTokens,
   type PromptEstimateOptions,
   type TokenizerFamily,
 } from './tokens'
-import type { ChatSettings, Message, MessageId } from './types'
-
-function mediaTokensForContent(
-  content: unknown,
-  family: TokenizerFamily,
-  resolver?: AttachmentResolver,
-): number {
-  let tokens = 0
-  for (const item of safeContent(content)) {
-    if (item.type === 'image_url' || item.type === 'output_image') {
-      const att = item.attachmentId ? resolver?.(item.attachmentId) : undefined
-      tokens += imageTokenEstimate(family, {
-        ...(att?.dimensions?.width !== undefined ? { width: att.dimensions.width } : {}),
-        ...(att?.dimensions?.height !== undefined ? { height: att.dimensions.height } : {}),
-      })
-    } else if (item.type === 'file') {
-      const att = item.attachmentId ? resolver?.(item.attachmentId) : undefined
-      if (att?.kind === 'pdf') {
-        const meta: PdfMeta = {}
-        if (att.pageCount !== undefined) meta.pageCount = att.pageCount
-        if (att.sizeBytes !== undefined) meta.sizeBytes = att.sizeBytes
-        tokens += pdfTokenEstimate(family, meta)
-      } else if (item.mime === 'application/pdf') {
-        tokens += pdfTokenEstimate(family, {})
-      } else {
-        tokens += GENERIC_FILE_TOKEN_FALLBACK
-      }
-    }
-  }
-  return tokens
-}
+import type { AttachmentRef, ChatSettings, Message, MessageId } from './types'
 
 export interface MessageCostOptions {
   family: TokenizerFamily
@@ -89,6 +63,7 @@ export interface MessageCostOptions {
   // Optional — unlocks attachment-aware image / PDF heuristics. Without
   // it, media tokens fall back to constant values (see media-tokens.ts).
   attachmentResolver?: AttachmentResolver
+  attachmentRefsByMessageId?: ReadonlyMap<MessageId, readonly AttachmentRef[]>
   // Optional — the chat's CURRENT model ID. Text-token estimation uses it to
   // decide whether a message stays in the same calibration bucket; when
   // omitted, the read path falls back to cache/fresh heuristics.
@@ -97,6 +72,7 @@ export interface MessageCostOptions {
   // present, same-bucket rows use original-token + edit-delta math and
   // other-model rows recompute under this model.
   currentTextCharsPerToken?: number
+  disableTextCalibration?: boolean
 }
 
 export interface MessageCost {
@@ -119,11 +95,21 @@ export function messageCost(m: Message, opts: MessageCostOptions): MessageCost {
     family: opts.family,
     currentModelId: opts.currentModelId,
     currentTextCharsPerToken: opts.currentTextCharsPerToken,
+    disableCalibration: opts.disableTextCalibration,
   })
+  const contextRefs =
+    opts.attachmentRefsByMessageId === undefined
+      ? undefined
+      : (opts.attachmentRefsByMessageId.get(m.id) ?? [])
   const media =
-    eligible && typeof m.cachedMediaTokens === 'number' && Number.isFinite(m.cachedMediaTokens)
+    contextRefs === undefined &&
+    eligible &&
+    typeof m.cachedMediaTokens === 'number' &&
+    Number.isFinite(m.cachedMediaTokens)
       ? m.cachedMediaTokens
-      : mediaTokensForContent(m.content, opts.family, opts.attachmentResolver)
+      : mediaTokensForMessage(m, opts.family, opts.attachmentResolver, contextRefs, {
+          ...(opts.currentModelId !== undefined ? { modelId: opts.currentModelId } : {}),
+        })
   const reasoning = opts.reasoningOpts
     ? estimateReasoningEchoTokensForMessage(m, opts.reasoningOpts)
     : 0
@@ -187,6 +173,7 @@ export interface CutoffPlanInput {
   // gauge time; the send pipeline passes 0 because the draft is already in
   // the path by the time the wire is composed.
   draftText?: string
+  draftAttachmentRefs?: readonly AttachmentRef[]
   // Precomputed system-prompt token count to avoid re-estimating when the
   // caller already has it. Falls back to estimating `settings.systemPrompt`.
   systemPromptTokensOverride?: number
@@ -196,6 +183,7 @@ export interface CutoffPlanInput {
   // via MessageCostOptions.
   currentModelId?: string
   currentTextCharsPerToken?: number
+  disableTextCalibration?: boolean
 }
 
 export interface CutoffPlan {
@@ -213,13 +201,14 @@ export interface CutoffPlan {
 
   systemTokens: number
   draftTokens: number
+  draftMediaTokens: number
   preambleTokens: number
   historyTextTokens: number
   historyMediaTokens: number
   historyReasoningTokens: number
   // history = preamble + head + tail buckets combined (text + media + reasoning).
   historyTokens: number
-  // total = system + history + draft. Does NOT include `reserveTokens` —
+  // total = system + history + draft text + draft media. Does NOT include `reserveTokens` —
   // that's part of the BUDGET side, not what we send.
   total: number
   reserveTokens: number
@@ -237,6 +226,7 @@ function buildPlan(
   keptPairs: PairBucket[],
   systemTokens: number,
   draftTokens: number,
+  draftMediaTokens: number,
   reserveTokens: number,
   cutoff: number,
   available: number,
@@ -269,12 +259,13 @@ function buildPlan(
     totalPairCount: grouped.pairs.length,
     systemTokens: clampTokens(systemTokens),
     draftTokens: clampTokens(draftTokens),
+    draftMediaTokens: clampTokens(draftMediaTokens),
     preambleTokens: clampTokens(grouped.preamble.tokens),
     historyTextTokens: clampTokens(historyText),
     historyMediaTokens: clampTokens(historyMedia),
     historyReasoningTokens: clampTokens(historyReasoning),
     historyTokens: clampTokens(historyTokens),
-    total: clampTokens(historyTokens + systemTokens + draftTokens),
+    total: clampTokens(historyTokens + systemTokens + draftTokens + draftMediaTokens),
     reserveTokens: clampTokens(reserveTokens),
     cutoff,
     available,
@@ -294,14 +285,23 @@ function resolveCutoff(settings: ChatSettings, providerCap: number | null): numb
 export function computeCutoffPlan(input: CutoffPlanInput): CutoffPlan {
   const { settings, tokenizer, providerCap } = input
   const visible = input.messages.filter((m) => m.hiddenFromContext !== true && !m.deleted)
+  const attachmentRefsByOwner = resolveAttachmentContextRefs({
+    messages: visible,
+    policy: attachmentContextPolicyForSettings(settings),
+    ...(input.draftAttachmentRefs
+      ? { draft: { refs: input.draftAttachmentRefs, role: 'user' } }
+      : {}),
+  })
 
   const costOpts: MessageCostOptions = { family: tokenizer }
   if (input.reasoningOpts) costOpts.reasoningOpts = input.reasoningOpts
   if (input.attachmentResolver) costOpts.attachmentResolver = input.attachmentResolver
+  costOpts.attachmentRefsByMessageId = attachmentRefsByOwner
   if (input.currentModelId !== undefined) costOpts.currentModelId = input.currentModelId
   if (input.currentTextCharsPerToken !== undefined) {
     costOpts.currentTextCharsPerToken = input.currentTextCharsPerToken
   }
+  if (input.disableTextCalibration === true) costOpts.disableTextCalibration = true
   const grouped = groupPath(visible, costOpts)
 
   const systemTokens =
@@ -309,6 +309,12 @@ export function computeCutoffPlan(input: CutoffPlanInput): CutoffPlan {
     (settings.systemPrompt.length > 0 ? estimateTokens(settings.systemPrompt, tokenizer) : 0)
   const draftText = input.draftText ?? ''
   const draftTokens = draftText.length > 0 ? estimateTokens(draftText, tokenizer) : 0
+  const draftMediaTokens = mediaTokensForRefs(
+    attachmentRefsByOwner.get(DRAFT_ATTACHMENT_CONTEXT_ID),
+    tokenizer,
+    input.attachmentResolver,
+    { ...(input.currentModelId !== undefined ? { modelId: input.currentModelId } : {}) },
+  )
 
   // Clamp the reserve to non-negative so a buggy/stored `maxCompletionTokens
   // = -999` can't backdoor-expand the available budget. `-1` means unlimited
@@ -331,6 +337,7 @@ export function computeCutoffPlan(input: CutoffPlanInput): CutoffPlan {
       grouped.pairs,
       systemTokens,
       draftTokens,
+      draftMediaTokens,
       reserveTokens,
       cutoff,
       Number.POSITIVE_INFINITY,
@@ -339,7 +346,8 @@ export function computeCutoffPlan(input: CutoffPlanInput): CutoffPlan {
     )
   }
 
-  const available = cutoff - systemTokens - grouped.preamble.tokens - draftTokens - reserveTokens
+  const available =
+    cutoff - systemTokens - grouped.preamble.tokens - draftTokens - draftMediaTokens - reserveTokens
 
   let N = Math.min(keepFirstPairs, totalPairs)
   let headTokens = 0
@@ -380,6 +388,7 @@ export function computeCutoffPlan(input: CutoffPlanInput): CutoffPlan {
     keptPairs,
     systemTokens,
     draftTokens,
+    draftMediaTokens,
     reserveTokens,
     cutoff,
     available,

@@ -12,11 +12,18 @@ import type { EffectiveCapability } from '../../core/capabilities'
 import { quirksFor } from '../../core/quirks'
 import { normalizeReasoningDetails } from '../../core/reasoning'
 import { detectStaleReasoning, staleReasoningBannerText } from '../../core/stale-reasoning'
-import type { ChatId, CursorMap, Message as MessageRow, ReasoningDetail } from '../../core/types'
+import type {
+  ChatId,
+  CursorMap,
+  Message as MessageRow,
+  MessageAttachmentRef,
+  ReasoningDetail,
+} from '../../core/types'
 import { dismissAbortReason, updateChatSettings } from '../../store/chats'
 import { useStreamStore } from '../../store/zustand/streamStore'
 import { useToastStore } from '../../store/zustand/toastStore'
 import { useUiStore } from '../../store/zustand/uiStore'
+import { AttachmentRefChips } from '../attachments/AttachmentRefChips'
 import { BranchControls } from './BranchControls'
 import { InlineEditor, plaintextOf } from './InlineEditor'
 import { type InsertSlot, MessageActions, MessageEditTreeActions } from './MessageActions'
@@ -62,11 +69,12 @@ export interface MessageProps {
     message: MessageRow,
     text: string,
     reasoning?: ReasoningDetail[],
+    attachmentRefs?: MessageAttachmentRef[],
   ) => Promise<void>
   onEditAndSend?: (
     message: MessageRow,
     text: string,
-    opts?: { prefillText?: string },
+    opts?: { prefillText?: string; attachmentRefs?: MessageAttachmentRef[] },
   ) => Promise<void>
   onRegenerate?: (message: MessageRow) => Promise<void>
   onContinue?: (message: MessageRow) => Promise<void>
@@ -277,8 +285,12 @@ function MessageInner({
   }, [collapseProfile.defaultMode, collapseProfile.modes])
 
   const handleSave = useCallback(
-    async (text: string, reasoning?: ReasoningDetail[]) => {
-      await onEditInPlace(message, text, reasoning)
+    async (
+      text: string,
+      reasoning?: ReasoningDetail[],
+      attachmentRefs?: MessageAttachmentRef[],
+    ) => {
+      await onEditInPlace(message, text, reasoning, attachmentRefs)
       setEditing(false)
     },
     [message, onEditInPlace],
@@ -289,15 +301,16 @@ function MessageInner({
   const handleToggleReasoningHidden = useCallback(
     (detailIndex: number) => {
       if (detailIndex < 0 || detailIndex >= reasoning.length) return
-      const next = reasoning.map((d, i) =>
-        i === detailIndex ? { ...d, hidden: !d.hidden } : d,
-      )
+      const next = reasoning.map((d, i) => (i === detailIndex ? { ...d, hidden: !d.hidden } : d))
       void onEditInPlace(message, text, next)
     },
     [message, reasoning, text, onEditInPlace],
   )
   const handleSaveAndSend = useCallback(
-    async (text: string, opts?: { prefillText?: string }) => {
+    async (
+      text: string,
+      opts?: { prefillText?: string; attachmentRefs?: MessageAttachmentRef[] },
+    ) => {
       if (!onEditAndSend) return
       await onEditAndSend(message, text, opts)
       setEditing(false)
@@ -398,6 +411,7 @@ function MessageInner({
             initial={plaintextOf(message.content)}
             onSave={handleSave}
             onCancel={() => setEditing(false)}
+            initialAttachmentRefs={message.attachmentRefs}
             {...(message.role === 'user' && onEditAndSend
               ? {
                   onSaveAndSend: handleSaveAndSend,
@@ -424,6 +438,9 @@ function MessageInner({
         ) : (
           <MessageContent text={text} streaming={streaming ?? false} collapseMode={collapseMode} />
         )}
+        {!editing ? (
+          <AttachmentRefChips refs={message.attachmentRefs} messageId={message.id} />
+        ) : null}
         {error ? (
           <div data-ui="message-error" data-role="error">
             <strong>Error{error.statusCode ? ` ${error.statusCode}` : ''}:</strong> {error.message}

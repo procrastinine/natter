@@ -149,6 +149,7 @@ describe.skipIf(!LIVE)('live — OpenRouter Responses (openai/gpt-5.4-nano)', ()
     expect(reasoning1).toBeDefined()
     expect(message1).toBeDefined()
     expect(message1?.phase).toBeDefined()
+    if (!reasoning1 || !message1) throw new Error('missing first-turn echoed output items')
 
     const echoedInput: ResponsesInputItem[] = [
       {
@@ -157,9 +158,9 @@ describe.skipIf(!LIVE)('live — OpenRouter Responses (openai/gpt-5.4-nano)', ()
         content: [{ type: 'input_text', text: 'Pick any integer. Give JUST the digit.' }],
       },
       // Echo reasoning verbatim.
-      reasoning1!,
+      reasoning1,
       // Echo message verbatim (phase + id preserved).
-      message1!,
+      message1,
       {
         type: 'message',
         role: 'user',

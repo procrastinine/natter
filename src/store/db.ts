@@ -10,6 +10,9 @@ import { readCachedPrivacyPayload } from '../api/privacy-scrape'
 import { migrateLegacyProviderSettings } from '../core/provider-settings-migration'
 import type {
   Attachment,
+  AttachmentArtifact,
+  AttachmentBlob,
+  AttachmentJob,
   Chat,
   ChatBranchCache,
   ChatFolder,
@@ -20,6 +23,7 @@ import type {
   DraftRow,
   KeyRecord,
   Message,
+  MessageAttachmentRef,
   PresetResolution,
   PromptPreset,
 } from '../core/types'
@@ -73,6 +77,9 @@ export class NatterDb extends Dexie {
   messages!: Table<Message, string>
   childLists!: Table<ChildListState, string>
   attachments!: Table<Attachment, string>
+  attachmentBlobs!: Table<AttachmentBlob, string>
+  attachmentArtifacts!: Table<AttachmentArtifact, string>
+  attachmentJobs!: Table<AttachmentJob, string>
   profiles!: Table<ConnectionProfile, string>
   presets!: Table<ChatPreset, string>
   promptPresets!: Table<PromptPreset, string>
@@ -336,6 +343,119 @@ export function registerSchema(db: Dexie): void {
         'global:continue-prompt',
       ]).delete()
     })
+
+  // v6: Phase 12 attachment backend. Move bytes out of `attachments.blob`,
+  // add artifact/job tables, and normalize prototype `attachmentRefs: string[]`
+  // rows to per-message ref objects.
+  db.version(6)
+    .stores({
+      chats:
+        'id, updatedAt, createdAt, lastViewedAt, lastUpdatedLeafId, lastBranchUpdatedAt, wordCount, totalCostUsd, archived, pinned, presetId, folderId, *tags',
+      messages:
+        'id, chatId, parentId, turnId, [chatId+parentId], [chatId+createdAt], [chatId+turnId], [chatId+deleted]',
+      childLists: 'id, [chatId+parentId], updatedAt',
+      attachments: 'id, contentHash, kind, mime, origin, refCount, createdAt, updatedAt, deletedAt',
+      attachmentBlobs: 'id, attachmentId, role, contentHash, createdAt',
+      attachmentArtifacts: 'artifactId, attachmentId, kind, processorId, createdAt',
+      attachmentJobs: 'id, attachmentId, processorId, status, updatedAt, [attachmentId+processorId+inputHash]',
+      profiles: 'id, name, kind, lastUsedAt, archived',
+      presets: 'id, name, connectionProfileId, lastUsedAt, archived',
+      promptPresets: 'id, kind, name, lastUsedAt',
+      folders: 'id, name, sortIndex, lastUsedAt',
+      tags: 'id, &nameLower, lastUsedAt',
+      chatBranchCache: '&chatId, branchLeafId, generatedAt',
+      keys: 'id, name',
+      settings: '&key',
+      models: '&[profileId+queryKey], fetchedAt',
+      endpoints: '&[profileId+modelId], fetchedAt',
+      privacyPolicies: '&[profileId+modelId], fetchedAt',
+      providers: '&profileId, fetchedAt',
+      generations: 'id, chatId, gen_id',
+      presetResolutions: '&[profileId+presetSlug], fetchedAt',
+      drafts: '&chatId, updatedAt',
+    })
+    .upgrade(async (tx) => {
+      const now = Date.now()
+      const blobs = tx.table<AttachmentBlob>('attachmentBlobs')
+      const attachmentTable = tx.table<Record<string, unknown>>('attachments')
+      const attachmentRows = await attachmentTable.toArray()
+      for (const row of attachmentRows) {
+        const id = String(row.id)
+        const createdAt = numberOr(row.createdAt, now)
+        const updatedAt = numberOr(row.updatedAt, createdAt)
+        const blob = legacyBlob(row.blob)
+        const blobId = storageBlobId(row.storage) ?? (blob ? `${id}:original` : undefined)
+        const contentHash = typeof row.contentHash === 'string' ? row.contentHash : undefined
+        if (blob && blobId && contentHash && !(await blobs.get(blobId))) {
+          await blobs.put({
+            id: blobId,
+            attachmentId: id,
+            role: 'original',
+            mime: typeof row.mime === 'string' ? row.mime : 'application/octet-stream',
+            contentHash,
+            sizeBytes: typeof row.sizeBytes === 'number' ? row.sizeBytes : blob.size,
+            blob,
+            createdAt,
+          })
+        }
+
+        delete row.blob
+        delete row.thumbnailB64
+        row.kind = row.kind === 'file' ? 'other' : (row.kind ?? 'other')
+        row.origin = row.origin ?? 'import'
+        row.createdAt = createdAt
+        row.updatedAt = updatedAt
+        row.extension = row.extension ?? extensionFromFilename(row.filename)
+        row.sizeBytes = row.sizeBytes ?? blob?.size
+        row.artifacts = Array.isArray(row.artifacts) ? row.artifacts : []
+        row.processing = Array.isArray(row.processing) ? row.processing : []
+        row.storage =
+          row.storage ??
+          (blobId
+            ? { kind: 'local-blob', blobId }
+            : { kind: 'missing', reason: 'import-missing', missingSince: now })
+        row.refCount = 0
+        await attachmentTable.put(row)
+      }
+
+      const refCounts = new Map<string, number>()
+      await tx
+        .table<Record<string, unknown>>('messages')
+        .toCollection()
+        .modify((row) => {
+          const refs =
+            normalizeLegacyAttachmentRefs(row.attachmentRefs, {
+              messageId: String(row.id),
+              createdAt: numberOr(row.createdAt, now),
+            }) ?? []
+          row.attachmentRefs = refs
+          for (const ref of refs ?? []) {
+            if (ref.deletedAt !== undefined) continue
+            refCounts.set(ref.attachmentId, (refCounts.get(ref.attachmentId) ?? 0) + 1)
+          }
+        })
+      await tx
+        .table<Record<string, unknown>>('drafts')
+        .toCollection()
+        .modify((row) => {
+          const refs =
+            normalizeLegacyAttachmentRefs(row.attachmentRefs, {
+              draftChatId: String(row.chatId),
+              createdAt: numberOr(row.updatedAt, now),
+            }) ?? []
+          row.attachmentRefs = refs
+          for (const ref of refs ?? []) {
+            if (ref.deletedAt !== undefined) continue
+            refCounts.set(ref.attachmentId, (refCounts.get(ref.attachmentId) ?? 0) + 1)
+          }
+        })
+      await tx
+        .table<Attachment>('attachments')
+        .toCollection()
+        .modify((row) => {
+          row.refCount = refCounts.get(row.id) ?? 0
+        })
+    })
 }
 
 function migrateSettingsRow(
@@ -358,6 +478,74 @@ function migrateSettingsRow(
 
 function providerCacheKey(profileId: string, modelId: string): string {
   return `${profileId}\u0000${modelId}`
+}
+
+function numberOr(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback
+}
+
+function extensionFromFilename(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const filename = value.split(/[\\/]/).pop() ?? value
+  const dot = filename.lastIndexOf('.')
+  if (dot <= 0 || dot === filename.length - 1) return undefined
+  return filename.slice(dot + 1).toLowerCase()
+}
+
+function storageBlobId(value: unknown): string | undefined {
+  if (!value || typeof value !== 'object') return undefined
+  const storage = value as { kind?: unknown; blobId?: unknown }
+  return storage.kind === 'local-blob' && typeof storage.blobId === 'string'
+    ? storage.blobId
+    : undefined
+}
+
+function legacyBlob(value: unknown): Blob | undefined {
+  if (value instanceof Blob) return value
+  if (!value || typeof value !== 'object') return undefined
+  const candidate = value as { size?: unknown; arrayBuffer?: unknown; type?: unknown }
+  if (typeof candidate.size !== 'number' || typeof candidate.arrayBuffer !== 'function') {
+    return undefined
+  }
+  return value as Blob
+}
+
+function normalizeLegacyAttachmentRefs(
+  value: unknown,
+  owner: { messageId?: string; draftChatId?: string; createdAt: number },
+): MessageAttachmentRef[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  return value
+    .map((raw, index): MessageAttachmentRef | undefined => {
+      if (typeof raw === 'string') {
+        return {
+          refId: `legacy:${owner.messageId ?? owner.draftChatId ?? 'unknown'}:${index}`,
+          attachmentId: raw,
+          includeInContext: true,
+          presentation: {},
+          createdAt: owner.createdAt,
+          updatedAt: owner.createdAt,
+        }
+      }
+      if (!raw || typeof raw !== 'object') return undefined
+      const ref = raw as Partial<MessageAttachmentRef>
+      if (typeof ref.attachmentId !== 'string') return undefined
+      return {
+        refId:
+          typeof ref.refId === 'string'
+            ? ref.refId
+            : `legacy:${owner.messageId ?? owner.draftChatId ?? 'unknown'}:${index}`,
+        attachmentId: ref.attachmentId,
+        includeInContext: ref.includeInContext !== false,
+        presentation: ref.presentation ?? {},
+        ...(ref.tokenEstimate ? { tokenEstimate: ref.tokenEstimate } : {}),
+        ...(ref.missingResolution ? { missingResolution: ref.missingResolution } : {}),
+        createdAt: numberOr(ref.createdAt, owner.createdAt),
+        updatedAt: numberOr(ref.updatedAt, owner.createdAt),
+        ...(typeof ref.deletedAt === 'number' ? { deletedAt: ref.deletedAt } : {}),
+      }
+    })
+    .filter((ref): ref is MessageAttachmentRef => ref !== undefined)
 }
 
 export function childListKey(chatId: string, parentId: string | null): string {

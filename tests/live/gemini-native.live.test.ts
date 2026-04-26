@@ -14,7 +14,9 @@ const LIVE = process.env.LIVE === '1'
 
 function loadKey(): string {
   const raw = readFileSync(resolve(__dirname, '../../../keys.json'), 'utf8')
-  return (JSON.parse(raw) as Record<string, string>).google!
+  const key = (JSON.parse(raw) as Record<string, string>).google
+  if (!key) throw new Error('keys.json missing google')
+  return key
 }
 
 async function drain(source: AsyncIterable<StreamLaneEvent>): Promise<StreamLaneEvent[]> {
@@ -77,7 +79,8 @@ describe.skipIf(!LIVE)('live — Gemini native generateContent', () => {
     // about the reasoning carrier shape, not the finish reason.
     expect(['STOP', 'MAX_TOKENS']).toContain(cand?.finishReason)
 
-    const parts = cand!.content.parts
+    const parts = cand?.content.parts
+    if (!parts) throw new Error('missing Gemini candidate parts')
     const thoughtSummary = parts.find(
       (p) => 'text' in p && (p as { thought?: boolean }).thought === true,
     )
@@ -214,6 +217,8 @@ describe.skipIf(!LIVE)('live — Gemini native generateContent', () => {
       // Gemini may not call the tool in this sparse setup — gracefully skip.
       return
     }
+    const functionCall = call.functionCall
+    if (!functionCall) throw new Error('expected Gemini functionCall part')
     expect(call.thoughtSignature).toBeDefined()
 
     // Now strip the signature and expect HTTP 400.
@@ -221,7 +226,7 @@ describe.skipIf(!LIVE)('live — Gemini native generateContent', () => {
       role: 'model',
       parts: [
         {
-          functionCall: call.functionCall!,
+          functionCall,
           // No thoughtSignature on purpose.
         },
       ],
@@ -241,7 +246,7 @@ describe.skipIf(!LIVE)('live — Gemini native generateContent', () => {
               parts: [
                 {
                   functionResponse: {
-                    name: call.functionCall!.name,
+                    name: functionCall.name,
                     response: { result: 42 },
                   },
                 },

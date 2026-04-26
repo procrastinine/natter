@@ -39,6 +39,6 @@
   [data-ui="sidebar"],
   [data-ui="composer"],
   [data-ui="settings-overlay"] {
-    display: none !important;
+    display: none;
   }
 }

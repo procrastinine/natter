@@ -85,6 +85,9 @@ describe('browser repository mutation executor', () => {
       'settings',
     ])
     expect(resolveMutationTableNames([{ kind: 'attachment', attachmentId: 'A1' }])).toEqual([
+      'attachmentArtifacts',
+      'attachmentBlobs',
+      'attachmentJobs',
       'attachments',
       'settings',
     ])
@@ -368,12 +371,16 @@ describe('browser repository mutation executor', () => {
       await ctx.putAttachment({
         id: 'A1',
         contentHash: 'hash',
-        kind: 'file',
+        kind: 'other',
         mime: 'text/plain',
         filename: 'a.txt',
         sizeBytes: 1,
+        origin: 'system-fixture',
         createdAt: 1,
-        blob: new Blob(['a']),
+        updatedAt: 1,
+        storage: { kind: 'local-blob', blobId: 'A1:blob' },
+        artifacts: [],
+        processing: [],
         refCount: 0,
       })
     })

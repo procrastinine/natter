@@ -80,6 +80,7 @@ export async function nukeSiteStorage(opts: NukeOptions = {}): Promise<void> {
           for (const path of ['/', location.pathname]) {
             for (const domain of [host, `.${host}`, '']) {
               const domainAttr = domain ? `; domain=${domain}` : ''
+              // biome-ignore lint/suspicious/noDocumentCookie: Dev-only nuke has to expire legacy JS-visible cookies across path/domain variants.
               document.cookie = `${name}=; path=${path}${domainAttr}; expires=Thu, 01 Jan 1970 00:00:00 GMT`
             }
           }

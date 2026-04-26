@@ -972,8 +972,8 @@ function OpenAIRoutingControls({ profile }: { profile: ConnectionProfile }) {
             </span>
           </label>
           <span data-ui="helper">
-            OpenAI retains the response for 30 days. Required for <code>previous_response_id</code>;
-            disabled by default for privacy.
+            OpenAI retains the response for 30 days. Required for <code>previous_response_id</code>
+            and disabled by default for privacy.
           </span>
           <label data-ui="reasoning-checkbox">
             <input

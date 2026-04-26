@@ -1,5 +1,11 @@
 import { newId } from '../lib/ulid'
-import { decRefs, diffAttachmentRefs, incRefs } from '../store/attachments'
+import {
+  attachmentRefsFromIds,
+  attachmentScopes,
+  decRefs,
+  diffAttachmentRefs,
+  incRefs,
+} from '../store/attachments'
 import { getBrowserRepository } from '../store/browser-repo'
 import type { MutationContext, WorkspaceMutationResult } from '../store/repository'
 import { cursorKeyOf, groupByParent, indexById } from './active-path'
@@ -20,6 +26,7 @@ import {
 } from './tree-ops'
 import type {
   AttachmentId,
+  AttachmentRef,
   ChatId,
   ChatVersions,
   ContentItem,
@@ -70,13 +77,6 @@ function childrenScope(chatId: ChatId, parentId: MessageId | null): MutationScop
   return { kind: 'children', chatId, parentId }
 }
 
-function attachmentScopes(ids: readonly AttachmentId[] | undefined): MutationScope[] {
-  return [...new Set(ids ?? [])].map((attachmentId) => ({
-    kind: 'attachment' as const,
-    attachmentId,
-  }))
-}
-
 function dedupeScopes(scopes: readonly MutationScope[]): MutationScope[] {
   const seen = new Set<string>()
   const out: MutationScope[] = []
@@ -100,11 +100,24 @@ function dedupeScopes(scopes: readonly MutationScope[]): MutationScope[] {
 
 function withAttachmentRefs<T extends object>(
   row: T,
-  refs: readonly AttachmentId[] | undefined,
-): T & { attachmentRefs?: AttachmentId[] } {
-  const next = row as T & { attachmentRefs?: AttachmentId[] }
+  refs: readonly AttachmentRef[] | undefined,
+  now?: number,
+  existing?: readonly AttachmentRef[],
+): T & { attachmentRefs?: AttachmentRef[] } {
+  const next = row as T & { attachmentRefs?: AttachmentRef[] }
   if (refs && refs.length > 0) {
-    next.attachmentRefs = [...refs]
+    next.attachmentRefs = refs.some((ref) => typeof ref !== 'string')
+      ? refs.map((ref) => {
+          if (typeof ref !== 'string') return { ...ref, updatedAt: now ?? ref.updatedAt }
+          return attachmentRefsFromIds([ref], {
+            ...(now !== undefined ? { createdAt: now } : {}),
+            ...(existing ? { existing } : {}),
+          })[0] as AttachmentRef
+        })
+      : attachmentRefsFromIds(refs as readonly AttachmentId[], {
+          ...(now !== undefined ? { createdAt: now } : {}),
+          ...(existing ? { existing } : {}),
+        })
   }
   return next
 }
@@ -404,7 +417,7 @@ export interface SendUserMessageInput {
   chatId: ChatId
   cursor: CursorMap
   content: ContentItem[]
-  attachmentRefs?: AttachmentId[]
+  attachmentRefs?: AttachmentRef[]
   origin?: MessageOrigin
   role?: MessageRole
   now?: number
@@ -467,6 +480,7 @@ export async function sendUserMessage(
           ...(calibrationFields ?? {}),
         },
         attachmentRefs,
+        now,
       )
       await ctx.putMessage(row)
       await incRefs(ctx, attachmentRefs ?? [])
@@ -532,7 +546,7 @@ export interface EditMessageInput {
   chatId: ChatId
   messageId: MessageId
   content: ContentItem[]
-  attachmentRefs?: AttachmentId[]
+  attachmentRefs?: AttachmentRef[]
   now?: number
 }
 
@@ -580,8 +594,15 @@ export async function editMessageContent(
         ...(calibrationPatch ?? {}),
       }
       if (input.attachmentRefs !== undefined) {
-        if (input.attachmentRefs.length > 0) next.attachmentRefs = [...input.attachmentRefs]
-        else delete next.attachmentRefs
+        if (input.attachmentRefs.length > 0) {
+          const withRefs = withAttachmentRefs(
+            {},
+            input.attachmentRefs,
+            input.now ?? Date.now(),
+            current.attachmentRefs,
+          )
+          if (withRefs.attachmentRefs) next.attachmentRefs = withRefs.attachmentRefs
+        } else delete next.attachmentRefs
       }
       await incRefs(ctx, toInc)
       await decRefs(ctx, toDec)
@@ -687,7 +708,7 @@ export interface InsertSiblingInput {
   content: ContentItem[]
   role?: MessageRole
   origin?: MessageOrigin
-  attachmentRefs?: AttachmentId[]
+  attachmentRefs?: AttachmentRef[]
   now?: number
 }
 

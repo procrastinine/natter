@@ -92,9 +92,9 @@ function normalizeArchitecture(v: unknown): ModelEndpoint['architecture'] | unde
   const obj = asRecord(v)
   if (!obj) return undefined
   const out: NonNullable<ModelEndpoint['architecture']> = {}
-  const im = asStringArray(obj['input_modalities']) ?? asStringArray(obj['inputModalities'])
-  const om = asStringArray(obj['output_modalities']) ?? asStringArray(obj['outputModalities'])
-  const tok = asString(obj['tokenizer'])
+  const im = asStringArray(obj.input_modalities) ?? asStringArray(obj.inputModalities)
+  const om = asStringArray(obj.output_modalities) ?? asStringArray(obj.outputModalities)
+  const tok = asString(obj.tokenizer)
   if (im) out.input_modalities = im
   if (om) out.output_modalities = om
   if (tok) out.tokenizer = tok
@@ -105,9 +105,9 @@ function normalizeArchitecture(v: unknown): ModelEndpoint['architecture'] | unde
 export function normalizeEndpoint(raw: unknown): ModelEndpoint | null {
   const obj = asRecord(raw)
   if (!obj) return null
-  const provider_name = asString(obj['provider_name'])
-  const supported_parameters = asStringArray(obj['supported_parameters'])
-  const context_length = asNumber(obj['context_length'])
+  const provider_name = asString(obj.provider_name)
+  const supported_parameters = asStringArray(obj.supported_parameters)
+  const context_length = asNumber(obj.context_length)
   if (!provider_name || !supported_parameters || context_length === undefined) {
     return null
   }
@@ -115,43 +115,43 @@ export function normalizeEndpoint(raw: unknown): ModelEndpoint | null {
     provider_name,
     supported_parameters,
     context_length,
-    pricing: normalizePricing(obj['pricing']) ?? {},
+    pricing: normalizePricing(obj.pricing) ?? {},
   }
-  const id = asString(obj['id'])
+  const id = asString(obj.id)
   if (id) endpoint.id = id
-  const providerDisplayName = asString(obj['provider_display_name']) ?? asString(asRecord(obj['provider_info'])?.['displayName'])
+  const providerDisplayName = asString(obj.provider_display_name) ?? asString(asRecord(obj.provider_info)?.displayName)
   if (providerDisplayName) endpoint.provider_display_name = providerDisplayName
   const providerSlug =
-    asString(obj['provider_slug']) ??
-    asString(obj['tag']) ??
-    asString(asRecord(obj['provider_info'])?.['slug'])
+    asString(obj.provider_slug) ??
+    asString(obj.tag) ??
+    asString(asRecord(obj.provider_info)?.slug)
   if (providerSlug) endpoint.provider_slug = providerSlug
-  const providerModelId = asString(obj['provider_model_id'])
+  const providerModelId = asString(obj.provider_model_id)
   if (providerModelId) endpoint.provider_model_id = providerModelId
-  const rawPolicy = asRecord(obj['data_policy']) ?? asRecord(asRecord(obj['provider_info'])?.['dataPolicy'])
+  const rawPolicy = asRecord(obj.data_policy) ?? asRecord(asRecord(obj.provider_info)?.dataPolicy)
   const dataPolicy = rawPolicy ? normalizeDataPolicy(rawPolicy) : null
   if (dataPolicy) endpoint.data_policy = dataPolicy
-  const mpt = asNumber(obj['max_prompt_tokens'])
+  const mpt = asNumber(obj.max_prompt_tokens)
   if (mpt !== undefined) endpoint.max_prompt_tokens = mpt
-  const mct = asNumber(obj['max_completion_tokens'])
+  const mct = asNumber(obj.max_completion_tokens)
   if (mct !== undefined) endpoint.max_completion_tokens = mct
-  const sic = obj['supports_implicit_caching']
+  const sic = obj.supports_implicit_caching
   if (typeof sic === 'boolean') endpoint.supports_implicit_caching = sic
-  const q = asString(obj['quantization'])
+  const q = asString(obj.quantization)
   if (q) endpoint.quantization = q
-  const status = asString(obj['status'])
+  const status = asString(obj.status)
   if (status) endpoint.status = status
-  const u5 = asNumber(obj['uptime_last_5m'])
+  const u5 = asNumber(obj.uptime_last_5m)
   if (u5 !== undefined) endpoint.uptime_last_5m = u5
-  const u30 = asNumber(obj['uptime_last_30m'])
+  const u30 = asNumber(obj.uptime_last_30m)
   if (u30 !== undefined) endpoint.uptime_last_30m = u30
-  const u1d = asNumber(obj['uptime_last_1d'])
+  const u1d = asNumber(obj.uptime_last_1d)
   if (u1d !== undefined) endpoint.uptime_last_1d = u1d
-  const lat = normalizePercentile(obj['latency_last_30m'])
+  const lat = normalizePercentile(obj.latency_last_30m)
   if (lat) endpoint.latency_last_30m = lat
-  const through = asRecord(obj['throughput_last_30m'])
+  const through = asRecord(obj.throughput_last_30m)
   if (through) endpoint.throughput_last_30m = through
-  const arch = normalizeArchitecture(obj['architecture'])
+  const arch = normalizeArchitecture(obj.architecture)
   if (arch) endpoint.architecture = arch
   return endpoint
 }
@@ -170,11 +170,11 @@ export interface EndpointsDescriptor {
 export function normalizeEndpointsResponse(raw: unknown): EndpointsDescriptor | null {
   let root = asRecord(raw)
   if (!root) return null
-  const dataField = asRecord(root['data'])
+  const dataField = asRecord(root.data)
   if (dataField) root = dataField
-  const modelId = asString(root['id']) ?? asString(root['canonical_slug'])
+  const modelId = asString(root.id) ?? asString(root.canonical_slug)
   if (!modelId) return null
-  const rawEndpoints = root['endpoints']
+  const rawEndpoints = root.endpoints
   const endpoints: ModelEndpoint[] = []
   if (Array.isArray(rawEndpoints)) {
     for (const row of rawEndpoints) {
@@ -183,13 +183,13 @@ export function normalizeEndpointsResponse(raw: unknown): EndpointsDescriptor | 
     }
   }
   const out: EndpointsDescriptor = { modelId, endpoints }
-  const name = asString(root['name'])
+  const name = asString(root.name)
   if (name) out.name = name
-  const description = asString(root['description'])
+  const description = asString(root.description)
   if (description) out.description = description
-  const cl = asNumber(root['context_length'])
+  const cl = asNumber(root.context_length)
   if (cl !== undefined) out.contextLength = cl
-  const arch = normalizeArchitecture(root['architecture'])
+  const arch = normalizeArchitecture(root.architecture)
   if (arch) out.architecture = arch
   return out
 }
@@ -201,57 +201,57 @@ export function normalizeEndpointsResponse(raw: unknown): EndpointsDescriptor | 
 export function normalizeModelsResponse(raw: unknown): ModelListEntry[] {
   const root = asRecord(raw)
   if (!root) return []
-  const data = root['data']
+  const data = root.data
   if (!Array.isArray(data)) return []
   const out: ModelListEntry[] = []
   for (const row of data) {
     const obj = asRecord(row)
     if (!obj) continue
-    const id = asString(obj['id'])
+    const id = asString(obj.id)
     if (!id) continue
     const entry: ModelListEntry = { id }
-    const slug = asString(obj['canonical_slug'])
+    const slug = asString(obj.canonical_slug)
     if (slug) entry.canonicalSlug = slug
-    const name = asString(obj['name'])
+    const name = asString(obj.name)
     if (name) entry.name = name
-    const description = asString(obj['description'])
+    const description = asString(obj.description)
     if (description) entry.description = description
-    const created = asNumber(obj['created'])
+    const created = asNumber(obj.created)
     if (created !== undefined) entry.created = created
     // OpenRouter returns `context_length` at the top level; llama.cpp /v1/models
     // tucks it under `meta.n_ctx_train` (training context); Ollama uses
     // `model_info.general.context_length` or similar. Try each so local
     // servers get a real numeric cap instead of the permissive default.
-    let cl = asNumber(obj['context_length'])
+    let cl = asNumber(obj.context_length)
     if (cl === undefined) {
-      const meta = asRecord(obj['meta'])
-      cl = asNumber(meta?.['n_ctx_train']) ?? asNumber(meta?.['n_ctx'])
+      const meta = asRecord(obj.meta)
+      cl = asNumber(meta?.n_ctx_train) ?? asNumber(meta?.n_ctx)
     }
     if (cl === undefined) {
-      const mi = asRecord(obj['model_info'])
-      cl = asNumber(mi?.['context_length'])
+      const mi = asRecord(obj.model_info)
+      cl = asNumber(mi?.context_length)
     }
     if (cl !== undefined) entry.contextLength = cl
-    const arch = asRecord(obj['architecture'])
+    const arch = asRecord(obj.architecture)
     if (arch) {
       const normalized: NonNullable<ModelListEntry['architecture']> = {}
-      const im = asStringArray(arch['input_modalities'])
-      const om = asStringArray(arch['output_modalities'])
-      const tok = asString(arch['tokenizer'])
+      const im = asStringArray(arch.input_modalities)
+      const om = asStringArray(arch.output_modalities)
+      const tok = asString(arch.tokenizer)
       if (im) normalized.inputModalities = im
       if (om) normalized.outputModalities = om
       if (tok) normalized.tokenizer = tok
       if (Object.keys(normalized).length > 0) entry.architecture = normalized
     }
-    const pricing = normalizePricing(obj['pricing'])
+    const pricing = normalizePricing(obj.pricing)
     if (pricing) entry.pricing = pricing
-    const tp = asRecord(obj['top_provider'])
+    const tp = asRecord(obj.top_provider)
     if (tp) entry.topProvider = tp
-    const prl = asRecord(obj['per_request_limits'])
+    const prl = asRecord(obj.per_request_limits)
     if (prl) entry.perRequestLimits = prl
-    const sp = asStringArray(obj['supported_parameters'])
+    const sp = asStringArray(obj.supported_parameters)
     if (sp) entry.supportedParameters = sp
-    const dp = asRecord(obj['default_parameters'])
+    const dp = asRecord(obj.default_parameters)
     if (dp) {
       const numericDefaults: Record<string, number> = {}
       for (const [k, v] of Object.entries(dp)) {
@@ -260,15 +260,15 @@ export function normalizeModelsResponse(raw: unknown): ModelListEntry[] {
       }
       if (Object.keys(numericDefaults).length > 0) entry.defaultParameters = numericDefaults
     }
-    const exp = asString(obj['expiration_date'])
+    const exp = asString(obj.expiration_date)
     if (exp) entry.expirationDate = exp
-    const kc = asString(obj['knowledge_cutoff'])
+    const kc = asString(obj.knowledge_cutoff)
     if (kc) entry.knowledgeCutoff = kc
-    const hf = asString(obj['hugging_face_id'])
+    const hf = asString(obj.hugging_face_id)
     if (hf) entry.huggingFaceId = hf
-    const links = asRecord(obj['links'])
+    const links = asRecord(obj.links)
     if (links) {
-      const details = asString(links['details'])
+      const details = asString(links.details)
       if (details) entry.links = { details }
     }
     out.push(entry)

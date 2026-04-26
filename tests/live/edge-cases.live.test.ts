@@ -21,7 +21,9 @@ const LIVE = process.env.LIVE === '1'
 
 function loadKey(name: string): string {
   const raw = readFileSync(resolve(__dirname, '../../../keys.json'), 'utf8')
-  return (JSON.parse(raw) as Record<string, string>)[name]!
+  const key = (JSON.parse(raw) as Record<string, string>)[name]
+  if (!key) throw new Error(`keys.json missing ${name}`)
+  return key
 }
 
 function openRouterProfile(): ConnectionProfile {

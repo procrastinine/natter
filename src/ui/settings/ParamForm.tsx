@@ -22,7 +22,6 @@ import {
   prefillClassFor,
   reasoningToggleableFor,
   responsesSupportFor,
-  textCompletionsSupportFor,
 } from '../../core/quirks'
 import type {
   ApiVariant,
@@ -880,15 +879,10 @@ export function ApiModeSection({
   if (profile.kind === 'google' && profile.geminiMode !== 'openai-compat') return null
   const support = responsesSupportFor(chat.settings.model)
   const canResponses = isResponsesCapable(profile) && support === 'both'
-  const textSupport = textCompletionsSupportFor(chat.settings.model)
   const canText = isTextCompletionsCapable(profile, chat.settings.model)
-  const showDisabledText =
-    profile.kind === 'openrouter' &&
-    support !== 'responses-only' &&
-    (textSupport === 'disabled-chat-native' || textSupport === 'accepted-reasoning-only')
-  // Hide toggle unless the model has a genuine choice or a disabled text
-  // option worth explaining.
-  if (!canResponses && !canText && !showDisabledText) return null
+  // Hide the whole section unless the current model exposes a genuine
+  // per-chat API choice beyond the default chat-completions route.
+  if (!canResponses && !canText) return null
   const route = chooseApi(profile, chat.settings, activePathMessages, capability)
   const resolvedKind: 'chat' | 'responses' | 'text' =
     route.kind === 'responses' ? 'responses' : route.kind === 'text-completions' ? 'text' : 'chat'
@@ -906,12 +900,6 @@ export function ApiModeSection({
     }
     void updateChatSettings(chat.id, { api: target as ApiVariant })
   }
-  const textDisabledReason =
-    textSupport === 'disabled-chat-native'
-      ? 'Text completions is disabled for closed-source chat-native families; use Chat completions or Responses.'
-      : textSupport === 'accepted-reasoning-only'
-        ? 'This model accepts prompt mode but returns reasoning-only output in live probes.'
-        : ''
   return (
     <section data-ui="settings-section" data-ui-section="api-mode">
       <h3>
@@ -938,13 +926,11 @@ export function ApiModeSection({
               Responses
             </button>
           ) : null}
-          {canText || showDisabledText ? (
+          {canText ? (
             <button
               type="button"
               data-ui="segmented-option"
               aria-pressed={resolvedKind === 'text'}
-              disabled={!canText}
-              title={textDisabledReason}
               onClick={() => pinTo('text')}
             >
               Text completions
@@ -1051,13 +1037,13 @@ function StopTextAreaControl({
   const hasStop =
     capability.supportedParameters.has('stop') ||
     capability.supportedParameters.has('stop_sequences')
-  if (!hasStop) return null
   const values = chat.settings.stop ?? []
   const text = values.join('\n')
   const [draft, setDraft] = useState(text)
   useEffect(() => {
     setDraft(text)
   }, [text])
+  if (!hasStop) return null
   const setValues = (next: string[]) => {
     const clean = sanitizeStopValues(next)
     void updateChatSettings(chat.id, clean.length === 0 ? { stop: [] } : { stop: clean })

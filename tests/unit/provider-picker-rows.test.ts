@@ -63,10 +63,10 @@ describe('buildPickerRows', () => {
       zeroEligible: false,
     }
     const [row] = buildPickerRows([azure], filter)
-    expect(row!.state).toBe('kept')
-    expect(row!.tier).toBe('green')
-    expect(row!.reasons).toEqual([])
-    expect(row!.policySynthesized).toBe(false)
+    expect(row?.state).toBe('kept')
+    expect(row?.tier).toBe('green')
+    expect(row?.reasons).toEqual([])
+    expect(row?.policySynthesized).toBe(false)
   })
 
   it('maps auto-excluded endpoints with their reasons + dominated tier', () => {
@@ -85,10 +85,10 @@ describe('buildPickerRows', () => {
       zeroEligible: true,
     }
     const [row] = buildPickerRows([openai], filter)
-    expect(row!.state).toBe('auto-excluded')
+    expect(row?.state).toBe('auto-excluded')
     // Indefinite retention + requiresUserIDs is orange per 2026-04-19 spec.
-    expect(row!.tier).toBe('orange')
-    expect(row!.reasons).toEqual(['dominated'])
+    expect(row?.tier).toBe('orange')
+    expect(row?.reasons).toEqual(['dominated'])
   })
 
   it('preserves endpoint order from input (picker controls sorting upstream)', () => {
@@ -127,9 +127,9 @@ describe('buildPickerRows', () => {
       zeroEligible: true,
     }
     const [row] = buildPickerRows([mystery], filter)
-    expect(row!.tier).toBe('red')
-    expect(row!.policySynthesized).toBe(true)
-    expect(row!.reasons).toContain('unknown-policy')
+    expect(row?.tier).toBe('red')
+    expect(row?.policySynthesized).toBe(true)
+    expect(row?.reasons).toContain('unknown-policy')
   })
 
   it('falls back gracefully when an endpoint is missing from both kept + excluded', () => {
@@ -143,10 +143,10 @@ describe('buildPickerRows', () => {
       zeroEligible: false,
     }
     const [row] = buildPickerRows([ghost], filter)
-    expect(row!.state).toBe('auto-excluded')
-    expect(row!.tier).toBe('unavailable')
-    expect(row!.reasons).toEqual(['unknown-policy'])
-    expect(row!.policySynthesized).toBe(false)
+    expect(row?.state).toBe('auto-excluded')
+    expect(row?.tier).toBe('unavailable')
+    expect(row?.reasons).toEqual(['unknown-policy'])
+    expect(row?.policySynthesized).toBe(false)
   })
 
   it('treats manually re-allowed dominated providers as kept while preserving their lower tier', () => {
@@ -167,9 +167,9 @@ describe('buildPickerRows', () => {
     const [row] = buildPickerRows([fastRetain], filter, {
       providerPrefs: { ignore: [], ignoreOverridesFilter: true },
     })
-    expect(row!.state).toBe('kept')
-    expect(row!.tier).toBe('orange')
-    expect(row!.reasons).toEqual([])
+    expect(row?.state).toBe('kept')
+    expect(row?.tier).toBe('orange')
+    expect(row?.reasons).toEqual([])
   })
 
   it('lets manual picker override even red privacy tiers', () => {
@@ -190,9 +190,9 @@ describe('buildPickerRows', () => {
     const [row] = buildPickerRows([trainer], filter, {
       providerPrefs: { ignore: [], ignoreOverridesFilter: true },
     })
-    expect(row!.state).toBe('kept')
-    expect(row!.tier).toBe('red')
-    expect(row!.reasons).toEqual([])
+    expect(row?.state).toBe('kept')
+    expect(row?.tier).toBe('red')
+    expect(row?.reasons).toEqual([])
   })
 
   it('renders compatibility providerPrefs.only as a visible pinned set', () => {

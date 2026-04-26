@@ -63,6 +63,11 @@ function assistant(id: string, text: string, opts: Partial<Message> = {}): Messa
   }
 }
 
+function required<T>(value: T | undefined, label: string): T {
+  if (value === undefined) throw new Error(`missing ${label}`)
+  return value
+}
+
 describe('toGeminiNative — envelope + URL', () => {
   it('strips provider prefix from the modelId', () => {
     const { modelId, requestedModel } = toGeminiNative(settings(), [user('u1', 'hi')])
@@ -249,9 +254,9 @@ describe('toGeminiNative — reasoning echo (thoughtSignature on LAST part)', ()
     )
     // contents[0] = user, contents[1] = model, contents[2] = user follow-up
     expect(wire.contents).toHaveLength(3)
-    const modelTurn = wire.contents[1]!
+    const modelTurn = required(wire.contents[1], 'model turn')
     expect(modelTurn.role).toBe('model')
-    const lastPart = modelTurn.parts[modelTurn.parts.length - 1]! as {
+    const lastPart = required(modelTurn.parts[modelTurn.parts.length - 1], 'last model part') as {
       text?: string
       thoughtSignature?: string
     }
@@ -278,8 +283,8 @@ describe('toGeminiNative — reasoning echo (thoughtSignature on LAST part)', ()
       }),
       path,
     )
-    const modelTurn = wire.contents[1]!
-    const lastPart = modelTurn.parts[modelTurn.parts.length - 1]! as { thoughtSignature?: string }
+    const modelTurn = required(wire.contents[1], 'model turn')
+    const lastPart = required(modelTurn.parts[modelTurn.parts.length - 1], 'last model part') as { thoughtSignature?: string }
     expect(lastPart.thoughtSignature).toBeUndefined()
   })
 
@@ -302,8 +307,8 @@ describe('toGeminiNative — reasoning echo (thoughtSignature on LAST part)', ()
       }),
       path,
     )
-    const modelTurn = wire.contents[1]!
-    const lastPart = modelTurn.parts[modelTurn.parts.length - 1]! as { thoughtSignature?: string }
+    const modelTurn = required(wire.contents[1], 'model turn')
+    const lastPart = required(modelTurn.parts[modelTurn.parts.length - 1], 'last model part') as { thoughtSignature?: string }
     // Format mismatch → preservation format is google-gemini-v1 (from quirks),
     // but the stored detail is openai-responses-v1 → skip the attach.
     expect(lastPart.thoughtSignature).toBeUndefined()
@@ -329,7 +334,7 @@ describe('toGeminiNative — reasoning echo (thoughtSignature on LAST part)', ()
       }),
       path,
     )
-    const modelTurn = wire.contents[1]!
+    const modelTurn = required(wire.contents[1], 'model turn')
     expect(modelTurn.parts).toEqual([
       { text: 'I was thinking about X.', thought: true },
       { text: 'answer' },
@@ -360,7 +365,7 @@ describe('toGeminiNative — reasoning echo (thoughtSignature on LAST part)', ()
       }),
       path,
     )
-    const modelTurn = wire.contents[1]!
+    const modelTurn = required(wire.contents[1], 'model turn')
     expect(modelTurn.parts[0]).toEqual({ text: 'Summary of thinking', thought: true })
   })
 
@@ -390,7 +395,7 @@ describe('toGeminiNative — reasoning echo (thoughtSignature on LAST part)', ()
       }),
       path,
     )
-    const modelTurn = wire.contents[1]!
+    const modelTurn = required(wire.contents[1], 'model turn')
     const thoughtParts = modelTurn.parts.filter(
       (p): p is { text: string; thought: true } =>
         'text' in p && (p as { thought?: boolean }).thought === true,
@@ -424,7 +429,7 @@ describe('toGeminiNative — reasoning echo (thoughtSignature on LAST part)', ()
       }),
       path,
     )
-    const modelTurn = wire.contents[1]!
+    const modelTurn = required(wire.contents[1], 'model turn')
     const thoughtParts = modelTurn.parts.filter(
       (p): p is { text: string; thought: true } =>
         'text' in p && (p as { thought?: boolean }).thought === true,
@@ -445,7 +450,7 @@ describe('toGeminiNative — tool calls + tool results', () => {
     ]
     const path: Message[] = [user('u1', 'search'), assistant('a1', '', { toolCalls })]
     const { wire } = toGeminiNative(settings(), path)
-    const model = wire.contents[1]!
+    const model = required(wire.contents[1], 'model turn')
     expect(model.parts).toEqual([
       {
         functionCall: { name: 'search', args: { q: 'consecutive' }, id: 'call_1' },

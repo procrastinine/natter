@@ -47,8 +47,11 @@
   animation: natter-fade-in var(--duration-fast) var(--ease-standard);
 }
 
-[data-generating="true"] [data-ui="spinner"],
 [data-ui="spinner"] {
+  animation: natter-spin 1s linear infinite;
+}
+
+[data-generating="true"] [data-ui="spinner"] {
   animation: natter-spin 1s linear infinite;
 }
 
@@ -58,29 +61,30 @@ html {
 
 [data-reduced-motion="true"],
 [data-reduced-motion="true"] * {
-  animation-duration: 0ms !important;
-  animation-iteration-count: 1 !important;
-  transition-duration: 0ms !important;
+  animation-duration: 0ms;
+  animation-iteration-count: 1;
+  transition-duration: 0ms;
 }
 
 [data-reduced-motion="true"]::after,
 [data-reduced-motion="true"] [data-streaming="true"]::after {
-  animation: none !important;
+  animation: none;
 }
 
 @media (prefers-reduced-motion: reduce) {
   html {
     scroll-behavior: auto;
   }
+  /* biome-ignore lint/style/noDescendingSpecificity: The media-query reset intentionally overrides earlier animation selectors. */
   *,
   *::before,
   *::after {
-    animation-duration: 0ms !important;
-    animation-iteration-count: 1 !important;
-    transition-duration: 0ms !important;
+    animation-duration: 0ms;
+    animation-iteration-count: 1;
+    transition-duration: 0ms;
   }
   [data-streaming="true"]::after {
-    animation: none !important;
+    animation: none;
     opacity: 0.6;
   }
 }

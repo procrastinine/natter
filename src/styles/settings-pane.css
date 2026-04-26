@@ -382,6 +382,60 @@
   color: var(--color-fg-primary);
 }
 
+[data-ui="attachment-context-settings"] {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding-top: var(--space-1);
+}
+
+[data-ui="settings-subheader"] {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--color-fg-primary);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
+}
+
+[data-ui="settings-subheader"] > span:not([hidden]) {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+[data-ui="segmented-control"] {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  margin: 0;
+  padding: 0;
+  min-inline-size: 0;
+}
+
+[data-ui="segmented-control"] > button {
+  min-width: 0;
+  border: none;
+  border-right: 1px solid var(--color-border-subtle);
+  background: var(--color-bg-surface-1);
+  color: var(--color-fg-secondary);
+  padding: var(--space-2);
+  cursor: pointer;
+  font-size: var(--font-size-xs);
+}
+
+[data-ui="segmented-control"] > button:last-child {
+  border-right: none;
+}
+
+[data-ui="segmented-control"] > button[aria-pressed="true"] {
+  background: var(--color-accent-subtle);
+  color: var(--color-fg-primary);
+  font-weight: var(--font-weight-medium);
+}
+
 /* Inline link-like action embedded inside a <label> (e.g. Reset to
  * default next to a field name). Text-only, muted so it doesn't
  * compete with the label itself. */

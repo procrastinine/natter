@@ -73,26 +73,25 @@ describe('ApiModeSection — two-button toggle', () => {
     const responsesBtn = screen.getByRole('button', { name: 'Responses' })
     expect(chatBtn).toBeTruthy()
     expect(responsesBtn).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Text completions' })).toBeNull()
     // No "Auto" button — collapsed with the resolved option.
     expect(screen.queryByRole('button', { name: /^Auto/ })).toBeNull()
     expect(responsesBtn.getAttribute('aria-pressed')).toBe('true')
     expect(chatBtn.getAttribute('aria-pressed')).toBe('false')
   })
 
-  it('renders closed-source chat-native text mode as disabled on OpenRouter', async () => {
+  it('hides API mode for OpenRouter models whose only selectable route is chat completions', async () => {
     const settings = cloneDefaultChatSettings()
-    settings.model = 'anthropic/claude-haiku-4.5'
+    settings.model = 'google/gemini-3.1-pro-preview'
     const chat = await createChat({ settings })
     const capability = effectiveCapabilityFromEndpoints(settings.model, [
       makeEndpoint({ supported_parameters: ['reasoning'] }),
     ])
-    render(
+    const { container } = render(
       <ApiModeSection chat={chat} capability={capability} profile={makeProfile('openrouter')} />,
     )
-    const chatBtn = screen.getByRole('button', { name: 'Chat completions' })
-    const textBtn = screen.getByRole('button', { name: 'Text completions' })
-    expect(chatBtn.getAttribute('aria-pressed')).toBe('true')
-    expect(textBtn).toBeDisabled()
+    expect(container.querySelector('[data-ui-section="api-mode"]')).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Text completions' })).toBeNull()
   })
 
   it('persists Text completions for OpenRouter open-weight models', async () => {

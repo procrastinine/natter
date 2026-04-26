@@ -1,14 +1,33 @@
 import { applyServerTemplate } from '../api/probe'
 import { chooseApi, type ApiRoute } from './api-choice'
+import {
+  attachmentContextHasRefs,
+  attachmentContextIds,
+  attachmentContextPolicyForSettings,
+  resolveAttachmentContextRefs,
+} from './attachments/context'
+import { buildStoredOpenRouterAttachmentWire } from './attachments/stored-openrouter'
 import { resolveBundledCapability } from '../capabilities'
 import { readGlobalPreferences } from './global-settings'
-import { estimateSettingsPromptSize, tokenizerFromSettings, UNLIMITED_CONTEXT } from './prompt-size'
+import {
+  estimateSettingsPromptSize,
+  type AttachmentResolver,
+  tokenizerFromSettings,
+  UNLIMITED_CONTEXT,
+} from './prompt-size'
 import { resolvePrivacyForSend, type ResolvePrivacyForSendResult } from './privacy-request'
 import { providerDisplayName, providerRoutingRef } from './provider-identity'
 import { isTextCompletionsSelectableFor, quirksFor } from './quirks'
 import { charsPerToken, readTokenCalibrationGlobal } from './token-calibration'
 import type { PromptEstimateOptions } from './tokens'
-import type { CapabilityDescriptor, Chat, ChatSettings, ConnectionProfile, Message } from './types'
+import type {
+  Attachment,
+  CapabilityDescriptor,
+  Chat,
+  ChatSettings,
+  ConnectionProfile,
+  Message,
+} from './types'
 import type {
   ChatCompletionsTransformOptions,
   GeminiNativeTransformOptions,
@@ -18,6 +37,7 @@ import { toChatCompletions, toGeminiNative, toResponses, toTextCompletions } fro
 import { applyContextCutoff } from './context-cutoff'
 import { resolveTextTemplateFromLibrary } from './text-templates'
 import { getCachedModels } from '../store/models-cache'
+import { getBrowserRepository } from '../store/browser-repo'
 import { normalizeModelsResponse } from '../api/providers'
 import { logRequestPlanDebug } from '../lib/debug-streams'
 
@@ -96,13 +116,17 @@ export async function resolveRequestPrivacyPlan(
       readGlobalPreferences(),
       readTokenCalibrationGlobal(),
     ])
+    const attachmentContext = await loadAttachmentEstimateContext(
+      input.activePathMessages,
+      settings,
+    )
     const est = estimateSettingsPromptSize(
       settings,
       input.activePathMessages,
       input.draftText,
       null,
       null,
-      undefined,
+      attachmentContext.resolver,
       {
         chatTokenCalibration: input.chat.tokenCalibration,
         globalCalibration,
@@ -147,6 +171,7 @@ export interface AssistantRequestPlan {
   outboundPath: Message[]
   outboundTokenizer: ReturnType<typeof tokenizerFromSettings>
   outboundReasoningOpts: PromptEstimateOptions
+  hasAttachmentContext: boolean
 }
 
 export class NoEligibleProvidersError extends Error {
@@ -318,6 +343,64 @@ function textPreview(value: unknown): { length: number; preview: string } | unde
   }
 }
 
+async function loadAttachmentEstimateContext(
+  messages: readonly Message[],
+  settings: ChatSettings,
+): Promise<{ resolver?: AttachmentResolver; hasAttachments: boolean }> {
+  const ids = attachmentContextIds({
+    messages,
+    policy: attachmentContextPolicyForSettings(settings),
+  })
+  if (ids.length === 0) return { hasAttachments: false }
+  const repo = getBrowserRepository()
+  const byId = new Map<string, Attachment>()
+  await Promise.all(
+    ids.map(async (id) => {
+      const attachment = await repo.getAttachment(id)
+      if (attachment) byId.set(id, attachment)
+    }),
+  )
+  return {
+    hasAttachments: true,
+    resolver: (id) => byId.get(id),
+  }
+}
+
+async function prepareOpenRouterAttachmentTransform(
+  path: readonly Message[],
+  settings: ChatSettings,
+): Promise<Pick<ChatCompletionsTransformOptions, 'attachmentPartsByMessageId' | 'extraPlugins'>> {
+  const repo = getBrowserRepository()
+  const partsByMessageId = new Map<string, unknown[]>()
+  const pluginByKey = new Map<string, unknown>()
+  const refsByMessageId = resolveAttachmentContextRefs({
+    messages: path,
+    policy: attachmentContextPolicyForSettings(settings),
+  })
+  for (const message of path) {
+    const refs = refsByMessageId.get(message.id) ?? []
+    if (refs.length === 0) continue
+    const parts: unknown[] = []
+    for (const ref of refs) {
+      const bundle = await repo.getAttachmentBundle(ref.attachmentId)
+      if (!bundle) continue
+      if (bundle.attachment.storage.kind === 'missing') continue
+      const wire = await buildStoredOpenRouterAttachmentWire(bundle, {
+        ...(ref.presentation.imageDetail ? { imageDetail: ref.presentation.imageDetail } : {}),
+      })
+      parts.push(...wire.parts)
+      for (const plugin of wire.plugins) {
+        pluginByKey.set(JSON.stringify(plugin), plugin)
+      }
+    }
+    if (parts.length > 0) partsByMessageId.set(message.id, parts)
+  }
+  return {
+    ...(partsByMessageId.size > 0 ? { attachmentPartsByMessageId: partsByMessageId } : {}),
+    ...(pluginByKey.size > 0 ? { extraPlugins: [...pluginByKey.values()] } : {}),
+  }
+}
+
 export async function buildAssistantRequestPlan(
   input: AssistantRequestPlanInput,
 ): Promise<AssistantRequestPlan> {
@@ -339,9 +422,17 @@ export async function buildAssistantRequestPlan(
     readTokenCalibrationGlobal(),
     readGlobalPreferences(),
   ])
-  const currentTextCharsPerToken = settings.model
-    ? charsPerToken(settings.model, input.chat, globalCalibration, globalPrefs.tokenCalibrationMode)
-    : undefined
+  const preCutAttachmentContext = await loadAttachmentEstimateContext(input.pathMessages, settings)
+  const disableTextCalibration = preCutAttachmentContext.hasAttachments
+  const currentTextCharsPerToken =
+    settings.model && !disableTextCalibration
+      ? charsPerToken(
+          settings.model,
+          input.chat,
+          globalCalibration,
+          globalPrefs.tokenCalibrationMode,
+        )
+      : undefined
   const outboundReasoningOpts: PromptEstimateOptions = {
     family: outboundTokenizer,
     reasoningInclude: settings.reasoning.include,
@@ -356,8 +447,16 @@ export async function buildAssistantRequestPlan(
     tokenizer: outboundTokenizer,
     providerCap: outboundCapCandidate ?? null,
     reasoningOpts: outboundReasoningOpts,
+    disableTextCalibration,
+    ...(preCutAttachmentContext.resolver
+      ? { attachmentResolver: preCutAttachmentContext.resolver }
+      : {}),
     currentModelId: settings.model,
     ...(currentTextCharsPerToken !== undefined ? { currentTextCharsPerToken } : {}),
+  })
+  const hasAttachmentContext = attachmentContextHasRefs({
+    messages: outboundPath,
+    policy: attachmentContextPolicyForSettings(settings),
   })
 
   let wire: Record<string, unknown>
@@ -415,6 +514,10 @@ export async function buildAssistantRequestPlan(
     })
     const rewriteSlug = (slug: string) => rewriteCompatibleModelId(input.connection, slug)
     const routeFormat = quirksFor(settings.model).reasoningPreservationFormat
+    const openRouterAttachmentTransform =
+      input.connection.kind === 'openrouter'
+        ? await prepareOpenRouterAttachmentTransform(outboundPath, settings)
+        : {}
     if (route.transport === 'openai-responses') {
       const transformOpts: ResponsesTransformOptions & {
         privacy?: ChatCompletionsTransformOptions['privacy']
@@ -445,6 +548,7 @@ export async function buildAssistantRequestPlan(
         stream,
         rewriteSlug,
         allowProviderRouting: input.connection.kind === 'openrouter',
+        ...openRouterAttachmentTransform,
         ...(input.capabilities ? { capabilities: input.capabilities } : {}),
         ...(input.transform ?? {}),
       }
@@ -464,5 +568,6 @@ export async function buildAssistantRequestPlan(
     outboundPath,
     outboundTokenizer,
     outboundReasoningOpts,
+    hasAttachmentContext,
   }
 }

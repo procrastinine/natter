@@ -73,8 +73,8 @@ describe('Phase 0 type additions', () => {
     expectTypeOf<ChatSettings['trace']>().toEqualTypeOf<TraceMetadata | undefined>()
   })
 
-  it('Attachment.contentHash is required', () => {
-    expectTypeOf<Attachment['contentHash']>().toEqualTypeOf<string>()
+  it('Attachment.contentHash is optional for remote-url rows', () => {
+    expectTypeOf<Attachment['contentHash']>().toEqualTypeOf<string | undefined>()
   })
 
   it('chat/message storage version fields are explicit', () => {

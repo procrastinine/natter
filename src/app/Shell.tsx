@@ -2,7 +2,7 @@ import { useLiveQuery } from 'dexie-react-hooks'
 import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
 import { normalizeModelsResponse } from '../api/providers'
 import { activePath } from '../core/active-path'
-import { computeCutoffPlan } from '../core/context-cutoff'
+import { attachmentsDisabledByTextProtocol } from '../core/attachments/context'
 import { cloneDefaultChatSettings } from '../core/defaults'
 import {
   applyBaseFontSizeToDocument,
@@ -14,18 +14,26 @@ import {
   readGlobalPreferences,
 } from '../core/global-settings'
 import {
+  buildSettingsPromptSizeEstimateInput,
   type PromptSizeEstimateInput,
-  tokenizerFromSettings,
   UNLIMITED_CONTEXT,
 } from '../core/prompt-size'
-import { prefillClassFor, quirksFor } from '../core/quirks'
-import { charsPerToken, readTokenCalibrationGlobal } from '../core/token-calibration'
-import type { Chat, ChatId, ChatPreset, ConnectionProfile, CursorMap } from '../core/types'
+import { prefillClassFor } from '../core/quirks'
+import { readTokenCalibrationGlobal } from '../core/token-calibration'
+import type {
+  Chat,
+  ChatId,
+  ChatPreset,
+  ConnectionProfile,
+  CursorMap,
+  MessageAttachmentRef,
+} from '../core/types'
 import { useBranchUrlSync } from '../hooks/useBranchUrlSync'
 import { recoverOrphans, useChat } from '../hooks/useChat'
 import { useEndpoints } from '../hooks/useEndpoints'
 import { useModels } from '../hooks/useModels'
 import { useStreamStablePromptEstimate } from '../hooks/useStreamStablePromptEstimate'
+import { newId } from '../lib/ulid'
 import { installChatPreviewMaintainer } from '../store/chat-preview-maintainer'
 import {
   createChat,
@@ -44,7 +52,7 @@ import { useToastStore } from '../store/zustand/toastStore'
 import { useUiStore } from '../store/zustand/uiStore'
 import { BannerTray } from '../ui/chat/BannerTray'
 import { ChatHeader } from '../ui/chat/ChatHeader'
-import { Composer } from '../ui/chat/Composer'
+import { Composer, type ComposerDroppedFiles } from '../ui/chat/Composer'
 import { EditTreeToolbar } from '../ui/chat/EditTreeToolbar'
 import { EmptyState } from '../ui/chat/EmptyState'
 import { FocusModeToggle } from '../ui/chat/FocusModeToggle'
@@ -54,15 +62,17 @@ import { PrefillSettingsPrompt } from '../ui/chat/PrefillSettingsPrompt'
 import { ScrollRegion, type ScrollRegionHandle, type ScrollState } from '../ui/chat/ScrollRegion'
 import { ToastTray } from '../ui/chat/ToastTray'
 import { ZeroEligibleModal } from '../ui/chat/ZeroEligibleModal'
+import { useAttachmentResolverForContext } from '../ui/attachments/useAttachmentResolver'
 import {
   ConnectionHeader,
   readActiveSeedState,
   writeActiveSeedState,
 } from '../ui/header/ConnectionHeader'
-import { ChevronIcon, CogIcon, NewChatIcon } from '../ui/icons/Icon'
+import { ChevronIcon, CogIcon, DatabaseIcon, NewChatIcon } from '../ui/icons/Icon'
 import { ChatModelPanel } from '../ui/settings/ChatModelPanel'
 import { GlobalSettingsModal } from '../ui/settings/GlobalSettingsModal'
 import { ChatList } from '../ui/sidebar/ChatList'
+import { StorageView } from '../ui/storage/StorageView'
 import {
   homeHref,
   makeAnchorClickHandler,
@@ -70,6 +80,7 @@ import {
   navigateNew,
   navigateToChat,
   newChatHref,
+  storageHref,
   useRoute,
 } from './router'
 
@@ -86,6 +97,10 @@ const MODEL_AUTOSELECT_QUERY = {
 
 function profileRequiresKey(kind: ConnectionProfile['kind']): boolean {
   return kind !== 'custom' && kind !== 'llama-server'
+}
+
+function hasFileTransfer(dataTransfer: DataTransfer): boolean {
+  return Array.from(dataTransfer.types).includes('Files')
 }
 
 // Seed settings for a new chat from this tab's remembered default first,
@@ -114,6 +129,8 @@ function seedSettingsForNewChat(
 export function Shell() {
   const route = useRoute()
   const activeChatId = route.kind === 'chat' ? route.chatId : null
+  const activeStorageRoute = route.kind === 'storage' ? route.storage : null
+  const focusModeAvailable = !activeStorageRoute
   const onNewChatSurface = route.kind === 'new'
   useBranchUrlSync(activeChatId)
   const { send, sendFrom } = useChat()
@@ -127,11 +144,16 @@ export function Shell() {
   const [composerSeed, setComposerSeed] = useState<string | null>(null)
   const [composerDraft, setComposerDraft] = useState('')
   const [composerPrefillDraft, setComposerPrefillDraft] = useState('')
+  const [composerAttachmentRefs, setComposerAttachmentRefs] = useState<MessageAttachmentRef[]>([])
+  const [composerDroppedFiles, setComposerDroppedFiles] = useState<ComposerDroppedFiles | null>(
+    null,
+  )
   const [scrollState, setScrollState] = useState<ScrollState>('follow')
   const [importAtEndOpen, setImportAtEndOpen] = useState(false)
   const editTreeMode = useUiStore((s) => s.editTreeMode)
   const setEditTreeMode = useUiStore((s) => s.setEditTreeMode)
   const focusMode = useUiStore((s) => s.focusMode)
+  const effectiveFocusMode = focusMode && focusModeAvailable
   const pushBanner = useToastStore((s) => s.pushBanner)
   const pushToast = useToastStore((s) => s.push)
   const clearBannersByKind = useToastStore((s) => s.clearBannersByKind)
@@ -218,6 +240,11 @@ export function Shell() {
     () => activePath(activeMessages ?? [], activeCursor),
     [activeMessages, activeCursor],
   )
+  const composerAttachmentResolver = useAttachmentResolverForContext({
+    settings: resolvedActiveChatRow?.settings,
+    messages: activePathMemo,
+    draftAttachmentRefs: composerAttachmentRefs,
+  })
   const prefs = useLiveQuery(readGlobalPreferences, [], DEFAULT_GLOBAL_PREFERENCES)
   const globalCalibration = useLiveQuery(readTokenCalibrationGlobal, [], null)
   const trailingLeaf = useMemo(() => activePathMemo.at(-1) ?? null, [activePathMemo])
@@ -240,59 +267,34 @@ export function Shell() {
     activeCapability?.maxPromptTokens ?? activeCapability?.contextLength ?? null
   const tokenEstimateInput = useMemo<PromptSizeEstimateInput | null>(() => {
     if (!resolvedActiveChatRow) return null
-    const quirks = quirksFor(resolvedActiveChatRow.settings.model)
-    const tokenizer = tokenizerFromSettings(resolvedActiveChatRow.settings, null)
-    const currentTextCharsPerToken = resolvedActiveChatRow.settings.model
-      ? charsPerToken(
-          resolvedActiveChatRow.settings.model,
-          resolvedActiveChatRow,
-          globalCalibration,
-          prefs.tokenCalibrationMode,
-        )
-      : undefined
-    const cutPlan = computeCutoffPlan({
-      messages: activePathMemo,
-      settings: resolvedActiveChatRow.settings,
-      tokenizer,
-      providerCap: composerProviderCap,
-      reasoningOpts: {
-        family: tokenizer,
-        reasoningInclude: resolvedActiveChatRow.settings.reasoning.include,
-        reasoningExcluded: resolvedActiveChatRow.settings.reasoning.exclude === true,
-        ...(quirks.reasoningPreservationFormat !== undefined
-          ? { reasoningPreservationFormat: quirks.reasoningPreservationFormat }
-          : {}),
-      },
-      currentModelId: resolvedActiveChatRow.settings.model,
-      ...(currentTextCharsPerToken !== undefined ? { currentTextCharsPerToken } : {}),
-    })
     // Roll the prefill draft into `draftText` so the token gauge reflects
     // both inputs the user is about to send. The wire transform sends the
     // prefill as a separate assistant turn but token-wise it's just bytes;
     // adding to draftText is the cheapest accurate accounting.
-    const combinedDraft = composerPrefillDraft.length > 0
-      ? `${composerDraft}\n${composerPrefillDraft}`
-      : composerDraft
-    const input: PromptSizeEstimateInput = {
-      systemPrompt: resolvedActiveChatRow.settings.systemPrompt,
-      activePathMessages: cutPlan.kept,
-      draftText: combinedDraft,
-      tokenizer,
-      reasoningInclude: resolvedActiveChatRow.settings.reasoning.include,
-      reasoningExcluded: resolvedActiveChatRow.settings.reasoning.exclude === true,
-      currentModelId: resolvedActiveChatRow.settings.model,
-      ...(currentTextCharsPerToken !== undefined ? { currentTextCharsPerToken } : {}),
-    }
-    if (quirks.reasoningPreservationFormat !== undefined) {
-      input.reasoningPreservationFormat = quirks.reasoningPreservationFormat
-    }
-    return input
+    const combinedDraft =
+      composerPrefillDraft.length > 0 ? `${composerDraft}\n${composerPrefillDraft}` : composerDraft
+    return buildSettingsPromptSizeEstimateInput(
+      resolvedActiveChatRow.settings,
+      activePathMemo,
+      combinedDraft,
+      null,
+      composerProviderCap,
+      composerAttachmentResolver,
+      {
+        chatTokenCalibration: resolvedActiveChatRow.tokenCalibration,
+        globalCalibration,
+        mode: prefs.tokenCalibrationMode,
+      },
+      composerAttachmentRefs,
+    )
   }, [
     resolvedActiveChatRow,
     activePathMemo,
     composerDraft,
     composerPrefillDraft,
+    composerAttachmentRefs,
     composerProviderCap,
+    composerAttachmentResolver,
     globalCalibration,
     prefs.tokenCalibrationMode,
   ])
@@ -353,6 +355,10 @@ export function Shell() {
     if (!activeChatId) return
     useStreamStore.getState().abortChat(activeChatId)
   }, [activeChatId])
+
+  useEffect(() => {
+    if (activeStorageRoute && chatModelOpen) setChatModelOpen(false)
+  }, [activeStorageRoute, chatModelOpen])
 
   useEffect(() => {
     void recoverOrphans()
@@ -511,14 +517,25 @@ export function Shell() {
     : null
   const showPrefillButton = activePrefillClass !== null && activePrefillClass !== 'unsupported'
   const activeDefaultPrefill = resolvedActiveChatRow?.settings.defaultPrefill ?? ''
+  const attachmentsDisabledForActiveChat = resolvedActiveChatRow
+    ? attachmentsDisabledByTextProtocol(resolvedActiveChatRow.settings)
+    : false
+  const handleDroppedFilesConsumed = useCallback((id: string) => {
+    setComposerDroppedFiles((current) => (current?.id === id ? null : current))
+  }, [])
 
   const handleSubmit = useCallback(
-    async (text: string, opts?: { prefillText?: string }) => {
+    async (
+      text: string,
+      opts?: { prefillText?: string; attachmentRefs?: MessageAttachmentRef[] },
+    ) => {
       if (!activeChatId) return failSend('send: no active chat')
       const chat = await getChat(activeChatId)
       if (!chat) return failSend('send: chat row missing', { chatId: activeChatId })
       if (!chat.settings.profileId) {
-        return failSend('send: chat.settings.profileId is empty — create the chat from a seeded preset')
+        return failSend(
+          'send: chat.settings.profileId is empty — create the chat from a seeded preset',
+        )
       }
       if (!chat.settings.model) {
         return failSend('send: chat.settings.model is empty — no model selected')
@@ -543,6 +560,7 @@ export function Shell() {
           connection: profile,
           apiKey,
           content: [{ type: 'text', text }],
+          ...(opts?.attachmentRefs ? { attachmentRefs: opts.attachmentRefs } : {}),
           ...(prefillText.length > 0
             ? { prefillContent: [{ type: 'text', text: prefillText }] }
             : {}),
@@ -561,7 +579,10 @@ export function Shell() {
   )
 
   const handleNewChatSubmit = useCallback(
-    async (text: string, opts?: { prefillText?: string }) => {
+    async (
+      text: string,
+      opts?: { prefillText?: string; attachmentRefs?: MessageAttachmentRef[] },
+    ) => {
       const { preset, settings } = await resolveNewChatSeed()
       if (!settings.profileId) {
         return failSend('send: chat.settings.profileId is empty — no profile selected')
@@ -599,6 +620,7 @@ export function Shell() {
           connection: profile,
           apiKey,
           content: [{ type: 'text', text }],
+          ...(opts?.attachmentRefs ? { attachmentRefs: opts.attachmentRefs } : {}),
           ...(prefillText.length > 0
             ? { prefillContent: [{ type: 'text', text: prefillText }] }
             : {}),
@@ -663,14 +685,14 @@ export function Shell() {
   // transition out of /new (after materializing a chat) doesn't make the
   // panel jump in from nowhere. The panel component itself no-ops when
   // chatId is null.
-  const showChatModelPanel = chatModelOpen
+  const showChatModelPanel = chatModelOpen && !activeStorageRoute
 
   return (
     <div
       data-ui="app-shell"
       data-chat-model-panel={showChatModelPanel ? 'open' : 'closed'}
       data-sidebar={sidebarCollapsed ? 'collapsed' : 'expanded'}
-      data-focus-mode={focusMode ? 'on' : 'off'}
+      data-focus-mode={effectiveFocusMode ? 'on' : 'off'}
     >
       <aside data-ui="sidebar" data-collapsed={sidebarCollapsed} aria-label="Chats">
         <div data-ui="sidebar-header">
@@ -713,48 +735,254 @@ export function Shell() {
             <CogIcon size={18} />
             {sidebarCollapsed ? null : <span>Settings</span>}
           </button>
+          <a
+            href={storageHref()}
+            data-ui="open-storage"
+            aria-label="Open storage"
+            title="Storage"
+            onClick={makeAnchorClickHandler(storageHref())}
+          >
+            <DatabaseIcon size={18} />
+          </a>
         </div>
       </aside>
-      <main data-ui="main-pane">
-        <ConnectionHeader
-          activeChatId={activeChatId}
-          activeChatProfileId={resolvedActiveChatRow?.settings.profileId ?? null}
-        />
-        {activeChatId ? (
+      <main
+        data-ui="main-pane"
+        onDragOver={(event) => {
+          if (activeStorageRoute || (!activeChatId && !onNewChatSurface)) return
+          if (!hasFileTransfer(event.dataTransfer)) return
+          event.preventDefault()
+          event.dataTransfer.dropEffect = 'copy'
+        }}
+        onDrop={(event) => {
+          if (activeStorageRoute || (!activeChatId && !onNewChatSurface)) return
+          if (!hasFileTransfer(event.dataTransfer)) return
+          const files = Array.from(event.dataTransfer.files ?? [])
+          if (files.length === 0) return
+          event.preventDefault()
+          setComposerDroppedFiles({ id: newId(), files })
+        }}
+      >
+        {activeStorageRoute ? (
+          <StorageView route={activeStorageRoute} />
+        ) : (
           <>
-            <div data-ui="chat-title-bar">
-              <ChatHeader
-                chatId={activeChatId}
-                settingsOpen={chatModelOpen}
-                onToggleSettings={() => setChatModelOpen((v) => !v)}
-                editTreeActive={editTreeMode}
-                onToggleEditTree={() => setEditTreeMode(!editTreeMode)}
-              />
-            </div>
-            <EditTreeToolbar />
-            <BannerTray />
-            <ScrollRegion
-              ref={scrollRef}
-              autoScrollOnOpen={prefs.autoScrollOnOpen}
-              autoScrollOnStream={prefs.autoScrollOnStream}
-              streamActive={streamingOnActiveChat}
-              resetKey={activeChatId}
-              onStateChange={setScrollState}
-            >
-              <MessageList
-                chatId={activeChatId}
-                chatSettings={resolvedActiveChatRow?.settings ?? cloneDefaultChatSettings()}
-                hasConnection={hasConnection}
-                {...(activeCapability ? { capability: activeCapability } : {})}
-                prefillRecommendationEndpoints={activeEndpoints.endpoints}
-              />
-              {focusMode ? (
+            <ConnectionHeader
+              activeChatId={activeChatId}
+              activeChatProfileId={resolvedActiveChatRow?.settings.profileId ?? null}
+            />
+            {activeChatId ? (
+              <>
+                <div data-ui="chat-title-bar">
+                  <ChatHeader
+                    chatId={activeChatId}
+                    settingsOpen={chatModelOpen}
+                    onToggleSettings={() => setChatModelOpen((v) => !v)}
+                    editTreeActive={editTreeMode}
+                    onToggleEditTree={() => setEditTreeMode(!editTreeMode)}
+                  />
+                </div>
+                <EditTreeToolbar />
+                <BannerTray />
+                <ScrollRegion
+                  ref={scrollRef}
+                  autoScrollOnOpen={prefs.autoScrollOnOpen}
+                  autoScrollOnStream={prefs.autoScrollOnStream}
+                  streamActive={streamingOnActiveChat}
+                  resetKey={activeChatId}
+                  onStateChange={setScrollState}
+                >
+                  <MessageList
+                    chatId={activeChatId}
+                    chatSettings={resolvedActiveChatRow?.settings ?? cloneDefaultChatSettings()}
+                    hasConnection={hasConnection}
+                    {...(activeCapability ? { capability: activeCapability } : {})}
+                    prefillRecommendationEndpoints={activeEndpoints.endpoints}
+                  />
+                  {effectiveFocusMode ? (
+                    <Composer
+                      onSubmit={handleSubmit}
+                      streaming={streamingOnActiveChat}
+                      onAbort={abortActiveChat}
+                      autoSize
+                      autoSizeVariant="focus"
+                      {...(hasConnection
+                        ? {}
+                        : { sendBlockedReason: 'Add a connection to send messages.' })}
+                      seed={composerSeed}
+                      onSeedConsumed={() => setComposerSeed(null)}
+                      onDraftChange={setComposerDraft}
+                      onPrefillDraftChange={setComposerPrefillDraft}
+                      attachmentScopeKey={activeChatId}
+                      onAttachmentDraftChange={setComposerAttachmentRefs}
+                      attachmentsDisabled={attachmentsDisabledForActiveChat}
+                      attachmentsDisabledReason="Attachments are unavailable with Text completions."
+                      droppedFiles={composerDroppedFiles}
+                      onDroppedFilesConsumed={handleDroppedFilesConsumed}
+                      sendShortcut={prefs.sendShortcut}
+                      onImportAtEnd={() => setImportAtEndOpen(true)}
+                      {...(showPrefillButton
+                        ? {
+                            showPrefillButton: true,
+                            defaultPrefill: activeDefaultPrefill,
+                            prefillScopeKey: activeChatId,
+                            prefillSettingsPrompt: resolvedActiveChatRow ? (
+                              <PrefillSettingsPrompt
+                                chatId={resolvedActiveChatRow.id}
+                                settings={resolvedActiveChatRow.settings}
+                                endpoints={activeEndpoints.endpoints}
+                              />
+                            ) : null,
+                          }
+                        : {})}
+                      {...(tokenBudgetIndicator ? { tokenBudget: tokenBudgetIndicator } : {})}
+                      trailingUserMessage={Boolean(trailingUserMessage)}
+                      {...(trailingUserMessage && hasConnection
+                        ? {
+                            onReplyToTrailingUser: async () => {
+                              const chat = await getChat(activeChatId)
+                              if (!chat) return
+                              const profile = await getProfile(chat.settings.profileId)
+                              if (!profile) return
+                              try {
+                                const apiKey = (await resolveKeyIfPresent(profile.apiKeyRef)) ?? ''
+                                if (profileRequiresKey(profile.kind) && !apiKey) return
+                                await sendFrom({
+                                  chatId: activeChatId,
+                                  connection: profile,
+                                  apiKey,
+                                  parentMessageId: trailingUserMessage.id,
+                                })
+                                await bumpProfileLastUsedAt(profile.id)
+                                if (chat.presetId) {
+                                  await bumpPresetLastUsedAt(chat.presetId)
+                                }
+                              } catch (err) {
+                                console.error('reply-to-trailing failed', err)
+                              }
+                            },
+                          }
+                        : {})}
+                    />
+                  ) : null}
+                </ScrollRegion>
+                {effectiveFocusMode ? null : (
+                  <Composer
+                    onSubmit={handleSubmit}
+                    streaming={streamingOnActiveChat}
+                    onAbort={abortActiveChat}
+                    autoSize
+                    {...(hasConnection
+                      ? {}
+                      : { sendBlockedReason: 'Add a connection to send messages.' })}
+                    seed={composerSeed}
+                    onSeedConsumed={() => setComposerSeed(null)}
+                    onDraftChange={setComposerDraft}
+                    onPrefillDraftChange={setComposerPrefillDraft}
+                    attachmentScopeKey={activeChatId}
+                    onAttachmentDraftChange={setComposerAttachmentRefs}
+                    attachmentsDisabled={attachmentsDisabledForActiveChat}
+                    attachmentsDisabledReason="Attachments are unavailable with Text completions."
+                    droppedFiles={composerDroppedFiles}
+                    onDroppedFilesConsumed={handleDroppedFilesConsumed}
+                    sendShortcut={prefs.sendShortcut}
+                    onImportAtEnd={() => setImportAtEndOpen(true)}
+                    {...(showPrefillButton
+                      ? {
+                          showPrefillButton: true,
+                          defaultPrefill: activeDefaultPrefill,
+                          prefillScopeKey: activeChatId,
+                          prefillSettingsPrompt: resolvedActiveChatRow ? (
+                            <PrefillSettingsPrompt
+                              chatId={resolvedActiveChatRow.id}
+                              settings={resolvedActiveChatRow.settings}
+                              endpoints={activeEndpoints.endpoints}
+                            />
+                          ) : null,
+                        }
+                      : {})}
+                    {...(tokenBudgetIndicator ? { tokenBudget: tokenBudgetIndicator } : {})}
+                    trailingUserMessage={Boolean(trailingUserMessage)}
+                    {...(trailingUserMessage && hasConnection
+                      ? {
+                          onReplyToTrailingUser: async () => {
+                            const chat = await getChat(activeChatId)
+                            if (!chat) return
+                            const profile = await getProfile(chat.settings.profileId)
+                            if (!profile) return
+                            try {
+                              const apiKey = (await resolveKeyIfPresent(profile.apiKeyRef)) ?? ''
+                              if (profileRequiresKey(profile.kind) && !apiKey) return
+                              await sendFrom({
+                                chatId: activeChatId,
+                                connection: profile,
+                                apiKey,
+                                parentMessageId: trailingUserMessage.id,
+                              })
+                              await bumpProfileLastUsedAt(profile.id)
+                              if (chat.presetId) {
+                                await bumpPresetLastUsedAt(chat.presetId)
+                              }
+                            } catch (err) {
+                              console.error('reply-to-trailing failed', err)
+                            }
+                          },
+                        }
+                      : {})}
+                    floatingAccessory={
+                      scrollState === 'pinned' ? (
+                        <button
+                          type="button"
+                          data-ui="jump-to-latest"
+                          onClick={() => scrollRef.current?.scrollToBottom({ smooth: true })}
+                        >
+                          ↓ Jump to latest
+                        </button>
+                      ) : null
+                    }
+                  />
+                )}
+              </>
+            ) : onNewChatSurface ? (
+              <>
+                {/* The new-chat surface still gets a chat-title-bar so the cog
+                 * (model panel), download, and chat-info actions are reachable
+                 * before the chat row materializes. Clicking the cog
+                 * pre-creates the chat from the MRU preset and opens the
+                 * model panel against the now-real chat. */}
+                <div data-ui="chat-title-bar">
+                  <span data-ui="chat-title" data-title-status="untitled">
+                    <span data-ui="chat-title-label">New chat</span>
+                  </span>
+                  <span data-ui="header-spacer" />
+                  <button
+                    type="button"
+                    data-ui="icon-button"
+                    data-role="settings-cog"
+                    aria-label="Open model panel"
+                    title="Model settings"
+                    onClick={async () => {
+                      const { preset, settings } = await resolveNewChatSeed()
+                      writeActiveSeedState({
+                        profileId: settings.profileId || null,
+                        presetId: preset?.id ?? null,
+                        settings,
+                      })
+                      const chat = await createChat({
+                        settings,
+                        ...(preset ? { presetId: preset.id } : {}),
+                      })
+                      navigateToChat(chat.id)
+                      setChatModelOpen(true)
+                    }}
+                  >
+                    <CogIcon size={20} />
+                  </button>
+                </div>
+                <EmptyState onPick={(text) => setComposerSeed(text)} />
                 <Composer
-                  onSubmit={handleSubmit}
-                  streaming={streamingOnActiveChat}
-                  onAbort={abortActiveChat}
+                  onSubmit={handleNewChatSubmit}
                   autoSize
-                  autoSizeVariant="focus"
                   {...(hasConnection
                     ? {}
                     : { sendBlockedReason: 'Add a connection to send messages.' })}
@@ -762,178 +990,19 @@ export function Shell() {
                   onSeedConsumed={() => setComposerSeed(null)}
                   onDraftChange={setComposerDraft}
                   onPrefillDraftChange={setComposerPrefillDraft}
+                  attachmentScopeKey="new"
+                  onAttachmentDraftChange={setComposerAttachmentRefs}
+                  droppedFiles={composerDroppedFiles}
+                  onDroppedFilesConsumed={handleDroppedFilesConsumed}
                   sendShortcut={prefs.sendShortcut}
                   onImportAtEnd={() => setImportAtEndOpen(true)}
-                  {...(showPrefillButton
-                    ? {
-                        showPrefillButton: true,
-                        defaultPrefill: activeDefaultPrefill,
-                        prefillScopeKey: activeChatId,
-                        prefillSettingsPrompt: resolvedActiveChatRow ? (
-                          <PrefillSettingsPrompt
-                            chatId={resolvedActiveChatRow.id}
-                            settings={resolvedActiveChatRow.settings}
-                            endpoints={activeEndpoints.endpoints}
-                          />
-                        ) : null,
-                      }
-                    : {})}
                   {...(tokenBudgetIndicator ? { tokenBudget: tokenBudgetIndicator } : {})}
-                  trailingUserMessage={Boolean(trailingUserMessage)}
-                  {...(trailingUserMessage && hasConnection
-                    ? {
-                        onReplyToTrailingUser: async () => {
-                          const chat = await getChat(activeChatId)
-                          if (!chat) return
-                          const profile = await getProfile(chat.settings.profileId)
-                          if (!profile) return
-                          try {
-                            const apiKey = (await resolveKeyIfPresent(profile.apiKeyRef)) ?? ''
-                            if (profileRequiresKey(profile.kind) && !apiKey) return
-                            await sendFrom({
-                              chatId: activeChatId,
-                              connection: profile,
-                              apiKey,
-                              parentMessageId: trailingUserMessage.id,
-                            })
-                            await bumpProfileLastUsedAt(profile.id)
-                            if (chat.presetId) {
-                              await bumpPresetLastUsedAt(chat.presetId)
-                            }
-                          } catch (err) {
-                            console.error('reply-to-trailing failed', err)
-                          }
-                        },
-                      }
-                    : {})}
                 />
-              ) : null}
-            </ScrollRegion>
-            {focusMode ? null : (
-              <Composer
-                onSubmit={handleSubmit}
-                streaming={streamingOnActiveChat}
-                onAbort={abortActiveChat}
-                autoSize
-                {...(hasConnection
-                  ? {}
-                  : { sendBlockedReason: 'Add a connection to send messages.' })}
-                seed={composerSeed}
-                onSeedConsumed={() => setComposerSeed(null)}
-                onDraftChange={setComposerDraft}
-                onPrefillDraftChange={setComposerPrefillDraft}
-                sendShortcut={prefs.sendShortcut}
-                onImportAtEnd={() => setImportAtEndOpen(true)}
-                {...(showPrefillButton
-                  ? {
-                      showPrefillButton: true,
-                      defaultPrefill: activeDefaultPrefill,
-                      prefillScopeKey: activeChatId,
-                      prefillSettingsPrompt: resolvedActiveChatRow ? (
-                        <PrefillSettingsPrompt
-                          chatId={resolvedActiveChatRow.id}
-                          settings={resolvedActiveChatRow.settings}
-                          endpoints={activeEndpoints.endpoints}
-                        />
-                      ) : null,
-                    }
-                  : {})}
-                {...(tokenBudgetIndicator ? { tokenBudget: tokenBudgetIndicator } : {})}
-                trailingUserMessage={Boolean(trailingUserMessage)}
-                {...(trailingUserMessage && hasConnection
-                  ? {
-                      onReplyToTrailingUser: async () => {
-                        const chat = await getChat(activeChatId)
-                        if (!chat) return
-                        const profile = await getProfile(chat.settings.profileId)
-                        if (!profile) return
-                        try {
-                          const apiKey = (await resolveKeyIfPresent(profile.apiKeyRef)) ?? ''
-                          if (profileRequiresKey(profile.kind) && !apiKey) return
-                          await sendFrom({
-                            chatId: activeChatId,
-                            connection: profile,
-                            apiKey,
-                            parentMessageId: trailingUserMessage.id,
-                          })
-                          await bumpProfileLastUsedAt(profile.id)
-                          if (chat.presetId) {
-                            await bumpPresetLastUsedAt(chat.presetId)
-                          }
-                        } catch (err) {
-                          console.error('reply-to-trailing failed', err)
-                        }
-                      },
-                    }
-                  : {})}
-                floatingAccessory={
-                  scrollState === 'pinned' ? (
-                    <button
-                      type="button"
-                      data-ui="jump-to-latest"
-                      onClick={() => scrollRef.current?.scrollToBottom({ smooth: true })}
-                    >
-                      ↓ Jump to latest
-                    </button>
-                  ) : null
-                }
-              />
+              </>
+            ) : (
+              <EmptyState onPick={(text) => setComposerSeed(text)} />
             )}
           </>
-        ) : onNewChatSurface ? (
-          <>
-            {/* The new-chat surface still gets a chat-title-bar so the cog
-             * (model panel), download, and chat-info actions are reachable
-             * before the chat row materializes. Clicking the cog
-             * pre-creates the chat from the MRU preset and opens the
-             * model panel against the now-real chat. */}
-            <div data-ui="chat-title-bar">
-              <span data-ui="chat-title" data-title-status="untitled">
-                <span data-ui="chat-title-label">New chat</span>
-              </span>
-              <span data-ui="header-spacer" />
-              <button
-                type="button"
-                data-ui="icon-button"
-                data-role="settings-cog"
-                aria-label="Open model panel"
-                title="Model settings"
-                onClick={async () => {
-                  const { preset, settings } = await resolveNewChatSeed()
-                  writeActiveSeedState({
-                    profileId: settings.profileId || null,
-                    presetId: preset?.id ?? null,
-                    settings,
-                  })
-                  const chat = await createChat({
-                    settings,
-                    ...(preset ? { presetId: preset.id } : {}),
-                  })
-                  navigateToChat(chat.id)
-                  setChatModelOpen(true)
-                }}
-              >
-                <CogIcon size={20} />
-              </button>
-            </div>
-            <EmptyState onPick={(text) => setComposerSeed(text)} />
-            <Composer
-              onSubmit={handleNewChatSubmit}
-              autoSize
-              {...(hasConnection
-                ? {}
-                : { sendBlockedReason: 'Add a connection to send messages.' })}
-              seed={composerSeed}
-              onSeedConsumed={() => setComposerSeed(null)}
-              onDraftChange={setComposerDraft}
-              onPrefillDraftChange={setComposerPrefillDraft}
-              sendShortcut={prefs.sendShortcut}
-              onImportAtEnd={() => setImportAtEndOpen(true)}
-              {...(tokenBudgetIndicator ? { tokenBudget: tokenBudgetIndicator } : {})}
-            />
-          </>
-        ) : (
-          <EmptyState onPick={(text) => setComposerSeed(text)} />
         )}
       </main>
       {showChatModelPanel ? (
@@ -980,7 +1049,7 @@ export function Shell() {
         />
       ) : null}
       <ToastTray />
-      <FocusModeToggle />
+      {focusModeAvailable ? <FocusModeToggle /> : null}
     </div>
   )
 }

@@ -40,7 +40,8 @@ export const useStreamStore = create<StreamStoreState>((set, get) => ({
   isTargetActive: (chatId, messageId) => {
     const map = get().activeByStreamId
     for (const id in map) {
-      const stream = map[id]!
+      const stream = map[id]
+      if (!stream) continue
       if (stream.chatId === chatId && stream.messageId === messageId) return true
     }
     return false
@@ -48,7 +49,7 @@ export const useStreamStore = create<StreamStoreState>((set, get) => ({
   hasStreamForChat: (chatId) => {
     const map = get().activeByStreamId
     for (const id in map) {
-      if (map[id]!.chatId === chatId) return true
+      if (map[id]?.chatId === chatId) return true
     }
     return false
   },

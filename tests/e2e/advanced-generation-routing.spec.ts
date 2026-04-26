@@ -124,7 +124,10 @@ test('GUI OpenRouter Text completions posts /completions with a selected templat
   await openSettingsPanel(page)
 
   const apiMode = page.locator('[data-ui-section="api-mode"]')
-  await apiMode.getByRole('button', { name: 'Text completions', exact: true }).click()
+  const textMode = apiMode.getByRole('button', { name: 'Text completions', exact: true })
+  await textMode.click()
+  await expect(textMode).toHaveAttribute('aria-pressed', 'true')
+  await page.getByRole('tab', { name: 'Generation' }).click()
   await page.locator('[data-ui="text-template-picker"]').selectOption('raw')
   await page.evaluate(() =>
     (

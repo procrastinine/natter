@@ -48,7 +48,12 @@ test('edited system prompt shows up in the NEXT /chat/completions body', async (
   await page.waitForTimeout(500)
   await page.locator('[data-role="settings-pane-close"]').click()
   await sendMessage(page, 'second')
-  await expect(page.locator('[data-ui="message"][data-role="assistant"]').nth(1)).toBeVisible()
+  await expect
+    .poll(() => bodies.length, { timeout: 5000 })
+    .toBeGreaterThanOrEqual(2)
+  await expect(page.locator('[data-ui="message"][data-role="assistant"]').nth(1)).toContainText(
+    'reply-2',
+  )
 
   expect(bodies.length).toBeGreaterThanOrEqual(2)
   const firstBody = JSON.parse(bodies[0] ?? '{}')

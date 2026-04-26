@@ -15,12 +15,12 @@
 // or descendants. See `plan/08-branching.md §8.1` + `§8.3`.
 
 import { newId } from '../lib/ulid'
-import { incRefs } from '../store/attachments'
+import { attachmentIdOf, incRefs } from '../store/attachments'
 import { postEvent } from '../store/broadcast'
 import { getBrowserRepository } from '../store/browser-repo'
 import { createChat, getChat, loadChatMessages } from '../store/chats'
 import { activePath, indexById } from './active-path'
-import type { AttachmentId, Chat, ChatId, Message, MessageId } from './types'
+import type { AttachmentId, AttachmentRef, Chat, ChatId, Message, MessageId } from './types'
 
 export interface ForkChatFromMessageInput {
   chatId: ChatId
@@ -111,7 +111,7 @@ export async function forkChatFromMessage(
   for (const row of ancestors) idMap.set(row.id, newId())
 
   const repo = getBrowserRepository()
-  const touchedAttachments: AttachmentId[] = []
+  const touchedAttachments: AttachmentRef[] = []
   const scopes: Array<
     | { kind: 'message'; messageId: MessageId }
     | { kind: 'children'; chatId: ChatId; parentId: MessageId | null }
@@ -133,7 +133,7 @@ export async function forkChatFromMessage(
   for (const row of ancestors) {
     for (const ref of row.attachmentRefs ?? []) {
       touchedAttachments.push(ref)
-      scopes.push({ kind: 'attachment', attachmentId: ref })
+      scopes.push({ kind: 'attachment', attachmentId: attachmentIdOf(ref) })
     }
   }
 
@@ -167,7 +167,7 @@ export async function forkChatFromMessage(
         clone.responsesEchoItem = structuredClone(src.responsesEchoItem)
       }
       if (src.attachmentRefs && src.attachmentRefs.length > 0) {
-        clone.attachmentRefs = [...src.attachmentRefs]
+        clone.attachmentRefs = structuredClone(src.attachmentRefs)
       }
       if (src.generation) {
         clone.generation = structuredClone(src.generation)

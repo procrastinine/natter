@@ -427,6 +427,13 @@
   gap: var(--space-2);
 }
 
+[data-ui="provider-picker-row-actions"] {
+  display: flex;
+  gap: 2px;
+  flex: 0 0 auto;
+  margin-left: auto;
+}
+
 [data-ui="provider-picker-row-head"] [data-ui="provider-picker-row-actions"] {
   margin-left: auto;
 }
@@ -448,6 +455,14 @@
    * Users can still toggle them (to silence or to prepare for a shorter
    * chat later) — greying never writes back to settings. */
   opacity: 0.55;
+}
+
+[data-ui="provider-picker-toggle"] {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  cursor: pointer;
+  flex: 0 0 auto;
 }
 
 [data-ui="provider-picker-row"][data-insufficient-context="true"]
@@ -503,6 +518,7 @@
 }
 
 [data-ui="provider-picker-sort-toggle"] label {
+  position: relative;
   color: var(--color-fg-secondary);
   font-size: var(--font-size-xs);
   line-height: 1.4;
@@ -513,8 +529,13 @@
 
 [data-ui="provider-picker-sort-toggle"] input {
   position: absolute;
+  inset: 0;
+  z-index: 1;
+  width: 100%;
+  height: 100%;
+  margin: 0;
   opacity: 0;
-  pointer-events: none;
+  cursor: pointer;
 }
 
 [data-ui="provider-picker-sort-toggle"] label[data-active="true"] {
@@ -552,14 +573,6 @@
   gap: var(--space-2);
   min-width: 0;
   flex: 1 1 auto;
-}
-
-[data-ui="provider-picker-toggle"] {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  cursor: pointer;
-  flex: 0 0 auto;
 }
 
 [data-ui="provider-picker-toggle"] input[type="checkbox"] {
@@ -608,13 +621,6 @@
   font-variant-numeric: tabular-nums;
   flex: 1 1 auto;
   min-width: 0;
-}
-
-[data-ui="provider-picker-row-actions"] {
-  display: flex;
-  gap: 2px;
-  flex: 0 0 auto;
-  margin-left: auto;
 }
 
 [data-ui="picker-action"] {

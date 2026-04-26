@@ -12,10 +12,7 @@
 // reasoning is discarded (it describes the meta-instruction, not the
 // original turn).
 
-import {
-  openAssistantRequestStream,
-  type AssistantStreamChunk,
-} from '../api/assistant-stream'
+import { openAssistantRequestStream, type AssistantStreamChunk } from '../api/assistant-stream'
 import { ApiError } from '../api/errors'
 import {
   splitChatStream,
@@ -26,16 +23,10 @@ import {
 import type { GeminiStreamChunk } from '../api/gemini-types'
 import type { ChatStreamChunk, ResponsesStreamChunk } from '../api/types'
 import { activePath, cursorKeyOf } from '../core/active-path'
-import {
-  readGlobalPreferences,
-  resolveContinueSystemPromptTemplate,
-} from '../core/global-settings'
+import { readGlobalPreferences, resolveContinueSystemPromptTemplate } from '../core/global-settings'
 // `globalPrefs` is still read for token-calibration mode; continue prompts
 // moved to `chat.settings` in the prompt-preset refactor.
-import {
-  calibrationFieldsForEdit,
-  readTokenCalibrationGlobal,
-} from '../core/token-calibration'
+import { calibrationFieldsForEdit, readTokenCalibrationGlobal } from '../core/token-calibration'
 import {
   type AssistantRequestPlan,
   NoEligibleProvidersError,
@@ -180,8 +171,7 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
   //     continue-user trailing turn (if non-empty) avoids the double-
   //     assistant shape.
   const usePrefillContinue =
-    chat.settings.continuePrefill === true &&
-    prefillClassFor(chat.settings.model) !== 'unsupported'
+    chat.settings.continuePrefill === true && prefillClassFor(chat.settings.model) !== 'unsupported'
   const continueSystemPrompt = chat.settings.continueSystemPrompt
   const continueUserPrompt = chat.settings.continueUserPrompt
   const originalSystemPrompt = chat.settings.systemPrompt
@@ -296,18 +286,19 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
           // flushes, so compute the tail from buffer and merge.
           combined,
         )
-        const calibrationPatch = chat.settings.model
-          ? calibrationFieldsForEdit(
-              nextContent,
-              current.originalCharCount,
-              current.originalModelId,
-              current.originalCalibrationKey,
-              chat.settings.model,
-              chat,
-              globalCalibration,
-              globalPrefs.tokenCalibrationMode,
-            )
-          : null
+        const calibrationPatch =
+          chat.settings.model && !requestPlan.hasAttachmentContext
+            ? calibrationFieldsForEdit(
+                nextContent,
+                current.originalCharCount,
+                current.originalModelId,
+                current.originalCalibrationKey,
+                chat.settings.model,
+                chat,
+                globalCalibration,
+                globalPrefs.tokenCalibrationMode,
+              )
+            : null
         await ctx.putMessage(
           { ...current, content: nextContent, ...(calibrationPatch ?? {}) },
           final ? undefined : { touchChatSummary: false, broadcast: false },

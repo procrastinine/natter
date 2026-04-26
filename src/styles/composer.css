@@ -78,6 +78,214 @@
   overflow: hidden;
 }
 
+[data-ui="attachment-draft-tray"],
+[data-ui="attachment-chip-row"] {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  background: transparent;
+  border-top: none;
+}
+
+[data-ui="attachment-draft-tray"] {
+  padding: var(--space-3) var(--space-3) var(--space-2);
+}
+
+[data-ui="attachment-chip-row"] {
+  padding: var(--space-3) 0 0;
+}
+
+[data-ui="attachment-preview"] {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  overflow: hidden;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-xs);
+  background: var(--color-bg-surface-2);
+  color: var(--color-fg-muted);
+  line-height: 1;
+}
+
+[data-ui="attachment-preview"][data-variant="chip"] {
+  width: 24px;
+  height: 24px;
+}
+
+[data-ui="attachment-preview"][data-variant="card"] {
+  width: 34px;
+  height: 34px;
+}
+
+[data-ui="attachment-preview"] img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+[data-ui="attachment-preview"][data-media="text-mini"] span {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-fg-secondary);
+}
+
+[data-ui="attachment-preview"][data-empty="true"] {
+  background: transparent;
+}
+
+[data-ui="attachment-file-card"] {
+  display: inline-flex;
+  align-items: stretch;
+  min-width: 180px;
+  max-width: min(360px, 100%);
+  min-height: 46px;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-fg-secondary);
+  overflow: hidden;
+}
+
+[data-ui="attachment-file-card"][data-context="excluded"] {
+  opacity: 0.62;
+  border-style: dashed;
+}
+
+[data-ui="attachment-file-card"][data-storage="missing"],
+[data-ui="attachment-file-card"][data-state="failed"] {
+  border-color: color-mix(in srgb, var(--color-warning) 55%, var(--color-border-subtle));
+}
+
+[data-ui="attachment-file-card"][data-state="uploading"] {
+  border-color: color-mix(in srgb, var(--color-accent) 48%, var(--color-border-subtle));
+}
+
+[data-ui="attachment-file-main"] {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  flex: 1 1 auto;
+  padding: var(--space-2);
+  color: inherit;
+  text-decoration: none;
+}
+
+[data-ui="attachment-file-main"]:hover {
+  color: var(--color-fg-primary);
+}
+
+[data-ui="attachment-file-copy"] {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 1px;
+}
+
+[data-ui="attachment-file-name"] {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--color-fg-primary);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-medium);
+}
+
+[data-ui="attachment-file-meta"] {
+  color: var(--color-fg-muted);
+  font-size: var(--font-size-xs);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+[data-ui="attachment-file-actions"] {
+  display: inline-flex;
+  align-items: center;
+  gap: 0;
+  padding-right: 2px;
+  border-left: 1px solid var(--color-border-subtle);
+}
+
+[data-ui="attachment-chip"] {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  max-width: 100%;
+  min-height: 26px;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-fg-secondary);
+  overflow: hidden;
+}
+
+[data-ui="attachment-chip"][data-context="excluded"] {
+  opacity: 0.62;
+  border-style: dashed;
+}
+
+[data-ui="attachment-chip"][data-storage="missing"] {
+  border-color: color-mix(in srgb, var(--color-warning) 55%, var(--color-border-subtle));
+}
+
+[data-ui="attachment-chip-main"] {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-width: 0;
+  padding: 2px var(--space-2);
+  color: inherit;
+  text-decoration: none;
+}
+
+[data-ui="attachment-chip-main"]:hover {
+  color: var(--color-fg-primary);
+}
+
+[data-ui="attachment-chip-name"] {
+  min-width: 0;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--color-fg-primary);
+  font-size: var(--font-size-xs);
+}
+
+[data-ui="attachment-chip-meta"],
+[data-ui="attachment-chip-state"] {
+  color: var(--color-fg-muted);
+  font-size: var(--font-size-xs);
+  white-space: nowrap;
+}
+
+[data-ui="attachment-chip-state"] {
+  color: var(--color-warning);
+}
+
+[data-ui="attachment-chip-actions"] {
+  display: inline-flex;
+  align-items: center;
+  gap: 0;
+  padding-right: 2px;
+}
+
+[data-ui="attachment-chip-row-tail"] {
+  display: inline-flex;
+  align-items: center;
+  color: var(--color-fg-muted);
+}
+
+[data-ui="attachment-hidden-input"] {
+  display: none;
+}
+
 /* Textarea region is the actual input; gets a light gray surface so it
  * reads as the "type here" affordance distinct from the surrounding
  * chrome. Focus ring is inset so the highlight stays *inside* the
@@ -177,7 +385,7 @@
  * match the card. No padding-margin around it. Pressing Enter (or the
  * configured send shortcut) submits, so the button is mostly visual
  * confirmation that the action exists. */
-[data-ui="send"] {
+button[data-ui="send"] {
   /* Slight inner shade on top so the send button reads the same way
    * every other affordance does (they all have shading; a flat accent
    * felt out of place). Gradient is very subtle — a 6% darken on the
@@ -203,15 +411,25 @@
   box-shadow: inset 0 1px 0 color-mix(in srgb, var(--color-accent-contrast) 20%, transparent);
 }
 
-[data-ui="send"]:hover:not(:disabled) {
+button[data-ui="send"]:hover:not(:disabled) {
   background: linear-gradient(
     to bottom,
-    color-mix(in srgb, var(--color-accent-hover) 92%, #000) 0%,
-    var(--color-accent-hover) 60%
+    color-mix(in srgb, var(--color-accent) 84%, #000) 0%,
+    color-mix(in srgb, var(--color-accent) 94%, #000) 60%
   );
+  color: var(--color-accent-contrast);
 }
 
-[data-ui="send"]:disabled {
+button[data-ui="send"]:active:not(:disabled) {
+  background: linear-gradient(
+    to bottom,
+    color-mix(in srgb, var(--color-accent) 76%, #000) 0%,
+    color-mix(in srgb, var(--color-accent) 88%, #000) 60%
+  );
+  color: var(--color-accent-contrast);
+}
+
+button[data-ui="send"]:disabled {
   opacity: var(--opacity-disabled);
   cursor: not-allowed;
 }

@@ -222,6 +222,16 @@
   color: var(--color-fg-muted);
 }
 
+[data-ui="inline-editor-button"][data-role="attach"],
+[data-ui="inline-editor-button"][data-role="attach-existing"] {
+  flex: 0 0 38px;
+  color: var(--color-fg-muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding-inline: 0;
+}
+
 [data-ui="inline-editor-button"][data-role="save"] {
   background: var(--color-bg-surface-2);
   color: var(--color-fg-primary);
@@ -627,6 +637,16 @@
   padding: var(--space-1) var(--space-5);
 }
 
+[data-ui="branch-tree-node"] {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+  color: inherit;
+  text-decoration: none;
+}
+
 [data-ui="branch-tree-row"][data-active="true"] [data-ui="branch-tree-node"] {
   background: var(--color-bg-surface-2);
   font-weight: var(--font-weight-semibold);
@@ -643,16 +663,6 @@
 }
 [data-ui="branch-tree-row"][data-depth="3"] [data-ui="branch-tree-node"] {
   padding-left: calc(var(--space-4) * 3);
-}
-
-[data-ui="branch-tree-node"] {
-  display: flex;
-  align-items: baseline;
-  gap: var(--space-3);
-  padding: var(--space-2) var(--space-3);
-  border-radius: var(--radius-sm);
-  color: inherit;
-  text-decoration: none;
 }
 
 [data-ui="branch-tree-node"]:hover {
@@ -917,7 +927,9 @@
  * full row height, rounded corners would clip weirdly against the
  * adjacent slots). Shaded a step darker than the action-row background
  * so it reads as a proper affordance. */
-[data-ui="composer-import-at-end"] {
+[data-ui="composer-import-at-end"],
+[data-ui="composer-attach"],
+[data-ui="composer-attach-existing"] {
   background: var(--color-bg-surface-2);
   border: none;
   border-left: 1px solid var(--color-border-subtle);
@@ -932,7 +944,9 @@
   gap: var(--space-2);
 }
 
-[data-ui="composer-import-at-end"]:hover:not(:disabled) {
+[data-ui="composer-import-at-end"]:hover:not(:disabled),
+[data-ui="composer-attach"]:hover:not(:disabled),
+[data-ui="composer-attach-existing"]:hover:not(:disabled) {
   background: var(--color-bg-hover);
   color: var(--color-fg-primary);
 }

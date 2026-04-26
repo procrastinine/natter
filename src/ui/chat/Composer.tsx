@@ -1,6 +1,10 @@
 import { type ReactNode, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import type { SendShortcut } from '../../core/global-settings'
-import { InsertIcon, PrefillIcon, StopIcon } from '../icons/Icon'
+import type { MessageAttachmentRef } from '../../core/types'
+import { AttachmentDraftTray } from '../attachments/AttachmentDraftTray'
+import { AttachmentPicker } from '../attachments/AttachmentPicker'
+import { useAttachmentDrafts } from '../attachments/useAttachmentDrafts'
+import { DatabaseIcon, InsertIcon, PaperclipIcon, PrefillIcon, StopIcon } from '../icons/Icon'
 
 export interface ComposerProps {
   // Disables the textarea entirely.
@@ -8,7 +12,10 @@ export interface ComposerProps {
   // The textarea remains editable but Send is locked. Reason is rendered
   // beneath the composer and used as the Send-button tooltip.
   sendBlockedReason?: string
-  onSubmit: (text: string, opts?: { prefillText?: string }) => void | Promise<void>
+  onSubmit: (
+    text: string,
+    opts?: { prefillText?: string; attachmentRefs?: MessageAttachmentRef[] },
+  ) => void | Promise<void>
   onDraftChange?: (text: string) => void
   seed?: string | null
   onSeedConsumed?: () => void
@@ -54,6 +61,12 @@ export interface ComposerProps {
   // include the prefill in its sum. Empty string when the prefill panel is
   // closed (so the consumer can drop it from the count).
   onPrefillDraftChange?: (text: string) => void
+  attachmentScopeKey?: string | null
+  onAttachmentDraftChange?: (refs: MessageAttachmentRef[]) => void
+  attachmentsDisabled?: boolean
+  attachmentsDisabledReason?: string
+  droppedFiles?: ComposerDroppedFiles | null
+  onDroppedFilesConsumed?: (id: string) => void
   // When true, the textarea starts at the variant's default height
   // and auto-grows with content up to the variant's auto-grow cap. The
   // drag handle remains visible; dragging sets a MINIMUM floor that
@@ -74,6 +87,11 @@ export interface ComposerProps {
 }
 
 type AutoSizeVariant = 'normal' | 'focus'
+
+export interface ComposerDroppedFiles {
+  id: string
+  files: File[]
+}
 
 interface AutoSizeProfile {
   defaultFloor: number
@@ -162,8 +180,15 @@ export function Composer({
   prefillScopeKey,
   prefillSettingsPrompt,
   onPrefillDraftChange,
+  attachmentScopeKey,
+  onAttachmentDraftChange,
+  attachmentsDisabled = false,
+  attachmentsDisabledReason = 'Attachments are unavailable for this request mode.',
+  droppedFiles,
+  onDroppedFilesConsumed,
 }: ComposerProps) {
   const [text, setText] = useState('')
+  const [pickerOpen, setPickerOpen] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [prefillOpen, setPrefillOpen] = useState(false)
   const [prefillText, setPrefillText] = useState(defaultPrefill ?? '')
@@ -172,7 +197,9 @@ export function Composer({
   // changes so an updated default does seed the next opening.
   const lastSeededDefaultRef = useRef<string | undefined>(defaultPrefill)
   const lastPrefillScopeRef = useRef<string | null | undefined>(prefillScopeKey)
+  const lastAttachmentScopeRef = useRef<string | null | undefined>(attachmentScopeKey)
   const prefillTextareaRef = useRef<HTMLTextAreaElement | null>(null)
+  const fileInputRef = useRef<HTMLInputElement | null>(null)
   // In auto-size mode this is a minimum FLOOR (per-variant default).
   // In fixed mode it's the absolute textarea height. Drag updates it
   // in both modes; persistence uses separate localStorage keys
@@ -228,9 +255,7 @@ export function Composer({
     const previousDefault = lastSeededDefaultRef.current ?? ''
     lastSeededDefaultRef.current = defaultPrefill
     setPrefillText((prev) =>
-      !prefillOpen || prev.length === 0 || prev === previousDefault
-        ? (defaultPrefill ?? '')
-        : prev,
+      !prefillOpen || prev.length === 0 || prev === previousDefault ? (defaultPrefill ?? '') : prev,
     )
   }, [defaultPrefill, prefillOpen])
   // When the user closes prefill, reset the text to the chat's default so
@@ -279,13 +304,60 @@ export function Composer({
     }
     el.style.height = `${height}px`
   }, [autoSize, profile.autoGrowMax, height, text])
-  const sendBlocked = Boolean(sendBlockedReason) || Boolean(disabled) || streaming || submitting
   const trimmed = text.trim()
+  const attachments = useAttachmentDrafts()
+  const {
+    attachmentRefs,
+    attachmentRows,
+    uploads,
+    addAttachment,
+    replaceAttachment,
+    toggleAttachment,
+    removeAttachment,
+    ingestFiles,
+    dismissUpload,
+    clear: clearAttachments,
+    restore: restoreAttachments,
+  } = attachments
+  useEffect(() => {
+    if (!droppedFiles) return
+    if (disabled || attachmentsDisabled) {
+      onDroppedFilesConsumed?.(droppedFiles.id)
+      return
+    }
+    void ingestFiles(droppedFiles.files).finally(() => {
+      onDroppedFilesConsumed?.(droppedFiles.id)
+    })
+  }, [droppedFiles, disabled, attachmentsDisabled, ingestFiles, onDroppedFilesConsumed])
+  useEffect(() => {
+    if (attachmentsDisabled) setPickerOpen(false)
+  }, [attachmentsDisabled])
+  useEffect(() => {
+    onAttachmentDraftChange?.(attachmentRefs)
+  }, [attachmentRefs, onAttachmentDraftChange])
+  useEffect(() => {
+    if (lastAttachmentScopeRef.current === attachmentScopeKey) return
+    lastAttachmentScopeRef.current = attachmentScopeKey
+    clearAttachments()
+    onAttachmentDraftChange?.([])
+  }, [attachmentScopeKey, clearAttachments, onAttachmentDraftChange])
+  const uploadingAttachments = uploads.some((upload) => upload.state === 'uploading')
+  const sendBlocked =
+    Boolean(sendBlockedReason) ||
+    Boolean(disabled) ||
+    streaming ||
+    submitting ||
+    uploadingAttachments
+  const attachmentControlsDisabled = Boolean(disabled) || attachmentsDisabled
+  const hasAttachments = !attachmentsDisabled && attachmentRefs.length > 0
   const emptyWithTrailingUser =
-    trimmed.length === 0 && Boolean(trailingUserMessage) && Boolean(onReplyToTrailingUser)
+    trimmed.length === 0 &&
+    !hasAttachments &&
+    Boolean(trailingUserMessage) &&
+    Boolean(onReplyToTrailingUser)
   const send = useCallback(async () => {
     if (sendBlocked) return
-    if (text.trim().length === 0) {
+    if (text.trim().length === 0 && !hasAttachments) {
       if (emptyWithTrailingUser && onReplyToTrailingUser) {
         setSubmitting(true)
         try {
@@ -299,6 +371,8 @@ export function Composer({
       return
     }
     const out = text.trim()
+    const refsOut = attachmentsDisabled ? [] : attachmentRefs
+    const rowsOut = new Map(attachmentRows)
     // Capture and clear the prefill text in the same render so a fast
     // double-tap doesn't send the same prefill twice. Empty / whitespace-
     // only prefill is treated as no prefill (the wire transform would trim
@@ -306,14 +380,19 @@ export function Composer({
     // no-op-then-confuse-the-model).
     const prefillOut = prefillOpen && prefillText.trim().length > 0 ? prefillText : ''
     setText('')
+    if (!attachmentsDisabled) clearAttachments()
     if (prefillOut.length > 0) {
       setPrefillText(defaultPrefill ?? '')
     }
     setSubmitting(true)
     try {
-      await onSubmit(out, prefillOut.length > 0 ? { prefillText: prefillOut } : undefined)
+      await onSubmit(out, {
+        ...(prefillOut.length > 0 ? { prefillText: prefillOut } : {}),
+        ...(refsOut.length > 0 ? { attachmentRefs: refsOut } : {}),
+      })
     } catch (err) {
       setText((current) => (current.length === 0 ? out : current))
+      if (refsOut.length > 0) restoreAttachments(refsOut, rowsOut)
       if (prefillOut.length > 0) setPrefillText(prefillOut)
       console.error('composer submit failed', err)
     } finally {
@@ -328,6 +407,12 @@ export function Composer({
     prefillOpen,
     prefillText,
     defaultPrefill,
+    attachmentRefs,
+    attachmentRows,
+    hasAttachments,
+    attachmentsDisabled,
+    clearAttachments,
+    restoreAttachments,
   ])
   const sendButtonLabel = emptyWithTrailingUser
     ? 'Reply ⏎'
@@ -448,6 +533,18 @@ export function Composer({
             />
           </>
         ) : null}
+        {attachmentRefs.length > 0 || uploads.length > 0 ? (
+          <AttachmentDraftTray
+            refs={attachmentRefs}
+            attachments={attachmentRows}
+            uploads={uploads}
+            disabled={disabled}
+            onToggle={toggleAttachment}
+            onRemove={removeAttachment}
+            onReplace={replaceAttachment}
+            onDismissUpload={dismissUpload}
+          />
+        ) : null}
         <div data-ui="composer-actions">
           <span data-ui="token-counter" aria-live="polite">
             {text.trim().length + (prefillOpen ? prefillText.length : 0)} chars
@@ -486,6 +583,42 @@ export function Composer({
               <span>Prefill</span>
             </button>
           ) : null}
+          <input
+            ref={fileInputRef}
+            data-ui="attachment-hidden-input"
+            type="file"
+            multiple
+            disabled={attachmentControlsDisabled}
+            onChange={(event) => {
+              const files = Array.from(event.currentTarget.files ?? [])
+              event.currentTarget.value = ''
+              if (files.length === 0) return
+              if (attachmentsDisabled) return
+              void ingestFiles(files)
+            }}
+          />
+          <button
+            type="button"
+            data-ui="composer-attach"
+            onClick={() => fileInputRef.current?.click()}
+            aria-label="Upload attachments"
+            title={attachmentsDisabled ? attachmentsDisabledReason : 'Upload attachments'}
+            disabled={attachmentControlsDisabled}
+          >
+            <PaperclipIcon size={14} />
+          </button>
+          <button
+            type="button"
+            data-ui="composer-attach-existing"
+            onClick={() => setPickerOpen(true)}
+            aria-label="Use existing stored attachment"
+            title={
+              attachmentsDisabled ? attachmentsDisabledReason : 'Use existing stored attachment'
+            }
+            disabled={attachmentControlsDisabled}
+          >
+            <DatabaseIcon size={14} />
+          </button>
           {onImportAtEnd ? (
             <button
               type="button"
@@ -514,9 +647,12 @@ export function Composer({
               type="submit"
               data-ui="send"
               data-mode={emptyWithTrailingUser ? 'reply' : 'send'}
-              disabled={sendBlocked || (text.trim() === '' && !emptyWithTrailingUser)}
+              disabled={
+                sendBlocked || (text.trim() === '' && !hasAttachments && !emptyWithTrailingUser)
+              }
               title={
                 sendBlockedReason ??
+                (uploadingAttachments ? 'Uploading attachments' : undefined) ??
                 (emptyWithTrailingUser
                   ? 'Generate an assistant reply for the trailing user message'
                   : undefined)
@@ -531,6 +667,16 @@ export function Composer({
         <p data-ui="composer-disabled-reason" role="status">
           {sendBlockedReason}
         </p>
+      ) : null}
+      {pickerOpen ? (
+        <AttachmentPicker
+          title="Use stored attachment"
+          onClose={() => setPickerOpen(false)}
+          onPick={(attachment) => {
+            addAttachment(attachment)
+            setPickerOpen(false)
+          }}
+        />
       ) : null}
     </form>
   )

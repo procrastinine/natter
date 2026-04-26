@@ -178,7 +178,7 @@ function usePromptSlot(
     async (promptTitle: string) => {
       await flushDraftBeforeAction()
       const name = window.prompt(`Name for new ${promptTitle.toLowerCase()} preset:`)
-      if (!name || !name.trim()) return
+      if (!name?.trim()) return
       const created = await createPromptPreset({
         kind: slot.kind,
         name: name.trim(),
@@ -201,7 +201,7 @@ function usePromptSlot(
   const renamePreset = useCallback(
     async (targetId: string, currentName: string) => {
       const name = window.prompt('Rename preset:', currentName)
-      if (!name || !name.trim() || name === currentName) return
+      if (!name?.trim() || name === currentName) return
       await updatePromptPreset(targetId, { name: name.trim() })
     },
     [],

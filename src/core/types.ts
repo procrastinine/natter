@@ -523,7 +523,7 @@ export interface ComposeOverrides {
 
 export interface ChatDraft {
   text: string
-  attachmentRefs: AttachmentId[]
+  attachmentRefs: AttachmentRef[]
   composeOverrides?: ComposeOverrides
   overrides?: Partial<ChatSettings>
   prefillEnabled?: boolean
@@ -780,7 +780,7 @@ export interface Message {
   refusal?: string
   phase?: MessagePhase
   responsesEchoItem?: ResponsesOutputItem
-  attachmentRefs?: AttachmentId[]
+  attachmentRefs?: AttachmentRef[]
   approval?: MessageApproval
   nodeVersion: number
   pinCache?: boolean
@@ -825,22 +825,170 @@ export interface Message {
 // Attachments
 // ---------------------------------------------------------------------------
 
-export type AttachmentKind = 'image' | 'pdf' | 'audio' | 'video' | 'file'
+export type AttachmentKind =
+  | 'image'
+  | 'pdf'
+  | 'audio'
+  | 'video'
+  | 'plaintext'
+  | 'code'
+  | 'document'
+  | 'spreadsheet'
+  | 'presentation'
+  | 'archive'
+  | 'other'
+  /** @deprecated Legacy pre-Phase-12 catch-all. New rows use `other`. */
+  | 'file'
+
+export type AttachmentOrigin =
+  | 'user-upload'
+  | 'user-remote-url'
+  | 'generated-output'
+  | 'server-tool-peel'
+  | 'import'
+  | 'system-fixture'
+
+export type AttachmentMissingReason =
+  | 'quota'
+  | 'deleted'
+  | 'import-missing'
+  | 'integrity-failed'
+  | 'processing-error'
+  | 'blob-not-found'
+
+export type AttachmentStorage =
+  | { kind: 'local-blob'; blobId: string }
+  | { kind: 'remote-url'; url: string }
+  | {
+      kind: 'missing'
+      reason: AttachmentMissingReason
+      missingSince: number
+      lastKnownBlobId?: string
+    }
+
+export interface AttachmentTokenEstimate {
+  modelKey: string
+  modality: AttachmentKind
+  contextForm:
+    | 'native-image'
+    | 'native-audio'
+    | 'native-video'
+    | 'native-file'
+    | 'openrouter-file-parser'
+    | 'client-extracted-text'
+    | 'remote-url'
+    | 'omitted'
+  tokens: number
+  source: 'server-usage' | 'heuristic' | 'calibrated-text' | 'manual-zero'
+  computedAt: number
+  processorId?: string
+}
+
+export type AttachmentArtifact =
+  | {
+      kind: 'text'
+      artifactId: string
+      attachmentId: AttachmentId
+      processorId: string
+      text: string
+      charCount: number
+      tokenEstimate?: AttachmentTokenEstimate
+      createdAt: number
+    }
+  | {
+      kind: 'json'
+      artifactId: string
+      attachmentId: AttachmentId
+      processorId: string
+      value: unknown
+      createdAt: number
+    }
+  | {
+      kind: 'blob'
+      artifactId: string
+      attachmentId: AttachmentId
+      processorId: string
+      blobId: string
+      createdAt: number
+    }
+
+export type AttachmentProcessingStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'skipped'
+
+export interface AttachmentProcessingState {
+  processorId: string
+  inputHash: string
+  status: AttachmentProcessingStatus
+  startedAt?: number
+  finishedAt?: number
+  error?: { code: string; message: string }
+  outputArtifactIds: string[]
+}
+
+export interface AttachmentJob extends AttachmentProcessingState {
+  id: string
+  attachmentId: AttachmentId
+  updatedAt: number
+}
+
+export interface AttachmentBlob {
+  id: string
+  attachmentId: AttachmentId
+  role: 'original' | 'thumbnail' | 'image-resize' | 'normalized' | 'tool-peel'
+  mime: string
+  contentHash: string
+  sizeBytes: number
+  blob: Blob
+  createdAt: number
+}
+
+export interface MessageAttachmentRef {
+  refId: string
+  attachmentId: AttachmentId
+  includeInContext: boolean
+  presentation: {
+    label?: string
+    imageDetail?: 'low' | 'high' | 'auto'
+    pdfTier?: 'native' | 'plugin' | 'client'
+    preferredArtifactId?: string
+  }
+  tokenEstimate?: AttachmentTokenEstimate
+  missingResolution?: {
+    promptedAt: number
+    action: 'reupload-later' | 'exclude-from-context' | 'use-text-artifact'
+  }
+  createdAt: number
+  updatedAt: number
+  deletedAt?: number
+}
+
+export type AttachmentRef = AttachmentId | MessageAttachmentRef
 
 export interface Attachment {
   id: AttachmentId
-  contentHash: string
+  contentHash?: string
   kind: AttachmentKind
   mime: string
   filename: string
-  sizeBytes: number
+  extension?: string
+  sizeBytes?: number
+  origin: AttachmentOrigin
+  sourceUrl?: string
   createdAt: number
-  blob: Blob
+  updatedAt: number
+  storage: AttachmentStorage
   dimensions?: { width: number; height: number }
   durationMs?: number
   pageCount?: number
-  thumbnailB64?: string
+  textCharCount?: number
+  languageHint?: string
+  scannedLike?: boolean
+  thumbnailBlobId?: string
+  artifacts: AttachmentArtifact[]
+  processing: AttachmentProcessingState[]
   refCount: number
+  deletedAt?: number
+  supersededByAttachmentId?: string
+  lastIntegrityCheckAt?: number
 }
 
 // ---------------------------------------------------------------------------
@@ -1028,7 +1176,7 @@ export interface ModelsQuery {
 export interface SendPayload {
   chatId: ChatId
   content: ContentItem[]
-  attachmentRefs?: AttachmentId[]
+  attachmentRefs?: AttachmentRef[]
   overrides?: Partial<ChatSettings>
   composeOverrides?: ComposeOverrides
   prefillContent?: ContentItem[]

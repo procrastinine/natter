@@ -28,6 +28,9 @@ describe('Dexie schema', () => {
     const names = db.tables.map((t) => t.name).sort()
     expect(names).toEqual(
       [
+        'attachmentArtifacts',
+        'attachmentBlobs',
+        'attachmentJobs',
         'attachments',
         'chatBranchCache',
         'chats',
@@ -95,7 +98,7 @@ function registerV1(db: Dexie): void {
 
 function registerV1Through3(db: Dexie): void {
   registerSchema(db)
-  db.version(6)
+  db.version(7)
     .stores({ profiles: 'id, name, kind, lastUsedAt, archived' })
     .upgrade(async (tx) => {
       await tx
@@ -105,7 +108,7 @@ function registerV1Through3(db: Dexie): void {
           if (row.appTitle === undefined) row.appTitle = 'Natter'
         })
     })
-  db.version(7)
+  db.version(8)
     .stores({ settings: '&key' })
     .upgrade(async (tx) => {
       const settings = tx.table<MinimalSetting>('settings')
@@ -139,6 +142,32 @@ function registerLegacyProviderPrefsV3(db: Dexie): void {
   })
 }
 
+function registerLegacyAttachmentsV5(db: Dexie): void {
+  db.version(5).stores({
+    chats:
+      'id, updatedAt, createdAt, lastViewedAt, lastUpdatedLeafId, lastBranchUpdatedAt, wordCount, totalCostUsd, archived, pinned, presetId, folderId, *tags',
+    messages:
+      'id, chatId, parentId, turnId, [chatId+parentId], [chatId+createdAt], [chatId+turnId], [chatId+deleted]',
+    childLists: 'id, [chatId+parentId], updatedAt',
+    attachments: 'id, contentHash, refCount, createdAt',
+    profiles: 'id, name, kind, lastUsedAt, archived',
+    presets: 'id, name, connectionProfileId, lastUsedAt, archived',
+    promptPresets: 'id, kind, name, lastUsedAt',
+    folders: 'id, name, sortIndex, lastUsedAt',
+    tags: 'id, &nameLower, lastUsedAt',
+    chatBranchCache: '&chatId, branchLeafId, generatedAt',
+    keys: 'id, name',
+    settings: '&key',
+    models: '&[profileId+queryKey], fetchedAt',
+    endpoints: '&[profileId+modelId], fetchedAt',
+    privacyPolicies: '&[profileId+modelId], fetchedAt',
+    providers: '&profileId, fetchedAt',
+    generations: 'id, chatId, gen_id',
+    presetResolutions: '&[profileId+presetSlug], fetchedAt',
+    drafts: '&chatId, updatedAt',
+  })
+}
+
 describe('Dexie migrations', () => {
   it('opens a fresh DB at the highest declared version without replaying upgrade callbacks', async () => {
     // Dexie's contract: on a truly fresh IDB, it creates the union of all
@@ -151,7 +180,7 @@ describe('Dexie migrations', () => {
     const db = new Dexie(name)
     registerV1Through3(db)
     await db.open()
-    expect(db.verno).toBe(7)
+    expect(db.verno).toBe(8)
     expect(db.tables.map((t) => t.name).includes('settings')).toBe(true)
     const tag = await db.table<MinimalSetting>('settings').get('schemaTag')
     expect(tag).toBeUndefined()
@@ -187,7 +216,7 @@ describe('Dexie migrations', () => {
     const up = new Dexie(name)
     registerV1Through3(up)
     await up.open()
-    expect(up.verno).toBe(7)
+    expect(up.verno).toBe(8)
     const profile = await up.table<MinimalProfile>('profiles').get('P1')
     expect(profile?.appTitle).toBe('CustomTitle') // preserved — synthetic bump only fills undefined
     const tag = await up.table<MinimalSetting>('settings').get('schemaTag')
@@ -197,7 +226,7 @@ describe('Dexie migrations', () => {
     const reopen = new Dexie(name)
     registerV1Through3(reopen)
     await reopen.open()
-    expect(reopen.verno).toBe(7)
+    expect(reopen.verno).toBe(8)
     const tag2 = await reopen.table<MinimalSetting>('settings').get('schemaTag')
     expect(tag2?.value).toBe('preexisting')
     await reopen.delete()
@@ -308,6 +337,147 @@ describe('Dexie migrations', () => {
     expect(chat?.settings.providerPrefs?.ignore).toEqual(['anthropic', 'anthropic/2'])
     expect(preset?.settings.privacy.ignoreProviders).toEqual([])
     expect(preset?.settings.providerPrefs?.ignore).toEqual(['anthropic', 'anthropic/2'])
+    await migrated.delete()
+  })
+
+  it('migrates old attachment-free and prototype attachment IndexedDB rows automatically', async () => {
+    const name = `natter-test-attachments-mig-${Math.random().toString(36).slice(2)}`
+    await Dexie.delete(name)
+
+    const legacy = new Dexie(name)
+    registerLegacyAttachmentsV5(legacy)
+    await legacy.open()
+    await legacy.table<Chat>('chats').put({
+      id: 'chat-old',
+      title: 'Old chat',
+      titleStatus: 'untitled',
+      createdAt: 1,
+      updatedAt: 1,
+      lastViewedAt: 1,
+      wordCount: 0,
+      totalCostUsd: 0,
+      metaVersion: 0,
+      summaryVersion: 0,
+      settings: cloneDefaultChatSettings(),
+      lastUpdatedLeafId: 'msg-proto',
+      lastBranchUpdatedAt: 1,
+      archived: false,
+      pinned: false,
+      folderId: null,
+      tags: [],
+    })
+    await legacy.table('messages').bulkPut([
+      {
+        id: 'msg-empty',
+        chatId: 'chat-old',
+        parentId: null,
+        siblingIndex: 0,
+        turnId: 'turn-empty',
+        turnIndex: 0,
+        createdAt: 2,
+        role: 'user',
+        origin: 'user',
+        content: [{ type: 'text', text: 'old text-only message' }],
+        nodeVersion: 0,
+        deleted: false,
+      },
+      {
+        id: 'msg-proto',
+        chatId: 'chat-old',
+        parentId: 'msg-empty',
+        siblingIndex: 0,
+        turnId: 'turn-proto',
+        turnIndex: 0,
+        createdAt: 3,
+        role: 'user',
+        origin: 'user',
+        content: [{ type: 'text', text: 'old attachment message' }],
+        attachmentRefs: ['att-old'],
+        nodeVersion: 0,
+        deleted: false,
+      },
+    ])
+    await legacy.table('drafts').put({
+      chatId: 'chat-old',
+      text: 'legacy draft',
+      attachmentRefs: ['att-old'],
+      updatedAt: 4,
+    })
+    await legacy.table('attachments').put({
+      id: 'att-old',
+      contentHash: 'hash-old',
+      kind: 'file',
+      mime: 'text/plain',
+      filename: 'old.txt',
+      sizeBytes: 3,
+      createdAt: 5,
+      blob: new Blob(['old']),
+      refCount: 0,
+    })
+    legacy.close()
+
+    const migrated = createDbForTests(name)
+    await migrated.open()
+    expect(migrated.tables.map((t) => t.name)).toEqual(
+      expect.arrayContaining(['attachmentBlobs', 'attachmentArtifacts', 'attachmentJobs']),
+    )
+
+    const emptyMessage = await migrated.messages.get('msg-empty')
+    expect(emptyMessage?.attachmentRefs).toEqual([])
+
+    const prototypeMessage = await migrated.messages.get('msg-proto')
+    expect(prototypeMessage?.attachmentRefs).toEqual([
+      expect.objectContaining({
+        refId: 'legacy:msg-proto:0',
+        attachmentId: 'att-old',
+        includeInContext: true,
+        presentation: {},
+      }),
+    ])
+
+    const draft = await migrated.drafts.get('chat-old')
+    expect(draft?.attachmentRefs).toEqual([
+      expect.objectContaining({
+        refId: 'legacy:chat-old:0',
+        attachmentId: 'att-old',
+        includeInContext: true,
+      }),
+    ])
+
+    const attachment = await migrated.attachments.get('att-old')
+    expect(attachment).toMatchObject({
+      id: 'att-old',
+      contentHash: 'hash-old',
+      kind: 'other',
+      origin: 'import',
+      artifacts: [],
+      processing: [],
+      refCount: 2,
+    })
+    expect(Object.hasOwn(attachment ?? {}, 'blob')).toBe(false)
+
+    // Real browser IndexedDB preserves Blob values; fake-indexeddb's older
+    // structured clone path may not. Either path is compatible: bytes migrate
+    // when available, otherwise the stored object becomes a recoverable
+    // missing attachment instead of breaking old chats.
+    if (attachment?.storage.kind === 'local-blob') {
+      expect(attachment.storage.blobId).toBe('att-old:original')
+      const blob = await migrated.attachmentBlobs.get('att-old:original')
+      expect(blob).toMatchObject({
+        id: 'att-old:original',
+        attachmentId: 'att-old',
+        role: 'original',
+        contentHash: 'hash-old',
+        sizeBytes: 3,
+      })
+    } else {
+      expect(attachment?.storage).toMatchObject({
+        kind: 'missing',
+        reason: 'import-missing',
+      })
+      expect(await migrated.attachmentBlobs.count()).toBe(0)
+    }
+
     await migrated.delete()
   })
 })

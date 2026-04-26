@@ -1,4 +1,4 @@
-import { render, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, waitFor } from '@testing-library/react'
 import 'fake-indexeddb/auto'
 import Dexie from 'dexie'
 import { IDBFactory } from 'fake-indexeddb'
@@ -37,6 +37,7 @@ describe('shell smoke render', () => {
   })
 
   afterEach(async () => {
+    cleanup()
     errorSpy.mockRestore()
     warnSpy.mockRestore()
     await resetAll()
@@ -68,6 +69,80 @@ describe('shell smoke render', () => {
       'data-chat-model-panel',
       'closed',
     )
+  })
+
+  it('hides the focus-mode toggle on storage pages', () => {
+    window.location.hash = '#/storage'
+    const { container } = render(<App />)
+
+    expect(container.querySelector('[data-ui="storage-view"]')).toBeInTheDocument()
+    expect(container.querySelector('[data-ui="focus-mode-toggle"]')).not.toBeInTheDocument()
+  })
+
+  it('keeps the focus-mode toggle on chat pages', async () => {
+    const chat = await createChat({ settings: cloneDefaultChatSettings() })
+    window.location.hash = `#/chat/${chat.id}`
+    const { container } = render(<App />)
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-ui="focus-mode-toggle"]')).toBeInTheDocument()
+    })
+  })
+
+  it('auto-closes the chat settings panel on storage routes', async () => {
+    const chat = await createChat({ settings: cloneDefaultChatSettings() })
+    window.location.hash = `#/chat/${chat.id}`
+    const { container } = render(<App />)
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-role="settings-cog"]')).toBeInTheDocument()
+    })
+    fireEvent.click(container.querySelector('[data-role="settings-cog"]') as HTMLButtonElement)
+    await waitFor(() => {
+      expect(container.querySelector('[data-ui="chat-model-panel"]')).toBeInTheDocument()
+      expect(container.querySelector('[data-ui="app-shell"]')).toHaveAttribute(
+        'data-chat-model-panel',
+        'open',
+      )
+    })
+
+    fireEvent.click(container.querySelector('[data-ui="open-storage"]') as HTMLAnchorElement)
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-ui="storage-view"]')).toBeInTheDocument()
+      expect(container.querySelector('[data-ui="chat-model-panel"]')).not.toBeInTheDocument()
+      expect(container.querySelector('[data-ui="app-shell"]')).toHaveAttribute(
+        'data-chat-model-panel',
+        'closed',
+      )
+    })
+  })
+
+  it('uploads files dropped onto the active chat pane', async () => {
+    const chat = await createChat({ settings: cloneDefaultChatSettings() })
+    window.location.hash = `#/chat/${chat.id}`
+    const { container, findByText } = render(<App />)
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-ui="main-pane"]')).toBeInTheDocument()
+    })
+    const mainPane = container.querySelector('[data-ui="main-pane"]') as HTMLElement
+    const file = new File(['drop upload body'], 'drop-note.txt', { type: 'text/plain' })
+    const dataTransfer = {
+      types: ['Files'],
+      files: [file],
+      dropEffect: 'none',
+    }
+
+    fireEvent.dragOver(mainPane, { dataTransfer })
+    fireEvent.drop(mainPane, { dataTransfer })
+
+    expect(await findByText('drop-note.txt')).toBeInTheDocument()
+    await waitFor(() => {
+      expect(
+        container.querySelector('[data-ui="attachment-file-card"][data-storage="local"]'),
+      ).toBeInTheDocument()
+    })
   })
 
   it('boots without console errors or warnings', () => {

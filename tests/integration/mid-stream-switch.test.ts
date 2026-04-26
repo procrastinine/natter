@@ -216,13 +216,14 @@ describe('mid-stream preset/connection/model switch', () => {
     expect(assistant.content).toEqual([{ type: 'output_text', text: 'pre-post' }])
     expect(assistant.generation?.abortReason).toBeUndefined()
     expect(assistant.generation?.requestedModel).toBe('model-s1')
+    if (!capturedWire) throw new Error('expected first send wire body to be captured')
 
     assertCommonSwitchInvariants({
       chatId: chat.id,
       assistantId: first.assistantMessageId,
       s1: { model: 'model-s1', profileId: 'prof-s1' },
       s2: { model: 'model-s2', profileId: 'prof-s2' },
-      composed: capturedWire!,
+      composed: capturedWire,
       switchLoggedNote: undefined,
       abortSignalled: false,
     })

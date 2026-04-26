@@ -25,19 +25,17 @@ import { useLiveQuery } from 'dexie-react-hooks'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { activePath } from '../../core/active-path'
 import type { EffectiveCapability } from '../../core/capabilities'
-import {
-  DEFAULT_GLOBAL_PREFERENCES,
-  readGlobalPreferences,
-} from '../../core/global-settings'
+import { DEFAULT_GLOBAL_PREFERENCES, readGlobalPreferences } from '../../core/global-settings'
 import {
   estimateSettingsPromptSize,
   type PromptSizeEstimate,
   UNLIMITED_CONTEXT,
 } from '../../core/prompt-size'
 import { readTokenCalibrationGlobal } from '../../core/token-calibration'
-import type { Chat } from '../../core/types'
+import type { Chat, MediaContextStrategy } from '../../core/types'
 import { getChatDraft, loadChatMessages, updateChatSettings } from '../../store/chats'
 import { useChatStore } from '../../store/zustand/chatStore'
+import { useAttachmentResolverForContext } from '../attachments/useAttachmentResolver'
 import { InfoDisclosure } from './InfoDisclosure'
 
 export interface ContextPanelProps {
@@ -63,15 +61,17 @@ export function ContextPanel({
     [chat.id, needsLocalEstimate],
     [],
   )
-  const cursor = useChatStore((s) => (needsLocalEstimate ? (s.cursors[chat.id] ?? EMPTY_CURSOR) : EMPTY_CURSOR))
+  const cursor = useChatStore((s) =>
+    needsLocalEstimate ? (s.cursors[chat.id] ?? EMPTY_CURSOR) : EMPTY_CURSOR,
+  )
   const draft = useLiveQuery(
-    () =>
-      needsLocalEstimate ? getChatDraft(chat.id).then((d) => d?.text ?? '') : Promise.resolve(''),
+    () => (needsLocalEstimate ? getChatDraft(chat.id) : Promise.resolve(undefined)),
     [chat.id, needsLocalEstimate],
-    '',
+    undefined,
   )
   const prefs = useLiveQuery(
-    () => (needsLocalEstimate ? readGlobalPreferences() : Promise.resolve(DEFAULT_GLOBAL_PREFERENCES)),
+    () =>
+      needsLocalEstimate ? readGlobalPreferences() : Promise.resolve(DEFAULT_GLOBAL_PREFERENCES),
     [needsLocalEstimate],
     DEFAULT_GLOBAL_PREFERENCES,
   )
@@ -85,31 +85,41 @@ export function ContextPanel({
   // parent without changing their prompt-cap). `null` disables cutoff when
   // capability hasn't loaded; once it does, the memo re-runs.
   const providerCap = capability?.maxPromptTokens ?? capability?.contextLength ?? null
+  const localPath = useMemo(
+    () => (needsLocalEstimate ? activePath(messages, cursor) : []),
+    [needsLocalEstimate, messages, cursor],
+  )
+  const attachmentResolver = useAttachmentResolverForContext({
+    settings: chat.settings,
+    messages: localPath,
+    draftAttachmentRefs: draft?.attachmentRefs,
+    enabled: needsLocalEstimate,
+  })
   const localEstimate = useMemo(() => {
     if (!needsLocalEstimate) return null
-    const path = activePath(messages, cursor)
     return estimateSettingsPromptSize(
       chat.settings,
-      path,
-      draft ?? '',
+      localPath,
+      draft?.text ?? '',
       endpointTokenizer ?? null,
       providerCap,
-      undefined,
+      attachmentResolver,
       {
         chatTokenCalibration: chat.tokenCalibration,
         globalCalibration,
         mode: prefs.tokenCalibrationMode,
       },
+      draft?.attachmentRefs,
     )
   }, [
     needsLocalEstimate,
-    messages,
-    cursor,
+    localPath,
     chat.settings,
     chat.tokenCalibration,
     draft,
     endpointTokenizer,
     providerCap,
+    attachmentResolver,
     globalCalibration,
     prefs.tokenCalibrationMode,
   ])
@@ -328,6 +338,57 @@ export function ContextPanel({
           </span>
         </label>
       ) : null}
+
+      <section data-ui="attachment-context-settings" aria-label="Attachment context settings">
+        <div data-ui="settings-subheader">
+          <span>
+            Files
+            <InfoDisclosure title="Chat-level default for media/file echo. Per-attachment chips still win: hiding one ref excludes only that exact reference." />
+          </span>
+        </div>
+        <fieldset data-ui="segmented-control" aria-label="Attachment inclusion">
+          {(
+            [
+              ['echo-all', 'All'],
+              ['echo-last-N', 'Recent'],
+              ['echo-user-only', 'User'],
+              ['drop-all', 'Off'],
+            ] as const
+          ).map(([value, label]) => (
+            <button
+              key={value}
+              type="button"
+              aria-pressed={chat.settings.mediaContextStrategy === value}
+              onClick={() =>
+                void updateChatSettings(chat.id, {
+                  mediaContextStrategy: value as MediaContextStrategy,
+                })
+              }
+            >
+              {label}
+            </button>
+          ))}
+        </fieldset>
+        {chat.settings.mediaContextStrategy === 'echo-last-N' ? (
+          <label data-ui="field-group" data-ui-field data-ui-inline-number-row>
+            <span>
+              Recent refs
+              <InfoDisclosure title="Number of most-recent attachment references to include when the chat-level media policy is Recent. Individual hidden refs remain excluded." />
+            </span>
+            <input
+              type="number"
+              min={1}
+              step={1}
+              value={chat.settings.mediaEchoN ?? 5}
+              onChange={(event) => {
+                const value = Number(event.target.value)
+                if (!Number.isFinite(value) || value < 1) return
+                void updateChatSettings(chat.id, { mediaEchoN: Math.floor(value) })
+              }}
+            />
+          </label>
+        ) : null}
+      </section>
     </section>
   )
 }

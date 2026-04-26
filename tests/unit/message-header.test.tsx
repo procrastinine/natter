@@ -173,9 +173,11 @@ describe('MessageInfo (revealed by ⓘ — full factual record)', () => {
 describe('Message hidden-reasoning footer', () => {
   it('uses the stored message model instead of the chat current-model capability', () => {
     const base = makeAssistant()
+    const generation = base.generation
+    if (!generation) throw new Error('expected assistant fixture generation metadata')
     const msg = makeAssistant({
       generation: {
-        ...base.generation!,
+        ...generation,
         model: 'openai/o3',
         requestedModel: 'openai/o3',
         apiUsed: 'chat',

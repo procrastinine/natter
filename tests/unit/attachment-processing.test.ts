@@ -6,7 +6,9 @@ import {
   AttachmentLibrary,
   buildOpenRouterContentPart,
   buildOpenRouterPdfPlugin,
+  classifyAttachment,
   processAttachment,
+  sniffMime,
 } from '../../src/core/attachments'
 import type {
   AttachmentArtifact,
@@ -33,6 +35,59 @@ const manifest = (
   entries: ManifestEntry[]
 }
 const entriesByPath = new Map(manifest.entries.map((entry) => [entry.path, entry]))
+
+describe('attachment processor normalization', () => {
+  it('normalizes LibreChat-style MIME aliases and broad code extensions', () => {
+    const textBytes = utf8("print('hello')\n")
+
+    expect(sniffMime('script.py', textBytes, 'text/x-python-script')).toBe('text/x-python')
+    expect(sniffMime('component.ts', utf8('export const value = 1\n'), 'video/mp2t')).toBe(
+      'application/typescript',
+    )
+    expect(sniffMime('README.markdown', utf8('# Fixture\n'))).toBe('text/markdown')
+    expect(sniffMime('config.yaml', utf8('name: fixture\n'))).toBe('application/yaml')
+    expect(sniffMime('Dockerfile', utf8('FROM scratch\n'))).toBe('text/x-dockerfile')
+    expect(classifyAttachment('text/plain', 'script.py')).toBe('code')
+    expect(
+      classifyAttachment(sniffMime('component.ts', textBytes, 'video/mp2t'), 'component.ts'),
+    ).toBe('code')
+    expect(classifyAttachment('text/plain', 'README.markdown')).toBe('plaintext')
+  })
+
+  it('classifies common image, audio, video, Office, OpenDocument, and archive types', () => {
+    expect(classifyAttachment('image/heic', 'photo.heic')).toBe('image')
+    expect(classifyAttachment('audio/flac', 'voice.flac')).toBe('audio')
+    expect(classifyAttachment('video/x-matroska', 'clip.mkv')).toBe('video')
+    expect(classifyAttachment('application/vnd.oasis.opendocument.text', 'sample.odt')).toBe(
+      'document',
+    )
+    expect(classifyAttachment('application/vnd.oasis.opendocument.spreadsheet', 'sample.ods')).toBe(
+      'spreadsheet',
+    )
+    expect(
+      classifyAttachment('application/vnd.oasis.opendocument.presentation', 'sample.odp'),
+    ).toBe('presentation')
+    expect(classifyAttachment('application/vnd.rar', 'archive.rar')).toBe('archive')
+  })
+
+  it('extracts text from OpenDocument packages through the same artifact path', async () => {
+    const result = await processAttachment({
+      id: 'odt-fixture',
+      filename: 'sample.odt',
+      bytes: storedZipEntry(
+        'content.xml',
+        '<office:document-content><text:p>OpenDocument text fixture</text:p></office:document-content>',
+      ),
+      origin: 'system-fixture',
+      now: 1,
+    })
+
+    expect(result.attachment.kind).toBe('document')
+    expect(result.attachment.mime).toBe('application/vnd.oasis.opendocument.text')
+    expect(textOf(result, 'office-text-v1')).toContain('OpenDocument text fixture')
+    expect(result.openRouter.contextForm).toBe('text-artifact')
+  })
+})
 
 describeWithFixtures('attachment processing corpus', () => {
   it.each(manifest.entries)('classifies and fingerprints $path', async (entry) => {
@@ -235,6 +290,27 @@ function fixtureBytes(relativePath: string): Uint8Array {
   const entry = entriesByPath.get(relativePath)
   if (!entry) throw new Error(`unknown fixture: ${relativePath}`)
   return new Uint8Array(readFileSync(join(FIXTURE_ROOT, relativePath)))
+}
+
+function utf8(text: string): Uint8Array {
+  return new TextEncoder().encode(text)
+}
+
+function storedZipEntry(name: string, text: string): Uint8Array {
+  const nameBytes = utf8(name)
+  const dataBytes = utf8(text)
+  const header = new Uint8Array(30)
+  const view = new DataView(header.buffer)
+  view.setUint32(0, 0x04034b50, true)
+  view.setUint16(8, 0, true)
+  view.setUint32(18, dataBytes.length, true)
+  view.setUint32(22, dataBytes.length, true)
+  view.setUint16(26, nameBytes.length, true)
+  const output = new Uint8Array(header.length + nameBytes.length + dataBytes.length)
+  output.set(header, 0)
+  output.set(nameBytes, header.length)
+  output.set(dataBytes, header.length + nameBytes.length)
+  return output
 }
 
 async function expectImageDimensions(
