@@ -47,6 +47,7 @@ import type {
   ReasoningDetail,
   ReasoningFormat,
   SamplingKey,
+  ServerToolId,
   TextTemplateConfig,
   ToolCall,
 } from './types'
@@ -73,6 +74,10 @@ export interface ChatCompletionsTransformOptions {
   // the request planner so direct/custom OpenAI-compatible endpoints never see
   // OpenRouter's `provider` extension.
   allowProviderRouting?: boolean
+  // OpenRouter-hosted server tools. Kept separate from provider routing because
+  // direct OpenAI/Anthropic/Gemini profiles also accept `tools`, but this first
+  // pass intentionally does not enable their hosted-tool surfaces.
+  allowHostedTools?: boolean
   // The carrier format the current route can round-trip for reasoning echo
   // (e.g. `anthropic-claude-v1` when sending to Claude; `openai-responses-v1`
   // for OpenAI Responses). Determined by `caps.quirks.reasoningPreservationFormat`
@@ -133,6 +138,26 @@ const SAMPLING_WIRE_KEY: Readonly<Record<SamplingKey, string>> = Object.freeze({
   dry_penalty_last_n: 'dry_penalty_last_n',
   n_keep: 'n_keep',
 })
+
+const OPENROUTER_SERVER_TOOL_TYPES: Readonly<Partial<Record<ServerToolId, string>>> =
+  Object.freeze({
+    'web-search': 'openrouter:web_search',
+    datetime: 'openrouter:datetime',
+    'web-fetch': 'openrouter:web_fetch',
+  })
+
+function buildOpenRouterServerTools(settings: ChatSettings): Array<{ type: string }> {
+  const tools: Array<{ type: string }> = []
+  const seen = new Set<ServerToolId>()
+  for (const id of settings.enabledServerToolIds) {
+    if (seen.has(id)) continue
+    seen.add(id)
+    const type = OPENROUTER_SERVER_TOOL_TYPES[id]
+    if (!type) continue
+    tools.push({ type })
+  }
+  return tools
+}
 
 // Apply prefill-specific path rewrites before any wire serialization. See
 // `plan/prefill-research.md §P.8.5` (trailing-whitespace trim) and §P.8.6
@@ -487,6 +512,18 @@ export function toChatCompletions(
   if (settings.responseFormat && gate('response_format')) {
     wire.response_format = toWireResponseFormat(settings.responseFormat)
   }
+  if (opts.allowHostedTools === true) {
+    const tools = buildOpenRouterServerTools(settings)
+    if (tools.length > 0 && gate('tools')) {
+      wire.tools = tools
+      if (settings.toolChoice !== undefined && gate('tool_choice')) {
+        wire.tool_choice = settings.toolChoice
+      }
+      if (settings.parallelToolCalls !== undefined && gate('parallel_tool_calls')) {
+        wire.parallel_tool_calls = settings.parallelToolCalls
+      }
+    }
+  }
   if (settings.serviceTier && settings.serviceTier !== 'auto' && gate('service_tier')) {
     wire.service_tier = settings.serviceTier
   }
@@ -743,6 +780,7 @@ export interface ResponsesTransformOptions {
   rewriteSlug?: (slug: string) => string
   privacy?: WireProviderPrivacy
   allowProviderRouting?: boolean
+  allowHostedTools?: boolean
   // Informs the reasoning-carry-forward filter about which encrypted format the
   // current route round-trips. For Responses the map is:
   //   OpenAI direct       → `openai-responses-v1`
@@ -874,6 +912,19 @@ export function toResponses(
     const format = toResponsesTextFormat(settings.responseFormat)
     if (format !== undefined) {
       wire.text = { ...(wire.text ?? {}), format }
+    }
+  }
+
+  if (opts.allowHostedTools === true) {
+    const tools = buildOpenRouterServerTools(settings)
+    if (tools.length > 0 && gate('tools')) {
+      wire.tools = tools
+      if (settings.toolChoice !== undefined && gate('tool_choice')) {
+        wire.tool_choice = settings.toolChoice
+      }
+      if (settings.parallelToolCalls !== undefined && gate('parallel_tool_calls')) {
+        wire.parallel_tool_calls = settings.parallelToolCalls
+      }
     }
   }
 

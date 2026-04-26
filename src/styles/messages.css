@@ -360,6 +360,24 @@
   word-break: break-all;
 }
 
+[data-ui="message-tool-calls"] {
+  display: grid;
+  gap: var(--space-1);
+  word-break: normal;
+}
+
+[data-ui="tool-call"] summary {
+  cursor: pointer;
+}
+
+[data-ui="tool-call"] pre {
+  margin: var(--space-1) 0 0;
+  max-height: 18rem;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 /* ─────────────────────────────────────────────────────────────────────────
  * Error / abort / crash banners — keep these clearly delineated even in
  * the otherwise quiet reading area.

@@ -200,6 +200,110 @@ test('GUI OpenRouter Text completions posts /completions with a selected templat
   expectNoConsoleProblems(consoleLines)
 })
 
+test('GUI OpenRouter hosted tools serialize for chat routes but not text completions', async ({
+  page,
+}) => {
+  const consoleLines = captureConsole(page)
+  const chatRequests: CapturedRequest[] = []
+  const textRequests: CapturedRequest[] = []
+  await mockOpenRouterDiscovery(page, OR_CHAT_MODEL, {
+    supportedParameters: [
+      'provider',
+      'tools',
+      'tool_choice',
+      'parallel_tool_calls',
+      'temperature',
+      'max_completion_tokens',
+    ],
+  })
+  await mockChatCompletionsCapture(page, chatRequests, ['hosted tools ok'], {
+    usageByIndex: [
+      {
+        prompt_tokens: 10,
+        completion_tokens: 2,
+        total_tokens: 12,
+        server_tool_use: { web_search_requests: 1 },
+      },
+    ],
+  })
+  await mockOpenRouterTextCompletions(page, textRequests)
+
+  await seedFirstRun(page, { model: OR_CHAT_MODEL, disablePrivacyFilter: false })
+  await createChatAndOpen(page)
+  await openSettingsPanel(page)
+  await page.getByRole('tab', { name: 'Generation' }).click()
+
+  const tools = page.locator('[data-ui-section="hosted-tools"]')
+  await expect(tools).toBeVisible()
+  await expect(tools.getByRole('checkbox', { name: 'Web search' })).toBeHidden()
+  await tools.locator('summary').click()
+  const webSearch = tools.getByRole('checkbox', { name: 'Web search' })
+  const datetime = tools.getByRole('checkbox', { name: 'Datetime' })
+  await expect(webSearch).toBeEnabled()
+  await expect(datetime).toBeEnabled()
+  await webSearch.click()
+  await expect(webSearch).toBeChecked()
+  await datetime.click()
+  await expect(datetime).toBeChecked()
+  await page.evaluate(() =>
+    (window as unknown as { __debugStreams?: { clearPlans(): void } }).__debugStreams?.clearPlans(),
+  )
+
+  const composer = page.locator('[data-ui="composer-input"]')
+  await composer.fill('OpenRouter hosted tools route check')
+  await composer.press('Enter')
+  const hostedAssistant = page
+    .locator('[data-ui="message"][data-role="assistant"]')
+    .filter({ hasText: 'hosted tools ok' })
+  await expect(hostedAssistant).toBeVisible()
+  await hostedAssistant.locator('[data-action="info"]').click()
+  const hostedInfo = hostedAssistant.locator('[data-ui="message-info"]')
+  await expect(hostedInfo).toContainText('Tool calls')
+  await expect(hostedInfo).toContainText('web search')
+
+  expect(chatRequests).toHaveLength(1)
+  expect(chatRequests[0]?.url).toBe('https://openrouter.ai/api/v1/chat/completions')
+  expect(chatRequests[0]?.body.tools).toEqual([
+    { type: 'openrouter:web_search' },
+    { type: 'openrouter:datetime' },
+  ])
+  expect(chatRequests[0]?.body.tool_choice).toBeUndefined()
+  expect(chatRequests[0]?.body.parallel_tool_calls).toBeUndefined()
+
+  await openSettingsPanel(page)
+  await page.getByRole('tab', { name: 'Model' }).click()
+  const apiMode = page.locator('[data-ui-section="api-mode"]')
+  await apiMode.getByRole('button', { name: 'Text completions', exact: true }).click()
+  await page.getByRole('tab', { name: 'Generation' }).click()
+  const textTools = page.locator('[data-ui-section="hosted-tools"]')
+  await textTools.locator('summary').click()
+  await expect(textTools.getByRole('checkbox', { name: 'Web search' })).toBeDisabled()
+  await expect(textTools.getByRole('checkbox', { name: 'Datetime' })).toBeDisabled()
+  await page.locator('[data-ui="text-template-picker"]').selectOption('raw')
+  await page.evaluate(() =>
+    (window as unknown as { __debugStreams?: { clearPlans(): void } }).__debugStreams?.clearPlans(),
+  )
+
+  await composer.fill('OpenRouter text completions omit tools')
+  await composer.press('Enter')
+  await expect(
+    page
+      .locator('[data-ui="message"][data-role="assistant"]')
+      .filter({ hasText: 'openrouter text ok' }),
+  ).toBeVisible()
+
+  expect(textRequests).toHaveLength(1)
+  expect(textRequests[0]?.url).toBe('https://openrouter.ai/api/v1/completions')
+  expect(textRequests[0]?.body.tools).toBeUndefined()
+
+  const plans = await requestPlans(page)
+  const sendPlan = findLastPlan(plans, 'send')
+  expect(sendPlan.payload.profile).toMatchObject({ kind: 'openrouter' })
+  expect(sendPlan.payload.route).toMatchObject({ kind: 'text-completions' })
+  expect((sendPlan.payload.request as Record<string, unknown>).tools).toBeUndefined()
+  expectNoConsoleProblems(consoleLines)
+})
+
 test('GUI edit Save & Send reuses provider planning for the edited branch', async ({ page }) => {
   const consoleLines = captureConsole(page)
   const requests: CapturedRequest[] = []
@@ -672,6 +776,7 @@ async function mockChatCompletionsCapture(
   page: Page,
   requests: CapturedRequest[],
   replies: readonly string[],
+  opts: { usageByIndex?: readonly Record<string, unknown>[] } = {},
 ): Promise<void> {
   await page.route('**/chat/completions', async (route) => {
     const body = parsePostBody(route.request().postData())
@@ -688,7 +793,14 @@ async function mockChatCompletionsCapture(
           provider: 'Alpha ZDR',
           content: replies[idx] ?? 'ok',
         },
-        { finish: 'stop', usage: { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 } },
+        {
+          finish: 'stop',
+          usage: opts.usageByIndex?.[idx] ?? {
+            prompt_tokens: 10,
+            completion_tokens: 2,
+            total_tokens: 12,
+          },
+        },
       ]),
     })
   })

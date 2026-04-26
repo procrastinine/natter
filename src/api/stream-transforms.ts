@@ -97,6 +97,9 @@ export type StreamLaneEvent =
         | 'code_interpreter_call'
         | 'computer_call'
         | 'mcp_tool_call'
+        | 'openrouter:datetime'
+        | 'openrouter:web_fetch'
+        | 'openrouter:web_search'
       status: 'in_progress' | 'searching' | 'completed'
       itemId: string
       outputIndex: number
@@ -542,6 +545,9 @@ const SERVER_TOOL_ITEM_TYPES = new Set<string>([
   'code_interpreter_call',
   'computer_call',
   'mcp_tool_call',
+  'openrouter:datetime',
+  'openrouter:web_fetch',
+  'openrouter:web_search',
 ])
 
 export async function* splitResponsesStream(

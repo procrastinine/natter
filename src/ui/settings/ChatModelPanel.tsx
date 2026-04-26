@@ -344,6 +344,8 @@ export function ChatModelPanel({ chatId, chatSnapshot = null, onClose }: ChatMod
             prefillRecommendationEndpoints={routing.endpoints}
             textTemplateMode={textTemplateMode}
             llamaProps={llamaProps}
+            connectionKind={profile?.kind ?? 'custom'}
+            textCompletionsActive={textTemplateMode !== null}
           />
         ) : null}
       </div>

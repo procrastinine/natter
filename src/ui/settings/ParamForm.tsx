@@ -27,12 +27,14 @@ import type {
   ApiVariant,
   Chat,
   ConnectionProfile,
+  ConnectionKind,
   EffortLevel,
   Message,
   ModelEndpoint,
   ReasoningInclude,
   ReasoningSummary,
   SamplingKey,
+  ServerToolId,
   VerbosityLevel,
 } from '../../core/types'
 import { updateChatSettings } from '../../store/chats'
@@ -54,6 +56,8 @@ export interface ParamFormProps {
   prefillRecommendationEndpoints?: readonly ModelEndpoint[] | undefined
   textTemplateMode?: 'openrouter' | 'llama-server' | null | undefined
   llamaProps?: LlamaServerProps | null | undefined
+  connectionKind?: ConnectionKind | undefined
+  textCompletionsActive?: boolean | undefined
 }
 
 interface SamplingSpec {
@@ -278,12 +282,23 @@ const SAMPLING_FIELDS: SamplingSpec[] = [
 
 const SETTINGS_SLIDER_COMMIT_DEBOUNCE_MS = 200
 
+const HOSTED_TOOL_OPTIONS: ReadonlyArray<{
+  id: ServerToolId
+  label: string
+}> = [
+  { id: 'web-search', label: 'Web search' },
+  { id: 'datetime', label: 'Datetime' },
+  { id: 'web-fetch', label: 'Web fetch' },
+]
+
 export function ParamForm({
   chat,
   capability,
   prefillRecommendationEndpoints = [],
   textTemplateMode = null,
   llamaProps = null,
+  connectionKind = 'custom',
+  textCompletionsActive = false,
 }: ParamFormProps) {
   const prefillSupportedForModel = chat.settings.model
     ? prefillClassFor(chat.settings.model) !== 'unsupported'
@@ -349,6 +364,11 @@ export function ParamForm({
     <div data-ui="param-form">
       <ReasoningSection chat={chat} capability={capability} />
       <VerbositySection chat={chat} capability={capability} />
+      <HostedToolsSection
+        chat={chat}
+        connectionKind={connectionKind}
+        textCompletionsActive={textCompletionsActive}
+      />
       <SystemPromptEditor chat={chat} />
       {prefillSupportedForModel ? (
         <PrefillSettingsSection chat={chat} endpoints={prefillRecommendationEndpoints} />
@@ -492,6 +512,61 @@ function PrefillChevronIcon({ expanded }: { expanded: boolean }) {
         strokeLinejoin="round"
       />
     </svg>
+  )
+}
+
+function HostedToolsSection({
+  chat,
+  connectionKind,
+  textCompletionsActive,
+}: {
+  chat: Chat
+  connectionKind: ConnectionKind
+  textCompletionsActive: boolean
+}) {
+  const selected = chat.settings.enabledServerToolIds
+  const enabledCount = HOSTED_TOOL_OPTIONS.filter((option) => selected.includes(option.id)).length
+  const available = connectionKind === 'openrouter' && !textCompletionsActive
+  const disabledReason = textCompletionsActive
+    ? 'Hosted tools are not sent on text completions.'
+    : connectionKind === 'openrouter'
+      ? ''
+      : 'Hosted tools are only sent through OpenRouter in this pass.'
+
+  const toggle = (id: ServerToolId, checked: boolean) => {
+    const next = checked
+      ? selected.includes(id)
+        ? selected
+        : [...selected, id]
+      : selected.filter((candidate) => candidate !== id)
+    void updateChatSettings(chat.id, { enabledServerToolIds: next })
+  }
+
+  return (
+    <details data-ui="settings-section" data-ui-section="hosted-tools">
+      <summary data-ui="settings-disclosure-summary">
+        <span>Tools</span>
+        {enabledCount > 0 ? <span data-ui="field-value">{enabledCount} enabled</span> : null}
+      </summary>
+      <div data-ui="field-group" data-ui-field>
+        {HOSTED_TOOL_OPTIONS.map((option) => (
+          <label
+            key={option.id}
+            data-ui="checkbox-row"
+            data-disabled={available ? undefined : 'true'}
+          >
+            <input
+              type="checkbox"
+              checked={selected.includes(option.id)}
+              disabled={!available}
+              onChange={(e) => toggle(option.id, e.target.checked)}
+            />
+            <span>{option.label}</span>
+          </label>
+        ))}
+        {!available && disabledReason ? <span data-ui="helper">{disabledReason}</span> : null}
+      </div>
+    </details>
   )
 }
 

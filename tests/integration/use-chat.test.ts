@@ -1,7 +1,7 @@
 import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from '../../src/api/errors'
-import type { ChatStreamChunk } from '../../src/api/types'
+import type { ChatStreamChunk, ResponsesStreamChunk } from '../../src/api/types'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import { tokenCalibrationKey } from '../../src/core/model-ids'
 import type { ChatSettings, ConnectionProfile, Message } from '../../src/core/types'
@@ -1156,6 +1156,97 @@ describe('sendText — token calibration sample ingest', () => {
     const ratio = (sample?.totalTextChars ?? 0) / (sample?.totalTextTokens ?? 1)
     expect(ratio).toBeGreaterThanOrEqual(2.5)
     expect(ratio).toBeLessThanOrEqual(5.0)
+  })
+
+  it('persists hosted-tool outputs and skips all token calibration for tool-enabled sends', async () => {
+    await putCachedEndpoints('prof', 'openai/gpt-5.4', {
+      id: 'openai/gpt-5.4',
+      endpoints: [
+        {
+          provider_name: 'Test Clean',
+          provider_slug: 'test-clean',
+          supported_parameters: ['tools', 'provider', 'max_completion_tokens'],
+          context_length: 200000,
+          pricing: {},
+          data_policy: {
+            training: false,
+            training_openrouter: false,
+            retains_prompts: false,
+            can_publish: false,
+          },
+        },
+      ],
+    })
+    const chat = await createChat({
+      settings: chatSettings({
+        model: 'openai/gpt-5.4',
+        api: 'responses',
+        systemPrompt: '',
+        enabledServerToolIds: ['web-fetch'],
+      }),
+    })
+    const text = 'X'.repeat(300)
+    await sendText({
+      chatId: chat.id,
+      connection: makeProfile(),
+      apiKey: 'sk-test',
+      content: [{ type: 'text', text: 'a'.repeat(600) }],
+      openStream: () =>
+        stream({
+          type: 'buffered_result',
+          result: {
+            id: 'resp-tools-1',
+            status: 'completed',
+            model: 'openai/gpt-5.4',
+            output: [
+              {
+                id: 'wf_1',
+                type: 'openrouter:web_fetch',
+                status: 'completed',
+                url: 'https://openrouter.ai/',
+                title: 'OpenRouter',
+                content: 'The Unified Interface For LLMs',
+              },
+              {
+                id: 'msg_1',
+                type: 'message',
+                status: 'completed',
+                role: 'assistant',
+                content: [{ type: 'output_text', text }],
+              },
+            ],
+            usage: { input_tokens: 180, output_tokens: 90, total_tokens: 270 },
+          },
+        } as ResponsesStreamChunk),
+    })
+    const all = liveMessagesSortedByCreated(await messagesFor(chat.id))
+    const assistant = requireDefined(
+      all.find((message) => message.role === 'assistant'),
+      'assistant',
+    )
+    expect(assistant.generation?.serverTools).toHaveLength(1)
+    expect(assistant.generation?.serverTools?.[0]).toMatchObject({
+      type: 'openrouter:web_fetch',
+      source: 'responses-output',
+      id: 'wf_1',
+      status: 'completed',
+      outputIndex: 0,
+      output: {
+        type: 'openrouter:web_fetch',
+        url: 'https://openrouter.ai/',
+        content: 'The Unified Interface For LLMs',
+      },
+    })
+
+    const user = requireDefined(
+      all.find((message) => message.role === 'user'),
+      'user',
+    )
+    expect(user.originalCalibrationKey).toBeUndefined()
+    expect(assistant.originalCalibrationKey).toBeUndefined()
+    expect(assistant.cachedTokenEstimate).toBeUndefined()
+    const chatRow = await getBrowserRepository().getChat(chat.id)
+    expect(chatRow?.tokenCalibration?.[tokenCalibrationKey('openai/gpt-5.4')]).toBeUndefined()
   })
 
   it('does not calibrate on an errored stream (no usage / bad signal)', async () => {

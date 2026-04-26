@@ -240,6 +240,46 @@ describe('splitResponsesStream — server tools', () => {
     expect(serverTool.every((s) => s.itemType === 'web_search_call')).toBe(true)
   })
 
+  it('emits server-tool lane events for OpenRouter hosted output items', async () => {
+    const events: ResponsesStreamChunk[] = [
+      {
+        type: 'event',
+        event: {
+          type: 'response.output_item.added',
+          output_index: 0,
+          item: { id: 'dt_1', type: 'openrouter:datetime', status: 'in_progress' },
+        },
+      },
+      {
+        type: 'event',
+        event: {
+          type: 'response.output_item.done',
+          output_index: 0,
+          item: {
+            id: 'dt_1',
+            type: 'openrouter:datetime',
+            status: 'completed',
+            datetime: '2026-04-26T00:00:00.000Z',
+            timezone: 'UTC',
+          },
+        },
+      },
+    ]
+    const lanes = await collect(splitResponsesStream(asAsync(events)))
+    const serverTool = lanes.filter(
+      (l): l is Extract<StreamLaneEvent, { lane: 'server-tool' }> => l.lane === 'server-tool',
+    )
+    expect(serverTool).toEqual([
+      {
+        lane: 'server-tool',
+        itemType: 'openrouter:datetime',
+        status: 'in_progress',
+        itemId: 'dt_1',
+        outputIndex: 0,
+      },
+    ])
+  })
+
   it('emits generated image output as a persistable content item', async () => {
     const imageUrl = 'data:image/png;base64,abc123'
     const events: ResponsesStreamChunk[] = [

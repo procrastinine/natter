@@ -4,7 +4,12 @@ import {
   RATIO_BOUNDS,
   tokenizerFamilyForModel,
 } from '../../core/token-calibration'
-import type { GenerationMeta, Message as MessageRow, ReasoningDetail } from '../../core/types'
+import type {
+  GenerationMeta,
+  GenerationServerToolCall,
+  Message as MessageRow,
+  ReasoningDetail,
+} from '../../core/types'
 
 export interface MessageInfoProps {
   message: MessageRow
@@ -158,6 +163,9 @@ export function MessageInfo({ message, staleReplyHint }: MessageInfoProps) {
   if (gen?.delivery) {
     rows.push(['Delivery', gen.delivery])
   }
+  if (gen?.serverTools && gen.serverTools.length > 0) {
+    rows.push(['Tool calls', <ServerToolCalls key="tool-calls" tools={gen.serverTools} />])
+  }
   if (staleReplyHint) {
     rows.push(['Note', 'Previous user message was edited after this reply — text may be stale.'])
   }
@@ -171,6 +179,43 @@ export function MessageInfo({ message, staleReplyHint }: MessageInfoProps) {
       ))}
     </dl>
   )
+}
+
+function ServerToolCalls({ tools }: { tools: readonly GenerationServerToolCall[] }) {
+  return (
+    <div data-ui="message-tool-calls">
+      {tools.map((tool, index) => (
+        <details key={`${tool.type}:${tool.id ?? tool.outputIndex ?? index}`} data-ui="tool-call">
+          <summary>{serverToolSummary(tool)}</summary>
+          <pre>{formatServerToolOutput(tool)}</pre>
+        </details>
+      ))}
+    </div>
+  )
+}
+
+function serverToolSummary(tool: GenerationServerToolCall): string {
+  const parts = [serverToolLabel(tool.type)]
+  if (tool.status) parts.push(tool.status)
+  if (tool.requestCount !== undefined) parts.push(`${tool.requestCount} request(s)`)
+  if (tool.id) parts.push(tool.id)
+  return parts.join(' · ')
+}
+
+function serverToolLabel(type: string): string {
+  if (type === 'openrouter:web_search' || type === 'web_search_call') return 'web search'
+  if (type === 'openrouter:web_fetch') return 'web fetch'
+  if (type === 'openrouter:datetime') return 'datetime'
+  return type
+}
+
+function formatServerToolOutput(tool: GenerationServerToolCall): string {
+  const payload = tool.output ?? tool
+  try {
+    return JSON.stringify(payload, null, 2)
+  } catch {
+    return String(payload)
+  }
 }
 
 function summarizeReasoningChars(details: ReasoningDetail[]): {

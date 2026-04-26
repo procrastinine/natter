@@ -106,3 +106,59 @@ describe('ParamForm reasoning budget persistence', () => {
     })
   })
 })
+
+describe('ParamForm hosted tools', () => {
+  it('renders collapsed hosted-tool controls and persists checkbox changes on OpenRouter chat mode', async () => {
+    const settings = cloneDefaultChatSettings()
+    settings.model = 'openai/gpt-5.4-nano'
+    const chat = await createChat({ settings })
+    const capability = effectiveCapabilityFromEndpoints(settings.model, [
+      makeEndpoint({ supported_parameters: ['tools', 'tool_choice'] }),
+    ])
+    const { container } = render(
+      <ParamForm chat={chat} capability={capability} connectionKind="openrouter" />,
+    )
+    const section = container.querySelector<HTMLDetailsElement>(
+      '[data-ui-section="hosted-tools"]',
+    )
+    expect(section).toBeTruthy()
+    expect(section?.open).toBe(false)
+
+    fireEvent.click(section?.querySelector('summary') as HTMLElement)
+    fireEvent.click(screen.getByLabelText('Web search'))
+
+    await waitFor(async () => {
+      expect((await getChat(chat.id))?.settings.enabledServerToolIds).toContain('web-search')
+    })
+  })
+
+  it('disables hosted-tool controls outside OpenRouter and text-completions routes', async () => {
+    const settings = cloneDefaultChatSettings()
+    settings.model = 'openai/gpt-5.4-nano'
+    const chat = await createChat({ settings })
+    const capability = effectiveCapabilityFromEndpoints(settings.model, [
+      makeEndpoint({ supported_parameters: ['tools', 'tool_choice'] }),
+    ])
+    const direct = render(
+      <ParamForm chat={chat} capability={capability} connectionKind="openai-compatible" />,
+    )
+    fireEvent.click(
+      direct.container.querySelector('[data-ui-section="hosted-tools"] summary') as HTMLElement,
+    )
+    expect(screen.getByLabelText('Datetime')).toBeDisabled()
+    direct.unmount()
+
+    const text = render(
+      <ParamForm
+        chat={chat}
+        capability={capability}
+        connectionKind="openrouter"
+        textCompletionsActive
+      />,
+    )
+    fireEvent.click(
+      text.container.querySelector('[data-ui-section="hosted-tools"] summary') as HTMLElement,
+    )
+    expect(screen.getByLabelText('Web fetch')).toBeDisabled()
+  })
+})

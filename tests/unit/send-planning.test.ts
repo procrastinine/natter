@@ -288,6 +288,7 @@ describe('resolveRequestPrivacyPlan', () => {
       model: 'gpt-4o',
       api: 'chat',
       allowFallbacks: false,
+      enabledServerToolIds: ['datetime'],
       providerPrefs: {
         sort: 'price',
         only: ['OpenAI'],
@@ -327,7 +328,54 @@ describe('resolveRequestPrivacyPlan', () => {
 
     expect(privacyPlan.privacy.applicable).toBe(false)
     expect(requestPlan.wire.provider).toBeUndefined()
+    expect(requestPlan.wire.tools).toBeUndefined()
     expect(requestPlan.route?.kind).toBe('chat-completions')
+  })
+
+  it('carries OpenRouter hosted tools on chat/responses plans only for OpenRouter connections', async () => {
+    const profile = makeProfile()
+    const chat = makeChat({
+      enabledServerToolIds: ['datetime', 'web-fetch'],
+      toolChoice: 'auto',
+    })
+    await putCachedEndpoints(profile.id, chat.settings.model, {
+      id: chat.settings.model,
+      endpoints: [
+        {
+          provider_name: 'OpenAI',
+          provider_slug: 'openai',
+          supported_parameters: ['tools', 'tool_choice'],
+          context_length: 200000,
+          pricing: {},
+        },
+      ],
+    })
+    await putCachedPrivacyPolicy(profile.id, chat.settings.model, {
+      policies: {
+        OpenAI: {
+          training: false,
+          trainingOpenRouter: false,
+          retainsPrompts: false,
+          canPublish: false,
+          termsOfServiceURL: '',
+          privacyPolicyURL: '',
+        },
+      },
+      fetchedAt: 0,
+    })
+
+    const { requestPlan } = await prepareAssistantRequestPlan({
+      chat,
+      connection: profile,
+      pathMessages: [makeMessage('what time is it?')],
+      draftText: '',
+    })
+
+    expect(requestPlan.wire.tools).toEqual([
+      { type: 'openrouter:datetime' },
+      { type: 'openrouter:web_fetch' },
+    ])
+    expect(requestPlan.wire.tool_choice).toBe('auto')
   })
 
   it('builds OpenRouter text-completions plans with the same provider routing inputs', async () => {
@@ -339,6 +387,7 @@ describe('resolveRequestPrivacyPlan', () => {
       textTemplate: 'chatml',
       maxCompletionTokens: 32,
       allowFallbacks: false,
+      enabledServerToolIds: ['datetime'],
       providerPrefs: { only: ['Nebius'] },
       reasoning: {
         ...cloneDefaultChatSettings().reasoning,
@@ -387,6 +436,7 @@ describe('resolveRequestPrivacyPlan', () => {
       only: ['Nebius'],
       allow_fallbacks: false,
     })
+    expect(requestPlan.wire.tools).toBeUndefined()
   })
 
   it('drops attachment context for text-completions plans', async () => {

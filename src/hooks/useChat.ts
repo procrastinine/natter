@@ -67,6 +67,7 @@ import type {
   ContentItem,
   FinishReason,
   GenerationMeta,
+  GenerationServerToolCall,
   Message,
   MessageId,
   ReasoningDetail,
@@ -226,6 +227,7 @@ interface ChatAccumulator {
   finishReason?: string
   usage?: ChatUsage
   generatedContent: ContentItem[]
+  serverTools: GenerationServerToolCall[]
   firstTextAt?: number
   reasoningStartedAt?: number
   reasoningFinishedAt?: number
@@ -365,6 +367,7 @@ export async function sendText(input: SendTextInput): Promise<SendTextResult> {
       throwWithZeroEligibleUi(input.chatId, err)
     }
     if (lifecycle.signal.aborted) throw new DOMException('Request aborted.', 'AbortError')
+    const skipTurnCalibration = requestHasTools(requestPlan.wire)
 
     const userMsg = await sendUserMessage({
       chatId: input.chatId,
@@ -374,6 +377,7 @@ export async function sendText(input: SendTextInput): Promise<SendTextResult> {
       now: createdAt,
       messageId: userMessageId,
       turnId: userTurnId,
+      ...(skipTurnCalibration ? { skipCalibration: true } : {}),
     })
     const cursorAfterUser = {
       ...cursor,
@@ -570,6 +574,7 @@ async function openAssistantStreamUnder(
     reasoningList: [],
     reasoningRowById: new Map(),
     generatedContent: [],
+    serverTools: [],
     lastFlushedAt: now(),
     lastFlushedTextLen: 0,
     lastChunkReceivedAt: now(),
@@ -686,6 +691,7 @@ async function openAssistantStreamUnder(
       now: now(),
       ...(hasAttachmentContext ||
       hasNonTextOutbound ||
+      requestHasTools(wire) ||
       accumulator.generatedContent.some(isNonTextContentItem)
         ? {}
         : {
@@ -795,6 +801,17 @@ function applyEvent(acc: ChatAccumulator, event: StreamLaneEvent, nowMs: number)
     case 'content-item':
       acc.generatedContent.push(structuredClone(event.item))
       return
+    case 'server-tool':
+      recordServerToolStatus(acc, event)
+      return
+    case 'output-item-added':
+      recordServerToolOutputItem(acc, event.item, event.outputIndex, 'stream-status')
+      return
+    case 'output-item-done':
+      recordServerToolOutputItem(acc, event.item, event.outputIndex, 'responses-output')
+      return
+    case 'phase':
+      return
     case 'error':
       acc.midStreamError = event.error
       return
@@ -810,6 +827,122 @@ function applyEvent(acc: ChatAccumulator, event: StreamLaneEvent, nowMs: number)
       // just add branches here.
       return
   }
+}
+
+const HOSTED_SERVER_TOOL_ITEM_TYPES = new Set<string>([
+  'web_search_call',
+  'file_search_call',
+  'image_generation_call',
+  'code_interpreter_call',
+  'computer_call',
+  'mcp_tool_call',
+  'openrouter:datetime',
+  'openrouter:web_fetch',
+  'openrouter:web_search',
+])
+
+function requestHasTools(wire: unknown): boolean {
+  if (!wire || typeof wire !== 'object') return false
+  const tools = (wire as { tools?: unknown }).tools
+  return Array.isArray(tools) && tools.length > 0
+}
+
+function hasServerToolUsage(usage: ChatUsage | undefined): boolean {
+  if (!usage?.server_tool_use || typeof usage.server_tool_use !== 'object') return false
+  return Object.values(usage.server_tool_use).some(
+    (value) => typeof value === 'number' && Number.isFinite(value) && value > 0,
+  )
+}
+
+function recordServerToolStatus(
+  acc: ChatAccumulator,
+  event: Extract<StreamLaneEvent, { lane: 'server-tool' }>,
+): void {
+  upsertServerTool(acc.serverTools, {
+    type: event.itemType,
+    source: 'stream-status',
+    id: event.itemId,
+    status: event.status,
+    outputIndex: event.outputIndex,
+    ...(event.partialImageB64 ? { output: { partialImageB64: event.partialImageB64 } } : {}),
+  })
+}
+
+function recordServerToolOutputItem(
+  acc: ChatAccumulator,
+  item: unknown,
+  outputIndex: number,
+  fallbackSource: GenerationServerToolCall['source'],
+): void {
+  if (!item || typeof item !== 'object') return
+  const record = item as { type?: unknown; id?: unknown; status?: unknown }
+  if (typeof record.type !== 'string' || !HOSTED_SERVER_TOOL_ITEM_TYPES.has(record.type)) return
+  upsertServerTool(acc.serverTools, {
+    type: record.type,
+    source: fallbackSource,
+    ...(typeof record.id === 'string' ? { id: record.id } : {}),
+    ...(typeof record.status === 'string' ? { status: record.status } : {}),
+    outputIndex,
+    output: structuredClone(item),
+  })
+}
+
+function serverToolRecordsFromUsage(usage: ChatUsage | undefined): GenerationServerToolCall[] {
+  const raw = usage?.server_tool_use
+  if (!raw || typeof raw !== 'object') return []
+  const records: GenerationServerToolCall[] = []
+  for (const [key, value] of Object.entries(raw)) {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) continue
+    records.push({
+      type: serverToolUsageKeyToType(key),
+      source: 'usage',
+      status: 'completed',
+      requestCount: value,
+      output: { [key]: value },
+    })
+  }
+  return records
+}
+
+function serverToolUsageKeyToType(key: string): string {
+  if (key === 'web_search_requests') return 'openrouter:web_search'
+  if (key === 'web_fetch_requests') return 'openrouter:web_fetch'
+  if (key === 'datetime_requests') return 'openrouter:datetime'
+  return key
+}
+
+function mergeServerToolRecords(records: readonly GenerationServerToolCall[]): GenerationServerToolCall[] {
+  const merged: GenerationServerToolCall[] = []
+  for (const record of records) upsertServerTool(merged, record)
+  return merged
+}
+
+function upsertServerTool(
+  records: GenerationServerToolCall[],
+  incoming: GenerationServerToolCall,
+): void {
+  const key = serverToolRecordKey(incoming)
+  const index = records.findIndex((record) => serverToolRecordKey(record) === key)
+  if (index < 0) {
+    records.push(structuredClone(incoming))
+    return
+  }
+  const existing = records[index]
+  if (!existing) return
+  records[index] = {
+    ...existing,
+    ...structuredClone(incoming),
+    source:
+      incoming.source === 'responses-output' || existing.source !== 'responses-output'
+        ? incoming.source
+        : existing.source,
+  }
+}
+
+function serverToolRecordKey(record: GenerationServerToolCall): string {
+  if (record.id) return `id:${record.id}`
+  if (record.outputIndex !== undefined) return `idx:${record.outputIndex}:${record.type}`
+  return `usage:${record.type}`
 }
 
 function shouldFlush(acc: ChatAccumulator, nowMs: number): boolean {
@@ -939,7 +1072,10 @@ async function finalize(ctx: FinalizeContext): Promise<void> {
   // This block only runs for text-only sends; multimodal input/output is
   // excluded before `calibrationInputs` is passed into finalize.
   let assistantCalibrationFields: ReturnType<typeof calibrationFieldsForCreate> | null = null
-  if (outcome === 'done' && calibrationInputs) {
+  const toolCalibrationBlocked =
+    calibrationInputs !== undefined &&
+    (accumulator.serverTools.length > 0 || hasServerToolUsage(accumulator.usage))
+  if (outcome === 'done' && calibrationInputs && !toolCalibrationBlocked) {
     try {
       const [chatForRatio, globalCal, prefs] = await Promise.all([
         repo.getChat(chatId),
@@ -1017,7 +1153,13 @@ async function finalize(ctx: FinalizeContext): Promise<void> {
   // so we have the final content + reasoningDetails + usage. Skips on
   // anything other than a clean `done`, because error/abort streams don't
   // have reliable usage from the server.
-  if (outcome === 'done' && calibrationInputs && persistedAssistant !== null && accumulator.usage) {
+  if (
+    outcome === 'done' &&
+    calibrationInputs &&
+    !toolCalibrationBlocked &&
+    persistedAssistant !== null &&
+    accumulator.usage
+  ) {
     try {
       await ingestCalibrationSample({
         repo,
@@ -1187,6 +1329,12 @@ function updatedGeneration(
   if (acc.provider) base.provider = acc.provider
   if (acc.usage) base.usage = acc.usage
   if (acc.usage?.cost !== undefined) base.cost = acc.usage.cost
+  const serverTools = mergeServerToolRecords([
+    ...acc.serverTools,
+    ...serverToolRecordsFromUsage(acc.usage),
+  ])
+  if (serverTools.length > 0) base.serverTools = serverTools
+  else delete base.serverTools
   if (acc.firstTextAt !== undefined) base.firstTextAt = acc.firstTextAt
   if (acc.reasoningStartedAt !== undefined) base.reasoningStartedAt = acc.reasoningStartedAt
   if (acc.reasoningFinishedAt !== undefined) base.reasoningFinishedAt = acc.reasoningFinishedAt

@@ -168,6 +168,32 @@ describe('MessageInfo (revealed by ⓘ — full factual record)', () => {
     expect(container.textContent).toMatch(/Reasoning chars/)
     expect(container.textContent).toMatch(/text 6/)
   })
+
+  it('renders persisted hosted-tool evidence in message info', () => {
+    const msg = makeAssistant()
+    if (!msg.generation) throw new Error('expected generation metadata')
+    msg.generation.serverTools = [
+      {
+        type: 'openrouter:web_fetch',
+        source: 'responses-output',
+        id: 'wf_1',
+        status: 'completed',
+        outputIndex: 0,
+        output: {
+          type: 'openrouter:web_fetch',
+          url: 'https://openrouter.ai/',
+          title: 'OpenRouter',
+          content: 'The Unified Interface For LLMs',
+        },
+      },
+    ]
+    const { container } = render(<MessageInfo message={msg} />)
+    const text = container.textContent ?? ''
+    expect(text).toMatch(/Tool calls/)
+    expect(text).toMatch(/web fetch/)
+    expect(text).toMatch(/wf_1/)
+    expect(text).toMatch(/The Unified Interface For LLMs/)
+  })
 })
 
 describe('Message hidden-reasoning footer', () => {

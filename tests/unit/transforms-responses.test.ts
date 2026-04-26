@@ -107,6 +107,25 @@ describe('toResponses — envelope', () => {
     expect(wire.tool_choice).toBeUndefined()
     expect(wire.parallel_tool_calls).toBeUndefined()
   })
+
+  it('serializes enabled OpenRouter hosted tools only when explicitly allowed', () => {
+    const s = settings({
+      enabledServerToolIds: ['web-search', 'datetime', 'web-fetch'],
+      toolChoice: 'auto',
+      parallelToolCalls: true,
+    })
+
+    expect(toResponses(s, [user('u1', 'hi')]).wire.tools).toBeUndefined()
+
+    const { wire } = toResponses(s, [user('u1', 'hi')], { allowHostedTools: true })
+    expect(wire.tools).toEqual([
+      { type: 'openrouter:web_search' },
+      { type: 'openrouter:datetime' },
+      { type: 'openrouter:web_fetch' },
+    ])
+    expect(wire.tool_choice).toBe('auto')
+    expect(wire.parallel_tool_calls).toBe(true)
+  })
 })
 
 describe('toResponses — reasoning echo', () => {

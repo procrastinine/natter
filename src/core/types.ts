@@ -228,7 +228,7 @@ export interface ToolDefinition {
   updatedAt: number
 }
 
-export type ServerToolId = 'web-search' | 'datetime' | 'image-generation'
+export type ServerToolId = 'web-search' | 'datetime' | 'web-fetch' | 'image-generation'
 
 export type PluginId = 'context-compression'
 
@@ -702,6 +702,7 @@ export interface ChatUsage {
   prompt_tokens: number
   completion_tokens: number
   total_tokens: number
+  server_tool_use?: Record<string, number>
   prompt_tokens_details?: {
     cached_tokens?: number
     audio_tokens?: number
@@ -730,6 +731,16 @@ export interface ApiError {
   raw?: unknown
 }
 
+export interface GenerationServerToolCall {
+  type: string
+  source: 'responses-output' | 'stream-status' | 'usage'
+  id?: string
+  status?: string
+  outputIndex?: number
+  requestCount?: number
+  output?: unknown
+}
+
 export interface GenerationMeta {
   id: string
   model: string
@@ -750,6 +761,7 @@ export interface GenerationMeta {
   nativeFinishReason?: string
   error?: ApiError
   abortReason?: AbortReason
+  serverTools?: GenerationServerToolCall[]
 }
 
 // Minimal echo envelope for a Responses API output item. The full variant list

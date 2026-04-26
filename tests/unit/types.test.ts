@@ -6,11 +6,14 @@ import type {
   ChildListState,
   ConnectionProfile,
   DataPolicy,
+  GenerationMeta,
+  GenerationServerToolCall,
   Message,
   MessageApproval,
   MutationScope,
   ProviderPreferences,
   ResponseFormat,
+  ServerToolId,
   ToolDefinition,
   ToolExecution,
   TraceMetadata,
@@ -71,6 +74,13 @@ describe('Phase 0 type additions', () => {
     expectTypeOf<ChatSettings['logitBias']>().toEqualTypeOf<Record<string, number> | undefined>()
     expectTypeOf<ChatSettings['autoContinueToolLoop']>().toEqualTypeOf<boolean>()
     expectTypeOf<ChatSettings['trace']>().toEqualTypeOf<TraceMetadata | undefined>()
+    expectTypeOf<ChatSettings['enabledServerToolIds']>().toEqualTypeOf<ServerToolId[]>()
+  })
+
+  it('GenerationMeta stores hosted server-tool evidence for message info', () => {
+    expectTypeOf<GenerationMeta['serverTools']>().toEqualTypeOf<
+      GenerationServerToolCall[] | undefined
+    >()
   })
 
   it('Attachment.contentHash is optional for remote-url rows', () => {

@@ -225,6 +225,48 @@ describe('toChatCompletions', () => {
     expect(wire.parallel_tool_calls).toBeUndefined()
   })
 
+  it('serializes enabled OpenRouter hosted tools only when explicitly allowed', () => {
+    const path = [textMessage({ id: 'u1', role: 'user', text: 'hi' })]
+    const s = settings({
+      enabledServerToolIds: ['web-search', 'datetime', 'web-fetch'],
+      toolChoice: 'auto',
+      parallelToolCalls: false,
+    })
+
+    expect(toChatCompletions(s, path).wire.tools).toBeUndefined()
+
+    const { wire } = toChatCompletions(s, path, {
+      allowHostedTools: true,
+      capabilities: {
+        supportedParameters: ['tools', 'tool_choice', 'parallel_tool_calls'],
+        streaming: 'supported',
+      },
+    })
+    expect(wire.tools).toEqual([
+      { type: 'openrouter:web_search' },
+      { type: 'openrouter:datetime' },
+      { type: 'openrouter:web_fetch' },
+    ])
+    expect(wire.tool_choice).toBe('auto')
+    expect(wire.parallel_tool_calls).toBe(false)
+  })
+
+  it('does not serialize the image-generation server tool in the hosted-tools first pass', () => {
+    const path = [textMessage({ id: 'u1', role: 'user', text: 'draw' })]
+    const { wire } = toChatCompletions(
+      settings({ enabledServerToolIds: ['image-generation'] }),
+      path,
+      {
+        allowHostedTools: true,
+        capabilities: {
+          supportedParameters: ['tools', 'tool_choice'],
+          streaming: 'supported',
+        },
+      },
+    )
+    expect(wire.tools).toBeUndefined()
+  })
+
   it('does not enable tools just because an OpenRouter model requests image output', () => {
     const path = [textMessage({ id: 'u1', role: 'user', text: 'draw a red square' })]
     const { wire } = toChatCompletions(

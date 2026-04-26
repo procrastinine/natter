@@ -431,6 +431,7 @@ export interface SendUserMessageInput {
   now?: number
   messageId?: MessageId
   turnId?: TurnId
+  skipCalibration?: boolean
 }
 
 export async function sendUserMessage(
@@ -454,7 +455,10 @@ export async function sendUserMessage(
     readGlobalPreferences(),
   ])
   const modelId = chatForRatio?.settings.model ?? ''
-  const canCacheTextCalibration = (attachmentRefs?.length ?? 0) === 0 && isTextOnlyContent(content)
+  const canCacheTextCalibration =
+    input.skipCalibration !== true &&
+    (attachmentRefs?.length ?? 0) === 0 &&
+    isTextOnlyContent(content)
   const calibrationFields =
     modelId && canCacheTextCalibration
       ? calibrationFieldsForCreate(

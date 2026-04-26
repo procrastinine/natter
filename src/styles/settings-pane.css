@@ -105,6 +105,33 @@
   text-transform: none;
 }
 
+[data-ui="settings-disclosure-summary"] {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  cursor: pointer;
+  color: var(--color-fg-primary);
+  font-size: var(--font-size-md);
+  font-weight: var(--font-weight-semibold);
+  list-style: none;
+}
+
+[data-ui="settings-disclosure-summary"]::-webkit-details-marker {
+  display: none;
+}
+
+[data-ui="settings-disclosure-summary"]::before {
+  content: "›";
+  color: var(--color-fg-muted);
+  font-size: var(--font-size-md);
+  line-height: 1;
+  transition: transform 120ms ease;
+}
+
+[data-ui="settings-section"][open] > [data-ui="settings-disclosure-summary"]::before {
+  transform: rotate(90deg);
+}
+
 [data-ui="field-group"] {
   display: flex;
   flex-direction: column;
@@ -255,6 +282,15 @@
 [data-ui="checkbox-row"] > input[type="checkbox"] {
   accent-color: var(--color-accent);
   cursor: pointer;
+}
+
+[data-ui="checkbox-row"][data-disabled="true"] {
+  color: var(--color-fg-muted);
+  cursor: not-allowed;
+}
+
+[data-ui="checkbox-row"][data-disabled="true"] > input[type="checkbox"] {
+  cursor: not-allowed;
 }
 
 /* Prompt-slot header pairs the section title with the inline preset picker,
