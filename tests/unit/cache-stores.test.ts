@@ -1,6 +1,11 @@
 import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { __resetBroadcastForTests, type BroadcastEvent, onEvent } from '../../src/store/broadcast'
+import {
+  readGlobalPreferences,
+  writeChatMaxWidth,
+  writeLongMessageDisplayMode,
+} from '../../src/core/global-settings'
 import { __resetDbForTests, openDb } from '../../src/store/db'
 import {
   clearEndpointsCacheForProfile,
@@ -206,5 +211,17 @@ describe('settings', () => {
     expect(await readCollapsedSidebarFolderIds()).toEqual(['a', 'b'])
     await updateCollapsedSidebarFolderIds((current) => [...current, 'c', 'a'])
     expect(await readCollapsedSidebarFolderIds()).toEqual(['a', 'b', 'c'])
+  })
+
+  it('global preferences preserve slider chat-width values', async () => {
+    await writeChatMaxWidth(960)
+    expect(await getSetting('global:chat-max-width')).toBe(960)
+    expect((await readGlobalPreferences()).chatMaxWidth).toBe(960)
+  })
+
+  it('global preferences preserve the long-message display mode', async () => {
+    await writeLongMessageDisplayMode('compact')
+    expect(await getSetting('global:long-message-display-mode')).toBe('compact')
+    expect((await readGlobalPreferences()).longMessageDisplayMode).toBe('compact')
   })
 })

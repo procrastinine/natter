@@ -61,9 +61,14 @@
   position: sticky;
   top: var(--space-3);
   z-index: 1;
+  width: var(--message-glyph-size);
+  height: var(--message-glyph-size);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   background: transparent;
   border: none;
-  border-radius: 0;
+  border-radius: 50%;
   box-shadow: none;
   padding: 0;
   margin-right: var(--message-gutter);
@@ -95,6 +100,10 @@
 }
 
 [data-ui="profile-glyph-button"]:active {
+  background: transparent;
+}
+
+[data-ui="profile-glyph-button"]:hover:not(:disabled) {
   background: transparent;
 }
 

@@ -18,6 +18,20 @@ test('send button is disabled when input is empty', async ({ page }) => {
   await expect(page.locator('[data-ui="send"]')).toBeDisabled()
 })
 
+test('empty composer input does not show a vertical scrollbar', async ({ page }) => {
+  const metrics = await page.locator('[data-ui="composer-input"]').evaluate((el) => {
+    const node = el as HTMLTextAreaElement
+    return {
+      overflowY: getComputedStyle(node).overflowY,
+      scrollHeight: node.scrollHeight,
+      clientHeight: node.clientHeight,
+    }
+  })
+
+  expect(metrics.overflowY).toBe('hidden')
+  expect(metrics.scrollHeight).toBeLessThanOrEqual(metrics.clientHeight + 1)
+})
+
 test('send button enables on non-empty input', async ({ page }) => {
   await page.locator('[data-ui="composer-input"]').fill('x')
   await expect(page.locator('[data-ui="send"]')).toBeEnabled()

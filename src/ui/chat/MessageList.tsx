@@ -4,6 +4,7 @@ import { navigateToChat } from '../../app/router'
 import { activePath, cursorKeyOf, groupByParent, indexById } from '../../core/active-path'
 import { resolveLastUpdatedBranchBelow } from '../../core/branch-resolve'
 import { computeBranchTitle, forkChatFromMessage } from '../../core/chat-fork'
+import type { LongMessageDisplayMode } from '../../core/global-settings'
 import { swipe } from '../../core/messages'
 import type {
   ChatId,
@@ -42,6 +43,7 @@ export interface MessageListProps {
   hasConnection: boolean
   capability?: EffectiveCapability
   prefillRecommendationEndpoints?: readonly ModelEndpoint[]
+  longMessageDisplayMode?: LongMessageDisplayMode
 }
 
 // Stable reference so `useChatStore(selector)` doesn't allocate a fresh `{}`
@@ -73,6 +75,7 @@ export const MessageList = memo(function MessageList({
   hasConnection,
   capability,
   prefillRecommendationEndpoints = [],
+  longMessageDisplayMode = 'full',
 }: MessageListProps) {
   const liveMessages = useLiveQuery(() => loadChatMessages(chatId), [chatId], [])
   const messages = useStableMessageRows(liveMessages ?? [])
@@ -393,6 +396,7 @@ export const MessageList = memo(function MessageList({
             {...(roleMismatchIdsOnPath.has(m.id) ? { roleMismatch: true } : {})}
             {...(showStaleHint ? { staleReplyHint: true } : {})}
             {...(excludedIds.has(m.id) ? { excludedFromContext: true } : {})}
+            longMessageDisplayMode={longMessageDisplayMode}
           />
         )
       })}

@@ -1,8 +1,5 @@
 import { expect, test } from '@playwright/test'
-import {
-  clearIndexedDb,
-  seedFirstRun,
-} from './helpers'
+import { clearIndexedDb, seedFirstRun } from './helpers'
 
 test.beforeEach(async ({ page }) => {
   await page.goto('/')
@@ -27,10 +24,12 @@ test('oversized stream lane auto-compacts and the avatar cycles compact -> peek 
           const now = Date.now()
           const userId = 'oversize-user'
           const assistantId = 'oversize-assistant'
-          const tx = db.transaction(['presets', 'messages', 'chats'], 'readwrite')
+          const tx = db.transaction(['presets', 'messages', 'chats', 'settings'], 'readwrite')
           const chats = tx.objectStore('chats')
           const messages = tx.objectStore('messages')
           const presets = tx.objectStore('presets')
+          const settings = tx.objectStore('settings')
+          settings.put({ key: 'global:long-message-display-mode', value: 'compact' })
           const getPresetsReq = presets.getAll()
           getPresetsReq.onsuccess = () => {
             const preset = getPresetsReq.result?.[0]
@@ -97,7 +96,7 @@ test('oversized stream lane auto-compacts and the avatar cycles compact -> peek 
     },
     { activeChatId: chatId, hugeMessage: huge },
   )
-  await page.goto(`/#/chat/${chatId}`)
+  await page.goto(`/?overflow=${Date.now()}#/chat/${chatId}`)
   const assistant = page.locator('[data-ui="message"][data-role="assistant"]').first()
   const avatar = assistant.locator('[data-ui="profile-glyph-button"]').first()
   await expect(assistant).toBeVisible()

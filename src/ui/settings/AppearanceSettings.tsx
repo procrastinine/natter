@@ -11,15 +11,21 @@ import {
   applyThemeToDocument,
   BASE_FONT_SIZE_OPTIONS,
   type BaseFontSize,
+  CHAT_MAX_WIDTH_FULL_POSITION,
+  CHAT_MAX_WIDTH_MAX_PX,
+  CHAT_MAX_WIDTH_MIN,
+  CHAT_MAX_WIDTH_STEP,
   type ChatMaxWidth,
   DEFAULT_GLOBAL_PREFERENCES,
   FONT_FAMILY_OPTIONS,
   type FontFamilyChoice,
+  type LongMessageDisplayMode,
   readGlobalPreferences,
   type ThemePreference,
   writeBaseFontSize,
   writeChatMaxWidth,
   writeFontFamily,
+  writeLongMessageDisplayMode,
   writeTheme,
 } from '../../core/global-settings'
 import { RenderingSettings } from './RenderingSettings'
@@ -31,18 +37,21 @@ const THEME_OPTIONS: ReadonlyArray<{ value: ThemePreference; label: string }> = 
   { value: 'high-contrast', label: 'High contrast' },
 ]
 
-const CHAT_WIDTH_MIN = 640
-const CHAT_WIDTH_MAX_PX = 1600
-const CHAT_WIDTH_STEP = 20
-const CHAT_WIDTH_FULL_POSITION = CHAT_WIDTH_MAX_PX + CHAT_WIDTH_STEP
+const LONG_MESSAGE_DISPLAY_OPTIONS: ReadonlyArray<{
+  value: LongMessageDisplayMode
+  label: string
+}> = [
+  { value: 'full', label: 'Fully displayed' },
+  { value: 'compact', label: 'Compact preview' },
+]
 
 function sliderPositionFromPref(value: ChatMaxWidth): number {
-  if (value === 'full') return CHAT_WIDTH_FULL_POSITION
-  return Math.min(CHAT_WIDTH_MAX_PX, Math.max(CHAT_WIDTH_MIN, value))
+  if (value === 'full') return CHAT_MAX_WIDTH_FULL_POSITION
+  return Math.min(CHAT_MAX_WIDTH_MAX_PX, Math.max(CHAT_MAX_WIDTH_MIN, value))
 }
 
 function prefFromSliderPosition(position: number): ChatMaxWidth {
-  if (position >= CHAT_WIDTH_FULL_POSITION) return 'full'
+  if (position >= CHAT_MAX_WIDTH_FULL_POSITION) return 'full'
   return position
 }
 
@@ -69,12 +78,21 @@ export function AppearanceSettings() {
     await writeBaseFontSize(value)
   }, [])
 
+  const onLongMessageDisplayMode = useCallback(async (value: LongMessageDisplayMode) => {
+    await writeLongMessageDisplayMode(value)
+  }, [])
+
   const [position, setPosition] = useState<number>(() => sliderPositionFromPref(prefs.chatMaxWidth))
-  const lastPersistedRef = useRef<ChatMaxWidth>(prefs.chatMaxWidth)
-  const persistTimerRef = useRef<number | null>(null)
+  const writeQueueRef = useRef<Promise<void>>(Promise.resolve())
+  const pendingChatMaxWidthRef = useRef<ChatMaxWidth | null>(null)
   useEffect(() => {
-    if (prefs.chatMaxWidth === lastPersistedRef.current) return
-    lastPersistedRef.current = prefs.chatMaxWidth
+    if (
+      pendingChatMaxWidthRef.current !== null &&
+      prefs.chatMaxWidth !== pendingChatMaxWidthRef.current
+    ) {
+      return
+    }
+    pendingChatMaxWidthRef.current = null
     setPosition(sliderPositionFromPref(prefs.chatMaxWidth))
     applyChatMaxWidthToDocument(prefs.chatMaxWidth)
   }, [prefs.chatMaxWidth])
@@ -83,14 +101,23 @@ export function AppearanceSettings() {
     if (!Number.isFinite(next)) return
     setPosition(next)
     const value = prefFromSliderPosition(next)
+    pendingChatMaxWidthRef.current = value
     applyChatMaxWidthToDocument(value)
-    if (persistTimerRef.current !== null) {
-      window.clearTimeout(persistTimerRef.current)
-    }
-    persistTimerRef.current = window.setTimeout(() => {
-      lastPersistedRef.current = value
-      void writeChatMaxWidth(value)
-    }, 200)
+    writeQueueRef.current = writeQueueRef.current
+      .catch(() => undefined)
+      .then(() => writeChatMaxWidth(value))
+      .then(
+        () => {
+          if (pendingChatMaxWidthRef.current === value) {
+            pendingChatMaxWidthRef.current = null
+          }
+        },
+        () => {
+          if (pendingChatMaxWidthRef.current === value) {
+            pendingChatMaxWidthRef.current = null
+          }
+        },
+      )
   }, [])
 
   return (
@@ -124,15 +151,35 @@ export function AppearanceSettings() {
             id="chat-max-width"
             data-ui="chat-max-width-slider"
             type="range"
-            min={CHAT_WIDTH_MIN}
-            max={CHAT_WIDTH_FULL_POSITION}
-            step={CHAT_WIDTH_STEP}
+            min={CHAT_MAX_WIDTH_MIN}
+            max={CHAT_MAX_WIDTH_FULL_POSITION}
+            step={CHAT_MAX_WIDTH_STEP}
             value={position}
             onChange={(e) => onChatMaxWidth(e.target.value)}
-            onInput={(e) => onChatMaxWidth((e.target as HTMLInputElement).value)}
           />
           <span data-ui="helper">
             Maximum width of the centered reading column. Drag to the right edge for full width.
+          </span>
+        </div>
+        <div data-ui="field-group">
+          <label htmlFor="long-message-display">Long messages</label>
+          <select
+            id="long-message-display"
+            data-ui="long-message-display-select"
+            value={prefs.longMessageDisplayMode}
+            onChange={(e) =>
+              void onLongMessageDisplayMode(e.target.value as LongMessageDisplayMode)
+            }
+          >
+            {LONG_MESSAGE_DISPLAY_OPTIONS.map((o) => (
+              <option key={o.value} value={o.value}>
+                {o.label}
+              </option>
+            ))}
+          </select>
+          <span data-ui="helper">
+            Controls whether long messages reload as full text or as an avatar-expandable compact
+            preview.
           </span>
         </div>
       </div>

@@ -1,4 +1,5 @@
 import type { ReactNode } from 'react'
+import type { LongMessageDisplayMode } from '../../core/global-settings'
 
 export type MessageCollapseMode = 'full' | 'compact' | 'peek'
 
@@ -10,6 +11,7 @@ export interface MessageCollapseProfile {
 
 export interface MessageCollapseProfileOptions {
   streaming?: boolean
+  longMessageDisplayMode?: LongMessageDisplayMode
 }
 
 export interface MessageStreamOverflowProps {
@@ -25,26 +27,27 @@ export const LONG_MESSAGE_THRESHOLD = 4_000
 // The user wants avatar-driven collapse states instead of a separate
 // "show full" banner:
 // - short messages:        full <-> peek
-// - long messages:         full -> compact -> peek -> full
-// - truly oversized rows:  start in compact to protect render cost
+// - long messages:         full/compact default -> compact -> peek -> full
+// - truly oversized rows:  use the long-message default after reload
 // - active streams:        stay full unless the user manually collapses
 export function collapseProfileFor(
   totalChars: number,
   options: MessageCollapseProfileOptions = {},
 ): MessageCollapseProfile {
+  const longDefault = options.longMessageDisplayMode ?? 'full'
   if (totalChars <= 0) {
     return { defaultMode: 'full', modes: ['full'], oversized: false }
   }
   if (totalChars > DEFAULT_OVERFLOW_THRESHOLD) {
     return {
-      defaultMode: options.streaming ? 'full' : 'compact',
+      defaultMode: options.streaming ? 'full' : longDefault,
       modes: ['full', 'compact', 'peek'],
       oversized: true,
     }
   }
   if (totalChars > LONG_MESSAGE_THRESHOLD) {
     return {
-      defaultMode: 'full',
+      defaultMode: longDefault,
       modes: ['full', 'compact', 'peek'],
       oversized: false,
     }

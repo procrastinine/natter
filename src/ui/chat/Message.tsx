@@ -9,6 +9,7 @@ import {
   useState,
 } from 'react'
 import type { EffectiveCapability } from '../../core/capabilities'
+import type { LongMessageDisplayMode } from '../../core/global-settings'
 import { quirksFor } from '../../core/quirks'
 import { normalizeReasoningDetails } from '../../core/reasoning'
 import { detectStaleReasoning, staleReasoningBannerText } from '../../core/stale-reasoning'
@@ -91,6 +92,7 @@ export interface MessageProps {
   showPrefillButton?: boolean
   defaultPrefill?: string
   prefillSettingsPrompt?: ReactNode
+  longMessageDisplayMode?: LongMessageDisplayMode
 }
 
 // Memoized — the markdown render path (Streamdown + Shiki + KaTeX) is
@@ -127,7 +129,8 @@ export const Message = memo(
     prev.onInsert === next.onInsert &&
     prev.showPrefillButton === next.showPrefillButton &&
     prev.defaultPrefill === next.defaultPrefill &&
-    prev.prefillSettingsPrompt === next.prefillSettingsPrompt,
+    prev.prefillSettingsPrompt === next.prefillSettingsPrompt &&
+    prev.longMessageDisplayMode === next.longMessageDisplayMode,
 )
 
 function MessageInner({
@@ -154,6 +157,7 @@ function MessageInner({
   showPrefillButton,
   defaultPrefill,
   prefillSettingsPrompt,
+  longMessageDisplayMode = 'full',
 }: MessageProps) {
   void branchTreeKey
   const error = message.generation?.error
@@ -302,8 +306,8 @@ function MessageInner({
     handleCopyError,
   ])
   const collapseProfile = useMemo(
-    () => collapseProfileFor(text.length, { streaming: isStreaming }),
-    [isStreaming, text.length],
+    () => collapseProfileFor(text.length, { streaming: isStreaming, longMessageDisplayMode }),
+    [isStreaming, longMessageDisplayMode, text.length],
   )
   const manualCollapseRef = useRef(false)
   const [collapseMode, setCollapseMode] = useState<MessageCollapseMode>(collapseProfile.defaultMode)

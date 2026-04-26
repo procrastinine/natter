@@ -69,8 +69,21 @@ describe('collapseProfileFor', () => {
     })
   })
 
-  it('auto-compacts truly oversized messages', () => {
+  it('keeps truly oversized messages expanded by default', () => {
     expect(collapseProfileFor(25_000)).toEqual({
+      defaultMode: 'full',
+      modes: ['full', 'compact', 'peek'],
+      oversized: true,
+    })
+  })
+
+  it('honors the compact long-message preference', () => {
+    expect(collapseProfileFor(6_000, { longMessageDisplayMode: 'compact' })).toEqual({
+      defaultMode: 'compact',
+      modes: ['full', 'compact', 'peek'],
+      oversized: false,
+    })
+    expect(collapseProfileFor(25_000, { longMessageDisplayMode: 'compact' })).toEqual({
       defaultMode: 'compact',
       modes: ['full', 'compact', 'peek'],
       oversized: true,
@@ -78,7 +91,9 @@ describe('collapseProfileFor', () => {
   })
 
   it('keeps truly oversized active streams expanded by default', () => {
-    expect(collapseProfileFor(25_000, { streaming: true })).toEqual({
+    expect(
+      collapseProfileFor(25_000, { streaming: true, longMessageDisplayMode: 'compact' }),
+    ).toEqual({
       defaultMode: 'full',
       modes: ['full', 'compact', 'peek'],
       oversized: true,
@@ -115,6 +130,7 @@ describe('Message active-stream overflow behavior', () => {
         hasSiblingVariants={false}
         cursor={{}}
         hasConnection={false}
+        longMessageDisplayMode="compact"
         onEditInPlace={async () => {}}
       />,
     )
@@ -122,7 +138,9 @@ describe('Message active-stream overflow behavior', () => {
     expect(container.querySelector('[data-ui="message"]')?.getAttribute('data-collapse-mode')).toBe(
       'full',
     )
-    expect(container.querySelector('[data-ui="markdown"]')?.getAttribute('data-streaming')).toBeNull()
+    expect(
+      container.querySelector('[data-ui="markdown"]')?.getAttribute('data-streaming'),
+    ).toBeNull()
   })
 })
 

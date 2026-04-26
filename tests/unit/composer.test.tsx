@@ -48,6 +48,30 @@ describe('Composer', () => {
     expect(onDraftChange).toHaveBeenLastCalledWith('count this draft')
   })
 
+  it('does not show an empty autosized textarea scrollbar', () => {
+    const descriptor = Object.getOwnPropertyDescriptor(
+      HTMLTextAreaElement.prototype,
+      'scrollHeight',
+    )
+    Object.defineProperty(HTMLTextAreaElement.prototype, 'scrollHeight', {
+      configurable: true,
+      get: () => 48,
+    })
+    try {
+      render(<Composer autoSize onSubmit={() => {}} />)
+      const input = screen.getByRole('textbox') as HTMLTextAreaElement
+
+      expect(input.style.height).toBe('48px')
+      expect(input.style.overflowY).toBe('hidden')
+    } finally {
+      if (descriptor) {
+        Object.defineProperty(HTMLTextAreaElement.prototype, 'scrollHeight', descriptor)
+      } else {
+        Reflect.deleteProperty(HTMLTextAreaElement.prototype, 'scrollHeight')
+      }
+    }
+  })
+
   it('uploads selected files, shows a file tile, and sends attachment refs', async () => {
     const onSubmit = vi.fn().mockResolvedValue(undefined)
     const { container } = render(<Composer onSubmit={onSubmit} />)

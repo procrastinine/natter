@@ -51,6 +51,8 @@ export type BaseFontSize = 13 | 14 | 15 | 16 | 17 | 18
 // accumulated samples are still there.
 export type TokenCalibrationMode = 'adaptive' | 'global-only' | 'family-defaults-only'
 
+export type LongMessageDisplayMode = 'full' | 'compact'
+
 // Continue prompts injected by Continue-in-place (see `src/hooks/useContinue.ts`).
 // The actual prompts live on `chat.settings.continueSystemPrompt` /
 // `continueUserPrompt` (per-chat, preset-pinnable). These constants remain
@@ -104,6 +106,9 @@ export interface GlobalPreferences {
   // Which tier of the chars-per-token calibration ladder to consume at
   // estimate time. Ingest is unaffected — samples keep accumulating.
   tokenCalibrationMode: TokenCalibrationMode
+  // Default rendering mode for long/oversized messages when a row mounts
+  // or reloads. Manual avatar clicks stay session-local.
+  longMessageDisplayMode: LongMessageDisplayMode
 }
 
 export const DEFAULT_PINNED_MODELS: readonly string[] = Object.freeze([
@@ -127,6 +132,7 @@ export const DEFAULT_GLOBAL_PREFERENCES: Readonly<GlobalPreferences> = Object.fr
   pinnedModels: [...DEFAULT_PINNED_MODELS],
   recentModels: [],
   tokenCalibrationMode: 'adaptive',
+  longMessageDisplayMode: 'full',
 })
 
 const THEME_KEY = 'global:theme'
@@ -141,6 +147,7 @@ const AUTO_SCROLL_STREAM_KEY = 'global:auto-scroll-stream'
 const PINNED_MODELS_KEY = 'global:pinned-models'
 const RECENT_MODELS_KEY = 'global:recent-models'
 const TOKEN_CALIBRATION_MODE_KEY = 'global:token-calibration-mode'
+const LONG_MESSAGE_DISPLAY_MODE_KEY = 'global:long-message-display-mode'
 // Legacy single-flag key — used for migration so existing installs
 // don't suddenly flip to the default. Read on boot, split into the
 // two new keys, then retired.
@@ -210,7 +217,25 @@ function pictureOrDefault(value: unknown, fallback: ProfilePictureRef): ProfileP
     : fallback
 }
 
-const ALLOWED_CHAT_MAX_WIDTHS: readonly ChatMaxWidth[] = [
+export const CHAT_MAX_WIDTH_MIN = 640
+export const CHAT_MAX_WIDTH_MAX_PX = 1600
+export const CHAT_MAX_WIDTH_STEP = 20
+export const CHAT_MAX_WIDTH_FULL_POSITION = CHAT_MAX_WIDTH_MAX_PX + CHAT_MAX_WIDTH_STEP
+
+function chatMaxWidthOrDefault(value: unknown): ChatMaxWidth {
+  if (value === 'full') return 'full'
+  if (
+    typeof value === 'number' &&
+    Number.isInteger(value) &&
+    value >= CHAT_MAX_WIDTH_MIN &&
+    value <= CHAT_MAX_WIDTH_MAX_PX
+  ) {
+    return value
+  }
+  return DEFAULT_GLOBAL_PREFERENCES.chatMaxWidth
+}
+
+export const CHAT_MAX_WIDTH_OPTIONS: readonly ChatMaxWidth[] = [
   640,
   720,
   840,
@@ -220,16 +245,6 @@ const ALLOWED_CHAT_MAX_WIDTHS: readonly ChatMaxWidth[] = [
   1440,
   'full',
 ]
-
-function chatMaxWidthOrDefault(value: unknown): ChatMaxWidth {
-  if (value === 'full') return 'full'
-  if (typeof value === 'number' && ALLOWED_CHAT_MAX_WIDTHS.includes(value)) {
-    return value
-  }
-  return DEFAULT_GLOBAL_PREFERENCES.chatMaxWidth
-}
-
-export const CHAT_MAX_WIDTH_OPTIONS = ALLOWED_CHAT_MAX_WIDTHS
 
 const ALLOWED_CALIBRATION_MODES: readonly TokenCalibrationMode[] = [
   'adaptive',
@@ -241,6 +256,14 @@ function calibrationModeOrDefault(value: unknown): TokenCalibrationMode {
   return ALLOWED_CALIBRATION_MODES.includes(value as TokenCalibrationMode)
     ? (value as TokenCalibrationMode)
     : DEFAULT_GLOBAL_PREFERENCES.tokenCalibrationMode
+}
+
+const ALLOWED_LONG_MESSAGE_DISPLAY_MODES: readonly LongMessageDisplayMode[] = ['full', 'compact']
+
+function longMessageDisplayModeOrDefault(value: unknown): LongMessageDisplayMode {
+  return ALLOWED_LONG_MESSAGE_DISPLAY_MODES.includes(value as LongMessageDisplayMode)
+    ? (value as LongMessageDisplayMode)
+    : DEFAULT_GLOBAL_PREFERENCES.longMessageDisplayMode
 }
 
 export async function readGlobalPreferences(): Promise<GlobalPreferences> {
@@ -258,6 +281,7 @@ export async function readGlobalPreferences(): Promise<GlobalPreferences> {
     pinned,
     recent,
     tokenCalibrationMode,
+    longMessageDisplayMode,
   ] = await Promise.all([
     getSetting<ThemePreference>(THEME_KEY),
     getSetting<SendShortcut>(SEND_SHORTCUT_KEY),
@@ -272,6 +296,7 @@ export async function readGlobalPreferences(): Promise<GlobalPreferences> {
     getSetting<string[]>(PINNED_MODELS_KEY),
     getSetting<string[]>(RECENT_MODELS_KEY),
     getSetting<TokenCalibrationMode>(TOKEN_CALIBRATION_MODE_KEY),
+    getSetting<LongMessageDisplayMode>(LONG_MESSAGE_DISPLAY_MODE_KEY),
   ])
   return {
     theme: ALLOWED_THEMES.includes(theme as ThemePreference)
@@ -300,10 +325,17 @@ export async function readGlobalPreferences(): Promise<GlobalPreferences> {
         : typeof legacyAutoScroll === 'boolean'
           ? legacyAutoScroll
           : DEFAULT_GLOBAL_PREFERENCES.autoScrollOnStream,
-    pinnedModels: Array.isArray(pinned) ? pinned.filter((x) => typeof x === 'string') : [...DEFAULT_PINNED_MODELS],
+    pinnedModels: Array.isArray(pinned)
+      ? pinned.filter((x) => typeof x === 'string')
+      : [...DEFAULT_PINNED_MODELS],
     recentModels: Array.isArray(recent) ? recent.filter((x) => typeof x === 'string') : [],
     tokenCalibrationMode: calibrationModeOrDefault(tokenCalibrationMode),
+    longMessageDisplayMode: longMessageDisplayModeOrDefault(longMessageDisplayMode),
   }
+}
+
+export async function writeLongMessageDisplayMode(value: LongMessageDisplayMode): Promise<void> {
+  await setSetting(LONG_MESSAGE_DISPLAY_MODE_KEY, value)
 }
 
 export async function writeTokenCalibrationMode(value: TokenCalibrationMode): Promise<void> {

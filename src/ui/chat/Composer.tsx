@@ -144,6 +144,12 @@ function clampFloorHeight(value: number): number {
   return Math.max(0, Math.min(COMPOSER_MAX_HEIGHT, value))
 }
 
+function setComposerTextareaHeight(el: HTMLTextAreaElement, height: number): void {
+  const effectiveHeight = Math.ceil(height)
+  el.style.height = `${effectiveHeight}px`
+  el.style.overflowY = el.scrollHeight > effectiveHeight + 1 ? 'auto' : 'hidden'
+}
+
 // Compact short-form for the composer's tok indicator so the
 // "used/budget" pair stays readable in a ~60px slot. Breakpoints match
 // the model-picker context column (`983k`, `1.0M`, `1.2M`, `200k`) so
@@ -297,12 +303,13 @@ export function Composer({
     if (!el) return
     if (autoSize) {
       el.style.height = 'auto'
+      el.style.overflowY = 'hidden'
       const contentHeight = Math.min(el.scrollHeight, profile.autoGrowMax)
       const effective = Math.max(contentHeight, height)
-      el.style.height = `${effective}px`
+      setComposerTextareaHeight(el, effective)
       return
     }
-    el.style.height = `${height}px`
+    setComposerTextareaHeight(el, height)
   }, [autoSize, profile.autoGrowMax, height, text])
   const trimmed = text.trim()
   const attachments = useAttachmentDrafts()

@@ -806,6 +806,7 @@ export function Shell() {
                     hasConnection={hasConnection}
                     {...(activeCapability ? { capability: activeCapability } : {})}
                     prefillRecommendationEndpoints={activeEndpoints.endpoints}
+                    longMessageDisplayMode={prefs.longMessageDisplayMode}
                   />
                   {effectiveFocusMode ? (
                     <Composer
