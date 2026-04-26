@@ -8,13 +8,18 @@ import type {
   AttachmentOrigin,
   AttachmentStorage,
   Chat,
+  ChatBranchCache,
+  ChatFolder,
   ChatId,
+  ChatTag,
   ChatVersions,
   ChildListState,
   DraftRow,
+  FolderId,
   Message,
   MessageId,
   MutationScope,
+  TagId,
 } from '../core/types'
 
 export interface WorkspaceMeta {
@@ -120,10 +125,69 @@ export interface WorkspaceMutationResult<T> {
   chatVersions: Record<ChatId, ChatVersions>
 }
 
+export interface CreateFolderInput {
+  id?: FolderId
+  name: string
+  color?: string
+  sortIndex?: number
+  now?: number
+}
+
+export interface UpdateFolderInput {
+  name?: string
+  color?: string | null
+  sortIndex?: number
+  lastUsedAt?: number | null
+  now?: number
+}
+
+export interface DeleteFolderResult {
+  deleted: boolean
+  affectedChatIds: ChatId[]
+}
+
+export interface CreateTagInput {
+  id?: TagId
+  name: string
+  color?: string
+  now?: number
+}
+
+export interface UpdateTagInput {
+  name?: string
+  color?: string | null
+  lastUsedAt?: number | null
+  now?: number
+}
+
+export interface DeleteTagResult {
+  deleted: boolean
+  affectedChatIds: ChatId[]
+}
+
+export interface DeleteArchivedChatsResult {
+  deletedChatIds: ChatId[]
+}
+
 export interface WorkspaceRepository {
   getWorkspaceMeta(): Promise<WorkspaceMeta>
   listChats(): Promise<Chat[]>
   getChat(chatId: ChatId): Promise<Chat | undefined>
+  deleteArchivedChat(chatId: ChatId): Promise<boolean>
+  emptyArchivedChats(): Promise<DeleteArchivedChatsResult>
+  listFolders(): Promise<ChatFolder[]>
+  getFolder(folderId: FolderId): Promise<ChatFolder | undefined>
+  createFolder(input: CreateFolderInput): Promise<ChatFolder>
+  updateFolder(folderId: FolderId, patch: UpdateFolderInput): Promise<ChatFolder | undefined>
+  deleteFolder(folderId: FolderId): Promise<DeleteFolderResult>
+  listTags(): Promise<ChatTag[]>
+  getTag(tagId: TagId): Promise<ChatTag | undefined>
+  createTag(input: CreateTagInput): Promise<ChatTag>
+  updateTag(tagId: TagId, patch: UpdateTagInput): Promise<ChatTag | undefined>
+  deleteTag(tagId: TagId): Promise<DeleteTagResult>
+  getChatBranchCache(chatId: ChatId): Promise<ChatBranchCache | undefined>
+  putChatBranchCache(cache: ChatBranchCache): Promise<ChatBranchCache>
+  deleteChatBranchCache(chatId: ChatId): Promise<boolean>
   getMessage(messageId: MessageId): Promise<Message | undefined>
   listMessages(chatId: ChatId): Promise<Message[]>
   getAttachment(attachmentId: AttachmentId): Promise<Attachment | undefined>

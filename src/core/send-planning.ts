@@ -38,7 +38,7 @@ import { toChatCompletions, toGeminiNative, toResponses, toTextCompletions } fro
 import { applyContextCutoff } from './context-cutoff'
 import { resolveTextTemplateFromLibrary } from './text-templates'
 import { getCachedModels } from '../store/models-cache'
-import { getBrowserRepository } from '../store/browser-repo'
+import { getWorkspaceRepository } from '../store/workspace-repository'
 import { normalizeModelsResponse } from '../api/providers'
 import { logRequestPlanDebug } from '../lib/debug-streams'
 
@@ -472,7 +472,7 @@ async function loadAttachmentEstimateContext(
     policy: attachmentContextPolicyForSettings(settings),
   })
   if (ids.length === 0) return { hasAttachments: false }
-  const repo = getBrowserRepository()
+  const repo = getWorkspaceRepository()
   const byId = new Map<string, Attachment>()
   await Promise.all(
     ids.map(async (id) => {
@@ -490,7 +490,7 @@ async function prepareOpenRouterAttachmentTransform(
   path: readonly Message[],
   settings: ChatSettings,
 ): Promise<Pick<ChatCompletionsTransformOptions, 'attachmentPartsByMessageId' | 'extraPlugins'>> {
-  const repo = getBrowserRepository()
+  const repo = getWorkspaceRepository()
   const partsByMessageId = new Map<string, unknown[]>()
   const pluginByKey = new Map<string, unknown>()
   const refsByMessageId = resolveAttachmentContextRefs({

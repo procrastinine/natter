@@ -17,8 +17,8 @@
 import { newId } from '../lib/ulid'
 import { attachmentIdOf, incRefs } from '../store/attachments'
 import { postEvent } from '../store/broadcast'
-import { getBrowserRepository } from '../store/browser-repo'
 import { createChat, getChat, loadChatMessages } from '../store/chats'
+import { getWorkspaceRepository } from '../store/workspace-repository'
 import { activePath, indexById } from './active-path'
 import type { AttachmentId, AttachmentRef, Chat, ChatId, Message, MessageId } from './types'
 
@@ -98,7 +98,7 @@ export async function forkChatFromMessage(
     title: input.title,
     titleStatus: 'manual',
   }
-  await getBrowserRepository().runMutation([{ kind: 'chat-meta', chatId: newChat.id }], (ctx) => {
+  await getWorkspaceRepository().runMutation([{ kind: 'chat-meta', chatId: newChat.id }], (ctx) => {
     ctx.patchChatMeta(newChat.id, titlePatch)
   })
 
@@ -110,7 +110,7 @@ export async function forkChatFromMessage(
   const idMap = new Map<MessageId, MessageId>()
   for (const row of ancestors) idMap.set(row.id, newId())
 
-  const repo = getBrowserRepository()
+  const repo = getWorkspaceRepository()
   const touchedAttachments: AttachmentRef[] = []
   const scopes: Array<
     | { kind: 'message'; messageId: MessageId }

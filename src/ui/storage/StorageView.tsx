@@ -1,8 +1,14 @@
 import { useLiveQuery } from 'dexie-react-hooks'
 import { useRef, useState } from 'react'
 import type { StorageRoute } from '../../app/router'
-import { attachmentHref, makeAnchorClickHandler, navigate, storageHref } from '../../app/router'
-import type { Attachment, AttachmentKind, ChatId, MessageId } from '../../core/types'
+import {
+  attachmentHref,
+  chatHref,
+  makeAnchorClickHandler,
+  navigate,
+  storageHref,
+} from '../../app/router'
+import type { Attachment, AttachmentKind, Chat, ChatId, MessageId } from '../../core/types'
 import {
   batchRelinkAttachmentRefs,
   deleteReferencedAttachmentBytes,
@@ -17,11 +23,18 @@ import {
   type AttachmentReferenceRow,
 } from '../../store/attachments'
 import { getBrowserRepository } from '../../store/browser-repo'
+import {
+  deleteArchivedChatPermanently,
+  emptyArchivedChats,
+  listChats,
+  unarchiveChat,
+} from '../../store/chats'
 import type { AttachmentBundle } from '../../store/repository'
 import { AttachmentPicker } from '../attachments/AttachmentPicker'
 import { AttachmentPreview } from '../attachments/AttachmentPreview'
 import { formatBytes, formatDate, kindLabel, shortId, storageLabel } from '../attachments/format'
 import {
+  ArchiveIcon,
   CloseIcon,
   DatabaseIcon,
   EyeIcon,
@@ -29,6 +42,7 @@ import {
   FileIcon,
   SearchIcon,
   TrashIcon,
+  UnarchiveIcon,
   UploadIcon,
 } from '../icons/Icon'
 
@@ -74,34 +88,50 @@ export function StorageView({ route }: StorageViewProps) {
             href={storageHref()}
             onClick={makeAnchorClickHandler(storageHref())}
             aria-current={route.section === 'overview' ? 'page' : undefined}
+            aria-label="Overview"
+            title="Overview"
           >
-            Overview
+            <DatabaseIcon size={15} />
           </a>
           <a
             href={storageHref({ section: 'attachments' })}
             onClick={makeAnchorClickHandler(storageHref({ section: 'attachments' }))}
             aria-current={route.section === 'attachments' ? 'page' : undefined}
+            aria-label="Attachments"
+            title="Attachments"
           >
-            Attachments
+            <FileIcon size={15} />
+          </a>
+          <a
+            href={storageHref({ section: 'archive' })}
+            onClick={makeAnchorClickHandler(storageHref({ section: 'archive' }))}
+            aria-current={route.section === 'archive' ? 'page' : undefined}
+            aria-label="Archive"
+            title="Archive"
+          >
+            <ArchiveIcon size={15} />
           </a>
           <a
             href={storageHref({ section: 'backups' })}
             onClick={makeAnchorClickHandler(storageHref({ section: 'backups' }))}
             aria-current={route.section === 'backups' ? 'page' : undefined}
+            aria-label="Backups"
+            title="Backups"
           >
-            Backups
+            <UploadIcon size={15} />
           </a>
         </nav>
       </header>
       {route.section === 'overview' ? <StorageOverview /> : null}
       {route.section === 'attachments' ? <AttachmentManager route={route} /> : null}
+      {route.section === 'archive' ? <ArchiveManager /> : null}
       {route.section === 'backups' ? <BackupSurface /> : null}
     </main>
   )
 }
 
 function StorageOverview() {
-  const chats = useLiveQuery(() => getBrowserRepository().listChats(), [], [])
+  const chats = useLiveQuery(() => listChats(), [], [])
   const attachments = useLiveQuery(
     () => getBrowserRepository().searchAttachments({ sort: 'size-desc', limit: 5000 }),
     [],
@@ -110,6 +140,7 @@ function StorageOverview() {
   const localBytes = attachments.rows.reduce((sum, row) => sum + (row.sizeBytes ?? 0), 0)
   const missing = attachments.rows.filter((row) => row.storage.kind === 'missing').length
   const unreferenced = attachments.rows.filter((row) => row.refCount === 0).length
+  const archived = chats.filter((chat) => chat.archived).length
   return (
     <section data-ui="storage-overview">
       <div data-ui="storage-stat-row">
@@ -124,6 +155,7 @@ function StorageOverview() {
         <a href={storageHref({ section: 'attachments', filter: 'unreferenced' })}>
           Unreferenced · {unreferenced}
         </a>
+        <a href={storageHref({ section: 'archive' })}>Archive · {archived}</a>
       </div>
     </section>
   )
@@ -145,6 +177,108 @@ function BackupSurface() {
       <p data-ui="helper">Backup, restore, and raw dump controls land with daemon storage.</p>
     </section>
   )
+}
+
+function ArchiveManager() {
+  const chats = useLiveQuery(() => listChats(), [], [])
+  const [busy, setBusy] = useState<string | null>(null)
+  const archived = chats
+    .filter((chat) => chat.archived)
+    .sort((left, right) => right.updatedAt - left.updatedAt || right.id.localeCompare(left.id))
+  const handleRestore = async (chat: Chat) => {
+    setBusy(chat.id)
+    try {
+      await unarchiveChat(chat.id)
+    } finally {
+      setBusy(null)
+    }
+  }
+  const handleDelete = async (chat: Chat) => {
+    const title = displayChatTitle(chat)
+    if (!window.confirm(`Permanently delete "${title}"? This cannot be undone.`)) return
+    setBusy(chat.id)
+    try {
+      await deleteArchivedChatPermanently(chat.id)
+    } finally {
+      setBusy(null)
+    }
+  }
+  const handleEmpty = async () => {
+    if (archived.length === 0) return
+    if (!window.confirm(`Permanently delete ${archived.length} archived chats?`)) return
+    setBusy('__all__')
+    try {
+      await emptyArchivedChats()
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  return (
+    <section data-ui="archive-manager">
+      <div data-ui="archive-toolbar">
+        <span data-ui="archive-count">{archived.length}</span>
+        <button
+          type="button"
+          data-ui="storage-action"
+          data-tone="danger"
+          aria-label="Empty trash"
+          title="Empty trash"
+          disabled={archived.length === 0 || busy !== null}
+          onClick={() => void handleEmpty()}
+        >
+          <TrashIcon size={14} />
+        </button>
+      </div>
+      {archived.length === 0 ? (
+        <p data-ui="helper">No archived chats.</p>
+      ) : (
+        <ul data-ui="archive-list">
+          {archived.map((chat) => {
+            const title = displayChatTitle(chat)
+            const href = chatHref(chat.id)
+            return (
+              <li key={chat.id} data-ui="archive-row">
+                <a data-ui="archive-row-link" href={href} onClick={makeAnchorClickHandler(href)}>
+                  <span data-ui="archive-row-main">
+                    <strong>{title}</strong>
+                    <span>{chat.previewText || shortId(chat.id)}</span>
+                  </span>
+                  <span data-ui="archive-row-meta">{formatDate(chat.updatedAt)}</span>
+                </a>
+                <span data-ui="archive-row-actions">
+                  <button
+                    type="button"
+                    data-ui="archive-restore-button"
+                    aria-label={`Restore ${title}`}
+                    title="Restore to sidebar"
+                    disabled={busy !== null}
+                    onClick={() => void handleRestore(chat)}
+                  >
+                    <UnarchiveIcon size={14} />
+                  </button>
+                  <button
+                    type="button"
+                    aria-label={`Permanently delete ${title}`}
+                    title="Delete permanently"
+                    disabled={busy !== null}
+                    onClick={() => void handleDelete(chat)}
+                  >
+                    <TrashIcon size={14} />
+                  </button>
+                </span>
+              </li>
+            )
+          })}
+        </ul>
+      )}
+    </section>
+  )
+}
+
+function displayChatTitle(chat: Chat): string {
+  const trimmed = chat.title.trim()
+  return trimmed.length > 0 ? trimmed : 'Untitled chat'
 }
 
 function AttachmentManager({

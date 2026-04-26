@@ -96,7 +96,7 @@ describe('browser repository mutation executor', () => {
         { kind: 'message', messageId: 'M1' },
         { kind: 'children', chatId: 'C1', parentId: null },
       ]),
-    ).toEqual(['chats', 'childLists', 'messages', 'settings'])
+    ).toEqual(['chatBranchCache', 'chats', 'childLists', 'messages', 'settings'])
   })
 
   it('throws ChatMissingError when a scoped mutation targets a missing chat', async () => {
@@ -330,6 +330,66 @@ describe('browser repository mutation executor', () => {
     const stored = await getDb().messages.get(row.id)
     expect(stored?.nodeVersion).toBe(2)
     expect(['v1', 'v2']).toContain((stored?.content[0] as { type: 'text'; text: string }).text)
+  })
+
+  it('recomputes totalCostUsd on cost writes, soft delete/restore, and hard delete', async () => {
+    const repo = getBrowserRepository()
+    const chat = await seedChat({ lastUpdatedLeafId: 'M1' })
+    const row = makeMessage(chat.id, { id: 'M1' })
+    await getDb().messages.put(row)
+
+    const withCost: Message = {
+      ...row,
+      generation: {
+        id: 'gen-M1',
+        model: 'test',
+        requestedModel: 'test',
+        apiUsed: 'chat',
+        delivery: 'buffered',
+        cost: 0.75,
+        costSource: 'estimated',
+        startedAt: 1,
+      },
+    }
+
+    await repo.runMutation([{ kind: 'message', messageId: row.id }], async (ctx) => {
+      await ctx.putMessage(withCost)
+    })
+    expect((await getDb().chats.get(chat.id))?.totalCostUsd).toBe(0.75)
+
+    await repo.runMutation(
+      [
+        { kind: 'message', messageId: row.id },
+        { kind: 'children', chatId: chat.id, parentId: null },
+      ],
+      async (ctx) => {
+        await ctx.putMessage({ ...withCost, deleted: true })
+      },
+    )
+    expect((await getDb().chats.get(chat.id))?.totalCostUsd).toBe(0)
+
+    await repo.runMutation(
+      [
+        { kind: 'message', messageId: row.id },
+        { kind: 'children', chatId: chat.id, parentId: null },
+      ],
+      async (ctx) => {
+        const current = (await ctx.getMessage(row.id)) as Message
+        await ctx.putMessage({ ...current, deleted: false })
+      },
+    )
+    expect((await getDb().chats.get(chat.id))?.totalCostUsd).toBe(0.75)
+
+    await repo.runMutation(
+      [
+        { kind: 'message', messageId: row.id },
+        { kind: 'children', chatId: chat.id, parentId: null },
+      ],
+      async (ctx) => {
+        await ctx.deleteMessage(row.id)
+      },
+    )
+    expect((await getDb().chats.get(chat.id))?.totalCostUsd).toBe(0)
   })
 
   it('rolls back message writes when the callback throws', async () => {

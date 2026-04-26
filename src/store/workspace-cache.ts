@@ -1,6 +1,6 @@
 import type { Chat, ChatId, DraftRow, Message, MessageId } from '../core/types'
-import { getBrowserRepository } from './browser-repo'
 import type { WorkspaceRepository } from './repository'
+import { getWorkspaceRepository } from './workspace-repository'
 
 // Phase 0-4 read-side cache boundary. The current implementation is a thin
 // repository-backed facade so UI code can depend on one workspace surface
@@ -44,7 +44,7 @@ class RepositoryWorkspaceCache implements WorkspaceCache {
 let singleton: WorkspaceCache | null = null
 
 export function getWorkspaceCache(): WorkspaceCache {
-  singleton ??= new RepositoryWorkspaceCache(getBrowserRepository())
+  singleton ??= new RepositoryWorkspaceCache(getWorkspaceRepository())
   return singleton
 }
 

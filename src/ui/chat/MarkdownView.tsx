@@ -15,8 +15,6 @@ export interface MarkdownViewProps {
   allowImageOrigins?: string[]
 }
 
-const mathPlugin = createMathPlugin({ singleDollarTextMath: false })
-
 // CJK plugin: adds remark plugins that make Chinese/Japanese/Korean text
 // respect proper emphasis, strikethrough, and autolink boundaries. No
 // options; pre-configured defaults are fine for our use.
@@ -84,10 +82,17 @@ export function MarkdownView({ content, streaming = false, allowImageOrigins }: 
     () => [renderingPrefs.shikiLight, renderingPrefs.shikiDark],
     [renderingPrefs.shikiLight, renderingPrefs.shikiDark],
   )
-  const plugins = useMemo(() => getPlugins(shikiTheme), [shikiTheme])
+  const plugins = useMemo(
+    () => getPlugins(shikiTheme, renderingPrefs.singleDollarTextMath),
+    [shikiTheme, renderingPrefs.singleDollarTextMath],
+  )
+  const rendererKey = `${shikiTheme.join('::')}::single-dollar=${
+    renderingPrefs.singleDollarTextMath ? 'on' : 'off'
+  }`
   return (
     <div data-ui="markdown" data-streaming={streaming ? 'true' : 'false'} data-overflow="full">
       <Streamdown
+        key={rendererKey}
         mode={streaming ? 'streaming' : 'static'}
         plugins={plugins}
         components={components}
@@ -99,20 +104,20 @@ export function MarkdownView({ content, streaming = false, allowImageOrigins }: 
   )
 }
 
-function buildPlugins(themes: [ShikiThemeChoice, ShikiThemeChoice]) {
+function buildPlugins(themes: [ShikiThemeChoice, ShikiThemeChoice], singleDollarTextMath: boolean) {
   return {
-    math: mathPlugin,
+    math: createMathPlugin({ singleDollarTextMath }),
     code: createCodePlugin({ themes }),
     cjk: cjkPlugin,
     mermaid: mermaidPlugin,
   }
 }
 
-function getPlugins(themes: [ShikiThemeChoice, ShikiThemeChoice]) {
-  const key = themes.join('::')
+function getPlugins(themes: [ShikiThemeChoice, ShikiThemeChoice], singleDollarTextMath: boolean) {
+  const key = `${themes.join('::')}::single-dollar=${singleDollarTextMath ? 'on' : 'off'}`
   const cached = pluginCache.get(key)
   if (cached) return cached
-  const created = buildPlugins(themes)
+  const created = buildPlugins(themes, singleDollarTextMath)
   pluginCache.set(key, created)
   return created
 }

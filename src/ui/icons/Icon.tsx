@@ -355,6 +355,84 @@ export function SearchIcon({ size = 18, ariaLabel }: IconProps) {
   )
 }
 
+export function PlusIcon({ size = 18, strokeWidth = 1.6, ariaLabel }: IconProps) {
+  return (
+    <BaseSvg size={size} strokeWidth={strokeWidth} {...(ariaLabel ? { 'aria-label': ariaLabel } : {})}>
+      <path d="M12 5v14" />
+      <path d="M5 12h14" />
+    </BaseSvg>
+  )
+}
+
+export function FolderIcon({ size = 18, ariaLabel }: IconProps) {
+  return (
+    <BaseSvg size={size} {...(ariaLabel ? { 'aria-label': ariaLabel } : {})}>
+      <path d="M3.5 6.5A2.5 2.5 0 0 1 6 4h4l2 2.5h6A2.5 2.5 0 0 1 20.5 9v8A2.5 2.5 0 0 1 18 19.5H6A2.5 2.5 0 0 1 3.5 17z" />
+      <path d="M3.5 9h17" />
+    </BaseSvg>
+  )
+}
+
+export function TagIcon({ size = 18, ariaLabel }: IconProps) {
+  return (
+    <BaseSvg size={size} {...(ariaLabel ? { 'aria-label': ariaLabel } : {})}>
+      <path d="M20 13.5 13.5 20 4 10.5V4h6.5z" />
+      <circle cx="8" cy="8" r="1.2" fill="currentColor" stroke="none" />
+    </BaseSvg>
+  )
+}
+
+export function ArchiveIcon({ size = 18, ariaLabel }: IconProps) {
+  return (
+    <BaseSvg size={size} {...(ariaLabel ? { 'aria-label': ariaLabel } : {})}>
+      <rect x="4" y="4" width="16" height="4" rx="1" />
+      <path d="M5.5 8v10A2 2 0 0 0 7.5 20h9a2 2 0 0 0 2-2V8" />
+      <path d="M9 12h6" />
+    </BaseSvg>
+  )
+}
+
+export function RestoreIcon({ size = 18, ariaLabel }: IconProps) {
+  return (
+    <BaseSvg size={size} {...(ariaLabel ? { 'aria-label': ariaLabel } : {})}>
+      <path d="M4 7v5h5" />
+      <path d="M5.8 12A6.5 6.5 0 1 0 8 5.9L4 9.5" />
+    </BaseSvg>
+  )
+}
+
+export function UnarchiveIcon({ size = 18, ariaLabel }: IconProps) {
+  return (
+    <BaseSvg size={size} {...(ariaLabel ? { 'aria-label': ariaLabel } : {})}>
+      <path d="M4 4h16v4H4z" />
+      <path d="M5.5 8v10A2 2 0 0 0 7.5 20h9a2 2 0 0 0 2-2V8" />
+      <path d="M12 17v-6" />
+      <path d="m8.8 14.2 3.2-3.2 3.2 3.2" />
+    </BaseSvg>
+  )
+}
+
+export function SortIcon({ size = 18, ariaLabel }: IconProps) {
+  return (
+    <BaseSvg size={size} {...(ariaLabel ? { 'aria-label': ariaLabel } : {})}>
+      <path d="M7 4v16" />
+      <polyline points="4 7 7 4 10 7" />
+      <path d="M17 20V4" />
+      <polyline points="14 17 17 20 20 17" />
+    </BaseSvg>
+  )
+}
+
+export function MoreVerticalIcon({ size = 18, ariaLabel }: IconProps) {
+  return (
+    <BaseSvg size={size} {...(ariaLabel ? { 'aria-label': ariaLabel } : {})}>
+      <circle cx="12" cy="5" r="1.3" fill="currentColor" stroke="none" />
+      <circle cx="12" cy="12" r="1.3" fill="currentColor" stroke="none" />
+      <circle cx="12" cy="19" r="1.3" fill="currentColor" stroke="none" />
+    </BaseSvg>
+  )
+}
+
 // Paper-plane arrow — Save & Send action on the inline editor.
 export function SendIcon({ size = 18, ariaLabel }: IconProps) {
   return (

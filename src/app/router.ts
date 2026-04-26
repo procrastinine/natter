@@ -12,6 +12,7 @@
 //   #/storage/attachments/missing → missing attachment cleanup filter
 //   #/storage/attachments/unreferenced → unreferenced attachment cleanup filter
 //   #/storage/attachments/<id>    → attachment details permalink
+//   #/storage/archive              → archived chats / trash
 //   #/storage/backups             → backup / restore / raw dump surface
 //
 // The hash form is intentional: it works on static hosts without server config
@@ -25,6 +26,7 @@ import type { AttachmentId, ChatId, MessageId } from '../core/types'
 export type StorageRoute =
   | { section: 'overview' }
   | { section: 'attachments'; filter?: 'missing' | 'unreferenced'; attachmentId?: AttachmentId }
+  | { section: 'archive' }
   | { section: 'backups' }
 
 export type Route =
@@ -60,6 +62,9 @@ export function parseRoute(hash: string): Route {
     }
     if (parts[1] === 'backups' && parts.length === 2) {
       return { kind: 'storage', storage: { section: 'backups' } }
+    }
+    if (parts[1] === 'archive' && parts.length === 2) {
+      return { kind: 'storage', storage: { section: 'archive' } }
     }
   }
   if (parts[0] === 'chat' && parts[1]) {
@@ -113,6 +118,7 @@ export function attachmentHref(attachmentId: AttachmentId): string {
 
 function storageRouteToHref(route: StorageRoute): string {
   if (route.section === 'overview') return '#/storage'
+  if (route.section === 'archive') return '#/storage/archive'
   if (route.section === 'backups') return '#/storage/backups'
   if (route.attachmentId) {
     return `#/storage/attachments/${encodeURIComponent(route.attachmentId)}`

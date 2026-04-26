@@ -11,7 +11,7 @@
 // matches the plan's 5s horizon — we don't try to undo edits that
 // happened after the user walked away.
 
-import { getBrowserRepository } from '../store/browser-repo'
+import { getWorkspaceRepository } from '../store/workspace-repository'
 import type { AttachmentId, ChatId, Message, MessageId, MutationScope } from './types'
 
 export interface StructuralSnapshot {
@@ -32,7 +32,7 @@ export async function snapshotMessages(
   chatId: ChatId,
   ids: readonly MessageId[],
 ): Promise<Message[]> {
-  const repo = getBrowserRepository()
+  const repo = getWorkspaceRepository()
   const rows: Message[] = []
   for (const id of ids) {
     const row = await repo.getMessage(id)
@@ -46,7 +46,7 @@ export async function snapshotMessages(
 // under the same `message:` + `children:` scopes the op claimed so
 // concurrent edits from another tab serialize cleanly.
 export async function applyStructuralSnapshot(snapshot: StructuralSnapshot): Promise<void> {
-  const repo = getBrowserRepository()
+  const repo = getWorkspaceRepository()
   const scopes: MutationScope[] = []
   const parentSlots = new Set<string>()
   for (const row of snapshot.previousRows) {

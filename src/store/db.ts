@@ -5,8 +5,14 @@
 // and close it when they're done.
 
 import Dexie, { type Table } from 'dexie'
-import { normalizeEndpointsResponse } from '../api/providers'
 import { readCachedPrivacyPayload } from '../api/privacy-scrape'
+import { normalizeEndpointsResponse } from '../api/providers'
+import { findLastUpdatedLeafId } from '../core/active-path'
+import { buildBranchMessages } from '../core/branch-flatten'
+import {
+  DEFAULT_CONTINUE_SYSTEM_PROMPT,
+  DEFAULT_CONTINUE_USER_PROMPT,
+} from '../core/global-settings'
 import { migrateLegacyProviderSettings } from '../core/provider-settings-migration'
 import type {
   Attachment,
@@ -27,10 +33,7 @@ import type {
   PresetResolution,
   PromptPreset,
 } from '../core/types'
-import {
-  DEFAULT_CONTINUE_SYSTEM_PROMPT,
-  DEFAULT_CONTINUE_USER_PROMPT,
-} from '../core/global-settings'
+import { countMessagesWords } from '../core/word-count'
 
 export interface CachedModelsRow {
   profileId: string
@@ -191,29 +194,28 @@ export function registerSchema(db: Dexie): void {
       }
     })
 
-  db.version(3)
-    .stores({
-      chats:
-        'id, updatedAt, createdAt, lastViewedAt, lastUpdatedLeafId, lastBranchUpdatedAt, wordCount, totalCostUsd, archived, pinned, presetId, folderId, *tags',
-      messages:
-        'id, chatId, parentId, turnId, [chatId+parentId], [chatId+createdAt], [chatId+turnId], [chatId+deleted]',
-      childLists: 'id, [chatId+parentId], updatedAt',
-      attachments: 'id, contentHash, refCount, createdAt',
-      profiles: 'id, name, kind, lastUsedAt, archived',
-      presets: 'id, name, connectionProfileId, lastUsedAt, archived',
-      folders: 'id, name, sortIndex, lastUsedAt',
-      tags: 'id, &nameLower, lastUsedAt',
-      chatBranchCache: '&chatId, branchLeafId, generatedAt',
-      keys: 'id, name',
-      settings: '&key',
-      models: '&[profileId+queryKey], fetchedAt',
-      endpoints: '&[profileId+modelId], fetchedAt',
-      privacyPolicies: '&[profileId+modelId], fetchedAt',
-      providers: '&profileId, fetchedAt',
-      generations: 'id, chatId, gen_id',
-      presetResolutions: '&[profileId+presetSlug], fetchedAt',
-      drafts: '&chatId, updatedAt',
-    })
+  db.version(3).stores({
+    chats:
+      'id, updatedAt, createdAt, lastViewedAt, lastUpdatedLeafId, lastBranchUpdatedAt, wordCount, totalCostUsd, archived, pinned, presetId, folderId, *tags',
+    messages:
+      'id, chatId, parentId, turnId, [chatId+parentId], [chatId+createdAt], [chatId+turnId], [chatId+deleted]',
+    childLists: 'id, [chatId+parentId], updatedAt',
+    attachments: 'id, contentHash, refCount, createdAt',
+    profiles: 'id, name, kind, lastUsedAt, archived',
+    presets: 'id, name, connectionProfileId, lastUsedAt, archived',
+    folders: 'id, name, sortIndex, lastUsedAt',
+    tags: 'id, &nameLower, lastUsedAt',
+    chatBranchCache: '&chatId, branchLeafId, generatedAt',
+    keys: 'id, name',
+    settings: '&key',
+    models: '&[profileId+queryKey], fetchedAt',
+    endpoints: '&[profileId+modelId], fetchedAt',
+    privacyPolicies: '&[profileId+modelId], fetchedAt',
+    providers: '&profileId, fetchedAt',
+    generations: 'id, chatId, gen_id',
+    presetResolutions: '&[profileId+presetSlug], fetchedAt',
+    drafts: '&chatId, updatedAt',
+  })
 
   db.version(4)
     .stores({
@@ -243,17 +245,24 @@ export function registerSchema(db: Dexie): void {
       const privacyRows = await tx.table<CachedPrivacyPolicyRow>('privacyPolicies').toArray()
       const endpointsByKey = new Map<string, CachedEndpointsRow>()
       const privacyByKey = new Map<string, CachedPrivacyPolicyRow>()
-      for (const row of endpointsRows) endpointsByKey.set(providerCacheKey(row.profileId, row.modelId), row)
-      for (const row of privacyRows) privacyByKey.set(providerCacheKey(row.profileId, row.modelId), row)
+      for (const row of endpointsRows)
+        endpointsByKey.set(providerCacheKey(row.profileId, row.modelId), row)
+      for (const row of privacyRows)
+        privacyByKey.set(providerCacheKey(row.profileId, row.modelId), row)
 
       await tx
         .table<Chat>('chats')
         .toCollection()
         .modify((chat) => {
-          const result = migrateSettingsRow(chat.settings, chat.settings.profileId, chat.settings.model, {
-            endpointsByKey,
-            privacyByKey,
-          })
+          const result = migrateSettingsRow(
+            chat.settings,
+            chat.settings.profileId,
+            chat.settings.model,
+            {
+              endpointsByKey,
+              privacyByKey,
+            },
+          )
           if (result.changed) chat.settings = result.settings
         })
 
@@ -337,11 +346,14 @@ export function registerSchema(db: Dexie): void {
           if (typeof s.continueSystemPrompt !== 'string') s.continueSystemPrompt = seedSystem
           if (typeof s.continueUserPrompt !== 'string') s.continueUserPrompt = seedUser
         })
-      await settings.where('key').anyOf([
-        'global:continue-system-prompt',
-        'global:continue-user-prompt',
-        'global:continue-prompt',
-      ]).delete()
+      await settings
+        .where('key')
+        .anyOf([
+          'global:continue-system-prompt',
+          'global:continue-user-prompt',
+          'global:continue-prompt',
+        ])
+        .delete()
     })
 
   // v6: Phase 12 attachment backend. Move bytes out of `attachments.blob`,
@@ -357,7 +369,8 @@ export function registerSchema(db: Dexie): void {
       attachments: 'id, contentHash, kind, mime, origin, refCount, createdAt, updatedAt, deletedAt',
       attachmentBlobs: 'id, attachmentId, role, contentHash, createdAt',
       attachmentArtifacts: 'artifactId, attachmentId, kind, processorId, createdAt',
-      attachmentJobs: 'id, attachmentId, processorId, status, updatedAt, [attachmentId+processorId+inputHash]',
+      attachmentJobs:
+        'id, attachmentId, processorId, status, updatedAt, [attachmentId+processorId+inputHash]',
       profiles: 'id, name, kind, lastUsedAt, archived',
       presets: 'id, name, connectionProfileId, lastUsedAt, archived',
       promptPresets: 'id, kind, name, lastUsedAt',
@@ -480,6 +493,63 @@ function providerCacheKey(profileId: string, modelId: string): string {
   return `${profileId}\u0000${modelId}`
 }
 
+function organizationDefaultsPatch(
+  chat: Chat & Record<string, unknown>,
+  messages: readonly Message[],
+  computed: { lastUpdatedLeafId: string | null; wordCount: number; totalCostUsd: number },
+): Partial<Chat> | null {
+  const patch: Partial<Chat> = {}
+  if (
+    chat.folderId === undefined ||
+    (chat.folderId !== null && typeof chat.folderId !== 'string')
+  ) {
+    patch.folderId = null
+  }
+  if (!Array.isArray(chat.tags) || !chat.tags.every((tag) => typeof tag === 'string')) {
+    patch.tags = []
+  }
+  if (!isTitleStatus(chat.titleStatus)) {
+    patch.titleStatus = inferLegacyTitleStatus(chat.title, messages)
+  }
+  if (!isFiniteNumber(chat.lastViewedAt)) {
+    patch.lastViewedAt = isFiniteNumber(chat.updatedAt) ? chat.updatedAt : 0
+  }
+  if (chat.lastUpdatedLeafId !== computed.lastUpdatedLeafId) {
+    patch.lastUpdatedLeafId = computed.lastUpdatedLeafId
+  }
+  if (!isFiniteNumber(chat.lastBranchUpdatedAt)) {
+    patch.lastBranchUpdatedAt = 0
+  }
+  if (!isFiniteNumber(chat.wordCount) || chat.wordCount !== computed.wordCount) {
+    patch.wordCount = computed.wordCount
+  }
+  if (!isFiniteNumber(chat.totalCostUsd) || chat.totalCostUsd !== computed.totalCostUsd) {
+    patch.totalCostUsd = computed.totalCostUsd
+  }
+  return Object.keys(patch).length > 0 ? patch : null
+}
+
+function isTitleStatus(value: unknown): value is Chat['titleStatus'] {
+  return (
+    value === 'untitled' ||
+    value === 'pending' ||
+    value === 'auto' ||
+    value === 'manual' ||
+    value === 'auto-failed'
+  )
+}
+
+function inferLegacyTitleStatus(value: unknown, messages: readonly Message[]): Chat['titleStatus'] {
+  const title = typeof value === 'string' ? value.trim() : ''
+  const imported = messages.some((message) => message.origin === 'imported')
+  if (imported || title.length === 0 || title === 'Untitled chat') return 'untitled'
+  return 'auto'
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value)
+}
+
 function numberOr(value: unknown, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback
 }
@@ -554,6 +624,8 @@ export function childListKey(chatId: string, parentId: string | null): string {
 
 let singleton: NatterDb | null = null
 let providerSettingsBackfillPromise: Promise<void> | null = null
+let organizationFieldsBackfillPromise: Promise<void> | null = null
+const ORGANIZATION_FIELDS_BACKFILL_KEY = 'backfill:organization-fields-v1'
 
 export function getDb(): NatterDb {
   if (!singleton) singleton = new NatterDb()
@@ -565,6 +637,11 @@ export function getDb(): NatterDb {
 export async function openDb(): Promise<NatterDb> {
   const db = getDb()
   if (!db.isOpen()) await db.open()
+  organizationFieldsBackfillPromise ??= backfillOrganizationFields(db).catch((err) => {
+    organizationFieldsBackfillPromise = null
+    throw err
+  })
+  await organizationFieldsBackfillPromise
   providerSettingsBackfillPromise ??= backfillProviderSettings(db).catch((err) => {
     providerSettingsBackfillPromise = null
     throw err
@@ -580,6 +657,7 @@ export function __resetDbForTests(): void {
     singleton = null
   }
   providerSettingsBackfillPromise = null
+  organizationFieldsBackfillPromise = null
 }
 
 // Mint a uniquely-named Dexie instance for integration tests that want to
@@ -596,6 +674,42 @@ export async function backfillProviderSettingsForModel(
   await runProviderSettingsBackfill(getDb(), { profileId, modelId })
 }
 
+export async function backfillOrganizationFields(db: NatterDb): Promise<void> {
+  const marker = await db.settings.get(ORGANIZATION_FIELDS_BACKFILL_KEY)
+  if (marker?.value === 1) return
+
+  const chats = await db.chats.toArray()
+  const messages = await db.messages.toArray()
+  const messagesByChat = new Map<string, Message[]>()
+  for (const message of messages) {
+    const list = messagesByChat.get(message.chatId) ?? []
+    list.push(message)
+    messagesByChat.set(message.chatId, list)
+  }
+
+  await db.transaction('rw', db.chats, db.settings, async () => {
+    const patchedChats: Chat[] = []
+    for (const chat of chats) {
+      const rows = messagesByChat.get(chat.id) ?? []
+      const nextLeafId = findLastUpdatedLeafId(rows)
+      const branch = buildBranchMessages(rows, nextLeafId)
+      const totalCostUsd = rows.reduce(
+        (total, message) => total + (message.deleted ? 0 : (message.generation?.cost ?? 0)),
+        0,
+      )
+      const patch = organizationDefaultsPatch(chat as Chat & Record<string, unknown>, rows, {
+        lastUpdatedLeafId: nextLeafId,
+        wordCount: countMessagesWords(branch),
+        totalCostUsd,
+      })
+      if (!patch) continue
+      patchedChats.push({ ...chat, ...patch })
+    }
+    if (patchedChats.length > 0) await db.chats.bulkPut(patchedChats)
+    await db.settings.put({ key: ORGANIZATION_FIELDS_BACKFILL_KEY, value: 1 })
+  })
+}
+
 async function backfillProviderSettings(db: NatterDb): Promise<void> {
   await runProviderSettingsBackfill(db)
 }
@@ -609,35 +723,42 @@ async function runProviderSettingsBackfill(
       ? db.endpoints.where('[profileId+modelId]').equals([scope.profileId, scope.modelId]).toArray()
       : db.endpoints.toArray(),
     scope
-      ? db.privacyPolicies.where('[profileId+modelId]').equals([scope.profileId, scope.modelId]).toArray()
+      ? db.privacyPolicies
+          .where('[profileId+modelId]')
+          .equals([scope.profileId, scope.modelId])
+          .toArray()
       : db.privacyPolicies.toArray(),
   ])
   const endpointsByKey = new Map<string, CachedEndpointsRow>()
   const privacyByKey = new Map<string, CachedPrivacyPolicyRow>()
-  for (const row of endpointsRows) endpointsByKey.set(providerCacheKey(row.profileId, row.modelId), row)
+  for (const row of endpointsRows)
+    endpointsByKey.set(providerCacheKey(row.profileId, row.modelId), row)
   for (const row of privacyRows) privacyByKey.set(providerCacheKey(row.profileId, row.modelId), row)
 
   await db.transaction('rw', db.chats, db.presets, async () => {
     const chats = scope
-      ? db.chats
-          .filter(
-            (chat) =>
-              chat.settings.profileId === scope.profileId && chat.settings.model === scope.modelId,
-          )
+      ? db.chats.filter(
+          (chat) =>
+            chat.settings.profileId === scope.profileId && chat.settings.model === scope.modelId,
+        )
       : db.chats.toCollection()
     const presets = scope
-      ? db.presets
-          .filter(
-            (preset) =>
-              preset.connectionProfileId === scope.profileId &&
-              preset.settings.model === scope.modelId,
-          )
+      ? db.presets.filter(
+          (preset) =>
+            preset.connectionProfileId === scope.profileId &&
+            preset.settings.model === scope.modelId,
+        )
       : db.presets.toCollection()
     await chats.modify((chat) => {
-      const result = migrateSettingsRow(chat.settings, chat.settings.profileId, chat.settings.model, {
-        endpointsByKey,
-        privacyByKey,
-      })
+      const result = migrateSettingsRow(
+        chat.settings,
+        chat.settings.profileId,
+        chat.settings.model,
+        {
+          endpointsByKey,
+          privacyByKey,
+        },
+      )
       if (result.changed) chat.settings = result.settings
     })
     await presets.modify((preset) => {

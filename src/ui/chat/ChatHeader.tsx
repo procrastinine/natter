@@ -3,10 +3,19 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { exportChatAsTxt, triggerBrowserDownload } from '../../core/chat-export'
 import { aggregateCalibrationSamples } from '../../core/token-calibration'
 import type { ChatId, CursorMap } from '../../core/types'
-import { getChat, setManualTitle } from '../../store/chats'
+import { getChat, setChatTagsFromNames, setManualTitle } from '../../store/chats'
+import { listTags } from '../../store/tags'
 import { useChatStore } from '../../store/zustand/chatStore'
 import type { TokenCalibrationSample } from '../../core/types'
-import { CloseIcon, CogIcon, DownloadIcon, EditTreeIcon, InfoIcon, PencilIcon } from '../icons/Icon'
+import {
+  CloseIcon,
+  CogIcon,
+  DownloadIcon,
+  EditTreeIcon,
+  InfoIcon,
+  PencilIcon,
+  TagIcon,
+} from '../icons/Icon'
 import { HeaderPrivacyBadge } from './HeaderPrivacyBadge'
 
 function formatCalibrationRatio(sample: TokenCalibrationSample): string {
@@ -99,6 +108,18 @@ export function ChatHeader({
     const { filename, content } = await exportChatAsTxt(chat.id, cursor)
     triggerBrowserDownload(filename, content)
   }, [chat, cursor])
+  const handleEditTags = useCallback(async () => {
+    if (!chat) return
+    const tags = await listTags()
+    const byId = new Map(tags.map((tag) => [tag.id, tag]))
+    const currentNames = chat.tags
+      .map((tagId) => byId.get(tagId)?.name)
+      .filter((name): name is string => Boolean(name))
+      .join(', ')
+    const value = window.prompt('Tags, comma-separated', currentNames)
+    if (value === null) return
+    await setChatTagsFromNames(chat.id, tagNamesFromPrompt(value))
+  }, [chat])
 
   const displayTitle = chat?.title?.trim().length ? chat.title : 'Untitled chat'
 
@@ -174,6 +195,16 @@ export function ChatHeader({
           <EditTreeIcon size={18} />
         </button>
       ) : null}
+      <button
+        type="button"
+        data-ui="icon-button"
+        data-role="chat-tags"
+        aria-label="Edit chat tags"
+        title="Tags"
+        onClick={() => void handleEditTags()}
+      >
+        <TagIcon size={18} />
+      </button>
       <HeaderPrivacyBadge chatId={chat.id} />
       <button
         type="button"
@@ -262,4 +293,11 @@ export function ChatHeader({
       ) : null}
     </>
   )
+}
+
+function tagNamesFromPrompt(value: string): string[] {
+  return value
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean)
 }

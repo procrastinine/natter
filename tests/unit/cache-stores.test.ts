@@ -22,6 +22,14 @@ import {
   putCachedProviders,
 } from '../../src/store/privacy-cache'
 import { deleteSetting, getSetting, setSetting, updateSetting } from '../../src/store/settings'
+import {
+  readCollapsedSidebarFolderIds,
+  readSidebarSortMode,
+  SIDEBAR_COLLAPSED_FOLDERS_SETTING_KEY,
+  SIDEBAR_SORT_SETTING_KEY,
+  updateCollapsedSidebarFolderIds,
+  writeSidebarSortMode,
+} from '../../src/store/sidebar-preferences'
 
 const DB_NAME = 'natter'
 
@@ -184,5 +192,19 @@ describe('settings', () => {
       ),
     )
     expect(await getSetting<number>('counter')).toBe(10)
+  })
+
+  it('sidebar preferences persist through the settings abstraction', async () => {
+    expect(await readSidebarSortMode()).toBe('updatedAt-desc')
+    await setSetting(SIDEBAR_SORT_SETTING_KEY, 'updated-desc')
+    expect(await readSidebarSortMode()).toBe('updatedAt-desc')
+    await writeSidebarSortMode('wordCount-desc')
+    expect(await getSetting(SIDEBAR_SORT_SETTING_KEY)).toBe('wordCount-desc')
+    expect(await readSidebarSortMode()).toBe('wordCount-desc')
+
+    await setSetting(SIDEBAR_COLLAPSED_FOLDERS_SETTING_KEY, ['b', 1, 'a', 'b'])
+    expect(await readCollapsedSidebarFolderIds()).toEqual(['a', 'b'])
+    await updateCollapsedSidebarFolderIds((current) => [...current, 'c', 'a'])
+    expect(await readCollapsedSidebarFolderIds()).toEqual(['a', 'b', 'c'])
   })
 })

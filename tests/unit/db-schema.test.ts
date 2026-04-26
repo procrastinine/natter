@@ -1,9 +1,15 @@
 import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
-import type { Chat, ChatPreset } from '../../src/core/types'
+import type { Chat, ChatPreset, Message } from '../../src/core/types'
 import type { NatterDb } from '../../src/store/db'
-import { __resetDbForTests, createDbForTests, openDb, registerSchema } from '../../src/store/db'
+import {
+  __resetDbForTests,
+  backfillOrganizationFields,
+  createDbForTests,
+  openDb,
+  registerSchema,
+} from '../../src/store/db'
 
 // Unique DB name per test so migrations start from a clean slate. We delete
 // any pre-existing data at the top of each test so repeated runs don't pick
@@ -480,6 +486,234 @@ describe('Dexie migrations', () => {
 
     await migrated.delete()
   })
+
+  it('backfills legacy chat organization fields idempotently without materializing cache rows', async () => {
+    const name = `natter-test-org-backfill-${Math.random().toString(36).slice(2)}`
+    await Dexie.delete(name)
+    const db = await freshDb(name)
+    await db.open()
+    const chatRows = db.table<Record<string, unknown>>('chats')
+    await chatRows.bulkPut([
+      {
+        id: 'empty',
+        title: '',
+        createdAt: 1,
+        updatedAt: 5,
+        metaVersion: 0,
+        summaryVersion: 0,
+        settings: cloneDefaultChatSettings(),
+        lastUpdatedLeafId: 'old-leaf',
+        wordCount: 123,
+        totalCostUsd: 999,
+        archived: false,
+        pinned: false,
+      },
+      {
+        id: 'titled',
+        title: 'Model title',
+        createdAt: 1,
+        updatedAt: 6,
+        metaVersion: 0,
+        summaryVersion: 0,
+        settings: cloneDefaultChatSettings(),
+        archived: false,
+        pinned: false,
+      },
+      {
+        id: 'legacy-default',
+        title: 'Untitled chat',
+        createdAt: 1,
+        updatedAt: 6,
+        metaVersion: 0,
+        summaryVersion: 0,
+        settings: cloneDefaultChatSettings(),
+        archived: false,
+        pinned: false,
+      },
+      {
+        id: 'imported',
+        title: 'Imported title',
+        createdAt: 1,
+        updatedAt: 7,
+        metaVersion: 0,
+        summaryVersion: 0,
+        settings: cloneDefaultChatSettings(),
+        archived: false,
+        pinned: false,
+      },
+      {
+        id: 'pinned-archived',
+        title: 'Pinned archive',
+        createdAt: 1,
+        updatedAt: 8,
+        metaVersion: 0,
+        summaryVersion: 0,
+        settings: cloneDefaultChatSettings(),
+        archived: true,
+        pinned: true,
+      },
+      {
+        id: 'branchy',
+        title: 'Branch',
+        createdAt: 1,
+        updatedAt: 9,
+        metaVersion: 0,
+        summaryVersion: 0,
+        settings: cloneDefaultChatSettings(),
+        archived: false,
+        pinned: false,
+      },
+      {
+        id: 'tombstoned-descendants',
+        title: 'Tombstones',
+        createdAt: 1,
+        updatedAt: 10,
+        metaVersion: 0,
+        summaryVersion: 0,
+        settings: cloneDefaultChatSettings(),
+        archived: false,
+        pinned: false,
+      },
+    ])
+    await db.table<Message>('messages').bulkPut([
+      legacyMessage({ id: 'i1', chatId: 'imported', origin: 'imported', text: 'imported text' }),
+      legacyMessage({ id: 'root', chatId: 'branchy', text: 'root text', createdAt: 1, cost: 0.1 }),
+      legacyMessage({
+        id: 'old-leaf',
+        chatId: 'branchy',
+        parentId: 'root',
+        siblingIndex: 0,
+        text: 'old leaf',
+        createdAt: 2,
+        cost: 0.2,
+      }),
+      legacyMessage({
+        id: 'new-leaf',
+        chatId: 'branchy',
+        parentId: 'root',
+        siblingIndex: 1,
+        text: 'new leaf',
+        createdAt: 3,
+        cost: 0.3,
+      }),
+      legacyMessage({
+        id: 'tomb-root',
+        chatId: 'tombstoned-descendants',
+        text: 'live root',
+        createdAt: 1,
+        cost: 0.4,
+      }),
+      legacyMessage({
+        id: 'tomb-child',
+        chatId: 'tombstoned-descendants',
+        parentId: 'tomb-root',
+        text: 'deleted child',
+        createdAt: 5,
+        cost: 1,
+        deleted: true,
+      }),
+      legacyMessage({
+        id: 'tomb-grandchild',
+        chatId: 'tombstoned-descendants',
+        parentId: 'tomb-child',
+        text: 'deleted grandchild',
+        createdAt: 6,
+        cost: 1,
+        deleted: true,
+      }),
+    ])
+
+    await backfillOrganizationFields(db)
+    await backfillOrganizationFields(db)
+
+    const empty = await db.chats.get('empty')
+    expect(empty).toMatchObject({
+      folderId: null,
+      tags: [],
+      titleStatus: 'untitled',
+      lastViewedAt: 5,
+      lastUpdatedLeafId: null,
+      lastBranchUpdatedAt: 0,
+      wordCount: 0,
+      totalCostUsd: 0,
+    })
+    expect((await db.chats.get('titled'))?.titleStatus).toBe('auto')
+    expect((await db.chats.get('legacy-default'))?.titleStatus).toBe('untitled')
+    expect((await db.chats.get('imported'))?.titleStatus).toBe('untitled')
+    expect(await db.chats.get('pinned-archived')).toMatchObject({
+      archived: true,
+      pinned: true,
+      folderId: null,
+      tags: [],
+    })
+    const branchy = await db.chats.get('branchy')
+    expect(branchy).toMatchObject({
+      lastUpdatedLeafId: 'new-leaf',
+      wordCount: 4,
+      totalCostUsd: 0.6,
+    })
+    expect(await db.chats.get('tombstoned-descendants')).toMatchObject({
+      lastUpdatedLeafId: 'tomb-root',
+      wordCount: 2,
+      totalCostUsd: 0.4,
+    })
+    expect((await db.settings.get('backfill:organization-fields-v1'))?.value).toBe(1)
+    expect(await db.chatBranchCache.count()).toBe(0)
+    await db.delete()
+  })
+
+  it('backfills organization fields on an empty DB and a 1000-chat DB', async () => {
+    const emptyName = `natter-test-org-empty-${Math.random().toString(36).slice(2)}`
+    await Dexie.delete(emptyName)
+    const empty = await freshDb(emptyName)
+    await empty.open()
+    await backfillOrganizationFields(empty)
+    expect(await empty.chats.count()).toBe(0)
+    expect((await empty.settings.get('backfill:organization-fields-v1'))?.value).toBe(1)
+    await empty.delete()
+
+    const bulkName = `natter-test-org-1000-${Math.random().toString(36).slice(2)}`
+    await Dexie.delete(bulkName)
+    const db = await freshDb(bulkName)
+    await db.open()
+    await db.table<Record<string, unknown>>('chats').bulkPut(
+      Array.from({ length: 1000 }, (_, index) => ({
+        id: `bulk-${index}`,
+        title: index % 2 === 0 ? '' : `Bulk ${index}`,
+        createdAt: index,
+        updatedAt: index + 10,
+        metaVersion: 0,
+        summaryVersion: 0,
+        settings: cloneDefaultChatSettings(),
+        archived: index % 3 === 0,
+        pinned: index % 5 === 0,
+      })),
+    )
+
+    await backfillOrganizationFields(db)
+
+    expect(await db.chats.count()).toBe(1000)
+    expect(await db.chats.get('bulk-0')).toMatchObject({
+      titleStatus: 'untitled',
+      lastViewedAt: 10,
+      lastUpdatedLeafId: null,
+      folderId: null,
+      tags: [],
+      archived: true,
+      pinned: true,
+    })
+    expect(await db.chats.get('bulk-999')).toMatchObject({
+      titleStatus: 'auto',
+      lastViewedAt: 1009,
+      wordCount: 0,
+      totalCostUsd: 0,
+      archived: true,
+      pinned: false,
+    })
+    expect(await db.chatBranchCache.count()).toBe(0)
+    expect((await db.settings.get('backfill:organization-fields-v1'))?.value).toBe(1)
+    await db.delete()
+  })
 })
 
 function legacyEndpoint(
@@ -502,5 +736,46 @@ function legacyEndpoint(
       privacyPolicyURL: '',
       ...policyOverrides,
     },
+  }
+}
+
+function legacyMessage(input: {
+  id: string
+  chatId: string
+  parentId?: string | null
+  siblingIndex?: number
+  text: string
+  origin?: Message['origin']
+  createdAt?: number
+  cost?: number
+  deleted?: boolean
+}): Message {
+  return {
+    id: input.id,
+    chatId: input.chatId,
+    parentId: input.parentId ?? null,
+    siblingIndex: input.siblingIndex ?? 0,
+    turnId: `turn-${input.id}`,
+    turnIndex: 0,
+    createdAt: input.createdAt ?? 1,
+    role: 'user',
+    origin: input.origin ?? 'user',
+    content: [{ type: 'text', text: input.text }],
+    ...(input.cost !== undefined
+      ? {
+          generation: {
+            id: `gen-${input.id}`,
+            model: 'test',
+            requestedModel: 'test',
+            apiUsed: 'chat' as const,
+            delivery: 'buffered' as const,
+            cost: input.cost,
+            costSource: 'estimated' as const,
+            startedAt: 1,
+          },
+        }
+      : {}),
+    nodeVersion: 0,
+    deleted: input.deleted ?? false,
   }
 }

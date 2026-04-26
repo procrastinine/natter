@@ -19,6 +19,7 @@ import {
   UNLIMITED_CONTEXT,
 } from '../core/prompt-size'
 import { prefillClassFor } from '../core/quirks'
+import { DEFAULT_SIDEBAR_SORT_MODE } from '../core/sidebar-sort'
 import { readTokenCalibrationGlobal } from '../core/token-calibration'
 import type {
   Chat,
@@ -46,6 +47,7 @@ import { resolveKeyIfPresent } from '../store/keys'
 import { getCachedModels } from '../store/models-cache'
 import { bumpPresetLastUsedAt, getPreset, pickPreferredPreset } from '../store/presets'
 import { bumpProfileLastUsedAt, countProfiles, getProfile } from '../store/profiles'
+import { readSidebarSortMode } from '../store/sidebar-preferences'
 import { useChatStore } from '../store/zustand/chatStore'
 import { useStreamStore } from '../store/zustand/streamStore'
 import { useToastStore } from '../store/zustand/toastStore'
@@ -247,6 +249,7 @@ export function Shell() {
   })
   const prefs = useLiveQuery(readGlobalPreferences, [], DEFAULT_GLOBAL_PREFERENCES)
   const globalCalibration = useLiveQuery(readTokenCalibrationGlobal, [], null)
+  const sidebarSortMode = useLiveQuery(readSidebarSortMode, [], DEFAULT_SIDEBAR_SORT_MODE)
   const trailingLeaf = useMemo(() => activePathMemo.at(-1) ?? null, [activePathMemo])
   const trailingUserMessage = trailingLeaf?.role === 'user' ? trailingLeaf : null
   const streamActivityKey = useStreamStore((s) =>
@@ -694,7 +697,12 @@ export function Shell() {
       data-sidebar={sidebarCollapsed ? 'collapsed' : 'expanded'}
       data-focus-mode={effectiveFocusMode ? 'on' : 'off'}
     >
-      <aside data-ui="sidebar" data-collapsed={sidebarCollapsed} aria-label="Chats">
+      <aside
+        data-ui="sidebar"
+        data-collapsed={sidebarCollapsed}
+        data-sort-key={sidebarSortMode}
+        aria-label="Chats"
+      >
         <div data-ui="sidebar-header">
           {sidebarCollapsed ? null : (
             <a data-ui="brand" href={homeHref()} onClick={makeAnchorClickHandler(homeHref())}>

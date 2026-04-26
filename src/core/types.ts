@@ -564,7 +564,7 @@ export interface Chat {
   favoriteModels?: string[]
   recentModels?: string[]
   // Denormalized sidebar preview — plaintext of the earliest live user
-  // message, trimmed to ~80 chars. Populated by `refreshChatPreview`
+  // message, trimmed to a generous single-line cap. Populated by `refreshChatPreview`
   // whenever a user message is created, edited, or deleted. The sidebar
   // reads this directly off the chat row so listing N chats never has to
   // touch the `messages` table (critical once a workspace holds

@@ -1,6 +1,10 @@
 import { render } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
 import { MarkdownView } from '../../src/ui/chat/MarkdownView'
+import {
+  DEFAULT_RENDERING_PREFS,
+  RenderingPreferencesContext,
+} from '../../src/ui/settings/RenderingSettings'
 
 describe('MarkdownView', () => {
   it('renders an empty surface for empty content without throwing', () => {
@@ -82,9 +86,42 @@ describe('MarkdownView', () => {
     expect(container.querySelector('.katex')).toBeNull()
   })
 
-  it('still renders double-dollar inline math', () => {
+  it('still renders double-dollar math', () => {
     const { container } = render(<MarkdownView content="Use $$E = mc^2$$ here." />)
     expect(container.querySelector('.katex')).toBeTruthy()
     expect(container.textContent).toContain('E=mc')
+  })
+
+  it('renders single-dollar math when the rendering preference is enabled', () => {
+    const { container } = render(
+      <RenderingPreferencesContext.Provider
+        value={{ ...DEFAULT_RENDERING_PREFS, singleDollarTextMath: true }}
+      >
+        <MarkdownView content="Use $x + y$ here." />
+      </RenderingPreferencesContext.Provider>,
+    )
+    expect(container.querySelector('.katex')).toBeTruthy()
+    expect(container.textContent).toContain('x+y')
+  })
+
+  it('re-renders mounted markdown when the single-dollar preference changes', () => {
+    const content = 'Use $x + y$ here.'
+    const { container, rerender } = render(
+      <RenderingPreferencesContext.Provider
+        value={{ ...DEFAULT_RENDERING_PREFS, singleDollarTextMath: false }}
+      >
+        <MarkdownView content={content} />
+      </RenderingPreferencesContext.Provider>,
+    )
+    expect(container.querySelector('.katex')).toBeNull()
+
+    rerender(
+      <RenderingPreferencesContext.Provider
+        value={{ ...DEFAULT_RENDERING_PREFS, singleDollarTextMath: true }}
+      >
+        <MarkdownView content={content} />
+      </RenderingPreferencesContext.Provider>,
+    )
+    expect(container.querySelector('.katex')).toBeTruthy()
   })
 })

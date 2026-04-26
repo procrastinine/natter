@@ -6,8 +6,8 @@ import {
   diffAttachmentRefs,
   incRefs,
 } from '../store/attachments'
-import { getBrowserRepository } from '../store/browser-repo'
 import type { MutationContext, WorkspaceMutationResult } from '../store/repository'
+import { getWorkspaceRepository } from '../store/workspace-repository'
 import { cursorKeyOf, groupByParent, indexById } from './active-path'
 import { cloneForExplicitBranch } from './branching'
 import { readGlobalPreferences } from './global-settings'
@@ -437,7 +437,7 @@ export interface SendUserMessageInput {
 export async function sendUserMessage(
   input: SendUserMessageInput,
 ): Promise<{ effects: StructuralEffects; versions: ChatVersions; messageId: MessageId }> {
-  const repo = getBrowserRepository()
+  const repo = getWorkspaceRepository()
   const { chatId, cursor, content, attachmentRefs, now = Date.now() } = input
   const role = input.role ?? 'user'
   const origin = input.origin ?? 'user'
@@ -515,7 +515,7 @@ export interface RegenerateInput {
 export async function regenerateAssistant(
   input: RegenerateInput,
 ): Promise<{ effects: StructuralEffects; versions: ChatVersions; messageId: MessageId }> {
-  const repo = getBrowserRepository()
+  const repo = getWorkspaceRepository()
   const target = await repo.getMessage(input.messageId)
   if (!target || target.chatId !== input.chatId || target.deleted) {
     throw new TreeChangedError(input.chatId, `regenerate target ${input.messageId} unavailable`)
@@ -567,7 +567,7 @@ export interface EditMessageInput {
 export async function editMessageContent(
   input: EditMessageInput,
 ): Promise<{ versions: ChatVersions }> {
-  const repo = getBrowserRepository()
+  const repo = getWorkspaceRepository()
   const target = await repo.getMessage(input.messageId)
   if (!target || target.chatId !== input.chatId || target.deleted) {
     throw new TreeChangedError(input.chatId, `edit target ${input.messageId} unavailable`)
@@ -633,7 +633,7 @@ export async function branchExplicit(params: {
   messageId: MessageId
   now?: number
 }): Promise<{ effects: StructuralEffects; versions: ChatVersions; messageId: MessageId }> {
-  const repo = getBrowserRepository()
+  const repo = getWorkspaceRepository()
   const source = await repo.getMessage(params.messageId)
   if (!source || source.chatId !== params.chatId || source.deleted) {
     throw new TreeChangedError(params.chatId, `branch source ${params.messageId} unavailable`)
@@ -677,7 +677,7 @@ export async function continueAssistant(params: {
   messageId: MessageId
   now?: number
 }): Promise<{ effects: StructuralEffects; versions: ChatVersions; messageId: MessageId }> {
-  const repo = getBrowserRepository()
+  const repo = getWorkspaceRepository()
   const target = await repo.getMessage(params.messageId)
   if (!target || target.chatId !== params.chatId || target.deleted) {
     throw new TreeChangedError(params.chatId, `continue target ${params.messageId} unavailable`)
@@ -731,7 +731,7 @@ export interface InsertSiblingInput {
 export async function insertSibling(
   input: InsertSiblingInput,
 ): Promise<{ effects: StructuralEffects; versions: ChatVersions; messageId: MessageId }> {
-  const repo = getBrowserRepository()
+  const repo = getWorkspaceRepository()
   const target = await repo.getMessage(input.targetId)
   if (!target || target.chatId !== input.chatId || target.deleted) {
     throw new TreeChangedError(input.chatId, `insert-sibling target ${input.targetId} unavailable`)
@@ -793,7 +793,7 @@ export interface InsertBetweenInput {
 export async function insertBetween(
   input: InsertBetweenInput,
 ): Promise<{ effects: StructuralEffects; versions: ChatVersions; messageId: MessageId }> {
-  const repo = getBrowserRepository()
+  const repo = getWorkspaceRepository()
   const snapshot = await repo.listMessages(input.chatId)
   const messageId = newId()
   const scopes = dedupeScopes([
@@ -838,7 +838,7 @@ export interface AppendAsChildInput {
 export async function appendAsChild(
   input: AppendAsChildInput,
 ): Promise<{ effects: StructuralEffects; versions: ChatVersions; messageId: MessageId }> {
-  const repo = getBrowserRepository()
+  const repo = getWorkspaceRepository()
   const parent = await repo.getMessage(input.parentMessageId)
   if (!parent || parent.chatId !== input.chatId || parent.deleted) {
     throw new TreeChangedError(
@@ -915,7 +915,7 @@ export async function pasteImport(
   if (input.messages.length === 0) {
     return { effects: emptyEffects(), versions: ZERO_VERSIONS, newMessageIds: [] }
   }
-  const repo = getBrowserRepository()
+  const repo = getWorkspaceRepository()
   const snapshot = await repo.listMessages(input.chatId)
   const newMessageIds = input.messages.map(() => newId())
   const attachmentIds = input.messages.flatMap((message) => message.attachmentRefs ?? [])
@@ -1197,7 +1197,7 @@ export interface DeleteInput {
 export async function deletePair(
   input: DeleteInput,
 ): Promise<{ effects: StructuralEffects; versions: ChatVersions }> {
-  const repo = getBrowserRepository()
+  const repo = getWorkspaceRepository()
   const all = await repo.listMessages(input.chatId)
   const byId = indexById(all)
   const byParent = groupByParent(all)
@@ -1228,7 +1228,7 @@ export async function deletePair(
 export async function deleteTurn(
   input: DeleteInput,
 ): Promise<{ effects: StructuralEffects; versions: ChatVersions }> {
-  const repo = getBrowserRepository()
+  const repo = getWorkspaceRepository()
   const all = await repo.listMessages(input.chatId)
   const byId = indexById(all)
   const byParent = groupByParent(all)
@@ -1264,7 +1264,7 @@ export async function deleteTurn(
 export async function deleteSingleMessage(
   input: DeleteInput,
 ): Promise<{ effects: StructuralEffects; versions: ChatVersions }> {
-  const repo = getBrowserRepository()
+  const repo = getWorkspaceRepository()
   const all = await repo.listMessages(input.chatId)
   const byId = indexById(all)
   const target = byId.get(input.messageId)
@@ -1287,7 +1287,7 @@ export async function deleteSingleMessage(
 export async function deleteVariant(
   input: DeleteInput,
 ): Promise<{ effects: StructuralEffects; versions: ChatVersions }> {
-  const repo = getBrowserRepository()
+  const repo = getWorkspaceRepository()
   const all = await repo.listMessages(input.chatId)
   const byId = indexById(all)
   const byParent = groupByParent(all)

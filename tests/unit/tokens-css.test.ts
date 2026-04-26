@@ -88,6 +88,7 @@ const REQUIRED_TOKENS = [
   '--space-8',
   '--space-10',
   '--sidebar-width',
+  '--sidebar-search-width',
   '--sidebar-width-collapsed',
   '--sidebar-folder-indent',
   '--sidebar-row-tag-gap',

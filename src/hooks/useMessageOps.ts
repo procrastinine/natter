@@ -30,11 +30,11 @@ import type {
   MessageId,
   ReasoningDetail,
 } from '../core/types'
-import { getBrowserRepository } from '../store/browser-repo'
 import { getChat, loadChatMessages } from '../store/chats'
 import { resolveKeyIfPresent } from '../store/keys'
 import { bumpPresetLastUsedAt } from '../store/presets'
 import { bumpProfileLastUsedAt, getProfile } from '../store/profiles'
+import { getWorkspaceRepository } from '../store/workspace-repository'
 import { useChatStore } from '../store/zustand/chatStore'
 import { writeTextInto } from '../ui/chat/InlineEditor'
 import type { SendTextResult } from './useChat'
@@ -73,7 +73,7 @@ export async function editInPlace(
   // generation factual record" rule for cost / usage / model while
   // still letting advanced users curate the reasoning carrier.
   if (reasoning !== undefined) {
-    const repo = getBrowserRepository()
+    const repo = getWorkspaceRepository()
     await repo.runMutation([{ kind: 'message', messageId: message.id }], async (ctx) => {
       const current = await ctx.getMessage(message.id)
       if (!current) return

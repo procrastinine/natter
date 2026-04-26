@@ -66,6 +66,10 @@ describe('parseRoute', () => {
       kind: 'storage',
       storage: { section: 'backups' },
     })
+    expect(parseRoute('#/storage/archive')).toEqual({
+      kind: 'storage',
+      storage: { section: 'archive' },
+    })
   })
 })
 
@@ -96,6 +100,7 @@ describe('routeToHref / convenience helpers', () => {
       '#/storage/attachments/unreferenced',
     )
     expect(storageHref({ section: 'backups' })).toBe('#/storage/backups')
+    expect(storageHref({ section: 'archive' })).toBe('#/storage/archive')
     expect(attachmentHref('att/1')).toBe('#/storage/attachments/att%2F1')
   })
 
@@ -111,6 +116,7 @@ describe('routeToHref / convenience helpers', () => {
       '#/storage/attachments/unreferenced',
       '#/storage/attachments/A',
       '#/storage/backups',
+      '#/storage/archive',
     ]
     for (const raw of cases) {
       const route = parseRoute(raw)

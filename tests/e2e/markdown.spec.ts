@@ -103,3 +103,28 @@ test('keeps currency ranges out of math rendering while preserving double-dollar
   await expect(assistant).toContainText('$10 to $12')
   await expect(assistant.locator('.katex')).toHaveCount(1)
 })
+
+test('global rendering setting enables single-dollar math', async ({ page }) => {
+  await mockChatCompletions(page, {
+    body: buildSseBody([
+      { id: 'single-dollar-math', content: 'Inline $x + y$ math.', finish: 'stop' },
+    ]),
+  })
+  await createChatAndOpen(page)
+  await sendMessage(page, 'show inline math')
+
+  const assistant = page.locator('[data-ui="message"][data-role="assistant"]').first()
+  await expect(assistant).toContainText('$x + y$')
+  await expect(assistant.locator('.katex')).toHaveCount(0)
+
+  await page.locator('[data-ui="open-global-settings"]').click()
+  await page.locator('[data-ui="settings-tab"][data-tab="appearance"]').click()
+  const toggle = page.getByLabel('Single-dollar LaTeX markdown')
+  await expect(toggle).not.toBeChecked()
+  await toggle.check()
+  await expect(toggle).toBeChecked()
+  await page.locator('[data-role="global-settings-close"]').click()
+
+  await expect(assistant.locator('.katex')).toHaveCount(1)
+  await expect(assistant).toContainText('x+y')
+})
