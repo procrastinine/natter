@@ -55,6 +55,11 @@ function asNumber(v: unknown): number | undefined {
   return typeof v === 'number' && Number.isFinite(v) ? v : undefined
 }
 
+function asPositiveNumber(v: unknown): number | undefined {
+  const n = asNumber(v)
+  return n !== undefined && n > 0 ? n : undefined
+}
+
 function asString(v: unknown): string | undefined {
   return typeof v === 'string' ? v : undefined
 }
@@ -187,7 +192,7 @@ export function normalizeEndpointsResponse(raw: unknown): EndpointsDescriptor | 
   if (name) out.name = name
   const description = asString(root.description)
   if (description) out.description = description
-  const cl = asNumber(root.context_length)
+  const cl = asPositiveNumber(root.context_length)
   if (cl !== undefined) out.contextLength = cl
   const arch = normalizeArchitecture(root.architecture)
   if (arch) out.architecture = arch
@@ -222,14 +227,14 @@ export function normalizeModelsResponse(raw: unknown): ModelListEntry[] {
     // tucks it under `meta.n_ctx_train` (training context); Ollama uses
     // `model_info.general.context_length` or similar. Try each so local
     // servers get a real numeric cap instead of the permissive default.
-    let cl = asNumber(obj.context_length)
+    let cl = asPositiveNumber(obj.context_length)
     if (cl === undefined) {
       const meta = asRecord(obj.meta)
-      cl = asNumber(meta?.n_ctx_train) ?? asNumber(meta?.n_ctx)
+      cl = asPositiveNumber(meta?.n_ctx_train) ?? asPositiveNumber(meta?.n_ctx)
     }
     if (cl === undefined) {
       const mi = asRecord(obj.model_info)
-      cl = asNumber(mi?.context_length)
+      cl = asPositiveNumber(mi?.context_length)
     }
     if (cl !== undefined) entry.contextLength = cl
     const arch = asRecord(obj.architecture)

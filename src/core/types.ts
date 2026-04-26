@@ -397,7 +397,7 @@ export interface ChatSettings {
   continuePrefill?: boolean
   sampling: Partial<Record<SamplingKey, number>>
   stop?: string[]
-  modalities?: Array<'text' | 'image' | 'audio'>
+  modalities?: Array<'text' | 'image' | 'audio' | 'video'>
   reasoning: ReasoningSettings
   verbosity?: VerbosityLevel
   maxCompletionTokens?: number
@@ -681,9 +681,17 @@ export type ContentItem =
     }
   | {
       type: 'audio_output'
-      attachmentId: AttachmentId
+      attachmentId?: AttachmentId
+      url?: string
       transcript?: string
       durationMs?: number
+      format?: 'wav' | 'mp3' | 'flac' | 'ogg' | 'm4a' | 'pcm16'
+    }
+  | {
+      type: 'output_video'
+      attachmentId?: AttachmentId
+      url?: string
+      prompt?: string
     }
 
 export interface Annotation {
@@ -747,7 +755,13 @@ export interface GenerationMeta {
   requestedModel: string
   requestedModels?: string[]
   provider?: string
-  apiUsed: 'chat' | 'responses' | 'gemini-native' | 'anthropic-messages' | 'completion'
+  apiUsed:
+    | 'chat'
+    | 'responses'
+    | 'gemini-native'
+    | 'anthropic-messages'
+    | 'completion'
+    | 'video-generation'
   delivery: DeliveryMethod
   usage?: ChatUsage
   cost?: number
@@ -1022,7 +1036,7 @@ export interface CapabilityDescriptor {
   }
   architecture?: {
     inputModalities?: Array<'text' | 'image' | 'audio' | 'video' | 'file'>
-    outputModalities?: Array<'text' | 'image' | 'audio'>
+    outputModalities?: Array<'text' | 'image' | 'audio' | 'video'>
   }
 }
 

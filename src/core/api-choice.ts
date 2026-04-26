@@ -29,6 +29,7 @@ export type ApiRouteKind =
   | 'responses'
   | 'gemini-generate'
   | 'anthropic-messages'
+  | 'video-generation'
 
 export type ApiTransport =
   | 'openai-chat'
@@ -36,6 +37,7 @@ export type ApiTransport =
   | 'openai-responses'
   | 'gemini-native'
   | 'anthropic'
+  | 'openrouter-video'
 
 export interface ApiRoute {
   kind: ApiRouteKind
@@ -55,6 +57,7 @@ export interface RouterCapabilities {
     reasoningHidden?: boolean
     hiddenReasoningOnChatApi?: boolean
   }
+  outputModalities?: ReadonlySet<string>
 }
 
 export function chooseApi(
@@ -69,6 +72,13 @@ export function chooseApi(
   const reasoning = normalizeReasoningSettings(settings.reasoning)
   const pin: ApiVariant = settings.api
   const support = responsesSupportFor(settings.model)
+
+  if (profile.kind === 'openrouter' && caps.outputModalities?.has('video')) {
+    return openRouterVideo('video output uses OpenRouter Video Generation API')
+  }
+  if (profile.kind === 'openrouter' && caps.outputModalities?.has('audio')) {
+    return openAiChat('audio output requires chat-completions streaming')
+  }
 
   // Step 1 — user-pinned chat completions. Wins over everything EXCEPT a
   // model that 404s on chat-completions (`responsesSupport: 'responses-only'`
@@ -231,6 +241,10 @@ function openAiResponses(reason: string): ApiRoute {
 
 function geminiNative(reason: string): ApiRoute {
   return { kind: 'gemini-generate', transport: 'gemini-native', reason }
+}
+
+function openRouterVideo(reason: string): ApiRoute {
+  return { kind: 'video-generation', transport: 'openrouter-video', reason }
 }
 
 // Convenience predicates used by the UI to decide whether to enable the

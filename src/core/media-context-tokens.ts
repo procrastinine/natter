@@ -26,7 +26,8 @@ export function mediaTokensForContent(
     } else if (
       item.type === 'input_audio' ||
       item.type === 'audio_output' ||
-      item.type === 'video_url'
+      item.type === 'video_url' ||
+      item.type === 'output_video'
     ) {
       tokens += genericMediaTokensForItem(item.attachmentId, resolver)
     }
@@ -96,7 +97,8 @@ function mediaTokensForContentWithVisibility(
     } else if (
       item.type === 'input_audio' ||
       item.type === 'audio_output' ||
-      item.type === 'video_url'
+      item.type === 'video_url' ||
+      item.type === 'output_video'
     ) {
       tokens += genericMediaTokensForItem(item.attachmentId, resolver)
     }

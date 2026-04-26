@@ -3,6 +3,7 @@ import { buildSseBody, clearIndexedDb, createChatAndOpen, seedFirstRun } from '.
 
 const OSS_MODEL = 'qwen/qwen3-4b'
 const OPENAI_MODEL = 'gpt-4o-mini'
+const VIDEO_MODEL = 'google/veo-3.1-lite'
 const LONG_OPENROUTER_DRAFT = `GUI OpenRouter route check ${'x'.repeat(2000)}`
 const OR_MODELS_QUERY_KEY =
   '{"outputModalities":["audio","file","image","text","video"],"supportedParameters":[]}'
@@ -178,6 +179,73 @@ test('GUI OpenAI-compatible send uses Responses and never carries OpenRouter pro
   expect(consoleLines.filter((line) => line.startsWith('error:'))).toEqual([])
 })
 
+test('GUI OpenRouter video model uses parent /endpoints architecture for UI and send routing', async ({
+  page,
+}) => {
+  const consoleLines = captureConsole(page)
+  const videoRequests: CapturedRequest[] = []
+  const videoDownloads: string[] = []
+  await mockOpenRouterDiscovery(page, VIDEO_MODEL)
+  await mockOpenRouterVideos(page, videoRequests, videoDownloads)
+
+  await seedFirstRun(page, { model: VIDEO_MODEL, disablePrivacyFilter: false })
+  const profileId = await activeProfileId(page)
+  await seedOpenRouterDiscovery(page, profileId, VIDEO_MODEL)
+  await page.evaluate(() =>
+    (window as unknown as { __debugStreams?: { clearPlans(): void } }).__debugStreams?.clearPlans(),
+  )
+
+  await createChatAndOpen(page)
+  const composer = page.locator('[data-ui="composer-input"]')
+  await composer.fill('GUI video route check')
+  await page.locator('[data-role="settings-cog"]').click()
+  await expect(page.locator('[data-ui-section="api-mode"]')).toHaveCount(0)
+  await page.locator('[data-ui="settings-tab"][data-tab="context"]').click()
+  await expect(page.locator('[data-ui-section="context-control"]')).toContainText(
+    'Video generation does not expose a token context window.',
+  )
+
+  await composer.press('Enter')
+  await expect(
+    page
+      .locator('[data-ui="message"][data-role="assistant"]')
+      .first()
+      .locator('[data-ui="message-output-media"][data-media="video"]'),
+  ).toHaveCount(2)
+
+  expect(videoRequests).toHaveLength(1)
+  expect(videoRequests[0]?.url).toContain('/videos')
+  expect(videoRequests[0]?.body).toMatchObject({
+    model: VIDEO_MODEL,
+    prompt: 'GUI video route check',
+  })
+  expect(videoRequests[0]?.body.provider).toMatchObject({ data_collection: 'deny' })
+  expect(videoDownloads).toEqual([
+    'https://openrouter.ai/api/v1/videos/video-gui-1/content?index=0',
+    'https://openrouter.ai/api/v1/videos/video-gui-1/content?index=1',
+  ])
+  const videoSrcs = await page
+    .locator('[data-ui="message-output-media"][data-media="video"] video')
+    .evaluateAll((nodes) =>
+      nodes.map((node) => (node as HTMLVideoElement).currentSrc || node.getAttribute('src') || ''),
+    )
+  expect(videoSrcs).toHaveLength(2)
+  expect(videoSrcs.every((src) => src.startsWith('blob:'))).toBe(true)
+
+  const plans = await requestPlans(page)
+  const sendPlan = findPlan(plans, 'send')
+  expect(sendPlan.payload.route).toMatchObject({
+    kind: 'video-generation',
+    transport: 'openrouter-video',
+  })
+  expect(sendPlan.payload.wireShape).toMatchObject({ hasProvider: true, hasMessages: false })
+  expect(providerSummary(sendPlan).privacy).toMatchObject({
+    applicable: true,
+    kept: [expect.objectContaining({ provider: 'Google' })],
+  })
+  expect(consoleLines.filter((line) => line.startsWith('error:'))).toEqual([])
+})
+
 function captureConsole(page: Page): string[] {
   const lines: string[] = []
   page.on('console', (msg) => {
@@ -245,19 +313,19 @@ async function mockOpenAiDirect(page: Page, responsesRequests: CapturedRequest[]
   })
 }
 
-async function mockOpenRouterDiscovery(page: Page): Promise<void> {
+async function mockOpenRouterDiscovery(page: Page, modelId: string = OSS_MODEL): Promise<void> {
   await page.route('https://openrouter.ai/api/v1/models**', async (route) => {
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
-      body: JSON.stringify(openRouterModelsPayload(OSS_MODEL)),
+      body: JSON.stringify(openRouterModelsPayload(modelId)),
     })
   })
   await page.route('https://openrouter.ai/api/v1/models/**/endpoints', async (route) => {
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
-      body: JSON.stringify(openRouterEndpointsPayload(OSS_MODEL)),
+      body: JSON.stringify(openRouterEndpointsPayload(modelId)),
     })
   })
   await page.route('**/_or_scrape/**', async (route) => {
@@ -265,8 +333,42 @@ async function mockOpenRouterDiscovery(page: Page): Promise<void> {
       status: 200,
       contentType: 'text/html',
       body: `<script id="__NEXT_DATA__" type="application/json">${JSON.stringify({
-        props: { pageProps: { providers: openRouterProviderPolicyRows() } },
+        props: { pageProps: { providers: openRouterProviderPolicyRows(modelId) } },
       })}</script>`,
+    })
+  })
+}
+
+async function mockOpenRouterVideos(
+  page: Page,
+  requests: CapturedRequest[],
+  downloads: string[],
+): Promise<void> {
+  await page.route('https://openrouter.ai/api/v1/videos/video-gui-1/content**', async (route) => {
+    downloads.push(route.request().url())
+    await route.fulfill({
+      status: 200,
+      contentType: 'video/mp4',
+      body: Buffer.from([0, 0, 0, 24, 102, 116, 121, 112, 109, 112, 52, 50]),
+    })
+  })
+  await page.route('https://openrouter.ai/api/v1/videos', async (route) => {
+    const body = parsePostBody(route.request().postData())
+    requests.push({ url: route.request().url(), body })
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        id: 'video-gui-1',
+        generation_id: 'video-gui-1',
+        polling_url: 'https://openrouter.ai/api/v1/videos/video-gui-1',
+        status: 'completed',
+        unsigned_urls: [
+          'https://openrouter.ai/api/v1/videos/video-gui-1/content?index=0',
+          'https://openrouter.ai/api/v1/videos/video-gui-1/content?index=1',
+        ],
+        usage: { cost: 0.001 },
+      }),
     })
   })
 }
@@ -394,6 +496,24 @@ async function seedOpenRouterDiscovery(
 }
 
 function openRouterModelsPayload(modelId: string): Record<string, unknown> {
+  if (modelId === VIDEO_MODEL) {
+    return {
+      data: [
+        {
+          id: modelId,
+          name: 'Veo 3.1 Lite',
+          context_length: 0,
+          architecture: {
+            input_modalities: ['text', 'image'],
+            output_modalities: ['video'],
+            tokenizer: 'Other',
+          },
+          pricing: { image: '0.02' },
+          supported_parameters: ['max_tokens', 'temperature', 'top_p', 'seed', 'response_format'],
+        },
+      ],
+    }
+  }
   return {
     data: [
       {
@@ -413,6 +533,31 @@ function openRouterModelsPayload(modelId: string): Record<string, unknown> {
 }
 
 function openRouterEndpointsPayload(modelId: string): Record<string, unknown> {
+  if (modelId === VIDEO_MODEL) {
+    return {
+      data: {
+        id: modelId,
+        name: 'Veo 3.1 Lite',
+        context_length: 0,
+        architecture: {
+          input_modalities: ['text', 'image'],
+          output_modalities: ['video'],
+          tokenizer: 'Other',
+        },
+        endpoints: [
+          {
+            provider_name: 'Google',
+            provider_slug: 'google',
+            supported_parameters: ['max_tokens', 'temperature', 'top_p', 'seed'],
+            context_length: 0,
+            max_prompt_tokens: null,
+            max_completion_tokens: null,
+            pricing: { image: '0.02' },
+          },
+        ],
+      },
+    }
+  }
   return {
     data: {
       id: modelId,
@@ -455,7 +600,12 @@ function endpoint(
   }
 }
 
-function openRouterPolicies(): Record<string, Record<string, unknown>> {
+function openRouterPolicies(modelId: string = OSS_MODEL): Record<string, Record<string, unknown>> {
+  if (modelId === VIDEO_MODEL) {
+    return {
+      Google: policy({}),
+    }
+  }
   return {
     'Alpha ZDR': policy({}),
     'Budget Clean': policy({}),
@@ -466,8 +616,8 @@ function openRouterPolicies(): Record<string, Record<string, unknown>> {
   }
 }
 
-function openRouterProviderPolicyRows(): Array<Record<string, unknown>> {
-  return Object.entries(openRouterPolicies()).map(([provider_name, data_policy]) => ({
+function openRouterProviderPolicyRows(modelId: string = OSS_MODEL): Array<Record<string, unknown>> {
+  return Object.entries(openRouterPolicies(modelId)).map(([provider_name, data_policy]) => ({
     provider_name,
     data_policy,
   }))

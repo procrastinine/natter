@@ -10,6 +10,7 @@ import {
 } from '../../src/store/browser-repo'
 import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
 import {
+  materializeGeneratedOutputAttachments,
   migrateGeneratedImageOutputAttachments,
   normalizeGeneratedImageOutputAttachmentRefs,
 } from '../../src/store/generated-images'
@@ -60,6 +61,35 @@ async function seedChat(): Promise<Chat> {
 }
 
 describe('generated image output storage migration', () => {
+  it('materializes raw generated audio data URLs into attachments', async () => {
+    const materialized = await materializeGeneratedOutputAttachments({
+      messageId: 'm-audio',
+      content: [
+        {
+          type: 'audio_output',
+          url: 'data:audio/wav;base64,UklGRg==',
+          transcript: 'Hi',
+          format: 'wav',
+        },
+      ],
+      now: 10,
+    })
+    const output = materialized.content[0]
+    expect(output).toMatchObject({ type: 'audio_output', transcript: 'Hi', format: 'wav' })
+    expect(output?.type === 'audio_output' ? output.url : undefined).toBeUndefined()
+    const attachmentId = output?.type === 'audio_output' ? output.attachmentId : undefined
+    expect(attachmentId).toBeTruthy()
+    expect(materialized.newRefs).toHaveLength(1)
+    const bundle = attachmentId
+      ? await getBrowserRepository().getAttachmentBundle(attachmentId)
+      : undefined
+    expect(bundle?.attachment).toMatchObject({
+      kind: 'audio',
+      mime: 'audio/wav',
+      origin: 'generated-output',
+    })
+  })
+
   it('moves legacy raw output_image data URLs into stored generated attachments', async () => {
     const chat = await seedChat()
     const message: Message = {

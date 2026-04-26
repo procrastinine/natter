@@ -5,6 +5,7 @@ import { geminiOnce, geminiStream, type GeminiContext } from './gemini-native'
 import type { GenerateContentResponseWire } from './gemini-types'
 import { responses, responsesOnce } from './responses'
 import { textCompletions, textCompletionsOnce } from './text-completions'
+import { videoGeneration } from './video-generation'
 import type {
   ChatCompletionResultWire,
   ChatStreamChunk,
@@ -54,6 +55,13 @@ export function openAssistantRequestStream(
       { ...(signal ? { signal } : {}) },
     )
   }
+  if (requestPlan.route?.transport === 'openrouter-video') {
+    return videoGeneration(
+      ctx,
+      requestPlan.wire as Parameters<typeof videoGeneration>[1],
+      { ...(signal ? { signal } : {}) },
+    )
+  }
   return chatCompletions(ctx, requestPlan.wire as Parameters<typeof chatCompletions>[1], {
     ...(signal ? { signal } : {}),
   })
@@ -84,6 +92,9 @@ export async function runAssistantRequestOnce(
       requestPlan.geminiModelId ?? requestPlan.requestedModel,
       { ...(signal ? { signal } : {}) },
     )
+  }
+  if (requestPlan.route?.transport === 'openrouter-video') {
+    throw new Error('runAssistantRequestOnce: video generation is an asynchronous streaming route')
   }
   return chatCompletionsOnce(
     ctx,

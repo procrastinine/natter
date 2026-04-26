@@ -1,5 +1,5 @@
 import { useLiveQuery } from 'dexie-react-hooks'
-import { useEffect, useMemo, useState } from 'react'
+import { useMemo } from 'react'
 import type { AttachmentBlob, AttachmentRef, ContentItem, MessageId } from '../../core/types'
 import { liveAttachmentRefs } from '../../store/attachment-refs'
 import { getBrowserRepository } from '../../store/browser-repo'
@@ -20,6 +20,12 @@ export interface MessageContentProps {
 
 const COMPACT_PREVIEW_CHARS = 8_000
 const PEEK_PREVIEW_CHARS = 160
+const MAX_OUTPUT_OBJECT_URL_CACHE = 128
+
+const outputObjectUrlCache = new Map<
+  string,
+  { url: string; contentHash: string; sizeBytes: number }
+>()
 
 export function messageTextFromContent(content: ContentItem[]): string {
   return content
@@ -39,21 +45,30 @@ export function MessageContent({
   attachmentRefs,
 }: MessageContentProps) {
   const images = useMemo(() => outputImagesFromContent(content), [content])
-  const imageRefs = useMemo(() => liveAttachmentRefs(attachmentRefs), [attachmentRefs])
+  const audios = useMemo(() => outputAudiosFromContent(content), [content])
+  const videos = useMemo(() => outputVideosFromContent(content), [content])
+  const mediaRefs = useMemo(() => liveAttachmentRefs(attachmentRefs), [attachmentRefs])
   const body = (
     <div data-ui="message-body" data-role="content">
       {text.length > 0 ? <MarkdownView content={text} streaming={streaming} /> : null}
-      <OutputImages images={images} messageId={messageId} attachmentRefs={imageRefs} />
+      <OutputImages images={images} messageId={messageId} attachmentRefs={mediaRefs} />
+      <OutputAudios audios={audios} messageId={messageId} attachmentRefs={mediaRefs} />
+      <OutputVideos videos={videos} messageId={messageId} attachmentRefs={mediaRefs} />
     </div>
   )
   const compactText = useMemo(() => previewSlice(text, COMPACT_PREVIEW_CHARS), [text])
   const compact = (
     <div data-ui="message-body" data-role="content" data-overflow="compact">
       {compactText.length > 0 ? <MarkdownView content={compactText} streaming={streaming} /> : null}
-      <OutputImages images={images} messageId={messageId} attachmentRefs={imageRefs} />
+      <OutputImages images={images} messageId={messageId} attachmentRefs={mediaRefs} />
+      <OutputAudios audios={audios} messageId={messageId} attachmentRefs={mediaRefs} />
+      <OutputVideos videos={videos} messageId={messageId} attachmentRefs={mediaRefs} />
     </div>
   )
-  const peekText = useMemo(() => previewFirstLine(text, images.length), [text, images.length])
+  const peekText = useMemo(
+    () => previewFirstLine(text, images.length + audios.length + videos.length),
+    [text, images.length, audios.length, videos.length],
+  )
   const peek = (
     <div data-ui="message-body" data-role="text" data-overflow="peek">
       <p data-ui="message-body-peek">{peekText}</p>
@@ -80,6 +95,22 @@ function outputImagesFromContent(content: readonly ContentItem[]) {
   return content.filter(
     (item): item is Extract<ContentItem, { type: 'output_image' }> =>
       item.type === 'output_image' &&
+      ((typeof item.url === 'string' && item.url.length > 0) || Boolean(item.attachmentId)),
+  )
+}
+
+function outputAudiosFromContent(content: readonly ContentItem[]) {
+  return content.filter(
+    (item): item is Extract<ContentItem, { type: 'audio_output' }> =>
+      item.type === 'audio_output' &&
+      ((typeof item.url === 'string' && item.url.length > 0) || Boolean(item.attachmentId)),
+  )
+}
+
+function outputVideosFromContent(content: readonly ContentItem[]) {
+  return content.filter(
+    (item): item is Extract<ContentItem, { type: 'output_video' }> =>
+      item.type === 'output_video' &&
       ((typeof item.url === 'string' && item.url.length > 0) || Boolean(item.attachmentId)),
   )
 }
@@ -114,6 +145,66 @@ function OutputImages({
   )
 }
 
+function OutputAudios({
+  audios,
+  messageId,
+  attachmentRefs,
+}: {
+  audios: Array<Extract<ContentItem, { type: 'audio_output' }>>
+  messageId?: MessageId | undefined
+  attachmentRefs: ReturnType<typeof liveAttachmentRefs>
+}) {
+  if (audios.length === 0) return null
+  return (
+    <div data-ui="message-output-media-list" data-media="audio">
+      {audios.map((audio, index) => {
+        const ref = audio.attachmentId
+          ? attachmentRefs.find((candidate) => candidate.attachmentId === audio.attachmentId)
+          : undefined
+        return (
+          <OutputAudio
+            key={audio.attachmentId ?? audio.url}
+            audio={audio}
+            index={index}
+            messageId={messageId}
+            attachmentRef={ref}
+          />
+        )
+      })}
+    </div>
+  )
+}
+
+function OutputVideos({
+  videos,
+  messageId,
+  attachmentRefs,
+}: {
+  videos: Array<Extract<ContentItem, { type: 'output_video' }>>
+  messageId?: MessageId | undefined
+  attachmentRefs: ReturnType<typeof liveAttachmentRefs>
+}) {
+  if (videos.length === 0) return null
+  return (
+    <div data-ui="message-output-media-list" data-media="video">
+      {videos.map((video, index) => {
+        const ref = video.attachmentId
+          ? attachmentRefs.find((candidate) => candidate.attachmentId === video.attachmentId)
+          : undefined
+        return (
+          <OutputVideo
+            key={video.attachmentId ?? video.url}
+            video={video}
+            index={index}
+            messageId={messageId}
+            attachmentRef={ref}
+          />
+        )
+      })}
+    </div>
+  )
+}
+
 function OutputImage({
   image,
   index,
@@ -134,17 +225,7 @@ function OutputImage({
     undefined,
   )
   const blob = useMemo(() => selectOutputImageBlob(bundle), [bundle])
-  const [objectUrl, setObjectUrl] = useState<string | undefined>(undefined)
-
-  useEffect(() => {
-    if (!blob || !(blob.blob instanceof Blob) || typeof URL.createObjectURL !== 'function') {
-      setObjectUrl(undefined)
-      return
-    }
-    const url = URL.createObjectURL(blob.blob)
-    setObjectUrl(url)
-    return () => URL.revokeObjectURL?.(url)
-  }, [blob])
+  const objectUrl = useMemo(() => objectUrlForOutputBlob(blob), [blob])
 
   const remoteUrl = remoteAttachmentUrl(bundle)
   const src = objectUrl ?? remoteUrl ?? image.url
@@ -157,32 +238,146 @@ function OutputImage({
     >
       {src ? <img src={src} alt={alt} /> : <span data-ui="message-output-image-missing" />}
       {messageId && attachmentRef ? (
-        <button
-          type="button"
-          data-ui="message-output-image-context-toggle"
-          aria-pressed={attachmentRef.includeInContext}
-          aria-label={
-            attachmentRef.includeInContext
-              ? 'Hide generated image from context'
-              : 'Include generated image in context'
-          }
-          title={
-            attachmentRef.includeInContext
-              ? 'Hide this generated image from future context'
-              : 'Include this generated image in future context'
-          }
-          onClick={() =>
-            void setAttachmentRefVisibility({
-              messageId,
-              refId: attachmentRef.refId,
-              includeInContext: !attachmentRef.includeInContext,
-            })
-          }
-        >
-          {attachmentRef.includeInContext ? <EyeIcon size={14} /> : <EyeOffIcon size={14} />}
-        </button>
+        <OutputMediaContextToggle
+          messageId={messageId}
+          attachmentRef={attachmentRef}
+          noun="image"
+        />
       ) : null}
     </figure>
+  )
+}
+
+function OutputAudio({
+  audio,
+  messageId,
+  attachmentRef,
+}: {
+  audio: Extract<ContentItem, { type: 'audio_output' }>
+  index: number
+  messageId?: MessageId | undefined
+  attachmentRef?: ReturnType<typeof liveAttachmentRefs>[number] | undefined
+}) {
+  const bundle = useLiveQuery(
+    async () => {
+      if (!audio.attachmentId) return undefined
+      return getBrowserRepository().getAttachmentBundle(audio.attachmentId)
+    },
+    [audio.attachmentId],
+    undefined,
+  )
+  const blob = useMemo(() => selectOutputImageBlob(bundle), [bundle])
+  const objectUrl = useMemo(() => objectUrlForOutputBlob(blob), [blob])
+
+  const src = objectUrl ?? remoteAttachmentUrl(bundle) ?? audio.url
+  return (
+    <figure
+      data-ui="message-output-media"
+      data-media="audio"
+      data-context={attachmentRef?.includeInContext === false ? 'excluded' : 'included'}
+      data-has-context-toggle={messageId && attachmentRef ? 'true' : undefined}
+    >
+      {src ? (
+        // biome-ignore lint/a11y/useMediaCaption: audio-output captions arrive as transcript text, not a timed VTT track.
+        <audio controls src={src} preload="metadata" />
+      ) : null}
+      {audio.transcript ? <figcaption>{audio.transcript}</figcaption> : null}
+      {messageId && attachmentRef ? (
+        <OutputMediaContextToggle
+          messageId={messageId}
+          attachmentRef={attachmentRef}
+          noun="audio"
+        />
+      ) : null}
+    </figure>
+  )
+}
+
+function OutputVideo({
+  video,
+  index,
+  messageId,
+  attachmentRef,
+}: {
+  video: Extract<ContentItem, { type: 'output_video' }>
+  index: number
+  messageId?: MessageId | undefined
+  attachmentRef?: ReturnType<typeof liveAttachmentRefs>[number] | undefined
+}) {
+  const bundle = useLiveQuery(
+    async () => {
+      if (!video.attachmentId) return undefined
+      return getBrowserRepository().getAttachmentBundle(video.attachmentId)
+    },
+    [video.attachmentId],
+    undefined,
+  )
+  const blob = useMemo(() => selectOutputImageBlob(bundle), [bundle])
+  const objectUrl = useMemo(() => objectUrlForOutputBlob(blob), [blob])
+
+  const src = objectUrl ?? remoteAttachmentUrl(bundle) ?? video.url
+  const title = video.prompt ?? bundle?.attachment.filename ?? `Generated video ${index + 1}`
+  return (
+    <figure
+      data-ui="message-output-media"
+      data-media="video"
+      data-context={attachmentRef?.includeInContext === false ? 'excluded' : 'included'}
+      data-has-context-toggle={messageId && attachmentRef ? 'true' : undefined}
+    >
+      {src ? (
+        // biome-ignore lint/a11y/useMediaCaption: generated video jobs do not return timed caption tracks.
+        <video
+          controls
+          src={src}
+          title={title}
+          preload={video.attachmentId ? 'auto' : 'metadata'}
+        />
+      ) : null}
+      {messageId && attachmentRef ? (
+        <OutputMediaContextToggle
+          messageId={messageId}
+          attachmentRef={attachmentRef}
+          noun="video"
+        />
+      ) : null}
+    </figure>
+  )
+}
+
+function OutputMediaContextToggle({
+  messageId,
+  attachmentRef,
+  noun,
+}: {
+  messageId: MessageId
+  attachmentRef: ReturnType<typeof liveAttachmentRefs>[number]
+  noun: 'image' | 'audio' | 'video'
+}) {
+  return (
+    <button
+      type="button"
+      data-ui="message-output-image-context-toggle"
+      aria-pressed={attachmentRef.includeInContext}
+      aria-label={
+        attachmentRef.includeInContext
+          ? `Hide generated ${noun} from context`
+          : `Include generated ${noun} in context`
+      }
+      title={
+        attachmentRef.includeInContext
+          ? `Hide this generated ${noun} from future context`
+          : `Include this generated ${noun} in future context`
+      }
+      onClick={() =>
+        void setAttachmentRefVisibility({
+          messageId,
+          refId: attachmentRef.refId,
+          includeInContext: !attachmentRef.includeInContext,
+        })
+      }
+    >
+      {attachmentRef.includeInContext ? <EyeIcon size={14} /> : <EyeOffIcon size={14} />}
+    </button>
   )
 }
 
@@ -194,21 +389,50 @@ function selectOutputImageBlob(bundle: AttachmentBundle | undefined): Attachment
   )
 }
 
+function objectUrlForOutputBlob(blob: AttachmentBlob | undefined): string | undefined {
+  if (!blob || !(blob.blob instanceof Blob) || typeof URL.createObjectURL !== 'function') {
+    return undefined
+  }
+  const cached = outputObjectUrlCache.get(blob.id)
+  if (cached && cached.contentHash === blob.contentHash && cached.sizeBytes === blob.sizeBytes) {
+    return cached.url
+  }
+  if (cached) URL.revokeObjectURL?.(cached.url)
+  const url = URL.createObjectURL(blob.blob)
+  outputObjectUrlCache.set(blob.id, {
+    url,
+    contentHash: blob.contentHash,
+    sizeBytes: blob.sizeBytes,
+  })
+  trimOutputObjectUrlCache()
+  return url
+}
+
+function trimOutputObjectUrlCache(): void {
+  while (outputObjectUrlCache.size > MAX_OUTPUT_OBJECT_URL_CACHE) {
+    const oldestKey = outputObjectUrlCache.keys().next().value
+    if (!oldestKey) return
+    const oldest = outputObjectUrlCache.get(oldestKey)
+    if (oldest) URL.revokeObjectURL?.(oldest.url)
+    outputObjectUrlCache.delete(oldestKey)
+  }
+}
+
 function remoteAttachmentUrl(bundle: AttachmentBundle | undefined): string | undefined {
   const attachment = bundle?.attachment
   if (!attachment) return undefined
   if (attachment.storage.kind === 'remote-url') return attachment.storage.url
-  return attachment.sourceUrl
+  return undefined
 }
 
-function previewFirstLine(text: string, imageCount: number): string {
+function previewFirstLine(text: string, mediaCount: number): string {
   const firstNonEmpty =
     text
       .split(/\r?\n/)
       .map((line) => line.trim())
       .find((line) => line.length > 0) ?? text.trim()
   if (firstNonEmpty.length === 0) {
-    return imageCount > 0 ? `Generated image${imageCount === 1 ? '' : 's'} ...` : '...'
+    return mediaCount > 0 ? `Generated media ...` : '...'
   }
   const singleLine = firstNonEmpty.replace(/\s+/g, ' ')
   if (singleLine.length <= PEEK_PREVIEW_CHARS) {

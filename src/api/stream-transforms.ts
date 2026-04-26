@@ -113,6 +113,13 @@ export type StreamLaneEvent =
       itemId?: string
     }
   | {
+      lane: 'audio-output'
+      dataDelta?: string
+      transcriptDelta?: string
+      format?: 'wav' | 'mp3' | 'flac' | 'ogg' | 'm4a' | 'pcm16'
+      chunkId?: string
+    }
+  | {
       lane: 'output-item-added'
       outputIndex: number
       item: ResponsesInputItem
@@ -301,6 +308,21 @@ function* splitChoiceDelta(
         yield { lane: 'content-item', item, ...(chunkId !== undefined ? { chunkId } : {}) }
       }
     }
+    if (Array.isArray(delta.videos)) {
+      for (const item of contentItemsFromChatVideos(delta.videos)) {
+        yield { lane: 'content-item', item, ...(chunkId !== undefined ? { chunkId } : {}) }
+      }
+    }
+    const audio = audioOutputFromChatAudio(delta.audio)
+    if (audio) {
+      yield {
+        lane: 'audio-output',
+        ...(audio.dataDelta !== undefined ? { dataDelta: audio.dataDelta } : {}),
+        ...(audio.transcriptDelta !== undefined ? { transcriptDelta: audio.transcriptDelta } : {}),
+        ...(audio.format !== undefined ? { format: audio.format } : {}),
+        ...(chunkId !== undefined ? { chunkId } : {}),
+      }
+    }
   }
   if (
     choice.finish_reason !== undefined &&
@@ -446,6 +468,25 @@ function* splitBufferedResult(
       }
     }
   }
+  if (Array.isArray(choice?.message?.videos)) {
+    for (const item of contentItemsFromChatVideos(choice.message.videos)) {
+      yield {
+        lane: 'content-item',
+        item,
+        ...(typeof result.id === 'string' ? { chunkId: result.id } : {}),
+      }
+    }
+  }
+  const audio = audioOutputFromChatAudio(choice?.message?.audio)
+  if (audio) {
+    yield {
+      lane: 'audio-output',
+      ...(audio.dataDelta !== undefined ? { dataDelta: audio.dataDelta } : {}),
+      ...(audio.transcriptDelta !== undefined ? { transcriptDelta: audio.transcriptDelta } : {}),
+      ...(audio.format !== undefined ? { format: audio.format } : {}),
+      ...(typeof result.id === 'string' ? { chunkId: result.id } : {}),
+    }
+  }
   if (choice?.finish_reason) {
     yield {
       lane: 'finish',
@@ -504,6 +545,19 @@ function contentItemsFromChatImages(images: readonly unknown[]): ContentItem[] {
   return out
 }
 
+function contentItemsFromChatVideos(videos: readonly unknown[]): ContentItem[] {
+  const out: ContentItem[] = []
+  for (const video of videos) {
+    const url = videoUrlFromChatVideo(video)
+    if (!url) continue
+    const item: ContentItem = { type: 'output_video', url }
+    const prompt = videoPromptFromChatVideo(video)
+    if (prompt) item.prompt = prompt
+    out.push(item)
+  }
+  return out
+}
+
 function imageUrlFromChatImage(image: unknown): string | null {
   if (typeof image === 'string') return normalizeImageUrlOrBase64(image)
   if (!image || typeof image !== 'object') return null
@@ -527,11 +581,83 @@ function imageUrlFromChatImage(image: unknown): string | null {
   return null
 }
 
+function videoUrlFromChatVideo(video: unknown): string | null {
+  if (typeof video === 'string') return normalizeMediaUrl(video)
+  if (!video || typeof video !== 'object') return null
+  const record = video as {
+    url?: unknown
+    video_url?: { url?: unknown } | unknown
+    content_url?: unknown
+  }
+  if (typeof record.url === 'string') return normalizeMediaUrl(record.url)
+  if (typeof record.content_url === 'string') return normalizeMediaUrl(record.content_url)
+  if (
+    record.video_url &&
+    typeof record.video_url === 'object' &&
+    typeof (record.video_url as { url?: unknown }).url === 'string'
+  ) {
+    return normalizeMediaUrl((record.video_url as { url: string }).url)
+  }
+  return null
+}
+
+function videoPromptFromChatVideo(video: unknown): string | undefined {
+  if (!video || typeof video !== 'object') return undefined
+  const prompt = (video as { prompt?: unknown }).prompt
+  return typeof prompt === 'string' && prompt.length > 0 ? prompt : undefined
+}
+
+function audioOutputFromChatAudio(audio: unknown): {
+  dataDelta?: string
+  transcriptDelta?: string
+  format?: 'wav' | 'mp3' | 'flac' | 'ogg' | 'm4a' | 'pcm16'
+} | null {
+  if (!audio || typeof audio !== 'object') return null
+  const record = audio as { data?: unknown; transcript?: unknown; format?: unknown }
+  const dataDelta = typeof record.data === 'string' && record.data.length > 0 ? record.data : undefined
+  const transcriptDelta =
+    typeof record.transcript === 'string' && record.transcript.length > 0
+      ? record.transcript
+      : undefined
+  const format = audioFormatFromString(record.format)
+  if (dataDelta === undefined && transcriptDelta === undefined) return null
+  return {
+    ...(dataDelta !== undefined ? { dataDelta } : {}),
+    ...(transcriptDelta !== undefined ? { transcriptDelta } : {}),
+    ...(format !== undefined ? { format } : {}),
+  }
+}
+
+function audioFormatFromString(
+  value: unknown,
+): 'wav' | 'mp3' | 'flac' | 'ogg' | 'm4a' | 'pcm16' | undefined {
+  if (typeof value !== 'string') return undefined
+  const lower = value.toLowerCase()
+  if (
+    lower === 'wav' ||
+    lower === 'mp3' ||
+    lower === 'flac' ||
+    lower === 'ogg' ||
+    lower === 'm4a' ||
+    lower === 'pcm16'
+  ) {
+    return lower
+  }
+  return undefined
+}
+
 function normalizeImageUrlOrBase64(value: string): string | null {
   const trimmed = value.trim()
   if (trimmed.length === 0) return null
   if (/^(data:|https?:|blob:)/i.test(trimmed)) return trimmed
   return `data:image/png;base64,${trimmed}`
+}
+
+function normalizeMediaUrl(value: string): string | null {
+  const trimmed = value.trim()
+  if (trimmed.length === 0) return null
+  if (/^(data:|https?:|blob:)/i.test(trimmed)) return trimmed
+  return null
 }
 
 // ---------------------------------------------------------------------------

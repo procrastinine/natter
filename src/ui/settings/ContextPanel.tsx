@@ -145,6 +145,13 @@ export function ContextPanel({
       capability.maxPromptTokens === undefined &&
       capability.maxCompletionTokens === undefined)
   ) {
+    if (capability?.outputModalities.has('video')) {
+      return (
+        <section data-ui="settings-section" data-ui-section="context-control">
+          <p data-ui="helper">Video generation does not expose a token context window.</p>
+        </section>
+      )
+    }
     return (
       <section data-ui="settings-section" data-ui-section="context-control">
         <p data-ui="helper">Waiting for model capability…</p>

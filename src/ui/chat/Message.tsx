@@ -21,9 +21,8 @@ import type {
 } from '../../core/types'
 import { dismissAbortReason, updateChatSettings } from '../../store/chats'
 import {
-  contentHasRawGeneratedImageOutput,
-  generatedImageOutputAttachmentIds,
-  migrateGeneratedImageOutputAttachments,
+  generatedOutputAttachmentIds,
+  migrateGeneratedOutputAttachments,
   normalizeGeneratedImageOutputAttachmentRefs,
 } from '../../store/generated-images'
 import { useStreamStore } from '../../store/zustand/streamStore'
@@ -180,16 +179,29 @@ function MessageInner({
   const isStreaming = streaming === true || storeStreaming
   const hasContent =
     text.length > 0 ||
-    message.content.some((item) => item.type === 'output_image' || item.type === 'audio_output')
+    message.content.some(
+      (item) =>
+        item.type === 'output_image' ||
+        item.type === 'audio_output' ||
+        item.type === 'output_video',
+    )
   useEffect(() => {
-    if (contentHasRawGeneratedImageOutput(message.content)) {
-      void migrateGeneratedImageOutputAttachments(message.id)
+    if (isStreaming) return
+    if (
+      message.content.some(
+        (item) =>
+          item.type === 'output_image' ||
+          item.type === 'audio_output' ||
+          item.type === 'output_video',
+      )
+    ) {
+      void migrateGeneratedOutputAttachments(message.id).catch(() => {})
       return
     }
-    if (generatedImageOutputAttachmentIds(message.content).size > 0) {
-      void normalizeGeneratedImageOutputAttachmentRefs(message.id)
+    if (generatedOutputAttachmentIds(message.content).size > 0) {
+      void normalizeGeneratedImageOutputAttachmentRefs(message.id).catch(() => {})
     }
-  }, [message.content, message.id])
+  }, [isStreaming, message.content, message.id])
   const gen = message.generation
   const messageModelQuirks = useMemo(
     () => quirksFor(gen?.model ?? gen?.requestedModel ?? ''),

@@ -173,7 +173,10 @@ export function useEndpoints(
   const capability = useMemo<EffectiveCapability | null>(() => {
     if (!profile || !modelId) return null
     if (enabled && endpoints.length > 0) {
-      return effectiveCapabilityFromEndpoints(modelId, endpoints, { strict })
+      return effectiveCapabilityFromEndpoints(modelId, endpoints, {
+        strict,
+        ...(descriptor?.architecture ? { architecture: descriptor.architecture } : {}),
+      })
     }
     if (!enabled) {
       if (profile.kind === 'llama-server' && modelAvailable === false) {
@@ -196,7 +199,7 @@ export function useEndpoints(
       return effectiveCapabilityFromDescriptor(modelId, merged)
     }
     return null
-  }, [profile, modelId, endpoints, strict, enabled, liveEntry, modelAvailable])
+  }, [profile, modelId, endpoints, descriptor, strict, enabled, liveEntry, modelAvailable])
 
   const fetchedAt = cachedRow?.fetchedAt ?? null
   const offline = error !== null && fetchedAt !== null

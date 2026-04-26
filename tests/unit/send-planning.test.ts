@@ -378,6 +378,55 @@ describe('resolveRequestPrivacyPlan', () => {
     expect(requestPlan.wire.tool_choice).toBe('auto')
   })
 
+  it('routes OpenRouter video generation from the top-level endpoint architecture', async () => {
+    const model = 'google/veo-3.1-lite'
+    const profile = makeProfile()
+    const chat = makeChat({ model })
+    await putCachedEndpoints(profile.id, model, {
+      id: model,
+      architecture: {
+        input_modalities: ['text', 'image'],
+        output_modalities: ['video'],
+      },
+      endpoints: [
+        {
+          provider_name: 'Google',
+          provider_slug: 'google',
+          supported_parameters: ['max_tokens', 'temperature', 'top_p', 'seed'],
+          context_length: 0,
+          pricing: {},
+        },
+      ],
+    })
+    await putCachedPrivacyPolicy(profile.id, model, {
+      policies: {
+        Google: {
+          training: false,
+          trainingOpenRouter: false,
+          retainsPrompts: false,
+          canPublish: false,
+          termsOfServiceURL: '',
+          privacyPolicyURL: '',
+        },
+      },
+      fetchedAt: 0,
+    })
+
+    const { requestPlan } = await prepareAssistantRequestPlan({
+      chat,
+      connection: profile,
+      pathMessages: [makeMessage('make a five second clip of a lighthouse')],
+      draftText: '',
+    })
+
+    expect(requestPlan.route?.transport).toBe('openrouter-video')
+    expect(requestPlan.route?.kind).toBe('video-generation')
+    expect(requestPlan.wire.model).toBe(model)
+    expect(requestPlan.wire.prompt).toBe('make a five second clip of a lighthouse')
+    expect(requestPlan.wire.messages).toBeUndefined()
+    expect(requestPlan.wire.provider).toMatchObject({ data_collection: 'deny' })
+  })
+
   it('builds OpenRouter text-completions plans with the same provider routing inputs', async () => {
     const model = 'meta-llama/llama-3.3-70b-instruct'
     const profile = makeProfile()

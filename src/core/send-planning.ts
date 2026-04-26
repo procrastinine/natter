@@ -26,6 +26,7 @@ import type {
   Chat,
   ChatSettings,
   ConnectionProfile,
+  ContentItem,
   Message,
 } from './types'
 import type {
@@ -49,6 +50,38 @@ function rewriteCompatibleModelId(connection: ConnectionProfile, modelId: string
 }
 
 const DIRECT_CAPABILITY_LOOKUP_QUERY = {} as const
+// OpenRouter send behavior historically used an ungated superset and let OR
+// drop unsupported optional fields. Request-time discovery is used here for
+// media routing/caps; it must not narrow normal text/reasoning sends.
+const OPENROUTER_SEND_PARAMETER_SUPERSET = [
+  'temperature',
+  'top_p',
+  'top_k',
+  'min_p',
+  'top_a',
+  'frequency_penalty',
+  'presence_penalty',
+  'repetition_penalty',
+  'seed',
+  'logprobs',
+  'top_logprobs',
+  'stop',
+  'max_tokens',
+  'max_completion_tokens',
+  'logit_bias',
+  'cache_prompt',
+  'modalities',
+  'audio',
+  'response_format',
+  'tools',
+  'tool_choice',
+  'parallel_tool_calls',
+  'service_tier',
+  'reasoning',
+  'verbosity',
+  'provider',
+  'plugins',
+] as const
 
 function idsEquivalent(left: string, right: string): boolean {
   return (
@@ -194,6 +227,85 @@ function mergePrivacyTransform(
   return { ...(transform ?? {}), privacy: privacy.wire }
 }
 
+function requestCapabilityFromPrivacy(
+  privacy: ResolvePrivacyForSendResult,
+): CapabilityDescriptor | undefined {
+  const endpoints = privacy.filter?.kept.map((row) => row.endpoint) ?? []
+  if (endpoints.length === 0) return undefined
+  const supported = new Set<string>(OPENROUTER_SEND_PARAMETER_SUPERSET)
+  const inputModalities = new Set<'text' | 'image' | 'audio' | 'video' | 'file'>()
+  const outputModalities = new Set<'text' | 'image' | 'audio' | 'video'>()
+  for (const modality of privacy.descriptor?.architecture?.input_modalities ?? []) {
+    if (
+      modality === 'text' ||
+      modality === 'image' ||
+      modality === 'audio' ||
+      modality === 'video' ||
+      modality === 'file'
+    ) {
+      inputModalities.add(modality)
+    }
+  }
+  for (const modality of privacy.descriptor?.architecture?.output_modalities ?? []) {
+    if (
+      modality === 'text' ||
+      modality === 'image' ||
+      modality === 'audio' ||
+      modality === 'video'
+    ) {
+      outputModalities.add(modality)
+    }
+  }
+  let contextLength = privacy.descriptor?.contextLength
+  let maxPromptTokens: number | undefined
+  let maxCompletionTokens: number | undefined
+  for (const endpoint of endpoints) {
+    for (const param of endpoint.supported_parameters) supported.add(param)
+    for (const modality of endpoint.architecture?.input_modalities ?? []) {
+      if (
+        modality === 'text' ||
+        modality === 'image' ||
+        modality === 'audio' ||
+        modality === 'video' ||
+        modality === 'file'
+      ) {
+        inputModalities.add(modality)
+      }
+    }
+    for (const modality of endpoint.architecture?.output_modalities ?? []) {
+      if (
+        modality === 'text' ||
+        modality === 'image' ||
+        modality === 'audio' ||
+        modality === 'video'
+      ) {
+        outputModalities.add(modality)
+      }
+    }
+    if (endpoint.context_length > 0) {
+      contextLength = Math.max(contextLength ?? 0, endpoint.context_length)
+    }
+    if (endpoint.max_prompt_tokens !== undefined && endpoint.max_prompt_tokens > 0) {
+      maxPromptTokens = Math.max(maxPromptTokens ?? 0, endpoint.max_prompt_tokens)
+    }
+    if (endpoint.max_completion_tokens !== undefined && endpoint.max_completion_tokens > 0) {
+      maxCompletionTokens = Math.max(maxCompletionTokens ?? 0, endpoint.max_completion_tokens)
+    }
+  }
+  const descriptor: CapabilityDescriptor = {
+    supportedParameters: [...supported],
+    streaming: 'supported',
+    architecture: {
+      inputModalities: inputModalities.size > 0 ? [...inputModalities] : ['text'],
+      outputModalities: outputModalities.size > 0 ? [...outputModalities] : ['text'],
+    },
+  }
+  if (contextLength !== undefined) descriptor.contextLength = contextLength
+  if (maxPromptTokens !== undefined) descriptor.maxPromptTokens = maxPromptTokens
+  if (maxCompletionTokens !== undefined) descriptor.maxCompletionTokens = maxCompletionTokens
+  return descriptor
+}
+
 export async function prepareAssistantRequestPlan(
   input: AssistantRequestPlanInput & { draftText?: string },
 ): Promise<PreparedAssistantRequestPlan> {
@@ -218,10 +330,11 @@ export async function prepareAssistantRequestPlan(
     throw new NoEligibleProvidersError()
   }
   const mergedTransform = mergePrivacyTransform(input.transform, privacyPlan.privacy)
+  const requestCapability = resolvedCapability ?? requestCapabilityFromPrivacy(privacyPlan.privacy)
   const requestPlan = await buildAssistantRequestPlan({
     ...input,
     settings,
-    ...(resolvedCapability ? { capabilities: resolvedCapability } : {}),
+    ...(requestCapability ? { capabilities: requestCapability } : {}),
     ...(mergedTransform ? { transform: mergedTransform } : {}),
   })
   logPreparedPlan(input.debugSource ?? 'unknown', input, requestPlan, privacyPlan)
@@ -343,6 +456,13 @@ function textPreview(value: unknown): { length: number; preview: string } | unde
   }
 }
 
+function outputModalitiesForRoute(
+  capabilities: CapabilityDescriptor | undefined,
+): ReadonlySet<string> | undefined {
+  const modalities = capabilities?.architecture?.outputModalities
+  return modalities && modalities.length > 0 ? new Set(modalities) : undefined
+}
+
 async function loadAttachmentEstimateContext(
   messages: readonly Message[],
   settings: ChatSettings,
@@ -399,6 +519,45 @@ async function prepareOpenRouterAttachmentTransform(
     ...(partsByMessageId.size > 0 ? { attachmentPartsByMessageId: partsByMessageId } : {}),
     ...(pluginByKey.size > 0 ? { extraPlugins: [...pluginByKey.values()] } : {}),
   }
+}
+
+function toOpenRouterVideoGeneration(
+  settings: ChatSettings,
+  path: readonly Message[],
+  opts: { privacy?: ChatCompletionsTransformOptions['privacy'] } = {},
+): { wire: Record<string, unknown>; requestedModel: string } {
+  const prompt = videoPromptFromPath(path)
+  const wire: Record<string, unknown> = {
+    model: settings.model,
+    prompt,
+  }
+  if (settings.sampling.seed !== undefined) wire.seed = settings.sampling.seed
+  if (settings.sampling.temperature !== undefined) wire.temperature = settings.sampling.temperature
+  if (settings.sampling.top_p !== undefined) wire.top_p = settings.sampling.top_p
+  if (opts.privacy) wire.provider = opts.privacy
+  return { wire, requestedModel: settings.model }
+}
+
+function videoPromptFromPath(path: readonly Message[]): string {
+  for (let i = path.length - 1; i >= 0; i -= 1) {
+    const message = path[i]
+    if (!message || message.role !== 'user') continue
+    const text = contentText(message.content).trim()
+    if (text.length > 0) return text
+  }
+  return path
+    .map((message) => contentText(message.content).trim())
+    .filter(Boolean)
+    .join('\n\n')
+}
+
+function contentText(content: readonly ContentItem[]): string {
+  return content
+    .map((item) => {
+      if (item.type === 'text' || item.type === 'output_text') return item.text
+      return ''
+    })
+    .join('')
 }
 
 export async function buildAssistantRequestPlan(
@@ -509,16 +668,24 @@ export async function buildAssistantRequestPlan(
       }
     }
   } else {
-    route = chooseApi(input.connection, settings, outboundPath, {
-      quirks: quirksFor(settings.model),
-    })
+    const outputModalities = outputModalitiesForRoute(input.capabilities)
+    const routeCaps = outputModalities
+      ? { quirks: quirksFor(settings.model), outputModalities }
+      : { quirks: quirksFor(settings.model) }
+    route = chooseApi(input.connection, settings, outboundPath, routeCaps)
     const rewriteSlug = (slug: string) => rewriteCompatibleModelId(input.connection, slug)
     const routeFormat = quirksFor(settings.model).reasoningPreservationFormat
     const openRouterAttachmentTransform =
       input.connection.kind === 'openrouter'
         ? await prepareOpenRouterAttachmentTransform(outboundPath, settings)
         : {}
-    if (route.transport === 'openai-responses') {
+    if (route.transport === 'openrouter-video') {
+      const result = toOpenRouterVideoGeneration(settings, outboundPath, {
+        ...(input.transform?.privacy ? { privacy: input.transform.privacy } : {}),
+      })
+      wire = result.wire
+      requestedModel = result.requestedModel
+    } else if (route.transport === 'openai-responses') {
       const transformOpts: ResponsesTransformOptions & {
         privacy?: ChatCompletionsTransformOptions['privacy']
       } = {

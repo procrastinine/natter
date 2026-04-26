@@ -103,6 +103,7 @@ const ENVELOPE_KEYS: ReadonlySet<string> = new Set([
   'stream',
   'input',
   'instructions',
+  'provider',
 ])
 
 // Sampling keys that can be gated by `supportedParameters`. The internal
@@ -506,7 +507,11 @@ export function toChatCompletions(
   if (settings.cachePrompt === false && gate('cache_prompt')) {
     wire.cache_prompt = false
   }
-  if (settings.modalities && settings.modalities.length > 0 && gate('modalities')) {
+  const requiresAudioOutput = caps?.architecture?.outputModalities?.includes('audio') === true
+  if (requiresAudioOutput) {
+    wire.modalities = ['text', 'audio']
+    wire.audio = { voice: 'alloy', format: 'pcm16' }
+  } else if (settings.modalities && settings.modalities.length > 0 && gate('modalities')) {
     wire.modalities = [...settings.modalities]
   }
   if (settings.responseFormat && gate('response_format')) {
@@ -806,6 +811,7 @@ const RESPONSES_ENVELOPE_KEYS: ReadonlySet<string> = new Set([
   'include',
   'store',
   'max_output_tokens',
+  'provider',
 ])
 
 export function toResponses(

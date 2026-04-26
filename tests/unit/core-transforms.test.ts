@@ -152,6 +152,25 @@ describe('toChatCompletions', () => {
     expect(wire.modalities).toBeUndefined()
   })
 
+  it('forces audio output parameters for audio-output models even when /models omits them', () => {
+    const path = [textMessage({ id: 'u1', role: 'user', text: 'say hi' })]
+    const caps: CapabilityDescriptor = {
+      supportedParameters: ['max_tokens', 'temperature'],
+      streaming: 'supported',
+      architecture: {
+        inputModalities: ['text', 'audio'],
+        outputModalities: ['text', 'audio'],
+      },
+    }
+    const { wire } = toChatCompletions(
+      settings({ model: 'openai/gpt-audio-mini' }),
+      path,
+      { capabilities: caps },
+    )
+    expect(wire.modalities).toEqual(['text', 'audio'])
+    expect(wire.audio).toEqual({ voice: 'alloy', format: 'pcm16' })
+  })
+
   it('respects reasoning.mode=off (emits enabled:false)', () => {
     const path = [textMessage({ id: 'u1', role: 'user', text: 'hi' })]
     const { wire } = toChatCompletions(

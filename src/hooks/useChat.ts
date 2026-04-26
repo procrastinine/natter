@@ -78,7 +78,8 @@ import { postEvent } from '../store/broadcast'
 import { getBrowserRepository } from '../store/browser-repo'
 import { getChat, loadChatMessages } from '../store/chats'
 import {
-  materializeGeneratedImageOutputAttachments,
+  type GeneratedOutputDownloader,
+  materializeGeneratedOutputAttachments,
   mergeGeneratedImageAttachmentRefs,
 } from '../store/generated-images'
 import { attachmentScopes, incRefs } from '../store/attachments'
@@ -94,6 +95,8 @@ function routeApiUsed(route: AssistantRequestPlan['route']): GenerationMeta['api
   if (route?.kind === 'responses') return 'responses'
   if (route?.kind === 'gemini-generate') return 'gemini-native'
   if (route?.kind === 'anthropic-messages') return 'anthropic-messages'
+  if (route?.kind === 'video-generation') return 'video-generation'
+  if (route?.kind === 'text-completions') return 'completion'
   return 'chat'
 }
 
@@ -227,6 +230,11 @@ interface ChatAccumulator {
   finishReason?: string
   usage?: ChatUsage
   generatedContent: ContentItem[]
+  audioOutput?: {
+    chunks: string[]
+    transcript: string
+    format: 'wav' | 'mp3' | 'flac' | 'ogg' | 'm4a' | 'pcm16'
+  }
   serverTools: GenerationServerToolCall[]
   firstTextAt?: number
   reasoningStartedAt?: number
@@ -682,6 +690,8 @@ async function openAssistantStreamUnder(
       chatId: input.chatId,
       streamId,
       messageId: assistantId,
+      connection: input.connection,
+      apiKey: input.apiKey,
       accumulator,
       requestedModel,
       apiUsed: resolvedApiUsed,
@@ -692,7 +702,8 @@ async function openAssistantStreamUnder(
       ...(hasAttachmentContext ||
       hasNonTextOutbound ||
       requestHasTools(wire) ||
-      accumulator.generatedContent.some(isNonTextContentItem)
+      accumulator.generatedContent.some(isNonTextContentItem) ||
+      hasAudioOutput(accumulator)
         ? {}
         : {
             calibrationInputs: {
@@ -800,6 +811,14 @@ function applyEvent(acc: ChatAccumulator, event: StreamLaneEvent, nowMs: number)
       return
     case 'content-item':
       acc.generatedContent.push(structuredClone(event.item))
+      return
+    case 'audio-output':
+      if (!acc.audioOutput) {
+        acc.audioOutput = { chunks: [], transcript: '', format: event.format ?? 'pcm16' }
+      }
+      if (event.format) acc.audioOutput.format = event.format
+      if (event.dataDelta) acc.audioOutput.chunks.push(event.dataDelta)
+      if (event.transcriptDelta) acc.audioOutput.transcript += event.transcriptDelta
       return
     case 'server-tool':
       recordServerToolStatus(acc, event)
@@ -911,7 +930,9 @@ function serverToolUsageKeyToType(key: string): string {
   return key
 }
 
-function mergeServerToolRecords(records: readonly GenerationServerToolCall[]): GenerationServerToolCall[] {
+function mergeServerToolRecords(
+  records: readonly GenerationServerToolCall[],
+): GenerationServerToolCall[] {
   const merged: GenerationServerToolCall[] = []
   for (const record of records) upsertServerTool(merged, record)
   return merged
@@ -975,6 +996,90 @@ function assistantContentWithStreamPrefix(
   ]
 }
 
+function streamPreviewGeneratedContent(generatedContent: readonly ContentItem[]): ContentItem[] {
+  return generatedContent.filter(
+    (item) => item.type !== 'audio_output' && item.type !== 'output_video',
+  )
+}
+
+function hasAudioOutput(acc: ChatAccumulator): boolean {
+  return Boolean(
+    acc.audioOutput && (acc.audioOutput.chunks.length > 0 || acc.audioOutput.transcript.length > 0),
+  )
+}
+
+function audioOutputContent(acc: ChatAccumulator): ContentItem[] {
+  if (!hasAudioOutput(acc) || !acc.audioOutput) return []
+  const format = acc.audioOutput.format
+  const joined = acc.audioOutput.chunks.join('')
+  const item: ContentItem = {
+    type: 'audio_output',
+    format,
+    ...(acc.audioOutput.transcript.length > 0 ? { transcript: acc.audioOutput.transcript } : {}),
+  }
+  if (joined.length > 0) {
+    item.url =
+      format === 'pcm16'
+        ? pcm16DataUrlToWav(joined, { sampleRate: 24_000, channels: 1 })
+        : `data:audio/${format};base64,${joined}`
+  }
+  return [item]
+}
+
+function pcm16DataUrlToWav(
+  base64Pcm: string,
+  opts: { sampleRate: number; channels: number },
+): string {
+  const pcm = decodeBase64Bytes(base64Pcm)
+  const header = wavHeader(pcm.byteLength, opts.sampleRate, opts.channels)
+  const bytes = new Uint8Array(header.byteLength + pcm.byteLength)
+  bytes.set(header, 0)
+  bytes.set(pcm, header.byteLength)
+  return `data:audio/wav;base64,${encodeBase64Bytes(bytes)}`
+}
+
+function decodeBase64Bytes(value: string): Uint8Array {
+  const normalized = value.replace(/\s+/gu, '').replace(/-/gu, '+').replace(/_/gu, '/')
+  const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, '=')
+  const binary = atob(padded)
+  const out = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i += 1) out[i] = binary.charCodeAt(i)
+  return out
+}
+
+function encodeBase64Bytes(bytes: Uint8Array): string {
+  let binary = ''
+  const chunkSize = 0x8000
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize))
+  }
+  return btoa(binary)
+}
+
+function wavHeader(dataBytes: number, sampleRate: number, channels: number): Uint8Array {
+  const bytesPerSample = 2
+  const header = new ArrayBuffer(44)
+  const view = new DataView(header)
+  writeAscii(view, 0, 'RIFF')
+  view.setUint32(4, 36 + dataBytes, true)
+  writeAscii(view, 8, 'WAVE')
+  writeAscii(view, 12, 'fmt ')
+  view.setUint32(16, 16, true)
+  view.setUint16(20, 1, true)
+  view.setUint16(22, channels, true)
+  view.setUint32(24, sampleRate, true)
+  view.setUint32(28, sampleRate * channels * bytesPerSample, true)
+  view.setUint16(32, channels * bytesPerSample, true)
+  view.setUint16(34, bytesPerSample * 8, true)
+  writeAscii(view, 36, 'data')
+  view.setUint32(40, dataBytes, true)
+  return new Uint8Array(header)
+}
+
+function writeAscii(view: DataView, offset: number, value: string): void {
+  for (let i = 0; i < value.length; i += 1) view.setUint8(offset + i, value.charCodeAt(i))
+}
+
 interface FlushContext {
   repo: ReturnType<typeof getBrowserRepository>
   chatId: ChatId
@@ -996,7 +1101,7 @@ async function flushPartial(ctx: FlushContext): Promise<void> {
       content: assistantContentWithStreamPrefix(
         accumulator.initialContent,
         accumulator.textBuffer,
-        accumulator.generatedContent,
+        streamPreviewGeneratedContent(accumulator.generatedContent),
       ),
     }
     if (reasoning.length > 0) next.reasoningDetails = reasoning
@@ -1022,6 +1127,8 @@ async function flushPartial(ctx: FlushContext): Promise<void> {
 }
 
 interface FinalizeContext extends FlushContext {
+  connection: ConnectionProfile
+  apiKey: string
   outcome: 'done' | 'error' | 'abort'
   abortReason?: AbortReason
   error?: ApiError
@@ -1036,6 +1143,36 @@ interface FinalizeContext extends FlushContext {
     family: import('../core/tokens').TokenizerFamily
     reasoningOpts?: PromptEstimateOptions
   }
+}
+
+function generatedOutputDownloader(input: {
+  connection: ConnectionProfile
+  apiKey: string
+}): GeneratedOutputDownloader {
+  return async ({ url }) => {
+    const headers: Record<string, string> = {}
+    if (shouldAuthorizeGeneratedOutputUrl(url, input.connection)) {
+      headers.Authorization = `Bearer ${input.apiKey}`
+    }
+    const response = await fetch(url, { headers })
+    if (!response.ok) return null
+    return response.blob()
+  }
+}
+
+function shouldAuthorizeGeneratedOutputUrl(url: string, connection: ConnectionProfile): boolean {
+  if (connection.kind !== 'openrouter') return false
+  let target: URL
+  let base: URL
+  try {
+    target = new URL(url)
+    base = new URL(connection.baseUrl)
+  } catch {
+    return false
+  }
+  if (target.origin !== base.origin) return false
+  const basePath = base.pathname.replace(/\/+$/u, '')
+  return target.pathname.startsWith(`${basePath}/videos/`)
 }
 
 async function finalize(ctx: FinalizeContext): Promise<void> {
@@ -1056,12 +1193,13 @@ async function finalize(ctx: FinalizeContext): Promise<void> {
   const rawFinalContent = assistantContentWithStreamPrefix(
     accumulator.initialContent,
     accumulator.textBuffer,
-    accumulator.generatedContent,
+    [...accumulator.generatedContent, ...audioOutputContent(accumulator)],
   )
-  const generatedImageAttachments = await materializeGeneratedImageOutputAttachments({
+  const generatedImageAttachments = await materializeGeneratedOutputAttachments({
     messageId,
     content: rawFinalContent,
     now,
+    downloader: generatedOutputDownloader(ctx),
   })
   const finalContent = generatedImageAttachments.content
 

@@ -952,6 +952,9 @@ export function ApiModeSection({
   if (!profile) return null
   // Gemini native picks transport at the connection level — nothing per-chat.
   if (profile.kind === 'google' && profile.geminiMode !== 'openai-compat') return null
+  if (capability.outputModalities.has('video') || capability.outputModalities.has('audio')) {
+    return null
+  }
   const support = responsesSupportFor(chat.settings.model)
   const canResponses = isResponsesCapable(profile) && support === 'both'
   const canText = isTextCompletionsCapable(profile, chat.settings.model)

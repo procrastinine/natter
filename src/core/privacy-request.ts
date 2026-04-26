@@ -15,7 +15,7 @@
 // not need to also be aware of the filter.
 
 import { fetchEndpoints } from '../api/models'
-import { normalizeEndpointsResponse } from '../api/providers'
+import { normalizeEndpointsResponse, type EndpointsDescriptor } from '../api/providers'
 import { fetchPrivacyScrape, readCachedPrivacyPayload } from '../api/privacy-scrape'
 import { isFreeModel } from './model-predicates'
 import { providerRoutingRef } from './provider-identity'
@@ -66,6 +66,7 @@ export interface ResolvePrivacyForSendInput {
 export interface ResolvePrivacyForSendResult {
   wire: WireProviderPrivacy | null
   filter: PrivacyFilterResult | null
+  descriptor: EndpointsDescriptor | null
   applicable: boolean
   contextIgnoredProviders: string[]
 }
@@ -75,13 +76,31 @@ export async function resolvePrivacyForSend(
 ): Promise<ResolvePrivacyForSendResult> {
   const { chat, profile } = input
   if (profile.kind !== 'openrouter') {
-    return { wire: null, filter: null, applicable: false, contextIgnoredProviders: [] }
+    return {
+      wire: null,
+      filter: null,
+      descriptor: null,
+      applicable: false,
+      contextIgnoredProviders: [],
+    }
   }
   if (!chat.settings.model) {
-    return { wire: null, filter: null, applicable: false, contextIgnoredProviders: [] }
+    return {
+      wire: null,
+      filter: null,
+      descriptor: null,
+      applicable: false,
+      contextIgnoredProviders: [],
+    }
   }
   if (isFreeModel(chat.settings.model)) {
-    return { wire: null, filter: null, applicable: false, contextIgnoredProviders: [] }
+    return {
+      wire: null,
+      filter: null,
+      descriptor: null,
+      applicable: false,
+      contextIgnoredProviders: [],
+    }
   }
   const endpointsRow = await ensureEndpointsRow(profile, chat.settings.model, input.signal)
   const descriptor = normalizeEndpointsResponse(endpointsRow.payload)
@@ -138,12 +157,13 @@ export async function resolvePrivacyForSend(
       return {
         wire: merged,
         filter,
+        descriptor,
         applicable: true,
         contextIgnoredProviders: insufficient,
       }
     }
   }
-  return { wire, filter, applicable: true, contextIgnoredProviders: [] }
+  return { wire, filter, descriptor, applicable: true, contextIgnoredProviders: [] }
 }
 
 async function ensureEndpointsRow(

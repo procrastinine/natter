@@ -154,6 +154,56 @@ describe('splitChatStream', () => {
     })
   })
 
+  it('emits OpenRouter chat audio deltas onto the audio-output lane', async () => {
+    const source = fromChunks([
+      {
+        type: 'delta',
+        chunk: {
+          id: 'g1',
+          choices: [
+            {
+              delta: {
+                audio: { data: 'abc', transcript: 'Hi' },
+              },
+            },
+          ],
+        },
+      },
+    ])
+    const events = await collect(splitChatStream(source))
+    expect(events.find((e) => e.lane === 'audio-output')).toMatchObject({
+      lane: 'audio-output',
+      chunkId: 'g1',
+      dataDelta: 'abc',
+      transcriptDelta: 'Hi',
+    })
+  })
+
+  it('emits OpenRouter video URLs as output video content items', async () => {
+    const videoUrl = 'https://openrouter.ai/api/v1/videos/job/content?index=0'
+    const source = fromChunks([
+      {
+        type: 'delta',
+        chunk: {
+          id: 'g1',
+          choices: [
+            {
+              delta: {
+                videos: [{ url: videoUrl, prompt: 'black screen' }],
+              },
+            },
+          ],
+        },
+      },
+    ])
+    const events = await collect(splitChatStream(source))
+    expect(events.find((e) => e.lane === 'content-item')).toMatchObject({
+      lane: 'content-item',
+      chunkId: 'g1',
+      item: { type: 'output_video', url: videoUrl, prompt: 'black screen' },
+    })
+  })
+
   it('drops mirrored reasoning text when reasoning_details already carry the same delta', async () => {
     const source = fromChunks([
       {

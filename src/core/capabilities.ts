@@ -80,6 +80,10 @@ function maxDefined(values: Array<number | undefined>): number | undefined {
   return max
 }
 
+function positiveCap(value: number | undefined): number | undefined {
+  return value !== undefined && value > 0 ? value : undefined
+}
+
 function intersectStringArrays(lists: Array<readonly string[]>): Set<string> {
   if (lists.length === 0) return new Set()
   const first = lists[0]
@@ -103,8 +107,10 @@ function unionStringArrays(lists: Array<readonly string[]>): Set<string> {
 function collectModalities(
   endpoints: ModelEndpoint[],
   kind: 'input_modalities' | 'output_modalities',
+  fallbackArchitecture?: ModelEndpoint['architecture'],
 ): Set<string> {
   const out = new Set<string>()
+  for (const m of fallbackArchitecture?.[kind] ?? []) out.add(m)
   for (const ep of endpoints) {
     const arr = ep.architecture?.[kind]
     if (!arr) continue
@@ -139,23 +145,25 @@ function pricingRange(
 export function effectiveCapabilityFromEndpoints(
   modelId: string,
   endpoints: ModelEndpoint[],
-  opts: { strict?: boolean } = {},
+  opts: { strict?: boolean; architecture?: ModelEndpoint['architecture'] } = {},
 ): EffectiveCapability {
   const supportedLists = endpoints.map((e) => e.supported_parameters)
   const supportedParameters = opts.strict
     ? intersectStringArrays(supportedLists)
     : unionStringArrays(supportedLists)
-  const inputModalities = collectModalities(endpoints, 'input_modalities')
-  const outputModalities = collectModalities(endpoints, 'output_modalities')
+  const inputModalities = collectModalities(endpoints, 'input_modalities', opts.architecture)
+  const outputModalities = collectModalities(endpoints, 'output_modalities', opts.architecture)
   // Upper bound: expose the largest context / completion caps across
   // retained providers, so the user's sliders go as high as any provider
   // can accommodate. In strict mode the intersection-caller narrows the
   // provider set first; without strict, OpenRouter's fallback routing
   // skips providers that can't handle the requested values.
   const numericAgg = opts.strict ? minDefined : maxDefined
-  const contextLength = numericAgg(endpoints.map((e) => e.context_length))
-  const maxPromptTokens = numericAgg(endpoints.map((e) => e.max_prompt_tokens))
-  const maxCompletionTokens = numericAgg(endpoints.map((e) => e.max_completion_tokens))
+  const contextLength = numericAgg(endpoints.map((e) => positiveCap(e.context_length)))
+  const maxPromptTokens = numericAgg(endpoints.map((e) => positiveCap(e.max_prompt_tokens)))
+  const maxCompletionTokens = numericAgg(
+    endpoints.map((e) => positiveCap(e.max_completion_tokens)),
+  )
   const supportsImplicitCaching =
     endpoints.length > 0 && endpoints.every((e) => e.supports_implicit_caching === true)
   const pr = pricingRange(endpoints, 'prompt')
@@ -206,11 +214,12 @@ export function effectiveCapabilityFromDescriptor(
     supportsImplicitCaching: false,
     quirks: q,
   }
-  if (descriptor.contextLength !== undefined) cap.contextLength = descriptor.contextLength
-  if (descriptor.maxPromptTokens !== undefined) cap.maxPromptTokens = descriptor.maxPromptTokens
-  if (descriptor.maxCompletionTokens !== undefined) {
-    cap.maxCompletionTokens = descriptor.maxCompletionTokens
-  }
+  const contextLength = positiveCap(descriptor.contextLength)
+  const maxPromptTokens = positiveCap(descriptor.maxPromptTokens)
+  const maxCompletionTokens = positiveCap(descriptor.maxCompletionTokens)
+  if (contextLength !== undefined) cap.contextLength = contextLength
+  if (maxPromptTokens !== undefined) cap.maxPromptTokens = maxPromptTokens
+  if (maxCompletionTokens !== undefined) cap.maxCompletionTokens = maxCompletionTokens
   const promptPrice = Number(descriptor.pricing?.prompt)
   const completionPrice = Number(descriptor.pricing?.completion)
   if (Number.isFinite(promptPrice) || Number.isFinite(completionPrice)) {

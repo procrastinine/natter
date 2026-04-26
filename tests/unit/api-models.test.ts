@@ -140,6 +140,24 @@ describe('normalizeEndpointsResponse', () => {
     })
     expect(desc?.endpoints).toHaveLength(1)
   })
+
+  it('does not expose top-level zero context as a usable context cap', () => {
+    const desc = normalizeEndpointsResponse({
+      data: {
+        id: 'google/veo-3.1-lite',
+        context_length: 0,
+        endpoints: [
+          {
+            provider_name: 'Google',
+            supported_parameters: ['seed'],
+            context_length: 0,
+          },
+        ],
+      },
+    })
+    expect(desc?.contextLength).toBeUndefined()
+    expect(desc?.endpoints[0]?.context_length).toBe(0)
+  })
 })
 
 describe('normalizeModelsResponse', () => {

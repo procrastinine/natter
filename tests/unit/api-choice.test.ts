@@ -58,6 +58,10 @@ function makeCaps(overrides: Partial<RouterCapabilities['quirks']> = {}): Router
   return { quirks: overrides }
 }
 
+function makeCapsWithOutput(outputModalities: readonly string[]): RouterCapabilities {
+  return { quirks: {}, outputModalities: new Set(outputModalities) }
+}
+
 function assistantWithEncrypted(id: string, format: ReasoningFormat | undefined): Message {
   const details: ReasoningDetail[] = [
     format === undefined
@@ -100,6 +104,30 @@ function assistantWithResponsesItem(itemType: string): Message {
 }
 
 describe('chooseApi matrix', () => {
+  describe('media-output locks', () => {
+    it('routes OpenRouter video-output models to the video generation API', () => {
+      const r = chooseApi(
+        makeProfile(),
+        makeSettings('chat', true, 'google/veo-3.1-lite'),
+        [],
+        makeCapsWithOutput(['video']),
+      )
+      expect(r.kind).toBe('video-generation')
+      expect(r.transport).toBe('openrouter-video')
+    })
+
+    it('routes OpenRouter audio-output models to chat-completions streaming', () => {
+      const r = chooseApi(
+        makeProfile(),
+        makeSettings('responses', true, 'openai/gpt-audio-mini'),
+        [],
+        makeCapsWithOutput(['text', 'audio']),
+      )
+      expect(r.kind).toBe('chat-completions')
+      expect(r.transport).toBe('openai-chat')
+    })
+  })
+
   describe('step 1 — user pinned chat', () => {
     it('wins over quirk preferApi: responses', () => {
       const r = chooseApi(

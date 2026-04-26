@@ -69,6 +69,45 @@ describe('effectiveCapabilityFromEndpoints', () => {
     expect(cap.maxCompletionTokens).toBe(16000)
   })
 
+  it('ignores zero numeric caps from non-token media-generation endpoints', () => {
+    const cap = effectiveCapabilityFromEndpoints('google/veo-3.1-lite', [
+      makeEndpoint({
+        context_length: 0,
+        max_prompt_tokens: 0,
+        max_completion_tokens: 0,
+        architecture: { output_modalities: ['video'] },
+      }),
+    ])
+    expect(cap.contextLength).toBeUndefined()
+    expect(cap.maxPromptTokens).toBeUndefined()
+    expect(cap.maxCompletionTokens).toBeUndefined()
+    expect(cap.outputModalities.has('video')).toBe(true)
+  })
+
+  it('uses top-level descriptor architecture when endpoint rows omit media modalities', () => {
+    const cap = effectiveCapabilityFromEndpoints(
+      'google/veo-3.1-lite',
+      [
+        makeEndpoint({
+          provider_name: 'Google',
+          supported_parameters: ['max_tokens', 'temperature', 'seed'],
+          context_length: 0,
+          max_prompt_tokens: 0,
+          max_completion_tokens: 0,
+        }),
+      ],
+      {
+        architecture: {
+          input_modalities: ['text', 'image'],
+          output_modalities: ['video'],
+        },
+      },
+    )
+    expect(cap.inputModalities.has('image')).toBe(true)
+    expect(cap.outputModalities.has('video')).toBe(true)
+    expect(cap.contextLength).toBeUndefined()
+  })
+
   it('takes min() of numeric caps in strict mode (lower bound)', () => {
     const a = makeEndpoint({ context_length: 200000, max_completion_tokens: 16000 })
     const b = makeEndpoint({ context_length: 128000, max_completion_tokens: 4096 })

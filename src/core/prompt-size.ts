@@ -113,7 +113,9 @@ function messageHasMediaContext(message: Message): boolean {
       item.type === 'output_image' ||
       item.type === 'file' ||
       item.type === 'input_audio' ||
-      item.type === 'video_url',
+      item.type === 'video_url' ||
+      item.type === 'output_video' ||
+      item.type === 'audio_output',
   )
 }
 
