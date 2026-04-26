@@ -172,7 +172,8 @@ function MessageInner({
   // Streaming state is tracked per-message (messageId) in the ephemeral
   // stream store. Prop `streaming` is the authoritative fallback when a
   // caller passes it in; otherwise we check the store. Either way, the
-  // resolved value drives auto-expand/collapse for the reasoning block.
+  // resolved value drives streaming render mode plus reasoning/collapse
+  // affordances.
   const storeStreaming = useStreamStore((s) =>
     message.role === 'assistant' ? s.isTargetActive(chatId, message.id) : false,
   )
@@ -300,7 +301,10 @@ function MessageInner({
     handleRetryWithoutReasoning,
     handleCopyError,
   ])
-  const collapseProfile = useMemo(() => collapseProfileFor(text.length), [text.length])
+  const collapseProfile = useMemo(
+    () => collapseProfileFor(text.length, { streaming: isStreaming }),
+    [isStreaming, text.length],
+  )
   const manualCollapseRef = useRef(false)
   const [collapseMode, setCollapseMode] = useState<MessageCollapseMode>(collapseProfile.defaultMode)
 
@@ -468,7 +472,7 @@ function MessageInner({
           <MessageContent
             content={message.content}
             text={text}
-            streaming={streaming ?? false}
+            streaming={isStreaming}
             collapseMode={collapseMode}
             messageId={message.id}
             attachmentRefs={message.attachmentRefs}

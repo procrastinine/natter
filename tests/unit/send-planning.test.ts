@@ -378,6 +378,50 @@ describe('resolveRequestPrivacyPlan', () => {
     expect(requestPlan.wire.tool_choice).toBe('auto')
   })
 
+  it('passes the max completion cap through max_tokens when OpenRouter endpoints advertise only that name', async () => {
+    const profile = makeProfile()
+    const chat = makeChat({
+      model: 'anthropic/claude-haiku-4.5',
+      maxCompletionTokens: 32,
+    })
+    await putCachedEndpoints(profile.id, chat.settings.model, {
+      id: chat.settings.model,
+      endpoints: [
+        {
+          provider_name: 'OpenAI',
+          provider_slug: 'openai',
+          supported_parameters: ['provider', 'max_tokens'],
+          context_length: 200000,
+          pricing: {},
+        },
+      ],
+    })
+    await putCachedPrivacyPolicy(profile.id, chat.settings.model, {
+      policies: {
+        OpenAI: {
+          training: false,
+          trainingOpenRouter: false,
+          retainsPrompts: false,
+          canPublish: false,
+          termsOfServiceURL: '',
+          privacyPolicyURL: '',
+        },
+      },
+      fetchedAt: 0,
+    })
+
+    const { requestPlan } = await prepareAssistantRequestPlan({
+      chat,
+      connection: profile,
+      pathMessages: [makeMessage('answer briefly')],
+      draftText: '',
+    })
+
+    expect(requestPlan.route?.kind).toBe('chat-completions')
+    expect(requestPlan.wire.max_tokens).toBe(32)
+    expect(requestPlan.wire.max_completion_tokens).toBeUndefined()
+  })
+
   it('routes OpenRouter video generation from the top-level endpoint architecture', async () => {
     const model = 'google/veo-3.1-lite'
     const profile = makeProfile()

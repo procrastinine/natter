@@ -491,11 +491,14 @@ export function toChatCompletions(
   }
   if (
     settings.maxCompletionTokens !== undefined &&
-    settings.maxCompletionTokens >= 0 &&
-    gate('max_completion_tokens')
+    settings.maxCompletionTokens >= 0
   ) {
     // -1 is our local "unlimited" sentinel; never send it on the wire.
-    wire.max_completion_tokens = settings.maxCompletionTokens
+    if (gate('max_completion_tokens')) {
+      wire.max_completion_tokens = settings.maxCompletionTokens
+    } else if (gate('max_tokens')) {
+      wire.max_tokens = settings.maxCompletionTokens
+    }
   }
   if (settings.logitBias && gate('logit_bias')) {
     wire.logit_bias = { ...settings.logitBias }

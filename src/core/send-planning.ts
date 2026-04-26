@@ -53,6 +53,9 @@ const DIRECT_CAPABILITY_LOOKUP_QUERY = {} as const
 // OpenRouter send behavior historically used an ungated superset and let OR
 // drop unsupported optional fields. Request-time discovery is used here for
 // media routing/caps; it must not narrow normal text/reasoning sends.
+// `max_tokens` / `max_completion_tokens` are excluded from the superset because
+// they are mutually exclusive aliases whose spelling must come from endpoint
+// metadata.
 const OPENROUTER_SEND_PARAMETER_SUPERSET = [
   'temperature',
   'top_p',
@@ -66,8 +69,6 @@ const OPENROUTER_SEND_PARAMETER_SUPERSET = [
   'logprobs',
   'top_logprobs',
   'stop',
-  'max_tokens',
-  'max_completion_tokens',
   'logit_bias',
   'cache_prompt',
   'modalities',

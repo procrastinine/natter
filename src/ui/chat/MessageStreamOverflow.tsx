@@ -8,6 +8,10 @@ export interface MessageCollapseProfile {
   oversized: boolean
 }
 
+export interface MessageCollapseProfileOptions {
+  streaming?: boolean
+}
+
 export interface MessageStreamOverflowProps {
   collapseMode: MessageCollapseMode
   fullChildren: ReactNode
@@ -23,13 +27,17 @@ export const LONG_MESSAGE_THRESHOLD = 4_000
 // - short messages:        full <-> peek
 // - long messages:         full -> compact -> peek -> full
 // - truly oversized rows:  start in compact to protect render cost
-export function collapseProfileFor(totalChars: number): MessageCollapseProfile {
+// - active streams:        stay full unless the user manually collapses
+export function collapseProfileFor(
+  totalChars: number,
+  options: MessageCollapseProfileOptions = {},
+): MessageCollapseProfile {
   if (totalChars <= 0) {
     return { defaultMode: 'full', modes: ['full'], oversized: false }
   }
   if (totalChars > DEFAULT_OVERFLOW_THRESHOLD) {
     return {
-      defaultMode: 'compact',
+      defaultMode: options.streaming ? 'full' : 'compact',
       modes: ['full', 'compact', 'peek'],
       oversized: true,
     }

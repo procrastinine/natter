@@ -123,6 +123,30 @@ describe('toChatCompletions', () => {
     expect(wire.stop).toEqual(['\n\n'])
   })
 
+  it('uses the advertised chat-completion max-token parameter name', () => {
+    const path = [textMessage({ id: 'u1', role: 'user', text: 'hi' })]
+    const maxCompletionCaps: CapabilityDescriptor = {
+      supportedParameters: ['max_completion_tokens', 'max_tokens'],
+      streaming: 'supported',
+    }
+    const maxTokensCaps: CapabilityDescriptor = {
+      supportedParameters: ['max_tokens'],
+      streaming: 'supported',
+    }
+
+    const preferred = toChatCompletions(settings({ maxCompletionTokens: 128 }), path, {
+      capabilities: maxCompletionCaps,
+    }).wire
+    expect(preferred.max_completion_tokens).toBe(128)
+    expect(preferred.max_tokens).toBeUndefined()
+
+    const fallback = toChatCompletions(settings({ maxCompletionTokens: 128 }), path, {
+      capabilities: maxTokensCaps,
+    }).wire
+    expect(fallback.max_tokens).toBe(128)
+    expect(fallback.max_completion_tokens).toBeUndefined()
+  })
+
   it('never drops envelope fields even when supported_parameters is narrow', () => {
     const path = [textMessage({ id: 'u1', role: 'user', text: 'hi' })]
     // Empty capabilities set — gate denies everything optional, but envelope
