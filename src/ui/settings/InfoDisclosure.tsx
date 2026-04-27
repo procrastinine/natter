@@ -71,7 +71,7 @@ export function InfoDisclosure({
       <button
         type="button"
         data-ui="info-hint"
-        aria-label={title}
+        aria-label="More info"
         title={title}
         aria-expanded={open}
         aria-controls={open ? panelId : undefined}
@@ -87,13 +87,33 @@ export function InfoDisclosure({
           <path d="M8 6.8v5" stroke="currentColor" strokeWidth="1.25" strokeLinecap="round" />
         </svg>
       </button>
+      {/* The popup lives inside whatever ancestor wraps the trigger, often a
+          `<label>` or `<h3>`. Without these handlers, clicking text in the
+          popup (or starting a text-selection drag) bubbles up and either
+          toggles the labelled control or runs the heading's click. Stopping
+          mouse and click events here keeps the popup behaving like a
+          standalone tooltip while still letting the document-level
+          outside-click handler see the event (it runs on
+          `document.mousedown` which fires before propagation, and it skips
+          this subtree via the `rootRef.contains` check anyway). */}
       {open ? (
+        // biome-ignore lint/a11y/useKeyWithClickEvents: defensive containment, not an interactive widget — the popup is read-only text.
         <div
           id={panelId}
           ref={panelRef}
           data-ui="info-disclosure-panel"
           data-align={align}
           role="note"
+          onClick={(event) => {
+            // preventDefault stops the parent <label>'s activation behavior
+            // (forwarding the click to the labeled checkbox); stopPropagation
+            // alone isn't enough because that's a default-action thing, not a
+            // listener on an ancestor.
+            event.preventDefault()
+            event.stopPropagation()
+          }}
+          onMouseDown={(event) => event.stopPropagation()}
+          onMouseUp={(event) => event.stopPropagation()}
         >
           {children ?? title}
         </div>

@@ -1,6 +1,7 @@
 import { useLiveQuery } from 'dexie-react-hooks'
 import { createContext, useCallback, useEffect, type ReactNode, useState } from 'react'
 import { getSetting, setSetting } from '../../store/settings'
+import { InfoDisclosure } from './InfoDisclosure'
 
 export type ShikiThemeChoice = 'github-light' | 'github-dark' | 'tokyo-night' | 'dracula'
 
@@ -95,11 +96,11 @@ export function RenderingSettings() {
               onChange={(e) => onSingleDollarTextMath(e.target.checked)}
             />
             <span>Single-dollar LaTeX markdown</span>
+            <InfoDisclosure title="Single-dollar LaTeX markdown">
+              When on, $...$ renders as inline math. Keep off for price-heavy chats; use
+              $$...$$ for math.
+            </InfoDisclosure>
           </label>
-          <span data-ui="helper">
-            When on, $...$ renders as inline math. Keep off for price-heavy chats; use $$...$$ for
-            math.
-          </span>
         </div>
         <div data-ui="field-group">
           <label htmlFor="shiki-light">Code theme · light</label>

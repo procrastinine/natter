@@ -927,10 +927,33 @@
   background: var(--color-bg-surface-1);
   box-shadow: var(--shadow-md);
   color: var(--color-fg-secondary);
+  /* Override any heading or label styling the trigger inherits from — the
+     popup should read as body copy regardless of where it's anchored. */
   font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-regular);
+  font-style: normal;
+  text-transform: none;
+  letter-spacing: normal;
   line-height: 1.5;
   white-space: normal;
+  cursor: text;
+  user-select: text;
   transform: translateX(var(--info-panel-shift, 0px));
+}
+
+[data-ui="info-disclosure-panel"] code {
+  font-weight: var(--font-weight-regular);
+}
+
+[data-ui="info-disclosure-panel"] ul {
+  margin: var(--space-1) 0;
+  padding-left: var(--space-4);
+  font-weight: var(--font-weight-regular);
+  list-style: disc outside;
+}
+
+[data-ui="info-disclosure-panel"] li + li {
+  margin-top: 4px;
 }
 
 [data-ui="info-disclosure-panel"][data-align="end"] {

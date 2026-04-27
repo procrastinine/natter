@@ -19,6 +19,7 @@ import {
   writeTokenCalibrationGlobal,
 } from '../../core/token-calibration'
 import type { GlobalTokenCalibration, TokenCalibrationSample } from '../../core/types'
+import { InfoDisclosure } from './InfoDisclosure'
 
 const MODE_OPTIONS: ReadonlyArray<{ value: TokenCalibrationMode; label: string; helper: string }> =
   [
@@ -69,7 +70,10 @@ export function TokenCalibrationSettings({
     <div data-ui="settings-section" data-ui-section="token-calibration">
       <h3>Token calibration</h3>
       <div data-ui="field-group">
-        <label htmlFor="token-calibration-mode">Estimation mode</label>
+        <label htmlFor="token-calibration-mode">
+          Estimation mode
+          <InfoDisclosure title="Estimation mode">{selectedHelper}</InfoDisclosure>
+        </label>
         <select
           id="token-calibration-mode"
           data-ui="token-calibration-mode"
@@ -82,7 +86,6 @@ export function TokenCalibrationSettings({
             </option>
           ))}
         </select>
-        <span data-ui="helper">{selectedHelper}</span>
       </div>
       <div data-ui="field-group">
         <span data-ui="field-label">Global calibration buckets</span>

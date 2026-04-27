@@ -1,6 +1,6 @@
 // UI tests for the global-settings Token Calibration section.
 
-import { render } from '@testing-library/react'
+import { fireEvent, render, within } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { TokenCalibrationSettings } from '../../src/ui/settings/TokenCalibrationSettings'
 
@@ -62,12 +62,19 @@ describe('TokenCalibrationSettings', () => {
     expect(values).toEqual(['adaptive', 'global-only', 'family-defaults-only'])
   })
 
-  it('shows the helper text for the currently-selected mode', () => {
+  it('shows the helper text for the currently-selected mode (revealed via info popover)', () => {
     const { container, rerender } = render(
       <TokenCalibrationSettings mode="family-defaults-only" onModeChange={() => {}} />,
     )
+    const reveal = (root: HTMLElement) => {
+      const infoButton = within(root).getAllByRole('button', { name: /more info/i })[0]
+      if (!infoButton) throw new Error('expected an info button')
+      fireEvent.click(infoButton)
+    }
+    reveal(container)
     expect(container.textContent).toMatch(/hardcoded per-family anchor/i)
     rerender(<TokenCalibrationSettings mode="adaptive" onModeChange={() => {}} />)
+    reveal(container)
     expect(container.textContent).toMatch(/per-chat.*global.*default/i)
   })
 

@@ -31,3 +31,57 @@ export interface CorsProxyConfig {
   /** Optional secret echoed as `X-Proxy-Secret`. Empty = header omitted. */
   secret: string
 }
+
+// Known public CORS bouncers. Each entry maps a canonical lowercase host
+// to the URL builder for the OpenRouter privacy-scrape page. The Settings
+// field's "simple host" shortcut works by looking the host up here; users
+// who paste the full template (e.g.
+// `https://corsproxy.io/?url=https://openrouter.ai/{model}/providers`)
+// take the template path in `privacyScrapeUrl` and bypass this table.
+//
+// To add a bouncer: live-check it returns `openrouter.ai/{model}/providers`
+// HTML (200 + the page's `data_policy` / `provider_display_name` markers)
+// from a browser-style request, document it in `plan/cors-proxy.md`, and
+// add a row here.
+export interface KnownBouncer {
+  host: string
+  buildUrl: (modelId: string) => string
+}
+
+export const KNOWN_BOUNCERS: ReadonlyArray<KnownBouncer> = [
+  {
+    host: 'corsproxy.io',
+    buildUrl: (m) => `https://corsproxy.io/?url=https://openrouter.ai/${m}/providers`,
+  },
+  {
+    host: 'api.allorigins.win',
+    buildUrl: (m) => `https://api.allorigins.win/raw?url=https://openrouter.ai/${m}/providers`,
+  },
+  {
+    host: 'proxy.corsfix.com',
+    buildUrl: (m) => `https://proxy.corsfix.com/?url=https://openrouter.ai/${m}/providers`,
+  },
+]
+
+// Resolve a user-pasted proxy value to a known bouncer when it's a bare
+// host (with optional scheme and trailing slash, no path/query/hash).
+// Returns `undefined` for templates, custom hosts, and anything that
+// looks like a path-prefix base — those follow other branches in
+// `privacyScrapeUrl`.
+export function matchKnownBouncer(raw: string): KnownBouncer | undefined {
+  const stripped = raw.trim().replace(/\/+$/, '')
+  if (stripped.length === 0) return undefined
+  const candidate = /^[a-z][a-z0-9+.-]*:\/\//i.test(stripped)
+    ? stripped
+    : `https://${stripped}`
+  let parsed: URL
+  try {
+    parsed = new URL(candidate)
+  } catch {
+    return undefined
+  }
+  if (parsed.pathname !== '/' && parsed.pathname !== '') return undefined
+  if (parsed.search !== '' || parsed.hash !== '') return undefined
+  const host = parsed.hostname.toLowerCase()
+  return KNOWN_BOUNCERS.find((b) => b.host === host)
+}

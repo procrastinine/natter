@@ -71,6 +71,62 @@ describe('privacyScrapeUrl', () => {
     const proxy = makeProxy({ url: 'https://example.com/{model}' })
     expect(privacyScrapeUrl(proxy, 'openai/gpt-5.4')).toBe('https://example.com/openai/gpt-5.4')
   })
+
+  it('expands the bare corsproxy.io host into its ?url= template', () => {
+    expect(privacyScrapeUrl(makeProxy({ url: 'corsproxy.io' }), 'openai/gpt-5.4')).toBe(
+      'https://corsproxy.io/?url=https://openrouter.ai/openai/gpt-5.4/providers',
+    )
+  })
+
+  it('expands the bare api.allorigins.win host into the /raw template', () => {
+    expect(
+      privacyScrapeUrl(makeProxy({ url: 'api.allorigins.win' }), 'anthropic/claude-opus-4.7'),
+    ).toBe(
+      'https://api.allorigins.win/raw?url=https://openrouter.ai/anthropic/claude-opus-4.7/providers',
+    )
+  })
+
+  it('expands the bare proxy.corsfix.com host into the ?url= template', () => {
+    expect(
+      privacyScrapeUrl(makeProxy({ url: 'proxy.corsfix.com' }), 'openai/gpt-5.4'),
+    ).toBe('https://proxy.corsfix.com/?url=https://openrouter.ai/openai/gpt-5.4/providers')
+  })
+
+  it('accepts known-bouncer hosts with explicit https:// scheme', () => {
+    expect(
+      privacyScrapeUrl(makeProxy({ url: 'https://corsproxy.io' }), 'openai/gpt-5.4'),
+    ).toBe('https://corsproxy.io/?url=https://openrouter.ai/openai/gpt-5.4/providers')
+  })
+
+  it('accepts known-bouncer hosts case-insensitively', () => {
+    expect(privacyScrapeUrl(makeProxy({ url: 'CORSPROXY.IO' }), 'openai/gpt-5.4')).toBe(
+      'https://corsproxy.io/?url=https://openrouter.ai/openai/gpt-5.4/providers',
+    )
+  })
+
+  it('treats a known host with a custom path as a path-prefix base, not a shortcut', () => {
+    // The user could conceivably point natter at their own reverse proxy
+    // hosted at a known-bouncer domain — pasting anything beyond the bare
+    // host opts out of the shortcut.
+    expect(
+      privacyScrapeUrl(makeProxy({ url: 'https://corsproxy.io/custom' }), 'openai/gpt-5.4'),
+    ).toBe('https://corsproxy.io/custom/openai/gpt-5.4/providers')
+  })
+
+  it('does not match similar but unknown hosts', () => {
+    expect(privacyScrapeUrl(makeProxy({ url: 'corsproxy.com' }), 'openai/gpt-5.4')).toBe(
+      'corsproxy.com/openai/gpt-5.4/providers',
+    )
+  })
+
+  it('lets the explicit corsproxy.io template win over the bare-host shortcut', () => {
+    const proxy = makeProxy({
+      url: 'https://corsproxy.io/?url=https://openrouter.ai/{model}/providers',
+    })
+    expect(privacyScrapeUrl(proxy, 'openai/gpt-5.4')).toBe(
+      'https://corsproxy.io/?url=https://openrouter.ai/openai/gpt-5.4/providers',
+    )
+  })
 })
 
 describe('normalizeDataPolicy', () => {

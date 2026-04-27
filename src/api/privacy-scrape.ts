@@ -21,6 +21,7 @@ import {
   CORS_PROXY_SECRET_HEADER,
   type CorsProxyConfig,
   DEFAULT_CORS_PROXY_URL,
+  matchKnownBouncer,
 } from '../core/cors-proxy'
 import type { DataPolicy, ProfileId } from '../core/types'
 import { fetchWithTimeout } from './client'
@@ -55,17 +56,23 @@ export interface PrivacyScrapeResult {
 // skip the proxy and pass `directCorsProxyConfig()` (base =
 // `https://openrouter.ai`).
 //
-// Two URL shapes are accepted:
+// Three URL shapes are accepted (resolution order matters — template
+// wins, then known-bouncer shortcut, then path-prefix fallback):
 //
-//   1. Path-prefix mode (default): the URL is treated as a base and the
-//      scrape becomes `<base>/{model}/providers`. Mirrors the dev
-//      proxy and self-hosted Cloudflare Workers.
-//   2. Template mode: when the URL contains `{model}` or `{path}`
+//   1. Template mode: when the URL contains `{model}` or `{path}`
 //      placeholders, those are substituted literally and the result is
-//      used as-is. This is what makes generic public CORS bouncers
-//      (e.g. `https://corsproxy.io/?url=https://openrouter.ai/{model}/providers`)
-//      work — they expect the upstream URL passed via query string,
-//      not appended to a base path.
+//      used as-is. This makes any public CORS bouncer (e.g.
+//      `https://corsproxy.io/?url=https://openrouter.ai/{model}/providers`)
+//      work, including ones we don't know about — they expect the
+//      upstream URL passed via query string, not appended to a base.
+//   2. Known-bouncer shortcut: when the URL is just a bare host that
+//      matches `KNOWN_BOUNCERS` in `core/cors-proxy.ts` (with or
+//      without `https://`, with at most a trailing slash), the
+//      bouncer's canonical template is applied. Lets users paste
+//      `corsproxy.io` instead of the full `?url=...` form.
+//   3. Path-prefix mode (fallback, default): the URL is treated as a
+//      base and the scrape becomes `<base>/{model}/providers`. Mirrors
+//      the dev proxy and self-hosted Cloudflare Workers.
 //
 // `{model}` expands to `{author}/{slug}` (e.g. `openai/gpt-5.4`).
 // `{path}` expands to `{author}/{slug}/providers`.
@@ -83,6 +90,8 @@ export function privacyScrapeUrl(proxy: CorsProxyConfig, modelId: string): strin
       .split(MODEL_PLACEHOLDER)
       .join(modelId)
   }
+  const bouncer = matchKnownBouncer(raw)
+  if (bouncer) return bouncer.buildUrl(modelId)
   const base = raw.trim().replace(/\/+$/, '') || DEFAULT_PRIVACY_SCRAPE_BASE
   // Model slugs contain a `/` — the URL path accepts it verbatim.
   return `${base}/${modelId}/providers`

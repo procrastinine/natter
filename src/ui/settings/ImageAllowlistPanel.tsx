@@ -3,6 +3,7 @@ import { useCallback, useState } from 'react'
 import { DEFAULT_IMAGE_ORIGINS } from '../../core/image-allowlist'
 import { getSetting, setSetting } from '../../store/settings'
 import { TrashIcon } from '../icons/Icon'
+import { InfoDisclosure } from './InfoDisclosure'
 
 const STORAGE_KEY = 'image-allowlist'
 
@@ -64,11 +65,13 @@ export function ImageAllowlistPanel() {
 
   return (
     <div data-ui="settings-section">
-      <h3>Image whitelist</h3>
-      <p data-ui="helper">
-        Images from origins not on this whitelist are replaced with a blocked-image stub. Built-in
-        origins are always allowed.
-      </p>
+      <h3>
+        Image whitelist
+        <InfoDisclosure title="Image whitelist">
+          Images from origins not on this whitelist are replaced with a blocked-image stub.
+          Built-in origins are always allowed.
+        </InfoDisclosure>
+      </h3>
       <div data-ui="image-allowlist-add">
         <input
           aria-label="Origin to allow"

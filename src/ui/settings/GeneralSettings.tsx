@@ -18,6 +18,7 @@ import {
   writeSendShortcut,
   writeTokenCalibrationMode,
 } from '../../core/global-settings'
+import { InfoDisclosure } from './InfoDisclosure'
 import { TokenCalibrationSettings } from './TokenCalibrationSettings'
 
 const SHORTCUT_OPTIONS: ReadonlyArray<{ value: SendShortcut; label: string }> = [
@@ -90,12 +91,12 @@ export function GeneralSettings() {
               onChange={(e) => void onAutoScrollOnOpen(e.target.checked)}
             />
             <span>Jump to the branch leaf when opening a chat</span>
+            <InfoDisclosure title="Jump to the branch leaf when opening a chat">
+              When on, the chat loads already positioned at the latest message (no visible
+              scroll, the view is placed before paint). When off, the chat opens at the top and
+              the view stays scrollable manually.
+            </InfoDisclosure>
           </label>
-          <span data-ui="helper">
-            When on, the chat loads already positioned at the latest message (no visible scroll,
-            the view is placed before paint). When off, the chat opens at the top and the view
-            stays scrollable manually.
-          </span>
         </div>
         <div data-ui="field-group">
           <label data-ui="toggle-row" htmlFor="auto-scroll-stream-toggle">
@@ -107,11 +108,11 @@ export function GeneralSettings() {
               onChange={(e) => void onAutoScrollOnStream(e.target.checked)}
             />
             <span>Auto-scroll to the bottom during streams</span>
+            <InfoDisclosure title="Auto-scroll to the bottom during streams">
+              When off, new tokens during a live stream don't pull the viewport. Jumping to the
+              latest reply via the floating chip remains available.
+            </InfoDisclosure>
           </label>
-          <span data-ui="helper">
-            When off, new tokens during a live stream don't pull the viewport. Jumping to the
-            latest reply via the floating chip remains available.
-          </span>
         </div>
       </div>
       <TokenCalibrationSettings
@@ -119,33 +120,40 @@ export function GeneralSettings() {
         onModeChange={onTokenCalibrationMode}
       />
       <div data-ui="settings-section">
-        <h3>Privacy-page proxy</h3>
-        <span data-ui="helper">
-          Fetches per-provider <code>data_policy</code> info from OpenRouter's per-model HTML
-          pages.{' '}
-          {isDev ? (
-            <>
-              Default <code>{DEFAULT_CORS_PROXY_URL}</code> works while <code>pnpm dev</code>{' '}
-              is running.
-            </>
-          ) : (
-            <>Paste one of the examples below.</>
-          )}
-        </span>
-        <ul data-ui="helper">
-          <li>
-            Public bouncer:{' '}
-            <code>{'https://corsproxy.io/?url=https://openrouter.ai/{model}/providers'}</code>
-          </li>
-          <li>
-            Self-hosted Worker base: <code>https://or-scrape.example.workers.dev</code>{' '}
-            (<code>{'/{model}/providers'}</code> is appended automatically)
-          </li>
-        </ul>
-        <span data-ui="helper">
-          URLs containing <code>{'{model}'}</code> are substituted in place; otherwise the
-          value is treated as a base and the path is appended.
-        </span>
+        <h3>
+          Privacy-page proxy
+          <InfoDisclosure title="Privacy-page proxy">
+            Fetches per-provider <code>data_policy</code> info from OpenRouter's per-model HTML
+            pages.{' '}
+            {isDev ? (
+              <>
+                Default <code>{DEFAULT_CORS_PROXY_URL}</code> works while <code>pnpm dev</code>{' '}
+                is running.
+              </>
+            ) : (
+              <>Paste one of the examples below.</>
+            )}
+            <ul>
+              <li>
+                Known bouncer (just the host): <code>corsproxy.io</code>,{' '}
+                <code>api.allorigins.win</code>, or <code>proxy.corsfix.com</code>.
+              </li>
+              <li>
+                Custom bouncer (full template):{' '}
+                <code>
+                  {'https://corsproxy.io/?url=https://openrouter.ai/{model}/providers'}
+                </code>
+              </li>
+              <li>
+                Self-hosted Worker base: <code>https://or-scrape.example.workers.dev</code>{' '}
+                (<code>{'/{model}/providers'}</code> is appended automatically)
+              </li>
+            </ul>
+            URLs containing <code>{'{model}'}</code> or <code>{'{path}'}</code> are substituted
+            in place; bare hosts in the known-bouncer list expand automatically; everything
+            else is treated as a base and the path is appended.
+          </InfoDisclosure>
+        </h3>
         <div data-ui="field-group">
           <label htmlFor="cors-proxy-url">Proxy URL</label>
           <input
@@ -169,6 +177,10 @@ export function GeneralSettings() {
         <div data-ui="field-group">
           <label htmlFor="cors-proxy-secret">
             Proxy secret <em>(optional)</em>
+            <InfoDisclosure title="Proxy secret">
+              Sent as <code>X-Proxy-Secret</code>. Only needed when a self-hosted bouncer
+              requires auth.
+            </InfoDisclosure>
           </label>
           <input
             id="cors-proxy-secret"
@@ -180,10 +192,6 @@ export function GeneralSettings() {
             value={prefs.corsProxySecret}
             onChange={(e) => void onCorsProxySecret(e.target.value)}
           />
-          <span data-ui="helper">
-            Sent as <code>X-Proxy-Secret</code>. Only needed when a self-hosted bouncer
-            requires auth.
-          </span>
         </div>
       </div>
     </>

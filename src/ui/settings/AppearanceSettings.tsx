@@ -28,6 +28,7 @@ import {
   writeLongMessageDisplayMode,
   writeTheme,
 } from '../../core/global-settings'
+import { InfoDisclosure } from './InfoDisclosure'
 import { RenderingSettings } from './RenderingSettings'
 
 const THEME_OPTIONS: ReadonlyArray<{ value: ThemePreference; label: string }> = [
@@ -146,6 +147,10 @@ export function AppearanceSettings() {
           <label htmlFor="chat-max-width">
             Chat width{' '}
             <span data-ui="field-value">{chatMaxWidthLabel(prefFromSliderPosition(position))}</span>
+            <InfoDisclosure title="Chat width">
+              Maximum width of the centered reading column. Drag to the right edge for full
+              width.
+            </InfoDisclosure>
           </label>
           <input
             id="chat-max-width"
@@ -157,12 +162,15 @@ export function AppearanceSettings() {
             value={position}
             onChange={(e) => onChatMaxWidth(e.target.value)}
           />
-          <span data-ui="helper">
-            Maximum width of the centered reading column. Drag to the right edge for full width.
-          </span>
         </div>
         <div data-ui="field-group">
-          <label htmlFor="long-message-display">Long messages</label>
+          <label htmlFor="long-message-display">
+            Long messages
+            <InfoDisclosure title="Long messages">
+              Controls whether long messages reload as full text or as an avatar-expandable
+              compact preview.
+            </InfoDisclosure>
+          </label>
           <select
             id="long-message-display"
             data-ui="long-message-display-select"
@@ -177,16 +185,18 @@ export function AppearanceSettings() {
               </option>
             ))}
           </select>
-          <span data-ui="helper">
-            Controls whether long messages reload as full text or as an avatar-expandable compact
-            preview.
-          </span>
         </div>
       </div>
       <div data-ui="settings-section">
         <h3>Typography</h3>
         <div data-ui="field-group">
-          <label htmlFor="font-family">Font family</label>
+          <label htmlFor="font-family">
+            Font family
+            <InfoDisclosure title="Font family">
+              Applies to the chat transcript, composer, and sidebar. Code blocks keep the
+              monospace family from the rendering theme.
+            </InfoDisclosure>
+          </label>
           <select
             id="font-family"
             data-ui="font-family-select"
@@ -199,13 +209,14 @@ export function AppearanceSettings() {
               </option>
             ))}
           </select>
-          <span data-ui="helper">
-            Applies to the chat transcript, composer, and sidebar. Code blocks keep the monospace
-            family from the rendering theme.
-          </span>
         </div>
         <div data-ui="field-group">
-          <label htmlFor="base-font-size">Base font size</label>
+          <label htmlFor="base-font-size">
+            Base font size
+            <InfoDisclosure title="Base font size">
+              Scales headings, chips, and helper text proportionally.
+            </InfoDisclosure>
+          </label>
           <select
             id="base-font-size"
             data-ui="base-font-size-select"
@@ -220,7 +231,6 @@ export function AppearanceSettings() {
               </option>
             ))}
           </select>
-          <span data-ui="helper">Scales headings, chips, and helper text proportionally.</span>
         </div>
       </div>
       <RenderingSettings />

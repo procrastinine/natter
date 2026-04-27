@@ -37,7 +37,7 @@ beforeEach(async () => {
 describe('AppearanceSettings', () => {
   it('persists chat width immediately when the slider changes', async () => {
     render(<AppearanceSettings />)
-    const slider = screen.getByLabelText(/Chat width/) as HTMLInputElement
+    const slider = screen.getByLabelText(/Chat width/, { selector: 'input' }) as HTMLInputElement
 
     fireEvent.change(slider, { target: { value: '960' } })
 
@@ -52,7 +52,9 @@ describe('AppearanceSettings', () => {
 
   it('persists the long-message default display mode', async () => {
     render(<AppearanceSettings />)
-    fireEvent.change(screen.getByLabelText('Long messages'), { target: { value: 'compact' } })
+    fireEvent.change(screen.getByLabelText('Long messages', { selector: 'select' }), {
+      target: { value: 'compact' },
+    })
 
     const mod = (await import('../../src/store/settings')) as unknown as {
       __get(key: string): unknown
