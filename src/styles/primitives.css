@@ -31,11 +31,18 @@ button {
     border-color var(--duration-fast) var(--ease-standard);
 }
 
-button:not([data-ui$="-scrim"]):hover:not(:disabled) {
+/* Wrapped in :where() so this default-button hover sits at (0,1,0)
+ * specificity. Any colored button (accent send, danger abort/stop,
+ * accent connection-add, …) sets its own background and a matching
+ * :hover at (0,2,0) or higher, and wins without needing to mirror an
+ * artificially high baseline. Without :where(), every colored button
+ * had to re-assert its hover background or get stomped to the surface
+ * tint and read white-ish on hover. */
+:where(button:not([data-ui$="-scrim"]):not(:disabled)):hover {
   background: var(--color-bg-hover);
 }
 
-button:not([data-ui$="-scrim"]):active:not(:disabled) {
+:where(button:not([data-ui$="-scrim"]):not(:disabled)):active {
   background: var(--color-bg-active);
 }
 
