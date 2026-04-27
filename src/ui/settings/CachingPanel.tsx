@@ -25,8 +25,8 @@ export interface CachingPanelProps {
   // Caching breakpoints are provider-specific wire features: Anthropic's
   // `cache_control` blocks, Gemini's manual cache, OpenRouter's header.
   // Local / OpenAI-compatible servers (llama.cpp, vLLM, LM Studio, OpenAI
-  // proper) don't expose a user-facing caching surface, so we hide the
-  // panel entirely for those kinds rather than render controls that do
+  // proper) don't expose a user-facing caching surface, so the panel
+  // is hidden entirely for those kinds rather than rendering controls that do
   // nothing. Only the kinds that can actually produce a cache breakpoint
   // are listed below.
   connectionKind: ConnectionKind

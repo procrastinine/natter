@@ -4,10 +4,10 @@
 //   - URL construction (`/responses`)
 //   - SSE event shape: instead of raw `data:` JSON frames with delta/message
 //     choices, OpenAI emits `event: response.<type>\ndata: {…}` pairs keyed by
-//     typed event names. We parse those into `ResponsesEventWire` envelopes.
-//   - Buffered fallback: like chat, we handle a JSON response when the server
-//     ignores `stream:true` (happens on some structured-output calls through
-//     OpenRouter).
+//     typed event names. The adapter parses those into `ResponsesEventWire` envelopes.
+//   - Buffered fallback: like chat, the adapter handles a JSON response when
+//     the server ignores `stream:true` (happens on some structured-output calls
+//     through OpenRouter).
 //
 // Stream-consumer contract:
 //   - `{type: 'event', event}` — one per SSE `data:` frame, typed.

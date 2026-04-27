@@ -109,8 +109,8 @@ describe('quirks registry', () => {
   })
 
   it('xAI Grok 4.x allowedEffort narrows to low/medium/high', () => {
-    // /chat/completions rejects 'none' / 'minimal' / 'xhigh' on these models
-    // — upstream clamps silently, so we hide those buttons.
+    // /chat/completions rejects 'none' / 'minimal' / 'xhigh' on these models.
+    // Upstream clamps silently, so those buttons stay hidden.
     expect(allowedEffortFor('x-ai/grok-4.20')).toEqual(['low', 'medium', 'high'])
     expect(allowedEffortFor('x-ai/grok-4.1')).toEqual(['low', 'medium', 'high'])
   })

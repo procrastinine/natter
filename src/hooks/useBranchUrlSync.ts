@@ -9,7 +9,7 @@
 //
 //   - URL → cursor runs on mount and on `hashchange`. The URL is a
 //     user-initiated intent (new tab arrival, back/forward, manual
-//     edit). We seed the cursor once per arrival so the pinned
+//     edit). The cursor is seeded once per arrival so the pinned
 //     message is on the active path.
 //   - cursor → URL runs on every cursor change. After seeding (or
 //     after any user swipe), the URL mirrors the active-path leaf
@@ -36,8 +36,8 @@ export function useBranchUrlSync(chatId: ChatId | null): void {
   const messagesRef = useRef<Message[]>(messages)
   messagesRef.current = messages
 
-  // Track the URLs we've already consumed (seeded from) so repeated
-  // triggers don't reseed once we've landed.
+  // Track the URLs already consumed (seeded from) so repeated
+  // triggers don't reseed once landed.
   const seededRef = useRef<Set<string>>(new Set())
 
   // ─── cursor → URL ────────────────────────────────────────────────
@@ -55,9 +55,9 @@ export function useBranchUrlSync(chatId: ChatId | null): void {
     const desired = chatHref(chatId, leaf.id)
     if (window.location.hash === desired) return
     replaceRoute(desired)
-    // Mark the URL we just wrote as already-seeded so the hashchange
+    // Mark the URL just written as already-seeded so the hashchange
     // that might fire for some external reason (DevTools edits, etc.)
-    // doesn't reseed and bounce us back.
+    // doesn't reseed and bounce back.
     seededRef.current.add(`${chatId}:${leaf.id}`)
   }
 
@@ -77,7 +77,7 @@ export function useBranchUrlSync(chatId: ChatId | null): void {
     if (!target || target.deleted) return
     // "Already on path" guard — a new-tab URL might happen to name a
     // message that IS already on the default active path, in which
-    // case we don't need to touch the cursor at all. This also makes
+    // case the cursor doesn't need to be touched at all. This also makes
     // the seed idempotent when a cursor-change race fires mid-flight.
     const cursor = useChatStore.getState().getCursor(chatId) ?? {}
     const currentPath = activePath(rows, cursor)
@@ -108,7 +108,7 @@ export function useBranchUrlSync(chatId: ChatId | null): void {
   }, [chatId])
 
   // Real browser navigation (back/forward, manual hash edit): seed
-  // from the new URL, then write back the canonical leaf. Our own
+  // from the new URL, then write back the canonical leaf. The internal
   // replaceState is silent, so this listener only fires for
   // user-driven URL changes.
   useEffect(() => {

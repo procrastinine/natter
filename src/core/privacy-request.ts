@@ -17,6 +17,7 @@
 import { fetchEndpoints } from '../api/models'
 import { normalizeEndpointsResponse, type EndpointsDescriptor } from '../api/providers'
 import { fetchPrivacyScrape, readCachedPrivacyPayload } from '../api/privacy-scrape'
+import type { CorsProxyConfig } from './cors-proxy'
 import { isFreeModel } from './model-predicates'
 import { providerRoutingRef } from './provider-identity'
 import { migrateLegacyProviderSettings } from './provider-settings-migration'
@@ -54,11 +55,17 @@ export class PrivacyDiscoveryUnavailableError extends Error {
 export interface ResolvePrivacyForSendInput {
   chat: Chat
   profile: ConnectionProfile
-  // Tokens we'd actually send to this model right now (visible text +
-  // media + reasoning echo + reserved completion). Provider endpoints
-  // whose context can't hold this number are added to `wire.ignore` as
-  // a transient filter — the user's persisted `providerPrefs.ignore`
-  // list is unchanged. Omit to skip the check entirely.
+  // Workspace-global CORS-proxy config (browser mode reads from
+  // `readCorsProxyConfig()`; daemon mode passes `directCorsProxyConfig()`).
+  // Threaded through to `fetchPrivacyScrape` so this env-neutral resolver
+  // never has to touch IDB or know which mode it's running in.
+  proxy: CorsProxyConfig
+  // Tokens that would actually be sent to this model right now (visible
+  // text + media + reasoning echo + reserved completion). Provider
+  // endpoints whose context can't hold this number are added to
+  // `wire.ignore` as a transient filter. The user's persisted
+  // `providerPrefs.ignore` list is unchanged. Omit to skip the check
+  // entirely.
   neededTokens?: number
   signal?: AbortSignal
 }
@@ -107,6 +114,7 @@ export async function resolvePrivacyForSend(
   const endpoints = descriptor?.endpoints ?? []
   const policyResult = await ensurePrivacyPolicies({
     profile,
+    proxy: input.proxy,
     modelId: chat.settings.model,
     endpoints,
     ...(input.signal ? { signal: input.signal } : {}),
@@ -146,10 +154,10 @@ export async function resolvePrivacyForSend(
       }
     }
     if (insufficient.length > 0) {
-      // Merge into the existing wire.ignore — keep user prefs / privacy
-      // filter exclusions intact. The UI still shows the provider as
+      // Merge into the existing wire.ignore. User prefs / privacy
+      // filter exclusions stay intact. The UI still shows the provider as
       // "checked" because the settings row is unchanged; the grey badge
-      // + this transient ignore are what keep the send honest.
+      // plus this transient ignore are what keep the send honest.
       const base: { ignore?: string[] } = (wire ?? { ignore: [] }) as { ignore?: string[] }
       const next = new Set<string>(base.ignore ?? [])
       for (const name of insufficient) next.add(name)
@@ -198,11 +206,12 @@ async function ensureEndpointsRow(
 
 async function ensurePrivacyPolicies(input: {
   profile: ConnectionProfile
+  proxy: CorsProxyConfig
   modelId: string
   endpoints: readonly { data_policy?: DataPolicy }[]
   signal?: AbortSignal
 }): Promise<{ policies: Record<string, DataPolicy>; offlineFallback: boolean }> {
-  const { profile, modelId, endpoints, signal } = input
+  const { profile, proxy, modelId, endpoints, signal } = input
   const needsScrape =
     profile.supportsPrivacyScrape !== false && endpoints.some((endpoint) => !endpoint.data_policy)
   const cached = await getCachedPrivacyPolicy(profile.id, modelId)
@@ -218,7 +227,7 @@ async function ensurePrivacyPolicies(input: {
   try {
     await dedupedPrivacyFetch(profile.id, modelId, async () => {
       const result = await fetchPrivacyScrape(
-        { profile },
+        { proxy },
         modelId,
         {
           ...(signal ? { signal } : {}),

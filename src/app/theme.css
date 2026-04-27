@@ -42,8 +42,8 @@
 
 /* Tailwind 4 auto-scans the project tree, but not node_modules. Streamdown's
  * compiled components (ul `list-disc`, strong `font-semibold`, tables, etc.)
- * need those utilities emitted in our bundle or the markdown pipeline renders
- * unstyled. Source-scan its dist so the classes land in our CSS. */
+ * need those utilities emitted in the bundle or the markdown pipeline renders
+ * unstyled. Source-scan its dist so the classes land in the CSS. */
 @source "../../node_modules/streamdown/dist";
 
 /* Streamdown renders tables / code-blocks / fullscreen modals with shadcn-
@@ -54,7 +54,7 @@
  * tables, code fences, and math blocks. Likewise `bg-background` resolves
  * to transparent, so the fullscreen-table overlay becomes invisible on top
  * of the page and the user can't see it at all. Map these shadcn names to
- * our existing design tokens with `@theme inline` so the resolution stays
+ * the existing design tokens with `@theme inline` so the resolution stays
  * dynamic across light / dark / high-contrast. */
 @theme inline {
   --color-background: var(--color-bg-surface-1);

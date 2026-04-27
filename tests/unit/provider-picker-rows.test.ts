@@ -1,7 +1,7 @@
 // Picker row mapping. See `plan/10-ui.md §10.5` +
 // `src/ui/settings/provider-picker-rows.ts`. These tests assume the
 // privacy filter's correctness is covered in `privacy-filter.test.ts`;
-// here we only verify that the UI-facing mapping lines up endpoint ↔
+// these tests only verify that the UI-facing mapping lines up endpoint ↔
 // filter-result ↔ row state.
 
 import { describe, expect, it } from 'vitest'

@@ -295,7 +295,7 @@ export function SystemPromptEditor({
         <>
           {s.toastVisible ? (
             <div data-ui="settings-toast" role="status">
-              System prompt updated — it takes effect on your next send. Earlier responses used
+              System prompt updated, it takes effect on the next send. Earlier responses used
               the previous prompt.
             </div>
           ) : null}

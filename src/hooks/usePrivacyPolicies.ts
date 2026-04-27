@@ -9,6 +9,11 @@
 import { useLiveQuery } from 'dexie-react-hooks'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { fetchPrivacyScrape, readCachedPrivacyPayload } from '../api/privacy-scrape'
+import {
+  DEFAULT_GLOBAL_PREFERENCES,
+  corsProxyConfigFromPrefs,
+  readGlobalPreferences,
+} from '../core/global-settings'
 import { isFreeModel } from '../core/model-predicates'
 import type { DataPolicy, ProfileId } from '../core/types'
 import { isFresh } from '../store/models-cache'
@@ -51,6 +56,7 @@ export function usePrivacyPolicies(
     [profileId],
     undefined,
   )
+  const globalPrefs = useLiveQuery(readGlobalPreferences, [], DEFAULT_GLOBAL_PREFERENCES)
   const [error, setError] = useState<string | null>(null)
   const [inFlight, setInFlight] = useState(false)
   const [refreshToken, setRefreshToken] = useState(0)
@@ -80,13 +86,15 @@ export function usePrivacyPolicies(
     if (forceRefresh) handledRefreshTokenRef.current = refreshToken
     setInFlight(true)
     setError(null)
+    const proxy = corsProxyConfigFromPrefs(globalPrefs)
     ;(async () => {
       try {
         await dedupedPrivacyFetch(profile.id, modelId, async () => {
           // The scrape URL is public — no Authorization header needed.
-          // A user-configured `privacyScrapeProxy` lives on the profile
-          // so it rides with `fetchPrivacyScrape` automatically.
-          const result = await fetchPrivacyScrape({ profile }, modelId)
+          // The CORS proxy + optional secret are workspace-global
+          // (`corsProxyUrl` / `corsProxySecret`); they're resolved here
+          // so `fetchPrivacyScrape` itself stays env-neutral.
+          const result = await fetchPrivacyScrape({ proxy }, modelId)
           if (Object.keys(result.raw.policies).length === 0 && hasPolicies && cachedRow) {
             return cachedRow.payload
           }
@@ -102,7 +110,7 @@ export function usePrivacyPolicies(
     return () => {
       cancelled = true
     }
-  }, [scrapeApplicable, profile, modelId, cachedRow, refreshToken])
+  }, [scrapeApplicable, profile, modelId, cachedRow, refreshToken, globalPrefs])
 
   const policies = useMemo<Record<string, DataPolicy>>(() => {
     if (!cachedRow) return {}

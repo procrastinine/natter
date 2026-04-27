@@ -16,7 +16,7 @@ export interface LlamaServerSectionProps {
 
 export function LlamaServerSection({ chat }: LlamaServerSectionProps) {
   const protocol = chat.settings.protocol ?? 'chat'
-  // Wire default is true. We only persist an explicit `false` when the
+  // Wire default is true. An explicit `false` is only persisted when the
   // user opts out; persisting true would be noise.
   const reuseCache = chat.settings.cachePrompt !== false
 

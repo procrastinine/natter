@@ -73,10 +73,10 @@ export function buildHeaders(
 }
 
 // Linked-abort helper. AbortSignal.any isn't available everywhere (jsdom
-// versions vary), and we need to distinguish "user aborted" from "timeout
-// fired" AFTER fetch throws — fetch itself only exposes a single AbortError.
+// versions vary), and "user aborted" must be distinguishable from "timeout
+// fired" AFTER fetch throws; fetch itself only exposes a single AbortError.
 // Forwarding both sources into one controller and keeping the source refs
-// gives us the introspection we need.
+// provides the needed introspection.
 function linkSignals(sources: Array<AbortSignal | undefined>): {
   signal: AbortSignal
   dispose: () => void

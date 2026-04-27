@@ -61,7 +61,7 @@
 /* Active state stays white and quiet — reading mode shouldn't have a
  * bright accent button drawing the eye back to the chrome. The crossed-
  * eye glyph alone communicates "mode is on"; opacity goes to 0.55 so
- * the button nearly blends into the page until you hover for it. */
+ * the button nearly blends into the page until hover. */
 [data-ui="focus-mode-toggle"][data-state="active"] {
   opacity: 0.55;
   background: var(--color-bg-surface-1);

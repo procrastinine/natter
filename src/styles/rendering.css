@@ -123,10 +123,10 @@
 }
 
 /* Streamdown wraps its code in `outer div (bg-sidebar) → body div
- * (bg-background, rounded + border + padding) → <pre>`. Our default
+ * (bg-background, rounded + border + padding) → <pre>`. The default
  * pre rule above adds its OWN surface + border + padding, which stacks
- * as a third visual layer inside the already-boxed body — the user
- * flagged this as "gray-white-gray 3 layers". Drop our pre chrome
+ * as a third visual layer inside the already-boxed body, the user
+ * flagged this as "gray-white-gray 3 layers". Drop the pre chrome
  * when it's inside Streamdown's body wrapper so the result matches
  * the 2-layer tables (outer sidebar tint + inner body). Bare <pre>
  * elements (raw HTML in markdown) still get the default treatment. */

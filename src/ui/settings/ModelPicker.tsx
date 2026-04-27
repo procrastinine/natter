@@ -36,7 +36,7 @@ import {
 import type { Chat, ConnectionKind } from '../../core/types'
 import { useModels } from '../../hooks/useModels'
 
-// Below this threshold, we collapse to a plain list. OpenRouter's ~350
+// Below this threshold, the picker collapses to a plain list. OpenRouter's ~350
 // models and OpenAI direct's ~20 bundled entries stay above it; a local
 // llama.cpp with one or two loaded models falls below.
 const COMPACT_MODEL_COUNT = 10

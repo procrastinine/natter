@@ -15,7 +15,7 @@
 //   budget so the model always has room to reply; also caps the model's
 //   actual completion length.
 // - Truncation: "Keep last N pairs" numeric + Middle-out checkbox.
-//   Overflow never fails — we always trim locally; middle-out is
+//   Overflow never fails, trimming is always done locally; middle-out is
 //   additive (server-side compression of what remains).
 //
 // All values are pinned to the effective capability; `validateChatSettings`
@@ -133,8 +133,8 @@ export function ContextPanel({
     )
   }
 
-  // Numeric caps drive every slider in this panel. Without a capability
-  // we'd have to invent fallback numbers — last time those were 128k,
+  // Numeric caps drive every slider in this panel. Without a capability,
+  // fallback numbers would have to be invented; last time those were 128k,
   // which briefly snapped 1M-context Gemini chats to a bogus ceiling and
   // clobbered customMaxContext on any render during the load. Render a
   // minimal placeholder instead so nothing is shown that can't be
@@ -287,7 +287,7 @@ export function ContextPanel({
             // Removing customMaxContext (rather than clamping to modelPromptCap)
             // lets the chat follow the model cap on future model swaps.
             // exactOptionalPropertyTypes rejects `undefined` as a value here,
-            // so we cast to write the deleted key.
+            // so a cast is required to write the deleted key.
             const patch = { customMaxContext: undefined } as unknown as Partial<Chat['settings']>
             void updateChatSettings(chat.id, patch)
           } else {
@@ -465,7 +465,7 @@ function NumberSlider({
   // unreachable whenever (max-min) wasn't cleanly divisible — e.g. a
   // 128000-range stopped at 127872 because 128000 isn't a multiple of 127.
   // Browsers handle integer step=1 on ranges up to ~2M without perf
-  // issues, which covers every model cap we'll see.
+  // issues, which covers every model cap that will ever be seen.
   return (
     <div data-ui="field-group" data-ui-field data-ui-slider-row>
       <span data-ui="slider-label">

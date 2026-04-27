@@ -87,7 +87,7 @@ describe('splitGeminiStream — coalesces thought:true parts into one summary ro
     // separate paragraphs of the same logical reasoning got rendered as
     // distinct blocks. Fix: coalesce to ONE row by sharing summaryIndex
     // across all parts; the accumulator's mergeReasoningText concatenates
-    // them (with the `\n\n` we prepend on non-first parts) into a single
+    // them (with the `\n\n` prepended on non-first parts) into a single
     // continuous summary.
     const frames: GenerateContentResponseWire[] = [
       {

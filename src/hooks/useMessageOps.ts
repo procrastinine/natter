@@ -183,8 +183,8 @@ export async function regenerateFromMessage(
 
 // Continue in place. Instead of creating a new assistant sibling (which
 // requires model-specific prefill semantics that not every model
-// supports), we:
-//   1. Keep the existing assistant row intact — its generation.model /
+// supports), the flow is:
+//   1. Keep the existing assistant row intact, its generation.model /
 //      usage / cost / reasoningDetails are the FACTUAL record of the
 //      original turn and must not be mutated.
 //   2. Build a one-shot wire body from the active path up to (and
@@ -192,10 +192,10 @@ export async function regenerateFromMessage(
 //      tells the model: "Continue this chat from the last incomplete
 //      assistant message. Output only the continuation, nothing else."
 //   3. Stream the response. Every chunk APPENDS to the target's
-//      `content` text; we don't create a new row, we don't touch
-//      generation metadata, and we discard any reasoning (the
-//      continuation call's reasoning is about the instruction, not the
-//      original turn, so keeping it would be misleading).
+//      `content` text; no new row is created, generation metadata is
+//      untouched, and any reasoning is discarded (the continuation
+//      call's reasoning is about the instruction, not the original
+//      turn, so keeping it would be misleading).
 //
 // Reasoning discipline: the existing reasoningDetails on the target
 // stay untouched (they describe the original partial run). The

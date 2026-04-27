@@ -86,8 +86,8 @@
 }
 
 /* The close-X icon button (data-ui="icon-button" + data-role="global-settings-close")
- * carries its own visual style; here we just push it to the trailing edge
- * of the modal header. */
+ * carries its own visual style; the rule here just pushes it to the trailing
+ * edge of the modal header. */
 [data-ui="global-settings-header"] > [data-role="global-settings-close"] {
   margin-left: auto;
 }

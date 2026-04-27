@@ -31,7 +31,7 @@ test('a single crashed Message renders a replacement; peers remain interactive',
 
   const chatId = await firstChatId(page)
   // Toggle debugCrash=true on the first assistant row. The raw IDB write
-  // bypasses Dexie's live-query, so we reload the page to pick up the fresh
+  // bypasses Dexie's live-query, so the page reloads to pick up the fresh
   // row and trigger the error boundary on re-render.
   await page.evaluate(async (id) => {
     const db = await new Promise<IDBDatabase>((resolve, reject) => {

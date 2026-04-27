@@ -1,5 +1,5 @@
 // Privacy filter. See `plan/09-privacy.md §9.6 / §9.9` and
-// `src/core/privacy-filter.ts`. The rules we test here are the load-bearing
+// `src/core/privacy-filter.ts`. The rules tested here are the load-bearing
 // ones called out in CLAUDE.md "Non-negotiable behaviors #2":
 //
 //   - Hard-deny (training OR trainingOpenRouter) BEFORE Pareto

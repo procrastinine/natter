@@ -1,8 +1,8 @@
 // Cross-tab broadcast channel. See `plan/03-storage.md §3.6`.
 //
 // BroadcastChannel delivers messages to OTHER tabs only — the sender never
-// receives its own `postMessage`. For the same-tab-within-a-module fan-out we
-// want UI listeners to fire on local writes too, so `postEvent` dispatches
+// receives its own `postMessage`. For same-tab-within-a-module fan-out
+// UI listeners need to fire on local writes too, so `postEvent` dispatches
 // locally and also crosses the channel. The two paths never double-fire because
 // remote tabs only see the BroadcastChannel path and local tabs only see the
 // direct dispatch (their own BC instance ignores their own posts).

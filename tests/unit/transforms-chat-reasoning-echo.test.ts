@@ -273,7 +273,7 @@ describe('buildChatMessages / toChatCompletions — reasoning echo', () => {
 
   it('falls back to <think> wrap when the target format is unknown', () => {
     // DeepSeek / Qwen / Gemma etc. — OR strips reasoning_details on input,
-    // so we wrap the reasoning in a single `<think>…</think>` block at the
+    // so the reasoning is wrapped in a single `<think>…</think>` block at the
     // start of assistant content so the model still conditions on prior CoT.
     const path: Message[] = [
       userMessage('u1', 'hello'),
@@ -508,9 +508,9 @@ describe('echoAsThinkTags — universal-compat transport', () => {
   })
 
   it('keeps Anthropic signed-text on reasoning_details[] (signature is opaque) when echoAsThinkTags is on', () => {
-    // reasoning.text with .signature is Anthropic's signed thinking block —
-    // the signature is what the next turn validates, so we never strip it
-    // out by tag-ifying the text.
+    // reasoning.text with .signature is Anthropic's signed thinking block.
+    // The signature is what the next turn validates, so it is never stripped
+    // by tag-ifying the text.
     const path: Message[] = [
       userMessage('u1', 'hi'),
       assistantWithReasoning('a1', 'reply', [

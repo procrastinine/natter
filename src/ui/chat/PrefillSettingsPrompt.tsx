@@ -27,7 +27,7 @@ export function PrefillSettingsPrompt({
 
   return (
     <div data-ui="prefill-settings-prompt" role="status">
-      <span>Prefill works best if you {label}.</span>
+      <span>For best prefill results: {label}.</span>
       <div data-ui="prefill-settings-actions">
         <button
           type="button"

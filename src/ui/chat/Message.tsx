@@ -175,7 +175,7 @@ function MessageInner({
   const text = useMemo(() => messageTextFromContent(message.content), [message.content])
   // Streaming state is tracked per-message (messageId) in the ephemeral
   // stream store. Prop `streaming` is the authoritative fallback when a
-  // caller passes it in; otherwise we check the store. Either way, the
+  // caller passes it in; otherwise the store is checked. Either way, the
   // resolved value drives streaming render mode plus reasoning/collapse
   // affordances.
   const storeStreaming = useStreamStore((s) =>
@@ -277,7 +277,7 @@ function MessageInner({
   }, [error, message.id])
   useEffect(() => {
     if (!staleProvider) return
-    // One banner per error id. We key on the message id so subsequent
+    // One banner per error id. The key is the message id so subsequent
     // swipes back to the same failed leaf don't stack a second banner.
     clearBannersByKind('stale-reasoning')
     const bannerId = pushBanner({

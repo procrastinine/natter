@@ -2,8 +2,8 @@
 // tab 1` and `plan/07-discovery.md §7.10`.
 //
 // Renders only controls whose wire-key is in the effective capability's
-// `supportedParameters`. For reasoning effort / verbosity we narrow the
-// value set against the quirks registry — e.g. Claude 4.7 shows the
+// `supportedParameters`. For reasoning effort / verbosity the value set
+// is narrowed against the quirks registry, e.g. Claude 4.7 shows the
 // "verbosity" segmented control with xhigh as the ceiling, and adaptive-
 // only models hide the effort segmented control entirely.
 //
@@ -241,7 +241,7 @@ const SAMPLING_FIELDS: SamplingSpec[] = [
     label: 'DRY multiplier',
     min: 0,
     max: 5,
-    hint: "DRY (Don't Repeat Yourself) penalty multiplier. 0 disables.",
+    hint: 'DRY penalty multiplier. 0 disables.',
   },
   {
     key: 'dry_base',
@@ -306,8 +306,8 @@ export function ParamForm({
   const continuePrefillStored = chat.settings.continuePrefill === true
 
   // Validate stored settings once the live cap lands. Re-run whenever the
-  // cap identity changes — e.g. model swap. Silent: we just fix the values,
-  // no user-visible banner (the UI re-renders with the clamped values).
+  // cap identity changes, e.g. model swap. Silent: values are simply
+  // fixed, no user-visible banner (the UI re-renders with the clamped values).
   const lastValidatedCapRef = useRef<EffectiveCapability | null>(null)
   useEffect(() => {
     if (!capability) return
@@ -638,8 +638,8 @@ function ReasoningSection({ chat, capability }: { chat: Chat; capability: Effect
       {adaptiveOnly ? (
         // Claude 4.6/4.7: the model picks its own effort. Exposing Mode +
         // Effort would mislead the user into thinking their clicks matter.
-        // We still render the section header + the include/summary sub-
-        // controls below (they DO matter — Anthropic returns signed reasoning
+        // The section header + the include/summary sub-controls below are
+        // still rendered (they DO matter, Anthropic returns signed reasoning
         // text that can be echoed on the next turn).
         <div data-ui="field-group" data-ui-field>
           <span data-ui="helper">This model decides reasoning effort automatically.</span>
@@ -838,9 +838,9 @@ function ReasoningSummaryControl({
 // Three independent checkboxes: encrypted / visible summary / visible text.
 // User directive: all three are ALWAYS clickable (a mid-chat model swap may
 // bring history from another family that the current model can still
-// consume). The only gate is the encrypted checkbox: we hide it entirely
+// consume). The only gate is the encrypted checkbox: it is hidden entirely
 // when the model doesn't emit encrypted reasoning (unknown format, Gemini
-// 2.5, etc.) — no disabled-with-tooltip.
+// 2.5, etc.), no disabled-with-tooltip.
 //
 // Filter-side safety: `filterReasoningForInclude` silent-drops incompatible
 // formats before sending, with a console.warn. The UI just lets users pick.

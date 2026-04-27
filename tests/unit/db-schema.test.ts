@@ -11,9 +11,9 @@ import {
   registerSchema,
 } from '../../src/store/db'
 
-// Unique DB name per test so migrations start from a clean slate. We delete
-// any pre-existing data at the top of each test so repeated runs don't pick
-// up stale state from fake-indexeddb's in-memory persistence.
+// Unique DB name per test so migrations start from a clean slate. Pre-existing
+// data is deleted at the top of each test so repeated runs don't pick up stale
+// state from fake-indexeddb's in-memory persistence.
 async function freshDb(name: string): Promise<NatterDb> {
   await Dexie.delete(name)
   return createDbForTests(name)
@@ -83,9 +83,9 @@ describe('Dexie schema', () => {
   })
 })
 
-// Synthetic post-schema upgrades exercised through plain Dexie instances. We avoid
-// subclassing (which trips "Type instantiation is excessively deep" under the
-// NatterDb branded Table types) and declare versions directly on the base Db.
+// Synthetic post-schema upgrades exercised through plain Dexie instances.
+// Subclassing is avoided (it trips "Type instantiation is excessively deep" under
+// the NatterDb branded Table types); versions are declared directly on the base Db.
 
 interface MinimalProfile {
   id: string

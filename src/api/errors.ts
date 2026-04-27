@@ -53,10 +53,10 @@ export class ApiError extends Error implements ApiErrorShape {
 export interface NormalizeCtx {
   midStream: boolean
   httpStatus?: number
-  // When the request never reached a response, the caller tells us WHICH
+  // When the request never reached a response, the caller indicates WHICH
   // abort happened (timeout, user-abort, or plain network failure).
   // 'timeout' + 'abort' distinguish the two AbortError sources that fetch
-  // cannot tell apart on its own — without this, every aborted request would
+  // cannot tell apart on its own; without this, every aborted request would
   // wind up as `network` or `unknown`.
   cause?: 'timeout' | 'abort' | 'network'
 }

@@ -617,7 +617,7 @@ describe('sendText — chat-completions streaming', () => {
       apiKey: 'sk-test',
       content: [{ type: 'text', text: 'slow please' }],
       signal: abort.signal,
-      // Slow async source so we can abort mid-stream deterministically.
+      // Slow async source so the abort can fire mid-stream deterministically.
       openStream: () =>
         (async function* () {
           yield {
@@ -823,7 +823,7 @@ describe('sendText — chat-completions streaming', () => {
     // Regression: OpenRouter's Gemini chat-completions stream emits BOTH
     // `reasoning.text` (actually a summary — Gemini 3 never emits raw CoT)
     // AND `reasoning.encrypted` (the thoughtSignature carrier) at `index: 0`
-    // in the SAME stream. Our on-ingest normalizer relabels the `.text`
+    // in the SAME stream. The on-ingest normalizer relabels the `.text`
     // entry with format `google-gemini-v1` (and no `.signature`) to
     // `.summary` so downstream Include-controls gate correctly. Live-probed
     // 2026-04-20.
@@ -1444,7 +1444,7 @@ describe('sendText — token calibration sample ingest', () => {
     // Neither prompt nor completion sample should land: both too short /
     // ratio out of bounds (completion 2 chars / 1 token is also outside).
     const s = chatRow?.tokenCalibration?.[tokenCalibrationKey('openai/gpt-4o')]
-    // If we accept nothing, field either stays undefined OR sampleCount=0.
+    // If nothing is accepted, the field either stays undefined OR sampleCount=0.
     expect(s?.sampleCount ?? 0).toBe(0)
   })
 })

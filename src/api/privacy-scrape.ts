@@ -6,20 +6,31 @@
 // per-model page OpenRouter ships to the browser; the relevant fields
 // are embedded in the page's React flight payload (`__NEXT_DATA__` or
 // streamed `self.__next_f.push(...)` fragments, depending on the route).
-// We grep for `"data_policy"` JSON objects, pair each with the nearest
-// preceding provider name, and return a map keyed by every stable
-// provider ref we can recover (display/name plus slug when present).
+// The scraper greps for `"data_policy"` JSON objects, pairs each with the
+// nearest preceding provider name, and returns a map keyed by every stable
+// provider ref recoverable from the payload (display/name plus slug when present).
 //
-// Fetch goes through the caller's ConnectionProfile so a user-configured
-// `privacyScrapeProxy` (e.g. CORS bouncer for the browser) can intercept.
-// No Authorization header is sent — the page is public.
+// The fetch path is a workspace-global CORS proxy — config shape +
+// constants live in `core/cors-proxy.ts` (the daemon-safe module the
+// browser preference layer also re-exports). Default `/_or_scrape` is
+// the same-origin Vite dev rewrite. No Authorization header is sent —
+// the page is public. When a secret is configured it rides as
+// `X-Proxy-Secret`.
 
-import type { ConnectionProfile, DataPolicy, ProfileId } from '../core/types'
+import {
+  CORS_PROXY_SECRET_HEADER,
+  type CorsProxyConfig,
+  DEFAULT_CORS_PROXY_URL,
+} from '../core/cors-proxy'
+import type { DataPolicy, ProfileId } from '../core/types'
 import { fetchWithTimeout } from './client'
 import { normalizeError } from './errors'
 
 export interface PrivacyScrapeContext {
-  profile: ConnectionProfile
+  // Workspace-global CORS-proxy config. Required — `core/privacy-request.ts`
+  // and `usePrivacyPolicies` resolve it before calling the scrape so this
+  // module never touches IDB itself (keeps it daemon-portable).
+  proxy: CorsProxyConfig
   // Optional fetcher injection for tests (default: fetchWithTimeout).
   fetchImpl?: (url: string, init: RequestInit) => Promise<Response>
 }
@@ -30,7 +41,7 @@ export interface PrivacyScrapeResult {
   // when the page exposes it. Missing providers are absent — the filter
   // layer treats online misses as unavailable, not as a guessed policy.
   policies: Record<string, DataPolicy>
-  // The raw scraped payload we persist in the cache row for replay /
+  // The raw scraped payload persisted in the cache row for replay /
   // regression tests. Shape-stable: `{ policies, fetchedAt }`.
   raw: { policies: Record<string, DataPolicy>; fetchedAt: number }
   fetchedAt: number
@@ -38,19 +49,41 @@ export interface PrivacyScrapeResult {
 
 // Build the scrape URL. The browser can't fetch `openrouter.ai/{model}/
 // providers` cross-origin (CORS), so the default is the relative proxy
-// path `/_or_scrape` — Vite's dev server proxies it, and a production
-// deploy is expected to provide an equivalent same-origin rewrite (or
-// the user sets `profile.privacyScrapeProxy` to a hosted CORS bouncer).
-// Without either, the scrape 404s in the browser and the filter can use
-// its explicit offline fallback instead of claiming live policy data.
-export const DEFAULT_PRIVACY_SCRAPE_BASE = '/_or_scrape'
+// path `/_or_scrape` — Vite's dev server rewrites it. A production
+// browser deploy is expected to either provide an equivalent same-origin
+// rewrite or set `corsProxyUrl` to a hosted bouncer. Daemon-mode hosts
+// skip the proxy and pass `directCorsProxyConfig()` (base =
+// `https://openrouter.ai`).
+//
+// Two URL shapes are accepted:
+//
+//   1. Path-prefix mode (default): the URL is treated as a base and the
+//      scrape becomes `<base>/{model}/providers`. Mirrors the dev
+//      proxy and self-hosted Cloudflare Workers.
+//   2. Template mode: when the URL contains `{model}` or `{path}`
+//      placeholders, those are substituted literally and the result is
+//      used as-is. This is what makes generic public CORS bouncers
+//      (e.g. `https://corsproxy.io/?url=https://openrouter.ai/{model}/providers`)
+//      work — they expect the upstream URL passed via query string,
+//      not appended to a base path.
+//
+// `{model}` expands to `{author}/{slug}` (e.g. `openai/gpt-5.4`).
+// `{path}` expands to `{author}/{slug}/providers`.
+export const DEFAULT_PRIVACY_SCRAPE_BASE = DEFAULT_CORS_PROXY_URL
 
-export function privacyScrapeUrl(
-  profile: ConnectionProfile,
-  modelId: string,
-): string {
-  const base =
-    profile.privacyScrapeProxy?.replace(/\/+$/, '') ?? DEFAULT_PRIVACY_SCRAPE_BASE
+const MODEL_PLACEHOLDER = '{model}'
+const PATH_PLACEHOLDER = '{path}'
+
+export function privacyScrapeUrl(proxy: CorsProxyConfig, modelId: string): string {
+  const raw = proxy.url
+  if (raw.includes(MODEL_PLACEHOLDER) || raw.includes(PATH_PLACEHOLDER)) {
+    return raw
+      .split(PATH_PLACEHOLDER)
+      .join(`${modelId}/providers`)
+      .split(MODEL_PLACEHOLDER)
+      .join(modelId)
+  }
+  const base = raw.trim().replace(/\/+$/, '') || DEFAULT_PRIVACY_SCRAPE_BASE
   // Model slugs contain a `/` — the URL path accepts it verbatim.
   return `${base}/${modelId}/providers`
 }
@@ -60,10 +93,12 @@ export async function fetchPrivacyScrape(
   modelId: string,
   opts: { signal?: AbortSignal; timeoutMs?: number } = {},
 ): Promise<PrivacyScrapeResult> {
-  const url = privacyScrapeUrl(ctx.profile, modelId)
+  const url = privacyScrapeUrl(ctx.proxy, modelId)
+  const headers: Record<string, string> = { Accept: 'text/html,application/xhtml+xml' }
+  if (ctx.proxy.secret.length > 0) headers[CORS_PROXY_SECRET_HEADER] = ctx.proxy.secret
   const init: RequestInit = {
     method: 'GET',
-    headers: { Accept: 'text/html,application/xhtml+xml' },
+    headers,
   }
   const fetchImpl = ctx.fetchImpl
   const impl = fetchImpl
@@ -96,9 +131,9 @@ export async function fetchPrivacyScrape(
 // The live page serializes each endpoint as a big object whose fields
 // are spread across many chunks — `provider_display_name` and
 // `data_policy` are on the same record but 200–400 characters apart.
-// We can't match them with a single non-nesting regex. Instead we scan
+// A single non-nesting regex can't match them. Instead the parser scans
 // forward from each provider-name marker to the next `data_policy:{...}`
-// and pair them up until we hit the next provider marker.
+// and pairs them up until the next provider marker.
 //
 // This parser is conservative: if nothing recognizable is present it
 // returns an empty map, leaving the filter to mark policy unavailable.
@@ -307,8 +342,8 @@ function walkForPolicies(node: unknown, out: Record<string, DataPolicy>): void {
   for (const value of Object.values(rec)) walkForPolicies(value, out)
 }
 
-// Coerce a raw `data_policy` object into our `DataPolicy` shape. We drop
-// fields we don't understand so tests survive future OpenRouter fields.
+// Coerce a raw `data_policy` object into the `DataPolicy` shape. Unknown
+// fields are dropped so tests survive future OpenRouter fields.
 export function normalizeDataPolicy(raw: Record<string, unknown>): DataPolicy | null {
   const training = asBool(raw.training)
   const trainingOpenRouter =
@@ -382,14 +417,15 @@ function safeParseObject(raw: string): Record<string, unknown> | null {
       return parsed as Record<string, unknown>
     }
   } catch {
-    // Not parseable — try trimming trailing commas / single quotes? For now
-    // we accept the loss — the UI falls back to worst-case policy.
+    // Not parseable. Trimming trailing commas / single quotes is a future
+    // possibility; the loss is currently accepted and the UI falls back to
+    // worst-case policy.
   }
   return null
 }
 
 // Used by `usePrivacyPolicies` and by test harnesses: wrap whatever the
-// scrape produced in the shape we persist to the cache row.
+// scrape produced in the shape persisted to the cache row.
 export interface CachedPrivacyPayload {
   policies: Record<string, DataPolicy>
   fetchedAt: number

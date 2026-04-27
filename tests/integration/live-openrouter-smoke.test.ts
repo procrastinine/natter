@@ -13,6 +13,8 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import type { ChatSettings, ConnectionProfile } from '../../src/core/types'
 import { sendText } from '../../src/hooks/useChat'
+import { DIRECT_OPENROUTER_BASE } from '../../src/core/cors-proxy'
+import { writeCorsProxyUrl } from '../../src/core/global-settings'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import {
   __resetBrowserRepositoryForTests,
@@ -80,6 +82,10 @@ beforeEach(async () => {
   if (!RUN) return
   await reset()
   await openDb()
+  // Node has no CORS — point the privacy scrape directly at openrouter.ai
+  // so the privacy filter sees real `data_policy` rows instead of synthesizing
+  // worst-case (and hard-denying every endpoint).
+  await writeCorsProxyUrl(DIRECT_OPENROUTER_BASE)
 })
 
 afterEach(async () => {
@@ -139,7 +145,7 @@ describe.skipIf(!RUN)('Phase 7 live OpenRouter chat-completions smoke', () => {
   it('carries a multi-turn conversation (prior assistant message echoed back)', async () => {
     const apiKey = readKey()
     const chat = await createChat({ settings: liveSettings() })
-    // Turn 1: ask for a token we can look for in turn 2's request.
+    // Turn 1: ask for a token to look for in turn 2's request.
     await sendText({
       chatId: chat.id,
       connection: liveProfile(),
@@ -184,11 +190,11 @@ describe.skipIf(!RUN)('Phase 7 live OpenRouter chat-completions smoke', () => {
     const first = assistant?.content[0]
     if (first?.type !== 'output_text') throw new Error('expected output_text')
     // The answer should be 221 either way; the reasoning path is the real
-    // artifact we're probing here.
+    // artifact under probe here.
     expect(first.text).toMatch(/221/)
     // Providers vary in whether they expose summary / text / encrypted. Gemini
     // typically emits reasoning.text deltas and/or reasoning.encrypted via
-    // thoughtSignature; at minimum we expect SOME detail entries OR usage
+    // thoughtSignature; at minimum, expect SOME detail entries OR usage
     // reporting reasoning tokens in completion_tokens_details.
     const details = assistant?.reasoningDetails ?? []
     const reasoningTokens =
@@ -199,7 +205,7 @@ describe.skipIf(!RUN)('Phase 7 live OpenRouter chat-completions smoke', () => {
   it('round-trips a reasoning request to Claude Haiku 4.5 without error', async () => {
     // Haiku 4.5 accepts `reasoning.effort` (mapped internally to
     // budget_tokens). Whether the model chooses to surface reasoning for a
-    // given prompt is up to the provider — we only assert the request path
+    // given prompt is up to the provider; this only asserts the request path
     // works end-to-end and any returned reasoning_details are captured.
     const apiKey = readKey()
     const chat = await createChat({
@@ -235,8 +241,8 @@ describe.skipIf(!RUN)('Phase 7 live OpenRouter chat-completions smoke', () => {
     // 143 * 37 = 5291. Accept either the exact number or any 4-digit answer
     // — the transport assertion is what matters, not the math.
     expect(first.text.length).toBeGreaterThan(0)
-    // If the provider emitted reasoning in this response, our accumulator
-    // should have captured it. We don't REQUIRE it: Anthropic sometimes
+    // If the provider emitted reasoning in this response, the accumulator
+    // should have captured it. Reasoning is NOT REQUIRED: Anthropic sometimes
     // suppresses reasoning output for simple prompts even when requested.
     const details = assistant?.reasoningDetails ?? []
     for (const detail of details) {
@@ -247,7 +253,7 @@ describe.skipIf(!RUN)('Phase 7 live OpenRouter chat-completions smoke', () => {
   it('handles json_schema structured output without breaking streaming', async () => {
     // Some provider+model combinations refuse to emit `text/event-stream`
     // when `response_format: json_schema` is set; the upstream instead
-    // answers with a single buffered JSON body. Our transport normalizes
+    // answers with a single buffered JSON body. The transport normalizes
     // that into a synthetic `buffered_result` so the send pipeline sees
     // one terminal event. This test asserts the pipeline completes and
     // the assistant row carries valid JSON regardless of whether the
@@ -311,8 +317,8 @@ describe.skipIf(!RUN)('Phase 7 live OpenRouter chat-completions smoke', () => {
     expect(['abort', 'done']).toContain(finished.outcome)
     const repo = getBrowserRepository()
     const assistant = await repo.getMessage(finished.assistantMessageId)
-    // We either aborted with partial text or the upstream wrapped up faster
-    // than the 700ms grace window — both are fine for "persists partial".
+    // The abort either landed with partial text or the upstream wrapped up
+    // faster than the 700ms grace window; both are fine for "persists partial".
     expect(assistant?.content[0]?.type).toBe('output_text')
     expect(assistant?.generation?.finishedAt).toBeDefined()
     if (finished.outcome === 'abort') {

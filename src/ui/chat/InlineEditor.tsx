@@ -62,7 +62,7 @@ const MIN_TEXTAREA_ROWS = 6
 const MAX_TEXTAREA_PX = 600
 
 // Extract the single plaintext run from a message's content array. Phase 8.1
-// only edits text lanes; multi-modal content stays untouched when we commit.
+// only edits text lanes; multi-modal content stays untouched on commit.
 export function plaintextOf(content: readonly ContentItem[]): string {
   return content
     .map((item) => (item.type === 'text' || item.type === 'output_text' ? item.text : ''))
@@ -223,8 +223,8 @@ export function InlineEditor({
     if (!el) return
     // preventScroll: true so the browser doesn't align the textarea's top
     // with the viewport top (which on long assistant messages pushes the
-    // Save/Cancel row below the fold). We scroll the action row into view
-    // ourselves with block: 'nearest' so the user always sees where they
+    // Save/Cancel row below the fold). The action row is scrolled into view
+    // explicitly with block: 'nearest' so the user always sees where to
     // commit or cancel.
     el.focus({ preventScroll: true })
     const end = el.value.length
@@ -478,7 +478,7 @@ export function InlineEditor({
             title={
               prefillOpen
                 ? 'Close prefill'
-                : 'Add an assistant prefill — the model continues from your text on Save & Send'
+                : 'Add an assistant prefill, the model continues from the prefilled text on Save & Send'
             }
           >
             <PrefillIcon size={14} />

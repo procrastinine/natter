@@ -9,7 +9,7 @@
 // user then "continues from here" in a separate chat.
 //
 // Performance note: a "branch" of a chat really means the selection of
-// a leaf — the tree stores every node and branches are just one root→
+// a leaf. The tree stores every node and branches are just one root→
 // leaf walk picked by the cursor. This fork flattens that walk into a
 // self-contained Chat, which is why it doesn't need to copy siblings
 // or descendants. See `plan/08-branching.md §8.1` + `§8.3`.
@@ -80,9 +80,9 @@ export async function forkChatFromMessage(
     throw new Error('fork: no ancestors to copy')
   }
   // Sanity-check: verify the target is on the currently-viewed active
-  // path. Silent prune if not — we still fork, but from the computed
-  // ancestors (which may differ from the user's cursor if they
-  // mid-action swiped).
+  // path. Silent prune if not. The fork still proceeds, but from the
+  // computed ancestors (which may differ from the user's cursor if
+  // a mid-action swipe occurred).
   void activePath
 
   const now = input.now ?? Date.now()
@@ -120,8 +120,8 @@ export async function forkChatFromMessage(
     kind: 'message' as const,
     messageId: idMap.get(row.id) as MessageId,
   }))
-  // Claim the children scope for every unique parentId slot we're about
-  // to populate so the mutation executor allows the `putMessage` calls.
+  // Claim the children scope for every unique parentId slot about
+  // to be populated so the mutation executor allows the `putMessage` calls.
   const parentSlots = new Set<string>()
   for (const row of ancestors) {
     const newParentId = row.parentId ? (idMap.get(row.parentId) ?? null) : null

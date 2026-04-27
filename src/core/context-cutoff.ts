@@ -26,11 +26,11 @@
 // summed into the pair/preamble buckets.
 //
 // `estimateSingleMessageReasoningEchoTokens` in `./tokens.ts` is the only
-// non-trivial part of per-message cost; we call it directly so the cutoff
-// matches what the wire/echo layer actually sends on the NEXT turn.
+// non-trivial part of per-message cost; the cutoff calls it directly so the
+// number matches what the wire/echo layer actually sends on the NEXT turn.
 //
 // Applied only when `settings.contextStrategy.kind === 'sliding_window'`.
-// `'off'` and `'middle_out_plugin'` both short-circuit with "send all" —
+// `'off'` and `'middle_out_plugin'` both short-circuit with "send all";
 // the former because the user opted out, the latter because OpenRouter's
 // server-side plugin compresses what remains.
 
@@ -208,8 +208,8 @@ export interface CutoffPlan {
   historyReasoningTokens: number
   // history = preamble + head + tail buckets combined (text + media + reasoning).
   historyTokens: number
-  // total = system + history + draft text + draft media. Does NOT include `reserveTokens` —
-  // that's part of the BUDGET side, not what we send.
+  // total = system + history + draft text + draft media. Does NOT include `reserveTokens`;
+  // that's part of the BUDGET side, not what gets sent.
   total: number
   reserveTokens: number
   cutoff: number

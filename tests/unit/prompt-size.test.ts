@@ -4,8 +4,8 @@
 //
 // The Composer's budget indicator and the Context-tab gauge both read from
 // `estimatePromptSize`, so every edge case here directly affects what the
-// user sees. We over-report before we ever under-report — the final number
-// is `max(fallback, calibrated)` and the baseline subtracts systemTokens
+// user sees. The estimator over-reports before ever under-reporting; the final
+// number is `max(fallback, calibrated)` and the baseline subtracts systemTokens
 // carefully to avoid negative values.
 
 import { describe, expect, it } from 'vitest'
@@ -152,8 +152,8 @@ describe('estimatePromptSize — fallback branch', () => {
       tokenizer: DEFAULT_TOKENIZER,
     })
     // The visible user message is small; the hidden assistant one is
-    // enormous. If hidden messages were included we'd see thousands of
-    // tokens. Assert we stay small.
+    // enormous. If hidden messages were included the estimate would land
+    // in the thousands of tokens. Assert it stays small.
     expect(est.historyTokens).toBeLessThan(20)
   })
 

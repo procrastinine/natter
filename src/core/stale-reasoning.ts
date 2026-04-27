@@ -1,11 +1,11 @@
 // Detect provider-side rejections that happen when echoed reasoning from an
-// earlier turn is no longer accepted — e.g. encrypted_content whose
+// earlier turn is no longer accepted, e.g. encrypted_content whose
 // attestation expired, or a Gemini `thoughtSignature` missing from an
 // imported chat. Phase 11.1's banner surface reads this predicate to offer
 // a "retry without preserved reasoning" recovery flow.
 //
 // Patterns come from live probes against OpenAI and Gemini direct, plus the
-// generic "upstream 400 while we were sending reasoning_details" fallback.
+// generic "upstream 400 while reasoning_details were being sent" fallback.
 // See `plan/13-delivery.md §Phase 11.1 → Stale-reasoning rejection UI`.
 
 import type { ApiError } from '../api/errors'
@@ -35,9 +35,9 @@ export function detectStaleReasoning(
   for (const re of GEMINI_PATTERNS) {
     if (re.test(msg)) return 'gemini'
   }
-  // Generic 400 while we were sending reasoning_details. Only classify this
-  // way when the caller tells us reasoning was in flight — otherwise every
-  // unrelated bad-request would trip the banner.
+  // Generic 400 while reasoning_details were being sent. Only classify
+  // this way when the caller signals reasoning was in flight; otherwise
+  // every unrelated bad-request would trip the banner.
   if (error.statusCode === 400 && opts.hadReasoningDetails === true) {
     return 'generic'
   }

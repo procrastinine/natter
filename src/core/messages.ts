@@ -217,8 +217,8 @@ function collectPairFollowers(
     // Fallback when there is no cursor entry at this fork (fresh chat
     // open, or user deleted before swiping). Pick the first assistant/
     // tool/system child at turnIndex=0. Mirror the §8.3 default rule:
-    // without a cursor we still need a deterministic pick so delete-pair
-    // works on freshly-opened chats.
+    // without a cursor a deterministic pick is still required so
+    // delete-pair works on freshly-opened chats.
     const fallback = kids.find((kid) => kid.turnIndex === 0 && kid.role !== 'user')
     const next = pinned ?? fallback
     if (!next || next.role === 'user') break
@@ -445,9 +445,9 @@ export async function sendUserMessage(
   const parentId = resolveActiveLeafId(all, cursor)
   const messageId = input.messageId ?? newId()
   const turnId = input.turnId ?? newId()
-  // Pre-fetch chat + global calibration outside the mutation — both are
-  // read-only reference data and we don't want to hold them under the
-  // scope lock. Chat lookup may miss for brand-new chats (first message)
+  // Pre-fetch chat + global calibration outside the mutation. Both are
+  // read-only reference data and should not be held under the scope
+  // lock. Chat lookup may miss for brand-new chats (first message)
   // in which case calibration falls through to hardcoded tiers.
   const chatForRatio = await repo.getChat(chatId)
   const [globalCal, prefs] = await Promise.all([
@@ -1257,9 +1257,9 @@ export async function deleteTurn(
 }
 
 // Tombstone exactly ONE message. Live direct children splice up to the
-// message's parent; tombstoned children stay in place (they're already
-// dead and re-parenting them has no user-visible effect). Used for the
-// "delete just this row" affordance when the user is cleaning up a
+// message's parent; tombstoned children stay in place (already dead and
+// re-parenting them has no user-visible effect). Used for the "delete
+// just this row" affordance when the user is cleaning up a
 // role-adjacency mismatch or explicitly opting out of pair-delete.
 export async function deleteSingleMessage(
   input: DeleteInput,

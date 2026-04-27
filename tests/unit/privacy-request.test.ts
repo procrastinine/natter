@@ -10,6 +10,7 @@ import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { fetchEndpoints } from '../../src/api/models'
 import { fetchPrivacyScrape } from '../../src/api/privacy-scrape'
+import { DEFAULT_CORS_PROXY_URL, type CorsProxyConfig } from '../../src/core/cors-proxy'
 import {
   PrivacyDiscoveryUnavailableError,
   resolvePrivacyForSend,
@@ -57,6 +58,8 @@ beforeEach(async () => {
 afterEach(async () => {
   await resetAll()
 })
+
+const TEST_PROXY: CorsProxyConfig = { url: DEFAULT_CORS_PROXY_URL, secret: '' }
 
 function makeProfile(kind: ConnectionProfile['kind'] = 'openrouter'): ConnectionProfile {
   return {
@@ -108,7 +111,7 @@ describe('resolvePrivacyForSend', () => {
   it('returns { applicable: false } for non-OpenRouter profiles', async () => {
     const chat = makeChat()
     const profile = makeProfile('openai-compatible')
-    const r = await resolvePrivacyForSend({ chat, profile })
+    const r = await resolvePrivacyForSend({ chat, profile, proxy: TEST_PROXY })
     expect(r.applicable).toBe(false)
     expect(r.wire).toBeNull()
     expect(r.filter).toBeNull()
@@ -117,7 +120,7 @@ describe('resolvePrivacyForSend', () => {
   it('returns { applicable: false } on a free model', async () => {
     const chat = makeChat({ model: 'deepseek/deepseek-r1:free' })
     const profile = makeProfile()
-    const r = await resolvePrivacyForSend({ chat, profile })
+    const r = await resolvePrivacyForSend({ chat, profile, proxy: TEST_PROXY })
     expect(r.applicable).toBe(false)
   })
 
@@ -148,7 +151,7 @@ describe('resolvePrivacyForSend', () => {
       fetchedAt: 0,
     })
     const chat = makeChat({ model: 'google/gemma-3-12b-it:free' })
-    const r = await resolvePrivacyForSend({ chat, profile })
+    const r = await resolvePrivacyForSend({ chat, profile, proxy: TEST_PROXY })
     expect(r.applicable).toBe(false)
     expect(r.wire).toBeNull()
     expect(r.filter).toBeNull()
@@ -201,7 +204,7 @@ describe('resolvePrivacyForSend', () => {
     })
     const chat = makeChat()
     const profile = makeProfile()
-    const r = await resolvePrivacyForSend({ chat, profile })
+    const r = await resolvePrivacyForSend({ chat, profile, proxy: TEST_PROXY })
     expect(r.applicable).toBe(true)
     expect(fetchEndpointsMock).toHaveBeenCalledTimes(1)
     expect(fetchPrivacyScrapeMock).toHaveBeenCalledTimes(1)
@@ -215,7 +218,7 @@ describe('resolvePrivacyForSend', () => {
     const chat = makeChat()
     const profile = makeProfile()
 
-    await expect(resolvePrivacyForSend({ chat, profile })).rejects.toBeInstanceOf(
+    await expect(resolvePrivacyForSend({ chat, profile, proxy: TEST_PROXY })).rejects.toBeInstanceOf(
       PrivacyDiscoveryUnavailableError,
     )
   })
@@ -262,7 +265,7 @@ describe('resolvePrivacyForSend', () => {
       },
       fetchedAt: 0,
     })
-    const r = await resolvePrivacyForSend({ chat, profile })
+    const r = await resolvePrivacyForSend({ chat, profile, proxy: TEST_PROXY })
     expect(r.applicable).toBe(true)
     expect(r.filter?.kept.map((k) => k.endpoint.provider_name)).toEqual(['Azure'])
     expect(r.wire?.ignore).toContain('OpenAI')
@@ -325,7 +328,7 @@ describe('resolvePrivacyForSend', () => {
       fetchedAt: Date.now(),
     })
 
-    const r = await resolvePrivacyForSend({ chat, profile })
+    const r = await resolvePrivacyForSend({ chat, profile, proxy: TEST_PROXY })
 
     expect(fetchPrivacyScrapeMock).toHaveBeenCalledTimes(1)
     expect(r.filter?.kept.map((k) => k.endpoint.provider_name)).toEqual(['DeepInfra'])
@@ -374,7 +377,7 @@ describe('resolvePrivacyForSend', () => {
       },
       fetchedAt: 0,
     })
-    const r = await resolvePrivacyForSend({ chat, profile })
+    const r = await resolvePrivacyForSend({ chat, profile, proxy: TEST_PROXY })
     expect(r.filter?.zeroEligible).toBe(true)
     expect(r.wire?.zeroEligible).toBe(true)
   })
@@ -427,7 +430,7 @@ describe('resolvePrivacyForSend', () => {
       },
       fetchedAt: 0,
     })
-    const r = await resolvePrivacyForSend({ chat, profile })
+    const r = await resolvePrivacyForSend({ chat, profile, proxy: TEST_PROXY })
     expect(r.wire?.ignore).toEqual(['Legacy Host'])
   })
 
@@ -477,7 +480,7 @@ describe('resolvePrivacyForSend', () => {
       },
       fetchedAt: 0,
     })
-    const r = await resolvePrivacyForSend({ chat, profile })
+    const r = await resolvePrivacyForSend({ chat, profile, proxy: TEST_PROXY })
     expect(r.wire?.ignore).toEqual(['anthropic/2'])
     expect(r.wire?.ignore).not.toContain('Anthropic')
     expect(r.wire?.order).toEqual(['anthropic/2', 'anthropic'])

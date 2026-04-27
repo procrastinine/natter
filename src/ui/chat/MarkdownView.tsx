@@ -17,12 +17,12 @@ export interface MarkdownViewProps {
 
 // CJK plugin: adds remark plugins that make Chinese/Japanese/Korean text
 // respect proper emphasis, strikethrough, and autolink boundaries. No
-// options; pre-configured defaults are fine for our use.
+// options; pre-configured defaults suffice here.
 const cjkPlugin = createCjkPlugin()
 
 // Mermaid plugin: renders ```mermaid code fences as SVG diagrams.
 // `securityLevel: 'strict'` (Mermaid's default) keeps click handlers
-// sandboxed — we're rendering LLM-generated content, so any looser
+// sandboxed (LLM-generated content is rendered here), so any looser
 // setting would let a model open dialogs or navigate the page.
 const mermaidPlugin = createMermaidPlugin({
   config: { securityLevel: 'strict' },
@@ -73,8 +73,8 @@ export function MarkdownView({ content, streaming = false, allowImageOrigins }: 
   // preferences (Settings → Rendering). Streamdown ships a
   // `CodeHighlighterPlugin` interface but no built-in implementation —
   // without a plugin mounted under `plugins.code`, the highlighter call
-  // returns null and code blocks render as raw monospace text. We use
-  // `@streamdown/code` (Shiki-backed) and rebuild the plugin whenever
+  // returns null and code blocks render as raw monospace text. The
+  // `@streamdown/code` plugin (Shiki-backed) is used and rebuilt whenever
   // the theme tuple changes so the Settings dropdown actually repaints
   // existing blocks.
   const renderingPrefs = useContext(RenderingPreferencesContext)
@@ -124,8 +124,9 @@ function getPlugins(themes: [ShikiThemeChoice, ShikiThemeChoice], singleDollarTe
 
 // Pre-process images: any `![alt](url)` or `<img src="url">` pointing at a
 // non-allowlisted origin is replaced with a stub that the markdown renderer
-// turns into a visible "blocked image from <origin>" affordance. We rewrite
-// BEFORE Streamdown parses so the final DOM never contains a tracking pixel.
+// turns into a visible "blocked image from <origin>" affordance. The
+// rewrite happens BEFORE Streamdown parses so the final DOM never contains
+// a tracking pixel.
 function rewriteBlockedImages(md: string, allowed: string[]): string {
   const mdImagePattern = /!\[([^\]]*)\]\(([^)\s]+)(\s+"[^"]*")?\)/g
   const htmlImagePattern = /<img\b[^>]*\bsrc=["']([^"']+)["'][^>]*\/?>/gi
@@ -154,12 +155,12 @@ function safeOrigin(url: string): string {
 // math even when the model emits it inline within a paragraph. The
 // micromark-extension-math flow-math tokenizer requires both that the
 // `$$` fences are preceded by a blank line AND that each fence is on
-// its own line — `$$x$$` on a single line (even as a standalone block)
-// is still parsed as text math. So we rewrite every `$$inner$$`
-// occurrence to `\n\n$$\ninner\n$$\n\n` so the opening fence,
+// its own line; `$$x$$` on a single line (even as a standalone block)
+// is still parsed as text math. So every `$$inner$$` occurrence is
+// rewritten to `\n\n$$\ninner\n$$\n\n` so the opening fence,
 // content, and closing fence all live on separate lines. Skip content
-// inside fenced code so we don't corrupt code samples that legitimately
-// contain dollar pairs.
+// inside fenced code so code samples that legitimately contain dollar
+// pairs are not corrupted.
 function promoteDisplayMath(md: string): string {
   const parts = md.split(/(```[\s\S]*?```)/g)
   return parts

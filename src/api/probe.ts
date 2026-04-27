@@ -2,14 +2,14 @@
 //
 // `GET {serverRoot}/props` returns the running server's configuration —
 // chat template, template capabilities, modalities, sleep state, and the
-// default generation settings (incl. `n_ctx`). We use it to:
+// default generation settings (incl. `n_ctx`). It's used to:
 //
-// 1. "Test connection" — does `baseUrl` actually resolve to a llama-server
+// 1. "Test connection", does `baseUrl` actually resolve to a llama-server
 //    instance, and is the server up / not sleeping?
 // 2. Populate the "Default (server template)" option in the text-completion
 //    template picker.
-// 3. Detect thinking support via `chat_template_caps` so we can show or
-//    hide the reasoning panel on llama-server chats.
+// 3. Detect thinking support via `chat_template_caps` so the reasoning
+//    panel can be shown or hidden on llama-server chats.
 //
 // Per the CLAUDE.md URL-scoping note, `/props` lives at SERVER ROOT, not
 // under `/v1`. A llama-server connection profile's `baseUrl` typically
@@ -70,7 +70,7 @@ function asRecord(v: unknown): Record<string, unknown> {
   return v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : {}
 }
 
-// Parse a /props response into our compact shape. Accepts any JSON and
+// Parse a /props response into the compact shape. Accepts any JSON and
 // returns null when the response clearly isn't llama-server (missing
 // both `chat_template` and `default_generation_settings`).
 export function parseLlamaServerProps(body: unknown): LlamaServerProps | null {
@@ -143,10 +143,10 @@ export async function probeLlamaServer(
   }
 }
 
-// POST {root}/apply-template — returns the prompt string that the server
-// would feed to the model if you posted these messages to /v1/chat/completions.
-// Used as the 'default' text-template option: we re-use the server's own
-// Jinja template instead of trying to replicate it client-side.
+// POST {root}/apply-template, returns the prompt string that the server
+// would feed to the model when these messages are posted to /v1/chat/completions.
+// Used as the 'default' text-template option: the server's own Jinja
+// template is re-used instead of replicating it client-side.
 export interface ApplyTemplateMessage {
   role: string
   content: string

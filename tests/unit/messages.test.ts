@@ -805,7 +805,7 @@ describe('deletePair (splice-up)', () => {
       role: 'user',
       deleted: true,
     })
-    // Sub-tree we'll re-parent: L → C, where C will splice up to P when L is deleted.
+    // Sub-tree to re-parent: L → C, where C will splice up to P when L is deleted.
     await putMessage(chat.id, {
       id: 'C',
       parentId: 'L',

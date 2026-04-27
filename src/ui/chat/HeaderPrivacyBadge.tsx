@@ -79,13 +79,13 @@ function Inner({ chat }: { chat: Chat }) {
   }
 
   // Non-OpenRouter connections don't expose a per-model data policy, so
-  // we just don't render the badge. Direct-provider privacy is an
+  // the badge is simply not rendered. Direct-provider privacy is an
   // always-on attribute of the profile itself.
   if (!scrapeApplicable) return null
 
   // While the filter is resolving for the first time on this
-  // (profile, model) pair we render a muted lock rather than jump from
-  // "unavailable" → real tier on arrival.
+  // (profile, model) pair, a muted lock is rendered rather than jumping
+  // from "unavailable" to real tier on arrival.
   const rows = filter
     ? buildPickerRows(endpoints, filter, {
         providerPrefs: chat.settings.providerPrefs,
@@ -181,8 +181,8 @@ function PopoverRow({
   )
 }
 
-// Highest tier rank among kept providers — the badge reflects the
-// worst-case we're routing to, not the best case. If routing ends up
+// Highest tier rank among kept providers, the badge reflects the
+// worst-case routing target, not the best case. If routing ends up
 // failing over to a worse-tier provider, the badge should reflect that.
 function worstTier(rows: readonly PickerRow[]): PrivacyTier {
   const rank: Record<PrivacyTier, number> = {

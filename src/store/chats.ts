@@ -334,8 +334,8 @@ export async function setChatPreset(
     const chat = await ctx.getChat(chatId)
     if (!chat) return
     if ((chat.presetId ?? null) === presetId) return
-    // exactOptionalPropertyTypes rejects `{ presetId: undefined }` — we
-    // have to cast when clearing the field so the Partial<Chat> literal
+    // exactOptionalPropertyTypes rejects `{ presetId: undefined }`, so a
+    // cast is required when clearing the field so the Partial<Chat> literal
     // doesn't carry the undefined value explicitly.
     const next: Partial<Chat> =
       presetId === null

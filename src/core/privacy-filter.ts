@@ -123,7 +123,7 @@ export function filterEndpointsByPrivacy(input: PrivacyFilterInput): PrivacyFilt
 
   // Step 3 — `onlyProviders` narrows the denied-survivor set. Anything
   // outside the list gets flagged as `not-in-only-list`. The picker shows
-  // these rows as "excluded by your pin."
+  // these rows as "excluded by the user's pin."
   const onlyRefs = privacy.onlyProviders
   const scoped = afterDeny.filter((aug) => {
     if (onlyRefs.length === 0) return true
@@ -152,7 +152,7 @@ export function filterEndpointsByPrivacy(input: PrivacyFilterInput): PrivacyFilt
 
   // Step 5 — user-driven ignore list runs after Pareto. It's *additive*
   // to `autoIgnore` at request time but it also changes what the picker
-  // shows as "kept" (user's explicit veto wins visually too).
+  // shows as "kept" (the user's explicit veto wins visually too).
   const ignoreRefs = privacy.ignoreProviders
   if (ignoreRefs.length > 0) {
     kept = kept.filter((aug) => {
@@ -220,7 +220,7 @@ function orderKeptRoutingRefs(model: string, kept: readonly FilteredEndpoint[]):
 // Privacy-lock tier. See `plan/09-privacy.md §9.11`. Computed from the
 // most-preferred kept endpoint's policy (first element of
 // `orderedKeptNames`). `open` means "privacy filter doesn't apply" (free
-// model); `unavailable` means we have kept endpoints but no data_policy
+// model); `unavailable` means kept endpoints exist but no data_policy
 // survives through to describe them.
 export type PrivacyTier =
   | 'green'
@@ -235,13 +235,12 @@ export function privacyTierForPolicy(
   opts: { synthesized?: boolean } = {},
 ): PrivacyTier {
   // Tier mapping (per user spec 2026-04-19):
-  //   red    = trains on prompts (hard-denied, but we still render the
-  //            row + lock so the user can see why)
+  //   red    = trains on prompts (hard-denied, but the row + lock still
+  //            render so the user can see why)
   //   orange = retains indefinitely OR requires user IDs
   //   yellow = retains prompts for a finite set period (no user IDs)
   //   green  = no retention, no user IDs
-  //   red (synthesized) = we couldn't resolve a policy at all, so assume
-  //            the worst
+  //   red (synthesized) = no policy could be resolved, so assume the worst
   //   unavailable = genuinely no policy data provided (direct-provider
   //            rows)
   if (opts.synthesized) return 'red'
@@ -320,7 +319,7 @@ export function buildWireProviderPrivacy(
     // When the user pins a set, echo the kept survivors (post-Pareto) so
     // the request matches what the UI shows. Using `onlyProviders`
     // verbatim would send providers that Pareto / hard-deny already
-    // excluded, which would be surprising.
+    // excluded, which would surprise the user.
     wire.only = result.kept.map((k) => providerRoutingRef(k.endpoint))
   } else if (existingOnly.length > 0) {
     wire.only = existingOnly

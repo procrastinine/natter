@@ -90,7 +90,7 @@ test('bumping lastViewedAt on the active chat from tab B leaves the stream intac
   await createChatAndOpen(page)
   await sendMessage(page, 'view me')
   await expect(page.locator('[data-ui="abort"]')).toBeVisible()
-  // Chat row materializes on first send, so we look it up *after* sending.
+  // Chat row materializes on first send, so the lookup happens *after* sending.
   const chatId = await firstChatId(page)
 
   // Simulate a peer tab bumping lastViewedAt via IDB while the stream is live.
@@ -135,7 +135,7 @@ test('renaming the chat while streaming does not abort the stream', async ({ pag
   await createChatAndOpen(page)
   await sendMessage(page, 'keep streaming')
   await expect(page.locator('[data-ui="abort"]')).toBeVisible()
-  // Chat row materializes on first send, so we look it up *after* sending.
+  // Chat row materializes on first send, so the lookup happens *after* sending.
   const chatId = await firstChatId(page)
 
   // Direct IDB title rename, emulating a peer-tab rename that lands before

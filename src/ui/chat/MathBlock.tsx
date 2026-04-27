@@ -33,9 +33,9 @@ export function MathBlock({ source, display }: MathBlockProps) {
   )
 }
 
-// Lightweight pre-parse check so we can render a helpful tooltip even when the
-// KaTeX plugin isn't loaded. We don't try to be a real parser — just flag the
-// obvious mismatched-delimiter / lone-backslash cases the plan calls out.
+// Lightweight pre-parse check so a helpful tooltip can render even when the
+// KaTeX plugin isn't loaded. Not a real parser, just flags the obvious
+// mismatched-delimiter / lone-backslash cases the plan calls out.
 function diagnose(source: string): string | null {
   const trimmed = source.trim()
   if (trimmed.length === 0) return 'empty'

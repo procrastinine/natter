@@ -5,8 +5,8 @@
 // caps, uptime/latency/throughput). Non-OpenRouter providers expose at most
 // a bare model list via `GET /v1/models`; capability data for those comes
 // from bundled tables (see `src/capabilities/`). Custom connections get a
-// permissive default — the user asked us to enable every control so they
-// can try whatever the endpoint actually accepts.
+// permissive default. Per user directive, every control is enabled so the
+// user can try whatever the endpoint actually accepts.
 //
 // Fetchers here are environment-neutral (no Dexie, no React). Hooks layer
 // in caching + reactivity.

@@ -102,7 +102,7 @@ export async function* chatCompletions(
   const contentType = response.headers.get('content-type') ?? ''
 
   // Buffered fallback: the upstream (or a caching proxy) answered with
-  // JSON even though we asked for SSE. Normalize into a single terminal
+  // JSON even though SSE was requested. Normalize into a single terminal
   // chunk so the rest of the app can keep one consumer shape.
   if (!/text\/event-stream/i.test(contentType)) {
     const result = (await response.json()) as ChatCompletionResultWire

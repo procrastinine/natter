@@ -17,7 +17,7 @@ export interface ProfileGlyphProps {
 }
 
 const ROLE_LABEL: Record<Message['role'], string> = {
-  user: 'You',
+  user: 'User',
   assistant: 'Assistant',
   system: 'System',
   developer: 'Developer',

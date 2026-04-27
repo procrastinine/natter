@@ -3,8 +3,8 @@ import { clearIndexedDb, seedFirstRun } from './helpers'
 
 // The orphan sweep (Shell.tsx → recoverOrphans on mount) rescues any message
 // whose `generation.startedAt` is set without `finishedAt` by marking it
-// `abortReason: 'tab-close'`. We don't need a mid-stream close for this spec —
-// we synthesize an orphan row directly in IDB and reload.
+// `abortReason: 'tab-close'`. A mid-stream close isn't needed for this spec;
+// the test synthesizes an orphan row directly in IDB and reloads.
 
 test.beforeEach(async ({ page }) => {
   await page.goto('/')

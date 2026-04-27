@@ -80,7 +80,7 @@ test('empty-after-trim is treated as a silent cancel (no error, editor closes)',
 
 test('committing an unchanged title is a silent no-op (no error banner)', async ({ page }) => {
   await createChatAndSend(page, 'seed')
-  // First, set a title we control.
+  // First, set a known title.
   await page.locator('[data-role="chat-title-edit"]').click()
   await page.locator('[data-ui="chat-title-editor"]').fill('Stable title')
   await page.locator('[data-ui="chat-title-editor"]').press('Enter')

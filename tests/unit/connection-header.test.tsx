@@ -58,8 +58,8 @@ beforeEach(async () => {
 
 afterEach(async () => {
   // Unmount the React tree BEFORE resetting the DB. The header's
-  // observable queries hold a live Dexie handle; if we close the DB while
-  // those are still resolving, vitest flags a `DatabaseClosedError`
+  // observable queries hold a live Dexie handle; closing the DB while
+  // those are still resolving makes vitest flag a `DatabaseClosedError`
   // unhandled rejection. Cleanup first cancels the subscriptions.
   cleanup()
   vi.restoreAllMocks()

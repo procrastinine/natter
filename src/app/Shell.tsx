@@ -109,9 +109,9 @@ function hasFileTransfer(dataTransfer: DataTransfer): boolean {
 // then fall back to the workspace-global MRU preset. The remembered seed
 // tracks the most recently viewed chat in this tab (including preset-backed
 // chats with no local edits), plus explicit new-chat/profile-switch actions.
-// We still override `profileId` with the preferred profile so an explicit
-// connection choice can win even when we had to fall back to a different
-// preset for the rest of the seed settings.
+// `profileId` is still overridden with the preferred profile so an explicit
+// connection choice can win even when a different preset had to be used
+// for the rest of the seed settings.
 // If the chosen profileId differs from the preset's, clear the model —
 // the preset's model is almost certainly not served on the new connection,
 // and the Shell-level auto-selector will fill it in if the new connection
@@ -200,7 +200,7 @@ export function Shell() {
   //
   // `useModels` powers the fetch half — mounting it here triggers a /v1/models
   // request for whichever profile the chat points at, whether or not the
-  // Model tab is open. For the read half we go through `useLiveQuery` →
+  // Model tab is open. The read half goes through `useLiveQuery` →
   // `getCachedModels` keyed on the CURRENT profileId directly (rather than
   // reading `useModels.models` which is a derived, slightly-delayed view).
   // This avoids a race where the chat's profileId has already flipped to
@@ -316,7 +316,7 @@ export function Shell() {
   //   1. Prefer the user's `customMaxContext` — it's explicit intent.
   //   2. Otherwise use the provider-derived cap from live /endpoints.
   //   3. If the capability hasn't loaded yet AND the user hasn't set a
-  //      custom cap, we return `undefined` so the Composer hides the
+  //      custom cap, return `undefined` so the Composer hides the
   //      indicator entirely instead of collapsing to a bogus 128k
   //      default. Transient flickers from "894k → 104k" during a model
   //      switch were the bug driving this.
@@ -328,9 +328,9 @@ export function Shell() {
     // (the label renders just the used count) rather than pretending the
     // provider cap applies when the user explicitly opted out.
     if (customMaxStored === UNLIMITED_CONTEXT) {
-      // Fall through with a large modelCap but we'll still cap it via max
+      // Fall through with a large modelCap but it will still be capped via max
       // completion below; the composer checks `budget <= used ? undefined
-      // : budget - used` so we just feed an effectively unbounded number.
+      // : budget - used` so an effectively unbounded number is fed in.
     }
     const modelCapRaw = customMaxStored === UNLIMITED_CONTEXT ? undefined : customMaxStored
     const modelCap = modelCapRaw ?? providerCap
@@ -484,8 +484,8 @@ export function Shell() {
 
   // Chat-not-found banner: if the route refers to a chat id that doesn't
   // resolve (deleted, never existed, or pasted from another workspace),
-  // surface the banner per §10.13.1 Route table. Live-query guarantees we
-  // re-evaluate when the chats table changes.
+  // surface the banner per §10.13.1 Route table. Live-query guarantees
+  // re-evaluation when the chats table changes.
   const routedChatExists = useLiveQuery(
     () => (activeChatId ? getChat(activeChatId).then((c) => !!c) : Promise.resolve(true)),
     [activeChatId],
@@ -666,8 +666,8 @@ export function Shell() {
         setEditTreeMode(!useUiStore.getState().editTreeMode)
       }
       // Import-at-end modal shortcut (§10.14). Only meaningful on an active
-      // chat; we swallow the keystroke either way so DevTools bindings
-      // (`Ctrl+Shift+I`) don't stomp us.
+      // chat; the keystroke is swallowed either way so DevTools bindings
+      // (`Ctrl+Shift+I`) don't stomp on it.
       if (e.key === 'V' && e.shiftKey && (e.metaKey || e.ctrlKey) && activeChatId && !isTyping) {
         e.preventDefault()
         setImportAtEndOpen(true)
@@ -684,7 +684,7 @@ export function Shell() {
   }, [streamingOnActiveChat, abortActiveChat, activeChatId, setEditTreeMode])
 
   // Keep the panel slot reserved whenever the user opened it, regardless
-  // of whether a chat is active. On /new we still render the shell so the
+  // of whether a chat is active. On /new the shell still renders so the
   // transition out of /new (after materializing a chat) doesn't make the
   // panel jump in from nowhere. The panel component itself no-ops when
   // chatId is null.

@@ -9,7 +9,7 @@
 //   - Mix of old and new messages in the same path → each handled per row.
 //   - corrupt/missing/bad typed fields on the message → clamp / ignore.
 //
-// We also confirm that Phase B additions are strictly pure-add — nothing
+// Also confirms that Phase B additions are strictly pure-add: nothing
 // they changed would break a row written by a Phase-A binary.
 
 import { describe, expect, it, vi } from 'vitest'
@@ -32,7 +32,7 @@ import type {
   TokenCalibrationSample,
 } from '../../src/core/types'
 
-// Fake the settings store so we don't need Dexie.
+// Fake the settings store so Dexie isn't required.
 vi.mock('../../src/store/settings', () => {
   const state = new Map<string, unknown>()
   return {
@@ -202,8 +202,8 @@ describe('backcompat — mixed paths (some new, some old)', () => {
   it('after model switch, legacy messages use fresh path regardless', () => {
     // Old message has NO originalModelId. When currentModelId is present,
     // cacheEligibleFor returns true for originalModelId===undefined
-    // (Phase-B backcompat contract — we can't know what model it was),
-    // and with NO cache field, we still fall to fresh.
+    // (Phase-B backcompat contract, since the original model is unknown),
+    // and with NO cache field, the path falls through to fresh.
     const legacy = makeLegacyMessage('user', 'a'.repeat(35))
     const est = estimatePromptSize({
       systemPrompt: '',

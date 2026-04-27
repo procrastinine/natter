@@ -34,8 +34,8 @@ import {
 import { getProfile } from '../store/profiles'
 
 // `useModels` in ModelPicker uses this exact query; useEndpoints looks up
-// the already-cached row keyed off the same signature so we don't double-
-// fetch just to read a context length for non-OpenRouter connections.
+// the already-cached row keyed off the same signature so a double
+// fetch is avoided just to read a context length for non-OpenRouter connections.
 const OPENROUTER_CAPABILITY_LOOKUP_QUERY = {
   outputModalities: ['text', 'image', 'audio', 'file', 'video'],
 } as const
@@ -57,7 +57,7 @@ export interface UseEndpointsResult {
   fetchedAt: number | null
   offline: boolean
   error: string | null
-  // `null` = we don't know yet (models list cold).
+  // `null` = unknown yet (models list cold).
   // `true`  = this modelId appears in the profile's /models list.
   // `false` = /models is cached and this modelId is not in it — that's why
   //           the Context tab has no capability, not a stale fetch.
@@ -141,11 +141,11 @@ export function useEndpoints(
   // The cached /models response drives two things: (a) a contextLength
   // overlay on top of the bundled capability for non-OpenRouter kinds
   // (llama.cpp advertises `meta.n_ctx_train` there), and (b) a
-  // model-availability signal for the panel. For OR we read it too so
+  // model-availability signal for the panel. For OR it is read too so
   // the panel can distinguish "waiting for /endpoints" from "this model
   // simply isn't served on this connection" (e.g., a chat started on
-  // llama-server with gemma, now pointed at OR — OR returns 404 and we
-  // want an actionable banner, not a permanently-spinning Context tab).
+  // llama-server with gemma, now pointed at OR; OR returns 404 and an
+  // actionable banner is needed, not a permanently-spinning Context tab).
   const liveModelsRow = useLiveQuery(
     () =>
       profileId

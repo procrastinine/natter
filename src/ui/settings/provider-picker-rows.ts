@@ -3,7 +3,7 @@
 //
 // Each endpoint becomes exactly one `PickerRow`, tagged with its kept /
 // auto-excluded / no-filter status, the resolved `DataPolicy` (or
-// undefined when we couldn't resolve one), the privacy tier, and any
+// undefined when none could be resolved), the privacy tier, and any
 // exclusion reasons. The picker renders directly from this list — the
 // order matches `endpoints` (the caller decides how to sort upstream).
 
@@ -141,9 +141,9 @@ export function reasonLabel(reason: ExclusionReason): string {
     case 'unknown-policy':
       return 'No privacy data available'
     case 'user-ignored':
-      return 'You ignored this provider'
+      return 'Provider is ignored'
     case 'not-in-only-list':
-      return 'Outside your pinned set'
+      return 'Outside the pinned set'
   }
 }
 

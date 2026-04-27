@@ -245,7 +245,7 @@ function buildProbeProfile(kind: ConnectionKind, name: string, baseUrl: string):
     usesResponsesApiByDefault: false,
     supportsEndpointsApi: false,
     supportsGenerationApi: false,
-    supportsPrivacyScrape: false,
+    supportsPrivacyScrape: kind === 'openrouter',
     createdAt: now,
     updatedAt: now,
   }
@@ -825,28 +825,15 @@ function ConnectionViewer({
 // applied via updateProfile() immediately. See `plan/10-ui.md §10.17.5` and
 // `plan/phase11-implementation.md §6`.
 function ConnectionRoutingControls({ profile }: { profile: ConnectionProfile }) {
-  // OpenRouter doesn't have a user-facing routing choice: chat completions is
-  // the default, and Responses is auto-upgraded by the quirks registry when
-  // needed. Show a static note rather than a no-op toggle.
-  if (profile.kind === 'openrouter') {
-    return (
-      <details data-ui="connection-routing" data-kind="openrouter">
-        <summary>API routing</summary>
-        <p data-ui="helper">
-          OpenRouter uses chat completions by default. Responses is auto-upgraded for models that
-          need it (gpt-5.4 family, encrypted-reasoning preservation, server-tool outputs).
-        </p>
-      </details>
-    )
-  }
   if (profile.kind === 'google') {
     return <GoogleRoutingControls profile={profile} />
   }
   if (profile.kind === 'openai-compatible') {
     return <OpenAIRoutingControls profile={profile} />
   }
-  // anthropic / llama-server / custom: no routing choice at the connection
-  // level. Hide entirely rather than rendering an empty disclosure.
+  // openrouter / anthropic / llama-server / custom: no user-facing routing
+  // choice. OpenRouter auto-upgrades to Responses via the quirks registry;
+  // the others have no transport choice at the connection level.
   return null
 }
 
@@ -992,7 +979,7 @@ function OpenAIRoutingControls({ profile }: { profile: ConnectionProfile }) {
           </label>
           <span data-ui="helper">
             Sends <code>include: ["reasoning.encrypted_content"]</code> on all Responses calls.
-            Leave on unless you want to strip reasoning at the wire level.
+            Leave on unless reasoning should be stripped at the wire level.
           </span>
         </details>
       </div>
@@ -1094,7 +1081,7 @@ function ConnectionEditor({
     : hasKey
       ? 'Saving in place. Leave the key empty to keep the existing key.'
       : requiresKey
-        ? 'Saving in place. This profile stays no-key until you paste one.'
+        ? 'Saving in place. This profile stays no-key until a key is pasted.'
         : 'Custom and local endpoints can save without a key.'
 
   const submit = useCallback(async () => {
@@ -1379,7 +1366,7 @@ function ConnectionSetupModal({
   const keyHelper = mustProvideKey
     ? 'The first hosted connection must include a key so the app can talk to it.'
     : requiresKey
-      ? 'Hosted providers can save without a key, but sends and tests stay blocked until you add one.'
+      ? 'Hosted providers can save without a key, but sends and tests stay blocked until a key is added.'
       : 'Custom and local endpoints can save without a key.'
 
   useEffect(() => {

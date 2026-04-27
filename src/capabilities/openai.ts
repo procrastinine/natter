@@ -1,6 +1,6 @@
 // Hand-maintained OpenAI capability table. OpenRouter returns this info
-// live via /endpoints; for OpenAI-direct ConnectionProfiles we don't have
-// that, so we bundle enough to populate the ParamForm.
+// live via /endpoints; OpenAI-direct ConnectionProfiles lack that, so a
+// bundled table populates the ParamForm.
 //
 // Only the most-used models are listed. Users who need others can add
 // entries via ConnectionProfile.capabilityOverrides.

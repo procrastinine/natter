@@ -13,7 +13,7 @@
 //     `geminiMode` + `usesResponsesApiByDefault`.
 //   - `settings`: the effective ChatSettings for this turn. The user's
 //     explicit `settings.api` pin wins over every model-derived heuristic.
-//   - `path`: the active branch (root → leaf). We check for prior Responses-
+//   - `path`: the active branch (root → leaf). Checked for prior Responses-
 //     API artifacts (e.g. encrypted reasoning, server-tool outputs) that
 //     would be lost on chat-completions.
 //   - `caps`: the resolved capability descriptor, carrying the quirks entry
@@ -109,8 +109,8 @@ export function chooseApi(
   }
 
   // Step 5 — prior server-tool output on the path (web_search_call, etc.).
-  // Chat completions can't round-trip those items, so we must stay on
-  // Responses for continuity.
+  // Chat completions can't round-trip those items, so the route must stay
+  // on Responses for continuity.
   if (hasResponsesServerToolArtifact(path) && canRunResponses(profile)) {
     return openAiResponses('prior server-tool output requires Responses for round-trip')
   }
@@ -166,7 +166,7 @@ export function chooseApi(
 // "Responses capable" covers OpenRouter (beta `/responses` proxy),
 // OpenAI-compatible endpoints (OpenAI direct, Azure OpenAI, GMI, etc.),
 // and any `custom` kind that the user opted into. Gemini native and
-// Anthropic's dedicated APIs are excluded — their Responses-equivalents
+// Anthropic's dedicated APIs are excluded; their Responses-equivalents
 // are their own transports.
 function canRunResponses(profile: ConnectionProfile): boolean {
   return (
@@ -215,9 +215,9 @@ function hasPriorOpenAiEncryptedReasoning(path: readonly Message[]): boolean {
     if (!m.reasoningDetails) continue
     for (const d of m.reasoningDetails) {
       if (d.type !== 'reasoning.encrypted') continue
-      // Accept any OpenAI-family carrier; the router only asks "should we
-      // stay on Responses to round-trip it?" — the transform decides the
-      // exact `include:` list from `format`.
+      // Accept any OpenAI-family carrier; the router only asks "should
+      // the route stay on Responses to round-trip it?" — the transform
+      // decides the exact `include:` list from `format`.
       if (isOpenAiResponsesFormat(d.format)) return true
       // If the carrier has no `format`, assume compatible (the ingest path
       // may have dropped it). Better to preserve than to discard.

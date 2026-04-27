@@ -1,8 +1,8 @@
 // Image origin allowlist for MarkdownView. See plan/11-rendering.md §11.5.
 //
 // The default list covers origins that LLM responses commonly reference and
-// that we trust not to ship tracking pixels. User-added origins are persisted
-// under `settings['image-allowlist']` and appended at render time.
+// that are trusted not to ship tracking pixels. User-added origins are
+// persisted under `settings['image-allowlist']` and appended at render time.
 
 export const DEFAULT_IMAGE_ORIGINS: readonly string[] = Object.freeze([
   'https://openrouter.ai',
@@ -41,7 +41,7 @@ function matchOriginPattern(origin: string, pattern: string): boolean {
   if (!pattern.startsWith('http')) return false
   if (pattern === origin) return true
   // Wildcard host pattern: `https://*.example.com` matches any subdomain of
-  // `example.com` (but NOT the bare apex — the apex needs its own entry).
+  // `example.com` (but NOT the bare apex; the apex needs its own entry).
   const wildcard = pattern.replace(/^https?:\/\//, '')
   if (wildcard.startsWith('*.')) {
     const suffix = wildcard.slice(1) // ".example.com"

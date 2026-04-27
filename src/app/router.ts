@@ -1,5 +1,5 @@
 // Hash router. The URL is the source of truth for "which chat / which sibling
-// am I looking at" so reload restores the view and Cmd/middle-click on chat
+// is in view" so reload restores the view and Cmd/middle-click on chat
 // affordances opens a new tab at the same route.
 //
 // Routes:

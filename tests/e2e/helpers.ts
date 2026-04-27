@@ -1,7 +1,7 @@
 // Shared e2e helpers. See `plan/13-delivery.md §13.3.0 Track B`.
 //
 // Every spec that hits the send pipeline uses `mockChatCompletions` to stub
-// `/api/v1/chat/completions` so we don't burn live quota on deterministic
+// `/api/v1/chat/completions` to avoid burning live quota on deterministic
 // assertions. Live-API specs live in `*.live.spec.ts` and gate on
 // `process.env.RUN_LIVE === '1'`.
 

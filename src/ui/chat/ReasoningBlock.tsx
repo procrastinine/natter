@@ -26,9 +26,9 @@ export interface ReasoningBlockProps {
   details: ReasoningDetail[]
   streaming?: boolean
   // True when the message body already has visible content. Drives the
-  // auto-collapse rule: we keep the panel open until content starts so the
-  // user can watch tokens stream into reasoning, then fold it away on first
-  // content token unless they pinned it open.
+  // auto-collapse rule: the panel stays open until content starts so the
+  // user can watch tokens stream into reasoning, then folds away on first
+  // content token unless pinned open.
   hasContent?: boolean
   // Caller-supplied toggle for per-row hide. When omitted, the eye icons
   // don't render (read-only view).
@@ -82,7 +82,7 @@ export function ReasoningBlock({
 
   // Auto-expand on first chunk while streaming; auto-collapse once content
   // starts unless the user has pinned the panel. `pinnedOpen` sticks on
-  // ANY user toggle — if they poke the chevron, we stop fighting them.
+  // ANY user toggle, once the chevron is poked the auto-collapse stops.
   const [pinnedOpen, setPinnedOpen] = useState(false)
   const [open, setOpen] = useState(() => streaming && !hasContent)
   const lastHadContentRef = useRef(hasContent)

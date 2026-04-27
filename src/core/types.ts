@@ -4,7 +4,7 @@
 // Conventions:
 // - snake_case on the wire, camelCase internally
 // - ULIDs for all ids (monotonic, 26 chars, lexicographically sortable)
-// - `undefined` = "not in our domain"; `null` = "explicitly unset on the wire"
+// - `undefined` = "not in the domain"; `null` = "explicitly unset on the wire"
 // - Append-only for ids/turn metadata; content and a few mutable fields use LWW inside the chat lock
 
 // ---------------------------------------------------------------------------
@@ -274,7 +274,7 @@ export interface ProviderPreferences {
   only?: string[]
   ignore?: string[]
   // True once the user clicks any provider checkbox. Signals that
-  // `ignore` is the authoritative disallowed list — the wire builder
+  // `ignore` is the authoritative disallowed list; the wire builder
   // and picker both skip the filter's auto-exclusion when this is set.
   // Stays set even when `ignore` happens to be empty (e.g. user
   // re-enabled every filter-excluded row), so "touched" is distinct
@@ -359,7 +359,7 @@ export interface ContextStrategy {
   keepFirstPairs?: number
   // When true, send OpenRouter's `plugins: [{id: 'context-compression'}]`
   // alongside client-side trimming. Server-side middle-out compresses what
-  // remains after we trim locally.
+  // remains after the local trim.
   useOpenRouterMiddleOut?: boolean
 }
 
@@ -403,7 +403,7 @@ export interface ChatSettings {
   maxCompletionTokens?: number
   // User-imposed ceiling on prompt tokens. Never exceeds the model's own
   // cap, but lets the user trim down for cost / latency / behaviour. When
-  // undefined, we use the model's advertised cap.
+  // undefined, the model's advertised cap is used.
   customMaxContext?: number
   // When true, route only to providers that support every set parameter
   // (wire: `provider.require_parameters: true`) and restrict the UI to the
@@ -462,7 +462,7 @@ export interface ChatSettings {
   customTextTemplate?: TextTemplateConfig
   // OpenAI Responses-API-specific knobs. Seeded from
   // `ConnectionProfile.responsesDefaults` at new-chat creation. Only read
-  // on the `responses` route — chat-completions ignores the block entirely.
+  // on the `responses` route; chat-completions ignores the block entirely.
   responses?: ResponsesChatSettings
   // Gemini-specific knobs. Seeded from `ConnectionProfile.geminiDefaults`.
   gemini?: GeminiChatSettings
@@ -474,15 +474,15 @@ export interface ResponsesChatSettings {
    *  escape hatch so the user can suppress the include without flipping the
    *  per-chat reasoning checkbox. */
   includeEncrypted: boolean
-  /** Pass through to OpenAI. Our default is `false` (stateless, privacy). */
+  /** Pass through to OpenAI. Default is `false` (stateless, privacy). */
   store: boolean
 }
 
 export interface GeminiChatSettings {
   /** Imported chats without `thoughtSignature` values on prior turns bypass
-   *  the 400-error validator when this is `true` (we pass
-   *  `"skip_thought_signature_validator"` as the signature). Default `false`
-   *  — surface a banner on first stale-reasoning rejection instead. */
+   *  the 400-error validator when this is `true` (the transform passes
+   *  `"skip_thought_signature_validator"` as the signature). Default `false`,
+   *  which surfaces a banner on first stale-reasoning rejection instead. */
   allowImportedWithoutSignature?: boolean
   /** When set, `cachedContents/<name>` passed as `cachedContent` on the
    *  request. Phase 14 wires the management UI; preserved here for round-trip. */
@@ -497,7 +497,7 @@ export type TextTemplateId = string
 // round-trip; UI edits save template source.
 //
 // See `SillyTavern/default/content/presets/instruct/*.json` for the
-// schema we modeled this on (ours is trimmed to the essentials).
+// schema this is modeled on (trimmed to the essentials).
 export interface TextTemplateConfig {
   template?: string
   includeSystemPrompt?: boolean
@@ -563,7 +563,7 @@ export interface Chat {
   tags: TagId[]
   favoriteModels?: string[]
   recentModels?: string[]
-  // Denormalized sidebar preview — plaintext of the earliest live user
+  // Denormalized sidebar preview: plaintext of the earliest live user
   // message, trimmed to a generous single-line cap. Populated by `refreshChatPreview`
   // whenever a user message is created, edited, or deleted. The sidebar
   // reads this directly off the chat row so listing N chats never has to
@@ -574,12 +574,12 @@ export interface Chat {
   // Running-sum calibration for chars-per-token. Keyed by the durable
   // calibration bucket: shared-tokenizer family key when known, otherwise the
   // canonicalized structural model key. Updated on every successful stream
-  // completion in this chat. Optional for backcompat — absence falls through
+  // completion in this chat. Optional for backcompat; absence falls through
   // to global + hardcoded tiers.
   tokenCalibration?: Record<string, TokenCalibrationSample>
 }
 
-// One per (chat, calibration-bucket) pair. Running sums — new samples add
+// One per (chat, calibration-bucket) pair. Running sums; new samples add
 // directly.
 // Ratio at any point is `totalTextChars / totalTextTokens`; that ratio is
 // automatically weighted by sample size (a 300-token completion
@@ -779,7 +779,7 @@ export interface GenerationMeta {
 }
 
 // Minimal echo envelope for a Responses API output item. The full variant list
-// lives in transforms; here we keep it open so callers can round-trip unknown
+// lives in transforms; this shape stays open so callers can round-trip unknown
 // item types without losing data. See `plan/15-non-text-in-context.md` and
 // `plan/02-data-model.md §2.9` for the canonical set.
 export interface ResponsesOutputItem {
@@ -819,7 +819,7 @@ export interface Message {
 
   // Character count at message creation (text content only, no media). For
   // assistant messages in the inline-`<think>` family, also includes the
-  // lifted reasoning-text chars — those were billed as completion tokens on
+  // lifted reasoning-text chars; those were billed as completion tokens on
   // the wire, so calibration should see them. Encrypted / signed reasoning
   // (out-of-band reasoning_tokens) is NOT included. Immutable once set.
   originalCharCount?: number
@@ -1060,7 +1060,6 @@ export interface ConnectionProfile {
   supportsPrivacyScrape: boolean
   capabilityOverrides?: Record<string, CapabilityOverride>
   debugRequests?: boolean
-  privacyScrapeProxy?: string
   createdAt: number
   updatedAt: number
   lastUsedAt?: number

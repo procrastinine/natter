@@ -5,8 +5,8 @@
 // - validateSample() is pure — covers ingest gates (physical bounds,
 //   family bounds, outliers, short samples, bad input).
 // - charsPerToken() is pure — covers tier fallbacks + final clamp.
-// - addSampleToChatAndGlobal() mutates + writes global; we stub the
-//   global store via an in-memory fake (no IDB in unit tests).
+// - addSampleToChatAndGlobal() mutates + writes global; the global
+//   store is stubbed via an in-memory fake (no IDB in unit tests).
 // - freshTokenEstimate() is pure — covers div-by-zero + clamp.
 
 import { beforeEach, describe, expect, it, vi } from 'vitest'
@@ -42,9 +42,9 @@ import type {
   TokenCalibrationSample,
 } from '../../src/core/types'
 
-// Fake settings backend — the real one is in ../../src/store/settings.ts
-// and hits Dexie. Unit tests don't boot Dexie; we swap out the module
-// under a vi.mock.
+// Fake settings backend. The real one is in ../../src/store/settings.ts
+// and hits Dexie. Unit tests don't boot Dexie; the module is swapped
+// out under a vi.mock.
 vi.mock('../../src/store/settings', () => {
   const state = new Map<string, unknown>()
   return {
@@ -205,9 +205,9 @@ describe('validateSample — outlier gate', () => {
     // New sample at ratio 4.9 → within GPT family bounds [2.5, 5.0] but
     // > 3 × 3.0 = 9. Wait — that's actually fine, 4.9 < 9.
     // Try a new sample at ratio 4.95 — same conclusion.
-    // For the 3× factor to fire within family bounds we need a seed
-    // ratio near the low end: seed 2.6, new 4.95 → 4.95 / 2.6 = 1.9 < 3.
-    // We can't easily construct a within-family outlier. Assert the
+    // For the 3× factor to fire within family bounds, a seed ratio
+    // near the low end is required: seed 2.6, new 4.95 → 4.95 / 2.6 = 1.9 < 3.
+    // A within-family outlier cannot easily be constructed. Assert the
     // gate doesn't FALSE-POSITIVE instead:
     expect(validateSample('openai/gpt-4o', 300 * 1.5, 100, sample).accepted).toBe(true)
     // And that it DOES fire with a far-enough-from-baseline sample that
@@ -225,10 +225,10 @@ describe('validateSample — outlier gate', () => {
       applyValidatedSample(sample, 200, 100, i)
     }
     // New sample 6.0 (at hi edge). 6.0 / 2.0 = 3.0 → exactly at threshold.
-    // Use > 3.0 × to definitively fire; but hi is 6.0 so we can't.
-    // Use LOW-side outlier: seed at 6.0, new at 1.9 (below lo), gets
+    // Using > 3.0 × would definitively fire, but hi is 6.0 so it isn't possible.
+    // A LOW-side outlier (seed at 6.0, new at 1.9, below lo) gets
     // rejected by family bounds first.
-    // So: use OUTLIER_FACTOR * 1.0001 to be just past the limit.
+    // So: OUTLIER_FACTOR * 1.0001 lands just past the limit.
     expect(
       validateSample('unknown-family/mystery', 600 * OUTLIER_FACTOR + 1, 100, sample).accepted,
     ).toBe(false)
@@ -401,8 +401,8 @@ describe('charsPerToken — tiered fallback', () => {
   })
 
   it('falls to tier 2 when chat sample count is below MIN_SAMPLES_CHAT', () => {
-    // MIN_SAMPLES_CHAT is currently 1; to construct a "not enough" chat
-    // sample we'd need sampleCount = 0 (empty sample). An empty sample
+    // MIN_SAMPLES_CHAT is currently 1; constructing a "not enough" chat
+    // sample requires sampleCount = 0 (empty sample). An empty sample
     // has sampleCount = 0 which is < 1. Tier 1 skipped.
     const chat = {
       tokenCalibration: {
@@ -419,8 +419,8 @@ describe('charsPerToken — tiered fallback', () => {
     // is outside — 6.0. This simulates "all early samples happened to
     // land near 5.0 (just below hi) and later samples also near 5.0 but
     // slightly over — family bounds WOULD reject them but imagine the
-    // running sum drifted". We model that by constructing a sample that's
-    // already out-of-bounds.
+    // running sum drifted". The test models this by constructing a sample
+    // that's already out-of-bounds.
     const chat = {
       tokenCalibration: {
         'openai/gpt-4o': {
@@ -918,7 +918,7 @@ describe('persistence round-trip', () => {
   })
 
   it('normalizes malformed stored payload', async () => {
-    // Hypothetical: prior version stored a bad shape; we should not crash.
+    // Hypothetical: prior version stored a bad shape; the read must not crash.
     const settings = (await import('../../src/store/settings')) as unknown as {
       setSetting<T>(key: string, value: T): Promise<void>
     }

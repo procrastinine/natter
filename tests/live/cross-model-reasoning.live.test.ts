@@ -3,7 +3,7 @@
 // Google / Anthropic.
 //
 // Live-probed 2026-04-20 — these pairs all accept each other's encrypted
-// reasoning. The tests re-prove the contract so regressions in our filter
+// reasoning. The tests re-prove the contract so regressions in the filter
 // / transform / api-choice code surface immediately.
 
 import { readFileSync } from 'node:fs'
@@ -242,7 +242,7 @@ describe.skipIf(!LIVE)('live cross-model — Gemini native (tier swap)', () => {
     )
     const parts = result.candidates?.[0]?.content.parts ?? []
     // 2.5 emits NO `thoughtSignature` outside function calls. This is the
-    // research claim the user asked us to verify.
+    // research claim under verification here.
     const hasSignature = parts.some((p) => 'thoughtSignature' in (p as object))
     expect(hasSignature).toBe(false)
   }, 60_000)

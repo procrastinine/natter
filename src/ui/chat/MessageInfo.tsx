@@ -23,7 +23,7 @@ export interface MessageInfoProps {
 }
 
 // Detail panel revealed via the ⓘ button on each message. Contains the
-// metadata we used to dump as always-visible chips (model, timestamps,
+// metadata previously dumped as always-visible chips (model, timestamps,
 // token breakdown, cost). Quiet two-column layout, no badges.
 export function MessageInfo({ message, staleReplyHint }: MessageInfoProps) {
   const gen = message.generation
@@ -112,7 +112,7 @@ export function MessageInfo({ message, staleReplyHint }: MessageInfoProps) {
   // Phase B calibration readout. ALWAYS computed so pre-Phase-B rows
   // (no originalCharCount) still show an estimate — the UI reads the
   // current content and derives chars on the fly. Cached values are
-  // preferred when present; else we fall back to a family-anchor fresh
+  // preferred when present; otherwise the fallback is a family-anchor fresh
   // estimate. (The gauge path uses the full tiered resolver with chat +
   // global calibration; MessageInfo is a lighter display surface with
   // no access to those tables, so it uses the family anchor.)

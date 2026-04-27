@@ -126,11 +126,11 @@ export function ProviderPicker({
     draftAttachmentRefs: draft?.attachmentRefs,
     enabled: needsLocalNeededTokens,
   })
-  // Provider filter uses the CURRENT estimate (tokens we'd actually send
-  // right now, including reasoning echo) + the reserved completion budget.
+  // Provider filter uses the CURRENT estimate (tokens that would actually
+  // be sent right now, including reasoning echo) + the reserved completion budget.
   // This means a provider whose context can't fit the user's declared
   // `customMaxContext` ceiling is NOT filtered out if the live prompt is
-  // smaller — the user still gets the provider while the chat is short.
+  // smaller, the provider stays available while the chat is short.
   const neededTokens = useMemo(() => {
     if (neededTokensOverride !== undefined) return neededTokensOverride
     const est = estimateSettingsPromptSize(
@@ -180,10 +180,10 @@ export function ProviderPicker({
       //     picker; trust their `ignore` list verbatim."
       //   - When false/undefined, the wire falls back to the filter's
       //     auto-exclusion.
-      // On first click we seed `ignore` from the filter's current
-      // excluded set, then mutate it — this way clicking Allow on the
+      // On first click `ignore` is seeded from the filter's current
+      // excluded set, then mutated, so that clicking Allow on the
       // only auto-excluded row yields `ignore=[]` but the Override flag
-      // still pins us into user-authoritative mode.
+      // still pins the chat into user-authoritative mode.
       const alreadyTouched = prefs.ignoreOverridesFilter === true
       const legacyPrivacyRefs =
         chat.settings.privacy.ignoreProviders.length > 0 ||
@@ -441,7 +441,7 @@ export function ProviderPicker({
         {/*
           Always shown so users can "reset to default" at any time,
           even from a state the picker wouldn't normally flag as
-          overridden (e.g. the UX disagrees with what we think of as
+          overridden (e.g. the UX disagrees with the internal definition of
           'touched'). When nothing is overridden this is a no-op,
           which is cheap and eliminates the "where's the reset?"
           question the user hit when the flag was gated on hasOverrides.
@@ -600,8 +600,8 @@ function ProviderRow({
               reflects the user's persisted intent, the row grays out via
               data-insufficient-context, and wire-time send skips these
               endpoints. The user can still toggle (to silence the row or
-              to prepare for a shorter chat later) and we never write the
-              greyed-out state back to settings. */}
+              to prepare for a shorter chat later) and the greyed-out
+              state is never written back to settings. */}
           <input
             type="checkbox"
             checked={allowed}

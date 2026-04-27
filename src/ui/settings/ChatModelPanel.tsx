@@ -13,7 +13,7 @@
 // diverges the chat from its seed preset; the breadcrumb lets the user
 // write those edits back to the preset (update or save-as-new).
 //
-// Model switch: we call `adaptSettingsForCapability` after the new /endpoints
+// Model switch: `adaptSettingsForCapability` is called after the new /endpoints
 // row arrives so settings the new model still supports are preserved; the
 // dropped ones are surfaced via a short issues banner on the Generation
 // tab (see ParamForm's own issues banner).
@@ -247,10 +247,10 @@ export function ChatModelPanel({ chatId, chatSnapshot = null, onClose }: ChatMod
   // Two distinct "no usable model" states, one banner either way:
   // 1. The chat has a model but the current connection doesn't serve it
   //    (e.g., gemma on an OpenRouter connection). Shows what's wrong.
-  // 2. The chat has no model at all (fresh chat, or we just cleared it on
+  // 2. The chat has no model at all (fresh chat, or just cleared on
   //    a connection switch). Shows a generic prompt.
-  // When `modelAvailable === null` we're still loading /models and suppress
-  // the banner to avoid flicker.
+  // When `modelAvailable === null` /models is still loading and the
+  // banner is suppressed to avoid flicker.
   const noModel =
     !chat.settings.model || (profile?.kind === 'llama-server' && modelAvailable === false)
   const unavailableModel =
@@ -562,7 +562,7 @@ function CloseGlyph() {
 
 function settingsMatch(a: Chat['settings'], b: Chat['settings']): boolean {
   // Shallow comparison on the high-signal fields that live on the panel.
-  // We intentionally don't JSON-stringify the full object; the breadcrumb
+  // The full object is intentionally not JSON-stringified; the breadcrumb
   // only needs a "roughly matches" signal for the "edited" dot.
   if (a.model !== b.model) return false
   if (a.systemPrompt !== b.systemPrompt) return false

@@ -1,9 +1,9 @@
 // Privacy-scrape parser. See `plan/09-privacy.md §9.4` and
 // `src/api/privacy-scrape.ts`.
 //
-// We don't test the live HTTP fetch here (that's a live-curl probe per
-// CLAUDE.md "Live validation policy"). We DO test the HTML-parsing
-// branch: __NEXT_DATA__ JSON envelopes, loose JSON objects, and the
+// The live HTTP fetch isn't covered here (that's a live-curl probe per
+// CLAUDE.md "Live validation policy"). The HTML-parsing branch IS
+// covered: __NEXT_DATA__ JSON envelopes, loose JSON objects, and the
 // worst-case "nothing recognizable" fallback.
 
 import { describe, expect, it } from 'vitest'
@@ -14,26 +14,14 @@ import {
   privacyScrapeUrl,
   readCachedPrivacyPayload,
 } from '../../src/api/privacy-scrape'
-import type { ConnectionProfile } from '../../src/core/types'
+import {
+  CORS_PROXY_SECRET_HEADER,
+  type CorsProxyConfig,
+  DEFAULT_CORS_PROXY_URL,
+} from '../../src/core/cors-proxy'
 
-function makeProfile(overrides: Partial<ConnectionProfile> = {}): ConnectionProfile {
-  return {
-    id: 'prof-1',
-    name: 'test',
-    kind: 'openrouter',
-    baseUrl: 'https://openrouter.ai/api/v1',
-    apiKeyRef: 'key-1',
-    defaultHeaders: {},
-    appTitle: 'natter',
-    appUrl: '',
-    usesResponsesApiByDefault: false,
-    supportsEndpointsApi: true,
-    supportsGenerationApi: true,
-    supportsPrivacyScrape: true,
-    createdAt: 0,
-    updatedAt: 0,
-    ...overrides,
-  }
+function makeProxy(overrides: Partial<CorsProxyConfig> = {}): CorsProxyConfig {
+  return { url: DEFAULT_CORS_PROXY_URL, secret: '', ...overrides }
 }
 
 describe('privacyScrapeUrl', () => {
@@ -42,23 +30,46 @@ describe('privacyScrapeUrl', () => {
     // (no CORS header). The default is the relative proxy path that
     // Vite's dev server rewrites to openrouter.ai. Tests never hit the
     // network; this just pins the contract.
-    expect(privacyScrapeUrl(makeProfile(), 'openai/gpt-5.4')).toBe(
+    expect(privacyScrapeUrl(makeProxy(), 'openai/gpt-5.4')).toBe(
       '/_or_scrape/openai/gpt-5.4/providers',
     )
   })
 
-  it('honors profile.privacyScrapeProxy when set', () => {
-    const profile = makeProfile({ privacyScrapeProxy: 'https://proxy.example.com' })
-    expect(privacyScrapeUrl(profile, 'anthropic/claude-opus-4.7')).toBe(
+  it('honors a user-configured proxy URL', () => {
+    const proxy = makeProxy({ url: 'https://proxy.example.com' })
+    expect(privacyScrapeUrl(proxy, 'anthropic/claude-opus-4.7')).toBe(
       'https://proxy.example.com/anthropic/claude-opus-4.7/providers',
     )
   })
 
   it('trims trailing slashes on the proxy base', () => {
-    const profile = makeProfile({ privacyScrapeProxy: 'https://proxy.example.com/' })
-    expect(privacyScrapeUrl(profile, 'openai/gpt-5.4')).toBe(
+    const proxy = makeProxy({ url: 'https://proxy.example.com/' })
+    expect(privacyScrapeUrl(proxy, 'openai/gpt-5.4')).toBe(
       'https://proxy.example.com/openai/gpt-5.4/providers',
     )
+  })
+
+  it('substitutes {model} as the literal model id (lets public ?url= proxies work)', () => {
+    const proxy = makeProxy({
+      url: 'https://corsproxy.io/?url=https://openrouter.ai/{model}/providers',
+    })
+    expect(privacyScrapeUrl(proxy, 'anthropic/claude-opus-4.7')).toBe(
+      'https://corsproxy.io/?url=https://openrouter.ai/anthropic/claude-opus-4.7/providers',
+    )
+  })
+
+  it('substitutes {path} as the full scrape path', () => {
+    const proxy = makeProxy({
+      url: 'https://api.allorigins.win/raw?url=https://openrouter.ai/{path}',
+    })
+    expect(privacyScrapeUrl(proxy, 'openai/gpt-5.4')).toBe(
+      'https://api.allorigins.win/raw?url=https://openrouter.ai/openai/gpt-5.4/providers',
+    )
+  })
+
+  it('does not append /providers in template mode (the template controls the path)', () => {
+    const proxy = makeProxy({ url: 'https://example.com/{model}' })
+    expect(privacyScrapeUrl(proxy, 'openai/gpt-5.4')).toBe('https://example.com/openai/gpt-5.4')
   })
 })
 
@@ -254,10 +265,10 @@ describe('fetchPrivacyScrape (injected fetch)', () => {
         ]}}}
       </script>
     `
-    const profile = makeProfile()
+    const proxy = makeProxy()
     const fetchImpl = async () =>
       new Response(html, { status: 200, headers: { 'content-type': 'text/html' } })
-    const result = await fetchPrivacyScrape({ profile, fetchImpl }, 'openai/gpt-5.4')
+    const result = await fetchPrivacyScrape({ proxy, fetchImpl }, 'openai/gpt-5.4')
     expect(result.modelId).toBe('openai/gpt-5.4')
     expect(result.policies.Azure?.retainsPrompts).toBe(false)
     expect(result.raw.policies.Azure).toEqual(result.policies.Azure)
@@ -265,17 +276,42 @@ describe('fetchPrivacyScrape (injected fetch)', () => {
   })
 
   it('surfaces non-2xx as an error', async () => {
-    const profile = makeProfile()
+    const proxy = makeProxy()
     const fetchImpl = async () => new Response('not found', { status: 404 })
     await expect(
-      fetchPrivacyScrape({ profile, fetchImpl }, 'unknown/model'),
+      fetchPrivacyScrape({ proxy, fetchImpl }, 'unknown/model'),
     ).rejects.toThrow()
   })
 
   it('returns an empty policies map when the page had nothing to parse', async () => {
-    const profile = makeProfile()
+    const proxy = makeProxy()
     const fetchImpl = async () => new Response('<html></html>', { status: 200 })
-    const result = await fetchPrivacyScrape({ profile, fetchImpl }, 'openai/gpt-5.4')
+    const result = await fetchPrivacyScrape({ proxy, fetchImpl }, 'openai/gpt-5.4')
     expect(result.policies).toEqual({})
+  })
+
+  it('sends the X-Proxy-Secret header when a secret is configured', async () => {
+    const proxy = makeProxy({
+      url: 'https://proxy.example.com',
+      secret: 's3kr3t',
+    })
+    let observed: HeadersInit | undefined
+    const fetchImpl = async (_url: string, init: RequestInit) => {
+      observed = init.headers
+      return new Response('<html></html>', { status: 200 })
+    }
+    await fetchPrivacyScrape({ proxy, fetchImpl }, 'openai/gpt-5.4')
+    expect((observed as Record<string, string>)?.[CORS_PROXY_SECRET_HEADER]).toBe('s3kr3t')
+  })
+
+  it('omits X-Proxy-Secret when the secret is empty', async () => {
+    const proxy = makeProxy({ url: 'https://proxy.example.com' })
+    let observed: HeadersInit | undefined
+    const fetchImpl = async (_url: string, init: RequestInit) => {
+      observed = init.headers
+      return new Response('<html></html>', { status: 200 })
+    }
+    await fetchPrivacyScrape({ proxy, fetchImpl }, 'openai/gpt-5.4')
+    expect((observed as Record<string, string>)?.[CORS_PROXY_SECRET_HEADER]).toBeUndefined()
   })
 })

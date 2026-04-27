@@ -118,7 +118,7 @@ export function PrivacySection({ chat }: PrivacySectionProps) {
             <span data-ui="privacy-toggle-copy">
               <span data-ui="privacy-toggle-title">
                 <strong>Allow provider fallbacks</strong>
-                <InfoDisclosure title="Retry another allowed provider for the same model when the first eligible provider fails or rate-limits. This never bypasses your allowed, ignored, or privacy-filtered provider set. Turn it off to fail on the first eligible provider." />
+                <InfoDisclosure title="Retry another allowed provider for the same model when the first eligible provider fails or rate-limits. This never bypasses the allowed, ignored, or privacy-filtered provider set. Turn it off to fail on the first eligible provider." />
               </span>
             </span>
           </label>

@@ -3,7 +3,7 @@
 // Parameter names follow Anthropic's Messages API (`stop_sequences`, not
 // `stop`; `max_tokens` required). Reasoning shows up as `thinking` on the
 // wire for 4.x models; the registry narrows `allowedEffort` / verbosity on
-// top of this table. We keep the bundled list narrow — 4.5+ families only.
+// top of this table. The bundled list stays narrow, 4.5+ families only.
 
 import type { CapabilityTable } from './types'
 

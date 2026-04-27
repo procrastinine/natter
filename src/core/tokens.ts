@@ -32,7 +32,7 @@ const CHAR_PER_TOKEN: Readonly<Record<TokenizerFamily, number>> = Object.freeze(
 })
 
 // Normalize a tokenizer string from `/endpoints` `architecture.tokenizer` into
-// our coarse family bucket. Accepts the canonical names observed across
+// the coarse family bucket. Accepts the canonical names observed across
 // OpenRouter (`Claude`, `GPT`, `cl100k_base`, `o200k_base`, `Gemini`, `Llama`,
 // `Llama3`, `Mistral`, `DeepSeek`, `Qwen`) and is defensively case-insensitive
 // because the field shape isn't formally contracted.
@@ -54,7 +54,7 @@ export function charPerToken(family: TokenizerFamily): number {
 }
 
 // Rough token count for a text blob. Uses `Math.ceil` so the trailing partial
-// token is counted — matches the "slightly over-report" discipline in §14.15.
+// token is counted, matching the "slightly over-report" discipline in §14.15.
 // Defensive against null/undefined/non-string input via `safeLen`.
 export function estimateTokens(text: unknown, family: TokenizerFamily): number {
   const len = safeLen(text)
@@ -87,7 +87,7 @@ export interface PromptEstimateOptions {
   reasoningExcluded: boolean
 }
 
-// Rough token cost of the reasoning fragments we echo on the NEXT turn for
+// Rough token cost of the reasoning fragments echoed on the NEXT turn for
 // a given list of assistant messages. Call AFTER filtering the path for
 // `hiddenFromContext` / `deleted`. Mirrors the contract in
 // `plan/phase11-implementation.md §3`:
@@ -98,10 +98,10 @@ export interface PromptEstimateOptions {
 //     tokens are accounted as prompt_tokens on the next call; exact ratio is
 //     model-dependent, this is a safe over-estimate)
 //
-// The estimate NEVER double-counts: we iterate `reasoningDetails[]` only
-// (storage never carries the scalar `reasoning` field — it was suppressed
-// by the splitter's de-dup fix in commit 1390685). We ALSO
-// `normalizeReasoningDetails` before estimating so any partial-overlap
+// The estimate NEVER double-counts: only `reasoningDetails[]` is iterated
+// (storage never carries the scalar `reasoning` field; it was suppressed
+// by the splitter's de-dup fix in commit 1390685).
+// `normalizeReasoningDetails` runs before estimating so any partial-overlap
 // artifacts in rehydrated-legacy rows collapse first.
 const SIGNATURE_TOKEN_GUARD = 16
 
@@ -113,8 +113,8 @@ export function estimateReasoningEchoTokensForMessage(
   if (!message.reasoningDetails || message.reasoningDetails.length === 0) return 0
 
   // Whole body wrapped: a corrupt rehydrated row with `reasoningDetails`
-  // items of unexpected shape would otherwise crash the gauge. We prefer a
-  // conservative 0 estimate over a UI-wide break.
+  // items of unexpected shape would otherwise crash the gauge. A
+  // conservative 0 estimate is preferred over a UI-wide break.
   try {
     // Deduplicate first: covers the "scalar + details both stored on
     // legacy chats" edge case called out in the 1390685 fix.
@@ -132,12 +132,12 @@ export function estimateReasoningEchoTokensForMessage(
     )
 
     // When the assistant message has `reasoning_tokens` from the provider,
-    // that number is our authoritative upper bound for the round-trip cost
+    // that number is the authoritative upper bound for the round-trip cost
     // of echoing the ENCRYPTED blob (OpenAI's encrypted_content, xAI's
-    // encrypted reasoning, Anthropic's signed text — all tokenize back at
-    // roughly the same count as they were emitted). Without it we fall
-    // back to the conservative `data.length / 3` byte-cap estimate, which
-    // over-reports by ~1.8x for base64-ish blobs.
+    // encrypted reasoning, Anthropic's signed text; all tokenize back at
+    // roughly the same count as they were emitted). Without it the
+    // estimator falls back to the conservative `data.length / 3` byte-cap
+    // estimate, which over-reports by ~1.8x for base64-ish blobs.
     const providerReasoningTokens = safeServerTokens(
       message.generation?.usage?.completion_tokens_details?.reasoning_tokens,
     )

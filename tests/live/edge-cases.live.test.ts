@@ -128,7 +128,7 @@ describe.skipIf(!LIVE)('live edge cases — OpenRouter chat-completions', () => 
       .map((d) => d.text ?? '')
       .join('')
     if (typeof scalar === 'string' && scalar.length > 0 && textConcat.length > 0) {
-      // Both present → must match (before our splitter dedup).
+      // Both present → must match (before the splitter dedup).
       expect(scalar).toBe(textConcat)
     }
     // Either presence-or-none is acceptable; this test's value is its
@@ -158,8 +158,8 @@ describe.skipIf(!LIVE)('live edge cases — OpenRouter chat-completions', () => 
       .filter((s): s is string => typeof s === 'string')
       .join('')
     // Either the stream delivered inline `<think>` tags OR the upstream
-    // already lifted reasoning into `reasoning_details`. We assert the
-    // lift happened if tags weren't inline.
+    // already lifted reasoning into `reasoning_details`. The lift is
+    // asserted when tags aren't inline.
     const hasInlineTags = /<think>/.test(raw)
     if (!hasInlineTags) {
       const reasoningDetails = chunks

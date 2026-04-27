@@ -2,8 +2,8 @@
 // `plan/08-branching.md §8.4.2–§8.4.10` and §8.10 for invariants.
 //
 // These helpers run inside a repository mutation. They do not start
-// transactions of their own, do not broadcast, and do not write cursor state —
-// they return the data the caller needs to apply those side effects.
+// transactions of their own, do not broadcast, and do not write cursor state.
+// They return the data the caller needs to apply those side effects.
 
 import type { MutationContext } from '../store/repository'
 import { groupByParent } from './active-path'
@@ -24,8 +24,8 @@ export async function loadChatMessages(ctx: MutationContext, chatId: ChatId): Pr
   return ctx.listMessages(chatId)
 }
 
-// `max(siblingIndex) + 1` across live AND tombstoned children — the uniqueness
-// invariant in §2.3.1 requires we stay above tombstones too. Returns 0 when
+// `max(siblingIndex) + 1` across live AND tombstoned children. The uniqueness
+// invariant in §2.3.1 requires staying above tombstones too. Returns 0 when
 // the parent has no children at all.
 export function nextSiblingIndex(
   byParent: Map<MessageId | null, Message[]>,
@@ -144,8 +144,8 @@ export async function softDeleteWithSplice(
     const newParentId = await firstLiveAncestor(node)
     for (const kid of kids) {
       if (deletedSet.has(kid.id)) continue
-      // Pre-tombstoned kids stay where they are — they are already dead
-      // and the UI never walks into them, so re-parenting them would
+      // Pre-tombstoned kids stay where they are: already dead, and
+      // the UI never walks into them, so re-parenting them would
       // only churn scopes (and fail the scope assertion because the
       // scope-collector in messages.ts only declares LIVE kid scopes).
       if (kid.deleted) continue
@@ -228,7 +228,7 @@ export function collectTurnChain(
   return result
 }
 
-// Find the `turnIndex: 0` ancestor of a message — the head of its turn chain.
+// Find the `turnIndex: 0` ancestor of a message: the head of its turn chain.
 // The walk goes up via `parentId`, following `turnId === node.turnId`. The
 // data model guarantees a turn chain is strictly parent→child under a shared
 // `turnId`, so at most one such ancestor exists.
@@ -237,7 +237,7 @@ export function turnHeadOf(message: Message, byId: Map<MessageId, Message>): Mes
   while (cur.turnIndex !== 0) {
     const parent = cur.parentId ? byId.get(cur.parentId) : undefined
     if (!parent || parent.turnId !== cur.turnId) {
-      // No matching parent in the same turn — treat `cur` as the head.
+      // No matching parent in the same turn; treat `cur` as the head.
       return cur
     }
     cur = parent

@@ -58,7 +58,7 @@ export interface MessageActionsProps {
   // editor clears via onEndEdit.
   isEditing: boolean
   onBeginEdit: () => void
-  // Permission flags. We keep the buttons VISIBLE (discoverable) but
+  // Permission flags. The buttons stay VISIBLE (discoverable) but
   // disabled with a tooltip so the user understands why the action
   // can't run right now.
   hasConnection: boolean

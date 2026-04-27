@@ -54,10 +54,10 @@
   border-color: var(--color-border-default);
 }
 
-/* Native <select> styling — we INTENTIONALLY keep the OS-native chevron
+/* Native <select> styling, the OS-native chevron is INTENTIONALLY kept
  * here. An earlier revision swapped to a custom SVG chevron via
  * `appearance: none` + background-image to give the arrow more right-
  * edge padding, but that caused noticeable hover-time perf degradation
  * on Chromium/macOS (the native shadow-DOM render path is significantly
- * cheaper than our custom-painted alternative). The cramped native
+ * cheaper than the custom-painted alternative). The cramped native
  * arrow is the lesser evil. */

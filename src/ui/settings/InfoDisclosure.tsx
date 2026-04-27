@@ -33,8 +33,8 @@ export function InfoDisclosure({
     }
   }, [open])
 
-  // Dynamic viewport-clamp shift — we measure the panel's bounding rect
-  // after render and push it inward if it's overflowing either edge. The
+  // Dynamic viewport-clamp shift, the panel's bounding rect is measured
+  // after render and pushed inward if it's overflowing either edge. The
   // shift writes to the `--info-panel-shift` CSS variable so the stylesheet
   // owns the `transform`; the style-discipline test forbids inline JSX
   // style attributes.

@@ -4,12 +4,12 @@
 //
 //   - Images: OpenRouter/providers do not bill the raw uploaded bitmap
 //     dimensions forever. They normalize the image before vision token
-//     accounting. We estimate against that normalized wire shape, then
-//     apply family formulas (`(w*h)/512 + 85` OpenAI-style, `(w*h)/750`
+//     accounting. The estimate runs against that normalized wire shape, then
+//     applies family formulas (`(w*h)/512 + 85` OpenAI-style, `(w*h)/750`
 //     Claude-style, midpoint for unknown OSS models).
 //   - Gemini vision: per-page non-dimensional billing; `258` is the
 //     conservative single-tile cost and matches what the OpenAI-compat
-//     shim charges. We use it as the fixed per-image estimate.
+//     shim charges. Used as the fixed per-image estimate.
 //   - PDFs: pages × per-page cost. Page count is either provided
 //     (`attachment.pageCount`) or derived from `max(1, bytes / 75000)` —
 //     ~1 base64-encoded page per ~75KB is the LibreChat heuristic.
@@ -22,7 +22,7 @@
 //
 // These are DEFAULTS for when calibration hasn't kicked in yet. Per-chat
 // per-model calibration (Phase B) adjusts the pure-text ratio but NOT
-// these media numbers — server-side image/PDF billing is deterministic
+// these media numbers; server-side image/PDF billing is deterministic
 // per input shape and doesn't drift with subject matter.
 
 import { MAX_PLAUSIBLE_TOKENS } from './token-guards'
@@ -34,8 +34,8 @@ const SAFETY_MARGIN = 1.05
 // corrupt/malicious attachment from dominating the whole estimate.
 const MAX_PER_ATTACHMENT_TOKENS = MAX_PLAUSIBLE_TOKENS / 10
 
-// Fallback when the attachment dims aren't known (remote URL we haven't
-// fetched yet, or the attachment table hasn't been threaded into the
+// Fallback when the attachment dims aren't known (remote URL not yet
+// fetched, or the attachment table hasn't been threaded into the
 // estimator yet). LibreChat's fallback; slightly above the typical
 // dimensioned estimate for common sizes (512x512 → ~600 tokens on GPT).
 const IMAGE_FALLBACK_TOKENS = 1024
@@ -95,10 +95,10 @@ const IMAGE_PER_FAMILY: Record<TokenizerFamily, (meta: ImageMeta) => number> = {
       : imageFallbackFromBytes(meta.sizeBytes)
   },
   // Gemini bills per-tile at a near-fixed rate; 258 matches the
-  // low-detail single-tile cost we were using previously.
+  // low-detail single-tile cost in prior use.
   gemini: () => 258,
   // OSS families — use a midpoint formula. Tokenizer-dependent, so
-  // call this advisory.
+  // treat as advisory.
   llama: (meta) => midpointImageEstimate(meta),
   mistral: (meta) => midpointImageEstimate(meta),
   deepseek: (meta) => midpointImageEstimate(meta),
@@ -169,7 +169,7 @@ const PDF_PER_PAGE_TIER1: Record<TokenizerFamily, number> = {
 // Per-page cost (Tier 2 server-side parser — extracted text, no image).
 // Lower than Tier 1 because layout overhead is dropped; higher than Tier 3
 // because server-side extraction sometimes preserves tables the local
-// pass would skip.
+// pass skips.
 const PDF_PER_PAGE_TIER2 = 500
 
 export function imageTokenEstimate(
@@ -201,7 +201,7 @@ export function pdfTokenEstimate(family: TokenizerFamily, meta: PdfMeta = {}): n
   return Math.min(Math.max(0, Math.ceil(raw)), MAX_PER_ATTACHMENT_TOKENS)
 }
 
-// Flat fallback for other file types (non-PDF) until we know their mime
-// shape and have a tokenizer path. Matches the previous constant used
-// throughout the codebase.
+// Flat fallback for other file types (non-PDF) until their mime shape
+// is known and a tokenizer path exists. Matches the previous constant
+// used throughout the codebase.
 export const GENERIC_FILE_TOKEN_FALLBACK = 1000

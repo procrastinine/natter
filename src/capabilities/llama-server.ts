@@ -1,6 +1,6 @@
 // llama-server capability defaults. The kind is a dedicated connection
-// option (separate from 'custom') so we can ship the llama.cpp-specific
-// param set and surface the chat/text protocol toggle without muddling
+// option (separate from 'custom') so the llama.cpp-specific param set
+// can ship and the chat/text protocol toggle can surface without muddling
 // the stock OpenAI-compatible defaults.
 //
 // Every llama-server profile uses this descriptor unless the user pins
@@ -50,9 +50,9 @@ export const LLAMA_SERVER_PARAMETERS: readonly string[] = [
   'cache_prompt',
   // Deliberately omitted: 'reasoning'. Whether a llama-server instance
   // honors the OAI-compat reasoning field depends on the loaded GGUF's
-  // chat template, which we can only guess at from `chat_template_caps`.
+  // chat template, which can only be guessed at from `chat_template_caps`.
   // The panel's out-of-the-box presence created false expectations on
-  // non-thinking models (gemma etc.), so we hide it entirely. Users on
+  // non-thinking models (gemma etc.), so it is hidden entirely. Users on
   // a thinking-capable GGUF can still request raw `<think>` output via
   // the model itself; the UI just doesn't expose an effort knob.
 ]

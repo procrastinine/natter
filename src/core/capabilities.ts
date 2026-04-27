@@ -5,7 +5,7 @@
 // Inputs:
 // - For OpenRouter: `ModelEndpoint[]` from `/endpoints`, filtered by user's
 //   provider prefs (only / ignore). Privacy filtering happens elsewhere
-//   (Phase 10); here we just take whatever survived.
+//   (Phase 10); this resolver just takes whatever survived.
 // - For non-OpenRouter: a bundled `CapabilityDescriptor` row from the table
 //   loader, possibly overridden by `ConnectionProfile.capabilityOverrides`.
 //
@@ -55,8 +55,8 @@ export interface EffectiveCapability {
   outputModalities: Set<string>
   // `true` iff all retained endpoints set `supports_implicit_caching: true`.
   supportsImplicitCaching: boolean
-  // When exactly one endpoint was retained (user pinned) we can safely
-  // show provider-specific fields.
+  // When exactly one endpoint was retained (user pinned), provider-specific
+  // fields are safe to show.
   singleProviderPin?: string
   // Passthrough quirks for the UI.
   quirks: ReturnType<typeof quirksFor>
@@ -137,8 +137,8 @@ function pricingRange(
 // Resolve capabilities from a set of /endpoints rows (OpenRouter). The
 // default is the UNION (upper bound) — the UI renders every control some
 // retained provider could answer for. Providers that don't support a field
-// ignore it at send time. When `strict` is true, we fall back to the
-// INTERSECTION (lower bound) — only show / send parameters ALL retained
+// ignore it at send time. When `strict` is true, the resolver falls back to
+// the INTERSECTION (lower bound): only show / send parameters ALL retained
 // providers support; combined with `require_parameters: true` this forces
 // routing to providers that honour every set option. `endpoints.length === 1`
 // collapses both modes to that single row's set.
@@ -246,7 +246,7 @@ export interface ValidationResult {
   changed: boolean
 }
 
-// Numeric and enum fields we know how to clamp.
+// Numeric and enum fields the validator knows how to clamp.
 const SAMPLING_PARAM_WIRE: Record<SamplingKey, string> = {
   temperature: 'temperature',
   top_p: 'top_p',
@@ -454,7 +454,7 @@ export function validateChatSettings(
 }
 
 // When clamping an enum to a narrower set, pick the value whose position in
-// the global superset is closest to the original — so "xhigh" clamped
+// the global superset is closest to the original, so "xhigh" clamped
 // against [low, medium, high] lands on "high", not "low".
 function pickClosestEnum<T extends string>(
   previous: T,

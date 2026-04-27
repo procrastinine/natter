@@ -31,7 +31,7 @@ export interface GeminiContext {
 
 // "models/{model}" is the Gemini URL pattern. Model ids sometimes arrive
 // with a slug prefix ("google/gemini-3.1-flash-lite-preview") from
-// OpenRouter-shaped settings; we strip it.
+// OpenRouter-shaped settings; the prefix is stripped.
 function normalizeModelId(raw: string): string {
   const slash = raw.indexOf('/')
   return slash >= 0 ? raw.slice(slash + 1) : raw

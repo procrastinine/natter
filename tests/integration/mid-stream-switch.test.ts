@@ -161,8 +161,8 @@ function assertCommonSwitchInvariants(input: SwitchAssertionInput) {
   // 4) generation.requestedModel frozen to S1's model.
   //    Verified per variant.
   // 5) Next send composes from S2 — verified per variant.
-  // 6) No fallback-used chip — we do not set any such flag during user switches.
-  //    This is implicitly satisfied by our generation meta never setting a
+  // 6) No fallback-used chip; no such flag is set during user switches.
+  //    This is implicitly satisfied by generation meta never setting a
   //    fallback marker; documented here to make the assertion explicit.
   void input.switchLoggedNote
 }

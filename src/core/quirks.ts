@@ -1,9 +1,9 @@
 // Per-model behavioral quirks that /endpoints cannot express. See
-// `plan/05-transforms-and-quirks.md` and `CLAUDE.md` "Per-model quirks we
-// must honor."
+// `plan/05-transforms-and-quirks.md` and `CLAUDE.md` "Per-model quirks
+// to honor."
 //
-// /endpoints tells us which top-level params exist for a model + provider.
-// What it CAN'T tell us:
+// /endpoints reports which top-level params exist for a model + provider.
+// What it CAN'T report:
 // - which enum values inside `reasoning.effort` / `verbosity` are actually
 //   honored (vs silently remapped down)
 // - adaptive-only reasoning (Claude 4.6/4.7 ignore effort)
@@ -38,8 +38,8 @@ export type TextCompletionsSupport =
   | 'unknown'
 
 // Effort ordered low → high for left-to-right UI rendering. Validation /
-// transform code doesn't care about order — it just filters by set
-// membership — but UI controls read the array verbatim so the visual
+// transform code doesn't care about order (it just filters by set
+// membership), but UI controls read the array verbatim so the visual
 // progression matches the user's mental model.
 export const FULL_EFFORT: readonly EffortLevel[] = [
   'none',
@@ -54,16 +54,16 @@ export const FULL_VERBOSITY: readonly VerbosityLevel[] = ['low', 'medium', 'high
 
 export interface QuirksEntry {
   // Empty array means "reasoning.effort is ignored" (adaptive-only).
-  // undefined means "no narrowing — use the full superset".
+  // undefined means "no narrowing; use the full superset".
   allowedEffort?: readonly EffortLevel[]
   allowedVerbosity?: readonly VerbosityLevel[]
   // Some models refuse chat-completions and require /responses (GPT-5.4 family).
   requiresResponsesApi?: boolean
-  // Soft preference — the api-choice matrix flips to Responses unless the
+  // Soft preference. The api-choice matrix flips to Responses unless the
   // user pinned `chat`. Less aggressive than `requiresResponsesApi` (which
   // forces the switch). Used for models where Responses is strictly better
   // (preserves encrypted reasoning, phase, etc.) but chat completions still
-  // works — e.g. GPT-5 / o-series.
+  // works (e.g. GPT-5 / o-series).
   preferApi?: 'chat' | 'responses'
   // Which `ReasoningFormat` the model's encrypted carrier uses. Drives the
   // carry-forward matrix in `core/transforms.ts`:
@@ -74,17 +74,17 @@ export interface QuirksEntry {
   //  - `google-gemini-v1` — Gemini native thoughtSignature, and Gemini via
   //    OpenRouter repackaged as `reasoning.encrypted`.
   //  - `xai-responses-v1` — xAI Grok.
-  //  - `unknown` (DeepSeek-R1 / Qwen3 / Gemma) — no opaque round-trip exists;
+  //  - `unknown` (DeepSeek-R1 / Qwen3 / Gemma): no opaque round-trip exists;
   //    plaintext `<think>` tags only.
   reasoningPreservationFormat?: ReasoningFormat
   // Claude 4.6 / 4.7 use adaptive reasoning: `reasoning` is in
   // supported_parameters but `effort` is silently ignored.
   adaptiveReasoningOnly?: boolean
-  // Anthropic cache floor — "cache_control" below this token count is
+  // Anthropic cache floor: "cache_control" below this token count is
   // not honored. One floor per variant per CLAUDE.md.
   cacheMinTokens?: number
   // `phase` field must be persisted verbatim across Responses-API turns
-  // (GPT-5.4 family — dropping phase causes early stopping).
+  // (GPT-5.4 family; dropping phase causes early stopping).
   persistsResponsesPhase?: boolean
   // Same as `persistsResponsesPhase`; Phase 11 introduces the preferred
   // spelling. Kept as a separate field so callers can assert on the
@@ -92,7 +92,7 @@ export interface QuirksEntry {
   requiresPhaseEcho?: boolean
   // Some models emit `<think>…</think>` inline in content; the stream
   // parser needs to lift that into the reasoning lane. Values are the tag
-  // names (without brackets) the model uses — DeepSeek-R1 / Qwen3 use
+  // names (without brackets) the model uses: DeepSeek-R1 / Qwen3 use
   // `think`; Gemma historically used `thought`. When unset, the chat
   // splitter's auto-detect covers generic thinking models (Kimi K2
   // Thinking, GLM-4.x thinking, etc.) by scanning the first chunk for a
@@ -109,22 +109,22 @@ export interface QuirksEntry {
   // GPT-5.4 family (including 5.3-codex, 5.4, 5.4-pro, 5.4-mini, 5.4-nano):
   // `temperature`, `top_p`, `logprobs`, `top_k` are ONLY accepted when
   // `reasoning.effort === 'none'`. With any other effort the API rejects
-  // the request. The transform strips these at wire time.
+  // the request. The transform strips them at wire time.
   gpt54SamplingGate?: boolean
   // Phase 11: Claude 3.7 Sonnet returns `redacted_thinking` blocks when
-  // its internal reasoning is flagged by the safety filter. We store those
+  // its internal reasoning is flagged by the safety filter. Stored
   // as `reasoning.encrypted` with `format: 'anthropic-claude-v1'`. Only 3.7
   // accepts these blocks on round-trip; Claude 4+ doesn't produce them
   // and their acceptance is unverified. Guard the echo by setting this
-  // flag `true` ONLY on `claude-sonnet-3.7` — the filter drops
+  // flag `true` ONLY on `claude-sonnet-3.7`. The filter drops
   // `reasoning.encrypted + format anthropic-claude-v1` entries when the
   // target model doesn't have this flag.
   acceptsAnthropicRedactedThinking?: boolean
   // Which wire APIs this model accepts. Drives UI toggle visibility and
   // chooseApi's auto-route. Mirrors OpenAI's per-model support list (for
-  // OpenRouter we apply the same table — OR accepts /responses on any model
+  // OpenRouter the same table applies. OR accepts /responses on any model
   // via translation, but /responses gives no benefit on non-OpenAI models,
-  // so we treat them as chat-only).
+  // so they are treated as chat-only).
   //   'responses-only' — model 404s on chat-completions (gpt-5.4-pro, 5.3-codex,
   //                      5.2-codex, 5.2-pro, 5.1-codex, 5.1-codex-max, 5-codex,
   //                      5-pro, o1-pro, o3-pro, *-deep-research).
@@ -143,20 +143,20 @@ export interface QuirksEntry {
   // `oss-reasoning-required` for the P.7 list (models whose reasoning can't
   // be toggled off).
   prefillClass?: PrefillClass
-  // True when the model's reasoning CANNOT be toggled off on the wire —
-  // either the endpoint rejects `reasoning.enabled: false` or it accepts it
-  // silently while still emitting reasoning tokens. Drives UI validation
-  // independently of prefill.
+  // True when the model's reasoning CANNOT be toggled off on the wire,
+  // either because the endpoint rejects `reasoning.enabled: false` or
+  // accepts it silently while still emitting reasoning tokens. Drives UI
+  // validation independently of prefill.
   reasoningToggleable?: boolean
-  // Whether the model emits an opaque encrypted-reasoning carrier that we
-  // can echo on the next turn. Drives the "Encrypted reasoning" include
-  // checkbox visibility.
+  // Whether the model emits an opaque encrypted-reasoning carrier that
+  // can be echoed on the next turn. Drives the "Encrypted reasoning"
+  // include checkbox visibility.
   //   'always'     — emits on every reasoning turn (GPT-5.x, Gemini 3+,
   //                  Claude 4.x via signed reasoning.text, Claude 3.7
   //                  redacted_thinking, xAI Grok).
   //   'tools-only' — only emits when tools are in the turn (Gemini 2.5).
-  //                  Treated as 'never' for UI purposes — we don't surface
-  //                  a checkbox that only works in tool flows.
+  //                  Treated as 'never' for UI purposes; a checkbox that
+  //                  only works in tool flows is not surfaced.
   //   'never'      — no opaque carrier (DeepSeek R1, Qwen3, Gemma, Kimi,
   //                  GLM, MiniMax, and anything with
   //                  `reasoningPreservationFormat: 'unknown'`).
@@ -181,8 +181,8 @@ const REGISTRY: Record<string, QuirksEntry> = {
     reasoningPreservationFormat: 'anthropic-claude-v1',
   },
   // Anthropic 4.6 — adaptive-only reasoning. Verbosity `max` is new on
-  // 4.6; `xhigh` falls back to `high` so we drop it from the allowed set
-  // to avoid rendering a button that silently no-ops.
+  // 4.6; `xhigh` falls back to `high` so it is dropped from the allowed
+  // set to avoid rendering a button that silently no-ops.
   'claude-opus-4.6': {
     adaptiveReasoningOnly: true,
     allowedEffort: [],
@@ -238,8 +238,8 @@ const REGISTRY: Record<string, QuirksEntry> = {
   // OpenAI GPT-5.x family — Responses API required, persist phase, strict
   // `gpt54SamplingGate` (temperature/top_p/logprobs only when effort:'none').
   // Effort enum authoritative from `openai_docs/pages/docs/guides/latest-model.md`
-  // + live probe 4: `none (default) | low | medium | high | xhigh` — NO
-  // `minimal`. Verbosity: low/medium/high/xhigh (no max — max is Claude-only).
+  // + live probe 4: `none (default) | low | medium | high | xhigh`, NO
+  // `minimal`. Verbosity: low/medium/high/xhigh (no max; max is Claude-only).
   'gpt-5.4-pro': {
     requiresResponsesApi: true,
     persistsResponsesPhase: true,
@@ -251,7 +251,7 @@ const REGISTRY: Record<string, QuirksEntry> = {
     responsesSupport: 'responses-only',
   },
   // gpt-5.4 family (non-pro): chat-completions accepts the model but drops
-  // `phase` — slug heuristic gives 'both' (toggle shown); `preferApi:
+  // `phase`. Slug heuristic gives 'both' (toggle shown); `preferApi:
   // 'responses'` + `persistsResponsesPhase: true` make the auto-route
   // default to Responses. Users who pin chat explicitly trip the
   // confirmation dialog in `ApiModeSection`.
@@ -311,7 +311,7 @@ const REGISTRY: Record<string, QuirksEntry> = {
     allowedEffort: ['minimal', 'low', 'medium', 'high'],
     reasoningPreservationFormat: 'openai-responses-v1',
   },
-  // Responses-only OpenAI models that aren't yet in our UI model list but
+  // Responses-only OpenAI models that aren't yet in the UI model list but
   // exist on OpenAI and OpenRouter. Kept so that if a user types the slug
   // in by hand (or OR exposes them in /models), the toggle correctly hides.
   'gpt-5-pro': {
@@ -415,7 +415,7 @@ const REGISTRY: Record<string, QuirksEntry> = {
   //   - Pro tier: `thinkingLevel` enum is low/medium/high (NO `minimal`;
   //     cannot be disabled).
   //   - Flash / Flash-Lite tier: `thinkingLevel` enum adds `minimal` (soft
-  //     disable — still no hard-disable path).
+  //     disable; still no hard-disable path).
   // Split keys so the UI renders the right effort buttons per-family. The
   // transform in `core/transforms.ts` independently clamps invalid effort
   // values for Pro. Canonicalization maps `3.1` → `3:1` so the 3.1 key
@@ -436,7 +436,7 @@ const REGISTRY: Record<string, QuirksEntry> = {
     allowedEffort: ['minimal', 'low', 'medium', 'high'],
     reasoningPreservationFormat: 'google-gemini-v1',
   },
-  // Fallback catch-alls for any unknown Gemini 3.x variant — take the
+  // Fallback catch-alls for any unknown Gemini 3.x variant: take the
   // conservative (Flash-style) enum that includes minimal.
   'gemini-3.1': {
     allowedEffort: ['minimal', 'low', 'medium', 'high'],
@@ -447,8 +447,8 @@ const REGISTRY: Record<string, QuirksEntry> = {
     reasoningPreservationFormat: 'google-gemini-v1',
   },
   // Gemini 2.5: thoughtSignature is emitted ONLY on tool turns (verified via
-  // native probes — plain conversational turns return no signature). User
-  // directive: treat as 'never' — only Gemini 3+ is expected to round-trip
+  // native probes; plain conversational turns return no signature). User
+  // directive: treat as 'never'. Only Gemini 3+ is expected to round-trip
   // encrypted reasoning. The explicit override flips the format-derived
   // 'always' default to 'never' so the include-encrypted checkbox hides.
   // Single prefix key covers pro / flash / flash-lite / dated-preview
@@ -460,7 +460,7 @@ const REGISTRY: Record<string, QuirksEntry> = {
   },
 
   // OSS / Chinese-lab thinking-model families fall through to a shared
-  // pattern below the registry — one entry per family was just six copies
+  // pattern below the registry; one entry per family was just six copies
   // of the same fields. See `OSS_THINKING_FAMILIES` + the pattern fallback
   // in `quirksFor`. Override individually here only when a slug deviates
   // from the family default (e.g. a model that narrows effort differently).
@@ -501,11 +501,11 @@ const REGISTRY_KEYS_BY_LENGTH = Object.keys(REGISTRY).sort((a, b) => b.length - 
 //   - no encrypted carry-forward carrier (carry-forward matrix drops
 //     `reasoning.encrypted` entries silently for `format: 'unknown'`).
 //   - effort enum honors low / medium / high; minimal / xhigh / none either
-//     no-op or fall through to high — so we narrow the UI to avoid no-op
+//     no-op or fall through to high, so the UI is narrowed to avoid no-op
 //     buttons. (FULL_EFFORT remains the safe default; this is a UX trim.)
 //
 // The lifter's auto-detect default already covers any *unknown* model that
-// happens to emit `<think>` — listing a family here only narrows the
+// happens to emit `<think>`. Listing a family here only narrows the
 // effort UI and pins the inline-tag set explicitly. New families would
 // only need to be added if their tag name differs (Gemma's `<thought>`).
 // Pattern accepts the family name followed by either a separator (`-`, `_`),
@@ -562,8 +562,8 @@ export function reasoningPreservationFormatFor(modelId: string): ReasoningFormat
 
 // True for OpenAI-family slugs that support the Responses API (gpt-*, o1/o3/o4
 // series minus chat-latest aliases and gpt-3.5-turbo-instruct). Used as a
-// fallback when the model isn't in the registry so we still route OpenAI
-// models on OpenRouter to Responses by default.
+// fallback when the model isn't in the registry so OpenAI models on
+// OpenRouter still route to Responses by default.
 function slugIsOpenAiResponsesFamily(stripped: string): boolean {
   if (!stripped) return false
   if (stripped.endsWith('-chat-latest')) return false
@@ -577,8 +577,8 @@ function slugIsOpenAiResponsesFamily(stripped: string): boolean {
 }
 
 // Effective `responsesSupport`. Registry wins; otherwise slug-heuristic for
-// OpenAI-family; otherwise `'chat-only'` (safest — don't show a toggle for
-// a model we don't know supports /responses).
+// OpenAI-family; otherwise `'chat-only'` (safest: don't show a toggle for
+// a model whose /responses support is unconfirmed).
 export function responsesSupportFor(modelId: string): 'responses-only' | 'chat-only' | 'both' {
   const q = quirksFor(modelId)
   if (q.responsesSupport) return q.responsesSupport
@@ -627,8 +627,8 @@ const OPENAI_PREFILL_UNSUPPORTED_PATTERN = /^(?:gpt-|chatgpt-|o\d|gpt-oss)/
 
 // Models that reject `reasoning.enabled: false` outright OR accept it
 // silently while still emitting reasoning tokens (per the r12/r13 probe
-// sweep). Generic default is "toggleable"; only these are reasoning-locked
-// — prefill would land in the <think> block, and the reasoning "off" UI
+// sweep). Generic default is "toggleable"; only these are reasoning-locked.
+// Prefill would land in the <think> block, and the reasoning "off" UI
 // option would be a no-op that trips HTTP 400 on the wire. Keys are the
 // slug form produced by `canonicalCompatModelId` (provider prefix stripped,
 // dots in versions normalized to `:`).

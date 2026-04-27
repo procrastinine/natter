@@ -19,9 +19,9 @@ describe('EmptyState', () => {
     const onPick = vi.fn()
     render(<EmptyState onPick={onPick} />)
     await waitFor(() => {
-      expect(screen.getByText(/Explain like I'm five/i)).toBeTruthy()
+      expect(screen.getByText(/Explain to a beginner/i)).toBeTruthy()
     })
-    fireEvent.click(screen.getByText(/Explain like I'm five/i))
+    fireEvent.click(screen.getByText(/Explain to a beginner/i))
     expect(onPick).toHaveBeenCalledTimes(1)
     expect(onPick.mock.calls[0]?.[0]).toMatch(/TCP congestion control/i)
   })
@@ -34,7 +34,7 @@ describe('EmptyState', () => {
     })
     fireEvent.click(screen.getByText(/Dismiss sample prompts/i))
     await waitFor(() => {
-      expect(screen.queryByText(/Explain like I'm five/i)).toBeNull()
+      expect(screen.queryByText(/Explain to a beginner/i)).toBeNull()
       expect(screen.getByText(/Show sample prompts/i)).toBeTruthy()
     })
   })

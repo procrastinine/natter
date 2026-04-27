@@ -40,7 +40,7 @@ test('edited system prompt shows up in the NEXT /chat/completions body', async (
 
   await page.locator('[data-role="settings-cog"]').click()
   // System prompt lives on the Generation tab now; panel opens to Model
-  // by default so we have to flip the tab before the textarea mounts.
+  // by default, so the tab needs to be flipped before the textarea mounts.
   await page.locator('[data-ui="settings-tab"][data-tab="generation"]').click()
   const textarea = page.locator('[data-ui="system-prompt-textarea"]')
   await textarea.fill('You are a terse copy editor.')
@@ -111,7 +111,7 @@ test('the one-off toast appears after the first edit and disappears on subsequen
     timeout: 2000,
   })
   await expect(page.locator('[data-ui="settings-toast"]')).toContainText(
-    /takes effect on your next send/i,
+    /takes effect on the next send/i,
   )
   // Second edit in the same session shouldn't re-show the toast.
   await page.locator('[data-ui="system-prompt-textarea"]').fill('First system prompt — appended')

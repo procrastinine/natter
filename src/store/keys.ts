@@ -118,7 +118,7 @@ async function deriveWrapperKey(passphraseOrSecret: string, salt: Uint8Array): P
   )
 }
 
-// Produce the obscured preview shown in the UI: "sk-or-v1-...edc7". We keep
+// Produce the obscured preview shown in the UI: "sk-or-v1-...edc7". Keeps
 // enough prefix to identify the provider and the last four characters so the
 // user can confirm which key is active, without rendering the full secret.
 export function obscurePreview(plaintext: string): string {
@@ -165,7 +165,7 @@ export async function createKey(input: CreateKeyInput): Promise<KeyRecord> {
     createdAt: now,
   }
   // Mode discriminator: `passphraseHint` present ↔ passphrase-protected. When
-  // the user supplied a passphrase without a hint we still set it to an empty
+  // the user supplied a passphrase without a hint, set it to an empty
   // string so the invariant holds (§9.3.1).
   if (input.passphrase !== undefined) {
     record.passphraseHint = input.passphraseHint ?? ''
@@ -189,7 +189,7 @@ export interface ResolveKeyOptions {
 
 // Returns the plaintext API key. Never cached on disk; the caller hands it to
 // fetch() and drops the reference. For install-secret keys, no passphrase
-// prompt is needed. For passphrase keys, we require `opts.passphrase` on the
+// prompt is needed. For passphrase keys, `opts.passphrase` is required on the
 // FIRST decrypt per tab; subsequent calls reuse the in-memory derived wrapper.
 export async function resolveKey(keyId: KeyId, opts: ResolveKeyOptions = {}): Promise<string> {
   ensureBroadcastHook()

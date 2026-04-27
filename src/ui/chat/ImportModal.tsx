@@ -68,7 +68,7 @@ export function ImportModal({
   const [error, setError] = useState<string | null>(null)
 
   // Sibling-insert forces all rows to the target's role per §8.4.9 #1.
-  // For simplicity we just fix the first row's role if it's a sibling.
+  // For simplicity, the first row's role is fixed if it's a sibling.
   const isSiblingSlot = slot.kind === 'sibling'
   useEffect(() => {
     if (!isSiblingSlot) return

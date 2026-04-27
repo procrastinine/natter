@@ -237,8 +237,8 @@ describe('guards — reasoning echo robustness', () => {
       path,
       opts({ encrypted: true, summary: false, text: false }),
     )
-    // 10M / 3 = 3.33M — well below MAX_PLAUSIBLE_TOKENS (100M) so we expect
-    // the ceil'd value through but NOT an overflow.
+    // 10M / 3 = 3.33M, well below MAX_PLAUSIBLE_TOKENS (100M), so the
+    // ceil'd value passes through without overflow.
     expect(cost).toBeGreaterThan(0)
     expect(cost).toBeLessThanOrEqual(100_000_000)
   })
@@ -255,7 +255,7 @@ describe('guards — reasoning echo robustness', () => {
         } as unknown as NonNullable<Message['generation']>['usage'],
       } as unknown as NonNullable<Message['generation']>,
     }
-    // When providerReasoningTokens is invalid, we fall back to the char estimate.
+    // When providerReasoningTokens is invalid, the char estimate is used.
     const cost = estimateReasoningEchoTokens(
       [m],
       opts({ encrypted: true, summary: false, text: false }),

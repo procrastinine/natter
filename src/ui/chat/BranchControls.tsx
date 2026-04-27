@@ -35,7 +35,7 @@ export function BranchControls({ chatId, message, messages }: BranchControlsProp
   const inputRef = useRef<HTMLInputElement | null>(null)
   // The flag guards `onBlur` from firing a redundant commit after Enter
   // has already committed — some browsers still fire blur as the input
-  // unmounts. We treat "commit already happened this cycle" as a no-op.
+  // unmounts. "commit already happened this cycle" is treated as a no-op.
   const committedRef = useRef(false)
 
   useEffect(() => {

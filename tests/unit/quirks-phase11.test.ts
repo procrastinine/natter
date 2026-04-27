@@ -30,7 +30,7 @@ describe('reasoningPreservationFormat', () => {
     }
   })
 
-  it('OpenAI o-series → openai-responses-v1 on the models we declared', () => {
+  it('OpenAI o-series → openai-responses-v1 on the declared models', () => {
     for (const model of [
       'openai/o1',
       'openai/o1-pro',

@@ -1,13 +1,13 @@
 // Per-chat per-bucket chars-per-token calibration. See
 // `plan/token-counting-audit.md §Phase B` for the full design.
 //
-// Core insight: every successful send gives us two (charCount, promptTokens)
+// Core insight: every successful send yields two (charCount, promptTokens)
 // pairs — one for the prompt, one for the completion. Running-summing these
 // per calibration bucket yields an empirically-calibrated ratio that adapts
 // to the subject matter of each chat (code vs prose, English vs other
 // languages, etc.). When a shared-tokenizer family is known, the bucket is
-// the family key; otherwise it is the canonicalized structural model key. We
-// fall through four tiers when the higher tier is missing or has insufficient
+// the family key; otherwise it is the canonicalized structural model key.
+// Four tiers cascade when the higher tier is missing or has insufficient
 // samples:
 //
 //   Tier 1: per-chat per-bucket running sums
@@ -48,7 +48,7 @@ import type { ChatUsage, GlobalTokenCalibration, Message, TokenCalibrationSample
 
 // Physical bounds on a plausible chars/token ratio. Anything outside this
 // is almost certainly a broken sample (miscounted chars, server returned
-// corrupted usage, etc.) — rejected at ingest time.
+// corrupted usage, etc.); rejected at ingest time.
 export const MIN_RATIO = 1
 export const MAX_RATIO = 20
 
@@ -64,8 +64,8 @@ export const MIN_SAMPLE_CHARS = 50
 export const OUTLIER_FACTOR = 3
 export const OUTLIER_GATE_MIN_SAMPLES = 3
 
-// Tier-1 (per-chat) minimum samples before we trust it. 1 = trust the
-// first sample; can be raised to 3 if we see instability.
+// Tier-1 (per-chat) minimum samples before the tier is trusted. 1 = trust
+// the first sample; can be raised to 3 if instability shows up.
 export const MIN_SAMPLES_CHAT = 1
 // Tier-2 (global) minimum. New chats need this many global samples for
 // the same calibration bucket before they skip past the hardcoded tier.
@@ -328,8 +328,8 @@ export type SampleIngestOutcome =
 
 // Validate a single (chars, tokens) observation and return whether it
 // passed the ingest gates. Does NOT mutate any sample — that's the
-// responsibility of `addSample*()` below so we can decide first whether
-// it's worth the IDB write.
+// responsibility of `addSample*()` below so the validation step decides
+// first whether the IDB write is worth doing.
 export function validateSample(
   modelId: string,
   chars: unknown,
@@ -357,7 +357,7 @@ export function validateSample(
     return { accepted: false, skipReason: 'bad-ratio-family' }
   }
 
-  // Outlier gate — only active once we've built some baseline. Guards
+  // Outlier gate — only active once a baseline has been built. Guards
   // against the mid-chat case where one bad sample would otherwise swing
   // a stable calibration.
   if (sample && sample.sampleCount >= OUTLIER_GATE_MIN_SAMPLES && sample.totalTextTokens > 0) {
@@ -378,7 +378,7 @@ export function validateSample(
 // Apply an accepted sample to a TokenCalibrationSample (mutating in place
 // for convenience; callers typically own the lifetime of the sample). The
 // caller is responsible for validating the sample first with
-// `validateSample()` — passing unchecked input here will corrupt the
+// `validateSample()`; passing unchecked input here will corrupt the
 // running sum.
 export function applyValidatedSample(
   sample: TokenCalibrationSample,
@@ -449,8 +449,8 @@ export async function addSampleToGlobal(
         global.byModel[calibrationKey] = globalSample
       }
       // Reuse the same validation as per-chat so bad samples don't
-      // infiltrate the global rollup either. We pass the existing sample
-      // for outlier-gate context.
+      // infiltrate the global rollup either. The existing sample is
+      // passed for outlier-gate context.
       const currentSample =
         aggregateSamplesForCalibrationKey(global.byModel, calibrationKey) ?? globalSample
       const outcome = validateSample(modelId, chars, tokens, currentSample)
@@ -710,7 +710,7 @@ export interface CalibrationFieldsForEdit {
 // `originalCalibrationKey` stay immutable per the Phase B design.
 //
 // For old messages without `originalCharCount`, the fresh path runs and
-// `charCountDelta` stays 0 — the next gauge tick will self-heal via
+// `charCountDelta` stays 0; the next gauge tick will self-heal via
 // back-write.
 export function calibrationFieldsForEdit(
   currentContent: unknown,

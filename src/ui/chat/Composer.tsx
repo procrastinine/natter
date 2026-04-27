@@ -198,8 +198,8 @@ export function Composer({
   const [submitting, setSubmitting] = useState(false)
   const [prefillOpen, setPrefillOpen] = useState(false)
   const [prefillText, setPrefillText] = useState(defaultPrefill ?? '')
-  // Track whether the prefill textarea has ever been opened so we don't
-  // accidentally re-seed on every open. Reset along with `defaultPrefill`
+  // Track whether the prefill textarea has ever been opened to avoid
+  // accidental re-seeding on every open. Reset along with `defaultPrefill`
   // changes so an updated default does seed the next opening.
   const lastSeededDefaultRef = useRef<string | undefined>(defaultPrefill)
   const lastPrefillScopeRef = useRef<string | null | undefined>(prefillScopeKey)
@@ -583,7 +583,7 @@ export function Composer({
               title={
                 prefillOpen
                   ? 'Close prefill (assistant text editor)'
-                  : 'Add an assistant prefill — the model continues from your text'
+                  : 'Add an assistant prefill, the model continues from the prefilled text'
               }
             >
               <PrefillIcon size={14} />

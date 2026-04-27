@@ -53,7 +53,6 @@ export interface CreateProfileInput {
   supportsPrivacyScrape?: boolean
   capabilityOverrides?: Record<string, Partial<unknown>>
   debugRequests?: boolean
-  privacyScrapeProxy?: string
   now?: number
 }
 
@@ -127,9 +126,6 @@ export async function createProfile(input: CreateProfileInput): Promise<Connecti
   }
   if (input.appCategories?.length) profile.appCategories = [...input.appCategories]
   if (input.debugRequests !== undefined) profile.debugRequests = input.debugRequests
-  if (input.privacyScrapeProxy !== undefined) {
-    profile.privacyScrapeProxy = input.privacyScrapeProxy
-  }
   await getDb().profiles.put(profile)
   postEvent({ kind: 'profile-mutated', profileId: profile.id })
   return profile

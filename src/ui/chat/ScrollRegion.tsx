@@ -197,8 +197,8 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
     [scrollToBottom],
   )
 
-  // On tab-hide/tab-show we snap to bottom (no animation) if the
-  // sentinel was visible before — keeps long streams legible when the
+  // On tab-hide/tab-show, snap to bottom (no animation) if the
+  // sentinel was visible before, keeps long streams legible when the
   // user returns.
   useEffect(() => {
     const onVisibility = () => {

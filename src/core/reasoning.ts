@@ -11,15 +11,14 @@ import type {
 //
 // Default policy:
 //   - **`encrypted: true`** — round-trip the opaque carry-forward carrier for
-//     whatever provider we're talking to. The filter treats `reasoning.text`
+//     whatever provider is being talked to. The filter treats `reasoning.text`
 //     entries that carry a `.signature` (Anthropic) as encrypted-gated too.
-//   - **`summary: false`** — don't echo the human-readable summary. We still
-//     REQUEST the summary (`settings.reasoning.summary = 'auto'`) so the UI
+//   - **`summary: false`** — don't echo the human-readable summary. The summary
+//     is still REQUESTED (`settings.reasoning.summary = 'auto'`) so the UI
 //     can display it, but the next turn doesn't need it in context.
 //   - **`text: false`** — don't echo plaintext reasoning (DeepSeek/Qwen/Gemma
 //     inline `<think>`, or OpenRouter's repackaged-Gemini summary which
-//     arrives as a `reasoning.text` detail). Users flip this on if they want
-//     to carry it.
+//     arrives as a `reasoning.text` detail). Users flip this on to carry it.
 //
 // Per-provider inventory (verified via live probes Apr 2026):
 //   - OpenAI Responses / Azure Responses / xAI: reasoning.encrypted + reasoning.summary
@@ -106,8 +105,8 @@ export function normalizeReasoningSettings(
 //      Extra Anthropic scope: `reasoning.encrypted + format anthropic-claude-v1`
 //      is an Anthropic `redacted_thinking` block. Only Claude 3.7 Sonnet
 //      accepts these; when the target model's `acceptsAnthropicRedactedThinking`
-//      flag is false, drop them so we don't leak Claude-3.7 safety-redactions
-//      to Claude 4+.
+//      flag is false, drop them so Claude-3.7 safety-redactions are not
+//      leaked to Claude 4+.
 //   3. `reasoning.summary` entries when `include.summary === false`.
 //   4. `reasoning.text` entries:
 //      - When they carry a `.signature` (Anthropic's carrier lives here),
@@ -129,7 +128,7 @@ export interface FilterReasoningOptions {
 // rewrites to `azure-openai-responses-v1` (confirmed by live probe 6 in
 // `plan/phase11-research.md`). Both are accepted on either target — treat as
 // interchangeable. xAI Grok uses `xai-responses-v1`, which is NOT accepted
-// by OpenAI / Azure (different upstream signing key); keep it distinct.
+// by OpenAI / Azure (different upstream signing key); kept distinct.
 const OPENAI_RESPONSES_FAMILY: ReadonlySet<ReasoningFormat> = new Set<ReasoningFormat>([
   'openai-responses-v1',
   'azure-openai-responses-v1',
@@ -154,7 +153,7 @@ export function filterReasoningForInclude(
   opts: FilterReasoningOptions = {},
 ): ReasoningDetail[] {
   // `tool_`-prefixed ids are tool-call signatures mixed into
-  // `reasoning_details` by OR — not carriers. Drop before gating.
+  // `reasoning_details` by OR, not carriers. Drop before gating.
   // `hidden: true` entries are user-soft-hidden from echo (eye icon in
   // InlineEditor); preserved on disk, never sent back.
   const clean = details.filter((d) => !d.id?.startsWith('tool_') && d.hidden !== true)
@@ -191,7 +190,7 @@ export function filterReasoningForInclude(
   })
 }
 
-// Console-only surface for "we dropped an encrypted reasoning blob because
+// Console-only surface for "an encrypted reasoning blob was dropped because
 // the target route doesn't accept its family tag." No UI banner — the drop
 // is silent per user directive. Gated on dev so prod consoles stay quiet.
 function warnIncompatibleFormat(stored: ReasoningFormat, target: ReasoningFormat): void {
@@ -248,7 +247,7 @@ export function mergeReasoningDetail(
     //
     // Gemini-family summaries: each thinking section arrives as its own
     // entry (one per OpenRouter `reasoning_details[]` element OR one per
-    // native `thought:true` part), and we coalesce them into a single
+    // native `thought:true` part), and they coalesce into a single
     // continuous Summary block. Inject a `\n\n` separator when both sides
     // have content and neither already provides one — keeps section breaks
     // visible even when the wire didn't include trailing newlines.
@@ -294,8 +293,8 @@ export function normalizeReasoningDetails(details: ReasoningDetail[]): Reasoning
 
 // On-ingest relabel: OpenRouter returns Gemini 3 thought SUMMARIES tagged
 // `type: "reasoning.text"` (format `google-gemini-v1`). Gemini 3 never emits
-// raw chain-of-thought — only summaries — so the `.text` label is misleading
-// and makes our Include-controls inconsistent (it'd gate on `include.text`
+// raw chain-of-thought, only summaries, so the `.text` label is misleading
+// and makes the Include-controls inconsistent (gating on `include.text`
 // instead of `include.summary`). Re-tag on the way in.
 //
 // Guards:
@@ -336,7 +335,7 @@ export function findMergeTargetIndex(
     if (incoming.type === 'reasoning.summary' && existing.type === 'reasoning.summary') {
       // Two Gemini-family summaries belong to the same logical reasoning
       // row regardless of index: Gemini emits each thinking section as its
-      // own atomic part, and we want one continuous Summary in the UI, not
+      // own atomic part, and the UI wants one continuous Summary, not
       // one block per section. OpenRouter's Gemini path reuses index=0
       // across all thought summaries; native-Gemini's path also keys
       // everything under summaryIndex=0 (see splitGeminiPart). Either way
@@ -378,7 +377,7 @@ function shareIdentity(existing: ReasoningDetail, incoming: ReasoningDetail): bo
   // Summaries are content-addressed: each summary part is its own row.
   // Two summaries that happen to carry the same `index` (OpenRouter's
   // Gemini path reuses index=0 across all thought summaries) are NOT the
-  // same block — `findMergeTargetIndex` falls through to a content-equality
+  // same block. `findMergeTargetIndex` falls through to a content-equality
   // check below, and distinct summaries end up as distinct rows.
   if (existing.type === 'reasoning.summary') return false
   return (

@@ -4,10 +4,26 @@
 // §2.5 for the precedence picture.
 //
 // Everything here is keyed under the `settings` IDB table via the existing
-// `getSetting/setSetting` helpers. We expose typed read/write wrappers so call
-// sites don't have to remember the key names.
+// `getSetting/setSetting` helpers. Typed read/write wrappers are exposed so
+// call sites don't have to remember the key names.
 
+import {
+  CORS_PROXY_SECRET_HEADER,
+  type CorsProxyConfig,
+  DEFAULT_CORS_PROXY_URL,
+  DIRECT_OPENROUTER_BASE,
+} from './cors-proxy'
 import { getSetting, setSetting } from '../store/settings'
+
+// Re-exports for browser callers that group their preference imports
+// here. The canonical source lives in `./cors-proxy` so daemon-mode and
+// `api/privacy-scrape.ts` can pull these in without dragging in IDB.
+export {
+  CORS_PROXY_SECRET_HEADER,
+  type CorsProxyConfig,
+  DEFAULT_CORS_PROXY_URL,
+  DIRECT_OPENROUTER_BASE,
+}
 
 export type ThemePreference = 'system' | 'light' | 'dark' | 'high-contrast'
 
@@ -40,15 +56,15 @@ export type BaseFontSize = 13 | 14 | 15 | 16 | 17 | 18
 //   - 'adaptive' (default): per-chat → global → family anchor. The
 //     learning pipeline runs as designed.
 //   - 'global-only': skip per-chat even if samples exist; use the
-//     cross-workspace global rollup. Useful if the user doesn't trust
-//     their own chat's drift.
+//     cross-workspace global rollup. Useful when the user doesn't trust
+//     a single chat's drift.
 //   - 'family-defaults-only': ignore learned calibration entirely; use
-//     the per-family anchor from RATIO_BOUNDS. Useful if something went
-//     wrong with calibration and the user wants a known baseline.
+//     the per-family anchor from RATIO_BOUNDS. Useful when calibration
+//     misbehaves and a known baseline is preferred.
 //
 // Sample ingestion still runs regardless — the toggle only affects
-// consumption. Users can flip back to 'adaptive' later and their
-// accumulated samples are still there.
+// consumption. Flipping back to 'adaptive' later resumes use of the
+// accumulated samples, which are still there.
 export type TokenCalibrationMode = 'adaptive' | 'global-only' | 'family-defaults-only'
 
 export type LongMessageDisplayMode = 'full' | 'compact'
@@ -86,7 +102,7 @@ export interface GlobalPreferences {
   fontFamily: FontFamilyChoice
   baseFontSize: BaseFontSize
   // Workspace-wide pinned model ids. Model picker shows these at the top.
-  // Seeded with sane defaults on first read; the user can pin/unpin any
+  // Seeded with sane defaults on first read; users can pin/unpin any
   // model and reorder pins.
   pinnedModels: string[]
   // Most-recently-used model ids (most-recent first). Drives the Recent
@@ -94,8 +110,8 @@ export interface GlobalPreferences {
   recentModels: string[]
   // Jump to the bottom when a chat opens. When false, the scroll
   // position starts wherever the browser's default places it (top
-  // for fresh mounts). Independent of `autoScrollOnStream` so you
-  // can, e.g., always land at the bottom on open but not get yanked
+  // for fresh mounts). Independent of `autoScrollOnStream`, so a user
+  // can, e.g., always land at the bottom on open without being yanked
   // while reading mid-stream.
   autoScrollOnOpen: boolean
   // Pull the viewport down as new tokens arrive during a live stream.
@@ -109,6 +125,12 @@ export interface GlobalPreferences {
   // Default rendering mode for long/oversized messages when a row mounts
   // or reloads. Manual avatar clicks stay session-local.
   longMessageDisplayMode: LongMessageDisplayMode
+  // CORS-proxy base URL prefixed in front of `/{model}/providers` for the
+  // privacy scrape. Empty string falls back to `DEFAULT_CORS_PROXY_URL`.
+  corsProxyUrl: string
+  // Optional secret echoed as `X-Proxy-Secret` so a hosted bouncer can
+  // gatekeep its open relay. Empty string = header omitted.
+  corsProxySecret: string
 }
 
 export const DEFAULT_PINNED_MODELS: readonly string[] = Object.freeze([
@@ -133,6 +155,8 @@ export const DEFAULT_GLOBAL_PREFERENCES: Readonly<GlobalPreferences> = Object.fr
   recentModels: [],
   tokenCalibrationMode: 'adaptive',
   longMessageDisplayMode: 'full',
+  corsProxyUrl: DEFAULT_CORS_PROXY_URL,
+  corsProxySecret: '',
 })
 
 const THEME_KEY = 'global:theme'
@@ -148,6 +172,8 @@ const PINNED_MODELS_KEY = 'global:pinned-models'
 const RECENT_MODELS_KEY = 'global:recent-models'
 const TOKEN_CALIBRATION_MODE_KEY = 'global:token-calibration-mode'
 const LONG_MESSAGE_DISPLAY_MODE_KEY = 'global:long-message-display-mode'
+const CORS_PROXY_URL_KEY = 'global:cors-proxy-url'
+const CORS_PROXY_SECRET_KEY = 'global:cors-proxy-secret'
 // Legacy single-flag key — used for migration so existing installs
 // don't suddenly flip to the default. Read on boot, split into the
 // two new keys, then retired.
@@ -282,6 +308,8 @@ export async function readGlobalPreferences(): Promise<GlobalPreferences> {
     recent,
     tokenCalibrationMode,
     longMessageDisplayMode,
+    corsProxyUrl,
+    corsProxySecret,
   ] = await Promise.all([
     getSetting<ThemePreference>(THEME_KEY),
     getSetting<SendShortcut>(SEND_SHORTCUT_KEY),
@@ -297,6 +325,8 @@ export async function readGlobalPreferences(): Promise<GlobalPreferences> {
     getSetting<string[]>(RECENT_MODELS_KEY),
     getSetting<TokenCalibrationMode>(TOKEN_CALIBRATION_MODE_KEY),
     getSetting<LongMessageDisplayMode>(LONG_MESSAGE_DISPLAY_MODE_KEY),
+    getSetting<string>(CORS_PROXY_URL_KEY),
+    getSetting<string>(CORS_PROXY_SECRET_KEY),
   ])
   return {
     theme: ALLOWED_THEMES.includes(theme as ThemePreference)
@@ -331,7 +361,36 @@ export async function readGlobalPreferences(): Promise<GlobalPreferences> {
     recentModels: Array.isArray(recent) ? recent.filter((x) => typeof x === 'string') : [],
     tokenCalibrationMode: calibrationModeOrDefault(tokenCalibrationMode),
     longMessageDisplayMode: longMessageDisplayModeOrDefault(longMessageDisplayMode),
+    corsProxyUrl: typeof corsProxyUrl === 'string' ? corsProxyUrl : DEFAULT_CORS_PROXY_URL,
+    corsProxySecret: typeof corsProxySecret === 'string' ? corsProxySecret : '',
   }
+}
+
+export function corsProxyConfigFromPrefs(prefs: GlobalPreferences): CorsProxyConfig {
+  const trimmed = prefs.corsProxyUrl.trim().replace(/\/+$/, '')
+  return {
+    url: trimmed.length > 0 ? trimmed : DEFAULT_CORS_PROXY_URL,
+    secret: prefs.corsProxySecret,
+  }
+}
+
+export async function readCorsProxyConfig(): Promise<CorsProxyConfig> {
+  return corsProxyConfigFromPrefs(await readGlobalPreferences())
+}
+
+// Daemon-mode config: skip the CORS-proxy preference and call
+// `openrouter.ai` directly, since the daemon process isn't subject to
+// browser CORS. The browser engine uses `readCorsProxyConfig()` instead.
+export function directCorsProxyConfig(): CorsProxyConfig {
+  return { url: DIRECT_OPENROUTER_BASE, secret: '' }
+}
+
+export async function writeCorsProxyUrl(value: string): Promise<void> {
+  await setSetting(CORS_PROXY_URL_KEY, value)
+}
+
+export async function writeCorsProxySecret(value: string): Promise<void> {
+  await setSetting(CORS_PROXY_SECRET_KEY, value)
 }
 
 export async function writeLongMessageDisplayMode(value: LongMessageDisplayMode): Promise<void> {
@@ -400,7 +459,7 @@ export async function writeAutoScrollOnStream(value: boolean): Promise<void> {
 // Apply the font-family preference by swapping the `--font-sans` CSS
 // variable on :root. Stacks are looked up in FONT_FAMILY_OPTIONS so
 // the token keeps the same `system-ui, …` fallback chain when the
-// user's preferred font isn't installed.
+// preferred font isn't installed.
 export function applyFontFamilyToDocument(value: FontFamilyChoice): void {
   if (typeof document === 'undefined') return
   const match = FONT_FAMILY_OPTIONS.find((f) => f.value === value)

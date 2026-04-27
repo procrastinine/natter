@@ -1,7 +1,7 @@
 // Custom / unknown-endpoint capability defaults. The user explicitly asked
-// for a permissive stance: "on custom providers we should just enable all
-// of the settings in case they work." We surface every common top-level
-// control; the upstream endpoint will reject what it doesn't understand
+// for a permissive stance: "on custom providers all of the settings should
+// just be enabled in case they work." Every common top-level control is
+// surfaced; the upstream endpoint will reject what it doesn't understand
 // and the user decides whether to prune.
 //
 // This is the default for every `kind: 'custom'` profile and every unknown

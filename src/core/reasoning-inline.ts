@@ -12,7 +12,7 @@
 //      activates reasoning-lift mode for the rest of the stream.
 //   2. While in reasoning mode, emits text as `{kind:'reasoning'}` so the
 //      splitter routes it to the reasoning lane. Partial close-tags are
-//      held back across chunks so we never ship a broken `</think>`
+//      held back across chunks so a broken `</think>` is never shipped
 //      through the lane.
 //   3. On close-tag, flips back to content mode.
 //
@@ -31,13 +31,13 @@ export interface InlineReasoningEvent {
 }
 
 export interface InlineReasoningLifterOptions {
-  // Tag set to look for. Defaults to ['think', 'thought'] — covers every
-  // generic thinking model we know about. Pass an empty array to disable
-  // the lifter entirely.
+  // Tag set to look for. Defaults to ['think', 'thought']; covers every
+  // generic thinking model in scope. Pass an empty array to disable the
+  // lifter entirely.
   tags?: readonly string[]
   // When `true` (default), the lifter only activates if the first content
   // chunk begins with a known open tag (after optional whitespace).
-  // When `false`, the lifter is always active — suitable for models where
+  // When `false`, the lifter is always active; suitable for models where
   // the quirks registry has explicitly said "this model uses inline tags".
   autoDetect?: boolean
 }
@@ -49,7 +49,7 @@ export interface InlineReasoningLifter {
   // Flush any buffered text at end-of-stream. Returns one final event
   // (or none if the buffer is empty). When still inside a `<think>` block
   // at end-of-stream (model truncated), the partial contents are flushed
-  // as reasoning — matches the plan's "open mid-stream renders to reasoning
+  // as reasoning, matching the plan's "open mid-stream renders to reasoning
   // lane" rule.
   finish(): InlineReasoningEvent[]
 }
@@ -59,7 +59,7 @@ export function createInlineReasoningLifter(
 ): InlineReasoningLifter {
   const tags = opts.tags ?? DEFAULT_TAGS
   const autoDetect = opts.autoDetect ?? true
-  // Empty tag list disables the lifter — pass-through mode.
+  // Empty tag list disables the lifter (pass-through mode).
   const disabled = tags.length === 0
 
   type Mode = 'undecided' | 'content' | 'reasoning'
@@ -68,7 +68,7 @@ export function createInlineReasoningLifter(
   let activeTag: string | null = null
   // Flips to `true` after the first auto-detected `<think>` open. Once the
   // lifter has confirmed this model emits inline tags, subsequent open tags
-  // (after a close) should ALSO lift — without this flag, multi-block
+  // (after a close) should ALSO lift; without this flag, multi-block
   // reasoning models like
   // `<think>step 1</think>partial<think>step 2</think>final`
   // would only lift the first block and leak the second into the content
@@ -91,8 +91,8 @@ export function createInlineReasoningLifter(
       }
       if (mode === 'content') {
         // Scan for a subsequent open tag when (a) this is explicit-mode,
-        // OR (b) we've already lifted at least one block in auto-detect
-        // mode (multi-block reasoning model — see `armedForMultiBlock`).
+        // OR (b) at least one block has already been lifted in auto-detect
+        // mode (multi-block reasoning model; see `armedForMultiBlock`).
         if (armedForMultiBlock) {
           const openIdx = findOpenTag(buffer, tags)
           if (openIdx.index >= 0) {
@@ -104,7 +104,7 @@ export function createInlineReasoningLifter(
             activeTag = openIdx.tag
             continue
           }
-          // No complete tag but a partial tag suffix might be open — hold back.
+          // No complete tag but a partial tag suffix might be open; hold back.
           const safeLen = findSafeContentPrefixLen(buffer, tags)
           if (safeLen > 0) {
             out.push({ kind: 'text', text: buffer.slice(0, safeLen) })

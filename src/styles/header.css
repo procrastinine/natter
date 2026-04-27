@@ -61,8 +61,9 @@
   line-height: 1;
 }
 
-/* The pencil glyph in our font points up-right; when sitting to the
- * RIGHT of the title it should point at the text on its left, so we mirror. */
+/* The pencil glyph in the font points up-right; when sitting to the
+ * RIGHT of the title it should point at the text on its left, so the
+ * glyph is mirrored. */
 [data-ui="chat-title-edit"] {
   transform: scaleX(-1);
 }
@@ -776,7 +777,7 @@
 
 /* The close-X icon button (data-ui="icon-button" + data-role="connection-setup-close")
  * is right-aligned in the modal header. Its visual style comes from
- * icons.css; here we just push it to the trailing edge. */
+ * icons.css; the rule here just pushes it to the trailing edge. */
 [data-ui="connection-setup-modal"] > header > [data-role="connection-setup-close"] {
   margin-left: auto;
 }

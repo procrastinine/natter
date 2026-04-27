@@ -3,7 +3,7 @@
 //
 // Persistent UI preferences (theme choice, sidebar collapsed state, composer
 // fullscreen) live in the `settings` IDB table and hydrate into this store on
-// mount. That hydration is Phase 7+; here we only shape the store.
+// mount. That hydration is Phase 7+; this module only shapes the store.
 
 import { create } from 'zustand'
 import type { ChatId, ChatSettings, PresetId } from '../../core/types'
@@ -25,8 +25,8 @@ export interface UiStoreState {
   activeChatId: ChatId | null
   composerFullscreen: boolean
   // Edit-tree mode toggle per §10.6.1. Applies globally across open chats
-  // because the user's mental model is "I'm editing the structure of the
-  // conversation I'm in"; switching chats re-uses the same mode.
+  // because the user's mental model is "editing the structure of the
+  // current conversation"; switching chats re-uses the same mode.
   editTreeMode: boolean
   // Cascade-delete checkbox state inside Edit-tree toolbar. UI-local; resets
   // whenever the mode toggles off per §10.6.1.
@@ -42,7 +42,7 @@ export interface UiStoreState {
   // Chat id whose privacy filter left zero eligible providers; triggers
   // the zero-eligible modal per §10.13.1. Cleared by any of the three
   // quick-fix actions (switch model / disable Pareto / allow fallbacks)
-  // or by explicit dismiss. We store only the chat id — the modal reads
+  // or by explicit dismiss. Only the chat id is stored, the modal reads
   // the live `usePrivacyRouting` result so it shows the current filter
   // decision, not a stale snapshot.
   zeroEligibleChatId: ChatId | null

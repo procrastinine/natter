@@ -6,12 +6,15 @@
 import { useLiveQuery } from 'dexie-react-hooks'
 import { useCallback } from 'react'
 import {
+  DEFAULT_CORS_PROXY_URL,
   DEFAULT_GLOBAL_PREFERENCES,
   readGlobalPreferences,
   type SendShortcut,
   type TokenCalibrationMode,
   writeAutoScrollOnOpen,
   writeAutoScrollOnStream,
+  writeCorsProxySecret,
+  writeCorsProxyUrl,
   writeSendShortcut,
   writeTokenCalibrationMode,
 } from '../../core/global-settings'
@@ -36,6 +39,24 @@ export function GeneralSettings() {
   const onTokenCalibrationMode = useCallback(async (value: TokenCalibrationMode) => {
     await writeTokenCalibrationMode(value)
   }, [])
+  const onCorsProxyUrl = useCallback(async (value: string) => {
+    await writeCorsProxyUrl(value)
+  }, [])
+  const onCorsProxySecret = useCallback(async (value: string) => {
+    await writeCorsProxySecret(value)
+  }, [])
+
+  // The default `/_or_scrape` is a Vite dev-server rewrite — the compiled
+  // bundle has no route for it, so a relative URL only works while
+  // `pnpm dev` is the host. Flag it so the user knows to swap in a
+  // hosted bouncer (e.g. a Cloudflare Worker) for production.
+  const isDev = import.meta.env.DEV
+  const trimmedProxyUrl = prefs.corsProxyUrl.trim()
+  const proxyIsRelative = trimmedProxyUrl.length === 0 || trimmedProxyUrl.startsWith('/')
+  const showDevDefaultWarning = proxyIsRelative && !isDev
+  const proxyPlaceholder = isDev
+    ? DEFAULT_CORS_PROXY_URL
+    : 'https://corsproxy.io/?url=https://openrouter.ai/{model}/providers'
 
   return (
     <>
@@ -71,9 +92,9 @@ export function GeneralSettings() {
             <span>Jump to the branch leaf when opening a chat</span>
           </label>
           <span data-ui="helper">
-            When on, the chat loads already positioned at the latest message (no visible scroll —
-            the view is placed before paint). When off, the chat opens at the top and you can scroll
-            down manually.
+            When on, the chat loads already positioned at the latest message (no visible scroll,
+            the view is placed before paint). When off, the chat opens at the top and the view
+            stays scrollable manually.
           </span>
         </div>
         <div data-ui="field-group">
@@ -88,8 +109,8 @@ export function GeneralSettings() {
             <span>Auto-scroll to the bottom during streams</span>
           </label>
           <span data-ui="helper">
-            When off, new tokens during a live stream don't pull the viewport. You can still jump
-            to the latest reply via the floating chip.
+            When off, new tokens during a live stream don't pull the viewport. Jumping to the
+            latest reply via the floating chip remains available.
           </span>
         </div>
       </div>
@@ -97,6 +118,74 @@ export function GeneralSettings() {
         mode={prefs.tokenCalibrationMode}
         onModeChange={onTokenCalibrationMode}
       />
+      <div data-ui="settings-section">
+        <h3>Privacy-page proxy</h3>
+        <span data-ui="helper">
+          Fetches per-provider <code>data_policy</code> info from OpenRouter's per-model HTML
+          pages.{' '}
+          {isDev ? (
+            <>
+              Default <code>{DEFAULT_CORS_PROXY_URL}</code> works while <code>pnpm dev</code>{' '}
+              is running.
+            </>
+          ) : (
+            <>Paste one of the examples below.</>
+          )}
+        </span>
+        <ul data-ui="helper">
+          <li>
+            Public bouncer:{' '}
+            <code>{'https://corsproxy.io/?url=https://openrouter.ai/{model}/providers'}</code>
+          </li>
+          <li>
+            Self-hosted Worker base: <code>https://or-scrape.example.workers.dev</code>{' '}
+            (<code>{'/{model}/providers'}</code> is appended automatically)
+          </li>
+        </ul>
+        <span data-ui="helper">
+          URLs containing <code>{'{model}'}</code> are substituted in place; otherwise the
+          value is treated as a base and the path is appended.
+        </span>
+        <div data-ui="field-group">
+          <label htmlFor="cors-proxy-url">Proxy URL</label>
+          <input
+            id="cors-proxy-url"
+            data-ui="cors-proxy-url"
+            type="text"
+            inputMode="url"
+            spellCheck={false}
+            placeholder={proxyPlaceholder}
+            value={prefs.corsProxyUrl}
+            onChange={(e) => void onCorsProxyUrl(e.target.value)}
+            aria-invalid={showDevDefaultWarning}
+          />
+          {showDevDefaultWarning ? (
+            <span data-ui="helper" data-validation="invalid">
+              Relative URLs only resolve under <code>pnpm dev</code>. Paste an absolute
+              bouncer URL to make the privacy scrape work in production.
+            </span>
+          ) : null}
+        </div>
+        <div data-ui="field-group">
+          <label htmlFor="cors-proxy-secret">
+            Proxy secret <em>(optional)</em>
+          </label>
+          <input
+            id="cors-proxy-secret"
+            data-ui="cors-proxy-secret"
+            type="password"
+            autoComplete="off"
+            spellCheck={false}
+            placeholder="X-Proxy-Secret value"
+            value={prefs.corsProxySecret}
+            onChange={(e) => void onCorsProxySecret(e.target.value)}
+          />
+          <span data-ui="helper">
+            Sent as <code>X-Proxy-Secret</code>. Only needed when a self-hosted bouncer
+            requires auth.
+          </span>
+        </div>
+      </div>
     </>
   )
 }

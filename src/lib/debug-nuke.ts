@@ -10,8 +10,8 @@
 //   - Cache Storage (Cache API)
 //   - Service workers
 //
-// After all stores resolve we call `location.reload()`. Errors are caught and
-// logged so one failing store doesn't block the rest.
+// After all stores resolve, `location.reload()` is called. Errors are caught
+// and logged so one failing store doesn't block the rest.
 
 interface NukeOptions {
   /** Skip the reload at the end. Useful when chaining debug commands. */

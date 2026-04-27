@@ -7,9 +7,9 @@
 //
 // Rationale: the 8.1 spec calls for "5s undo toasts" on structural ops
 // but doesn't mandate a full operation-journal. A tight
-// "here's what I overwrote" snapshot is enough for the common case and
-// matches the plan's 5s horizon — we don't try to undo edits that
-// happened after the user walked away.
+// "here's what was overwritten" snapshot is enough for the common case
+// and matches the plan's 5s horizon. Edits that happened after the user
+// walked away are not undone.
 
 import { getWorkspaceRepository } from '../store/workspace-repository'
 import type { AttachmentId, ChatId, Message, MessageId, MutationScope } from './types'
@@ -17,8 +17,8 @@ import type { AttachmentId, ChatId, Message, MessageId, MutationScope } from './
 export interface StructuralSnapshot {
   chatId: ChatId
   // Row-by-row restore list. Each entry is an exact `Message` that was
-  // alive (or tombstoned) immediately before the mutation; on undo we
-  // put it back. Rows created by the mutation are not restored — the
+  // alive (or tombstoned) immediately before the mutation; on undo it
+  // is put back. Rows created by the mutation are not restored. The
   // caller lists them in `newMessageIds` so the undo path deletes them.
   previousRows: Message[]
   newMessageIds: MessageId[]
@@ -41,7 +41,7 @@ export async function snapshotMessages(
   return rows
 }
 
-// Reverse the structural change captured in `snapshot` — restores any
+// Reverse the structural change captured in `snapshot`. Restores any
 // rows the op overwrote and removes any rows the op introduced. Runs
 // under the same `message:` + `children:` scopes the op claimed so
 // concurrent edits from another tab serialize cleanly.

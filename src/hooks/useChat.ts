@@ -268,8 +268,8 @@ export interface SendTextInput {
 }
 
 // "Open an assistant stream under an existing user (or other) message."
-// Used by edit-then-send (the user sibling already exists; we just need
-// a fresh assistant reply) and regenerate-after-branch flows. No user
+// Used by edit-then-send (the user sibling already exists; only a
+// fresh assistant reply is needed) and regenerate-after-branch flows. No user
 // message is created here. `prefillContent` (inherited from SendTextInput)
 // is honored by adding a trailing assistant input to the request plan and
 // initializing the generated assistant row with that text.
@@ -1135,7 +1135,7 @@ interface FinalizeContext extends FlushContext {
   now: number
   // Token-calibration inputs — present when the send can produce a
   // calibration sample on success. When omitted, calibration is skipped
-  // (e.g., text-protocol / llama-server, where we don't get usage).
+  // (e.g., text-protocol / llama-server, where usage is not returned).
   calibrationInputs?: {
     outboundPath: readonly Message[]
     systemPrompt: string
@@ -1204,9 +1204,10 @@ async function finalize(ctx: FinalizeContext): Promise<void> {
   const finalContent = generatedImageAttachments.content
 
   // Pre-compute calibration fields for the assistant row. On a successful
-  // `done`, we populate `originalCharCount` / `originalTokenEstimate` /
-  // `originalModelId` / `cachedTokenEstimate` so the next gauge tick can
-  // read the cache directly instead of re-multiplying chars × ratio.
+  // `done`, `originalCharCount` / `originalTokenEstimate` /
+  // `originalModelId` / `cachedTokenEstimate` are populated so the next
+  // gauge tick can read the cache directly instead of re-multiplying
+  // chars × ratio.
   // This block only runs for text-only sends; multimodal input/output is
   // excluded before `calibrationInputs` is passed into finalize.
   let assistantCalibrationFields: ReturnType<typeof calibrationFieldsForCreate> | null = null
@@ -1287,10 +1288,10 @@ async function finalize(ctx: FinalizeContext): Promise<void> {
     },
   )
 
-  // Token calibration — happens AFTER the assistant message is persisted
-  // so we have the final content + reasoningDetails + usage. Skips on
-  // anything other than a clean `done`, because error/abort streams don't
-  // have reliable usage from the server.
+  // Token calibration happens AFTER the assistant message is persisted
+  // so the final content + reasoningDetails + usage are available. Skips
+  // on anything other than a clean `done`, because error/abort streams
+  // don't have reliable usage from the server.
   if (
     outcome === 'done' &&
     calibrationInputs &&
@@ -1351,9 +1352,9 @@ async function ingestCalibrationSample(args: {
   if (promptSample === null && completionSample === null) return
 
   // Step 1: apply per-chat samples in memory. `patchChatMeta` with
-  // `touchVisibleState: false` writes into the hidden meta patch so we
-  // don't bump `metaVersion` / trigger a sidebar broadcast just for a
-  // calibration delta.
+  // `touchVisibleState: false` writes into the hidden meta patch so
+  // `metaVersion` doesn't bump and a sidebar broadcast doesn't fire just
+  // for a calibration delta.
   const acceptedSamples: Array<{ chars: number; tokens: number }> = []
   await repo.runMutation([{ kind: 'chat-meta', chatId }], async (inner) => {
     const chat = await inner.getChat(chatId)

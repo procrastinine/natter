@@ -130,7 +130,7 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
   }
 
   const baseCursor = useChatStore.getState().getCursor(input.chatId) ?? {}
-  // Pin the cursor so the active-path walk ends at our target. Without
+  // Pin the cursor so the active-path walk ends at the target. Without
   // this, a fresh chat (no cursor) might resolve a different leaf.
   const cursor: Record<string, MessageId> = { ...baseCursor }
   let cur: Message | undefined = target
@@ -140,12 +140,12 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
   }
   const allMessages = await loadChatMessages(input.chatId)
   const path = activePath(allMessages, cursor)
-  // Truncate the path at the target so we don't include downstream
-  // descendants that happen to share siblingIndex 0.
+  // Truncate the path at the target so downstream descendants that
+  // happen to share siblingIndex 0 are excluded.
   const targetIdx = path.findIndex((m) => m.id === target.id)
   const upstream = targetIdx >= 0 ? path.slice(0, targetIdx + 1) : path
 
-  // Build the wire body as if we were sending a request that ends with
+  // Build the wire body as if sending a request that ends with
   // the target assistant. Continue has two independent per-chat prompt slots
   // (stored on chat.settings, preset-pinnable): a system override (which
   // replaces the chat system prompt when non-empty) and a synthetic trailing
@@ -281,7 +281,7 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
         if (!current) return
         const nextContent: ContentItem[] = appendTextOnto(
           current.content,
-          // The delta-since-last-flush is what we haven't written yet;
+          // The delta-since-last-flush is what hasn't been written yet;
           // but `current.content` already has everything from prior
           // flushes, so compute the tail from buffer and merge.
           combined,
@@ -374,7 +374,7 @@ function appendTextOnto(content: readonly ContentItem[], fullText: string): Cont
   // text, drop any subsequent plain text items that were part of the
   // prior partial (they get merged into the first), keep non-text
   // items. The simplest reliable form: return a single output_text
-  // entry with the full combined text plus any non-text items we had.
+  // entry with the full combined text plus any non-text items present.
   const nonText: ContentItem[] = content.filter(
     (item) => item.type !== 'text' && item.type !== 'output_text',
   )

@@ -12,13 +12,13 @@ interface Prompt {
 
 const SAMPLE_PROMPTS: readonly Prompt[] = [
   {
-    title: "Explain like I'm five",
-    body: 'Explain how TCP congestion control works as if I were five.',
+    title: 'Explain to a beginner',
+    body: 'Explain how TCP congestion control works for a beginner.',
     preview: 'Beginner-friendly walkthroughs',
   },
   {
     title: 'Brainstorm titles',
-    body: 'Give me ten blog post titles about the difference between branching and swiping in chat UIs.',
+    body: 'Generate ten blog post titles about the difference between branching and swiping in chat UIs.',
     preview: 'Idea generation',
   },
   {

@@ -6,7 +6,7 @@ The whole app is a static bundle, served from any file server or opened directly
 
 ## Why this exists
 
-I use a variety of models on OpenRouter and wanted an easy way to make it at least reasonably private (anonymized/no user ID retention, no prompt retention in policy). Additional gripes I had with other frontends were reasoning support (including encrypted reasoning), proper caching for different models, and various testing/copy-pasting mechanisms that benefit a lot from having a fully-featured chat tree, in-place editing, prefill, etc etc.
+The goal is an easy way to use a variety of models on OpenRouter while keeping things at least reasonably private (anonymized/no user ID retention, no prompt retention in policy). Additional gaps in other frontends were reasoning support (including encrypted reasoning), proper caching for different models, and various testing/copy-pasting mechanisms that benefit a lot from having a fully-featured chat tree, in-place editing, prefill, etc etc.
 
 ## OpenRouter privacy
 

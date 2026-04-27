@@ -183,7 +183,7 @@ describe('toGeminiNative — thinkingConfig (Gemini 2.5)', () => {
 
   it('maps effort → thinkingBudget (integer)', () => {
     // Per Google's Vertex thinking docs: gemini-2.5-flash supports budgets
-    // 0..24576. `xhigh` uses the model's max (24576) rather than our old
+    // 0..24576. `xhigh` uses the model's max (24576) rather than the old
     // conservative 8192 cap. `none` = 0 is valid only on flash (not
     // pro/flash-lite).
     const cases: Array<[NonNullable<ChatSettings['reasoning']['effort']>, number]> = [

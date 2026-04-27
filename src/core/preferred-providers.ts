@@ -12,11 +12,11 @@ export interface ProviderPreferenceRule {
 
 // Known-good OSS-model hosts, in rough preference order. Used by every
 // open-weights model below (DeepSeek, Qwen, Llama, Mistral, Gemma, etc).
-// Chutes is deliberately excluded — it doesn't train on prompts, but per
+// Chutes is deliberately excluded. It doesn't train on prompts, but per
 // user report (2026-04-19) it retains prompts for an unknown period. Live
 // OpenRouter policy data should make Pareto dominate it whenever a clean
-// host is available; the user can still manually include it if they
-// accept the tradeoff.
+// host is available; the user can still manually include it if accepting
+// the tradeoff.
 // The user's curated list was: DeepInfra, Together, Novita, Parasail, Fireworks.
 const OSS_PREFERRED: readonly string[] = [
   'DeepInfra',
@@ -49,7 +49,7 @@ const OSS_PREFERRED: readonly string[] = [
 // names within a lab churn faster than the lab itself.
 //
 // Not listed: anthropic, openai, google (proprietary; have their own rules);
-// cohere, x-ai, perplexity, nvidia, etc. (either not open-weights or their
+// cohere, x-ai, perplexity, nvidia, etc. (either not open-weights, or their
 // OSS routing isn't worth a curated rule yet).
 const OSS_LABS: readonly string[] = [
   'qwen',
@@ -65,7 +65,7 @@ function ossRuleForLab(lab: string): ProviderPreferenceRule {
   // `/^lab\//` anchors on the author segment. Anchoring avoids false
   // positives like "qwen-plus" or "z-ai-hosted-gemini" appearing inside a
   // longer slug. Periods, hyphens, and underscores in lab names are safe
-  // inside a JS regex character class but we keep the RegExp literal-ish
+  // inside a JS regex character class but the RegExp stays literal-ish
   // since all listed labs are alphanumeric-plus-hyphen.
   const escaped = lab.replace(/[-]/g, '\\-')
   return { match: new RegExp(`^${escaped}/`), order: OSS_PREFERRED }
@@ -102,7 +102,7 @@ export function findPreferredRule(model: string): ProviderPreferenceRule | null 
 // Reorder `keptNames` according to the preferred-order rule for `model`.
 // Names present in the rule come first in rule order; names not in the
 // rule preserve their original relative order at the tail. Returns a new
-// array — never mutates the input.
+// array; never mutates the input.
 export function applyPreferredOrdering(
   model: string,
   keptNames: readonly string[],

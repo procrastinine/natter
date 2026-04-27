@@ -22,8 +22,8 @@ export interface GeminiContent {
   parts: GeminiPart[]
 }
 
-// One part per content chunk. Multiple part variants exist — we preserve an
-// open shape so adapters can round-trip unknown parts (new modalities etc.).
+// One part per content chunk. Multiple part variants exist; the shape stays
+// open so adapters can round-trip unknown parts (new modalities etc.).
 export type GeminiPart =
   | {
       text: string

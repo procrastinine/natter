@@ -32,7 +32,7 @@ const MODE_OPTIONS: ReadonlyArray<{ value: TokenCalibrationMode; label: string; 
       value: 'global-only',
       label: 'Global only (skip per-chat learning)',
       helper:
-        'Use the cross-chat average even when the current chat has its own samples. Useful when your chat topics vary wildly and per-chat calibration is noisy.',
+        'Use the cross-chat average even when the current chat has its own samples. Useful when chat topics vary wildly and per-chat calibration is noisy.',
     },
     {
       value: 'family-defaults-only',

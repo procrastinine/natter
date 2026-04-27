@@ -142,8 +142,8 @@ describe('ApiModeSection — two-button toggle', () => {
 
   it('gates the Chat pin behind a confirm() dialog on phase-echo models', async () => {
     // gpt-5.4-nano has requiresPhaseEcho — clicking Chat must trip the
-    // confirmation. We stub window.confirm to return true and verify the
-    // pin persists.
+    // confirmation. window.confirm is stubbed to return true, then the
+    // pin is verified to persist.
     const settings = cloneDefaultChatSettings()
     settings.model = 'openai/gpt-5.4-nano'
     const chat = await createChat({ settings })

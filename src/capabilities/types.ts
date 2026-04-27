@@ -1,6 +1,6 @@
 // Bundled capability tables for non-OpenRouter providers. See
 // `plan/07-discovery.md §7.6`. OpenRouter's /endpoints is authoritative; for
-// everything else, we fall back to these hand-maintained rows.
+// everything else, the fallback is these hand-maintained rows.
 //
 // Shape mirrors CapabilityDescriptor (camelCase), plus a display title and
 // grouping so the picker can show "OpenAI", "Anthropic", etc.

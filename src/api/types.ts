@@ -134,9 +134,9 @@ export interface ResponsesRequestWire {
   tool_choice?: unknown
   parallel_tool_calls?: boolean
   include?: string[]
-  // OpenAI default: `true`. Our default: `false` (stateless, privacy posture).
+  // OpenAI default: `true`. Natter default: `false` (stateless, privacy posture).
   store?: boolean
-  // Reserved — we don't use server-side stateful mode today.
+  // Reserved, server-side stateful mode is not used today.
   previous_response_id?: string
   // These three are gated by the GPT-5.4 sampling gate (only valid when
   // `reasoning.effort === 'none'`). Quirks strip them otherwise.
@@ -198,9 +198,9 @@ export interface ResponsesResultWire {
   [extra: string]: unknown
 }
 
-// SSE envelope. We keep the union narrow for the events we care about and
-// forward-compat via a catch-all so unknown event names don't crash the
-// splitter.
+// SSE envelope. The union stays narrow for the events the splitter cares
+// about; a forward-compat catch-all keeps unknown event names from crashing
+// the splitter.
 export type ResponsesEventWire =
   | {
       type: 'response.created'

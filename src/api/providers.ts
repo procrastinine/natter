@@ -1,13 +1,13 @@
 // OpenRouter `/endpoints` + `/models` response normalizers.
 //
-// Wire payloads are snake_case and can include fields we don't care about.
-// We normalize to a compact TypeScript shape defined in `src/core/types.ts`
-// (`ModelEndpoint`, `ModelListEntry`) so downstream consumers don't have to
-// defensively check random fields.
+// Wire payloads are snake_case and can include fields outside the consumer's
+// concern. The normalizer reduces them to a compact TypeScript shape defined
+// in `src/core/types.ts` (`ModelEndpoint`, `ModelListEntry`) so downstream
+// consumers don't have to defensively check random fields.
 //
 // Non-OpenRouter `/v1/models` responses are OpenAI-compatible bare lists:
-// `{ data: [{ id, object, created, owned_by }, ...] }`. No capability data —
-// we merge with bundled capability tables in the hooks layer.
+// `{ data: [{ id, object, created, owned_by }, ...] }`. No capability data;
+// the hooks layer merges with bundled capability tables.
 
 import type { ModelEndpoint, PercentileBucket } from '../core/types'
 import { normalizeDataPolicy } from './privacy-scrape'

@@ -98,8 +98,8 @@ describe.skipIf(!LIVE)('live — OpenRouter Responses (openai/gpt-5.4-nano)', ()
     // OpenRouter's `/responses` stream for openai/* skips emitting a
     // separate `reasoning` output_item during streaming (unlike OpenAI
     // direct). The reasoning appears only in the buffered-result shape.
-    // We still assert the message-item + phase + completed flow so the
-    // splitter's invariants hold on this route.
+    // The test still asserts the message-item + phase + completed flow so
+    // the splitter's invariants hold on this route.
     const events: ResponsesEventWire[] = []
     for await (const chunk of responses(ctx, {
       model: 'openai/gpt-5.4-nano',
@@ -204,8 +204,8 @@ describe.skipIf(!LIVE)('live — OpenRouter Responses (openai/gpt-5.4-nano)', ()
     const finish = lanes.find((l) => l.lane === 'finish')
     expect(finish).toBeDefined()
     // OpenRouter streaming omits reasoning output_items — the encrypted
-    // blob only lands on the buffered-result shape. We assert text lanes
-    // fired instead.
+    // blob only lands on the buffered-result shape. The test asserts text
+    // lanes fired instead.
     const textLanes = lanes.filter((l) => l.lane === 'text')
     expect(textLanes.length).toBeGreaterThan(0)
   }, 60_000)

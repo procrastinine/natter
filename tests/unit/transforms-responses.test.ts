@@ -161,7 +161,7 @@ describe('toResponses — reasoning echo', () => {
   it('drops naked reasoning item when stripping leaves no carrier fields', () => {
     // With include.encrypted=false and no `summary` on the echo item,
     // stripping leaves `{type:'reasoning', id}` — an empty envelope the
-    // next turn cannot use. We drop instead of sending it.
+    // next turn cannot use. The transform drops it instead of sending it.
     const echo: ResponsesOutputItem = {
       type: 'reasoning',
       id: 'rs_1',

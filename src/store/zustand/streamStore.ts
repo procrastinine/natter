@@ -22,8 +22,8 @@ export interface StreamStoreState {
   isTargetActive: (chatId: ChatId, messageId?: MessageId) => boolean
   // Short-circuiting membership test for "is ANY stream running for this
   // chat?". Used on the hot path (Shell re-renders on every stream token
-  // update) so we avoid allocating an array via `Object.values()` — the
-  // allocation is discarded immediately and adds GC pressure.
+  // update) so allocating an array via `Object.values()` is avoided, the
+  // allocation would be discarded immediately and add GC pressure.
   hasStreamForChat: (chatId: ChatId) => boolean
   getActive: (streamId: string) => ActiveStream | undefined
   listByChat: (chatId: ChatId) => ActiveStream[]

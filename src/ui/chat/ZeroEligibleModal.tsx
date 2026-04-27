@@ -55,13 +55,13 @@ export function ZeroEligibleModal({ chatId }: ZeroEligibleModalProps) {
       />
       <div data-ui="zero-eligible-dialog">
         <header data-ui="zero-eligible-header">
-          <h2 id="zero-eligible-title">No providers match your privacy filter</h2>
+          <h2 id="zero-eligible-title">No providers match the privacy filter</h2>
         </header>
         <div data-ui="zero-eligible-body">
           <p>
             Every provider for <code>{modelLabel}</code> either trains on prompts,
             retains for an unknown period, or was manually ignored. The request
-            was blocked — we won&rsquo;t silently route to a training provider.
+            was blocked, the chat won&rsquo;t silently route to a training provider.
           </p>
           <p data-ui="helper">Pick a fix:</p>
         </div>
@@ -74,7 +74,7 @@ export function ZeroEligibleModal({ chatId }: ZeroEligibleModalProps) {
             Disable Pareto for this chat
           </button>
           <button type="button" data-ui="field-inline-action" onClick={close}>
-            Show me the picker
+            Show the picker
           </button>
           <button
             ref={okRef}

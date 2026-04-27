@@ -191,7 +191,7 @@ describe('computeCutoffPlan — unlimited cutoff', () => {
 
 describe('computeCutoffPlan — head + greedy tail', () => {
   // Each pair text of length 35 → 10 tokens. With customMaxContext=50 and
-  // reserve=0, available = 50; we can fit 5 pairs. `keepFirstPairs=1`
+  // reserve=0, available = 50; 5 pairs fit. `keepFirstPairs=1`
   // anchors pair 0 plus the last 4 pairs (0, 6, 7, 8, 9 for 10 pairs).
   function tenEqualPairs(): Message[] {
     const path: Message[] = []

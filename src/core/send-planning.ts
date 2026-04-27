@@ -8,7 +8,7 @@ import {
 } from './attachments/context'
 import { buildStoredOpenRouterAttachmentWire } from './attachments/stored-openrouter'
 import { resolveBundledCapability } from '../capabilities'
-import { readGlobalPreferences } from './global-settings'
+import { corsProxyConfigFromPrefs, readGlobalPreferences } from './global-settings'
 import {
   estimateSettingsPromptSize,
   type AttachmentResolver,
@@ -145,11 +145,9 @@ export async function resolveRequestPrivacyPlan(
 ): Promise<RequestPrivacyPlan> {
   const settings = input.settings ?? input.chat.settings
   let neededTokens: number | undefined
+  const globalPrefs = await readGlobalPreferences()
   try {
-    const [globalPrefs, globalCalibration] = await Promise.all([
-      readGlobalPreferences(),
-      readTokenCalibrationGlobal(),
-    ])
+    const globalCalibration = await readTokenCalibrationGlobal()
     const attachmentContext = await loadAttachmentEstimateContext(
       input.activePathMessages,
       settings,
@@ -177,6 +175,7 @@ export async function resolveRequestPrivacyPlan(
   const privacy = await resolvePrivacyForSend({
     chat: chatForRequest,
     profile: input.profile,
+    proxy: corsProxyConfigFromPrefs(globalPrefs),
     ...(neededTokens !== undefined ? { neededTokens } : {}),
     ...(input.signal ? { signal: input.signal } : {}),
   })

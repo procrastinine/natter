@@ -35,8 +35,8 @@
 }
 
 /* The close-X icon button (data-ui="icon-button" + data-role="settings-pane-close")
- * carries its own visual style from icons.css; here we just push it to the
- * trailing edge of the pane header. */
+ * carries its own visual style from icons.css; the rule here just pushes it
+ * to the trailing edge of the pane header. */
 [data-ui="settings-pane-header"] > [data-role="settings-pane-close"] {
   margin-left: auto;
 }
@@ -44,7 +44,7 @@
 /* Tab strip. No `overflow-x: auto` — that triggers a horizontal
  * scrollbar gutter even when the tabs fit, which the user flagged.
  * Tabs are sized by their content; if a future tab list overflows the
- * modal width we'll wrap to a second row instead of scrolling. */
+ * modal width the row wraps to a second row instead of scrolling. */
 [data-ui="settings-tabs"] {
   display: flex;
   gap: 0;

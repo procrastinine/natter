@@ -10,7 +10,7 @@
 //   cache_control keys — the non-negotiable ones pass through.
 // - `hiddenFromContext` and tombstoned messages are never sent upstream.
 // - A trailing `origin: 'prefill'` assistant message is serialized in place;
-//   we never append a synthetic echo.
+//   the transform never appends a synthetic echo.
 // - System prompt becomes the first `system`/`developer` message iff non-empty
 //   AND the active path doesn't already contain one (e.g. imported transcript).
 // - `requestedModel` is the ORIGINAL `settings.model`; the wire `model` goes
@@ -55,8 +55,8 @@ import type {
 export interface ChatCompletionsTransformOptions {
   // Live capability descriptor — from `/endpoints` (OpenRouter) or a static
   // capabilities JSON (direct providers). `supportedParameters` gates optional
-  // request fields. When omitted we send the full superset; the upstream then
-  // decides what to accept (matches the "live-first, registry-last" rule).
+  // request fields. When omitted, the full superset is sent; the upstream
+  // then decides what to accept (matches the "live-first, registry-last" rule).
   capabilities?: CapabilityDescriptor
   // Override whether to include stream:true in the body. Defaults to `true`
   // because Phase 7's send pipeline always streams. Non-stream buffering goes
@@ -257,7 +257,7 @@ function trimTrailingWhitespaceOnLastText(message: Message): Message {
 }
 
 // Translate a `ContentItem[]` into chat-completions wire content parts. For
-// text-only Phase 7 this is nearly identity; we preserve the typed shape so
+// text-only Phase 7 this is nearly identity; the typed shape is preserved so
 // later phases can bolt on image/audio/file/video without revisiting callers.
 function serializeContent(items: ContentItem[], extraParts: readonly unknown[] = []): unknown {
   if (items.length === 0 && extraParts.length === 0) return ''
@@ -404,9 +404,9 @@ function serializeChatMessage(
 }
 
 // `reasoning.encrypted` is opaque by definition. Anthropic's signed-text
-// carrier ALSO rides as opaque — `reasoning.text` with a non-empty
+// carrier ALSO rides as opaque: `reasoning.text` with a non-empty
 // `.signature` is Anthropic's signed thinking block; the signature is what
-// the next turn validates, so we never tag-ify the text out from under it.
+// the next turn validates, so the text is never tag-ified out from under it.
 // Used to split kept entries into "wrap as <think>" vs "keep on native
 // reasoning_details[]" buckets when the universal-compat path is active.
 function isOpaqueReasoningCarrier(d: ReasoningDetail): boolean {
@@ -418,10 +418,10 @@ function isOpaqueReasoningCarrier(d: ReasoningDetail): boolean {
 }
 
 // Assemble a single `<think>…</think>` block from summary + text entries
-// (encrypted entries can't be expressed in plaintext — they're skipped by
-// the filter when preservationFormat is 'unknown' anyway). Summaries come
-// first as "Summary:" lines then text as "Reasoning:" lines so the model
-// can tell them apart. Returns `null` when nothing usable remains.
+// (encrypted entries can't be expressed in plaintext; the filter skips them
+// when preservationFormat is 'unknown' anyway). Summaries come first as
+// "Summary:" lines then text as "Reasoning:" lines so the model can tell
+// them apart. Returns `null` when nothing usable remains.
 function wrapReasoningAsThinkTag(kept: readonly ReasoningDetail[]): string | null {
   const parts: string[] = []
   for (const d of kept) {
@@ -493,7 +493,7 @@ export function toChatCompletions(
     settings.maxCompletionTokens !== undefined &&
     settings.maxCompletionTokens >= 0
   ) {
-    // -1 is our local "unlimited" sentinel; never send it on the wire.
+    // -1 is the local "unlimited" sentinel; never send it on the wire.
     if (gate('max_completion_tokens')) {
       wire.max_completion_tokens = settings.maxCompletionTokens
     } else if (gate('max_tokens')) {
@@ -768,7 +768,7 @@ function buildReasoning(settings: ChatSettings): Record<string, unknown> | undef
   }
   // Build the body from whichever knobs are set. `enabled: true` is
   // always emitted for non-default, non-off modes so the provider knows
-  // we want reasoning. Summary and exclude ride along independently.
+  // reasoning is wanted. Summary and exclude ride along independently.
   const body: Record<string, unknown> = { enabled: true }
   if (reasoning.effort !== undefined) body.effort = reasoning.effort
   if (reasoning.maxTokens !== undefined) body.max_tokens = reasoning.maxTokens
@@ -835,7 +835,7 @@ export function toResponses(
   const input: ResponsesInputItem[] = []
 
   // System prompt handling. The Responses API has a dedicated `instructions`
-  // field; we put the first system/developer message there, and any SECOND
+  // field; the first system/developer message goes there, and any SECOND
   // system message (rare but possible in imported transcripts) becomes a
   // `message` input item with role=system.
   const systemMessages = visible.filter((m) => m.role === 'system' || m.role === 'developer')
@@ -973,7 +973,7 @@ function toResponsesTextFormat(
 //   - user → single `{type:'message', role:'user', content}` item.
 //   - assistant with text + optional reasoning → reasoning item first (if any
 //     include flags are true) then a message item. When a `responsesEchoItem`
-//     exists we emit that verbatim (preserving its id/phase), BUT with
+//     exists, that gets emitted verbatim (preserving its id/phase), BUT with
 //     `encrypted_content` stripped if `include.encrypted === false`.
 //   - assistant with tool calls → one `{type:'function_call', …}` item per call.
 //   - tool (role:'tool') → `{type:'function_call_output', call_id, output}`.
@@ -1004,13 +1004,13 @@ function messageToResponsesItems(
   if (message.role === 'assistant') {
     const items: ResponsesInputItem[] = []
 
-    // Prefer the verbatim echo item if we stored one.
+    // Prefer the verbatim echo item if one was stored.
     if (message.responsesEchoItem) {
       const echoed = applyIncludeToEchoItem(message.responsesEchoItem, include, preservationFormat)
       // When stripping leaves a `reasoning` item with no `encrypted_content`
-      // AND no `summary`, the item is empty — nothing of value for the next
-      // turn. Skip it so we don't send a naked `{type:'reasoning'}`
-      // envelope. Non-reasoning items (message/function_call/server-tool)
+      // AND no `summary`, the item is empty: nothing of value for the next
+      // turn. Skip it so a naked `{type:'reasoning'}` envelope is not sent.
+      // Non-reasoning items (message/function_call/server-tool)
       // always ride through verbatim.
       const isEmptyReasoning =
         echoed.type === 'reasoning' &&
@@ -1019,7 +1019,7 @@ function messageToResponsesItems(
           (Array.isArray(echoed.summary) && echoed.summary.length === 0))
       if (!isEmptyReasoning) items.push(echoed)
     } else {
-      // Synthesize a reasoning item if we have kept reasoning details.
+      // Synthesize a reasoning item if reasoning details have been kept.
       const filtered = message.reasoningDetails
         ? filterReasoningForInclude(message.reasoningDetails, include, preservationFormat)
         : []
@@ -1119,8 +1119,8 @@ function applyIncludeToEchoItem(
   preservationFormat: ReasoningFormat | undefined,
 ): ResponsesInputItem {
   // `responsesEchoItem` carries the verbatim wire shape from the previous
-  // turn. For reasoning items we optionally strip `encrypted_content` per
-  // the include flags. Message items ride verbatim (including `phase`).
+  // turn. For reasoning items, `encrypted_content` is optionally stripped
+  // per the include flags. Message items ride verbatim (including `phase`).
   if (item.type !== 'reasoning') {
     const next = { ...(item as ResponsesInputItem) } as ResponsesInputItem & { id?: string }
     if (typeof next.id === 'string' && /^(rs|msg)_tmp_/.test(next.id)) delete next.id
@@ -1129,16 +1129,16 @@ function applyIncludeToEchoItem(
   const next = { ...(item as ResponsesInputItem) } as ResponsesInputItem & { id?: string }
   // OpenRouter rewrites item ids to `rs_tmp_*` / `msg_tmp_*` on its proxy.
   // Echoing those back to Azure makes the upstream reject with
-  // `Encrypted content item_id did not match the target item id.` — strip
-  // our synthetic ids and let the upstream pair `encrypted_content` by
+  // `Encrypted content item_id did not match the target item id.`; strip
+  // those synthetic ids and let the upstream pair `encrypted_content` by
   // content rather than id. Real upstream ids (`rs_01...`) round-trip fine.
   if (typeof next.id === 'string' && /^(rs|msg)_tmp_/.test(next.id)) delete next.id
   // Drop encrypted_content when the include flag is off OR the target route
   // can't round-trip it. OpenAI/Azure Responses accept `encrypted_content`
   // (OpenRouter proxy rewrites between `openai-responses-v1` and
-  // `azure-openai-responses-v1` — both work). xAI Grok also accepts its own
+  // `azure-openai-responses-v1`, both work). xAI Grok also accepts its own
   // format on /responses. Anthropic + Gemini have NO `encrypted_content`
-  // slot on this wire shape, so we always strip for those targets.
+  // slot on this wire shape, so it is always stripped for those targets.
   if (
     !include.encrypted ||
     !preservationFormat ||
@@ -1311,7 +1311,7 @@ export function toGeminiNative(
   if (settings.sampling.top_p !== undefined) generationConfig.topP = settings.sampling.top_p
   if (settings.sampling.top_k !== undefined) generationConfig.topK = settings.sampling.top_k
   if (settings.maxCompletionTokens !== undefined && settings.maxCompletionTokens >= 0) {
-    // -1 is our local "unlimited" sentinel; never send it on the wire.
+    // -1 is the local "unlimited" sentinel; never send it on the wire.
     // Matches the chat-completions gate above.
     generationConfig.maxOutputTokens = settings.maxCompletionTokens
   }
@@ -1571,7 +1571,7 @@ function messageToGeminiContents(
 
     // Imported-turn escape hatch: Gemini 3 REJECTS requests whose functionCall
     // parts lack thought_signatures (HTTP 400). When the user opts in on the
-    // chat level, we inject a dummy signature — per
+    // chat level, a dummy signature is injected, per
     // `gemini_docs/guides/thought-signatures.md` FAQ.
     if (
       preservationFormat === 'google-gemini-v1' &&

@@ -75,8 +75,8 @@ describe.skipIf(!LIVE)('live — Gemini native generateContent', () => {
     )
     const cand = result.candidates?.[0]
     expect(cand).toBeDefined()
-    // Either STOP (completed) or MAX_TOKENS (truncated) — we only care
-    // about the reasoning carrier shape, not the finish reason.
+    // Either STOP (completed) or MAX_TOKENS (truncated). Only the reasoning
+    // carrier shape matters here, not the finish reason.
     expect(['STOP', 'MAX_TOKENS']).toContain(cand?.finishReason)
 
     const parts = cand?.content.parts

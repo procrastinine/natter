@@ -2,7 +2,7 @@
 // `plan/05-transforms-and-quirks.md §5.3`.
 //
 // A single stream produces multiple independent lanes. Rather than force every
-// caller to re-parse the tagged union, we expose lane-tagged events that the
+// caller to re-parse the tagged union, the splitter exposes lane-tagged events that the
 // send-pipeline accumulator folds into the message. Events match the lane
 // contract sketched in `plan/06-streaming.md §6.1a "StreamDelta"`:
 //
@@ -714,8 +714,8 @@ function metaFromEvent(
   previouslyEmittedGenerationId: string | undefined,
 ): (StreamLaneEvent & { lane: 'meta' }) | null {
   // Only `response.created` and `response.in_progress` carry a full
-  // `response` payload we can pull metadata from. We emit at most one
-  // additional `meta` event when a new field appears.
+  // `response` payload metadata can be pulled from. At most one
+  // additional `meta` event is emitted when a new field appears.
   const response = (ev as { response?: ResponsesResultWire }).response
   if (!response) {
     if (generationId && generationId !== previouslyEmittedGenerationId) {
@@ -981,9 +981,9 @@ function* splitResponsesEvent(ev: ResponsesEventWire): Generator<StreamLaneEvent
       return
     }
 
-    // The non-delta events we deliberately drop — the lane model tracks
-    // the `text.delta` / `output_item.done` flow; part-level events
-    // are redundant for our accumulator.
+    // These non-delta events are deliberately dropped. The lane model
+    // tracks the `text.delta` / `output_item.done` flow; part-level events
+    // are redundant for the accumulator.
     case 'response.content_part.added':
     case 'response.content_part.done':
     case 'response.output_text.done':
@@ -996,7 +996,7 @@ function* splitResponsesEvent(ev: ResponsesEventWire): Generator<StreamLaneEvent
 
     default:
       // Forward-compat: silently drop unknown event types so future OpenAI
-      // additions don't crash our pipeline.
+      // additions don't crash the pipeline.
       return
   }
 }
@@ -1107,7 +1107,7 @@ function contentItemFromResponsesOutputItem(item: ResponsesInputItem): ContentIt
 }
 
 // OpenAI Responses uses `input_tokens` / `output_tokens` / `output_tokens_details`,
-// while chat-completions and our internal UI use `prompt_tokens` /
+// while chat-completions and the internal UI use `prompt_tokens` /
 // `completion_tokens` / `completion_tokens_details`. Normalize so the
 // accumulator and UI don't need a dedicated Responses branch. The
 // pass-through of `cost` / `cost_details` lets OpenRouter-specific numbers
@@ -1139,7 +1139,7 @@ function normalizeResponsesUsage(u: ResponsesUsageWire): ChatCompletionUsageWire
 // ---------------------------------------------------------------------------
 //
 // Gemini `streamGenerateContent?alt=sse` emits ONE JSON object per SSE frame
-// carrying the same shape as `:generateContent`. Per frame we may see:
+// carrying the same shape as `:generateContent`. Per frame:
 //   - text parts (with optional `thought: true` flag — when thoughts are
 //     summarized, the `thought: true` parts carry the visible summary)
 //   - a `thoughtSignature` on a part (Gemini 3: last part of a non-function
@@ -1148,11 +1148,11 @@ function normalizeResponsesUsage(u: ResponsesUsageWire): ChatCompletionUsageWire
 //   - `usageMetadata` (final chunk typically) with reasoning/thought token counts
 //   - `finishReason` (STOP / MAX_TOKENS / SAFETY / …)
 //
-// Splitter contract: we emit one `reasoning` event per `thought: true` text
-// part with `summaryDelta`; we emit one `reasoning { encryptedDelta,
-// replaceEncrypted: true }` for any part carrying a `thoughtSignature` —
+// Splitter contract: emit one `reasoning` event per `thought: true` text
+// part with `summaryDelta`; emit one `reasoning { encryptedDelta,
+// replaceEncrypted: true }` for any part carrying a `thoughtSignature`,
 // "last wins" because the signature on the final part is the authoritative
-// one per `gemini_docs/guides/thought-signatures.md`. We emit one `text`
+// one per `gemini_docs/guides/thought-signatures.md`. Emit one `text`
 // event per `thought:false` text part. `usageMetadata` → `usage`,
 // `finishReason` → `finish`.
 
@@ -1166,11 +1166,11 @@ export async function* splitGeminiStream(
   // streams — sections like "**Defining the Core Idea**…" and
   // "**Confirming the Transformation**…" arrive as separate parts).
   //
-  // We coalesce them into a SINGLE `reasoning.summary` row so the UI shows
-  // one continuous Summary block, not one row per section. The shared
+  // The splitter coalesces them into a SINGLE `reasoning.summary` row so the
+  // UI shows one continuous Summary block, not one row per section. The shared
   // `summaryIndex: 0` makes the accumulator (`putReasoningDetail` + the
   // synthetic id `summary#0`) merge each part into the same row via
-  // `mergeReasoningText`. We track section count to prepend a `\n\n`
+  // `mergeReasoningText`. Section count is tracked to prepend a `\n\n`
   // separator on non-first parts so the joined text has clean breaks
   // even on synthetic / probe inputs that don't already end with newlines.
   const counter = { summary: 0 }
@@ -1222,9 +1222,9 @@ function metaFromGemini(
   return dirty ? event : null
 }
 
-// One Gemini response body → lane events. We treat buffered and streaming
-// identically here: each frame carries candidates[0].content.parts that we
-// map to lane events, plus usageMetadata + finishReason.
+// One Gemini response body → lane events. Buffered and streaming are treated
+// identically here: each frame carries candidates[0].content.parts that map
+// to lane events, plus usageMetadata + finishReason.
 function* splitGeminiResponse(
   resp: GenerateContentResponseWire,
   counter: { summary: number },
@@ -1309,12 +1309,12 @@ function* splitGeminiPart(
     return
   }
 
-  // inlineData / fileData / functionResponse — Phase 12+ attachments. For
-  // Phase 11 we don't surface them on a lane; the buffered `chunk` still
+  // inlineData / fileData / functionResponse — Phase 12+ attachments. In
+  // Phase 11 they're not surfaced on a lane; the buffered `chunk` still
   // carries the raw object for downstream code that inspects it.
 }
 
-// Map Gemini's usageMetadata into our ChatCompletionUsageWire shape so the
+// Map Gemini's usageMetadata into the ChatCompletionUsageWire shape so the
 // accumulator speaks one usage type. `thoughtsTokenCount` becomes the
 // reasoning-tokens subfield on completion_tokens_details. promptTokensDetails
 // pass through for modality breakdowns.

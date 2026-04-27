@@ -1,22 +1,22 @@
 // Rough pre-send prompt-size estimate. See `plan/14-details.md §14.15` for
 // the tokenization ratio; `plan/10-ui.md §10.9` for the gauge this feeds.
 //
-// We do not have the model's tokenizer; we approximate with a family-keyed
-// char/token ratio. The number is ONLY used for UI context gauges and for
-// the truncation preview — the authoritative token count comes from the
-// stream's `usage.prompt_tokens`.
+// The model's tokenizer isn't available; the estimator approximates with a
+// family-keyed char/token ratio. The number is ONLY used for UI context
+// gauges and for the truncation preview; the authoritative token count comes
+// from the stream's `usage.prompt_tokens`.
 //
 // The estimate covers the active path, the system prompt, and the composer
 // draft. Attachments flow through `./media-context-tokens.ts`, which wraps
 // the shared LibreChat/OpenRouter media heuristics in `./media-tokens.ts`.
 // Callers that have an attachment table pass `attachmentResolver` to unlock
-// dimensions / page-count / bytes aware estimates; without it we fall back
-// to conservative family-specific constants.
+// dimensions / page-count / bytes aware estimates; without it the estimator
+// falls back to conservative family-specific constants.
 //
 // Reasoning echo: when an assistant message carries `reasoningDetails[]`,
 // the next turn echoes the subset allowed by the chat's `ReasoningInclude`
 // flags (`encrypted` / `summary` / `text`) back in the wire. That costs
-// prompt tokens — `filterReasoningForInclude` + `estimateReasoningEchoTokens`
+// prompt tokens. `filterReasoningForInclude` + `estimateReasoningEchoTokens`
 // live in `core/tokens.ts` and `core/reasoning.ts` respectively. Per-block
 // `hidden: true` is honored inside the filter, so toggling the eye on a
 // reasoning row drops its contribution from the gauge.
@@ -84,8 +84,8 @@ export interface PromptSizeEstimateInput {
   // Optional — resolved chars/token ratio for the CURRENT model under the
   // caller's chosen calibration mode (per-chat → global → family anchor).
   // When present, same-bucket rows use original-token + edit-delta math and
-  // other-model rows recompute fresh under this model. When absent, we fall
-  // back to the message cache or to the family anchor.
+  // other-model rows recompute fresh under this model. When absent, the
+  // estimator falls back to the message cache or to the family anchor.
   currentTextCharsPerToken?: number
   disableTextCalibration?: boolean
 }
@@ -203,8 +203,8 @@ export function estimatePromptSize(input: PromptSizeEstimateInput): PromptSizeEs
       : {}),
   })
 
-  // We always compute a character-based fallback estimate so edits,
-  // deletions, and inserts between sends are reflected immediately —
+  // A character-based fallback estimate always runs so edits,
+  // deletions, and inserts between sends are reflected immediately;
   // the provider-reported `prompt_tokens` on older assistant messages
   // is frozen at the time of that request and can lie about current
   // path content. The final number is max(fallback, calibrated) to
@@ -237,7 +237,7 @@ export function estimatePromptSize(input: PromptSizeEstimateInput): PromptSizeEs
     { ...(input.currentModelId !== undefined ? { modelId: input.currentModelId } : {}) },
   )
 
-  // Provider-calibrated estimate — use the LATEST reported usage on the
+  // Provider-calibrated estimate: use the LATEST reported usage on the
   // active path as a baseline, then estimate only the deltas after it.
   // `safeServerTokens` rejects negatives / NaN / non-number so a malicious
   // or buggy server can't poison the baseline.
@@ -338,8 +338,8 @@ export function estimatePromptSize(input: PromptSizeEstimateInput): PromptSizeEs
   const mediaTokens = Math.max(calibratedMedia, fallbackMedia) + draftMediaTokens
   const draftTokens = estimateTokens(input.draftText, family)
 
-  // Reasoning echo is computed from visible path only (we already
-  // filtered hiddenFromContext + deleted). Each assistant message with
+  // Reasoning echo is computed from visible path only (hiddenFromContext +
+  // deleted have already been filtered). Each assistant message with
   // `reasoningDetails[]` contributes the tokens whose `ReasoningInclude`
   // flag is on AND whose `hidden` flag is off, gated further by
   // preservation-format match for encrypted carriers.
@@ -419,7 +419,7 @@ export function buildSettingsPromptSizeEstimateInput(
   activePathMessages: Message[],
   draftText: string,
   endpointTokenizer: string | null | undefined,
-  // Provider/model cap — when provided AND the user hasn't set an explicit
+  // Provider/model cap. When provided AND the user hasn't set an explicit
   // `customMaxContext`, this becomes the cutoff used by the head+tail trim.
   // Pass `null` to skip cutoff entirely unless the user set `customMaxContext`
   // themselves (e.g. the send pipeline when capability hasn't loaded).
@@ -502,7 +502,7 @@ export function estimateSettingsPromptSize(
   activePathMessages: Message[],
   draftText: string,
   endpointTokenizer: string | null | undefined,
-  // Provider/model cap — when provided AND the user hasn't set an explicit
+  // Provider/model cap. When provided AND the user hasn't set an explicit
   // `customMaxContext`, this becomes the cutoff used by the head+tail trim.
   // Pass `null` to skip cutoff entirely unless the user set `customMaxContext`
   // themselves (e.g. the send pipeline when capability hasn't loaded).
@@ -527,7 +527,7 @@ export function estimateSettingsPromptSize(
 
 // Sentinel value for `customMaxContext` / `maxCompletionTokens` meaning
 // "no cap — rely on provider limits or OpenRouter middle-out compression."
-// The user types `-1` into the numeric input; we keep the stored value as
+// The user types `-1` into the numeric input; the stored value stays as
 // -1 so preset/chat round-tripping preserves intent, but budget math
 // treats it as `Infinity`.
 export const UNLIMITED_CONTEXT = -1

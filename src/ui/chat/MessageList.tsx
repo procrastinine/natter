@@ -131,9 +131,9 @@ export const MessageList = memo(function MessageList({
     ? prefillClassFor(chatSettings.model) !== 'unsupported'
     : false
   // Track the focused message id via a ref; the DOM's `:focus-within` +
-  // `data-message-id` tuple on each <article> tells us which message the
-  // user is navigating. Keeps keyboard shortcuts tied to "the message you
-  // just clicked" without forcing a controlled-selection state.
+  // `data-message-id` tuple on each <article> identifies which message the
+  // user is navigating. Keeps keyboard shortcuts tied to "the message just
+  // clicked" without forcing a controlled-selection state.
   const listRef = useRef<HTMLDivElement | null>(null)
   const focusedMessageId = useCallback((): MessageId | null => {
     const el = listRef.current?.querySelector<HTMLElement>('[data-ui="message"]:focus-within')
@@ -278,9 +278,9 @@ export const MessageList = memo(function MessageList({
   //   - before M       → opposite of M (forms a conversation pair with M)
   //   - after M        → opposite of M (the next turn in the dialogue).
   //                      This also handles the "after the last message"
-  //                      case naturally: if the chat ends on user, we
-  //                      seed an assistant; if it ends on assistant, we
-  //                      seed a user.
+  //                      case naturally: if the chat ends on user, an
+  //                      assistant is seeded; if it ends on assistant, a
+  //                      user is seeded.
   const openInsert = useCallback((target: MessageRow, slot: InsertSlot) => {
     const defaultRole = slot === 'sibling' ? target.role : oppositeRole(target.role)
     setInsertTarget({ messageId: target.id, slot, defaultRole })
@@ -454,8 +454,8 @@ function useStableMessageRows(messages: readonly MessageRow[]): readonly Message
 // Algorithm:
 // - System prompt tokens are taken off the budget up front.
 // - The first `keepFirstPairs * 2` messages are pinned.
-// - We walk backward from the end, accumulating, until the budget
-//   overflows; everything we didn't touch is "excluded".
+// - The walk goes backward from the end, accumulating, until the budget
+//   overflows; everything untouched is "excluded".
 function computeExcludedIds(
   path: readonly MessageRow[],
   settings: import('../../core/types').ChatSettings,
@@ -463,10 +463,10 @@ function computeExcludedIds(
 ): Set<MessageId> {
   const out = new Set<MessageId>()
   if (path.length === 0) return out
-  // Live provider cap beats stale defaults. Without capability we can't
-  // honestly compute exclusion, so we skip the trim-cost side (only
-  // hiddenFromContext messages are marked). The 128k fallback we used to
-  // carry here produced false "excluded" rings on 1M-context Gemini
+  // Live provider cap beats stale defaults. Without capability, exclusion
+  // can't be honestly computed, so the trim-cost side is skipped (only
+  // hiddenFromContext messages are marked). The 128k fallback formerly
+  // carried here produced false "excluded" rings on 1M-context Gemini
   // models whenever the chat grew past 128k.
   const providerCap = capability?.maxPromptTokens ?? capability?.contextLength
   const customMaxStored = settings.customMaxContext
@@ -493,7 +493,7 @@ function computeExcludedIds(
   // any budget either. Filter them out of the working set first.
   const eligible = path.filter((m) => !m.hiddenFromContext)
   for (const m of path) if (m.hiddenFromContext) out.add(m.id)
-  // No budget means we can't compute trim-based exclusion — only the
+  // No budget means trim-based exclusion can't be computed, only the
   // hiddenFromContext set stays.
   if (budget === undefined) return out
 
