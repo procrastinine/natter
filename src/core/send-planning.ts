@@ -18,6 +18,7 @@ import {
 import { resolvePrivacyForSend, type ResolvePrivacyForSendResult } from './privacy-request'
 import { providerDisplayName, providerRoutingRef } from './provider-identity'
 import { isTextCompletionsSelectableFor, quirksFor } from './quirks'
+import { applyOutboundContextRewrites } from './prompt-context'
 import { charsPerToken, readTokenCalibrationGlobal } from './token-calibration'
 import type { PromptEstimateOptions } from './tokens'
 import type {
@@ -538,45 +539,6 @@ function toOpenRouterVideoGeneration(
   return { wire, requestedModel: settings.model }
 }
 
-// `appendPrompt` is silently glued onto the LAST real user message right
-// before the wire transform runs. It never persists onto a stored row —
-// only this clone reaches the network. The synthetic continueUser wrapper
-// (id prefix `continue-user:`) is skipped so non-prefill Continue rides
-// the append on the previous user turn instead.
-const CONTINUE_USER_ID_PREFIX = 'continue-user:'
-
-function applyAppendPromptToPath(
-  path: readonly Message[],
-  appendPrompt: string,
-): Message[] {
-  if (appendPrompt.length === 0) return [...path]
-  for (let i = path.length - 1; i >= 0; i -= 1) {
-    const m = path[i]
-    if (!m) continue
-    if (m.role !== 'user') continue
-    if (m.id.startsWith(CONTINUE_USER_ID_PREFIX)) continue
-    const cloned: Message = { ...m, content: appendTextToContent(m.content, appendPrompt) }
-    return [...path.slice(0, i), cloned, ...path.slice(i + 1)]
-  }
-  return [...path]
-}
-
-function appendTextToContent(
-  content: readonly ContentItem[],
-  appendText: string,
-): ContentItem[] {
-  const next: ContentItem[] = [...content]
-  for (let i = next.length - 1; i >= 0; i -= 1) {
-    const item = next[i]
-    if (item && item.type === 'text') {
-      next[i] = { ...item, text: item.text + appendText }
-      return next
-    }
-  }
-  next.push({ type: 'text', text: appendText })
-  return next
-}
-
 function videoPromptFromPath(path: readonly Message[]): string {
   for (let i = path.length - 1; i >= 0; i -= 1) {
     const message = path[i]
@@ -603,6 +565,7 @@ export async function buildAssistantRequestPlan(
   input: AssistantRequestPlanInput,
 ): Promise<AssistantRequestPlan> {
   const settings = input.settings ?? input.chat.settings
+  const contextPathMessages = applyOutboundContextRewrites(input.pathMessages, settings)
   const stream = input.stream ?? true
   const useOpenRouterTextProtocol =
     settings.api === 'text' &&
@@ -620,7 +583,10 @@ export async function buildAssistantRequestPlan(
     readTokenCalibrationGlobal(),
     readGlobalPreferences(),
   ])
-  const preCutAttachmentContext = await loadAttachmentEstimateContext(input.pathMessages, settings)
+  const preCutAttachmentContext = await loadAttachmentEstimateContext(
+    contextPathMessages,
+    settings,
+  )
   const disableTextCalibration = preCutAttachmentContext.hasAttachments
   const currentTextCharsPerToken =
     settings.model && !disableTextCalibration
@@ -640,7 +606,7 @@ export async function buildAssistantRequestPlan(
     outboundReasoningOpts.reasoningPreservationFormat = outboundQuirks.reasoningPreservationFormat
   }
   const cutoffPath = applyContextCutoff({
-    messages: input.pathMessages,
+    messages: contextPathMessages,
     settings,
     tokenizer: outboundTokenizer,
     providerCap: outboundCapCandidate ?? null,
@@ -652,7 +618,7 @@ export async function buildAssistantRequestPlan(
     currentModelId: settings.model,
     ...(currentTextCharsPerToken !== undefined ? { currentTextCharsPerToken } : {}),
   })
-  const outboundPath = applyAppendPromptToPath(cutoffPath, settings.appendPrompt)
+  const outboundPath = cutoffPath
   const hasAttachmentContext = attachmentContextHasRefs({
     messages: outboundPath,
     policy: attachmentContextPolicyForSettings(settings),

@@ -2,7 +2,13 @@ import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type { ChatStreamChunk } from '../../src/api/types'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
-import type { ChatSettings, ConnectionProfile, Message } from '../../src/core/types'
+import type {
+  ChatSettings,
+  ConnectionProfile,
+  Message,
+  MessageRole,
+  ReasoningDetail,
+} from '../../src/core/types'
 import { continueAssistantInPlace } from '../../src/hooks/useContinue'
 import { sendFromMessage, sendText } from '../../src/hooks/useChat'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
@@ -39,6 +45,35 @@ function makeProfile(): ConnectionProfile {
     supportsPrivacyScrape: true,
     createdAt: 1,
     updatedAt: 1,
+  }
+}
+
+function makeOpenAiProfile(): ConnectionProfile {
+  return {
+    ...makeProfile(),
+    id: 'prof-openai',
+    name: 'OpenAI',
+    kind: 'openai-compatible',
+    baseUrl: 'https://api.openai.com/v1',
+    usesResponsesApiByDefault: true,
+    supportsEndpointsApi: false,
+    supportsGenerationApi: false,
+    supportsPrivacyScrape: false,
+  }
+}
+
+function makeGoogleNativeProfile(): ConnectionProfile {
+  return {
+    ...makeProfile(),
+    id: 'prof-google',
+    name: 'Google',
+    kind: 'google',
+    baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+    usesResponsesApiByDefault: false,
+    supportsEndpointsApi: false,
+    supportsGenerationApi: false,
+    supportsPrivacyScrape: false,
+    geminiMode: 'native',
   }
 }
 
@@ -82,6 +117,79 @@ function requireDefined<T>(value: T | undefined, label: string): T {
   expect(value).toBeDefined()
   if (value === undefined) throw new Error(`${label} missing`)
   return value
+}
+
+const LOREM_USER =
+  'Lorem ipsum dolor sit amet, consectetur adipiscing elit. Integer posuere erat a ante.'
+const LOREM_ASSISTANT =
+  'Sed ut perspiciatis unde omnis iste natus error sit voluptatem accusantium doloremque.'
+const LOREM_FOLLOWUP =
+  'Quisque rutrum, aenean imperdiet etiam ultricies nisi vel augue curabitur ullamcorper.'
+const SYSTEM_PROMPT =
+  'System: answer with concise citations, preserve variables, and never drop the requested format.'
+const APPEND_PROMPT = '\n\nAppend: verify assumptions and include the requested unit labels.'
+
+interface SeedMessage {
+  id: string
+  role: MessageRole
+  text: string
+  origin?: Message['origin']
+  reasoningDetails?: ReasoningDetail[]
+}
+
+async function seedLinearMessages(chatId: string, specs: readonly SeedMessage[]): Promise<Message[]> {
+  const repo = getBrowserRepository()
+  const rows: Message[] = []
+  let parentId: string | null = null
+  for (let i = 0; i < specs.length; i += 1) {
+    const spec = specs[i] as SeedMessage
+    const row: Message = {
+      id: spec.id,
+      chatId,
+      parentId,
+      siblingIndex: 0,
+      turnId: `seed-turn-${i}`,
+      turnIndex: i,
+      createdAt: 100 + i,
+      role: spec.role,
+      origin: spec.origin ?? (spec.role === 'assistant' ? 'generated' : 'user'),
+      content:
+        spec.role === 'assistant'
+          ? [{ type: 'output_text', text: spec.text }]
+          : [{ type: 'text', text: spec.text }],
+      nodeVersion: 0,
+      deleted: false,
+      ...(spec.reasoningDetails ? { reasoningDetails: spec.reasoningDetails } : {}),
+    }
+    await repo.runMutation(
+      [
+        { kind: 'message', messageId: row.id },
+        { kind: 'children', chatId, parentId },
+      ],
+      async (ctx) => {
+        await ctx.putMessage(row)
+      },
+    )
+    rows.push(row)
+    parentId = row.id
+  }
+  return rows
+}
+
+function captureChatDelta(
+  capture: (wire: Record<string, unknown>) => void,
+  text = 'ok',
+): NonNullable<Parameters<typeof sendText>[0]['openStream']> {
+  return (open) => {
+    capture(open.wireBody)
+    return stream({
+      type: 'delta',
+      chunk: {
+        id: 'almost-live',
+        choices: [{ delta: { content: text }, finish_reason: 'stop' }],
+      },
+    } as ChatStreamChunk)
+  }
 }
 
 async function warmOpenRouterPrivacy(modelId: string) {
@@ -133,6 +241,328 @@ beforeEach(async () => {
 
 afterEach(async () => {
   await reset()
+})
+
+describe('almost-live request shape matrix', () => {
+  it('normal send captures seeded history, system prompt, append prompt, and assistant prefill', async () => {
+    const modelId = 'google/gemini-3.1-flash-lite-preview'
+    await warmOpenRouterPrivacy(modelId)
+    const chat = await createChat({
+      settings: chatSettings({
+        model: modelId,
+        systemPrompt: SYSTEM_PROMPT,
+        appendPrompt: APPEND_PROMPT,
+      }),
+    })
+    await seedLinearMessages(chat.id, [
+      { id: 'seed-u1', role: 'user', text: LOREM_USER },
+      { id: 'seed-a1', role: 'assistant', text: LOREM_ASSISTANT },
+    ])
+
+    let wire: Record<string, unknown> | undefined
+    await sendText({
+      chatId: chat.id,
+      connection: makeProfile(),
+      apiKey: 'sk-test',
+      content: [{ type: 'text', text: LOREM_FOLLOWUP }],
+      prefillContent: [{ type: 'text', text: 'Prefilled opening sentence   ' }],
+      openStream: captureChatDelta((captured) => {
+        wire = captured
+      }),
+    })
+
+    const messages = (wire as { messages?: Array<{ role: string; content: unknown }> }).messages
+    expect(messages).toEqual([
+      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'user', content: LOREM_USER },
+      { role: 'assistant', content: LOREM_ASSISTANT },
+      { role: 'user', content: `${LOREM_FOLLOWUP}${APPEND_PROMPT}` },
+      { role: 'assistant', content: 'Prefilled opening sentence' },
+    ])
+    expect(wire?.input).toBeUndefined()
+    expect(wire?.provider).toMatchObject({ data_collection: 'deny' })
+  })
+
+  it('sendFromMessage captures the same append/system shape without creating another user turn', async () => {
+    const modelId = 'google/gemini-3.1-flash-lite-preview'
+    await warmOpenRouterPrivacy(modelId)
+    const chat = await createChat({
+      settings: chatSettings({
+        model: modelId,
+        systemPrompt: SYSTEM_PROMPT,
+        appendPrompt: APPEND_PROMPT,
+      }),
+    })
+    const [user] = await seedLinearMessages(chat.id, [
+      { id: 'edit-u1', role: 'user', text: LOREM_USER },
+    ])
+
+    let wire: Record<string, unknown> | undefined
+    await sendFromMessage({
+      chatId: chat.id,
+      connection: makeProfile(),
+      apiKey: 'sk-test',
+      parentMessageId: requireDefined(user, 'seeded user').id,
+      openStream: captureChatDelta((captured) => {
+        wire = captured
+      }),
+    })
+
+    const messages = (wire as { messages?: Array<{ role: string; content: unknown }> }).messages
+    expect(messages).toEqual([
+      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'user', content: `${LOREM_USER}${APPEND_PROMPT}` },
+    ])
+  })
+
+  it('legacy Continue captures continue prompts while append stays on the real user turn', async () => {
+    const modelId = 'google/gemini-3.1-flash-lite-preview'
+    await warmOpenRouterPrivacy(modelId)
+    const chat = await createChat({
+      settings: chatSettings({
+        model: modelId,
+        systemPrompt: SYSTEM_PROMPT,
+        appendPrompt: APPEND_PROMPT,
+        continueSystemPrompt: 'Continue the assistant text.\n\nOriginal system:\n[SYSTEM_PROMPT]',
+        continueUserPrompt: 'Continue from the exact next token.',
+      }),
+    })
+    const [, assistant] = await seedLinearMessages(chat.id, [
+      { id: 'cont-u1', role: 'user', text: LOREM_USER },
+      { id: 'cont-a1', role: 'assistant', text: LOREM_ASSISTANT },
+    ])
+
+    let wire: Record<string, unknown> | undefined
+    await continueAssistantInPlace({
+      chatId: chat.id,
+      targetMessageId: requireDefined(assistant, 'seeded assistant').id,
+      connection: makeProfile(),
+      apiKey: 'sk-test',
+      openStream: (open) => {
+        wire = open.wireBody
+        return stream({
+          type: 'delta',
+          chunk: {
+            id: 'almost-live-continue',
+            choices: [{ delta: { content: ' continuation' }, finish_reason: 'stop' }],
+          },
+        } as ChatStreamChunk)
+      },
+    })
+
+    const messages = (wire as { messages?: Array<{ role: string; content: unknown }> }).messages
+    expect(messages).toEqual([
+      {
+        role: 'system',
+        content: `Continue the assistant text.\n\nOriginal system:\n${SYSTEM_PROMPT}`,
+      },
+      { role: 'user', content: `${LOREM_USER}${APPEND_PROMPT}` },
+      { role: 'assistant', content: LOREM_ASSISTANT },
+      { role: 'user', content: 'Continue from the exact next token.' },
+    ])
+  })
+
+  it('Continue prefill captures append plus visible reasoning context and omits continue prompts', async () => {
+    const modelId = 'z-ai/glm-5.1'
+    await warmOpenRouterPrivacy(modelId)
+    const chat = await createChat({
+      settings: chatSettings({
+        model: modelId,
+        systemPrompt: SYSTEM_PROMPT,
+        appendPrompt: APPEND_PROMPT,
+        continueSystemPrompt: 'THIS CONTINUE SYSTEM PROMPT MUST NOT BE SENT',
+        continueUserPrompt: 'THIS CONTINUE USER PROMPT MUST NOT BE SENT',
+        continuePrefill: true,
+        reasoning: {
+          mode: 'off',
+          exclude: true,
+          summary: 'off',
+          carryForward: 'off',
+          include: { encrypted: false, summary: false, text: false },
+        },
+      }),
+    })
+    const [, assistant] = await seedLinearMessages(chat.id, [
+      { id: 'prefill-u1', role: 'user', text: LOREM_USER },
+      {
+        id: 'prefill-a1',
+        role: 'assistant',
+        text: LOREM_ASSISTANT,
+        reasoningDetails: [
+          { type: 'reasoning.text', text: 'Visible lorem reasoning.' },
+          { type: 'reasoning.text', text: 'Hidden lorem reasoning.', hidden: true },
+          { type: 'reasoning.encrypted', data: 'opaque-carrier' },
+        ],
+      },
+    ])
+
+    let wire: Record<string, unknown> | undefined
+    await continueAssistantInPlace({
+      chatId: chat.id,
+      targetMessageId: requireDefined(assistant, 'seeded assistant').id,
+      connection: makeProfile(),
+      apiKey: 'sk-test',
+      openStream: (open) => {
+        wire = open.wireBody
+        return stream({
+          type: 'delta',
+          chunk: {
+            id: 'almost-live-continue-prefill',
+            choices: [{ delta: { content: ' continuation' }, finish_reason: 'stop' }],
+          },
+        } as ChatStreamChunk)
+      },
+    })
+
+    const messages = (wire as { messages?: Array<{ role: string; content: unknown }> }).messages
+    expect(messages).toEqual([
+      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'user', content: `${LOREM_USER}${APPEND_PROMPT}` },
+      {
+        role: 'assistant',
+        content: `<think>\nVisible lorem reasoning.\n</think>\n\n${LOREM_ASSISTANT}`,
+      },
+    ])
+    expect(JSON.stringify(wire)).not.toContain('THIS CONTINUE')
+    expect(JSON.stringify(wire)).not.toContain('Hidden lorem reasoning.')
+    expect(JSON.stringify(wire)).not.toContain('opaque-carrier')
+  })
+
+  it('Responses and Gemini native sends expose valid transport-specific request shapes', async () => {
+    const openAiChat = await createChat({
+      settings: chatSettings({
+        profileId: 'prof-openai',
+        model: 'gpt-5.4',
+        systemPrompt: SYSTEM_PROMPT,
+        appendPrompt: APPEND_PROMPT,
+      }),
+    })
+    await seedLinearMessages(openAiChat.id, [
+      { id: 'resp-u1', role: 'user', text: LOREM_USER },
+      { id: 'resp-a1', role: 'assistant', text: LOREM_ASSISTANT },
+    ])
+
+    let responsesWire: Record<string, unknown> | undefined
+    await sendText({
+      chatId: openAiChat.id,
+      connection: makeOpenAiProfile(),
+      apiKey: 'sk-test',
+      content: [{ type: 'text', text: LOREM_FOLLOWUP }],
+      openStream: captureChatDelta((captured) => {
+        responsesWire = captured
+      }),
+    })
+
+    expect(responsesWire?.instructions).toBe(SYSTEM_PROMPT)
+    expect(responsesWire?.messages).toBeUndefined()
+    expect(responsesWire?.provider).toBeUndefined()
+    const responseInput = responsesWire?.input as Array<{
+      type: string
+      role?: string
+      content?: Array<{ type: string; text?: string }>
+    }>
+    expect(responseInput.map((item) => item.role)).toEqual(['user', 'assistant', 'user'])
+    expect(responseInput[2]?.content?.[0]?.text).toBe(`${LOREM_FOLLOWUP}${APPEND_PROMPT}`)
+
+    const geminiChat = await createChat({
+      settings: chatSettings({
+        profileId: 'prof-google',
+        model: 'google/gemini-3.1-flash-lite-preview',
+        systemPrompt: SYSTEM_PROMPT,
+        appendPrompt: APPEND_PROMPT,
+      }),
+    })
+    await seedLinearMessages(geminiChat.id, [
+      { id: 'gem-u1', role: 'user', text: LOREM_USER },
+      { id: 'gem-a1', role: 'assistant', text: LOREM_ASSISTANT },
+    ])
+
+    let geminiWire: Record<string, unknown> | undefined
+    await sendText({
+      chatId: geminiChat.id,
+      connection: makeGoogleNativeProfile(),
+      apiKey: 'sk-test',
+      content: [{ type: 'text', text: LOREM_FOLLOWUP }],
+      openStream: captureChatDelta((captured) => {
+        geminiWire = captured
+      }),
+    })
+
+    expect(geminiWire?.systemInstruction).toEqual({
+      role: 'system',
+      parts: [{ text: SYSTEM_PROMPT }],
+    })
+    expect(geminiWire?.messages).toBeUndefined()
+    expect(geminiWire?.input).toBeUndefined()
+    const contents = geminiWire?.contents as Array<{
+      role: string
+      parts: Array<{ text?: string }>
+    }>
+    expect(contents.map((item) => item.role)).toEqual(['user', 'model', 'user'])
+    expect(contents[2]?.parts?.[0]?.text).toBe(`${LOREM_FOLLOWUP}${APPEND_PROMPT}`)
+  })
+
+  it('text-completions send captures a rendered prompt with the same rewritten context', async () => {
+    const modelId = 'meta-llama/llama-3.3-70b-instruct'
+    await putCachedEndpoints('prof', modelId, {
+      id: modelId,
+      endpoints: [
+        {
+          provider_name: 'Trusted Host',
+          provider_slug: 'trusted-host',
+          supported_parameters: ['provider', 'max_tokens', 'reasoning'],
+          context_length: 200000,
+          pricing: {},
+        },
+      ],
+    })
+    await putCachedPrivacyPolicy('prof', modelId, {
+      policies: {
+        'Trusted Host': {
+          training: false,
+          trainingOpenRouter: false,
+          retainsPrompts: false,
+          canPublish: false,
+          termsOfServiceURL: '',
+          privacyPolicyURL: '',
+        },
+      },
+      fetchedAt: 0,
+    })
+    const chat = await createChat({
+      settings: chatSettings({
+        model: modelId,
+        api: 'text',
+        textTemplate: 'chatml',
+        systemPrompt: SYSTEM_PROMPT,
+        appendPrompt: APPEND_PROMPT,
+        maxCompletionTokens: 64,
+      }),
+    })
+    await seedLinearMessages(chat.id, [
+      { id: 'text-u1', role: 'user', text: LOREM_USER },
+      { id: 'text-a1', role: 'assistant', text: LOREM_ASSISTANT },
+    ])
+
+    let wire: Record<string, unknown> | undefined
+    await sendText({
+      chatId: chat.id,
+      connection: makeProfile(),
+      apiKey: 'sk-test',
+      content: [{ type: 'text', text: LOREM_FOLLOWUP }],
+      openStream: captureChatDelta((captured) => {
+        wire = captured
+      }),
+    })
+
+    expect(wire?.messages).toBeUndefined()
+    expect(wire?.input).toBeUndefined()
+    expect(wire?.prompt).toContain(`<|im_start|>system\n${SYSTEM_PROMPT}<|im_end|>`)
+    expect(wire?.prompt).toContain(`<|im_start|>user\n${LOREM_USER}<|im_end|>`)
+    expect(wire?.prompt).toContain(`<|im_start|>assistant\n${LOREM_ASSISTANT}<|im_end|>`)
+    expect(wire?.prompt).toContain(`<|im_start|>user\n${LOREM_FOLLOWUP}${APPEND_PROMPT}<|im_end|>`)
+    expect(wire?.max_tokens).toBe(64)
+  })
 })
 
 describe('send action routing', () => {

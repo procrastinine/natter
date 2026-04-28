@@ -136,7 +136,7 @@ describe('estimatePromptSize — fallback branch', () => {
     expect(est.total).toBe(est.systemTokens + est.historyTokens + est.draftTokens + est.mediaTokens)
   })
 
-  it('folds appendPromptText into historyTokens so the gauge tracks the wire', () => {
+  it('folds appendPrompt into the last user message before estimating', () => {
     const path = [makeMessage({ role: 'user', text: 'hello world hello world' })]
     const without = estimatePromptSize({
       systemPrompt: '',
@@ -144,15 +144,41 @@ describe('estimatePromptSize — fallback branch', () => {
       draftText: '',
       tokenizer: DEFAULT_TOKENIZER,
     })
-    const withAppend = estimatePromptSize({
-      systemPrompt: '',
-      appendPromptText: '\n\nMake sure to double-check your work before finalizing.',
-      activePathMessages: path,
-      draftText: '',
-      tokenizer: DEFAULT_TOKENIZER,
-    })
+    const settings = cloneDefaultChatSettings()
+    settings.model = 'openai/gpt-4o'
+    settings.appendPrompt = '\n\nMake sure to double-check your work before finalizing.'
+    const input = buildSettingsPromptSizeEstimateInput(
+      settings,
+      path,
+      '',
+      tokenizerFromSettings(settings, null),
+    )
+    const withAppend = estimatePromptSize(input)
+    const rewrittenUser = input.activePathMessages.find((m) => m.role === 'user')
+    expect(rewrittenUser?.content).toEqual([
+      {
+        type: 'text',
+        text: 'hello world hello world\n\nMake sure to double-check your work before finalizing.',
+      },
+    ])
     expect(withAppend.historyTokens).toBeGreaterThan(without.historyTokens)
     expect(withAppend.total).toBe(without.total + (withAppend.historyTokens - without.historyTokens))
+  })
+
+  it('applies appendPrompt before cutoff so appended tokens can evict an overflowing pair', () => {
+    const settings = cloneDefaultChatSettings()
+    settings.model = 'openai/gpt-4o'
+    settings.customMaxContext = 12
+    settings.maxCompletionTokens = 0
+    settings.contextStrategy = { ...settings.contextStrategy, keepFirstPairs: 0 }
+    settings.appendPrompt = '\n\n' + 'x'.repeat(200)
+    const input = buildSettingsPromptSizeEstimateInput(
+      settings,
+      [makeMessage({ role: 'user', text: 'short' })],
+      '',
+      tokenizerFromSettings(settings, null),
+    )
+    expect(input.activePathMessages).toHaveLength(0)
   })
 
   it('skips hiddenFromContext messages in both branches', () => {

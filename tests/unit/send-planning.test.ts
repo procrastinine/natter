@@ -622,6 +622,33 @@ describe('resolveRequestPrivacyPlan', () => {
     expect(outboundLastUser).not.toBe(stored)
   })
 
+  it('applies appendPrompt before context cutoff instead of after it', async () => {
+    const profile = makeOpenAiProfile()
+    const chat = makeChat({
+      profileId: profile.id,
+      model: 'gpt-4o',
+      api: 'chat',
+      customMaxContext: 12,
+      maxCompletionTokens: 0,
+      contextStrategy: {
+        ...cloneDefaultChatSettings().contextStrategy,
+        keepFirstPairs: 0,
+      },
+      appendPrompt: '\n\n' + 'x'.repeat(200),
+    })
+
+    const { requestPlan } = await prepareAssistantRequestPlan({
+      chat,
+      connection: profile,
+      pathMessages: [makeMessage('short')],
+      draftText: '',
+    })
+
+    const wireMessages = requestPlan.wire.messages as Array<{ role: string; content: unknown }>
+    expect(requestPlan.outboundPath).toHaveLength(0)
+    expect(wireMessages.some((m) => m.role === 'user')).toBe(false)
+  })
+
   it('non-prefill continue rides appendPrompt on the previous user turn, not the synthetic continueUser wrapper', async () => {
     const profile = makeOpenAiProfile()
     const chat = makeChat({
@@ -661,6 +688,95 @@ describe('resolveRequestPrivacyPlan', () => {
       'Solve x^2 = 9.\n\nDouble-check your work.',
       'continue from where you left off.',
     ])
+  })
+
+  it('continue-prefill injects visible plaintext reasoning as think context even when reasoning echo is off', async () => {
+    const profile = makeOpenAiProfile()
+    const chat = makeChat({
+      profileId: profile.id,
+      model: 'gpt-4o',
+      api: 'chat',
+      reasoning: {
+        ...cloneDefaultChatSettings().reasoning,
+        mode: 'off',
+        exclude: true,
+        include: { encrypted: false, summary: false, text: false },
+      },
+    })
+    const user = makeMessage('Explain the proof.')
+    const prefillAssistant: Message = {
+      ...makeMessage('Partial answer'),
+      id: 'a1',
+      parentId: user.id,
+      role: 'assistant',
+      origin: 'prefill',
+      content: [{ type: 'output_text', text: 'Partial answer' }],
+      reasoningDetails: [
+        { type: 'reasoning.encrypted', data: 'opaque' },
+        { type: 'reasoning.text', text: 'visible chain' },
+        { type: 'reasoning.summary', summary: 'visible summary' },
+      ],
+    }
+
+    const { requestPlan } = await prepareAssistantRequestPlan({
+      chat,
+      connection: profile,
+      pathMessages: [user, prefillAssistant],
+      draftText: '',
+    })
+
+    const wireMessages = requestPlan.wire.messages as Array<{
+      role: string
+      content: unknown
+      reasoning_details?: unknown
+    }>
+    const assistantWire = wireMessages.find((m) => m.role === 'assistant')
+    expect(assistantWire?.content).toBe(
+      '<think>\nvisible chain\n\nSummary: visible summary\n</think>\n\nPartial answer',
+    )
+    expect(assistantWire).not.toHaveProperty('reasoning_details')
+    expect(prefillAssistant.reasoningDetails).toHaveLength(3)
+  })
+
+  it('continue-prefill honors hidden reasoning and leaves an open think block when only reasoning exists', async () => {
+    const profile = makeOpenAiProfile()
+    const chat = makeChat({
+      profileId: profile.id,
+      model: 'gpt-4o',
+      api: 'chat',
+      reasoning: {
+        ...cloneDefaultChatSettings().reasoning,
+        mode: 'off',
+        exclude: true,
+        include: { encrypted: false, summary: false, text: false },
+      },
+    })
+    const user = makeMessage('Continue when ready.')
+    const prefillAssistant: Message = {
+      ...makeMessage(''),
+      id: 'a1',
+      parentId: user.id,
+      role: 'assistant',
+      origin: 'prefill',
+      content: [],
+      reasoningDetails: [
+        { type: 'reasoning.text', text: 'do not send me', hidden: true },
+        { type: 'reasoning.text', text: 'still thinking' },
+      ],
+    }
+
+    const { requestPlan } = await prepareAssistantRequestPlan({
+      chat,
+      connection: profile,
+      pathMessages: [user, prefillAssistant],
+      draftText: '',
+    })
+
+    const wireMessages = requestPlan.wire.messages as Array<{ role: string; content: unknown }>
+    const assistantWire = wireMessages.find((m) => m.role === 'assistant')
+    expect(assistantWire?.content).toBe('<think>\nstill thinking')
+    expect(String(assistantWire?.content)).not.toContain('</think>')
+    expect(String(assistantWire?.content)).not.toContain('do not send me')
   })
 
   it('omits appendPrompt entirely when the slot is blank', async () => {

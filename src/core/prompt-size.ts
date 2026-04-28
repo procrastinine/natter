@@ -35,6 +35,7 @@ import {
   type AttachmentResolver,
 } from './media-context-tokens'
 import { quirksFor } from './quirks'
+import { applyOutboundContextRewrites } from './prompt-context'
 import { charsPerToken, readPathTextTokenEstimate, type CalibrationMode } from './token-calibration'
 import { clampTokens, safeContent, safeServerTokens } from './token-guards'
 import {
@@ -59,10 +60,6 @@ export type { AttachmentResolver } from './media-context-tokens'
 
 export interface PromptSizeEstimateInput {
   systemPrompt: string
-  // Silently glued onto the last user message at send time. Counted on top
-  // of historyTokens so the gauge matches the wire. Omit (or pass '') when
-  // the chat has no append prompt configured.
-  appendPromptText?: string
   activePathMessages: Message[]
   draftText: string
   tokenizer: TokenizerFamily
@@ -92,6 +89,7 @@ export interface PromptSizeEstimateInput {
   // estimator falls back to the message cache or to the family anchor.
   currentTextCharsPerToken?: number
   disableTextCalibration?: boolean
+  contextRewriteKey?: string
 }
 
 export interface TokenEstimateCalibrationContext {
@@ -196,7 +194,6 @@ function pathHasVisibilityExclusions(messages: readonly Message[]): boolean {
 export function estimatePromptSize(input: PromptSizeEstimateInput): PromptSizeEstimate {
   const family = input.tokenizer
   const systemTokens = estimateTokens(input.systemPrompt, family)
-  const appendPromptTokens = estimateTokens(input.appendPromptText ?? '', family)
   const attachmentRefsByOwner = resolveAttachmentContextRefs({
     messages: input.activePathMessages,
     policy: {
@@ -338,10 +335,8 @@ export function estimatePromptSize(input: PromptSizeEstimateInput): PromptSizeEs
     calibratedMedia = media
   }
   // Conservative: never report below the char-based estimate so edits
-  // that grew a pre-baseline message are still reflected. The append-prompt
-  // rides on the last user message at wire time, so its cost is folded into
-  // historyTokens here for parity with what gets sent.
-  const historyTokens = Math.max(calibratedHistory, fallbackHistory) + appendPromptTokens
+  // that grew a pre-baseline message are still reflected.
+  const historyTokens = Math.max(calibratedHistory, fallbackHistory)
   const mediaTokens = Math.max(calibratedMedia, fallbackMedia) + draftMediaTokens
   const draftTokens = estimateTokens(input.draftText, family)
 
@@ -395,7 +390,7 @@ export function promptEstimateInputSignature(
 ): string {
   return JSON.stringify({
     systemPrompt: input.systemPrompt,
-    appendPromptText: input.appendPromptText ?? '',
+    contextRewriteKey: input.contextRewriteKey ?? '',
     draftText: input.draftText,
     draftAttachmentRefs: attachmentRefSignature(input.draftAttachmentRefs),
     tokenizer: input.tokenizer,
@@ -438,9 +433,10 @@ export function buildSettingsPromptSizeEstimateInput(
 ): PromptSizeEstimateInput {
   const quirks = quirksFor(settings.model)
   const tokenizer = tokenizerFromSettings(settings, endpointTokenizer ?? null)
+  const contextPathMessages = applyOutboundContextRewrites(activePathMessages, settings)
   const attachmentPolicy = attachmentContextPolicyForSettings(settings)
   const contextHasAttachments = attachmentContextHasRefs({
-    messages: activePathMessages,
+    messages: contextPathMessages,
     policy: attachmentPolicy,
     ...(draftAttachmentRefs ? { draft: { refs: draftAttachmentRefs, role: 'user' } } : {}),
   })
@@ -464,7 +460,7 @@ export function buildSettingsPromptSizeEstimateInput(
   }
 
   const plan = computeCutoffPlan({
-    messages: activePathMessages,
+    messages: contextPathMessages,
     settings,
     tokenizer,
     providerCap,
@@ -477,11 +473,10 @@ export function buildSettingsPromptSizeEstimateInput(
     ...(currentTextCharsPerToken !== undefined ? { currentTextCharsPerToken } : {}),
   })
   const baselineInvalidated =
-    plan.applied || contextHasAttachments || pathHasVisibilityExclusions(activePathMessages)
+    plan.applied || contextHasAttachments || pathHasVisibilityExclusions(contextPathMessages)
 
   const input: PromptSizeEstimateInput = {
     systemPrompt: settings.systemPrompt,
-    ...(settings.appendPrompt.length > 0 ? { appendPromptText: settings.appendPrompt } : {}),
     activePathMessages: plan.kept,
     draftText,
     ...(draftAttachmentRefs ? { draftAttachmentRefs } : {}),
@@ -497,6 +492,7 @@ export function buildSettingsPromptSizeEstimateInput(
     reasoningExcluded: settings.reasoning.exclude === true,
     ...(attachmentResolver !== undefined ? { attachmentResolver } : {}),
     currentModelId: settings.model,
+    ...(settings.appendPrompt.length > 0 ? { contextRewriteKey: settings.appendPrompt } : {}),
     ...(contextHasAttachments ? { disableTextCalibration: true } : {}),
     ...(currentTextCharsPerToken !== undefined ? { currentTextCharsPerToken } : {}),
   }
