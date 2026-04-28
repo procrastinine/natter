@@ -18,6 +18,9 @@
   color: var(--color-fg-secondary);
   position: relative;
   flex-wrap: wrap;
+  /* Same lock as settings-pane-header — keep the breadcrumb at its
+   * natural height regardless of inner panel overflow. */
+  flex: 0 0 auto;
 }
 
 [data-ui="preset-breadcrumb-label"] {
@@ -156,8 +159,6 @@
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
-  padding-bottom: var(--space-4);
-  border-bottom: 1px solid var(--color-border-subtle);
   margin-bottom: var(--space-3);
 }
 
@@ -967,6 +968,17 @@
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: var(--space-2);
+}
+
+[data-ui="sampling-stop-row"] {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+[data-ui="sampling-stop-label"] {
+  font-size: var(--font-size-sm);
+  color: var(--color-fg-secondary);
 }
 
 [data-ui="sampling-field"] {

@@ -91,20 +91,19 @@
 }
 
 /* ─────────────────────────────────────────────────────────────────
- * Privacy section in the chat-model panel.
+ * Privacy block — nested inside the Providers section on the Model
+ * tab. Reads as a sub-region under the provider list, not its own
+ * top-level section.
  * ─────────────────────────────────────────────────────────────── */
 
-[data-ui-section="privacy-section"] {
-  padding-top: var(--space-4);
+[data-ui="privacy-block"] {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
 }
 
-[data-ui="privacy-section-header"] h3 {
-  margin: 0;
-  font-size: var(--font-size-md);
+[data-ui="privacy-block-label"] {
   color: var(--color-fg-primary);
-  font-weight: var(--font-weight-semibold);
-  letter-spacing: normal;
-  text-transform: none;
 }
 
 [data-ui="privacy-section-list"] {

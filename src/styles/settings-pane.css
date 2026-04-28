@@ -22,6 +22,15 @@
   padding: var(--space-3) var(--space-4);
   border-bottom: 1px solid var(--color-border-subtle);
   min-height: var(--header-height);
+  /* Lock the natural height so the chat-model-panel's flex column can't
+   * squish the header when the inner settings-panel content overflows. */
+  flex: 0 0 auto;
+}
+
+/* Same lock for the in-panel notice banner — without it, the banner's
+ * default flex-shrink: 1 lets it compress on tabs whose content scrolls. */
+[data-ui="chat-model-panel"] > [data-ui="notice-banner"] {
+  flex: 0 0 auto;
 }
 
 [data-ui="settings-pane-header"] h2,
@@ -44,11 +53,16 @@
 /* Tab strip. No `overflow-x: auto` — that triggers a horizontal
  * scrollbar gutter even when the tabs fit, which the user flagged.
  * Tabs are sized by their content; if a future tab list overflows the
- * modal width the row wraps to a second row instead of scrolling. */
+ * modal width the row wraps to a second row instead of scrolling. The
+ * outer gutter is the gap between leftmost/rightmost tab and the panel
+ * edge; per-tab horizontal padding (below) is the gap between adjacent
+ * tabs. The four-tab row (Model / Context / Prompts / Generation) only
+ * fits a 360px-wide chat-model panel when the strip's edge padding is
+ * tight, so this stays at `--space-3`. */
 [data-ui="settings-tabs"] {
   display: flex;
   gap: 0;
-  padding: 0 var(--space-4);
+  padding: 0;
   border-bottom: 1px solid var(--color-border-default);
   flex: 0 0 auto;
   flex-wrap: wrap;
@@ -75,14 +89,34 @@
   background: transparent;
 }
 
+/* Restore the gray hover / press feedback. The shared button hover rule in
+ * `primitives.css` is wrapped in `:where()` so its background lands at
+ * (0,1,0) — tied with the resting `[data-ui="settings-tab"] { background:
+ * transparent }` declaration above and stomped by source order. Re-asserting
+ * the hover/active background here lifts the specificity to (0,2,1). */
 [data-ui="settings-tab"]:hover:not([aria-selected="true"]) {
   color: var(--color-fg-secondary);
+  background: var(--color-bg-hover);
+}
+
+[data-ui="settings-tab"]:active:not([aria-selected="true"]) {
+  background: var(--color-bg-active);
 }
 
 [data-ui="settings-panel"] {
   flex: 1 1 auto;
+  /* Same min-height: 0 trick as the chat-model-panel grid item: the flex
+   * default of `min-height: auto` would let the panel grow with its content
+   * and bypass overflow-y entirely. */
+  min-height: 0;
   overflow-y: auto;
   padding: var(--space-4);
+  /* `position: relative` anchors the visually-hidden field labels (a11y
+   * `position: absolute` elements) to this panel instead of letting them
+   * escape to the initial containing block. Without it the absolute labels
+   * inflate `<html>`'s scrollHeight when the Prompts tab grows long, which
+   * paints a stray vertical scrollbar across the entire window. */
+  position: relative;
 }
 
 /* Section rhythm: keep within-section spacing comfortable so labelled
@@ -103,6 +137,18 @@
   font-weight: var(--font-weight-semibold);
   letter-spacing: normal;
   text-transform: none;
+}
+
+/* Separator rule above selected sections so the panel reads as grouped
+ * blocks rather than a flat stack. Mirrors the line below the model
+ * picker. `:not(:first-child)` keeps the line off when prior sections
+ * happen to be hidden (e.g. reasoning + verbosity both gated out). */
+[data-ui="settings-section"][data-ui-section="reasoning-include"]:not(:first-child),
+[data-ui="settings-section"][data-ui-section="hosted-tools"]:not(:first-child),
+[data-ui="settings-section"][data-ui-section="sampling"]:not(:first-child),
+[data-ui="settings-section"][data-ui-section="provider-picker"]:not(:first-child) {
+  border-top: 1px solid var(--color-border-subtle);
+  padding-top: var(--space-4);
 }
 
 [data-ui="settings-disclosure-summary"] {
@@ -193,11 +239,27 @@
   accent-color: var(--color-accent);
 }
 
-[data-ui="system-prompt-textarea"] {
-  min-height: 160px;
+/* Every prompt-slot textarea (System / Append / default Prefill /
+ * Continue-system / Continue-user) shares one typography rule so the
+ * Prompts tab reads as a single set of inputs rather than five differently
+ * sized boxes. Mono font + sm size matches the System slot's earlier look. */
+[data-ui="system-prompt-textarea"],
+[data-ui="append-prompt-textarea"],
+[data-ui="default-prefill-textarea"],
+[data-ui="continue-system-prompt-textarea"],
+[data-ui="continue-user-prompt-textarea"] {
   font-family: var(--font-mono);
   font-size: var(--font-size-sm);
   line-height: var(--line-height-body);
+  resize: vertical;
+}
+
+[data-ui="system-prompt-textarea"] {
+  min-height: 160px;
+}
+
+[data-ui="append-prompt-textarea"] {
+  min-height: 100px;
 }
 
 [data-ui="text-template-editor"] {
@@ -230,16 +292,10 @@
 [data-ui="continue-system-prompt-textarea"],
 [data-ui="continue-user-prompt-textarea"] {
   min-height: 90px;
-  font-size: var(--font-size-sm);
-  line-height: var(--line-height-body);
-  resize: vertical;
 }
 
 [data-ui="default-prefill-textarea"] {
   min-height: 80px;
-  font-size: var(--font-size-sm);
-  line-height: var(--line-height-body);
-  resize: vertical;
 }
 
 [data-ui="prefill-settings-prompt"] {
@@ -295,12 +351,27 @@
 
 /* Prompt-slot header pairs the section title with the inline preset picker,
  * so the whole section (title + picker + textarea) reads as one unit. The
- * title is a button — clicking it expands / collapses the section body. */
+ * title is a button — clicking it expands / collapses the section body. The
+ * info-disclosure (i) icon sits next to the title inside `title-group`, so
+ * the toggle button doesn't nest another button inside itself. */
 [data-ui="prompt-slot-header"] {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: var(--space-2);
+  /* Reserve the height of the preset picker button so collapsed and
+   * expanded states share a row height — keeps the title from drifting
+   * when the picker mounts. The picker button below pins itself to the
+   * same height so neither side can grow the row. */
+  min-height: 24px;
+}
+
+[data-ui="prompt-slot-title-group"] {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex: 1 1 auto;
+  min-width: 0;
 }
 
 [data-ui="prompt-slot-toggle"] {
@@ -316,7 +387,7 @@
   font: inherit;
   text-align: left;
   min-width: 0;
-  flex: 1 1 auto;
+  flex: 0 0 auto;
 }
 
 [data-ui="prompt-slot-toggle"] > h3 {
@@ -335,6 +406,12 @@
 
 [data-ui="prompt-preset-picker"] {
   position: relative;
+  /* Use flex so the wrapper hugs the button height exactly. As a block
+   * container with an inline-flex child, the inherited 22.5px strut and
+   * the button's 24px box stacked into a 25px line box, growing the
+   * header row by 1px on expand. */
+  display: flex;
+  align-items: center;
 }
 
 [data-ui="prompt-preset-picker-button"] {
@@ -344,9 +421,15 @@
   background: transparent;
   border: 1px solid var(--color-border-subtle);
   border-radius: var(--radius-sm);
-  padding: 2px var(--space-2);
+  padding: 0 var(--space-2);
+  /* box-sizing pins the visual height to 24px so it can't grow the
+   * header row (default content-box would add the 1px borders, making
+   * the row 26px on expand and 24px when collapsed → 1px title drift). */
+  box-sizing: border-box;
+  height: 24px;
   font: inherit;
   font-size: var(--font-size-xs);
+  line-height: 1;
   color: var(--color-fg-secondary);
   cursor: pointer;
 }
@@ -440,38 +523,6 @@
   gap: var(--space-1);
 }
 
-[data-ui="segmented-control"] {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  border: 1px solid var(--color-border-subtle);
-  border-radius: var(--radius-sm);
-  overflow: hidden;
-  margin: 0;
-  padding: 0;
-  min-inline-size: 0;
-}
-
-[data-ui="segmented-control"] > button {
-  min-width: 0;
-  border: none;
-  border-right: 1px solid var(--color-border-subtle);
-  background: var(--color-bg-surface-1);
-  color: var(--color-fg-secondary);
-  padding: var(--space-2);
-  cursor: pointer;
-  font-size: var(--font-size-xs);
-}
-
-[data-ui="segmented-control"] > button:last-child {
-  border-right: none;
-}
-
-[data-ui="segmented-control"] > button[aria-pressed="true"] {
-  background: var(--color-accent-subtle);
-  color: var(--color-fg-primary);
-  font-weight: var(--font-weight-medium);
-}
-
 /* Inline link-like action embedded inside a <label> (e.g. Reset to
  * default next to a field name). Text-only, muted so it doesn't
  * compete with the label itself. */
@@ -503,7 +554,8 @@
   color: var(--color-fg-muted);
 }
 
-[data-ui="system-prompt-token-estimate"] {
+[data-ui="system-prompt-token-estimate"],
+[data-ui="append-prompt-token-estimate"] {
   align-self: flex-end;
   color: var(--color-fg-muted);
   font-size: var(--font-size-xs);

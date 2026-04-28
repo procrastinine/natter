@@ -415,12 +415,12 @@ function MessageInner({
       </button>
       <div data-ui="message-body-column">
         <MessageHeader message={message} />
-        {collapseMode === 'full' && reasoning.length > 0 ? (
+        {collapseMode === 'full' && reasoning.length > 0 && !editing ? (
           <ReasoningBlock
             details={reasoning}
             streaming={isStreaming}
             hasContent={hasContent}
-            {...(message.role === 'assistant' && !editing
+            {...(message.role === 'assistant'
               ? { onToggleHidden: handleToggleReasoningHidden }
               : {})}
           />

@@ -551,6 +551,102 @@ export function registerSchema(db: Dexie): void {
           if (result.changed) preset.settings = result.settings
         })
     })
+
+  // v8: appendPrompt slot lands on ChatSettings as a fourth preset-pinnable
+  // prompt. Existing rows get a blank string so reads always see the field.
+  db.version(8)
+    .stores({
+      chats:
+        'id, updatedAt, createdAt, lastViewedAt, lastUpdatedLeafId, lastBranchUpdatedAt, wordCount, totalCostUsd, archived, pinned, presetId, folderId, *tags',
+      messages:
+        'id, chatId, parentId, turnId, [chatId+parentId], [chatId+createdAt], [chatId+turnId], [chatId+deleted]',
+      childLists: 'id, [chatId+parentId], updatedAt',
+      attachments: 'id, contentHash, kind, mime, origin, refCount, createdAt, updatedAt, deletedAt',
+      attachmentBlobs: 'id, attachmentId, role, contentHash, createdAt',
+      attachmentArtifacts: 'artifactId, attachmentId, kind, processorId, createdAt',
+      attachmentJobs:
+        'id, attachmentId, processorId, status, updatedAt, [attachmentId+processorId+inputHash]',
+      profiles: 'id, name, kind, lastUsedAt, archived',
+      presets: 'id, name, connectionProfileId, lastUsedAt, archived',
+      promptPresets: 'id, kind, name, lastUsedAt',
+      folders: 'id, name, sortIndex, lastUsedAt',
+      tags: 'id, &nameLower, lastUsedAt',
+      chatBranchCache: '&chatId, branchLeafId, generatedAt',
+      keys: 'id, name',
+      settings: '&key',
+      models: '&[profileId+queryKey], fetchedAt',
+      endpoints: '&[profileId+modelId], fetchedAt',
+      privacyPolicies: '&[profileId+modelId], fetchedAt',
+      providers: '&profileId, fetchedAt',
+      generations: 'id, chatId, gen_id',
+      presetResolutions: '&[profileId+presetSlug], fetchedAt',
+      drafts: '&chatId, updatedAt',
+    })
+    .upgrade(async (tx) => {
+      await tx
+        .table<Chat>('chats')
+        .toCollection()
+        .modify((chat) => {
+          const s = chat.settings as Chat['settings'] & { appendPrompt?: string }
+          if (typeof s.appendPrompt !== 'string') s.appendPrompt = ''
+        })
+      await tx
+        .table<ChatPreset>('presets')
+        .toCollection()
+        .modify((preset) => {
+          const s = preset.settings as ChatPreset['settings'] & { appendPrompt?: string }
+          if (typeof s.appendPrompt !== 'string') s.appendPrompt = ''
+        })
+    })
+
+  // v9: defaultPrefill joins the prompt-preset family. Existing chats / presets
+  // already used `defaultPrefill?: string` so the field is sometimes missing
+  // on legacy rows; backfill it to '' so the editor and propagation logic see
+  // a stable string.
+  db.version(9)
+    .stores({
+      chats:
+        'id, updatedAt, createdAt, lastViewedAt, lastUpdatedLeafId, lastBranchUpdatedAt, wordCount, totalCostUsd, archived, pinned, presetId, folderId, *tags',
+      messages:
+        'id, chatId, parentId, turnId, [chatId+parentId], [chatId+createdAt], [chatId+turnId], [chatId+deleted]',
+      childLists: 'id, [chatId+parentId], updatedAt',
+      attachments: 'id, contentHash, kind, mime, origin, refCount, createdAt, updatedAt, deletedAt',
+      attachmentBlobs: 'id, attachmentId, role, contentHash, createdAt',
+      attachmentArtifacts: 'artifactId, attachmentId, kind, processorId, createdAt',
+      attachmentJobs:
+        'id, attachmentId, processorId, status, updatedAt, [attachmentId+processorId+inputHash]',
+      profiles: 'id, name, kind, lastUsedAt, archived',
+      presets: 'id, name, connectionProfileId, lastUsedAt, archived',
+      promptPresets: 'id, kind, name, lastUsedAt',
+      folders: 'id, name, sortIndex, lastUsedAt',
+      tags: 'id, &nameLower, lastUsedAt',
+      chatBranchCache: '&chatId, branchLeafId, generatedAt',
+      keys: 'id, name',
+      settings: '&key',
+      models: '&[profileId+queryKey], fetchedAt',
+      endpoints: '&[profileId+modelId], fetchedAt',
+      privacyPolicies: '&[profileId+modelId], fetchedAt',
+      providers: '&profileId, fetchedAt',
+      generations: 'id, chatId, gen_id',
+      presetResolutions: '&[profileId+presetSlug], fetchedAt',
+      drafts: '&chatId, updatedAt',
+    })
+    .upgrade(async (tx) => {
+      await tx
+        .table<Chat>('chats')
+        .toCollection()
+        .modify((chat) => {
+          const s = chat.settings as Chat['settings'] & { defaultPrefill?: string }
+          if (typeof s.defaultPrefill !== 'string') s.defaultPrefill = ''
+        })
+      await tx
+        .table<ChatPreset>('presets')
+        .toCollection()
+        .modify((preset) => {
+          const s = preset.settings as ChatPreset['settings'] & { defaultPrefill?: string }
+          if (typeof s.defaultPrefill !== 'string') s.defaultPrefill = ''
+        })
+    })
 }
 
 function migrateSettingsRow(

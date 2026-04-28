@@ -59,6 +59,10 @@ export type { AttachmentResolver } from './media-context-tokens'
 
 export interface PromptSizeEstimateInput {
   systemPrompt: string
+  // Silently glued onto the last user message at send time. Counted on top
+  // of historyTokens so the gauge matches the wire. Omit (or pass '') when
+  // the chat has no append prompt configured.
+  appendPromptText?: string
   activePathMessages: Message[]
   draftText: string
   tokenizer: TokenizerFamily
@@ -192,6 +196,7 @@ function pathHasVisibilityExclusions(messages: readonly Message[]): boolean {
 export function estimatePromptSize(input: PromptSizeEstimateInput): PromptSizeEstimate {
   const family = input.tokenizer
   const systemTokens = estimateTokens(input.systemPrompt, family)
+  const appendPromptTokens = estimateTokens(input.appendPromptText ?? '', family)
   const attachmentRefsByOwner = resolveAttachmentContextRefs({
     messages: input.activePathMessages,
     policy: {
@@ -333,8 +338,10 @@ export function estimatePromptSize(input: PromptSizeEstimateInput): PromptSizeEs
     calibratedMedia = media
   }
   // Conservative: never report below the char-based estimate so edits
-  // that grew a pre-baseline message are still reflected.
-  const historyTokens = Math.max(calibratedHistory, fallbackHistory)
+  // that grew a pre-baseline message are still reflected. The append-prompt
+  // rides on the last user message at wire time, so its cost is folded into
+  // historyTokens here for parity with what gets sent.
+  const historyTokens = Math.max(calibratedHistory, fallbackHistory) + appendPromptTokens
   const mediaTokens = Math.max(calibratedMedia, fallbackMedia) + draftMediaTokens
   const draftTokens = estimateTokens(input.draftText, family)
 
@@ -388,6 +395,7 @@ export function promptEstimateInputSignature(
 ): string {
   return JSON.stringify({
     systemPrompt: input.systemPrompt,
+    appendPromptText: input.appendPromptText ?? '',
     draftText: input.draftText,
     draftAttachmentRefs: attachmentRefSignature(input.draftAttachmentRefs),
     tokenizer: input.tokenizer,
@@ -473,6 +481,7 @@ export function buildSettingsPromptSizeEstimateInput(
 
   const input: PromptSizeEstimateInput = {
     systemPrompt: settings.systemPrompt,
+    ...(settings.appendPrompt.length > 0 ? { appendPromptText: settings.appendPrompt } : {}),
     activePathMessages: plan.kept,
     draftText,
     ...(draftAttachmentRefs ? { draftAttachmentRefs } : {}),

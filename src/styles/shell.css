@@ -125,6 +125,11 @@
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  /* Grid items default to min-height: auto, which lets them grow past the
+   * track height when their content gets tall (Prompts tab fully expanded
+   * was overflowing into the viewport scrollbar). Pin to 0 so the inner
+   * `[data-ui="settings-panel"]` overflow-y: auto can take over. */
+  min-height: 0;
 }
 
 [data-ui="app-shell"] > [data-ui="sidebar"] {

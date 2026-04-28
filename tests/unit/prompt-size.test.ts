@@ -136,6 +136,25 @@ describe('estimatePromptSize — fallback branch', () => {
     expect(est.total).toBe(est.systemTokens + est.historyTokens + est.draftTokens + est.mediaTokens)
   })
 
+  it('folds appendPromptText into historyTokens so the gauge tracks the wire', () => {
+    const path = [makeMessage({ role: 'user', text: 'hello world hello world' })]
+    const without = estimatePromptSize({
+      systemPrompt: '',
+      activePathMessages: path,
+      draftText: '',
+      tokenizer: DEFAULT_TOKENIZER,
+    })
+    const withAppend = estimatePromptSize({
+      systemPrompt: '',
+      appendPromptText: '\n\nMake sure to double-check your work before finalizing.',
+      activePathMessages: path,
+      draftText: '',
+      tokenizer: DEFAULT_TOKENIZER,
+    })
+    expect(withAppend.historyTokens).toBeGreaterThan(without.historyTokens)
+    expect(withAppend.total).toBe(without.total + (withAppend.historyTokens - without.historyTokens))
+  })
+
   it('skips hiddenFromContext messages in both branches', () => {
     const path = [
       makeMessage({ role: 'user', text: 'visible visible visible' }),

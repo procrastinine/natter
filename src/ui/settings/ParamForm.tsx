@@ -40,11 +40,7 @@ import type {
 import { updateChatSettings } from '../../store/chats'
 import { PrefillSettingsPrompt } from '../chat/PrefillSettingsPrompt'
 import { InfoDisclosure } from './InfoDisclosure'
-import {
-  ContinueSystemPromptEditor,
-  ContinueUserPromptEditor,
-  SystemPromptEditor,
-} from './PromptPresetEditor'
+import { PrefillPromptEditor } from './PromptPresetEditor'
 import { TextTemplateSection } from './TextTemplateSection'
 
 export interface ParamFormProps {
@@ -53,7 +49,6 @@ export interface ParamFormProps {
   // Preserved for forward-compat — future sampling fields (seed variance,
   // deterministic tokenizer-aware ops) may want it. Unused today.
   endpointTokenizer?: string | null | undefined
-  prefillRecommendationEndpoints?: readonly ModelEndpoint[] | undefined
   textTemplateMode?: 'openrouter' | 'llama-server' | null | undefined
   llamaProps?: LlamaServerProps | null | undefined
   connectionKind?: ConnectionKind | undefined
@@ -294,7 +289,6 @@ const HOSTED_TOOL_OPTIONS: ReadonlyArray<{
 export function ParamForm({
   chat,
   capability,
-  prefillRecommendationEndpoints = [],
   textTemplateMode = null,
   llamaProps = null,
   connectionKind = 'custom',
@@ -333,9 +327,6 @@ export function ParamForm({
           <h3>Generation</h3>
           <p data-ui="helper">Select a model first.</p>
         </section>
-        <SystemPromptEditor chat={chat} />
-        <ContinueSystemPromptEditor chat={chat} />
-        <ContinueUserPromptEditor chat={chat} />
       </div>
     )
   }
@@ -347,19 +338,13 @@ export function ParamForm({
           <h3>Generation</h3>
           <p data-ui="helper">Waiting for model capability…</p>
         </section>
-        <SystemPromptEditor chat={chat} />
-        <ContinueSystemPromptEditor chat={chat} />
-        <ContinueUserPromptEditor chat={chat} />
       </div>
     )
   }
 
-  // Ordering per user spec: reasoning → verbosity, then prompt slots, then
-  // sampling. Continue prompts start collapsed; system prompt starts open.
-  // Prefill block lives between the prompt slots and sampling so the user
-  // sees it as another prompt-like input. Continue prompts auto-hide when
-  // continuePrefill is on (their slots are unused in that mode).
-  const continuePrefill = prefillSupportedForModel && continuePrefillStored
+  // Reasoning → verbosity → hosted tools → sampling → stop / text template.
+  // Prompt-slot editors moved to the dedicated Prompts tab in `PromptsTab.tsx`
+  // so the Generation tab stays focused on knobs the model layer cares about.
   return (
     <div data-ui="param-form">
       <ReasoningSection chat={chat} capability={capability} />
@@ -369,13 +354,11 @@ export function ParamForm({
         connectionKind={connectionKind}
         textCompletionsActive={textCompletionsActive}
       />
-      <SystemPromptEditor chat={chat} />
-      {prefillSupportedForModel ? (
-        <PrefillSettingsSection chat={chat} endpoints={prefillRecommendationEndpoints} />
-      ) : null}
-      {continuePrefill ? null : <ContinueSystemPromptEditor chat={chat} defaultCollapsed />}
-      {continuePrefill ? null : <ContinueUserPromptEditor chat={chat} defaultCollapsed />}
-      <SamplingSection chat={chat} capability={capability} />
+      <SamplingSection
+        chat={chat}
+        capability={capability}
+        showStopInline={!textTemplateMode}
+      />
       {textTemplateMode ? (
         <TextTemplateSection
           chat={chat}
@@ -391,127 +374,42 @@ export function ParamForm({
             />
           }
         />
-      ) : (
-        <StopSection chat={chat} capability={capability} />
-      )}
+      ) : null}
     </div>
   )
 }
 
-function PrefillSettingsSection({
+export function PrefillSettingsSection({
   chat,
   endpoints,
 }: {
   chat: Chat
   endpoints: readonly ModelEndpoint[]
 }) {
-  const draft = chat.settings.defaultPrefill ?? ''
   const continuePrefill = chat.settings.continuePrefill === true
-  const [expanded, setExpanded] = useState(false)
-  const lastPersistedRef = useRef(draft)
-  const [text, setText] = useState(draft)
-  const lastChatIdRef = useRef(chat.id)
-  // Resync on chat switch / external write.
-  useEffect(() => {
-    if (lastChatIdRef.current !== chat.id) {
-      lastChatIdRef.current = chat.id
-      lastPersistedRef.current = draft
-      setText(draft)
-      return
-    }
-    if (draft !== lastPersistedRef.current) {
-      lastPersistedRef.current = draft
-      setText(draft)
-    }
-  }, [chat.id, draft])
-  // Debounced save (300ms — matches the prompt-preset editor).
-  useEffect(() => {
-    if (text === lastPersistedRef.current) return
-    const id = window.setTimeout(() => {
-      lastPersistedRef.current = text
-      void updateChatSettings(chat.id, { defaultPrefill: text })
-    }, 300)
-    return () => window.clearTimeout(id)
-  }, [text, chat.id])
   const toggleContinuePrefill = () =>
     void updateChatSettings(chat.id, { continuePrefill: !continuePrefill })
   return (
-    <section
-      data-ui="settings-section"
-      data-ui-section="prefill"
-      data-expanded={expanded ? 'true' : 'false'}
-    >
-      <div data-ui="prompt-slot-header">
-        <button
-          type="button"
-          data-ui="prompt-slot-toggle"
-          aria-expanded={expanded}
-          onClick={() => setExpanded((v) => !v)}
-        >
-          <PrefillChevronIcon expanded={expanded} />
-          <h3>Prefill</h3>
-        </button>
+    <PrefillPromptEditor chat={chat}>
+      <div data-ui="field-group" data-ui-field>
+        <label data-ui="checkbox-row">
+          <input
+            type="checkbox"
+            checked={continuePrefill}
+            onChange={toggleContinuePrefill}
+            data-ui="continue-prefill-toggle"
+          />
+          <span>Continue prefill</span>
+        </label>
       </div>
-      {expanded ? (
-        <>
-          <div data-ui="field-group">
-            <label htmlFor="default-prefill-textarea" data-ui="visually-hidden">
-              Default prefill text
-            </label>
-            <textarea
-              id="default-prefill-textarea"
-              data-ui="default-prefill-textarea"
-              value={text}
-              onChange={(e) => setText(e.target.value)}
-              placeholder='Default text for the prefill box. Example: "Chapter 1: The"'
-              rows={3}
-              spellCheck
-            />
-          </div>
-          <div data-ui="field-group" data-ui-field>
-            <label data-ui="checkbox-row">
-              <input
-                type="checkbox"
-                checked={continuePrefill}
-                onChange={toggleContinuePrefill}
-                data-ui="continue-prefill-toggle"
-              />
-              <span>Continue prefill</span>
-            </label>
-          </div>
-          {continuePrefill ? (
-            <PrefillSettingsPrompt
-              chatId={chat.id}
-              settings={chat.settings}
-              endpoints={endpoints}
-            />
-          ) : null}
-        </>
+      {continuePrefill ? (
+        <PrefillSettingsPrompt
+          chatId={chat.id}
+          settings={chat.settings}
+          endpoints={endpoints}
+        />
       ) : null}
-    </section>
-  )
-}
-
-function PrefillChevronIcon({ expanded }: { expanded: boolean }) {
-  return (
-    <svg
-      data-ui="prompt-slot-chevron"
-      data-expanded={expanded ? 'true' : 'false'}
-      viewBox="0 0 12 12"
-      aria-hidden="true"
-      focusable="false"
-      width="10"
-      height="10"
-    >
-      <path
-        d="M4 2.5L8 6l-4 3.5"
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="1.5"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
-    </svg>
+    </PrefillPromptEditor>
   )
 }
 
@@ -543,11 +441,16 @@ function HostedToolsSection({
   }
 
   return (
-    <details data-ui="settings-section" data-ui-section="hosted-tools">
-      <summary data-ui="settings-disclosure-summary">
-        <span>Tools</span>
-        {enabledCount > 0 ? <span data-ui="field-value">{enabledCount} enabled</span> : null}
-      </summary>
+    <section data-ui="settings-section" data-ui-section="hosted-tools">
+      <h3>
+        Tools
+        {enabledCount > 0 ? (
+          <>
+            {' '}
+            <span data-ui="field-value">{enabledCount} enabled</span>
+          </>
+        ) : null}
+      </h3>
       <div data-ui="field-group" data-ui-field>
         {HOSTED_TOOL_OPTIONS.map((option) => (
           <label
@@ -566,14 +469,26 @@ function HostedToolsSection({
         ))}
         {!available && disabledReason ? <span data-ui="helper">{disabledReason}</span> : null}
       </div>
-    </details>
+    </section>
   )
 }
 
-function SamplingSection({ chat, capability }: { chat: Chat; capability: EffectiveCapability }) {
+function SamplingSection({
+  chat,
+  capability,
+  showStopInline = false,
+}: {
+  chat: Chat
+  capability: EffectiveCapability
+  showStopInline?: boolean
+}) {
   const visible = SAMPLING_FIELDS.filter((s) => capability.supportedParameters.has(s.wire))
   const hasLogitBias = capability.supportedParameters.has('logit_bias')
-  if (visible.length === 0 && !hasLogitBias) return null
+  const hasStop =
+    capability.supportedParameters.has('stop') ||
+    capability.supportedParameters.has('stop_sequences')
+  const showStop = showStopInline && hasStop
+  if (visible.length === 0 && !hasLogitBias && !showStop) return null
   return (
     <section data-ui="settings-section" data-ui-section="sampling">
       <h3>Sampling</h3>
@@ -594,6 +509,7 @@ function SamplingSection({ chat, capability }: { chat: Chat; capability: Effecti
           ))}
         </div>
       ) : null}
+      {showStop ? <StopInlineRow chat={chat} capability={capability} /> : null}
       <LogitBiasSection chat={chat} capability={capability} />
     </section>
   )
@@ -980,11 +896,11 @@ export function ApiModeSection({
   }
   return (
     <section data-ui="settings-section" data-ui-section="api-mode">
-      <h3>
-        API Mode{' '}
-        <InfoDisclosure title="Responses preserves encrypted reasoning and `phase` metadata across turns. Text completions sends a single rendered prompt to /completions and is intended for OpenRouter-routed open-weight models." />
-      </h3>
       <div data-ui="field-group" data-ui-field>
+        <span>
+          API Mode{' '}
+          <InfoDisclosure title="Responses preserves encrypted reasoning and `phase` metadata across turns. Text completions sends a single rendered prompt to /completions and is intended for OpenRouter-routed open-weight models." />
+        </span>
         <div data-ui="segmented">
           <button
             type="button"
@@ -1051,7 +967,13 @@ function VerbositySection({ chat, capability }: { chat: Chat; capability: Effect
   )
 }
 
-function StopSection({ chat, capability }: { chat: Chat; capability: EffectiveCapability }) {
+function StopInlineRow({
+  chat,
+  capability,
+}: {
+  chat: Chat
+  capability: EffectiveCapability
+}) {
   const hasStop =
     capability.supportedParameters.has('stop') ||
     capability.supportedParameters.has('stop_sequences')
@@ -1067,8 +989,8 @@ function StopSection({ chat, capability }: { chat: Chat; capability: EffectiveCa
     key: `${value}:${values.slice(0, index).filter((item) => item === value).length}`,
   }))
   return (
-    <section data-ui="settings-section" data-ui-section="stop">
-      <h3>Stop sequences</h3>
+    <div data-ui="sampling-stop-row">
+      <span data-ui="sampling-stop-label">Stop sequences</span>
       <div data-ui="chip-input">
         {entries.map((entry) => (
           <span key={entry.key} data-ui="chip">
@@ -1097,7 +1019,7 @@ function StopSection({ chat, capability }: { chat: Chat; capability: EffectiveCa
           }}
         />
       </div>
-    </section>
+    </div>
   )
 }
 

@@ -61,8 +61,8 @@ import { ContextPanel } from './ContextPanel'
 import { LlamaServerSection } from './LlamaServerSection'
 import { ModelPicker } from './ModelPicker'
 import { ApiModeSection, ParamForm, ReasoningIncludeControls } from './ParamForm'
-import { PrivacySection } from './PrivacySection'
 import { ProviderPicker } from './ProviderPicker'
+import { PromptsTab } from './PromptsTab'
 
 export interface ChatModelPanelProps {
   // Null while the user is on /new before the chat row has materialized.
@@ -73,7 +73,7 @@ export interface ChatModelPanelProps {
   onClose: () => void
 }
 
-type Tab = 'model' | 'context' | 'generation'
+type Tab = 'model' | 'context' | 'prompts' | 'generation'
 const EMPTY_CURSOR = Object.freeze({}) as Readonly<Record<string, string>>
 
 export function ChatModelPanel({ chatId, chatSnapshot = null, onClose }: ChatModelPanelProps) {
@@ -279,6 +279,7 @@ export function ChatModelPanel({ chatId, chatSnapshot = null, onClose }: ChatMod
           [
             ['model', 'Model'],
             ['context', 'Context'],
+            ['prompts', 'Prompts'],
             ['generation', 'Generation'],
           ] as const
         ).map(([value, label]) => (
@@ -321,7 +322,6 @@ export function ChatModelPanel({ chatId, chatSnapshot = null, onClose }: ChatMod
                   : {})}
               />
             ) : null}
-            {isOpenRouter ? <PrivacySection chat={chat} /> : null}
             {profile?.kind === 'llama-server' ? (
               <LlamaServerSection chat={chat} profile={profile} />
             ) : null}
@@ -337,12 +337,14 @@ export function ChatModelPanel({ chatId, chatSnapshot = null, onClose }: ChatMod
             connectionKind={profile?.kind ?? 'custom'}
           />
         ) : null}
+        {tab === 'prompts' ? (
+          <PromptsTab chat={chat} prefillRecommendationEndpoints={routing.endpoints} />
+        ) : null}
         {tab === 'generation' ? (
           <ParamForm
             chat={chat}
             capability={capability}
             endpointTokenizer={endpointTokenizer}
-            prefillRecommendationEndpoints={routing.endpoints}
             textTemplateMode={textTemplateMode}
             llamaProps={llamaProps}
             connectionKind={profile?.kind ?? 'custom'}

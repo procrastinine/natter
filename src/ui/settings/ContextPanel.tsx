@@ -353,7 +353,7 @@ export function ContextPanel({
             <InfoDisclosure title="Chat-level default for media/file echo. Per-attachment chips still win: hiding one ref excludes only that exact reference." />
           </span>
         </div>
-        <fieldset data-ui="segmented-control" aria-label="Attachment inclusion">
+        <div data-ui="segmented" aria-label="Attachment inclusion">
           {(
             [
               ['echo-all', 'All'],
@@ -365,6 +365,7 @@ export function ContextPanel({
             <button
               key={value}
               type="button"
+              data-ui="segmented-option"
               aria-pressed={chat.settings.mediaContextStrategy === value}
               onClick={() =>
                 void updateChatSettings(chat.id, {
@@ -375,7 +376,7 @@ export function ContextPanel({
               {label}
             </button>
           ))}
-        </fieldset>
+        </div>
         {chat.settings.mediaContextStrategy === 'echo-last-N' ? (
           <label data-ui="field-group" data-ui-field data-ui-inline-number-row>
             <span>

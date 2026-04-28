@@ -40,6 +40,7 @@ import { useChatStore } from '../../store/zustand/chatStore'
 import { useAttachmentResolverForContext } from '../attachments/useAttachmentResolver'
 import { LockIcon } from '../icons/Icon'
 import { InfoDisclosure } from './InfoDisclosure'
+import { PrivacySection } from './PrivacySection'
 import {
   buildPickerRows,
   reasonsToTooltip,
@@ -417,6 +418,7 @@ export function ProviderPicker({
           Privacy filter does not apply to this connection. Manual overrides still apply.
         </p>
       ) : null}
+      <PrivacySection chat={chat} />
       <footer data-ui="provider-picker-footer">
         <button
           type="button"

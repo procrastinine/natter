@@ -18,6 +18,7 @@ describe('defaults', () => {
           "ttl": "5m",
         },
         "api": "auto",
+        "appendPrompt": "",
         "autoContinueToolLoop": true,
         "cacheRemoteImages": true,
         "contextStrategy": {

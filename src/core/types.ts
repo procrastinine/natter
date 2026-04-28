@@ -375,6 +375,14 @@ export interface ChatSettings {
   // preserves the last propagated text. See `plan/02-data-model.md §2.6b`.
   systemPromptPresetId?: PromptPresetId
   systemRole: 'system' | 'developer'
+  // Silently appended to the LAST user message on the wire (regular send,
+  // regenerate, save-and-send). Stripped from history so older turns never
+  // accumulate it. During non-prefill continue the synthetic continue-user
+  // wrapper is skipped and the append rides on the previous (real) user
+  // turn instead. Whitespace is preserved verbatim — leading newlines are
+  // a feature, not a bug. Empty = no append.
+  appendPrompt: string
+  appendPromptPresetId?: PromptPresetId
   // Continue-in-place overrides. Template; `[SYSTEM_PROMPT]` expands to the
   // chat's own `systemPrompt` verbatim. Empty = send no system message
   // during continue. See `core/global-settings.ts` for the template helper.
@@ -387,8 +395,11 @@ export interface ChatSettings {
   // Default prefill text seeded into the prefill box whenever the user opens
   // prefill on this chat (composer or Edit-and-Send, NOT Continue). Blank
   // means "start empty". Prefill research §P.8: shown above the continue
-  // prompts in the generation tab.
+  // prompts in the generation tab. Optional pin back to a `PromptPreset`
+  // (`kind: 'prefill'`) follows the same propagation rules as the other
+  // prompt slots — see `plan/02-data-model.md §2.6b`.
   defaultPrefill?: string
+  defaultPrefillPresetId?: PromptPresetId
   // Continue-in-place mode. When true, Continue sends the history with the
   // target assistant message as a real prefill (trailing `role: 'assistant'`,
   // no synthetic double-assistant shape). When false (default), Continue
@@ -1097,7 +1108,12 @@ export interface ChatPreset {
 
 // Prompt slot a PromptPreset fills. Each ChatSettings has one pin slot per
 // kind. Storage is keyed by `id` alone; `kind` filters the picker.
-export type PromptPresetKind = 'system' | 'continue-system' | 'continue-user'
+export type PromptPresetKind =
+  | 'system'
+  | 'append'
+  | 'continue-system'
+  | 'continue-user'
+  | 'prefill'
 
 // A named, workspace-global prompt snapshot. Unlike ChatPreset (per-profile
 // bundle of the full ChatSettings), PromptPresets are kind-scoped and hold

@@ -41,15 +41,23 @@ export class PromptPresetMissingError extends Error {
 // Maps a kind onto the two ChatSettings fields it controls. Keeps the rest
 // of the file free of per-kind branching.
 interface SlotAccessors {
-  textKey: 'systemPrompt' | 'continueSystemPrompt' | 'continueUserPrompt'
+  textKey:
+    | 'systemPrompt'
+    | 'appendPrompt'
+    | 'continueSystemPrompt'
+    | 'continueUserPrompt'
+    | 'defaultPrefill'
   pinKey:
     | 'systemPromptPresetId'
+    | 'appendPromptPresetId'
     | 'continueSystemPromptPresetId'
     | 'continueUserPromptPresetId'
+    | 'defaultPrefillPresetId'
 }
 
 const SLOTS: Record<PromptPresetKind, SlotAccessors> = {
   system: { textKey: 'systemPrompt', pinKey: 'systemPromptPresetId' },
+  append: { textKey: 'appendPrompt', pinKey: 'appendPromptPresetId' },
   'continue-system': {
     textKey: 'continueSystemPrompt',
     pinKey: 'continueSystemPromptPresetId',
@@ -58,6 +66,7 @@ const SLOTS: Record<PromptPresetKind, SlotAccessors> = {
     textKey: 'continueUserPrompt',
     pinKey: 'continueUserPromptPresetId',
   },
+  prefill: { textKey: 'defaultPrefill', pinKey: 'defaultPrefillPresetId' },
 }
 
 export function slotFor(kind: PromptPresetKind): SlotAccessors {

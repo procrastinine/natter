@@ -1,4 +1,5 @@
-// Three parallel prompt editors: system / continue-system / continue-user.
+// Four parallel prompt editors: system / append / continue-system /
+// continue-user.
 //
 // Each component owns its own chat-settings slot. They share a thin state
 // hook (`usePromptSlot`) for the draft/save/preset-action plumbing — the
@@ -11,6 +12,7 @@
 // `src/store/prompt-presets.ts`. UI spec: `plan/10-ui.md §10.9`.
 
 import { useLiveQuery } from 'dexie-react-hooks'
+import type { ReactNode } from 'react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { estimateTokensByTokenizer } from '../../core/tokens'
 import type { Chat, ChatSettings, PromptPreset, PromptPresetKind } from '../../core/types'
@@ -23,6 +25,7 @@ import {
   updatePromptPreset,
 } from '../../store/prompt-presets'
 import { useToastStore } from '../../store/zustand/toastStore'
+import { InfoDisclosure } from './InfoDisclosure'
 
 const SAVE_DEBOUNCE_MS = 300
 
@@ -60,7 +63,7 @@ function usePromptSlot(
   slot: Slot<PromptPresetKind>,
   opts: UsePromptSlotOpts,
 ): SlotState {
-  const storedText = chat.settings[slot.textKey] as string
+  const storedText = (chat.settings[slot.textKey] as string | undefined) ?? ''
   const pinnedId = chat.settings[slot.pinKey] as string | undefined
 
   const [draft, setDraft] = useState(storedText)
@@ -268,15 +271,20 @@ export function SystemPromptEditor({
       data-expanded={expanded ? 'true' : 'false'}
     >
       <div data-ui="prompt-slot-header">
-        <button
-          type="button"
-          data-ui="prompt-slot-toggle"
-          aria-expanded={expanded}
-          onClick={() => setExpanded((v) => !v)}
-        >
-          <ChevronIcon expanded={expanded} />
-          <h3>System prompt</h3>
-        </button>
+        <div data-ui="prompt-slot-title-group">
+          <button
+            type="button"
+            data-ui="prompt-slot-toggle"
+            aria-expanded={expanded}
+            onClick={() => setExpanded((v) => !v)}
+          >
+            <ChevronIcon expanded={expanded} />
+            <h3>System prompt</h3>
+          </button>
+          <InfoDisclosure title="System prompt">
+            Sent ahead of every turn as the chat's system message. Empty = no system message.
+          </InfoDisclosure>
+        </div>
         {expanded ? (
           <PromptPresetPicker
             open={s.pickerOpen}
@@ -308,7 +316,6 @@ export function SystemPromptEditor({
               data-ui="system-prompt-textarea"
               value={s.draft}
               onChange={(e) => s.setDraft(e.target.value)}
-              placeholder="Leave empty to send no system message."
               rows={8}
               spellCheck
             />
@@ -316,6 +323,168 @@ export function SystemPromptEditor({
               ~{s.tokens.toLocaleString()} tokens
             </span>
           </div>
+        </>
+      ) : null}
+    </section>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Append prompt — silently glued onto the LAST user message at send time
+// and stripped from history. During non-prefill continue the planner skips
+// the synthetic continueUser wrapper so the append rides on the previous
+// real user turn instead. Whitespace is preserved verbatim.
+// ---------------------------------------------------------------------------
+
+export function AppendPromptEditor({
+  chat,
+  defaultCollapsed = false,
+}: {
+  chat: Chat
+  defaultCollapsed?: boolean
+}) {
+  const slot: Slot<'append'> = {
+    kind: 'append',
+    textKey: 'appendPrompt',
+    pinKey: 'appendPromptPresetId',
+  }
+  const s = usePromptSlot(chat, slot, { showTokens: true })
+  const [expanded, setExpanded] = useState(!defaultCollapsed)
+  return (
+    <section
+      data-ui="settings-section"
+      data-ui-section="prompt-slot-append"
+      data-expanded={expanded ? 'true' : 'false'}
+    >
+      <div data-ui="prompt-slot-header">
+        <div data-ui="prompt-slot-title-group">
+          <button
+            type="button"
+            data-ui="prompt-slot-toggle"
+            aria-expanded={expanded}
+            onClick={() => setExpanded((v) => !v)}
+          >
+            <ChevronIcon expanded={expanded} />
+            <h3>Append prompt</h3>
+          </button>
+          <InfoDisclosure title="Append prompt">
+            Glued onto the last user message at send time and stripped from history. Leading
+            whitespace is preserved.
+          </InfoDisclosure>
+        </div>
+        {expanded ? (
+          <PromptPresetPicker
+            open={s.pickerOpen}
+            setOpen={s.setPickerOpen}
+            pinnedPreset={s.pinnedPreset}
+            presets={s.presets}
+            onLoad={(id) => void s.loadPreset(id)}
+            onSaveToExisting={(id, name) => void s.saveToExisting(id, name)}
+            onSaveAsNew={() => void s.saveAsNew('append prompt')}
+            onRename={(id, name) => void s.renamePreset(id, name)}
+            onDelete={(id, name) => void s.deletePresetWithConfirm(id, name)}
+          />
+        ) : null}
+      </div>
+      {expanded ? (
+        <div data-ui="field-group">
+          <label htmlFor="append-prompt-textarea" data-ui="visually-hidden">
+            Append prompt
+          </label>
+          <textarea
+            id="append-prompt-textarea"
+            data-ui="append-prompt-textarea"
+            value={s.draft}
+            onChange={(e) => s.setDraft(e.target.value)}
+            rows={4}
+            spellCheck
+          />
+          <span data-ui="append-prompt-token-estimate" aria-live="polite">
+            ~{s.tokens.toLocaleString()} tokens
+          </span>
+        </div>
+      ) : null}
+    </section>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Default prefill — text seeded into the prefill box when the user opens
+// prefill on this chat. Lives in ParamForm's "Prefill" section because the
+// continue-prefill toggle and recommendation widget render alongside it; the
+// `children` slot is where ParamForm injects those.
+// ---------------------------------------------------------------------------
+
+export function PrefillPromptEditor({
+  chat,
+  defaultCollapsed = false,
+  children,
+}: {
+  chat: Chat
+  defaultCollapsed?: boolean
+  children?: ReactNode
+}) {
+  const slot: Slot<'prefill'> = {
+    kind: 'prefill',
+    textKey: 'defaultPrefill',
+    pinKey: 'defaultPrefillPresetId',
+  }
+  const s = usePromptSlot(chat, slot, { showTokens: false })
+  const [expanded, setExpanded] = useState(!defaultCollapsed)
+  return (
+    <section
+      data-ui="settings-section"
+      data-ui-section="prefill"
+      data-expanded={expanded ? 'true' : 'false'}
+    >
+      <div data-ui="prompt-slot-header">
+        <div data-ui="prompt-slot-title-group">
+          <button
+            type="button"
+            data-ui="prompt-slot-toggle"
+            aria-expanded={expanded}
+            onClick={() => setExpanded((v) => !v)}
+          >
+            <ChevronIcon expanded={expanded} />
+            <h3>Prefill</h3>
+          </button>
+          <InfoDisclosure title="Prefill">
+            Seeds the prefill box when prefill opens on this chat. The Continue-prefill toggle
+            below sends the existing assistant message as a real prefill turn during Continue,
+            instead of the continue-prompt template.
+          </InfoDisclosure>
+        </div>
+        {expanded ? (
+          <PromptPresetPicker
+            open={s.pickerOpen}
+            setOpen={s.setPickerOpen}
+            pinnedPreset={s.pinnedPreset}
+            presets={s.presets}
+            onLoad={(id) => void s.loadPreset(id)}
+            onSaveToExisting={(id, name) => void s.saveToExisting(id, name)}
+            onSaveAsNew={() => void s.saveAsNew('default prefill')}
+            onRename={(id, name) => void s.renamePreset(id, name)}
+            onDelete={(id, name) => void s.deletePresetWithConfirm(id, name)}
+          />
+        ) : null}
+      </div>
+      {expanded ? (
+        <>
+          <div data-ui="field-group">
+            <label htmlFor="default-prefill-textarea" data-ui="visually-hidden">
+              Default prefill text
+            </label>
+            <textarea
+              id="default-prefill-textarea"
+              data-ui="default-prefill-textarea"
+              value={s.draft}
+              onChange={(e) => s.setDraft(e.target.value)}
+              placeholder='Default text seeded into the prefill box. Example: "Chapter 1: The"'
+              rows={3}
+              spellCheck
+            />
+          </div>
+          {children}
         </>
       ) : null}
     </section>
@@ -349,15 +518,21 @@ export function ContinueSystemPromptEditor({
       data-expanded={expanded ? 'true' : 'false'}
     >
       <div data-ui="prompt-slot-header">
-        <button
-          type="button"
-          data-ui="prompt-slot-toggle"
-          aria-expanded={expanded}
-          onClick={() => setExpanded((v) => !v)}
-        >
-          <ChevronIcon expanded={expanded} />
-          <h3>Continue system prompt</h3>
-        </button>
+        <div data-ui="prompt-slot-title-group">
+          <button
+            type="button"
+            data-ui="prompt-slot-toggle"
+            aria-expanded={expanded}
+            onClick={() => setExpanded((v) => !v)}
+          >
+            <ChevronIcon expanded={expanded} />
+            <h3>Continue system prompt</h3>
+          </button>
+          <InfoDisclosure title="Continue system prompt">
+            Used by Continue-in-place. [SYSTEM_PROMPT] expands to this chat's system prompt;
+            blank sends none.
+          </InfoDisclosure>
+        </div>
         {expanded ? (
           <PromptPresetPicker
             open={s.pickerOpen}
@@ -382,14 +557,9 @@ export function ContinueSystemPromptEditor({
             data-ui="continue-system-prompt-textarea"
             value={s.draft}
             onChange={(e) => s.setDraft(e.target.value)}
-            placeholder="Leave empty to send no system message during Continue. [SYSTEM_PROMPT] expands to this chat's system prompt."
             rows={4}
             spellCheck
           />
-          <span data-ui="helper">
-            Used by Continue-in-place. <code>[SYSTEM_PROMPT]</code> expands to this chat's system
-            prompt; blank = send none.
-          </span>
         </div>
       ) : null}
     </section>
@@ -422,15 +592,21 @@ export function ContinueUserPromptEditor({
       data-expanded={expanded ? 'true' : 'false'}
     >
       <div data-ui="prompt-slot-header">
-        <button
-          type="button"
-          data-ui="prompt-slot-toggle"
-          aria-expanded={expanded}
-          onClick={() => setExpanded((v) => !v)}
-        >
-          <ChevronIcon expanded={expanded} />
-          <h3>Continue user prompt</h3>
-        </button>
+        <div data-ui="prompt-slot-title-group">
+          <button
+            type="button"
+            data-ui="prompt-slot-toggle"
+            aria-expanded={expanded}
+            onClick={() => setExpanded((v) => !v)}
+          >
+            <ChevronIcon expanded={expanded} />
+            <h3>Continue user prompt</h3>
+          </button>
+          <InfoDisclosure title="Continue user prompt">
+            Synthetic trailing user message appended during Continue-in-place. Blank falls back
+            to the legacy double-assistant shape.
+          </InfoDisclosure>
+        </div>
         {expanded ? (
           <PromptPresetPicker
             open={s.pickerOpen}
@@ -455,13 +631,9 @@ export function ContinueUserPromptEditor({
             data-ui="continue-user-prompt-textarea"
             value={s.draft}
             onChange={(e) => s.setDraft(e.target.value)}
-            placeholder="Optional. Blank falls back to the legacy double-assistant shape."
             rows={3}
             spellCheck
           />
-          <span data-ui="helper">
-            Used by Continue-in-place. Blank = fall back to the legacy double-assistant shape.
-          </span>
         </div>
       ) : null}
     </section>

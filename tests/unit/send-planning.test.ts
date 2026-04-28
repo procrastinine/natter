@@ -591,4 +591,94 @@ describe('resolveRequestPrivacyPlan', () => {
     expect(requestPlan.hasAttachmentContext).toBe(false)
     expect(String(requestPlan.wire.prompt)).not.toContain('cat.png')
   })
+
+  it('glues appendPrompt onto the last user message at wire time and leaves the stored row alone', async () => {
+    const profile = makeOpenAiProfile()
+    const chat = makeChat({
+      profileId: profile.id,
+      model: 'gpt-4o',
+      api: 'chat',
+      appendPrompt: '\n\nMake sure you do not introduce variables without defining them.',
+    })
+    const stored = makeMessage('What is 2+2?')
+    const { requestPlan } = await prepareAssistantRequestPlan({
+      chat,
+      connection: profile,
+      pathMessages: [stored],
+      draftText: '',
+    })
+
+    const wireMessages = requestPlan.wire.messages as Array<{ role: string; content: unknown }>
+    const lastUser = [...wireMessages].reverse().find((m) => m.role === 'user')
+    const lastUserText = typeof lastUser?.content === 'string' ? lastUser.content : ''
+    expect(lastUserText).toBe(
+      'What is 2+2?\n\nMake sure you do not introduce variables without defining them.',
+    )
+    // Stored row is untouched — only the wire clone carries the append.
+    expect(stored.content).toEqual([{ type: 'text', text: 'What is 2+2?' }])
+
+    // Outbound path message is a NEW object, not the stored row.
+    const outboundLastUser = [...requestPlan.outboundPath].reverse().find((m) => m.role === 'user')
+    expect(outboundLastUser).not.toBe(stored)
+  })
+
+  it('non-prefill continue rides appendPrompt on the previous user turn, not the synthetic continueUser wrapper', async () => {
+    const profile = makeOpenAiProfile()
+    const chat = makeChat({
+      profileId: profile.id,
+      model: 'gpt-4o',
+      api: 'chat',
+      appendPrompt: '\n\nDouble-check your work.',
+    })
+    const realUser = makeMessage('Solve x^2 = 9.')
+    const assistantPartial: Message = {
+      ...makeMessage('We start by'),
+      id: 'a1',
+      parentId: 'u1',
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: 'We start by' }],
+    }
+    const continueUser: Message = {
+      ...makeMessage('continue from where you left off.'),
+      id: 'continue-user:a1',
+      parentId: 'a1',
+    }
+
+    const { requestPlan } = await prepareAssistantRequestPlan({
+      chat,
+      connection: profile,
+      pathMessages: [realUser, assistantPartial, continueUser],
+      draftText: '',
+    })
+
+    const wireMessages = requestPlan.wire.messages as Array<{ role: string; content: unknown }>
+    const userTexts = wireMessages
+      .filter((m) => m.role === 'user')
+      .map((m) => (typeof m.content === 'string' ? m.content : ''))
+    // Real user gets the append; the synthetic continueUser wrapper stays clean.
+    expect(userTexts).toEqual([
+      'Solve x^2 = 9.\n\nDouble-check your work.',
+      'continue from where you left off.',
+    ])
+  })
+
+  it('omits appendPrompt entirely when the slot is blank', async () => {
+    const profile = makeOpenAiProfile()
+    const chat = makeChat({
+      profileId: profile.id,
+      model: 'gpt-4o',
+      api: 'chat',
+      appendPrompt: '',
+    })
+    const { requestPlan } = await prepareAssistantRequestPlan({
+      chat,
+      connection: profile,
+      pathMessages: [makeMessage('hi')],
+      draftText: '',
+    })
+    const wireMessages = requestPlan.wire.messages as Array<{ role: string; content: unknown }>
+    const lastUser = [...wireMessages].reverse().find((m) => m.role === 'user')
+    expect(lastUser?.content).toBe('hi')
+  })
 })

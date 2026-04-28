@@ -1,6 +1,6 @@
 // Privacy controls block. See `plan/09-privacy.md §9.9` + `plan/10-ui.md §10.5.1`.
 //
-// Sits beneath the provider picker on the Model tab. Exposes the two
+// Renders inline inside the Providers section on the Model tab. Exposes the
 // axes the picker itself can't surface:
 //   - `paretoFilter` — turn off the tier-based auto-exclusion
 //   - `zdrOnly` — route only through ZDR-tagged endpoints
@@ -58,10 +58,8 @@ export function PrivacySection({ chat }: PrivacySectionProps) {
   )
 
   return (
-    <div data-ui="settings-section" data-ui-section="privacy-section">
-      <header data-ui="privacy-section-header">
-        <h3>Privacy</h3>
-      </header>
+    <div data-ui="privacy-block">
+      <span data-ui="privacy-block-label">Privacy</span>
       <ul data-ui="privacy-section-list">
         <li>
           <label data-ui="privacy-toggle">
