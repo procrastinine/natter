@@ -17,11 +17,11 @@ import {
 import {
   CORS_PROXY_SECRET_HEADER,
   type CorsProxyConfig,
-  DEFAULT_CORS_PROXY_URL,
+  DEV_CORS_PROXY_URL,
 } from '../../src/core/cors-proxy'
 
 function makeProxy(overrides: Partial<CorsProxyConfig> = {}): CorsProxyConfig {
-  return { url: DEFAULT_CORS_PROXY_URL, secret: '', ...overrides }
+  return { url: DEV_CORS_PROXY_URL, secret: '', ...overrides }
 }
 
 describe('privacyScrapeUrl', () => {

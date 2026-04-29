@@ -2,10 +2,12 @@ import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { __resetBroadcastForTests, type BroadcastEvent, onEvent } from '../../src/store/broadcast'
 import {
+  defaultCorsProxyUrlForRuntime,
   readGlobalPreferences,
   writeChatMaxWidth,
   writeLongMessageDisplayMode,
 } from '../../src/core/global-settings'
+import { DEV_CORS_PROXY_URL, PUBLIC_CORS_PROXY_URL } from '../../src/core/cors-proxy'
 import { __resetDbForTests, openDb } from '../../src/store/db'
 import {
   clearEndpointsCacheForProfile,
@@ -223,5 +225,10 @@ describe('settings', () => {
     await writeLongMessageDisplayMode('compact')
     expect(await getSetting('global:long-message-display-mode')).toBe('compact')
     expect((await readGlobalPreferences()).longMessageDisplayMode).toBe('compact')
+  })
+
+  it('uses /_or_scrape only for the Vite dev runtime default', () => {
+    expect(defaultCorsProxyUrlForRuntime(true)).toBe(DEV_CORS_PROXY_URL)
+    expect(defaultCorsProxyUrlForRuntime(false)).toBe(PUBLIC_CORS_PROXY_URL)
   })
 })

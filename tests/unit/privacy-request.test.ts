@@ -10,7 +10,7 @@ import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { fetchEndpoints } from '../../src/api/models'
 import { fetchPrivacyScrape } from '../../src/api/privacy-scrape'
-import { DEFAULT_CORS_PROXY_URL, type CorsProxyConfig } from '../../src/core/cors-proxy'
+import { DEV_CORS_PROXY_URL, type CorsProxyConfig } from '../../src/core/cors-proxy'
 import {
   PrivacyDiscoveryUnavailableError,
   resolvePrivacyForSend,
@@ -59,7 +59,7 @@ afterEach(async () => {
   await resetAll()
 })
 
-const TEST_PROXY: CorsProxyConfig = { url: DEFAULT_CORS_PROXY_URL, secret: '' }
+const TEST_PROXY: CorsProxyConfig = { url: DEV_CORS_PROXY_URL, secret: '' }
 
 function makeProfile(kind: ConnectionProfile['kind'] = 'openrouter'): ConnectionProfile {
   return {

@@ -6,8 +6,10 @@
 import { useLiveQuery } from 'dexie-react-hooks'
 import { useCallback } from 'react'
 import {
-  DEFAULT_CORS_PROXY_URL,
   DEFAULT_GLOBAL_PREFERENCES,
+  DEV_CORS_PROXY_URL,
+  PUBLIC_CORS_PROXY_URL,
+  defaultCorsProxyUrlForRuntime,
   readGlobalPreferences,
   type SendShortcut,
   type TokenCalibrationMode,
@@ -47,17 +49,13 @@ export function GeneralSettings() {
     await writeCorsProxySecret(value)
   }, [])
 
-  // The default `/_or_scrape` is a Vite dev-server rewrite — the compiled
-  // bundle has no route for it, so a relative URL only works while
-  // `pnpm dev` is the host. Flag it so the user knows to swap in a
-  // hosted bouncer (e.g. a Cloudflare Worker) for production.
+  // `/_or_scrape` is a Vite dev-server rewrite — the compiled bundle
+  // has no route for it, so it is only the default in `pnpm dev`.
   const isDev = import.meta.env.DEV
   const trimmedProxyUrl = prefs.corsProxyUrl.trim()
   const proxyIsRelative = trimmedProxyUrl.length === 0 || trimmedProxyUrl.startsWith('/')
   const showDevDefaultWarning = proxyIsRelative && !isDev
-  const proxyPlaceholder = isDev
-    ? DEFAULT_CORS_PROXY_URL
-    : 'https://corsproxy.io/?url=https://openrouter.ai/{model}/providers'
+  const proxyPlaceholder = defaultCorsProxyUrlForRuntime(isDev)
 
   return (
     <>
@@ -127,11 +125,13 @@ export function GeneralSettings() {
             pages.{' '}
             {isDev ? (
               <>
-                Default <code>{DEFAULT_CORS_PROXY_URL}</code> works while <code>pnpm dev</code>{' '}
+                Default <code>{DEV_CORS_PROXY_URL}</code> works while <code>pnpm dev</code>{' '}
                 is running.
               </>
             ) : (
-              <>Paste one of the examples below.</>
+              <>
+                Default <code>{PUBLIC_CORS_PROXY_URL}</code> uses a public bouncer.
+              </>
             )}
             <ul>
               <li>

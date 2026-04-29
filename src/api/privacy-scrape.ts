@@ -12,9 +12,10 @@
 //
 // The fetch path is a workspace-global CORS proxy — config shape +
 // constants live in `core/cors-proxy.ts` (the daemon-safe module the
-// browser preference layer also re-exports). Default `/_or_scrape` is
-// the same-origin Vite dev rewrite. No Authorization header is sent —
-// the page is public. When a secret is configured it rides as
+// browser preference layer also re-exports). Vite dev defaults to the
+// same-origin `/_or_scrape` rewrite; static builds default to a public
+// bouncer. No Authorization header is sent — the page is public. When
+// a secret is configured it rides as
 // `X-Proxy-Secret`.
 
 import {
@@ -50,11 +51,10 @@ interface PrivacyScrapeResult {
 
 // Build the scrape URL. The browser can't fetch `openrouter.ai/{model}/
 // providers` cross-origin (CORS), so the default is the relative proxy
-// path `/_or_scrape` — Vite's dev server rewrites it. A production
-// browser deploy is expected to either provide an equivalent same-origin
-// rewrite or set `corsProxyUrl` to a hosted bouncer. Daemon-mode hosts
-// skip the proxy and pass `directCorsProxyConfig()` (base =
-// `https://openrouter.ai`).
+// path `/_or_scrape` — Vite's dev server rewrites it. Static builds
+// default to a public bouncer, and users can override `corsProxyUrl` to
+// any hosted bouncer. Daemon-mode hosts can pass a direct OpenRouter
+// base because CORS does not apply server-to-server.
 //
 // Three URL shapes are accepted (resolution order matters — template
 // wins, then known-bouncer shortcut, then path-prefix fallback):

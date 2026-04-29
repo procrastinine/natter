@@ -7,13 +7,18 @@
 // `getSetting/setSetting` helpers. Typed read/write wrappers are exposed so
 // call sites don't have to remember the key names.
 
-import { type CorsProxyConfig, DEFAULT_CORS_PROXY_URL } from './cors-proxy'
+import {
+  type CorsProxyConfig,
+  DEFAULT_CORS_PROXY_URL,
+  DEV_CORS_PROXY_URL,
+  PUBLIC_CORS_PROXY_URL,
+} from './cors-proxy'
 import { getSetting, setSetting } from '../store/settings'
 
 // Re-exports for browser callers that group their preference imports
 // here. The canonical source lives in `./cors-proxy` so daemon-mode and
 // `api/privacy-scrape.ts` can pull these in without dragging in IDB.
-export { DEFAULT_CORS_PROXY_URL }
+export { DEFAULT_CORS_PROXY_URL, DEV_CORS_PROXY_URL, PUBLIC_CORS_PROXY_URL }
 
 export type ThemePreference = 'system' | 'light' | 'dark' | 'high-contrast'
 
@@ -116,7 +121,7 @@ interface GlobalPreferences {
   // or reloads. Manual avatar clicks stay session-local.
   longMessageDisplayMode: LongMessageDisplayMode
   // CORS-proxy base URL prefixed in front of `/{model}/providers` for the
-  // privacy scrape. Empty string falls back to `DEFAULT_CORS_PROXY_URL`.
+  // privacy scrape. Empty string falls back to the runtime default.
   corsProxyUrl: string
   // Optional secret echoed as `X-Proxy-Secret` so a hosted bouncer can
   // gatekeep its open relay. Empty string = header omitted.
@@ -130,6 +135,10 @@ export const DEFAULT_PINNED_MODELS: readonly string[] = Object.freeze([
   'google/gemini-3.1-pro-preview',
   'google/gemini-3.1-flash-lite-preview',
 ])
+
+export function defaultCorsProxyUrlForRuntime(isDev = import.meta.env.DEV): string {
+  return isDev ? DEV_CORS_PROXY_URL : PUBLIC_CORS_PROXY_URL
+}
 
 export const DEFAULT_GLOBAL_PREFERENCES: Readonly<GlobalPreferences> = Object.freeze({
   theme: 'system',
@@ -145,7 +154,7 @@ export const DEFAULT_GLOBAL_PREFERENCES: Readonly<GlobalPreferences> = Object.fr
   recentModels: [],
   tokenCalibrationMode: 'adaptive',
   longMessageDisplayMode: 'full',
-  corsProxyUrl: DEFAULT_CORS_PROXY_URL,
+  corsProxyUrl: defaultCorsProxyUrlForRuntime(),
   corsProxySecret: '',
 })
 
@@ -340,7 +349,8 @@ export async function readGlobalPreferences(): Promise<GlobalPreferences> {
     recentModels: Array.isArray(recent) ? recent.filter((x) => typeof x === 'string') : [],
     tokenCalibrationMode: calibrationModeOrDefault(tokenCalibrationMode),
     longMessageDisplayMode: longMessageDisplayModeOrDefault(longMessageDisplayMode),
-    corsProxyUrl: typeof corsProxyUrl === 'string' ? corsProxyUrl : DEFAULT_CORS_PROXY_URL,
+    corsProxyUrl:
+      typeof corsProxyUrl === 'string' ? corsProxyUrl : defaultCorsProxyUrlForRuntime(),
     corsProxySecret: typeof corsProxySecret === 'string' ? corsProxySecret : '',
   }
 }
@@ -348,7 +358,7 @@ export async function readGlobalPreferences(): Promise<GlobalPreferences> {
 export function corsProxyConfigFromPrefs(prefs: GlobalPreferences): CorsProxyConfig {
   const trimmed = prefs.corsProxyUrl.trim().replace(/\/+$/, '')
   return {
-    url: trimmed.length > 0 ? trimmed : DEFAULT_CORS_PROXY_URL,
+    url: trimmed.length > 0 ? trimmed : defaultCorsProxyUrlForRuntime(),
     secret: prefs.corsProxySecret,
   }
 }
