@@ -4,7 +4,7 @@ import { filterEndpointsByPrivacy } from '../../src/core/privacy-filter'
 import {
   DEFAULT_OPENROUTER_PROVIDER_SORT,
   migrateLegacyProviderSettings,
-} from '../../src/core/provider-settings-migration'
+} from '../../src/backcompat/provider-settings'
 import type { ChatSettings, DataPolicy, ModelEndpoint } from '../../src/core/types'
 import { buildPickerRows } from '../../src/ui/settings/provider-picker-rows'
 

@@ -16,7 +16,7 @@ import type {
   PromptPresetId,
   TagId,
 } from '../core/types'
-import type { ChatMutationSummary } from './repository'
+import type { ChatMutationSummary, StreamLeaseRow } from './repository'
 
 export type EngineKind = 'daemon' | 'in-tab'
 export type AutoTitleStatus = 'auto' | 'auto-failed' | 'manual'
@@ -53,6 +53,13 @@ export type BroadcastEvent =
       chatId: ChatId
       streamId: string
       messageId?: string
+      ownerClientId: string
+    }
+  | { kind: 'stream-heartbeat'; lease: StreamLeaseRow }
+  | {
+      kind: 'stream-abort-requested'
+      chatId: ChatId
+      streamId: string
       ownerClientId: string
     }
   | {

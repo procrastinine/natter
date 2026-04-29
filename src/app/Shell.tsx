@@ -1,7 +1,6 @@
 import { useLiveQuery } from 'dexie-react-hooks'
 import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
 import { normalizeModelsResponse } from '../api/providers'
-import { activePath } from '../core/active-path'
 import { attachmentsDisabledByTextProtocol } from '../core/attachments/context'
 import { cloneDefaultChatSettings } from '../core/defaults'
 import {
@@ -39,7 +38,7 @@ import { installChatPreviewMaintainer } from '../store/chat-preview-maintainer'
 import {
   createChat,
   getChat,
-  loadChatMessages,
+  loadActiveBranchSnapshot,
   refreshChatPreview,
   updateChatSettings,
 } from '../store/chats'
@@ -48,6 +47,7 @@ import { getCachedModels } from '../store/models-cache'
 import { bumpPresetLastUsedAt, getPreset, pickPreferredPreset } from '../store/presets'
 import { bumpProfileLastUsedAt, countProfiles, getProfile } from '../store/profiles'
 import { readSidebarSortMode } from '../store/sidebar-preferences'
+import { installStreamLeaseListener, requestAbortForChat } from '../store/stream-leases'
 import { useChatStore } from '../store/zustand/chatStore'
 import { useStreamStore } from '../store/zustand/streamStore'
 import { useToastStore } from '../store/zustand/toastStore'
@@ -179,10 +179,11 @@ export function Shell() {
   }, [activeChatRow])
   const resolvedActiveChatRow =
     activeChatRow ?? (activeChatId ? chatSnapshotCacheRef.current.get(activeChatId) : undefined)
-  const activeMessages = useLiveQuery(
-    async () => (activeChatId ? await loadChatMessages(activeChatId) : []),
-    [activeChatId],
-    [],
+  const activeBranchSnapshot = useLiveQuery(
+    () =>
+      activeChatId ? loadActiveBranchSnapshot(activeChatId, activeCursor) : Promise.resolve(null),
+    [activeChatId, activeCursor],
+    null,
   )
   const activeEndpoints = useEndpoints(
     resolvedActiveChatRow?.settings.profileId ?? null,
@@ -238,10 +239,7 @@ export function Shell() {
       await updateChatSettings(resolvedActiveChatRow.id, { model: only.id })
     })()
   }, [resolvedActiveChatRow, autoSelectRow])
-  const activePathMemo = useMemo(
-    () => activePath(activeMessages ?? [], activeCursor),
-    [activeMessages, activeCursor],
-  )
+  const activePathMemo = activeBranchSnapshot?.branch ?? []
   const composerAttachmentResolver = useAttachmentResolverForContext({
     settings: resolvedActiveChatRow?.settings,
     messages: activePathMemo,
@@ -356,17 +354,25 @@ export function Shell() {
   const scrollRef = useRef<ScrollRegionHandle>(null)
   const abortActiveChat = useCallback(() => {
     if (!activeChatId) return
-    useStreamStore.getState().abortChat(activeChatId)
-  }, [activeChatId])
+    const aborted = requestAbortForChat(activeChatId)
+    if (aborted === 0) {
+      pushToast({ level: 'warning', text: 'No active stream was found for this chat.' })
+    }
+  }, [activeChatId, pushToast])
 
   useEffect(() => {
     if (activeStorageRoute && chatModelOpen) setChatModelOpen(false)
   }, [activeStorageRoute, chatModelOpen])
 
   useEffect(() => {
-    void recoverOrphans()
     installChatPreviewMaintainer()
+    installStreamLeaseListener()
   }, [])
+
+  useEffect(() => {
+    if (!activeChatId) return
+    void recoverOrphans(Date.now(), activeChatId).catch(() => {})
+  }, [activeChatId])
 
   // Lazy backfill: legacy chat rows may lack `previewText` because they
   // predate the denormalization. Compute + write once per chat on open.

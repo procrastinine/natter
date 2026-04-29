@@ -1,5 +1,5 @@
 import type { WorkspaceRepository } from '../store/repository'
-import { activePath, indexById } from './active-path'
+import { indexById } from './active-path'
 import type {
   Chat,
   ChatBranchCache,
@@ -114,12 +114,14 @@ export async function exportActiveBranchAsTxt(
   chatId: ChatId,
   cursorSnapshot: CursorMap = {},
 ): Promise<ChatTextExport> {
-  const [chat, messages] = await Promise.all([repo.getChat(chatId), repo.listMessages(chatId)])
+  const [chat, snapshot] = await Promise.all([
+    repo.getChat(chatId),
+    repo.getActiveBranchSnapshot(chatId, cursorSnapshot),
+  ])
   if (!chat) throw new Error(`ChatMissing:${chatId}`)
-  const branch = activePath(messages, cursorSnapshot)
   return {
     filename: exportFilename(chat),
-    content: flattenBranchMessages(branch, chat),
+    content: flattenBranchMessages(snapshot.branch, chat),
   }
 }
 
@@ -141,8 +143,7 @@ export async function exportLastUpdatedBranchAsTxt(
     }
   }
 
-  const messages = await repo.listMessages(chatId)
-  const branch = buildBranchMessages(messages, chat.lastUpdatedLeafId)
+  const branch = await repo.getBranchByLeaf(chatId, chat.lastUpdatedLeafId)
   if (chat.lastUpdatedLeafId === null) {
     if (cached) await repo.deleteChatBranchCache(chatId)
   } else {
@@ -150,7 +151,7 @@ export async function exportLastUpdatedBranchAsTxt(
       buildBranchCacheRow({
         chatId,
         branchLeafId: chat.lastUpdatedLeafId,
-        messages,
+        messages: branch,
       }),
     )
   }

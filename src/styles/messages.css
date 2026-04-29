@@ -44,6 +44,8 @@
     minmax(var(--message-glyph-gutter), 1fr);
   column-gap: 0;
   padding: var(--message-row-padding) 0 0;
+  content-visibility: auto;
+  contain-intrinsic-size: 240px;
 }
 
 /* Vertically center the round glyph on the role label (User / Assistant)
@@ -463,6 +465,17 @@
 [data-ui="message-error"][data-role="abort"] {
   background: var(--color-banner-info-bg);
   border-left-color: var(--color-info);
+  color: var(--color-info);
+}
+
+[data-ui="message-stream-remote"] {
+  margin-top: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--font-size-sm);
+  background: var(--color-banner-info-bg);
+  border: 1px solid var(--color-border-subtle);
+  border-left: 3px solid var(--color-info);
+  border-radius: var(--radius-sm);
   color: var(--color-info);
 }
 

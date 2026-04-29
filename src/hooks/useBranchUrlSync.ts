@@ -24,15 +24,15 @@ import { chatHref, parseRoute, replaceRoute } from '../app/router'
 import { activePath } from '../core/active-path'
 import { seedCursorAtMessage } from '../core/branch-resolve'
 import type { ChatId, Message } from '../core/types'
-import { loadChatMessages } from '../store/chats'
+import { loadMessageHeaders } from '../store/chats'
 import { useChatStore } from '../store/zustand/chatStore'
 
 export function useBranchUrlSync(chatId: ChatId | null): void {
   const messages = useLiveQuery(
-    () => (chatId ? loadChatMessages(chatId) : Promise.resolve([])),
+    () => (chatId ? loadMessageHeaders(chatId) : Promise.resolve([])),
     [chatId],
     [],
-  )
+  ) as Message[]
   const messagesRef = useRef<Message[]>(messages)
   messagesRef.current = messages
 

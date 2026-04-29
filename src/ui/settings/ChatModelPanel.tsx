@@ -21,11 +21,17 @@
 import { useLiveQuery } from 'dexie-react-hooks'
 import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
 import { probeLlamaServer, type LlamaServerProps } from '../../api/probe'
-import { activePath } from '../../core/active-path'
 import { DEFAULT_GLOBAL_PREFERENCES, readGlobalPreferences } from '../../core/global-settings'
 import { isTextCompletionsSelectableFor } from '../../core/quirks'
 import { readTokenCalibrationGlobal } from '../../core/token-calibration'
-import type { Chat, ChatId, ChatPreset, ConnectionKind, ConnectionProfile } from '../../core/types'
+import type {
+  Chat,
+  ChatId,
+  ChatPreset,
+  ConnectionKind,
+  ConnectionProfile,
+  Message,
+} from '../../core/types'
 import type { EffectiveCapability } from '../../core/capabilities'
 import {
   buildSettingsPromptSizeEstimateInput,
@@ -38,7 +44,7 @@ import { useStreamStablePromptEstimate } from '../../hooks/useStreamStablePrompt
 import {
   getChat,
   getChatDraft,
-  loadChatMessages,
+  loadActiveBranchSnapshot,
   replaceChatSettings,
   setChatPreset,
   updateChatSettings,
@@ -75,6 +81,7 @@ export interface ChatModelPanelProps {
 
 type Tab = 'model' | 'context' | 'prompts' | 'generation'
 const EMPTY_CURSOR = Object.freeze({}) as Readonly<Record<string, string>>
+const EMPTY_MESSAGES: Message[] = []
 
 export function ChatModelPanel({ chatId, chatSnapshot = null, onClose }: ChatModelPanelProps) {
   const liveChat = useLiveQuery(
@@ -133,10 +140,11 @@ export function ChatModelPanel({ chatId, chatSnapshot = null, onClose }: ChatMod
   const routing = usePrivacyRouting(chat)
   const { capability, descriptor, modelAvailable } = routing
   const endpointTokenizer = descriptor?.architecture?.tokenizer ?? null
-  const messages = useLiveQuery(
-    () => (chat ? loadChatMessages(chat.id) : Promise.resolve([])),
-    [chat?.id],
-    [],
+  const cursor = useChatStore((s) => (chat ? (s.cursors[chat.id] ?? EMPTY_CURSOR) : EMPTY_CURSOR))
+  const activeBranchSnapshot = useLiveQuery(
+    () => (chat ? loadActiveBranchSnapshot(chat.id, cursor) : Promise.resolve(null)),
+    [chat?.id, cursor],
+    null,
   )
   const draft = useLiveQuery(
     () => (chat ? getChatDraft(chat.id) : Promise.resolve(undefined)),
@@ -145,7 +153,6 @@ export function ChatModelPanel({ chatId, chatSnapshot = null, onClose }: ChatMod
   )
   const prefs = useLiveQuery(readGlobalPreferences, [], DEFAULT_GLOBAL_PREFERENCES)
   const globalCalibration = useLiveQuery(readTokenCalibrationGlobal, [], null)
-  const cursor = useChatStore((s) => (chat ? (s.cursors[chat.id] ?? EMPTY_CURSOR) : EMPTY_CURSOR))
   const streamActivityKey = useStreamStore((s) =>
     chat
       ? Object.values(s.activeByStreamId)
@@ -155,7 +162,7 @@ export function ChatModelPanel({ chatId, chatSnapshot = null, onClose }: ChatMod
           .join('|')
       : '',
   )
-  const activePathMessages = useMemo(() => activePath(messages, cursor), [messages, cursor])
+  const activePathMessages = activeBranchSnapshot?.branch ?? EMPTY_MESSAGES
   const attachmentResolver = useAttachmentResolverForContext({
     settings: chat?.settings,
     messages: activePathMessages,

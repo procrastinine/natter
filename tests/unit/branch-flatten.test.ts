@@ -185,7 +185,14 @@ describe('branch-flatten', () => {
     })
     const repo = {
       getChat: vi.fn(async () => fullChat({ title: 'Branching Deep Dive' })),
-      listMessages: vi.fn(async () => [user, stale, active]),
+      getActiveBranchSnapshot: vi.fn(async () => ({
+        chatId: 'c',
+        branch: [user, active],
+        allHeaders: [user, stale, active],
+        branchHeaders: [user, active],
+        siblingGroups: [],
+        treeKey: 'tree',
+      })),
     } as unknown as WorkspaceRepository
 
     const out = await exportActiveBranchAsTxt(repo, 'c', { u: 'active' })
@@ -207,7 +214,14 @@ describe('branch-flatten', () => {
           titleStatus: 'untitled',
         }),
       ),
-      listMessages: vi.fn(async () => []),
+      getActiveBranchSnapshot: vi.fn(async () => ({
+        chatId: 'c',
+        branch: [],
+        allHeaders: [],
+        branchHeaders: [],
+        siblingGroups: [],
+        treeKey: '',
+      })),
     } as unknown as WorkspaceRepository
 
     const out = await exportActiveBranchAsTxt(repo, 'c', {})
@@ -277,7 +291,7 @@ describe('branch-flatten', () => {
         wordCount: 1,
         messageTimestamps: [],
       })),
-      listMessages: vi.fn(async () => [user, assistant]),
+      getBranchByLeaf: vi.fn(async () => [user, assistant]),
       putChatBranchCache,
     } as unknown as WorkspaceRepository
 

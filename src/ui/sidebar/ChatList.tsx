@@ -17,8 +17,13 @@ import {
   sidebarSortOption,
   type SidebarSortMode,
 } from '../../core/sidebar-sort'
-import type { Chat, ChatFolder, ChatId, ChatTag, FolderId } from '../../core/types'
-import { archiveChat, listChats, moveChatToFolder, setChatTagsFromNames } from '../../store/chats'
+import type { ChatFolder, ChatId, ChatSidebarRow, ChatTag, FolderId } from '../../core/types'
+import {
+  archiveChat,
+  listChatSidebarRows,
+  moveChatToFolder,
+  setChatTagsFromNames,
+} from '../../store/chats'
 import { abortSearchSession, requestSearchSession } from '../../store/search-session'
 import {
   DEFAULT_SEARCH_FILTERS,
@@ -73,12 +78,16 @@ const EMPTY_SEARCH_RESULTS: SearchResult[] = []
 // implement the same read via the repository boundary; this module
 // doesn't couple to Dexie semantics beyond the live-query subscription.
 async function loadSidebarModel(): Promise<{
-  chats: Chat[]
+  chats: ChatSidebarRow[]
   folders: ChatFolder[]
   tags: ChatTag[]
 }> {
   try {
-    const [chats, folders, tags] = await Promise.all([listChats(), listFolders(), listTags()])
+    const [chats, folders, tags] = await Promise.all([
+      listChatSidebarRows(),
+      listFolders(),
+      listTags(),
+    ])
     return { chats, folders, tags }
   } catch (error) {
     if (error instanceof Error && error.name === 'DatabaseClosedError') {
@@ -238,13 +247,13 @@ export const ChatList = memo(function ChatList({ activeChatId, collapsed }: Chat
   // moment the user clicked New chat, violating the "rows materialize on
   // first send" contract (see tests/e2e/sidebar.spec.ts).
   const handleDelete = useCallback(
-    async (chat: Chat) => {
+    async (chat: ChatSidebarRow) => {
       await archiveChat(chat.id)
       if (activeChatId === chat.id) navigateHome()
     },
     [activeChatId],
   )
-  const handleDownload = useCallback(async (chat: Chat) => {
+  const handleDownload = useCallback(async (chat: ChatSidebarRow) => {
     const { filename, content } = await exportLastUpdatedChatAsTxt(chat.id)
     triggerBrowserDownload(filename, content)
   }, [])
@@ -298,7 +307,7 @@ export const ChatList = memo(function ChatList({ activeChatId, collapsed }: Chat
     }, 1400)
   }, [])
   const handleMoveChat = useCallback(
-    async (chat: Chat) => {
+    async (chat: ChatSidebarRow) => {
       const currentFolder = chat.folderId ? folderById.get(chat.folderId)?.name : ''
       const name = window.prompt('Move to folder (blank removes folder)', currentFolder ?? '')
       if (name === null) return
@@ -317,7 +326,7 @@ export const ChatList = memo(function ChatList({ activeChatId, collapsed }: Chat
     [folderById, markRecentMove, model.folders],
   )
   const handleSetTags = useCallback(
-    async (chat: Chat) => {
+    async (chat: ChatSidebarRow) => {
       const currentNames = chat.tags
         .map((tagId) => tagById.get(tagId)?.name)
         .filter((name): name is string => Boolean(name))
@@ -421,7 +430,7 @@ export const ChatList = memo(function ChatList({ activeChatId, collapsed }: Chat
       console.error('Failed to persist sidebar folder state', error)
     })
   }, [])
-  const renderChatRow = (chat: Chat, searchResult?: SearchResult) => {
+  const renderChatRow = (chat: ChatSidebarRow, searchResult?: SearchResult) => {
     const displayTitle = chat.title?.trim().length ? chat.title : 'Untitled chat'
     const preview = chat.previewText ?? ''
     const searchTargetId = searchResult?.messageId ?? searchResult?.branchLeafId ?? undefined
@@ -593,7 +602,7 @@ export const ChatList = memo(function ChatList({ activeChatId, collapsed }: Chat
       </li>
     )
   }
-  const renderChatRows = (chats: Chat[]) => {
+  const renderChatRows = (chats: ChatSidebarRow[]) => {
     if (!shouldRenderCreatedAtGroups(sortMode)) return chats.map((chat) => renderChatRow(chat))
     return buildCreatedAtGroups(chats, sortMode).map((group) => (
       <li key={group.key} data-ui="sidebar-time-group">

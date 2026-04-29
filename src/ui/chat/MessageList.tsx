@@ -1,7 +1,7 @@
 import { useLiveQuery } from 'dexie-react-hooks'
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { navigateToChat } from '../../app/router'
-import { activePath, cursorKeyOf, groupByParent, indexById } from '../../core/active-path'
+import { cursorKeyOf, groupByParent, indexById } from '../../core/active-path'
 import { resolveLastUpdatedBranchBelow } from '../../core/branch-resolve'
 import { computeBranchTitle, forkChatFromMessage } from '../../core/chat-fork'
 import type { LongMessageDisplayMode } from '../../core/global-settings'
@@ -28,7 +28,7 @@ import {
   type MessageOpsContext,
   regenerateFromMessage,
 } from '../../hooks/useMessageOps'
-import { getChat, listChats, loadChatMessages } from '../../store/chats'
+import { getChat, listChatSidebarRows, loadActiveBranchSnapshot } from '../../store/chats'
 import { useChatStore } from '../../store/zustand/chatStore'
 import { useStreamStore } from '../../store/zustand/streamStore'
 import { useToastStore } from '../../store/zustand/toastStore'
@@ -77,9 +77,17 @@ export const MessageList = memo(function MessageList({
   prefillRecommendationEndpoints = [],
   longMessageDisplayMode = 'full',
 }: MessageListProps) {
-  const liveMessages = useLiveQuery(() => loadChatMessages(chatId), [chatId], [])
-  const messages = useStableMessageRows(liveMessages ?? [])
   const cursor = useChatStore((state) => state.cursors[chatId] ?? EMPTY_CURSOR)
+  const branchSnapshot = useLiveQuery(
+    () => loadActiveBranchSnapshot(chatId, cursor),
+    [chatId, cursor],
+    null,
+  )
+  const messages = useStableMessageRows(branchSnapshot?.branch ?? [])
+  const treeMessages = useMemo(
+    () => (branchSnapshot?.allHeaders ?? []) as unknown as MessageRow[],
+    [branchSnapshot],
+  )
   const streamGenerationBusy = useStreamStore((state) => state.hasStreamForChat(chatId))
   const [localGenerationBusy, setLocalGenerationBusy] = useState(false)
   const localGenerationBusyRef = useRef(false)
@@ -88,8 +96,9 @@ export const MessageList = memo(function MessageList({
   // keyboard shortcuts (§10.6.1) don't rebuild them per keystroke. `byId`
   // and `byParent` only change when the live-query refires with a new
   // message array; `path` additionally depends on the cursor.
-  const byId = useMemo(() => indexById(messages), [messages])
-  const byParent = useMemo(() => groupByParent(messages), [messages])
+  const pathById = useMemo(() => indexById(messages), [messages])
+  const byId = useMemo(() => indexById(treeMessages), [treeMessages])
+  const byParent = useMemo(() => groupByParent(treeMessages), [treeMessages])
   const liveSiblingsByParent = useMemo(() => {
     const live = new Map<MessageId | null, MessageRow[]>()
     for (const [parentId, kids] of byParent) {
@@ -99,19 +108,13 @@ export const MessageList = memo(function MessageList({
     return live
   }, [byParent])
   const branchTreeKey = useMemo(
-    () =>
-      messages
-        .map(
-          (message) =>
-            `${message.id}:${message.parentId ?? 'root'}:${message.siblingIndex}:${message.deleted ? 1 : 0}`,
-        )
-        .join('|'),
-    [messages],
+    () => branchSnapshot?.treeKey ?? '',
+    [branchSnapshot],
   )
-  const path = useMemo(() => activePath(messages, cursor), [messages, cursor])
+  const path = messages
   const hasAnyReasoningDetails = useMemo(
-    () => messages.some((m) => (m.reasoningDetails?.length ?? 0) > 0),
-    [messages],
+    () => path.some((m) => (m.reasoningDetails?.length ?? 0) > 0),
+    [path],
   )
   const { sendFrom } = useChat()
   const pushToast = useToastStore((s) => s.push)
@@ -240,7 +243,7 @@ export const MessageList = memo(function MessageList({
         pushToast({ level: 'danger', text: 'Chat not found.' })
         return
       }
-      const existing = await listChats()
+      const existing = await listChatSidebarRows()
       const defaultTitle = computeBranchTitle(
         sourceChat.title,
         existing.map((c) => c.title),
@@ -297,14 +300,14 @@ export const MessageList = memo(function MessageList({
       if (isTyping) return
       const focusedId = focusedMessageId()
       if (!focusedId) return
-      const focused = byId.get(focusedId)
+      const focused = pathById.get(focusedId)
       if (!focused) return
       if (e.key === '[' || e.key === ']') {
         e.preventDefault()
         const direction = e.key === '[' ? -1 : 1
         const base = useChatStore.getState().getCursor(chatId) ?? {}
         const { cursorUpdates } = swipe({
-          messages,
+          messages: treeMessages,
           targetId: focusedId,
           direction,
           cursor: base,
@@ -324,7 +327,7 @@ export const MessageList = memo(function MessageList({
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [chatId, messages, byId, byParent, focusedMessageId, handleRegenerate])
+  }, [chatId, treeMessages, pathById, byId, byParent, focusedMessageId, handleRegenerate])
 
   const roleMismatchIdsOnPath = useMemo(() => {
     const set = new Set<MessageId>()
@@ -353,7 +356,7 @@ export const MessageList = memo(function MessageList({
             chatId={chatId}
             message={m}
             {...((liveSiblingsByParent.get(m.parentId)?.length ?? 0) > 1
-              ? { branchMessages: messages, branchTreeKey }
+              ? { branchMessages: treeMessages, branchTreeKey }
               : {})}
             hasAnyReasoningDetails={hasAnyReasoningDetails}
             hasSiblingVariants={(liveSiblingsByParent.get(m.parentId)?.length ?? 0) > 1}

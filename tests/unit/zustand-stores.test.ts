@@ -25,7 +25,7 @@ describe('streamStore', () => {
   })
 
   it('supports multiple same-chat streams keyed independently', () => {
-    const { setActive, getActive, isTargetActive } = useStreamStore.getState()
+    const { setActive, getActive, getTargetActive, isTargetActive } = useStreamStore.getState()
     setActive({
       streamId: 'S1',
       chatId: 'C1',
@@ -42,6 +42,7 @@ describe('streamStore', () => {
     })
     expect(getActive('S1')?.streamId).toBe('S1')
     expect(getActive('S2')?.streamId).toBe('S2')
+    expect(getTargetActive('C1', 'M1')?.streamId).toBe('S1')
     expect(isTargetActive('C1', 'M1')).toBe(true)
     expect(isTargetActive('C1', 'M2')).toBe(true)
     expect(isTargetActive('C1', 'M3')).toBe(false)

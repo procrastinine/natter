@@ -231,11 +231,31 @@ export async function readMessages(
     })
     try {
       return await new Promise<Array<Record<string, unknown>>>((resolve, reject) => {
-        const tx = db.transaction('messages', 'readonly')
-        const store = tx.objectStore('messages')
-        const index = store.index('chatId')
+        const tx = db.transaction(['messages', 'messageBodies'], 'readonly')
+        const messageStore = tx.objectStore('messages')
+        const bodyStore = tx.objectStore('messageBodies')
+        const index = messageStore.index('chatId')
         const req = index.getAll(id)
-        req.onsuccess = () => resolve(req.result as Array<Record<string, unknown>>)
+        req.onsuccess = () => {
+          const headers = req.result as Array<Record<string, unknown>>
+          if (headers.length === 0) {
+            resolve([])
+            return
+          }
+          const bodyReq = bodyStore.getAll()
+          bodyReq.onsuccess = () => {
+            const byId = new Map(
+              (bodyReq.result as Array<Record<string, unknown>>).map((row) => [row.id, row]),
+            )
+            resolve(
+              headers.map((header) => {
+                const body = byId.get(header.id)
+                return body ? { ...header, ...body, nodeVersion: header.nodeVersion } : header
+              }),
+            )
+          }
+          bodyReq.onerror = () => reject(bodyReq.error)
+        }
         req.onerror = () => reject(req.error)
       })
     } finally {

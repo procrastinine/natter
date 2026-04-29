@@ -17,9 +17,9 @@
 import { newId } from '../lib/ulid'
 import { attachmentIdOf, incRefs } from '../store/attachments'
 import { postEvent } from '../store/broadcast'
-import { createChat, getChat, loadChatMessages } from '../store/chats'
+import { createChat, getChat } from '../store/chats'
 import { getWorkspaceRepository } from '../store/workspace-repository'
-import { activePath, indexById } from './active-path'
+import { indexById } from './active-path'
 import type { AttachmentId, AttachmentRef, Chat, ChatId, Message, MessageId } from './types'
 
 export interface ForkChatFromMessageInput {
@@ -69,21 +69,31 @@ export function computeBranchTitle(baseTitle: string, existingTitles: readonly s
   return `${base} Branch ${n}`
 }
 
+async function loadAncestorsToMessage(chatId: ChatId, targetId: MessageId): Promise<Message[]> {
+  const repo = getWorkspaceRepository()
+  const ancestors: Message[] = []
+  let cur = await repo.getMessage(targetId)
+  if (!cur) throw new Error(`fork: message ${targetId} not found`)
+  while (cur) {
+    if (cur.chatId !== chatId) {
+      throw new Error(`fork: message ${cur.id} does not belong to chat ${chatId}`)
+    }
+    ancestors.push(cur)
+    cur = cur.parentId ? await repo.getMessage(cur.parentId) : undefined
+  }
+  ancestors.reverse()
+  return ancestors
+}
+
 export async function forkChatFromMessage(
   input: ForkChatFromMessageInput,
 ): Promise<ForkChatFromMessageResult> {
   const source = await getChat(input.chatId)
   if (!source) throw new Error(`fork: source chat ${input.chatId} not found`)
-  const allMessages = await loadChatMessages(input.chatId)
-  const ancestors = collectAncestorsToMessage(allMessages, input.messageId)
+  const ancestors = await loadAncestorsToMessage(input.chatId, input.messageId)
   if (ancestors.length === 0) {
     throw new Error('fork: no ancestors to copy')
   }
-  // Sanity-check: verify the target is on the currently-viewed active
-  // path. Silent prune if not. The fork still proceeds, but from the
-  // computed ancestors (which may differ from the user's cursor if
-  // a mid-action swipe occurred).
-  void activePath
 
   const now = input.now ?? Date.now()
   // Copy settings by value so the fork can diverge freely.

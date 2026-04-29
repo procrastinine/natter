@@ -26,6 +26,7 @@ import {
   mergeTagInto,
   updateTag,
 } from '../../src/store/tags'
+import { putTestMessage } from '../helpers/message-storage'
 
 const DB_NAME = 'natter'
 
@@ -88,7 +89,7 @@ async function seedMessage(chatId: string, overrides: Partial<Message> = {}): Pr
     deleted: false,
     ...overrides,
   }
-  await getDb().messages.put(message)
+  await putTestMessage(message)
   return message
 }
 

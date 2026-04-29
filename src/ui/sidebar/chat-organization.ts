@@ -1,4 +1,4 @@
-import type { Chat, ChatFolder } from '../../core/types'
+import type { ChatFolder, ChatSidebarRow } from '../../core/types'
 import {
   DEFAULT_SIDEBAR_SORT_MODE,
   isCreatedAtSidebarSort,
@@ -13,7 +13,7 @@ export type SidebarSortValue = number | string
 
 export interface SidebarChatEntry {
   kind: 'chat'
-  chat: Chat
+  chat: ChatSidebarRow
   sortValue: SidebarSortValue
   pinned: boolean
 }
@@ -21,7 +21,7 @@ export interface SidebarChatEntry {
 export interface SidebarFolderEntry {
   kind: 'folder'
   folder: ChatFolder
-  chats: Chat[]
+  chats: ChatSidebarRow[]
   sortValue: SidebarSortValue
   pinned: boolean
 }
@@ -31,7 +31,7 @@ export type SidebarEntry = SidebarChatEntry | SidebarFolderEntry
 export interface SidebarCreatedAtGroup {
   key: 'today' | 'yesterday' | 'previous-7-days' | 'previous-30-days' | 'older'
   label: string
-  chats: Chat[]
+  chats: ChatSidebarRow[]
 }
 
 export interface SidebarSortOptions {
@@ -52,7 +52,7 @@ const SIDEBAR_DATE_WITH_YEAR_FORMATTER = new Intl.DateTimeFormat(undefined, {
   year: '2-digit',
 })
 
-export function isEmptySidebarDraft(chat: Chat): boolean {
+export function isEmptySidebarDraft(chat: ChatSidebarRow): boolean {
   const p = chat.previewText
   return p === undefined || p === ''
 }
@@ -61,7 +61,7 @@ export function shouldRenderCreatedAtGroups(mode: SidebarSortMode): boolean {
   return isCreatedAtSidebarSort(mode)
 }
 
-export function chatSortValue(chat: Chat, mode: SidebarSortMode): SidebarSortValue {
+export function chatSortValue(chat: ChatSidebarRow, mode: SidebarSortMode): SidebarSortValue {
   const updatedAt = numberOrZero(chat.updatedAt)
   const field = sidebarSortField(mode)
   switch (field) {
@@ -82,7 +82,7 @@ export function chatSortValue(chat: Chat, mode: SidebarSortMode): SidebarSortVal
 
 export function folderSortValue(
   folder: ChatFolder,
-  chats: readonly Chat[],
+  chats: readonly ChatSidebarRow[],
   mode: SidebarSortMode,
   options: SidebarSortOptions = {},
 ): SidebarSortValue {
@@ -103,10 +103,10 @@ export function folderSortValue(
 }
 
 export function sortChats(
-  chats: readonly Chat[],
+  chats: readonly ChatSidebarRow[],
   mode: SidebarSortMode,
   options: SidebarSortOptions = {},
-): Chat[] {
+): ChatSidebarRow[] {
   const collator = collatorFor(options.locale)
   return [...chats].sort((left, right) => {
     const byPinned = Number(right.pinned === true) - Number(left.pinned === true)
@@ -116,14 +116,14 @@ export function sortChats(
 }
 
 export function buildSidebarEntries(
-  chats: readonly Chat[],
+  chats: readonly ChatSidebarRow[],
   folders: readonly ChatFolder[],
   mode: SidebarSortMode = DEFAULT_SIDEBAR_SORT_MODE,
   options: SidebarSortOptions = {},
 ): SidebarEntry[] {
   const visibleChats = chats.filter((chat) => !chat.archived && !isEmptySidebarDraft(chat))
   const foldersById = new Map(folders.map((folder) => [folder.id, folder]))
-  const chatsByFolder = new Map<string, Chat[]>()
+  const chatsByFolder = new Map<string, ChatSidebarRow[]>()
   const entries: SidebarEntry[] = []
   const collator = collatorFor(options.locale)
 
@@ -171,7 +171,7 @@ export function buildSidebarEntries(
 }
 
 export function buildCreatedAtGroups(
-  chats: readonly Chat[],
+  chats: readonly ChatSidebarRow[],
   mode: SidebarSortMode,
   now: number = Date.now(),
 ): SidebarCreatedAtGroup[] {
@@ -190,7 +190,7 @@ export function buildCreatedAtGroups(
 }
 
 export function formatSidebarRowMeta(
-  chat: Chat,
+  chat: ChatSidebarRow,
   mode: SidebarSortMode,
   now: number = Date.now(),
 ): string {
@@ -212,8 +212,8 @@ export function formatSidebarRowMeta(
 }
 
 function compareChatsWithinBucket(
-  left: Chat,
-  right: Chat,
+  left: ChatSidebarRow,
+  right: ChatSidebarRow,
   mode: SidebarSortMode,
   collator: Intl.Collator,
 ): number {
@@ -267,7 +267,10 @@ function emptyFolderSortValue(folder: ChatFolder, mode: SidebarSortMode): Sideba
   }
 }
 
-function createdAtBucket(chat: Chat, now: number): Pick<SidebarCreatedAtGroup, 'key' | 'label'> {
+function createdAtBucket(
+  chat: ChatSidebarRow,
+  now: number,
+): Pick<SidebarCreatedAtGroup, 'key' | 'label'> {
   const createdAt = numberOrFallback(chat.createdAt, chat.updatedAt)
   const daysAgo = Math.floor((startOfLocalDay(now) - startOfLocalDay(createdAt)) / 86_400_000)
   if (daysAgo <= 0) return { key: 'today', label: 'Today' }
@@ -283,7 +286,7 @@ function startOfLocalDay(value: number): number {
   return date.getTime()
 }
 
-function chatTitle(chat: Chat): string {
+function chatTitle(chat: ChatSidebarRow): string {
   const title = chat.title?.trim()
   return title ? title : 'Untitled chat'
 }

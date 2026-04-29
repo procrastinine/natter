@@ -11,7 +11,7 @@ import { newId } from '../lib/ulid'
 import {
   DEFAULT_OPENROUTER_PROVIDER_SORT,
   migrateLegacyProviderSettings,
-} from '../core/provider-settings-migration'
+} from '../backcompat/provider-settings'
 import { postEvent } from './broadcast'
 import { getDb } from './db'
 import { ProfileMissingError } from './profiles'

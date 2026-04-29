@@ -1,12 +1,22 @@
-import { filterEndpointsByPrivacy, type PrivacyFilterResult } from './privacy-filter'
+import { readCachedPrivacyPayload } from '../api/privacy-scrape'
+import { normalizeEndpointsResponse } from '../api/providers'
+import { filterEndpointsByPrivacy, type PrivacyFilterResult } from '../core/privacy-filter'
 import {
   endpointMatchesAnyProviderRef,
   providerEndpointKey,
   providerPolicyLookupKeys,
   providerRoutingRef,
   resolveProviderRefsToRoutingRefs,
-} from './provider-identity'
-import type { ChatSettings, DataPolicy, ModelEndpoint, ProviderPreferences, SortBy } from './types'
+} from '../core/provider-identity'
+import type {
+  ChatSettings,
+  ConnectionProfile,
+  DataPolicy,
+  ModelEndpoint,
+  ProviderPreferences,
+  SortBy,
+} from '../core/types'
+import type { CachedEndpointsRow, CachedPrivacyPolicyRow } from '../store/db'
 
 export const DEFAULT_OPENROUTER_PROVIDER_SORT: SortBy = 'price'
 
@@ -20,6 +30,34 @@ export interface ProviderSettingsMigrationContext {
 export interface ProviderSettingsMigrationResult {
   settings: ChatSettings
   changed: boolean
+}
+
+export interface ProviderSettingsRowMigrationCaches {
+  endpointsByKey: ReadonlyMap<string, CachedEndpointsRow>
+  privacyByKey: ReadonlyMap<string, CachedPrivacyPolicyRow>
+  profilesById?: ReadonlyMap<string, ConnectionProfile>
+}
+
+export function providerCacheKey(profileId: string, modelId: string): string {
+  return `${profileId}\u0000${modelId}`
+}
+
+export function migrateProviderSettingsRow(
+  settings: ChatSettings,
+  profileId: string,
+  modelId: string,
+  caches: ProviderSettingsRowMigrationCaches,
+): ProviderSettingsMigrationResult {
+  const key = providerCacheKey(profileId, modelId)
+  const endpoints = normalizeEndpointsResponse(caches.endpointsByKey.get(key)?.payload)?.endpoints
+  const policies = readCachedPrivacyPayload(caches.privacyByKey.get(key)?.payload)?.policies
+  const context: ProviderSettingsMigrationContext = { model: modelId }
+  if (endpoints) context.endpoints = endpoints
+  if (policies) context.policies = policies
+  if (caches.profilesById?.get(profileId)?.kind === 'openrouter') {
+    context.defaultSort = DEFAULT_OPENROUTER_PROVIDER_SORT
+  }
+  return migrateLegacyProviderSettings(settings, context)
 }
 
 export function migrateLegacyProviderSettings(

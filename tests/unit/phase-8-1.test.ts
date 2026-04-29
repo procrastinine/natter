@@ -18,7 +18,9 @@ import type { Chat, ChatId, Message, MessageId, MessageRole } from '../../src/co
 import { applyStructuralSnapshot, snapshotMessages } from '../../src/core/undo'
 import { newId } from '../../src/lib/ulid'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
+import { loadChatMessages } from '../../src/store/chats'
 import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
+import { splitMessageForStorage } from '../../src/store/message-storage'
 import { plaintextOf, writeTextInto } from '../../src/ui/chat/InlineEditor'
 
 const DB_NAME = 'natter'
@@ -87,7 +89,9 @@ async function putMessage(chatId: ChatId, spec: SeedMsg = {}): Promise<Message> 
     nodeVersion: 0,
     deleted: spec.deleted ?? false,
   }
-  await getDb().messages.put(row)
+  const { header, body } = splitMessageForStorage(row)
+  await getDb().messages.put(header)
+  await getDb().messageBodies.put(body)
   return row
 }
 
@@ -138,7 +142,7 @@ describe('collectAncestorsToMessage', () => {
       role: 'assistant',
       createdAt: 4,
     })
-    const rows = await getDb().messages.where('chatId').equals(chat.id).toArray()
+    const rows = await loadChatMessages(chat.id)
     const ancestors = collectAncestorsToMessage(rows, 'U2')
     expect(ancestors.map((a) => a.id)).toEqual(['R', 'A', 'U2'])
   })
@@ -180,7 +184,7 @@ describe('forkChatFromMessage', () => {
     const fork = await getDb().chats.get(forkId)
     expect(fork?.title).toBe('Design review Branch 1')
     expect(fork?.titleStatus).toBe('manual')
-    const forkMessages = await getDb().messages.where('chatId').equals(forkId).toArray()
+    const forkMessages = await loadChatMessages(forkId)
     expect(forkMessages).toHaveLength(2)
     const roles = forkMessages.sort((a, b) => a.createdAt - b.createdAt).map((m) => m.role)
     expect(roles).toEqual(['user', 'assistant'])
@@ -189,7 +193,7 @@ describe('forkChatFromMessage', () => {
       expect(['root', 'a']).toContain((m.content[0] as { type: string; text: string }).text)
     }
     // Source chat is untouched.
-    const sourceRows = await getDb().messages.where('chatId').equals(chat.id).toArray()
+    const sourceRows = await loadChatMessages(chat.id)
     expect(sourceRows).toHaveLength(4)
   })
 })

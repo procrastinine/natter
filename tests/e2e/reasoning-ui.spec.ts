@@ -22,10 +22,35 @@ test('mirrored Claude reasoning renders once in the UI and shows reasoning time 
         const now = Date.now()
         const userId = 'reasoning-user'
         const assistantId = 'reasoning-assistant'
-        const tx = db.transaction(['presets', 'messages', 'chats'], 'readwrite')
+        const tx = db.transaction(['presets', 'messages', 'messageBodies', 'chats'], 'readwrite')
         const chats = tx.objectStore('chats')
         const messages = tx.objectStore('messages')
+        const messageBodies = tx.objectStore('messageBodies')
         const presets = tx.objectStore('presets')
+        const putMessage = (row: Record<string, unknown>) => {
+          const {
+            content,
+            reasoningDetails,
+            toolCalls,
+            refusal,
+            phase,
+            responsesEchoItem,
+            ...header
+          } = row
+          messages.put(header)
+          messageBodies.put({
+            id: row.id,
+            chatId: row.chatId,
+            nodeVersion: row.nodeVersion,
+            updatedAt: now,
+            content,
+            ...(reasoningDetails !== undefined ? { reasoningDetails } : {}),
+            ...(toolCalls !== undefined ? { toolCalls } : {}),
+            ...(refusal !== undefined ? { refusal } : {}),
+            ...(phase !== undefined ? { phase } : {}),
+            ...(responsesEchoItem !== undefined ? { responsesEchoItem } : {}),
+          })
+        }
         const getPresetsReq = presets.getAll()
         getPresetsReq.onsuccess = () => {
           const preset = getPresetsReq.result?.[0]
@@ -53,7 +78,7 @@ test('mirrored Claude reasoning renders once in the UI and shows reasoning time 
             folderId: null,
             tags: [],
           })
-          messages.put({
+          putMessage({
             id: userId,
             chatId: activeChatId,
             parentId: null,
@@ -67,7 +92,7 @@ test('mirrored Claude reasoning renders once in the UI and shows reasoning time 
             nodeVersion: 0,
             deleted: false,
           })
-          messages.put({
+          putMessage({
             id: assistantId,
             chatId: activeChatId,
             parentId: userId,

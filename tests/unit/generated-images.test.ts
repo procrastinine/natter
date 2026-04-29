@@ -15,6 +15,7 @@ import {
   normalizeGeneratedImageOutputAttachmentRefs,
 } from '../../src/store/generated-images'
 import { ingestAttachmentBytes } from '../../src/store/attachments'
+import { putTestMessage } from '../helpers/message-storage'
 
 const DB_NAME = 'natter'
 const ONE_PIXEL_PNG =
@@ -106,7 +107,7 @@ describe('generated image output storage migration', () => {
       nodeVersion: 0,
       deleted: false,
     }
-    await getDb().messages.put(message)
+    await putTestMessage(message)
 
     await migrateGeneratedImageOutputAttachments(message.id)
 
@@ -150,7 +151,7 @@ describe('generated image output storage migration', () => {
       nodeVersion: 0,
       deleted: false,
     }
-    await getDb().messages.put(message)
+    await putTestMessage(message)
 
     await Promise.all([
       migrateGeneratedImageOutputAttachments(message.id),
@@ -220,7 +221,7 @@ describe('generated image output storage migration', () => {
       nodeVersion: 0,
       deleted: false,
     }
-    await getDb().messages.put(message)
+    await putTestMessage(message)
 
     await normalizeGeneratedImageOutputAttachmentRefs(message.id)
 

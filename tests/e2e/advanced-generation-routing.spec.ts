@@ -235,8 +235,6 @@ test('GUI OpenRouter hosted tools serialize for chat routes but not text complet
 
   const tools = page.locator('[data-ui-section="hosted-tools"]')
   await expect(tools).toBeVisible()
-  await expect(tools.getByRole('checkbox', { name: 'Web search' })).toBeHidden()
-  await tools.locator('summary').click()
   const webSearch = tools.getByRole('checkbox', { name: 'Web search' })
   const datetime = tools.getByRole('checkbox', { name: 'Datetime' })
   await expect(webSearch).toBeEnabled()
@@ -276,7 +274,6 @@ test('GUI OpenRouter hosted tools serialize for chat routes but not text complet
   await apiMode.getByRole('button', { name: 'Text completions', exact: true }).click()
   await page.getByRole('tab', { name: 'Generation' }).click()
   const textTools = page.locator('[data-ui-section="hosted-tools"]')
-  await textTools.locator('summary').click()
   await expect(textTools.getByRole('checkbox', { name: 'Web search' })).toBeDisabled()
   await expect(textTools.getByRole('checkbox', { name: 'Datetime' })).toBeDisabled()
   await page.locator('[data-ui="text-template-picker"]').selectOption('raw')

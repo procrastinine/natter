@@ -27,6 +27,7 @@ import {
   getBrowserRepository,
 } from '../../src/store/browser-repo'
 import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
+import { putTestMessage } from '../helpers/message-storage'
 
 const DB_NAME = 'natter'
 
@@ -225,7 +226,7 @@ describe('attachment backend storage', () => {
   it('manages refs, relinks to existing storage, and deletes referenced bytes into missing state', async () => {
     const chat = await seedChat()
     const message = makeMessage(chat.id)
-    await getDb().messages.put(message)
+    await putTestMessage(message)
 
     const first = await ingestAttachmentBytes({
       blob: bytes('first attachment'),
@@ -398,7 +399,7 @@ describe('reapOrphanedAttachments', () => {
       createdAt: 1000,
     })
     await putAttachment(attachment)
-    await getDb().messages.put(makeMessage(chat.id, [attachment.id]))
+    await putTestMessage(makeMessage(chat.id, [attachment.id]))
 
     const reaped = await reapOrphanedAttachments({ now: 10_000, olderThanMs: 5000 })
     expect(reaped).toEqual([])
@@ -423,7 +424,7 @@ describe('misc attachment helpers', () => {
       kind: 'file',
     })
     await putAttachment(attachment)
-    await getDb().messages.put(makeMessage(chat.id, [attachment.id]))
+    await putTestMessage(makeMessage(chat.id, [attachment.id]))
     await getDb().drafts.put({
       chatId: chat.id,
       text: '',

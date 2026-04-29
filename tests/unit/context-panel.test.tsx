@@ -9,8 +9,9 @@ import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import type { Chat, Message, MessageAttachmentRef, ModelEndpoint } from '../../src/core/types'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import { createChat, getChat } from '../../src/store/chats'
-import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
+import { __resetDbForTests, openDb } from '../../src/store/db'
 import { ContextPanel } from '../../src/ui/settings/ContextPanel'
+import { putTestMessages } from '../helpers/message-storage'
 
 const DB_NAME = 'natter'
 
@@ -137,7 +138,7 @@ describe('ContextPanel slider persistence', () => {
     const settings = cloneDefaultChatSettings()
     settings.model = 'openai/gpt-4o-mini'
     const chat = await createChat({ settings })
-    await getDb().messages.bulkPut([userMessage(chat.id), assistantMessage(chat.id)])
+    await putTestMessages([userMessage(chat.id), assistantMessage(chat.id)])
     const capability = effectiveCapabilityFromEndpoints(settings.model, [makeEndpoint()])
     const { container, getByRole } = render(
       <LiveContextPanel chatId={chat.id} capability={capability} />,

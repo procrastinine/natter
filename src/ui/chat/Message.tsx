@@ -26,6 +26,7 @@ import {
   migrateGeneratedOutputAttachments,
   normalizeGeneratedImageOutputAttachmentRefs,
 } from '../../store/generated-images'
+import { getStreamClientId } from '../../store/stream-leases'
 import { useStreamStore } from '../../store/zustand/streamStore'
 import { useToastStore } from '../../store/zustand/toastStore'
 import { useUiStore } from '../../store/zustand/uiStore'
@@ -160,31 +161,47 @@ function MessageInner({
   longMessageDisplayMode = 'full',
 }: MessageProps) {
   void branchTreeKey
-  const error = message.generation?.error
-  const abortReason = message.generation?.abortReason
   const debug = (message as unknown as { debugCrash?: boolean }).debugCrash
   if (debug) {
     throw new Error('Message debug crash')
   }
-  const reasoning = useMemo(
-    () => normalizeReasoningDetails(message.reasoningDetails ?? []),
-    [message.reasoningDetails],
-  )
   const [showInfo, setShowInfo] = useState(false)
   const [editing, setEditing] = useState(false)
-  const text = useMemo(() => messageTextFromContent(message.content), [message.content])
   // Streaming state is tracked per-message (messageId) in the ephemeral
   // stream store. Prop `streaming` is the authoritative fallback when a
   // caller passes it in; otherwise the store is checked. Either way, the
   // resolved value drives streaming render mode plus reasoning/collapse
   // affordances.
-  const storeStreaming = useStreamStore((s) =>
-    message.role === 'assistant' ? s.isTargetActive(chatId, message.id) : false,
+  const activeStream = useStreamStore((s) =>
+    message.role === 'assistant' ? s.getTargetActive(chatId, message.id) : undefined,
   )
+  const liveSnapshot = useStreamStore((s) =>
+    message.role === 'assistant' ? s.liveByMessageId[message.id] : undefined,
+  )
+  const storeStreaming = activeStream !== undefined
   const isStreaming = streaming === true || storeStreaming
+  const remoteStreaming =
+    activeStream !== undefined && activeStream.ownerClientId !== getStreamClientId()
+  const renderedContent = liveSnapshot?.content ?? message.content
+  const renderedReasoningDetails = liveSnapshot?.reasoningDetails ?? message.reasoningDetails
+  const renderedGeneration = mergeLiveGeneration(message.generation, liveSnapshot?.generation)
+  const infoMessage = useMemo(() => {
+    if (!showInfo || !liveSnapshot) return message
+    return {
+      ...message,
+      content: renderedContent,
+      ...(renderedReasoningDetails ? { reasoningDetails: renderedReasoningDetails } : {}),
+      ...(renderedGeneration ? { generation: renderedGeneration } : {}),
+    }
+  }, [showInfo, liveSnapshot, message, renderedContent, renderedReasoningDetails, renderedGeneration])
+  const reasoning = useMemo(
+    () => normalizeReasoningDetails(renderedReasoningDetails ?? []),
+    [renderedReasoningDetails],
+  )
+  const text = useMemo(() => messageTextFromContent(renderedContent), [renderedContent])
   const hasContent =
     text.length > 0 ||
-    message.content.some(
+    renderedContent.some(
       (item) =>
         item.type === 'output_image' ||
         item.type === 'audio_output' ||
@@ -193,7 +210,7 @@ function MessageInner({
   useEffect(() => {
     if (isStreaming) return
     if (
-      message.content.some(
+      renderedContent.some(
         (item) =>
           item.type === 'output_image' ||
           item.type === 'audio_output' ||
@@ -203,11 +220,13 @@ function MessageInner({
       void migrateGeneratedOutputAttachments(message.id).catch(() => {})
       return
     }
-    if (generatedOutputAttachmentIds(message.content).size > 0) {
+    if (generatedOutputAttachmentIds(renderedContent).size > 0) {
       void normalizeGeneratedImageOutputAttachmentRefs(message.id).catch(() => {})
     }
-  }, [isStreaming, message.content, message.id])
-  const gen = message.generation
+  }, [isStreaming, renderedContent, message.id])
+  const gen = renderedGeneration
+  const error = gen?.error
+  const abortReason = gen?.abortReason
   const messageModelQuirks = useMemo(
     () => quirksFor(gen?.model ?? gen?.requestedModel ?? ''),
     [gen?.model, gen?.requestedModel],
@@ -474,7 +493,7 @@ function MessageInner({
           />
         ) : (
           <MessageContent
-            content={message.content}
+            content={renderedContent}
             text={text}
             streaming={isStreaming}
             collapseMode={collapseMode}
@@ -528,6 +547,11 @@ function MessageInner({
             </button>
           </div>
         ) : null}
+        {remoteStreaming ? (
+          <div data-ui="message-stream-remote" role="status">
+            This response is currently streaming in another tab.
+          </div>
+        ) : null}
         {null}
         <div data-ui="message-action-row">
           {hasSiblingVariants && branchMessages ? (
@@ -561,11 +585,27 @@ function MessageInner({
           />
         ) : null}
         {showInfo ? (
-          <MessageInfo message={message} {...(staleReplyHint ? { staleReplyHint: true } : {})} />
+          <MessageInfo
+            message={infoMessage}
+            {...(staleReplyHint ? { staleReplyHint: true } : {})}
+          />
         ) : null}
       </div>
     </article>
   )
+}
+
+function mergeLiveGeneration(
+  persisted: MessageRow['generation'],
+  live: MessageRow['generation'],
+): MessageRow['generation'] {
+  if (!live) return persisted
+  if (!persisted) return live
+  return {
+    ...persisted,
+    ...live,
+    startedAt: persisted.startedAt,
+  }
 }
 
 function collapseButtonLabel(

@@ -1,5 +1,6 @@
 import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { assertNoInlineMessageBodies } from '../../src/backcompat/message-body-split'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import type { Chat, ChatPreset, Message } from '../../src/core/types'
 import type { NatterDb } from '../../src/store/db'
@@ -10,6 +11,7 @@ import {
   openDb,
   registerSchema,
 } from '../../src/store/db'
+import { splitMessageForStorage } from '../../src/store/message-storage'
 
 // Unique DB name per test so migrations start from a clean slate. Pre-existing
 // data is deleted at the top of each test so repeated runs don't pick up stale
@@ -46,6 +48,7 @@ describe('Dexie schema', () => {
         'folders',
         'generations',
         'keys',
+        'messageBodies',
         'messages',
         'models',
         'presets',
@@ -55,6 +58,8 @@ describe('Dexie schema', () => {
         'promptPresets',
         'providers',
         'settings',
+        'streamChunks',
+        'streamLeases',
         'tags',
       ].sort(),
     )
@@ -104,7 +109,7 @@ function registerV1(db: Dexie): void {
 
 function registerV1Through3(db: Dexie): void {
   registerSchema(db)
-  db.version(10)
+  db.version(13)
     .stores({ profiles: 'id, name, kind, lastUsedAt, archived' })
     .upgrade(async (tx) => {
       await tx
@@ -114,7 +119,7 @@ function registerV1Through3(db: Dexie): void {
           if (row.appTitle === undefined) row.appTitle = 'Natter'
         })
     })
-  db.version(11)
+  db.version(14)
     .stores({ settings: '&key' })
     .upgrade(async (tx) => {
       const settings = tx.table<MinimalSetting>('settings')
@@ -186,7 +191,7 @@ describe('Dexie migrations', () => {
     const db = new Dexie(name)
     registerV1Through3(db)
     await db.open()
-    expect(db.verno).toBe(11)
+    expect(db.verno).toBe(14)
     expect(db.tables.map((t) => t.name).includes('settings')).toBe(true)
     const tag = await db.table<MinimalSetting>('settings').get('schemaTag')
     expect(tag).toBeUndefined()
@@ -222,7 +227,7 @@ describe('Dexie migrations', () => {
     const up = new Dexie(name)
     registerV1Through3(up)
     await up.open()
-    expect(up.verno).toBe(11)
+    expect(up.verno).toBe(14)
     const profile = await up.table<MinimalProfile>('profiles').get('P1')
     expect(profile?.appTitle).toBe('CustomTitle') // preserved — synthetic bump only fills undefined
     const tag = await up.table<MinimalSetting>('settings').get('schemaTag')
@@ -232,7 +237,7 @@ describe('Dexie migrations', () => {
     const reopen = new Dexie(name)
     registerV1Through3(reopen)
     await reopen.open()
-    expect(reopen.verno).toBe(11)
+    expect(reopen.verno).toBe(14)
     const tag2 = await reopen.table<MinimalSetting>('settings').get('schemaTag')
     expect(tag2?.value).toBe('preexisting')
     await reopen.delete()
@@ -552,9 +557,16 @@ describe('Dexie migrations', () => {
     )
 
     const emptyMessage = await migrated.messages.get('msg-empty')
+    expect(Object.hasOwn(emptyMessage ?? {}, 'content')).toBe(false)
     expect(emptyMessage?.attachmentRefs).toEqual([])
+    expect(await migrated.messageBodies.get('msg-empty')).toMatchObject({
+      id: 'msg-empty',
+      chatId: 'chat-old',
+      content: [{ type: 'text', text: 'old text-only message' }],
+    })
 
     const prototypeMessage = await migrated.messages.get('msg-proto')
+    expect(Object.hasOwn(prototypeMessage ?? {}, 'content')).toBe(false)
     expect(prototypeMessage?.attachmentRefs).toEqual([
       expect.objectContaining({
         refId: 'legacy:msg-proto:0',
@@ -563,6 +575,12 @@ describe('Dexie migrations', () => {
         presentation: {},
       }),
     ])
+    expect(await migrated.messageBodies.get('msg-proto')).toMatchObject({
+      id: 'msg-proto',
+      chatId: 'chat-old',
+      content: [{ type: 'text', text: 'old attachment message' }],
+    })
+    await expect(assertNoInlineMessageBodies(migrated)).resolves.toBeUndefined()
 
     const draft = await migrated.drafts.get('chat-old')
     expect(draft?.attachmentRefs).toEqual([
@@ -698,7 +716,7 @@ describe('Dexie migrations', () => {
         pinned: false,
       },
     ])
-    await db.table<Message>('messages').bulkPut([
+    const messages = [
       legacyMessage({ id: 'i1', chatId: 'imported', origin: 'imported', text: 'imported text' }),
       legacyMessage({ id: 'root', chatId: 'branchy', text: 'root text', createdAt: 1, cost: 0.1 }),
       legacyMessage({
@@ -744,7 +762,11 @@ describe('Dexie migrations', () => {
         cost: 1,
         deleted: true,
       }),
-    ])
+    ]
+    const splitMessages = messages.map((message) => splitMessageForStorage(message))
+    await db.messages.bulkPut(splitMessages.map((message) => message.header))
+    await db.messageBodies.bulkPut(splitMessages.map((message) => message.body))
+    await db.messageBodies.delete('old-leaf')
 
     await backfillOrganizationFields(db)
     await backfillOrganizationFields(db)

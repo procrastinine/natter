@@ -20,7 +20,6 @@ import { fetchPrivacyScrape, readCachedPrivacyPayload } from '../api/privacy-scr
 import type { CorsProxyConfig } from './cors-proxy'
 import { isFreeModel } from './model-predicates'
 import { providerRoutingRef } from './provider-identity'
-import { migrateLegacyProviderSettings } from './provider-settings-migration'
 import {
   buildWireProviderPrivacy,
   filterEndpointsByPrivacy,
@@ -119,20 +118,14 @@ export async function resolvePrivacyForSend(
     endpoints,
     ...(input.signal ? { signal: input.signal } : {}),
   })
-  const migrated = migrateLegacyProviderSettings(chat.settings, {
+  const filter = filterEndpointsByPrivacy({
     model: chat.settings.model,
     endpoints,
     policies: policyResult.policies,
-  })
-  const settings = migrated.settings
-  const filter = filterEndpointsByPrivacy({
-    model: settings.model,
-    endpoints,
-    policies: policyResult.policies,
-    privacy: settings.privacy,
+    privacy: chat.settings.privacy,
     ...(policyResult.offlineFallback ? { missingPolicyMode: 'offline-worst-case' } : {}),
   })
-  const prefs = settings.providerPrefs
+  const prefs = chat.settings.providerPrefs
   const wireOpts: {
     existingIgnore?: readonly string[]
     existingOnly?: readonly string[]
@@ -144,7 +137,7 @@ export async function resolvePrivacyForSend(
   if (prefs?.ignore) wireOpts.existingIgnore = prefs.ignore
   if (prefs?.only) wireOpts.existingOnly = prefs.only
   if (prefs?.order) wireOpts.existingOrder = prefs.order
-  const wire = buildWireProviderPrivacy(filter, settings.privacy, wireOpts)
+  const wire = buildWireProviderPrivacy(filter, chat.settings.privacy, wireOpts)
   if (typeof input.neededTokens === 'number' && input.neededTokens > 0) {
     const insufficient: string[] = []
     for (const ep of endpoints) {

@@ -33,7 +33,7 @@ test('orphan in-flight message is marked tab-close on next mount', async ({ page
         req.onerror = () => reject(req.error)
       })
       await new Promise<void>((resolve, reject) => {
-        const tx = db.transaction('messages', 'readwrite')
+        const tx = db.transaction(['messages', 'messageBodies'], 'readwrite')
         tx.objectStore('messages').put({
           id,
           chatId,
@@ -44,7 +44,6 @@ test('orphan in-flight message is marked tab-close on next mount', async ({ page
           createdAt: 1,
           role: 'assistant',
           origin: 'generated',
-          content: [{ type: 'output_text', text: 'partial' }],
           nodeVersion: 0,
           deleted: false,
           generation: {
@@ -56,6 +55,13 @@ test('orphan in-flight message is marked tab-close on next mount', async ({ page
             costSource: 'stream',
             startedAt: 100,
           },
+        })
+        tx.objectStore('messageBodies').put({
+          id,
+          chatId,
+          nodeVersion: 0,
+          updatedAt: 100,
+          content: [{ type: 'output_text', text: 'partial' }],
         })
         tx.oncomplete = () => resolve()
         tx.onerror = () => reject(tx.error)

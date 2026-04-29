@@ -13,6 +13,7 @@ import {
   getBrowserRepository,
 } from '../../src/store/browser-repo'
 import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
+import { putTestMessage, putTestMessages } from '../helpers/message-storage'
 
 const DB_NAME = 'natter'
 
@@ -87,7 +88,7 @@ describe('branch-cache store', () => {
       createdAt: 2,
       content: [{ type: 'output_text', text: 'hello assistant' }],
     })
-    await getDb().messages.bulkPut([user, assistant])
+    await putTestMessages([user, assistant])
     const events: BroadcastEvent[] = []
     const unsub = onEvent((event) => events.push(event))
 
@@ -172,7 +173,7 @@ describe('branch-cache store', () => {
       createdAt: 2,
       content: [{ type: 'output_text', text: 'old answer' }],
     })
-    await getDb().messages.bulkPut([user, assistant])
+    await putTestMessages([user, assistant])
     await getDb().chatBranchCache.put({
       chatId: 'chat-cache',
       branchLeafId: 'a',
@@ -225,7 +226,7 @@ describe('branch-cache store', () => {
       createdAt: 2,
       content: [{ type: 'output_text', text: 'old branch' }],
     })
-    await getDb().messages.bulkPut([root, latest, offPath])
+    await putTestMessages([root, latest, offPath])
     await getDb().chatBranchCache.put({
       chatId: 'chat-cache',
       branchLeafId: 'latest',
@@ -257,7 +258,7 @@ describe('branch-cache store', () => {
   it('deletes the branch cache atomically when the final live leaf is tombstoned', async () => {
     await seedChat({ lastUpdatedLeafId: 'u', lastBranchUpdatedAt: 1 })
     const user = message({ id: 'u', content: [{ type: 'text', text: 'hello user' }] })
-    await getDb().messages.put(user)
+    await putTestMessage(user)
     await getDb().chatBranchCache.put({
       chatId: 'chat-cache',
       branchLeafId: 'u',

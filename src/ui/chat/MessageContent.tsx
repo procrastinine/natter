@@ -7,7 +7,7 @@ import { setAttachmentRefVisibility } from '../../store/attachments'
 import type { AttachmentBundle } from '../../store/repository'
 import { EyeIcon, EyeOffIcon } from '../icons/Icon'
 import { MarkdownView } from './MarkdownView'
-import { MessageStreamOverflow, type MessageCollapseMode } from './MessageStreamOverflow'
+import type { MessageCollapseMode } from './MessageStreamOverflow'
 
 export interface MessageContentProps {
   content: ContentItem[]
@@ -28,12 +28,15 @@ const outputObjectUrlCache = new Map<
 >()
 
 export function messageTextFromContent(content: ContentItem[]): string {
-  return content
-    .map((item) => {
-      if (item.type === 'text' || item.type === 'output_text') return item.text
-      return ''
-    })
-    .join('')
+  if (content.length === 1) {
+    const only = content[0]
+    return only && (only.type === 'text' || only.type === 'output_text') ? only.text : ''
+  }
+  let text = ''
+  for (const item of content) {
+    if (item.type === 'text' || item.type === 'output_text') text += item.text
+  }
+  return text
 }
 
 export function MessageContent({
@@ -48,39 +51,43 @@ export function MessageContent({
   const audios = useMemo(() => outputAudiosFromContent(content), [content])
   const videos = useMemo(() => outputVideosFromContent(content), [content])
   const mediaRefs = useMemo(() => liveAttachmentRefs(attachmentRefs), [attachmentRefs])
-  const body = (
+  const compactText = useMemo(
+    () => (collapseMode === 'compact' ? previewSlice(text, COMPACT_PREVIEW_CHARS) : ''),
+    [collapseMode, text],
+  )
+  const peekText = useMemo(
+    () =>
+      collapseMode === 'peek'
+        ? previewFirstLine(text, images.length + audios.length + videos.length)
+        : '',
+    [collapseMode, text, images.length, audios.length, videos.length],
+  )
+  if (collapseMode === 'peek') {
+    return (
+      <div data-ui="message-body" data-role="text" data-overflow="peek">
+        <p data-ui="message-body-peek">{peekText}</p>
+      </div>
+    )
+  }
+  if (collapseMode === 'compact') {
+    return (
+      <div data-ui="message-body" data-role="content" data-overflow="compact">
+        {compactText.length > 0 ? (
+          <MarkdownView content={compactText} streaming={streaming} />
+        ) : null}
+        <OutputImages images={images} messageId={messageId} attachmentRefs={mediaRefs} />
+        <OutputAudios audios={audios} messageId={messageId} attachmentRefs={mediaRefs} />
+        <OutputVideos videos={videos} messageId={messageId} attachmentRefs={mediaRefs} />
+      </div>
+    )
+  }
+  return (
     <div data-ui="message-body" data-role="content">
       {text.length > 0 ? <MarkdownView content={text} streaming={streaming} /> : null}
       <OutputImages images={images} messageId={messageId} attachmentRefs={mediaRefs} />
       <OutputAudios audios={audios} messageId={messageId} attachmentRefs={mediaRefs} />
       <OutputVideos videos={videos} messageId={messageId} attachmentRefs={mediaRefs} />
     </div>
-  )
-  const compactText = useMemo(() => previewSlice(text, COMPACT_PREVIEW_CHARS), [text])
-  const compact = (
-    <div data-ui="message-body" data-role="content" data-overflow="compact">
-      {compactText.length > 0 ? <MarkdownView content={compactText} streaming={streaming} /> : null}
-      <OutputImages images={images} messageId={messageId} attachmentRefs={mediaRefs} />
-      <OutputAudios audios={audios} messageId={messageId} attachmentRefs={mediaRefs} />
-      <OutputVideos videos={videos} messageId={messageId} attachmentRefs={mediaRefs} />
-    </div>
-  )
-  const peekText = useMemo(
-    () => previewFirstLine(text, images.length + audios.length + videos.length),
-    [text, images.length, audios.length, videos.length],
-  )
-  const peek = (
-    <div data-ui="message-body" data-role="text" data-overflow="peek">
-      <p data-ui="message-body-peek">{peekText}</p>
-    </div>
-  )
-  return (
-    <MessageStreamOverflow
-      collapseMode={collapseMode}
-      fullChildren={body}
-      compactChildren={compact}
-      peekChildren={peek}
-    />
   )
 }
 

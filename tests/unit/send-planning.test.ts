@@ -526,7 +526,7 @@ describe('resolveRequestPrivacyPlan', () => {
     expect(requestPlan.wire.max_tokens).toBe(32)
     expect(requestPlan.wire.reasoning).toEqual({ enabled: false })
     expect(requestPlan.wire.provider).toMatchObject({
-      only: ['Nebius'],
+      only: ['nebius'],
       allow_fallbacks: false,
     })
     expect(requestPlan.wire.tools).toBeUndefined()
@@ -634,7 +634,7 @@ describe('resolveRequestPrivacyPlan', () => {
         ...cloneDefaultChatSettings().contextStrategy,
         keepFirstPairs: 0,
       },
-      appendPrompt: '\n\n' + 'x'.repeat(200),
+      appendPrompt: `\n\n${'x'.repeat(200)}`,
     })
 
     const { requestPlan } = await prepareAssistantRequestPlan({

@@ -6,7 +6,6 @@
 // They return the data the caller needs to apply those side effects.
 
 import type { MutationContext } from '../store/repository'
-import { groupByParent } from './active-path'
 import type { ChatId, Message, MessageId } from './types'
 
 export class TreeChangedError extends Error {
@@ -18,10 +17,6 @@ export class TreeChangedError extends Error {
     this.chatId = chatId
     this.detail = detail
   }
-}
-
-export async function loadChatMessages(ctx: MutationContext, chatId: ChatId): Promise<Message[]> {
-  return ctx.listMessages(chatId)
 }
 
 // `max(siblingIndex) + 1` across live AND tombstoned children. The uniqueness
@@ -38,6 +33,20 @@ export function nextSiblingIndex(
     if (k.siblingIndex > max) max = k.siblingIndex
   }
   return max + 1
+}
+
+type MessageTreeRow = Pick<Message, 'id' | 'parentId'>
+
+function groupTreeRowsByParent(
+  messages: readonly MessageTreeRow[],
+): Map<MessageId | null, MessageTreeRow[]> {
+  const buckets = new Map<MessageId | null, MessageTreeRow[]>()
+  for (const message of messages) {
+    const bucket = buckets.get(message.parentId)
+    if (bucket) bucket.push(message)
+    else buckets.set(message.parentId, [message])
+  }
+  return buckets
 }
 
 // Cycle check: walk upward from `parentId` and fail if `childId` appears on
@@ -181,8 +190,7 @@ export async function cascadeSoftDelete(
   nodeIdsToDelete: readonly MessageId[],
 ): Promise<MessageId[]> {
   if (nodeIdsToDelete.length === 0) return []
-  const all = await loadChatMessages(ctx, chatId)
-  const byParent = groupByParent(all)
+  const byParent = groupTreeRowsByParent(await ctx.listMessageHeaders(chatId))
   const toTombstone = new Set<MessageId>(nodeIdsToDelete)
   const stack: MessageId[] = [...nodeIdsToDelete]
   while (stack.length > 0) {
@@ -208,11 +216,13 @@ export async function cascadeSoftDelete(
 // Collect every message in the same turn chain as `headId`. The head (the
 // `turnIndex: 0` message of the turn) plus every descendant whose `turnId`
 // matches. Pure in-memory walk.
-export function collectTurnChain(
-  head: Message,
-  byParent: Map<MessageId | null, Message[]>,
-): Message[] {
-  const result: Message[] = [head]
+type MessageTurnRow = Pick<Message, 'id' | 'parentId' | 'turnId' | 'turnIndex'>
+
+export function collectTurnChain<T extends MessageTurnRow>(
+  head: T,
+  byParent: Map<MessageId | null, T[]>,
+): T[] {
+  const result: T[] = [head]
   const stack: MessageId[] = [head.id]
   while (stack.length > 0) {
     const parentId = stack.pop() as MessageId
@@ -232,8 +242,8 @@ export function collectTurnChain(
 // The walk goes up via `parentId`, following `turnId === node.turnId`. The
 // data model guarantees a turn chain is strictly parent→child under a shared
 // `turnId`, so at most one such ancestor exists.
-export function turnHeadOf(message: Message, byId: Map<MessageId, Message>): Message {
-  let cur: Message = message
+export function turnHeadOf<T extends MessageTurnRow>(message: T, byId: Map<MessageId, T>): T {
+  let cur: T = message
   while (cur.turnIndex !== 0) {
     const parent = cur.parentId ? byId.get(cur.parentId) : undefined
     if (!parent || parent.turnId !== cur.turnId) {

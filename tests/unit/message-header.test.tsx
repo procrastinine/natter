@@ -1,11 +1,17 @@
-import { render } from '@testing-library/react'
-import { describe, expect, it } from 'vitest'
+import { fireEvent, render } from '@testing-library/react'
+import { afterEach, describe, expect, it } from 'vitest'
 import { effectiveCapabilityFromEndpoints } from '../../src/core/capabilities'
 import type { Message as MessageRow, ModelEndpoint } from '../../src/core/types'
+import { getStreamClientId } from '../../src/store/stream-leases'
+import { useStreamStore } from '../../src/store/zustand/streamStore'
 import { Message as ChatMessage } from '../../src/ui/chat/Message'
 import { MessageHeader } from '../../src/ui/chat/MessageHeader'
 import { MessageInfo } from '../../src/ui/chat/MessageInfo'
 import { ReasoningBlock } from '../../src/ui/chat/ReasoningBlock'
+
+afterEach(() => {
+  useStreamStore.getState().reset()
+})
 
 function makeAssistant(overrides: Partial<MessageRow> = {}): MessageRow {
   return {
@@ -227,6 +233,111 @@ describe('Message hidden-reasoning footer', () => {
     )
     expect(container.querySelector('[data-ui="message-hidden-reasoning"]')?.textContent).toMatch(
       /reasoned internally/i,
+    )
+  })
+})
+
+describe('Message streaming info surface', () => {
+  it('keeps MessageInfo unmounted until the info action is clicked', () => {
+    const msg = makeAssistant()
+    const { container } = render(
+      <ChatMessage
+        chatId={msg.chatId}
+        message={msg}
+        hasAnyReasoningDetails={false}
+        hasSiblingVariants={false}
+        cursor={{}}
+        hasConnection={false}
+        onEditInPlace={async () => {}}
+      />,
+    )
+
+    expect(container.querySelector('[data-ui="message-info"]')).toBeNull()
+  })
+
+  it('uses the live streaming snapshot as the message-info source while open', () => {
+    const msg = makeAssistant({
+      content: [{ type: 'output_text', text: '' }],
+      reasoningDetails: [],
+    })
+    const generation = msg.generation
+    if (!generation) throw new Error('expected generation metadata')
+    useStreamStore.getState().setActive({
+      streamId: 'stream-live',
+      chatId: msg.chatId,
+      messageId: msg.id,
+      startedAt: generation.startedAt,
+      ownerClientId: getStreamClientId(),
+    })
+    useStreamStore.getState().setLiveSnapshot({
+      streamId: 'stream-live',
+      chatId: msg.chatId,
+      messageId: msg.id,
+      content: [{ type: 'output_text', text: 'live streamed words' }],
+      reasoningDetails: [{ type: 'reasoning.text', text: 'thinking live' }],
+      generation: {
+        ...generation,
+        provider: 'Live Provider',
+        usage: {
+          prompt_tokens: 5,
+          completion_tokens: 11,
+          total_tokens: 16,
+        },
+      },
+      textLength: 19,
+      reasoningLength: 13,
+      updatedAt: generation.startedAt + 1000,
+    })
+
+    const { container, getByRole } = render(
+      <ChatMessage
+        chatId={msg.chatId}
+        message={msg}
+        hasAnyReasoningDetails={false}
+        hasSiblingVariants={false}
+        cursor={{}}
+        hasConnection={false}
+        onEditInPlace={async () => {}}
+      />,
+    )
+
+    fireEvent.click(getByRole('button', { name: 'Show message info' }))
+
+    const text = container.querySelector('[data-ui="message-info"]')?.textContent ?? ''
+    expect(text).toMatch(/Live Provider/)
+    expect(text).toMatch(/Completion tokens/)
+    expect(text).toMatch(/11/)
+    expect(text).toMatch(/Reasoning chars/)
+    expect(text).toMatch(/text 13/)
+    expect(text).toMatch(/Current chars/)
+    expect(text).toMatch(/19/)
+  })
+
+  it('surfaces a status banner when this message is streaming in another tab', () => {
+    const msg = makeAssistant({ content: [] })
+    delete msg.generation
+    useStreamStore.getState().setActive({
+      streamId: 'remote-stream',
+      chatId: msg.chatId,
+      messageId: msg.id,
+      startedAt: 1,
+      ownerClientId: 'other-tab',
+    })
+
+    const { container } = render(
+      <ChatMessage
+        chatId={msg.chatId}
+        message={msg}
+        hasAnyReasoningDetails={false}
+        hasSiblingVariants={false}
+        cursor={{}}
+        hasConnection={false}
+        onEditInPlace={async () => {}}
+      />,
+    )
+
+    expect(container.querySelector('[data-ui="message-stream-remote"]')?.textContent).toMatch(
+      /currently streaming in another tab/i,
     )
   })
 })

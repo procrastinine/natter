@@ -22,7 +22,13 @@ import type { Chat, ChatId, Message, MessageId, MessageRole } from '../../src/co
 import { newId } from '../../src/lib/ulid'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
-import { replaceChatSettings, updateChatSettings } from '../../src/store/chats'
+import {
+  getMessage as getStoredMessage,
+  loadChatMessages,
+  replaceChatSettings,
+  updateChatSettings,
+} from '../../src/store/chats'
+import { splitMessageForStorage } from '../../src/store/message-storage'
 
 const DB_NAME = 'natter'
 
@@ -93,12 +99,18 @@ async function putMessage(chatId: ChatId, spec: SeedMsg = {}): Promise<Message> 
     nodeVersion: 0,
     deleted: spec.deleted ?? false,
   }
-  await getDb().messages.put(row)
+  await putStoredMessage(row)
   return row
 }
 
 async function loadMessages(chatId: ChatId): Promise<Message[]> {
-  return getDb().messages.where('chatId').equals(chatId).toArray()
+  return loadChatMessages(chatId)
+}
+
+async function putStoredMessage(row: Message): Promise<void> {
+  const { header, body } = splitMessageForStorage(row)
+  await getDb().messages.put(header)
+  await getDb().messageBodies.put(body)
 }
 
 async function getChat(chatId: ChatId): Promise<Chat | undefined> {
@@ -116,7 +128,7 @@ describe('sendUserMessage', () => {
       content: [{ type: 'text', text: 'hi' }],
       now: 200,
     })
-    const stored = await getDb().messages.get(res.messageId)
+    const stored = await getStoredMessage(res.messageId)
     expect(stored?.parentId).toBeNull()
     expect(stored?.siblingIndex).toBe(0)
     expect(stored?.turnIndex).toBe(0)
@@ -138,7 +150,7 @@ describe('sendUserMessage', () => {
       content: [{ type: 'text', text: 'new' }],
       now: 300,
     })
-    const row = await getDb().messages.get(res.messageId)
+    const row = await getStoredMessage(res.messageId)
     expect(row?.parentId).not.toBeNull()
     // New leaf sits under the active-path leaf (not the root user message).
     expect(row?.parentId).not.toBe(root.id)
@@ -204,7 +216,7 @@ describe('regenerateAssistant', () => {
     expect(newMsg?.role).toBe('assistant')
     expect(newMsg?.origin).toBe('generated')
     // Previous variant still live.
-    const prev = await getDb().messages.get('A')
+    const prev = await getStoredMessage('A')
     expect(prev?.deleted).toBe(false)
     // Cursor advances to the new variant at user's fork.
     expect(res.effects.cursorUpdates[user.id]).toBe(res.messageId)
@@ -240,7 +252,7 @@ describe('regenerateAssistant', () => {
       messageId: 'A1',
       now: 4,
     })
-    const newMsg = await getDb().messages.get(res.messageId)
+    const newMsg = await getStoredMessage(res.messageId)
     expect(newMsg?.siblingIndex).toBe(6)
   })
 
@@ -292,14 +304,14 @@ describe('editMessageContent', () => {
       reasoningDetails: [{ type: 'reasoning.text', text: 'original thought' }],
       deleted: false,
     }
-    await getDb().messages.put(row)
+    await putStoredMessage(row)
     await editMessageContent({
       chatId: chat.id,
       messageId: 'M',
       content: [{ type: 'text', text: 'edited' }],
       now: 500,
     })
-    const stored = await getDb().messages.get('M')
+    const stored = await getStoredMessage('M')
     expect(stored?.content).toEqual([{ type: 'text', text: 'edited' }])
     expect(stored?.editedAt).toBe(500)
     // Immutable fields unchanged.
@@ -340,7 +352,7 @@ describe('editMessageContent', () => {
       nodeVersion: 0,
       deleted: false,
     }
-    await getDb().messages.put(row)
+    await putStoredMessage(row)
     await editMessageContent({
       chatId: chat.id,
       messageId: 'M',
@@ -348,7 +360,7 @@ describe('editMessageContent', () => {
       attachmentRefs: [],
       now: 500,
     })
-    const stored = await getDb().messages.get('M')
+    const stored = await getStoredMessage('M')
     expect(stored?.attachmentRefs).toEqual([])
   })
 
@@ -378,8 +390,8 @@ describe('editMessageContent', () => {
       content: [{ type: 'text', text: 'edited' }],
       now: 500,
     })
-    const assistantAfter = await getDb().messages.get(assistant.id)
-    const user2After = await getDb().messages.get(user2.id)
+    const assistantAfter = await getStoredMessage(assistant.id)
+    const user2After = await getStoredMessage(user2.id)
     expect(assistantAfter?.parentId).toBe(user.id)
     expect(assistantAfter?.content).toEqual([{ type: 'text', text: 'x' }])
     expect(user2After?.parentId).toBe(assistant.id)
@@ -467,7 +479,7 @@ describe('continueAssistant', () => {
       messageId: assistant.id,
       now: 2,
     })
-    const row = await getDb().messages.get(res.messageId)
+    const row = await getStoredMessage(res.messageId)
     expect(row?.parentId).toBe(assistant.id)
     expect(row?.role).toBe('assistant')
     expect(row?.origin).toBe('continued')
@@ -507,9 +519,9 @@ describe('branchExplicit', () => {
       hiddenFromContext: true,
       deleted: false,
     }
-    await getDb().messages.put(source)
+    await putStoredMessage(source)
     const res = await branchExplicit({ chatId: chat.id, messageId: 'A', now: 100 })
-    const clone = await getDb().messages.get(res.messageId)
+    const clone = await getStoredMessage(res.messageId)
     expect(clone).toBeDefined()
     expect(clone?.role).toBe('assistant')
     expect(clone?.content).toEqual([{ type: 'text', text: 'cloned' }])
@@ -549,7 +561,7 @@ describe('insertSibling', () => {
       content: [{ type: 'text', text: 'alt' }],
       now: 3,
     })
-    const newMsg = await getDb().messages.get(res.messageId)
+    const newMsg = await getStoredMessage(res.messageId)
     expect(newMsg?.role).toBe('user') // inherited from target
     expect(newMsg?.siblingIndex).toBe(4) // above tombstoned max (3) + 1
     expect(newMsg?.parentId).toBeNull()
@@ -582,8 +594,8 @@ describe('insertBetween', () => {
       role: 'assistant',
       now: 3,
     })
-    const x = await getDb().messages.get(res.messageId)
-    const cAfter = await getDb().messages.get(c.id)
+    const x = await getStoredMessage(res.messageId)
+    const cAfter = await getStoredMessage(c.id)
     expect(x?.parentId).toBe(p.id)
     expect(cAfter?.parentId).toBe(res.messageId)
     expect(cAfter?.siblingIndex).toBe(0)
@@ -625,9 +637,9 @@ describe('insertBetween', () => {
       role: 'assistant',
       now: 5,
     })
-    const x = await getDb().messages.get(res.messageId)
+    const x = await getStoredMessage(res.messageId)
     expect(x?.siblingIndex).toBe(2) // above V (siblingIndex 1)
-    const vAfter = await getDb().messages.get('V')
+    const vAfter = await getStoredMessage('V')
     expect(vAfter?.parentId).toBe(p.id) // V NOT reparented
   })
 
@@ -658,7 +670,7 @@ describe('appendAsChild', () => {
       role: 'assistant',
       now: 2,
     })
-    const newMsg = await getDb().messages.get(res.messageId)
+    const newMsg = await getStoredMessage(res.messageId)
     expect(newMsg?.parentId).toBe(p.id)
     expect(newMsg?.siblingIndex).toBe(0)
     expect(res.effects.cursorUpdates[p.id]).toBe(res.messageId)
@@ -775,12 +787,12 @@ describe('deletePair (splice-up)', () => {
       cursor,
       now: 10,
     })
-    const k = await getDb().messages.get('K')
+    const k = await getStoredMessage('K')
     // TAIL is tombstoned; K splices through HEAD+MID+TAIL to P.
     expect(k?.parentId).toBe('P')
-    const head = await getDb().messages.get('HEAD')
-    const mid = await getDb().messages.get('MID')
-    const tail = await getDb().messages.get('TAIL')
+    const head = await getStoredMessage('HEAD')
+    const mid = await getStoredMessage('MID')
+    const tail = await getStoredMessage('TAIL')
     expect(head?.deleted).toBe(true)
     expect(mid?.deleted).toBe(true)
     expect(tail?.deleted).toBe(true)
@@ -859,9 +871,9 @@ describe('deleteTurn', () => {
       cursor: { __root__: 'P', P: 'V1', V1: 'K' },
       now: 10,
     })
-    const v1 = await getDb().messages.get('V1')
-    const v2 = await getDb().messages.get('V2')
-    const k = await getDb().messages.get('K')
+    const v1 = await getStoredMessage('V1')
+    const v2 = await getStoredMessage('V2')
+    const k = await getStoredMessage('K')
     expect(v1?.deleted).toBe(true)
     expect(v2?.deleted).toBe(true)
     // K splices up to P.
@@ -895,8 +907,8 @@ describe('deleteVariant', () => {
       cursor: {},
       now: 10,
     })
-    expect((await getDb().messages.get('V1'))?.deleted).toBe(true)
-    expect((await getDb().messages.get('V2'))?.deleted).toBe(false)
+    expect((await getStoredMessage('V1'))?.deleted).toBe(true)
+    expect((await getStoredMessage('V2'))?.deleted).toBe(false)
   })
 })
 
@@ -936,11 +948,11 @@ describe('cascade delete', () => {
       now: 10,
     })
     for (const id of ['A', 'K', 'GK']) {
-      expect((await getDb().messages.get(id))?.deleted).toBe(true)
+      expect((await getStoredMessage(id))?.deleted).toBe(true)
     }
     // K and GK still point at their original parents (no reparent).
-    expect((await getDb().messages.get('K'))?.parentId).toBe('A')
-    expect((await getDb().messages.get('GK'))?.parentId).toBe('K')
+    expect((await getStoredMessage('K'))?.parentId).toBe('A')
+    expect((await getStoredMessage('GK'))?.parentId).toBe('K')
   })
 })
 
@@ -967,8 +979,8 @@ describe('pasteImport', () => {
     })
     expect(res.newMessageIds).toHaveLength(2)
     const [firstId, secondId] = res.newMessageIds as [MessageId, MessageId]
-    const first = await getDb().messages.get(firstId)
-    const second = await getDb().messages.get(secondId)
+    const first = await getStoredMessage(firstId)
+    const second = await getStoredMessage(secondId)
     expect(first?.parentId).toBe(root.id)
     expect(first?.origin).toBe('imported')
     expect(second?.parentId).toBe(firstId)
@@ -985,7 +997,7 @@ describe('pasteImport', () => {
       messages: [{ role: 'assistant', content: [{ type: 'text', text: 'x' }] }],
       now: 5,
     })
-    const first = await getDb().messages.get(res.newMessageIds[0] as MessageId)
+    const first = await getStoredMessage(res.newMessageIds[0] as MessageId)
     expect(first?.parentId).toBe('L')
   })
 })

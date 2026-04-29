@@ -17,6 +17,7 @@ import { createTag } from '../../src/store/tags'
 import { __resetSearchStoreForTests } from '../../src/store/zustand/searchStore'
 import { readActiveSeedState } from '../../src/ui/header/ConnectionHeader'
 import { App } from '../../src/app/App'
+import { putTestMessageHeaderOnly, putTestMessages } from '../helpers/message-storage'
 
 describe('shell smoke render', () => {
   let errorSpy: ReturnType<typeof vi.spyOn>
@@ -95,6 +96,71 @@ describe('shell smoke render', () => {
     await waitFor(() => {
       expect(container.querySelector('[data-ui="focus-mode-toggle"]')).toBeInTheDocument()
     })
+  })
+
+  it('renders the active chat without hydrating irrelevant chat or branch bodies', async () => {
+    const active = await createChat({ title: 'Active huge-safe', settings: cloneDefaultChatSettings() })
+    const other = await createChat({ title: 'Other poison', settings: cloneDefaultChatSettings() })
+    const root: Message = {
+      id: 'ui-root',
+      chatId: active.id,
+      parentId: null,
+      siblingIndex: 0,
+      turnId: 'ui-root',
+      turnIndex: 0,
+      createdAt: 1,
+      role: 'user',
+      origin: 'user',
+      content: [{ type: 'text', text: 'visible active prompt' }],
+      nodeVersion: 0,
+      deleted: false,
+    }
+    const activeLeaf: Message = {
+      ...root,
+      id: 'ui-active-leaf',
+      parentId: root.id,
+      turnId: 'ui-active-leaf',
+      createdAt: 3,
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: 'visible active answer' }],
+    }
+    const offBranch: Message = {
+      ...activeLeaf,
+      id: 'ui-off-branch-poison',
+      siblingIndex: 1,
+      createdAt: 2,
+      content: [{ type: 'output_text', text: 'off branch body should not load' }],
+    }
+    const otherMessage: Message = {
+      ...root,
+      id: 'ui-other-chat-poison',
+      chatId: other.id,
+      content: [{ type: 'text', text: 'other chat body should not load' }],
+    }
+    await putTestMessages([root, activeLeaf])
+    await putTestMessageHeaderOnly(offBranch)
+    await putTestMessageHeaderOnly(otherMessage)
+    await getDb().chats.bulkPut([
+      {
+        ...active,
+        titleStatus: 'manual',
+        previewText: 'visible active prompt',
+        lastUpdatedLeafId: activeLeaf.id,
+      },
+      {
+        ...other,
+        titleStatus: 'manual',
+        previewText: 'poison preview',
+        lastUpdatedLeafId: otherMessage.id,
+      },
+    ])
+    window.location.hash = `#/chat/${active.id}`
+
+    const { findByText } = render(<App />)
+
+    expect(await findByText('visible active prompt')).toBeInTheDocument()
+    expect(await findByText('visible active answer')).toBeInTheDocument()
   })
 
   it('auto-closes the chat settings panel on storage routes', async () => {
@@ -264,7 +330,7 @@ describe('shell smoke render', () => {
       createdAt: 4,
       content: [{ type: 'output_text', text: 'fresh branch answer' }],
     }
-    await getDb().messages.bulkPut([root, older, latest])
+    await putTestMessages([root, older, latest])
     await getDb().chats.put({
       ...chat,
       titleStatus: 'manual',
@@ -328,7 +394,7 @@ describe('shell smoke render', () => {
       createdAt: 4,
       content: [{ type: 'output_text', text: 'fresh branch answer' }],
     }
-    await getDb().messages.bulkPut([root, older, latest])
+    await putTestMessages([root, older, latest])
     await getDb().chats.put({
       ...chat,
       titleStatus: 'manual',
@@ -533,7 +599,7 @@ describe('shell smoke render', () => {
       createdAt: 4,
       content: [{ type: 'output_text', text: 'latest answer' }],
     }
-    await getDb().messages.bulkPut([root, older, latest])
+    await putTestMessages([root, older, latest])
     await getDb().chats.put({
       ...chat,
       titleStatus: 'manual',

@@ -39,9 +39,7 @@ test('edited system prompt shows up in the NEXT /chat/completions body', async (
   await expect(page.locator('[data-ui="message"][data-role="assistant"]').first()).toBeVisible()
 
   await page.locator('[data-role="settings-cog"]').click()
-  // System prompt lives on the Generation tab now; panel opens to Model
-  // by default, so the tab needs to be flipped before the textarea mounts.
-  await page.locator('[data-ui="settings-tab"][data-tab="generation"]').click()
+  await page.locator('[data-ui="settings-tab"][data-tab="prompts"]').click()
   const textarea = page.locator('[data-ui="system-prompt-textarea"]')
   await textarea.fill('You are a terse copy editor.')
   // System prompt save is debounced; send the next message after the debounce.
@@ -82,7 +80,7 @@ test('committing a system prompt bumps updatedAt + metaVersion and leaves branch
   const chatId = await firstChatId(page)
   const before = await readChat(page, chatId)
   await page.locator('[data-role="settings-cog"]').click()
-  await page.locator('[data-ui="settings-tab"][data-tab="generation"]').click()
+  await page.locator('[data-ui="settings-tab"][data-tab="prompts"]').click()
   await page.locator('[data-ui="system-prompt-textarea"]').fill('System edit v1')
   await page.waitForTimeout(500)
   const after = await readChat(page, chatId)
@@ -105,7 +103,7 @@ test('the one-off toast appears after the first edit and disappears on subsequen
   await sendMessage(page, 'initial')
   await expect(page.locator('[data-ui="message"][data-role="assistant"]').first()).toBeVisible()
   await page.locator('[data-role="settings-cog"]').click()
-  await page.locator('[data-ui="settings-tab"][data-tab="generation"]').click()
+  await page.locator('[data-ui="settings-tab"][data-tab="prompts"]').click()
   await page.locator('[data-ui="system-prompt-textarea"]').fill('First system prompt')
   await expect(page.locator('[data-ui="settings-toast"]')).toBeVisible({
     timeout: 2000,

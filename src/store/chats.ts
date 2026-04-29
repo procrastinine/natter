@@ -6,10 +6,12 @@
 // so browser mode already matches the future daemon contract.
 
 import { cloneDefaultChatSettings } from '../core/defaults'
+import { activePath } from '../core/active-path'
 import { normalizeReasoningSettings } from '../core/reasoning'
 import type {
   Chat,
   ChatId,
+  ChatSidebarRow,
   ChatSettings,
   ChatTag,
   FolderId,
@@ -21,6 +23,17 @@ import type {
 import { newId } from '../lib/ulid'
 import { postEvent } from './broadcast'
 import { getDb, openDb } from './db'
+import type {
+  ActiveBranchBodyWindow,
+  ActiveBranchSnapshot,
+  ActiveBranchWindowSnapshot,
+} from './repository'
+import {
+  hydrateMessage,
+  hydrateMessages,
+  type MessageBodyRow,
+  type MessageHeaderRow,
+} from './message-storage'
 import { getWorkspaceRepository } from './workspace-repository'
 
 type OptionalKeys<T> = {
@@ -36,6 +49,13 @@ type ChatSettingsPatch = {
 function isDatabaseClosedError(error: unknown): boolean {
   const candidate = error as { name?: unknown; inner?: { name?: unknown } } | null
   return candidate?.name === 'DatabaseClosedError' || candidate?.inner?.name === 'DatabaseClosedError'
+}
+
+export interface ChatSidebarListOptions {
+  limit?: number
+  offset?: number
+  orderBy?: 'updatedAt' | 'createdAt' | 'lastViewedAt'
+  direction?: 'asc' | 'desc'
 }
 
 export interface CreateChatInput {
@@ -111,12 +131,66 @@ export async function listChats(): Promise<Chat[]> {
   }
 }
 
+export function projectChatSidebarRow(chat: Chat): ChatSidebarRow {
+  return {
+    id: chat.id,
+    title: chat.title,
+    titleStatus: chat.titleStatus,
+    createdAt: chat.createdAt,
+    updatedAt: chat.updatedAt,
+    lastViewedAt: chat.lastViewedAt,
+    wordCount: chat.wordCount,
+    totalCostUsd: chat.totalCostUsd,
+    lastUpdatedLeafId: chat.lastUpdatedLeafId,
+    lastBranchUpdatedAt: chat.lastBranchUpdatedAt,
+    archived: chat.archived,
+    pinned: chat.pinned,
+    folderId: chat.folderId,
+    tags: [...chat.tags],
+    ...(chat.previewText !== undefined ? { previewText: chat.previewText } : {}),
+  }
+}
+
+export async function listChatSidebarRows(
+  options: ChatSidebarListOptions = {},
+): Promise<ChatSidebarRow[]> {
+  try {
+    const db = getDb()
+    const orderBy = options.orderBy
+    let rows: Chat[]
+    if (orderBy) {
+      let collection = db.chats.orderBy(orderBy)
+      if (options.direction !== 'asc') collection = collection.reverse()
+      if (options.offset && options.offset > 0) collection = collection.offset(options.offset)
+      if (options.limit !== undefined) collection = collection.limit(options.limit)
+      rows = await collection.toArray()
+    } else {
+      rows = await db.chats.toArray()
+      const offset = options.offset ?? 0
+      if (offset > 0 || options.limit !== undefined) {
+        rows = rows.slice(offset, options.limit === undefined ? undefined : offset + options.limit)
+      }
+    }
+    return rows.map(projectChatSidebarRow)
+  } catch (error) {
+    if (isDatabaseClosedError(error)) return []
+    throw error
+  }
+}
+
 // Load every message row for a chat, including tombstones. Callers filter
 // `!deleted` per op (search + cache writers want tombstones; active-path
 // renderers want only live nodes).
 export async function loadChatMessages(chatId: ChatId): Promise<Message[]> {
   try {
-    return await getDb().messages.where('chatId').equals(chatId).toArray()
+    const db = getDb()
+    return await db.transaction('r', db.messages, db.messageBodies, async () => {
+      const headers = await db.messages.where('chatId').equals(chatId).toArray()
+      const bodies = (await db.messageBodies.bulkGet(headers.map((header) => header.id))).filter(
+        (row): row is NonNullable<typeof row> => row !== undefined,
+      )
+      return hydrateMessages(headers, bodies)
+    })
   } catch (error) {
     if (isDatabaseClosedError(error)) return []
     throw error
@@ -125,11 +199,162 @@ export async function loadChatMessages(chatId: ChatId): Promise<Message[]> {
 
 export async function getMessage(messageId: MessageId): Promise<Message | undefined> {
   try {
-    return await getDb().messages.get(messageId)
+    const db = getDb()
+    return await db.transaction('r', db.messages, db.messageBodies, async () => {
+      const [header, body] = await Promise.all([
+        db.messages.get(messageId),
+        db.messageBodies.get(messageId),
+      ])
+      return header && body ? hydrateMessage(header, body) : undefined
+    })
   } catch (error) {
     if (isDatabaseClosedError(error)) return undefined
     throw error
   }
+}
+
+export async function loadMessageHeaders(chatId: ChatId): Promise<MessageHeaderRow[]> {
+  try {
+    return await getDb().messages.where('chatId').equals(chatId).toArray()
+  } catch (error) {
+    if (isDatabaseClosedError(error)) return []
+    throw error
+  }
+}
+
+export async function loadActiveBranchSnapshot(
+  chatId: ChatId,
+  cursor: Record<string, MessageId>,
+): Promise<ActiveBranchSnapshot> {
+  try {
+    const db = getDb()
+    return await db.transaction('r', db.messages, db.messageBodies, async () => {
+      const headers = await db.messages.where('chatId').equals(chatId).toArray()
+      const branchHeaders = activePath(headers as unknown as Message[], cursor).map(
+        (message) => message as unknown as MessageHeaderRow,
+      )
+      const bodies = (
+        await db.messageBodies.bulkGet(branchHeaders.map((header) => header.id))
+      ).filter((row): row is MessageBodyRow => row !== undefined)
+      return {
+        chatId,
+        allHeaders: headers,
+        branchHeaders,
+        branch: hydrateMessages(branchHeaders, bodies),
+        siblingGroups: siblingGroupsForBranch(headers, branchHeaders),
+        treeKey: messageHeaderTreeKey(headers),
+      }
+    })
+  } catch (error) {
+    if (isDatabaseClosedError(error)) {
+      return {
+        chatId,
+        allHeaders: [],
+        branchHeaders: [],
+        branch: [],
+        siblingGroups: [],
+        treeKey: '',
+      }
+    }
+    throw error
+  }
+}
+
+function branchWindowRange(
+  total: number,
+  window: ActiveBranchBodyWindow,
+): { start: number; end: number; limit: number } {
+  const limit = Math.max(0, Math.floor(window.limit))
+  const start = Math.max(0, Math.min(total, Math.floor(window.offset)))
+  return { start, end: Math.min(total, start + limit), limit }
+}
+
+export async function loadActiveBranchWindowSnapshot(
+  chatId: ChatId,
+  cursor: Record<string, MessageId>,
+  window: ActiveBranchBodyWindow,
+): Promise<ActiveBranchWindowSnapshot> {
+  try {
+    const db = getDb()
+    return await db.transaction('r', db.messages, db.messageBodies, async () => {
+      const headers = await db.messages.where('chatId').equals(chatId).toArray()
+      const branchHeaders = activePath(headers as unknown as Message[], cursor).map(
+        (message) => message as unknown as MessageHeaderRow,
+      )
+      const range = branchWindowRange(branchHeaders.length, window)
+      const windowHeaders = branchHeaders.slice(range.start, range.end)
+      const bodies = (
+        await db.messageBodies.bulkGet(windowHeaders.map((header) => header.id))
+      ).filter((row): row is MessageBodyRow => row !== undefined)
+      return {
+        chatId,
+        allHeaders: headers,
+        branchHeaders,
+        branchWindow: hydrateMessages(windowHeaders, bodies),
+        windowOffset: range.start,
+        windowLimit: range.limit,
+        branchLength: branchHeaders.length,
+        siblingGroups: siblingGroupsForBranch(headers, branchHeaders),
+        treeKey: messageHeaderTreeKey(headers),
+      }
+    })
+  } catch (error) {
+    if (isDatabaseClosedError(error)) {
+      return {
+        chatId,
+        allHeaders: [],
+        branchHeaders: [],
+        branchWindow: [],
+        windowOffset: 0,
+        windowLimit: Math.max(0, Math.floor(window.limit)),
+        branchLength: 0,
+        siblingGroups: [],
+        treeKey: '',
+      }
+    }
+    throw error
+  }
+}
+
+function groupHeadersByParent(
+  headers: readonly MessageHeaderRow[],
+): Map<MessageId | null, MessageHeaderRow[]> {
+  const buckets = new Map<MessageId | null, MessageHeaderRow[]>()
+  for (const header of headers) {
+    const bucket = buckets.get(header.parentId)
+    if (bucket) bucket.push(header)
+    else buckets.set(header.parentId, [header])
+  }
+  for (const bucket of buckets.values()) bucket.sort((a, b) => a.siblingIndex - b.siblingIndex)
+  return buckets
+}
+
+function siblingGroupsForBranch(
+  headers: readonly MessageHeaderRow[],
+  branchHeaders: readonly MessageHeaderRow[],
+): ActiveBranchSnapshot['siblingGroups'] {
+  const byParent = groupHeadersByParent(headers)
+  const parentIds = new Set<MessageId | null>([null])
+  for (const header of branchHeaders) parentIds.add(header.parentId)
+  return [...parentIds].map((parentId) => ({
+    parentId,
+    siblings: byParent.get(parentId) ?? [],
+  }))
+}
+
+function messageHeaderTreeKey(headers: readonly MessageHeaderRow[]): string {
+  return headers
+    .map((message) =>
+      [
+        message.id,
+        message.nodeVersion,
+        message.parentId ?? '',
+        message.siblingIndex,
+        message.createdAt,
+        message.deleted ? 1 : 0,
+      ].join(':'),
+    )
+    .join('|')
 }
 
 // Draft reads. Writes go through the repo's runMutation with the `draft`
@@ -469,12 +694,13 @@ const PREVIEW_MAX_CHARS = 240
 // would reorder on every sidebar refresh, and meta-version-gated caches
 // would thrash).
 export async function refreshChatPreview(chatId: ChatId): Promise<void> {
-  const messages = await loadChatMessages(chatId)
-  let earliest: Message | undefined
-  for (const m of messages) {
-    if (m.deleted || m.role !== 'user') continue
-    if (!earliest || m.createdAt < earliest.createdAt) earliest = m
+  const headers = await loadMessageHeaders(chatId)
+  let earliestHeader: MessageHeaderRow | undefined
+  for (const header of headers) {
+    if (header.deleted || header.role !== 'user') continue
+    if (!earliestHeader || header.createdAt < earliestHeader.createdAt) earliestHeader = header
   }
+  const earliest = earliestHeader ? await getMessage(earliestHeader.id) : undefined
   let plain = ''
   if (earliest) {
     const parts: string[] = []

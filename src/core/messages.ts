@@ -19,7 +19,6 @@ import {
 import {
   cascadeSoftDelete,
   collectTurnChain,
-  nextSiblingIndex,
   softDeleteWithSplice,
   TreeChangedError,
   turnHeadOf,
@@ -130,31 +129,67 @@ function withAttachmentRefs<T extends object>(
   return next
 }
 
-function resolveActiveLeafId(messages: readonly Message[], cursor: CursorMap): MessageId | null {
-  const byParent = groupByParent(messages)
-  const byId = indexById(messages)
+type MessageTreeRow = Pick<
+  Message,
+  | 'id'
+  | 'parentId'
+  | 'siblingIndex'
+  | 'turnId'
+  | 'turnIndex'
+  | 'createdAt'
+  | 'role'
+  | 'deleted'
+>
+
+function groupTreeRowsByParent(
+  messages: readonly MessageTreeRow[],
+): Map<MessageId | null, MessageTreeRow[]> {
+  const buckets = new Map<MessageId | null, MessageTreeRow[]>()
+  for (const message of messages) {
+    const bucket = buckets.get(message.parentId)
+    if (bucket) bucket.push(message)
+    else buckets.set(message.parentId, [message])
+  }
+  for (const bucket of buckets.values()) bucket.sort((a, b) => a.siblingIndex - b.siblingIndex)
+  return buckets
+}
+
+function nextSiblingIndexFromChildren(children: readonly Pick<Message, 'siblingIndex'>[]): number {
+  let max = -1
+  for (const child of children) {
+    if (child.siblingIndex > max) max = child.siblingIndex
+  }
+  return max + 1
+}
+
+function resolveActiveLeafId(
+  messages: readonly MessageTreeRow[],
+  cursor: CursorMap,
+): MessageId | null {
+  const byParent = groupTreeRowsByParent(messages)
+  const byId = new Map(messages.map((message) => [message.id, message]))
   let parentId: MessageId | null = null
   while (true) {
-    const kids: Message[] = (byParent.get(parentId) ?? []).filter((m) => !m.deleted)
+    const kids = (byParent.get(parentId) ?? []).filter((m) => !m.deleted)
     if (kids.length === 0) break
     const pinnedId: MessageId | undefined = cursor[cursorKeyOf(parentId)]
-    const pinned: Message | undefined =
+    const pinned: MessageTreeRow | undefined =
       pinnedId !== undefined ? kids.find((k) => k.id === pinnedId) : undefined
-    const chosen: Message = pinned ?? pickByGreatestSubtreeCreatedAt(kids, byParent, byId)
+    const chosen: MessageTreeRow = pinned ?? pickByGreatestSubtreeCreatedAt(kids, byParent, byId)
     parentId = chosen.id
   }
   return parentId
 }
 
 function pickByGreatestSubtreeCreatedAt(
-  kids: readonly Message[],
-  byParent: Map<MessageId | null, Message[]>,
-  byId: Map<MessageId, Message>,
-): Message {
-  let best = kids[0] as Message
+  kids: readonly MessageTreeRow[],
+  byParent: Map<MessageId | null, MessageTreeRow[]>,
+  byId: Map<MessageId, MessageTreeRow>,
+): MessageTreeRow {
+  let best = kids[0] as MessageTreeRow
   let bestScore = subtreeMaxCreatedAt(best.id, byParent, byId)
   for (let i = 1; i < kids.length; i += 1) {
-    const candidate = kids[i] as Message
+    const candidate = kids[i] as MessageTreeRow
     const score = subtreeMaxCreatedAt(candidate.id, byParent, byId)
     if (
       score > bestScore ||
@@ -171,8 +206,8 @@ function pickByGreatestSubtreeCreatedAt(
 
 function subtreeMaxCreatedAt(
   rootId: MessageId,
-  byParent: Map<MessageId | null, Message[]>,
-  byId: Map<MessageId, Message>,
+  byParent: Map<MessageId | null, MessageTreeRow[]>,
+  byId: Map<MessageId, MessageTreeRow>,
 ): number {
   const start = byId.get(rootId)
   let best = start && !start.deleted ? start.createdAt : -Infinity
@@ -190,11 +225,11 @@ function subtreeMaxCreatedAt(
 }
 
 function walkUpUntilRole(
-  start: Message,
+  start: MessageTreeRow,
   role: MessageRole,
-  byId: Map<MessageId, Message>,
-): Message | null {
-  let current: Message | null = start
+  byId: Map<MessageId, MessageTreeRow>,
+): MessageTreeRow | null {
+  let current: MessageTreeRow | null = start
   while (current !== null) {
     if (!current.deleted && current.role === role) return current
     current = current.parentId ? (byId.get(current.parentId) ?? null) : null
@@ -203,11 +238,11 @@ function walkUpUntilRole(
 }
 
 function collectPairFollowers(
-  userHead: Message,
-  byParent: Map<MessageId | null, Message[]>,
+  userHead: MessageTreeRow,
+  byParent: Map<MessageId | null, MessageTreeRow[]>,
   cursor: CursorMap,
-): Message[] {
-  const result: Message[] = []
+): MessageTreeRow[] {
+  const result: MessageTreeRow[] = []
   let currentId: MessageId = userHead.id
   while (true) {
     const kids = (byParent.get(currentId) ?? []).filter((kid) => !kid.deleted)
@@ -229,7 +264,7 @@ function collectPairFollowers(
         (kid) => !kid.deleted && kid.turnId === next.turnId,
       )
       if (chainKids.length === 0) break
-      const inner = chainKids[0] as Message
+      const inner = chainKids[0] as MessageTreeRow
       result.push(inner)
       cursorId = inner.id
     }
@@ -240,13 +275,13 @@ function collectPairFollowers(
 
 function collectInsertBetweenScopes(
   chatId: ChatId,
-  messages: readonly Message[],
+  messages: readonly MessageTreeRow[],
   parentId: MessageId | null,
   childId: MessageId,
   newMessageId: MessageId,
 ): MutationScope[] {
-  const byId = indexById(messages)
-  const byParent = groupByParent(messages)
+  const byId = new Map(messages.map((message) => [message.id, message]))
+  const byParent = groupTreeRowsByParent(messages)
   const child = byId.get(childId)
   if (!child || child.deleted || child.parentId !== parentId) {
     throw new TreeChangedError(chatId, `insert-between child ${childId} unavailable`)
@@ -267,7 +302,7 @@ function collectInsertBetweenScopes(
 
 function collectPasteImportScopes(
   chatId: ChatId,
-  messages: readonly Message[],
+  messages: readonly MessageTreeRow[],
   slot: PasteImportSlot,
   cursor: CursorMap,
   newMessageIds: readonly MessageId[],
@@ -280,7 +315,7 @@ function collectPasteImportScopes(
   }
   scopes.push(...attachmentScopes(attachmentIds))
 
-  const byId = indexById(messages)
+  const byId = new Map(messages.map((message) => [message.id, message]))
 
   if (slot.kind === 'at-end') {
     scopes.push(childrenScope(chatId, resolveActiveLeafId(messages, cursor)))
@@ -311,7 +346,9 @@ function collectPasteImportScopes(
     ])
   }
 
-  const liveKids = (groupByParent(messages).get(target.id) ?? []).filter((kid) => !kid.deleted)
+  const liveKids = (groupTreeRowsByParent(messages).get(target.id) ?? []).filter(
+    (kid) => !kid.deleted,
+  )
   const activeDescendantId = cursor[cursorKeyOf(target.id)]
   const activeDescendant =
     activeDescendantId !== undefined
@@ -336,12 +373,12 @@ function collectPasteImportScopes(
 
 function collectDeleteScopes(
   chatId: ChatId,
-  messages: readonly Message[],
-  members: readonly Message[],
+  messages: readonly MessageTreeRow[],
+  members: readonly MessageTreeRow[],
   cascade: boolean,
 ): MutationScope[] {
-  const byParent = groupByParent(messages)
-  const byId = indexById(messages)
+  const byParent = groupTreeRowsByParent(messages)
+  const byId = new Map(messages.map((message) => [message.id, message]))
   const idsToDelete = new Set(
     members.filter((member) => !member.deleted).map((member) => member.id),
   )
@@ -359,7 +396,7 @@ function collectDeleteScopes(
   const scopes: MutationScope[] = []
   const affectedNewParents = new Set<MessageId | null>()
 
-  const firstLiveAncestor = (message: Message): MessageId | null => {
+  const firstLiveAncestor = (message: MessageTreeRow): MessageId | null => {
     let parentId = message.parentId
     while (parentId && idsToDelete.has(parentId)) {
       parentId = byId.get(parentId)?.parentId ?? null
@@ -399,7 +436,7 @@ function collectDeleteScopes(
 async function applyDelete(
   ctx: MutationContext,
   chatId: ChatId,
-  members: readonly Message[],
+  members: readonly Pick<MessageTreeRow, 'id' | 'deleted'>[],
   cascade: boolean,
   effects: StructuralEffects,
 ): Promise<void> {
@@ -441,8 +478,8 @@ export async function sendUserMessage(
   const { chatId, cursor, content, attachmentRefs, now = Date.now() } = input
   const role = input.role ?? 'user'
   const origin = input.origin ?? 'user'
-  const all = await repo.listMessages(chatId)
-  const parentId = resolveActiveLeafId(all, cursor)
+  const headers = await repo.listMessageHeaders(chatId)
+  const parentId = resolveActiveLeafId(headers, cursor)
   const messageId = input.messageId ?? newId()
   const turnId = input.turnId ?? newId()
   // Pre-fetch chat + global calibration outside the mutation. Both are
@@ -482,7 +519,7 @@ export async function sendUserMessage(
           id: messageId,
           chatId,
           parentId,
-          siblingIndex: nextSiblingIndex(groupByParent(await ctx.listMessages(chatId)), parentId),
+          siblingIndex: nextSiblingIndexFromChildren(await ctx.listChildHeaders(chatId, parentId)),
           turnId,
           turnIndex: 0,
           createdAt: now,
@@ -533,12 +570,12 @@ export async function regenerateAssistant(
         throw new TreeChangedError(input.chatId, `regenerate target ${target.id} unavailable`)
       }
       const effects = emptyEffects()
-      const siblings = groupByParent(await ctx.listMessages(input.chatId))
+      const siblings = await ctx.listChildHeaders(input.chatId, current.parentId)
       await ctx.putMessage({
         id: messageId,
         chatId: input.chatId,
         parentId: current.parentId,
-        siblingIndex: nextSiblingIndex(siblings, current.parentId),
+        siblingIndex: nextSiblingIndexFromChildren(siblings),
         turnId: newId(),
         turnIndex: 0,
         createdAt: input.now ?? Date.now(),
@@ -651,13 +688,13 @@ export async function branchExplicit(params: {
       if (!current || current.chatId !== params.chatId || current.deleted) {
         throw new TreeChangedError(params.chatId, `branch source ${source.id} unavailable`)
       }
-      const all = await ctx.listMessages(params.chatId)
+      const siblings = await ctx.listChildHeaders(params.chatId, current.parentId)
       const cloned = cloneForExplicitBranch(current, {
         id: messageId,
         turnId: newId(),
         turnIndex: 0,
         parentId: current.parentId,
-        siblingIndex: nextSiblingIndex(groupByParent(all), current.parentId),
+        siblingIndex: nextSiblingIndexFromChildren(siblings),
         createdAt: params.now ?? Date.now(),
       })
       cloned.nodeVersion = 0
@@ -694,12 +731,12 @@ export async function continueAssistant(params: {
       if (!current || current.chatId !== params.chatId || current.deleted) {
         throw new TreeChangedError(params.chatId, `continue target ${target.id} unavailable`)
       }
-      const all = await ctx.listMessages(params.chatId)
+      const children = await ctx.listChildHeaders(params.chatId, current.id)
       await ctx.putMessage({
         id: messageId,
         chatId: params.chatId,
         parentId: current.id,
-        siblingIndex: nextSiblingIndex(groupByParent(all), current.id),
+        siblingIndex: nextSiblingIndexFromChildren(children),
         turnId: newId(),
         turnIndex: 0,
         createdAt: params.now ?? Date.now(),
@@ -749,14 +786,14 @@ export async function insertSibling(
       if (!current || current.chatId !== input.chatId || current.deleted) {
         throw new TreeChangedError(input.chatId, `insert-sibling target ${target.id} unavailable`)
       }
-      const all = await ctx.listMessages(input.chatId)
+      const siblings = await ctx.listChildHeaders(input.chatId, current.parentId)
       await ctx.putMessage(
         withAttachmentRefs(
           {
             id: messageId,
             chatId: input.chatId,
             parentId: current.parentId,
-            siblingIndex: nextSiblingIndex(groupByParent(all), current.parentId),
+            siblingIndex: nextSiblingIndexFromChildren(siblings),
             turnId: newId(),
             turnIndex: 0,
             createdAt: input.now ?? Date.now(),
@@ -794,7 +831,7 @@ export async function insertBetween(
   input: InsertBetweenInput,
 ): Promise<{ effects: StructuralEffects; versions: ChatVersions; messageId: MessageId }> {
   const repo = getWorkspaceRepository()
-  const snapshot = await repo.listMessages(input.chatId)
+  const snapshot = await repo.listMessageHeaders(input.chatId)
   const messageId = newId()
   const scopes = dedupeScopes([
     ...collectInsertBetweenScopes(input.chatId, snapshot, input.parentId, input.childId, messageId),
@@ -859,14 +896,14 @@ export async function appendAsChild(
       if (!current || current.chatId !== input.chatId || current.deleted) {
         throw new TreeChangedError(input.chatId, `append-as-child parent ${parent.id} unavailable`)
       }
-      const all = await ctx.listMessages(input.chatId)
+      const children = await ctx.listChildHeaders(input.chatId, current.id)
       await ctx.putMessage(
         withAttachmentRefs(
           {
             id: messageId,
             chatId: input.chatId,
             parentId: current.id,
-            siblingIndex: nextSiblingIndex(groupByParent(all), current.id),
+            siblingIndex: nextSiblingIndexFromChildren(children),
             turnId: newId(),
             turnIndex: 0,
             createdAt: input.now ?? Date.now(),
@@ -916,7 +953,7 @@ export async function pasteImport(
     return { effects: emptyEffects(), versions: ZERO_VERSIONS, newMessageIds: [] }
   }
   const repo = getWorkspaceRepository()
-  const snapshot = await repo.listMessages(input.chatId)
+  const snapshot = await repo.listMessageHeaders(input.chatId)
   const newMessageIds = input.messages.map(() => newId())
   const attachmentIds = input.messages.flatMap((message) => message.attachmentRefs ?? [])
   const scopes = collectPasteImportScopes(
@@ -945,13 +982,13 @@ export async function pasteImport(
     for (let i = 1; i < input.messages.length; i += 1) {
       const spec = input.messages[i] as PasteImportMessageInput
       const id = newMessageIds[i] as MessageId
-      const all = await ctx.listMessages(input.chatId)
+      const children = await ctx.listChildHeaders(input.chatId, tail.id)
       const row: Message = withAttachmentRefs(
         {
           id,
           chatId: input.chatId,
           parentId: tail.id,
-          siblingIndex: nextSiblingIndex(groupByParent(all), tail.id),
+          siblingIndex: nextSiblingIndexFromChildren(children),
           turnId: newId(),
           turnIndex: 0,
           createdAt: input.now ?? Date.now(),
@@ -991,14 +1028,15 @@ async function createFirstImported(
   effects: StructuralEffects,
 ): Promise<Message> {
   if (slot.kind === 'at-end') {
-    const all = await ctx.listMessages(chatId)
-    const leaf = resolveActiveLeafId(all, cursor)
+    const headers = await ctx.listMessageHeaders(chatId)
+    const leaf = resolveActiveLeafId(headers, cursor)
+    const children = await ctx.listChildHeaders(chatId, leaf)
     const row: Message = withAttachmentRefs(
       {
         id: messageId,
         chatId,
         parentId: leaf,
-        siblingIndex: nextSiblingIndex(groupByParent(all), leaf),
+        siblingIndex: nextSiblingIndexFromChildren(children),
         turnId: newId(),
         turnIndex: 0,
         createdAt: now,
@@ -1023,13 +1061,13 @@ async function createFirstImported(
   }
 
   if (slot.kind === 'sibling') {
-    const all = await ctx.listMessages(chatId)
+    const siblings = await ctx.listChildHeaders(chatId, target.parentId)
     const row: Message = withAttachmentRefs(
       {
         id: messageId,
         chatId,
         parentId: target.parentId,
-        siblingIndex: nextSiblingIndex(groupByParent(all), target.parentId),
+        siblingIndex: nextSiblingIndexFromChildren(siblings),
         turnId: newId(),
         turnIndex: 0,
         createdAt: now,
@@ -1068,7 +1106,7 @@ async function createFirstImported(
     )
   }
 
-  const liveKids = (await ctx.listChildren(chatId, target.id)).filter((kid) => !kid.deleted)
+  const liveKids = (await ctx.listChildHeaders(chatId, target.id)).filter((kid) => !kid.deleted)
   const activeDescendantId = cursor[cursorKeyOf(target.id)]
   const activeDescendant =
     activeDescendantId !== undefined
@@ -1094,13 +1132,13 @@ async function createFirstImported(
     )
   }
 
-  const all = await ctx.listMessages(chatId)
+  const children = await ctx.listChildHeaders(chatId, target.id)
   const row: Message = withAttachmentRefs(
     {
       id: messageId,
       chatId,
       parentId: target.id,
-      siblingIndex: nextSiblingIndex(groupByParent(all), target.id),
+      siblingIndex: nextSiblingIndexFromChildren(children),
       turnId: newId(),
       turnIndex: 0,
       createdAt: now,
@@ -1145,14 +1183,13 @@ async function insertBetweenInner(
     }
   }
 
-  const all = await ctx.listMessages(chatId)
-  const byParent = groupByParent(all)
+  const siblings = await ctx.listChildHeaders(chatId, parentId)
   const row: Message = withAttachmentRefs(
     {
       id: spec.id,
       chatId,
       parentId,
-      siblingIndex: nextSiblingIndex(byParent, parentId),
+      siblingIndex: nextSiblingIndexFromChildren(siblings),
       turnId: newId(),
       turnIndex: 0,
       createdAt: spec.createdAt,
@@ -1167,11 +1204,15 @@ async function insertBetweenInner(
   await ctx.putMessage(row)
   await incRefs(ctx, spec.attachmentRefs ?? [])
 
-  const peers = (byParent.get(parentId) ?? [])
+  const peerHeaders = siblings
     .filter((sibling) => sibling.turnId === child.turnId && !sibling.deleted)
     .sort((a, b) => a.createdAt - b.createdAt)
-  for (let i = 0; i < peers.length; i += 1) {
-    const peer = peers[i] as Message
+  for (let i = 0; i < peerHeaders.length; i += 1) {
+    const peerHeader = peerHeaders[i] as MessageTreeRow
+    const peer = await ctx.getMessage(peerHeader.id)
+    if (!peer || peer.chatId !== chatId || peer.deleted || peer.parentId !== parentId) {
+      throw new TreeChangedError(chatId, `insert-between peer ${peerHeader.id} unavailable`)
+    }
     await ctx.putMessage({ ...peer, parentId: row.id, siblingIndex: i })
     effects.reparented.push({
       id: peer.id,
@@ -1198,15 +1239,15 @@ export async function deletePair(
   input: DeleteInput,
 ): Promise<{ effects: StructuralEffects; versions: ChatVersions }> {
   const repo = getWorkspaceRepository()
-  const all = await repo.listMessages(input.chatId)
-  const byId = indexById(all)
-  const byParent = groupByParent(all)
+  const all = await repo.listMessageHeaders(input.chatId)
+  const byId = new Map(all.map((message) => [message.id, message]))
+  const byParent = groupTreeRowsByParent(all)
   const target = byId.get(input.messageId)
   if (!target || target.deleted) {
     throw new TreeChangedError(input.chatId, `delete-pair target ${input.messageId} unavailable`)
   }
   const userHead = walkUpUntilRole(target, 'user', byId)
-  const members: Message[] = []
+  const members: MessageTreeRow[] = []
   if (userHead) {
     members.push(...collectTurnChain(userHead, byParent))
     members.push(...collectPairFollowers(userHead, byParent, input.cursor))
@@ -1229,9 +1270,9 @@ export async function deleteTurn(
   input: DeleteInput,
 ): Promise<{ effects: StructuralEffects; versions: ChatVersions }> {
   const repo = getWorkspaceRepository()
-  const all = await repo.listMessages(input.chatId)
-  const byId = indexById(all)
-  const byParent = groupByParent(all)
+  const all = await repo.listMessageHeaders(input.chatId)
+  const byId = new Map(all.map((message) => [message.id, message]))
+  const byParent = groupTreeRowsByParent(all)
   const target = byId.get(input.messageId)
   if (!target || target.deleted) {
     throw new TreeChangedError(input.chatId, `delete-turn target ${input.messageId} unavailable`)
@@ -1240,7 +1281,7 @@ export async function deleteTurn(
   const slotSiblings = (byParent.get(head.parentId) ?? []).filter(
     (sibling) => !sibling.deleted && sibling.turnIndex === 0,
   )
-  const members: Message[] = []
+  const members: MessageTreeRow[] = []
   for (const variantHead of slotSiblings) {
     members.push(...collectTurnChain(variantHead, byParent))
   }
@@ -1265,13 +1306,13 @@ export async function deleteSingleMessage(
   input: DeleteInput,
 ): Promise<{ effects: StructuralEffects; versions: ChatVersions }> {
   const repo = getWorkspaceRepository()
-  const all = await repo.listMessages(input.chatId)
-  const byId = indexById(all)
+  const all = await repo.listMessageHeaders(input.chatId)
+  const byId = new Map(all.map((message) => [message.id, message]))
   const target = byId.get(input.messageId)
   if (!target || target.deleted) {
     throw new TreeChangedError(input.chatId, `delete-single target ${input.messageId} unavailable`)
   }
-  const members: Message[] = [target]
+  const members: MessageTreeRow[] = [target]
   const result = await repo.runMutation(
     collectDeleteScopes(input.chatId, all, members, input.cascade ?? false),
     async (ctx) => {
@@ -1288,9 +1329,9 @@ export async function deleteVariant(
   input: DeleteInput,
 ): Promise<{ effects: StructuralEffects; versions: ChatVersions }> {
   const repo = getWorkspaceRepository()
-  const all = await repo.listMessages(input.chatId)
-  const byId = indexById(all)
-  const byParent = groupByParent(all)
+  const all = await repo.listMessageHeaders(input.chatId)
+  const byId = new Map(all.map((message) => [message.id, message]))
+  const byParent = groupTreeRowsByParent(all)
   const target = byId.get(input.messageId)
   if (!target || target.deleted) {
     throw new TreeChangedError(input.chatId, `delete-variant target ${input.messageId} unavailable`)

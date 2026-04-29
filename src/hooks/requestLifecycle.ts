@@ -1,5 +1,6 @@
 import type { ChatId, MessageId } from '../core/types'
 import { postEvent } from '../store/broadcast'
+import { getStreamClientId, startStreamLease, stopStreamLease } from '../store/stream-leases'
 import { useStreamStore } from '../store/zustand/streamStore'
 
 export interface RequestLifecycle {
@@ -29,14 +30,15 @@ export function startRequestLifecycle(args: {
     streamId: args.streamId,
     chatId: args.chatId,
     startedAt: Date.now(),
-    ownerClientId: 'in-tab',
+    heartbeatAt: Date.now(),
+    ownerClientId: getStreamClientId(),
     abort,
   })
   postEvent({
     kind: 'stream-started',
     chatId: args.chatId,
     streamId: args.streamId,
-    ownerClientId: 'in-tab',
+    ownerClientId: getStreamClientId(),
   })
 
   return {
@@ -44,6 +46,7 @@ export function startRequestLifecycle(args: {
     signal: controller.signal,
     end(outcome) {
       removeUserAbort?.()
+      stopStreamLease(args.streamId)
       if (!useStreamStore.getState().isActive(args.streamId)) return
       useStreamStore.getState().clearActive(args.streamId)
       postEvent({
@@ -62,19 +65,27 @@ export function markLifecycleTarget(args: {
   messageId: MessageId
   abort: () => void
 }): void {
+  const startedAt = Date.now()
   useStreamStore.getState().setActive({
     streamId: args.streamId,
     chatId: args.chatId,
     messageId: args.messageId,
-    startedAt: Date.now(),
-    ownerClientId: 'in-tab',
+    startedAt,
+    heartbeatAt: startedAt,
+    ownerClientId: getStreamClientId(),
     abort: args.abort,
+  })
+  startStreamLease({
+    streamId: args.streamId,
+    chatId: args.chatId,
+    messageId: args.messageId,
+    startedAt,
   })
   postEvent({
     kind: 'stream-started',
     chatId: args.chatId,
     streamId: args.streamId,
     messageId: args.messageId,
-    ownerClientId: 'in-tab',
+    ownerClientId: getStreamClientId(),
   })
 }

@@ -11,6 +11,7 @@ import {
   resolveMutationTableNames,
 } from '../../src/store/browser-repo'
 import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
+import { splitMessageForStorage } from '../../src/store/message-storage'
 
 const DB_NAME = 'natter'
 
@@ -73,6 +74,18 @@ function makeMessage(chatId: string, overrides: Partial<Message> = {}): Message 
   }
 }
 
+async function putStoredMessage(row: Message): Promise<void> {
+  const { header, body } = splitMessageForStorage(row)
+  await getDb().messages.put(header)
+  await getDb().messageBodies.put(body)
+}
+
+async function putStoredMessages(rows: readonly Message[]): Promise<void> {
+  const split = rows.map((row) => splitMessageForStorage(row))
+  await getDb().messages.bulkPut(split.map((row) => row.header))
+  await getDb().messageBodies.bulkPut(split.map((row) => row.body))
+}
+
 describe('browser repository mutation executor', () => {
   it('derives the minimal browser table set from the declared scopes', () => {
     expect(resolveMutationTableNames([{ kind: 'chat-meta', chatId: 'C1' }])).toEqual([
@@ -96,7 +109,7 @@ describe('browser repository mutation executor', () => {
         { kind: 'message', messageId: 'M1' },
         { kind: 'children', chatId: 'C1', parentId: null },
       ]),
-    ).toEqual(['chatBranchCache', 'chats', 'childLists', 'messages', 'settings'])
+    ).toEqual(['chatBranchCache', 'chats', 'childLists', 'messages', 'messageBodies', 'settings'])
   })
 
   it('throws ChatMissingError when a scoped mutation targets a missing chat', async () => {
@@ -247,7 +260,7 @@ describe('browser repository mutation executor', () => {
     const chat = await seedChat()
     const first = makeMessage(chat.id, { id: 'M1' })
     const second = makeMessage(chat.id, { id: 'M2', siblingIndex: 1 })
-    await getDb().messages.bulkPut([first, second])
+    await putStoredMessages([first, second])
 
     await Promise.all([
       repo.runMutation([{ kind: 'message', messageId: first.id }], async (ctx) => {
@@ -266,8 +279,8 @@ describe('browser repository mutation executor', () => {
       }),
     ])
 
-    const storedFirst = await getDb().messages.get(first.id)
-    const storedSecond = await getDb().messages.get(second.id)
+    const storedFirst = await repo.getMessage(first.id)
+    const storedSecond = await repo.getMessage(second.id)
     expect((storedFirst?.content[0] as { type: 'text'; text: string }).text).toBe('edited-1')
     expect((storedSecond?.content[0] as { type: 'text'; text: string }).text).toBe('edited-2')
   })
@@ -304,11 +317,82 @@ describe('browser repository mutation executor', () => {
     expect(await getDb().messages.get(rightMessage.id)).toBeDefined()
   })
 
+  it('loads an active-branch snapshot without requiring off-branch message bodies', async () => {
+    const repo = getBrowserRepository()
+    const chat = await seedChat()
+    const otherChat = await seedChat({ id: 'other-chat' })
+    const root = makeMessage(chat.id, { id: 'R', createdAt: 1 })
+    const latest = makeMessage(chat.id, { id: 'L', parentId: 'R', createdAt: 3 })
+    const offPath = makeMessage(chat.id, {
+      id: 'O',
+      parentId: 'R',
+      siblingIndex: 1,
+      createdAt: 2,
+      content: [{ type: 'text', text: 'missing body should not load' }],
+    })
+    const otherChatMessage = makeMessage(otherChat.id, {
+      id: 'OTHER',
+      content: [{ type: 'text', text: 'other chat body should not load' }],
+    })
+    await putStoredMessages([root, latest])
+    const offPathSplit = splitMessageForStorage(offPath)
+    await getDb().messages.put(offPathSplit.header)
+    const otherChatSplit = splitMessageForStorage(otherChatMessage)
+    await getDb().messages.put(otherChatSplit.header)
+
+    const snapshot = await repo.getActiveBranchSnapshot(chat.id, {})
+    expect(snapshot.branch.map((message) => message.id)).toEqual(['R', 'L'])
+    expect(snapshot.branch.map((message) => message.content[0])).toEqual([
+      { type: 'text', text: 'hi' },
+      { type: 'text', text: 'hi' },
+    ])
+    expect(snapshot.siblingGroups.find((group) => group.parentId === 'R')?.siblings).toHaveLength(2)
+    await expect(repo.listMessages(chat.id)).rejects.toThrow('MessageBodyMissing:O')
+    await expect(repo.listMessages(otherChat.id)).rejects.toThrow('MessageBodyMissing:OTHER')
+  })
+
+  it('loads only the requested active-branch body window', async () => {
+    const repo = getBrowserRepository()
+    const chat = await seedChat()
+    const rows = [
+      makeMessage(chat.id, { id: 'W0', createdAt: 0 }),
+      makeMessage(chat.id, { id: 'W1', parentId: 'W0', createdAt: 1 }),
+      makeMessage(chat.id, { id: 'W2', parentId: 'W1', createdAt: 2 }),
+      makeMessage(chat.id, { id: 'W3', parentId: 'W2', createdAt: 3 }),
+    ]
+    await putStoredMessages([rows[1] as Message, rows[2] as Message])
+    for (const row of [rows[0], rows[3]]) {
+      const split = splitMessageForStorage(row as Message)
+      await getDb().messages.put(split.header)
+    }
+
+    const snapshot = await repo.getActiveBranchWindowSnapshot(chat.id, {}, { offset: 1, limit: 2 })
+
+    expect(snapshot.branchHeaders.map((row) => row.id)).toEqual(['W0', 'W1', 'W2', 'W3'])
+    expect(snapshot.branchWindow.map((row) => row.id)).toEqual(['W1', 'W2'])
+    expect(snapshot.branchLength).toBe(4)
+    await expect(repo.getActiveBranchSnapshot(chat.id, {})).rejects.toThrow('MessageBodyMissing:W0')
+  })
+
+  it('reads root child headers without querying a null compound key', async () => {
+    const repo = getBrowserRepository()
+    const chat = await seedChat()
+    const left = makeMessage(chat.id, { id: 'R1', createdAt: 1 })
+    const right = makeMessage(chat.id, { id: 'R2', siblingIndex: 1, createdAt: 2 })
+    const child = makeMessage(chat.id, { id: 'C1', parentId: 'R1', createdAt: 3 })
+    await putStoredMessages([left, right, child])
+
+    expect((await repo.listChildHeaders(chat.id, null)).map((row) => row.id)).toEqual(['R1', 'R2'])
+    await repo.runMutation([{ kind: 'children', chatId: chat.id, parentId: null }], async (ctx) => {
+      expect((await ctx.listChildHeaders(chat.id, null)).map((row) => row.id)).toEqual(['R1', 'R2'])
+    })
+  })
+
   it('serializes overlapping message scopes and increments nodeVersion on each committed rewrite', async () => {
     const repo = getBrowserRepository()
     const chat = await seedChat()
     const row = makeMessage(chat.id, { id: 'M1' })
-    await getDb().messages.put(row)
+    await putStoredMessage(row)
 
     await Promise.all([
       repo.runMutation([{ kind: 'message', messageId: row.id }], async (ctx) => {
@@ -327,16 +411,132 @@ describe('browser repository mutation executor', () => {
       }),
     ])
 
-    const stored = await getDb().messages.get(row.id)
+    const stored = await repo.getMessage(row.id)
     expect(stored?.nodeVersion).toBe(2)
     expect(['v1', 'v2']).toContain((stored?.content[0] as { type: 'text'; text: string }).text)
+  })
+
+  it('patches streaming body fields without touching chat summary state', async () => {
+    const repo = getBrowserRepository()
+    const chat = await seedChat()
+    const row = makeMessage(chat.id, {
+      id: 'M1',
+      role: 'assistant',
+      origin: 'generated',
+      generation: {
+        id: '',
+        model: 'initial',
+        requestedModel: 'initial',
+        apiUsed: 'chat',
+        delivery: 'streaming',
+        costSource: 'stream',
+        startedAt: 1,
+      },
+    })
+    await putStoredMessage(row)
+
+    await repo.runMutation([{ kind: 'message', messageId: row.id }], async (ctx) => {
+      await ctx.patchMessageBody(
+        row.id,
+        {
+          content: [{ type: 'output_text', text: 'partial' }],
+          reasoningDetails: [{ type: 'reasoning.text', text: 'thinking' }],
+        },
+        {
+          touchChatSummary: false,
+          broadcast: false,
+          headerPatch: {
+            generation: {
+              id: 'gen-1',
+              model: 'resolved',
+              requestedModel: 'initial',
+              apiUsed: 'responses',
+              delivery: 'streaming',
+              costSource: 'stream',
+              startedAt: 1,
+            },
+          },
+        },
+      )
+    })
+
+    const header = await getDb().messages.get(row.id)
+    const body = await getDb().messageBodies.get(row.id)
+    const stored = await repo.getMessage(row.id)
+    expect(header).toMatchObject({
+      id: row.id,
+      nodeVersion: 1,
+      generation: { id: 'gen-1', model: 'resolved', apiUsed: 'responses' },
+    })
+    expect(header && 'content' in header).toBe(false)
+    expect(body).toMatchObject({
+      id: row.id,
+      nodeVersion: 1,
+      content: [{ type: 'output_text', text: 'partial' }],
+      reasoningDetails: [{ type: 'reasoning.text', text: 'thinking' }],
+    })
+    expect(stored).toMatchObject({
+      id: row.id,
+      nodeVersion: 1,
+      content: [{ type: 'output_text', text: 'partial' }],
+      generation: { id: 'gen-1', model: 'resolved', apiUsed: 'responses' },
+    })
+    expect((await getDb().chats.get(chat.id))?.summaryVersion).toBe(0)
+  })
+
+  it('keeps message body patches out of structural header fields', async () => {
+    const repo = getBrowserRepository()
+    const chat = await seedChat()
+    const row = makeMessage(chat.id, {
+      id: 'M1',
+      reasoningDetails: [{ type: 'reasoning.text', text: 'old' }],
+    })
+    await putStoredMessage(row)
+
+    await repo.runMutation([{ kind: 'message', messageId: row.id }], async (ctx) => {
+      await ctx.patchMessageBody(row.id, { reasoningDetails: undefined })
+    })
+    expect((await repo.getMessage(row.id))?.reasoningDetails).toBeUndefined()
+
+    await expect(
+      repo.runMutation([{ kind: 'message', messageId: row.id }], async (ctx) => {
+        await ctx.patchMessageBody(
+          row.id,
+          { content: row.content },
+          { headerPatch: { parentId: 'P' } },
+        )
+      }),
+    ).rejects.toThrow('MessageHeaderPatchForbidden:M1:parentId')
+  })
+
+  it('can replace a streaming body without reading the existing body row', async () => {
+    const repo = getBrowserRepository()
+    const chat = await seedChat()
+    const row = makeMessage(chat.id, { id: 'M1' })
+    await putStoredMessage(row)
+    await getDb().messageBodies.delete(row.id)
+
+    await repo.runMutation([{ kind: 'message', messageId: row.id }], async (ctx) => {
+      await ctx.patchMessageBody(
+        row.id,
+        { content: [{ type: 'output_text', text: 'stream replacement' }] },
+        { touchChatSummary: false, broadcast: false, replaceBody: true },
+      )
+    })
+
+    const stored = await repo.getMessage(row.id)
+    expect(stored).toMatchObject({
+      id: row.id,
+      nodeVersion: 1,
+      content: [{ type: 'output_text', text: 'stream replacement' }],
+    })
   })
 
   it('recomputes totalCostUsd on cost writes, soft delete/restore, and hard delete', async () => {
     const repo = getBrowserRepository()
     const chat = await seedChat({ lastUpdatedLeafId: 'M1' })
     const row = makeMessage(chat.id, { id: 'M1' })
-    await getDb().messages.put(row)
+    await putStoredMessage(row)
 
     const withCost: Message = {
       ...row,

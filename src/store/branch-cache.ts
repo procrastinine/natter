@@ -49,7 +49,7 @@ export async function readFreshChatBranchCache(
 export async function refreshChatBranchCache(chatId: ChatId): Promise<ChatBranchCache | undefined> {
   ensureListener()
   const repo = getWorkspaceRepository()
-  const [chat, messages] = await Promise.all([repo.getChat(chatId), repo.listMessages(chatId)])
+  const chat = await repo.getChat(chatId)
   if (!chat) {
     await repo.deleteChatBranchCache(chatId)
     cacheByChat.delete(chatId)
@@ -60,6 +60,7 @@ export async function refreshChatBranchCache(chatId: ChatId): Promise<ChatBranch
     cacheByChat.set(chatId, undefined)
     return undefined
   }
+  const messages = await repo.getBranchByLeaf(chatId, chat.lastUpdatedLeafId)
   const row = buildBranchCacheRow({
     chatId,
     branchLeafId: chat.lastUpdatedLeafId,

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { normalizeReasoningDetails } from '../../src/core/reasoning'
+import { mergeReasoningText, normalizeReasoningDetails } from '../../src/core/reasoning'
 import type { ReasoningDetail } from '../../src/core/types'
 
 describe('normalizeReasoningDetails', () => {
@@ -72,5 +72,24 @@ describe('normalizeReasoningDetails', () => {
         summary: 'Most CJK',
       },
     ])
+  })
+})
+
+describe('mergeReasoningText', () => {
+  it('preserves full-snapshot replacement for large reasoning text', () => {
+    const existing = `start ${'a'.repeat(10_000)}`
+    const incoming = `${existing} done`
+
+    expect(mergeReasoningText(existing, incoming)).toBe(incoming)
+  })
+
+  it('dedupes bounded overlaps without scanning the full strings', () => {
+    const overlap = 'x'.repeat(1024)
+    const existing = `${'a'.repeat(80_000)}${overlap}`
+    const incoming = `${overlap}${'b'.repeat(80_000)}`
+
+    expect(mergeReasoningText(existing, incoming)).toBe(
+      `${'a'.repeat(80_000)}${overlap}${'b'.repeat(80_000)}`,
+    )
   })
 })

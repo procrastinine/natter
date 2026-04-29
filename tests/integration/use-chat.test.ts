@@ -3,11 +3,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from '../../src/api/errors'
 import type { ChatStreamChunk, ResponsesStreamChunk } from '../../src/api/types'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
+import { cursorKeyOf } from '../../src/core/active-path'
 import { tokenCalibrationKey } from '../../src/core/model-ids'
 import type { ChatSettings, ConnectionProfile, Message } from '../../src/core/types'
 import { recoverOrphans, sendText } from '../../src/hooks/useChat'
 import { newId } from '../../src/lib/ulid'
-import { __resetBroadcastForTests } from '../../src/store/broadcast'
+import { __resetBroadcastForTests, postEvent } from '../../src/store/broadcast'
 import {
   __resetBrowserRepositoryForTests,
   getBrowserRepository,
@@ -15,6 +16,11 @@ import {
 import { createChat } from '../../src/store/chats'
 import { __resetDbForTests, openDb } from '../../src/store/db'
 import { putCachedEndpoints } from '../../src/store/models-cache'
+import {
+  __resetStreamLeasesForTests,
+  getStreamClientId,
+  installStreamLeaseListener,
+} from '../../src/store/stream-leases'
 import { useChatStore } from '../../src/store/zustand/chatStore'
 import { useStreamStore } from '../../src/store/zustand/streamStore'
 
@@ -109,6 +115,7 @@ async function reset() {
   __resetBrowserRepositoryForTests()
   __resetDbForTests()
   __resetBroadcastForTests()
+  __resetStreamLeasesForTests()
   useChatStore.getState().reset()
   useStreamStore.getState().reset()
   await Dexie.delete(DB_NAME)
@@ -134,12 +141,36 @@ async function messagesFor(chatId: string): Promise<Message[]> {
   return getBrowserRepository().listMessages(chatId)
 }
 
+async function eventually(assertion: () => Promise<void> | void): Promise<void> {
+  let lastError: unknown
+  for (let i = 0; i < 40; i += 1) {
+    try {
+      await assertion()
+      return
+    } catch (err) {
+      lastError = err
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+  }
+  throw lastError
+}
+
 function liveMessagesSortedByCreated(messages: Message[]): Message[] {
   return messages.filter((m) => !m.deleted).sort((a, b) => a.createdAt - b.createdAt)
 }
 
 async function* stream<T>(...chunks: T[]): AsyncGenerator<T> {
   for (const c of chunks) yield c
+}
+
+function patternedChunks(prefix: string, length: number, chunkChars: number): string[] {
+  const chunks: string[] = []
+  for (let offset = 0; offset < length; offset += chunkChars) {
+    const size = Math.min(chunkChars, length - offset)
+    const marker = `<${prefix}:${offset}>`
+    chunks.push(`${marker}${prefix.repeat(size)}`.slice(0, size))
+  }
+  return chunks
 }
 
 async function seedOpenRouterDiscovery(
@@ -271,6 +302,88 @@ describe('sendText — chat-completions streaming', () => {
     expect(assistant.generation?.finishedAt).toBe(1000)
     expect(assistant.generation?.abortReason).toBeUndefined()
   })
+
+  it(
+    'streams 100k reasoning and 100k completion in small chunks without per-chunk body rewrites',
+    async () => {
+      const chat = await createChat({ settings: chatSettings() })
+      const targetChars = 100_000
+      const reasoningChars = 100_000
+      const chunkChars = 128
+      const textChunks = patternedChunks('t', targetChars, chunkChars)
+      const reasoningChunks = patternedChunks('r', reasoningChars, chunkChars)
+      const expectedText = textChunks.join('')
+      const expectedReasoning = reasoningChunks.join('')
+      let clock = 1000
+      async function* longStream(): AsyncGenerator<ChatStreamChunk> {
+        for (let index = 0; index < reasoningChunks.length; index += 1) {
+          const offset = index * chunkChars
+          yield {
+            type: 'delta',
+            chunk: {
+              id: `reason-${offset}`,
+              model: 'google/gemini-3.1-flash-lite-preview',
+              choices: [{ delta: { reasoning: reasoningChunks[index] ?? '' } }],
+            },
+          }
+        }
+        for (let index = 0; index < textChunks.length; index += 1) {
+          const offset = index * chunkChars
+          yield {
+            type: 'delta',
+            chunk: {
+              id: `text-${offset}`,
+              model: 'google/gemini-3.1-flash-lite-preview',
+              choices: [{ delta: { content: textChunks[index] ?? '' } }],
+            },
+          }
+        }
+        yield {
+          type: 'delta',
+          chunk: {
+            id: 'done',
+            model: 'google/gemini-3.1-flash-lite-preview',
+            choices: [{ delta: {}, finish_reason: 'stop' }],
+            usage: {
+              prompt_tokens: 4,
+              completion_tokens: Math.ceil(targetChars / 4),
+              completion_tokens_details: { reasoning_tokens: Math.ceil(reasoningChars / 4) },
+              total_tokens: 4 + Math.ceil((targetChars + reasoningChars) / 4),
+            },
+          },
+        }
+      }
+
+      const result = await sendText({
+        chatId: chat.id,
+        connection: makeProfile(),
+        apiKey: 'sk-test',
+        content: [{ type: 'text', text: 'stress stream' }],
+        openStream: longStream,
+        now: () => ++clock,
+      })
+
+      expect(result.outcome).toBe('done')
+      expect(useStreamStore.getState().liveByMessageId[result.assistantMessageId]).toBeUndefined()
+      const assistant = requireDefined(
+        await getBrowserRepository().getMessage(result.assistantMessageId),
+        'assistant message',
+      )
+      expect(assistant.content).toEqual([{ type: 'output_text', text: expectedText }])
+      expect(assistant.reasoningDetails).toHaveLength(1)
+      expect(assistant.reasoningDetails?.[0]).toMatchObject({
+        type: 'reasoning.text',
+        id: 'text#default',
+        text: expectedReasoning,
+      })
+      const header = requireDefined(
+        await getBrowserRepository().getMessageHeader(result.assistantMessageId),
+        'assistant header',
+      )
+      expect(header.nodeVersion).toBeLessThanOrEqual(6)
+    },
+    15_000,
+  )
 
   it('sends assistant prefill through the unified request plan and stores the continuation below it', async () => {
     const chat = await createChat({
@@ -717,7 +830,7 @@ describe('sendText — chat-completions streaming', () => {
 
     const midChat = await getBrowserRepository().getChat(chat.id)
     const midAssistant = (await messagesFor(chat.id)).find((m) => m.role === 'assistant')
-    expect(midAssistant?.content).toEqual([{ type: 'output_text', text: 'Partial ' }])
+    expect(midAssistant?.content).toEqual([{ type: 'output_text', text: '' }])
     expect(midChat?.wordCount).toBe(2)
     expect(midChat?.totalCostUsd).toBe(0)
 
@@ -732,6 +845,119 @@ describe('sendText — chat-completions streaming', () => {
     expect(afterChat?.summaryVersion).toBe((midChat?.summaryVersion ?? 0) + 1)
     expect(afterChat?.wordCount).toBe(4)
     expect(afterChat?.totalCostUsd).toBeCloseTo(0.0002)
+  })
+
+  it('continues streaming when this tab or another tab views a different branch', async () => {
+    const chat = await createChat({ settings: chatSettings() })
+    const repo = getBrowserRepository()
+    const root: Message = {
+      id: 'root-user',
+      chatId: chat.id,
+      parentId: null,
+      siblingIndex: 0,
+      turnId: newId(),
+      turnIndex: 0,
+      createdAt: 1,
+      role: 'user',
+      origin: 'user',
+      content: [{ type: 'text', text: 'root' }],
+      nodeVersion: 0,
+      deleted: false,
+    }
+    const left: Message = {
+      id: 'left-assistant',
+      chatId: chat.id,
+      parentId: root.id,
+      siblingIndex: 0,
+      turnId: newId(),
+      turnIndex: 0,
+      createdAt: 2,
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: 'left' }],
+      nodeVersion: 0,
+      deleted: false,
+    }
+    const right: Message = {
+      ...left,
+      id: 'right-assistant',
+      siblingIndex: 1,
+      createdAt: 3,
+      content: [{ type: 'output_text', text: 'right' }],
+    }
+    await repo.runMutation(
+      [
+        { kind: 'message', messageId: root.id },
+        { kind: 'message', messageId: left.id },
+        { kind: 'message', messageId: right.id },
+        { kind: 'children', chatId: chat.id, parentId: null },
+        { kind: 'children', chatId: chat.id, parentId: root.id },
+      ],
+      async (ctx) => {
+        await ctx.putMessage(root)
+        await ctx.putMessage(left)
+        await ctx.putMessage(right)
+      },
+    )
+    useChatStore.getState().setCursor(chat.id, {
+      [cursorKeyOf(null)]: root.id,
+      [cursorKeyOf(root.id)]: left.id,
+    })
+
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    let markPaused!: () => void
+    const paused = new Promise<void>((resolve) => {
+      markPaused = resolve
+    })
+    let tick = 0
+    const sendPromise = sendText({
+      chatId: chat.id,
+      connection: makeProfile(),
+      apiKey: 'sk-test',
+      content: [{ type: 'text', text: 'continue left' }],
+      openStream: () =>
+        (async function* () {
+          yield {
+            type: 'delta',
+            chunk: { choices: [{ delta: { content: 'Partial ' } }] },
+          } as ChatStreamChunk
+          markPaused()
+          await gate
+          yield {
+            type: 'delta',
+            chunk: {
+              choices: [{ delta: { content: 'answer' }, finish_reason: 'stop' }],
+              usage: { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 },
+            },
+          } as ChatStreamChunk
+        })(),
+      now: () => {
+        tick += 250
+        return tick
+      },
+    })
+    await paused
+    expect(useStreamStore.getState().hasStreamForChat(chat.id)).toBe(true)
+
+    const rightBranchCursor = {
+      [cursorKeyOf(null)]: root.id,
+      [cursorKeyOf(root.id)]: right.id,
+    }
+    useChatStore.getState().setCursor(chat.id, rightBranchCursor)
+    const rightBranch = await repo.getActiveBranchSnapshot(chat.id, rightBranchCursor)
+    expect(rightBranch.branch.map((message) => message.id)).toEqual([root.id, right.id])
+    expect(useStreamStore.getState().hasStreamForChat(chat.id)).toBe(true)
+
+    release()
+    const result = await sendPromise
+    expect(result.outcome).toBe('done')
+    const assistant = await repo.getMessage(result.assistantMessageId)
+    expect(assistant?.parentId).toBe(result.userMessageId)
+    expect(assistant?.content).toEqual([{ type: 'output_text', text: 'Partial answer' }])
+    expect(useChatStore.getState().getCursor(chat.id)?.[cursorKeyOf(root.id)]).toBe(right.id)
   })
 
   it('releases the stream store entry on completion', async () => {
@@ -1006,6 +1232,7 @@ describe('sendText — chat-completions streaming', () => {
     expect(assistant?.reasoningDetails).toEqual([
       {
         type: 'reasoning.text',
+        id: 'text#default',
         index: 0,
         text: 'A ratio of Gaussians',
       },
@@ -1417,6 +1644,208 @@ describe('sendText — token calibration sample ingest', () => {
     expect(assistant.cachedTokenEstimate).toBeGreaterThan(0)
   })
 
+  it('keeps partial stream text out of messageBodies while appending recovery chunks', async () => {
+    const chat = await createChat({ settings: chatSettings({ model: 'openai/gpt-4o' }) })
+    let releaseStream!: () => void
+    const blocked = new Promise<void>((resolve) => {
+      releaseStream = resolve
+    })
+    const ctl = new AbortController()
+    let now = 1_000
+    const sendPromise = sendText({
+      chatId: chat.id,
+      connection: makeProfile(),
+      apiKey: 'sk-test',
+      content: [{ type: 'text', text: 'hi' }],
+      signal: ctl.signal,
+      now: () => {
+        now += 250
+        return now
+      },
+      openStream: async function* () {
+        yield {
+          type: 'delta',
+          chunk: { choices: [{ delta: { content: 'partial text' } }] },
+        } as ChatStreamChunk
+        await blocked
+      },
+    })
+
+    await eventually(async () => {
+      const db = await openDb()
+      expect(await db.streamChunks.count()).toBeGreaterThan(0)
+    })
+    const assistant = liveMessagesSortedByCreated(await messagesFor(chat.id)).find(
+      (message) => message.role === 'assistant',
+    )
+    expect(assistant).toBeDefined()
+    expect(assistant?.content).toEqual([{ type: 'output_text', text: '' }])
+
+    ctl.abort()
+    releaseStream()
+    await sendPromise
+    const db = await openDb()
+    expect(await db.streamChunks.count()).toBe(0)
+  })
+
+  it('honors a cross-tab abort request and finalizes the owner accumulator once', async () => {
+    installStreamLeaseListener()
+    const chat = await createChat({ settings: chatSettings({ model: 'openai/gpt-4o' }) })
+    let markPaused!: () => void
+    const paused = new Promise<void>((resolve) => {
+      markPaused = resolve
+    })
+    let now = 1_000
+    const sendPromise = sendText({
+      chatId: chat.id,
+      connection: makeProfile(),
+      apiKey: 'sk-test',
+      content: [{ type: 'text', text: 'hi' }],
+      now: () => {
+        now += 250
+        return now
+      },
+      openStream: ({ signal }) =>
+        (async function* () {
+          yield {
+            type: 'delta',
+            chunk: { choices: [{ delta: { content: 'remote-stop partial' } }] },
+          } as ChatStreamChunk
+          markPaused()
+          await new Promise<void>((_, reject) => {
+            if (signal.aborted) {
+              reject(new DOMException('aborted', 'AbortError'))
+              return
+            }
+            const onAbort = () => {
+              signal.removeEventListener('abort', onAbort)
+              reject(new DOMException('aborted', 'AbortError'))
+            }
+            signal.addEventListener('abort', onAbort, { once: true })
+          })
+        })(),
+    })
+
+    await paused
+    await eventually(async () => {
+      const db = await openDb()
+      expect(await db.streamChunks.count()).toBeGreaterThan(0)
+    })
+    const ownerStream = Object.values(useStreamStore.getState().activeByStreamId).find(
+      (stream) => stream.chatId === chat.id && stream.messageId !== undefined,
+    )
+    expect(ownerStream).toBeDefined()
+
+    postEvent({
+      kind: 'stream-abort-requested',
+      chatId: chat.id,
+      streamId: ownerStream?.streamId ?? '',
+      ownerClientId: getStreamClientId(),
+    })
+
+    const result = await sendPromise
+    expect(result.outcome).toBe('abort')
+    const assistant = await getBrowserRepository().getMessage(result.assistantMessageId)
+    expect(assistant?.content).toEqual([{ type: 'output_text', text: 'remote-stop partial' }])
+    expect(assistant?.generation?.abortReason).toBe('user')
+    const db = await openDb()
+    expect(await db.streamChunks.count()).toBe(0)
+    expect(await getBrowserRepository().listStreamLeases(chat.id)).toEqual([])
+  })
+
+  it('persists Responses phase deltas without logging full message output-item snapshots', async () => {
+    const chat = await createChat({
+      settings: chatSettings({
+        profileId: 'prof-openai',
+        model: 'openai/gpt-5.4',
+        api: 'responses',
+      }),
+    })
+    let releaseStream!: () => void
+    const blocked = new Promise<void>((resolve) => {
+      releaseStream = resolve
+    })
+    let markPaused!: () => void
+    const paused = new Promise<void>((resolve) => {
+      markPaused = resolve
+    })
+    let now = 1_000
+    const sendPromise = sendText({
+      chatId: chat.id,
+      connection: makeOpenAiProfile(),
+      apiKey: 'sk-test',
+      content: [{ type: 'text', text: 'phase please' }],
+      now: () => {
+        now += 250
+        return now
+      },
+      openStream: async function* () {
+        yield {
+          type: 'event',
+          event: {
+            type: 'response.output_text.delta',
+            output_index: 0,
+            content_index: 0,
+            item_id: 'msg_1',
+            delta: 'phase text',
+          },
+        } as ResponsesStreamChunk
+        yield {
+          type: 'event',
+          event: {
+            type: 'response.output_item.done',
+            output_index: 0,
+            item: {
+              id: 'msg_1',
+              type: 'message',
+              status: 'completed',
+              role: 'assistant',
+              phase: 'final_answer',
+              content: [{ type: 'output_text', text: 'phase text'.repeat(500) }],
+            },
+          },
+        } as ResponsesStreamChunk
+        markPaused()
+        await blocked
+        yield {
+          type: 'event',
+          event: {
+            type: 'response.completed',
+            response: {
+              id: 'resp_1',
+              status: 'completed',
+              model: 'openai/gpt-5.4',
+              usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+            },
+          },
+        } as ResponsesStreamChunk
+      },
+    })
+
+    await paused
+    await eventually(async () => {
+      const db = await openDb()
+      const rows = await db.streamChunks.toArray()
+      expect(rows.some((row) => (row.event as { lane?: string }).lane === 'phase')).toBe(true)
+    })
+    const db = await openDb()
+    const rows = await db.streamChunks.toArray()
+    expect(
+      rows.some((row) => {
+        const event = row.event as { lane?: string; item?: { type?: string } }
+        return event.lane === 'output-item-done' && event.item?.type === 'message'
+      }),
+    ).toBe(false)
+
+    releaseStream()
+    const result = await sendPromise
+    expect(result.outcome).toBe('done')
+    const assistant = await getBrowserRepository().getMessage(result.assistantMessageId)
+    expect(assistant?.content).toEqual([{ type: 'output_text', text: 'phase text' }])
+    expect(assistant?.phase).toBe('final_answer')
+    expect(await db.streamChunks.count()).toBe(0)
+  })
+
   it('skips the sample when the implied ratio is outside family bounds', async () => {
     const chat = await createChat({
       settings: chatSettings({ model: 'openai/gpt-4o', systemPrompt: '' }),
@@ -1485,11 +1914,258 @@ describe('recoverOrphans', () => {
         })
       },
     )
-    const recovered = await recoverOrphans(2000)
+    const recovered = await recoverOrphans(20_000)
     expect(recovered).toBe(1)
     const after = await repo.getMessage(orphanId)
     expect(after?.generation?.abortReason).toBe('tab-close')
-    expect(after?.generation?.finishedAt).toBe(2000)
+    expect(after?.generation?.finishedAt).toBe(20_000)
+  })
+
+  it('does not mark a message that has a fresh cross-tab stream lease', async () => {
+    const chat = await createChat({ settings: chatSettings() })
+    const repo = getBrowserRepository()
+    const leasedId = newId()
+    await repo.runMutation(
+      [
+        { kind: 'message', messageId: leasedId },
+        { kind: 'children', chatId: chat.id, parentId: null },
+      ],
+      async (ctx) => {
+        await ctx.putMessage({
+          id: leasedId,
+          chatId: chat.id,
+          parentId: null,
+          siblingIndex: 0,
+          turnId: newId(),
+          turnIndex: 0,
+          createdAt: 1,
+          role: 'assistant',
+          origin: 'generated',
+          content: [{ type: 'output_text', text: 'partial' }],
+          nodeVersion: 0,
+          deleted: false,
+          generation: {
+            id: '',
+            model: 'm',
+            requestedModel: 'm',
+            apiUsed: 'chat',
+            delivery: 'streaming',
+            costSource: 'stream',
+            startedAt: 100,
+          },
+        })
+      },
+    )
+    await repo.upsertStreamLease({
+      streamId: 'stream-other-tab',
+      chatId: chat.id,
+      messageId: leasedId,
+      ownerClientId: 'other-tab',
+      startedAt: 100,
+      heartbeatAt: 19_000,
+    })
+
+    expect(await recoverOrphans(20_000)).toBe(0)
+    expect((await repo.getMessage(leasedId))?.generation?.abortReason).toBeUndefined()
+  })
+
+  it('does not compact chunks while a fresh owner lease exists', async () => {
+    const chat = await createChat({ settings: chatSettings() })
+    const repo = getBrowserRepository()
+    const leasedId = newId()
+    await repo.runMutation(
+      [
+        { kind: 'message', messageId: leasedId },
+        { kind: 'children', chatId: chat.id, parentId: null },
+      ],
+      async (ctx) => {
+        await ctx.putMessage({
+          id: leasedId,
+          chatId: chat.id,
+          parentId: null,
+          siblingIndex: 0,
+          turnId: newId(),
+          turnIndex: 0,
+          createdAt: 1,
+          role: 'assistant',
+          origin: 'generated',
+          content: [{ type: 'output_text', text: '' }],
+          nodeVersion: 0,
+          deleted: false,
+          generation: {
+            id: '',
+            model: 'm',
+            requestedModel: 'm',
+            apiUsed: 'chat',
+            delivery: 'streaming',
+            costSource: 'stream',
+            startedAt: 100,
+          },
+        })
+      },
+    )
+    await repo.appendStreamChunks([
+      {
+        id: 'active-stream:0',
+        streamId: 'active-stream',
+        chatId: chat.id,
+        messageId: leasedId,
+        seq: 0,
+        createdAt: 200,
+        event: { lane: 'text', text: 'owned elsewhere' },
+      },
+    ])
+    await repo.upsertStreamLease({
+      streamId: 'active-stream',
+      chatId: chat.id,
+      messageId: leasedId,
+      ownerClientId: 'other-tab',
+      startedAt: 100,
+      heartbeatAt: 19_000,
+    })
+
+    expect(await recoverOrphans(20_000)).toBe(0)
+    const after = await repo.getMessage(leasedId)
+    expect(after?.content).toEqual([{ type: 'output_text', text: '' }])
+    expect(after?.generation?.abortReason).toBeUndefined()
+    expect(await repo.listStreamChunksForMessage(leasedId)).toHaveLength(1)
+  })
+
+  it('compacts stale stream chunks once and deletes the recovery log', async () => {
+    const chat = await createChat({ settings: chatSettings() })
+    const repo = getBrowserRepository()
+    const orphanId = newId()
+    await repo.runMutation(
+      [
+        { kind: 'message', messageId: orphanId },
+        { kind: 'children', chatId: chat.id, parentId: null },
+      ],
+      async (ctx) => {
+        await ctx.putMessage({
+          id: orphanId,
+          chatId: chat.id,
+          parentId: null,
+          siblingIndex: 0,
+          turnId: newId(),
+          turnIndex: 0,
+          createdAt: 1,
+          role: 'assistant',
+          origin: 'generated',
+          content: [{ type: 'output_text', text: '' }],
+          nodeVersion: 0,
+          deleted: false,
+          generation: {
+            id: '',
+            model: 'm',
+            requestedModel: 'm',
+            apiUsed: 'chat',
+            delivery: 'streaming',
+            costSource: 'stream',
+            startedAt: 100,
+          },
+        })
+      },
+    )
+    await repo.appendStreamChunks([
+      {
+        id: 'stale-stream:0',
+        streamId: 'stale-stream',
+        chatId: chat.id,
+        messageId: orphanId,
+        seq: 0,
+        createdAt: 200,
+        event: { lane: 'reasoning', textDelta: 'thinking', outputIndex: 0 },
+      },
+      {
+        id: 'stale-stream:1',
+        streamId: 'stale-stream',
+        chatId: chat.id,
+        messageId: orphanId,
+        seq: 1,
+        createdAt: 300,
+        event: { lane: 'text', text: 'hello ' },
+      },
+      {
+        id: 'stale-stream:2',
+        streamId: 'stale-stream',
+        chatId: chat.id,
+        messageId: orphanId,
+        seq: 2,
+        createdAt: 400,
+        event: { lane: 'text', text: 'world' },
+      },
+      {
+        id: 'stale-stream:3',
+        streamId: 'stale-stream',
+        chatId: chat.id,
+        messageId: orphanId,
+        seq: 3,
+        createdAt: 500,
+        event: { lane: 'phase', phase: 'final_answer', outputIndex: 0 },
+      },
+    ])
+    await repo.upsertStreamLease({
+      streamId: 'stale-stream',
+      chatId: chat.id,
+      messageId: orphanId,
+      ownerClientId: 'dead-tab',
+      startedAt: 100,
+      heartbeatAt: 1_000,
+    })
+
+    expect(await recoverOrphans(20_000)).toBe(1)
+    const after = await repo.getMessage(orphanId)
+    expect(after?.content).toEqual([{ type: 'output_text', text: 'hello world' }])
+    expect(after?.reasoningDetails?.[0]).toMatchObject({
+      type: 'reasoning.text',
+      text: 'thinking',
+    })
+    expect(after?.generation?.abortReason).toBe('tab-close')
+    expect(after?.phase).toBe('final_answer')
+    expect(await repo.listStreamChunksForMessage(orphanId)).toEqual([])
+    expect(await repo.listStreamLeases(chat.id)).toEqual([])
+
+    expect(await recoverOrphans(21_000)).toBe(0)
+  })
+
+  it('graces very recent placeholders before a lease heartbeat is visible', async () => {
+    const chat = await createChat({ settings: chatSettings() })
+    const repo = getBrowserRepository()
+    const freshId = newId()
+    await repo.runMutation(
+      [
+        { kind: 'message', messageId: freshId },
+        { kind: 'children', chatId: chat.id, parentId: null },
+      ],
+      async (ctx) => {
+        await ctx.putMessage({
+          id: freshId,
+          chatId: chat.id,
+          parentId: null,
+          siblingIndex: 0,
+          turnId: newId(),
+          turnIndex: 0,
+          createdAt: 1,
+          role: 'assistant',
+          origin: 'generated',
+          content: [{ type: 'output_text', text: 'partial' }],
+          nodeVersion: 0,
+          deleted: false,
+          generation: {
+            id: '',
+            model: 'm',
+            requestedModel: 'm',
+            apiUsed: 'chat',
+            delivery: 'streaming',
+            costSource: 'stream',
+            startedAt: 10_000,
+          },
+        })
+      },
+    )
+
+    expect(await recoverOrphans(20_000)).toBe(0)
+    expect((await repo.getMessage(freshId))?.generation?.abortReason).toBeUndefined()
   })
 
   it('does not touch messages that already finished', async () => {
@@ -1529,7 +2205,7 @@ describe('recoverOrphans', () => {
         })
       },
     )
-    const recovered = await recoverOrphans(2000)
+    const recovered = await recoverOrphans(20_000)
     expect(recovered).toBe(0)
     const after = await repo.getMessage(id)
     expect(after?.generation?.abortReason).toBeUndefined()

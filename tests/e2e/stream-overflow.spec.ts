@@ -24,11 +24,39 @@ test('oversized stream lane auto-compacts and the avatar cycles compact -> peek 
           const now = Date.now()
           const userId = 'oversize-user'
           const assistantId = 'oversize-assistant'
-          const tx = db.transaction(['presets', 'messages', 'chats', 'settings'], 'readwrite')
+          const tx = db.transaction(
+            ['presets', 'messages', 'messageBodies', 'chats', 'settings'],
+            'readwrite',
+          )
           const chats = tx.objectStore('chats')
           const messages = tx.objectStore('messages')
+          const messageBodies = tx.objectStore('messageBodies')
           const presets = tx.objectStore('presets')
           const settings = tx.objectStore('settings')
+          const putMessage = (row: Record<string, unknown>) => {
+            const {
+              content,
+              reasoningDetails,
+              toolCalls,
+              refusal,
+              phase,
+              responsesEchoItem,
+              ...header
+            } = row
+            messages.put(header)
+            messageBodies.put({
+              id: row.id,
+              chatId: row.chatId,
+              nodeVersion: row.nodeVersion,
+              updatedAt: now,
+              content,
+              ...(reasoningDetails !== undefined ? { reasoningDetails } : {}),
+              ...(toolCalls !== undefined ? { toolCalls } : {}),
+              ...(refusal !== undefined ? { refusal } : {}),
+              ...(phase !== undefined ? { phase } : {}),
+              ...(responsesEchoItem !== undefined ? { responsesEchoItem } : {}),
+            })
+          }
           settings.put({ key: 'global:long-message-display-mode', value: 'compact' })
           const getPresetsReq = presets.getAll()
           getPresetsReq.onsuccess = () => {
@@ -57,7 +85,7 @@ test('oversized stream lane auto-compacts and the avatar cycles compact -> peek 
               folderId: null,
               tags: [],
             })
-            messages.put({
+            putMessage({
               id: userId,
               chatId: activeChatId,
               parentId: null,
@@ -71,7 +99,7 @@ test('oversized stream lane auto-compacts and the avatar cycles compact -> peek 
               nodeVersion: 0,
               deleted: false,
             })
-            messages.put({
+            putMessage({
               id: assistantId,
               chatId: activeChatId,
               parentId: userId,

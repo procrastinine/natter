@@ -20,9 +20,8 @@
 
 import { useLiveQuery } from 'dexie-react-hooks'
 import { useCallback, useMemo, useState } from 'react'
-import { activePath } from '../../core/active-path'
 import { DEFAULT_GLOBAL_PREFERENCES, readGlobalPreferences } from '../../core/global-settings'
-import { DEFAULT_OPENROUTER_PROVIDER_SORT } from '../../core/provider-settings-migration'
+import { DEFAULT_OPENROUTER_PROVIDER_SORT } from '../../backcompat/provider-settings'
 import { estimateSettingsPromptSize, UNLIMITED_CONTEXT } from '../../core/prompt-size'
 import {
   endpointMatchesProviderRef,
@@ -33,9 +32,9 @@ import {
   resolveProviderRefsToRoutingRefs,
 } from '../../core/provider-identity'
 import { readTokenCalibrationGlobal } from '../../core/token-calibration'
-import type { Chat, ModelEndpoint, ProviderPreferences, SortBy } from '../../core/types'
+import type { Chat, Message, ModelEndpoint, ProviderPreferences, SortBy } from '../../core/types'
 import type { UsePrivacyRoutingResult } from '../../hooks/usePrivacyRouting'
-import { getChatDraft, loadChatMessages, updateChatSettings } from '../../store/chats'
+import { getChatDraft, loadActiveBranchSnapshot, updateChatSettings } from '../../store/chats'
 import { useChatStore } from '../../store/zustand/chatStore'
 import { useAttachmentResolverForContext } from '../attachments/useAttachmentResolver'
 import { LockIcon } from '../icons/Icon'
@@ -55,6 +54,7 @@ export interface ProviderPickerProps {
 }
 
 const EMPTY_CURSOR = Object.freeze({}) as Readonly<Record<string, string>>
+const EMPTY_MESSAGES: Message[] = []
 const SORT_OPTIONS: ReadonlyArray<{ value: SortBy; label: string }> = [
   { value: 'price', label: 'Price' },
   { value: 'throughput', label: 'Throughput' },
@@ -91,13 +91,14 @@ export function ProviderPicker({
   )
   const needsLocalNeededTokens = neededTokensOverride === undefined
 
-  const messages = useLiveQuery(
-    () => (needsLocalNeededTokens ? loadChatMessages(chat.id) : Promise.resolve([])),
-    [chat.id, needsLocalNeededTokens],
-    [],
-  )
   const cursor = useChatStore((s) =>
     needsLocalNeededTokens ? (s.cursors[chat.id] ?? EMPTY_CURSOR) : EMPTY_CURSOR,
+  )
+  const branchSnapshot = useLiveQuery(
+    () =>
+      needsLocalNeededTokens ? loadActiveBranchSnapshot(chat.id, cursor) : Promise.resolve(null),
+    [chat.id, needsLocalNeededTokens, cursor],
+    null,
   )
   const draft = useLiveQuery(
     () => (needsLocalNeededTokens ? getChatDraft(chat.id) : Promise.resolve(undefined)),
@@ -117,10 +118,9 @@ export function ProviderPicker({
     [needsLocalNeededTokens],
     null,
   )
-  const localPath = useMemo(
-    () => (needsLocalNeededTokens ? activePath(messages, cursor) : []),
-    [needsLocalNeededTokens, messages, cursor],
-  )
+  const localPath = needsLocalNeededTokens
+    ? (branchSnapshot?.branch ?? EMPTY_MESSAGES)
+    : EMPTY_MESSAGES
   const attachmentResolver = useAttachmentResolverForContext({
     settings: chat.settings,
     messages: localPath,
@@ -186,28 +186,11 @@ export function ProviderPicker({
       // only auto-excluded row yields `ignore=[]` but the Override flag
       // still pins the chat into user-authoritative mode.
       const alreadyTouched = prefs.ignoreOverridesFilter === true
-      const legacyPrivacyRefs =
-        chat.settings.privacy.ignoreProviders.length > 0 ||
-        chat.settings.privacy.onlyProviders.length > 0
       const base = alreadyTouched
         ? new Set(
             resolveProviderRefsToRoutingRefs(endpoints, prefs.ignore, { preserveUnknown: true }),
           )
         : new Set((filter?.excluded ?? []).map((e) => providerRoutingRef(e.endpoint)))
-      if (legacyPrivacyRefs) {
-        for (const ref of resolveProviderRefsToRoutingRefs(
-          endpoints,
-          chat.settings.privacy.ignoreProviders,
-          {
-            preserveUnknown: true,
-          },
-        )) {
-          base.add(ref)
-        }
-        for (const row of filter?.excluded ?? []) {
-          if (row.reasons.includes('not-in-only-list')) base.add(providerRoutingRef(row.endpoint))
-        }
-      }
       if (enabled) base.delete(providerRef)
       else base.add(providerRef)
       const nextPrefs: ProviderPreferences = {
@@ -218,23 +201,11 @@ export function ProviderPicker({
       delete nextPrefs.only
       delete nextPrefs.dataCollection
       delete nextPrefs.zdr
-      if (!legacyPrivacyRefs) {
-        void updateChatSettings(chat.id, { providerPrefs: nextPrefs })
-        return
-      }
-      void updateChatSettings(chat.id, {
-        providerPrefs: nextPrefs,
-        privacy: {
-          ...chat.settings.privacy,
-          ignoreProviders: [],
-          onlyProviders: [],
-        },
-      })
+      void updateChatSettings(chat.id, { providerPrefs: nextPrefs })
     },
     [
       chat.id,
       chat.settings.providerPrefs,
-      chat.settings.privacy,
       endpoints,
       prefs.ignore,
       prefs.ignoreOverridesFilter,
@@ -271,20 +242,13 @@ export function ProviderPicker({
 
   const resetPrefs = useCallback(() => {
     // Reset clears every override this panel can produce: provider
-    // order, manual ignore, the user-touched flag, non-default sort, privacy-side
-    // `onlyProviders` / `ignoreProviders`. After reset the picker falls
-    // back to Price + the filter's default — kept providers checked,
+    // order, manual ignore, the user-touched flag, and non-default sort.
+    // After reset the picker falls back to Price + the filter's default — kept providers checked,
     // auto-excluded providers unchecked.
-    const nextPrivacy = {
-      ...chat.settings.privacy,
-      onlyProviders: [],
-      ignoreProviders: [],
-    }
     void updateChatSettings(chat.id, {
       providerPrefs: { sort: DEFAULT_OPENROUTER_PROVIDER_SORT },
-      privacy: nextPrivacy,
     })
-  }, [chat.id, chat.settings.privacy])
+  }, [chat.id])
 
   const setAllProviders = useCallback(
     (enabled: boolean) => {
@@ -296,22 +260,13 @@ export function ProviderPicker({
       delete nextPrefs.only
       delete nextPrefs.dataCollection
       delete nextPrefs.zdr
-      void updateChatSettings(chat.id, {
-        providerPrefs: nextPrefs,
-        privacy: {
-          ...chat.settings.privacy,
-          ignoreProviders: [],
-          onlyProviders: [],
-        },
-      })
+      void updateChatSettings(chat.id, { providerPrefs: nextPrefs })
     },
-    [chat.id, chat.settings.providerPrefs, chat.settings.privacy, displayOrdered],
+    [chat.id, chat.settings.providerPrefs, displayOrdered],
   )
 
   if (!chat.settings.model) return null
 
-  const privacyOverrides =
-    chat.settings.privacy.onlyProviders.length + chat.settings.privacy.ignoreProviders.length
   const sortOverridden =
     prefs.sort !== undefined &&
     JSON.stringify(prefs.sort) !== JSON.stringify(DEFAULT_OPENROUTER_PROVIDER_SORT)
@@ -319,8 +274,7 @@ export function ProviderPicker({
     prefs.ignoreOverridesFilter === true ||
     (prefs.ignore?.length ?? 0) > 0 ||
     (prefs.order?.length ?? 0) > 0 ||
-    sortOverridden ||
-    privacyOverrides > 0
+    sortOverridden
 
   return (
     <div data-ui="settings-section" data-ui-section="provider-picker">

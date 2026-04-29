@@ -1,6 +1,7 @@
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import { App } from './app/App'
+import { installDebugFakeStream } from './lib/debug-fake-stream'
 import { installDebugNuke } from './lib/debug-nuke'
 import { installDebugStreams } from './lib/debug-streams'
 import { openDb } from './store/db'
@@ -11,6 +12,7 @@ import './app/theme.css'
 if (import.meta.env.DEV) {
   installDebugNuke()
   installDebugStreams()
+  installDebugFakeStream()
 }
 
 const container = document.getElementById('root')

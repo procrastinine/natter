@@ -1,5 +1,5 @@
 import type { Table, Transaction } from 'dexie'
-import { findLastUpdatedLeafId, indexById, isOnPathToLeaf } from '../core/active-path'
+import { activePath, findLastUpdatedLeafId, indexById, isOnPathToLeaf } from '../core/active-path'
 import { buildBranchCacheRow, buildBranchMessages } from '../core/branch-flatten'
 import type {
   Attachment,
@@ -27,18 +27,33 @@ import { liveAttachmentRefs, normalizeAttachmentRefs } from './attachment-refs'
 import { postEvent } from './broadcast'
 import { childListKey, type NatterDb, openDb, type SettingsRow } from './db'
 import { withMutationLocks } from './locks'
+import {
+  hydrateMessage,
+  hydrateMessages,
+  splitMessageForStorage,
+  type MessageBodyRow,
+  type MessageHeaderRow,
+} from './message-storage'
 import type {
   AttachmentBundle,
   AttachmentSearchPage,
   AttachmentSearchQuery,
+  ActiveBranchSnapshot,
+  ActiveBranchBodyWindow,
+  ActiveBranchWindowSnapshot,
   ChatMutationSummary,
   CreateFolderInput,
   CreateTagInput,
   DeleteArchivedChatsResult,
   DeleteFolderResult,
   DeleteTagResult,
+  MessageBodyPatch,
+  MessageHeaderPatch,
   MutationContext,
+  PatchMessageBodyOptions,
   PutMessageOptions,
+  StreamChunkRow,
+  StreamLeaseRow,
   UpdateFolderInput,
   UpdateTagInput,
   WorkspaceMeta,
@@ -88,6 +103,7 @@ type BrowserMutationTableName =
   | 'childLists'
   | 'drafts'
   | 'messages'
+  | 'messageBodies'
   | 'settings'
 
 const MUTATION_TABLE_ORDER: readonly BrowserMutationTableName[] = [
@@ -100,11 +116,43 @@ const MUTATION_TABLE_ORDER: readonly BrowserMutationTableName[] = [
   'childLists',
   'drafts',
   'messages',
+  'messageBodies',
   'settings',
 ]
 
 function stableStringify(value: unknown): string {
   return JSON.stringify(value)
+}
+
+function isStreamLeaseRow(value: unknown): value is StreamLeaseRow {
+  if (!value || typeof value !== 'object') return false
+  const row = value as Partial<StreamLeaseRow>
+  return (
+    typeof row.streamId === 'string' &&
+    typeof row.chatId === 'string' &&
+    (row.messageId === undefined || typeof row.messageId === 'string') &&
+    typeof row.ownerClientId === 'string' &&
+    typeof row.startedAt === 'number' &&
+    Number.isFinite(row.startedAt) &&
+    typeof row.heartbeatAt === 'number' &&
+    Number.isFinite(row.heartbeatAt)
+  )
+}
+
+function isStreamChunkRow(value: unknown): value is StreamChunkRow {
+  if (!value || typeof value !== 'object') return false
+  const row = value as Partial<StreamChunkRow>
+  return (
+    typeof row.id === 'string' &&
+    typeof row.streamId === 'string' &&
+    typeof row.chatId === 'string' &&
+    typeof row.messageId === 'string' &&
+    typeof row.seq === 'number' &&
+    Number.isFinite(row.seq) &&
+    typeof row.createdAt === 'number' &&
+    Number.isFinite(row.createdAt) &&
+    'event' in row
+  )
 }
 
 function valuesEqual(left: unknown, right: unknown): boolean {
@@ -133,6 +181,213 @@ function cloneMessage(message: Message): Message {
     createdAt: cloned.createdAt,
   })
   return cloned
+}
+
+function cloneMessageHeader(message: MessageHeaderRow): MessageHeaderRow {
+  const cloned = structuredClone(message)
+  cloned.attachmentRefs = normalizeAttachmentRefs(cloned.attachmentRefs, {
+    messageId: cloned.id,
+    createdAt: cloned.createdAt,
+  })
+  return cloned
+}
+
+function branchWindowRange(
+  total: number,
+  window: ActiveBranchBodyWindow,
+): { start: number; end: number; limit: number } {
+  const limit = Math.max(0, Math.floor(window.limit))
+  const start = Math.max(0, Math.min(total, Math.floor(window.offset)))
+  return { start, end: Math.min(total, start + limit), limit }
+}
+
+async function listChildHeaderRows(
+  table: Table<MessageHeaderRow, MessageId>,
+  chatId: ChatId,
+  parentId: MessageId | null,
+): Promise<MessageHeaderRow[]> {
+  if (parentId === null) {
+    return table
+      .where('chatId')
+      .equals(chatId)
+      .filter((row) => row.parentId === null)
+      .toArray()
+  }
+  return table
+    .where('[chatId+parentId]')
+    .equals([chatId, parentId] as never)
+    .toArray()
+}
+
+function applyMessageBodyPatch(body: MessageBodyRow, patch: MessageBodyPatch): MessageBodyRow {
+  const next = structuredClone(body)
+  if ('content' in patch) {
+    if (patch.content === undefined) throw new Error(`MessageBodyPatchMissingContent:${body.id}`)
+    next.content = structuredClone(patch.content)
+  }
+  if ('reasoningDetails' in patch) {
+    if (patch.reasoningDetails === undefined) delete next.reasoningDetails
+    else next.reasoningDetails = structuredClone(patch.reasoningDetails)
+  }
+  if ('toolCalls' in patch) {
+    if (patch.toolCalls === undefined) delete next.toolCalls
+    else next.toolCalls = structuredClone(patch.toolCalls)
+  }
+  if ('refusal' in patch) {
+    if (patch.refusal === undefined) delete next.refusal
+    else next.refusal = patch.refusal
+  }
+  if ('phase' in patch) {
+    if (patch.phase === undefined) delete next.phase
+    else next.phase = patch.phase
+  }
+  if ('responsesEchoItem' in patch) {
+    if (patch.responsesEchoItem === undefined) delete next.responsesEchoItem
+    else next.responsesEchoItem = structuredClone(patch.responsesEchoItem)
+  }
+  return next
+}
+
+function replacementMessageBody(
+  header: MessageHeaderRow,
+  patch: MessageBodyPatch,
+  options: { nodeVersion: number; updatedAt: number },
+): MessageBodyRow {
+  if (!('content' in patch) || patch.content === undefined) {
+    throw new Error(`MessageBodyPatchMissingContent:${header.id}`)
+  }
+  const body: MessageBodyRow = {
+    id: header.id,
+    chatId: header.chatId,
+    nodeVersion: options.nodeVersion,
+    updatedAt: options.updatedAt,
+    content: structuredClone(patch.content),
+  }
+  if (patch.reasoningDetails !== undefined) {
+    body.reasoningDetails = structuredClone(patch.reasoningDetails)
+  }
+  if (patch.toolCalls !== undefined) body.toolCalls = structuredClone(patch.toolCalls)
+  if (patch.refusal !== undefined) body.refusal = patch.refusal
+  if (patch.phase !== undefined) body.phase = patch.phase
+  if (patch.responsesEchoItem !== undefined) {
+    body.responsesEchoItem = structuredClone(patch.responsesEchoItem)
+  }
+  return body
+}
+
+const FORBIDDEN_MESSAGE_HEADER_PATCH_KEYS = new Set<keyof MessageHeaderRow>([
+  'id',
+  'chatId',
+  'parentId',
+  'siblingIndex',
+  'turnId',
+  'turnIndex',
+  'createdAt',
+  'role',
+  'origin',
+  'nodeVersion',
+  'deleted',
+])
+
+function applyMessageHeaderPatch(
+  header: MessageHeaderRow,
+  patch: MessageHeaderPatch | undefined,
+): MessageHeaderRow {
+  const next = cloneMessageHeader(header)
+  if (!patch) return next
+  for (const key of Object.keys(patch) as Array<keyof MessageHeaderRow>) {
+    if (FORBIDDEN_MESSAGE_HEADER_PATCH_KEYS.has(key)) {
+      throw new Error(`MessageHeaderPatchForbidden:${header.id}:${String(key)}`)
+    }
+    const value = patch[key]
+    if (value === undefined) delete next[key]
+    else next[key] = structuredClone(value) as never
+  }
+  return next
+}
+
+function hydrateStoredMessage(header: MessageHeaderRow, body: MessageBodyRow): Message {
+  return hydrateMessage(cloneMessageHeader(header), body)
+}
+
+async function hydrateStoredMessages(
+  headers: readonly MessageHeaderRow[],
+  bodyTable: Table<MessageBodyRow, MessageId>,
+): Promise<Message[]> {
+  const bodies = (await bodyTable.bulkGet(headers.map((header) => header.id))).filter(
+    (row): row is MessageBodyRow => row !== undefined,
+  )
+  return hydrateMessages(headers.map(cloneMessageHeader), bodies)
+}
+
+async function listMessagesInTransaction(tx: Transaction, chatId: ChatId): Promise<Message[]> {
+  const headers = await tx
+    .table<MessageHeaderRow, MessageId>('messages')
+    .where('chatId')
+    .equals(chatId)
+    .toArray()
+  return hydrateStoredMessages(headers, tx.table<MessageBodyRow, MessageId>('messageBodies'))
+}
+
+function groupHeadersByParent(
+  headers: readonly MessageHeaderRow[],
+): Map<MessageId | null, MessageHeaderRow[]> {
+  const buckets = new Map<MessageId | null, MessageHeaderRow[]>()
+  for (const header of headers) {
+    const bucket = buckets.get(header.parentId)
+    if (bucket) bucket.push(header)
+    else buckets.set(header.parentId, [header])
+  }
+  for (const bucket of buckets.values()) {
+    bucket.sort((a, b) => a.siblingIndex - b.siblingIndex)
+  }
+  return buckets
+}
+
+function branchHeadersByLeaf(
+  headers: readonly MessageHeaderRow[],
+  leafId: MessageId | null,
+): MessageHeaderRow[] {
+  if (leafId === null) return []
+  const byId = new Map(headers.map((header) => [header.id, header]))
+  const branch: MessageHeaderRow[] = []
+  let cursor: MessageId | null = leafId
+  while (cursor !== null) {
+    const header = byId.get(cursor)
+    if (!header || header.deleted) break
+    branch.push(header)
+    cursor = header.parentId
+  }
+  branch.reverse()
+  return branch
+}
+
+function messageHeaderTreeKey(headers: readonly MessageHeaderRow[]): string {
+  return headers
+    .map((message) =>
+      [
+        message.id,
+        message.nodeVersion,
+        message.parentId ?? '',
+        message.siblingIndex,
+        message.createdAt,
+        message.deleted ? 1 : 0,
+      ].join(':'),
+    )
+    .join('|')
+}
+
+function siblingGroupsForBranch(
+  headers: readonly MessageHeaderRow[],
+  branchHeaders: readonly MessageHeaderRow[],
+): ActiveBranchSnapshot['siblingGroups'] {
+  const byParent = groupHeadersByParent(headers)
+  const parentIds = new Set<MessageId | null>([null])
+  for (const header of branchHeaders) parentIds.add(header.parentId)
+  return [...parentIds].map((parentId) => ({
+    parentId,
+    siblings: (byParent.get(parentId) ?? []).map(cloneMessageHeader),
+  }))
 }
 
 function cloneDraft(draft: DraftRow): DraftRow {
@@ -255,6 +510,7 @@ export function resolveMutationTableNames(
         names.add('chats')
         names.add('childLists')
         names.add('messages')
+        names.add('messageBodies')
         break
       case 'draft':
         names.add('chats')
@@ -264,6 +520,7 @@ export function resolveMutationTableNames(
         names.add('chatBranchCache')
         names.add('chats')
         names.add('messages')
+        names.add('messageBodies')
         break
     }
   }
@@ -294,6 +551,8 @@ function resolveMutationTables(
         return db.drafts as Table<unknown, unknown>
       case 'messages':
         return db.messages as Table<unknown, unknown>
+      case 'messageBodies':
+        return db.messageBodies as Table<unknown, unknown>
       case 'settings':
         return db.settings as Table<unknown, unknown>
     }
@@ -495,7 +754,7 @@ async function archivedDeleteSnapshots(
   const snapshots: ArchivedChatDeleteSnapshot[] = []
   await db.transaction('r', [db.chats, db.messages, db.drafts], async (tx: Transaction) => {
     const chats = tx.table<Chat, ChatId>('chats')
-    const messages = tx.table<Message, MessageId>('messages')
+    const messages = tx.table<MessageHeaderRow, MessageId>('messages')
     const drafts = tx.table<DraftRow, ChatId>('drafts')
     for (const chatId of chatIds) {
       const chat = await chats.get(chatId)
@@ -513,7 +772,7 @@ async function archivedDeleteSnapshots(
 }
 
 function attachmentIdsFromDeletedChat(
-  messages: readonly Message[],
+  messages: readonly Pick<Message, 'attachmentRefs'>[],
   draft: DraftRow | undefined,
 ): AttachmentId[] {
   const ids: AttachmentId[] = []
@@ -533,6 +792,65 @@ function countAttachmentIds(ids: readonly AttachmentId[]): Map<AttachmentId, num
 class BrowserWorkspaceRepository implements WorkspaceRepository {
   async getWorkspaceMeta(): Promise<WorkspaceMeta> {
     return getWorkspaceMetaRow()
+  }
+
+  async upsertStreamLease(lease: StreamLeaseRow): Promise<StreamLeaseRow> {
+    const db = await openDb()
+    const row: StreamLeaseRow = { ...lease }
+    await db.streamLeases.put(row)
+    postEvent({ kind: 'stream-heartbeat', lease: row })
+    return row
+  }
+
+  async deleteStreamLease(streamId: string): Promise<boolean> {
+    const db = await openDb()
+    const existing = await db.streamLeases.get(streamId)
+    if (!existing) return false
+    await db.streamLeases.delete(streamId)
+    return true
+  }
+
+  async listStreamLeases(chatId?: ChatId): Promise<StreamLeaseRow[]> {
+    const db = await openDb()
+    const rows =
+      chatId === undefined
+        ? await db.streamLeases.toArray()
+        : await db.streamLeases.where('chatId').equals(chatId).toArray()
+    return rows
+      .filter(isStreamLeaseRow)
+      .map((lease) => ({ ...lease }))
+  }
+
+  async appendStreamChunks(chunks: readonly StreamChunkRow[]): Promise<void> {
+    if (chunks.length === 0) return
+    const db = await openDb()
+    await db.streamChunks.bulkPut(chunks.map((chunk) => structuredClone(chunk)))
+  }
+
+  async listStreamChunksForMessage(messageId: MessageId): Promise<StreamChunkRow[]> {
+    const db = await openDb()
+    const rows = await db.streamChunks.where('messageId').equals(messageId).toArray()
+    return rows
+      .filter(isStreamChunkRow)
+      .sort((a, b) => a.seq - b.seq)
+      .map((chunk) => structuredClone(chunk))
+  }
+
+  async listStreamChunksForChat(chatId: ChatId): Promise<StreamChunkRow[]> {
+    const db = await openDb()
+    const rows = await db.streamChunks.where('chatId').equals(chatId).toArray()
+    return rows
+      .filter(isStreamChunkRow)
+      .sort((a, b) =>
+        a.streamId === b.streamId ? a.seq - b.seq : a.streamId.localeCompare(b.streamId),
+      )
+      .map((chunk) => structuredClone(chunk))
+  }
+
+  async deleteStreamChunks(streamId: string): Promise<number> {
+    const db = await openDb()
+    const deleted = await db.streamChunks.where('streamId').equals(streamId).delete()
+    return deleted
   }
 
   async listChats(): Promise<Chat[]> {
@@ -591,11 +909,14 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
           db.childLists,
           db.drafts,
           db.messages,
+          db.messageBodies,
+          db.streamLeases,
+          db.streamChunks,
           db.settings,
         ],
         async (tx: Transaction) => {
           const chats = tx.table<Chat, ChatId>('chats')
-          const messages = tx.table<Message, MessageId>('messages')
+          const messages = tx.table<MessageHeaderRow, MessageId>('messages')
           const drafts = tx.table<DraftRow, ChatId>('drafts')
           const attachments = tx.table<Attachment, AttachmentId>('attachments')
           for (const { chatId } of snapshots) {
@@ -610,11 +931,26 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
               await attachments.put({ ...row, refCount: Math.max(0, row.refCount - count) })
             }
             await messages.where('chatId').equals(chatId).delete()
+            await tx
+              .table<MessageBodyRow, MessageId>('messageBodies')
+              .where('chatId')
+              .equals(chatId)
+              .delete()
             await drafts.delete(chatId)
             await tx.table<ChatBranchCache, ChatId>('chatBranchCache').delete(chatId)
             await tx
               .table<ChildListState, string>('childLists')
               .filter((row) => row.chatId === chatId)
+              .delete()
+            await tx
+              .table<StreamLeaseRow, string>('streamLeases')
+              .where('chatId')
+              .equals(chatId)
+              .delete()
+            await tx
+              .table<StreamChunkRow, string>('streamChunks')
+              .where('chatId')
+              .equals(chatId)
               .delete()
             await chats.delete(chatId)
             deletedChatIds.push(chatId)
@@ -866,15 +1202,102 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
 
   async getMessage(messageId: MessageId): Promise<Message | undefined> {
     return openDb().then(async (db) => {
-      const row = await db.messages.get(messageId)
-      return row ? cloneMessage(row) : undefined
+      return db.transaction('r', db.messages, db.messageBodies, async () => {
+        const [header, body] = await Promise.all([
+          db.messages.get(messageId),
+          db.messageBodies.get(messageId),
+        ])
+        return header && body ? hydrateStoredMessage(header, body) : undefined
+      })
     })
   }
 
   async listMessages(chatId: ChatId): Promise<Message[]> {
-    return openDb().then(async (db) =>
-      (await db.messages.where('chatId').equals(chatId).toArray()).map(cloneMessage),
-    )
+    return openDb().then(async (db) => {
+      return db.transaction('r', db.messages, db.messageBodies, async () => {
+        const headers = await db.messages.where('chatId').equals(chatId).toArray()
+        return hydrateStoredMessages(headers, db.messageBodies)
+      })
+    })
+  }
+
+  async getMessageHeader(messageId: MessageId): Promise<MessageHeaderRow | undefined> {
+    const db = await openDb()
+    const header = await db.messages.get(messageId)
+    return header ? cloneMessageHeader(header) : undefined
+  }
+
+  async listMessageHeaders(chatId: ChatId): Promise<MessageHeaderRow[]> {
+    const db = await openDb()
+    return (await db.messages.where('chatId').equals(chatId).toArray()).map(cloneMessageHeader)
+  }
+
+  async listChildHeaders(chatId: ChatId, parentId: MessageId | null): Promise<MessageHeaderRow[]> {
+    const db = await openDb()
+    return (await listChildHeaderRows(db.messages, chatId, parentId)).map(cloneMessageHeader)
+  }
+
+  async getActiveBranchSnapshot(
+    chatId: ChatId,
+    cursor: Record<string, MessageId>,
+  ): Promise<ActiveBranchSnapshot> {
+    const db = await openDb()
+    return db.transaction('r', db.messages, db.messageBodies, async () => {
+      const headers = await db.messages.where('chatId').equals(chatId).toArray()
+      const branchHeaders = activePath(headers as unknown as Message[], cursor).map(
+        (message) => message as unknown as MessageHeaderRow,
+      )
+      const bodies = (
+        await db.messageBodies.bulkGet(branchHeaders.map((header) => header.id))
+      ).filter((row): row is MessageBodyRow => row !== undefined)
+      return {
+        chatId,
+        allHeaders: headers.map(cloneMessageHeader),
+        branchHeaders: branchHeaders.map(cloneMessageHeader),
+        branch: hydrateMessages(branchHeaders.map(cloneMessageHeader), bodies),
+        siblingGroups: siblingGroupsForBranch(headers, branchHeaders),
+        treeKey: messageHeaderTreeKey(headers),
+      }
+    })
+  }
+
+  async getActiveBranchWindowSnapshot(
+    chatId: ChatId,
+    cursor: Record<string, MessageId>,
+    window: ActiveBranchBodyWindow,
+  ): Promise<ActiveBranchWindowSnapshot> {
+    const db = await openDb()
+    return db.transaction('r', db.messages, db.messageBodies, async () => {
+      const headers = await db.messages.where('chatId').equals(chatId).toArray()
+      const branchHeaders = activePath(headers as unknown as Message[], cursor).map(
+        (message) => message as unknown as MessageHeaderRow,
+      )
+      const range = branchWindowRange(branchHeaders.length, window)
+      const windowHeaders = branchHeaders.slice(range.start, range.end)
+      const bodies = (
+        await db.messageBodies.bulkGet(windowHeaders.map((header) => header.id))
+      ).filter((row): row is MessageBodyRow => row !== undefined)
+      return {
+        chatId,
+        allHeaders: headers.map(cloneMessageHeader),
+        branchHeaders: branchHeaders.map(cloneMessageHeader),
+        branchWindow: hydrateMessages(windowHeaders.map(cloneMessageHeader), bodies),
+        windowOffset: range.start,
+        windowLimit: range.limit,
+        branchLength: branchHeaders.length,
+        siblingGroups: siblingGroupsForBranch(headers, branchHeaders),
+        treeKey: messageHeaderTreeKey(headers),
+      }
+    })
+  }
+
+  async getBranchByLeaf(chatId: ChatId, leafId: MessageId | null): Promise<Message[]> {
+    const db = await openDb()
+    return db.transaction('r', db.messages, db.messageBodies, async () => {
+      const headers = await db.messages.where('chatId').equals(chatId).toArray()
+      const branchHeaders = branchHeadersByLeaf(headers, leafId)
+      return hydrateStoredMessages(branchHeaders, db.messageBodies)
+    })
   }
 
   async getAttachment(attachmentId: AttachmentId): Promise<Attachment | undefined> {
@@ -1008,11 +1431,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
               afterMessages: state.afterMessages,
             }
           }
-          const snapshot = await tx
-            .table<Message, MessageId>('messages')
-            .where('chatId')
-            .equals(state.beforeChat.id)
-            .toArray()
+          const snapshot = await listMessagesInTransaction(tx, state.beforeChat.id)
           state.beforeMessages = snapshot.map(cloneMessage)
           state.afterMessages = snapshot.map(cloneMessage)
           return {
@@ -1118,39 +1537,57 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
           },
 
           getMessage: async (messageId) => {
-            const row = await tx.table<Message, MessageId>('messages').get(messageId)
-            return row ? cloneMessage(row) : undefined
+            const [header, body] = await Promise.all([
+              tx.table<MessageHeaderRow, MessageId>('messages').get(messageId),
+              tx.table<MessageBodyRow, MessageId>('messageBodies').get(messageId),
+            ])
+            return header && body ? hydrateStoredMessage(header, body) : undefined
           },
 
-          listMessages: async (chatId) =>
+          getMessageHeader: async (messageId) => {
+            const header = await tx.table<MessageHeaderRow, MessageId>('messages').get(messageId)
+            return header ? cloneMessageHeader(header) : undefined
+          },
+
+          listMessages: async (chatId) => listMessagesInTransaction(tx, chatId),
+
+          listMessageHeaders: async (chatId) =>
             (
               await tx
-                .table<Message, MessageId>('messages')
+                .table<MessageHeaderRow, MessageId>('messages')
                 .where('chatId')
                 .equals(chatId)
                 .toArray()
-            ).map(cloneMessage),
+            ).map(cloneMessageHeader),
+
+          listChildHeaders: async (chatId, parentId) => {
+            return (
+              await listChildHeaderRows(
+                tx.table<MessageHeaderRow, MessageId>('messages'),
+                chatId,
+                parentId,
+              )
+            ).map(cloneMessageHeader)
+          },
 
           listChildren: async (chatId, parentId) => {
-            const rows =
-              parentId === null
-                ? await tx
-                    .table<Message, MessageId>('messages')
-                    .where('chatId')
-                    .equals(chatId)
-                    .toArray()
-                : await tx
-                    .table<Message, MessageId>('messages')
-                    .where('[chatId+parentId]')
-                    .equals([chatId, parentId])
-                    .toArray()
-            return rows.filter((row) => row.parentId === parentId).map(cloneMessage)
+            const headers = await listChildHeaderRows(
+              tx.table<MessageHeaderRow, MessageId>('messages'),
+              chatId,
+              parentId,
+            )
+            return hydrateStoredMessages(
+              headers,
+              tx.table<MessageBodyRow, MessageId>('messageBodies'),
+            )
           },
 
           putMessage: async (message, options: PutMessageOptions = {}) => {
             const { touchChatSummary = true, broadcast = touchChatSummary } = options
-            const table = tx.table<Message, MessageId>('messages')
-            const existing = await table.get(message.id)
+            const headerTable = tx.table<MessageHeaderRow, MessageId>('messages')
+            const bodyTable = tx.table<MessageBodyRow, MessageId>('messageBodies')
+            const existing = await headerTable.get(message.id)
+            const existingBody = existing ? await bodyTable.get(message.id) : undefined
             const chatId = existing?.chatId ?? message.chatId
             const needsChatState = touchChatSummary || broadcast
             const state = needsChatState ? await ensureChatState(chatId) : undefined
@@ -1171,13 +1608,22 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
                 assertScope({ kind: 'children', chatId, parentId: existing.parentId })
                 assertScope({ kind: 'children', chatId, parentId: clone.parentId })
               }
-              const changed = stableStringify(existing) !== stableStringify(clone)
+              if (!existingBody) throw new Error(`MessageBodyMissing:${clone.id}`)
+              const comparable = { ...clone, nodeVersion: existing.nodeVersion }
+              const comparableSplit = splitMessageForStorage(comparable, {
+                updatedAt: existingBody.updatedAt,
+              })
+              const changed =
+                stableStringify(existing) !== stableStringify(comparableSplit.header) ||
+                stableStringify(existingBody) !== stableStringify(comparableSplit.body)
               if (!changed) return
               if (touchChatSummary) {
                 await ensureMessageSnapshots(state as ChatMutationState)
               }
               clone.nodeVersion = existing.nodeVersion + 1
-              await table.put(clone)
+              const { header, body } = splitMessageForStorage(clone, { updatedAt: now })
+              await headerTable.put(header)
+              await bodyTable.put(body)
               wroteWorkspaceState = true
               if (state?.afterMessages) {
                 replaceMessage(state.afterMessages, clone)
@@ -1195,7 +1641,9 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
               await ensureMessageSnapshots(state as ChatMutationState)
               assertScope({ kind: 'children', chatId, parentId: clone.parentId })
               if (clone.nodeVersion === undefined) clone.nodeVersion = 0
-              await table.put(clone)
+              const { header, body } = splitMessageForStorage(clone, { updatedAt: now })
+              await headerTable.put(header)
+              await bodyTable.put(body)
               wroteWorkspaceState = true
               if (state?.afterMessages) {
                 replaceMessage(state.afterMessages, clone)
@@ -1215,15 +1663,81 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
             affectedMessageIds.add(clone.id)
           },
 
+          patchMessageBody: async (messageId, patch, options: PatchMessageBodyOptions = {}) => {
+            const {
+              touchChatSummary = true,
+              broadcast = touchChatSummary,
+              headerPatch,
+              replaceBody = false,
+            } = options
+            assertScope({ kind: 'message', messageId })
+            const headerTable = tx.table<MessageHeaderRow, MessageId>('messages')
+            const bodyTable = tx.table<MessageBodyRow, MessageId>('messageBodies')
+            const existing = await headerTable.get(messageId)
+            if (!existing) return
+            const state =
+              touchChatSummary || broadcast ? await ensureChatState(existing.chatId) : undefined
+            const nextHeader = applyMessageHeaderPatch(existing, headerPatch)
+            const existingBody = replaceBody ? undefined : await bodyTable.get(messageId)
+            if (!replaceBody && !existingBody) throw new Error(`MessageBodyMissing:${messageId}`)
+            let nextBody: MessageBodyRow
+            if (!replaceBody) {
+              const patchedBody = applyMessageBodyPatch(existingBody as MessageBodyRow, patch)
+              nextHeader.nodeVersion = existing.nodeVersion
+              patchedBody.nodeVersion = (existingBody as MessageBodyRow).nodeVersion
+              patchedBody.updatedAt = (existingBody as MessageBodyRow).updatedAt
+              const changed =
+                stableStringify(existing) !== stableStringify(nextHeader) ||
+                stableStringify(existingBody) !== stableStringify(patchedBody)
+              if (!changed) return
+              nextHeader.nodeVersion = existing.nodeVersion + 1
+              nextBody = {
+                ...patchedBody,
+                nodeVersion: nextHeader.nodeVersion,
+                updatedAt: now,
+              }
+            } else {
+              nextHeader.nodeVersion = existing.nodeVersion + 1
+              nextBody = replacementMessageBody(nextHeader, patch, {
+                nodeVersion: nextHeader.nodeVersion,
+                updatedAt: now,
+              })
+            }
+            if (touchChatSummary) {
+              await ensureMessageSnapshots(state as ChatMutationState)
+            }
+            await headerTable.put(nextHeader)
+            await bodyTable.put(nextBody)
+            wroteWorkspaceState = true
+            if (state?.afterMessages) {
+              replaceMessage(state.afterMessages, hydrateStoredMessage(nextHeader, nextBody))
+            }
+            if (touchChatSummary && state) {
+              state.summaryVersionDirty = true
+              state.messageSummaryDirty = true
+              state.changedMessageIds.add(messageId)
+            }
+            if (broadcast && state) {
+              state.broadcast = true
+              upsertAffected(state, {
+                kind: 'message',
+                chatId: existing.chatId,
+                messageId,
+              })
+            }
+            affectedMessageIds.add(messageId)
+          },
+
           deleteMessage: async (messageId) => {
             assertScope({ kind: 'message', messageId })
-            const table = tx.table<Message, MessageId>('messages')
+            const table = tx.table<MessageHeaderRow, MessageId>('messages')
             const existing = await table.get(messageId)
             if (!existing) return
             const state = await ensureChatState(existing.chatId)
             await ensureMessageSnapshots(state)
             assertScope({ kind: 'children', chatId: existing.chatId, parentId: existing.parentId })
             await table.delete(messageId)
+            await tx.table<MessageBodyRow, MessageId>('messageBodies').delete(messageId)
             wroteWorkspaceState = true
             removeMessage(state.afterMessages ?? [], messageId)
             await bumpChildList(existing.chatId, existing.parentId)
@@ -1395,12 +1909,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
 
           if (state.messageSummaryDirty) {
             const afterMessages =
-              state.afterMessages ??
-              (await tx
-                .table<Message, MessageId>('messages')
-                .where('chatId')
-                .equals(chatId)
-                .toArray())
+              state.afterMessages ?? (await listMessagesInTransaction(tx, chatId))
             const nextLeafId = findLastUpdatedLeafId(afterMessages)
             next.lastUpdatedLeafId = nextLeafId
             next.wordCount = countMessagesWords(buildBranchMessages(afterMessages, nextLeafId))

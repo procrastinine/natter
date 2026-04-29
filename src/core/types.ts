@@ -590,6 +590,25 @@ export interface Chat {
   tokenCalibration?: Record<string, TokenCalibrationSample>
 }
 
+export type ChatSidebarRow = Pick<
+  Chat,
+  | 'id'
+  | 'title'
+  | 'titleStatus'
+  | 'createdAt'
+  | 'updatedAt'
+  | 'lastViewedAt'
+  | 'wordCount'
+  | 'totalCostUsd'
+  | 'lastUpdatedLeafId'
+  | 'lastBranchUpdatedAt'
+  | 'archived'
+  | 'pinned'
+  | 'folderId'
+  | 'tags'
+  | 'previewText'
+>
+
 // One per (chat, calibration-bucket) pair. Running sums; new samples add
 // directly.
 // Ratio at any point is `totalTextChars / totalTextTokens`; that ratio is

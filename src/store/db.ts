@@ -5,18 +5,20 @@
 // and close it when they're done.
 
 import Dexie, { type Table } from 'dexie'
-import { readCachedPrivacyPayload } from '../api/privacy-scrape'
-import { normalizeEndpointsResponse } from '../api/providers'
+import {
+  backfillMissingMessageBodies,
+  migrateInlineMessageBodies,
+} from '../backcompat/message-body-split'
+import {
+  migrateProviderSettingsRow,
+  providerCacheKey,
+} from '../backcompat/provider-settings'
 import { findLastUpdatedLeafId } from '../core/active-path'
 import { buildBranchMessages } from '../core/branch-flatten'
 import {
   DEFAULT_CONTINUE_SYSTEM_PROMPT,
   DEFAULT_CONTINUE_USER_PROMPT,
 } from '../core/global-settings'
-import {
-  DEFAULT_OPENROUTER_PROVIDER_SORT,
-  migrateLegacyProviderSettings,
-} from '../core/provider-settings-migration'
 import type {
   Attachment,
   AttachmentArtifact,
@@ -37,6 +39,8 @@ import type {
   PromptPreset,
 } from '../core/types'
 import { countMessagesWords } from '../core/word-count'
+import { hydrateMessages, type MessageBodyRow, type MessageHeaderRow } from './message-storage'
+import type { StreamChunkRow, StreamLeaseRow } from './repository'
 
 export interface CachedModelsRow {
   profileId: string
@@ -80,7 +84,8 @@ export interface SettingsRow {
 
 export class NatterDb extends Dexie {
   chats!: Table<Chat, string>
-  messages!: Table<Message, string>
+  messages!: Table<MessageHeaderRow, string>
+  messageBodies!: Table<MessageBodyRow, string>
   childLists!: Table<ChildListState, string>
   attachments!: Table<Attachment, string>
   attachmentBlobs!: Table<AttachmentBlob, string>
@@ -94,6 +99,8 @@ export class NatterDb extends Dexie {
   chatBranchCache!: Table<ChatBranchCache, string>
   keys!: Table<KeyRecord, string>
   settings!: Table<SettingsRow, string>
+  streamLeases!: Table<StreamLeaseRow, string>
+  streamChunks!: Table<StreamChunkRow, string>
   models!: Table<CachedModelsRow, [string, string]>
   endpoints!: Table<CachedEndpointsRow, [string, string]>
   privacyPolicies!: Table<CachedPrivacyPolicyRow, [string, string]>
@@ -259,7 +266,7 @@ export function registerSchema(db: Dexie): void {
         .table<Chat>('chats')
         .toCollection()
         .modify((chat) => {
-          const result = migrateSettingsRow(
+          const result = migrateProviderSettingsRow(
             chat.settings,
             chat.settings.profileId,
             chat.settings.model,
@@ -276,7 +283,7 @@ export function registerSchema(db: Dexie): void {
         .table<ChatPreset>('presets')
         .toCollection()
         .modify((preset) => {
-          const result = migrateSettingsRow(
+          const result = migrateProviderSettingsRow(
             preset.settings,
             preset.connectionProfileId,
             preset.settings.model,
@@ -525,7 +532,7 @@ export function registerSchema(db: Dexie): void {
         .table<Chat>('chats')
         .toCollection()
         .modify((chat) => {
-          const result = migrateSettingsRow(
+          const result = migrateProviderSettingsRow(
             chat.settings,
             chat.settings.profileId,
             chat.settings.model,
@@ -542,7 +549,7 @@ export function registerSchema(db: Dexie): void {
         .table<ChatPreset>('presets')
         .toCollection()
         .modify((preset) => {
-          const result = migrateSettingsRow(
+          const result = migrateProviderSettingsRow(
             preset.settings,
             preset.connectionProfileId,
             preset.settings.model,
@@ -647,37 +654,113 @@ export function registerSchema(db: Dexie): void {
           if (typeof s.defaultPrefill !== 'string') s.defaultPrefill = ''
         })
     })
-}
 
-function migrateSettingsRow(
-  settings: Chat['settings'],
-  profileId: string,
-  modelId: string,
-  caches: {
-    endpointsByKey: ReadonlyMap<string, CachedEndpointsRow>
-    privacyByKey: ReadonlyMap<string, CachedPrivacyPolicyRow>
-    profilesById?: ReadonlyMap<string, ConnectionProfile>
-  },
-): ReturnType<typeof migrateLegacyProviderSettings> {
-  const key = providerCacheKey(profileId, modelId)
-  const endpoints = normalizeEndpointsResponse(caches.endpointsByKey.get(key)?.payload)?.endpoints
-  const policies = readCachedPrivacyPayload(caches.privacyByKey.get(key)?.payload)?.policies
-  const context: Parameters<typeof migrateLegacyProviderSettings>[1] = { model: modelId }
-  if (endpoints) context.endpoints = endpoints
-  if (policies) context.policies = policies
-  if (caches.profilesById?.get(profileId)?.kind === 'openrouter') {
-    context.defaultSort = DEFAULT_OPENROUTER_PROVIDER_SORT
-  }
-  return migrateLegacyProviderSettings(settings, context)
-}
+  // v10: split heavy message body fields out of the tree/header row. The
+  // public domain Message shape is unchanged; browser storage now stores
+  // metadata in `messages` and content/reasoning/tool payloads in
+  // `messageBodies`.
+  db.version(10)
+    .stores({
+      chats:
+        'id, updatedAt, createdAt, lastViewedAt, lastUpdatedLeafId, lastBranchUpdatedAt, wordCount, totalCostUsd, archived, pinned, presetId, folderId, *tags',
+      messages:
+        'id, chatId, parentId, turnId, [chatId+parentId], [chatId+createdAt], [chatId+turnId], [chatId+deleted]',
+      messageBodies: '&id, chatId, updatedAt, nodeVersion',
+      childLists: 'id, [chatId+parentId], updatedAt',
+      attachments: 'id, contentHash, kind, mime, origin, refCount, createdAt, updatedAt, deletedAt',
+      attachmentBlobs: 'id, attachmentId, role, contentHash, createdAt',
+      attachmentArtifacts: 'artifactId, attachmentId, kind, processorId, createdAt',
+      attachmentJobs:
+        'id, attachmentId, processorId, status, updatedAt, [attachmentId+processorId+inputHash]',
+      profiles: 'id, name, kind, lastUsedAt, archived',
+      presets: 'id, name, connectionProfileId, lastUsedAt, archived',
+      promptPresets: 'id, kind, name, lastUsedAt',
+      folders: 'id, name, sortIndex, lastUsedAt',
+      tags: 'id, &nameLower, lastUsedAt',
+      chatBranchCache: '&chatId, branchLeafId, generatedAt',
+      keys: 'id, name',
+      settings: '&key',
+      models: '&[profileId+queryKey], fetchedAt',
+      endpoints: '&[profileId+modelId], fetchedAt',
+      privacyPolicies: '&[profileId+modelId], fetchedAt',
+      providers: '&profileId, fetchedAt',
+      generations: 'id, chatId, gen_id',
+      presetResolutions: '&[profileId+presetSlug], fetchedAt',
+      drafts: '&chatId, updatedAt',
+    })
+    .upgrade(migrateInlineMessageBodies)
 
-function providerCacheKey(profileId: string, modelId: string): string {
-  return `${profileId}\u0000${modelId}`
+  // v11: tiny per-stream leases for cross-tab stream ownership/status.
+  // Content never lives here; this table only prevents orphan recovery from
+  // claiming a currently-owned stream in another tab.
+  db.version(11).stores({
+    chats:
+      'id, updatedAt, createdAt, lastViewedAt, lastUpdatedLeafId, lastBranchUpdatedAt, wordCount, totalCostUsd, archived, pinned, presetId, folderId, *tags',
+    messages:
+      'id, chatId, parentId, turnId, [chatId+parentId], [chatId+createdAt], [chatId+turnId], [chatId+deleted]',
+    messageBodies: '&id, chatId, updatedAt, nodeVersion',
+    childLists: 'id, [chatId+parentId], updatedAt',
+    attachments: 'id, contentHash, kind, mime, origin, refCount, createdAt, updatedAt, deletedAt',
+    attachmentBlobs: 'id, attachmentId, role, contentHash, createdAt',
+    attachmentArtifacts: 'artifactId, attachmentId, kind, processorId, createdAt',
+    attachmentJobs:
+      'id, attachmentId, processorId, status, updatedAt, [attachmentId+processorId+inputHash]',
+    profiles: 'id, name, kind, lastUsedAt, archived',
+    presets: 'id, name, connectionProfileId, lastUsedAt, archived',
+    promptPresets: 'id, kind, name, lastUsedAt',
+    folders: 'id, name, sortIndex, lastUsedAt',
+    tags: 'id, &nameLower, lastUsedAt',
+    chatBranchCache: '&chatId, branchLeafId, generatedAt',
+    keys: 'id, name',
+    settings: '&key',
+    streamLeases: '&streamId, chatId, ownerClientId, heartbeatAt',
+    models: '&[profileId+queryKey], fetchedAt',
+    endpoints: '&[profileId+modelId], fetchedAt',
+    privacyPolicies: '&[profileId+modelId], fetchedAt',
+    providers: '&profileId, fetchedAt',
+    generations: 'id, chatId, gen_id',
+    presetResolutions: '&[profileId+presetSlug], fetchedAt',
+    drafts: '&chatId, updatedAt',
+  })
+
+  // v12: append-only stream chunks for crash/reload recovery. The canonical
+  // `messageBodies` table stays cold during healthy streams; chunks are
+  // compacted into the message body on normal finish or stale-stream recovery.
+  db.version(12).stores({
+    chats:
+      'id, updatedAt, createdAt, lastViewedAt, lastUpdatedLeafId, lastBranchUpdatedAt, wordCount, totalCostUsd, archived, pinned, presetId, folderId, *tags',
+    messages:
+      'id, chatId, parentId, turnId, [chatId+parentId], [chatId+createdAt], [chatId+turnId], [chatId+deleted]',
+    messageBodies: '&id, chatId, updatedAt, nodeVersion',
+    childLists: 'id, [chatId+parentId], updatedAt',
+    attachments: 'id, contentHash, kind, mime, origin, refCount, createdAt, updatedAt, deletedAt',
+    attachmentBlobs: 'id, attachmentId, role, contentHash, createdAt',
+    attachmentArtifacts: 'artifactId, attachmentId, kind, processorId, createdAt',
+    attachmentJobs:
+      'id, attachmentId, processorId, status, updatedAt, [attachmentId+processorId+inputHash]',
+    profiles: 'id, name, kind, lastUsedAt, archived',
+    presets: 'id, name, connectionProfileId, lastUsedAt, archived',
+    promptPresets: 'id, kind, name, lastUsedAt',
+    folders: 'id, name, sortIndex, lastUsedAt',
+    tags: 'id, &nameLower, lastUsedAt',
+    chatBranchCache: '&chatId, branchLeafId, generatedAt',
+    keys: 'id, name',
+    settings: '&key',
+    streamLeases: '&streamId, chatId, ownerClientId, heartbeatAt',
+    streamChunks: '&id, streamId, chatId, messageId, [streamId+seq], createdAt',
+    models: '&[profileId+queryKey], fetchedAt',
+    endpoints: '&[profileId+modelId], fetchedAt',
+    privacyPolicies: '&[profileId+modelId], fetchedAt',
+    providers: '&profileId, fetchedAt',
+    generations: 'id, chatId, gen_id',
+    presetResolutions: '&[profileId+presetSlug], fetchedAt',
+    drafts: '&chatId, updatedAt',
+  })
 }
 
 function organizationDefaultsPatch(
   chat: Chat & Record<string, unknown>,
-  messages: readonly Message[],
+  messageHeaders: readonly Pick<Message, 'origin'>[],
   computed: { lastUpdatedLeafId: string | null; wordCount: number; totalCostUsd: number },
 ): Partial<Chat> | null {
   const patch: Partial<Chat> = {}
@@ -691,7 +774,7 @@ function organizationDefaultsPatch(
     patch.tags = []
   }
   if (!isTitleStatus(chat.titleStatus)) {
-    patch.titleStatus = inferLegacyTitleStatus(chat.title, messages)
+    patch.titleStatus = inferLegacyTitleStatus(chat.title, messageHeaders)
   }
   if (!isFiniteNumber(chat.lastViewedAt)) {
     patch.lastViewedAt = isFiniteNumber(chat.updatedAt) ? chat.updatedAt : 0
@@ -721,9 +804,12 @@ function isTitleStatus(value: unknown): value is Chat['titleStatus'] {
   )
 }
 
-function inferLegacyTitleStatus(value: unknown, messages: readonly Message[]): Chat['titleStatus'] {
+function inferLegacyTitleStatus(
+  value: unknown,
+  messageHeaders: readonly Pick<Message, 'origin'>[],
+): Chat['titleStatus'] {
   const title = typeof value === 'string' ? value.trim() : ''
-  const imported = messages.some((message) => message.origin === 'imported')
+  const imported = messageHeaders.some((message) => message.origin === 'imported')
   if (imported || title.length === 0 || title === 'Untitled chat') return 'untitled'
   return 'auto'
 }
@@ -807,6 +893,7 @@ export function childListKey(chatId: string, parentId: string | null): string {
 let singleton: NatterDb | null = null
 let providerSettingsBackfillPromise: Promise<void> | null = null
 let organizationFieldsBackfillPromise: Promise<void> | null = null
+let messageBodySplitBackfillPromise: Promise<void> | null = null
 const ORGANIZATION_FIELDS_BACKFILL_KEY = 'backfill:organization-fields-v1'
 
 export function getDb(): NatterDb {
@@ -819,6 +906,11 @@ export function getDb(): NatterDb {
 export async function openDb(): Promise<NatterDb> {
   const db = getDb()
   if (!db.isOpen()) await db.open()
+  messageBodySplitBackfillPromise ??= backfillMissingMessageBodies(db).catch((err) => {
+    messageBodySplitBackfillPromise = null
+    throw err
+  })
+  await messageBodySplitBackfillPromise
   organizationFieldsBackfillPromise ??= backfillOrganizationFields(db).catch((err) => {
     organizationFieldsBackfillPromise = null
     throw err
@@ -840,6 +932,7 @@ export function __resetDbForTests(): void {
   }
   providerSettingsBackfillPromise = null
   organizationFieldsBackfillPromise = null
+  messageBodySplitBackfillPromise = null
 }
 
 // Mint a uniquely-named Dexie instance for integration tests that want to
@@ -860,33 +953,45 @@ export async function backfillOrganizationFields(db: NatterDb): Promise<void> {
   const marker = await db.settings.get(ORGANIZATION_FIELDS_BACKFILL_KEY)
   if (marker?.value === 1) return
 
-  const chats = await db.chats.toArray()
-  const messages = await db.messages.toArray()
-  const messagesByChat = new Map<string, Message[]>()
-  for (const message of messages) {
+  const { chats, messageHeaders } = await db.transaction('r', db.chats, db.messages, async () => {
+    const chatRows = await db.chats.toArray()
+    const headers = await db.messages.toArray()
+    return { chats: chatRows, messageHeaders: headers }
+  })
+  const messagesByChat = new Map<string, MessageHeaderRow[]>()
+  for (const message of messageHeaders) {
     const list = messagesByChat.get(message.chatId) ?? []
     list.push(message)
     messagesByChat.set(message.chatId, list)
   }
 
+  const chatPatches: Array<{ chat: Chat; patch: Partial<Chat> }> = []
+  for (const chat of chats) {
+    const rows = messagesByChat.get(chat.id) ?? []
+    const nextLeafId = findLastUpdatedLeafId(rows as unknown as Message[])
+    const branchHeaders =
+      nextLeafId !== null ? (buildBranchMessages(rows as unknown as Message[], nextLeafId) as MessageHeaderRow[]) : []
+    const messageBodies =
+      branchHeaders.length > 0
+        ? (
+            await db.messageBodies.bulkGet(branchHeaders.map((message) => message.id))
+          ).filter((row): row is MessageBodyRow => row !== undefined)
+        : []
+    const branch = hydrateMessages(branchHeaders, messageBodies)
+    const totalCostUsd = rows.reduce(
+      (total, message) => total + (message.deleted ? 0 : (message.generation?.cost ?? 0)),
+      0,
+    )
+    const patch = organizationDefaultsPatch(chat as Chat & Record<string, unknown>, rows, {
+      lastUpdatedLeafId: nextLeafId,
+      wordCount: countMessagesWords(branch),
+      totalCostUsd,
+    })
+    if (patch) chatPatches.push({ chat, patch })
+  }
+
   await db.transaction('rw', db.chats, db.settings, async () => {
-    const patchedChats: Chat[] = []
-    for (const chat of chats) {
-      const rows = messagesByChat.get(chat.id) ?? []
-      const nextLeafId = findLastUpdatedLeafId(rows)
-      const branch = buildBranchMessages(rows, nextLeafId)
-      const totalCostUsd = rows.reduce(
-        (total, message) => total + (message.deleted ? 0 : (message.generation?.cost ?? 0)),
-        0,
-      )
-      const patch = organizationDefaultsPatch(chat as Chat & Record<string, unknown>, rows, {
-        lastUpdatedLeafId: nextLeafId,
-        wordCount: countMessagesWords(branch),
-        totalCostUsd,
-      })
-      if (!patch) continue
-      patchedChats.push({ ...chat, ...patch })
-    }
+    const patchedChats = chatPatches.map(({ chat, patch }) => ({ ...chat, ...patch }))
     if (patchedChats.length > 0) await db.chats.bulkPut(patchedChats)
     await db.settings.put({ key: ORGANIZATION_FIELDS_BACKFILL_KEY, value: 1 })
   })
@@ -934,7 +1039,7 @@ async function runProviderSettingsBackfill(
         )
       : db.presets.toCollection()
     await chats.modify((chat) => {
-      const result = migrateSettingsRow(
+      const result = migrateProviderSettingsRow(
         chat.settings,
         chat.settings.profileId,
         chat.settings.model,
@@ -947,7 +1052,7 @@ async function runProviderSettingsBackfill(
       if (result.changed) chat.settings = result.settings
     })
     await presets.modify((preset) => {
-      const result = migrateSettingsRow(
+      const result = migrateProviderSettingsRow(
         preset.settings,
         preset.connectionProfileId,
         preset.settings.model,

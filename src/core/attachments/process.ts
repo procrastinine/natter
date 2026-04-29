@@ -526,7 +526,7 @@ export function classifyAttachment(mime: string, filename: string): AttachmentKi
   if (
     isCodeMime(normalizedMime) ||
     (extension && isCodeExtension(extension)) ||
-    Boolean(specialFilenameLanguage(filename))
+    specialFilenameLanguage(filename)
   ) {
     return 'code'
   }

@@ -22,7 +22,7 @@ import {
 } from '../api/stream-transforms'
 import type { GeminiStreamChunk } from '../api/gemini-types'
 import type { ChatStreamChunk, ResponsesStreamChunk } from '../api/types'
-import { activePath, cursorKeyOf } from '../core/active-path'
+import { cursorKeyOf } from '../core/active-path'
 import { readGlobalPreferences, resolveContinueSystemPromptTemplate } from '../core/global-settings'
 // `globalPrefs` is still read for token-calibration mode; continue prompts
 // moved to `chat.settings` in the prompt-preset refactor.
@@ -37,7 +37,7 @@ import type { ChatId, ConnectionProfile, ContentItem, Message, MessageId } from 
 import { newId } from '../lib/ulid'
 import { postEvent } from '../store/broadcast'
 import { getBrowserRepository } from '../store/browser-repo'
-import { dismissAbortReason, getChat, loadChatMessages } from '../store/chats'
+import { dismissAbortReason, getChat, loadActiveBranchSnapshot } from '../store/chats'
 import { useChatStore } from '../store/zustand/chatStore'
 import { useStreamStore } from '../store/zustand/streamStore'
 import { useUiStore } from '../store/zustand/uiStore'
@@ -138,8 +138,8 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
     cursor[cursorKeyOf(cur.parentId)] = cur.id
     cur = cur.parentId ? await repo.getMessage(cur.parentId) : undefined
   }
-  const allMessages = await loadChatMessages(input.chatId)
-  const path = activePath(allMessages, cursor)
+  const branchSnapshot = await loadActiveBranchSnapshot(input.chatId, cursor)
+  const path = branchSnapshot.branch
   // Truncate the path at the target so downstream descendants that
   // happen to share siblingIndex 0 are excluded.
   const targetIdx = path.findIndex((m) => m.id === target.id)
@@ -299,10 +299,19 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
                 globalPrefs.tokenCalibrationMode,
               )
             : null
-        await ctx.putMessage(
-          { ...current, content: nextContent, ...(calibrationPatch ?? {}) },
-          final ? undefined : { touchChatSummary: false, broadcast: false },
-        )
+        if (final) {
+          await ctx.putMessage({ ...current, content: nextContent, ...(calibrationPatch ?? {}) })
+        } else {
+          await ctx.patchMessageBody(
+            target.id,
+            { content: nextContent },
+            {
+              touchChatSummary: false,
+              broadcast: false,
+              ...(calibrationPatch ? { headerPatch: calibrationPatch } : {}),
+            },
+          )
+        }
       })
       lastFlushedAt = now()
       lastFlushedLen = buffer.length

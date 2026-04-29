@@ -23,7 +23,6 @@
 
 import { useLiveQuery } from 'dexie-react-hooks'
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { activePath } from '../../core/active-path'
 import type { EffectiveCapability } from '../../core/capabilities'
 import { DEFAULT_GLOBAL_PREFERENCES, readGlobalPreferences } from '../../core/global-settings'
 import {
@@ -32,8 +31,8 @@ import {
   UNLIMITED_CONTEXT,
 } from '../../core/prompt-size'
 import { readTokenCalibrationGlobal } from '../../core/token-calibration'
-import type { Chat, MediaContextStrategy } from '../../core/types'
-import { getChatDraft, loadChatMessages, updateChatSettings } from '../../store/chats'
+import type { Chat, MediaContextStrategy, Message } from '../../core/types'
+import { getChatDraft, loadActiveBranchSnapshot, updateChatSettings } from '../../store/chats'
 import { useChatStore } from '../../store/zustand/chatStore'
 import { useAttachmentResolverForContext } from '../attachments/useAttachmentResolver'
 import { InfoDisclosure } from './InfoDisclosure'
@@ -56,13 +55,14 @@ export function ContextPanel({
   showMiddleOut = false,
 }: ContextPanelProps) {
   const needsLocalEstimate = estimateOverride === null
-  const messages = useLiveQuery(
-    () => (needsLocalEstimate ? loadChatMessages(chat.id) : Promise.resolve([])),
-    [chat.id, needsLocalEstimate],
-    [],
-  )
   const cursor = useChatStore((s) =>
     needsLocalEstimate ? (s.cursors[chat.id] ?? EMPTY_CURSOR) : EMPTY_CURSOR,
+  )
+  const branchSnapshot = useLiveQuery(
+    () =>
+      needsLocalEstimate ? loadActiveBranchSnapshot(chat.id, cursor) : Promise.resolve(null),
+    [chat.id, needsLocalEstimate, cursor],
+    null,
   )
   const draft = useLiveQuery(
     () => (needsLocalEstimate ? getChatDraft(chat.id) : Promise.resolve(undefined)),
@@ -85,10 +85,7 @@ export function ContextPanel({
   // parent without changing their prompt-cap). `null` disables cutoff when
   // capability hasn't loaded; once it does, the memo re-runs.
   const providerCap = capability?.maxPromptTokens ?? capability?.contextLength ?? null
-  const localPath = useMemo(
-    () => (needsLocalEstimate ? activePath(messages, cursor) : []),
-    [needsLocalEstimate, messages, cursor],
-  )
+  const localPath = needsLocalEstimate ? (branchSnapshot?.branch ?? EMPTY_MESSAGES) : EMPTY_MESSAGES
   const attachmentResolver = useAttachmentResolverForContext({
     settings: chat.settings,
     messages: localPath,
@@ -353,7 +350,7 @@ export function ContextPanel({
             <InfoDisclosure title="Chat-level default for media/file echo. Per-attachment chips still win: hiding one ref excludes only that exact reference." />
           </span>
         </div>
-        <div data-ui="segmented" aria-label="Attachment inclusion">
+        <fieldset data-ui="segmented" aria-label="Attachment inclusion">
           {(
             [
               ['echo-all', 'All'],
@@ -376,7 +373,7 @@ export function ContextPanel({
               {label}
             </button>
           ))}
-        </div>
+        </fieldset>
         {chat.settings.mediaContextStrategy === 'echo-last-N' ? (
           <label data-ui="field-group" data-ui-field data-ui-inline-number-row>
             <span>
@@ -518,3 +515,4 @@ function NumberSlider({
 const SLIDER_COMMIT_DEBOUNCE_MS = 200
 
 const EMPTY_CURSOR = Object.freeze({}) as Readonly<Record<string, string>>
+const EMPTY_MESSAGES: Message[] = []

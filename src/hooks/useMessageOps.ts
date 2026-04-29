@@ -30,7 +30,7 @@ import type {
   MessageId,
   ReasoningDetail,
 } from '../core/types'
-import { getChat, loadChatMessages } from '../store/chats'
+import { getChat } from '../store/chats'
 import { resolveKeyIfPresent } from '../store/keys'
 import { bumpPresetLastUsedAt } from '../store/presets'
 import { bumpProfileLastUsedAt, getProfile } from '../store/profiles'
@@ -266,12 +266,4 @@ export async function deleteSingleOp(args: DeleteOpArgs) {
     cursor: args.cursor,
     ...(args.cascade ? { cascade: true } : {}),
   })
-}
-
-// Collect the turn chain of the message plus its "pair partners" so the
-// undo-snapshot knows which rows to restore. Best-effort: callers use the
-// result only to stash the rows for a 5s undo toast.
-export async function snapshotForDelete(chatId: ChatId, messageId: MessageId): Promise<Message[]> {
-  const rows = await loadChatMessages(chatId)
-  return rows.filter((row) => row.id === messageId || row.chatId === chatId)
 }

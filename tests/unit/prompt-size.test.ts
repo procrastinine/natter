@@ -171,7 +171,7 @@ describe('estimatePromptSize — fallback branch', () => {
     settings.customMaxContext = 12
     settings.maxCompletionTokens = 0
     settings.contextStrategy = { ...settings.contextStrategy, keepFirstPairs: 0 }
-    settings.appendPrompt = '\n\n' + 'x'.repeat(200)
+    settings.appendPrompt = `\n\n${'x'.repeat(200)}`
     const input = buildSettingsPromptSizeEstimateInput(
       settings,
       [makeMessage({ role: 'user', text: 'short' })],

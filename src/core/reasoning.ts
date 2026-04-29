@@ -209,6 +209,8 @@ function startsWithBlankLine(s: string | null | undefined): boolean {
   return typeof s === 'string' && /^\s*\n/.test(s)
 }
 
+const MAX_REASONING_OVERLAP_CHARS = 4096
+
 export function mergeReasoningText(
   existingRaw: string | null | undefined,
   incomingRaw: string | null | undefined,
@@ -220,7 +222,11 @@ export function mergeReasoningText(
   if (incoming === existing) return existing
   if (incoming.startsWith(existing)) return incoming
   if (existing.startsWith(incoming) || existing.endsWith(incoming)) return existing
-  for (let overlap = Math.min(existing.length, incoming.length); overlap > 0; overlap -= 1) {
+  for (
+    let overlap = Math.min(existing.length, incoming.length, MAX_REASONING_OVERLAP_CHARS);
+    overlap > 0;
+    overlap -= 1
+  ) {
     if (existing.slice(-overlap) === incoming.slice(0, overlap)) {
       return existing + incoming.slice(overlap)
     }

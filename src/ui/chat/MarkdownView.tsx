@@ -29,6 +29,7 @@ const mermaidPlugin = createMermaidPlugin({
 })
 
 const pluginCache = new Map<string, ReturnType<typeof buildPlugins>>()
+const streamingPluginCache = new Map<string, ReturnType<typeof buildStreamingPlugins>>()
 
 function isExternalUrl(href: string | undefined): boolean {
   if (!href) return false
@@ -83,12 +84,15 @@ export function MarkdownView({ content, streaming = false, allowImageOrigins }: 
     [renderingPrefs.shikiLight, renderingPrefs.shikiDark],
   )
   const plugins = useMemo(
-    () => getPlugins(shikiTheme, renderingPrefs.singleDollarTextMath),
-    [shikiTheme, renderingPrefs.singleDollarTextMath],
+    () =>
+      streaming
+        ? getStreamingPlugins(renderingPrefs.singleDollarTextMath)
+        : getPlugins(shikiTheme, renderingPrefs.singleDollarTextMath),
+    [streaming, shikiTheme, renderingPrefs.singleDollarTextMath],
   )
   const rendererKey = `${shikiTheme.join('::')}::single-dollar=${
     renderingPrefs.singleDollarTextMath ? 'on' : 'off'
-  }`
+  }::mode=${streaming ? 'streaming' : 'static'}`
   return (
     <div data-ui="markdown" data-overflow="full">
       <Streamdown
@@ -113,12 +117,28 @@ function buildPlugins(themes: [ShikiThemeChoice, ShikiThemeChoice], singleDollar
   }
 }
 
+function buildStreamingPlugins(singleDollarTextMath: boolean) {
+  return {
+    math: createMathPlugin({ singleDollarTextMath }),
+    cjk: cjkPlugin,
+  }
+}
+
 function getPlugins(themes: [ShikiThemeChoice, ShikiThemeChoice], singleDollarTextMath: boolean) {
   const key = `${themes.join('::')}::single-dollar=${singleDollarTextMath ? 'on' : 'off'}`
   const cached = pluginCache.get(key)
   if (cached) return cached
   const created = buildPlugins(themes, singleDollarTextMath)
   pluginCache.set(key, created)
+  return created
+}
+
+function getStreamingPlugins(singleDollarTextMath: boolean) {
+  const key = `single-dollar=${singleDollarTextMath ? 'on' : 'off'}`
+  const cached = streamingPluginCache.get(key)
+  if (cached) return cached
+  const created = buildStreamingPlugins(singleDollarTextMath)
+  streamingPluginCache.set(key, created)
   return created
 }
 
