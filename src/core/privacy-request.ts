@@ -15,18 +15,8 @@
 // not need to also be aware of the filter.
 
 import { fetchEndpoints } from '../api/models'
-import { normalizeEndpointsResponse, type EndpointsDescriptor } from '../api/providers'
 import { fetchPrivacyScrape, readCachedPrivacyPayload } from '../api/privacy-scrape'
-import type { CorsProxyConfig } from './cors-proxy'
-import { isFreeModel } from './model-predicates'
-import { providerRoutingRef } from './provider-identity'
-import {
-  buildWireProviderPrivacy,
-  filterEndpointsByPrivacy,
-  type PrivacyFilterResult,
-  type WireProviderPrivacy,
-} from './privacy-filter'
-import type { Chat, ConnectionProfile, DataPolicy } from './types'
+import { type EndpointsDescriptor, normalizeEndpointsResponse } from '../api/providers'
 import { resolveKeyIfPresent } from '../store/keys'
 import {
   dedupedEndpointsFetch,
@@ -39,8 +29,27 @@ import {
   getCachedPrivacyPolicy,
   PRIVACY_POLICY_TTL_MS,
 } from '../store/privacy-cache'
+import type { CorsProxyConfig } from './cors-proxy'
+import { isFreeModel } from './model-predicates'
+import {
+  buildWireProviderPrivacy,
+  filterEndpointsByPrivacy,
+  type PrivacyFilterResult,
+  type WireProviderPrivacy,
+} from './privacy-filter'
+import { providerRoutingRef } from './provider-identity'
+import type { Chat, ConnectionProfile, DataPolicy } from './types'
 
 const SEND_DISCOVERY_TIMEOUT_MS = 15_000
+
+function usableCachedPrivacyPolicyRow(
+  row: Awaited<ReturnType<typeof getCachedPrivacyPolicy>>,
+): boolean {
+  if (!row) return false
+  const payload = readCachedPrivacyPayload(row.payload)
+  const hasPolicies = payload ? Object.keys(payload.policies).length > 0 : false
+  return hasPolicies && isFresh(row.fetchedAt, PRIVACY_POLICY_TTL_MS)
+}
 
 export class PrivacyDiscoveryUnavailableError extends Error {
   override readonly cause?: unknown
@@ -218,20 +227,21 @@ async function ensurePrivacyPolicies(input: {
   }
 
   try {
-    await dedupedPrivacyFetch(profile.id, modelId, async () => {
-      const result = await fetchPrivacyScrape(
-        { proxy },
-        modelId,
-        {
+    await dedupedPrivacyFetch(
+      profile.id,
+      modelId,
+      async () => {
+        const result = await fetchPrivacyScrape({ proxy }, modelId, {
           ...(signal ? { signal } : {}),
           timeoutMs: SEND_DISCOVERY_TIMEOUT_MS,
-        },
-      )
-      if (Object.keys(result.raw.policies).length === 0 && hasCachedPolicies && cached) {
-        return cached.payload
-      }
-      return result.raw
-    })
+        })
+        if (Object.keys(result.raw.policies).length === 0 && hasCachedPolicies && cached) {
+          return cached.payload
+        }
+        return result.raw
+      },
+      { isCachedFresh: usableCachedPrivacyPolicyRow },
+    )
   } catch {
     if (hasCachedPolicies) return { policies: cachedPolicies, offlineFallback: false }
     return { policies: cachedPolicies, offlineFallback: true }

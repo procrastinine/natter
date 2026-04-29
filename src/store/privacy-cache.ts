@@ -13,6 +13,7 @@ import {
   type CachedProvidersRow,
   getDb,
 } from './db'
+import { withNamedLock } from './locks'
 
 export const PRIVACY_POLICY_TTL_MS = 24 * 60 * 60 * 1000
 export const EMPTY_PRIVACY_POLICY_RETRY_MS = 2_000
@@ -64,22 +65,41 @@ export async function clearProvidersForProfile(profileId: ProfileId): Promise<vo
 // `dedupedEndpointsFetch` in `models-cache.ts`: two sibling components
 // (header badge + provider picker) opening at the same time would
 // otherwise fire two scrapes against the same (profile, model). The
-// Map shares one Promise. Single-tab only — cross-tab overlap collapses
-// harmlessly into the last-writer-wins cache row.
+// Map shares one Promise inside a tab; the Web Lock inside the Promise
+// collapses cold-cache startup races across many tabs.
 const privacyInFlight = new Map<string, Promise<void>>()
+
+export interface DedupedPrivacyFetchOptions {
+  force?: boolean
+  isCachedFresh?: (row: CachedPrivacyPolicyRow | undefined) => boolean
+}
+
+function privacyCacheKey(profileId: ProfileId, modelId: string): string {
+  return `${profileId}\u0000${modelId}`
+}
+
+function privacyLockName(profileId: ProfileId, modelId: string): string {
+  return `privacy-policy:${profileId}:${modelId}`
+}
 
 export function dedupedPrivacyFetch(
   profileId: ProfileId,
   modelId: string,
   fetchPayload: () => Promise<unknown>,
+  opts: DedupedPrivacyFetchOptions = {},
 ): Promise<void> {
-  const key = `${profileId}\u0000${modelId}`
+  const key = privacyCacheKey(profileId, modelId)
   const existing = privacyInFlight.get(key)
   if (existing) return existing
   const promise = (async () => {
     try {
-      const payload = await fetchPayload()
-      await putCachedPrivacyPolicy(profileId, modelId, payload)
+      await withNamedLock(privacyLockName(profileId, modelId), async () => {
+        if (!opts.force && opts.isCachedFresh?.(await getCachedPrivacyPolicy(profileId, modelId))) {
+          return
+        }
+        const payload = await fetchPayload()
+        await putCachedPrivacyPolicy(profileId, modelId, payload)
+      })
     } finally {
       privacyInFlight.delete(key)
     }

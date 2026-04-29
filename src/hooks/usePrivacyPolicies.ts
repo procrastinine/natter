@@ -4,18 +4,20 @@
 // OpenRouter-only. For non-OpenRouter connections the hook returns an
 // empty policy map; the UI consumes that as "privacy routing does not apply."
 // Cache TTL is 24h (privacy data changes rarely); fetch rolls through a
-// shared in-flight Map so sibling mounts hit the network once.
+// single-flight path so sibling mounts and cold-cache tab storms hit the
+// network once per (profile, model).
 
 import { useLiveQuery } from 'dexie-react-hooks'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { fetchPrivacyScrape, readCachedPrivacyPayload } from '../api/privacy-scrape'
 import {
-  DEFAULT_GLOBAL_PREFERENCES,
   corsProxyConfigFromPrefs,
+  DEFAULT_GLOBAL_PREFERENCES,
   readGlobalPreferences,
 } from '../core/global-settings'
 import { isFreeModel } from '../core/model-predicates'
 import type { DataPolicy, ProfileId } from '../core/types'
+import type { CachedPrivacyPolicyRow } from '../store/db'
 import { isFresh } from '../store/models-cache'
 import {
   dedupedPrivacyFetch,
@@ -41,13 +43,22 @@ export interface UsePrivacyPoliciesResult {
   isFreeModel: boolean
 }
 
+function usableCachedPrivacyPolicy(row: CachedPrivacyPolicyRow | undefined): boolean {
+  if (!row) return false
+  const payload = readCachedPrivacyPayload(row.payload)
+  const hasPolicies = payload ? Object.keys(payload.policies).length > 0 : false
+  return isFresh(row.fetchedAt, hasPolicies ? PRIVACY_POLICY_TTL_MS : EMPTY_PRIVACY_POLICY_RETRY_MS)
+}
+
 export function usePrivacyPolicies(
   profileId: ProfileId | null,
   modelId: string | null,
 ): UsePrivacyPoliciesResult {
   const cachedRow = useLiveQuery(
     () =>
-      profileId && modelId ? getCachedPrivacyPolicy(profileId, modelId) : Promise.resolve(undefined),
+      profileId && modelId
+        ? getCachedPrivacyPolicy(profileId, modelId)
+        : Promise.resolve(undefined),
     [profileId, modelId],
     undefined,
   )
@@ -60,6 +71,7 @@ export function usePrivacyPolicies(
   const [error, setError] = useState<string | null>(null)
   const [inFlight, setInFlight] = useState(false)
   const [refreshToken, setRefreshToken] = useState(0)
+  const [staleRefreshToken, setStaleRefreshToken] = useState(0)
   const handledRefreshTokenRef = useRef(0)
 
   const freeModel = modelId ? isFreeModel(modelId) : false
@@ -67,19 +79,24 @@ export function usePrivacyPolicies(
     !!profile && profile.kind === 'openrouter' && profile.supportsPrivacyScrape && !freeModel
 
   useEffect(() => {
+    void staleRefreshToken
     if (!scrapeApplicable) return
     if (!profile || !modelId) return
     const fetchedAt = cachedRow?.fetchedAt
     const cachedPayload = cachedRow ? readCachedPrivacyPayload(cachedRow.payload) : null
     const hasPolicies = cachedPayload ? Object.keys(cachedPayload.policies).length > 0 : false
     const forceRefresh = refreshToken !== handledRefreshTokenRef.current
-    const fullFresh = fetchedAt !== undefined && hasPolicies && isFresh(fetchedAt, PRIVACY_POLICY_TTL_MS)
+    const fullFresh = cachedRow !== undefined && hasPolicies && usableCachedPrivacyPolicy(cachedRow)
     const emptyFresh =
       fetchedAt !== undefined && !hasPolicies && isFresh(fetchedAt, EMPTY_PRIVACY_POLICY_RETRY_MS)
-    if (!forceRefresh && fullFresh) return
+    if (!forceRefresh && fullFresh) {
+      const delay = Math.max(0, PRIVACY_POLICY_TTL_MS - (Date.now() - cachedRow.fetchedAt))
+      const timer = window.setTimeout(() => setStaleRefreshToken((n) => n + 1), delay)
+      return () => window.clearTimeout(timer)
+    }
     if (!forceRefresh && emptyFresh) {
       const delay = Math.max(0, EMPTY_PRIVACY_POLICY_RETRY_MS - (Date.now() - fetchedAt))
-      const timer = window.setTimeout(() => setRefreshToken((n) => n + 1), delay)
+      const timer = window.setTimeout(() => setStaleRefreshToken((n) => n + 1), delay)
       return () => window.clearTimeout(timer)
     }
     let cancelled = false
@@ -89,17 +106,25 @@ export function usePrivacyPolicies(
     const proxy = corsProxyConfigFromPrefs(globalPrefs)
     ;(async () => {
       try {
-        await dedupedPrivacyFetch(profile.id, modelId, async () => {
-          // The scrape URL is public — no Authorization header needed.
-          // The CORS proxy + optional secret are workspace-global
-          // (`corsProxyUrl` / `corsProxySecret`); they're resolved here
-          // so `fetchPrivacyScrape` itself stays env-neutral.
-          const result = await fetchPrivacyScrape({ proxy }, modelId)
-          if (Object.keys(result.raw.policies).length === 0 && hasPolicies && cachedRow) {
-            return cachedRow.payload
-          }
-          return result.raw
-        })
+        await dedupedPrivacyFetch(
+          profile.id,
+          modelId,
+          async () => {
+            // The scrape URL is public — no Authorization header needed.
+            // The CORS proxy + optional secret are workspace-global
+            // (`corsProxyUrl` / `corsProxySecret`); they're resolved here
+            // so `fetchPrivacyScrape` itself stays env-neutral.
+            const result = await fetchPrivacyScrape({ proxy }, modelId)
+            if (Object.keys(result.raw.policies).length === 0 && hasPolicies && cachedRow) {
+              return cachedRow.payload
+            }
+            return result.raw
+          },
+          {
+            force: forceRefresh,
+            isCachedFresh: usableCachedPrivacyPolicy,
+          },
+        )
       } catch (err) {
         if (cancelled) return
         setError(err instanceof Error ? err.message : 'privacy scrape failed')
@@ -110,7 +135,7 @@ export function usePrivacyPolicies(
     return () => {
       cancelled = true
     }
-  }, [scrapeApplicable, profile, modelId, cachedRow, refreshToken, globalPrefs])
+  }, [scrapeApplicable, profile, modelId, cachedRow, refreshToken, staleRefreshToken, globalPrefs])
 
   const policies = useMemo<Record<string, DataPolicy>>(() => {
     if (!cachedRow) return {}
