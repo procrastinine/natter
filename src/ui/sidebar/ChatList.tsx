@@ -1,5 +1,11 @@
 import { useLiveQuery } from 'dexie-react-hooks'
 import {
+  defaultRangeExtractor,
+  useVirtualizer,
+  type Range,
+  type VirtualItem,
+} from '@tanstack/react-virtual'
+import {
   memo,
   useCallback,
   useEffect,
@@ -70,6 +76,53 @@ export interface ChatListProps {
 
 const EMPTY_COLLAPSED_FOLDER_IDS: FolderId[] = []
 const EMPTY_SEARCH_RESULTS: SearchResult[] = []
+const SIDEBAR_VIRTUALIZE_THRESHOLD = 200
+const SIDEBAR_INITIAL_VIRTUAL_ROWS = 18
+
+type SidebarRowDepth = 'root' | 'folder'
+
+type SidebarVirtualRow =
+  | {
+      kind: 'chat'
+      key: string
+      chat: ChatSidebarRow
+      depth: SidebarRowDepth
+      searchResult?: SearchResult
+    }
+  | {
+      kind: 'folder'
+      key: string
+      folder: ChatFolder
+      chats: ChatSidebarRow[]
+    }
+  | {
+      kind: 'time-group'
+      key: string
+      label: string
+      depth: SidebarRowDepth
+    }
+  | {
+      kind: 'status'
+      key: string
+      text: string
+    }
+  | {
+      kind: 'folder-empty'
+      key: string
+      depth: SidebarRowDepth
+    }
+
+interface VirtualRowOptions {
+  key?: string
+  depth?: SidebarRowDepth
+  virtual?: SidebarVirtualMount
+}
+
+interface SidebarVirtualMount {
+  index: number
+  start: number
+  measureElement: (node: HTMLLIElement | null) => void
+}
 
 // Loads the chat-row list only — never touches the `messages` table.
 // `chat.previewText` is populated by `refreshChatPreview` on the write
@@ -95,6 +148,99 @@ async function loadSidebarModel(): Promise<{
     }
     throw error
   }
+}
+
+function buildChatVirtualRows(
+  chats: readonly ChatSidebarRow[],
+  options: {
+    keyPrefix: string
+    depth: SidebarRowDepth
+    sortMode: SidebarSortMode
+    searchResultsByChatId?: ReadonlyMap<ChatId, SearchResult>
+  },
+): SidebarVirtualRow[] {
+  const chatRow = (chat: ChatSidebarRow): SidebarVirtualRow => {
+    const row: SidebarVirtualRow = {
+      kind: 'chat',
+      key: `${options.keyPrefix}:chat:${chat.id}`,
+      chat,
+      depth: options.depth,
+    }
+    const searchResult = options.searchResultsByChatId?.get(chat.id)
+    if (searchResult) row.searchResult = searchResult
+    return row
+  }
+  if (!shouldRenderCreatedAtGroups(options.sortMode)) {
+    return chats.map(chatRow)
+  }
+
+  const rows: SidebarVirtualRow[] = []
+  for (const group of buildCreatedAtGroups(chats, options.sortMode)) {
+    rows.push({
+      kind: 'time-group',
+      key: `${options.keyPrefix}:time:${group.key}`,
+      label: group.label,
+      depth: options.depth,
+    })
+    for (const chat of group.chats) {
+      rows.push(chatRow(chat))
+    }
+  }
+  return rows
+}
+
+function estimateSidebarVirtualRowSize(row: SidebarVirtualRow | undefined, collapsed: boolean): number {
+  if (!row) return 56
+  switch (row.kind) {
+    case 'folder':
+      return 41
+    case 'time-group':
+      return 25
+    case 'status':
+    case 'folder-empty':
+      return 36
+    case 'chat':
+      if (collapsed) return 38
+      return row.chat.tags.length > 0 ? 82 : 58
+  }
+}
+
+function bindSidebarVirtualRow(node: HTMLLIElement | null, virtual: SidebarVirtualMount): void {
+  if (node) node.style.setProperty('--sidebar-row-y', `${virtual.start}px`)
+  virtual.measureElement(node)
+}
+
+function sidebarRangeExtractor(range: Range): number[] {
+  const rows = defaultRangeExtractor(range)
+  if (rows.length > 0) return rows
+  return Array.from({ length: Math.min(SIDEBAR_INITIAL_VIRTUAL_ROWS, range.count) }, (_, index) => index)
+}
+
+function fallbackSidebarVirtualItems(
+  rows: readonly SidebarVirtualRow[],
+  collapsed: boolean,
+): VirtualItem[] {
+  let start = 0
+  return rows.slice(0, SIDEBAR_INITIAL_VIRTUAL_ROWS).map((row, index) => {
+    const size = estimateSidebarVirtualRowSize(row, collapsed)
+    const item: VirtualItem = {
+      key: row.key,
+      index,
+      start,
+      end: start + size,
+      size,
+      lane: 0,
+    }
+    start += size
+    return item
+  })
+}
+
+function estimateSidebarVirtualTotalSize(
+  rows: readonly SidebarVirtualRow[],
+  collapsed: boolean,
+): number {
+  return rows.reduce((sum, row) => sum + estimateSidebarVirtualRowSize(row, collapsed), 0)
 }
 
 export const ChatList = memo(function ChatList({ activeChatId, collapsed }: ChatListProps) {
@@ -189,9 +335,100 @@ export const ChatList = memo(function ChatList({ activeChatId, collapsed }: Chat
       .filter((result): result is SearchResult => Boolean(result))
   }, [searchSession?.results, sortMode, sortOptions])
   const rowMetaNow = Date.now()
+  const sidebarListRef = useRef<HTMLUListElement | null>(null)
+  const virtualRows = useMemo<SidebarVirtualRow[]>(() => {
+    if (collapsed) {
+      return flatRows.map((chat) => ({
+        kind: 'chat',
+        key: `collapsed:chat:${chat.id}`,
+        chat,
+        depth: 'root',
+      }))
+    }
+    if (searchActive) {
+      if (sortedSearchResults.length === 0) {
+        const status = searchSession?.status ?? 'idle'
+        return [
+          {
+            kind: 'status',
+            key: `search-status:${status}`,
+            text: status === 'scanning' || status === 'debouncing' ? 'Searching...' : 'No matches',
+          },
+        ]
+      }
+      return sortedSearchResults.map((result) => ({
+        kind: 'chat',
+        key: `search:chat:${result.chat.id}:${result.messageId ?? result.branchLeafId ?? 'row'}`,
+        chat: result.chat,
+        depth: 'root',
+        searchResult: result,
+      }))
+    }
+
+    const rows: SidebarVirtualRow[] = []
+    for (const entry of entries) {
+      if (entry.kind === 'chat') {
+        rows.push({
+          kind: 'chat',
+          key: `entry:chat:${entry.chat.id}`,
+          chat: entry.chat,
+          depth: 'root',
+        })
+        continue
+      }
+      rows.push({
+        kind: 'folder',
+        key: `entry:folder:${entry.folder.id}`,
+        folder: entry.folder,
+        chats: entry.chats,
+      })
+      if (collapsedFolderIds.has(entry.folder.id)) continue
+      if (entry.chats.length === 0) {
+        rows.push({
+          kind: 'folder-empty',
+          key: `entry:folder:${entry.folder.id}:empty`,
+          depth: 'folder',
+        })
+        continue
+      }
+      rows.push(
+        ...buildChatVirtualRows(entry.chats, {
+          keyPrefix: `entry:folder:${entry.folder.id}`,
+          depth: 'folder',
+          sortMode,
+        }),
+      )
+    }
+    return rows
+  }, [
+    collapsed,
+    collapsedFolderIds,
+    entries,
+    flatRows,
+    searchActive,
+    searchSession?.status,
+    sortMode,
+    sortedSearchResults,
+  ])
+  const shouldVirtualizeSidebar = virtualRows.length > SIDEBAR_VIRTUALIZE_THRESHOLD
+  const sidebarVirtualizer = useVirtualizer<HTMLUListElement, HTMLLIElement>({
+    count: virtualRows.length,
+    getScrollElement: () => sidebarListRef.current,
+    estimateSize: (index) => estimateSidebarVirtualRowSize(virtualRows[index], collapsed === true),
+    getItemKey: (index) => virtualRows[index]?.key ?? index,
+    overscan: 8,
+    initialRect: { width: 260, height: 720 },
+    rangeExtractor: sidebarRangeExtractor,
+    enabled: shouldVirtualizeSidebar,
+  })
   useEffect(() => {
     startSearchStoreBroadcastListener()
   }, [])
+  useEffect(() => {
+    if (!openActionChatId) return
+    if (virtualRows.some((row) => row.kind === 'chat' && row.chat.id === openActionChatId)) return
+    setOpenActionChatId(null)
+  }, [openActionChatId, virtualRows])
   useEffect(() => {
     requestSearchSession({
       query: searchQuery,
@@ -430,7 +667,11 @@ export const ChatList = memo(function ChatList({ activeChatId, collapsed }: Chat
       console.error('Failed to persist sidebar folder state', error)
     })
   }, [])
-  const renderChatRow = (chat: ChatSidebarRow, searchResult?: SearchResult) => {
+  const renderChatRow = (
+    chat: ChatSidebarRow,
+    searchResult?: SearchResult,
+    options: VirtualRowOptions = {},
+  ) => {
     const displayTitle = chat.title?.trim().length ? chat.title : 'Untitled chat'
     const preview = chat.previewText ?? ''
     const searchTargetId = searchResult?.messageId ?? searchResult?.branchLeafId ?? undefined
@@ -441,12 +682,19 @@ export const ChatList = memo(function ChatList({ activeChatId, collapsed }: Chat
       .filter((tag): tag is ChatTag => Boolean(tag))
     return (
       <li
-        key={chat.id}
+        key={options.key ?? chat.id}
         data-ui="chat-row"
+        data-sidebar-depth={options.depth === 'folder' ? 'folder' : undefined}
         data-active={chat.id === activeChatId}
         data-menu-open={openActionChatId === chat.id ? 'true' : undefined}
         data-moved={recentMove?.chatId === chat.id ? 'true' : undefined}
         data-title-status={chat.titleStatus}
+        data-index={options.virtual?.index}
+        ref={
+          options.virtual
+            ? (node) => bindSidebarVirtualRow(node, options.virtual as SidebarVirtualMount)
+            : undefined
+        }
         draggable={!collapsed}
         onDragStart={(event) => {
           event.dataTransfer.effectAllowed = 'move'
@@ -611,6 +859,162 @@ export const ChatList = memo(function ChatList({ activeChatId, collapsed }: Chat
       </li>
     ))
   }
+  const renderFolderHeaderContents = (row: Extract<SidebarVirtualRow, { kind: 'folder' }>) => {
+    const folderCollapsed = collapsedFolderIds.has(row.folder.id)
+    const dropState =
+      dragOverFolderId === row.folder.id
+        ? 'over'
+        : recentMove?.folderId === row.folder.id
+          ? 'recent'
+          : undefined
+    return (
+      <fieldset
+        data-ui="folder-header"
+        data-drop-state={dropState}
+        aria-label={`Folder ${row.folder.name}`}
+        onDragEnter={(event) => {
+          if (!event.dataTransfer.types.includes('application/x-natter-chat-id')) return
+          setDragOverFolderId(row.folder.id)
+        }}
+        onDragOver={(event) => {
+          if (!event.dataTransfer.types.includes('application/x-natter-chat-id')) return
+          event.preventDefault()
+          setDragOverFolderId(row.folder.id)
+          event.dataTransfer.dropEffect = 'move'
+        }}
+        onDragLeave={(event) => {
+          const nextTarget = event.relatedTarget as Node | null
+          if (nextTarget && event.currentTarget.contains(nextTarget)) return
+          setDragOverFolderId((current) => (current === row.folder.id ? null : current))
+        }}
+        onDrop={(event) => void handleDropOnFolder(event, row.folder.id)}
+      >
+        <button
+          type="button"
+          data-ui="folder-main"
+          title={row.folder.name}
+          aria-expanded={!folderCollapsed}
+          onClick={() => toggleFolder(row.folder.id)}
+        >
+          <ChevronIcon size={13} rotate={folderCollapsed ? 0 : 90} />
+          <FolderIcon size={14} />
+          <span>{row.folder.name}</span>
+          <span data-ui="folder-count">{row.chats.length}</span>
+        </button>
+        <span data-ui="folder-actions">
+          <button
+            type="button"
+            aria-label={`Rename folder ${row.folder.name}`}
+            title="Rename folder"
+            onClick={() => void handleRenameFolder(row.folder)}
+          >
+            <PencilIcon size={13} />
+          </button>
+          <button
+            type="button"
+            aria-label={`Delete folder ${row.folder.name}`}
+            title="Delete folder"
+            onClick={() => beginDeleteFolder(row.folder)}
+          >
+            <TrashIcon size={13} />
+          </button>
+        </span>
+      </fieldset>
+    )
+  }
+  const renderVirtualSidebarRow = (virtualItem: VirtualItem) => {
+    const row = virtualRows[virtualItem.index]
+    if (!row) return null
+    const virtual = {
+      index: virtualItem.index,
+      start: virtualItem.start,
+      measureElement: sidebarVirtualizer.measureElement,
+    }
+    switch (row.kind) {
+      case 'chat':
+        return renderChatRow(row.chat, row.searchResult, {
+          key: row.key,
+          depth: row.depth,
+          virtual,
+        })
+      case 'folder':
+        return (
+          <li
+            key={row.key}
+            data-ui="folder-section"
+            data-index={virtual.index}
+            ref={(node) => bindSidebarVirtualRow(node, virtual)}
+          >
+            {renderFolderHeaderContents(row)}
+          </li>
+        )
+      case 'time-group':
+        return (
+          <li
+            key={row.key}
+            data-ui="sidebar-time-group"
+            data-sidebar-depth={row.depth === 'folder' ? 'folder' : undefined}
+            data-index={virtual.index}
+            ref={(node) => bindSidebarVirtualRow(node, virtual)}
+          >
+            <div data-ui="sidebar-time-group-label">{row.label}</div>
+          </li>
+        )
+      case 'status':
+        return (
+          <li
+            key={row.key}
+            data-ui="sidebar-search-empty"
+            data-index={virtual.index}
+            ref={(node) => bindSidebarVirtualRow(node, virtual)}
+          >
+            {row.text}
+          </li>
+        )
+      case 'folder-empty':
+        return (
+          <li
+            key={row.key}
+            data-ui="folder-empty"
+            data-sidebar-depth={row.depth === 'folder' ? 'folder' : undefined}
+            data-index={virtual.index}
+            ref={(node) => bindSidebarVirtualRow(node, virtual)}
+          >
+            Empty
+          </li>
+        )
+    }
+  }
+
+  const renderVirtualSidebarList = () => {
+    const virtualItems = sidebarVirtualizer.getVirtualItems()
+    const renderedItems =
+      virtualItems.length > 0
+        ? virtualItems
+        : fallbackSidebarVirtualItems(virtualRows, collapsed === true)
+    const totalSize = Math.max(
+      sidebarVirtualizer.getTotalSize(),
+      estimateSidebarVirtualTotalSize(virtualRows, collapsed === true),
+    )
+    return (
+      <ul
+        ref={sidebarListRef}
+        data-ui="chat-list"
+        data-sort-key={sortMode}
+        data-search-mode={searchActive ? 'true' : undefined}
+        data-virtualized="true"
+      >
+        <li
+          data-ui="sidebar-virtual-spacer"
+          aria-hidden="true"
+          ref={(node) => {
+            if (node) node.style.setProperty('--sidebar-virtual-total-h', `${totalSize}px`)
+          }}
+        />
+        {renderedItems.map(renderVirtualSidebarRow)}
+      </ul>
+    )
+  }
 
   const renderSearchControls = () => {
     const status = searchSession?.status ?? 'idle'
@@ -772,6 +1176,7 @@ export const ChatList = memo(function ChatList({ activeChatId, collapsed }: Chat
   }
 
   if (collapsed) {
+    if (shouldVirtualizeSidebar) return renderVirtualSidebarList()
     return (
       <ul data-ui="chat-list" data-sort-key={sortMode}>
         {flatRows.map((chat) => renderChatRow(chat))}
@@ -843,88 +1248,39 @@ export const ChatList = memo(function ChatList({ activeChatId, collapsed }: Chat
         </div>
         {renderSearchDetails()}
       </div>
-      <ul
-        data-ui="chat-list"
-        data-sort-key={sortMode}
-        data-search-mode={searchActive ? 'true' : undefined}
-      >
-        {searchActive
-          ? renderSearchResults()
-          : entries.map((entry) => {
-              if (entry.kind === 'chat') return renderChatRow(entry.chat)
-              const folderCollapsed = collapsedFolderIds.has(entry.folder.id)
-              const dropState =
-                dragOverFolderId === entry.folder.id
-                  ? 'over'
-                  : recentMove?.folderId === entry.folder.id
-                    ? 'recent'
-                    : undefined
-              return (
-                <li key={entry.folder.id} data-ui="folder-section">
-                  <fieldset
-                    data-ui="folder-header"
-                    data-drop-state={dropState}
-                    aria-label={`Folder ${entry.folder.name}`}
-                    onDragEnter={(event) => {
-                      if (!event.dataTransfer.types.includes('application/x-natter-chat-id')) return
-                      setDragOverFolderId(entry.folder.id)
-                    }}
-                    onDragOver={(event) => {
-                      if (!event.dataTransfer.types.includes('application/x-natter-chat-id')) return
-                      event.preventDefault()
-                      setDragOverFolderId(entry.folder.id)
-                      event.dataTransfer.dropEffect = 'move'
-                    }}
-                    onDragLeave={(event) => {
-                      const nextTarget = event.relatedTarget as Node | null
-                      if (nextTarget && event.currentTarget.contains(nextTarget)) return
-                      setDragOverFolderId((current) =>
-                        current === entry.folder.id ? null : current,
-                      )
-                    }}
-                    onDrop={(event) => void handleDropOnFolder(event, entry.folder.id)}
-                  >
-                    <button
-                      type="button"
-                      data-ui="folder-main"
-                      title={entry.folder.name}
-                      aria-expanded={!folderCollapsed}
-                      onClick={() => toggleFolder(entry.folder.id)}
-                    >
-                      <ChevronIcon size={13} rotate={folderCollapsed ? 0 : 90} />
-                      <FolderIcon size={14} />
-                      <span>{entry.folder.name}</span>
-                      <span data-ui="folder-count">{entry.chats.length}</span>
-                    </button>
-                    <span data-ui="folder-actions">
-                      <button
-                        type="button"
-                        aria-label={`Rename folder ${entry.folder.name}`}
-                        title="Rename folder"
-                        onClick={() => void handleRenameFolder(entry.folder)}
-                      >
-                        <PencilIcon size={13} />
-                      </button>
-                      <button
-                        type="button"
-                        aria-label={`Delete folder ${entry.folder.name}`}
-                        title="Delete folder"
-                        onClick={() => beginDeleteFolder(entry.folder)}
-                      >
-                        <TrashIcon size={13} />
-                      </button>
-                    </span>
-                  </fieldset>
-                  {!folderCollapsed && entry.chats.length > 0 ? (
-                    <ul data-ui="folder-chat-list">{renderChatRows(entry.chats)}</ul>
-                  ) : null}
-                  {!folderCollapsed && entry.chats.length === 0 ? (
-                    <div data-ui="folder-empty">Empty</div>
-                  ) : null}
-                </li>
-              )
-            })}
-      </ul>
+      {shouldVirtualizeSidebar ? (
+        renderVirtualSidebarList()
+      ) : (
+        <ul
+          data-ui="chat-list"
+          data-sort-key={sortMode}
+          data-search-mode={searchActive ? 'true' : undefined}
+        >
+          {searchActive
+            ? renderSearchResults()
+            : entries.map((entry) => {
+                if (entry.kind === 'chat') return renderChatRow(entry.chat)
+                const folderCollapsed = collapsedFolderIds.has(entry.folder.id)
+                const folderRow: Extract<SidebarVirtualRow, { kind: 'folder' }> = {
+                  kind: 'folder',
+                  key: `static:folder:${entry.folder.id}`,
+                  folder: entry.folder,
+                  chats: entry.chats,
+                }
+                return (
+                  <li key={entry.folder.id} data-ui="folder-section">
+                    {renderFolderHeaderContents(folderRow)}
+                    {!folderCollapsed && entry.chats.length > 0 ? (
+                      <ul data-ui="folder-chat-list">{renderChatRows(entry.chats)}</ul>
+                    ) : null}
+                    {!folderCollapsed && entry.chats.length === 0 ? (
+                      <div data-ui="folder-empty">Empty</div>
+                    ) : null}
+                  </li>
+                )
+              })}
+        </ul>
+      )}
       {folderDeleteTarget ? (
         <div data-ui="folder-delete-dialog" role="dialog" aria-label="Delete folder">
           <div data-ui="folder-delete-title">{folderDeleteTarget.name}</div>

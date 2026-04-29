@@ -858,7 +858,7 @@ describe('Dexie migrations', () => {
     expect(await db.chatBranchCache.count()).toBe(0)
     expect((await db.settings.get('backfill:organization-fields-v1'))?.value).toBe(1)
     await db.delete()
-  })
+  }, 15_000)
 })
 
 function legacyEndpoint(

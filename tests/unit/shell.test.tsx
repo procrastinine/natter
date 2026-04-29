@@ -4,7 +4,7 @@ import Dexie from 'dexie'
 import { IDBFactory } from 'fake-indexeddb'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
-import type { Message } from '../../src/core/types'
+import type { Chat, Message } from '../../src/core/types'
 import { archiveChat, createChat } from '../../src/store/chats'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
@@ -289,6 +289,48 @@ describe('shell smoke render', () => {
     await waitFor(() => {
       expect(window.location.hash).toBe(`#/chat/${chat.id}`)
     })
+  })
+
+  it('virtualizes large folder-backed sidebar lists while preserving tag chips', async () => {
+    const folder = await createFolder({ id: 'folder-virtualized', name: 'Virtualized', now: 1 })
+    const tag = await createTag({ id: 'tag-virtualized', name: 'VirtualTag', now: 1 })
+    const baseSettings = cloneDefaultChatSettings()
+    const chats: Chat[] = Array.from({ length: 225 }, (_, index) => ({
+      id: `virtual-chat-${index}`,
+      title: index === 224 ? 'Virtual tagged chat' : `Virtual chat ${index}`,
+      titleStatus: 'manual',
+      createdAt: index + 1,
+      updatedAt: index + 1,
+      lastViewedAt: index + 1,
+      wordCount: 0,
+      totalCostUsd: 0,
+      metaVersion: 0,
+      summaryVersion: 0,
+      settings: structuredClone(baseSettings),
+      lastUpdatedLeafId: null,
+      lastBranchUpdatedAt: index + 1,
+      archived: false,
+      pinned: false,
+      folderId: folder.id,
+      tags: index === 224 ? [tag.id] : [],
+      previewText: `preview ${index}`,
+    }))
+    await getDb().chats.bulkPut(chats)
+
+    const { container } = render(<App />)
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-ui="chat-list"]')).toHaveAttribute(
+        'data-virtualized',
+        'true',
+      )
+    })
+    expect(container.querySelector('[data-ui="folder-header"]')).toHaveTextContent('Virtualized')
+    expect(container.querySelector('[data-ui="chat-row-title"]')).toHaveTextContent(
+      'Virtual tagged chat',
+    )
+    expect(container.querySelector('[data-ui="chat-row-tag"]')).toHaveTextContent('VirtualTag')
+    expect(container.querySelectorAll('[data-ui="chat-row"]').length).toBeLessThan(80)
   })
 
   it('uses default search results as last-updated-branch deep links', async () => {

@@ -503,6 +503,18 @@
   border-top: 1px solid transparent;
 }
 
+[data-ui="chat-list"][data-virtualized="true"] {
+  display: block;
+  position: relative;
+}
+
+[data-ui="sidebar-virtual-spacer"] {
+  display: block;
+  height: var(--sidebar-virtual-total-h, 0);
+  width: 1px;
+  pointer-events: none;
+}
+
 [data-ui="folder-section"] {
   border-bottom: 1px solid var(--color-border-subtle);
 }
@@ -675,6 +687,10 @@ button[data-ui="folder-main"]:active:not(:disabled) {
   padding-left: calc(var(--space-4) + var(--sidebar-folder-indent));
 }
 
+[data-ui="chat-row"][data-sidebar-depth="folder"] > [data-ui="chat-row-link"] {
+  padding-left: calc(var(--space-4) + var(--sidebar-folder-indent));
+}
+
 [data-ui="chat-row-link"]:hover {
   background: transparent;
 }
@@ -797,6 +813,10 @@ button[data-ui="folder-main"]:active:not(:disabled) {
 }
 
 [data-ui="folder-chat-list"] [data-ui="chat-row-tags"] {
+  padding-left: calc(var(--space-4) + var(--sidebar-folder-indent));
+}
+
+[data-ui="chat-row"][data-sidebar-depth="folder"] > [data-ui="chat-row-tags"] {
   padding-left: calc(var(--space-4) + var(--sidebar-folder-indent));
 }
 
@@ -1029,4 +1049,16 @@ button[data-ui="folder-main"]:active:not(:disabled) {
   justify-content: center;
   padding: 0;
   height: 40px;
+}
+
+[data-ui="chat-list"][data-virtualized="true"] > [data-ui="chat-row"],
+[data-ui="chat-list"][data-virtualized="true"] > [data-ui="folder-section"],
+[data-ui="chat-list"][data-virtualized="true"] > [data-ui="sidebar-time-group"],
+[data-ui="chat-list"][data-virtualized="true"] > [data-ui="sidebar-search-empty"],
+[data-ui="chat-list"][data-virtualized="true"] > [data-ui="folder-empty"] {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  transform: translateY(var(--sidebar-row-y, 0));
 }
