@@ -1,6 +1,6 @@
 import type { ChatId, Message, MessageId } from '../core/types'
 
-export type MessageBodyKey =
+type MessageBodyKey =
   | 'content'
   | 'reasoningDetails'
   | 'toolCalls'
@@ -66,7 +66,7 @@ export function hydrateMessage(header: MessageHeaderRow, body: MessageBodyRow): 
   }
 
   const message: Message = {
-    ...(structuredClone(header) as MessageHeaderRow),
+    ...(structuredClone(header)),
     content: structuredClone(body.content),
   }
   if (body.reasoningDetails !== undefined) {

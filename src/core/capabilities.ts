@@ -232,7 +232,7 @@ export function effectiveCapabilityFromDescriptor(
 }
 
 // Validation result for the stored ChatSettings against an effective cap.
-export interface ValidationIssue {
+interface ValidationIssue {
   kind: 'dropped-param' | 'clamped-enum' | 'clamped-numeric'
   field: string
   reason: string
@@ -240,7 +240,7 @@ export interface ValidationIssue {
   replacement?: unknown
 }
 
-export interface ValidationResult {
+interface ValidationResult {
   settings: ChatSettings
   issues: ValidationIssue[]
   changed: boolean
@@ -327,7 +327,7 @@ export function validateChatSettings(
     } else if (allowed.length === 0 && cap.quirks.adaptiveReasoningOnly) {
       // Adaptive-only: drop effort entirely so the request is clean.
       const { effort: _effort, ...rest } = stored.reasoning
-      nextReasoning = rest as ChatSettings['reasoning']
+      nextReasoning = rest
       issues.push({
         kind: 'dropped-param',
         field: 'reasoning.effort',

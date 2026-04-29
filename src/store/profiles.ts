@@ -35,7 +35,7 @@ export class ProfileInUseError extends Error {
   }
 }
 
-export interface CreateProfileInput {
+interface CreateProfileInput {
   id?: ProfileId
   name: string
   kind: ConnectionKind
@@ -271,7 +271,7 @@ export async function profileDependents(
   }
 }
 
-export interface DeleteProfileOptions {
+interface DeleteProfileOptions {
   force?: boolean
   reassignTo?: ProfileId
   now?: number
@@ -343,7 +343,7 @@ async function reassignDependents(from: ProfileId, to: ProfileId, now: number): 
 // Per-profile JSON export. Strips `apiKeyRef` and `managementApiKeyRef` so no
 // key material rides along — the importer wires up a new KeyRecord. See
 // §9.2.A "Export / Import".
-export interface ProfileExport {
+interface ProfileExport {
   schemaVersion: 1
   profile: Omit<
     ConnectionProfile,

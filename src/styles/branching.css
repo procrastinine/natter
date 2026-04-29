@@ -1,6 +1,6 @@
 /*
- * branching.css — swipe controls, variant ghost card, edit-tree toolbar, tree view.
- * Owns: [data-ui='branch-controls'|'variant-ghost'|'edit-tree-toolbar'|'branch-tree'|
+ * branching.css — swipe controls, variant ghost card, edit-tree toolbar.
+ * Owns: [data-ui='branch-controls'|'variant-ghost'|'edit-tree-toolbar'|
  *              'branch-node'|'inline-editor'|'import-modal'|'toast-tray'|
  *              'banner-tray'].
  * Wired out in Phase 8.1 per plan/08-branching.md.
@@ -452,7 +452,6 @@
 }
 
 [data-ui="import-modal-scrim"],
-[data-ui="branch-tree-scrim"],
 [data-ui="confirm-delete-scrim"] {
   position: absolute;
   inset: 0;
@@ -581,119 +580,6 @@
   margin: 0;
   color: var(--color-danger);
   font-size: var(--font-size-sm);
-}
-
-/* Branch tree view — indent-based tree. */
-[data-ui="branch-tree-overlay"] {
-  position: fixed;
-  inset: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: var(--z-overlay);
-  padding: var(--space-5);
-}
-
-[data-ui="branch-tree"] {
-  position: relative;
-  z-index: 1;
-  background: var(--color-bg-surface-1);
-  border: 1px solid var(--color-border-default);
-  border-radius: var(--radius-md);
-  box-shadow: var(--shadow-overlay);
-  width: min(720px, calc(100vw - var(--space-8)));
-  max-height: 85vh;
-  overflow: hidden;
-  display: flex;
-  flex-direction: column;
-}
-
-[data-ui="branch-tree-header"] {
-  display: flex;
-  align-items: center;
-  gap: var(--space-3);
-  padding: var(--space-3) var(--space-5);
-  border-bottom: 1px solid var(--color-border-subtle);
-}
-
-[data-ui="branch-tree-header"] h2 {
-  margin: 0;
-  font-size: var(--font-size-lg);
-  font-weight: var(--font-weight-semibold);
-}
-
-[data-ui="branch-tree-search"] {
-  flex: 1 1 auto;
-}
-
-[data-ui="branch-tree-list"] {
-  list-style: none;
-  padding: 0;
-  margin: 0;
-  overflow-y: auto;
-}
-
-[data-ui="branch-tree-row"] {
-  padding: var(--space-1) var(--space-5);
-}
-
-[data-ui="branch-tree-node"] {
-  display: flex;
-  align-items: baseline;
-  gap: var(--space-3);
-  padding: var(--space-2) var(--space-3);
-  border-radius: var(--radius-sm);
-  color: inherit;
-  text-decoration: none;
-}
-
-[data-ui="branch-tree-row"][data-active="true"] [data-ui="branch-tree-node"] {
-  background: var(--color-bg-surface-2);
-  font-weight: var(--font-weight-semibold);
-}
-
-[data-ui="branch-tree-row"][data-depth="0"] [data-ui="branch-tree-node"] {
-  padding-left: 0;
-}
-[data-ui="branch-tree-row"][data-depth="1"] [data-ui="branch-tree-node"] {
-  padding-left: var(--space-4);
-}
-[data-ui="branch-tree-row"][data-depth="2"] [data-ui="branch-tree-node"] {
-  padding-left: calc(var(--space-4) * 2);
-}
-[data-ui="branch-tree-row"][data-depth="3"] [data-ui="branch-tree-node"] {
-  padding-left: calc(var(--space-4) * 3);
-}
-
-[data-ui="branch-tree-node"]:hover {
-  background: var(--color-bg-hover);
-}
-
-[data-ui="branch-tree-role"] {
-  font-size: var(--font-size-xs);
-  color: var(--color-fg-muted);
-  font-variant-caps: all-small-caps;
-  min-width: 60px;
-}
-
-[data-ui="branch-tree-preview"] {
-  flex: 1 1 auto;
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-  color: var(--color-fg-primary);
-}
-
-[data-ui="branch-tree-variants"] {
-  font-size: var(--font-size-xs);
-  color: var(--color-fg-muted);
-  font-variant-numeric: tabular-nums;
-}
-
-[data-ui="branch-tree-empty"] {
-  padding: var(--space-5);
-  text-align: center;
-  color: var(--color-fg-muted);
 }
 
 [data-ui="icon-button-hint"] {

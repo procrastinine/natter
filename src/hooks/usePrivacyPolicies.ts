@@ -27,7 +27,7 @@ import {
 } from '../store/privacy-cache'
 import { getProfile } from '../store/profiles'
 
-export interface UsePrivacyPoliciesResult {
+interface UsePrivacyPoliciesResult {
   policies: Record<string, DataPolicy>
   loading: boolean
   fetchedAt: number | null

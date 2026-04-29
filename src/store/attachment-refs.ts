@@ -6,14 +6,10 @@ import type {
   MessageId,
 } from '../core/types'
 
-export interface AttachmentRefOwner {
+interface AttachmentRefOwner {
   messageId?: MessageId
   draftChatId?: string
   createdAt?: number
-}
-
-export function isMessageAttachmentRef(ref: AttachmentRef): ref is MessageAttachmentRef {
-  return typeof ref !== 'string'
 }
 
 export function attachmentIdOf(ref: AttachmentRef): AttachmentId {

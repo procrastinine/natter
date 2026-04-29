@@ -49,7 +49,7 @@ const DIRECT_MODELS_QUERY = {} as const
 
 type PickerTab = 'recent' | 'all'
 
-export interface ModelPickerProps {
+interface ModelPickerProps {
   chat: Chat
   profileKind: ConnectionKind
   onPick: (modelId: string) => void | Promise<void>

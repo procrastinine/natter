@@ -19,7 +19,7 @@ import {
 } from '../../core/provider-identity'
 import type { DataPolicy, ModelEndpoint, PrivacyPrefs, ProviderPreferences } from '../../core/types'
 
-export type PickerRowState = 'kept' | 'auto-excluded' | 'no-filter'
+type PickerRowState = 'kept' | 'auto-excluded' | 'no-filter'
 
 export interface PickerRow {
   endpoint: ModelEndpoint
@@ -30,7 +30,7 @@ export interface PickerRow {
   policySynthesized: boolean
 }
 
-export interface BuildPickerRowsOptions {
+interface BuildPickerRowsOptions {
   providerPrefs?: ProviderPreferences | undefined
   privacy?: PrivacyPrefs | undefined
 }

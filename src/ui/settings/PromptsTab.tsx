@@ -14,7 +14,7 @@ import {
   SystemPromptEditor,
 } from './PromptPresetEditor'
 
-export interface PromptsTabProps {
+interface PromptsTabProps {
   chat: Chat
   prefillRecommendationEndpoints?: readonly ModelEndpoint[] | undefined
 }

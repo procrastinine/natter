@@ -13,7 +13,7 @@ export interface IndexedDbDump {
   stores: Record<string, unknown[]>
 }
 
-export interface SeedOptions {
+interface SeedOptions {
   apiKey?: string
   model?: string
   disablePrivacyFilter?: boolean
@@ -93,7 +93,7 @@ export async function seedFirstRun(page: Page, opts: SeedOptions = {}): Promise<
           presetId?: string | null
           settings?: Record<string, unknown> | null
         }
-        const settings = (parsed.settings ?? {}) as Record<string, unknown>
+        const settings = (parsed.settings ?? {})
         const privacy = (settings.privacy ?? {}) as Record<string, unknown>
         window.sessionStorage.setItem(
           'natter:active-seed',
@@ -142,7 +142,7 @@ export async function createChatAndSend(page: Page, text: string): Promise<void>
   await page.locator('[data-ui="chat-row"]').first().waitFor({ state: 'visible' })
 }
 
-export interface SseDelta {
+interface SseDelta {
   id?: string
   model?: string
   provider?: string
@@ -184,7 +184,7 @@ export function buildSseBody(frames: SseDelta[], options: { noDone?: boolean } =
   return `${lines.join('\n')}\n`
 }
 
-export interface MockChatOptions {
+interface MockChatOptions {
   body?: string
   status?: number
   json?: unknown

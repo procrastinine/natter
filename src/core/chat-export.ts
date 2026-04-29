@@ -2,18 +2,11 @@ import { getWorkspaceRepository } from '../store/workspace-repository'
 import { exportActiveBranchAsTxt, exportLastUpdatedBranchAsTxt } from './branch-flatten'
 import type { ChatId, CursorMap } from './types'
 
-export async function exportCurrentViewAsTxt(
-  chatId: ChatId,
-  cursor: CursorMap = {},
-): Promise<{ filename: string; content: string }> {
-  return exportActiveBranchAsTxt(getWorkspaceRepository(), chatId, cursor)
-}
-
 export async function exportChatAsTxt(
   chatId: ChatId,
   cursor: CursorMap = {},
 ): Promise<{ filename: string; content: string }> {
-  return exportCurrentViewAsTxt(chatId, cursor)
+  return exportActiveBranchAsTxt(getWorkspaceRepository(), chatId, cursor)
 }
 
 export async function exportLastUpdatedChatAsTxt(

@@ -128,7 +128,7 @@ describe('normalizeResponsesUsage (Responses API shape)', () => {
 describe('normalizeChatUsage — robustness guards', () => {
   it('coerces negative token fields to 0', () => {
     const u: ChatUsage = {
-      prompt_tokens: -500 as unknown as number,
+      prompt_tokens: -500,
       completion_tokens: 200,
       total_tokens: 300,
     }
@@ -139,8 +139,8 @@ describe('normalizeChatUsage — robustness guards', () => {
 
   it('coerces NaN/Infinity token fields to 0', () => {
     const u: ChatUsage = {
-      prompt_tokens: Number.NaN as unknown as number,
-      completion_tokens: Number.POSITIVE_INFINITY as unknown as number,
+      prompt_tokens: Number.NaN,
+      completion_tokens: Number.POSITIVE_INFINITY,
       total_tokens: 300,
     }
     const n = normalizeChatUsage(u)
@@ -171,7 +171,7 @@ describe('normalizeChatUsage — robustness guards', () => {
       prompt_tokens: 1,
       completion_tokens: 1,
       total_tokens: 2,
-      cost: Number.NaN as unknown as number,
+      cost: Number.NaN,
     })
     expect(u1.cost).toBe(0)
     expect(u2.cost).toBe(0)
@@ -181,9 +181,9 @@ describe('normalizeChatUsage — robustness guards', () => {
 describe('normalizeResponsesUsage — robustness guards', () => {
   it('coerces negative / NaN / Infinity token fields to 0', () => {
     const u: ResponsesUsage = {
-      input_tokens: -100 as unknown as number,
-      output_tokens: Number.NaN as unknown as number,
-      total_tokens: Number.POSITIVE_INFINITY as unknown as number,
+      input_tokens: -100,
+      output_tokens: Number.NaN,
+      total_tokens: Number.POSITIVE_INFINITY,
     }
     const n = normalizeResponsesUsage(u)
     expect(n.promptTokens).toBe(0)

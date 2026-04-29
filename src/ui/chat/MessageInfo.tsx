@@ -11,7 +11,7 @@ import type {
   ReasoningDetail,
 } from '../../core/types'
 
-export interface MessageInfoProps {
+interface MessageInfoProps {
   message: MessageRow
   // Set to true when the previous message on the active path was a user
   // message that got edited after this assistant was generated — the

@@ -8,7 +8,7 @@ import {
   type MessageHeaderRow,
 } from '../store/message-storage'
 
-export const MESSAGE_BODY_SPLIT_BACKFILL_KEY = 'backfill:message-body-split-v1'
+const MESSAGE_BODY_SPLIT_BACKFILL_KEY = 'backfill:message-body-split-v1'
 
 type LegacyInlineMessageRow = Record<string, unknown> & Partial<Message>
 
@@ -33,14 +33,14 @@ export async function backfillMissingMessageBodies(db: NatterDb): Promise<void> 
       const existingBody = await db.messageBodies.get(String(row.id))
       if (existingBody) {
         if (hasInlineBodyFields(row)) {
-          await db.messages.put(stripInlineBodyFields(row) as unknown as MessageHeaderRow)
+          await db.messages.put(stripInlineBodyFields(row))
         }
         continue
       }
       if (!hasInlineBodyFields(row)) throw new Error(`MessageBodyMissing:${String(row.id)}`)
       await splitAndStoreLegacyMessage(
-        db.messages as unknown as ReturnType<Transaction['table']>,
-        db.messageBodies as unknown as ReturnType<Transaction['table']>,
+        db.messages,
+        db.messageBodies,
         row,
       )
     }
@@ -70,7 +70,7 @@ async function splitAndStoreLegacyMessage(
 }
 
 function normalizeLegacyMessage(row: LegacyInlineMessageRow): Message {
-  const legacy = structuredClone(row) as LegacyInlineMessageRow
+  const legacy = structuredClone(row)
   if (!Array.isArray(legacy.content)) legacy.content = []
   if (typeof legacy.nodeVersion !== 'number') legacy.nodeVersion = 0
   if (legacy.deleted !== true) legacy.deleted = false
@@ -78,7 +78,7 @@ function normalizeLegacyMessage(row: LegacyInlineMessageRow): Message {
 }
 
 function stripInlineBodyFields(row: LegacyInlineMessageRow): MessageHeaderRow {
-  const next = structuredClone(row) as LegacyInlineMessageRow
+  const next = structuredClone(row)
   for (const key of MESSAGE_BODY_KEYS) delete next[key]
   return next as MessageHeaderRow
 }

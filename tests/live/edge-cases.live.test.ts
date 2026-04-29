@@ -11,8 +11,6 @@ import {
 } from '../../src/api/chat-completions'
 import type {
   ChatCompletionChunkWire,
-  ChatCompletionMessageWire,
-  ChatCompletionRequestWire,
   ChatCompletionResultWire,
 } from '../../src/api/types'
 import type { ConnectionProfile } from '../../src/core/types'
@@ -65,8 +63,8 @@ describe.skipIf(!LIVE)('live edge cases — OpenRouter chat-completions', () => 
       ],
       max_tokens: 2000,
       reasoning: { enabled: true, max_tokens: 1024 },
-    } as ChatCompletionRequestWire)
-    const msg = result.choices?.[0]?.message as ChatCompletionMessageWire | undefined
+    })
+    const msg = result.choices?.[0]?.message
     const details = (msg?.reasoning_details ?? []) as Array<{
       type?: string
       format?: string
@@ -91,8 +89,8 @@ describe.skipIf(!LIVE)('live edge cases — OpenRouter chat-completions', () => 
       ],
       max_tokens: 1200,
       reasoning: { enabled: true, effort: 'high' },
-    } as ChatCompletionRequestWire)
-    const msg = result.choices?.[0]?.message as ChatCompletionMessageWire | undefined
+    })
+    const msg = result.choices?.[0]?.message
     const details = (msg?.reasoning_details ?? []) as Array<{
       type?: string
       format?: string
@@ -116,8 +114,8 @@ describe.skipIf(!LIVE)('live edge cases — OpenRouter chat-completions', () => 
       messages: [{ role: 'user', content: 'Explain why 5+3=8 using place value.' }],
       max_tokens: 1000,
       reasoning: { enabled: true, effort: 'high' },
-    } as ChatCompletionRequestWire)
-    const msg = result.choices?.[0]?.message as ChatCompletionMessageWire | undefined
+    })
+    const msg = result.choices?.[0]?.message
     const scalar = msg?.reasoning
     const details = (msg?.reasoning_details ?? []) as Array<{
       type?: string
@@ -180,8 +178,8 @@ describe.skipIf(!LIVE)('live edge cases — OpenRouter chat-completions', () => 
       ],
       max_tokens: 300,
       reasoning: { enabled: true, effort: 'low' },
-    } as ChatCompletionRequestWire)
-    const msg1 = turn1.choices?.[0]?.message as ChatCompletionMessageWire | undefined
+    })
+    const msg1 = turn1.choices?.[0]?.message
     expect(msg1).toBeDefined()
     const details1 = msg1?.reasoning_details as Array<{
       type?: string
@@ -203,7 +201,7 @@ describe.skipIf(!LIVE)('live edge cases — OpenRouter chat-completions', () => 
       ],
       max_tokens: 200,
       reasoning: { enabled: true, effort: 'low' },
-    } as ChatCompletionRequestWire)
+    })
     // 200-series response — no rejection.
     expect(turn2.choices?.[0]?.message?.content ?? '').toMatch(/14/)
   }, 120_000)

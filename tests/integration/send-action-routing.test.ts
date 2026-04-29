@@ -1,6 +1,5 @@
 import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import type { ChatStreamChunk } from '../../src/api/types'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import type {
   ChatSettings,
@@ -188,7 +187,7 @@ function captureChatDelta(
         id: 'almost-live',
         choices: [{ delta: { content: text }, finish_reason: 'stop' }],
       },
-    } as ChatStreamChunk)
+    })
   }
 }
 
@@ -346,7 +345,7 @@ describe('almost-live request shape matrix', () => {
             id: 'almost-live-continue',
             choices: [{ delta: { content: ' continuation' }, finish_reason: 'stop' }],
           },
-        } as ChatStreamChunk)
+        })
       },
     })
 
@@ -410,7 +409,7 @@ describe('almost-live request shape matrix', () => {
             id: 'almost-live-continue-prefill',
             choices: [{ delta: { content: ' continuation' }, finish_reason: 'stop' }],
           },
-        } as ChatStreamChunk)
+        })
       },
     })
 
@@ -714,7 +713,7 @@ describe('send action routing', () => {
             id: 'continue',
             choices: [{ delta: { content: ' more' }, finish_reason: 'stop' }],
           },
-        } as ChatStreamChunk)
+        })
       },
     })
 
@@ -811,7 +810,7 @@ describe('send action routing', () => {
             id: 'continue',
             choices: [{ delta: { content: ' more' }, finish_reason: 'stop' }],
           },
-        } as ChatStreamChunk)
+        })
       },
     })
 
@@ -870,7 +869,7 @@ describe('send action routing', () => {
             id: 'continue',
             choices: [{ delta: { content: ' more' }, finish_reason: 'stop' }],
           },
-        } as ChatStreamChunk)
+        })
       },
     })
 
@@ -985,7 +984,7 @@ describe('send action routing', () => {
             id: 'seed',
             choices: [{ delta: { content: 'partial' }, finish_reason: 'stop' }],
           },
-        } as ChatStreamChunk),
+        }),
     })
     const rows = await messagesFor(chat.id)
     const assistant = requireDefined(
@@ -1007,7 +1006,7 @@ describe('send action routing', () => {
             id: 'continue-prefill',
             choices: [{ delta: { content: ' more' }, finish_reason: 'stop' }],
           },
-        } as ChatStreamChunk)
+        })
       },
     })
 

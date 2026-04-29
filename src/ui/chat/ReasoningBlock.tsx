@@ -22,7 +22,7 @@ import { useEffect, useRef, useState } from 'react'
 import { normalizeReasoningDetails } from '../../core/reasoning'
 import type { ReasoningDetail } from '../../core/types'
 
-export interface ReasoningBlockProps {
+interface ReasoningBlockProps {
   details: ReasoningDetail[]
   streaming?: boolean
   // True when the message body already has visible content. Drives the
@@ -111,7 +111,7 @@ export function ReasoningBlock({
       data-pinned={pinnedOpen ? 'true' : undefined}
       open={open}
       onToggle={(e) => {
-        const isOpen = (e.currentTarget as HTMLDetailsElement).open
+        const isOpen = (e.currentTarget).open
         setOpen(isOpen)
         setPinnedOpen(true)
       }}

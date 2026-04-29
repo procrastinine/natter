@@ -12,7 +12,7 @@ const DEBUG_MODEL_ID = 'debug/fake-lorem-stream'
 const LOREM =
   'Lorem ipsum dolor sit amet, consectetur adipiscing elit. Integer vitae sem sed nulla gravida feugiat. '
 
-export interface DebugFakeStreamOptions {
+interface DebugFakeStreamOptions {
   chatId?: ChatId
   targetChars?: number
   reasoningChars?: number
@@ -24,7 +24,7 @@ export interface DebugFakeStreamOptions {
   reasoningAsSnapshots?: boolean
 }
 
-export interface DebugFakeStreamResult extends SendTextResult {
+interface DebugFakeStreamResult extends SendTextResult {
   chatId: ChatId
   targetChars: number
   reasoningChars: number

@@ -13,7 +13,7 @@ import type { Chat } from '../../core/types'
 import { updateChatSettings } from '../../store/chats'
 import { InfoDisclosure } from './InfoDisclosure'
 
-export interface PrivacySectionProps {
+interface PrivacySectionProps {
   chat: Chat
 }
 

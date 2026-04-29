@@ -23,7 +23,7 @@ import { isTextCompletionsSelectableFor, responsesSupportFor } from './quirks'
 import { normalizeReasoningSettings } from './reasoning'
 import type { ApiVariant, ChatSettings, ConnectionProfile, Message, ReasoningFormat } from './types'
 
-export type ApiRouteKind =
+type ApiRouteKind =
   | 'chat-completions'
   | 'text-completions'
   | 'responses'
@@ -31,7 +31,7 @@ export type ApiRouteKind =
   | 'anthropic-messages'
   | 'video-generation'
 
-export type ApiTransport =
+type ApiTransport =
   | 'openai-chat'
   | 'openai-text'
   | 'openai-responses'

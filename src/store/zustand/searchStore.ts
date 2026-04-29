@@ -2,7 +2,6 @@ import { create } from 'zustand'
 import type { ChatId } from '../../core/types'
 import {
   cloneSearchFilters,
-  DEFAULT_SEARCH_FILTERS,
   hasSearchWork,
   type SearchFilters,
   type SearchResult,
@@ -10,7 +9,7 @@ import {
 } from '../chat-search'
 import { onEvent } from '../broadcast'
 
-export type SearchStatus = 'idle' | 'debouncing' | 'scanning' | 'done' | 'aborted' | 'error'
+type SearchStatus = 'idle' | 'debouncing' | 'scanning' | 'done' | 'aborted' | 'error'
 
 export interface SearchSession {
   queryId: string
@@ -30,7 +29,7 @@ export interface SearchSession {
   deletedChatIds: ChatId[]
 }
 
-export interface SearchStoreState {
+interface SearchStoreState {
   session: SearchSession | null
   setQuery: (query: string, options?: Partial<Pick<SearchSession, 'scope' | 'filters'>>) => void
   setStatus: (status: SearchStatus, error?: string) => void
@@ -226,6 +225,3 @@ function upsertResult(results: readonly SearchResult[], result: SearchResult): S
 function appendUnique<T>(values: readonly T[], value: T): T[] {
   return values.includes(value) ? [...values] : [...values, value]
 }
-
-export { DEFAULT_SEARCH_FILTERS }
-export type { SearchFilters, SearchResult, SearchScope }

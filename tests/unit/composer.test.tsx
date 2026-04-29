@@ -31,7 +31,7 @@ describe('Composer', () => {
         }}
       />,
     )
-    const input = screen.getByRole('textbox') as HTMLTextAreaElement
+    const input = screen.getByRole('textbox')
     fireEvent.change(input, { target: { value: 'keep this draft' } })
     fireEvent.submit(container.querySelector('[data-ui="composer"]') as HTMLFormElement)
 
@@ -41,7 +41,7 @@ describe('Composer', () => {
   it('reports live draft changes for prompt-budget estimation', () => {
     const onDraftChange = vi.fn()
     render(<Composer onSubmit={() => {}} onDraftChange={onDraftChange} />)
-    const input = screen.getByRole('textbox') as HTMLTextAreaElement
+    const input = screen.getByRole('textbox')
 
     fireEvent.change(input, { target: { value: 'count this draft' } })
 
@@ -59,7 +59,7 @@ describe('Composer', () => {
     })
     try {
       render(<Composer autoSize onSubmit={() => {}} />)
-      const input = screen.getByRole('textbox') as HTMLTextAreaElement
+      const input = screen.getByRole('textbox')
 
       expect(input.style.height).toBe('48px')
       expect(input.style.overflowY).toBe('hidden')

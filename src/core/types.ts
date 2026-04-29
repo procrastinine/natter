@@ -15,7 +15,7 @@ export type ChatId = string
 export type MessageId = string
 export type TurnId = string
 export type AttachmentId = string
-export type ToolDefinitionId = string
+type ToolDefinitionId = string
 export type KeyId = string
 export type ProfileId = string
 export type PresetId = string
@@ -33,21 +33,21 @@ export type MessagePhase = 'commentary' | 'final_answer'
 
 export type FinishReason = 'stop' | 'length' | 'tool_calls' | 'content_filter' | 'error'
 
-export type DeliveryMethod = 'streaming' | 'buffered'
+type DeliveryMethod = 'streaming' | 'buffered'
 
 export type AbortReason = 'user' | 'tab-close' | 'error' | 'network' | 'quota'
 
-export type ContextStrategyKind = 'sliding_window' | 'middle_out_plugin' | 'off'
+type ContextStrategyKind = 'sliding_window' | 'middle_out_plugin' | 'off'
 
-export type OnOverflow = 'ask' | 'auto_compress' | 'fail'
+type OnOverflow = 'ask' | 'auto_compress' | 'fail'
 
 export type MediaContextStrategy = 'echo-all' | 'echo-last-N' | 'echo-user-only' | 'drop-all'
 
-export type ToolContextStrategy = 'echo-all' | 'summarize-old'
+type ToolContextStrategy = 'echo-all' | 'summarize-old'
 
-export type UserIdMode = 'omit' | 'stable-hash' | 'chat-id'
+type UserIdMode = 'omit' | 'stable-hash' | 'chat-id'
 
-export type ServiceTier = 'auto' | 'default' | 'flex' | 'priority' | 'scale'
+type ServiceTier = 'auto' | 'default' | 'flex' | 'priority' | 'scale'
 
 export type ConnectionKind =
   | 'openrouter'
@@ -108,7 +108,7 @@ export type ReasoningMode = 'default' | 'off' | 'enabled' | 'effort' | 'budget'
  *  should prefer `include` and fall back to migrated values from here. */
 export type ReasoningCarryForward = 'off' | 'plaintext' | 'encrypted' | 'auto'
 
-export type ReasoningSummary = 'off' | 'auto' | 'concise' | 'detailed'
+type ReasoningSummary = 'off' | 'auto' | 'concise' | 'detailed'
 
 /** Three independent flags — maps 1:1 to the three Phase-11.1 UI checkboxes.
  *  - `encrypted`: round-trip the family-native opaque carrier
@@ -193,7 +193,7 @@ export interface ToolCall {
   function: { name: string; arguments: string }
 }
 
-export type ToolChoice =
+type ToolChoice =
   | 'none'
   | 'auto'
   | 'required'
@@ -230,7 +230,7 @@ export interface ToolDefinition {
 
 export type ServerToolId = 'web-search' | 'datetime' | 'web-fetch' | 'image-generation'
 
-export type PluginId = 'context-compression'
+type PluginId = 'context-compression'
 
 // ---------------------------------------------------------------------------
 // Response format / structured output
@@ -254,9 +254,9 @@ export type ResponseFormat =
 
 export type SortBy = 'price' | 'throughput' | 'latency'
 
-export type SortPartition = 'model' | 'none'
+type SortPartition = 'model' | 'none'
 
-export type ProviderSort = SortBy | { by: SortBy; partition: SortPartition }
+type ProviderSort = SortBy | { by: SortBy; partition: SortPartition }
 
 export type PercentileBucket = {
   p50?: number
@@ -341,13 +341,13 @@ export interface AnthropicCacheSettings {
   breakpointIndex?: number
 }
 
-export type CacheControl = { type: 'ephemeral'; ttl?: '1h' }
+type CacheControl = { type: 'ephemeral'; ttl?: '1h' }
 
 // ---------------------------------------------------------------------------
 // ChatSettings
 // ---------------------------------------------------------------------------
 
-export interface ContextStrategy {
+interface ContextStrategy {
   kind: ContextStrategyKind
   reservedForCompletion: number
   onOverflow: OnOverflow
@@ -479,7 +479,7 @@ export interface ChatSettings {
   gemini?: GeminiChatSettings
 }
 
-export interface ResponsesChatSettings {
+interface ResponsesChatSettings {
   /** Emit `include: ['reasoning.encrypted_content']` on the request. Default
    *  `true` when `reasoning.include.encrypted` is also `true`. Independent
    *  escape hatch so the user can suppress the include without flipping the
@@ -489,7 +489,7 @@ export interface ResponsesChatSettings {
   store: boolean
 }
 
-export interface GeminiChatSettings {
+interface GeminiChatSettings {
   /** Imported chats without `thoughtSignature` values on prior turns bypass
    *  the 400-error validator when this is `true` (the transform passes
    *  `"skip_thought_signature_validator"` as the signature). Default `false`,
@@ -522,7 +522,7 @@ export interface TextTemplateConfig {
   stop: string[]
 }
 
-export interface ComposeOverrides {
+interface ComposeOverrides {
   enabledToolIds?: ToolDefinitionId[]
   enabledServerToolIds?: ServerToolId[]
   enabledPluginIds?: PluginId[]
@@ -532,7 +532,7 @@ export interface ComposeOverrides {
 // Drafts
 // ---------------------------------------------------------------------------
 
-export interface ChatDraft {
+interface ChatDraft {
   text: string
   attachmentRefs: AttachmentRef[]
   composeOverrides?: ComposeOverrides
@@ -724,7 +724,7 @@ export type ContentItem =
       prompt?: string
     }
 
-export interface Annotation {
+interface Annotation {
   type: 'url_citation' | 'file_citation'
   [key: string]: unknown
 }
@@ -761,7 +761,7 @@ export interface ChatUsage {
   cache_creation_input_tokens?: number
 }
 
-export interface ApiError {
+interface ApiError {
   code: string
   message: string
   statusCode?: number
@@ -968,9 +968,9 @@ export type AttachmentArtifact =
       createdAt: number
     }
 
-export type AttachmentProcessingStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'skipped'
+type AttachmentProcessingStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'skipped'
 
-export interface AttachmentProcessingState {
+interface AttachmentProcessingState {
   processorId: string
   inputHash: string
   status: AttachmentProcessingStatus
@@ -1070,7 +1070,7 @@ export interface CapabilityDescriptor {
   }
 }
 
-export type CapabilityOverride = Partial<CapabilityDescriptor>
+type CapabilityOverride = Partial<CapabilityDescriptor>
 
 export interface ConnectionProfile {
   id: ProfileId
@@ -1227,17 +1227,4 @@ export interface ModelEndpoint {
 export interface ModelsQuery {
   outputModalities?: readonly string[]
   supportedParameters?: readonly string[]
-}
-
-// ---------------------------------------------------------------------------
-// Envelope for send pipeline
-// ---------------------------------------------------------------------------
-
-export interface SendPayload {
-  chatId: ChatId
-  content: ContentItem[]
-  attachmentRefs?: AttachmentRef[]
-  overrides?: Partial<ChatSettings>
-  composeOverrides?: ComposeOverrides
-  prefillContent?: ContentItem[]
 }

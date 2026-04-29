@@ -6,7 +6,7 @@ import { AttachmentPicker } from '../attachments/AttachmentPicker'
 import { useAttachmentDrafts } from '../attachments/useAttachmentDrafts'
 import { DatabaseIcon, InsertIcon, PaperclipIcon, PrefillIcon, StopIcon } from '../icons/Icon'
 
-export interface ComposerProps {
+interface ComposerProps {
   // Disables the textarea entirely.
   disabled?: boolean
   // The textarea remains editable but Send is locked. Reason is rendered

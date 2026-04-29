@@ -9,7 +9,7 @@ import { DEFAULT_IMAGE_ORIGINS, isImageOriginAllowed } from '../../core/image-al
 import type { ShikiThemeChoice } from '../settings/RenderingSettings'
 import { RenderingPreferencesContext } from '../settings/RenderingSettings'
 
-export interface MarkdownViewProps {
+interface MarkdownViewProps {
   content: string
   streaming?: boolean
   allowImageOrigins?: string[]

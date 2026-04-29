@@ -32,9 +32,9 @@ function calibrationEntries(
 // Stable empty reference so useChatStore's selector doesn't allocate a fresh
 // `{}` every render — React 19's useSyncExternalStore detects that as an
 // infinite loop ("getSnapshot should be cached").
-const EMPTY_CURSOR: CursorMap = Object.freeze({}) as CursorMap
+const EMPTY_CURSOR: CursorMap = Object.freeze({})
 
-export interface ChatHeaderProps {
+interface ChatHeaderProps {
   chatId: ChatId | null
   settingsOpen: boolean
   onToggleSettings: () => void

@@ -7,23 +7,13 @@
 // `getSetting/setSetting` helpers. Typed read/write wrappers are exposed so
 // call sites don't have to remember the key names.
 
-import {
-  CORS_PROXY_SECRET_HEADER,
-  type CorsProxyConfig,
-  DEFAULT_CORS_PROXY_URL,
-  DIRECT_OPENROUTER_BASE,
-} from './cors-proxy'
+import { type CorsProxyConfig, DEFAULT_CORS_PROXY_URL } from './cors-proxy'
 import { getSetting, setSetting } from '../store/settings'
 
 // Re-exports for browser callers that group their preference imports
 // here. The canonical source lives in `./cors-proxy` so daemon-mode and
 // `api/privacy-scrape.ts` can pull these in without dragging in IDB.
-export {
-  CORS_PROXY_SECRET_HEADER,
-  type CorsProxyConfig,
-  DEFAULT_CORS_PROXY_URL,
-  DIRECT_OPENROUTER_BASE,
-}
+export { DEFAULT_CORS_PROXY_URL }
 
 export type ThemePreference = 'system' | 'light' | 'dark' | 'high-contrast'
 
@@ -93,7 +83,7 @@ export function resolveContinueSystemPromptTemplate(
   return template.split(CONTINUE_SYSTEM_PROMPT_PLACEHOLDER).join(originalSystemPrompt)
 }
 
-export interface GlobalPreferences {
+interface GlobalPreferences {
   theme: ThemePreference
   sendShortcut: SendShortcut
   userProfilePicture: ProfilePictureRef
@@ -261,17 +251,6 @@ function chatMaxWidthOrDefault(value: unknown): ChatMaxWidth {
   return DEFAULT_GLOBAL_PREFERENCES.chatMaxWidth
 }
 
-export const CHAT_MAX_WIDTH_OPTIONS: readonly ChatMaxWidth[] = [
-  640,
-  720,
-  840,
-  920,
-  1040,
-  1200,
-  1440,
-  'full',
-]
-
 const ALLOWED_CALIBRATION_MODES: readonly TokenCalibrationMode[] = [
   'adaptive',
   'global-only',
@@ -374,17 +353,6 @@ export function corsProxyConfigFromPrefs(prefs: GlobalPreferences): CorsProxyCon
   }
 }
 
-export async function readCorsProxyConfig(): Promise<CorsProxyConfig> {
-  return corsProxyConfigFromPrefs(await readGlobalPreferences())
-}
-
-// Daemon-mode config: skip the CORS-proxy preference and call
-// `openrouter.ai` directly, since the daemon process isn't subject to
-// browser CORS. The browser engine uses `readCorsProxyConfig()` instead.
-export function directCorsProxyConfig(): CorsProxyConfig {
-  return { url: DIRECT_OPENROUTER_BASE, secret: '' }
-}
-
 export async function writeCorsProxyUrl(value: string): Promise<void> {
   await setSetting(CORS_PROXY_URL_KEY, value)
 }
@@ -426,14 +394,6 @@ export async function writeTheme(theme: ThemePreference): Promise<void> {
 
 export async function writeSendShortcut(value: SendShortcut): Promise<void> {
   await setSetting(SEND_SHORTCUT_KEY, value)
-}
-
-export async function writeUserProfilePicture(value: ProfilePictureRef): Promise<void> {
-  await setSetting(USER_PIC_KEY, value)
-}
-
-export async function writeAssistantProfilePicture(value: ProfilePictureRef): Promise<void> {
-  await setSetting(ASSISTANT_PIC_KEY, value)
 }
 
 export async function writeChatMaxWidth(value: ChatMaxWidth): Promise<void> {

@@ -28,7 +28,7 @@ import { AttachmentPicker } from '../attachments/AttachmentPicker'
 import { useAttachmentDrafts } from '../attachments/useAttachmentDrafts'
 import { DatabaseIcon, PaperclipIcon, PrefillIcon } from '../icons/Icon'
 
-export interface InlineEditorProps {
+interface InlineEditorProps {
   initial: string
   onSave: (
     text: string,

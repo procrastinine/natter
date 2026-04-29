@@ -30,7 +30,7 @@ export const BRANCH_EXPLICIT_CLEAR_FIELDS = [
   'editedAt',
 ] as const
 
-export interface BranchExplicitInput {
+interface BranchExplicitInput {
   id: MessageId
   turnId: TurnId
   turnIndex: number

@@ -110,11 +110,11 @@ export const DEFAULT_CHAT_SETTINGS: Readonly<ChatSettings> = Object.freeze({
 // Deep-clone the defaults for seeding a new chat or preset. We never hand out the
 // frozen singleton because callers mutate freely.
 export function cloneDefaultChatSettings(): ChatSettings {
-  return structuredClone(DEFAULT_CHAT_SETTINGS) as ChatSettings
+  return structuredClone(DEFAULT_CHAT_SETTINGS)
 }
 
 export function cloneDefaultPrivacyPrefs(): PrivacyPrefs {
-  return structuredClone(DEFAULT_PRIVACY_PREFS) as PrivacyPrefs
+  return structuredClone(DEFAULT_PRIVACY_PREFS)
 }
 
 // Pick a default model for a brand-new ConnectionProfile's seed preset.
@@ -123,7 +123,7 @@ export function cloneDefaultPrivacyPrefs(): PrivacyPrefs {
 // out. If none match, fall back to the first tool-capable model; finally, the
 // first model the endpoint advertised at all. Phase 5 callers pass
 // `availableModels` from the live `/models` response; tests supply fixtures.
-export interface ModelCandidate {
+interface ModelCandidate {
   id: string
   expirationDate?: string
   supportedParameters?: string[]
@@ -161,7 +161,7 @@ export function resolveDefaultModel(
 // `resolveDefaultModel` is expected to run before calling this so the preset
 // starts with a concrete model; callers that haven't loaded /models yet can
 // pass an explicit `model` and defer resolution.
-export interface FirstRunSeedInput {
+interface FirstRunSeedInput {
   apiKey: string
   keyName?: string
   passphrase?: string
@@ -176,7 +176,7 @@ export interface FirstRunSeedInput {
   now?: number
 }
 
-export interface FirstRunSeedResult {
+interface FirstRunSeedResult {
   key: KeyRecord
   profile: ConnectionProfile
   preset: ChatPreset

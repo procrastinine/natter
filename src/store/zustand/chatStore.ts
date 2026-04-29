@@ -9,7 +9,7 @@
 import { create } from 'zustand'
 import type { ChatId, CursorMap, MessageId } from '../../core/types'
 
-export interface ChatStoreState {
+interface ChatStoreState {
   cursors: Record<ChatId, CursorMap>
   getCursor: (chatId: ChatId) => CursorMap | undefined
   setCursor: (chatId: ChatId, cursor: CursorMap) => void

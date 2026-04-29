@@ -5,7 +5,7 @@ import { InfoDisclosure } from './InfoDisclosure'
 
 export type ShikiThemeChoice = 'github-light' | 'github-dark' | 'tokyo-night' | 'dracula'
 
-export interface RenderingPreferences {
+interface RenderingPreferences {
   shikiLight: ShikiThemeChoice
   shikiDark: ShikiThemeChoice
   singleDollarTextMath: boolean
@@ -35,12 +35,12 @@ function subscribeRenderingPreferences(listener: RenderingPreferencesListener): 
   return () => renderingPreferencesListeners.delete(listener)
 }
 
-export async function readRenderingPreferences(): Promise<RenderingPreferences> {
+async function readRenderingPreferences(): Promise<RenderingPreferences> {
   const stored = await getSetting<Partial<RenderingPreferences>>(STORAGE_KEY)
   return { ...DEFAULT_RENDERING_PREFS, ...(stored ?? {}) }
 }
 
-export async function writeRenderingPreferences(
+async function writeRenderingPreferences(
   next: Partial<RenderingPreferences>,
 ): Promise<void> {
   publishRenderingPreferences({ ...latestRenderingPreferences, ...next })
@@ -50,7 +50,7 @@ export async function writeRenderingPreferences(
   publishRenderingPreferences(updated)
 }
 
-export function useRenderingPreferences(): RenderingPreferences {
+function useRenderingPreferences(): RenderingPreferences {
   const storedPrefs = useLiveQuery(readRenderingPreferences, [], DEFAULT_RENDERING_PREFS)
   const [prefs, setPrefs] = useState<RenderingPreferences>(storedPrefs ?? DEFAULT_RENDERING_PREFS)
   useEffect(() => {

@@ -12,11 +12,6 @@
 // and a "Save to preset…" affordance. Picking a model + editing params
 // diverges the chat from its seed preset; the breadcrumb lets the user
 // write those edits back to the preset (update or save-as-new).
-//
-// Model switch: `adaptSettingsForCapability` is called after the new /endpoints
-// row arrives so settings the new model still supports are preserved; the
-// dropped ones are surfaced via a short issues banner on the Generation
-// tab (see ParamForm's own issues banner).
 
 import { useLiveQuery } from 'dexie-react-hooks'
 import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
@@ -70,7 +65,7 @@ import { ApiModeSection, ParamForm, ReasoningIncludeControls } from './ParamForm
 import { ProviderPicker } from './ProviderPicker'
 import { PromptsTab } from './PromptsTab'
 
-export interface ChatModelPanelProps {
+interface ChatModelPanelProps {
   // Null while the user is on /new before the chat row has materialized.
   // The panel renders a placeholder in that case; the rest of the wiring
   // already handles undefined chat / profile / preset.

@@ -29,7 +29,7 @@ import type { WorkspaceRepository } from './repository'
 import { getWorkspaceRepository } from './workspace-repository'
 
 export type SearchScope = 'last-updated-branch' | 'all-branches'
-export type SearchResultSource = 'title' | 'branch-cache' | 'all-branches' | 'folder' | 'tag' | 'preview'
+type SearchResultSource = 'title' | 'branch-cache' | 'all-branches' | 'folder' | 'tag' | 'preview'
 
 export interface SearchFilters {
   includeFolderIds: FolderId[]
@@ -40,7 +40,7 @@ export interface SearchFilters {
   titleOnly: boolean
 }
 
-export interface SearchHighlightRange {
+interface SearchHighlightRange {
   start: number
   end: number
 }
@@ -60,13 +60,13 @@ export interface SearchResult {
   rank: number
 }
 
-export interface ChatSearchStartedUpdate {
+interface ChatSearchStartedUpdate {
   kind: 'started'
   queryId: string
   candidateCount: number
 }
 
-export interface ChatSearchHitUpdate {
+interface ChatSearchHitUpdate {
   kind: 'hit'
   queryId: string
   result: SearchResult
@@ -74,7 +74,7 @@ export interface ChatSearchHitUpdate {
   candidateCount: number
 }
 
-export interface ChatSearchMissUpdate {
+interface ChatSearchMissUpdate {
   kind: 'miss'
   queryId: string
   chatId: ChatId
@@ -82,7 +82,7 @@ export interface ChatSearchMissUpdate {
   candidateCount: number
 }
 
-export interface ChatSearchTaskErrorUpdate {
+interface ChatSearchTaskErrorUpdate {
   kind: 'task-error'
   queryId: string
   chatId: ChatId
@@ -91,7 +91,7 @@ export interface ChatSearchTaskErrorUpdate {
   candidateCount: number
 }
 
-export interface ChatSearchDoneUpdate {
+interface ChatSearchDoneUpdate {
   kind: 'done'
   queryId: string
   completedCount: number
@@ -105,7 +105,7 @@ export type ChatSearchUpdate =
   | ChatSearchTaskErrorUpdate
   | ChatSearchDoneUpdate
 
-export interface ChatSearchOutput {
+interface ChatSearchOutput {
   queryId: string
   results: SearchResult[]
   candidateCount: number
@@ -113,7 +113,7 @@ export interface ChatSearchOutput {
   warnings: SearchQuery['warnings']
 }
 
-export interface SearchChatsInput {
+interface SearchChatsInput {
   queryId: string
   query: string
   scope?: SearchScope
@@ -156,7 +156,7 @@ interface ScanContext {
   signal?: AbortSignal
 }
 
-export class ChatSearchParseError extends Error {
+class ChatSearchParseError extends Error {
   readonly position: number
 
   constructor(error: SearchQueryParseError) {
@@ -166,7 +166,7 @@ export class ChatSearchParseError extends Error {
   }
 }
 
-export class ChatSearchAbortedError extends Error {
+class ChatSearchAbortedError extends Error {
   constructor() {
     super('Search aborted')
     this.name = 'AbortError'

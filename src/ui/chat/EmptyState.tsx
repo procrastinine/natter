@@ -33,7 +33,7 @@ const SAMPLE_PROMPTS: readonly Prompt[] = [
   },
 ]
 
-export interface EmptyStateProps {
+interface EmptyStateProps {
   onPick: (text: string) => void
 }
 

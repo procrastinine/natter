@@ -91,12 +91,12 @@ function idsEquivalent(left: string, right: string): boolean {
   )
 }
 
-export interface ResolveRequestCapabilityInput {
+interface ResolveRequestCapabilityInput {
   profile: ConnectionProfile
   modelId: string
 }
 
-export async function resolveRequestCapability(
+async function resolveRequestCapability(
   input: ResolveRequestCapabilityInput,
 ): Promise<CapabilityDescriptor | undefined> {
   const { profile, modelId } = input
@@ -127,7 +127,7 @@ export async function resolveRequestCapability(
   return merged
 }
 
-export interface RequestPrivacyPlanInput {
+interface RequestPrivacyPlanInput {
   chat: Chat
   profile: ConnectionProfile
   activePathMessages: Message[]
@@ -136,7 +136,7 @@ export interface RequestPrivacyPlanInput {
   signal?: AbortSignal
 }
 
-export interface RequestPrivacyPlan {
+interface RequestPrivacyPlan {
   neededTokens?: number
   privacy: ResolvePrivacyForSendResult
 }
@@ -183,7 +183,7 @@ export async function resolveRequestPrivacyPlan(
   return neededTokens !== undefined ? { neededTokens, privacy } : { privacy }
 }
 
-export interface AssistantRequestPlanInput {
+interface AssistantRequestPlanInput {
   chat: Chat
   connection: ConnectionProfile
   pathMessages: Message[]
@@ -215,7 +215,7 @@ export class NoEligibleProvidersError extends Error {
   }
 }
 
-export interface PreparedAssistantRequestPlan {
+interface PreparedAssistantRequestPlan {
   requestPlan: AssistantRequestPlan
   privacyPlan: RequestPrivacyPlan
 }
@@ -561,7 +561,7 @@ function contentText(content: readonly ContentItem[]): string {
     .join('')
 }
 
-export async function buildAssistantRequestPlan(
+async function buildAssistantRequestPlan(
   input: AssistantRequestPlanInput,
 ): Promise<AssistantRequestPlan> {
   const settings = input.settings ?? input.chat.settings
@@ -664,7 +664,7 @@ export async function buildAssistantRequestPlan(
       ...(prerenderedPrompt !== undefined ? { prerenderedPrompt } : {}),
     }
     const result = toTextCompletions(settings, outboundPath, textOpts)
-    wire = result.wire as unknown as Record<string, unknown>
+    wire = result.wire
     requestedModel = result.requestedModel
     if (useOpenRouterTextProtocol) {
       route = {
@@ -704,7 +704,7 @@ export async function buildAssistantRequestPlan(
         ...(input.transform?.privacy ? { privacy: input.transform.privacy } : {}),
       }
       const result = toResponses(settings, outboundPath, transformOpts)
-      wire = result.wire as unknown as Record<string, unknown>
+      wire = result.wire
       requestedModel = result.requestedModel
     } else if (route.transport === 'gemini-native') {
       const transformOpts: GeminiNativeTransformOptions = {
@@ -714,7 +714,7 @@ export async function buildAssistantRequestPlan(
         ...(routeFormat !== undefined ? { reasoningPreservationFormat: routeFormat } : {}),
       }
       const result = toGeminiNative(settings, outboundPath, transformOpts)
-      wire = result.wire as unknown as Record<string, unknown>
+      wire = result.wire
       requestedModel = result.requestedModel
       geminiModelId = result.modelId
     } else {
@@ -728,7 +728,7 @@ export async function buildAssistantRequestPlan(
         ...(input.transform ?? {}),
       }
       const result = toChatCompletions(settings, outboundPath, transformOpts)
-      wire = result.wire as unknown as Record<string, unknown>
+      wire = result.wire
       requestedModel = result.requestedModel
     }
   }

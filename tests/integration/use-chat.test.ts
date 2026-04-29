@@ -227,15 +227,14 @@ describe('sendText — chat-completions streaming', () => {
       })
     })
     vi.stubGlobal('fetch', fetchMock)
-    const openStream = vi.fn(() =>
-      stream({
-        type: 'delta',
-        chunk: {
-          id: 'should-not-open',
-          choices: [{ delta: { content: 'nope' }, finish_reason: 'stop' }],
-        },
-      } as ChatStreamChunk),
-    )
+    const notOpenedChunk: ChatStreamChunk = {
+      type: 'delta',
+      chunk: {
+        id: 'should-not-open',
+        choices: [{ delta: { content: 'nope' }, finish_reason: 'stop' }],
+      },
+    }
+    const openStream = vi.fn(() => stream(notOpenedChunk))
 
     const sendPromise = sendText({
       chatId: chat.id,
@@ -736,7 +735,7 @@ describe('sendText — chat-completions streaming', () => {
           yield {
             type: 'delta',
             chunk: { choices: [{ delta: { content: 'slow ' } }] },
-          } as ChatStreamChunk
+          }
           producedChunks += 1
           // Hand the event loop back so the microtask queue can run the
           // abort() call scheduled below.
@@ -768,7 +767,7 @@ describe('sendText — chat-completions streaming', () => {
           yield {
             type: 'delta',
             chunk: { id: 'gen-live-shape', choices: [{ delta: { content: 'slow ' } }] },
-          } as ChatStreamChunk
+          }
           await Promise.resolve()
           abort.abort()
           throw new ApiError({
@@ -809,7 +808,7 @@ describe('sendText — chat-completions streaming', () => {
           yield {
             type: 'delta',
             chunk: { choices: [{ delta: { content: 'Partial ' } }] },
-          } as ChatStreamChunk
+          }
           markPaused()
           await gate
           yield {
@@ -818,7 +817,7 @@ describe('sendText — chat-completions streaming', () => {
               choices: [{ delta: { content: 'answer' }, finish_reason: 'stop' }],
               usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5, cost: 0.0002 },
             },
-          } as ChatStreamChunk
+          }
         })(),
       now: () => {
         tick += 250
@@ -923,7 +922,7 @@ describe('sendText — chat-completions streaming', () => {
           yield {
             type: 'delta',
             chunk: { choices: [{ delta: { content: 'Partial ' } }] },
-          } as ChatStreamChunk
+          }
           markPaused()
           await gate
           yield {
@@ -932,7 +931,7 @@ describe('sendText — chat-completions streaming', () => {
               choices: [{ delta: { content: 'answer' }, finish_reason: 'stop' }],
               usage: { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 },
             },
-          } as ChatStreamChunk
+          }
         })(),
       now: () => {
         tick += 250
@@ -1666,7 +1665,7 @@ describe('sendText — token calibration sample ingest', () => {
         yield {
           type: 'delta',
           chunk: { choices: [{ delta: { content: 'partial text' } }] },
-        } as ChatStreamChunk
+        }
         await blocked
       },
     })
@@ -1710,7 +1709,7 @@ describe('sendText — token calibration sample ingest', () => {
           yield {
             type: 'delta',
             chunk: { choices: [{ delta: { content: 'remote-stop partial' } }] },
-          } as ChatStreamChunk
+          }
           markPaused()
           await new Promise<void>((_, reject) => {
             if (signal.aborted) {
@@ -1789,7 +1788,7 @@ describe('sendText — token calibration sample ingest', () => {
             item_id: 'msg_1',
             delta: 'phase text',
           },
-        } as ResponsesStreamChunk
+        }
         yield {
           type: 'event',
           event: {
@@ -1804,7 +1803,7 @@ describe('sendText — token calibration sample ingest', () => {
               content: [{ type: 'output_text', text: 'phase text'.repeat(500) }],
             },
           },
-        } as ResponsesStreamChunk
+        }
         markPaused()
         await blocked
         yield {
@@ -1818,7 +1817,7 @@ describe('sendText — token calibration sample ingest', () => {
               usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
             },
           },
-        } as ResponsesStreamChunk
+        }
       },
     })
 

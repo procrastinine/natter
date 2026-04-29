@@ -18,7 +18,7 @@
 import { safeServerTokens } from './token-guards'
 import type { ChatUsage, Message } from './types'
 
-export interface NormalizedUsage {
+interface NormalizedUsage {
   promptTokens: number
   completionTokens: number
   totalTokens: number

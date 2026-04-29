@@ -3,9 +3,9 @@
 export const QUOTA_WARN_RATIO = 0.8
 export const QUOTA_HARD_WARN_RATIO = 0.95
 
-export type QuotaLevel = 'ok' | 'warn' | 'hard-warn'
+type QuotaLevel = 'ok' | 'warn' | 'hard-warn'
 
-export interface QuotaSnapshot {
+interface QuotaSnapshot {
   usage: number
   quota: number
   ratio: number

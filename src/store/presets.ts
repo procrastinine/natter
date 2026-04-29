@@ -25,7 +25,7 @@ export class PresetMissingError extends Error {
   }
 }
 
-export interface CreatePresetInput {
+interface CreatePresetInput {
   id?: PresetId
   name: string
   connectionProfileId: ProfileId
@@ -213,7 +213,7 @@ export async function pickPreferredPreset(opts: {
 // Per-preset JSON export. Strips `lastUsedAt`/`archived` and includes a
 // `connectionSketch` so the importer can suggest a matching connection. No key
 // material travels with the export; the importer wires up a key. See §9.2.B.
-export interface PresetExport {
+interface PresetExport {
   schemaVersion: 1
   preset: Omit<ChatPreset, 'lastUsedAt' | 'archived'>
   connectionSketch: {

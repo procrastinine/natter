@@ -115,7 +115,7 @@ export function normalizeReasoningSettings(
 //      - Otherwise plaintext reasoning (DeepSeek inline `<think>` / OpenRouter-
 //        repackaged Gemini summary): kept iff `include.text === true`.
 // Returns the kept subset; never mutates the input.
-export interface FilterReasoningOptions {
+interface FilterReasoningOptions {
   // Only meaningful when the target route is Anthropic. When `true`, the
   // filter keeps `reasoning.encrypted` entries with
   // `format: 'anthropic-claude-v1'` (Claude 3.7 Sonnet redacted_thinking).
@@ -195,7 +195,7 @@ export function filterReasoningForInclude(
 // is silent per user directive. Gated on dev so prod consoles stay quiet.
 function warnIncompatibleFormat(stored: ReasoningFormat, target: ReasoningFormat): void {
   if (typeof console === 'undefined') return
-  // eslint-disable-next-line no-console
+
   console.warn(
     `[reasoning] dropping encrypted reasoning — stored format ${stored} is not compatible with target ${target}. Switching providers / bridges mid-chat invalidates opaque carriers.`,
   )

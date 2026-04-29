@@ -7,7 +7,6 @@ import type {
   ChatSettings,
   Message,
   ReasoningDetail,
-  ReasoningInclude,
   ResponsesOutputItem,
   ToolCall,
 } from '../../src/core/types'
@@ -177,7 +176,7 @@ describe('toResponses — reasoning echo', () => {
           mode: 'off',
           exclude: false,
           summary: 'off',
-          include: { encrypted: false, summary: true, text: false } as ReasoningInclude,
+          include: { encrypted: false, summary: true, text: false },
         },
       }),
       path,
@@ -204,7 +203,7 @@ describe('toResponses — reasoning echo', () => {
           mode: 'off',
           exclude: false,
           summary: 'off',
-          include: { encrypted: false, summary: true, text: false } as ReasoningInclude,
+          include: { encrypted: false, summary: true, text: false },
         },
       }),
       path,
@@ -235,7 +234,7 @@ describe('toResponses — reasoning echo', () => {
           mode: 'off',
           exclude: false,
           summary: 'off',
-          include: { encrypted: true, summary: true, text: false } as ReasoningInclude,
+          include: { encrypted: true, summary: true, text: false },
         },
       }),
       path,
@@ -263,7 +262,7 @@ describe('toResponses — reasoning echo', () => {
           mode: 'off',
           exclude: false,
           summary: 'off',
-          include: { encrypted: false, summary: false, text: false } as ReasoningInclude,
+          include: { encrypted: false, summary: false, text: false },
         },
       }),
       path,
@@ -296,7 +295,7 @@ describe('toResponses — gpt54SamplingGate', () => {
         effort: 'medium',
         exclude: false,
         summary: 'off',
-        include: { encrypted: true, summary: false, text: false } as ReasoningInclude,
+        include: { encrypted: true, summary: false, text: false },
       },
     })
     const { wire } = toResponses(s, [user('u1', 'hi')])
@@ -314,7 +313,7 @@ describe('toResponses — gpt54SamplingGate', () => {
         effort: 'none',
         exclude: false,
         summary: 'off',
-        include: { encrypted: true, summary: false, text: false } as ReasoningInclude,
+        include: { encrypted: true, summary: false, text: false },
       },
     })
     const { wire } = toResponses(s, [user('u1', 'hi')])

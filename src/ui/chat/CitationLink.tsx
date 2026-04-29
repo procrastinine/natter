@@ -1,6 +1,6 @@
 import type { MouseEvent, ReactNode } from 'react'
 
-export interface CitationLinkProps {
+interface CitationLinkProps {
   kind: 'url' | 'file'
   href?: string
   fileRef?: string

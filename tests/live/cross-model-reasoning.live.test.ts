@@ -16,7 +16,7 @@ import {
 } from '../../src/api/chat-completions'
 import { responsesOnce, type ResponsesContext } from '../../src/api/responses'
 import { geminiOnce, type GeminiContext } from '../../src/api/gemini-native'
-import type { ChatCompletionRequestWire, ResponsesInputItem } from '../../src/api/types'
+import type { ResponsesInputItem } from '../../src/api/types'
 import type { ConnectionProfile } from '../../src/core/types'
 
 const LIVE = process.env.LIVE === '1'
@@ -260,7 +260,7 @@ describe.skipIf(!LIVE)('live cross-model — Anthropic via OpenRouter (cross-tie
       messages: [{ role: 'user', content: 'What is 6+7? Show carry.' }],
       max_tokens: 1500,
       reasoning: { enabled: true, max_tokens: 1000 },
-    } as ChatCompletionRequestWire)
+    })
     const msg1 = turn1.choices?.[0]?.message
     const details1 = msg1?.reasoning_details as Array<{ type?: string; signature?: string }> | undefined
     const signed = details1?.find((d) => d.type === 'reasoning.text' && !!d.signature)
@@ -280,7 +280,7 @@ describe.skipIf(!LIVE)('live cross-model — Anthropic via OpenRouter (cross-tie
       ],
       max_tokens: 200,
       reasoning: { enabled: true, max_tokens: 500 },
-    } as ChatCompletionRequestWire)
+    })
     expect(turn2.choices?.[0]?.message?.content ?? '').toMatch(/14/)
   }, 120_000)
 })
@@ -358,7 +358,7 @@ describe.skipIf(!LIVE)('live — OpenRouter reasoning summary surface', () => {
       ],
       max_tokens: 500,
       reasoning: { enabled: true, effort: 'medium' },
-    } as ChatCompletionRequestWire)
+    })
     const msg = result.choices?.[0]?.message
     expect(typeof msg?.reasoning).toBe('string')
     expect((msg?.reasoning ?? '').length).toBeGreaterThan(30)
@@ -386,7 +386,7 @@ describe.skipIf(!LIVE)('live — OpenRouter reasoning summary surface', () => {
       max_tokens: 1500,
       reasoning: { enabled: true, effort: 'high' },
       stream: true,
-    } as ChatCompletionRequestWire)) {
+    })) {
       if (chunk.type !== 'delta') continue
       const rd = chunk.chunk.choices?.[0]?.delta?.reasoning_details
       if (!Array.isArray(rd)) continue

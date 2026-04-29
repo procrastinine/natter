@@ -7,12 +7,12 @@ import { InfoDisclosure } from './InfoDisclosure'
 
 const STORAGE_KEY = 'image-allowlist'
 
-export async function readImageAllowlist(): Promise<string[]> {
+async function readImageAllowlist(): Promise<string[]> {
   const stored = await getSetting<string[]>(STORAGE_KEY)
   return stored ?? []
 }
 
-export async function writeImageAllowlist(next: string[]): Promise<void> {
+async function writeImageAllowlist(next: string[]): Promise<void> {
   await setSetting(STORAGE_KEY, next)
 }
 

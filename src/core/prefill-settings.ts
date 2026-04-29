@@ -6,9 +6,9 @@ import {
 import { prefillClassFor, reasoningToggleableFor } from './quirks'
 import type { ChatSettings, ModelEndpoint, ProviderPreferences } from './types'
 
-export const PREFILL_PREFERRED_PROVIDERS = ['deepinfra', 'nebius'] as const
+const PREFILL_PREFERRED_PROVIDERS = ['deepinfra', 'nebius'] as const
 
-export interface PrefillSettingsRecommendation {
+interface PrefillSettingsRecommendation {
   issues: string[]
   patch: Partial<ChatSettings>
 }
@@ -46,7 +46,7 @@ export function prefillSettingsRecommendation(
   return issues.length > 0 ? { issues, patch } : null
 }
 
-export function availablePrefillProviderRefs(endpoints: readonly ModelEndpoint[]): string[] {
+function availablePrefillProviderRefs(endpoints: readonly ModelEndpoint[]): string[] {
   const out: string[] = []
   const seen = new Set<string>()
   for (const endpoint of endpoints) {

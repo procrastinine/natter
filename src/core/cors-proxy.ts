@@ -43,12 +43,12 @@ export interface CorsProxyConfig {
 // HTML (200 + the page's `data_policy` / `provider_display_name` markers)
 // from a browser-style request, document it in `plan/cors-proxy.md`, and
 // add a row here.
-export interface KnownBouncer {
+interface KnownBouncer {
   host: string
   buildUrl: (modelId: string) => string
 }
 
-export const KNOWN_BOUNCERS: ReadonlyArray<KnownBouncer> = [
+const KNOWN_BOUNCERS: ReadonlyArray<KnownBouncer> = [
   {
     host: 'corsproxy.io',
     buildUrl: (m) => `https://corsproxy.io/?url=https://openrouter.ai/${m}/providers`,

@@ -1,23 +1,9 @@
 import type { ChatId, ChatTag, TagId } from '../core/types'
-import { onEvent } from './broadcast'
 import { getDb } from './db'
 import type { CreateTagInput, UpdateTagInput } from './repository'
 import { getWorkspaceRepository } from './workspace-repository'
 
-let cache: ChatTag[] | null = null
-let unsubscribe: (() => void) | null = null
-
-function ensureListener(): void {
-  if (unsubscribe) return
-  unsubscribe = onEvent((event) => {
-    if (event.kind === 'tag-mutated' || event.kind === 'tag-deleted') {
-      cache = null
-    }
-  })
-}
-
 export async function listTags(): Promise<ChatTag[]> {
-  ensureListener()
   // Keep this read synchronous up to the Dexie table access so useLiveQuery can
   // subscribe to tag writes. The UI still depends only on this store-layer
   // abstraction; daemon mode will replace the store implementation.
@@ -30,30 +16,20 @@ export async function listTags(): Promise<ChatTag[]> {
   }
 }
 
-export async function getTag(tagId: TagId): Promise<ChatTag | undefined> {
-  ensureListener()
-  const cached = cache?.find((tag) => tag.id === tagId)
-  if (cached) return { ...cached }
-  return getWorkspaceRepository().getTag(tagId)
-}
-
 export async function createTag(input: CreateTagInput): Promise<ChatTag> {
-  ensureListener()
   return getWorkspaceRepository().createTag(input)
 }
 
 export async function updateTag(tagId: TagId, patch: UpdateTagInput): Promise<ChatTag | undefined> {
-  ensureListener()
   return getWorkspaceRepository().updateTag(tagId, patch)
 }
 
 export async function deleteTag(tagId: TagId): Promise<boolean> {
-  ensureListener()
   const result = await getWorkspaceRepository().deleteTag(tagId)
   return result.deleted
 }
 
-export interface MergeTagResult {
+interface MergeTagResult {
   merged: boolean
   affectedChatIds: ChatId[]
 }
@@ -89,7 +65,6 @@ export async function mergeTagInto(
   targetTagId: TagId,
   now = Date.now(),
 ): Promise<MergeTagResult> {
-  ensureListener()
   if (sourceTagId === targetTagId) return { merged: false, affectedChatIds: [] }
   const repo = getWorkspaceRepository()
   const [source, target, chats] = await Promise.all([
@@ -122,11 +97,7 @@ function sameStringList(left: readonly string[], right: readonly string[]): bool
   return left.every((value, index) => value === right[index])
 }
 
-export function __resetTagStoreForTests(): void {
-  cache = null
-  unsubscribe?.()
-  unsubscribe = null
-}
+export function __resetTagStoreForTests(): void {}
 
 function sortTags(rows: ChatTag[]): ChatTag[] {
   return rows.sort((left, right) => {

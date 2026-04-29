@@ -30,45 +30,35 @@ export type GeneratedOutputDownloader = (input: {
   kind: GeneratedOutputKind
 }) => Promise<Blob | null | undefined>
 
-export type GeneratedVideoUrlResolver = (url: string) => Promise<string[]>
+type GeneratedVideoUrlResolver = (url: string) => Promise<string[]>
 
-export interface GeneratedImageReplacement {
+interface GeneratedImageReplacement {
   sourceUrl: string
   item: OutputImageItem
   ref: MessageAttachmentRef
 }
 
-export interface GeneratedOutputReplacement {
+interface GeneratedOutputReplacement {
   sourceUrl: string
   item: ContentItem
   ref: MessageAttachmentRef
 }
 
-export interface GeneratedImageMaterialization {
+interface GeneratedImageMaterialization {
   content: ContentItem[]
   replacements: GeneratedImageReplacement[]
   newRefs: MessageAttachmentRef[]
   changed: boolean
 }
 
-export interface GeneratedOutputMaterialization {
+interface GeneratedOutputMaterialization {
   content: ContentItem[]
   replacements: GeneratedOutputReplacement[]
   newRefs: MessageAttachmentRef[]
   changed: boolean
 }
 
-export function contentHasRawGeneratedImageOutput(content: readonly ContentItem[]): boolean {
-  return content.some(
-    (item) =>
-      item.type === 'output_image' &&
-      !item.attachmentId &&
-      typeof item.url === 'string' &&
-      item.url.length > 0,
-  )
-}
-
-export function generatedImageOutputAttachmentIds(content: readonly ContentItem[]): Set<string> {
+function generatedImageOutputAttachmentIds(content: readonly ContentItem[]): Set<string> {
   return generatedOutputAttachmentIds(content)
 }
 
@@ -82,7 +72,7 @@ export function generatedOutputAttachmentIds(content: readonly ContentItem[]): S
   return ids
 }
 
-export async function materializeGeneratedImageOutputAttachments(input: {
+async function materializeGeneratedImageOutputAttachments(input: {
   messageId: MessageId
   content: readonly ContentItem[]
   now?: number
@@ -380,7 +370,7 @@ async function localizeReferencedGeneratedOutputAttachments(
       blob.type ||
       (kind === 'image'
         ? remoteImage(sourceUrl)?.mime
-        : remoteMedia(sourceUrl, kind as 'audio' | 'video')?.mime) ||
+        : remoteMedia(sourceUrl, kind)?.mime) ||
       attachment.mime
     const filename =
       kind === 'image'

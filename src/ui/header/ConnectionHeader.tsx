@@ -61,8 +61,8 @@ function normalizeActiveSeedState(value: unknown): ActiveSeedState | null {
   if (!value || typeof value !== 'object') return null
   const candidate = value as { profileId?: unknown; presetId?: unknown; settings?: unknown }
   const profileId =
-    typeof candidate.profileId === 'string' ? (candidate.profileId as ProfileId) : null
-  const presetId = typeof candidate.presetId === 'string' ? (candidate.presetId as PresetId) : null
+    typeof candidate.profileId === 'string' ? (candidate.profileId) : null
+  const presetId = typeof candidate.presetId === 'string' ? (candidate.presetId) : null
   const rawSettings =
     candidate.settings && typeof candidate.settings === 'object'
       ? (candidate.settings as ChatSettings)
@@ -71,7 +71,7 @@ function normalizeActiveSeedState(value: unknown): ActiveSeedState | null {
   // didn't have `reasoning.include` yet. Heal them on the way in so the seed
   // can't carry a malformed shape into newly-created chats.
   const settings = rawSettings
-    ? ({ ...rawSettings, reasoning: normalizeReasoningSettings(rawSettings.reasoning) } as ChatSettings)
+    ? ({ ...rawSettings, reasoning: normalizeReasoningSettings(rawSettings.reasoning) })
     : null
   if (!profileId && !presetId && !settings) return null
   return { profileId, presetId, settings }
@@ -89,7 +89,7 @@ export function readActiveSeedState(): ActiveSeedState {
     }
   }
   const legacy = window.localStorage.getItem(ACTIVE_PROFILE_KEY)
-  return { profileId: (legacy ?? null) as ProfileId | null, presetId: null, settings: null }
+  return { profileId: (legacy ?? null), presetId: null, settings: null }
 }
 
 export function writeActiveSeedState(state: ActiveSeedState): void {
@@ -401,7 +401,7 @@ async function runConnectionTest(opts: {
   }
 }
 
-export interface ConnectionHeaderProps {
+interface ConnectionHeaderProps {
   activeChatId?: ChatId | null
   activeChatProfileId?: ProfileId | null
 }
@@ -640,7 +640,7 @@ function ProfileSwitcher({ profiles, activeId, onSwitch, onCreateNew }: ProfileS
         id="connection-profile-select"
         data-ui="connection-profile-select"
         value={activeId}
-        onChange={(e) => void onSwitch(e.target.value as ProfileId)}
+        onChange={(e) => void onSwitch(e.target.value)}
       >
         {profiles.map((p) => (
           <option key={p.id} value={p.id}>

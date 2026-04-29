@@ -9,7 +9,7 @@ import { EyeIcon, EyeOffIcon } from '../icons/Icon'
 import { MarkdownView } from './MarkdownView'
 import type { MessageCollapseMode } from './MessageStreamOverflow'
 
-export interface MessageContentProps {
+interface MessageContentProps {
   content: ContentItem[]
   text: string
   streaming?: boolean

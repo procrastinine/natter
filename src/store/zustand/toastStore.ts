@@ -13,9 +13,9 @@
 
 import { create } from 'zustand'
 
-export type ToastLevel = 'info' | 'success' | 'warning' | 'danger'
+type ToastLevel = 'info' | 'success' | 'warning' | 'danger'
 
-export interface Toast {
+interface Toast {
   id: string
   level: ToastLevel
   text: string
@@ -27,9 +27,9 @@ export interface Toast {
   createdAt: number
 }
 
-export type BannerKind = 'chat-not-found' | 'mutation-conflict' | 'stale-edit' | 'stale-reasoning'
+type BannerKind = 'chat-not-found' | 'mutation-conflict' | 'stale-edit' | 'stale-reasoning'
 
-export interface Banner {
+interface Banner {
   id: string
   kind: BannerKind
   text: string
@@ -39,7 +39,7 @@ export interface Banner {
   secondary?: { label: string; action: () => void | Promise<void> }
 }
 
-export interface ToastStoreState {
+interface ToastStoreState {
   toasts: Toast[]
   banners: Banner[]
   push: (t: Omit<Toast, 'id' | 'createdAt' | 'durationMs'> & { durationMs?: number }) => string

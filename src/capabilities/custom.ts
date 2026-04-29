@@ -9,7 +9,7 @@
 
 import type { CapabilityDescriptor } from '../core/types'
 
-export const PERMISSIVE_PARAMETERS: readonly string[] = [
+const PERMISSIVE_PARAMETERS: readonly string[] = [
   // Sampling
   'temperature',
   'top_p',

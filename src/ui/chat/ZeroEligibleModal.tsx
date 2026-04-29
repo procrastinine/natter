@@ -16,7 +16,7 @@ import type { ChatId } from '../../core/types'
 import { getChat, updateChatSettings } from '../../store/chats'
 import { useUiStore } from '../../store/zustand/uiStore'
 
-export interface ZeroEligibleModalProps {
+interface ZeroEligibleModalProps {
   chatId: ChatId
 }
 

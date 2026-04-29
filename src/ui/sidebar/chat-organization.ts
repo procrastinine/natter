@@ -7,18 +7,16 @@ import {
   type SidebarSortMode,
 } from '../../core/sidebar-sort'
 
-export type { SidebarSortMode } from '../../core/sidebar-sort'
+type SidebarSortValue = number | string
 
-export type SidebarSortValue = number | string
-
-export interface SidebarChatEntry {
+interface SidebarChatEntry {
   kind: 'chat'
   chat: ChatSidebarRow
   sortValue: SidebarSortValue
   pinned: boolean
 }
 
-export interface SidebarFolderEntry {
+interface SidebarFolderEntry {
   kind: 'folder'
   folder: ChatFolder
   chats: ChatSidebarRow[]
@@ -26,15 +24,15 @@ export interface SidebarFolderEntry {
   pinned: boolean
 }
 
-export type SidebarEntry = SidebarChatEntry | SidebarFolderEntry
+type SidebarEntry = SidebarChatEntry | SidebarFolderEntry
 
-export interface SidebarCreatedAtGroup {
+interface SidebarCreatedAtGroup {
   key: 'today' | 'yesterday' | 'previous-7-days' | 'previous-30-days' | 'older'
   label: string
   chats: ChatSidebarRow[]
 }
 
-export interface SidebarSortOptions {
+interface SidebarSortOptions {
   locale?: string | string[]
 }
 
@@ -61,7 +59,7 @@ export function shouldRenderCreatedAtGroups(mode: SidebarSortMode): boolean {
   return isCreatedAtSidebarSort(mode)
 }
 
-export function chatSortValue(chat: ChatSidebarRow, mode: SidebarSortMode): SidebarSortValue {
+function chatSortValue(chat: ChatSidebarRow, mode: SidebarSortMode): SidebarSortValue {
   const updatedAt = numberOrZero(chat.updatedAt)
   const field = sidebarSortField(mode)
   switch (field) {
@@ -80,7 +78,7 @@ export function chatSortValue(chat: ChatSidebarRow, mode: SidebarSortMode): Side
   }
 }
 
-export function folderSortValue(
+function folderSortValue(
   folder: ChatFolder,
   chats: readonly ChatSidebarRow[],
   mode: SidebarSortMode,

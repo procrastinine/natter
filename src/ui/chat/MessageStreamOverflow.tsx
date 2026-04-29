@@ -3,18 +3,18 @@ import type { LongMessageDisplayMode } from '../../core/global-settings'
 
 export type MessageCollapseMode = 'full' | 'compact' | 'peek'
 
-export interface MessageCollapseProfile {
+interface MessageCollapseProfile {
   defaultMode: MessageCollapseMode
   modes: readonly MessageCollapseMode[]
   oversized: boolean
 }
 
-export interface MessageCollapseProfileOptions {
+interface MessageCollapseProfileOptions {
   streaming?: boolean
   longMessageDisplayMode?: LongMessageDisplayMode
 }
 
-export interface MessageStreamOverflowProps {
+interface MessageStreamOverflowProps {
   collapseMode: MessageCollapseMode
   fullChildren: ReactNode
   compactChildren: ReactNode
@@ -22,7 +22,7 @@ export interface MessageStreamOverflowProps {
 }
 
 export const DEFAULT_OVERFLOW_THRESHOLD = 20_000
-export const LONG_MESSAGE_THRESHOLD = 4_000
+const LONG_MESSAGE_THRESHOLD = 4_000
 
 // The user wants avatar-driven collapse states instead of a separate
 // "show full" banner:

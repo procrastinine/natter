@@ -69,7 +69,7 @@ export interface CachedProvidersRow {
   payload: unknown
 }
 
-export interface CachedGenerationRow {
+interface CachedGenerationRow {
   id: string
   chatId: string
   gen_id: string

@@ -51,9 +51,7 @@ describe('splitResponsesStream — streaming fixture (probe 5)', () => {
     const lanes = await collect(splitResponsesStream(asAsync(sseToChunks(body))))
 
     // 1. First event should be meta with model + generationId.
-    const firstMeta = lanes.find((l) => l.lane === 'meta') as
-      | Extract<StreamLaneEvent, { lane: 'meta' }>
-      | undefined
+    const firstMeta = lanes.find((l) => l.lane === 'meta')
     expect(firstMeta?.model).toMatch(/gpt-5\.4-nano/)
     expect(firstMeta?.generationId).toMatch(/^resp_/)
 

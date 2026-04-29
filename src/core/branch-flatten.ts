@@ -24,12 +24,12 @@ const PHASE_LABEL: Record<NonNullable<Message['phase']>, string> = {
   final_answer: 'final',
 }
 
-export interface ChatTextExport {
+interface ChatTextExport {
   filename: string
   content: string
 }
 
-export interface FlattenBranchOptions {
+interface FlattenBranchOptions {
   includeTitle?: boolean
 }
 

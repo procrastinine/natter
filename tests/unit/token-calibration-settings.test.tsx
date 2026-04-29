@@ -58,7 +58,7 @@ describe('TokenCalibrationSettings', () => {
     )
     const options = container.querySelectorAll('option')
     expect(options.length).toBe(3)
-    const values = Array.from(options).map((o) => (o as HTMLOptionElement).value)
+    const values = Array.from(options).map((o) => (o).value)
     expect(values).toEqual(['adaptive', 'global-only', 'family-defaults-only'])
   })
 

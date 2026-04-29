@@ -18,7 +18,7 @@ import { DEFAULT_LLAMA_SERVER_CAPABILITY } from './llama-server'
 import { OPENAI_CAPABILITIES } from './openai'
 import type { BundledModelEntry, CapabilityTable } from './types'
 
-export function tableFor(kind: ConnectionKind): CapabilityTable | null {
+function tableFor(kind: ConnectionKind): CapabilityTable | null {
   switch (kind) {
     case 'openai-compatible':
       return OPENAI_CAPABILITIES
@@ -41,7 +41,7 @@ function defaultCapabilityFor(kind: ConnectionKind): CapabilityDescriptor {
   return kind === 'llama-server' ? DEFAULT_LLAMA_SERVER_CAPABILITY : DEFAULT_CUSTOM_CAPABILITY
 }
 
-export function lookupBundledEntry(
+function lookupBundledEntry(
   kind: ConnectionKind,
   modelId: string,
 ): BundledModelEntry | undefined {

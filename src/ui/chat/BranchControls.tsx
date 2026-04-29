@@ -23,7 +23,7 @@ import { swipe } from '../../core/messages'
 import type { ChatId, CursorMap, Message } from '../../core/types'
 import { useChatStore } from '../../store/zustand/chatStore'
 
-export interface BranchControlsProps {
+interface BranchControlsProps {
   chatId: ChatId
   message: Message
   messages: readonly Message[]

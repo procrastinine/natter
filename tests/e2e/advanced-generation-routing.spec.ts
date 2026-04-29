@@ -1159,7 +1159,7 @@ async function requestPlans(page: Page): Promise<PlanEntry[]> {
       (
         window as unknown as { __debugStreams?: { plans(): PlanEntry[] } }
       ).__debugStreams?.plans() ?? [],
-  ) as Promise<PlanEntry[]>
+  )
 }
 
 function findLastPlan(plans: PlanEntry[], source: string): PlanEntry {

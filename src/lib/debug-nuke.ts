@@ -18,7 +18,7 @@ interface NukeOptions {
   skipReload?: boolean
 }
 
-export async function nukeSiteStorage(opts: NukeOptions = {}): Promise<void> {
+async function nukeSiteStorage(opts: NukeOptions = {}): Promise<void> {
   const tasks: Array<Promise<unknown>> = []
 
   // IndexedDB — enumerate via the modern API, fall back to the known db name.
@@ -126,7 +126,7 @@ export function installDebugNuke(): void {
   if (typeof window === 'undefined') return
   ;(window as unknown as { __nuke: typeof nukeSiteStorage }).__nuke = nukeSiteStorage
   // Friendly hint in the console — fires once on first load.
-  // eslint-disable-next-line no-console
+
   console.info(
     '%c[debug] window.__nuke() — wipe IDB / storage / cookies / cache and reload.',
     'color:#888;font-style:italic',

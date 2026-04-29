@@ -18,10 +18,10 @@ import type {
 } from '../core/types'
 import type { ChatMutationSummary, StreamLeaseRow } from './repository'
 
-export type EngineKind = 'daemon' | 'in-tab'
-export type AutoTitleStatus = 'auto' | 'auto-failed' | 'manual'
-export type StreamOutcome = 'done' | 'error' | 'abort'
-export type EngineDetachReason = 'daemon-offline' | 'tab-close' | 'shutdown'
+type EngineKind = 'daemon' | 'in-tab'
+type AutoTitleStatus = 'auto' | 'auto-failed' | 'manual'
+type StreamOutcome = 'done' | 'error' | 'abort'
+type EngineDetachReason = 'daemon-offline' | 'tab-close' | 'shutdown'
 
 export type BroadcastEvent =
   | {
@@ -72,7 +72,7 @@ export type BroadcastEvent =
   | { kind: 'engine-attached'; engineKind: EngineKind; version: string }
   | { kind: 'engine-detached'; reason: EngineDetachReason }
 
-export type BroadcastHandler = (event: BroadcastEvent) => void
+type BroadcastHandler = (event: BroadcastEvent) => void
 
 const CHANNEL_NAME = 'llm-api-frontend'
 

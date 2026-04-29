@@ -8,7 +8,6 @@ import { buildChatMessages, toChatCompletions } from '../../src/core/transforms'
 import type {
   ChatSettings,
   Message,
-  MessageRole,
   ReasoningDetail,
   ReasoningFormat,
   ReasoningInclude,
@@ -29,7 +28,7 @@ function assistantWithReasoning(
     turnId: `${id}-t`,
     turnIndex: 0,
     createdAt: 1,
-    role: 'assistant' as MessageRole,
+    role: 'assistant',
     origin: 'generated',
     content: [{ type: 'text', text }],
     reasoningDetails: details,

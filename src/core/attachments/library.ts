@@ -7,7 +7,7 @@ import type {
   ProcessAttachmentResult,
 } from './types'
 
-export interface CreateAttachmentRefInput {
+interface CreateAttachmentRefInput {
   attachmentId: string
   refId?: string
   messageId?: string
@@ -16,7 +16,7 @@ export interface CreateAttachmentRefInput {
   now?: number
 }
 
-export interface AttachmentLibrarySnapshot {
+interface AttachmentLibrarySnapshot {
   attachments: ProcessAttachmentResult[]
   refs: MessageAttachmentRef[]
 }

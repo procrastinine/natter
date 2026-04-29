@@ -51,14 +51,14 @@ function isDatabaseClosedError(error: unknown): boolean {
   return candidate?.name === 'DatabaseClosedError' || candidate?.inner?.name === 'DatabaseClosedError'
 }
 
-export interface ChatSidebarListOptions {
+interface ChatSidebarListOptions {
   limit?: number
   offset?: number
   orderBy?: 'updatedAt' | 'createdAt' | 'lastViewedAt'
   direction?: 'asc' | 'desc'
 }
 
-export interface CreateChatInput {
+interface CreateChatInput {
   id?: ChatId
   title?: string
   settings?: ChatSettings
@@ -419,7 +419,7 @@ export async function moveChatToFolder(
   return changed
 }
 
-export async function setChatTags(
+async function setChatTags(
   chatId: ChatId,
   tagIds: readonly TagId[],
   now = Date.now(),
@@ -582,7 +582,7 @@ export async function updateChatSettings(
   await repo.runMutation([{ kind: 'chat-meta', chatId }], async (ctx) => {
     const chat = await ctx.getChat(chatId)
     if (!chat) return
-    let nextSettings = { ...chat.settings } as ChatSettings
+    let nextSettings = { ...chat.settings }
     for (const key of keys) {
       const value = patch[key]
       if (value === undefined) delete (nextSettings as Partial<ChatSettings>)[key]

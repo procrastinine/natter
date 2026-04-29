@@ -73,7 +73,7 @@ export function slotFor(kind: PromptPresetKind): SlotAccessors {
   return SLOTS[kind]
 }
 
-export interface CreatePromptPresetInput {
+interface CreatePromptPresetInput {
   id?: PromptPresetId
   kind: PromptPresetKind
   name: string
@@ -115,7 +115,7 @@ export async function listPromptPresets(
   return rows
 }
 
-export interface UpdatePromptPresetPatch {
+interface UpdatePromptPresetPatch {
   name?: string
   text?: string
 }

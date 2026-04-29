@@ -11,7 +11,7 @@ import {
 
 export type ScrollState = 'follow' | 'pinned'
 
-export interface ScrollRegionProps {
+interface ScrollRegionProps {
   children: ReactNode
   pinThresholdPx?: number
   // Notified whenever the follow/pinned state changes. Lets a sibling render

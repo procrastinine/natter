@@ -2,7 +2,7 @@ import type { ProfilePictureRef } from '../../core/global-settings'
 import type { Message } from '../../core/types'
 import { PersonIcon, RobotIcon } from '../icons/Icon'
 
-export interface ProfileGlyphProps {
+interface ProfileGlyphProps {
   role: Message['role']
   // Override the default picture for the user / assistant glyphs (consumed
   // from global preferences). System / tool / developer fall back to the

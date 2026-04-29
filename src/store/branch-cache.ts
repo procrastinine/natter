@@ -15,7 +15,7 @@ function ensureListener(): void {
   })
 }
 
-export async function getChatBranchCache(chatId: ChatId): Promise<ChatBranchCache | undefined> {
+async function getChatBranchCache(chatId: ChatId): Promise<ChatBranchCache | undefined> {
   ensureListener()
   if (cacheByChat.has(chatId)) return cacheByChat.get(chatId)
   const row = await getWorkspaceRepository().getChatBranchCache(chatId)

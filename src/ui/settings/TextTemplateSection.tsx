@@ -18,7 +18,7 @@ import type { Chat, TextTemplateConfig, TextTemplateId } from '../../core/types'
 import { updateChatSettings } from '../../store/chats'
 import { InfoDisclosure } from './InfoDisclosure'
 
-export interface TextTemplateSectionProps {
+interface TextTemplateSectionProps {
   chat: Chat
   mode: 'llama-server' | 'openrouter'
   llamaProps?: LlamaServerProps | null

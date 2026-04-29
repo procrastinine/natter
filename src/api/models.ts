@@ -15,7 +15,7 @@ import type { ConnectionProfile } from '../core/types'
 import { buildHeaders, fetchWithTimeout } from './client'
 import { normalizeError } from './errors'
 
-export interface DiscoveryContext {
+interface DiscoveryContext {
   profile: ConnectionProfile
   apiKey: string
 }

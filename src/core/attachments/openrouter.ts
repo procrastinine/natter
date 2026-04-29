@@ -1,19 +1,19 @@
 import type { ProcessAttachmentResult } from './types'
 
-export type OpenRouterImageDetail = 'auto' | 'low' | 'high'
+type OpenRouterImageDetail = 'auto' | 'low' | 'high'
 
-export type OpenRouterContentPart =
+type OpenRouterContentPart =
   | { type: 'text'; text: string }
   | { type: 'image_url'; image_url: { url: string; detail?: OpenRouterImageDetail } }
   | { type: 'input_audio'; input_audio: { data: string; format: string } }
   | { type: 'video_url'; video_url: { url: string } }
   | { type: 'file'; file: { filename: string; file_data: string } }
 
-export interface BuildOpenRouterPartOptions {
+interface BuildOpenRouterPartOptions {
   imageDetail?: OpenRouterImageDetail
 }
 
-export interface OpenRouterFileParserPlugin {
+interface OpenRouterFileParserPlugin {
   id: 'file-parser'
   pdf: {
     engine: 'cloudflare-ai' | 'mistral-ocr' | 'native'
@@ -85,26 +85,11 @@ export function buildOpenRouterPdfPlugin(
   return engine ? { id: 'file-parser', pdf: { engine } } : undefined
 }
 
-export function buildOpenRouterContentParts(
-  results: ProcessAttachmentResult[],
-  bytesByAttachmentId: ReadonlyMap<string, Uint8Array> = new Map(),
-  options: BuildOpenRouterPartOptions = {},
-): OpenRouterContentPart[] {
-  return results.flatMap((result) => {
-    const part = buildOpenRouterContentPart(
-      result,
-      bytesByAttachmentId.get(result.attachment.id),
-      options,
-    )
-    return part ? [part] : []
-  })
-}
-
-export function dataUrl(mime: string, bytes: Uint8Array): string {
+function dataUrl(mime: string, bytes: Uint8Array): string {
   return `data:${mime};base64,${base64Encode(bytes)}`
 }
 
-export function base64Encode(bytes: Uint8Array): string {
+function base64Encode(bytes: Uint8Array): string {
   const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
   let output = ''
   let index = 0

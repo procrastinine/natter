@@ -69,7 +69,7 @@ import {
   sortChats,
 } from './chat-organization'
 
-export interface ChatListProps {
+interface ChatListProps {
   activeChatId: ChatId | null
   collapsed?: boolean
 }

@@ -49,8 +49,8 @@ import type { ChatUsage, GlobalTokenCalibration, Message, TokenCalibrationSample
 // Physical bounds on a plausible chars/token ratio. Anything outside this
 // is almost certainly a broken sample (miscounted chars, server returned
 // corrupted usage, etc.); rejected at ingest time.
-export const MIN_RATIO = 1
-export const MAX_RATIO = 20
+const MIN_RATIO = 1
+const MAX_RATIO = 20
 
 // Minimum character count per sample. Short samples (e.g. a 5-character
 // user "yes") are too noisy to be useful. The completion pair is usually
@@ -62,7 +62,7 @@ export const MIN_SAMPLE_CHARS = 50
 // establish "normal". 3× is generous enough to allow a chat that legitimately
 // switches subject matter (English → code) without losing the new ratio.
 export const OUTLIER_FACTOR = 3
-export const OUTLIER_GATE_MIN_SAMPLES = 3
+const OUTLIER_GATE_MIN_SAMPLES = 3
 
 // Tier-1 (per-chat) minimum samples before the tier is trusted. 1 = trust
 // the first sample; can be raised to 3 if instability shows up.
@@ -82,7 +82,7 @@ export const MIN_SAMPLES_GLOBAL = 3
 // typical English-prose ratios. See the plan for tuning notes.
 // ---------------------------------------------------------------------------
 
-export interface FamilyRatioBounds {
+interface FamilyRatioBounds {
   anchor: number
   lo: number
   hi: number
@@ -192,7 +192,7 @@ export function aggregateCalibrationSamples(
   return aggregated
 }
 
-export function normalizedCalibrationSamples(
+function normalizedCalibrationSamples(
   samples: Record<string, TokenCalibrationSample> | undefined,
 ): Record<string, TokenCalibrationSample> | undefined {
   if (!samples) return undefined
@@ -319,7 +319,7 @@ function emptySample(): TokenCalibrationSample {
 
 // Outcome of an attempted sample ingest. `skipReason` is informational
 // (dev tools / tests) so callers can surface WHY a sample was rejected.
-export type SampleIngestOutcome =
+type SampleIngestOutcome =
   | { accepted: true }
   | {
       accepted: false
@@ -544,7 +544,7 @@ export function messageTextCharCount(content: unknown): number {
   return total
 }
 
-export function currentMessageTextCharCount(
+function currentMessageTextCharCount(
   message: Pick<Message, 'content' | 'originalCharCount' | 'charCountDelta'>,
 ): number {
   if (finiteNumber(message.originalCharCount)) {
@@ -554,7 +554,7 @@ export function currentMessageTextCharCount(
   return messageTextCharCount(message.content)
 }
 
-export interface ReadPathTextTokenEstimateInput {
+interface ReadPathTextTokenEstimateInput {
   message: Pick<
     Message,
     | 'content'
@@ -663,7 +663,7 @@ export function readPathTextTokenEstimate(input: ReadPathTextTokenEstimateInput)
 // paths without crashing.
 // ---------------------------------------------------------------------------
 
-export interface CalibrationFieldsForCreate {
+interface CalibrationFieldsForCreate {
   originalCharCount: number
   originalTokenEstimate: number
   originalModelId: string
@@ -697,7 +697,7 @@ export function calibrationFieldsForCreate(
   }
 }
 
-export interface CalibrationFieldsForEdit {
+interface CalibrationFieldsForEdit {
   originalCalibrationKey?: string
   charCountDelta: number
   cachedTokenEstimate: number
@@ -783,7 +783,7 @@ function reasoningDetailsChars(message: Message): number {
   return total
 }
 
-export interface DerivePromptSampleInput {
+interface DerivePromptSampleInput {
   sentPath: readonly Message[]
   systemPrompt: string
   usage: ChatUsage
@@ -795,7 +795,7 @@ export interface DerivePromptSampleInput {
   reasoningEchoOpts?: PromptEstimateOptions
 }
 
-export interface SamplePair {
+interface SamplePair {
   chars: number
   tokens: number
 }
@@ -830,7 +830,7 @@ export function derivePromptSample(input: DerivePromptSampleInput): SamplePair |
   return { chars: sentTextChars, tokens: calibratedTextTokens }
 }
 
-export interface DeriveCompletionSampleInput {
+interface DeriveCompletionSampleInput {
   assistantMessage: Message
   usage: ChatUsage
   family: TokenizerFamily

@@ -29,7 +29,7 @@ export type StorageRoute =
   | { section: 'archive' }
   | { section: 'backups' }
 
-export type Route =
+type Route =
   | { kind: 'home' }
   | { kind: 'new' }
   | { kind: 'chat'; chatId: ChatId; pinnedMessageId?: MessageId }

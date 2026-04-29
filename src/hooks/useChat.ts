@@ -93,11 +93,11 @@ import { markLifecycleTarget, startRequestLifecycle } from './requestLifecycle'
 import { useUiStore } from '../store/zustand/uiStore'
 import type { MessageHeaderPatch, StreamChunkRow } from '../store/repository'
 
-export const STREAM_LIVE_UPDATE_INTERVAL_MS = 125
-export const STREAM_LIVE_TEXT_GROWTH_CHARS = 2048
-export const STREAM_CHUNK_FLUSH_INTERVAL_MS = 150
-export const STREAM_CHUNK_FLUSH_MAX_ROWS = 256
-export const STREAM_CHUNK_FLUSH_MAX_TEXT_CHARS = 128 * 1024
+const STREAM_LIVE_UPDATE_INTERVAL_MS = 125
+const STREAM_LIVE_TEXT_GROWTH_CHARS = 2048
+const STREAM_CHUNK_FLUSH_INTERVAL_MS = 150
+const STREAM_CHUNK_FLUSH_MAX_ROWS = 256
+const STREAM_CHUNK_FLUSH_MAX_TEXT_CHARS = 128 * 1024
 
 function routeApiUsed(route: AssistantRequestPlan['route']): GenerationMeta['apiUsed'] {
   if (route?.kind === 'responses') return 'responses'
@@ -295,7 +295,7 @@ function createAccumulator(input: {
   }
 }
 
-export interface SendTextInput {
+interface SendTextInput {
   chatId: ChatId
   connection: ConnectionProfile
   apiKey: string
@@ -322,13 +322,13 @@ export interface SendTextInput {
 // message is created here. `prefillContent` (inherited from SendTextInput)
 // is honored by adding a trailing assistant input to the request plan and
 // initializing the generated assistant row with that text.
-export interface SendFromMessageInput extends Omit<SendTextInput, 'content'> {
+interface SendFromMessageInput extends Omit<SendTextInput, 'content'> {
   // Any existing message on the active path; the assistant placeholder
   // will be created as its child. Typically a user-role message.
   parentMessageId: MessageId
 }
 
-export interface OpenStreamInput {
+interface OpenStreamInput {
   connection: ConnectionProfile
   apiKey: string
   wireBody: Record<string, unknown>
@@ -690,7 +690,7 @@ async function openAssistantStreamUnder(
     const chunkIter = openStream({
       connection: input.connection,
       apiKey: input.apiKey,
-      wireBody: wire as Record<string, unknown>,
+      wireBody: wire,
       signal: abortController.signal,
       ...(route ? { route } : {}),
       ...(geminiModelId ? { geminiModelId } : {}),
@@ -834,7 +834,7 @@ function applyEvent(acc: ChatAccumulator, event: StreamLaneEvent, nowMs: number)
           if (!raw || typeof raw !== 'object') continue
           const detail = normalizeIncomingReasoningDetail(
             raw as ReasoningDetail & { index?: number },
-          ) as ReasoningDetail & { index?: number }
+          )
           if (detail.id?.startsWith('tool_')) continue
           putReasoningDetail(acc, detail)
           acc.dirtySinceLastLivePublish = true
@@ -1220,7 +1220,7 @@ function serializeStreamEvent(event: StreamLaneEvent, acc: ChatAccumulator): Str
       error: {
         ...event.error,
         message: event.error.message,
-      } as ApiError,
+      },
     }
   }
   return structuredClone(event)
@@ -1703,7 +1703,7 @@ async function ingestCalibrationSample(args: {
     if (!chat) return
     const staged = {
       tokenCalibration: { ...(chat.tokenCalibration ?? {}) },
-    } as { tokenCalibration: Record<string, import('../core/types').TokenCalibrationSample> }
+    }
     if (promptSample !== null) {
       const outcome = addSampleToChat(
         staged,
@@ -1964,7 +1964,7 @@ function replayableStreamEvent(event: unknown): StreamLaneEvent | null {
   }
 }
 
-export interface UseChatApi {
+interface UseChatApi {
   send: (input: Omit<SendTextInput, 'signal'>) => Promise<SendTextResult>
   sendFrom: (input: Omit<SendFromMessageInput, 'signal'>) => Promise<SendTextResult>
   abort: () => void

@@ -115,9 +115,7 @@ describe.skipIf(!LIVE)('live — Gemini native generateContent', () => {
         ),
       ),
     )
-    const finishLane = lanes.find((l) => l.lane === 'finish') as
-      | Extract<StreamLaneEvent, { lane: 'finish' }>
-      | undefined
+    const finishLane = lanes.find((l) => l.lane === 'finish')
     // `stop` or `length` — either way, one encrypted lane event should fire.
     expect(['stop', 'length']).toContain(finishLane?.finishReason)
 

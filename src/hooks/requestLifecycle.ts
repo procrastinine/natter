@@ -3,7 +3,7 @@ import { postEvent } from '../store/broadcast'
 import { getStreamClientId, startStreamLease, stopStreamLease } from '../store/stream-leases'
 import { useStreamStore } from '../store/zustand/streamStore'
 
-export interface RequestLifecycle {
+interface RequestLifecycle {
   streamId: string
   signal: AbortSignal
   end: (outcome: 'done' | 'error' | 'abort') => void

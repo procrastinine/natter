@@ -49,7 +49,7 @@ import { ConfirmDeleteDialog } from './ConfirmDeleteDialog'
 
 export type InsertSlot = 'before' | 'after' | 'sibling'
 
-export interface MessageActionsProps {
+interface MessageActionsProps {
   message: Message
   showInfo: boolean
   onToggleInfo: () => void
@@ -356,7 +356,7 @@ export function MessageActions(props: MessageActionsProps) {
   )
 }
 
-export interface MessageEditTreeActionsProps {
+interface MessageEditTreeActionsProps {
   message: Message
   chatId: string
   cursor: Record<string, MessageId>

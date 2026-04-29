@@ -1,6 +1,6 @@
-export type SidebarSortDirection = 'asc' | 'desc'
+type SidebarSortDirection = 'asc' | 'desc'
 
-export type SidebarSortField =
+type SidebarSortField =
   | 'updatedAt'
   | 'createdAt'
   | 'lastViewedAt'
@@ -10,7 +10,7 @@ export type SidebarSortField =
 
 export type SidebarSortMode = `${SidebarSortField}-${SidebarSortDirection}`
 
-export interface SidebarSortOption {
+interface SidebarSortOption {
   mode: SidebarSortMode
   label: string
   shortLabel: string

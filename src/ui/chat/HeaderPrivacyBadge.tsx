@@ -21,12 +21,12 @@ import {
 } from '../settings/provider-picker-rows'
 import type { PrivacyTier } from '../../core/privacy-filter'
 
-export interface HeaderPrivacyBadgeProps {
+interface HeaderPrivacyBadgeProps {
   chatId: ChatId
 }
 
 export function HeaderPrivacyBadge({ chatId }: HeaderPrivacyBadgeProps) {
-  const chat = useLiveQuery(() => getChat(chatId), [chatId], undefined) as Chat | undefined
+  const chat = useLiveQuery(() => getChat(chatId), [chatId], undefined)
   if (!chat) return null
   return <Inner chat={chat} />
 }

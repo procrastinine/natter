@@ -53,7 +53,7 @@ const OPENROUTER_KIMI_IMAGE_TOKEN_CAP = 4000
 // Fallback when PDF bytes / pageCount are both unknown — treat as one page.
 const PDF_FALLBACK_PAGES = 1
 
-export interface ImageMeta {
+interface ImageMeta {
   width?: number
   height?: number
   sizeBytes?: number

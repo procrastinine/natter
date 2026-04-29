@@ -43,9 +43,9 @@ import { getBrowserRepository } from './browser-repo'
 import { openDb } from './db'
 import type { MutationContext } from './repository'
 
-export const DEFAULT_ORPHAN_GC_AGE_MS = 24 * 60 * 60 * 1000
+const DEFAULT_ORPHAN_GC_AGE_MS = 24 * 60 * 60 * 1000
 
-export interface CreateAttachmentInput {
+interface CreateAttachmentInput {
   blob: Blob
   filename: string
   mime: string
@@ -58,14 +58,14 @@ export interface CreateAttachmentInput {
   sourceUrl?: string
 }
 
-export interface AttachmentBundle {
+interface AttachmentBundle {
   attachment: Attachment
   blobs: AttachmentBlob[]
   artifacts: AttachmentArtifact[]
   jobs: AttachmentJob[]
 }
 
-export interface IngestAttachmentBytesInput {
+interface IngestAttachmentBytesInput {
   blob: Blob
   filename: string
   declaredMime?: string
@@ -75,7 +75,7 @@ export interface IngestAttachmentBytesInput {
   now?: number
 }
 
-export interface ReplaceAttachmentBytesInput {
+interface ReplaceAttachmentBytesInput {
   attachmentId: AttachmentId
   blob: Blob
   filename: string
@@ -85,12 +85,12 @@ export interface ReplaceAttachmentBytesInput {
   now?: number
 }
 
-export interface ReplaceAttachmentBytesResult {
+interface ReplaceAttachmentBytesResult {
   bundle: AttachmentBundle
   reusedExisting: boolean
 }
 
-export interface CreateRemoteAttachmentInput {
+interface CreateRemoteAttachmentInput {
   url: string
   filename: string
   mime?: string
@@ -100,39 +100,39 @@ export interface CreateRemoteAttachmentInput {
   now?: number
 }
 
-export interface AttachmentRefTarget {
+interface AttachmentRefTarget {
   messageId?: MessageId
   draftChatId?: ChatId
 }
 
-export interface AddAttachmentRefInput extends AttachmentRefTarget {
+interface AddAttachmentRefInput extends AttachmentRefTarget {
   attachmentId: AttachmentId
   afterRefId?: string
   includeInContext?: boolean
   now?: number
 }
 
-export interface RelinkAttachmentRefInput extends AttachmentRefTarget {
+interface RelinkAttachmentRefInput extends AttachmentRefTarget {
   refId: string
   newAttachmentId: AttachmentId
   now?: number
 }
 
-export interface BatchRelinkAttachmentRefsInput {
+interface BatchRelinkAttachmentRefsInput {
   oldAttachmentId: AttachmentId
   newAttachmentId: AttachmentId
   refs: Array<AttachmentRefTarget & { refId: string }>
   now?: number
 }
 
-export interface RestoreMissingAttachmentInput {
+interface RestoreMissingAttachmentInput {
   missingAttachmentId: AttachmentId
   replacementAttachmentId: AttachmentId
   refs: Array<AttachmentRefTarget & { refId: string }>
   now?: number
 }
 
-export interface OrphanReapOptions {
+interface OrphanReapOptions {
   olderThanMs?: number
   now?: number
 }
@@ -291,7 +291,7 @@ export async function createRemoteAttachment(
   return attachment
 }
 
-export async function putAttachmentBundle(bundle: AttachmentBundle): Promise<void> {
+async function putAttachmentBundle(bundle: AttachmentBundle): Promise<void> {
   const repo = getBrowserRepository()
   await repo.runMutation(
     [{ kind: 'attachment', attachmentId: bundle.attachment.id }],
@@ -372,13 +372,6 @@ async function replaceAttachmentBundle(
       for (const job of next.jobs) await ctx.putAttachmentJob(job)
     },
   )
-}
-
-export async function getAttachmentOriginalBlob(
-  attachmentId: AttachmentId,
-): Promise<AttachmentBlob | undefined> {
-  const bundle = await getAttachmentBundle(attachmentId)
-  return bundle?.blobs.find((blob) => blob.role === 'original')
 }
 
 export async function incRefs(
@@ -644,22 +637,6 @@ export async function deleteReferencedAttachmentBytes(
   return updated
 }
 
-export async function markAttachmentMissing(
-  attachmentId: AttachmentId,
-  reason: AttachmentMissingReason,
-  now = Date.now(),
-): Promise<Attachment | undefined> {
-  const repo = getBrowserRepository()
-  let updated: Attachment | undefined
-  await repo.runMutation([{ kind: 'attachment', attachmentId }], async (ctx) => {
-    const current = await ctx.getAttachment(attachmentId)
-    if (!current) return
-    updated = markMissingRow(current, reason, now)
-    await ctx.putAttachment(updated)
-  })
-  return updated
-}
-
 export async function restoreMissingAttachment(
   input: RestoreMissingAttachmentInput,
 ): Promise<MessageAttachmentRef[]> {
@@ -801,7 +778,7 @@ export function attachmentScopes(refs: readonly AttachmentRef[] | undefined): Mu
   }))
 }
 
-export { attachmentIdOf, attachmentRefsFromIds, normalizeAttachmentRefs }
+export { attachmentIdOf, attachmentRefsFromIds }
 
 function metadataAndOptionalBlob(row: PendingAttachment): {
   metadata: Attachment
@@ -838,7 +815,7 @@ function bundleFromProcessed(result: ProcessAttachmentResult, blob: Blob): Attac
   const attachment: Attachment = {
     id: attachmentId,
     contentHash,
-    kind: canonicalKind(result.attachment.kind as AttachmentKind),
+    kind: canonicalKind(result.attachment.kind),
     mime: result.attachment.mime,
     filename: result.attachment.filename,
     ...(result.attachment.extension ? { extension: result.attachment.extension } : {}),

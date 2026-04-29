@@ -45,7 +45,7 @@ import {
 import { ProfileGlyph } from './ProfileGlyph'
 import { ReasoningBlock } from './ReasoningBlock'
 
-export interface MessageProps {
+interface MessageProps {
   chatId: ChatId
   message: MessageRow
   branchMessages?: readonly MessageRow[]

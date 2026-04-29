@@ -57,15 +57,7 @@ export interface ChatMutationSummary {
   attachmentId?: AttachmentId
 }
 
-export interface WorkspaceEvent {
-  kind: 'chat-mutated'
-  chatId: ChatId
-  metaVersion: number
-  summaryVersion: number
-  affected: ChatMutationSummary[]
-}
-
-export interface AttachmentSearchFilters {
+interface AttachmentSearchFilters {
   kind?: AttachmentKind
   mime?: string
   origin?: AttachmentOrigin
@@ -76,7 +68,7 @@ export interface AttachmentSearchFilters {
   maxRefCount?: number
 }
 
-export type AttachmentSearchSort =
+type AttachmentSearchSort =
   | 'created-desc'
   | 'created-asc'
   | 'updated-desc'
@@ -103,7 +95,7 @@ export interface AttachmentBundle {
   jobs: AttachmentJob[]
 }
 
-export interface ChatMetaPatchOptions {
+interface ChatMetaPatchOptions {
   touchVisibleState?: boolean
   broadcast?: boolean
 }
@@ -214,7 +206,7 @@ export interface DeleteArchivedChatsResult {
   deletedChatIds: ChatId[]
 }
 
-export interface BranchSiblingGroup {
+interface BranchSiblingGroup {
   parentId: MessageId | null
   siblings: MessageHeaderRow[]
 }

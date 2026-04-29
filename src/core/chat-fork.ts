@@ -22,7 +22,7 @@ import { getWorkspaceRepository } from '../store/workspace-repository'
 import { indexById } from './active-path'
 import type { AttachmentId, AttachmentRef, Chat, ChatId, Message, MessageId } from './types'
 
-export interface ForkChatFromMessageInput {
+interface ForkChatFromMessageInput {
   chatId: ChatId
   messageId: MessageId
   title: string
@@ -30,7 +30,7 @@ export interface ForkChatFromMessageInput {
   now?: number
 }
 
-export interface ForkChatFromMessageResult {
+interface ForkChatFromMessageResult {
   chatId: ChatId
   messageCount: number
 }

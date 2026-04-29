@@ -11,7 +11,7 @@ export type AttachmentKind =
   | 'archive'
   | 'other'
 
-export type AttachmentOrigin =
+type AttachmentOrigin =
   | 'user-upload'
   | 'user-remote-url'
   | 'generated-output'
@@ -19,9 +19,9 @@ export type AttachmentOrigin =
   | 'import'
   | 'system-fixture'
 
-export type AttachmentStorageState = 'local-bytes' | 'remote-url' | 'missing'
+type AttachmentStorageState = 'local-bytes' | 'remote-url' | 'missing'
 
-export type AttachmentArtifactKind =
+type AttachmentArtifactKind =
   | 'text'
   | 'thumbnail'
   | 'wire-variant'
@@ -100,7 +100,7 @@ export interface ProcessAttachmentResult {
   }
 }
 
-export interface AttachmentSearchFilters {
+interface AttachmentSearchFilters {
   kind?: AttachmentKind
   mime?: string
   origin?: AttachmentOrigin
@@ -111,7 +111,7 @@ export interface AttachmentSearchFilters {
   maxRefCount?: number
 }
 
-export type AttachmentSearchSort = 'created-desc' | 'created-asc' | 'size-desc' | 'size-asc'
+type AttachmentSearchSort = 'created-desc' | 'created-asc' | 'size-desc' | 'size-asc'
 
 export interface AttachmentSearchQuery {
   query?: string

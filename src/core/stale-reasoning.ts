@@ -10,7 +10,7 @@
 
 import type { ApiError } from '../api/errors'
 
-export type StaleReasoningProvider = 'openai' | 'gemini' | 'generic'
+type StaleReasoningProvider = 'openai' | 'gemini' | 'generic'
 
 const OPENAI_PATTERNS = [
   /invalid encrypted reasoning content/i,

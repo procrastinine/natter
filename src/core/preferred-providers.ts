@@ -5,7 +5,7 @@
 // it never adds or removes providers. Providers not named by the rule
 // keep their original relative order and sit after the named ones.
 
-export interface ProviderPreferenceRule {
+interface ProviderPreferenceRule {
   match: RegExp
   order: readonly string[]
 }

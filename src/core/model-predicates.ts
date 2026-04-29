@@ -27,7 +27,7 @@ export function isPresetSlug(slug: string): boolean {
 // `Google Vertex` → `Google` has been observed in the wild, so both match.
 export function isAnthropicOnBedrockOrVertex(
   model: string,
-  endpoint?: Pick<ModelEndpoint, 'provider_name' | 'provider_display_name' | 'provider_slug'> | undefined,
+  endpoint?: Pick<ModelEndpoint, 'provider_name' | 'provider_display_name' | 'provider_slug'>  ,
 ): boolean {
   if (!/^anthropic\//.test(model)) return false
   const refs = [

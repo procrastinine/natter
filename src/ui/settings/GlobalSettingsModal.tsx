@@ -4,7 +4,7 @@ import { AppearanceSettings } from './AppearanceSettings'
 import { GeneralSettings } from './GeneralSettings'
 import { ImageAllowlistPanel } from './ImageAllowlistPanel'
 
-export type GlobalSettingsTab = 'general' | 'appearance' | 'images'
+type GlobalSettingsTab = 'general' | 'appearance' | 'images'
 
 const TAB_LABELS: Record<GlobalSettingsTab, string> = {
   general: 'General',
@@ -12,7 +12,7 @@ const TAB_LABELS: Record<GlobalSettingsTab, string> = {
   images: 'Images',
 }
 
-export interface GlobalSettingsModalProps {
+interface GlobalSettingsModalProps {
   open: boolean
   onClose: () => void
 }

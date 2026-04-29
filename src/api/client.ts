@@ -8,7 +8,7 @@ import type { ConnectionProfile } from '../core/types'
 import { ApiError, normalizeError } from './errors'
 import type { CallOpts } from './types'
 
-export const DEFAULT_TIMEOUT_MS = 120_000
+const DEFAULT_TIMEOUT_MS = 120_000
 const DEFAULT_RETRY_CAP_MS = 5_000
 
 function isAnthropicBrowserOriginProfile(profile: ConnectionProfile): boolean {
@@ -190,7 +190,7 @@ export function isKeyFallbackTrigger(response: Response): boolean {
   return false
 }
 
-export interface KeyFallbackResult {
+interface KeyFallbackResult {
   response: Response
   keyIndex: number
 }

@@ -129,7 +129,7 @@ export function obscurePreview(plaintext: string): string {
   return `${prefix}…${tail}`
 }
 
-export interface CreateKeyInput {
+interface CreateKeyInput {
   name: string
   plaintextKey: string
   passphrase?: string
@@ -179,11 +179,7 @@ export async function getKey(keyId: KeyId): Promise<KeyRecord | undefined> {
   return getDb().keys.get(keyId)
 }
 
-export async function listKeys(): Promise<KeyRecord[]> {
-  return getDb().keys.toArray()
-}
-
-export interface ResolveKeyOptions {
+interface ResolveKeyOptions {
   passphrase?: string
 }
 
@@ -246,7 +242,7 @@ async function touchLastUsedAt(keyId: KeyId, now = Date.now()): Promise<void> {
   await db.keys.put({ ...row, lastUsedAt: now })
 }
 
-export interface ChangePassphraseInput {
+interface ChangePassphraseInput {
   keyId: KeyId
   oldPassphrase?: string
   newPassphrase?: string
@@ -299,13 +295,6 @@ export async function deleteKey(keyId: KeyId): Promise<void> {
   derivedKeyCache.delete(keyId)
   await getDb().keys.delete(keyId)
   postEvent({ kind: 'key-rotated', keyId })
-}
-
-// Check whether a key exists without actually decrypting it. Used by the
-// connection manager to decide "key missing" state.
-export async function keyExists(keyId: KeyId): Promise<boolean> {
-  const row = await getDb().keys.get(keyId)
-  return row !== undefined
 }
 
 export function __resetKeyCacheForTests(): void {

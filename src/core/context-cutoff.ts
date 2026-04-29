@@ -55,7 +55,7 @@ import {
 } from './tokens'
 import type { AttachmentRef, ChatSettings, Message, MessageId } from './types'
 
-export interface MessageCostOptions {
+interface MessageCostOptions {
   family: TokenizerFamily
   // Optional — when omitted, reasoning contributes 0 (same policy as
   // `estimatePromptSize` when `reasoningInclude` is absent).
@@ -75,7 +75,7 @@ export interface MessageCostOptions {
   disableTextCalibration?: boolean
 }
 
-export interface MessageCost {
+interface MessageCost {
   text: number
   media: number
   reasoning: number
@@ -161,7 +161,7 @@ function groupPath(visible: readonly Message[], opts: MessageCostOptions): Group
   return { preamble, pairs }
 }
 
-export interface CutoffPlanInput {
+interface CutoffPlanInput {
   messages: readonly Message[]
   settings: ChatSettings
   tokenizer: TokenizerFamily
@@ -186,7 +186,7 @@ export interface CutoffPlanInput {
   disableTextCalibration?: boolean
 }
 
-export interface CutoffPlan {
+interface CutoffPlan {
   // Visible-filtered, cutoff-applied path (preamble + head + tail, in path
   // order). Transforms receive this as `path`. Always returned even when
   // nothing was excluded, so callers can pass it directly without checking

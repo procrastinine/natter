@@ -37,7 +37,7 @@ export function countWords(text: string): number {
   return trimmed.match(FALLBACK_WORD_RE)?.length ?? 0
 }
 
-export function countMessageWords(message: Message): number {
+function countMessageWords(message: Message): number {
   let total = 0
   for (const item of message.content) {
     if (item.type === 'text' || item.type === 'output_text') {

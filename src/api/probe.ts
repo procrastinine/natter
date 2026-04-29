@@ -29,14 +29,14 @@ export interface LlamaServerProps {
   totalSlots: number | null
 }
 
-export interface ProbeSuccess {
+interface ProbeSuccess {
   kind: 'ok'
   props: LlamaServerProps
   rootUrl: string
   elapsedMs: number
 }
 
-export interface ProbeFailure {
+interface ProbeFailure {
   kind: 'error'
   status: number | null
   message: string
@@ -44,12 +44,12 @@ export interface ProbeFailure {
   elapsedMs: number
 }
 
-export type ProbeResult = ProbeSuccess | ProbeFailure
+type ProbeResult = ProbeSuccess | ProbeFailure
 
 // Strip a trailing /v1 (or /v1beta, /v2, …) path segment so root-scoped
 // llama.cpp endpoints resolve correctly regardless of whether the user
 // entered "http://host:8080" or "http://host:8080/v1".
-export function llamaServerRoot(baseUrl: string): string {
+function llamaServerRoot(baseUrl: string): string {
   const trimmed = baseUrl.replace(/\/+$/, '')
   return trimmed.replace(/\/v\d+(?:beta\d*)?$/i, '')
 }
@@ -73,7 +73,7 @@ function asRecord(v: unknown): Record<string, unknown> {
 // Parse a /props response into the compact shape. Accepts any JSON and
 // returns null when the response clearly isn't llama-server (missing
 // both `chat_template` and `default_generation_settings`).
-export function parseLlamaServerProps(body: unknown): LlamaServerProps | null {
+function parseLlamaServerProps(body: unknown): LlamaServerProps | null {
   const obj = asRecord(body)
   const chatTemplate = asString(obj.chat_template)
   const defaultGenSettings = asRecord(obj.default_generation_settings)
@@ -93,7 +93,7 @@ export function parseLlamaServerProps(body: unknown): LlamaServerProps | null {
   }
 }
 
-export interface ProbeOptions {
+interface ProbeOptions {
   timeoutMs?: number
   signal?: AbortSignal
 }
@@ -147,7 +147,7 @@ export async function probeLlamaServer(
 // would feed to the model when these messages are posted to /v1/chat/completions.
 // Used as the 'default' text-template option: the server's own Jinja
 // template is re-used instead of replicating it client-side.
-export interface ApplyTemplateMessage {
+interface ApplyTemplateMessage {
   role: string
   content: string
 }

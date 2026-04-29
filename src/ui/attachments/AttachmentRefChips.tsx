@@ -14,7 +14,7 @@ import { AttachmentPicker } from './AttachmentPicker'
 import { AttachmentPreview } from './AttachmentPreview'
 import { formatBytes, kindLabel, shortId, storageLabel } from './format'
 
-export interface AttachmentRefChipsProps {
+interface AttachmentRefChipsProps {
   refs: readonly AttachmentRef[] | undefined
   messageId?: MessageId
   draftChatId?: ChatId

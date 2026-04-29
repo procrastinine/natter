@@ -49,29 +49,11 @@ function groupTreeRowsByParent(
   return buckets
 }
 
-// Cycle check: walk upward from `parentId` and fail if `childId` appears on
-// the chain. Called after any re-parenting to prove the invariant held. The
-// plan (§8.10) argues cycles are impossible by construction; this is a
-// runtime safety net.
-export function assertNoCycle(
-  byId: Map<MessageId, Message>,
-  childId: MessageId,
-  parentId: MessageId | null,
-): void {
-  let cur: MessageId | null = parentId
-  while (cur !== null) {
-    if (cur === childId) {
-      throw new Error(`Cycle detected: re-parenting ${childId} under ${parentId}`)
-    }
-    cur = byId.get(cur)?.parentId ?? null
-  }
-}
-
 // Re-number all children (live + tombstoned) of `parentId` so they form a
 // unique, dense, ascending `siblingIndex` list ordered by `createdAt`. Used
 // after splice-up and insert-between reparenting. Caller must have already
 // persisted any new/changed children under this parent before calling.
-export async function renumberSiblingsByCreatedAt(
+async function renumberSiblingsByCreatedAt(
   ctx: MutationContext,
   chatId: ChatId,
   parentId: MessageId | null,
@@ -89,7 +71,7 @@ export async function renumberSiblingsByCreatedAt(
   }
 }
 
-export interface SoftDeleteResult {
+interface SoftDeleteResult {
   tombstoned: MessageId[]
   // For each live direct child that was re-parented, a before/after record.
   // Callers use this to mend cursor entries that named a tombstoned node.

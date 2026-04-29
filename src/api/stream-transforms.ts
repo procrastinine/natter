@@ -149,7 +149,7 @@ export type StreamLaneEvent =
       generationId?: string
     }
 
-export interface SplitChatStreamOptions {
+interface SplitChatStreamOptions {
   // Tag set the inline-reasoning lifter should look for. Pass `[]` to
   // disable (useful when callers know the model returns reasoning only
   // via `reasoning_details[]`). When `undefined`, the lifter auto-detects
@@ -799,7 +799,7 @@ function* splitResponsesEvent(ev: ResponsesEventWire): Generator<StreamLaneEvent
       if (e.item.type === 'message' && e.item.phase !== undefined) {
         yield {
           lane: 'phase',
-          phase: (e.item.phase as MessagePhase | null) ?? null,
+          phase: (e.item.phase) ?? null,
           outputIndex: e.output_index,
         }
       }
@@ -1069,7 +1069,7 @@ function* splitBufferedResponsesResult(
         yield { lane: 'text', text: textContent, outputIndex: idx }
       }
       if (item.phase !== undefined) {
-        yield { lane: 'phase', phase: (item.phase as MessagePhase | null) ?? null, outputIndex: idx }
+        yield { lane: 'phase', phase: (item.phase) ?? null, outputIndex: idx }
       }
     }
     const contentItem = contentItemFromResponsesOutputItem(item)

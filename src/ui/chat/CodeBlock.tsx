@@ -1,6 +1,6 @@
 import { useCallback, useMemo, useState } from 'react'
 
-export interface CodeBlockProps {
+interface CodeBlockProps {
   code: string
   language?: string
   fileName?: string

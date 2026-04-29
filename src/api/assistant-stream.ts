@@ -19,12 +19,12 @@ export type AssistantStreamChunk =
   | ResponsesStreamChunk
   | GeminiStreamChunk
 
-export type AssistantOnceResult =
+type AssistantOnceResult =
   | ChatCompletionResultWire
   | ResponsesResultWire
   | GenerateContentResponseWire
 
-export interface AssistantDispatchInput {
+interface AssistantDispatchInput {
   connection: ConnectionProfile
   apiKey: string
   requestPlan: AssistantRequestPlan

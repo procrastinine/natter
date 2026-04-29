@@ -9,7 +9,7 @@
 import type { Chat, ConnectionProfile } from '../../core/types'
 import { updateChatSettings } from '../../store/chats'
 
-export interface LlamaServerSectionProps {
+interface LlamaServerSectionProps {
   chat: Chat
   profile: ConnectionProfile
 }

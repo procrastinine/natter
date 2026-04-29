@@ -3,12 +3,12 @@ import { buildHeaders, fetchWithTimeout } from './client'
 import { normalizeError } from './errors'
 import type { CallOpts, ChatCompletionUsageWire, ChatStreamChunk } from './types'
 
-export interface VideoGenerationContext {
+interface VideoGenerationContext {
   profile: ConnectionProfile
   apiKey: string
 }
 
-export interface VideoGenerationRequestWire {
+interface VideoGenerationRequestWire {
   model: string
   prompt: string
   [extra: string]: unknown

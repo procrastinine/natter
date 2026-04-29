@@ -24,15 +24,12 @@ import {
   responsesSupportFor,
 } from '../../core/quirks'
 import type {
-  ApiVariant,
   Chat,
   ConnectionProfile,
   ConnectionKind,
-  EffortLevel,
   Message,
   ModelEndpoint,
   ReasoningInclude,
-  ReasoningSummary,
   SamplingKey,
   ServerToolId,
   VerbosityLevel,
@@ -43,7 +40,7 @@ import { InfoDisclosure } from './InfoDisclosure'
 import { PrefillPromptEditor } from './PromptPresetEditor'
 import { TextTemplateSection } from './TextTemplateSection'
 
-export interface ParamFormProps {
+interface ParamFormProps {
   chat: Chat
   capability: EffectiveCapability | null
   // Preserved for forward-compat — future sampling fields (seed variance,
@@ -588,7 +585,7 @@ function ReasoningSection({ chat, capability }: { chat: Chat; capability: Effect
                     type="button"
                     data-ui="segmented-option"
                     aria-pressed={r.effort === e}
-                    onClick={() => updateReasoning({ effort: e as EffortLevel })}
+                    onClick={() => updateReasoning({ effort: e })}
                   >
                     {e}
                   </button>
@@ -739,7 +736,7 @@ function ReasoningSummaryControl({
             aria-pressed={selected === v}
             onClick={() =>
               void updateChatSettings(chat.id, {
-                reasoning: { ...r, summary: v as ReasoningSummary },
+                reasoning: { ...r, summary: v },
               })
             }
           >
@@ -892,7 +889,7 @@ export function ApiModeSection({
         return
       }
     }
-    void updateChatSettings(chat.id, { api: target as ApiVariant })
+    void updateChatSettings(chat.id, { api: target })
   }
   return (
     <section data-ui="settings-section" data-ui-section="api-mode">
@@ -1276,7 +1273,3 @@ function SamplingInput({
     </div>
   )
 }
-
-// Re-exported so tests and other code can reference the spec list without
-// importing individual fields.
-export { SAMPLING_FIELDS }

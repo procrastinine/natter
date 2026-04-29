@@ -4,7 +4,7 @@ import { getBrowserRepository } from '../../store/browser-repo'
 import { CloseIcon, DatabaseIcon, SearchIcon } from '../icons/Icon'
 import { formatBytes, kindLabel, shortId, storageLabel } from './format'
 
-export interface AttachmentPickerProps {
+interface AttachmentPickerProps {
   title?: string
   excludeAttachmentId?: string
   onPick: (attachment: Attachment) => void | Promise<void>

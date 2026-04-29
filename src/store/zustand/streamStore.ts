@@ -13,7 +13,7 @@ import type {
   ReasoningDetail,
 } from '../../core/types'
 
-export interface ActiveStream {
+interface ActiveStream {
   streamId: string
   chatId: ChatId
   messageId?: MessageId
@@ -23,7 +23,7 @@ export interface ActiveStream {
   abort?: () => void
 }
 
-export interface LiveStreamSnapshot {
+interface LiveStreamSnapshot {
   streamId: string
   chatId: ChatId
   messageId: MessageId
@@ -35,7 +35,7 @@ export interface LiveStreamSnapshot {
   updatedAt: number
 }
 
-export interface StreamStoreState {
+interface StreamStoreState {
   activeByStreamId: Record<string, ActiveStream>
   liveByMessageId: Record<string, LiveStreamSnapshot>
   isActive: (streamId: string) => boolean

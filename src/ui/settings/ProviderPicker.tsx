@@ -47,7 +47,7 @@ import {
   type PickerRow,
 } from './provider-picker-rows'
 
-export interface ProviderPickerProps {
+interface ProviderPickerProps {
   chat: Chat
   routing: UsePrivacyRoutingResult
   neededTokens?: number

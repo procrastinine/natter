@@ -29,7 +29,7 @@ export interface ChatCompletionRequestWire {
   [extra: string]: unknown
 }
 
-export interface ChatCompletionDeltaWire {
+interface ChatCompletionDeltaWire {
   role?: string
   content?: string | null
   audio?: unknown
@@ -41,7 +41,7 @@ export interface ChatCompletionDeltaWire {
   [extra: string]: unknown
 }
 
-export interface ChatCompletionMessageWire {
+interface ChatCompletionMessageWire {
   role?: string
   content?: string | null
   audio?: unknown
@@ -69,7 +69,7 @@ export interface ChatCompletionUsageWire {
   [extra: string]: unknown
 }
 
-export interface ChatCompletionErrorWire {
+interface ChatCompletionErrorWire {
   code: number | string
   message: string
   metadata?: Record<string, unknown>

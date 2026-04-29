@@ -8,18 +8,18 @@
 import { create } from 'zustand'
 import type { ChatId, ChatSettings, PresetId } from '../../core/types'
 
-export type ThemePreference = 'light' | 'dark' | 'system'
+type ThemePreference = 'light' | 'dark' | 'system'
 
 // Settings for the next chat the user starts on /new. Seeded from the MRU
 // preset when the surface mounts; edits in the model panel flow here so
 // the user can configure a chat before typing the first message. On send
 // these get passed into createChat.
-export interface DraftChatSettings {
+interface DraftChatSettings {
   settings: ChatSettings
   presetId: PresetId | null
 }
 
-export interface UiStoreState {
+interface UiStoreState {
   theme: ThemePreference
   sidebarCollapsed: boolean
   activeChatId: ChatId | null

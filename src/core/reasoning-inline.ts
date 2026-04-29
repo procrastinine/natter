@@ -25,12 +25,12 @@
 
 const DEFAULT_TAGS: readonly string[] = Object.freeze(['think', 'thought'])
 
-export interface InlineReasoningEvent {
+interface InlineReasoningEvent {
   kind: 'text' | 'reasoning'
   text: string
 }
 
-export interface InlineReasoningLifterOptions {
+interface InlineReasoningLifterOptions {
   // Tag set to look for. Defaults to ['think', 'thought']; covers every
   // generic thinking model in scope. Pass an empty array to disable the
   // lifter entirely.

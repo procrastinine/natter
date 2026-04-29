@@ -7,7 +7,7 @@ import {
 import type { WorkspaceRepository } from './repository'
 import { useSearchStore, type SearchSession } from './zustand/searchStore'
 
-export interface SearchSessionRequest {
+interface SearchSessionRequest {
   query: string
   scope?: SearchScope
   filters?: SearchFilters
@@ -16,7 +16,7 @@ export interface SearchSessionRequest {
   debounceMs?: number
 }
 
-export const SEARCH_DEBOUNCE_MS = 150
+const SEARCH_DEBOUNCE_MS = 150
 
 let pendingTimer: ReturnType<typeof setTimeout> | null = null
 let activeController: AbortController | null = null

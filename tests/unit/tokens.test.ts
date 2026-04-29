@@ -80,10 +80,10 @@ describe('estimateTokens', () => {
   })
 
   it('returns 0 for null / undefined / non-string input (no throw)', () => {
-    expect(estimateTokens(null as unknown as string, 'gpt')).toBe(0)
+    expect(estimateTokens(null, 'gpt')).toBe(0)
     expect(estimateTokens(undefined as unknown as string, 'gpt')).toBe(0)
-    expect(estimateTokens(42 as unknown as string, 'gpt')).toBe(0)
-    expect(estimateTokens({} as unknown as string, 'gpt')).toBe(0)
+    expect(estimateTokens(42, 'gpt')).toBe(0)
+    expect(estimateTokens({}, 'gpt')).toBe(0)
   })
 })
 

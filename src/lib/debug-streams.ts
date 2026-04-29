@@ -66,7 +66,7 @@ function globalDebugEnabled(): boolean {
   }
 }
 
-export function requestPlanDebugEnabled(): boolean {
+function requestPlanDebugEnabled(): boolean {
   if (typeof window === 'undefined') return false
   try {
     return window.localStorage.getItem(PLAN_STORAGE_KEY) === '1'
@@ -76,7 +76,7 @@ export function requestPlanDebugEnabled(): boolean {
 }
 
 export function streamDebugEnabled(
-  profile?: Pick<ConnectionProfile, 'debugRequests'> | undefined,
+  profile?: Pick<ConnectionProfile, 'debugRequests'>  ,
 ): boolean {
   return profile?.debugRequests === true || globalDebugEnabled()
 }
@@ -282,7 +282,7 @@ function formatEntry(label: string, payload: unknown): string {
 function emitDebug(label: string, stage: string, payload?: unknown): void {
   const summarized = summarizePayload(stage, payload)
   pushEntry(label, summarized)
-  // eslint-disable-next-line no-console
+
   console.debug(label, summarized)
 }
 
@@ -291,7 +291,7 @@ export function logRequestPlanDebug(label: string, payload?: unknown): void {
   const summarized = sanitize(payload)
   const fullLabel = `[request-plan] ${label}`
   pushPlanEntry(fullLabel, payload)
-  // eslint-disable-next-line no-console
+
   console.debug(fullLabel, summarized)
 }
 
@@ -359,7 +359,7 @@ async function copyDumpText(text: string): Promise<string> {
       ;(window as unknown as { __debugStreamsLastCopyText?: string }).__debugStreamsLastCopyText =
         text
     }
-    // eslint-disable-next-line no-console
+
     console.warn(
       '[debug] clipboard copy unavailable; returning dump text and storing it on window.__debugStreamsLastCopyText',
       err,
@@ -385,12 +385,12 @@ export function installDebugStreams(): void {
     enable() {
       window.localStorage.setItem(STORAGE_KEY, '1')
       entryBuffer.splice(0, entryBuffer.length)
-      // eslint-disable-next-line no-console
+
       console.info('[debug] stream logging enabled and buffer reset')
     },
     disable() {
       window.localStorage.removeItem(STORAGE_KEY)
-      // eslint-disable-next-line no-console
+
       console.info('[debug] stream logging disabled')
     },
     status() {
@@ -398,7 +398,7 @@ export function installDebugStreams(): void {
     },
     clear() {
       entryBuffer.splice(0, entryBuffer.length)
-      // eslint-disable-next-line no-console
+
       console.info('[debug] stream log buffer cleared')
     },
     dump() {
@@ -413,12 +413,12 @@ export function installDebugStreams(): void {
     enablePlans() {
       window.localStorage.setItem(PLAN_STORAGE_KEY, '1')
       planBuffer.splice(0, planBuffer.length)
-      // eslint-disable-next-line no-console
+
       console.info('[debug] compact request-plan logging enabled and buffer reset')
     },
     disablePlans() {
       window.localStorage.removeItem(PLAN_STORAGE_KEY)
-      // eslint-disable-next-line no-console
+
       console.info('[debug] compact request-plan logging disabled')
     },
     planStatus() {
@@ -426,7 +426,7 @@ export function installDebugStreams(): void {
     },
     clearPlans() {
       planBuffer.splice(0, planBuffer.length)
-      // eslint-disable-next-line no-console
+
       console.info('[debug] compact request-plan buffer cleared')
     },
     dumpPlans() {
@@ -462,7 +462,7 @@ export function installDebugStreams(): void {
     },
   }
   ;(window as unknown as { __debugStreams: StreamDebugApi }).__debugStreams = api
-  // eslint-disable-next-line no-console
+
   console.info(
     '%c[debug] window.__debugStreams.enable() — compact stream logging with buffer helpers (`dump()`, `last()`, `copy()`, `clear()`). Use `enablePlans()` for one-line request-plan logs.',
     'color:#888;font-style:italic',

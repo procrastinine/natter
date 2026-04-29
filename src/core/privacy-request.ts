@@ -60,7 +60,7 @@ export class PrivacyDiscoveryUnavailableError extends Error {
   }
 }
 
-export interface ResolvePrivacyForSendInput {
+interface ResolvePrivacyForSendInput {
   chat: Chat
   profile: ConnectionProfile
   // Workspace-global CORS-proxy config (browser mode reads from
@@ -160,7 +160,7 @@ export async function resolvePrivacyForSend(
       // filter exclusions stay intact. The UI still shows the provider as
       // "checked" because the settings row is unchanged; the grey badge
       // plus this transient ignore are what keep the send honest.
-      const base: { ignore?: string[] } = (wire ?? { ignore: [] }) as { ignore?: string[] }
+      const base: { ignore?: string[] } = (wire ?? { ignore: [] })
       const next = new Set<string>(base.ignore ?? [])
       for (const name of insufficient) next.add(name)
       const merged: WireProviderPrivacy = { ...(wire ?? {}), ignore: [...next] }

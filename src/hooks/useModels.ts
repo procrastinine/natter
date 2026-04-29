@@ -30,12 +30,12 @@ import {
 } from '../store/models-cache'
 import { getProfile } from '../store/profiles'
 
-export interface UseModelsOptions {
+interface UseModelsOptions {
   query?: ModelsQuery
   enabled?: boolean
 }
 
-export interface UseModelsResult {
+interface UseModelsResult {
   models: ModelListEntry[]
   loading: boolean
   fetchedAt: number | null

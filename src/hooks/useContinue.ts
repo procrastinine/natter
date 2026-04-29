@@ -43,7 +43,7 @@ import { useStreamStore } from '../store/zustand/streamStore'
 import { useUiStore } from '../store/zustand/uiStore'
 import { markLifecycleTarget, startRequestLifecycle } from './requestLifecycle'
 
-export interface ContinueInPlaceInput {
+interface ContinueInPlaceInput {
   chatId: ChatId
   targetMessageId: MessageId
   connection: ConnectionProfile
@@ -320,7 +320,7 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
     const chunkIter = openStream({
       connection: input.connection,
       apiKey: input.apiKey,
-      wireBody: wire as Record<string, unknown>,
+      wireBody: wire,
       signal: abortController.signal,
       ...(route ? { route } : {}),
       ...(geminiModelId ? { geminiModelId } : {}),

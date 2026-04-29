@@ -18,7 +18,6 @@ const REFRESH_DEBOUNCE_MS = 750
 
 const timers = new Map<ChatId, ReturnType<typeof setTimeout>>()
 let installed = false
-let unsubscribe: (() => void) | null = null
 
 function scheduleRefresh(chatId: ChatId): void {
   const existing = timers.get(chatId)
@@ -37,7 +36,7 @@ function scheduleRefresh(chatId: ChatId): void {
 export function installChatPreviewMaintainer(): void {
   if (installed) return
   installed = true
-  unsubscribe = onEvent((event) => {
+  onEvent((event) => {
     if (event.kind === 'chat-deleted') {
       const t = timers.get(event.chatId)
       if (t !== undefined) clearTimeout(t)
@@ -54,14 +53,4 @@ export function installChatPreviewMaintainer(): void {
     if (!hasStructuralChange) return
     scheduleRefresh(event.chatId)
   })
-}
-
-// Test-only teardown. Clears the subscription + pending timers so tests
-// don't leak state between runs.
-export function __resetChatPreviewMaintainerForTests(): void {
-  if (unsubscribe) unsubscribe()
-  unsubscribe = null
-  installed = false
-  for (const t of timers.values()) clearTimeout(t)
-  timers.clear()
 }

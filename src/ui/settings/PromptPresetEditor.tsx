@@ -112,7 +112,7 @@ function usePromptSlot(
       const saved = await updateChatSettings(chat.id, {
         [slot.textKey]: draft,
         [slot.pinKey]: undefined,
-      } as Parameters<typeof updateChatSettings>[1])
+      })
       if (saved && opts.firstEditToastKey && typeof window !== 'undefined') {
         if (!window.sessionStorage.getItem(opts.firstEditToastKey)) {
           window.sessionStorage.setItem(opts.firstEditToastKey, '1')
@@ -140,7 +140,7 @@ function usePromptSlot(
     await updateChatSettings(chat.id, {
       [slot.textKey]: draft,
       [slot.pinKey]: undefined,
-    } as Parameters<typeof updateChatSettings>[1])
+    })
   }, [chat.id, draft, slot.pinKey, slot.textKey])
 
   const loadPreset = useCallback(
@@ -153,7 +153,7 @@ function usePromptSlot(
       await updateChatSettings(chat.id, {
         [slot.textKey]: target.text,
         [slot.pinKey]: target.id,
-      } as Parameters<typeof updateChatSettings>[1])
+      })
       await bumpPromptPresetLastUsedAt(target.id)
       setPickerOpen(false)
     },
@@ -166,7 +166,7 @@ function usePromptSlot(
       await updatePromptPreset(targetId, { text: draft })
       await updateChatSettings(chat.id, {
         [slot.pinKey]: targetId,
-      } as Parameters<typeof updateChatSettings>[1])
+      })
       pushToast({
         level: 'info',
         text: `Saved to "${presetName}".`,
@@ -190,7 +190,7 @@ function usePromptSlot(
       })
       await updateChatSettings(chat.id, {
         [slot.pinKey]: created.id,
-      } as Parameters<typeof updateChatSettings>[1])
+      })
       pushToast({
         level: 'info',
         text: `Created preset "${created.name}".`,

@@ -38,7 +38,7 @@ import type {
   TurnId,
 } from './types'
 
-export interface StructuralEffects {
+interface StructuralEffects {
   cursorUpdates: CursorMap
   cursorRemoveKeys: string[]
   cursorRemoveValueIds: MessageId[]
@@ -458,7 +458,7 @@ function finalizeDelete(cursor: CursorMap, effects: StructuralEffects): void {
   }
 }
 
-export interface SendUserMessageInput {
+interface SendUserMessageInput {
   chatId: ChatId
   cursor: CursorMap
   content: ContentItem[]
@@ -543,7 +543,7 @@ export async function sendUserMessage(
   return { effects: result.value.effects, versions: versionsFor(result, chatId), messageId }
 }
 
-export interface RegenerateInput {
+interface RegenerateInput {
   chatId: ChatId
   messageId: MessageId
   now?: number
@@ -593,7 +593,7 @@ export async function regenerateAssistant(
   return { effects: result.value.effects, versions: versionsFor(result, input.chatId), messageId }
 }
 
-export interface EditMessageInput {
+interface EditMessageInput {
   chatId: ChatId
   messageId: MessageId
   content: ContentItem[]
@@ -755,7 +755,7 @@ export async function continueAssistant(params: {
   return { effects: result.value.effects, versions: versionsFor(result, params.chatId), messageId }
 }
 
-export interface InsertSiblingInput {
+interface InsertSiblingInput {
   chatId: ChatId
   targetId: MessageId
   content: ContentItem[]
@@ -816,7 +816,7 @@ export async function insertSibling(
   return { effects: result.value.effects, versions: versionsFor(result, input.chatId), messageId }
 }
 
-export interface InsertBetweenInput {
+interface InsertBetweenInput {
   chatId: ChatId
   parentId: MessageId | null
   childId: MessageId
@@ -862,7 +862,7 @@ export async function insertBetween(
   return { effects: result.value.effects, versions: versionsFor(result, input.chatId), messageId }
 }
 
-export interface AppendAsChildInput {
+interface AppendAsChildInput {
   chatId: ChatId
   parentMessageId: MessageId
   content: ContentItem[]
@@ -932,13 +932,13 @@ export type PasteImportSlot =
   | { kind: 'after'; messageId: MessageId }
   | { kind: 'sibling'; messageId: MessageId }
 
-export interface PasteImportMessageInput {
+interface PasteImportMessageInput {
   role: MessageRole
   content: ContentItem[]
   attachmentRefs?: AttachmentId[]
 }
 
-export interface PasteImportInput {
+interface PasteImportInput {
   chatId: ChatId
   slot: PasteImportSlot
   cursor: CursorMap
@@ -1227,7 +1227,7 @@ async function insertBetweenInner(
   return row
 }
 
-export interface DeleteInput {
+interface DeleteInput {
   chatId: ChatId
   messageId: MessageId
   cursor: CursorMap
@@ -1349,7 +1349,7 @@ export async function deleteVariant(
   return { effects: result.value.effects, versions: versionsFor(result, input.chatId) }
 }
 
-export interface SwipeInput {
+interface SwipeInput {
   messages: readonly Message[]
   targetId: MessageId
   direction: -1 | 1
@@ -1388,5 +1388,3 @@ export function swipe(input: SwipeInput): { cursorUpdates: CursorMap; chosenSibl
   }
   return { cursorUpdates: updates, chosenSiblingId: chosen.id }
 }
-
-export type { TurnId }

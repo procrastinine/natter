@@ -11,31 +11,7 @@ import type { Attachment, AttachmentId, AttachmentRef, Message } from './types'
 
 export type AttachmentResolver = (id: AttachmentId) => Attachment | undefined
 
-export function mediaTokensForContent(
-  content: unknown,
-  family: TokenizerFamily,
-  resolver?: AttachmentResolver,
-  options?: MediaTokenEstimateOptions,
-): number {
-  let tokens = 0
-  for (const item of safeContent(content)) {
-    if (item.type === 'image_url' || item.type === 'output_image') {
-      tokens += imageTokensForItem(item.attachmentId, family, resolver, options)
-    } else if (item.type === 'file') {
-      tokens += fileTokensForItem(item.attachmentId, item.mime, family, resolver)
-    } else if (
-      item.type === 'input_audio' ||
-      item.type === 'audio_output' ||
-      item.type === 'video_url' ||
-      item.type === 'output_video'
-    ) {
-      tokens += genericMediaTokensForItem(item.attachmentId, resolver)
-    }
-  }
-  return tokens
-}
-
-export function attachmentTokenCountFor(
+function attachmentTokenCountFor(
   attachmentId: AttachmentId,
   family: TokenizerFamily,
   resolver?: AttachmentResolver,
@@ -119,7 +95,7 @@ export function mediaTokensForRefs(
   )
 }
 
-export function visibleAttachmentRefs(refs: readonly AttachmentRef[] | undefined): AttachmentRef[] {
+function visibleAttachmentRefs(refs: readonly AttachmentRef[] | undefined): AttachmentRef[] {
   if (!refs) return []
   const out: AttachmentRef[] = []
   for (const ref of refs) {
@@ -133,7 +109,7 @@ export function visibleAttachmentRefs(refs: readonly AttachmentRef[] | undefined
   return out
 }
 
-export function attachmentIdsInContent(content: unknown): Set<AttachmentId> {
+function attachmentIdsInContent(content: unknown): Set<AttachmentId> {
   const ids = new Set<AttachmentId>()
   for (const item of safeContent(content)) {
     const attachmentId = 'attachmentId' in item ? item.attachmentId : undefined

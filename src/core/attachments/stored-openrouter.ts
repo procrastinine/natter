@@ -7,7 +7,7 @@ import type {
   ProcessAttachmentResult,
 } from './types'
 
-export interface StoredOpenRouterAttachmentWire {
+interface StoredOpenRouterAttachmentWire {
   parts: unknown[]
   plugins: unknown[]
 }

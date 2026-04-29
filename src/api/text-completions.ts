@@ -23,7 +23,7 @@ import type {
   ChatStreamChunk,
 } from './types'
 
-export interface TextCompletionsContext {
+interface TextCompletionsContext {
   profile: ConnectionProfile
   apiKey: string
 }
@@ -105,7 +105,7 @@ function liftTextToDelta(chunk: TextCompletionChunkWire): ChatCompletionChunkWir
     return base
   })
   const { usage: _usage, choices: _choices, ...rest } = chunk
-  return { ...rest, choices: liftedChoices } as ChatCompletionChunkWire
+  return { ...rest, choices: liftedChoices }
 }
 
 function liftBufferedToChat(result: TextCompletionChunkWire): ChatCompletionResultWire {

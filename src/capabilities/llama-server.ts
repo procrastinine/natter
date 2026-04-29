@@ -12,7 +12,7 @@ import type { CapabilityDescriptor } from '../core/types'
 // /v1/chat/completions and /v1/completions accept. Names follow the wire
 // names llama.cpp expects (see llama_server.md §sampling params and
 // §POST /v1/chat/completions).
-export const LLAMA_SERVER_PARAMETERS: readonly string[] = [
+const LLAMA_SERVER_PARAMETERS: readonly string[] = [
   // OAI-shared sampling
   'temperature',
   'top_p',

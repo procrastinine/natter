@@ -31,13 +31,13 @@ import {
   UNLIMITED_CONTEXT,
 } from '../../core/prompt-size'
 import { readTokenCalibrationGlobal } from '../../core/token-calibration'
-import type { Chat, MediaContextStrategy, Message } from '../../core/types'
+import type { Chat, Message } from '../../core/types'
 import { getChatDraft, loadActiveBranchSnapshot, updateChatSettings } from '../../store/chats'
 import { useChatStore } from '../../store/zustand/chatStore'
 import { useAttachmentResolverForContext } from '../attachments/useAttachmentResolver'
 import { InfoDisclosure } from './InfoDisclosure'
 
-export interface ContextPanelProps {
+interface ContextPanelProps {
   chat: Chat
   capability: EffectiveCapability | null
   endpointTokenizer: string | null | undefined
@@ -189,13 +189,13 @@ export function ContextPanel({
   const keepFirstPairs = strategy.keepFirstPairs ?? 0
   const useMiddleOut = strategy.useOpenRouterMiddleOut === true
   const effectivePromptBudget = Number.isFinite(effectiveMax)
-    ? Math.max(0, (effectiveMax as number) - storedMaxCompletion)
+    ? Math.max(0, (effectiveMax) - storedMaxCompletion)
     : Number.POSITIVE_INFINITY
 
   const usedTokens = estimate.total
   const budgetPct =
     Number.isFinite(effectivePromptBudget) && effectivePromptBudget > 0
-      ? usedTokens / (effectivePromptBudget as number)
+      ? usedTokens / (effectivePromptBudget)
       : 0
   const overBudget = Number.isFinite(effectivePromptBudget) && usedTokens > effectivePromptBudget
   const warnLevel: 'ok' | 'warn' | 'danger' = overBudget
@@ -366,7 +366,7 @@ export function ContextPanel({
               aria-pressed={chat.settings.mediaContextStrategy === value}
               onClick={() =>
                 void updateChatSettings(chat.id, {
-                  mediaContextStrategy: value as MediaContextStrategy,
+                  mediaContextStrategy: value,
                 })
               }
             >

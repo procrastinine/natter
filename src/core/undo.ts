@@ -14,7 +14,7 @@
 import { getWorkspaceRepository } from '../store/workspace-repository'
 import type { AttachmentId, ChatId, Message, MessageId, MutationScope } from './types'
 
-export interface StructuralSnapshot {
+interface StructuralSnapshot {
   chatId: ChatId
   // Row-by-row restore list. Each entry is an exact `Message` that was
   // alive (or tombstoned) immediately before the mutation; on undo it

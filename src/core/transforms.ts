@@ -89,7 +89,7 @@ export interface ChatCompletionsTransformOptions {
   extraPlugins?: readonly unknown[]
 }
 
-export interface ChatCompletionsTransformResult {
+interface ChatCompletionsTransformResult {
   wire: ChatCompletionRequestWire
   // The model id the caller should store on `generation.requestedModel`
   // (before any quirk rewrite). Kept separate so callers don't have to
@@ -292,7 +292,7 @@ function toWireRole(role: MessageRole): string {
   return role
 }
 
-export interface BuildChatMessagesOptions {
+interface BuildChatMessagesOptions {
   reasoningPreservationFormat?: ReasoningFormat
   acceptsAnthropicRedactedThinking?: boolean
   attachmentPartsByMessageId?: ReadonlyMap<MessageId, readonly unknown[]>
@@ -575,7 +575,7 @@ export function toChatCompletions(
 // Text completions (llama-server protocol='text')
 // ---------------------------------------------------------------------------
 
-export interface TextCompletionsTransformOptions {
+interface TextCompletionsTransformOptions {
   capabilities?: CapabilityDescriptor
   stream?: boolean
   privacy?: WireProviderPrivacy
@@ -590,7 +590,7 @@ export interface TextCompletionsTransformOptions {
   prerenderedPrompt?: string
 }
 
-export interface TextCompletionsTransformResult {
+interface TextCompletionsTransformResult {
   wire: TextCompletionRequestWire
   requestedModel: string
 }
@@ -798,7 +798,7 @@ export interface ResponsesTransformOptions {
   reasoningPreservationFormat?: ReasoningFormat
 }
 
-export interface ResponsesTransformResult {
+interface ResponsesTransformResult {
   wire: ResponsesRequestWire
   requestedModel: string
 }
@@ -938,7 +938,7 @@ export function toResponses(
   }
 
   // GPT-5.4 sampling gate — strip temp/top_p/logprobs when effort != none.
-  adjustGpt54SamplingGate(wire as unknown as Record<string, unknown>, quirks)
+  adjustGpt54SamplingGate(wire, quirks)
 
   return { wire, requestedModel }
 }
@@ -1023,9 +1023,7 @@ function messageToResponsesItems(
       const filtered = message.reasoningDetails
         ? filterReasoningForInclude(message.reasoningDetails, include, preservationFormat)
         : []
-      const encrypted = filtered.find((d) => d.type === 'reasoning.encrypted') as
-        | Extract<(typeof filtered)[number], { type: 'reasoning.encrypted' }>
-        | undefined
+      const encrypted = filtered.find((d) => d.type === 'reasoning.encrypted')
       const summaries = filtered.filter(
         (d): d is Extract<(typeof filtered)[number], { type: 'reasoning.summary' }> =>
           d.type === 'reasoning.summary',
@@ -1185,7 +1183,7 @@ export interface GeminiNativeTransformOptions {
   thinkingBudgetByEffort?: Partial<Record<EffortLevel, number>>
 }
 
-export interface GeminiNativeTransformResult {
+interface GeminiNativeTransformResult {
   wire: GenerateContentRequestWire
   // The model id the caller should pass to `geminiStream()` /
   // `geminiOnce()` — stripped of any provider prefix.

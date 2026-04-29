@@ -29,9 +29,9 @@ import { canonicalCompatModelId, canonicalModelSlug } from './model-ids'
 //                    prefill works when reasoning is disabled on the wire.
 // `oss-reasoning-required` — model can't toggle reasoning off; prefill lands
 //                            in the <think> block rather than content.
-export type PrefillClass = 'native' | 'unsupported' | 'oss-toggleable' | 'oss-reasoning-required'
+type PrefillClass = 'native' | 'unsupported' | 'oss-toggleable' | 'oss-reasoning-required'
 
-export type TextCompletionsSupport =
+type TextCompletionsSupport =
   | 'visible'
   | 'accepted-reasoning-only'
   | 'disabled-chat-native'
@@ -52,7 +52,7 @@ export const FULL_EFFORT: readonly EffortLevel[] = [
 
 export const FULL_VERBOSITY: readonly VerbosityLevel[] = ['low', 'medium', 'high', 'xhigh', 'max']
 
-export interface QuirksEntry {
+interface QuirksEntry {
   // Empty array means "reasoning.effort is ignored" (adaptive-only).
   // undefined means "no narrowing; use the full superset".
   allowedEffort?: readonly EffortLevel[]
@@ -597,13 +597,6 @@ export function emitsEncryptedReasoningFor(modelId: string): 'always' | 'tools-o
   return 'always'
 }
 
-// Tag set for inline-reasoning lifting. Registry entries narrow this; unset
-// means "auto-detect generically". The stream splitter reads this via
-// `inlineReasoningTagsFor` and passes it to `createInlineReasoningLifter`.
-export function inlineReasoningTagsFor(modelId: string): readonly string[] | undefined {
-  return quirksFor(modelId).reasoningInlineTags
-}
-
 // ---------------------------------------------------------------------------
 // Prefill classification + reasoning-toggleable gate. See
 // `plan/prefill-research.md §P.7` and §P.8.1.
@@ -684,7 +677,7 @@ export function reasoningToggleableFor(modelId: string): boolean {
 // ChatML scaffold, and DeepSeek R1 text mode returns reasoning-only output.
 // Keep those disabled in the API-mode UI while letting open-weight and unknown
 // OSS-like families opt in.
-export function textCompletionsSupportFor(modelId: string): TextCompletionsSupport {
+function textCompletionsSupportFor(modelId: string): TextCompletionsSupport {
   const slug = canonicalCompatModelId(modelId).toLowerCase()
   if (!slug) return 'unknown'
   if (/^deepseek-r1(?:$|-0528$)/u.test(slug)) return 'accepted-reasoning-only'

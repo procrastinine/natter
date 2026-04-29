@@ -49,7 +49,7 @@ function idsEquivalent(left: string, right: string): boolean {
   )
 }
 
-export interface UseEndpointsResult {
+interface UseEndpointsResult {
   descriptor: EndpointsDescriptor | null
   endpoints: ModelEndpoint[]
   capability: EffectiveCapability | null
@@ -65,7 +65,7 @@ export interface UseEndpointsResult {
   refresh: () => void
 }
 
-export interface UseEndpointsOptions {
+interface UseEndpointsOptions {
   strict?: boolean
 }
 

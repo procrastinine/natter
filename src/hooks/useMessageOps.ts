@@ -221,7 +221,7 @@ export async function continueFromMessage(
   if (conn.presetId) await bumpPresetLastUsedAt(conn.presetId)
 }
 
-export interface DeleteOpArgs {
+interface DeleteOpArgs {
   chatId: ChatId
   messageId: MessageId
   cursor: Record<string, string>

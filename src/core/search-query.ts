@@ -1,4 +1,4 @@
-export type SearchKnownIsValue = 'pinned' | 'archived' | 'untitled'
+type SearchKnownIsValue = 'pinned' | 'archived' | 'untitled'
 
 export interface SearchTextClause {
   kind: 'text'
@@ -16,14 +16,14 @@ export interface SearchNameClause {
   raw: string
 }
 
-export interface SearchIsClause {
+interface SearchIsClause {
   value: SearchKnownIsValue
   negated: boolean
   position: number
   raw: string
 }
 
-export interface SearchQueryWarning {
+interface SearchQueryWarning {
   code: 'unknown-is'
   value: string
   position: number
@@ -43,7 +43,7 @@ export interface SearchQueryParseError {
   position: number
 }
 
-export type SearchQueryParseResult =
+type SearchQueryParseResult =
   | { ok: true; query: SearchQuery }
   | { ok: false; error: SearchQueryParseError }
 
@@ -113,14 +113,6 @@ export function parseSearchQuery(raw: string): SearchQueryParseResult {
   }
 
   return { ok: true, query }
-}
-
-export function positiveSearchTerms(query: SearchQuery): string[] {
-  return query.text.filter((clause) => !clause.negated).map((clause) => clause.value)
-}
-
-export function negativeSearchTerms(query: SearchQuery): string[] {
-  return query.text.filter((clause) => clause.negated).map((clause) => clause.value)
 }
 
 export function hasPositiveTextTerms(query: SearchQuery): boolean {

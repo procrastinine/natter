@@ -9,7 +9,7 @@ import type { DataPolicy } from './types'
 // Always returns a deep copy of the synthetic policy so callers can mutate freely.
 export function synthesizeDataPolicy(raw: DataPolicy | null | undefined): DataPolicy {
   if (raw) return raw
-  return structuredClone(UNKNOWN_POLICY) as DataPolicy
+  return structuredClone(UNKNOWN_POLICY)
 }
 
 // Tier-based dominance (per user spec 2026-04-19). `a` dominates `b` iff

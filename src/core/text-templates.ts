@@ -15,7 +15,7 @@ import type {
 import { newId } from '../lib/ulid'
 import { getSetting, updateSetting } from '../store/settings'
 
-export interface TextTemplateDescriptor extends TextTemplateConfig {
+interface TextTemplateDescriptor extends TextTemplateConfig {
   id: TextTemplateId
   name: string
   description?: string
@@ -306,13 +306,7 @@ export const BUILTIN_TEXT_TEMPLATE_ORDER: readonly TextTemplateId[] = [
   'raw',
 ]
 
-export const TEXT_TEMPLATE_ORDER: readonly TextTemplateId[] = [
-  'default',
-  ...BUILTIN_TEXT_TEMPLATE_ORDER,
-  'custom',
-]
-
-export function resolveTextTemplate(
+function resolveTextTemplate(
   id: TextTemplateId,
   customFallback?: TextTemplateConfig,
 ): TextTemplateConfig | null {

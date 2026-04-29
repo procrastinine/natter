@@ -37,7 +37,7 @@ import { Message } from './Message'
 import type { InsertSlot } from './MessageActions'
 import { PrefillSettingsPrompt } from './PrefillSettingsPrompt'
 
-export interface MessageListProps {
+interface MessageListProps {
   chatId: ChatId
   chatSettings: ChatSettings
   hasConnection: boolean
@@ -49,7 +49,7 @@ export interface MessageListProps {
 // Stable reference so `useChatStore(selector)` doesn't allocate a fresh `{}`
 // every render — that triggers React 19's infinite-rerender detection via
 // `useSyncExternalStore` (getSnapshot must return a stable value).
-const EMPTY_CURSOR: CursorMap = Object.freeze({}) as CursorMap
+const EMPTY_CURSOR: CursorMap = Object.freeze({})
 
 interface InsertTarget {
   messageId: MessageId

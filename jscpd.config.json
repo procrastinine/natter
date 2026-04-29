@@ -1,0 +1,17 @@
+{
+  "$schema": "https://raw.githubusercontent.com/kucherenko/jscpd/master/schemas/jscpd-schema.json",
+  "threshold": 10,
+  "minLines": 12,
+  "minTokens": 80,
+  "path": ["src", "tests"],
+  "reporters": ["console"],
+  "ignore": [
+    "node_modules/**",
+    "dist/**",
+    "test-results/**",
+    ".playwright-cli/**",
+    "coverage/**",
+    "pnpm-lock.yaml",
+    "src/capabilities/*.json"
+  ]
+}

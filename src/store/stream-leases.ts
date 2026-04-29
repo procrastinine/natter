@@ -5,7 +5,7 @@ import type { StreamLeaseRow } from './repository'
 import { getWorkspaceRepository } from './workspace-repository'
 import { useStreamStore } from './zustand/streamStore'
 
-export const STREAM_LEASE_HEARTBEAT_MS = 2_000
+const STREAM_LEASE_HEARTBEAT_MS = 2_000
 export const STREAM_LEASE_TTL_MS = 15_000
 
 const clientId = newId()
@@ -84,7 +84,7 @@ export function stopStreamLease(streamId: string): void {
   void getWorkspaceRepository().deleteStreamLease(streamId).catch(() => {})
 }
 
-export async function freshStreamLeases(chatId?: ChatId, now = Date.now()): Promise<StreamLeaseRow[]> {
+async function freshStreamLeases(chatId?: ChatId, now = Date.now()): Promise<StreamLeaseRow[]> {
   const leases = await getWorkspaceRepository().listStreamLeases(chatId)
   return leases.filter((lease) => isFreshStreamLease(lease, now))
 }

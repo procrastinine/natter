@@ -11,7 +11,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { CloseIcon } from '../icons/Icon'
 
-export interface ConfirmDeleteDialogProps {
+interface ConfirmDeleteDialogProps {
   previewText: string
   // When true, the pair checkbox is disabled (role-adjacency mismatch
   // — pair-delete would sweep a valid neighbor). Default false.

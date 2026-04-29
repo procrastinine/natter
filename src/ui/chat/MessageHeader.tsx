@@ -1,6 +1,6 @@
 import type { Message as MessageRow } from '../../core/types'
 
-export interface MessageHeaderProps {
+interface MessageHeaderProps {
   message: MessageRow
 }
 

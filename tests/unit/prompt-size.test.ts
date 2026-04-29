@@ -48,7 +48,7 @@ function makeMessage(partial: Partial<Message> & { role: MessageRole; text?: str
     createdAt: partial.createdAt ?? 1,
     role: partial.role,
     origin: partial.origin ?? (partial.role === 'user' ? 'user' : 'generated'),
-    content: content as Message['content'],
+    content: content,
     nodeVersion: partial.nodeVersion ?? 1,
     deleted: partial.deleted ?? false,
     ...(partial.hiddenFromContext !== undefined
@@ -1208,7 +1208,7 @@ describe('estimatePromptSize — robustness guards', () => {
       makeMessage({
         role: 'assistant',
         text: 'ok',
-        generation: withUsage(Number.NaN as unknown as number),
+        generation: withUsage(Number.NaN),
       }),
     ]
     const est = estimatePromptSize({

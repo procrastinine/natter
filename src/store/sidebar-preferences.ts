@@ -33,10 +33,6 @@ export async function readCollapsedSidebarFolderIds(): Promise<FolderId[]> {
   }
 }
 
-export async function writeCollapsedSidebarFolderIds(ids: readonly FolderId[]): Promise<void> {
-  await setSetting(SIDEBAR_COLLAPSED_FOLDERS_SETTING_KEY, normalizeFolderIds(ids))
-}
-
 export async function updateCollapsedSidebarFolderIds(
   updater: (current: readonly FolderId[]) => readonly FolderId[],
 ): Promise<FolderId[]> {

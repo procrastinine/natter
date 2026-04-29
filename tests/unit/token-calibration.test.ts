@@ -128,7 +128,7 @@ describe('validateSample — physical bounds', () => {
   })
 
   it('rejects bad-input (non-number chars / negative tokens / NaN)', () => {
-    expect(validateSample('openai/gpt-4o', 'oops' as unknown as number, 10, undefined)).toEqual({
+    expect(validateSample('openai/gpt-4o', 'oops', 10, undefined)).toEqual({
       accepted: false,
       skipReason: 'bad-input',
     })
@@ -548,7 +548,7 @@ describe('derivePromptSample', () => {
     const sample = derivePromptSample({
       sentPath: [message('user', 'A'.repeat(10)), message('assistant', 'B'.repeat(10))],
       systemPrompt: 'S'.repeat(10),
-      usage: { prompt_tokens: 100, completion_tokens: 0, total_tokens: 100 } as ChatUsage,
+      usage: { prompt_tokens: 100, completion_tokens: 0, total_tokens: 100 },
       family: 'gpt',
       modelId: 'openai/gpt-4o',
       mediaTokens: 0,
@@ -586,7 +586,7 @@ describe('derivePromptSample', () => {
       derivePromptSample({
         sentPath: [],
         systemPrompt: '',
-        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } as ChatUsage,
+        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
         family: 'gpt',
         modelId: 'openai/gpt-4o',
         mediaTokens: 0,
@@ -596,7 +596,7 @@ describe('derivePromptSample', () => {
       derivePromptSample({
         sentPath: [],
         systemPrompt: '',
-        usage: { prompt_tokens: -10, completion_tokens: 0, total_tokens: 0 } as ChatUsage,
+        usage: { prompt_tokens: -10, completion_tokens: 0, total_tokens: 0 },
         family: 'gpt',
         modelId: 'openai/gpt-4o',
         mediaTokens: 0,
@@ -608,7 +608,7 @@ describe('derivePromptSample', () => {
     const sample = derivePromptSample({
       sentPath: [message('user', 'hi')],
       systemPrompt: '',
-      usage: { prompt_tokens: 100, completion_tokens: 0, total_tokens: 100 } as ChatUsage,
+      usage: { prompt_tokens: 100, completion_tokens: 0, total_tokens: 100 },
       family: 'gpt',
       modelId: 'openai/gpt-4o',
       mediaTokens: 50,
@@ -628,7 +628,7 @@ describe('derivePromptSample', () => {
       derivePromptSample({
         sentPath: [userWithImage],
         systemPrompt: '',
-        usage: { prompt_tokens: 100, completion_tokens: 0, total_tokens: 100 } as ChatUsage,
+        usage: { prompt_tokens: 100, completion_tokens: 0, total_tokens: 100 },
         family: 'gpt',
         modelId: 'openai/gpt-4o',
         mediaTokens: 0,
@@ -659,7 +659,7 @@ describe('deriveCompletionSample', () => {
   it('straight text: chars = content, tokens = completion_tokens', () => {
     const sample = deriveCompletionSample({
       assistantMessage: assistant('B'.repeat(100)),
-      usage: { prompt_tokens: 0, completion_tokens: 50, total_tokens: 50 } as ChatUsage,
+      usage: { prompt_tokens: 0, completion_tokens: 50, total_tokens: 50 },
       family: 'gpt',
     })
     expect(sample).toEqual({ chars: 100, tokens: 50 })
@@ -677,7 +677,7 @@ describe('deriveCompletionSample', () => {
         completion_tokens: 100,
         total_tokens: 100,
         completion_tokens_details: { reasoning_tokens: 30 },
-      } as ChatUsage,
+      },
       family: 'gpt',
     })
     expect(sample?.chars).toBe(50) // content only
@@ -695,7 +695,7 @@ describe('deriveCompletionSample', () => {
         prompt_tokens: 0,
         completion_tokens: 80,
         total_tokens: 80,
-      } as ChatUsage,
+      },
       family: 'deepseek',
     })
     expect(sample?.chars).toBe(60 + 230) // 6*10 + 23*10
@@ -706,7 +706,7 @@ describe('deriveCompletionSample', () => {
     expect(
       deriveCompletionSample({
         assistantMessage: assistant('ok'),
-        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } as ChatUsage,
+        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
         family: 'gpt',
       }),
     ).toBeNull()
@@ -723,7 +723,7 @@ describe('deriveCompletionSample', () => {
           completion_tokens: 50,
           total_tokens: 50,
           completion_tokens_details: { reasoning_tokens: 50 },
-        } as ChatUsage,
+        },
         family: 'gpt',
       }),
     ).toBeNull()
@@ -737,7 +737,7 @@ describe('deriveCompletionSample', () => {
     expect(
       deriveCompletionSample({
         assistantMessage: withImage,
-        usage: { prompt_tokens: 0, completion_tokens: 100, total_tokens: 100 } as ChatUsage,
+        usage: { prompt_tokens: 0, completion_tokens: 100, total_tokens: 100 },
         family: 'gpt',
       }),
     ).toBeNull()
@@ -753,7 +753,7 @@ describe('deriveCompletionSample', () => {
         prompt_tokens: 0,
         completion_tokens: 40,
         total_tokens: 40,
-      } as ChatUsage,
+      },
       family: 'gpt',
     })
     // No reasoning_tokens reported, no reasoning.text/summary chars →
@@ -786,7 +786,7 @@ describe('messageTextCharCount', () => {
     expect(messageTextCharCount(null)).toBe(0)
     expect(messageTextCharCount(undefined)).toBe(0)
     expect(messageTextCharCount([])).toBe(0)
-    expect(messageTextCharCount('oops' as unknown as unknown[])).toBe(0)
+    expect(messageTextCharCount('oops')).toBe(0)
   })
 })
 
@@ -922,7 +922,7 @@ describe('persistence round-trip', () => {
     const settings = (await import('../../src/store/settings')) as unknown as {
       setSetting<T>(key: string, value: T): Promise<void>
     }
-    await settings.setSetting('global:token-calibration', { version: 'oops' } as unknown)
+    await settings.setSetting('global:token-calibration', { version: 'oops' })
     const read = await readTokenCalibrationGlobal()
     expect(read.version).toBe(1)
     expect(Object.keys(read.byModel).length).toBe(0)

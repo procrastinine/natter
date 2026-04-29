@@ -46,7 +46,7 @@ import {
   UploadIcon,
 } from '../icons/Icon'
 
-export interface StorageViewProps {
+interface StorageViewProps {
   route: StorageRoute
 }
 

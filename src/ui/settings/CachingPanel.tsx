@@ -19,7 +19,7 @@ import type { AnthropicCacheSettings, Chat, ConnectionKind } from '../../core/ty
 import { updateChatSettings } from '../../store/chats'
 import { InfoDisclosure } from './InfoDisclosure'
 
-export interface CachingPanelProps {
+interface CachingPanelProps {
   chat: Chat
   capability: EffectiveCapability | null
   // Caching breakpoints are provider-specific wire features: Anthropic's

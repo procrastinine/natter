@@ -153,7 +153,7 @@ describe('ApiModeSection — two-button toggle', () => {
     window.confirm = (() => {
       prompted = true
       return true
-    }) as typeof window.confirm
+    })
     try {
       render(
         <ApiModeSection chat={chat} capability={capability} profile={makeProfile('openrouter')} />,

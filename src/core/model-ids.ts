@@ -53,7 +53,7 @@ const DECORATION_PROVIDERS = new Set<string>([
 ])
 const DECORATION_PROVIDER_LIST = [...DECORATION_PROVIDERS]
 
-export interface DeterministicStructuralModelIdentity {
+interface DeterministicStructuralModelIdentity {
   provider: string | null
   slug: string
   compatSlug: string
@@ -346,7 +346,7 @@ export function bestGuessTokenizerFamilyKey(
   return heuristicFamilyGuess(identity.slug)?.familyKey ?? null
 }
 
-export function isTokenizerFamilyKey(key: string): boolean {
+function isTokenizerFamilyKey(key: string): boolean {
   return TOKENIZER_FAMILY_KEY_SET.has(key)
 }
 

@@ -32,7 +32,7 @@ function makeSettings(overrides: Partial<ChatSettings['reasoning']> & { mode: Re
 
 function transform(settings: ChatSettings): Record<string, unknown> {
   const { wire } = toChatCompletions(settings, [], { stream: false })
-  return wire as unknown as Record<string, unknown>
+  return wire
 }
 
 describe('buildReasoning via toChatCompletions', () => {

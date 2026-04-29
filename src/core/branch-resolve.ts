@@ -2,7 +2,7 @@
 //
 // Given a target message M and a mutable cursor, write cursor entries from
 // M downward so the active-path walk agrees with the "most-recently-updated
-// chain below M" choice. Swipe, branch-tree click, search-click, and
+// chain below M" choice. Swipe, search-click, and
 // hash-route deep-link all funnel through this helper so the same target
 // always resolves to the same descendant chain.
 //
@@ -14,7 +14,7 @@
 import { cursorKeyOf, indexById, pickDefaultChild } from './active-path'
 import type { CursorMap, Message, MessageId } from './types'
 
-export interface ResolveBranchInput {
+interface ResolveBranchInput {
   targetId: MessageId
   byParent: Map<MessageId | null, Message[]>
   byId: Map<MessageId, Message>

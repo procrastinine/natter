@@ -6,7 +6,7 @@
 // `retryable` flag is a HINT for the UI's retry button; the actual retry policy
 // (GET backoff, key fallback chain) lives in `client.ts`.
 
-export type ApiErrorKind =
+type ApiErrorKind =
   | 'network'
   | 'timeout'
   | 'abort'
@@ -20,7 +20,7 @@ export type ApiErrorKind =
   | 'validation'
   | 'unknown'
 
-export interface ApiErrorShape {
+interface ApiErrorShape {
   kind: ApiErrorKind
   httpStatus?: number
   code: number | string
@@ -50,7 +50,7 @@ export class ApiError extends Error implements ApiErrorShape {
   }
 }
 
-export interface NormalizeCtx {
+interface NormalizeCtx {
   midStream: boolean
   httpStatus?: number
   // When the request never reached a response, the caller indicates WHICH
@@ -92,7 +92,7 @@ interface ErrorLike {
 }
 
 function extractErrorBody(input: unknown): ErrorLike {
-  if (input && typeof input === 'object') return input as ErrorLike
+  if (input && typeof input === 'object') return input
   return {}
 }
 

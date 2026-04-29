@@ -11,14 +11,14 @@ import type {
 
 export const DRAFT_ATTACHMENT_CONTEXT_ID = '__draft__'
 
-export type AttachmentContextOwnerId = MessageId | typeof DRAFT_ATTACHMENT_CONTEXT_ID
+type AttachmentContextOwnerId = MessageId | typeof DRAFT_ATTACHMENT_CONTEXT_ID
 
-export interface AttachmentContextPolicy {
+interface AttachmentContextPolicy {
   mediaContextStrategy?: MediaContextStrategy
   mediaEchoN?: number
 }
 
-export interface AttachmentContextDraft {
+interface AttachmentContextDraft {
   refs?: readonly AttachmentRef[]
   role?: MessageRole
   createdAt?: number

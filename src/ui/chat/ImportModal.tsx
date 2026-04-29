@@ -13,7 +13,7 @@ import type { ChatId, ContentItem, CursorMap, MessageRole } from '../../core/typ
 import { newId } from '../../lib/ulid'
 import { CloseIcon, TrashIcon } from '../icons/Icon'
 
-export interface ImportModalProps {
+interface ImportModalProps {
   // Existing chat to import into. Pass `null` together with
   // `materializeChat` when the import is running on the new-chat
   // surface — the chat row is created lazily, only if the user
@@ -82,7 +82,7 @@ export function ImportModal({
 
   const addRow = useCallback(() => {
     setRows((prev) => {
-      const last = prev[prev.length - 1] as Row | undefined
+      const last = prev[prev.length - 1]
       const nextRole: MessageRole = last?.role === 'user' ? 'assistant' : 'user'
       return [...prev, { id: newId(), role: nextRole, text: '' }]
     })

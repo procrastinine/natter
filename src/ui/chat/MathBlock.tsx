@@ -1,6 +1,6 @@
 import { useMemo } from 'react'
 
-export interface MathBlockProps {
+interface MathBlockProps {
   source: string
   display?: boolean
 }

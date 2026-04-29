@@ -6,7 +6,7 @@ import { IDBFactory } from 'fake-indexeddb'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { effectiveCapabilityFromEndpoints } from '../../src/core/capabilities'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
-import type { Chat, Message, MessageAttachmentRef, ModelEndpoint } from '../../src/core/types'
+import type { Message, MessageAttachmentRef, ModelEndpoint } from '../../src/core/types'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import { createChat, getChat } from '../../src/store/chats'
 import { __resetDbForTests, openDb } from '../../src/store/db'
@@ -92,7 +92,7 @@ function LiveContextPanel({
 }) {
   const chat = useLiveQuery(() => getChat(chatId), [chatId], undefined)
   if (!chat) return null
-  return <ContextPanel chat={chat as Chat} capability={capability} endpointTokenizer={null} />
+  return <ContextPanel chat={chat} capability={capability} endpointTokenizer={null} />
 }
 
 async function resetAll() {

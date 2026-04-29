@@ -39,7 +39,7 @@ export type ExclusionReason =
   | 'user-ignored'
   | 'not-in-only-list'
 
-export interface FilteredEndpoint {
+interface FilteredEndpoint {
   endpoint: ModelEndpoint
   policy: DataPolicy | undefined
   // True only when the caller explicitly requested the offline safety
@@ -48,7 +48,7 @@ export interface FilteredEndpoint {
   policySynthesized: boolean
 }
 
-export interface ExcludedEndpoint extends FilteredEndpoint {
+interface ExcludedEndpoint extends FilteredEndpoint {
   reasons: ExclusionReason[]
 }
 
@@ -65,7 +65,7 @@ export interface PrivacyFilterResult {
   zeroEligible: boolean
 }
 
-export interface PrivacyFilterInput {
+interface PrivacyFilterInput {
   model: string
   endpoints: readonly ModelEndpoint[]
   policies: Readonly<Record<string, DataPolicy | undefined>>

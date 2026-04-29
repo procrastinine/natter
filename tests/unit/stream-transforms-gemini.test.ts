@@ -51,9 +51,7 @@ describe('splitGeminiStream — probe 8 (native stream w/ thoughtSignature)', ()
     const body = readFileSync(PROBE8, 'utf8')
     const lanes = await collect(splitGeminiStream(asAsync(sseToChunks(body))))
 
-    const firstMeta = lanes.find((l) => l.lane === 'meta') as
-      | Extract<StreamLaneEvent, { lane: 'meta' }>
-      | undefined
+    const firstMeta = lanes.find((l) => l.lane === 'meta')
     expect(firstMeta?.model).toBe('gemini-3.1-flash-lite-preview')
     expect(firstMeta?.generationId).toBeDefined()
 
@@ -71,9 +69,7 @@ describe('splitGeminiStream — probe 8 (native stream w/ thoughtSignature)', ()
     expect(encrypted[0]?.encryptedDelta?.length).toBeGreaterThan(100)
 
     expect(lanes.some((l) => l.lane === 'usage')).toBe(true)
-    const finish = lanes.find((l) => l.lane === 'finish') as
-      | Extract<StreamLaneEvent, { lane: 'finish' }>
-      | undefined
+    const finish = lanes.find((l) => l.lane === 'finish')
     expect(finish?.finishReason).toBe('stop')
   })
 })
@@ -194,9 +190,7 @@ describe('splitGeminiStream — both summary + signature in one stream', () => {
     expect(encryptedEvents[0]?.replaceEncrypted).toBe(true)
 
     // usage maps thoughtsTokenCount → completion_tokens_details.reasoning_tokens
-    const usage = lanes.find((l) => l.lane === 'usage') as
-      | Extract<StreamLaneEvent, { lane: 'usage' }>
-      | undefined
+    const usage = lanes.find((l) => l.lane === 'usage')
     expect(usage?.usage).toMatchObject({
       prompt_tokens: 10,
       completion_tokens: 20,
@@ -226,9 +220,7 @@ describe('splitGeminiStream — finishReason mapping', () => {
         },
       ]
       const lanes = await collect(splitGeminiStream(asAsync(chunks)))
-      const f = lanes.find((l) => l.lane === 'finish') as
-        | Extract<StreamLaneEvent, { lane: 'finish' }>
-        | undefined
+      const f = lanes.find((l) => l.lane === 'finish')
       expect(f?.finishReason).toBe(mapped)
     }
   })

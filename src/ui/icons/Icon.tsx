@@ -10,7 +10,7 @@ import type { ReactNode, SVGProps } from 'react'
 // `display: inline-flex; align-items: center; justify-content: center;
 // line-height: 1` so the SVG is centered without baseline drift.
 
-export interface IconProps {
+interface IconProps {
   size?: number
   className?: string
   strokeWidth?: number
@@ -388,15 +388,6 @@ export function ArchiveIcon({ size = 18, ariaLabel }: IconProps) {
       <rect x="4" y="4" width="16" height="4" rx="1" />
       <path d="M5.5 8v10A2 2 0 0 0 7.5 20h9a2 2 0 0 0 2-2V8" />
       <path d="M9 12h6" />
-    </BaseSvg>
-  )
-}
-
-export function RestoreIcon({ size = 18, ariaLabel }: IconProps) {
-  return (
-    <BaseSvg size={size} {...(ariaLabel ? { 'aria-label': ariaLabel } : {})}>
-      <path d="M4 7v5h5" />
-      <path d="M5.8 12A6.5 6.5 0 1 0 8 5.9L4 9.5" />
     </BaseSvg>
   )
 }

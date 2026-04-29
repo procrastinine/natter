@@ -21,7 +21,6 @@
 // `hidden: true` is honored inside the filter, so toggling the eye on a
 // reasoning row drops its contribution from the gauge.
 
-import { activePath } from './active-path'
 import {
   attachmentContextHasRefs,
   attachmentContextPolicyForSettings,
@@ -92,7 +91,7 @@ export interface PromptSizeEstimateInput {
   contextRewriteKey?: string
 }
 
-export interface TokenEstimateCalibrationContext {
+interface TokenEstimateCalibrationContext {
   chatTokenCalibration?: Record<string, TokenCalibrationSample> | undefined
   globalCalibration?: GlobalTokenCalibration | null | undefined
   mode?: CalibrationMode | undefined
@@ -557,5 +556,3 @@ export function tokenizerFromSettings(
   if (model.includes('qwen')) return 'qwen'
   return 'unknown'
 }
-
-export { activePath }

@@ -23,11 +23,11 @@ import {
   DEFAULT_CORS_PROXY_URL,
   matchKnownBouncer,
 } from '../core/cors-proxy'
-import type { DataPolicy, ProfileId } from '../core/types'
+import type { DataPolicy } from '../core/types'
 import { fetchWithTimeout } from './client'
 import { normalizeError } from './errors'
 
-export interface PrivacyScrapeContext {
+interface PrivacyScrapeContext {
   // Workspace-global CORS-proxy config. Required — `core/privacy-request.ts`
   // and `usePrivacyPolicies` resolve it before calling the scrape so this
   // module never touches IDB itself (keeps it daemon-portable).
@@ -36,7 +36,7 @@ export interface PrivacyScrapeContext {
   fetchImpl?: (url: string, init: RequestInit) => Promise<Response>
 }
 
-export interface PrivacyScrapeResult {
+interface PrivacyScrapeResult {
   modelId: string
   // Keyed by recovered provider refs: display/name plus provider_slug
   // when the page exposes it. Missing providers are absent — the filter
@@ -76,7 +76,7 @@ export interface PrivacyScrapeResult {
 //
 // `{model}` expands to `{author}/{slug}` (e.g. `openai/gpt-5.4`).
 // `{path}` expands to `{author}/{slug}/providers`.
-export const DEFAULT_PRIVACY_SCRAPE_BASE = DEFAULT_CORS_PROXY_URL
+const DEFAULT_PRIVACY_SCRAPE_BASE = DEFAULT_CORS_PROXY_URL
 
 const MODEL_PLACEHOLDER = '{model}'
 const PATH_PLACEHOLDER = '{path}'
@@ -435,7 +435,7 @@ function safeParseObject(raw: string): Record<string, unknown> | null {
 
 // Used by `usePrivacyPolicies` and by test harnesses: wrap whatever the
 // scrape produced in the shape persisted to the cache row.
-export interface CachedPrivacyPayload {
+interface CachedPrivacyPayload {
   policies: Record<string, DataPolicy>
   fetchedAt: number
 }
@@ -458,10 +458,4 @@ export function readCachedPrivacyPayload(
     policies: out,
     fetchedAt: typeof fetchedAt === 'number' ? fetchedAt : 0,
   }
-}
-
-// Helper for the hook layer — key the in-flight dedup map the same way
-// the cache is keyed, so two sibling mounts share one scrape.
-export function privacyScrapeDedupKey(profileId: ProfileId, modelId: string): string {
-  return `${profileId}\u0000${modelId}`
 }

@@ -20,19 +20,19 @@ import type { CachedEndpointsRow, CachedPrivacyPolicyRow } from '../store/db'
 
 export const DEFAULT_OPENROUTER_PROVIDER_SORT: SortBy = 'price'
 
-export interface ProviderSettingsMigrationContext {
+interface ProviderSettingsMigrationContext {
   model?: string
   endpoints?: readonly ModelEndpoint[]
   policies?: Readonly<Record<string, DataPolicy | undefined>>
   defaultSort?: SortBy
 }
 
-export interface ProviderSettingsMigrationResult {
+interface ProviderSettingsMigrationResult {
   settings: ChatSettings
   changed: boolean
 }
 
-export interface ProviderSettingsRowMigrationCaches {
+interface ProviderSettingsRowMigrationCaches {
   endpointsByKey: ReadonlyMap<string, CachedEndpointsRow>
   privacyByKey: ReadonlyMap<string, CachedPrivacyPolicyRow>
   profilesById?: ReadonlyMap<string, ConnectionProfile>

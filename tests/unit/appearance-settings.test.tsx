@@ -37,7 +37,7 @@ beforeEach(async () => {
 describe('AppearanceSettings', () => {
   it('persists chat width immediately when the slider changes', async () => {
     render(<AppearanceSettings />)
-    const slider = screen.getByLabelText(/Chat width/, { selector: 'input' }) as HTMLInputElement
+    const slider = screen.getByLabelText(/Chat width/, { selector: 'input' })
 
     fireEvent.change(slider, { target: { value: '960' } })
 

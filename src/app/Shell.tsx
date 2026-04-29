@@ -23,7 +23,6 @@ import { readTokenCalibrationGlobal } from '../core/token-calibration'
 import type {
   Chat,
   ChatId,
-  ChatPreset,
   ConnectionProfile,
   CursorMap,
   MessageAttachmentRef,
@@ -89,7 +88,7 @@ import {
 const SIDEBAR_COLLAPSED_STORAGE_KEY = 'natter:sidebar-collapsed'
 // Stable empty reference so useSyncExternalStore selectors don't allocate a
 // fresh `{}` each render (React 19 flags that as infinite re-render).
-const EMPTY_CURSOR: CursorMap = Object.freeze({}) as CursorMap
+const EMPTY_CURSOR: CursorMap = Object.freeze({})
 // Matches ModelPicker's MODELS_QUERY — the cache row is keyed on the query
 // signature, so reusing the same one here means the picker and the
 // auto-selector share a single /models fetch instead of triggering two.
@@ -416,7 +415,7 @@ export function Shell() {
       const preset = remembered.presetId ? await getPreset(remembered.presetId) : undefined
       return {
         preset,
-        settings: structuredClone(remembered.settings) as Chat['settings'],
+        settings: structuredClone(remembered.settings),
       }
     }
     const preset = await pickPreferredPreset({
@@ -1077,5 +1076,3 @@ function ZeroEligibleModalHost() {
   if (!chatId) return null
   return <ZeroEligibleModal chatId={chatId} />
 }
-
-export type { ChatId, ChatPreset, ConnectionProfile }
