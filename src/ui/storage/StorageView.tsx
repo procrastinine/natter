@@ -1,5 +1,5 @@
 import { useLiveQuery } from 'dexie-react-hooks'
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { StorageRoute } from '../../app/router'
 import {
   attachmentHref,
@@ -29,7 +29,15 @@ import {
   listChats,
   unarchiveChat,
 } from '../../store/chats'
+import {
+  estimateQuota,
+  isPersisted,
+  requestPersist,
+  storagePersistenceAvailable,
+  type QuotaSnapshot,
+} from '../../store/quota'
 import type { AttachmentBundle } from '../../store/repository'
+import { useToastStore } from '../../store/zustand/toastStore'
 import { AttachmentPicker } from '../attachments/AttachmentPicker'
 import { AttachmentPreview } from '../attachments/AttachmentPreview'
 import { formatBytes, formatDate, kindLabel, shortId, storageLabel } from '../attachments/format'
@@ -131,16 +139,86 @@ export function StorageView({ route }: StorageViewProps) {
 }
 
 function StorageOverview() {
+  const pushToast = useToastStore((s) => s.push)
   const chats = useLiveQuery(() => listChats(), [], [])
   const attachments = useLiveQuery(
     () => getBrowserRepository().searchAttachments({ sort: 'size-desc', limit: 5000 }),
     [],
     { rows: [] },
   )
+  const [quota, setQuota] = useState<QuotaSnapshot | null>(null)
+  const [persistence, setPersistence] = useState<
+    'checking' | 'unsupported' | 'persistent' | 'best-effort'
+  >(storagePersistenceAvailable() ? 'checking' : 'unsupported')
+  const [persistenceRequestResult, setPersistenceRequestResult] = useState<
+    'granted' | 'denied' | null
+  >(null)
+  const [persistenceBusy, setPersistenceBusy] = useState(false)
   const localBytes = attachments.rows.reduce((sum, row) => sum + (row.sizeBytes ?? 0), 0)
   const missing = attachments.rows.filter((row) => row.storage.kind === 'missing').length
   const unreferenced = attachments.rows.filter((row) => row.refCount === 0).length
   const archived = chats.filter((chat) => chat.archived).length
+  useEffect(() => {
+    let active = true
+    void Promise.all([
+      estimateQuota(),
+      storagePersistenceAvailable() ? isPersisted() : Promise.resolve(false),
+    ]).then(([quotaSnapshot, persisted]) => {
+      if (!active) return
+      setQuota(quotaSnapshot)
+      setPersistence(
+        storagePersistenceAvailable() ? (persisted ? 'persistent' : 'best-effort') : 'unsupported',
+      )
+    })
+    return () => {
+      active = false
+    }
+  }, [])
+  const handleRequestPersistence = async () => {
+    if (!storagePersistenceAvailable()) {
+      setPersistence('unsupported')
+      setPersistenceRequestResult(null)
+      return
+    }
+    setPersistenceBusy(true)
+    try {
+      const granted = await requestPersist()
+      const persisted = granted || (await isPersisted())
+      setPersistence(persisted ? 'persistent' : 'best-effort')
+      setPersistenceRequestResult(persisted ? 'granted' : 'denied')
+      if (persisted) {
+        console.info('Natter storage persistence granted for this origin.')
+        pushToast({ level: 'success', text: 'Storage persistence granted.' })
+      } else {
+        console.warn(
+          'Natter storage persistence denied by the browser. Chromium grants this only for origins it considers important, such as installed, bookmarked, notification-permitted, or high-engagement sites.',
+        )
+        pushToast({ level: 'warning', text: 'Browser denied storage persistence.' })
+      }
+      const quotaSnapshot = await estimateQuota()
+      setQuota(quotaSnapshot)
+    } finally {
+      setPersistenceBusy(false)
+    }
+  }
+  const quotaValue = quota ? formatBytes(quota.usage) : 'Unknown'
+  const quotaDetail = quota ? `${formatBytes(quota.quota)} quota` : undefined
+  const persistenceValue =
+    persistenceRequestResult === 'denied'
+      ? 'Denied'
+      : persistence === 'persistent'
+        ? 'Persistent'
+        : persistence === 'best-effort'
+          ? 'Best effort'
+          : persistence === 'unsupported'
+            ? 'Unsupported'
+            : 'Checking'
+  let persistenceDetail: string | undefined
+  if (persistenceRequestResult === 'granted') persistenceDetail = 'Granted by browser'
+  else if (persistenceRequestResult === 'denied') persistenceDetail = 'Denied by browser'
+  else if (persistence === 'persistent') persistenceDetail = 'Eviction protected'
+  else if (persistence === 'best-effort') persistenceDetail = 'Browser may evict under pressure'
+  else if (persistence === 'unsupported') persistenceDetail = 'API unavailable'
   return (
     <section data-ui="storage-overview">
       <div data-ui="storage-stat-row">
@@ -148,6 +226,8 @@ function StorageOverview() {
         <StorageStat label="chats" value={String(chats.length)} />
         <StorageStat label="attachments" value={String(attachments.rows.length)} />
         <StorageStat label="bytes" value={formatBytes(localBytes)} />
+        <StorageStat label="quota" value={quotaValue} detail={quotaDetail} />
+        <StorageStat label="persistence" value={persistenceValue} detail={persistenceDetail} />
       </div>
       <div data-ui="storage-shortcuts">
         <a href={storageHref({ section: 'attachments' })}>All attachments</a>
@@ -156,12 +236,36 @@ function StorageOverview() {
           Unreferenced · {unreferenced}
         </a>
         <a href={storageHref({ section: 'archive' })}>Archive · {archived}</a>
+        <button
+          type="button"
+          data-ui="storage-action"
+          onClick={handleRequestPersistence}
+          disabled={
+            persistenceBusy || persistence === 'persistent' || persistence === 'unsupported'
+          }
+          title="Request persistent browser storage"
+        >
+          <DatabaseIcon size={14} />
+          {persistenceBusy
+            ? 'Requesting'
+            : persistenceRequestResult === 'denied'
+              ? 'Request again'
+              : 'Request persistence'}
+        </button>
       </div>
     </section>
   )
 }
 
-function StorageStat({ label, value, detail }: { label: string; value: string; detail?: string }) {
+function StorageStat({
+  label,
+  value,
+  detail,
+}: {
+  label: string
+  value: string
+  detail?: string | undefined
+}) {
   return (
     <dl data-ui="storage-stat">
       <dt>{label}</dt>

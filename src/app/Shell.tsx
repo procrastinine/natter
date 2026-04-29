@@ -34,16 +34,12 @@ import { useModels } from '../hooks/useModels'
 import { useStreamStablePromptEstimate } from '../hooks/useStreamStablePromptEstimate'
 import { newId } from '../lib/ulid'
 import { installChatPreviewMaintainer } from '../store/chat-preview-maintainer'
-import {
-  createChat,
-  getChat,
-  loadActiveBranchSnapshot,
-  updateChatSettings,
-} from '../store/chats'
+import { createChat, getChat, loadActiveBranchSnapshot, updateChatSettings } from '../store/chats'
 import { resolveKeyIfPresent } from '../store/keys'
 import { getCachedModels } from '../store/models-cache'
 import { bumpPresetLastUsedAt, getPreset, pickPreferredPreset } from '../store/presets'
 import { bumpProfileLastUsedAt, countProfiles, getProfile } from '../store/profiles'
+import { installPersistenceRequestOnFirstInteraction } from '../store/quota'
 import { readSidebarSortMode } from '../store/sidebar-preferences'
 import { installStreamLeaseListener, requestAbortForChat } from '../store/stream-leases'
 import { useChatStore } from '../store/zustand/chatStore'
@@ -462,6 +458,8 @@ export function Shell() {
   useEffect(() => {
     applyBaseFontSizeToDocument(prefs.baseFontSize)
   }, [prefs.baseFontSize])
+
+  useEffect(() => installPersistenceRequestOnFirstInteraction(), [])
 
   // Persist the panel's open/closed state across route transitions —
   // in particular, navigating to /new or between chats shouldn't auto-

@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Natter">
+  <rect width="512" height="512" rx="96" fill="#141417"/>
+  <path d="M118 148h276c31 0 56 25 56 56v120c0 31-25 56-56 56H256l-72 58c-13 10-32 1-32-16v-42h-34c-31 0-56-25-56-56V204c0-31 25-56 56-56Z" fill="#f4f1e8"/>
+  <path d="M148 222h216" stroke="#141417" stroke-width="28" stroke-linecap="round"/>
+  <path d="M148 286h150" stroke="#141417" stroke-width="28" stroke-linecap="round"/>
+</svg>

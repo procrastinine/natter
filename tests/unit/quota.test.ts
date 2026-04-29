@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   classifyQuota,
   estimateQuota,
@@ -6,7 +6,26 @@ import {
   QUOTA_HARD_WARN_RATIO,
   QUOTA_WARN_RATIO,
   requestPersist,
+  storagePersistenceAvailable,
 } from '../../src/store/quota'
+
+const originalStorageDescriptor = Object.getOwnPropertyDescriptor(navigator, 'storage')
+
+function setNavigatorStorage(storage: Partial<StorageManager> | undefined): void {
+  Object.defineProperty(navigator, 'storage', {
+    configurable: true,
+    value: storage,
+  })
+}
+
+afterEach(() => {
+  vi.restoreAllMocks()
+  if (originalStorageDescriptor) {
+    Object.defineProperty(navigator, 'storage', originalStorageDescriptor)
+  } else {
+    Reflect.deleteProperty(navigator, 'storage')
+  }
+})
 
 describe('classifyQuota', () => {
   it('flags ok / warn / hard-warn at the 80% and 95% breakpoints', () => {
@@ -42,5 +61,25 @@ describe('storage probes (fallback when navigator.storage is unavailable)', () =
 
   it('isPersisted resolves to false when the API is missing', async () => {
     expect(await isPersisted()).toBe(false)
+  })
+
+  it('reports persistent storage support only when both APIs exist', () => {
+    expect(storagePersistenceAvailable()).toBe(false)
+    setNavigatorStorage({
+      persist: vi.fn(),
+      persisted: vi.fn(),
+    } as Partial<StorageManager>)
+    expect(storagePersistenceAvailable()).toBe(true)
+  })
+
+  it('wraps the browser persistence calls', async () => {
+    const persist = vi.fn<StorageManager['persist']>().mockResolvedValue(true)
+    const persisted = vi.fn<StorageManager['persisted']>().mockResolvedValue(true)
+    setNavigatorStorage({ persist, persisted } as Partial<StorageManager>)
+
+    expect(await requestPersist()).toBe(true)
+    expect(await isPersisted()).toBe(true)
+    expect(persist).toHaveBeenCalledTimes(1)
+    expect(persisted).toHaveBeenCalledTimes(1)
   })
 })
