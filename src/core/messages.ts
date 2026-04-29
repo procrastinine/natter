@@ -2,8 +2,9 @@ import { newId } from '../lib/ulid'
 import {
   attachmentRefsFromIds,
   attachmentScopes,
-  decRefs,
+  decAttachmentIds,
   diffAttachmentRefs,
+  incAttachmentIds,
   incRefs,
 } from '../store/attachments'
 import type { MutationContext, WorkspaceMutationResult } from '../store/repository'
@@ -76,6 +77,10 @@ function childrenScope(chatId: ChatId, parentId: MessageId | null): MutationScop
   return { kind: 'children', chatId, parentId }
 }
 
+function attachmentIdScopes(ids: readonly AttachmentId[] | undefined): MutationScope[] {
+  return [...new Set(ids ?? [])].map((attachmentId) => ({ kind: 'attachment', attachmentId }))
+}
+
 function dedupeScopes(scopes: readonly MutationScope[]): MutationScope[] {
   const seen = new Set<string>()
   const out: MutationScope[] = []
@@ -107,26 +112,26 @@ function contentHasAttachmentIds(content: readonly ContentItem[]): boolean {
 
 function withAttachmentRefs<T extends object>(
   row: T,
-  refs: readonly AttachmentRef[] | undefined,
+  refs: readonly AttachmentRef[] | readonly AttachmentId[] | undefined,
   now?: number,
   existing?: readonly AttachmentRef[],
 ): T & { attachmentRefs?: AttachmentRef[] } {
   const next = row as T & { attachmentRefs?: AttachmentRef[] }
   if (refs && refs.length > 0) {
-    next.attachmentRefs = refs.some((ref) => typeof ref !== 'string')
-      ? refs.map((ref) => {
-          if (typeof ref !== 'string') return { ...ref, updatedAt: now ?? ref.updatedAt }
-          return attachmentRefsFromIds([ref], {
-            ...(now !== undefined ? { createdAt: now } : {}),
-            ...(existing ? { existing } : {}),
-          })[0] as AttachmentRef
-        })
-      : attachmentRefsFromIds(refs as readonly AttachmentId[], {
+    next.attachmentRefs = attachmentInputIsIds(refs)
+      ? attachmentRefsFromIds(refs, {
           ...(now !== undefined ? { createdAt: now } : {}),
           ...(existing ? { existing } : {}),
         })
+      : refs.map((ref) => ({ ...ref, updatedAt: now ?? ref.updatedAt }))
   }
   return next
+}
+
+function attachmentInputIsIds(
+  refs: readonly AttachmentRef[] | readonly AttachmentId[],
+): refs is readonly AttachmentId[] {
+  return typeof refs[0] === 'string'
 }
 
 type MessageTreeRow = Pick<
@@ -313,7 +318,7 @@ function collectPasteImportScopes(
   for (let i = 0; i < newMessageIds.length - 1; i += 1) {
     scopes.push(childrenScope(chatId, newMessageIds[i] as MessageId))
   }
-  scopes.push(...attachmentScopes(attachmentIds))
+  scopes.push(...attachmentIdScopes(attachmentIds))
 
   const byId = new Map(messages.map((message) => [message.id, message]))
 
@@ -632,7 +637,7 @@ export async function editMessageContent(
       )
     : null
   const result = await repo.runMutation(
-    dedupeScopes([messageScope(input.messageId), ...attachmentScopes([...toInc, ...toDec])]),
+    dedupeScopes([messageScope(input.messageId), ...attachmentIdScopes([...toInc, ...toDec])]),
     async (ctx) => {
       const current = await ctx.getMessage(input.messageId)
       if (!current || current.chatId !== input.chatId || current.deleted) {
@@ -657,8 +662,8 @@ export async function editMessageContent(
           next.attachmentRefs = []
         } else delete next.attachmentRefs
       }
-      await incRefs(ctx, toInc)
-      await decRefs(ctx, toDec)
+      await incAttachmentIds(ctx, toInc)
+      await decAttachmentIds(ctx, toDec)
       await ctx.putMessage(next)
     },
   )
@@ -787,26 +792,25 @@ export async function insertSibling(
         throw new TreeChangedError(input.chatId, `insert-sibling target ${target.id} unavailable`)
       }
       const siblings = await ctx.listChildHeaders(input.chatId, current.parentId)
-      await ctx.putMessage(
-        withAttachmentRefs(
-          {
-            id: messageId,
-            chatId: input.chatId,
-            parentId: current.parentId,
-            siblingIndex: nextSiblingIndexFromChildren(siblings),
-            turnId: newId(),
-            turnIndex: 0,
-            createdAt: input.now ?? Date.now(),
-            role: input.role ?? current.role,
-            origin: input.origin ?? 'imported',
-            content: structuredClone(input.content),
-            nodeVersion: 0,
-            deleted: false,
-          },
-          input.attachmentRefs,
-        ),
+      const row = withAttachmentRefs(
+        {
+          id: messageId,
+          chatId: input.chatId,
+          parentId: current.parentId,
+          siblingIndex: nextSiblingIndexFromChildren(siblings),
+          turnId: newId(),
+          turnIndex: 0,
+          createdAt: input.now ?? Date.now(),
+          role: input.role ?? current.role,
+          origin: input.origin ?? 'imported',
+          content: structuredClone(input.content),
+          nodeVersion: 0,
+          deleted: false,
+        },
+        input.attachmentRefs,
       )
-      await incRefs(ctx, input.attachmentRefs ?? [])
+      await ctx.putMessage(row)
+      await incRefs(ctx, row.attachmentRefs)
       const effects = emptyEffects()
       effects.newMessageIds.push(messageId)
       effects.cursorUpdates[cursorKeyOf(current.parentId)] = messageId
@@ -835,7 +839,7 @@ export async function insertBetween(
   const messageId = newId()
   const scopes = dedupeScopes([
     ...collectInsertBetweenScopes(input.chatId, snapshot, input.parentId, input.childId, messageId),
-    ...attachmentScopes(input.attachmentRefs),
+    ...attachmentIdScopes(input.attachmentRefs),
   ])
   const result = await repo.runMutation(scopes, async (ctx) => {
     const effects = emptyEffects()
@@ -889,7 +893,7 @@ export async function appendAsChild(
       messageScope(parent.id),
       messageScope(messageId),
       childrenScope(input.chatId, parent.id),
-      ...attachmentScopes(input.attachmentRefs),
+      ...attachmentIdScopes(input.attachmentRefs),
     ]),
     async (ctx) => {
       const current = await ctx.getMessage(parent.id)
@@ -897,26 +901,25 @@ export async function appendAsChild(
         throw new TreeChangedError(input.chatId, `append-as-child parent ${parent.id} unavailable`)
       }
       const children = await ctx.listChildHeaders(input.chatId, current.id)
-      await ctx.putMessage(
-        withAttachmentRefs(
-          {
-            id: messageId,
-            chatId: input.chatId,
-            parentId: current.id,
-            siblingIndex: nextSiblingIndexFromChildren(children),
-            turnId: newId(),
-            turnIndex: 0,
-            createdAt: input.now ?? Date.now(),
-            role: input.role,
-            origin: input.origin ?? 'imported',
-            content: structuredClone(input.content),
-            nodeVersion: 0,
-            deleted: false,
-          },
-          input.attachmentRefs,
-        ),
+      const row = withAttachmentRefs(
+        {
+          id: messageId,
+          chatId: input.chatId,
+          parentId: current.id,
+          siblingIndex: nextSiblingIndexFromChildren(children),
+          turnId: newId(),
+          turnIndex: 0,
+          createdAt: input.now ?? Date.now(),
+          role: input.role,
+          origin: input.origin ?? 'imported',
+          content: structuredClone(input.content),
+          nodeVersion: 0,
+          deleted: false,
+        },
+        input.attachmentRefs,
       )
-      await incRefs(ctx, input.attachmentRefs ?? [])
+      await ctx.putMessage(row)
+      await incRefs(ctx, row.attachmentRefs)
       const effects = emptyEffects()
       effects.newMessageIds.push(messageId)
       effects.cursorUpdates[cursorKeyOf(current.id)] = messageId
@@ -1001,7 +1004,7 @@ export async function pasteImport(
         spec.attachmentRefs,
       )
       await ctx.putMessage(row)
-      await incRefs(ctx, spec.attachmentRefs ?? [])
+      await incRefs(ctx, row.attachmentRefs)
       effects.newMessageIds.push(id)
       effects.cursorUpdates[cursorKeyOf(tail.id)] = id
       tail = row
@@ -1049,7 +1052,7 @@ async function createFirstImported(
       spec.attachmentRefs,
     )
     await ctx.putMessage(row)
-    await incRefs(ctx, spec.attachmentRefs ?? [])
+    await incRefs(ctx, row.attachmentRefs)
     effects.newMessageIds.push(row.id)
     effects.cursorUpdates[cursorKeyOf(leaf)] = row.id
     return row
@@ -1080,7 +1083,7 @@ async function createFirstImported(
       spec.attachmentRefs,
     )
     await ctx.putMessage(row)
-    await incRefs(ctx, spec.attachmentRefs ?? [])
+    await incRefs(ctx, row.attachmentRefs)
     effects.newMessageIds.push(row.id)
     effects.cursorUpdates[cursorKeyOf(target.parentId)] = row.id
     return row
@@ -1151,7 +1154,7 @@ async function createFirstImported(
     spec.attachmentRefs,
   )
   await ctx.putMessage(row)
-  await incRefs(ctx, spec.attachmentRefs ?? [])
+  await incRefs(ctx, row.attachmentRefs)
   effects.newMessageIds.push(row.id)
   effects.cursorUpdates[cursorKeyOf(target.id)] = row.id
   return row
@@ -1202,7 +1205,7 @@ async function insertBetweenInner(
     spec.attachmentRefs,
   )
   await ctx.putMessage(row)
-  await incRefs(ctx, spec.attachmentRefs ?? [])
+  await incRefs(ctx, row.attachmentRefs)
 
   const peerHeaders = siblings
     .filter((sibling) => sibling.turnId === child.turnId && !sibling.deleted)

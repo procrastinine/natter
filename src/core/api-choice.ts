@@ -66,9 +66,9 @@ export function chooseApi(
   path: readonly Message[],
   caps: RouterCapabilities,
 ): ApiRoute {
-  // Defensive read: imported chats / older builds may have a partial
-  // `reasoning` block; normalize so step 6 below can read `include.encrypted`
-  // without exploding. See `core/reasoning.ts:normalizeReasoningSettings`.
+  // Defensive read: settings patches may replace the full `reasoning`
+  // block with a partial object; normalize so step 6 below can read
+  // `include.encrypted`.
   const reasoning = normalizeReasoningSettings(settings.reasoning)
   const pin: ApiVariant = settings.api
   const support = responsesSupportFor(settings.model)
@@ -82,7 +82,7 @@ export function chooseApi(
 
   // Step 1 — user-pinned chat completions. Wins over everything EXCEPT a
   // model that 404s on chat-completions (`responsesSupport: 'responses-only'`
-  // or the legacy `requiresResponsesApi` flag).
+  // or a registry `requiresResponsesApi` flag).
   const responsesOnly = support === 'responses-only' || caps.quirks.requiresResponsesApi === true
   if (pin === 'text' && canRunTextCompletions(profile, settings.model) && !responsesOnly) {
     return openAiText('user pinned Text completions')

@@ -1,7 +1,7 @@
 import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
-import type { Chat, Message } from '../../src/core/types'
+import type { Chat, Message, MessageAttachmentRef } from '../../src/core/types'
 import { newId } from '../../src/lib/ulid'
 import {
   addExistingAttachmentRef,
@@ -75,7 +75,18 @@ function bytes(content: string): Blob {
   return new Blob([new TextEncoder().encode(content)])
 }
 
-function makeMessage(chatId: string, attachmentRefs?: string[]): Message {
+function attachmentRef(attachmentId: string, createdAt = 1): MessageAttachmentRef {
+  return {
+    refId: `ref-${attachmentId}-${createdAt}`,
+    attachmentId,
+    includeInContext: true,
+    presentation: {},
+    createdAt,
+    updatedAt: createdAt,
+  }
+}
+
+function makeMessage(chatId: string, attachmentRefs?: MessageAttachmentRef[]): Message {
   const row: Message = {
     id: newId(),
     chatId,
@@ -297,12 +308,12 @@ describe('attachment refcounts under repository mutations', () => {
     await putAttachment(attachment)
 
     await repo.runMutation([{ kind: 'attachment', attachmentId: attachment.id }], async (ctx) => {
-      await incRefs(ctx, [attachment.id])
+      await incRefs(ctx, [attachmentRef(attachment.id)])
     })
     expect((await getDb().attachments.get(attachment.id))?.refCount).toBe(1)
 
     await repo.runMutation([{ kind: 'attachment', attachmentId: attachment.id }], async (ctx) => {
-      await decRefs(ctx, [attachment.id, attachment.id])
+      await decRefs(ctx, [attachmentRef(attachment.id), attachmentRef(attachment.id, 2)])
     })
     expect((await getDb().attachments.get(attachment.id))?.refCount).toBe(0)
     expect(chat.id).toBeTruthy()
@@ -318,7 +329,7 @@ describe('attachment refcounts under repository mutations', () => {
       kind: 'file',
     })
     await putAttachment(attachment)
-    const message = makeMessage(chat.id, [attachment.id])
+    const message = makeMessage(chat.id, [attachmentRef(attachment.id)])
 
     await repo.runMutation(
       [
@@ -328,7 +339,7 @@ describe('attachment refcounts under repository mutations', () => {
       ],
       async (ctx) => {
         await ctx.putMessage(message)
-        await incRefs(ctx, [attachment.id])
+        await incRefs(ctx, message.attachmentRefs)
       },
     )
     expect((await getDb().attachments.get(attachment.id))?.refCount).toBe(1)
@@ -356,7 +367,7 @@ describe('attachment refcounts under repository mutations', () => {
       ],
       async (ctx) => {
         await ctx.deleteMessage(message.id)
-        await decRefs(ctx, [attachment.id])
+        await decRefs(ctx, message.attachmentRefs)
       },
     )
     expect((await getDb().attachments.get(attachment.id))?.refCount).toBe(0)
@@ -399,7 +410,7 @@ describe('reapOrphanedAttachments', () => {
       createdAt: 1000,
     })
     await putAttachment(attachment)
-    await putTestMessage(makeMessage(chat.id, [attachment.id]))
+    await putTestMessage(makeMessage(chat.id, [attachmentRef(attachment.id)]))
 
     const reaped = await reapOrphanedAttachments({ now: 10_000, olderThanMs: 5000 })
     expect(reaped).toEqual([])
@@ -409,7 +420,9 @@ describe('reapOrphanedAttachments', () => {
 
 describe('misc attachment helpers', () => {
   it('diffAttachmentRefs returns increment and decrement sets', () => {
-    expect(diffAttachmentRefs(['A', 'B'], ['B', 'C'])).toEqual({
+    expect(
+      diffAttachmentRefs([attachmentRef('A'), attachmentRef('B')], [attachmentRef('B'), attachmentRef('C')]),
+    ).toEqual({
       toInc: ['C'],
       toDec: ['A'],
     })
@@ -424,11 +437,11 @@ describe('misc attachment helpers', () => {
       kind: 'file',
     })
     await putAttachment(attachment)
-    await putTestMessage(makeMessage(chat.id, [attachment.id]))
+    await putTestMessage(makeMessage(chat.id, [attachmentRef(attachment.id)]))
     await getDb().drafts.put({
       chatId: chat.id,
       text: '',
-      attachmentRefs: [attachment.id],
+      attachmentRefs: [attachmentRef(attachment.id)],
       updatedAt: 1,
     })
 

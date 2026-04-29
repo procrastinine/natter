@@ -9,12 +9,7 @@
 import { modelsCacheKey } from '../core/cache-keys'
 import type { ModelsQuery, ProfileId } from '../core/types'
 import { postEvent } from './broadcast'
-import {
-  backfillProviderSettingsForModel,
-  type CachedEndpointsRow,
-  type CachedModelsRow,
-  getDb,
-} from './db'
+import { type CachedEndpointsRow, type CachedModelsRow, getDb } from './db'
 
 export const MODELS_TTL_MS = 60 * 60 * 1000
 export const ENDPOINTS_TTL_MS = 5 * 60 * 1000
@@ -71,7 +66,6 @@ export async function putCachedEndpoints(
   fetchedAt: number = Date.now(),
 ): Promise<void> {
   await getDb().endpoints.put({ profileId, modelId, fetchedAt, payload })
-  await backfillProviderSettingsForModel(profileId, modelId)
 }
 
 export async function clearEndpointsCacheForProfile(profileId: ProfileId): Promise<void> {

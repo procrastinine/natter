@@ -4,7 +4,18 @@ import {
   BRANCH_EXPLICIT_COPY_FIELDS,
   cloneForExplicitBranch,
 } from '../../src/core/branching'
-import type { Message } from '../../src/core/types'
+import type { Message, MessageAttachmentRef } from '../../src/core/types'
+
+function attachmentRef(attachmentId: string, createdAt = 1): MessageAttachmentRef {
+  return {
+    refId: `ref-${attachmentId}-${createdAt}`,
+    attachmentId,
+    includeInContext: true,
+    presentation: {},
+    createdAt,
+    updatedAt: createdAt,
+  }
+}
 
 function fixtureAssistant(): Message {
   return {
@@ -35,7 +46,7 @@ function fixtureAssistant(): Message {
     toolCalls: [{ id: 'tc_1', type: 'function', function: { name: 'search', arguments: '{}' } }],
     phase: 'final_answer',
     responsesEchoItem: { type: 'message', id: 'out_1' },
-    attachmentRefs: ['ATT_1'],
+    attachmentRefs: [attachmentRef('ATT_1')],
     pinCache: true,
     hiddenFromContext: false,
     deleted: false,
@@ -110,10 +121,10 @@ describe('cloneForExplicitBranch', () => {
     })
 
     ;(cloned.content[0] as { type: 'text'; text: string }).text = 'mutated'
-    cloned.attachmentRefs?.push('ATT_NEW')
+    cloned.attachmentRefs?.push(attachmentRef('ATT_NEW'))
 
     expect((source.content[0] as { type: 'text'; text: string }).text).toBe('hello')
-    expect(source.attachmentRefs).toEqual(['ATT_1'])
+    expect(source.attachmentRefs).toEqual([attachmentRef('ATT_1')])
   })
 
   it('omits optional fields that are absent on the source', () => {

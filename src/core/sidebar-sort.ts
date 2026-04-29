@@ -35,15 +35,8 @@ export const SIDEBAR_SORT_OPTIONS: readonly SidebarSortOption[] = [
 
 const VALID_SIDEBAR_SORT_MODES = new Set<string>(SIDEBAR_SORT_OPTIONS.map((option) => option.mode))
 
-const LEGACY_SIDEBAR_SORT_MODES: Record<string, SidebarSortMode> = {
-  'updated-desc': 'updatedAt-desc',
-  'updated-asc': 'updatedAt-asc',
-}
-
 export function parseSidebarSortMode(value: unknown): SidebarSortMode {
   if (typeof value !== 'string') return DEFAULT_SIDEBAR_SORT_MODE
-  const legacy = LEGACY_SIDEBAR_SORT_MODES[value]
-  if (legacy) return legacy
   if (VALID_SIDEBAR_SORT_MODES.has(value)) return value as SidebarSortMode
   return DEFAULT_SIDEBAR_SORT_MODE
 }

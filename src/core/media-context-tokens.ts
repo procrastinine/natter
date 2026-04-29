@@ -99,10 +99,6 @@ function visibleAttachmentRefs(refs: readonly AttachmentRef[] | undefined): Atta
   if (!refs) return []
   const out: AttachmentRef[] = []
   for (const ref of refs) {
-    if (typeof ref === 'string') {
-      out.push(ref)
-      continue
-    }
     if (ref.deletedAt !== undefined || ref.includeInContext === false) continue
     out.push(ref)
   }
@@ -181,11 +177,11 @@ function pdfTokensForAttachment(
 }
 
 function attachmentRefId(ref: AttachmentRef): AttachmentId {
-  return typeof ref === 'string' ? ref : ref.attachmentId
+  return ref.attachmentId
 }
 
 function pdfTierForRef(ref: AttachmentRef | undefined): NonNullable<PdfMeta['tier']> {
-  if (typeof ref === 'object') {
+  if (ref) {
     if (ref.presentation.pdfTier === 'native') return 'native'
     if (ref.presentation.pdfTier === 'client') return 'client-extract'
   }

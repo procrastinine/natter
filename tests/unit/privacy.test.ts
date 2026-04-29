@@ -58,7 +58,8 @@ describe('dominates', () => {
     // Per the 2026-04-19 tier-based dominance rule, two policies in the
     // same tier don't dominate each other. `shortRetention` (30d +
     // userIDs) and `unknownRetention` (indefinite + userIDs) are both
-    // orange — neither drops the other; preferred-ordering breaks the tie.
+    // orange — neither drops the other; the visible provider sort/manual
+    // order decides request order.
     expect(dominates(shortRetention, unknownRetention)).toBe(false)
     expect(dominates(unknownRetention, shortRetention)).toBe(false)
   })

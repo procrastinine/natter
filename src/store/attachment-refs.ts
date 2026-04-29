@@ -13,7 +13,7 @@ interface AttachmentRefOwner {
 }
 
 export function attachmentIdOf(ref: AttachmentRef): AttachmentId {
-  return typeof ref === 'string' ? ref : ref.attachmentId
+  return ref.attachmentId
 }
 
 export function liveAttachmentRefs(
@@ -78,20 +78,10 @@ export function createAttachmentRef(
 
 function normalizeAttachmentRef(
   ref: AttachmentRef,
-  index: number,
+  _index: number,
   owner: AttachmentRefOwner,
 ): MessageAttachmentRef {
   const now = owner.createdAt ?? 0
-  if (typeof ref === 'string') {
-    return {
-      refId: `legacy:${owner.messageId ?? owner.draftChatId ?? 'unknown'}:${index}`,
-      attachmentId: ref,
-      includeInContext: true,
-      presentation: {},
-      createdAt: now,
-      updatedAt: now,
-    }
-  }
   return {
     refId: ref.refId,
     attachmentId: ref.attachmentId,

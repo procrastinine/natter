@@ -1,10 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import { filterEndpointsByPrivacy } from '../../src/core/privacy-filter'
-import {
-  DEFAULT_OPENROUTER_PROVIDER_SORT,
-  migrateLegacyProviderSettings,
-} from '../../src/backcompat/provider-settings'
+import { DEFAULT_OPENROUTER_PROVIDER_SORT } from '../../src/core/provider-defaults'
+import { migrateLegacyProviderSettings } from '../../src/backcompat/provider-settings-migration'
 import type { ChatSettings, DataPolicy, ModelEndpoint } from '../../src/core/types'
 import { buildPickerRows } from '../../src/ui/settings/provider-picker-rows'
 
@@ -54,7 +52,7 @@ describe('migrateLegacyProviderSettings', () => {
         ...cloneDefaultChatSettings().privacy,
         ignoreProviders: ['Anthropic'],
         onlyProviders: [],
-      },
+      } as unknown as ChatSettings['privacy'],
     })
 
     const migrated = migrateLegacyProviderSettings(old, {
@@ -64,8 +62,8 @@ describe('migrateLegacyProviderSettings', () => {
     })
 
     expect(migrated.changed).toBe(true)
-    expect(migrated.settings.privacy.ignoreProviders).toEqual([])
-    expect(migrated.settings.privacy.onlyProviders).toEqual([])
+    expect('ignoreProviders' in migrated.settings.privacy).toBe(false)
+    expect('onlyProviders' in migrated.settings.privacy).toBe(false)
     expect(migrated.settings.providerPrefs?.ignoreOverridesFilter).toBe(true)
     expect(migrated.settings.providerPrefs?.ignore).toEqual(['anthropic', 'anthropic/2'])
 
@@ -97,7 +95,7 @@ describe('migrateLegacyProviderSettings', () => {
         ...cloneDefaultChatSettings().privacy,
         ignoreProviders: [],
         onlyProviders: ['Anthropic'],
-      },
+      } as unknown as ChatSettings['privacy'],
     })
 
     const migrated = migrateLegacyProviderSettings(old, {
@@ -106,8 +104,8 @@ describe('migrateLegacyProviderSettings', () => {
       policies: {},
     })
 
-    expect(migrated.settings.privacy.ignoreProviders).toEqual([])
-    expect(migrated.settings.privacy.onlyProviders).toEqual([])
+    expect('ignoreProviders' in migrated.settings.privacy).toBe(false)
+    expect('onlyProviders' in migrated.settings.privacy).toBe(false)
     expect(migrated.settings.providerPrefs?.ignoreOverridesFilter).toBe(true)
     expect(migrated.settings.providerPrefs?.ignore).toEqual(['amazon-bedrock'])
   })
@@ -118,19 +116,19 @@ describe('migrateLegacyProviderSettings', () => {
         ...cloneDefaultChatSettings().privacy,
         ignoreProviders: ['Anthropic'],
         onlyProviders: ['Amazon Bedrock'],
-      },
+      } as unknown as ChatSettings['privacy'],
     })
 
     const migrated = migrateLegacyProviderSettings(old)
 
-    expect(migrated.settings.privacy.ignoreProviders).toEqual([])
-    expect(migrated.settings.privacy.onlyProviders).toEqual([])
+    expect('ignoreProviders' in migrated.settings.privacy).toBe(false)
+    expect('onlyProviders' in migrated.settings.privacy).toBe(false)
     expect(migrated.settings.providerPrefs?.ignore).toEqual(['Anthropic'])
     expect(migrated.settings.providerPrefs?.only).toEqual(['Amazon Bedrock'])
     expect(migrated.settings.providerPrefs?.ignoreOverridesFilter).toBe(true)
   })
 
-  it('converts stale providerPrefs.only into the visible ignore-list model once endpoints are known', () => {
+  it('normalizes providerPrefs.only refs when endpoints are known', () => {
     const endpoints = [
       endpoint('Amazon Bedrock', 'amazon-bedrock', CLEAN),
       endpoint('Anthropic', 'anthropic', USER_IDS),
@@ -148,10 +146,10 @@ describe('migrateLegacyProviderSettings', () => {
       policies: {},
     })
 
-    expect(migrated.changed).toBe(true)
-    expect(migrated.settings.providerPrefs?.only).toBeUndefined()
-    expect(migrated.settings.providerPrefs?.ignoreOverridesFilter).toBe(true)
-    expect(migrated.settings.providerPrefs?.ignore).toEqual(['amazon-bedrock', 'anthropic/2'])
+    expect(migrated.changed).toBe(false)
+    expect(migrated.settings.providerPrefs?.only).toEqual(['anthropic'])
+    expect(migrated.settings.providerPrefs?.ignoreOverridesFilter).toBeUndefined()
+    expect(migrated.settings.providerPrefs?.ignore).toBeUndefined()
   })
 
   it('moves legacy providerPrefs privacy knobs into the visible privacy settings', () => {
@@ -165,7 +163,7 @@ describe('migrateLegacyProviderSettings', () => {
         dataCollection: 'deny',
         zdr: true,
         sort: 'price',
-      },
+      } as unknown as NonNullable<ChatSettings['providerPrefs']>,
     })
 
     const migrated = migrateLegacyProviderSettings(old)
@@ -173,9 +171,44 @@ describe('migrateLegacyProviderSettings', () => {
     expect(migrated.changed).toBe(true)
     expect(migrated.settings.privacy.denyDataCollection).toBe(true)
     expect(migrated.settings.privacy.zdrOnly).toBe(true)
-    expect(migrated.settings.providerPrefs?.dataCollection).toBeUndefined()
-    expect(migrated.settings.providerPrefs?.zdr).toBeUndefined()
+    expect('dataCollection' in (migrated.settings.providerPrefs ?? {})).toBe(false)
+    expect('zdr' in (migrated.settings.providerPrefs ?? {})).toBe(false)
     expect(migrated.settings.providerPrefs?.sort).toBe('price')
+  })
+
+  it('strips retired PrivacyPrefs fields before returning current settings', () => {
+    const old = settings({
+      privacy: {
+        ...cloneDefaultChatSettings().privacy,
+        usePreferredOrdering: false,
+      } as unknown as ChatSettings['privacy'],
+    })
+
+    const migrated = migrateLegacyProviderSettings(old)
+
+    expect(migrated.changed).toBe(true)
+    expect('usePreferredOrdering' in migrated.settings.privacy).toBe(false)
+  })
+
+  it('strips retired reasoning carryForward and migrates it into include', () => {
+    const old = settings({
+      reasoning: {
+        mode: 'default',
+        exclude: false,
+        summary: 'auto',
+        carryForward: 'plaintext',
+      } as unknown as ChatSettings['reasoning'],
+    })
+
+    const migrated = migrateLegacyProviderSettings(old)
+
+    expect(migrated.changed).toBe(true)
+    expect('carryForward' in migrated.settings.reasoning).toBe(false)
+    expect(migrated.settings.reasoning.include).toEqual({
+      encrypted: false,
+      summary: true,
+      text: true,
+    })
   })
 
   it('adds the OpenRouter default provider sort when requested', () => {

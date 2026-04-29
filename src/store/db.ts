@@ -6,13 +6,23 @@
 
 import Dexie, { type Table } from 'dexie'
 import {
+  attachmentRefsBackfillMarker,
+  migrateAttachmentRefRows,
+  normalizeLegacyAttachmentRefs,
+} from '../backcompat/attachment-refs'
+import {
   backfillMissingMessageBodies,
+  messageBodySplitBackfillMarker,
   migrateInlineMessageBodies,
 } from '../backcompat/message-body-split'
 import {
+  globalSettingsBackfillMarker,
+  migrateGlobalSettingsRows,
+} from '../backcompat/global-settings'
+import {
   migrateProviderSettingsRow,
   providerCacheKey,
-} from '../backcompat/provider-settings'
+} from '../backcompat/provider-settings-migration'
 import { findLastUpdatedLeafId } from '../core/active-path'
 import { buildBranchMessages } from '../core/branch-flatten'
 import {
@@ -34,7 +44,6 @@ import type {
   DraftRow,
   KeyRecord,
   Message,
-  MessageAttachmentRef,
   PresetResolution,
   PromptPreset,
 } from '../core/types'
@@ -118,6 +127,15 @@ export class NatterDb extends Dexie {
 // Schema registration is pulled out so test-only subclasses can replay v1 and
 // then tack on synthetic v2/v3 upgrades.
 export function registerSchema(db: Dexie): void {
+  db.on('populate', (tx) => {
+    void tx.table<SettingsRow>('settings').bulkPut([
+      attachmentRefsBackfillMarker(),
+      messageBodySplitBackfillMarker(),
+      organizationFieldsBackfillMarker(),
+      globalSettingsBackfillMarker(),
+    ])
+  })
+
   db.version(1).stores({
     chats:
       'id, updatedAt, createdAt, lastViewedAt, lastUpdatedLeafId, lastBranchUpdatedAt, wordCount, totalCostUsd, archived, pinned, presetId, folderId, *tags',
@@ -756,12 +774,94 @@ export function registerSchema(db: Dexie): void {
     presetResolutions: '&[profileId+presetSlug], fetchedAt',
     drafts: '&chatId, updatedAt',
   })
+
+  // v13: remove retired chat-setting fields so the main app only sees
+  // the current ChatSettings schema. Backcompat details live in
+  // `backcompat/provider-settings-migration.ts` and `backcompat/chat-settings.ts`.
+  db.version(13)
+    .stores({
+      chats:
+        'id, updatedAt, createdAt, lastViewedAt, lastUpdatedLeafId, lastBranchUpdatedAt, wordCount, totalCostUsd, archived, pinned, presetId, folderId, *tags',
+      messages:
+        'id, chatId, parentId, turnId, [chatId+parentId], [chatId+createdAt], [chatId+turnId], [chatId+deleted]',
+      messageBodies: '&id, chatId, updatedAt, nodeVersion',
+      childLists: 'id, [chatId+parentId], updatedAt',
+      attachments: 'id, contentHash, kind, mime, origin, refCount, createdAt, updatedAt, deletedAt',
+      attachmentBlobs: 'id, attachmentId, role, contentHash, createdAt',
+      attachmentArtifacts: 'artifactId, attachmentId, kind, processorId, createdAt',
+      attachmentJobs:
+        'id, attachmentId, processorId, status, updatedAt, [attachmentId+processorId+inputHash]',
+      profiles: 'id, name, kind, lastUsedAt, archived',
+      presets: 'id, name, connectionProfileId, lastUsedAt, archived',
+      promptPresets: 'id, kind, name, lastUsedAt',
+      folders: 'id, name, sortIndex, lastUsedAt',
+      tags: 'id, &nameLower, lastUsedAt',
+      chatBranchCache: '&chatId, branchLeafId, generatedAt',
+      keys: 'id, name',
+      settings: '&key',
+      streamLeases: '&streamId, chatId, ownerClientId, heartbeatAt',
+      streamChunks: '&id, streamId, chatId, messageId, [streamId+seq], createdAt',
+      models: '&[profileId+queryKey], fetchedAt',
+      endpoints: '&[profileId+modelId], fetchedAt',
+      privacyPolicies: '&[profileId+modelId], fetchedAt',
+      providers: '&profileId, fetchedAt',
+      generations: 'id, chatId, gen_id',
+      presetResolutions: '&[profileId+presetSlug], fetchedAt',
+      drafts: '&chatId, updatedAt',
+    })
+    .upgrade(async (tx) => {
+      const endpointsRows = await tx.table<CachedEndpointsRow>('endpoints').toArray()
+      const privacyRows = await tx.table<CachedPrivacyPolicyRow>('privacyPolicies').toArray()
+      const profiles = await tx.table<ConnectionProfile>('profiles').toArray()
+      const endpointsByKey = new Map<string, CachedEndpointsRow>()
+      const privacyByKey = new Map<string, CachedPrivacyPolicyRow>()
+      const profilesById = new Map(profiles.map((profile) => [profile.id, profile]))
+      for (const row of endpointsRows)
+        endpointsByKey.set(providerCacheKey(row.profileId, row.modelId), row)
+      for (const row of privacyRows)
+        privacyByKey.set(providerCacheKey(row.profileId, row.modelId), row)
+
+      await tx
+        .table<Chat>('chats')
+        .toCollection()
+        .modify((chat) => {
+          const result = migrateProviderSettingsRow(
+            chat.settings,
+            chat.settings.profileId,
+            chat.settings.model,
+            {
+              endpointsByKey,
+              privacyByKey,
+              profilesById,
+            },
+          )
+          if (result.changed) chat.settings = result.settings
+        })
+
+      await tx
+        .table<ChatPreset>('presets')
+        .toCollection()
+        .modify((preset) => {
+          const result = migrateProviderSettingsRow(
+            preset.settings,
+            preset.connectionProfileId,
+            preset.settings.model,
+            { endpointsByKey, privacyByKey, profilesById },
+          )
+          if (result.changed) preset.settings = result.settings
+        })
+    })
 }
 
 function organizationDefaultsPatch(
   chat: Chat & Record<string, unknown>,
   messageHeaders: readonly Pick<Message, 'origin'>[],
-  computed: { lastUpdatedLeafId: string | null; wordCount: number; totalCostUsd: number },
+  computed: {
+    lastUpdatedLeafId: string | null
+    previewText: string
+    wordCount: number
+    totalCostUsd: number
+  },
 ): Partial<Chat> | null {
   const patch: Partial<Chat> = {}
   if (
@@ -781,6 +881,9 @@ function organizationDefaultsPatch(
   }
   if (chat.lastUpdatedLeafId !== computed.lastUpdatedLeafId) {
     patch.lastUpdatedLeafId = computed.lastUpdatedLeafId
+  }
+  if (chat.previewText === undefined) {
+    patch.previewText = computed.previewText
   }
   if (!isFiniteNumber(chat.lastBranchUpdatedAt)) {
     patch.lastBranchUpdatedAt = 0
@@ -822,6 +925,29 @@ function numberOr(value: unknown, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback
 }
 
+const PREVIEW_MAX_CHARS = 240
+
+async function computePreviewText(
+  db: NatterDb,
+  rows: readonly MessageHeaderRow[],
+): Promise<string> {
+  let earliestHeader: MessageHeaderRow | undefined
+  for (const header of rows) {
+    if (header.deleted || header.role !== 'user') continue
+    if (!earliestHeader || header.createdAt < earliestHeader.createdAt) earliestHeader = header
+  }
+  if (!earliestHeader) return ''
+  const body = await db.messageBodies.get(earliestHeader.id)
+  const parts: string[] = []
+  for (const item of body?.content ?? []) {
+    if (item.type === 'text' || item.type === 'output_text') parts.push(item.text)
+  }
+  const trimmed = parts.join('').replace(/\s+/g, ' ').trim()
+  return trimmed.length > PREVIEW_MAX_CHARS
+    ? `${trimmed.slice(0, PREVIEW_MAX_CHARS - 1)}…`
+    : trimmed
+}
+
 function extensionFromFilename(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined
   const filename = value.split(/[\\/]/).pop() ?? value
@@ -848,53 +974,20 @@ function legacyBlob(value: unknown): Blob | undefined {
   return value as Blob
 }
 
-function normalizeLegacyAttachmentRefs(
-  value: unknown,
-  owner: { messageId?: string; draftChatId?: string; createdAt: number },
-): MessageAttachmentRef[] | undefined {
-  if (!Array.isArray(value)) return undefined
-  return value
-    .map((raw, index): MessageAttachmentRef | undefined => {
-      if (typeof raw === 'string') {
-        return {
-          refId: `legacy:${owner.messageId ?? owner.draftChatId ?? 'unknown'}:${index}`,
-          attachmentId: raw,
-          includeInContext: true,
-          presentation: {},
-          createdAt: owner.createdAt,
-          updatedAt: owner.createdAt,
-        }
-      }
-      if (!raw || typeof raw !== 'object') return undefined
-      const ref = raw as Partial<MessageAttachmentRef>
-      if (typeof ref.attachmentId !== 'string') return undefined
-      return {
-        refId:
-          typeof ref.refId === 'string'
-            ? ref.refId
-            : `legacy:${owner.messageId ?? owner.draftChatId ?? 'unknown'}:${index}`,
-        attachmentId: ref.attachmentId,
-        includeInContext: ref.includeInContext !== false,
-        presentation: ref.presentation ?? {},
-        ...(ref.tokenEstimate ? { tokenEstimate: ref.tokenEstimate } : {}),
-        ...(ref.missingResolution ? { missingResolution: ref.missingResolution } : {}),
-        createdAt: numberOr(ref.createdAt, owner.createdAt),
-        updatedAt: numberOr(ref.updatedAt, owner.createdAt),
-        ...(typeof ref.deletedAt === 'number' ? { deletedAt: ref.deletedAt } : {}),
-      }
-    })
-    .filter((ref): ref is MessageAttachmentRef => ref !== undefined)
-}
-
 export function childListKey(chatId: string, parentId: string | null): string {
   return `${chatId}:${parentId ?? '__root__'}`
 }
 
 let singleton: NatterDb | null = null
-let providerSettingsBackfillPromise: Promise<void> | null = null
 let organizationFieldsBackfillPromise: Promise<void> | null = null
 let messageBodySplitBackfillPromise: Promise<void> | null = null
+let globalSettingsBackfillPromise: Promise<void> | null = null
+let attachmentRefsBackfillPromise: Promise<void> | null = null
 const ORGANIZATION_FIELDS_BACKFILL_KEY = 'backfill:organization-fields-v1'
+
+function organizationFieldsBackfillMarker(): SettingsRow {
+  return { key: ORGANIZATION_FIELDS_BACKFILL_KEY, value: 1 }
+}
 
 export function getDb(): NatterDb {
   if (!singleton) singleton = new NatterDb()
@@ -906,6 +999,11 @@ export function getDb(): NatterDb {
 export async function openDb(): Promise<NatterDb> {
   const db = getDb()
   if (!db.isOpen()) await db.open()
+  attachmentRefsBackfillPromise ??= migrateAttachmentRefRows(db).catch((err) => {
+    attachmentRefsBackfillPromise = null
+    throw err
+  })
+  await attachmentRefsBackfillPromise
   messageBodySplitBackfillPromise ??= backfillMissingMessageBodies(db).catch((err) => {
     messageBodySplitBackfillPromise = null
     throw err
@@ -916,11 +1014,11 @@ export async function openDb(): Promise<NatterDb> {
     throw err
   })
   await organizationFieldsBackfillPromise
-  providerSettingsBackfillPromise ??= backfillProviderSettings(db).catch((err) => {
-    providerSettingsBackfillPromise = null
+  globalSettingsBackfillPromise ??= migrateGlobalSettingsRows(db).catch((err) => {
+    globalSettingsBackfillPromise = null
     throw err
   })
-  await providerSettingsBackfillPromise
+  await globalSettingsBackfillPromise
   return db
 }
 
@@ -930,9 +1028,10 @@ export function __resetDbForTests(): void {
     singleton.close()
     singleton = null
   }
-  providerSettingsBackfillPromise = null
   organizationFieldsBackfillPromise = null
   messageBodySplitBackfillPromise = null
+  globalSettingsBackfillPromise = null
+  attachmentRefsBackfillPromise = null
 }
 
 // Mint a uniquely-named Dexie instance for integration tests that want to
@@ -940,13 +1039,6 @@ export function __resetDbForTests(): void {
 // Caller is responsible for `await db.delete()` on teardown.
 export function createDbForTests(name: string): NatterDb {
   return new NatterDb(name)
-}
-
-export async function backfillProviderSettingsForModel(
-  profileId: string,
-  modelId: string,
-): Promise<void> {
-  await runProviderSettingsBackfill(getDb(), { profileId, modelId })
 }
 
 export async function backfillOrganizationFields(db: NatterDb): Promise<void> {
@@ -984,6 +1076,8 @@ export async function backfillOrganizationFields(db: NatterDb): Promise<void> {
     )
     const patch = organizationDefaultsPatch(chat as Chat & Record<string, unknown>, rows, {
       lastUpdatedLeafId: nextLeafId,
+      previewText:
+        chat.previewText === undefined ? await computePreviewText(db, rows) : chat.previewText,
       wordCount: countMessagesWords(branch),
       totalCostUsd,
     })
@@ -993,72 +1087,6 @@ export async function backfillOrganizationFields(db: NatterDb): Promise<void> {
   await db.transaction('rw', db.chats, db.settings, async () => {
     const patchedChats = chatPatches.map(({ chat, patch }) => ({ ...chat, ...patch }))
     if (patchedChats.length > 0) await db.chats.bulkPut(patchedChats)
-    await db.settings.put({ key: ORGANIZATION_FIELDS_BACKFILL_KEY, value: 1 })
-  })
-}
-
-async function backfillProviderSettings(db: NatterDb): Promise<void> {
-  await runProviderSettingsBackfill(db)
-}
-
-async function runProviderSettingsBackfill(
-  db: NatterDb,
-  scope?: { profileId: string; modelId: string },
-): Promise<void> {
-  const [endpointsRows, privacyRows, profiles] = await Promise.all([
-    scope
-      ? db.endpoints.where('[profileId+modelId]').equals([scope.profileId, scope.modelId]).toArray()
-      : db.endpoints.toArray(),
-    scope
-      ? db.privacyPolicies
-          .where('[profileId+modelId]')
-          .equals([scope.profileId, scope.modelId])
-          .toArray()
-      : db.privacyPolicies.toArray(),
-    scope ? db.profiles.where('id').equals(scope.profileId).toArray() : db.profiles.toArray(),
-  ])
-  const endpointsByKey = new Map<string, CachedEndpointsRow>()
-  const privacyByKey = new Map<string, CachedPrivacyPolicyRow>()
-  const profilesById = new Map(profiles.map((profile) => [profile.id, profile]))
-  for (const row of endpointsRows)
-    endpointsByKey.set(providerCacheKey(row.profileId, row.modelId), row)
-  for (const row of privacyRows) privacyByKey.set(providerCacheKey(row.profileId, row.modelId), row)
-
-  await db.transaction('rw', db.chats, db.presets, async () => {
-    const chats = scope
-      ? db.chats.filter(
-          (chat) =>
-            chat.settings.profileId === scope.profileId && chat.settings.model === scope.modelId,
-        )
-      : db.chats.toCollection()
-    const presets = scope
-      ? db.presets.filter(
-          (preset) =>
-            preset.connectionProfileId === scope.profileId &&
-            preset.settings.model === scope.modelId,
-        )
-      : db.presets.toCollection()
-    await chats.modify((chat) => {
-      const result = migrateProviderSettingsRow(
-        chat.settings,
-        chat.settings.profileId,
-        chat.settings.model,
-        {
-          endpointsByKey,
-          privacyByKey,
-          profilesById,
-        },
-      )
-      if (result.changed) chat.settings = result.settings
-    })
-    await presets.modify((preset) => {
-      const result = migrateProviderSettingsRow(
-        preset.settings,
-        preset.connectionProfileId,
-        preset.settings.model,
-        { endpointsByKey, privacyByKey, profilesById },
-      )
-      if (result.changed) preset.settings = result.settings
-    })
+    await db.settings.put(organizationFieldsBackfillMarker())
   })
 }

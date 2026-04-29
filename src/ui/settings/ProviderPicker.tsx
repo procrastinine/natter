@@ -21,7 +21,7 @@
 import { useLiveQuery } from 'dexie-react-hooks'
 import { useCallback, useMemo, useState } from 'react'
 import { DEFAULT_GLOBAL_PREFERENCES, readGlobalPreferences } from '../../core/global-settings'
-import { DEFAULT_OPENROUTER_PROVIDER_SORT } from '../../backcompat/provider-settings'
+import { DEFAULT_OPENROUTER_PROVIDER_SORT } from '../../core/provider-defaults'
 import { estimateSettingsPromptSize, UNLIMITED_CONTEXT } from '../../core/prompt-size'
 import {
   endpointMatchesProviderRef,
@@ -66,7 +66,8 @@ export function ProviderPicker({
   routing,
   neededTokens: neededTokensOverride,
 }: ProviderPickerProps) {
-  const { endpoints, filter, loading, isFreeModel, scrapeApplicable, refresh } = routing
+  const { endpoints, filter, loading, isFreeModel, scrapeApplicable, liveScrapeEnabled, refresh } =
+    routing
   const prefs = chat.settings.providerPrefs ?? {}
   const currentSort: SortBy =
     typeof prefs.sort === 'string'
@@ -166,8 +167,6 @@ export function ProviderPicker({
   const updatePrefs = useCallback(
     (patch: Partial<ProviderPreferences>) => {
       const next: ProviderPreferences = { ...(chat.settings.providerPrefs ?? {}), ...patch }
-      delete next.dataCollection
-      delete next.zdr
       if (patch.ignore !== undefined) delete next.only
       void updateChatSettings(chat.id, { providerPrefs: next })
     },
@@ -199,8 +198,6 @@ export function ProviderPicker({
         ignoreOverridesFilter: true,
       }
       delete nextPrefs.only
-      delete nextPrefs.dataCollection
-      delete nextPrefs.zdr
       void updateChatSettings(chat.id, { providerPrefs: nextPrefs })
     },
     [
@@ -258,8 +255,6 @@ export function ProviderPicker({
         ignoreOverridesFilter: true,
       }
       delete nextPrefs.only
-      delete nextPrefs.dataCollection
-      delete nextPrefs.zdr
       void updateChatSettings(chat.id, { providerPrefs: nextPrefs })
     },
     [chat.id, chat.settings.providerPrefs, displayOrdered],
@@ -370,6 +365,13 @@ export function ProviderPicker({
       ) : !scrapeApplicable ? (
         <p data-ui="helper" data-tone="muted">
           Privacy filter does not apply to this connection. Manual overrides still apply.
+        </p>
+      ) : null}
+      {scrapeApplicable && !liveScrapeEnabled ? (
+        <p data-ui="helper" data-tone="muted">
+          Live provider privacy refresh is off. Provider privacy uses cached policy data,
+          endpoint-supplied policy data, and curated fallback defaults until a proxy is configured
+          in General settings.
         </p>
       ) : null}
       <PrivacySection chat={chat} />

@@ -58,9 +58,7 @@ export function messageRenderableText(message: Message): string {
     if (rendered.length > 0) parts.push(rendered)
   }
   for (const ref of message.attachmentRefs ?? []) {
-    const attachmentId = typeof ref === 'string' ? ref : ref.attachmentId
-    const label = typeof ref === 'string' ? undefined : ref.presentation.label
-    if (attachmentId) parts.push(`[attachment: ${label ?? attachmentId}]`)
+    if (ref.attachmentId) parts.push(`[attachment: ${ref.presentation.label ?? ref.attachmentId}]`)
   }
   for (const call of message.toolCalls ?? []) {
     parts.push(`[tool call: ${call.function.name}]`)

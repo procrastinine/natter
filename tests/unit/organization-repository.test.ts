@@ -1,7 +1,7 @@
 import Dexie, { liveQuery } from 'dexie'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
-import type { Attachment, Chat, Message } from '../../src/core/types'
+import type { Attachment, Chat, Message, MessageAttachmentRef } from '../../src/core/types'
 import { newId } from '../../src/lib/ulid'
 import { __resetBroadcastForTests, type BroadcastEvent, onEvent } from '../../src/store/broadcast'
 import {
@@ -110,6 +110,17 @@ async function seedAttachment(overrides: Partial<Attachment> = {}): Promise<Atta
   }
   await getDb().attachments.put(attachment)
   return attachment
+}
+
+function attachmentRef(attachmentId: string): MessageAttachmentRef {
+  return {
+    refId: `ref-${attachmentId}`,
+    attachmentId,
+    includeInContext: true,
+    presentation: {},
+    createdAt: 100,
+    updatedAt: 100,
+  }
 }
 
 async function waitForCondition(predicate: () => boolean): Promise<void> {
@@ -298,11 +309,14 @@ describe('organization repository contract', () => {
     const attachment = await seedAttachment({ id: 'att-1', refCount: 2 })
     const archived = await seedChat({ id: 'archived', archived: true })
     const live = await seedChat({ id: 'live', archived: false })
-    await seedMessage(archived.id, { id: 'archived-message', attachmentRefs: [attachment.id] })
+    await seedMessage(archived.id, {
+      id: 'archived-message',
+      attachmentRefs: [attachmentRef(attachment.id)],
+    })
     await getDb().drafts.put({
       chatId: archived.id,
       text: '',
-      attachmentRefs: [attachment.id],
+      attachmentRefs: [attachmentRef(attachment.id)],
       updatedAt: 100,
     })
     await seedMessage(live.id, { id: 'live-message' })

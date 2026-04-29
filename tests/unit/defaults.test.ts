@@ -44,10 +44,7 @@ describe('defaults', () => {
         "privacy": {
           "byokEnabled": false,
           "denyDataCollection": true,
-          "ignoreProviders": [],
-          "onlyProviders": [],
           "paretoFilter": true,
-          "usePreferredOrdering": true,
           "zdrOnly": false,
         },
         "profileId": "",
@@ -80,9 +77,6 @@ describe('defaults', () => {
       denyDataCollection: true,
       zdrOnly: false,
       paretoFilter: true,
-      usePreferredOrdering: true,
-      ignoreProviders: [],
-      onlyProviders: [],
       byokEnabled: false,
     })
   })

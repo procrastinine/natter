@@ -14,9 +14,9 @@ export default defineConfig({
       // `openrouter.ai/{model}/providers` doesn't serve CORS, so a
       // browser-origin fetch is blocked. In dev the request is proxied
       // through Vite's own server so `/_or_scrape/*` becomes same-origin
-      // and the scrape can read the live HTML. Static builds default to a
-      // public bouncer instead, because this Vite-only route does not exist
-      // on GitHub Pages.
+      // and the scrape can read the live HTML. Static builds default to no
+      // live scrape because this Vite-only route does not exist on GitHub
+      // Pages.
       '/_or_scrape': {
         target: 'https://openrouter.ai',
         changeOrigin: true,

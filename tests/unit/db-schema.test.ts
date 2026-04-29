@@ -109,7 +109,7 @@ function registerV1(db: Dexie): void {
 
 function registerV1Through3(db: Dexie): void {
   registerSchema(db)
-  db.version(13)
+  db.version(14)
     .stores({ profiles: 'id, name, kind, lastUsedAt, archived' })
     .upgrade(async (tx) => {
       await tx
@@ -119,7 +119,7 @@ function registerV1Through3(db: Dexie): void {
           if (row.appTitle === undefined) row.appTitle = 'Natter'
         })
     })
-  db.version(14)
+  db.version(15)
     .stores({ settings: '&key' })
     .upgrade(async (tx) => {
       const settings = tx.table<MinimalSetting>('settings')
@@ -191,7 +191,7 @@ describe('Dexie migrations', () => {
     const db = new Dexie(name)
     registerV1Through3(db)
     await db.open()
-    expect(db.verno).toBe(14)
+    expect(db.verno).toBe(15)
     expect(db.tables.map((t) => t.name).includes('settings')).toBe(true)
     const tag = await db.table<MinimalSetting>('settings').get('schemaTag')
     expect(tag).toBeUndefined()
@@ -227,7 +227,7 @@ describe('Dexie migrations', () => {
     const up = new Dexie(name)
     registerV1Through3(up)
     await up.open()
-    expect(up.verno).toBe(14)
+    expect(up.verno).toBe(15)
     const profile = await up.table<MinimalProfile>('profiles').get('P1')
     expect(profile?.appTitle).toBe('CustomTitle') // preserved — synthetic bump only fills undefined
     const tag = await up.table<MinimalSetting>('settings').get('schemaTag')
@@ -237,7 +237,7 @@ describe('Dexie migrations', () => {
     const reopen = new Dexie(name)
     registerV1Through3(reopen)
     await reopen.open()
-    expect(reopen.verno).toBe(14)
+    expect(reopen.verno).toBe(15)
     const tag2 = await reopen.table<MinimalSetting>('settings').get('schemaTag')
     expect(tag2?.value).toBe('preexisting')
     await reopen.delete()
@@ -342,11 +342,11 @@ describe('Dexie migrations', () => {
     await migrated.open()
     const chat = await migrated.chats.get('chat-1')
     const preset = await migrated.presets.get('preset-1')
-    expect(chat?.settings.privacy.ignoreProviders).toEqual([])
-    expect(chat?.settings.privacy.onlyProviders).toEqual([])
+    expect('ignoreProviders' in (chat?.settings.privacy ?? {})).toBe(false)
+    expect('onlyProviders' in (chat?.settings.privacy ?? {})).toBe(false)
     expect(chat?.settings.providerPrefs?.ignoreOverridesFilter).toBe(true)
     expect(chat?.settings.providerPrefs?.ignore).toEqual(['anthropic', 'anthropic/2'])
-    expect(preset?.settings.privacy.ignoreProviders).toEqual([])
+    expect('ignoreProviders' in (preset?.settings.privacy ?? {})).toBe(false)
     expect(preset?.settings.providerPrefs?.ignore).toEqual(['anthropic', 'anthropic/2'])
     await migrated.delete()
   })
@@ -359,9 +359,17 @@ describe('Dexie migrations', () => {
     const baseSettings = cloneDefaultChatSettings()
     baseSettings.profileId = openRouterProfileId
     baseSettings.model = 'anthropic/claude-opus-4.7'
+    baseSettings.privacy = {
+      ...baseSettings.privacy,
+      usePreferredOrdering: true,
+    } as unknown as Chat['settings']['privacy']
     const directSettings = cloneDefaultChatSettings()
     directSettings.profileId = directProfileId
     directSettings.model = 'gpt-4o'
+    directSettings.privacy = {
+      ...directSettings.privacy,
+      usePreferredOrdering: false,
+    } as unknown as Chat['settings']['privacy']
 
     const legacy = new Dexie(name)
     registerLegacyAttachmentsV5(legacy)
@@ -471,6 +479,10 @@ describe('Dexie migrations', () => {
     expect(openRouterPreset?.settings.providerPrefs).toEqual({ sort: 'price' })
     expect(directChat?.settings.providerPrefs).toBeUndefined()
     expect(directPreset?.settings.providerPrefs).toBeUndefined()
+    expect('usePreferredOrdering' in (openRouterChat?.settings.privacy ?? {})).toBe(false)
+    expect('usePreferredOrdering' in (openRouterPreset?.settings.privacy ?? {})).toBe(false)
+    expect('usePreferredOrdering' in (directChat?.settings.privacy ?? {})).toBe(false)
+    expect('usePreferredOrdering' in (directPreset?.settings.privacy ?? {})).toBe(false)
     await migrated.delete()
   })
 
@@ -767,6 +779,7 @@ describe('Dexie migrations', () => {
     await db.messages.bulkPut(splitMessages.map((message) => message.header))
     await db.messageBodies.bulkPut(splitMessages.map((message) => message.body))
     await db.messageBodies.delete('old-leaf')
+    await db.settings.delete('backfill:organization-fields-v1')
 
     await backfillOrganizationFields(db)
     await backfillOrganizationFields(db)
@@ -834,6 +847,7 @@ describe('Dexie migrations', () => {
         pinned: index % 5 === 0,
       })),
     )
+    await db.settings.delete('backfill:organization-fields-v1')
 
     await backfillOrganizationFields(db)
 

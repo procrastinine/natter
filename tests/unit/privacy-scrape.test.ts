@@ -35,6 +35,12 @@ describe('privacyScrapeUrl', () => {
     )
   })
 
+  it('treats an empty proxy URL as live scrape disabled', () => {
+    expect(() => privacyScrapeUrl(makeProxy({ url: '' }), 'openai/gpt-5.4')).toThrow(
+      'Privacy-page proxy is disabled',
+    )
+  })
+
   it('honors a user-configured proxy URL', () => {
     const proxy = makeProxy({ url: 'https://proxy.example.com' })
     expect(privacyScrapeUrl(proxy, 'anthropic/claude-opus-4.7')).toBe(

@@ -9,14 +9,14 @@
 // CORS proxy used for the OpenRouter privacy scrape (see
 // `plan/09-privacy.md §9.4` and `plan/14-details.md §14.14`). Vite dev uses
 // `/_or_scrape`, the same-origin path its dev server rewrites to
-// `https://openrouter.ai`. Static builds default to a public bouncer so the
-// deployed repo does not expose a private proxy endpoint. When
+// `https://openrouter.ai`. Static builds default to no live scrape; users can
+// opt into a public or self-hosted bouncer in Settings. When
 // `corsProxySecret` is non-empty the scrape sends `X-Proxy-Secret: <secret>`
 // so a custom bouncer can require auth.
 export const DEV_CORS_PROXY_URL = '/_or_scrape'
 export const PUBLIC_CORS_PROXY_URL =
   'https://corsproxy.io/?url=https://openrouter.ai/{model}/providers'
-export const DEFAULT_CORS_PROXY_URL = PUBLIC_CORS_PROXY_URL
+export const DEFAULT_CORS_PROXY_URL = ''
 export const CORS_PROXY_SECRET_HEADER = 'X-Proxy-Secret'
 
 // Direct OpenRouter base for daemon-mode hosts that fetch
@@ -28,11 +28,14 @@ export const CORS_PROXY_SECRET_HEADER = 'X-Proxy-Secret'
 export const DIRECT_OPENROUTER_BASE = 'https://openrouter.ai'
 
 export interface CorsProxyConfig {
-  /** Trimmed proxy URL or template. Always non-empty — falls back to the
-   *  browser runtime default when the user clears the input. */
+  /** Trimmed proxy URL or template. Empty means browser live scrape is off. */
   url: string
   /** Optional secret echoed as `X-Proxy-Secret`. Empty = header omitted. */
   secret: string
+}
+
+export function isCorsProxyDisabled(proxy: CorsProxyConfig): boolean {
+  return proxy.url.trim().length === 0
 }
 
 // Known public CORS bouncers. Each entry maps a canonical lowercase host

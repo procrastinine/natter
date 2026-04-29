@@ -213,6 +213,29 @@ describe('resolvePrivacyForSend', () => {
     expect(r.wire?.data_collection).toBe('deny')
   })
 
+  it('does not live-scrape when the privacy proxy is disabled', async () => {
+    await putCachedEndpoints('prof-1', 'openai/gpt-5.4', {
+      id: 'openai/gpt-5.4',
+      endpoints: [
+        {
+          provider_name: 'Azure',
+          supported_parameters: ['temperature'],
+          context_length: 200000,
+          pricing: { prompt: '0.0000025', completion: '0.00001' },
+        },
+      ],
+    })
+    const chat = makeChat()
+    const profile = makeProfile()
+    const r = await resolvePrivacyForSend({ chat, profile, proxy: { url: '', secret: '' } })
+
+    expect(fetchPrivacyScrapeMock).not.toHaveBeenCalled()
+    expect(r.applicable).toBe(true)
+    expect(r.filter?.zeroEligible).toBe(false)
+    expect(r.filter?.kept.map((row) => row.endpoint.provider_name)).toEqual(['Azure'])
+    expect(r.wire?.zeroEligible).toBe(false)
+  })
+
   it('blocks instead of sending without privacy routing when cold endpoint discovery fails', async () => {
     fetchEndpointsMock.mockRejectedValueOnce(new Error('network down'))
     const chat = makeChat()
@@ -437,7 +460,11 @@ describe('resolvePrivacyForSend', () => {
   it('resolves duplicate provider display names to exact provider slugs on the wire', async () => {
     const chat = makeChat({
       model: 'anthropic/claude-opus-4.7',
-      providerPrefs: { ignore: ['anthropic/2'], ignoreOverridesFilter: true },
+      providerPrefs: {
+        ignore: ['anthropic/2'],
+        ignoreOverridesFilter: true,
+        order: ['Anthropic'],
+      },
     })
     const profile = makeProfile()
     await putCachedEndpoints('prof-1', 'anthropic/claude-opus-4.7', {

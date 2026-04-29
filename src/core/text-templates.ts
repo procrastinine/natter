@@ -424,7 +424,7 @@ function stringOrEmpty(value: unknown): string {
 }
 
 export function templateSourceForConfig(config: TextTemplateConfig): string {
-  return config.template ?? legacyTemplateSourceForConfig(config)
+  return config.template ?? prefixTemplateSourceForConfig(config)
 }
 
 export function editableTextTemplateConfig(config: TextTemplateConfig): TextTemplateConfig {
@@ -438,7 +438,7 @@ export function editableTextTemplateConfig(config: TextTemplateConfig): TextTemp
   return next
 }
 
-function legacyTemplateSourceForConfig(config: TextTemplateConfig): string {
+function prefixTemplateSourceForConfig(config: TextTemplateConfig): string {
   if (isPlainContinuationTemplate(config)) return RAW_TEXT_TEMPLATE_SOURCE
   const parts: string[] = []
   if (config.bos.length > 0) parts.push(config.bos)

@@ -13,15 +13,15 @@
 // The fetch path is a workspace-global CORS proxy — config shape +
 // constants live in `core/cors-proxy.ts` (the daemon-safe module the
 // browser preference layer also re-exports). Vite dev defaults to the
-// same-origin `/_or_scrape` rewrite; static builds default to a public
-// bouncer. No Authorization header is sent — the page is public. When
-// a secret is configured it rides as
-// `X-Proxy-Secret`.
+// same-origin `/_or_scrape` rewrite; static builds do not fetch live provider
+// pages until the user configures a bouncer. No Authorization header is sent —
+// the page is public. When a secret is configured it rides as `X-Proxy-Secret`.
 
 import {
   CORS_PROXY_SECRET_HEADER,
   type CorsProxyConfig,
   DEFAULT_CORS_PROXY_URL,
+  isCorsProxyDisabled,
   matchKnownBouncer,
 } from '../core/cors-proxy'
 import type { DataPolicy } from '../core/types'
@@ -50,11 +50,11 @@ interface PrivacyScrapeResult {
 }
 
 // Build the scrape URL. The browser can't fetch `openrouter.ai/{model}/
-// providers` cross-origin (CORS), so the default is the relative proxy
-// path `/_or_scrape` — Vite's dev server rewrites it. Static builds
-// default to a public bouncer, and users can override `corsProxyUrl` to
-// any hosted bouncer. Daemon-mode hosts can pass a direct OpenRouter
-// base because CORS does not apply server-to-server.
+// providers` cross-origin (CORS), so Vite dev defaults to the relative proxy
+// path `/_or_scrape`, which the dev server rewrites. Static builds default to
+// no live scrape, and users can override `corsProxyUrl` to any hosted bouncer.
+// Daemon-mode hosts can pass a direct OpenRouter base because CORS does not
+// apply server-to-server.
 //
 // Three URL shapes are accepted (resolution order matters — template
 // wins, then known-bouncer shortcut, then path-prefix fallback):
@@ -83,6 +83,9 @@ const PATH_PLACEHOLDER = '{path}'
 
 export function privacyScrapeUrl(proxy: CorsProxyConfig, modelId: string): string {
   const raw = proxy.url
+  if (isCorsProxyDisabled(proxy)) {
+    throw new Error('Privacy-page proxy is disabled')
+  }
   if (raw.includes(MODEL_PLACEHOLDER) || raw.includes(PATH_PLACEHOLDER)) {
     return raw
       .split(PATH_PLACEHOLDER)

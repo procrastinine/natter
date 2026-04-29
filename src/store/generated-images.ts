@@ -192,7 +192,7 @@ export async function migrateGeneratedOutputAttachments(messageId: MessageId): P
   const existing = await repo.getMessage(messageId)
   if (!existing || existing.deleted) return
   const migrationContext = await generatedOutputMigrationContext(existing)
-  const expanded = await expandLegacyVideoPollingOutputs(existing.content, migrationContext)
+  const expanded = await expandVideoPollingOutputs(existing.content, migrationContext)
   const materialized = await materializeGeneratedImageOutputAttachments({
     messageId,
     content: expanded.content,
@@ -284,7 +284,7 @@ async function generatedOutputMigrationContext(message: Message): Promise<
   return { downloader, videoUrlResolver }
 }
 
-async function expandLegacyVideoPollingOutputs(
+async function expandVideoPollingOutputs(
   content: readonly ContentItem[],
   context:
     | {

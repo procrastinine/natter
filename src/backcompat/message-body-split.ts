@@ -8,7 +8,11 @@ import {
   type MessageHeaderRow,
 } from '../store/message-storage'
 
-const MESSAGE_BODY_SPLIT_BACKFILL_KEY = 'backfill:message-body-split-v1'
+export const MESSAGE_BODY_SPLIT_BACKFILL_KEY = 'backfill:message-body-split-v1'
+
+export function messageBodySplitBackfillMarker(): SettingsRow {
+  return { key: MESSAGE_BODY_SPLIT_BACKFILL_KEY, value: 1 }
+}
 
 type LegacyInlineMessageRow = Record<string, unknown> & Partial<Message>
 
@@ -20,7 +24,7 @@ export async function migrateInlineMessageBodies(tx: Transaction): Promise<void>
   for (const row of rows) {
     await splitAndStoreLegacyMessage(messages, bodies, row)
   }
-  await settings.put({ key: MESSAGE_BODY_SPLIT_BACKFILL_KEY, value: 1 })
+  await settings.put(messageBodySplitBackfillMarker())
 }
 
 export async function backfillMissingMessageBodies(db: NatterDb): Promise<void> {
@@ -44,7 +48,7 @@ export async function backfillMissingMessageBodies(db: NatterDb): Promise<void> 
         row,
       )
     }
-    await db.settings.put({ key: MESSAGE_BODY_SPLIT_BACKFILL_KEY, value: 1 })
+    await db.settings.put(messageBodySplitBackfillMarker())
   })
 }
 

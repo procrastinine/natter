@@ -378,23 +378,40 @@ export async function incRefs(
   ctx: MutationContext,
   refs: readonly AttachmentRef[] | undefined,
 ): Promise<void> {
-  const ids = attachmentIdsOf(refs)
-  for (const id of ids) {
-    const row = await ctx.getAttachment(id)
-    if (!row) continue
-    await ctx.putAttachment({ ...row, refCount: row.refCount + 1 })
-  }
+  await updateAttachmentRefCounts(ctx, attachmentIdsOf(refs), 1)
 }
 
 export async function decRefs(
   ctx: MutationContext,
   refs: readonly AttachmentRef[] | undefined,
 ): Promise<void> {
-  const ids = attachmentIdsOf(refs)
+  await updateAttachmentRefCounts(ctx, attachmentIdsOf(refs), -1)
+}
+
+export async function incAttachmentIds(
+  ctx: MutationContext,
+  ids: readonly AttachmentId[] | undefined,
+): Promise<void> {
+  await updateAttachmentRefCounts(ctx, ids ?? [], 1)
+}
+
+export async function decAttachmentIds(
+  ctx: MutationContext,
+  ids: readonly AttachmentId[] | undefined,
+): Promise<void> {
+  await updateAttachmentRefCounts(ctx, ids ?? [], -1)
+}
+
+async function updateAttachmentRefCounts(
+  ctx: MutationContext,
+  ids: readonly AttachmentId[],
+  delta: 1 | -1,
+): Promise<void> {
   for (const id of ids) {
     const row = await ctx.getAttachment(id)
     if (!row) continue
-    await ctx.putAttachment({ ...row, refCount: Math.max(0, row.refCount - 1) })
+    const refCount = delta > 0 ? row.refCount + 1 : Math.max(0, row.refCount - 1)
+    await ctx.putAttachment({ ...row, refCount })
   }
 }
 
@@ -458,7 +475,7 @@ export async function addExistingAttachmentRef(
         updatedAt: now,
       })
     }
-    await incRefs(ctx, [input.attachmentId])
+    await incRefs(ctx, [ref])
   })
   return ref
 }
@@ -613,7 +630,7 @@ export async function batchRelinkAttachmentRefs(
         await ctx.putDraft({ ...draft, attachmentRefs: next, updatedAt: now })
       }
     }
-    await decRefs(ctx, oldIds)
+    await decAttachmentIds(ctx, oldIds)
     await incRefs(ctx, updated)
   })
   return updated

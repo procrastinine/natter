@@ -103,11 +103,6 @@ export type VerbosityLevel = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 // `effort` / `budget` = the two dimensional knobs when supported.
 export type ReasoningMode = 'default' | 'off' | 'enabled' | 'effort' | 'budget'
 
-/** @deprecated Phase 11 replaces this with `ReasoningInclude`. Kept for one
- *  release so legacy chat rows can round-trip through import/export. Readers
- *  should prefer `include` and fall back to migrated values from here. */
-export type ReasoningCarryForward = 'off' | 'plaintext' | 'encrypted' | 'auto'
-
 type ReasoningSummary = 'off' | 'auto' | 'concise' | 'detailed'
 
 /** Three independent flags — maps 1:1 to the three Phase-11.1 UI checkboxes.
@@ -144,8 +139,6 @@ export interface ReasoningSettings {
    * and Gemini-native routes (those have structured reasoning channels).
    */
   echoAsThinkTags?: boolean
-  /** @deprecated Use `include`. Preserved for import/export backcompat only. */
-  carryForward?: ReasoningCarryForward
 }
 
 export type ReasoningFormat =
@@ -269,8 +262,6 @@ export type PercentileBucket = {
 export interface ProviderPreferences {
   order?: string[]
   requireParameters?: boolean
-  dataCollection?: 'allow' | 'deny'
-  zdr?: boolean
   only?: string[]
   ignore?: string[]
   // True once the user clicks any provider checkbox. Signals that
@@ -297,9 +288,6 @@ export interface PrivacyPrefs {
   denyDataCollection: boolean
   zdrOnly: boolean
   paretoFilter: boolean
-  usePreferredOrdering: boolean
-  ignoreProviders: string[]
-  onlyProviders: string[]
   byokEnabled: boolean
 }
 
@@ -464,7 +452,7 @@ export interface ChatSettings {
   // not offered there and stale values fall back to a client-rendered template.
   // Built-in ids and user-defined global-template ids are resolved through
   // `core/text-templates.ts`; 'raw' is a Jinja-style plaintext continuation
-  // template; 'custom' remains a per-chat legacy escape hatch via
+  // template; 'custom' remains a per-chat escape hatch via
   // `customTextTemplate`.
   textTemplate?: TextTemplateId
   // Only read when `textTemplate === 'custom'`. The shape matches the
@@ -534,7 +522,7 @@ interface ComposeOverrides {
 
 interface ChatDraft {
   text: string
-  attachmentRefs: AttachmentRef[]
+  attachmentRefs: MessageAttachmentRef[]
   composeOverrides?: ComposeOverrides
   overrides?: Partial<ChatSettings>
   prefillEnabled?: boolean
@@ -579,8 +567,8 @@ export interface Chat {
   // whenever a user message is created, edited, or deleted. The sidebar
   // reads this directly off the chat row so listing N chats never has to
   // touch the `messages` table (critical once a workspace holds
-  // thousands of chats). Optional for backward-compat with pre-existing
-  // chat rows; legacy rows are lazily backfilled on first open.
+  // thousands of chats). Optional because old rows are backfilled before
+  // app render.
   previewText?: string
   // Running-sum calibration for chars-per-token. Keyed by the durable
   // calibration bucket: shared-tokenizer family key when known, otherwise the
@@ -836,7 +824,7 @@ export interface Message {
   refusal?: string
   phase?: MessagePhase
   responsesEchoItem?: ResponsesOutputItem
-  attachmentRefs?: AttachmentRef[]
+  attachmentRefs?: MessageAttachmentRef[]
   approval?: MessageApproval
   nodeVersion: number
   pinCache?: boolean
@@ -1017,7 +1005,7 @@ export interface MessageAttachmentRef {
   deletedAt?: number
 }
 
-export type AttachmentRef = AttachmentId | MessageAttachmentRef
+export type AttachmentRef = MessageAttachmentRef
 
 export interface Attachment {
   id: AttachmentId

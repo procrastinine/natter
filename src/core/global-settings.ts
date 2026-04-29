@@ -121,7 +121,8 @@ interface GlobalPreferences {
   // or reloads. Manual avatar clicks stay session-local.
   longMessageDisplayMode: LongMessageDisplayMode
   // CORS-proxy base URL prefixed in front of `/{model}/providers` for the
-  // privacy scrape. Empty string falls back to the runtime default.
+  // privacy scrape. Empty string uses the runtime default: `/_or_scrape`
+  // under Vite dev, no live scrape in static builds.
   corsProxyUrl: string
   // Optional secret echoed as `X-Proxy-Secret` so a hosted bouncer can
   // gatekeep its open relay. Empty string = header omitted.
@@ -137,7 +138,7 @@ export const DEFAULT_PINNED_MODELS: readonly string[] = Object.freeze([
 ])
 
 export function defaultCorsProxyUrlForRuntime(isDev = import.meta.env.DEV): string {
-  return isDev ? DEV_CORS_PROXY_URL : PUBLIC_CORS_PROXY_URL
+  return isDev ? DEV_CORS_PROXY_URL : DEFAULT_CORS_PROXY_URL
 }
 
 export const DEFAULT_GLOBAL_PREFERENCES: Readonly<GlobalPreferences> = Object.freeze({
@@ -173,10 +174,6 @@ const TOKEN_CALIBRATION_MODE_KEY = 'global:token-calibration-mode'
 const LONG_MESSAGE_DISPLAY_MODE_KEY = 'global:long-message-display-mode'
 const CORS_PROXY_URL_KEY = 'global:cors-proxy-url'
 const CORS_PROXY_SECRET_KEY = 'global:cors-proxy-secret'
-// Legacy single-flag key — used for migration so existing installs
-// don't suddenly flip to the default. Read on boot, split into the
-// two new keys, then retired.
-const LEGACY_AUTO_SCROLL_KEY = 'global:auto-scroll'
 
 export const FONT_FAMILY_OPTIONS: ReadonlyArray<{
   value: FontFamilyChoice
@@ -291,7 +288,6 @@ export async function readGlobalPreferences(): Promise<GlobalPreferences> {
     baseFontSize,
     autoScrollOpen,
     autoScrollStream,
-    legacyAutoScroll,
     pinned,
     recent,
     tokenCalibrationMode,
@@ -308,7 +304,6 @@ export async function readGlobalPreferences(): Promise<GlobalPreferences> {
     getSetting<BaseFontSize>(BASE_FONT_SIZE_KEY),
     getSetting<boolean>(AUTO_SCROLL_OPEN_KEY),
     getSetting<boolean>(AUTO_SCROLL_STREAM_KEY),
-    getSetting<boolean>(LEGACY_AUTO_SCROLL_KEY),
     getSetting<string[]>(PINNED_MODELS_KEY),
     getSetting<string[]>(RECENT_MODELS_KEY),
     getSetting<TokenCalibrationMode>(TOKEN_CALIBRATION_MODE_KEY),
@@ -334,15 +329,11 @@ export async function readGlobalPreferences(): Promise<GlobalPreferences> {
     autoScrollOnOpen:
       typeof autoScrollOpen === 'boolean'
         ? autoScrollOpen
-        : typeof legacyAutoScroll === 'boolean'
-          ? legacyAutoScroll
-          : DEFAULT_GLOBAL_PREFERENCES.autoScrollOnOpen,
+        : DEFAULT_GLOBAL_PREFERENCES.autoScrollOnOpen,
     autoScrollOnStream:
       typeof autoScrollStream === 'boolean'
         ? autoScrollStream
-        : typeof legacyAutoScroll === 'boolean'
-          ? legacyAutoScroll
-          : DEFAULT_GLOBAL_PREFERENCES.autoScrollOnStream,
+        : DEFAULT_GLOBAL_PREFERENCES.autoScrollOnStream,
     pinnedModels: Array.isArray(pinned)
       ? pinned.filter((x) => typeof x === 'string')
       : [...DEFAULT_PINNED_MODELS],

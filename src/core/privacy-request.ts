@@ -29,7 +29,7 @@ import {
   getCachedPrivacyPolicy,
   PRIVACY_POLICY_TTL_MS,
 } from '../store/privacy-cache'
-import type { CorsProxyConfig } from './cors-proxy'
+import { isCorsProxyDisabled, type CorsProxyConfig } from './cors-proxy'
 import { isFreeModel } from './model-predicates'
 import {
   buildWireProviderPrivacy,
@@ -221,6 +221,9 @@ async function ensurePrivacyPolicies(input: {
   const cachedPolicies = cachedPayload?.policies ?? {}
   const hasCachedPolicies = Object.keys(cachedPolicies).length > 0
   if (!needsScrape) return { policies: cachedPolicies, offlineFallback: false }
+  if (isCorsProxyDisabled(proxy)) {
+    return { policies: cachedPolicies, offlineFallback: false }
+  }
 
   if (cached && hasCachedPolicies && isFresh(cached.fetchedAt, PRIVACY_POLICY_TTL_MS)) {
     return { policies: cachedPolicies, offlineFallback: false }

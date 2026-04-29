@@ -5,7 +5,6 @@ import { fetchModels } from '../../api/models'
 import { probeLlamaServer } from '../../api/probe'
 import { normalizeModelsResponse } from '../../api/providers'
 import { cloneDefaultChatSettings } from '../../core/defaults'
-import { normalizeReasoningSettings } from '../../core/reasoning'
 import { prepareAssistantRequestPlan } from '../../core/send-planning'
 import type {
   Chat,
@@ -48,7 +47,6 @@ interface ConnectionSaveResult {
   resetModel: boolean
 }
 
-const ACTIVE_PROFILE_KEY = 'natter:active-profile-id'
 const ACTIVE_SEED_KEY = 'natter:active-seed'
 
 interface ActiveSeedState {
@@ -67,12 +65,7 @@ function normalizeActiveSeedState(value: unknown): ActiveSeedState | null {
     candidate.settings && typeof candidate.settings === 'object'
       ? (candidate.settings as ChatSettings)
       : null
-  // SessionStorage may contain settings authored by a pre-Phase-11 build that
-  // didn't have `reasoning.include` yet. Heal them on the way in so the seed
-  // can't carry a malformed shape into newly-created chats.
-  const settings = rawSettings
-    ? ({ ...rawSettings, reasoning: normalizeReasoningSettings(rawSettings.reasoning) })
-    : null
+  const settings = rawSettings ? structuredClone(rawSettings) : null
   if (!profileId && !presetId && !settings) return null
   return { profileId, presetId, settings }
 }
@@ -85,11 +78,10 @@ export function readActiveSeedState(): ActiveSeedState {
       const parsed = normalizeActiveSeedState(JSON.parse(raw))
       if (parsed) return parsed
     } catch {
-      // Fall through to legacy migration path.
+      window.sessionStorage.removeItem(ACTIVE_SEED_KEY)
     }
   }
-  const legacy = window.localStorage.getItem(ACTIVE_PROFILE_KEY)
-  return { profileId: (legacy ?? null), presetId: null, settings: null }
+  return { profileId: null, presetId: null, settings: null }
 }
 
 export function writeActiveSeedState(state: ActiveSeedState): void {
@@ -106,7 +98,6 @@ export function writeActiveSeedState(state: ActiveSeedState): void {
   } else {
     window.sessionStorage.removeItem(ACTIVE_SEED_KEY)
   }
-  window.localStorage.removeItem(ACTIVE_PROFILE_KEY)
 }
 
 export function readActiveProfileId(): ProfileId | null {

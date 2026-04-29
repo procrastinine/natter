@@ -704,9 +704,9 @@ function buildProviderBlock(
   const base = settings.providerPrefs ? toWireProviderPrefs(settings.providerPrefs) : {}
   if (privacy) {
     // Auto-ignore wins additively: user-ignored + Pareto-excluded + hard-
-    // denied are unioned. `only` / `order` from the resolver are already
-    // normalized to routing refs (including any user-set provider prefs),
-    // so they replace raw stored settings instead of leaking display names.
+    // denied are unioned. `only` from the resolver is normalized to routing
+    // refs, so it replaces raw stored settings instead of leaking display
+    // names. `order` remains exclusively user-owned via `providerPrefs`.
     // `data_collection` / `zdr` come from `privacy.*`.
     if (privacy.ignore) base.ignore = privacy.ignore
     if (privacy.only) base.only = privacy.only

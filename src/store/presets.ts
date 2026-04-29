@@ -8,10 +8,7 @@
 
 import type { ChatPreset, ChatSettings, PresetId, ProfileId } from '../core/types'
 import { newId } from '../lib/ulid'
-import {
-  DEFAULT_OPENROUTER_PROVIDER_SORT,
-  migrateLegacyProviderSettings,
-} from '../backcompat/provider-settings'
+import { withOpenRouterProviderDefaults } from '../core/provider-defaults'
 import { postEvent } from './broadcast'
 import { getDb } from './db'
 import { ProfileMissingError } from './profiles'
@@ -120,9 +117,7 @@ function normalizePresetSettings(
 ): ChatSettings {
   const aligned = { ...settings, profileId }
   if (kind !== 'openrouter') return aligned
-  return migrateLegacyProviderSettings(aligned, {
-    defaultSort: DEFAULT_OPENROUTER_PROVIDER_SORT,
-  }).settings
+  return withOpenRouterProviderDefaults(aligned)
 }
 
 export async function archivePreset(presetId: PresetId, now = Date.now()): Promise<void> {

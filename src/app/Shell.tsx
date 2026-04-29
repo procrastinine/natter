@@ -38,7 +38,6 @@ import {
   createChat,
   getChat,
   loadActiveBranchSnapshot,
-  refreshChatPreview,
   updateChatSettings,
 } from '../store/chats'
 import { resolveKeyIfPresent } from '../store/keys'
@@ -371,20 +370,6 @@ export function Shell() {
   useEffect(() => {
     if (!activeChatId) return
     void recoverOrphans(Date.now(), activeChatId).catch(() => {})
-  }, [activeChatId])
-
-  // Lazy backfill: legacy chat rows may lack `previewText` because they
-  // predate the denormalization. Compute + write once per chat on open.
-  // Skips chats that already have the field set (including the empty
-  // string — a chat with no user messages legitimately has '' as preview).
-  useEffect(() => {
-    if (!activeChatId) return
-    void (async () => {
-      const chat = await getChat(activeChatId)
-      if (!chat) return
-      if (chat.previewText !== undefined) return
-      await refreshChatPreview(activeChatId)
-    })()
   }, [activeChatId])
 
   const lastSeedSignatureRef = useRef<string>('')

@@ -4,10 +4,9 @@
 //
 //   - Hard-deny (training OR trainingOpenRouter) BEFORE Pareto
 //   - Pareto dominance along 4 dimensions
-//   - onlyProviders narrows post-deny but BEFORE Pareto
-//   - ignoreProviders layers on TOP of Pareto
-//   - Preferred ordering is only a tiebreaker (reorders, never excludes)
-//   - Missing online policy → unavailable/excluded, flagged `unknown-policy`
+//   - Provider allow/block state is supplied through providerPrefs, not PrivacyPrefs
+//   - Provider ordering is user-owned via `providerPrefs.order` / sort, not privacy.
+//   - Missing online policy → curated fallback for known hosts, otherwise unavailable/excluded
 //   - Explicit offline fallback → synthesized worst-case, flagged `unknown-policy`
 
 import { describe, expect, it } from 'vitest'
@@ -175,12 +174,26 @@ describe('filterEndpointsByPrivacy — Gemini fixture', () => {
     })
     const kept = result.kept.map((k) => k.endpoint.provider_name).sort()
     expect(kept).toEqual(['Google AI Studio', 'Google Vertex'])
-    // Preferred ordering still runs — AI Studio before Vertex.
-    expect(result.orderedKeptNames).toEqual(['Google AI Studio', 'Google Vertex'])
   })
 })
 
 describe('filterEndpointsByPrivacy — missing policies', () => {
+  it('prefers scraped policy data over endpoint-embedded policy data on conflict', () => {
+    const result = filterEndpointsByPrivacy({
+      model: 'openai/gpt-5.4',
+      endpoints: [
+        ep('Azure', {
+          data_policy: POLICY_UNKNOWN_RETENTION,
+        }),
+      ],
+      policies: { Azure: POLICY_CLEAN },
+      privacy: cloneDefaultPrivacyPrefs(),
+    })
+    expect(result.kept[0]?.policy).toBe(POLICY_CLEAN)
+    expect(result.kept[0]?.policy).not.toBe(POLICY_UNKNOWN_RETENTION)
+    expect(result.excluded).toHaveLength(0)
+  })
+
   it('online policy misses are unavailable, not synthesized training policies', () => {
     const result = filterEndpointsByPrivacy({
       model: 'example/x',
@@ -232,70 +245,58 @@ describe('filterEndpointsByPrivacy — missing policies', () => {
     expect(rows.every((row) => row.policySynthesized === false)).toBe(true)
     expect(rows.every((row) => row.policy?.training === false)).toBe(true)
   })
-})
 
-describe('filterEndpointsByPrivacy — manual override layers', () => {
-  it('onlyProviders narrows the scoped set before Pareto', () => {
-    const prefs = cloneDefaultPrivacyPrefs()
-    prefs.onlyProviders = ['Azure']
-    const result = filterEndpointsByPrivacy({
+  it('uses curated fallback policies for proprietary provider defaults when live privacy is missing', () => {
+    const openai = filterEndpointsByPrivacy({
       model: 'openai/gpt-5.4',
       endpoints: [ep('Azure'), ep('OpenAI')],
-      policies: {
-        Azure: POLICY_CLEAN,
-        OpenAI: POLICY_UNKNOWN_RETENTION,
-      },
-      privacy: prefs,
+      policies: {},
+      privacy: cloneDefaultPrivacyPrefs(),
     })
-    expect(result.kept.map((k) => k.endpoint.provider_name)).toEqual(['Azure'])
-    const openai = result.excluded.find((e) => e.endpoint.provider_name === 'OpenAI')
-    expect(openai?.reasons).toContain('not-in-only-list')
-  })
-
-  it('ignoreProviders drops a Pareto-survivor (with Pareto off, proves user veto)', () => {
-    // With paretoFilter on, AI Studio would already dominate Vertex and
-    // Vertex wouldn't be in kept. Turn Pareto off so both survive, then
-    // ignoreProviders vetoes AI Studio — leaving Vertex as the sole
-    // kept endpoint. Under Pareto-on, see the Gemini fixture test —
-    // which asserts AI Studio alone stands.
-    const prefs = cloneDefaultPrivacyPrefs()
-    prefs.paretoFilter = false
-    prefs.ignoreProviders = ['Google AI Studio']
-    const result = filterEndpointsByPrivacy({
-      model: 'google/gemini-3.1-pro',
-      endpoints: [ep('Google Vertex'), ep('Google AI Studio')],
-      policies: {
-        'Google Vertex': POLICY_VERTEX,
-        'Google AI Studio': POLICY_AI_STUDIO,
-      },
-      privacy: prefs,
-    })
-    expect(result.kept.map((k) => k.endpoint.provider_name)).toEqual(['Google Vertex'])
-    const studio = result.excluded.find(
-      (e) => e.endpoint.provider_name === 'Google AI Studio',
+    expect(openai.kept.map((k) => k.endpoint.provider_name)).toEqual(['Azure'])
+    expect(openai.excluded.find((e) => e.endpoint.provider_name === 'OpenAI')?.reasons).toContain(
+      'dominated',
     )
-    expect(studio?.reasons).toContain('user-ignored')
-  })
 
-  it('matches manual refs by endpoint identity so duplicate display names stay separate', () => {
-    const prefs = cloneDefaultPrivacyPrefs()
-    prefs.paretoFilter = false
-    prefs.ignoreProviders = ['anthropic/2']
-    const anth2 = ep('Anthropic', { provider_slug: 'anthropic/2' })
-    const anth = ep('Anthropic', { provider_slug: 'anthropic' })
-    const result = filterEndpointsByPrivacy({
+    const anthropic = filterEndpointsByPrivacy({
       model: 'anthropic/claude-opus-4.7',
-      endpoints: [anth2, anth],
-      policies: {
-        'anthropic/2': POLICY_CLEAN,
-        anthropic: POLICY_CLEAN,
-      },
-      privacy: prefs,
+      endpoints: [ep('Amazon Bedrock'), ep('Anthropic'), ep('Google Vertex')],
+      policies: {},
+      privacy: cloneDefaultPrivacyPrefs(),
     })
-    expect(result.kept.map((k) => k.endpoint.provider_slug)).toEqual(['anthropic'])
-    expect(result.excluded.find((e) => e.endpoint.provider_slug === 'anthropic/2')?.reasons).toContain(
-      'user-ignored',
-    )
+    expect(anthropic.kept.map((k) => k.endpoint.provider_name)).toEqual(['Amazon Bedrock'])
+
+    const gemini = filterEndpointsByPrivacy({
+      model: 'google/gemini-3.1-flash-lite-preview',
+      endpoints: [ep('Google Vertex'), ep('Google AI Studio')],
+      policies: {},
+      privacy: cloneDefaultPrivacyPrefs(),
+    })
+    expect(gemini.kept.map((k) => k.endpoint.provider_name)).toEqual(['Google AI Studio'])
+  })
+
+  it('allows curated OSS hosts without synthesizing an order', () => {
+    const result = filterEndpointsByPrivacy({
+      model: 'qwen/qwen3-235b-a22b-thinking-2507',
+      endpoints: [
+        ep('Fireworks'),
+        ep('Together AI'),
+        ep('DeepInfra'),
+        ep('Novita'),
+        ep('Parasail'),
+      ],
+      policies: {},
+      privacy: cloneDefaultPrivacyPrefs(),
+    })
+    expect(result.kept.map((k) => k.endpoint.provider_name)).toEqual([
+      'Fireworks',
+      'Together AI',
+      'DeepInfra',
+      'Novita',
+      'Parasail',
+    ])
+    expect(result.excluded).toHaveLength(0)
+    expect(buildWireProviderPrivacy(result, cloneDefaultPrivacyPrefs()).order).toBeUndefined()
   })
 })
 
@@ -384,7 +385,7 @@ describe('buildWireProviderPrivacy', () => {
     expect(wire.zeroEligible).toBe(false)
   })
 
-  it('emits order when the filter kept more than one provider', () => {
+  it('does not synthesize provider order when multiple providers survive', () => {
     // Disable Pareto so both Gemini providers survive — otherwise AI
     // Studio dominates Vertex (yellow vs orange) and there's only one.
     const prefs = cloneDefaultPrivacyPrefs()
@@ -399,7 +400,7 @@ describe('buildWireProviderPrivacy', () => {
       privacy: prefs,
     })
     const wire = buildWireProviderPrivacy(result, prefs)
-    expect(wire.order).toEqual(['Google AI Studio', 'Google Vertex'])
+    expect(wire.order).toBeUndefined()
   })
 
   it('emits provider slugs for duplicate display-name endpoints', () => {
@@ -426,19 +427,20 @@ describe('buildWireProviderPrivacy', () => {
     expect(wire.order).toEqual(['anthropic/2', 'anthropic'])
   })
 
-  it('echoes the pinned-and-surviving set when onlyProviders is set', () => {
+  it('emits caller-supplied providerPrefs.only when the picker has taken over', () => {
     const prefs = cloneDefaultPrivacyPrefs()
-    prefs.onlyProviders = ['Azure', 'OpenAI']
     const result = filterEndpointsByPrivacy({
       model: 'openai/gpt-5.4',
       endpoints: [ep('Azure'), ep('OpenAI')],
       policies: { Azure: POLICY_CLEAN, OpenAI: POLICY_UNKNOWN_RETENTION },
       privacy: prefs,
     })
-    const wire = buildWireProviderPrivacy(result, prefs)
-    // onlyProviders = [Azure, OpenAI] but Pareto drops OpenAI — only Azure
-    // survives, so the wire `only` reflects the post-filter survivors.
-    expect(wire.only).toEqual(['Azure'])
+    const wire = buildWireProviderPrivacy(result, prefs, {
+      existingOnly: ['Azure', 'OpenAI'],
+      userTouchedPicker: true,
+    })
+    expect(wire.only).toEqual(['Azure', 'OpenAI'])
+    expect(wire.ignore).toBeUndefined()
   })
 
   it('omits data_collection when the user turned it off', () => {

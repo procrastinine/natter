@@ -47,11 +47,9 @@ export function PrivacySection({ chat }: PrivacySectionProps) {
   )
   const setAllowFallbacks = useCallback(
     (on: boolean) => {
-      const nextPrefs = { ...prefs } as typeof prefs & { allowFallbacks?: boolean }
-      delete nextPrefs.allowFallbacks
       void updateChatSettings(chat.id, {
         allowFallbacks: on,
-        providerPrefs: nextPrefs,
+        providerPrefs: prefs,
       })
     },
     [chat.id, prefs],

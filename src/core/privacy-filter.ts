@@ -6,10 +6,9 @@
 //   1. Resolve live per-endpoint policy from /endpoints or the OpenRouter
 //      providers scrape. Missing online policy is "unavailable", not guessed.
 //   2. Hard-deny — drop endpoints with training: true OR trainingOpenRouter: true.
-//   3. Apply user `onlyProviders` (scoped to the survivors of step 2).
-//   4. Pareto-dominance exclusion, IF `privacy.paretoFilter`.
-//   5. Apply user `ignoreProviders` (always adds, never removes from "kept").
-//   6. Preferred-ordering tiebreaker, IF `privacy.usePreferredOrdering` AND >1 kept.
+//   3. Pareto-dominance exclusion, IF `privacy.paretoFilter`.
+//   4. Preserve the filtered endpoint order for UI rendering. Request-time provider
+//      order comes only from visible `providerPrefs.sort` / `providerPrefs.order`.
 //
 // The result exposes both `kept` and `excluded` with per-endpoint reasons
 // so the provider picker can render "auto-excluded: Requires user IDs"
@@ -17,17 +16,16 @@
 //
 // This function is pure. It takes endpoints + policies + privacy prefs
 // and produces a decision. The scraper and hook layers feed it; the
-// request composer consumes `buildWireProviderPrefs`.
+// request composer consumes `buildWireProviderPrivacy`.
 
 import { synthesizeDataPolicy } from './privacy'
-import { findPreferredRule } from './preferred-providers'
 import {
   endpointMatchesAnyProviderRef,
-  endpointMatchesProviderRef,
   providerPolicyLookupKeys,
   providerRoutingRef,
   resolveProviderRefsToRoutingRefs,
 } from './provider-identity'
+import { fallbackDataPolicyForEndpoint } from './privacy-fallbacks'
 import type { DataPolicy, ModelEndpoint, PrivacyPrefs } from './types'
 import { dominates } from './privacy'
 
@@ -55,12 +53,7 @@ interface ExcludedEndpoint extends FilteredEndpoint {
 export interface PrivacyFilterResult {
   kept: FilteredEndpoint[]
   excluded: ExcludedEndpoint[]
-  // The kept set ordered by the preferred-ordering rule for the model,
-  // with rule-named providers first. Values are provider routing refs
-  // (OpenRouter slugs when available). The legacy property name is kept
-  // so older call sites/tests don't need a schema migration.
-  orderedKeptNames: string[]
-  // True when hard-deny + onlyProviders + Pareto leaves zero providers.
+  // True when hard-deny + Pareto leaves zero providers.
   // The UI renders a zero-eligible modal; the request is blocked.
   zeroEligible: boolean
 }
@@ -76,15 +69,15 @@ interface PrivacyFilterInput {
 export function filterEndpointsByPrivacy(input: PrivacyFilterInput): PrivacyFilterResult {
   const { endpoints, policies, privacy } = input
 
-  // Step 1 — resolve the per-endpoint policy. Prefer policy data embedded
-  // in the endpoint row, then lookup by every known identity (slug,
-  // display name, provider_name, provider_model_id, row id). This keeps
-  // duplicate display names distinct while preserving old name-keyed
-  // caches/settings. Do not use hardcoded provider policy guesses here:
-  // OpenRouter live data is authoritative when reachable.
+  // Step 1 — resolve the per-endpoint policy. Prefer scraped/cached policy
+  // data over policy data embedded in the endpoint row, then use curated
+  // fallback policies only for the documented hosts that need an offline
+  // default. Lookups use every known identity (slug, display name,
+  // provider_name, provider_model_id, row id), so duplicate display names
+  // stay distinct while old name-keyed caches/settings still resolve.
   type AugmentedEndpoint = FilteredEndpoint
   const augmented: AugmentedEndpoint[] = endpoints.map((ep) => {
-    const raw = resolveEndpointPolicy(ep, policies)
+    const raw = resolveEndpointPolicy(input.model, ep, policies)
     if (!raw && input.missingPolicyMode === 'offline-worst-case') {
       return {
         endpoint: ep,
@@ -121,53 +114,23 @@ export function filterEndpointsByPrivacy(input: PrivacyFilterInput): PrivacyFilt
   }
   const afterDeny = augmented.filter((aug) => !reasons.has(aug))
 
-  // Step 3 — `onlyProviders` narrows the denied-survivor set. Anything
-  // outside the list gets flagged as `not-in-only-list`. The picker shows
-  // these rows as "excluded by the user's pin."
-  const onlyRefs = privacy.onlyProviders
-  const scoped = afterDeny.filter((aug) => {
-    if (onlyRefs.length === 0) return true
-    if (endpointMatchesAnyProviderRef(aug.endpoint, onlyRefs, endpoints)) return true
-    excludeWith(aug, 'not-in-only-list')
-    return false
-  })
-
-  // Step 4 — Pareto exclusion, opt-out via `paretoFilter: false`. An
+  // Step 3 — Pareto exclusion, opt-out via `paretoFilter: false`. An
   // endpoint is dominated iff some OTHER scoped endpoint dominates it.
-  let kept = scoped
+  let kept = afterDeny
   if (privacy.paretoFilter) {
-    const undominated = scoped.filter((aug) => {
-      for (const other of scoped) {
+    const undominated = afterDeny.filter((aug) => {
+      for (const other of afterDeny) {
         if (other === aug) continue
         if (!other.policy || !aug.policy) continue
         if (dominates(other.policy, aug.policy)) return false
       }
       return true
     })
-    for (const aug of scoped) {
+    for (const aug of afterDeny) {
       if (!undominated.includes(aug)) excludeWith(aug, 'dominated')
     }
     kept = undominated
   }
-
-  // Step 5 — user-driven ignore list runs after Pareto. It's *additive*
-  // to `autoIgnore` at request time but it also changes what the picker
-  // shows as "kept" (the user's explicit veto wins visually too).
-  const ignoreRefs = privacy.ignoreProviders
-  if (ignoreRefs.length > 0) {
-    kept = kept.filter((aug) => {
-      if (endpointMatchesAnyProviderRef(aug.endpoint, ignoreRefs, endpoints)) {
-        excludeWith(aug, 'user-ignored')
-        return false
-      }
-      return true
-    })
-  }
-
-  // Step 6 — preferred ordering over the kept set. Never adds/removes.
-  const orderedKeptNames = privacy.usePreferredOrdering
-    ? orderKeptRoutingRefs(input.model, kept)
-    : kept.map((aug) => providerRoutingRef(aug.endpoint))
 
   const excluded: ExcludedEndpoint[] = []
   for (const aug of augmented) {
@@ -179,49 +142,29 @@ export function filterEndpointsByPrivacy(input: PrivacyFilterInput): PrivacyFilt
   return {
     kept,
     excluded,
-    orderedKeptNames,
     zeroEligible: kept.length === 0 && endpoints.length > 0,
   }
 }
 
 function resolveEndpointPolicy(
+  model: string,
   endpoint: ModelEndpoint,
   policies: Readonly<Record<string, DataPolicy | undefined>>,
 ): DataPolicy | undefined {
-  if (endpoint.data_policy) return endpoint.data_policy
   for (const key of providerPolicyLookupKeys(endpoint)) {
     const policy = policies[key]
     if (policy) return policy
   }
+  if (endpoint.data_policy) return endpoint.data_policy
+  const fallback = fallbackDataPolicyForEndpoint(model, endpoint)
+  if (fallback) return fallback
   return undefined
 }
 
-function orderKeptRoutingRefs(model: string, kept: readonly FilteredEndpoint[]): string[] {
-  const rule = findPreferredRule(model)
-  if (!rule || kept.length <= 1) return kept.map((aug) => providerRoutingRef(aug.endpoint))
-  const keptEndpoints = kept.map((row) => row.endpoint)
-  const out: FilteredEndpoint[] = []
-  const used = new Set<FilteredEndpoint>()
-  for (const ref of rule.order) {
-    for (const aug of kept) {
-      if (used.has(aug)) continue
-      if (!endpointMatchesProviderRef(aug.endpoint, ref, keptEndpoints)) continue
-      used.add(aug)
-      out.push(aug)
-    }
-  }
-  for (const aug of kept) {
-    if (used.has(aug)) continue
-    out.push(aug)
-  }
-  return out.map((aug) => providerRoutingRef(aug.endpoint))
-}
-
 // Privacy-lock tier. See `plan/09-privacy.md §9.11`. Computed from the
-// most-preferred kept endpoint's policy (first element of
-// `orderedKeptNames`). `open` means "privacy filter doesn't apply" (free
-// model); `unavailable` means kept endpoints exist but no data_policy
-// survives through to describe them.
+// kept endpoints' policies in the UI. `open` means "privacy filter doesn't
+// apply" (free model); `unavailable` means kept endpoints exist but no
+// data_policy survives through to describe them.
 export type PrivacyTier =
   | 'green'
   | 'yellow'
@@ -300,14 +243,9 @@ export function buildWireProviderPrivacy(
   const existingOrder = resolveProviderRefsToRoutingRefs(allEndpoints, opts.existingOrder, {
     preserveUnknown: true,
   })
-  const privacyIgnore = userTookOver
-    ? []
-    : resolveProviderRefsToRoutingRefs(allEndpoints, privacy.ignoreProviders, {
-        preserveUnknown: true,
-      })
   const mergedIgnore = userTookOver
     ? uniqueStrings([...existingIgnore])
-    : uniqueStrings([...autoIgnore, ...privacyIgnore])
+    : uniqueStrings([...autoIgnore])
   const allowedAfterManualOverride = userTookOver
     ? allEndpoints.some((endpoint) => !endpointMatchesAnyProviderRef(endpoint, mergedIgnore, allEndpoints))
     : false
@@ -315,19 +253,11 @@ export function buildWireProviderPrivacy(
     zeroEligible: userTookOver && allowedAfterManualOverride ? false : result.zeroEligible,
   }
   if (mergedIgnore.length > 0) wire.ignore = mergedIgnore
-  if (!userTookOver && privacy.onlyProviders.length > 0) {
-    // When the user pins a set, echo the kept survivors (post-Pareto) so
-    // the request matches what the UI shows. Using `onlyProviders`
-    // verbatim would send providers that Pareto / hard-deny already
-    // excluded, which would surprise the user.
-    wire.only = result.kept.map((k) => providerRoutingRef(k.endpoint))
-  } else if (existingOnly.length > 0) {
+  if (existingOnly.length > 0) {
     wire.only = existingOnly
   }
   if (existingOrder.length > 0) {
     wire.order = existingOrder
-  } else if (result.orderedKeptNames.length > 1) {
-    wire.order = [...result.orderedKeptNames]
   }
   if (privacy.denyDataCollection) wire.data_collection = 'deny'
   if (privacy.zdrOnly) wire.zdr = true

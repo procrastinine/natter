@@ -29,6 +29,7 @@ export interface UsePrivacyRoutingResult {
   offline: boolean
   error: string | null
   scrapeApplicable: boolean
+  liveScrapeEnabled: boolean
   isFreeModel: boolean
   // Refreshes both `/endpoints` and the privacy scrape in one call so the
   // picker's reload button can freshen everything it depends on.
@@ -70,7 +71,7 @@ export function usePrivacyRouting(chat: Chat | null | undefined): UsePrivacyRout
     if (!chat) return null
     if (!filter) return null
     const prefs = chat.settings.providerPrefs
-    const userTouched = prefs?.ignoreOverridesFilter === true
+    const userTouched = prefs?.ignoreOverridesFilter === true || (prefs?.only?.length ?? 0) > 0
     const opts: {
       existingIgnore?: readonly string[]
       existingOnly?: readonly string[]
@@ -101,6 +102,7 @@ export function usePrivacyRouting(chat: Chat | null | undefined): UsePrivacyRout
     offline: ep.offline || pol.offline,
     error: ep.error ?? pol.error,
     scrapeApplicable: pol.scrapeApplicable,
+    liveScrapeEnabled: pol.liveScrapeEnabled,
     isFreeModel: pol.isFreeModel,
     refresh,
   }

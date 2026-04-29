@@ -371,16 +371,12 @@ const EMPTY_FROZEN_MESSAGE_IDS = new Set<string>()
 
 function attachmentRefSignature(refs: readonly AttachmentRef[] | undefined): unknown[] {
   if (!refs) return []
-  return refs.map((ref) =>
-    typeof ref === 'string'
-      ? { attachmentId: ref, includeInContext: true, deletedAt: null }
-      : {
-          refId: ref.refId,
-          attachmentId: ref.attachmentId,
-          includeInContext: ref.includeInContext !== false,
-          deletedAt: ref.deletedAt ?? null,
-        },
-  )
+  return refs.map((ref) => ({
+    refId: ref.refId,
+    attachmentId: ref.attachmentId,
+    includeInContext: ref.includeInContext !== false,
+    deletedAt: ref.deletedAt ?? null,
+  }))
 }
 
 export function promptEstimateInputSignature(

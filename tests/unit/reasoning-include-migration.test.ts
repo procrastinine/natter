@@ -1,14 +1,14 @@
 // Phase 11: legacy `reasoning.carryForward` → `reasoning.include` migrator.
 
 import { describe, expect, it } from 'vitest'
+import { migrateLegacyCarryForwardToInclude } from '../../src/backcompat/chat-settings'
 import {
   defaultReasoningInclude,
-  migrateCarryForwardToInclude,
 } from '../../src/core/reasoning'
 
-describe('migrateCarryForwardToInclude', () => {
+describe('migrateLegacyCarryForwardToInclude', () => {
   it("'off' → all false", () => {
-    expect(migrateCarryForwardToInclude('off', 'openai-responses-v1')).toEqual({
+    expect(migrateLegacyCarryForwardToInclude('off', 'openai-responses-v1')).toEqual({
       encrypted: false,
       summary: false,
       text: false,
@@ -16,7 +16,7 @@ describe('migrateCarryForwardToInclude', () => {
   })
 
   it("'plaintext' → summary+text", () => {
-    expect(migrateCarryForwardToInclude('plaintext', 'anthropic-claude-v1')).toEqual({
+    expect(migrateLegacyCarryForwardToInclude('plaintext', 'anthropic-claude-v1')).toEqual({
       encrypted: false,
       summary: true,
       text: true,
@@ -24,7 +24,7 @@ describe('migrateCarryForwardToInclude', () => {
   })
 
   it("'encrypted' → encrypted only", () => {
-    expect(migrateCarryForwardToInclude('encrypted', 'openai-responses-v1')).toEqual({
+    expect(migrateLegacyCarryForwardToInclude('encrypted', 'openai-responses-v1')).toEqual({
       encrypted: true,
       summary: false,
       text: false,
@@ -41,7 +41,7 @@ describe('migrateCarryForwardToInclude', () => {
       'unknown',
       undefined,
     ] as const) {
-      expect(migrateCarryForwardToInclude('auto', fmt)).toEqual({
+      expect(migrateLegacyCarryForwardToInclude('auto', fmt)).toEqual({
         encrypted: true,
         summary: false,
         text: false,
@@ -50,7 +50,7 @@ describe('migrateCarryForwardToInclude', () => {
   })
 
   it('undefined legacy also falls through to the default', () => {
-    expect(migrateCarryForwardToInclude(undefined, 'openai-responses-v1')).toEqual({
+    expect(migrateLegacyCarryForwardToInclude(undefined, 'openai-responses-v1')).toEqual({
       encrypted: true,
       summary: false,
       text: false,

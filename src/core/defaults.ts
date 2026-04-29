@@ -33,9 +33,6 @@ export const DEFAULT_PRIVACY_PREFS: Readonly<PrivacyPrefs> = Object.freeze({
   denyDataCollection: true,
   zdrOnly: false,
   paretoFilter: true,
-  usePreferredOrdering: true,
-  ignoreProviders: [],
-  onlyProviders: [],
   byokEnabled: false,
 })
 

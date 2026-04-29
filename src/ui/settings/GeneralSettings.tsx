@@ -8,7 +8,6 @@ import { useCallback } from 'react'
 import {
   DEFAULT_GLOBAL_PREFERENCES,
   DEV_CORS_PROXY_URL,
-  PUBLIC_CORS_PROXY_URL,
   defaultCorsProxyUrlForRuntime,
   readGlobalPreferences,
   type SendShortcut,
@@ -53,9 +52,10 @@ export function GeneralSettings() {
   // has no route for it, so it is only the default in `pnpm dev`.
   const isDev = import.meta.env.DEV
   const trimmedProxyUrl = prefs.corsProxyUrl.trim()
-  const proxyIsRelative = trimmedProxyUrl.length === 0 || trimmedProxyUrl.startsWith('/')
+  const proxyDisabled = trimmedProxyUrl.length === 0 && !isDev
+  const proxyIsRelative = trimmedProxyUrl.length > 0 && trimmedProxyUrl.startsWith('/')
   const showDevDefaultWarning = proxyIsRelative && !isDev
-  const proxyPlaceholder = defaultCorsProxyUrlForRuntime(isDev)
+  const proxyPlaceholder = isDev ? defaultCorsProxyUrlForRuntime(isDev) : 'No live scrape by default'
 
   return (
     <>
@@ -130,7 +130,8 @@ export function GeneralSettings() {
               </>
             ) : (
               <>
-                Default <code>{PUBLIC_CORS_PROXY_URL}</code> uses a public bouncer.
+                Static builds default to no live scrape. Paste a proxy URL here to refresh live
+                provider policies from the browser.
               </>
             )}
             <ul>
@@ -151,7 +152,8 @@ export function GeneralSettings() {
             </ul>
             URLs containing <code>{'{model}'}</code> or <code>{'{path}'}</code> are substituted
             in place; bare hosts in the known-bouncer list expand automatically; everything
-            else is treated as a base and the path is appended.
+            else is treated as a base and the path is appended. Public bouncers can see the
+            OpenRouter model/provider page URLs requested through them.
           </InfoDisclosure>
         </h3>
         <div data-ui="field-group">
@@ -171,6 +173,12 @@ export function GeneralSettings() {
             <span data-ui="helper" data-validation="invalid">
               Relative URLs only resolve under <code>pnpm dev</code>. Paste an absolute
               bouncer URL to make the privacy scrape work in production.
+            </span>
+          ) : null}
+          {proxyDisabled ? (
+            <span data-ui="helper" data-tone="muted">
+              Live privacy scrape is off. Provider privacy uses cached data, endpoint-supplied
+              data, and curated fallback defaults until a proxy is configured.
             </span>
           ) : null}
         </div>

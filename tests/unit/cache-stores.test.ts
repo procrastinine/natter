@@ -7,8 +7,10 @@ import {
   writeChatMaxWidth,
   writeLongMessageDisplayMode,
 } from '../../src/core/global-settings'
-import { DEV_CORS_PROXY_URL, PUBLIC_CORS_PROXY_URL } from '../../src/core/cors-proxy'
-import { __resetDbForTests, openDb } from '../../src/store/db'
+import { DEFAULT_CORS_PROXY_URL, DEV_CORS_PROXY_URL } from '../../src/core/cors-proxy'
+import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
+import type { MessageHeaderRow } from '../../src/store/message-storage'
+import type { DraftRow } from '../../src/core/types'
 import {
   clearEndpointsCacheForProfile,
   clearModelsCacheForProfile,
@@ -203,7 +205,7 @@ describe('settings', () => {
 
   it('sidebar preferences persist through the settings abstraction', async () => {
     expect(await readSidebarSortMode()).toBe('updatedAt-desc')
-    await setSetting(SIDEBAR_SORT_SETTING_KEY, 'updated-desc')
+    await setSetting(SIDEBAR_SORT_SETTING_KEY, 'updated-asc')
     expect(await readSidebarSortMode()).toBe('updatedAt-desc')
     await writeSidebarSortMode('wordCount-desc')
     expect(await getSetting(SIDEBAR_SORT_SETTING_KEY)).toBe('wordCount-desc')
@@ -227,8 +229,91 @@ describe('settings', () => {
     expect((await readGlobalPreferences()).longMessageDisplayMode).toBe('compact')
   })
 
+  it('marks run-once backcompat tasks complete on a fresh database', async () => {
+    expect(await getSetting('backfill:attachment-refs-v1')).toBe(1)
+    expect(await getSetting('backfill:message-body-split-v1')).toBe(1)
+    expect(await getSetting('backfill:organization-fields-v1')).toBe(1)
+    expect(await getSetting('backfill:global-settings-v1')).toBe(1)
+  })
+
+  it('migrates the retired auto-scroll setting once before live reads', async () => {
+    await setSetting('global:auto-scroll', false)
+    await deleteSetting('backfill:global-settings-v1')
+    __resetDbForTests()
+    await openDb()
+
+    expect(await getSetting('global:auto-scroll')).toBeUndefined()
+    expect(await getSetting('global:auto-scroll-open')).toBe(false)
+    expect(await getSetting('global:auto-scroll-stream')).toBe(false)
+    const prefs = await readGlobalPreferences()
+    expect(prefs.autoScrollOnOpen).toBe(false)
+    expect(prefs.autoScrollOnStream).toBe(false)
+    expect(await getSetting('backfill:global-settings-v1')).toBe(1)
+  })
+
+  it('migrates retired sidebar sort values before live reads', async () => {
+    await setSetting('sidebar:sort-key', 'updated-asc')
+    await deleteSetting('backfill:global-settings-v1')
+    __resetDbForTests()
+    await openDb()
+
+    expect(await getSetting('sidebar:sort-key')).toBe('updatedAt-asc')
+    expect(await readSidebarSortMode()).toBe('updatedAt-asc')
+  })
+
+  it('migrates stored string attachment refs before live reads', async () => {
+    const db = getDb()
+    await db.attachments.put({
+      id: 'att-old',
+      kind: 'other',
+      mime: 'text/plain',
+      filename: 'old.txt',
+      origin: 'import',
+      createdAt: 1,
+      updatedAt: 1,
+      storage: { kind: 'missing', reason: 'import-missing', missingSince: 1 },
+      artifacts: [],
+      processing: [],
+      refCount: 0,
+    })
+    await db.messages.put({
+      id: 'msg-old',
+      chatId: 'chat-old',
+      parentId: null,
+      siblingIndex: 0,
+      turnId: 'turn-old',
+      turnIndex: 0,
+      createdAt: 2,
+      role: 'user',
+      origin: 'user',
+      nodeVersion: 0,
+      deleted: false,
+      attachmentRefs: ['att-old'],
+    } as unknown as MessageHeaderRow)
+    await db.drafts.put({
+      chatId: 'chat-old',
+      text: '',
+      attachmentRefs: ['att-old'],
+      updatedAt: 3,
+    } as unknown as DraftRow)
+    await deleteSetting('backfill:attachment-refs-v1')
+    __resetDbForTests()
+    await openDb()
+
+    const migrated = getDb()
+    expect((await migrated.messages.get('msg-old'))?.attachmentRefs).toEqual([
+      expect.objectContaining({ refId: 'legacy:msg-old:0', attachmentId: 'att-old' }),
+    ])
+    expect((await migrated.drafts.get('chat-old'))?.attachmentRefs).toEqual([
+      expect.objectContaining({ refId: 'legacy:chat-old:0', attachmentId: 'att-old' }),
+    ])
+    expect((await migrated.attachments.get('att-old'))?.refCount).toBe(2)
+    expect(await getSetting('backfill:attachment-refs-v1')).toBe(1)
+  })
+
   it('uses /_or_scrape only for the Vite dev runtime default', () => {
     expect(defaultCorsProxyUrlForRuntime(true)).toBe(DEV_CORS_PROXY_URL)
-    expect(defaultCorsProxyUrlForRuntime(false)).toBe(PUBLIC_CORS_PROXY_URL)
+    expect(defaultCorsProxyUrlForRuntime(false)).toBe(DEFAULT_CORS_PROXY_URL)
+    expect(DEFAULT_CORS_PROXY_URL).toBe('')
   })
 })

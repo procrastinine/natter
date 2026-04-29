@@ -1,13 +1,12 @@
 import type {
-  ReasoningCarryForward,
   ReasoningDetail,
   ReasoningFormat,
   ReasoningInclude,
   ReasoningSettings,
 } from './types'
 
-// Phase 11: the three-checkbox `ReasoningInclude` replaces the legacy
-// `ReasoningCarryForward` enum. See `plan/phase11-implementation.md §2`.
+// Phase 11: the three-checkbox `ReasoningInclude` policy. See
+// `plan/phase11-implementation.md §2`.
 //
 // Default policy:
 //   - **`encrypted: true`** — round-trip the opaque carry-forward carrier for
@@ -32,32 +31,11 @@ export function defaultReasoningInclude(
   return { encrypted: true, summary: false, text: false }
 }
 
-// One-shot migrator: translate a legacy `carryForward` enum value into the
-// new `include` object. Used when loading existing chats after the Phase 11
-// ship; deletes `carryForward` in the caller once the translation lands.
-export function migrateCarryForwardToInclude(
-  legacy: ReasoningCarryForward | undefined,
-  preservationFormat: ReasoningFormat | undefined,
-): ReasoningInclude {
-  switch (legacy) {
-    case 'off':
-      return { encrypted: false, summary: false, text: false }
-    case 'plaintext':
-      return { encrypted: false, summary: true, text: true }
-    case 'encrypted':
-      return { encrypted: true, summary: false, text: false }
-    default:
-      // `'auto'` and `undefined` both defer to the capability-aware default.
-      return defaultReasoningInclude(preservationFormat)
-  }
-}
-
 // Defensive normalizer: ensure `ReasoningSettings` always has `mode`,
-// `exclude`, and `include` present. Imported chats, rows written by older
-// builds, or partial patches that bypassed updateChatSettings can leave any
-// of these undefined; callers (chooseApi, transforms, UI gates) assume they
-// exist. Return the input verbatim when already well-formed so downstream
-// memoization holds. Never mutates.
+// `exclude`, and `include` present. Current callers sometimes replace the
+// full reasoning object with a partial UI patch; normalize that boundary
+// before readers assume the nested fields exist. Return the input verbatim
+// when already well-formed so downstream memoization holds. Never mutates.
 export function normalizeReasoningSettings(
   input: Partial<ReasoningSettings> | undefined,
 ): ReasoningSettings {
@@ -75,23 +53,14 @@ export function normalizeReasoningSettings(
     typeof (input.include as Partial<ReasoningInclude>).encrypted !== 'boolean'
   const needsMode = input.mode === undefined
   const needsExclude = input.exclude === undefined
-  const hasLegacyCarryForward = input.carryForward !== undefined
-  if (!needsInclude && !needsMode && !needsExclude && !hasLegacyCarryForward) {
+  if (!needsInclude && !needsMode && !needsExclude) {
     return input as ReasoningSettings
   }
-  // Strip the legacy `carryForward` field once the migration lands so the
-  // deprecated key doesn't linger in preset exports and keep confusing
-  // future readers.
-  const { carryForward: _legacy, ...rest } = input
   const next: ReasoningSettings = {
-    ...(rest as ReasoningSettings),
+    ...(input as ReasoningSettings),
     mode: input.mode ?? 'default',
     exclude: input.exclude ?? false,
-    include: needsInclude
-      ? input.carryForward
-        ? migrateCarryForwardToInclude(input.carryForward, undefined)
-        : defaultReasoningInclude(undefined)
-      : (input.include as ReasoningInclude),
+    include: needsInclude ? defaultReasoningInclude(undefined) : (input.include as ReasoningInclude),
   }
   return next
 }

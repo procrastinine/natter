@@ -1,6 +1,8 @@
 import { readCachedPrivacyPayload } from '../api/privacy-scrape'
 import { normalizeEndpointsResponse } from '../api/providers'
 import { filterEndpointsByPrivacy, type PrivacyFilterResult } from '../core/privacy-filter'
+import { DEFAULT_OPENROUTER_PROVIDER_SORT } from '../core/provider-defaults'
+import { migrateLegacyChatSettings } from './chat-settings'
 import {
   endpointMatchesAnyProviderRef,
   providerEndpointKey,
@@ -18,7 +20,15 @@ import type {
 } from '../core/types'
 import type { CachedEndpointsRow, CachedPrivacyPolicyRow } from '../store/db'
 
-export const DEFAULT_OPENROUTER_PROVIDER_SORT: SortBy = 'price'
+type LegacyPrivacyPrefs = ChatSettings['privacy'] & {
+  ignoreProviders?: string[]
+  onlyProviders?: string[]
+}
+
+interface LegacyProviderPreferences extends ProviderPreferences {
+  dataCollection?: 'allow' | 'deny'
+  zdr?: boolean
+}
 
 interface ProviderSettingsMigrationContext {
   model?: string
@@ -61,12 +71,14 @@ export function migrateProviderSettingsRow(
 }
 
 export function migrateLegacyProviderSettings(
-  settings: ChatSettings,
+  rawSettings: ChatSettings,
   context: ProviderSettingsMigrationContext = {},
 ): ProviderSettingsMigrationResult {
-  const originalPrivacy = settings.privacy
-  const legacyIgnore = originalPrivacy.ignoreProviders
-  const legacyOnly = originalPrivacy.onlyProviders
+  const settingsResult = migrateLegacyChatSettings(rawSettings)
+  const settings = settingsResult.settings
+  const originalPrivacy = settings.privacy as LegacyPrivacyPrefs
+  const legacyIgnore = normalizeArray(originalPrivacy.ignoreProviders)
+  const legacyOnly = normalizeArray(originalPrivacy.onlyProviders)
   const endpoints = context.endpoints ?? []
   const hasLegacyPrivacyRefs = legacyIgnore.length > 0 || legacyOnly.length > 0
   const normalizedPrefs = normalizeProviderPrefs(
@@ -75,8 +87,15 @@ export function migrateLegacyProviderSettings(
     context.defaultSort ? { defaultSort: context.defaultSort } : {},
   )
   let providerPrefs: ProviderPreferences = normalizedPrefs.prefs ?? {}
-  let privacy = applyProviderPrefPrivacyPatch(settings.privacy, normalizedPrefs.privacyPatch)
-  const changed = normalizedPrefs.changed || privacy !== settings.privacy
+  const privacyResult = stripLegacyPrivacyProviderRefs(
+    applyProviderPrefPrivacyPatch(settings.privacy, normalizedPrefs.privacyPatch),
+  )
+  let privacy = privacyResult.privacy
+  const changed =
+    settingsResult.changed ||
+    normalizedPrefs.changed ||
+    privacyResult.changed ||
+    privacy !== settings.privacy
 
   if (!hasLegacyPrivacyRefs) {
     return changed
@@ -93,7 +112,12 @@ export function migrateLegacyProviderSettings(
     })
     providerPrefs = {
       ...providerPrefs,
-      ignore: effectiveIgnoredRoutingRefs(oldFilter, privacy, providerPrefs, endpoints),
+      ignore: effectiveIgnoredRoutingRefs(
+        oldFilter,
+        { ignore: legacyIgnore, only: legacyOnly },
+        providerPrefs,
+        endpoints,
+      ),
       ignoreOverridesFilter: true,
     }
     delete providerPrefs.only
@@ -123,11 +147,6 @@ export function migrateLegacyProviderSettings(
     else delete providerPrefs.only
   }
 
-  privacy = {
-    ...privacy,
-    ignoreProviders: [],
-    onlyProviders: [],
-  }
   return {
     settings: withProviderPrefs(settings, providerPrefs, privacy),
     changed: true,
@@ -161,10 +180,11 @@ function normalizeProviderPrefs(
       : { prefs, changed: false, privacyPatch: {} }
   }
   let changed = false
-  const next: ProviderPreferences = { ...prefs }
+  const legacyPrefs = prefs as LegacyProviderPreferences
+  const next: ProviderPreferences & Partial<LegacyProviderPreferences> = { ...prefs }
   const privacyPatch: { denyDataCollection?: true; zdrOnly?: true } = {}
-  if (prefs.dataCollection === 'deny') privacyPatch.denyDataCollection = true
-  if (prefs.zdr === true) privacyPatch.zdrOnly = true
+  if (legacyPrefs.dataCollection === 'deny') privacyPatch.denyDataCollection = true
+  if (legacyPrefs.zdr === true) privacyPatch.zdrOnly = true
   if ('dataCollection' in next) {
     delete next.dataCollection
     changed = true
@@ -185,18 +205,7 @@ function normalizeProviderPrefs(
   const currentOnly = normalizeArray(prefs.only)
   if (currentOnly.length > 0) {
     const normalizedOnly = normalizeRefs(currentOnly, endpoints)
-    if (endpoints.length > 0) {
-      const ignoredOutsideOnly = ignoredOutsideOnlyRefs(normalizedOnly, endpoints)
-      const mergedIgnore = uniqueStrings([
-        ...normalizeArray(next.ignore),
-        ...ignoredOutsideOnly,
-      ])
-      if (mergedIgnore.length > 0) next.ignore = mergedIgnore
-      else delete next.ignore
-      next.ignoreOverridesFilter = true
-      delete next.only
-      changed = true
-    } else if (JSON.stringify(currentOnly) !== JSON.stringify(normalizedOnly)) {
+    if (JSON.stringify(currentOnly) !== JSON.stringify(normalizedOnly)) {
       next.only = normalizedOnly
       changed = true
     }
@@ -251,7 +260,7 @@ function normalizeSortBy(value: string): SortBy | undefined {
 
 function effectiveIgnoredRoutingRefs(
   oldFilter: PrivacyFilterResult,
-  privacy: ChatSettings['privacy'],
+  legacyRefs: { ignore: readonly string[]; only: readonly string[] },
   providerPrefs: ProviderPreferences | undefined,
   endpoints: readonly ModelEndpoint[],
 ): string[] {
@@ -262,18 +271,15 @@ function effectiveIgnoredRoutingRefs(
   const out: string[] = []
   for (const endpoint of endpoints) {
     const excluded = excludedByKey.get(providerEndpointKey(endpoint))
-    let ignored = excluded !== undefined
-    if (userTouchedPicker) {
-      const reasons = new Set(excluded?.reasons ?? [])
-      const outsidePinnedSet =
-        reasons.has('not-in-only-list') ||
-        (privacy.onlyProviders.length > 0 &&
-          !endpointMatchesAnyProviderRef(endpoint, privacy.onlyProviders, endpoints))
-      ignored =
-        outsidePinnedSet ||
-        endpointMatchesAnyProviderRef(endpoint, privacy.ignoreProviders, endpoints) ||
-        endpointMatchesAnyProviderRef(endpoint, providerPrefs?.ignore, endpoints)
-    }
+    const legacyIgnored = endpointMatchesAnyProviderRef(endpoint, legacyRefs.ignore, endpoints)
+    const pickerIgnored = endpointMatchesAnyProviderRef(endpoint, providerPrefs?.ignore, endpoints)
+    const outsidePinnedSet =
+      legacyRefs.only.length > 0 &&
+      !endpointMatchesAnyProviderRef(endpoint, legacyRefs.only, endpoints)
+    const ignored =
+      legacyRefs.only.length > 0
+        ? outsidePinnedSet || legacyIgnored || pickerIgnored
+        : excluded !== undefined || legacyIgnored || (userTouchedPicker && pickerIgnored)
     if (ignored) out.push(providerRoutingRef(endpoint))
   }
   return uniqueStrings(out)
@@ -311,6 +317,23 @@ function applyProviderPrefPrivacyPatch(
     return privacy
   }
   return { ...privacy, denyDataCollection, zdrOnly }
+}
+
+function stripLegacyPrivacyProviderRefs(privacy: ChatSettings['privacy']): {
+  privacy: ChatSettings['privacy']
+  changed: boolean
+} {
+  const next = { ...privacy } as ChatSettings['privacy'] & Partial<LegacyPrivacyPrefs>
+  let changed = false
+  if ('ignoreProviders' in next) {
+    delete next.ignoreProviders
+    changed = true
+  }
+  if ('onlyProviders' in next) {
+    delete next.onlyProviders
+    changed = true
+  }
+  return changed ? { privacy: next, changed: true } : { privacy, changed: false }
 }
 
 function compactProviderPrefs(

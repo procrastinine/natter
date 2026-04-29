@@ -15,6 +15,7 @@ import {
   DEFAULT_GLOBAL_PREFERENCES,
   readGlobalPreferences,
 } from '../core/global-settings'
+import { isCorsProxyDisabled } from '../core/cors-proxy'
 import { isFreeModel } from '../core/model-predicates'
 import type { DataPolicy, ProfileId } from '../core/types'
 import type { CachedPrivacyPolicyRow } from '../store/db'
@@ -34,9 +35,12 @@ interface UsePrivacyPoliciesResult {
   offline: boolean
   error: string | null
   refresh: () => void
-  // True when the connection doesn't support the scrape (not OpenRouter,
-  // or scrape explicitly disabled). UI skips privacy-routing controls.
+  // True when this OpenRouter model can use provider privacy policy data.
+  // Live fetching may still be disabled by the workspace proxy setting.
   scrapeApplicable: boolean
+  // False in static builds until the user explicitly configures a proxy.
+  // Cached and endpoint-embedded policy data can still be used.
+  liveScrapeEnabled: boolean
   // True when the selected model is a `*:free` variant. Privacy controls
   // are irrelevant per the free-model exception; UI disables them with
   // explanatory copy.
@@ -77,10 +81,16 @@ export function usePrivacyPolicies(
   const freeModel = modelId ? isFreeModel(modelId) : false
   const scrapeApplicable =
     !!profile && profile.kind === 'openrouter' && profile.supportsPrivacyScrape && !freeModel
+  const proxy = useMemo(() => corsProxyConfigFromPrefs(globalPrefs), [globalPrefs])
+  const liveScrapeEnabled = !isCorsProxyDisabled(proxy)
 
   useEffect(() => {
     void staleRefreshToken
-    if (!scrapeApplicable) return
+    if (!scrapeApplicable || !liveScrapeEnabled) {
+      setInFlight(false)
+      setError(null)
+      return
+    }
     if (!profile || !modelId) return
     const fetchedAt = cachedRow?.fetchedAt
     const cachedPayload = cachedRow ? readCachedPrivacyPayload(cachedRow.payload) : null
@@ -103,7 +113,6 @@ export function usePrivacyPolicies(
     if (forceRefresh) handledRefreshTokenRef.current = refreshToken
     setInFlight(true)
     setError(null)
-    const proxy = corsProxyConfigFromPrefs(globalPrefs)
     ;(async () => {
       try {
         await dedupedPrivacyFetch(
@@ -135,7 +144,16 @@ export function usePrivacyPolicies(
     return () => {
       cancelled = true
     }
-  }, [scrapeApplicable, profile, modelId, cachedRow, refreshToken, staleRefreshToken, globalPrefs])
+  }, [
+    scrapeApplicable,
+    liveScrapeEnabled,
+    profile,
+    modelId,
+    cachedRow,
+    refreshToken,
+    staleRefreshToken,
+    proxy,
+  ])
 
   const policies = useMemo<Record<string, DataPolicy>>(() => {
     if (!cachedRow) return {}
@@ -146,7 +164,7 @@ export function usePrivacyPolicies(
   const fetchedAt = cachedRow?.fetchedAt ?? null
   const offline = error !== null
   const hasPolicies = Object.keys(policies).length > 0
-  const loading = scrapeApplicable && inFlight && !hasPolicies
+  const loading = scrapeApplicable && liveScrapeEnabled && inFlight && !hasPolicies
 
   return {
     policies,
@@ -156,6 +174,7 @@ export function usePrivacyPolicies(
     error,
     refresh: () => setRefreshToken((n) => n + 1),
     scrapeApplicable,
+    liveScrapeEnabled,
     isFreeModel: freeModel,
   }
 }

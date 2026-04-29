@@ -14,9 +14,9 @@ export function synthesizeDataPolicy(raw: DataPolicy | null | undefined): DataPo
 
 // Tier-based dominance (per user spec 2026-04-19). `a` dominates `b` iff
 // `a` sits in a strictly better tier than `b` (green < yellow < orange <
-// red). Same-tier pairs don't dominate — the preferred-ordering
-// tiebreaker decides which comes first. This replaces the old
-// 4-dimensional check; the tier computation already folds
+// red). Same-tier pairs don't dominate; the visible provider sort/manual
+// order decides request order. This replaces the old 4-dimensional check;
+// the tier computation already folds
 // training/retention/user-IDs into a single axis, and the user wants the
 // filter to auto-exclude the worse tier by default (e.g. Google Vertex
 // orange drops out when Google AI Studio yellow is present).

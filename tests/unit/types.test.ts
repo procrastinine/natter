@@ -30,10 +30,6 @@ describe('Phase 0 type additions', () => {
   it('ProviderPreferences covers routing + sort + budget axes', () => {
     expectTypeOf<ProviderPreferences['order']>().toEqualTypeOf<string[] | undefined>()
     expectTypeOf<ProviderPreferences['requireParameters']>().toEqualTypeOf<boolean | undefined>()
-    expectTypeOf<ProviderPreferences['dataCollection']>().toEqualTypeOf<
-      'allow' | 'deny' | undefined
-    >()
-    expectTypeOf<ProviderPreferences['zdr']>().toEqualTypeOf<boolean | undefined>()
     expectTypeOf<ProviderPreferences['only']>().toEqualTypeOf<string[] | undefined>()
     expectTypeOf<ProviderPreferences['ignore']>().toEqualTypeOf<string[] | undefined>()
     expectTypeOf<ProviderPreferences['quantizations']>().toEqualTypeOf<string[] | undefined>()

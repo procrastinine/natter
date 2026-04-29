@@ -7,12 +7,7 @@
 
 import type { ProfileId } from '../core/types'
 import { postEvent } from './broadcast'
-import {
-  backfillProviderSettingsForModel,
-  type CachedPrivacyPolicyRow,
-  type CachedProvidersRow,
-  getDb,
-} from './db'
+import { type CachedPrivacyPolicyRow, type CachedProvidersRow, getDb } from './db'
 import { withNamedLock } from './locks'
 
 export const PRIVACY_POLICY_TTL_MS = 24 * 60 * 60 * 1000
@@ -32,7 +27,6 @@ export async function putCachedPrivacyPolicy(
   fetchedAt: number = Date.now(),
 ): Promise<void> {
   await getDb().privacyPolicies.put({ profileId, modelId, fetchedAt, payload })
-  await backfillProviderSettingsForModel(profileId, modelId)
   postEvent({ kind: 'privacy-refreshed', profileId, modelId })
 }
 

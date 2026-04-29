@@ -39,12 +39,12 @@ export function TextTemplateSection({
   const selected = !allowServerDefault && selectedRaw === 'default' ? 'chatml' : selectedRaw
   const selectedSaved = saved.find((row) => row.id === selected) ?? null
   const selectedBuiltin = TEXT_TEMPLATES[selected] ?? null
-  const selectedIsLegacyCustom = selected === 'custom'
+  const selectedIsPerChatCustom = selected === 'custom'
   const selectedConfig =
     selectedSaved?.config ??
     selectedBuiltin ??
-    (selectedIsLegacyCustom ? (chat.settings.customTextTemplate ?? EMPTY_TEXT_TEMPLATE) : null)
-  const canEdit = selectedSaved !== null || selectedIsLegacyCustom
+    (selectedIsPerChatCustom ? (chat.settings.customTextTemplate ?? EMPTY_TEXT_TEMPLATE) : null)
+  const canEdit = selectedSaved !== null || selectedIsPerChatCustom
   const helper = useMemo(
     () => describeTemplate(selected, mode, llamaProps, selectedSaved?.config),
     [selected, mode, llamaProps, selectedSaved?.config],
@@ -86,7 +86,7 @@ export function TextTemplateSection({
       void updateSavedTextTemplate(selectedSaved.id, { config })
       return
     }
-    if (selectedIsLegacyCustom) {
+    if (selectedIsPerChatCustom) {
       void updateChatSettings(chat.id, { customTextTemplate: config })
     }
   }
@@ -122,7 +122,7 @@ export function TextTemplateSection({
               ))}
             </optgroup>
           ) : null}
-          {selectedIsLegacyCustom ? <option value="custom">Per-chat custom (legacy)</option> : null}
+          {selectedIsPerChatCustom ? <option value="custom">Per-chat custom</option> : null}
         </select>
         <span data-ui="helper">{helper}</span>
       </div>
@@ -185,7 +185,7 @@ function describeTemplate(
     }
     return "Uses the server's GGUF chat_template via POST /apply-template."
   }
-  if (id === 'custom') return 'Legacy per-chat template. Use Save as new for a global copy.'
+  if (id === 'custom') return 'Per-chat template. Use Save as new for a global copy.'
   const config = savedConfig ?? TEXT_TEMPLATES[id]
   if (!config) return 'Template not found; send falls back to a raw prompt.'
   if (id === 'raw') {

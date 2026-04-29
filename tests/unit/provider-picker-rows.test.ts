@@ -59,7 +59,6 @@ describe('buildPickerRows', () => {
     const filter: PrivacyFilterResult = {
       kept: [{ endpoint: azure, policy: POLICY_CLEAN, policySynthesized: false }],
       excluded: [],
-      orderedKeptNames: ['Azure'],
       zeroEligible: false,
     }
     const [row] = buildPickerRows([azure], filter)
@@ -81,7 +80,6 @@ describe('buildPickerRows', () => {
           reasons: ['dominated'],
         },
       ],
-      orderedKeptNames: [],
       zeroEligible: true,
     }
     const [row] = buildPickerRows([openai], filter)
@@ -103,7 +101,6 @@ describe('buildPickerRows', () => {
       excluded: [
         { endpoint: b, policy: POLICY_CLEAN, policySynthesized: false, reasons: ['user-ignored'] },
       ],
-      orderedKeptNames: ['Gamma', 'Alpha'],
       zeroEligible: false,
     }
     const rows = buildPickerRows([a, b, c], filter)
@@ -123,7 +120,6 @@ describe('buildPickerRows', () => {
           reasons: ['unknown-policy', 'training'],
         },
       ],
-      orderedKeptNames: [],
       zeroEligible: true,
     }
     const [row] = buildPickerRows([mystery], filter)
@@ -139,7 +135,6 @@ describe('buildPickerRows', () => {
     const filter: PrivacyFilterResult = {
       kept: [],
       excluded: [],
-      orderedKeptNames: [],
       zeroEligible: false,
     }
     const [row] = buildPickerRows([ghost], filter)
@@ -161,7 +156,6 @@ describe('buildPickerRows', () => {
           reasons: ['dominated'],
         },
       ],
-      orderedKeptNames: [],
       zeroEligible: false,
     }
     const [row] = buildPickerRows([fastRetain], filter, {
@@ -184,7 +178,6 @@ describe('buildPickerRows', () => {
           reasons: ['training'],
         },
       ],
-      orderedKeptNames: [],
       zeroEligible: true,
     }
     const [row] = buildPickerRows([trainer], filter, {
@@ -204,7 +197,6 @@ describe('buildPickerRows', () => {
         { endpoint: outside, policy: POLICY_CLEAN, policySynthesized: false },
       ],
       excluded: [],
-      orderedKeptNames: ['allowed', 'outside'],
       zeroEligible: false,
     }
     const rows = buildPickerRows([kept, outside], filter, {
@@ -225,7 +217,6 @@ describe('buildPickerRows', () => {
         { endpoint: outside, policy: POLICY_CLEAN, policySynthesized: false },
       ],
       excluded: [],
-      orderedKeptNames: ['allowed', 'outside'],
       zeroEligible: false,
     }
     const rows = buildPickerRows([kept, outside], filter, {
@@ -250,7 +241,6 @@ describe('buildPickerRows', () => {
           reasons: ['user-ignored'],
         },
       ],
-      orderedKeptNames: ['anthropic'],
       zeroEligible: false,
     }
     const rows = buildPickerRows([anth2, anth], filter)
@@ -267,7 +257,6 @@ describe('buildPickerRows', () => {
         { endpoint: anth, policy: POLICY_CLEAN, policySynthesized: false },
       ],
       excluded: [],
-      orderedKeptNames: ['anthropic/2', 'anthropic'],
       zeroEligible: false,
     }
     const exact = buildPickerRows([anth2, anth], filter, {
