@@ -92,7 +92,7 @@ export function nativeResponsesToolItemsForMessage(
 ): unknown[] {
   return providerOutputItemsForMessage(message)
     .filter((item) => isNativeProviderOutputForContext(item, target, opts))
-    .map((item) => structuredClone(item.item))
+    .map((item) => nativeContextItem(item))
 }
 
 export function nativeGeminiToolPartsForMessage(
@@ -101,7 +101,7 @@ export function nativeGeminiToolPartsForMessage(
 ): unknown[] {
   return providerOutputItemsForMessage(message)
     .filter((item) => isNativeProviderOutputForContext(item, 'google-gemini', opts))
-    .map((item) => structuredClone(item.item))
+    .map((item) => nativeContextItem(item))
 }
 
 export function nativeAnthropicToolBlocksForMessage(
@@ -110,7 +110,7 @@ export function nativeAnthropicToolBlocksForMessage(
 ): unknown[] {
   return providerOutputItemsForMessage(message)
     .filter((item) => isNativeProviderOutputForContext(item, 'anthropic-claude', opts))
-    .map((item) => structuredClone(item.item))
+    .map((item) => nativeContextItem(item))
 }
 
 export function unsupportedToolContextTextForMessage(
@@ -193,9 +193,43 @@ export function isNativeProviderOutputForContext(
 ): boolean {
   return (
     shouldIncludeProviderOutputItem(item, opts) &&
-    item.edited !== true &&
+    shouldReplayProviderOutputNative(item, target) &&
     isNativeProviderOutput(item, target)
   )
+}
+
+function shouldReplayProviderOutputNative(
+  item: ProviderOutputItem,
+  target: ProviderToolContextTarget,
+): boolean {
+  if (target === 'openrouter-responses') return false
+  if (item.edited !== true) return true
+  return (
+    target === 'openai-responses' ||
+    target === 'google-gemini' ||
+    target === 'anthropic-claude'
+  )
+}
+
+function nativeContextItem(item: ProviderOutputItem): unknown {
+  const cloned = structuredClone(item.item)
+  if (item.edited === true && item.dialect === 'google-gemini') {
+    return stripGeminiThoughtSignature(cloned)
+  }
+  return cloned
+}
+
+function stripGeminiThoughtSignature(value: unknown): unknown {
+  if (!value || typeof value !== 'object') return value
+  if (Array.isArray(value)) {
+    return value.map(stripGeminiThoughtSignature)
+  }
+  const out: Record<string, unknown> = {}
+  for (const [key, child] of Object.entries(value)) {
+    if (key === 'thoughtSignature') continue
+    out[key] = stripGeminiThoughtSignature(child)
+  }
+  return out
 }
 
 export function isNativeProviderOutput(

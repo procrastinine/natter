@@ -110,7 +110,7 @@ function registerV1(db: Dexie): void {
 
 function registerV1Through3(db: Dexie): void {
   registerSchema(db)
-  db.version(16)
+  db.version(17)
     .stores({ profiles: 'id, name, kind, lastUsedAt, archived' })
     .upgrade(async (tx) => {
       await tx
@@ -120,7 +120,7 @@ function registerV1Through3(db: Dexie): void {
           if (row.appTitle === undefined) row.appTitle = 'Natter'
         })
     })
-  db.version(17)
+  db.version(18)
     .stores({ settings: '&key' })
     .upgrade(async (tx) => {
       const settings = tx.table<MinimalSetting>('settings')
@@ -202,7 +202,7 @@ describe('Dexie migrations', () => {
     const db = new Dexie(name)
     registerV1Through3(db)
     await db.open()
-    expect(db.verno).toBe(17)
+    expect(db.verno).toBe(18)
     expect(db.tables.map((t) => t.name).includes('settings')).toBe(true)
     const tag = await db.table<MinimalSetting>('settings').get('schemaTag')
     expect(tag).toBeUndefined()
@@ -238,7 +238,7 @@ describe('Dexie migrations', () => {
     const up = new Dexie(name)
     registerV1Through3(up)
     await up.open()
-    expect(up.verno).toBe(17)
+    expect(up.verno).toBe(18)
     const profile = await up.table<MinimalProfile>('profiles').get('P1')
     expect(profile?.appTitle).toBe('CustomTitle') // preserved — synthetic bump only fills undefined
     const tag = await up.table<MinimalSetting>('settings').get('schemaTag')
@@ -248,7 +248,7 @@ describe('Dexie migrations', () => {
     const reopen = new Dexie(name)
     registerV1Through3(reopen)
     await reopen.open()
-    expect(reopen.verno).toBe(17)
+    expect(reopen.verno).toBe(18)
     const tag2 = await reopen.table<MinimalSetting>('settings').get('schemaTag')
     expect(tag2?.value).toBe('preexisting')
     await reopen.delete()
@@ -284,6 +284,26 @@ describe('Dexie migrations', () => {
     const row = await up.table<MinimalProfile>('profiles').get('P2')
     expect(row?.appTitle).toBe('Natter') // synthetic bump backfilled
     await up.delete()
+  })
+
+  it('deletes the retired open-scroll preference during schema upgrade', async () => {
+    const name = `natter-test-open-scroll-mig-${Math.random().toString(36).slice(2)}`
+    await Dexie.delete(name)
+
+    const legacy = new Dexie(name)
+    registerLegacyChatSettingsV14(legacy)
+    await legacy.open()
+    await legacy.table<MinimalSetting>('settings').bulkPut([
+      { key: 'global:auto-scroll-open', value: false },
+      { key: 'global:auto-scroll-stream', value: false },
+    ])
+    legacy.close()
+
+    const migrated = createDbForTests(name)
+    await migrated.open()
+    expect(await migrated.settings.get('global:auto-scroll-open')).toBeUndefined()
+    expect((await migrated.settings.get('global:auto-scroll-stream'))?.value).toBe(false)
+    await migrated.delete()
   })
 
   it('migrates legacy privacy provider refs on chats and presets into providerPrefs', async () => {
@@ -654,7 +674,7 @@ describe('Dexie migrations', () => {
 
     const migrated = createDbForTests(name)
     await migrated.open()
-    expect(migrated.verno).toBe(15)
+    expect(migrated.verno).toBe(16)
     const chat = await migrated.chats.get('chat-settings-snapshot')
     const preset = await migrated.presets.get('preset-settings-snapshot')
     for (const settings of [chat?.settings, preset?.settings]) {

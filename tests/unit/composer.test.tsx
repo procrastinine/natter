@@ -127,4 +127,79 @@ describe('Composer', () => {
     expect(onSave.mock.calls[0]?.[2]).toHaveLength(1)
     expect(onSave.mock.calls[0]?.[2]?.[0]).toMatchObject({ includeInContext: true })
   })
+
+  it('preserves provider sealed fields when editing tool-call JSON', async () => {
+    const onSave = vi.fn().mockResolvedValue(undefined)
+    render(
+      <InlineEditor
+        initial="existing message"
+        onSave={onSave}
+        onCancel={() => {}}
+        initialProviderOutputItems={[
+          {
+            dialect: 'anthropic-claude',
+            type: 'web_search_tool_result',
+            item: {
+              type: 'web_search_tool_result',
+              tool_use_id: 'srvtoolu_1',
+              content: [
+                {
+                  type: 'web_search_result',
+                  title: 'Original title',
+                  url: 'https://example.com',
+                  encrypted_content: 'sealed-result-payload',
+                },
+              ],
+            },
+          },
+        ]}
+      />,
+    )
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Edit message' }), {
+      target: { value: 'existing message updated' },
+    })
+    fireEvent.change(screen.getByLabelText('Edit tool call JSON or text'), {
+      target: {
+        value: JSON.stringify(
+          {
+            type: 'web_search_tool_result',
+            tool_use_id: 'srvtoolu_1',
+            content: [
+              {
+                type: 'web_search_result',
+                title: 'Edited title',
+                url: 'https://example.com',
+              },
+            ],
+          },
+          null,
+          2,
+        ),
+      },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1))
+    expect(onSave.mock.calls[0]?.[0]).toBe('existing message updated')
+    expect(onSave.mock.calls[0]?.[3]).toEqual([
+      {
+        dialect: 'anthropic-claude',
+        type: 'web_search_tool_result',
+        edited: true,
+        item: {
+          type: 'web_search_tool_result',
+          tool_use_id: 'srvtoolu_1',
+          content: [
+            {
+              type: 'web_search_result',
+              title: 'Edited title',
+              url: 'https://example.com',
+              encrypted_content: 'sealed-result-payload',
+            },
+          ],
+        },
+      },
+    ])
+  })
 })

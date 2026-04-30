@@ -40,12 +40,14 @@ import { getCachedModels } from '../store/models-cache'
 import { bumpPresetLastUsedAt, getPreset, pickPreferredPreset } from '../store/presets'
 import { bumpProfileLastUsedAt, countProfiles, getProfile } from '../store/profiles'
 import { installPersistenceRequestOnFirstInteraction } from '../store/quota'
+import type { ActiveBranchSnapshot } from '../store/repository'
 import { readSidebarSortMode } from '../store/sidebar-preferences'
 import { installStreamLeaseListener, requestAbortForChat } from '../store/stream-leases'
 import { useChatStore } from '../store/zustand/chatStore'
 import { useStreamStore } from '../store/zustand/streamStore'
 import { useToastStore } from '../store/zustand/toastStore'
 import { useUiStore } from '../store/zustand/uiStore'
+import { useAttachmentResolverForContext } from '../ui/attachments/useAttachmentResolver'
 import { BannerTray } from '../ui/chat/BannerTray'
 import { ChatHeader } from '../ui/chat/ChatHeader'
 import { Composer, type ComposerDroppedFiles } from '../ui/chat/Composer'
@@ -58,7 +60,6 @@ import { PrefillSettingsPrompt } from '../ui/chat/PrefillSettingsPrompt'
 import { ScrollRegion, type ScrollRegionHandle, type ScrollState } from '../ui/chat/ScrollRegion'
 import { ToastTray } from '../ui/chat/ToastTray'
 import { ZeroEligibleModal } from '../ui/chat/ZeroEligibleModal'
-import { useAttachmentResolverForContext } from '../ui/attachments/useAttachmentResolver'
 import {
   ConnectionHeader,
   readActiveSeedState,
@@ -90,6 +91,11 @@ const EMPTY_CURSOR: CursorMap = Object.freeze({})
 const MODEL_AUTOSELECT_QUERY = {
   outputModalities: ['text', 'image', 'audio', 'file', 'video'],
 } as const
+
+function cursorCacheKey(chatId: ChatId, cursor: CursorMap): string {
+  const entries = Object.entries(cursor).sort(([left], [right]) => left.localeCompare(right))
+  return JSON.stringify([chatId, entries])
+}
 
 function profileRequiresKey(kind: ConnectionProfile['kind']): boolean {
   return kind !== 'custom' && kind !== 'llama-server'
@@ -179,6 +185,22 @@ export function Shell() {
     [activeChatId, activeCursor],
     null,
   )
+  const activeCursorCacheKey = activeChatId ? cursorCacheKey(activeChatId, activeCursor) : null
+  const branchSnapshotCacheRef = useRef(new Map<string, ActiveBranchSnapshot>())
+  useEffect(() => {
+    if (!activeBranchSnapshot) return
+    if (activeBranchSnapshot.chatId !== activeChatId) return
+    branchSnapshotCacheRef.current.set(
+      cursorCacheKey(activeBranchSnapshot.chatId, activeCursor),
+      activeBranchSnapshot,
+    )
+  }, [activeBranchSnapshot, activeChatId, activeCursor])
+  const resolvedActiveBranchSnapshot =
+    activeBranchSnapshot?.chatId === activeChatId
+      ? activeBranchSnapshot
+      : activeCursorCacheKey
+        ? (branchSnapshotCacheRef.current.get(activeCursorCacheKey) ?? null)
+        : null
   const activeEndpoints = useEndpoints(
     resolvedActiveChatRow?.settings.profileId ?? null,
     resolvedActiveChatRow?.settings.model || null,
@@ -233,7 +255,7 @@ export function Shell() {
       await updateChatSettings(resolvedActiveChatRow.id, { model: only.id })
     })()
   }, [resolvedActiveChatRow, autoSelectRow])
-  const activePathMemo = activeBranchSnapshot?.branch ?? []
+  const activePathMemo = resolvedActiveBranchSnapshot?.branch ?? []
   const composerAttachmentResolver = useAttachmentResolverForContext({
     settings: resolvedActiveChatRow?.settings,
     messages: activePathMemo,
@@ -781,8 +803,8 @@ export function Shell() {
                 <EditTreeToolbar />
                 <BannerTray />
                 <ScrollRegion
+                  key={activeChatId}
                   ref={scrollRef}
-                  autoScrollOnOpen={prefs.autoScrollOnOpen}
                   autoScrollOnStream={prefs.autoScrollOnStream}
                   streamActive={streamingOnActiveChat}
                   resetKey={activeChatId}
@@ -792,6 +814,7 @@ export function Shell() {
                     chatId={activeChatId}
                     chatSettings={resolvedActiveChatRow?.settings ?? cloneDefaultChatSettings()}
                     hasConnection={hasConnection}
+                    branchSnapshot={resolvedActiveBranchSnapshot}
                     {...(activeCapability ? { capability: activeCapability } : {})}
                     prefillRecommendationEndpoints={activeEndpoints.endpoints}
                     longMessageDisplayMode={prefs.longMessageDisplayMode}

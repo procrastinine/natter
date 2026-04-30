@@ -48,6 +48,13 @@
   contain-intrinsic-size: 240px;
 }
 
+[data-ui="message"]:has([data-ui="tool-evidence"][open]),
+[data-ui="message"]:has([data-ui="reasoning"][open]),
+[data-ui="message"]:has([data-ui="message-info"]),
+[data-ui="message"]:has([data-ui="inline-editor"]) {
+  content-visibility: visible;
+}
+
 /* Vertically center the round glyph on the role label (User / Assistant)
  * rather than on the top of the whole row. The row is taller than the
  * header line (it also holds the body and action row) so the default

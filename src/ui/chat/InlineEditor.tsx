@@ -226,15 +226,42 @@ function fromEditableToolCalls(list: EditableToolCall[]): ProviderOutputItem[] {
       type !== row.original.type ||
       outputIndex !== row.original.outputIndex ||
       row.rawText !== row.originalRawText
+    const outputItem =
+      row.original && changed
+        ? preserveProviderSealedFields(row.original.item, item)
+        : item
     return {
       dialect: row.dialect,
       type,
       ...(outputIndex !== undefined ? { outputIndex } : {}),
       ...(row.hidden ? { hidden: true } : {}),
       ...(row.original?.edited === true || changed ? { edited: true } : {}),
-      item,
+      item: outputItem,
     }
   })
+}
+
+const PROVIDER_SEALED_FIELD_NAMES = new Set(['encrypted_content', 'thoughtSignature', 'signature'])
+
+function preserveProviderSealedFields(original: unknown, edited: unknown): unknown {
+  if (!original || typeof original !== 'object') return edited
+  if (!edited || typeof edited !== 'object') return edited
+  if (Array.isArray(original)) {
+    if (!Array.isArray(edited)) return edited
+    return edited.map((child, index) => preserveProviderSealedFields(original[index], child))
+  }
+  if (Array.isArray(edited)) return edited
+  const next: Record<string, unknown> = { ...(edited as Record<string, unknown>) }
+  for (const [key, originalChild] of Object.entries(original)) {
+    if (PROVIDER_SEALED_FIELD_NAMES.has(key)) {
+      next[key] = originalChild
+      continue
+    }
+    if (key in next) {
+      next[key] = preserveProviderSealedFields(originalChild, next[key])
+    }
+  }
+  return next
 }
 
 function formatToolItemForEdit(value: unknown): string {

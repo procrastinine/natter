@@ -153,6 +153,41 @@ describe('toAnthropicMessages', () => {
     expect(JSON.stringify(wire)).toContain('Dialect: google-gemini')
   })
 
+  it('keeps edited Anthropic provider tool blocks native', () => {
+    const prior = assistant('a1', 'I searched.', {
+      providerOutputItems: [
+        {
+          dialect: 'anthropic-claude',
+          type: 'server_tool_use',
+          edited: true,
+          item: {
+            type: 'server_tool_use',
+            id: 'srvtoolu_1',
+            name: 'web_search',
+            input: { query: 'edited docs' },
+          },
+        },
+      ],
+    })
+
+    const { wire } = toAnthropicMessages(settings(), [prior, user('u2', 'continue')], {
+      reasoningPreservationFormat: 'anthropic-claude-v1',
+    })
+    expect(wire.messages[0]).toMatchObject({
+      role: 'assistant',
+      content: [
+        {
+          type: 'server_tool_use',
+          id: 'srvtoolu_1',
+          name: 'web_search',
+          input: { query: 'edited docs' },
+        },
+        { type: 'text', text: 'I searched.' },
+      ],
+    })
+    expect(JSON.stringify(wire)).not.toContain('<tool_call>')
+  })
+
   it('round-trips signed Claude thinking as a native thinking block', () => {
     const prior = assistant('a1', 'Answer.', {
       reasoningDetails: [

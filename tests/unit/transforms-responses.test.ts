@@ -299,11 +299,13 @@ describe('toResponses — reasoning echo', () => {
     const items = wire.input as Array<{ type: string; [k: string]: unknown }>
     const reasoningItem = items.find((i) => i.type === 'reasoning') as
       | {
+          id?: string
           encrypted_content?: string
           summary?: unknown[]
         }
       | undefined
     expect(reasoningItem).toBeDefined()
+    expect(reasoningItem?.id).toBeUndefined()
     expect(reasoningItem?.encrypted_content).toBeUndefined()
     expect(reasoningItem?.summary).toHaveLength(1)
   })
@@ -549,7 +551,7 @@ describe('toResponses — tool calls + tool outputs', () => {
     expect(JSON.stringify(items)).not.toContain('print(55)')
   })
 
-  it('falls edited native provider tool output back to tool_call text', () => {
+  it('keeps edited direct OpenAI provider tool output native on Responses', () => {
     const path: Message[] = [
       user('u1', 'compute'),
       assistant('a1', '55', {
@@ -569,13 +571,38 @@ describe('toResponses — tool calls + tool outputs', () => {
     ]
     const { wire } = toResponses(settings(), path, { hostedToolsProvider: 'openai' })
     const items = wire.input as Array<Record<string, unknown>>
-    expect(items.some((item) => item.type === 'code_interpreter_call')).toBe(false)
+    expect(items.some((item) => item.type === 'code_interpreter_call')).toBe(true)
+    const assistantMessage = items.find(
+      (item) => item.type === 'message' && item.role === 'assistant',
+    ) as { content?: Array<{ text?: string }> } | undefined
+    expect(assistantMessage?.content?.[0]?.text).toBe('55')
+  })
+
+  it('always renders OpenRouter provider output as tool_call text on Responses', () => {
+    const path: Message[] = [
+      user('u1', 'fetch'),
+      assistant('a1', 'fetched', {
+        providerOutputItems: [
+          {
+            dialect: 'openrouter-responses',
+            type: 'openrouter:web_fetch',
+            item: {
+              type: 'openrouter:web_fetch',
+              url: 'https://example.com',
+              content: 'edited body',
+            },
+          },
+        ],
+      }),
+    ]
+    const { wire } = toResponses(settings(), path, { hostedToolsProvider: 'openrouter' })
+    const items = wire.input as Array<Record<string, unknown>>
+    expect(items.some((item) => item.type === 'openrouter:web_fetch')).toBe(false)
     const assistantMessage = items.find(
       (item) => item.type === 'message' && item.role === 'assistant',
     ) as { content?: Array<{ text?: string }> } | undefined
     expect(assistantMessage?.content?.[0]?.text).toContain('<tool_call>')
-    expect(assistantMessage?.content?.[0]?.text).toContain('Edited: true')
-    expect(assistantMessage?.content?.[0]?.text).toContain('print(55)')
+    expect(assistantMessage?.content?.[0]?.text).toContain('edited body')
   })
 
   it('respects the global tool-call context checkbox', () => {

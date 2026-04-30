@@ -213,9 +213,10 @@
 [data-ui="tool-evidence-row-value"],
 [data-ui="tool-evidence-raw"] pre {
   margin: 0;
-  white-space: pre-wrap;
+  white-space: pre;
   overflow-x: auto;
-  overflow-wrap: break-word;
+  max-width: 100%;
+  overflow-wrap: normal;
   word-break: normal;
   font-family: var(--font-mono);
   font-size: var(--font-size-xs);

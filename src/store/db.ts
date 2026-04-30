@@ -21,14 +21,14 @@ import {
   migrateInlineMessageBodies,
 } from '../backcompat/message-body-split'
 import {
-  migrateProviderSettingsRow,
-  providerCacheKey,
-} from '../backcompat/provider-settings-migration'
-import {
   migrateProviderOutputItemRows,
   migrateProviderOutputItemsFromGeneration,
   providerOutputItemsBackfillMarker,
 } from '../backcompat/provider-output-items'
+import {
+  migrateProviderSettingsRow,
+  providerCacheKey,
+} from '../backcompat/provider-settings-migration'
 import {
   migrateProviderToolSettings,
   migrateProviderToolSettingsRows,
@@ -992,6 +992,43 @@ export function registerSchema(db: Dexie): void {
             : result.settings
           if (result.changed || profileChanged) preset.settings = settings
         })
+    })
+
+  // v16: Retire the old open-at-leaf preference. Opening a chat at the
+  // branch leaf is now invariant, so old rows must not survive in stale DBs.
+  db.version(16)
+    .stores({
+      chats:
+        'id, updatedAt, createdAt, lastViewedAt, lastUpdatedLeafId, lastBranchUpdatedAt, wordCount, totalCostUsd, archived, pinned, presetId, folderId, *tags',
+      messages:
+        'id, chatId, parentId, turnId, [chatId+parentId], [chatId+createdAt], [chatId+turnId], [chatId+deleted]',
+      messageBodies: '&id, chatId, updatedAt, nodeVersion',
+      childLists: 'id, [chatId+parentId], updatedAt',
+      attachments: 'id, contentHash, kind, mime, origin, refCount, createdAt, updatedAt, deletedAt',
+      attachmentBlobs: 'id, attachmentId, role, contentHash, createdAt',
+      attachmentArtifacts: 'artifactId, attachmentId, kind, processorId, createdAt',
+      attachmentJobs:
+        'id, attachmentId, processorId, status, updatedAt, [attachmentId+processorId+inputHash]',
+      profiles: 'id, name, kind, lastUsedAt, archived',
+      presets: 'id, name, connectionProfileId, lastUsedAt, archived',
+      promptPresets: 'id, kind, name, lastUsedAt',
+      folders: 'id, name, sortIndex, lastUsedAt',
+      tags: 'id, &nameLower, lastUsedAt',
+      chatBranchCache: '&chatId, branchLeafId, generatedAt',
+      keys: 'id, name',
+      settings: '&key',
+      streamLeases: '&streamId, chatId, ownerClientId, heartbeatAt',
+      streamChunks: '&id, streamId, chatId, messageId, [streamId+seq], createdAt',
+      models: '&[profileId+queryKey], fetchedAt',
+      endpoints: '&[profileId+modelId], fetchedAt',
+      privacyPolicies: '&[profileId+modelId], fetchedAt',
+      providers: '&profileId, fetchedAt',
+      generations: 'id, chatId, gen_id',
+      presetResolutions: '&[profileId+presetSlug], fetchedAt',
+      drafts: '&chatId, updatedAt',
+    })
+    .upgrade(async (tx) => {
+      await tx.table<SettingsRow>('settings').delete('global:auto-scroll-open')
     })
 }
 

@@ -1,16 +1,16 @@
 import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { __resetBroadcastForTests, type BroadcastEvent, onEvent } from '../../src/store/broadcast'
+import { DEFAULT_CORS_PROXY_URL, DEV_CORS_PROXY_URL } from '../../src/core/cors-proxy'
 import {
   defaultCorsProxyUrlForRuntime,
   readGlobalPreferences,
   writeChatMaxWidth,
   writeLongMessageDisplayMode,
 } from '../../src/core/global-settings'
-import { DEFAULT_CORS_PROXY_URL, DEV_CORS_PROXY_URL } from '../../src/core/cors-proxy'
+import type { DraftRow } from '../../src/core/types'
+import { __resetBroadcastForTests, type BroadcastEvent, onEvent } from '../../src/store/broadcast'
 import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
 import type { MessageHeaderRow } from '../../src/store/message-storage'
-import type { DraftRow } from '../../src/core/types'
 import {
   clearEndpointsCacheForProfile,
   clearModelsCacheForProfile,
@@ -243,10 +243,9 @@ describe('settings', () => {
     await openDb()
 
     expect(await getSetting('global:auto-scroll')).toBeUndefined()
-    expect(await getSetting('global:auto-scroll-open')).toBe(false)
+    expect(await getSetting('global:auto-scroll-open')).toBeUndefined()
     expect(await getSetting('global:auto-scroll-stream')).toBe(false)
     const prefs = await readGlobalPreferences()
-    expect(prefs.autoScrollOnOpen).toBe(false)
     expect(prefs.autoScrollOnStream).toBe(false)
     expect(await getSetting('backfill:global-settings-v1')).toBe(1)
   })

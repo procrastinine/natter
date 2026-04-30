@@ -516,6 +516,34 @@ describe('toGeminiNative — tool calls + tool results', () => {
     expect(modelTurn?.parts.some((part) => 'codeExecutionResult' in part)).toBe(true)
   })
 
+  it('keeps edited Gemini provider output native and strips thoughtSignature', () => {
+    const path: Message[] = [
+      user('u1', 'compute'),
+      assistant('a1', '55', {
+        providerOutputItems: [
+          {
+            dialect: 'google-gemini',
+            type: 'google:code_execution',
+            edited: true,
+            item: {
+              executableCode: { language: 'PYTHON', code: 'print(55)' },
+              thoughtSignature: 'SIG',
+            },
+          },
+        ],
+      }),
+    ]
+    const { wire } = toGeminiNative(settings(), path)
+    const modelTurn = wire.contents.find((content) => content.role === 'model')
+    const codePart = modelTurn?.parts.find((part) => 'executableCode' in part) as
+      | { thoughtSignature?: string }
+      | undefined
+    expect(codePart).toBeDefined()
+    expect(codePart?.thoughtSignature).toBeUndefined()
+    const text = modelTurn?.parts.find((part): part is { text: string } => 'text' in part)
+    expect(text?.text).toBe('55')
+  })
+
   it('renders unsupported provider output as Gemini text context', () => {
     const path: Message[] = [
       user('u1', 'compute'),

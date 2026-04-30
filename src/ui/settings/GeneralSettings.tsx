@@ -12,7 +12,6 @@ import {
   readGlobalPreferences,
   type SendShortcut,
   type TokenCalibrationMode,
-  writeAutoScrollOnOpen,
   writeAutoScrollOnStream,
   writeCorsProxySecret,
   writeCorsProxyUrl,
@@ -31,9 +30,6 @@ export function GeneralSettings() {
   const prefs = useLiveQuery(readGlobalPreferences, [], DEFAULT_GLOBAL_PREFERENCES)
   const onShortcut = useCallback(async (value: SendShortcut) => {
     await writeSendShortcut(value)
-  }, [])
-  const onAutoScrollOnOpen = useCallback(async (value: boolean) => {
-    await writeAutoScrollOnOpen(value)
   }, [])
   const onAutoScrollOnStream = useCallback(async (value: boolean) => {
     await writeAutoScrollOnStream(value)
@@ -55,7 +51,9 @@ export function GeneralSettings() {
   const proxyDisabled = trimmedProxyUrl.length === 0 && !isDev
   const proxyIsRelative = trimmedProxyUrl.length > 0 && trimmedProxyUrl.startsWith('/')
   const showDevDefaultWarning = proxyIsRelative && !isDev
-  const proxyPlaceholder = isDev ? defaultCorsProxyUrlForRuntime(isDev) : 'No live scrape by default'
+  const proxyPlaceholder = isDev
+    ? defaultCorsProxyUrlForRuntime(isDev)
+    : 'No live scrape by default'
 
   return (
     <>
@@ -79,23 +77,6 @@ export function GeneralSettings() {
       </div>
       <div data-ui="settings-section">
         <h3>Scroll</h3>
-        <div data-ui="field-group">
-          <label data-ui="toggle-row" htmlFor="auto-scroll-open-toggle">
-            <input
-              id="auto-scroll-open-toggle"
-              data-ui="auto-scroll-open-toggle"
-              type="checkbox"
-              checked={prefs.autoScrollOnOpen}
-              onChange={(e) => void onAutoScrollOnOpen(e.target.checked)}
-            />
-            <span>Jump to the branch leaf when opening a chat</span>
-            <InfoDisclosure title="Jump to the branch leaf when opening a chat">
-              When on, the chat loads already positioned at the latest message (no visible
-              scroll, the view is placed before paint). When off, the chat opens at the top and
-              the view stays scrollable manually.
-            </InfoDisclosure>
-          </label>
-        </div>
         <div data-ui="field-group">
           <label data-ui="toggle-row" htmlFor="auto-scroll-stream-toggle">
             <input
@@ -125,8 +106,8 @@ export function GeneralSettings() {
             pages.{' '}
             {isDev ? (
               <>
-                Default <code>{DEV_CORS_PROXY_URL}</code> works while <code>pnpm dev</code>{' '}
-                is running.
+                Default <code>{DEV_CORS_PROXY_URL}</code> works while <code>pnpm dev</code> is
+                running.
               </>
             ) : (
               <>
@@ -141,19 +122,17 @@ export function GeneralSettings() {
               </li>
               <li>
                 Custom bouncer (full template):{' '}
-                <code>
-                  {'https://corsproxy.io/?url=https://openrouter.ai/{model}/providers'}
-                </code>
+                <code>{'https://corsproxy.io/?url=https://openrouter.ai/{model}/providers'}</code>
               </li>
               <li>
-                Self-hosted Worker base: <code>https://or-scrape.example.workers.dev</code>{' '}
-                (<code>{'/{model}/providers'}</code> is appended automatically)
+                Self-hosted Worker base: <code>https://or-scrape.example.workers.dev</code> (
+                <code>{'/{model}/providers'}</code> is appended automatically)
               </li>
             </ul>
-            URLs containing <code>{'{model}'}</code> or <code>{'{path}'}</code> are substituted
-            in place; bare hosts in the known-bouncer list expand automatically; everything
-            else is treated as a base and the path is appended. Public bouncers can see the
-            OpenRouter model/provider page URLs requested through them.
+            URLs containing <code>{'{model}'}</code> or <code>{'{path}'}</code> are substituted in
+            place; bare hosts in the known-bouncer list expand automatically; everything else is
+            treated as a base and the path is appended. Public bouncers can see the OpenRouter
+            model/provider page URLs requested through them.
           </InfoDisclosure>
         </h3>
         <div data-ui="field-group">
@@ -171,14 +150,14 @@ export function GeneralSettings() {
           />
           {showDevDefaultWarning ? (
             <span data-ui="helper" data-validation="invalid">
-              Relative URLs only resolve under <code>pnpm dev</code>. Paste an absolute
-              bouncer URL to make the privacy scrape work in production.
+              Relative URLs only resolve under <code>pnpm dev</code>. Paste an absolute bouncer URL
+              to make the privacy scrape work in production.
             </span>
           ) : null}
           {proxyDisabled ? (
             <span data-ui="helper" data-tone="muted">
-              Live privacy scrape is off. Provider privacy uses cached data, endpoint-supplied
-              data, and curated fallback defaults until a proxy is configured.
+              Live privacy scrape is off. Provider privacy uses cached data, endpoint-supplied data,
+              and curated fallback defaults until a proxy is configured.
             </span>
           ) : null}
         </div>
@@ -186,8 +165,8 @@ export function GeneralSettings() {
           <label htmlFor="cors-proxy-secret">
             Proxy secret <em>(optional)</em>
             <InfoDisclosure title="Proxy secret">
-              Sent as <code>X-Proxy-Secret</code>. Only needed when a self-hosted bouncer
-              requires auth.
+              Sent as <code>X-Proxy-Secret</code>. Only needed when a self-hosted bouncer requires
+              auth.
             </InfoDisclosure>
           </label>
           <input

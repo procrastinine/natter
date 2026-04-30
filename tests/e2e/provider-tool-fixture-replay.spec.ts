@@ -145,6 +145,51 @@ test('tool evidence supports per-item visibility and edit/create in the inline e
   )
 })
 
+test('tool evidence keeps long stdout horizontally scrollable in narrow layouts', async ({
+  page,
+}) => {
+  await startProviderFixture(page, 'openai-shell')
+  const assistant = page.locator('[data-ui="message"][data-role="assistant"]').last()
+  await assistant.locator('[data-action="edit"]').click()
+  await assistant.locator('[data-ui="inline-editor-tool-calls"] summary').click()
+  const longStdout = `LONG_STDOUT_${'x'.repeat(180)}`
+  await assistant
+    .locator('[data-ui="inline-editor-tool-call-input"]')
+    .nth(1)
+    .fill(JSON.stringify({ type: 'shell_call_output', stdout: longStdout }))
+  await assistant.locator('[data-role="save"]').click()
+
+  await page.setViewportSize({ width: 760, height: 840 })
+  const evidence = assistant.locator('[data-ui="tool-evidence"]')
+  if (!(await evidence.evaluate((node) => (node as HTMLDetailsElement).open))) {
+    await evidence.locator('[data-ui="tool-evidence-summary"]').click()
+  }
+  await expect(assistant).toHaveCSS('content-visibility', 'visible')
+
+  const stdout = evidence
+    .locator('[data-ui="tool-evidence-row-value"]')
+    .filter({ hasText: 'LONG_STDOUT_' })
+    .first()
+  await expect(stdout).toBeVisible()
+  const metrics = await stdout.evaluate((node) => {
+    const styles = window.getComputedStyle(node)
+    const lineHeight = Number.parseFloat(styles.lineHeight)
+    const rect = node.getBoundingClientRect()
+    return {
+      height: rect.height,
+      clientWidth: node.clientWidth,
+      scrollWidth: node.scrollWidth,
+      lineHeight: Number.isFinite(lineHeight) ? lineHeight : 0,
+      whiteSpace: styles.whiteSpace,
+      overflowWrap: styles.overflowWrap,
+    }
+  })
+  expect(metrics.whiteSpace).toBe('pre')
+  expect(metrics.overflowWrap).toBe('normal')
+  expect(metrics.scrollWidth).toBeGreaterThan(metrics.clientWidth)
+  expect(metrics.height).toBeLessThanOrEqual(Math.max(40, metrics.lineHeight * 2.2))
+})
+
 async function replayProviderFixture(
   page: Page,
   input: {

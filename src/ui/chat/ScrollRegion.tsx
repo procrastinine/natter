@@ -8,6 +8,7 @@ import {
   useRef,
   useState,
 } from 'react'
+import { logScrollDebug } from '../../lib/debug-scroll'
 
 export type ScrollState = 'follow' | 'pinned'
 
@@ -18,20 +19,15 @@ interface ScrollRegionProps {
   // a "Jump to latest" affordance anchored to the main-pane viewport bottom
   // (rather than scrolling with the content inside the region).
   onStateChange?: (state: ScrollState) => void
-  // One-shot: on mount (or after `resetKey` changes) jump the viewport to
-  // the bottom so the chat opens already positioned at the leaf. Uses
-  // useLayoutEffect + behavior: 'auto' — the scroll lands BEFORE paint so
-  // there is no visible animation. When false, opens at the top.
-  autoScrollOnOpen?: boolean
   // While `streamActive` is true AND the sentinel is currently visible
   // (user hasn't scrolled up), follow new tokens into view as they arrive.
   // When false, streams never move the viewport — user stays wherever they
-  // are. Completely independent of `autoScrollOnOpen`.
+  // are. Chat open always lands at the branch leaf regardless of this setting.
   autoScrollOnStream?: boolean
   // Parent signals that a stream is currently in progress for the content
   // being rendered here. Stream-time follow only activates during this
   // window; outside it, content changes never move the scroll position
-  // (chat switches, in-place edits, deletes all stay put).
+  // through the streaming path.
   streamActive?: boolean
   // Identity that resets the open-latch. When this value changes (e.g. the
   // user switches chats via sidebar), the next content-load triggers
@@ -45,34 +41,65 @@ export interface ScrollRegionHandle {
 }
 
 const DEFAULT_THRESHOLD_PX = 48
+const OPEN_FOLLOW_GRACE_MS = 6_000
+const STREAM_FOLLOW_GRACE_MS = 4_000
+const USER_SCROLL_INTENT_MS = 750
+
+type PositionSource = 'layout' | 'observer' | 'resize' | 'scroll'
+type ScrollDebugEvent =
+  | 'state'
+  | 'scroll.to-bottom'
+  | 'follow.settle.start'
+  | 'follow.settle.tick'
+  | 'follow.schedule'
+  | 'follow.scheduled-scroll'
+  | 'follow.resize-scroll'
+  | 'position'
+  | 'open.wait'
+  | 'open.bottom'
+  | 'reset-key'
+  | 'observer'
+  | 'resize'
+  | 'mutation'
+  | 'wheel'
+  | 'touchmove'
+  | 'native-scroll'
+  | 'stream-start'
+  | 'stream-settle-start'
+  | 'user-follow-cancel'
+  | 'visibility'
 
 function scrollStateFromPosition(container: HTMLDivElement, threshold: number): ScrollState {
   const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight
   return distanceFromBottom <= threshold ? 'follow' : 'pinned'
 }
 
+function bottomScrollTop(container: HTMLDivElement): number {
+  return Math.max(0, container.scrollHeight - container.clientHeight)
+}
+
+function nowMs(): number {
+  return typeof performance === 'undefined' ? Date.now() : performance.now()
+}
+
 // A scroll container with two independent auto-scroll behaviors:
 //
-//   - autoScrollOnOpen: on mount (or resetKey change), instantly position
-//     at the bottom BEFORE paint. The chat just appears at the leaf — no
-//     animation, no flash of "at top then jumps."
+//   - Opening a chat always positions at the bottom before paint. The chat
+//     appears at the branch leaf with no animated jump.
 //
 //   - autoScrollOnStream + streamActive: while a stream is in flight and
 //     the user is already at the bottom, keep new tokens in view as they
 //     arrive. Scrolling up mid-stream flips to `pinned` and the stream
-//     stops chasing. These two settings don't leak into each other: the
-//     stream setting never fires on open, and the open setting doesn't
-//     influence stream-time behavior.
+//     stops chasing. The stream setting never blocks the open-time leaf jump.
 //
-// A bottom sentinel plus IntersectionObserver tracks content-growth changes,
-// while a throttled scroll listener keeps Firefox and wheel-driven scrolls
-// honest when the container position changes before the observer reports.
+// ResizeObserver tracks content-growth changes from child-only stream renders,
+// while a bottom sentinel and direct scroll listener keep wheel-driven scrolls
+// honest when the container position changes before observers report.
 export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(function ScrollRegion(
   {
     children,
     pinThresholdPx,
     onStateChange,
-    autoScrollOnOpen = true,
     autoScrollOnStream = true,
     streamActive = false,
     resetKey = null,
@@ -80,39 +107,195 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
   ref,
 ) {
   const containerRef = useRef<HTMLDivElement | null>(null)
+  const contentRef = useRef<HTMLDivElement | null>(null)
   const sentinelRef = useRef<HTMLDivElement | null>(null)
-  // Always start in `pinned`. The IntersectionObserver promotes to
-  // `follow` after paint if the sentinel is visible. Settings never
-  // bias the initial value — this is what keeps stream auto-scroll
-  // from accidentally firing on open.
-  const [state, setState] = useState<ScrollState>('pinned')
+  // Start in `follow`: an empty or non-overflowing transcript is already
+  // at its leaf. Overflow measurement below flips to `pinned` when needed.
+  const [state, setState] = useState<ScrollState>('follow')
   const stateRef = useRef<ScrollState>(state)
   stateRef.current = state
+  const followIntentRef = useRef(true)
+  const didOpenRef = useRef(false)
+  const resetKeyRef = useRef(resetKey)
+  const followFrameRef = useRef<number | null>(null)
+  const settleFrameRef = useRef<number | null>(null)
+  const settleFollowUntilRef = useRef(0)
+  const userScrollIntentUntilRef = useRef(0)
+  const thresholdRef = useRef(pinThresholdPx ?? DEFAULT_THRESHOLD_PX)
+  const autoScrollOnStreamRef = useRef(autoScrollOnStream)
+  const streamActiveRef = useRef(streamActive)
+  const previousStreamActiveRef = useRef(streamActive)
+  const streamFollowGraceUntilRef = useRef(streamActive ? Number.POSITIVE_INFINITY : 0)
+  thresholdRef.current = pinThresholdPx ?? DEFAULT_THRESHOLD_PX
+  autoScrollOnStreamRef.current = autoScrollOnStream
+  if (streamActive) {
+    streamFollowGraceUntilRef.current = Number.POSITIVE_INFINITY
+  } else if (previousStreamActiveRef.current) {
+    streamFollowGraceUntilRef.current = nowMs() + STREAM_FOLLOW_GRACE_MS
+  }
+  previousStreamActiveRef.current = streamActive
+  streamActiveRef.current = streamActive
+
+  const debugScroll = useCallback(
+    (event: ScrollDebugEvent, details: Record<string, unknown> = {}) => {
+      const container = containerRef.current
+      const timestamp = nowMs()
+      logScrollDebug(event, {
+        resetKey,
+        state: stateRef.current,
+        followIntent: followIntentRef.current,
+        didOpen: didOpenRef.current,
+        streamActive: streamActiveRef.current,
+        autoScrollOnStream: autoScrollOnStreamRef.current,
+        userScrollIntentMsRemaining: Math.max(0, userScrollIntentUntilRef.current - timestamp),
+        streamGraceMsRemaining:
+          streamFollowGraceUntilRef.current === Number.POSITIVE_INFINITY
+            ? 'infinity'
+            : Math.max(0, streamFollowGraceUntilRef.current - timestamp),
+        settleMsRemaining: Math.max(0, settleFollowUntilRef.current - timestamp),
+        metrics: container
+          ? {
+              scrollTop: container.scrollTop,
+              clientHeight: container.clientHeight,
+              scrollHeight: container.scrollHeight,
+              distanceFromBottom:
+                container.scrollHeight - container.scrollTop - container.clientHeight,
+            }
+          : null,
+        ...details,
+      })
+    },
+    [resetKey],
+  )
+
   useEffect(() => {
     onStateChange?.(state)
   }, [state, onStateChange])
 
-  // Open-time jump. Fires once on mount (or after `resetKey` changes)
-  // the first time the container has overflowing content. Uses
-  // useLayoutEffect + behavior: 'auto' so the scroll position is set
-  // before the browser paints — the chat renders already at the leaf.
-  const didOpenRef = useRef(false)
-  // biome-ignore lint/correctness/useExhaustiveDependencies: resetKey is the explicit reset signal for this ref.
-  useEffect(() => {
-    didOpenRef.current = false
-  }, [resetKey])
-  // biome-ignore lint/correctness/useExhaustiveDependencies: children changes are the content-load signal for measuring overflow.
-  useLayoutEffect(() => {
-    if (didOpenRef.current) return
+  const setScrollStateNow = useCallback(
+    (next: ScrollState, reason = 'unknown') => {
+      const previous = stateRef.current
+      stateRef.current = next
+      if (previous !== next) debugScroll('state', { from: previous, to: next, reason })
+      setState((prev) => (prev === next ? prev : next))
+    },
+    [debugScroll],
+  )
+
+  const scrollToBottomNow = useCallback(
+    (opts?: { smooth?: boolean; reason?: string }) => {
+      const container = containerRef.current
+      if (!container) return
+      const smooth = opts?.smooth ?? false
+      const top = bottomScrollTop(container)
+      debugScroll('scroll.to-bottom', {
+        reason: opts?.reason ?? 'unknown',
+        smooth,
+        targetTop: top,
+      })
+      container.scrollTo({
+        top,
+        behavior: smooth ? 'smooth' : 'auto',
+      })
+      if (!smooth) container.scrollTop = top
+      followIntentRef.current = true
+      setScrollStateNow('follow', opts?.reason ?? 'scroll.to-bottom')
+    },
+    [debugScroll, setScrollStateNow],
+  )
+
+  const shouldFollowContentGrowth = useCallback(() => {
+    if (!followIntentRef.current) return false
+    if (nowMs() <= settleFollowUntilRef.current) return true
+    if (!autoScrollOnStreamRef.current) return false
+    if (streamActiveRef.current) return true
+    return nowMs() <= streamFollowGraceUntilRef.current
+  }, [])
+
+  const settleActive = useCallback(() => nowMs() <= settleFollowUntilRef.current, [])
+
+  const startFollowSettle = useCallback(
+    (durationMs = STREAM_FOLLOW_GRACE_MS, reason = 'stream') => {
+      settleFollowUntilRef.current = Math.max(settleFollowUntilRef.current, nowMs() + durationMs)
+      debugScroll('follow.settle.start', { durationMs, reason })
+      if (settleFrameRef.current !== null) return
+      const tick = () => {
+        settleFrameRef.current = null
+        if (!shouldFollowContentGrowth()) return
+        debugScroll('follow.settle.tick', { reason })
+        scrollToBottomNow({ smooth: false, reason: `settle:${reason}` })
+        if (nowMs() > settleFollowUntilRef.current) return
+        settleFrameRef.current = requestAnimationFrame(tick)
+      }
+      settleFrameRef.current = requestAnimationFrame(tick)
+    },
+    [debugScroll, scrollToBottomNow, shouldFollowContentGrowth],
+  )
+
+  const scheduleFollowScroll = useCallback(() => {
+    if (followFrameRef.current !== null) return
+    debugScroll('follow.schedule')
+    followFrameRef.current = requestAnimationFrame(() => {
+      followFrameRef.current = null
+      if (!shouldFollowContentGrowth()) return
+      debugScroll('follow.scheduled-scroll')
+      scrollToBottomNow({ smooth: false, reason: 'scheduled-follow' })
+    })
+  }, [debugScroll, scrollToBottomNow, shouldFollowContentGrowth])
+
+  const updateFromScrollPosition = useCallback(
+    (source: PositionSource) => {
+      const container = containerRef.current
+      if (!container) return
+      const next = scrollStateFromPosition(container, thresholdRef.current)
+      debugScroll('position', { source, next })
+      if (next === 'follow') {
+        followIntentRef.current = true
+        setScrollStateNow('follow', source)
+        return
+      }
+      const userScrollIntentActive = nowMs() <= userScrollIntentUntilRef.current
+      if (shouldFollowContentGrowth() && !userScrollIntentActive) {
+        scheduleFollowScroll()
+        return
+      }
+      followIntentRef.current = false
+      setScrollStateNow('pinned', source)
+    },
+    [debugScroll, scheduleFollowScroll, setScrollStateNow, shouldFollowContentGrowth],
+  )
+
+  const completeOpenScrollIfReady = useCallback(() => {
     const container = containerRef.current
-    if (!container) return
-    // No content yet (empty or still loading). Wait for another render
-    // so autoScrollOnOpen can apply once content arrives.
-    if (container.scrollHeight <= container.clientHeight) return
+    if (!container || didOpenRef.current) return false
+    // No overflow yet (empty, still loading, or short transcript). Keep the
+    // latch open so the first real overflow can still land at the leaf.
+    if (container.scrollHeight <= container.clientHeight) {
+      followIntentRef.current = true
+      debugScroll('open.wait')
+      setScrollStateNow('follow', 'open.wait')
+      return false
+    }
     didOpenRef.current = true
-    if (!autoScrollOnOpen) return
-    container.scrollTo({ top: container.scrollHeight, behavior: 'auto' })
-  }, [children, autoScrollOnOpen])
+    debugScroll('open.bottom')
+    scrollToBottomNow({ smooth: false, reason: 'open' })
+    startFollowSettle(OPEN_FOLLOW_GRACE_MS, 'open')
+    return true
+  }, [debugScroll, scrollToBottomNow, setScrollStateNow, startFollowSettle])
+
+  // Open-time jump. The reset happens in the same layout pass as the
+  // measurement, so a reused scroll container can't carry the previous chat's
+  // "already opened" latch into the new chat.
+  useLayoutEffect(() => {
+    if (!Object.is(resetKeyRef.current, resetKey)) {
+      debugScroll('reset-key', { from: resetKeyRef.current, to: resetKey })
+      resetKeyRef.current = resetKey
+      didOpenRef.current = false
+      followIntentRef.current = true
+    }
+    if (completeOpenScrollIfReady()) return
+    updateFromScrollPosition('layout')
+  })
 
   // IntersectionObserver tracks whether the sentinel is visible.
   // Settings don't filter the signal — `state` always reflects actual
@@ -126,7 +309,9 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
     const threshold = pinThresholdPx ?? DEFAULT_THRESHOLD_PX
     const observer = new IntersectionObserver(
       () => {
-        setState(scrollStateFromPosition(container, threshold))
+        debugScroll('observer')
+        if (completeOpenScrollIfReady()) return
+        updateFromScrollPosition('observer')
       },
       {
         root: container,
@@ -136,57 +321,124 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
     )
     observer.observe(sentinel)
     return () => observer.disconnect()
-  }, [pinThresholdPx])
+  }, [pinThresholdPx, completeOpenScrollIfReady, debugScroll, updateFromScrollPosition])
+
+  // Live stream snapshots rerender individual Message rows through Zustand;
+  // the ScrollRegion parent does not necessarily rerender per token. Observing
+  // content height is the durable signal that the bottom moved.
+  useEffect(() => {
+    if (typeof ResizeObserver === 'undefined') return
+    const content = contentRef.current
+    if (!content) return
+    const observer = new ResizeObserver(() => {
+      debugScroll('resize')
+      if (completeOpenScrollIfReady()) return
+      if (shouldFollowContentGrowth()) {
+        if (settleActive()) {
+          debugScroll('follow.resize-scroll')
+          scrollToBottomNow({ smooth: false, reason: 'resize-follow' })
+        } else {
+          scheduleFollowScroll()
+        }
+        return
+      }
+      updateFromScrollPosition('resize')
+    })
+    observer.observe(content)
+    return () => observer.disconnect()
+  }, [
+    completeOpenScrollIfReady,
+    debugScroll,
+    scheduleFollowScroll,
+    shouldFollowContentGrowth,
+    scrollToBottomNow,
+    settleActive,
+    updateFromScrollPosition,
+  ])
+
+  useEffect(() => {
+    if (typeof MutationObserver === 'undefined') return
+    const content = contentRef.current
+    if (!content) return
+    const observer = new MutationObserver(() => {
+      debugScroll('mutation')
+      if (completeOpenScrollIfReady()) return
+      if (shouldFollowContentGrowth()) {
+        if (settleActive()) {
+          debugScroll('follow.resize-scroll', { source: 'mutation' })
+          scrollToBottomNow({ smooth: false, reason: 'mutation-follow' })
+        } else {
+          scheduleFollowScroll()
+        }
+        return
+      }
+      updateFromScrollPosition('resize')
+    })
+    observer.observe(content, {
+      childList: true,
+      characterData: true,
+      subtree: true,
+    })
+    return () => observer.disconnect()
+  }, [
+    completeOpenScrollIfReady,
+    debugScroll,
+    scheduleFollowScroll,
+    shouldFollowContentGrowth,
+    scrollToBottomNow,
+    settleActive,
+    updateFromScrollPosition,
+  ])
 
   useEffect(() => {
     const container = containerRef.current
     if (!container) return
-    const threshold = pinThresholdPx ?? DEFAULT_THRESHOLD_PX
-    let frame: number | null = null
-    const updateFromScrollPosition = () => {
-      frame = null
-      setState(scrollStateFromPosition(container, threshold))
+    const markUserScrollIntent = (event: 'wheel' | 'touchmove') => {
+      userScrollIntentUntilRef.current = nowMs() + USER_SCROLL_INTENT_MS
+      if (followIntentRef.current) {
+        followIntentRef.current = false
+        settleFollowUntilRef.current = 0
+        debugScroll('user-follow-cancel', { event })
+      }
+      debugScroll(event)
     }
     const onScroll = () => {
-      if (frame !== null) return
-      frame = requestAnimationFrame(updateFromScrollPosition)
+      debugScroll('native-scroll')
+      updateFromScrollPosition('scroll')
     }
+    const onWheel = () => markUserScrollIntent('wheel')
+    const onTouchMove = () => markUserScrollIntent('touchmove')
+    container.addEventListener('wheel', onWheel, { passive: true })
+    container.addEventListener('touchmove', onTouchMove, { passive: true })
     container.addEventListener('scroll', onScroll, { passive: true })
     return () => {
+      container.removeEventListener('wheel', onWheel)
+      container.removeEventListener('touchmove', onTouchMove)
       container.removeEventListener('scroll', onScroll)
-      if (frame !== null) cancelAnimationFrame(frame)
     }
-  }, [pinThresholdPx])
+  }, [debugScroll, updateFromScrollPosition])
 
-  // Stream-time follow. Fires ONLY while a stream is active AND the
-  // user is at the bottom. Chat switches, content loads, and in-place
-  // edits don't trigger this because `streamActive` is false in those
-  // cases — the scroll position stays put.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: children changes are the stream-content signal for follow scrolling.
-  useEffect(() => {
+  useLayoutEffect(() => {
+    if (!autoScrollOnStream || !streamActive || !followIntentRef.current) return
+    debugScroll('stream-start')
+    scrollToBottomNow({ smooth: false, reason: 'stream-start' })
+  }, [autoScrollOnStream, debugScroll, streamActive, scrollToBottomNow])
+
+  useLayoutEffect(() => {
+    if (streamActive) return
     if (!autoScrollOnStream) return
-    if (!streamActive) return
-    if (state !== 'follow') return
-    const container = containerRef.current
-    if (!container) return
-    const id = requestAnimationFrame(() => {
-      container.scrollTo({
-        top: container.scrollHeight,
-        behavior: 'auto',
-      })
-    })
-    return () => cancelAnimationFrame(id)
-  }, [state, children, autoScrollOnStream, streamActive])
+    if (!followIntentRef.current) return
+    if (nowMs() > streamFollowGraceUntilRef.current) return
+    debugScroll('stream-settle-start')
+    startFollowSettle()
+  }, [autoScrollOnStream, debugScroll, streamActive, startFollowSettle])
 
-  const scrollToBottom = useCallback((opts?: { smooth?: boolean }) => {
-    const container = containerRef.current
-    if (!container) return
-    const smooth = opts?.smooth ?? true
-    container.scrollTo({
-      top: container.scrollHeight,
-      behavior: smooth ? 'smooth' : 'auto',
-    })
-  }, [])
+  const scrollToBottom = useCallback(
+    (opts?: { smooth?: boolean }) => {
+      scrollToBottomNow({ smooth: opts?.smooth ?? true })
+    },
+    [scrollToBottomNow],
+  )
 
   useImperativeHandle(
     ref,
@@ -203,17 +455,27 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
   useEffect(() => {
     const onVisibility = () => {
       if (document.visibilityState !== 'visible') return
-      if (stateRef.current !== 'follow') return
+      if (!followIntentRef.current) return
+      debugScroll('visibility')
       scrollToBottom({ smooth: false })
     }
     document.addEventListener('visibilitychange', onVisibility)
     return () => document.removeEventListener('visibilitychange', onVisibility)
-  }, [scrollToBottom])
+  }, [debugScroll, scrollToBottom])
+
+  useEffect(() => {
+    return () => {
+      if (followFrameRef.current !== null) cancelAnimationFrame(followFrameRef.current)
+      if (settleFrameRef.current !== null) cancelAnimationFrame(settleFrameRef.current)
+    }
+  }, [])
 
   return (
     <div ref={containerRef} data-ui="scroll-region" data-scroll-state={state}>
-      {children}
-      <div ref={sentinelRef} data-ui="scroll-sentinel" aria-hidden="true" />
+      <div ref={contentRef} data-ui="scroll-content">
+        {children}
+        <div ref={sentinelRef} data-ui="scroll-sentinel" aria-hidden="true" />
+      </div>
     </div>
   )
 })

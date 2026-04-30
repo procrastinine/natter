@@ -1,25 +1,24 @@
-import { useLiveQuery } from 'dexie-react-hooks'
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { navigateToChat } from '../../app/router'
 import { cursorKeyOf, groupByParent, indexById } from '../../core/active-path'
 import { resolveLastUpdatedBranchBelow } from '../../core/branch-resolve'
+import type { EffectiveCapability } from '../../core/capabilities'
 import { computeBranchTitle, forkChatFromMessage } from '../../core/chat-fork'
 import type { LongMessageDisplayMode } from '../../core/global-settings'
 import { swipe } from '../../core/messages'
+import { UNLIMITED_CONTEXT } from '../../core/prompt-size'
+import { prefillClassFor } from '../../core/quirks'
 import type {
   ChatId,
   ChatSettings,
   CursorMap,
-  ModelEndpoint,
-  MessageId,
   MessageAttachmentRef,
+  MessageId,
   MessageRole,
   Message as MessageRow,
+  ModelEndpoint,
   ReasoningDetail,
 } from '../../core/types'
-import type { EffectiveCapability } from '../../core/capabilities'
-import { UNLIMITED_CONTEXT } from '../../core/prompt-size'
-import { prefillClassFor } from '../../core/quirks'
 import { useChat } from '../../hooks/useChat'
 import {
   continueFromMessage,
@@ -28,7 +27,8 @@ import {
   type MessageOpsContext,
   regenerateFromMessage,
 } from '../../hooks/useMessageOps'
-import { getChat, listChatSidebarRows, loadActiveBranchSnapshot } from '../../store/chats'
+import { getChat, listChatSidebarRows } from '../../store/chats'
+import type { ActiveBranchSnapshot } from '../../store/repository'
 import { useChatStore } from '../../store/zustand/chatStore'
 import { useStreamStore } from '../../store/zustand/streamStore'
 import { useToastStore } from '../../store/zustand/toastStore'
@@ -44,6 +44,7 @@ interface MessageListProps {
   capability?: EffectiveCapability
   prefillRecommendationEndpoints?: readonly ModelEndpoint[]
   longMessageDisplayMode?: LongMessageDisplayMode
+  branchSnapshot: ActiveBranchSnapshot | null
 }
 
 // Stable reference so `useChatStore(selector)` doesn't allocate a fresh `{}`
@@ -76,13 +77,9 @@ export const MessageList = memo(function MessageList({
   capability,
   prefillRecommendationEndpoints = [],
   longMessageDisplayMode = 'full',
+  branchSnapshot,
 }: MessageListProps) {
   const cursor = useChatStore((state) => state.cursors[chatId] ?? EMPTY_CURSOR)
-  const branchSnapshot = useLiveQuery(
-    () => loadActiveBranchSnapshot(chatId, cursor),
-    [chatId, cursor],
-    null,
-  )
   const messages = useStableMessageRows(branchSnapshot?.branch ?? [])
   const treeMessages = useMemo(
     () => (branchSnapshot?.allHeaders ?? []) as unknown as MessageRow[],
@@ -107,10 +104,7 @@ export const MessageList = memo(function MessageList({
     }
     return live
   }, [byParent])
-  const branchTreeKey = useMemo(
-    () => branchSnapshot?.treeKey ?? '',
-    [branchSnapshot],
-  )
+  const branchTreeKey = useMemo(() => branchSnapshot?.treeKey ?? '', [branchSnapshot])
   const path = messages
   const hasAnyReasoningDetails = useMemo(
     () => path.some((m) => (m.reasoningDetails?.length ?? 0) > 0),

@@ -7,13 +7,13 @@
 // `getSetting/setSetting` helpers. Typed read/write wrappers are exposed so
 // call sites don't have to remember the key names.
 
+import { getSetting, setSetting } from '../store/settings'
 import {
   type CorsProxyConfig,
   DEFAULT_CORS_PROXY_URL,
   DEV_CORS_PROXY_URL,
   PUBLIC_CORS_PROXY_URL,
 } from './cors-proxy'
-import { getSetting, setSetting } from '../store/settings'
 
 // Re-exports for browser callers that group their preference imports
 // here. The canonical source lives in `./cors-proxy` so daemon-mode and
@@ -103,12 +103,6 @@ interface GlobalPreferences {
   // Most-recently-used model ids (most-recent first). Drives the Recent
   // list in the picker. Capped at 20 entries.
   recentModels: string[]
-  // Jump to the bottom when a chat opens. When false, the scroll
-  // position starts wherever the browser's default places it (top
-  // for fresh mounts). Independent of `autoScrollOnStream`, so a user
-  // can, e.g., always land at the bottom on open without being yanked
-  // while reading mid-stream.
-  autoScrollOnOpen: boolean
   // Pull the viewport down as new tokens arrive during a live stream.
   // Only applies while the ScrollRegion is in `follow` state (the
   // sentinel is visible); scrolling up into `pinned` always stops
@@ -149,7 +143,6 @@ export const DEFAULT_GLOBAL_PREFERENCES: Readonly<GlobalPreferences> = Object.fr
   chatMaxWidth: 920,
   fontFamily: 'system',
   baseFontSize: 15,
-  autoScrollOnOpen: true,
   autoScrollOnStream: true,
   pinnedModels: [...DEFAULT_PINNED_MODELS],
   recentModels: [],
@@ -166,7 +159,6 @@ const ASSISTANT_PIC_KEY = 'global:assistant-profile-picture'
 const CHAT_MAX_WIDTH_KEY = 'global:chat-max-width'
 const FONT_FAMILY_KEY = 'global:font-family'
 const BASE_FONT_SIZE_KEY = 'global:base-font-size'
-const AUTO_SCROLL_OPEN_KEY = 'global:auto-scroll-open'
 const AUTO_SCROLL_STREAM_KEY = 'global:auto-scroll-stream'
 const PINNED_MODELS_KEY = 'global:pinned-models'
 const RECENT_MODELS_KEY = 'global:recent-models'
@@ -286,7 +278,6 @@ export async function readGlobalPreferences(): Promise<GlobalPreferences> {
     chatMaxWidth,
     fontFamily,
     baseFontSize,
-    autoScrollOpen,
     autoScrollStream,
     pinned,
     recent,
@@ -302,7 +293,6 @@ export async function readGlobalPreferences(): Promise<GlobalPreferences> {
     getSetting<ChatMaxWidth>(CHAT_MAX_WIDTH_KEY),
     getSetting<FontFamilyChoice>(FONT_FAMILY_KEY),
     getSetting<BaseFontSize>(BASE_FONT_SIZE_KEY),
-    getSetting<boolean>(AUTO_SCROLL_OPEN_KEY),
     getSetting<boolean>(AUTO_SCROLL_STREAM_KEY),
     getSetting<string[]>(PINNED_MODELS_KEY),
     getSetting<string[]>(RECENT_MODELS_KEY),
@@ -326,10 +316,6 @@ export async function readGlobalPreferences(): Promise<GlobalPreferences> {
     chatMaxWidth: chatMaxWidthOrDefault(chatMaxWidth),
     fontFamily: fontFamilyOrDefault(fontFamily),
     baseFontSize: baseFontSizeOrDefault(baseFontSize),
-    autoScrollOnOpen:
-      typeof autoScrollOpen === 'boolean'
-        ? autoScrollOpen
-        : DEFAULT_GLOBAL_PREFERENCES.autoScrollOnOpen,
     autoScrollOnStream:
       typeof autoScrollStream === 'boolean'
         ? autoScrollStream
@@ -340,8 +326,7 @@ export async function readGlobalPreferences(): Promise<GlobalPreferences> {
     recentModels: Array.isArray(recent) ? recent.filter((x) => typeof x === 'string') : [],
     tokenCalibrationMode: calibrationModeOrDefault(tokenCalibrationMode),
     longMessageDisplayMode: longMessageDisplayModeOrDefault(longMessageDisplayMode),
-    corsProxyUrl:
-      typeof corsProxyUrl === 'string' ? corsProxyUrl : defaultCorsProxyUrlForRuntime(),
+    corsProxyUrl: typeof corsProxyUrl === 'string' ? corsProxyUrl : defaultCorsProxyUrlForRuntime(),
     corsProxySecret: typeof corsProxySecret === 'string' ? corsProxySecret : '',
   }
 }
@@ -407,10 +392,6 @@ export async function writeFontFamily(value: FontFamilyChoice): Promise<void> {
 
 export async function writeBaseFontSize(value: BaseFontSize): Promise<void> {
   await setSetting(BASE_FONT_SIZE_KEY, value)
-}
-
-export async function writeAutoScrollOnOpen(value: boolean): Promise<void> {
-  await setSetting(AUTO_SCROLL_OPEN_KEY, value)
 }
 
 export async function writeAutoScrollOnStream(value: boolean): Promise<void> {

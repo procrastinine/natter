@@ -206,6 +206,85 @@ describe.skipIf(!LIVE)('live — OpenAI direct Responses (gpt-5.4-nano)', () => 
     expect(t2Input).toBeGreaterThan(t1Input)
   }, 120_000)
 
+  it('multi-turn: summary-only reasoning echo must drop original id', async () => {
+    const user1: ResponsesInputItem = {
+      type: 'message',
+      role: 'user',
+      content: [
+        {
+          type: 'input_text',
+          text: 'How many distinct positive divisors does 720 have? Show brief work.',
+        },
+      ],
+    }
+    const turn1 = await responsesOnce(ctx, {
+      model: 'gpt-5.4-nano',
+      input: [user1],
+      max_output_tokens: 400,
+      reasoning: { effort: 'high', summary: 'auto' },
+      include: ['reasoning.encrypted_content'],
+      store: false,
+    })
+    const r1 = turn1.output?.find((i) => i.type === 'reasoning') as
+      | (ResponsesInputItem & { id?: string; encrypted_content?: string; summary?: unknown[] })
+      | undefined
+    const m1 = turn1.output?.find((i) => i.type === 'message')
+    expect(r1?.id).toBeDefined()
+    expect(r1?.encrypted_content).toBeDefined()
+    expect(r1?.summary?.length ?? 0).toBeGreaterThan(0)
+    expect(m1).toBeDefined()
+    if (!r1 || !m1) throw new Error('missing first-turn output items')
+
+    const editedToolContext: ResponsesInputItem = {
+      type: 'message',
+      role: 'assistant',
+      content: [
+        {
+          type: 'output_text',
+          text: [
+            '<tool_call>',
+            'Tool: edited lookup',
+            'Dialect: openai-responses',
+            'Type: function_call',
+            'Edited: true',
+            'Arguments: {"query":"720"}',
+            '</tool_call>',
+          ].join('\n'),
+        },
+      ],
+    }
+    const followup: ResponsesInputItem = {
+      type: 'message',
+      role: 'user',
+      content: [{ type: 'input_text', text: 'Continue from this context. Five words max.' }],
+    }
+
+    const badSummaryOnly = { ...r1 }
+    delete badSummaryOnly.encrypted_content
+    await expect(
+      responsesOnce(ctx, {
+        model: 'gpt-5.4-nano',
+        input: [user1, badSummaryOnly, m1, editedToolContext, followup],
+        max_output_tokens: 160,
+        reasoning: { effort: 'low', summary: 'auto' },
+        include: ['reasoning.encrypted_content'],
+        store: false,
+      }),
+    ).rejects.toThrow(/not found|store.*false|input/i)
+
+    const goodSummaryOnly = { ...badSummaryOnly }
+    delete goodSummaryOnly.id
+    const turn2 = await responsesOnce(ctx, {
+      model: 'gpt-5.4-nano',
+      input: [user1, goodSummaryOnly, m1, editedToolContext, followup],
+      max_output_tokens: 160,
+      reasoning: { effort: 'low', summary: 'auto' },
+      include: ['reasoning.encrypted_content'],
+      store: false,
+    })
+    expect(turn2.status).toBe('completed')
+  }, 120_000)
+
   it('splitter: live stream → lanes with phase + finish', async () => {
     const lanes = await drain(
       splitResponsesStream(

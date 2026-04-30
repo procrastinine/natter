@@ -6,7 +6,7 @@ import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { beforeAll, describe, expect, it } from 'vitest'
 import { geminiOnce, geminiStream, type GeminiContext } from '../../src/api/gemini-native'
-import type { GeminiContent } from '../../src/api/gemini-types'
+import type { GeminiContent, GeminiPart } from '../../src/api/gemini-types'
 import { splitGeminiStream, type StreamLaneEvent } from '../../src/api/stream-transforms'
 import type { ConnectionProfile } from '../../src/core/types'
 
@@ -176,8 +176,7 @@ describe.skipIf(!LIVE)('live — Gemini native generateContent', () => {
     expect(promptTokens2).toBeGreaterThan(promptTokens1)
   }, 90_000)
 
-  it('rejects missing thoughtSignature in function-call round-trip', async () => {
-    // Set up a tool call (Gemini 3 REQUIRES signature on echoed functionCall parts)
+  it('function-call round-trip accepts omitted/edited signatures but rejects corrupted signatures', async () => {
     const tool = {
       functionDeclarations: [
         {
@@ -210,7 +209,12 @@ describe.skipIf(!LIVE)('live — Gemini native generateContent', () => {
     )
     const call = turn1.candidates?.[0]?.content.parts.find(
       (p) => 'functionCall' in p,
-    ) as { functionCall?: { name: string; args?: Record<string, unknown> }; thoughtSignature?: string } | undefined
+    ) as
+      | {
+          functionCall?: { name: string; args?: Record<string, unknown>; id?: string }
+          thoughtSignature?: string
+        }
+      | undefined
     if (!call) {
       // Gemini may not call the tool in this sparse setup — gracefully skip.
       return
@@ -219,7 +223,14 @@ describe.skipIf(!LIVE)('live — Gemini native generateContent', () => {
     if (!functionCall) throw new Error('expected Gemini functionCall part')
     expect(call.thoughtSignature).toBeDefined()
 
-    // Now strip the signature and expect HTTP 400.
+    const signedPart: GeminiPart =
+      call.thoughtSignature !== undefined
+        ? { functionCall, thoughtSignature: call.thoughtSignature }
+        : { functionCall }
+    const signedModel: GeminiContent = {
+      role: 'model',
+      parts: [signedPart],
+    }
     const strippedModel: GeminiContent = {
       role: 'model',
       parts: [
@@ -229,33 +240,93 @@ describe.skipIf(!LIVE)('live — Gemini native generateContent', () => {
         },
       ],
     }
+    const editedFunctionCall = {
+      ...functionCall,
+      args: { ...(functionCall.args ?? {}), key: 'edited-answer' },
+    }
+    const editedPart: GeminiPart =
+      call.thoughtSignature !== undefined
+        ? { functionCall: editedFunctionCall, thoughtSignature: call.thoughtSignature }
+        : { functionCall: editedFunctionCall }
+    const editedModel: GeminiContent = {
+      role: 'model',
+      parts: [editedPart],
+    }
+    const corruptedModel: GeminiContent = {
+      role: 'model',
+      parts: [
+        {
+          functionCall: {
+            ...functionCall,
+            args: { ...(functionCall.args ?? {}), key: 'edited-answer' },
+          },
+          thoughtSignature: 'definitely-not-a-valid-signature',
+        },
+      ],
+    }
+    const functionResponse: GeminiContent = {
+      role: 'user',
+      parts: [
+        {
+          functionResponse: {
+            name: functionCall.name,
+            response: { result: 42 },
+          },
+        },
+      ],
+    }
+    const followup: GeminiContent = {
+      role: 'user',
+      parts: [{ text: 'Use the tool result in five words max.' }],
+    }
+    const baseUser: GeminiContent = {
+      role: 'user',
+      parts: [{ text: 'Use the lookup tool to look up "answer".' }],
+    }
+
+    const signed = await geminiOnce(
+      ctx,
+      {
+        contents: [baseUser, signedModel, functionResponse, followup],
+        tools: [tool],
+        generationConfig: { maxOutputTokens: 100 },
+      },
+      'gemini-3.1-flash-lite-preview',
+    )
+    expect(signed.candidates?.[0]?.finishReason).toBe('STOP')
+
+    const stripped = await geminiOnce(
+      ctx,
+      {
+        contents: [baseUser, strippedModel, functionResponse, followup],
+        tools: [tool],
+        generationConfig: { maxOutputTokens: 100 },
+      },
+      'gemini-3.1-flash-lite-preview',
+    )
+    expect(stripped.candidates?.[0]?.finishReason).toBe('STOP')
+
+    const edited = await geminiOnce(
+      ctx,
+      {
+        contents: [baseUser, editedModel, functionResponse, followup],
+        tools: [tool],
+        generationConfig: { maxOutputTokens: 100 },
+      },
+      'gemini-3.1-flash-lite-preview',
+    )
+    expect(edited.candidates?.[0]?.finishReason).toBe('STOP')
+
     await expect(
       geminiOnce(
         ctx,
         {
-          contents: [
-            {
-              role: 'user',
-              parts: [{ text: 'Use the lookup tool to look up "answer".' }],
-            },
-            strippedModel,
-            {
-              role: 'user',
-              parts: [
-                {
-                  functionResponse: {
-                    name: functionCall.name,
-                    response: { result: 42 },
-                  },
-                },
-              ],
-            },
-          ],
+          contents: [baseUser, corruptedModel, functionResponse, followup],
           tools: [tool],
           generationConfig: { maxOutputTokens: 100 },
         },
         'gemini-3.1-flash-lite-preview',
       ),
-    ).rejects.toThrow(/thought_signature|thoughtSignature/i)
+    ).rejects.toThrow(/thought[_ ]?signature|thoughtSignature/i)
   }, 120_000)
 })

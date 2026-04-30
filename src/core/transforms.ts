@@ -1225,7 +1225,8 @@ function applyIncludeToEchoItem(
   // Echoing those back to Azure makes the upstream reject with
   // `Encrypted content item_id did not match the target item id.`; strip
   // those synthetic ids and let the upstream pair `encrypted_content` by
-  // content rather than id. Real upstream ids (`rs_01...`) round-trip fine.
+  // content rather than id. Real upstream ids (`rs_01...`) round-trip fine
+  // only while the encrypted blob is still present.
   if (typeof next.id === 'string' && /^(rs|msg)_tmp_/.test(next.id)) delete next.id
   // Drop encrypted_content when the include flag is off OR the target route
   // can't round-trip it. OpenAI/Azure Responses accept `encrypted_content`
@@ -1241,6 +1242,9 @@ function applyIncludeToEchoItem(
     preservationFormat === 'google-gemini-v1'
   ) {
     delete next.encrypted_content
+  }
+  if (next.encrypted_content === undefined && typeof next.id === 'string') {
+    delete next.id
   }
   // OpenAI /responses requires `summary` to be present on `{type:'reasoning'}`
   // input items (empty `[]` is fine). Per live probe R2: dropping summary
