@@ -17,6 +17,7 @@ import type { LlamaServerProps } from '../../api/probe'
 import { chooseApi, isResponsesCapable, isTextCompletionsCapable } from '../../core/api-choice'
 import type { EffectiveCapability } from '../../core/capabilities'
 import { validateChatSettings } from '../../core/capabilities'
+import { type HostedToolProvider, isOpenAiDirectProfile } from '../../core/provider-hosted-tools'
 import {
   emitsEncryptedReasoningFor,
   prefillClassFor,
@@ -25,10 +26,14 @@ import {
 } from '../../core/quirks'
 import type {
   Chat,
-  ConnectionProfile,
+  ChatProviderToolSettings,
+  AnthropicServerToolId,
   ConnectionKind,
+  ConnectionProfile,
+  GoogleServerToolId,
   Message,
   ModelEndpoint,
+  OpenAiServerToolId,
   ReasoningInclude,
   SamplingKey,
   ServerToolId,
@@ -49,6 +54,7 @@ interface ParamFormProps {
   textTemplateMode?: 'openrouter' | 'llama-server' | null | undefined
   llamaProps?: LlamaServerProps | null | undefined
   connectionKind?: ConnectionKind | undefined
+  connectionProfile?: ConnectionProfile | null | undefined
   textCompletionsActive?: boolean | undefined
 }
 
@@ -274,13 +280,46 @@ const SAMPLING_FIELDS: SamplingSpec[] = [
 
 const SETTINGS_SLIDER_COMMIT_DEBOUNCE_MS = 200
 
-const HOSTED_TOOL_OPTIONS: ReadonlyArray<{
+const OPENROUTER_HOSTED_TOOL_OPTIONS: ReadonlyArray<{
   id: ServerToolId
   label: string
+  help: string
 }> = [
-  { id: 'web-search', label: 'Web search' },
-  { id: 'datetime', label: 'Datetime' },
-  { id: 'web-fetch', label: 'Web fetch' },
+  { id: 'web-search', label: 'Web search', help: 'OpenRouter runs the search server-side.' },
+  { id: 'datetime', label: 'Datetime', help: 'OpenRouter supplies current date/time context.' },
+  { id: 'web-fetch', label: 'Web fetch', help: 'OpenRouter fetches URLs server-side.' },
+]
+
+const OPENAI_HOSTED_TOOL_OPTIONS: ReadonlyArray<{
+  id: OpenAiServerToolId
+  label: string
+  help: string
+}> = [
+  { id: 'web-search', label: 'Web search', help: 'OpenAI Responses web search.' },
+  { id: 'image-generation', label: 'Image generation', help: 'OpenAI hosted image tool.' },
+  { id: 'code-interpreter', label: 'Code interpreter', help: 'OpenAI provider-hosted Python.' },
+  { id: 'shell', label: 'Shell', help: "OpenAI's provider-hosted container shell." },
+]
+
+const GOOGLE_HOSTED_TOOL_OPTIONS: ReadonlyArray<{
+  id: GoogleServerToolId
+  label: string
+  help: string
+}> = [
+  { id: 'google-search', label: 'Google Search', help: 'Gemini native search grounding.' },
+  { id: 'url-context', label: 'URL context', help: 'Gemini reads URLs explicitly in context.' },
+  { id: 'code-execution', label: 'Code execution', help: 'Gemini provider-hosted Python.' },
+]
+
+const ANTHROPIC_HOSTED_TOOL_OPTIONS: ReadonlyArray<{
+  id: AnthropicServerToolId
+  label: string
+  help: string
+}> = [
+  { id: 'web-search', label: 'Web search', help: 'Claude searches the web server-side.' },
+  { id: 'web-fetch', label: 'Web fetch', help: 'Claude fetches explicit URLs server-side.' },
+  { id: 'code-execution', label: 'Code execution', help: 'Claude provider-hosted code sandbox.' },
+  { id: 'advisor', label: 'Advisor', help: 'Claude consults a higher-capability advisor model.' },
 ]
 
 export function ParamForm({
@@ -289,6 +328,7 @@ export function ParamForm({
   textTemplateMode = null,
   llamaProps = null,
   connectionKind = 'custom',
+  connectionProfile = null,
   textCompletionsActive = false,
 }: ParamFormProps) {
   const prefillSupportedForModel = chat.settings.model
@@ -348,14 +388,12 @@ export function ParamForm({
       <VerbositySection chat={chat} capability={capability} />
       <HostedToolsSection
         chat={chat}
+        capability={capability}
         connectionKind={connectionKind}
+        connectionProfile={connectionProfile}
         textCompletionsActive={textCompletionsActive}
       />
-      <SamplingSection
-        chat={chat}
-        capability={capability}
-        showStopInline={!textTemplateMode}
-      />
+      <SamplingSection chat={chat} capability={capability} showStopInline={!textTemplateMode} />
       {textTemplateMode ? (
         <TextTemplateSection
           chat={chat}
@@ -400,11 +438,7 @@ export function PrefillSettingsSection({
         </label>
       </div>
       {continuePrefill ? (
-        <PrefillSettingsPrompt
-          chatId={chat.id}
-          settings={chat.settings}
-          endpoints={endpoints}
-        />
+        <PrefillSettingsPrompt chatId={chat.id} settings={chat.settings} endpoints={endpoints} />
       ) : null}
     </PrefillPromptEditor>
   )
@@ -412,35 +446,53 @@ export function PrefillSettingsSection({
 
 function HostedToolsSection({
   chat,
+  capability,
   connectionKind,
+  connectionProfile,
   textCompletionsActive,
 }: {
   chat: Chat
+  capability: EffectiveCapability
   connectionKind: ConnectionKind
+  connectionProfile?: ConnectionProfile | null | undefined
   textCompletionsActive: boolean
 }) {
-  const selected = chat.settings.enabledServerToolIds
-  const enabledCount = HOSTED_TOOL_OPTIONS.filter((option) => selected.includes(option.id)).length
-  const available = connectionKind === 'openrouter' && !textCompletionsActive
-  const disabledReason = textCompletionsActive
-    ? 'Hosted tools are not sent on text completions.'
-    : connectionKind === 'openrouter'
-      ? ''
-      : 'Hosted tools are only sent through OpenRouter in this pass.'
+  const config = hostedToolUiConfig({ connectionKind, connectionProfile, capability })
+  if (!config || textCompletionsActive) {
+    return null
+  }
+  const options =
+    config.provider === 'anthropic'
+      ? config.options.filter(
+          (option) => option.id !== 'advisor' || anthropicAdvisorAvailable(chat.settings.model),
+        )
+      : config.options
+  if (options.length === 0) return null
+  const bucket = chat.settings.tools[config.provider]
+  const selected = bucket.enabledServerToolIds as string[]
+  const enabledCount = options.filter((option) => selected.includes(option.id)).length
 
-  const toggle = (id: ServerToolId, checked: boolean) => {
+  const toggle = (id: string, checked: boolean) => {
     const next = checked
       ? selected.includes(id)
         ? selected
         : [...selected, id]
       : selected.filter((candidate) => candidate !== id)
-    void updateChatSettings(chat.id, { enabledServerToolIds: next })
+    void updateChatSettings(chat.id, {
+      tools: {
+        ...chat.settings.tools,
+        [config.provider]: {
+          ...bucket,
+          enabledServerToolIds: next,
+        },
+      } as ChatProviderToolSettings,
+    })
   }
 
   return (
     <section data-ui="settings-section" data-ui-section="hosted-tools">
       <h3>
-        Tools
+        {config.title}
         {enabledCount > 0 ? (
           <>
             {' '}
@@ -449,24 +501,446 @@ function HostedToolsSection({
         ) : null}
       </h3>
       <div data-ui="field-group" data-ui-field>
-        {HOSTED_TOOL_OPTIONS.map((option) => (
-          <label
-            key={option.id}
-            data-ui="checkbox-row"
-            data-disabled={available ? undefined : 'true'}
-          >
-            <input
-              type="checkbox"
-              checked={selected.includes(option.id)}
-              disabled={!available}
-              onChange={(e) => toggle(option.id, e.target.checked)}
-            />
-            <span>{option.label}</span>
-          </label>
-        ))}
-        {!available && disabledReason ? <span data-ui="helper">{disabledReason}</span> : null}
+        {options.map((option) => {
+          const enabled = selected.includes(option.id)
+          return (
+            <div key={option.id} data-ui="hosted-tool-row">
+              <label data-ui="checkbox-row">
+                <input
+                  type="checkbox"
+                  checked={enabled}
+                  onChange={(e) => toggle(option.id, e.target.checked)}
+                />
+                <span>{option.label}</span>
+                <InfoDisclosure title={option.help} />
+              </label>
+              {enabled ? (
+                <HostedToolConfigControls
+                  chat={chat}
+                  provider={config.provider}
+                  toolId={option.id}
+                />
+              ) : null}
+            </div>
+          )
+        })}
       </div>
     </section>
+  )
+}
+
+type HostedToolUiOption = {
+  id: string
+  label: string
+  help: string
+}
+
+function hostedToolUiConfig(input: {
+  connectionKind: ConnectionKind
+  connectionProfile?: ConnectionProfile | null | undefined
+  capability: EffectiveCapability
+}): {
+  provider: HostedToolProvider
+  title: string
+  options: readonly HostedToolUiOption[]
+} | null {
+  if (!input.capability.supportedParameters.has('tools')) return null
+  if (input.connectionKind === 'openrouter') {
+    return {
+      provider: 'openrouter',
+      title: 'OpenRouter tools',
+      options: OPENROUTER_HOSTED_TOOL_OPTIONS,
+    }
+  }
+  const profile = input.connectionProfile
+  if (
+    (profile ? isOpenAiDirectProfile(profile) : input.connectionKind === 'openai-compatible') &&
+    input.capability.supportedParameters.has('tools')
+  ) {
+    return { provider: 'openai', title: 'OpenAI tools', options: OPENAI_HOSTED_TOOL_OPTIONS }
+  }
+  if (input.connectionKind === 'google' && (!profile || profile.geminiMode !== 'openai-compat')) {
+    return { provider: 'google', title: 'Gemini tools', options: GOOGLE_HOSTED_TOOL_OPTIONS }
+  }
+  if (input.connectionKind === 'anthropic') {
+    return { provider: 'anthropic', title: 'Anthropic tools', options: ANTHROPIC_HOSTED_TOOL_OPTIONS }
+  }
+  return null
+}
+
+function HostedToolConfigControls({
+  chat,
+  provider,
+  toolId,
+}: {
+  chat: Chat
+  provider: HostedToolProvider
+  toolId: string
+}) {
+  if (provider === 'openai') {
+    return <OpenAiHostedToolConfig chat={chat} toolId={toolId as OpenAiServerToolId} />
+  }
+  if (provider === 'google') {
+    return <GoogleHostedToolConfig chat={chat} toolId={toolId as GoogleServerToolId} />
+  }
+  if (provider === 'anthropic') {
+    return <AnthropicHostedToolConfig chat={chat} toolId={toolId as AnthropicServerToolId} />
+  }
+  return null
+}
+
+function OpenAiHostedToolConfig({ chat, toolId }: { chat: Chat; toolId: OpenAiServerToolId }) {
+  const bucket = chat.settings.tools.openai
+  const config = bucket.config ?? {}
+  const updateConfig = (patch: NonNullable<typeof bucket.config>) => {
+    void updateChatSettings(chat.id, {
+      tools: {
+        ...chat.settings.tools,
+        openai: {
+          ...bucket,
+          config: {
+            ...config,
+            ...patch,
+          },
+        },
+      },
+    })
+  }
+  if (toolId === 'web-search') {
+    const web = config['web-search'] ?? {}
+    return (
+      <div data-ui="hosted-tool-config">
+        <div data-ui="field-group" data-ui-field>
+          <span>Search context</span>
+          <div data-ui="segmented">
+            {(['low', 'medium', 'high'] as const).map((value) => (
+              <button
+                key={value}
+                type="button"
+                data-ui="segmented-option"
+                aria-pressed={(web.searchContextSize ?? 'medium') === value}
+                onClick={() => updateConfig({ 'web-search': { ...web, searchContextSize: value } })}
+              >
+                {value}
+              </button>
+            ))}
+          </div>
+        </div>
+        <label data-ui="checkbox-row">
+          <input
+            type="checkbox"
+            checked={web.includeSources === true}
+            onChange={(e) =>
+              updateConfig({ 'web-search': { ...web, includeSources: e.target.checked } })
+            }
+          />
+          <span>Include sources</span>
+        </label>
+      </div>
+    )
+  }
+  if (toolId === 'image-generation') {
+    const image = config['image-generation'] ?? {}
+    return (
+      <div data-ui="hosted-tool-config">
+        <div data-ui="field-group" data-ui-field>
+          <span>Image output</span>
+          <select
+            aria-label="Image format"
+            value={image.format ?? 'png'}
+            onChange={(e) =>
+              updateConfig({
+                'image-generation': {
+                  ...image,
+                  format: e.target.value as NonNullable<typeof image.format>,
+                },
+              })
+            }
+          >
+            <option value="png">PNG</option>
+            <option value="jpeg">JPEG</option>
+            <option value="webp">WebP</option>
+          </select>
+          <select
+            aria-label="Image size"
+            value={image.size ?? 'auto'}
+            onChange={(e) =>
+              updateConfig({
+                'image-generation': {
+                  ...image,
+                  size: e.target.value as NonNullable<typeof image.size>,
+                },
+              })
+            }
+          >
+            <option value="auto">auto</option>
+            <option value="1024x1024">1024x1024</option>
+            <option value="1024x1536">1024x1536</option>
+            <option value="1536x1024">1536x1024</option>
+          </select>
+        </div>
+      </div>
+    )
+  }
+  if (toolId === 'shell') {
+    return <span data-ui="helper">Runs in OpenAI's provider container with network disabled.</span>
+  }
+  if (toolId === 'code-interpreter') {
+    return <span data-ui="helper">Runs provider-hosted Python without local file uploads.</span>
+  }
+  return null
+}
+
+function GoogleHostedToolConfig({ chat, toolId }: { chat: Chat; toolId: GoogleServerToolId }) {
+  if (toolId !== 'google-search') return null
+  const bucket = chat.settings.tools.google
+  const config = bucket.config ?? {}
+  const search = config['google-search'] ?? {}
+  return (
+    <label data-ui="checkbox-row">
+      <input
+        type="checkbox"
+        checked={search.renderSearchEntryPoint === true}
+        onChange={(e) =>
+          void updateChatSettings(chat.id, {
+            tools: {
+              ...chat.settings.tools,
+              google: {
+                ...bucket,
+                config: {
+                  ...config,
+                  'google-search': {
+                    ...search,
+                    renderSearchEntryPoint: e.target.checked,
+                  },
+                },
+              },
+            },
+          })
+        }
+      />
+      <span>Render search entry point when returned</span>
+    </label>
+  )
+}
+
+function AnthropicHostedToolConfig({
+  chat,
+  toolId,
+}: {
+  chat: Chat
+  toolId: AnthropicServerToolId
+}) {
+  const bucket = chat.settings.tools.anthropic
+  const config = bucket.config ?? {}
+  const updateConfig = (patch: NonNullable<typeof bucket.config>) => {
+    void updateChatSettings(chat.id, {
+      tools: {
+        ...chat.settings.tools,
+        anthropic: {
+          ...bucket,
+          config: {
+            ...config,
+            ...patch,
+          },
+        },
+      },
+    })
+  }
+
+  if (toolId === 'web-search') {
+    const web = config['web-search'] ?? {}
+    return (
+      <div data-ui="hosted-tool-config">
+        <div data-ui="field-group" data-ui-field>
+          <span>Version</span>
+          <select
+            aria-label="Anthropic web search version"
+            value={web.version ?? 'web_search_20250305'}
+            onChange={(e) =>
+              updateConfig({
+                'web-search': {
+                  ...web,
+                  version: e.target.value as NonNullable<typeof web.version>,
+                },
+              })
+            }
+          >
+            <option value="web_search_20250305">Basic</option>
+            <option value="web_search_20260209">Dynamic filtering</option>
+          </select>
+          <NumberField
+            label="Max uses"
+            value={web.maxUses}
+            min={1}
+            max={100}
+            onCommit={(value) => {
+              const next = { ...web }
+              if (value === undefined) delete next.maxUses
+              else next.maxUses = value
+              updateConfig({ 'web-search': next })
+            }}
+          />
+        </div>
+      </div>
+    )
+  }
+
+  if (toolId === 'web-fetch') {
+    const fetch = config['web-fetch'] ?? {}
+    return (
+      <div data-ui="hosted-tool-config">
+        <div data-ui="field-group" data-ui-field>
+          <span>Version</span>
+          <select
+            aria-label="Anthropic web fetch version"
+            value={fetch.version ?? 'web_fetch_20250910'}
+            onChange={(e) =>
+              updateConfig({
+                'web-fetch': {
+                  ...fetch,
+                  version: e.target.value as NonNullable<typeof fetch.version>,
+                },
+              })
+            }
+          >
+            <option value="web_fetch_20250910">Basic</option>
+            <option value="web_fetch_20260209">Dynamic filtering</option>
+          </select>
+          <NumberField
+            label="Max uses"
+            value={fetch.maxUses}
+            min={1}
+            max={100}
+            onCommit={(value) => {
+              const next = { ...fetch }
+              if (value === undefined) delete next.maxUses
+              else next.maxUses = value
+              updateConfig({ 'web-fetch': next })
+            }}
+          />
+          <NumberField
+            label="Max content tokens"
+            value={fetch.maxContentTokens}
+            min={1}
+            max={200000}
+            onCommit={(value) => {
+              const next = { ...fetch }
+              if (value === undefined) delete next.maxContentTokens
+              else next.maxContentTokens = value
+              updateConfig({ 'web-fetch': next })
+            }}
+          />
+        </div>
+        <label data-ui="checkbox-row">
+          <input
+            type="checkbox"
+            checked={fetch.citationsEnabled === true}
+            onChange={(e) =>
+              updateConfig({ 'web-fetch': { ...fetch, citationsEnabled: e.target.checked } })
+            }
+          />
+          <span>Include citations</span>
+        </label>
+      </div>
+    )
+  }
+
+  if (toolId === 'code-execution') {
+    const code = config['code-execution'] ?? {}
+    return (
+      <div data-ui="hosted-tool-config">
+        <div data-ui="field-group" data-ui-field>
+          <span>Version</span>
+          <select
+            aria-label="Anthropic code execution version"
+            value={code.version ?? 'code_execution_20250825'}
+            onChange={(e) =>
+              updateConfig({
+                'code-execution': {
+                  ...code,
+                  version: e.target.value as NonNullable<typeof code.version>,
+                },
+              })
+            }
+          >
+            <option value="code_execution_20250825">Current</option>
+            <option value="code_execution_20260120">2026 beta</option>
+          </select>
+        </div>
+        <span data-ui="helper">Provider-hosted sandbox; local files are not uploaded.</span>
+      </div>
+    )
+  }
+
+  if (toolId === 'advisor') {
+    const advisor = config.advisor ?? { advisorModel: 'claude-opus-4-7' as const }
+    return (
+      <div data-ui="hosted-tool-config">
+        <div data-ui="field-group" data-ui-field>
+          <span>Advisor model</span>
+          <select
+            aria-label="Anthropic advisor model"
+            value={advisor.advisorModel}
+            onChange={() => updateConfig({ advisor: { advisorModel: 'claude-opus-4-7' } })}
+          >
+            <option value="claude-opus-4-7">Claude Opus 4.7</option>
+          </select>
+        </div>
+      </div>
+    )
+  }
+  return null
+}
+
+function anthropicAdvisorAvailable(modelId: string): boolean {
+  const normalized = modelId
+    .replace(/^anthropic\//u, '')
+    .replace(/(\d)\.(\d)(?=-|$)/g, '$1-$2')
+    .replace(/-\d{8}$/u, '')
+  return new Set(['claude-haiku-4-5', 'claude-sonnet-4-6', 'claude-opus-4-6', 'claude-opus-4-7']).has(
+    normalized,
+  )
+}
+
+function NumberField({
+  label,
+  value,
+  min,
+  max,
+  onCommit,
+}: {
+  label: string
+  value: number | undefined
+  min: number
+  max: number
+  onCommit: (value: number | undefined) => void
+}) {
+  const [draft, setDraft] = useState(value === undefined ? '' : String(value))
+  useEffect(() => {
+    setDraft(value === undefined ? '' : String(value))
+  }, [value])
+  return (
+    <label data-ui="inline-control-row">
+      <span>{label}</span>
+      <input
+        type="number"
+        min={min}
+        max={max}
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={() => {
+          const trimmed = draft.trim()
+          if (trimmed.length === 0) {
+            onCommit(undefined)
+            return
+          }
+          const parsed = Number(trimmed)
+          if (!Number.isFinite(parsed)) return
+          onCommit(Math.min(max, Math.max(min, Math.trunc(parsed))))
+        }}
+      />
+    </label>
   )
 }
 
@@ -748,12 +1222,15 @@ function ReasoningSummaryControl({
   )
 }
 
-// Three independent checkboxes: encrypted / visible summary / visible text.
-// User directive: all three are ALWAYS clickable (a mid-chat model swap may
-// bring history from another family that the current model can still
-// consume). The only gate is the encrypted checkbox: it is hidden entirely
-// when the model doesn't emit encrypted reasoning (unknown format, Gemini
-// 2.5, etc.), no disabled-with-tooltip.
+// Include-in-next-turn checkboxes: reasoning carriers plus provider tool
+// evidence. Tool evidence is intentionally controlled from the same context
+// group as reasoning because both affect what assistant-side metadata is
+// echoed into the next request.
+// User directive: shown reasoning include checkboxes are ALWAYS clickable (a
+// mid-chat model swap may bring history from another family that the current
+// model can still consume). The only gate is the encrypted checkbox: it is
+// hidden entirely when the model doesn't emit encrypted reasoning (unknown
+// format, Gemini 2.5, etc.), no disabled-with-tooltip.
 //
 // Filter-side safety: `filterReasoningForInclude` silent-drops incompatible
 // formats before sending, with a console.warn. The UI just lets users pick.
@@ -764,17 +1241,21 @@ export function ReasoningIncludeControls({
   capability,
 }: {
   chat: Chat
-  capability: EffectiveCapability
+  capability: EffectiveCapability | null
 }) {
-  // Only surface this control when the model actually has a reasoning param.
-  // Otherwise include flags are a no-op.
-  const hasReasoning =
-    capability.supportedParameters.has('reasoning') ||
-    capability.supportedParameters.has('thinking') ||
-    capability.supportedParameters.has('include_reasoning')
-  if (!hasReasoning) return null
+  if (!chat.settings.model) return null
+
+  // Only surface reasoning controls when the model actually has a reasoning
+  // param. Otherwise those flags are a no-op, but tool-call context remains
+  // a real context concern for any selected model.
+  const hasReasoning = Boolean(
+    capability?.supportedParameters.has('reasoning') ||
+      capability?.supportedParameters.has('thinking') ||
+      capability?.supportedParameters.has('include_reasoning'),
+  )
   const r = chat.settings.reasoning
   const include = r.include
+  const includeToolCalls = chat.settings.toolCallContext.include
   const emitsEncrypted = emitsEncryptedReasoningFor(chat.settings.model) === 'always'
   const updateInclude = (patch: Partial<ReasoningInclude>) =>
     void updateChatSettings(chat.id, {
@@ -792,11 +1273,11 @@ export function ReasoningIncludeControls({
       ? 'No plaintext reasoning is being included — check Visible summary or Visible text first.'
       : 'When on, kept summary + text are sent as a <think>…</think> block prepended to the assistant message body instead of reasoning_details. Encrypted carriers ride the native channel either way. Ignored on Responses + Gemini-native routes.'
   return (
-    <section data-ui="settings-section" data-ui-section="reasoning-include">
+    <section data-ui="settings-section" data-ui-section="include-next-turn">
       <h3>Include in next turn</h3>
-      <div data-ui="field-group" data-ui-field data-ui-group="reasoning-include">
+      <div data-ui="field-group" data-ui-field data-ui-group="include-next-turn">
         <div data-ui="reasoning-include-group">
-          {emitsEncrypted ? (
+          {hasReasoning && emitsEncrypted ? (
             <label data-ui="reasoning-checkbox">
               <input
                 type="checkbox"
@@ -806,39 +1287,56 @@ export function ReasoningIncludeControls({
               <span>Encrypted reasoning</span>
             </label>
           ) : null}
+          {hasReasoning ? (
+            <>
+              <label data-ui="reasoning-checkbox">
+                <input
+                  type="checkbox"
+                  checked={include.summary}
+                  onChange={(e) => updateInclude({ summary: e.target.checked })}
+                />
+                <span>Visible summary</span>
+              </label>
+              <label data-ui="reasoning-checkbox">
+                <input
+                  type="checkbox"
+                  checked={include.text}
+                  onChange={(e) => updateInclude({ text: e.target.checked })}
+                />
+                <span>Visible text</span>
+              </label>
+              <label
+                data-ui="reasoning-checkbox"
+                data-disabled={sendAsThinkDisabled ? 'true' : undefined}
+                title={sendAsThinkTitle}
+              >
+                <input
+                  type="checkbox"
+                  checked={sendAsThinkChecked}
+                  disabled={sendAsThinkDisabled}
+                  onChange={(e) => {
+                    if (textCompletionsActive) return
+                    void updateChatSettings(chat.id, {
+                      reasoning: { ...r, echoAsThinkTags: e.target.checked },
+                    })
+                  }}
+                />
+                <span>Send as &lt;think&gt; tags</span>
+              </label>
+            </>
+          ) : null}
           <label data-ui="reasoning-checkbox">
             <input
               type="checkbox"
-              checked={include.summary}
-              onChange={(e) => updateInclude({ summary: e.target.checked })}
-            />
-            <span>Visible summary</span>
-          </label>
-          <label data-ui="reasoning-checkbox">
-            <input
-              type="checkbox"
-              checked={include.text}
-              onChange={(e) => updateInclude({ text: e.target.checked })}
-            />
-            <span>Visible text</span>
-          </label>
-          <label
-            data-ui="reasoning-checkbox"
-            data-disabled={sendAsThinkDisabled ? 'true' : undefined}
-            title={sendAsThinkTitle}
-          >
-            <input
-              type="checkbox"
-              checked={sendAsThinkChecked}
-              disabled={sendAsThinkDisabled}
-              onChange={(e) => {
-                if (textCompletionsActive) return
+              checked={includeToolCalls}
+              onChange={(e) =>
                 void updateChatSettings(chat.id, {
-                  reasoning: { ...r, echoAsThinkTags: e.target.checked },
+                  toolCallContext: { include: e.target.checked },
                 })
-              }}
+              }
             />
-            <span>Send as &lt;think&gt; tags</span>
+            <span>Tool calls</span>
+            <InfoDisclosure title="When enabled, provider-returned tool calls and results are replayed in their native format when the next provider supports that dialect; otherwise they are converted to <tool_call> text blocks. Per-message eye toggles can exclude individual tool records." />
           </label>
         </div>
       </div>
@@ -964,13 +1462,7 @@ function VerbositySection({ chat, capability }: { chat: Chat; capability: Effect
   )
 }
 
-function StopInlineRow({
-  chat,
-  capability,
-}: {
-  chat: Chat
-  capability: EffectiveCapability
-}) {
+function StopInlineRow({ chat, capability }: { chat: Chat; capability: EffectiveCapability }) {
   const hasStop =
     capability.supportedParameters.has('stop') ||
     capability.supportedParameters.has('stop_sequences')

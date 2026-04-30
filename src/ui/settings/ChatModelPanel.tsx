@@ -15,8 +15,15 @@
 
 import { useLiveQuery } from 'dexie-react-hooks'
 import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
-import { probeLlamaServer, type LlamaServerProps } from '../../api/probe'
+import { type LlamaServerProps, probeLlamaServer } from '../../api/probe'
+import type { EffectiveCapability } from '../../core/capabilities'
 import { DEFAULT_GLOBAL_PREFERENCES, readGlobalPreferences } from '../../core/global-settings'
+import {
+  buildSettingsPromptSizeEstimateInput,
+  type PromptSizeEstimate,
+  type PromptSizeEstimateInput,
+  UNLIMITED_CONTEXT,
+} from '../../core/prompt-size'
 import { isTextCompletionsSelectableFor } from '../../core/quirks'
 import { readTokenCalibrationGlobal } from '../../core/token-calibration'
 import type {
@@ -27,13 +34,6 @@ import type {
   ConnectionProfile,
   Message,
 } from '../../core/types'
-import type { EffectiveCapability } from '../../core/capabilities'
-import {
-  buildSettingsPromptSizeEstimateInput,
-  type PromptSizeEstimateInput,
-  type PromptSizeEstimate,
-  UNLIMITED_CONTEXT,
-} from '../../core/prompt-size'
 import { usePrivacyRouting } from '../../hooks/usePrivacyRouting'
 import { useStreamStablePromptEstimate } from '../../hooks/useStreamStablePromptEstimate'
 import {
@@ -61,9 +61,13 @@ import { CachingPanel } from './CachingPanel'
 import { ContextPanel } from './ContextPanel'
 import { LlamaServerSection } from './LlamaServerSection'
 import { ModelPicker } from './ModelPicker'
-import { ApiModeSection, ParamForm, ReasoningIncludeControls } from './ParamForm'
-import { ProviderPicker } from './ProviderPicker'
+import {
+  ApiModeSection,
+  ParamForm,
+  ReasoningIncludeControls,
+} from './ParamForm'
 import { PromptsTab } from './PromptsTab'
+import { ProviderPicker } from './ProviderPicker'
 
 interface ChatModelPanelProps {
   // Null while the user is on /new before the chat row has materialized.
@@ -350,6 +354,7 @@ export function ChatModelPanel({ chatId, chatSnapshot = null, onClose }: ChatMod
             textTemplateMode={textTemplateMode}
             llamaProps={llamaProps}
             connectionKind={profile?.kind ?? 'custom'}
+            connectionProfile={profile}
             textCompletionsActive={textTemplateMode !== null}
           />
         ) : null}
@@ -574,7 +579,8 @@ function settingsMatch(a: Chat['settings'], b: Chat['settings']): boolean {
   if (stableSettingsString(a.reasoning) !== stableSettingsString(b.reasoning)) return false
   if (a.verbosity !== b.verbosity) return false
   if (a.maxCompletionTokens !== b.maxCompletionTokens) return false
-  if (stableSettingsString(a.anthropicCache) !== stableSettingsString(b.anthropicCache)) return false
+  if (stableSettingsString(a.anthropicCache) !== stableSettingsString(b.anthropicCache))
+    return false
   if (stableSettingsString(a.providerPrefs ?? {}) !== stableSettingsString(b.providerPrefs ?? {}))
     return false
   return true
@@ -625,7 +631,9 @@ function ContextTab({
         estimateOverride={promptEstimate}
         showMiddleOut={isOpenRouter}
       />
-      {capability ? <ReasoningIncludeControls chat={chat} capability={capability} /> : null}
+      {chat.settings.model ? (
+        <ReasoningIncludeControls chat={chat} capability={capability} />
+      ) : null}
       <CachingPanel chat={chat} capability={capability} connectionKind={connectionKind} />
     </>
   )

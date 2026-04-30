@@ -149,7 +149,8 @@ export interface ResponsesRequestWire {
 export interface ResponsesInputItem {
   // 'message' | 'reasoning' | 'function_call' | 'function_call_output' |
   // 'web_search_call' | 'file_search_call' | 'image_generation_call' |
-  // 'code_interpreter_call' | 'computer_call' | 'mcp_tool_call' | …
+  // 'code_interpreter_call' | 'shell_call' | 'shell_call_output' |
+  // 'computer_call' | 'mcp_tool_call' | …
   type: string
   id?: string
   role?: string
@@ -162,7 +163,7 @@ export interface ResponsesInputItem {
   call_id?: string
   name?: string
   arguments?: string
-  output?: string
+  output?: unknown
   // Free-form forward-compat: let unknown item types round-trip without loss.
   [extra: string]: unknown
 }
@@ -327,6 +328,9 @@ export type ResponsesEventWire =
         | 'response.file_search_call.completed'
         | 'response.code_interpreter_call.in_progress'
         | 'response.code_interpreter_call.completed'
+        | 'response.shell_call.in_progress'
+        | 'response.shell_call.completed'
+        | 'response.shell_call_output.completed'
       output_index: number
       item_id: string
       sequence_number?: number

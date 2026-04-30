@@ -149,8 +149,9 @@ export const MessageList = memo(function MessageList({
       text: string,
       reasoning?: ReasoningDetail[],
       attachmentRefs?: MessageAttachmentRef[],
+      providerOutputItems?: MessageRow['providerOutputItems'],
     ) => {
-      await editInPlace(chatId, m, text, reasoning, attachmentRefs)
+      await editInPlace(chatId, m, text, reasoning, attachmentRefs, providerOutputItems)
       if (m.role === 'user') {
         setStaleHintFor((prev) => {
           if (prev.has(m.id)) return prev

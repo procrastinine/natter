@@ -56,6 +56,16 @@ export type GeminiPart =
       }
       [extra: string]: unknown
     }
+  | {
+      executableCode: { language?: string; code?: string; [extra: string]: unknown }
+      thoughtSignature?: string
+      [extra: string]: unknown
+    }
+  | {
+      codeExecutionResult: { outcome?: string; output?: string; [extra: string]: unknown }
+      thoughtSignature?: string
+      [extra: string]: unknown
+    }
 
 export interface ThinkingConfig {
   // Gemini 3+: 'minimal' | 'low' | 'medium' | 'high' (default 'high').

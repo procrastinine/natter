@@ -245,6 +245,10 @@ function applyMessageBodyPatch(body: MessageBodyRow, patch: MessageBodyPatch): M
     if (patch.responsesEchoItem === undefined) delete next.responsesEchoItem
     else next.responsesEchoItem = structuredClone(patch.responsesEchoItem)
   }
+  if ('providerOutputItems' in patch) {
+    if (patch.providerOutputItems === undefined) delete next.providerOutputItems
+    else next.providerOutputItems = structuredClone(patch.providerOutputItems)
+  }
   return next
 }
 
@@ -271,6 +275,9 @@ function replacementMessageBody(
   if (patch.phase !== undefined) body.phase = patch.phase
   if (patch.responsesEchoItem !== undefined) {
     body.responsesEchoItem = structuredClone(patch.responsesEchoItem)
+  }
+  if (patch.providerOutputItems !== undefined) {
+    body.providerOutputItems = structuredClone(patch.providerOutputItems)
   }
   return body
 }

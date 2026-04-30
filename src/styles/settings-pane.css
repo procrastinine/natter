@@ -143,6 +143,7 @@
  * blocks rather than a flat stack. Mirrors the line below the model
  * picker. `:not(:first-child)` keeps the line off when prior sections
  * happen to be hidden (e.g. reasoning + verbosity both gated out). */
+[data-ui="settings-section"][data-ui-section="include-next-turn"]:not(:first-child),
 [data-ui="settings-section"][data-ui-section="reasoning-include"]:not(:first-child),
 [data-ui="settings-section"][data-ui-section="hosted-tools"]:not(:first-child),
 [data-ui="settings-section"][data-ui-section="sampling"]:not(:first-child),
@@ -347,6 +348,24 @@
 
 [data-ui="checkbox-row"][data-disabled="true"] > input[type="checkbox"] {
   cursor: not-allowed;
+}
+
+[data-ui="hosted-tool-row"] {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+[data-ui="hosted-tool-config"] {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding-left: calc(var(--space-4) + var(--space-2));
+}
+
+[data-ui="hosted-tool-config"] select {
+  width: 100%;
+  box-sizing: border-box;
 }
 
 /* Prompt-slot header pairs the section title with the inline preset picker,

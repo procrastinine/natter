@@ -25,8 +25,8 @@ function isAnthropicBrowserOriginProfile(profile: ConnectionProfile): boolean {
 // e.g. custom auth scheme); per-call overrides are the escape hatch.
 //
 // `authScheme` selects between `Authorization: Bearer` (default, for any
-// OpenAI-compatible endpoint including Gemini's `/v1beta/openai/…` shim) and
-// `x-goog-api-key` (only for the native Gemini transport — see Phase 11).
+// OpenAI-compatible endpoint including Gemini's `/v1beta/openai/…` shim),
+// `x-goog-api-key` (native Gemini), and `x-api-key` (native Anthropic).
 // The transport adapter decides; `buildHeaders` does not infer it from the
 // profile's `kind` because the same Google profile can serve BOTH transports
 // depending on `geminiMode`.
@@ -36,13 +36,15 @@ export function buildHeaders(
   opts: {
     overrideHeaders?: Record<string, string>
     method?: 'GET' | 'POST'
-    authScheme?: 'bearer' | 'gemini-native'
+    authScheme?: 'bearer' | 'gemini-native' | 'anthropic-native'
   } = {},
 ): Record<string, string> {
   const headers: Record<string, string> = {}
   if (apiKey) {
     if (opts.authScheme === 'gemini-native') {
       headers['x-goog-api-key'] = apiKey
+    } else if (opts.authScheme === 'anthropic-native') {
+      headers['x-api-key'] = apiKey
     } else {
       headers.Authorization = `Bearer ${apiKey}`
     }

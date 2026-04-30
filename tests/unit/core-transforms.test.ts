@@ -41,6 +41,13 @@ function settings(overrides: Partial<ChatSettings> = {}): ChatSettings {
   }
 }
 
+function openRouterTools(
+  openrouter: Partial<ChatSettings['tools']['openrouter']>,
+): Pick<ChatSettings, 'tools'> {
+  const tools = cloneDefaultChatSettings().tools
+  return { tools: { ...tools, openrouter: { ...tools.openrouter, ...openrouter } } }
+}
+
 describe('toChatCompletions', () => {
   it('plain text conversation — envelope + messages + stream', () => {
     const path = [textMessage({ id: 'u1', role: 'user', text: 'hi' })]
@@ -185,11 +192,9 @@ describe('toChatCompletions', () => {
         outputModalities: ['text', 'audio'],
       },
     }
-    const { wire } = toChatCompletions(
-      settings({ model: 'openai/gpt-audio-mini' }),
-      path,
-      { capabilities: caps },
-    )
+    const { wire } = toChatCompletions(settings({ model: 'openai/gpt-audio-mini' }), path, {
+      capabilities: caps,
+    })
     expect(wire.modalities).toEqual(['text', 'audio'])
     expect(wire.audio).toEqual({ voice: 'alloy', format: 'pcm16' })
   })
@@ -267,15 +272,17 @@ describe('toChatCompletions', () => {
   it('serializes enabled OpenRouter hosted tools only when explicitly allowed', () => {
     const path = [textMessage({ id: 'u1', role: 'user', text: 'hi' })]
     const s = settings({
-      enabledServerToolIds: ['web-search', 'datetime', 'web-fetch'],
-      toolChoice: 'auto',
-      parallelToolCalls: false,
+      ...openRouterTools({
+        enabledServerToolIds: ['web-search', 'datetime', 'web-fetch'],
+        toolChoice: 'auto',
+        parallelToolCalls: false,
+      }),
     })
 
     expect(toChatCompletions(s, path).wire.tools).toBeUndefined()
 
     const { wire } = toChatCompletions(s, path, {
-      allowHostedTools: true,
+      hostedToolsProvider: 'openrouter',
       capabilities: {
         supportedParameters: ['tools', 'tool_choice', 'parallel_tool_calls'],
         streaming: 'supported',
@@ -293,10 +300,10 @@ describe('toChatCompletions', () => {
   it('does not serialize the image-generation server tool in the hosted-tools first pass', () => {
     const path = [textMessage({ id: 'u1', role: 'user', text: 'draw' })]
     const { wire } = toChatCompletions(
-      settings({ enabledServerToolIds: ['image-generation'] }),
+      settings(openRouterTools({ enabledServerToolIds: ['image-generation'] })),
       path,
       {
-        allowHostedTools: true,
+        hostedToolsProvider: 'openrouter',
         capabilities: {
           supportedParameters: ['tools', 'tool_choice'],
           streaming: 'supported',
@@ -442,5 +449,30 @@ describe('buildChatMessages', () => {
         tool_call_id: 'call_1',
       },
     ])
+  })
+
+  it('renders provider-hosted tool output as text on chat-completions history', () => {
+    const path: Message[] = [
+      textMessage({ id: 'u1', role: 'user', text: 'run shell' }),
+      {
+        ...textMessage({ id: 'a1', role: 'assistant', origin: 'generated', text: 'done' }),
+        providerOutputItems: [
+          {
+            dialect: 'openai-responses',
+            type: 'shell_call_output',
+            item: {
+              type: 'shell_call_output',
+              output: [{ stdout: 'natter-shape-probe.' }],
+            },
+          },
+        ],
+      },
+    ]
+    const { wire } = toChatCompletions(settings(), path)
+    const assistantMessage = wire.messages?.find(
+      (message) => (message as { role?: string }).role === 'assistant',
+    ) as { content?: string } | undefined
+    expect(assistantMessage?.content).toContain('<tool_call>')
+    expect(assistantMessage?.content).toContain('natter-shape-probe.')
   })
 })

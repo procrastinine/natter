@@ -135,27 +135,31 @@
   outline: none;
 }
 
-[data-ui="inline-editor-reasoning"] {
+[data-ui="inline-editor-reasoning"],
+[data-ui="inline-editor-tool-calls"] {
   border-top: 1px solid var(--color-border-subtle);
   padding: var(--space-2) var(--space-3);
   font-size: var(--font-size-sm);
   background: var(--color-bg-surface-2);
 }
 
-[data-ui="inline-editor-reasoning"] summary {
+[data-ui="inline-editor-reasoning"] summary,
+[data-ui="inline-editor-tool-calls"] summary {
   cursor: pointer;
   color: var(--color-fg-muted);
   user-select: none;
 }
 
-[data-ui="inline-editor-reasoning-list"] {
+[data-ui="inline-editor-reasoning-list"],
+[data-ui="inline-editor-tool-call-list"] {
   display: flex;
   flex-direction: column;
   gap: var(--space-3);
   margin-top: var(--space-2);
 }
 
-[data-ui="inline-editor-reasoning-row"] {
+[data-ui="inline-editor-reasoning-row"],
+[data-ui="inline-editor-tool-call-row"] {
   display: flex;
   flex-direction: column;
   gap: var(--space-1);
@@ -168,12 +172,39 @@
   letter-spacing: 0.03em;
 }
 
-[data-ui="inline-editor-reasoning-input"] {
+[data-ui="inline-editor-reasoning-input"],
+[data-ui="inline-editor-tool-call-input"] {
   font: inherit;
   min-height: 8rem;
   padding: var(--space-2);
   background: var(--color-bg-surface-1);
   resize: vertical;
+}
+
+[data-ui="inline-editor-tool-call-meta"] {
+  display: grid;
+  grid-template-columns: minmax(8rem, 1.1fr) minmax(10rem, 2fr) minmax(4rem, 0.6fr);
+  gap: var(--space-2);
+}
+
+[data-ui="inline-editor-tool-call-meta"] label {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  font-size: var(--font-size-xs);
+  color: var(--color-fg-muted);
+}
+
+[data-ui="inline-editor-tool-call-meta"] input,
+[data-ui="inline-editor-tool-call-meta"] select {
+  min-width: 0;
+  padding: var(--space-1) var(--space-2);
+  background: var(--color-bg-surface-1);
+  color: var(--color-fg-primary);
+}
+
+[data-ui="inline-editor-tool-call-add-button"] {
+  margin-top: var(--space-2);
 }
 
 [data-ui="inline-editor-reasoning-readonly"] {

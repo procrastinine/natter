@@ -193,6 +193,7 @@ function baseSettings(): ChatSettings {
     },
     allowFallbacks: true,
     contextStrategy: { kind: 'off' },
+    toolCallContext: { include: true },
     protocol: 'chat',
     api: 'auto',
     tools: { enabled: false, functions: [] },

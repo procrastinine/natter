@@ -6,10 +6,10 @@ import {
   resolveRequestPrivacyPlan,
 } from '../../src/core/send-planning'
 import type { Chat, ConnectionProfile, Message, MessageAttachmentRef } from '../../src/core/types'
+import { ingestAttachmentBytes } from '../../src/store/attachments'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import { __resetBrowserRepositoryForTests } from '../../src/store/browser-repo'
 import { __resetDbForTests, openDb } from '../../src/store/db'
-import { ingestAttachmentBytes } from '../../src/store/attachments'
 import { putCachedEndpoints } from '../../src/store/models-cache'
 import {
   __resetPrivacyInFlightForTests,
@@ -59,6 +59,35 @@ function makeOpenAiProfile(): ConnectionProfile {
   }
 }
 
+function makeGoogleProfile(): ConnectionProfile {
+  return {
+    ...makeProfile(),
+    id: 'prof-google',
+    name: 'Google',
+    kind: 'google',
+    baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+    usesResponsesApiByDefault: false,
+    supportsEndpointsApi: false,
+    supportsGenerationApi: false,
+    supportsPrivacyScrape: false,
+    geminiMode: 'native',
+  }
+}
+
+function makeAnthropicProfile(): ConnectionProfile {
+  return {
+    ...makeProfile(),
+    id: 'prof-anthropic',
+    name: 'Anthropic',
+    kind: 'anthropic',
+    baseUrl: 'https://api.anthropic.com/v1',
+    usesResponsesApiByDefault: false,
+    supportsEndpointsApi: false,
+    supportsGenerationApi: false,
+    supportsPrivacyScrape: false,
+  }
+}
+
 function makeChat(overrides: Partial<Chat['settings']> = {}): Chat {
   const settings = cloneDefaultChatSettings()
   settings.profileId = 'prof-1'
@@ -86,6 +115,20 @@ function makeChat(overrides: Partial<Chat['settings']> = {}): Chat {
   }
 }
 
+function openRouterTools(
+  openrouter: Partial<Chat['settings']['tools']['openrouter']>,
+): Pick<Chat['settings'], 'tools'> {
+  const tools = cloneDefaultChatSettings().tools
+  return { tools: { ...tools, openrouter: { ...tools.openrouter, ...openrouter } } }
+}
+
+function anthropicTools(
+  anthropic: Partial<Chat['settings']['tools']['anthropic']>,
+): Pick<Chat['settings'], 'tools'> {
+  const tools = cloneDefaultChatSettings().tools
+  return { tools: { ...tools, anthropic: { ...tools.anthropic, ...anthropic } } }
+}
+
 function makeMessage(text: string): Message {
   return {
     id: 'u1',
@@ -100,6 +143,20 @@ function makeMessage(text: string): Message {
     content: [{ type: 'text', text }],
     nodeVersion: 0,
     deleted: false,
+  }
+}
+
+function makeAssistantWithProviderOutput(
+  providerOutputItems: NonNullable<Message['providerOutputItems']>,
+): Message {
+  return {
+    ...makeMessage('tool evidence answer'),
+    id: 'a1',
+    parentId: 'u1',
+    role: 'assistant',
+    origin: 'generated',
+    content: [{ type: 'output_text', text: 'tool evidence answer' }],
+    providerOutputItems,
   }
 }
 
@@ -288,7 +345,7 @@ describe('resolveRequestPrivacyPlan', () => {
       model: 'gpt-4o',
       api: 'chat',
       allowFallbacks: false,
-      enabledServerToolIds: ['datetime'],
+      ...openRouterTools({ enabledServerToolIds: ['datetime'] }),
       providerPrefs: {
         sort: 'price',
         only: ['OpenAI'],
@@ -332,11 +389,188 @@ describe('resolveRequestPrivacyPlan', () => {
     expect(requestPlan.route?.kind).toBe('chat-completions')
   })
 
+  it('does not carry OpenRouter hosted tools onto direct OpenAI Responses requests', async () => {
+    const profile = makeOpenAiProfile()
+    const chat = makeChat({
+      profileId: profile.id,
+      model: 'gpt-5.4',
+      api: 'responses',
+      allowFallbacks: false,
+      ...openRouterTools({
+        enabledServerToolIds: ['datetime', 'web-fetch'],
+        toolChoice: 'auto',
+      }),
+      providerPrefs: {
+        sort: 'price',
+        only: ['OpenAI'],
+      },
+    })
+    await putCachedEndpoints(profile.id, 'gpt-5.4', {
+      id: 'gpt-5.4',
+      endpoints: [
+        {
+          provider_name: 'Training Host',
+          supported_parameters: ['tools', 'provider', 'tool_choice'],
+          context_length: 200000,
+          pricing: {},
+        },
+      ],
+    })
+
+    const { requestPlan, privacyPlan } = await prepareAssistantRequestPlan({
+      chat,
+      connection: profile,
+      pathMessages: [makeMessage('hello')],
+      draftText: '',
+    })
+
+    expect(privacyPlan.privacy.applicable).toBe(false)
+    expect(requestPlan.route?.kind).toBe('responses')
+    expect(requestPlan.wire.input).toBeDefined()
+    expect(requestPlan.wire.provider).toBeUndefined()
+    expect(requestPlan.wire.tools).toBeUndefined()
+    expect(requestPlan.wire.tool_choice).toBeUndefined()
+    expect(requestPlan.wire.parallel_tool_calls).toBeUndefined()
+  })
+
+  it('carries OpenAI hosted tools only on direct OpenAI Responses plans', async () => {
+    const profile = makeOpenAiProfile()
+    const tools = cloneDefaultChatSettings().tools
+    const chat = makeChat({
+      profileId: profile.id,
+      model: 'gpt-5.4-nano',
+      api: 'chat',
+      tools: {
+        ...tools,
+        openai: {
+          ...tools.openai,
+          enabledServerToolIds: ['web-search', 'image-generation'],
+          toolChoice: 'auto',
+          config: {
+            'web-search': {
+              searchContextSize: 'medium',
+              includeSources: true,
+            },
+            'image-generation': {
+              size: '1024x1024',
+              quality: 'low',
+              format: 'png',
+            },
+          },
+        },
+        openrouter: { ...tools.openrouter, enabledServerToolIds: ['datetime'] },
+      },
+    })
+
+    const { requestPlan, privacyPlan } = await prepareAssistantRequestPlan({
+      chat,
+      connection: profile,
+      pathMessages: [makeMessage('search then draw')],
+      draftText: '',
+      capabilities: {
+        supportedParameters: ['tools', 'tool_choice', 'parallel_tool_calls', 'reasoning'],
+        streaming: 'supported',
+        architecture: { inputModalities: ['text'], outputModalities: ['text'] },
+      },
+    })
+
+    expect(privacyPlan.privacy.applicable).toBe(false)
+    expect(requestPlan.route?.kind).toBe('responses')
+    expect(requestPlan.route?.reason).toBe('OpenAI hosted tools require Responses API')
+    expect(requestPlan.wire.provider).toBeUndefined()
+    expect(requestPlan.wire.tools).toEqual([
+      { type: 'web_search', search_context_size: 'medium' },
+      {
+        type: 'image_generation',
+        quality: 'low',
+        size: '1024x1024',
+        output_format: 'png',
+      },
+    ])
+    expect(requestPlan.wire.include).toEqual(
+      expect.arrayContaining(['web_search_call.action.sources']),
+    )
+    expect(requestPlan.wire.tool_choice).toBe('auto')
+  })
+
+  it('carries Google hosted tools only on Gemini native plans', async () => {
+    const profile = makeGoogleProfile()
+    const tools = cloneDefaultChatSettings().tools
+    const chat = makeChat({
+      profileId: profile.id,
+      model: 'google/gemini-3.1-flash-lite-preview',
+      api: 'chat',
+      tools: {
+        ...tools,
+        google: {
+          ...tools.google,
+          enabledServerToolIds: ['google-search', 'url-context'],
+        },
+        openrouter: { ...tools.openrouter, enabledServerToolIds: ['datetime'] },
+      },
+    })
+
+    const { requestPlan, privacyPlan } = await prepareAssistantRequestPlan({
+      chat,
+      connection: profile,
+      pathMessages: [makeMessage('search and read this URL')],
+      draftText: '',
+      capabilities: {
+        supportedParameters: ['tools'],
+        streaming: 'supported',
+        architecture: { inputModalities: ['text'], outputModalities: ['text'] },
+      },
+    })
+
+    expect(privacyPlan.privacy.applicable).toBe(false)
+    expect(requestPlan.route?.kind).toBe('gemini-generate')
+    expect(requestPlan.route?.reason).toBe('Gemini native required for Google hosted tools')
+    expect(requestPlan.wire.provider).toBeUndefined()
+    expect(requestPlan.wire.tools).toEqual([{ googleSearch: {} }, { urlContext: {} }])
+  })
+
+  it('carries Anthropic hosted tools only on Messages plans', async () => {
+    const profile = makeAnthropicProfile()
+    const chat = makeChat({
+      profileId: profile.id,
+      model: 'claude-haiku-4.5',
+      api: 'chat',
+      ...anthropicTools({
+        enabledServerToolIds: ['web-search', 'web-fetch'],
+        toolChoice: 'required',
+      }),
+    })
+
+    const { requestPlan, privacyPlan } = await prepareAssistantRequestPlan({
+      chat,
+      connection: profile,
+      pathMessages: [makeMessage('search the web')],
+      draftText: '',
+      capabilities: {
+        supportedParameters: ['tools', 'tool_choice'],
+        streaming: 'supported',
+        architecture: { inputModalities: ['text'], outputModalities: ['text'] },
+      },
+    })
+
+    expect(privacyPlan.privacy.applicable).toBe(false)
+    expect(requestPlan.route?.kind).toBe('anthropic-messages')
+    expect(requestPlan.anthropicModelId).toBe('claude-haiku-4-5')
+    expect(requestPlan.wire.model).toBe('claude-haiku-4-5')
+    expect(requestPlan.wire.tools).toEqual([
+      { type: 'web_search_20250305', name: 'web_search' },
+      { type: 'web_fetch_20250910', name: 'web_fetch' },
+    ])
+    expect(requestPlan.wire.tool_choice).toEqual({ type: 'any' })
+  })
+
   it('carries OpenRouter hosted tools on chat/responses plans only for OpenRouter connections', async () => {
     const profile = makeProfile()
     const chat = makeChat({
-      enabledServerToolIds: ['datetime', 'web-fetch'],
-      toolChoice: 'auto',
+      ...openRouterTools({
+        enabledServerToolIds: ['datetime', 'web-fetch'],
+        toolChoice: 'auto',
+      }),
     })
     await putCachedEndpoints(profile.id, chat.settings.model, {
       id: chat.settings.model,
@@ -376,6 +610,128 @@ describe('resolveRequestPrivacyPlan', () => {
       { type: 'openrouter:web_fetch' },
     ])
     expect(requestPlan.wire.tool_choice).toBe('auto')
+  })
+
+  it('uses one tool-call visibility source for OpenRouter, OpenAI, Gemini, and Anthropic planning', async () => {
+    const providerOutputItems: NonNullable<Message['providerOutputItems']> = [
+      {
+        dialect: 'openai-responses',
+        type: 'code_interpreter_call',
+        item: {
+          id: 'ci_1',
+          type: 'code_interpreter_call',
+          code: 'print(55)',
+          outputs: [{ type: 'logs', logs: '55' }],
+        },
+      },
+      {
+        dialect: 'google-gemini',
+        type: 'google:code_execution',
+        item: { executableCode: { language: 'PYTHON', code: 'print(55)' } },
+      },
+      {
+        dialect: 'anthropic-claude',
+        type: 'server_tool_use',
+        item: {
+          type: 'server_tool_use',
+          id: 'srvtoolu_1',
+          name: 'web_search',
+          input: { query: 'natter' },
+        },
+      },
+    ]
+    const path = [makeMessage('Use the tool evidence.'), makeAssistantWithProviderOutput(providerOutputItems)]
+
+    const openRouterProfile = makeProfile()
+    await putCachedEndpoints(openRouterProfile.id, 'anthropic/claude-haiku-4.5', {
+      id: 'anthropic/claude-haiku-4.5',
+      endpoints: [
+        {
+          provider_name: 'Anthropic',
+          provider_slug: 'anthropic',
+          supported_parameters: ['provider', 'tools'],
+          context_length: 200000,
+          pricing: {},
+        },
+      ],
+    })
+    await putCachedPrivacyPolicy(openRouterProfile.id, 'anthropic/claude-haiku-4.5', {
+      policies: {
+        anthropic: {
+          training: false,
+          trainingOpenRouter: false,
+          retainsPrompts: false,
+          canPublish: false,
+          termsOfServiceURL: '',
+          privacyPolicyURL: '',
+        },
+      },
+      fetchedAt: 0,
+    })
+
+    const cases = [
+      {
+        name: 'openrouter',
+        profile: openRouterProfile,
+        settings: { model: 'anthropic/claude-haiku-4.5' },
+        nativeNeedle: '<tool_call>',
+      },
+      {
+        name: 'openai',
+        profile: makeOpenAiProfile(),
+        settings: { profileId: 'prof-openai', model: 'gpt-5.4-nano' },
+        nativeNeedle: '"code_interpreter_call"',
+      },
+      {
+        name: 'google',
+        profile: makeGoogleProfile(),
+        settings: {
+          profileId: 'prof-google',
+          model: 'google/gemini-3.1-flash-lite-preview',
+        },
+        nativeNeedle: '"executableCode"',
+      },
+      {
+        name: 'anthropic',
+        profile: makeAnthropicProfile(),
+        settings: { profileId: 'prof-anthropic', model: 'anthropic/claude-haiku-4.5' },
+        nativeNeedle: '"server_tool_use"',
+      },
+    ] as const
+
+    for (const entry of cases) {
+      const includedChat = makeChat(entry.settings)
+      const included = await prepareAssistantRequestPlan({
+        chat: includedChat,
+        connection: entry.profile,
+        pathMessages: path,
+        draftText: '',
+      })
+      expect(included.requestPlan.outboundReasoningOpts.includeToolCalls, entry.name).toBe(true)
+      const includedWire = JSON.stringify(included.requestPlan.wire)
+      expect(includedWire, entry.name).toContain(entry.nativeNeedle)
+      expect(includedWire, entry.name).toContain('<tool_call>')
+
+      const disabledChat = makeChat({
+        ...entry.settings,
+        toolCallContext: { include: false },
+      })
+      const disabled = await prepareAssistantRequestPlan({
+        chat: disabledChat,
+        connection: entry.profile,
+        pathMessages: path,
+        draftText: '',
+      })
+      expect(disabled.requestPlan.outboundReasoningOpts.includeToolCalls, entry.name).toBe(false)
+      const disabledWire = JSON.stringify(disabled.requestPlan.wire)
+      expect(disabledWire, entry.name).not.toContain('<tool_call>')
+      expect(disabledWire, entry.name).not.toContain('code_interpreter_call')
+      expect(disabledWire, entry.name).not.toContain('executableCode')
+      expect(disabledWire, entry.name).not.toContain('server_tool_use')
+      expect(included.privacyPlan.neededTokens ?? 0, entry.name).toBeGreaterThan(
+        disabled.privacyPlan.neededTokens ?? 0,
+      )
+    }
   })
 
   it('passes the max completion cap through max_tokens when OpenRouter endpoints advertise only that name', async () => {
@@ -480,7 +836,7 @@ describe('resolveRequestPrivacyPlan', () => {
       textTemplate: 'chatml',
       maxCompletionTokens: 32,
       allowFallbacks: false,
-      enabledServerToolIds: ['datetime'],
+      ...openRouterTools({ enabledServerToolIds: ['datetime'] }),
       providerPrefs: { only: ['Nebius'] },
       reasoning: {
         ...cloneDefaultChatSettings().reasoning,

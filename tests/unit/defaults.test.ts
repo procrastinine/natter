@@ -36,7 +36,6 @@ describe('defaults', () => {
         "continueUserPrompt": "Now please generate only the continuation of the last message, with zero filler text.",
         "defaultPrefill": "",
         "enabledPluginIds": [],
-        "enabledServerToolIds": [],
         "enabledToolIds": [],
         "mediaContextStrategy": "echo-all",
         "mediaEchoN": 5,
@@ -64,8 +63,25 @@ describe('defaults', () => {
         "stripExifOnUpload": true,
         "systemPrompt": "",
         "systemRole": "system",
+        "toolCallContext": {
+          "include": true,
+        },
         "toolContextStrategy": "echo-all",
         "toolContextSummarizeAfterN": 6,
+        "tools": {
+          "anthropic": {
+            "enabledServerToolIds": [],
+          },
+          "google": {
+            "enabledServerToolIds": [],
+          },
+          "openai": {
+            "enabledServerToolIds": [],
+          },
+          "openrouter": {
+            "enabledServerToolIds": [],
+          },
+        },
         "trustedToolIds": [],
         "userIdMode": "omit",
       }

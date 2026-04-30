@@ -5,6 +5,10 @@
 // so the UI context gauge is safer to under-fill. `usage.*_tokens` in the response
 // is authoritative and always wins during reconciliation.
 
+import {
+  providerOutputItemsIncludedInContext,
+  renderProviderOutputItemsAsText,
+} from './provider-tool-context'
 import { clampTokens, safeContent, safeLen, safeServerTokens } from './token-guards'
 
 export type TokenizerFamily =
@@ -85,6 +89,7 @@ export interface PromptEstimateOptions {
   // (so there's nothing to echo on the *next* one). Forces visible-summary
   // / visible-text echo cost to 0 regardless of include flags.
   reasoningExcluded: boolean
+  includeToolCalls?: boolean
 }
 
 // Rough token cost of the reasoning fragments echoed on the NEXT turn for
@@ -187,6 +192,28 @@ export function estimateReasoningEchoTokens(
   return total
 }
 
+export function estimateToolCallContextTokensForMessage(
+  message: Message,
+  opts: Pick<PromptEstimateOptions, 'family' | 'includeToolCalls'>,
+): number {
+  if (message.role !== 'assistant') return 0
+  if (opts.includeToolCalls !== true) return 0
+  const items = providerOutputItemsIncludedInContext(message, {
+    includeToolCalls: opts.includeToolCalls,
+  })
+  if (items.length === 0) return 0
+  return estimateTokens(renderProviderOutputItemsAsText(items), opts.family)
+}
+
+export function estimateToolCallContextTokens(
+  messages: readonly Message[],
+  opts: Pick<PromptEstimateOptions, 'family' | 'includeToolCalls'>,
+): number {
+  let total = 0
+  for (const message of messages) total += estimateToolCallContextTokensForMessage(message, opts)
+  return total
+}
+
 // Convenience: estimate prompt-token cost of an entire path including
 // reasoning echo. Visible content + system prompt use the existing
 // `estimateTokens`; reasoning echo uses `estimateReasoningEchoTokens`.
@@ -206,5 +233,6 @@ export function estimatePromptTokens(
     }
   }
   total += estimateReasoningEchoTokens(messages, opts)
+  total += estimateToolCallContextTokens(messages, opts)
   return clampTokens(total)
 }

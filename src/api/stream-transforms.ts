@@ -16,7 +16,17 @@
 // (and exercised by unit tests) but not consumed by `useChat` until later
 // phases.
 
+import { isOpenAiResponsesFamilyFormat } from '../core/reasoning'
+import { createInlineReasoningLifter, type InlineReasoningLifter } from '../core/reasoning-inline'
+import type { ContentItem, MessagePhase } from '../core/types'
 import { type ApiError, normalizeError } from './errors'
+import type {
+  AnthropicContentBlock,
+  AnthropicEventWire,
+  AnthropicMessagesResultWire,
+  AnthropicStreamChunk,
+  AnthropicUsageWire,
+} from './anthropic-types'
 import type {
   GeminiContent,
   GeminiPart,
@@ -35,12 +45,6 @@ import type {
   ResponsesStreamChunk,
   ResponsesUsageWire,
 } from './types'
-import {
-  createInlineReasoningLifter,
-  type InlineReasoningLifter,
-} from '../core/reasoning-inline'
-import { isOpenAiResponsesFamilyFormat } from '../core/reasoning'
-import type { ContentItem, MessagePhase } from '../core/types'
 
 // Lane-tagged events consumed by the message accumulator. Phase 7 defined the
 // chat-completions lanes (text / reasoning / tool-call / usage / finish / meta
@@ -95,15 +99,37 @@ export type StreamLaneEvent =
         | 'file_search_call'
         | 'image_generation_call'
         | 'code_interpreter_call'
+        | 'shell_call'
+        | 'shell_call_output'
         | 'computer_call'
         | 'mcp_tool_call'
+        | 'mcp_call'
+        | 'google:google_search'
+        | 'google:url_context'
+        | 'google:code_execution'
+        | 'google:google_maps'
         | 'openrouter:datetime'
         | 'openrouter:web_fetch'
         | 'openrouter:web_search'
+        | 'server_tool_use'
+        | 'web_search_tool_result'
+        | 'web_fetch_tool_result'
+        | 'code_execution_tool_result'
+        | 'bash_code_execution_tool_result'
+        | 'text_editor_code_execution_tool_result'
+        | 'advisor_tool_result'
       status: 'in_progress' | 'searching' | 'completed'
       itemId: string
       outputIndex: number
       partialImageB64?: string
+    }
+  | {
+      lane: 'server-tool-output'
+      itemType: string
+      itemId: string
+      outputIndex: number
+      output: unknown
+      status?: string
     }
   | {
       lane: 'content-item'
@@ -145,7 +171,7 @@ export type StreamLaneEvent =
   | { lane: 'error'; error: ApiError }
   | {
       lane: 'buffered'
-      result: ChatCompletionResultWire | ResponsesResultWire
+      result: ChatCompletionResultWire | ResponsesResultWire | AnthropicMessagesResultWire
       generationId?: string
     }
 
@@ -503,7 +529,10 @@ function* splitBufferedResult(
   }
 }
 
-function reasoningDetailsMirrorText(reasoningText: string, details: unknown[] | undefined): boolean {
+function reasoningDetailsMirrorText(
+  reasoningText: string,
+  details: unknown[] | undefined,
+): boolean {
   if (!details || details.length === 0) return false
   let merged = ''
   let sawText = false
@@ -532,7 +561,9 @@ function reasoningDetailsMirrorText(reasoningText: string, details: unknown[] | 
       sawOpenAiSummary = true
     }
   }
-  return (sawText && merged === reasoningText) || (sawOpenAiSummary && mergedSummary === reasoningText)
+  return (
+    (sawText && merged === reasoningText) || (sawOpenAiSummary && mergedSummary === reasoningText)
+  )
 }
 
 function contentItemsFromChatImages(images: readonly unknown[]): ContentItem[] {
@@ -614,7 +645,8 @@ function audioOutputFromChatAudio(audio: unknown): {
 } | null {
   if (!audio || typeof audio !== 'object') return null
   const record = audio as { data?: unknown; transcript?: unknown; format?: unknown }
-  const dataDelta = typeof record.data === 'string' && record.data.length > 0 ? record.data : undefined
+  const dataDelta =
+    typeof record.data === 'string' && record.data.length > 0 ? record.data : undefined
   const transcriptDelta =
     typeof record.transcript === 'string' && record.transcript.length > 0
       ? record.transcript
@@ -669,11 +701,21 @@ const SERVER_TOOL_ITEM_TYPES = new Set<string>([
   'file_search_call',
   'image_generation_call',
   'code_interpreter_call',
+  'shell_call',
+  'shell_call_output',
   'computer_call',
   'mcp_tool_call',
+  'mcp_call',
   'openrouter:datetime',
   'openrouter:web_fetch',
   'openrouter:web_search',
+  'server_tool_use',
+  'web_search_tool_result',
+  'web_fetch_tool_result',
+  'code_execution_tool_result',
+  'bash_code_execution_tool_result',
+  'text_editor_code_execution_tool_result',
+  'advisor_tool_result',
 ])
 
 export async function* splitResponsesStream(
@@ -799,7 +841,7 @@ function* splitResponsesEvent(ev: ResponsesEventWire): Generator<StreamLaneEvent
       if (e.item.type === 'message' && e.item.phase !== undefined) {
         yield {
           lane: 'phase',
-          phase: (e.item.phase) ?? null,
+          phase: e.item.phase ?? null,
           outputIndex: e.output_index,
         }
       }
@@ -839,10 +881,7 @@ function* splitResponsesEvent(ev: ResponsesEventWire): Generator<StreamLaneEvent
     }
 
     case 'response.reasoning_summary_text.delta': {
-      const e = ev as Extract<
-        ResponsesEventWire,
-        { type: 'response.reasoning_summary_text.delta' }
-      >
+      const e = ev as Extract<ResponsesEventWire, { type: 'response.reasoning_summary_text.delta' }>
       yield {
         lane: 'reasoning',
         summaryDelta: e.delta,
@@ -874,7 +913,10 @@ function* splitResponsesEvent(ev: ResponsesEventWire): Generator<StreamLaneEvent
     case 'response.file_search_call.searching':
     case 'response.file_search_call.completed':
     case 'response.code_interpreter_call.in_progress':
-    case 'response.code_interpreter_call.completed': {
+    case 'response.code_interpreter_call.completed':
+    case 'response.shell_call.in_progress':
+    case 'response.shell_call.completed':
+    case 'response.shell_call_output.completed': {
       const e = ev as {
         type: string
         output_index: number
@@ -947,8 +989,9 @@ function* splitResponsesEvent(ev: ResponsesEventWire): Generator<StreamLaneEvent
 
     case 'response.failed': {
       const e = ev as Extract<ResponsesEventWire, { type: 'response.failed' }>
-      const errorPayload = (e.response as { error?: { code?: unknown; message?: string } } | undefined)
-        ?.error ?? { message: 'Responses API reported failure' }
+      const errorPayload = (
+        e.response as { error?: { code?: unknown; message?: string } } | undefined
+      )?.error ?? { message: 'Responses API reported failure' }
       yield {
         lane: 'error',
         error: normalizeError(
@@ -1069,7 +1112,7 @@ function* splitBufferedResponsesResult(
         yield { lane: 'text', text: textContent, outputIndex: idx }
       }
       if (item.phase !== undefined) {
-        yield { lane: 'phase', phase: (item.phase) ?? null, outputIndex: idx }
+        yield { lane: 'phase', phase: item.phase ?? null, outputIndex: idx }
       }
     }
     const contentItem = contentItemFromResponsesOutputItem(item)
@@ -1125,13 +1168,374 @@ function normalizeResponsesUsage(u: ResponsesUsageWire): ChatCompletionUsageWire
   }
   const reasoningTokens = u.output_tokens_details?.reasoning_tokens
   if (typeof reasoningTokens === 'number') {
-    ;(out as { completion_tokens_details?: { reasoning_tokens?: number } }).completion_tokens_details = {
+    ;(
+      out as { completion_tokens_details?: { reasoning_tokens?: number } }
+    ).completion_tokens_details = {
       reasoning_tokens: reasoningTokens,
     }
   }
   if (typeof u.cost === 'number') (out as { cost?: number }).cost = u.cost
-  if (u.cost_details) (out as { cost_details?: Record<string, unknown> }).cost_details = u.cost_details
+  if (u.cost_details)
+    (out as { cost_details?: Record<string, unknown> }).cost_details = u.cost_details
   return out
+}
+
+// ---------------------------------------------------------------------------
+// Anthropic Messages splitter.
+// ---------------------------------------------------------------------------
+
+interface AnthropicBlockState {
+  index: number
+  block: AnthropicContentBlock
+  thinking: string
+  text: string
+  signature: string
+  inputJson: string
+  citations: unknown[]
+}
+
+export async function* splitAnthropicStream(
+  source: AsyncIterable<AnthropicStreamChunk>,
+): AsyncGenerator<StreamLaneEvent> {
+  const blocks = new Map<number, AnthropicBlockState>()
+  let finishReason: string | undefined
+  let metaEmittedGenerationId: string | undefined
+  let metaEmittedModel: string | undefined
+
+  for await (const chunk of source) {
+    if (chunk.type === 'keepalive') {
+      yield { lane: 'keepalive', comment: chunk.comment }
+      continue
+    }
+    if (chunk.type === 'buffered_result') {
+      yield* splitBufferedAnthropicResult(chunk.result, chunk.generationId)
+      continue
+    }
+
+    const ev = chunk.event
+    if (chunk.generationId && chunk.generationId !== metaEmittedGenerationId) {
+      metaEmittedGenerationId = chunk.generationId
+      yield { lane: 'meta', generationId: chunk.generationId }
+    }
+    switch (ev.type) {
+      case 'message_start': {
+        const e = ev as Extract<AnthropicEventWire, { type: 'message_start' }>
+        const meta: StreamLaneEvent & { lane: 'meta' } = { lane: 'meta' }
+        let dirty = false
+        if (typeof e.message?.model === 'string' && e.message.model !== metaEmittedModel) {
+          meta.model = e.message.model
+          metaEmittedModel = e.message.model
+          dirty = true
+        }
+        const generationId = e.message?.id ?? chunk.generationId
+        if (generationId && generationId !== metaEmittedGenerationId) {
+          meta.generationId = generationId
+          metaEmittedGenerationId = generationId
+          dirty = true
+        }
+        if (dirty) yield meta
+        if (e.message?.usage) yield { lane: 'usage', usage: remapAnthropicUsage(e.message.usage) }
+        break
+      }
+
+      case 'content_block_start': {
+        const e = ev as Extract<AnthropicEventWire, { type: 'content_block_start' }>
+        const state = createAnthropicBlockState(e.index, e.content_block)
+        blocks.set(e.index, state)
+        yield* emitAnthropicBlockStart(state)
+        break
+      }
+
+      case 'content_block_delta': {
+        const e = ev as Extract<AnthropicEventWire, { type: 'content_block_delta' }>
+        const state =
+          blocks.get(e.index) ?? createAnthropicBlockState(e.index, { type: 'unknown' })
+        blocks.set(e.index, state)
+        yield* applyAnthropicBlockDelta(state, e.delta)
+        break
+      }
+
+      case 'content_block_stop': {
+        const e = ev as Extract<AnthropicEventWire, { type: 'content_block_stop' }>
+        const state = blocks.get(e.index)
+        if (state) {
+          yield* emitAnthropicBlockDone(state)
+          blocks.delete(e.index)
+        }
+        break
+      }
+
+      case 'message_delta': {
+        const e = ev as Extract<AnthropicEventWire, { type: 'message_delta' }>
+        if (e.usage) yield { lane: 'usage', usage: remapAnthropicUsage(e.usage) }
+        if (typeof e.delta?.stop_reason === 'string') {
+          finishReason = mapAnthropicFinishReason(e.delta.stop_reason)
+          yield { lane: 'finish', finishReason }
+        }
+        break
+      }
+
+      case 'message_stop':
+        if (!finishReason) yield { lane: 'finish', finishReason: 'stop' }
+        break
+
+      case 'ping':
+        break
+
+      case 'error':
+        const e = ev as Extract<AnthropicEventWire, { type: 'error' }>
+        yield {
+          lane: 'error',
+          error: normalizeError(
+            { error: { code: e.error?.type, message: e.error?.message ?? 'Anthropic stream error' } },
+            { midStream: true },
+          ),
+        }
+        break
+
+      default:
+        break
+    }
+  }
+}
+
+function createAnthropicBlockState(
+  index: number,
+  block: AnthropicContentBlock,
+): AnthropicBlockState {
+  return {
+    index,
+    block: structuredClone(block),
+    thinking: typeof block.thinking === 'string' ? block.thinking : '',
+    text: typeof block.text === 'string' ? block.text : '',
+    signature: typeof block.signature === 'string' ? block.signature : '',
+    inputJson: '',
+    citations: Array.isArray(block.citations) ? structuredClone(block.citations) : [],
+  }
+}
+
+function* emitAnthropicBlockStart(state: AnthropicBlockState): Generator<StreamLaneEvent> {
+  const type = state.block.type
+  if (type === 'text' && state.text.length > 0) {
+    yield { lane: 'text', text: state.text, outputIndex: state.index, contentIndex: state.index }
+  } else if (type === 'thinking' && state.thinking.length > 0) {
+    yield {
+      lane: 'reasoning',
+      textDelta: state.thinking,
+      outputIndex: state.index,
+      itemId: anthropicReasoningId(state),
+    }
+  } else if (type === 'redacted_thinking' && typeof state.block.data === 'string') {
+    yield {
+      lane: 'reasoning',
+      encryptedDelta: state.block.data,
+      replaceEncrypted: true,
+      outputIndex: state.index,
+      itemId: anthropicReasoningId(state),
+    }
+  } else if (isAnthropicToolBlockType(type)) {
+    const id = anthropicBlockId(state)
+    if (type === 'server_tool_use') {
+      yield {
+        lane: 'server-tool',
+        itemType: 'server_tool_use',
+        status: 'in_progress',
+        itemId: id,
+        outputIndex: state.index,
+      }
+    }
+  }
+}
+
+function* applyAnthropicBlockDelta(
+  state: AnthropicBlockState,
+  delta: AnthropicContentBlock,
+): Generator<StreamLaneEvent> {
+  const deltaType = delta.type
+  if (deltaType === 'text_delta' && typeof delta.text === 'string') {
+    state.text += delta.text
+    yield { lane: 'text', text: delta.text, outputIndex: state.index, contentIndex: state.index }
+    return
+  }
+  if (deltaType === 'thinking_delta' && typeof delta.thinking === 'string') {
+    state.thinking += delta.thinking
+    yield {
+      lane: 'reasoning',
+      textDelta: delta.thinking,
+      outputIndex: state.index,
+      itemId: anthropicReasoningId(state),
+    }
+    return
+  }
+  if (deltaType === 'signature_delta' && typeof delta.signature === 'string') {
+    state.signature += delta.signature
+    return
+  }
+  if (deltaType === 'input_json_delta' && typeof delta.partial_json === 'string') {
+    state.inputJson += delta.partial_json
+    return
+  }
+  if (deltaType === 'citations_delta' && delta.citation !== undefined) {
+    state.citations.push(structuredClone(delta.citation))
+  }
+}
+
+function* emitAnthropicBlockDone(state: AnthropicBlockState): Generator<StreamLaneEvent> {
+  const type = state.block.type
+  if (type === 'thinking') {
+    if (state.thinking.length > 0 || state.signature.length > 0) {
+      yield {
+        lane: 'reasoning',
+        details: [
+          {
+            type: 'reasoning.text',
+            id: anthropicReasoningId(state),
+            index: state.index,
+            format: 'anthropic-claude-v1',
+            ...(state.thinking.length > 0 ? { text: state.thinking } : {}),
+            ...(state.signature.length > 0 ? { signature: state.signature } : {}),
+          },
+        ],
+        outputIndex: state.index,
+        itemId: anthropicReasoningId(state),
+      }
+    }
+    return
+  }
+  if (type === 'redacted_thinking' && typeof state.block.data === 'string') {
+    yield {
+      lane: 'reasoning',
+      details: [
+        {
+          type: 'reasoning.encrypted',
+          id: anthropicReasoningId(state),
+          index: state.index,
+          format: 'anthropic-claude-v1',
+          data: state.block.data,
+        },
+      ],
+      outputIndex: state.index,
+      itemId: anthropicReasoningId(state),
+    }
+    return
+  }
+  if (!isAnthropicToolBlockType(type)) return
+  const output = finalizeAnthropicToolBlock(state)
+  const itemId = anthropicBlockId(state)
+  if (type === 'server_tool_use') {
+    yield {
+      lane: 'server-tool',
+      itemType: 'server_tool_use',
+      status: 'completed',
+      itemId,
+      outputIndex: state.index,
+    }
+  }
+  yield {
+    lane: 'server-tool-output',
+    itemType: type,
+    itemId,
+    outputIndex: state.index,
+    ...(type === 'server_tool_use' ? { status: 'completed' } : {}),
+    output,
+  }
+}
+
+function* splitBufferedAnthropicResult(
+  result: AnthropicMessagesResultWire,
+  generationId: string | undefined,
+): Generator<StreamLaneEvent> {
+  if (result.error) {
+    yield {
+      lane: 'error',
+      error: normalizeError(
+        { error: { code: result.error.type, message: result.error.message ?? 'Anthropic error' } },
+        { midStream: true },
+      ),
+    }
+    return
+  }
+  const effectiveGenId = generationId ?? result.id
+  if (typeof result.model === 'string' || effectiveGenId) {
+    const meta: StreamLaneEvent & { lane: 'meta' } = { lane: 'meta' }
+    if (typeof result.model === 'string') meta.model = result.model
+    if (effectiveGenId) meta.generationId = effectiveGenId
+    yield meta
+  }
+  yield { lane: 'buffered', result, ...(generationId !== undefined ? { generationId } : {}) }
+
+  for (const [index, block] of (result.content ?? []).entries()) {
+    const state = createAnthropicBlockState(index, block)
+    yield* emitAnthropicBlockStart(state)
+    yield* emitAnthropicBlockDone(state)
+  }
+  if (result.usage) yield { lane: 'usage', usage: remapAnthropicUsage(result.usage) }
+  if (result.stop_reason) {
+    yield { lane: 'finish', finishReason: mapAnthropicFinishReason(result.stop_reason) }
+  }
+}
+
+function finalizeAnthropicToolBlock(state: AnthropicBlockState): AnthropicContentBlock {
+  const output = structuredClone(state.block)
+  if (state.inputJson.length > 0 && output.input === undefined) {
+    try {
+      output.input = JSON.parse(state.inputJson)
+    } catch {
+      output.input = state.inputJson
+    }
+  }
+  if (state.citations.length > 0 && output.citations === undefined) {
+    output.citations = structuredClone(state.citations)
+  }
+  return output
+}
+
+function isAnthropicToolBlockType(type: string): boolean {
+  return (
+    type === 'server_tool_use' ||
+    type === 'web_search_tool_result' ||
+    type === 'web_fetch_tool_result' ||
+    type === 'code_execution_tool_result' ||
+    type === 'bash_code_execution_tool_result' ||
+    type === 'text_editor_code_execution_tool_result' ||
+    type === 'advisor_tool_result'
+  )
+}
+
+function anthropicBlockId(state: AnthropicBlockState): string {
+  const id = state.block.id ?? state.block.tool_use_id
+  return typeof id === 'string' ? id : `anthropic-${state.block.type}-${state.index}`
+}
+
+function anthropicReasoningId(state: AnthropicBlockState): string {
+  return `anthropic-reasoning-${state.index}`
+}
+
+function remapAnthropicUsage(u: AnthropicUsageWire): ChatCompletionUsageWire {
+  const out: ChatCompletionUsageWire = {}
+  if (typeof u.input_tokens === 'number') out.prompt_tokens = u.input_tokens
+  if (typeof u.output_tokens === 'number') out.completion_tokens = u.output_tokens
+  if (typeof u.input_tokens === 'number' && typeof u.output_tokens === 'number') {
+    out.total_tokens = u.input_tokens + u.output_tokens
+  }
+  if (typeof u.cache_read_input_tokens === 'number' || typeof u.cache_creation_input_tokens === 'number') {
+    out.prompt_tokens_details = {
+      cached_tokens:
+        (typeof u.cache_read_input_tokens === 'number' ? u.cache_read_input_tokens : 0) +
+        (typeof u.cache_creation_input_tokens === 'number' ? u.cache_creation_input_tokens : 0),
+    }
+  }
+  if (u.server_tool_use) out.server_tool_use = { ...u.server_tool_use }
+  if (typeof u.cache_creation_input_tokens === 'number') {
+    out.cache_creation_input_tokens = u.cache_creation_input_tokens
+  }
+  return out
+}
+
+function mapAnthropicFinishReason(raw: string): string {
+  if (raw === 'end_turn') return 'stop'
+  if (raw === 'max_tokens') return 'length'
+  return raw
 }
 
 // ---------------------------------------------------------------------------
@@ -1186,12 +1590,7 @@ export async function* splitGeminiStream(
     }
     // streaming `chunk` type
     const resp = chunk.chunk
-    const meta = metaFromGemini(
-      resp,
-      chunk.generationId,
-      metaEmittedModel,
-      metaEmittedGenerationId,
-    )
+    const meta = metaFromGemini(resp, chunk.generationId, metaEmittedModel, metaEmittedGenerationId)
     if (meta) {
       metaEmittedModel = meta.model ?? metaEmittedModel
       metaEmittedGenerationId = meta.generationId ?? metaEmittedGenerationId
@@ -1208,7 +1607,8 @@ function metaFromGemini(
   previouslyEmittedGenerationId: string | undefined,
 ): (StreamLaneEvent & { lane: 'meta' }) | null {
   const model = typeof resp.modelVersion === 'string' ? resp.modelVersion : undefined
-  const effectiveGenId = generationId ?? (typeof resp.responseId === 'string' ? resp.responseId : undefined)
+  const effectiveGenId =
+    generationId ?? (typeof resp.responseId === 'string' ? resp.responseId : undefined)
   const event: StreamLaneEvent & { lane: 'meta' } = { lane: 'meta' }
   let dirty = false
   if (model !== undefined && model !== previouslyEmittedModel) {
@@ -1249,6 +1649,7 @@ function* splitGeminiResponse(
   for (const part of parts) {
     yield* splitGeminiPart(part, counter)
   }
+  yield* splitGeminiProviderToolMetadata(resp, candidate?.index ?? 0)
 
   if (resp.usageMetadata) {
     yield {
@@ -1259,6 +1660,43 @@ function* splitGeminiResponse(
 
   if (candidate?.finishReason) {
     yield { lane: 'finish', finishReason: mapGeminiFinishReason(candidate.finishReason) }
+  }
+}
+
+function* splitGeminiProviderToolMetadata(
+  resp: GenerateContentResponseWire,
+  outputIndex: number,
+): Generator<StreamLaneEvent> {
+  const record = resp as Record<string, unknown>
+  if (record.groundingMetadata !== undefined) {
+    yield {
+      lane: 'server-tool-output',
+      itemType: 'google:google_search',
+      itemId: `google-search-${outputIndex}`,
+      outputIndex,
+      status: 'completed',
+      output: structuredClone(record.groundingMetadata),
+    }
+  }
+  if (record.urlContextMetadata !== undefined) {
+    yield {
+      lane: 'server-tool-output',
+      itemType: 'google:url_context',
+      itemId: `google-url-context-${outputIndex}`,
+      outputIndex,
+      status: 'completed',
+      output: structuredClone(record.urlContextMetadata),
+    }
+  }
+  if (record.googleMapsMetadata !== undefined) {
+    yield {
+      lane: 'server-tool-output',
+      itemType: 'google:google_maps',
+      itemId: `google-maps-${outputIndex}`,
+      outputIndex,
+      status: 'completed',
+      output: structuredClone(record.googleMapsMetadata),
+    }
   }
 }
 
@@ -1296,7 +1734,9 @@ function* splitGeminiPart(
     return
   }
 
-  const fnCall = (part as { functionCall?: { name: string; args?: Record<string, unknown>; id?: string } }).functionCall
+  const fnCall = (
+    part as { functionCall?: { name: string; args?: Record<string, unknown>; id?: string } }
+  ).functionCall
   if (fnCall) {
     const event: StreamLaneEvent & { lane: 'tool-call' } = {
       lane: 'tool-call',
@@ -1306,6 +1746,30 @@ function* splitGeminiPart(
     }
     if (fnCall.id !== undefined) event.id = fnCall.id
     yield event
+    return
+  }
+
+  if ('executableCode' in part) {
+    yield {
+      lane: 'server-tool-output',
+      itemType: 'google:code_execution',
+      itemId: 'google-code-executable',
+      outputIndex: 0,
+      status: 'in_progress',
+      output: structuredClone(part),
+    }
+    return
+  }
+
+  if ('codeExecutionResult' in part) {
+    yield {
+      lane: 'server-tool-output',
+      itemType: 'google:code_execution',
+      itemId: 'google-code-result',
+      outputIndex: 0,
+      status: 'completed',
+      output: structuredClone(part),
+    }
     return
   }
 
@@ -1326,7 +1790,9 @@ function remapGeminiUsage(
   if (typeof u.candidatesTokenCount === 'number') out.completion_tokens = u.candidatesTokenCount
   if (typeof u.totalTokenCount === 'number') out.total_tokens = u.totalTokenCount
   if (typeof u.thoughtsTokenCount === 'number') {
-    ;(out as { completion_tokens_details?: { reasoning_tokens?: number } }).completion_tokens_details = {
+    ;(
+      out as { completion_tokens_details?: { reasoning_tokens?: number } }
+    ).completion_tokens_details = {
       reasoning_tokens: u.thoughtsTokenCount,
     }
   }

@@ -11,18 +11,28 @@ import {
   normalizeLegacyAttachmentRefs,
 } from '../backcompat/attachment-refs'
 import {
+  globalSettingsBackfillMarker,
+  migrateGlobalSettingsRows,
+} from '../backcompat/global-settings'
+import {
   backfillMissingMessageBodies,
   messageBodySplitBackfillMarker,
   migrateInlineMessageBodies,
 } from '../backcompat/message-body-split'
 import {
-  globalSettingsBackfillMarker,
-  migrateGlobalSettingsRows,
-} from '../backcompat/global-settings'
-import {
   migrateProviderSettingsRow,
   providerCacheKey,
 } from '../backcompat/provider-settings-migration'
+import {
+  migrateProviderOutputItemRows,
+  migrateProviderOutputItemsFromGeneration,
+  providerOutputItemsBackfillMarker,
+} from '../backcompat/provider-output-items'
+import {
+  migrateProviderToolSettings,
+  migrateProviderToolSettingsRows,
+  providerToolSettingsBackfillMarker,
+} from '../backcompat/provider-tools'
 import { findLastUpdatedLeafId } from '../core/active-path'
 import { buildBranchMessages } from '../core/branch-flatten'
 import {
@@ -128,12 +138,16 @@ export class NatterDb extends Dexie {
 // then tack on synthetic v2/v3 upgrades.
 export function registerSchema(db: Dexie): void {
   db.on('populate', (tx) => {
-    void tx.table<SettingsRow>('settings').bulkPut([
-      attachmentRefsBackfillMarker(),
-      messageBodySplitBackfillMarker(),
-      organizationFieldsBackfillMarker(),
-      globalSettingsBackfillMarker(),
-    ])
+    void tx
+      .table<SettingsRow>('settings')
+      .bulkPut([
+        attachmentRefsBackfillMarker(),
+        messageBodySplitBackfillMarker(),
+        organizationFieldsBackfillMarker(),
+        globalSettingsBackfillMarker(),
+        providerOutputItemsBackfillMarker(),
+        providerToolSettingsBackfillMarker(),
+      ])
   })
 
   db.version(1).stores({
@@ -851,6 +865,76 @@ export function registerSchema(db: Dexie): void {
           if (result.changed) preset.settings = result.settings
         })
     })
+
+  // v14: move first-pass OpenRouter hosted-tool settings from the old shared
+  // top-level fields into provider-scoped buckets.
+  db.version(14)
+    .stores({
+      chats:
+        'id, updatedAt, createdAt, lastViewedAt, lastUpdatedLeafId, lastBranchUpdatedAt, wordCount, totalCostUsd, archived, pinned, presetId, folderId, *tags',
+      messages:
+        'id, chatId, parentId, turnId, [chatId+parentId], [chatId+createdAt], [chatId+turnId], [chatId+deleted]',
+      messageBodies: '&id, chatId, updatedAt, nodeVersion',
+      childLists: 'id, [chatId+parentId], updatedAt',
+      attachments: 'id, contentHash, kind, mime, origin, refCount, createdAt, updatedAt, deletedAt',
+      attachmentBlobs: 'id, attachmentId, role, contentHash, createdAt',
+      attachmentArtifacts: 'artifactId, attachmentId, kind, processorId, createdAt',
+      attachmentJobs:
+        'id, attachmentId, processorId, status, updatedAt, [attachmentId+processorId+inputHash]',
+      profiles: 'id, name, kind, lastUsedAt, archived',
+      presets: 'id, name, connectionProfileId, lastUsedAt, archived',
+      promptPresets: 'id, kind, name, lastUsedAt',
+      folders: 'id, name, sortIndex, lastUsedAt',
+      tags: 'id, &nameLower, lastUsedAt',
+      chatBranchCache: '&chatId, branchLeafId, generatedAt',
+      keys: 'id, name',
+      settings: '&key',
+      streamLeases: '&streamId, chatId, ownerClientId, heartbeatAt',
+      streamChunks: '&id, streamId, chatId, messageId, [streamId+seq], createdAt',
+      models: '&[profileId+queryKey], fetchedAt',
+      endpoints: '&[profileId+modelId], fetchedAt',
+      privacyPolicies: '&[profileId+modelId], fetchedAt',
+      providers: '&profileId, fetchedAt',
+      generations: 'id, chatId, gen_id',
+      presetResolutions: '&[profileId+presetSlug], fetchedAt',
+      drafts: '&chatId, updatedAt',
+    })
+    .upgrade(async (tx) => {
+      await tx
+        .table<Chat>('chats')
+        .toCollection()
+        .modify((chat) => {
+          const result = migrateProviderToolSettings(chat.settings)
+          if (result.changed) chat.settings = result.settings
+        })
+
+      await tx
+        .table<ChatPreset>('presets')
+        .toCollection()
+        .modify((preset) => {
+          const result = migrateProviderToolSettings(preset.settings)
+          if (result.changed) preset.settings = result.settings
+        })
+
+      const headers = await tx.table<MessageHeaderRow>('messages').toArray()
+      const headersById = new Map(headers.map((header) => [header.id, header]))
+      await tx
+        .table<MessageBodyRow>('messageBodies')
+        .toCollection()
+        .modify((body) => {
+          const migrated = migrateProviderOutputItemsFromGeneration(
+            headersById.get(body.id)?.generation,
+            (body as { providerOutputItems?: unknown }).providerOutputItems,
+          )
+          if (migrated) {
+            ;(
+              body as MessageBodyRow & {
+                providerOutputItems: typeof migrated
+              }
+            ).providerOutputItems = migrated
+          }
+        })
+    })
 }
 
 function organizationDefaultsPatch(
@@ -983,6 +1067,8 @@ let organizationFieldsBackfillPromise: Promise<void> | null = null
 let messageBodySplitBackfillPromise: Promise<void> | null = null
 let globalSettingsBackfillPromise: Promise<void> | null = null
 let attachmentRefsBackfillPromise: Promise<void> | null = null
+let providerOutputItemsBackfillPromise: Promise<void> | null = null
+let providerToolSettingsBackfillPromise: Promise<void> | null = null
 const ORGANIZATION_FIELDS_BACKFILL_KEY = 'backfill:organization-fields-v1'
 
 function organizationFieldsBackfillMarker(): SettingsRow {
@@ -1019,6 +1105,16 @@ export async function openDb(): Promise<NatterDb> {
     throw err
   })
   await globalSettingsBackfillPromise
+  providerOutputItemsBackfillPromise ??= migrateProviderOutputItemRows(db).catch((err) => {
+    providerOutputItemsBackfillPromise = null
+    throw err
+  })
+  await providerOutputItemsBackfillPromise
+  providerToolSettingsBackfillPromise ??= migrateProviderToolSettingsRows(db).catch((err) => {
+    providerToolSettingsBackfillPromise = null
+    throw err
+  })
+  await providerToolSettingsBackfillPromise
   return db
 }
 
@@ -1032,6 +1128,8 @@ export function __resetDbForTests(): void {
   messageBodySplitBackfillPromise = null
   globalSettingsBackfillPromise = null
   attachmentRefsBackfillPromise = null
+  providerOutputItemsBackfillPromise = null
+  providerToolSettingsBackfillPromise = null
 }
 
 // Mint a uniquely-named Dexie instance for integration tests that want to
@@ -1062,12 +1160,14 @@ export async function backfillOrganizationFields(db: NatterDb): Promise<void> {
     const rows = messagesByChat.get(chat.id) ?? []
     const nextLeafId = findLastUpdatedLeafId(rows as unknown as Message[])
     const branchHeaders =
-      nextLeafId !== null ? (buildBranchMessages(rows as unknown as Message[], nextLeafId) as MessageHeaderRow[]) : []
+      nextLeafId !== null
+        ? (buildBranchMessages(rows as unknown as Message[], nextLeafId) as MessageHeaderRow[])
+        : []
     const messageBodies =
       branchHeaders.length > 0
-        ? (
-            await db.messageBodies.bulkGet(branchHeaders.map((message) => message.id))
-          ).filter((row): row is MessageBodyRow => row !== undefined)
+        ? (await db.messageBodies.bulkGet(branchHeaders.map((message) => message.id))).filter(
+            (row): row is MessageBodyRow => row !== undefined,
+          )
         : []
     const branch = hydrateMessages(branchHeaders, messageBodies)
     const totalCostUsd = rows.reduce(

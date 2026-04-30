@@ -130,12 +130,12 @@ describe('splitResponsesStream — buffered result (probe 6)', () => {
     // One output-item-added per item in result.output.
     const adds = lanes.filter((l) => l.lane === 'output-item-added')
     expect(adds).toHaveLength(2)
-    expect(
-      (adds[0] as Extract<StreamLaneEvent, { lane: 'output-item-added' }>).item.type,
-    ).toBe('reasoning')
-    expect(
-      (adds[1] as Extract<StreamLaneEvent, { lane: 'output-item-added' }>).item.type,
-    ).toBe('message')
+    expect((adds[0] as Extract<StreamLaneEvent, { lane: 'output-item-added' }>).item.type).toBe(
+      'reasoning',
+    )
+    expect((adds[1] as Extract<StreamLaneEvent, { lane: 'output-item-added' }>).item.type).toBe(
+      'message',
+    )
 
     // Reasoning lane carries encrypted + summary.
     const reasoning = lanes.filter(
@@ -278,6 +278,39 @@ describe('splitResponsesStream — server tools', () => {
     ])
   })
 
+  it('preserves shell call and output items from buffered Responses results', async () => {
+    const result: ResponsesResultWire = {
+      id: 'resp_shell',
+      status: 'completed',
+      output: [
+        {
+          id: 'sh_1',
+          type: 'shell_call',
+          status: 'completed',
+          call_id: 'call_1',
+          action: { type: 'exec', command: 'printf natter-shape-probe.' },
+        },
+        {
+          id: 'sho_1',
+          type: 'shell_call_output',
+          call_id: 'call_1',
+          output: [{ type: 'stdout', text: 'natter-shape-probe.' }],
+        },
+      ],
+    }
+
+    const lanes = await collect(
+      splitResponsesStream(
+        asAsync([{ type: 'buffered_result', result, generationId: 'resp_shell' }]),
+      ),
+    )
+    const done = lanes.filter(
+      (l): l is Extract<StreamLaneEvent, { lane: 'output-item-done' }> =>
+        l.lane === 'output-item-done',
+    )
+    expect(done.map((event) => event.item.type)).toEqual(['shell_call', 'shell_call_output'])
+  })
+
   it('emits generated image output as a persistable content item', async () => {
     const imageUrl = 'data:image/png;base64,abc123'
     const events: ResponsesStreamChunk[] = [
@@ -313,8 +346,7 @@ describe('splitResponsesStream — server tools', () => {
     ]
     const lanes = await collect(splitResponsesStream(asAsync(events)))
     const content = lanes.find(
-      (l): l is Extract<StreamLaneEvent, { lane: 'content-item' }> =>
-        l.lane === 'content-item',
+      (l): l is Extract<StreamLaneEvent, { lane: 'content-item' }> => l.lane === 'content-item',
     )
     expect(content).toMatchObject({
       outputIndex: 0,
@@ -341,8 +373,7 @@ describe('splitResponsesStream — server tools', () => {
     ]
     const lanes = await collect(splitResponsesStream(asAsync(events)))
     const content = lanes.find(
-      (l): l is Extract<StreamLaneEvent, { lane: 'content-item' }> =>
-        l.lane === 'content-item',
+      (l): l is Extract<StreamLaneEvent, { lane: 'content-item' }> => l.lane === 'content-item',
     )
     expect(content?.item).toEqual({ type: 'output_image', url: 'data:image/png;base64,abc123' })
   })

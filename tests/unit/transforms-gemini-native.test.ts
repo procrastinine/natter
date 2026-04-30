@@ -7,12 +7,7 @@
 import { describe, expect, it } from 'vitest'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import { toGeminiNative } from '../../src/core/transforms'
-import type {
-  ChatSettings,
-  Message,
-  ReasoningDetail,
-  ToolCall,
-} from '../../src/core/types'
+import type { ChatSettings, Message, ReasoningDetail, ToolCall } from '../../src/core/types'
 
 function settings(overrides: Partial<ChatSettings> = {}): ChatSettings {
   const s = cloneDefaultChatSettings()
@@ -25,6 +20,13 @@ function settings(overrides: Partial<ChatSettings> = {}): ChatSettings {
     include: { encrypted: true, summary: false, text: false },
   }
   return { ...s, ...overrides }
+}
+
+function googleTools(
+  google: Partial<ChatSettings['tools']['google']>,
+): Pick<ChatSettings, 'tools'> {
+  const tools = cloneDefaultChatSettings().tools
+  return { tools: { ...tools, google: { ...tools.google, ...google } } }
 }
 
 function user(id: string, text: string): Message {
@@ -95,6 +97,51 @@ describe('toGeminiNative — envelope + URL', () => {
     const s = settings({ systemPrompt: 'You are a calculator.' })
     const { wire } = toGeminiNative(s, [user('u1', 'hi')])
     expect(wire.systemInstruction?.parts[0]).toEqual({ text: 'You are a calculator.' })
+  })
+
+  it('serializes Google hosted tools only when the Gemini provider is active', () => {
+    const s = settings({
+      ...googleTools({
+        enabledServerToolIds: ['google-search', 'url-context', 'code-execution', 'google-maps'],
+        config: {
+          'google-maps': {
+            enableWidget: true,
+            location: { latitude: 37.7749, longitude: -122.4194 },
+          },
+        },
+      }),
+    })
+
+    expect(toGeminiNative(s, [user('u1', 'hi')]).wire.tools).toBeUndefined()
+
+    const { wire } = toGeminiNative(s, [user('u1', 'hi')], {
+      hostedToolsProvider: 'google',
+    })
+    expect(wire.tools).toEqual([
+      { googleSearch: {} },
+      { urlContext: {} },
+      { codeExecution: {} },
+      { googleMaps: { enableWidget: true } },
+    ])
+    expect(wire.toolConfig).toEqual({
+      retrievalConfig: { latLng: { latitude: 37.7749, longitude: -122.4194 } },
+    })
+  })
+
+  it('omits URL context when the prompt contains private or tunnel URLs', () => {
+    const s = settings({
+      ...googleTools({
+        enabledServerToolIds: ['google-search', 'url-context', 'code-execution'],
+      }),
+    })
+
+    const { wire } = toGeminiNative(
+      s,
+      [user('u1', 'Read https://example.com and http://127.0.0.1:5173 for comparison.')],
+      { hostedToolsProvider: 'google' },
+    )
+
+    expect(wire.tools).toEqual([{ googleSearch: {} }, { codeExecution: {} }])
   })
 })
 
@@ -283,7 +330,9 @@ describe('toGeminiNative — reasoning echo (thoughtSignature on LAST part)', ()
       path,
     )
     const modelTurn = required(wire.contents[1], 'model turn')
-    const lastPart = required(modelTurn.parts[modelTurn.parts.length - 1], 'last model part') as { thoughtSignature?: string }
+    const lastPart = required(modelTurn.parts[modelTurn.parts.length - 1], 'last model part') as {
+      thoughtSignature?: string
+    }
     expect(lastPart.thoughtSignature).toBeUndefined()
   })
 
@@ -307,7 +356,9 @@ describe('toGeminiNative — reasoning echo (thoughtSignature on LAST part)', ()
       path,
     )
     const modelTurn = required(wire.contents[1], 'model turn')
-    const lastPart = required(modelTurn.parts[modelTurn.parts.length - 1], 'last model part') as { thoughtSignature?: string }
+    const lastPart = required(modelTurn.parts[modelTurn.parts.length - 1], 'last model part') as {
+      thoughtSignature?: string
+    }
     // Format mismatch → preservation format is google-gemini-v1 (from quirks),
     // but the stored detail is openai-responses-v1 → skip the attach.
     expect(lastPart.thoughtSignature).toBeUndefined()
@@ -439,6 +490,60 @@ describe('toGeminiNative — reasoning echo (thoughtSignature on LAST part)', ()
 })
 
 describe('toGeminiNative — tool calls + tool results', () => {
+  it('keeps Gemini code-execution provider output parts native', () => {
+    const path: Message[] = [
+      user('u1', 'compute'),
+      assistant('a1', '55', {
+        providerOutputItems: [
+          {
+            dialect: 'google-gemini',
+            type: 'google:code_execution',
+            outputIndex: 0,
+            item: { executableCode: { language: 'PYTHON', code: 'print(55)', id: 'code_1' } },
+          },
+          {
+            dialect: 'google-gemini',
+            type: 'google:code_execution',
+            outputIndex: 0,
+            item: { codeExecutionResult: { outcome: 'OUTCOME_OK', output: '55\n', id: 'code_1' } },
+          },
+        ],
+      }),
+    ]
+    const { wire } = toGeminiNative(settings(), path)
+    const modelTurn = wire.contents.find((content) => content.role === 'model')
+    expect(modelTurn?.parts.some((part) => 'executableCode' in part)).toBe(true)
+    expect(modelTurn?.parts.some((part) => 'codeExecutionResult' in part)).toBe(true)
+  })
+
+  it('renders unsupported provider output as Gemini text context', () => {
+    const path: Message[] = [
+      user('u1', 'compute'),
+      assistant('a1', '55', {
+        providerOutputItems: [
+          {
+            dialect: 'openai-responses',
+            type: 'code_interpreter_call',
+            item: {
+              id: 'ci_1',
+              type: 'code_interpreter_call',
+              code: 'sum(i*i for i in range(6))',
+              outputs: [{ type: 'logs', logs: '55' }],
+            },
+          },
+        ],
+      }),
+    ]
+    const { wire } = toGeminiNative(settings(), path)
+    const modelTurn = wire.contents.find((content) => content.role === 'model')
+    const text = modelTurn?.parts
+      .filter((part): part is { text: string } => 'text' in part && typeof part.text === 'string')
+      .map((part) => part.text)
+      .join('\n')
+    expect(text).toContain('<tool_call>')
+    expect(text).toContain('55')
+  })
+
   it('assistant toolCalls → functionCall parts with parsed args', () => {
     const toolCalls: ToolCall[] = [
       {

@@ -40,7 +40,7 @@ import {
   tokenCalibrationKey,
   tokenCalibrationKeyForStoredRecordKey,
 } from './model-ids'
-import { estimateReasoningEchoTokensForMessage } from './tokens'
+import { estimateReasoningEchoTokensForMessage, estimateToolCallContextTokensForMessage } from './tokens'
 import { clampTokens, safeContent, safeLen, safeServerTokens } from './token-guards'
 import type { PromptEstimateOptions, TokenizerFamily } from './tokens'
 import { charPerToken, tokenizerFamily } from './tokens'
@@ -812,10 +812,12 @@ export function derivePromptSample(input: DerivePromptSampleInput): SamplePair |
 
   let sentTextChars = safeLen(input.systemPrompt)
   let reasoningEchoHeuristic = 0
+  let toolCallHeuristic = 0
   for (const m of input.sentPath) {
     sentTextChars += messageTextChars(m.content)
     if (input.reasoningEchoOpts) {
       reasoningEchoHeuristic += estimateReasoningEchoTokensForMessage(m, input.reasoningEchoOpts)
+      toolCallHeuristic += estimateToolCallContextTokensForMessage(m, input.reasoningEchoOpts)
     }
   }
 
@@ -824,7 +826,8 @@ export function derivePromptSample(input: DerivePromptSampleInput): SamplePair |
   // wrapper at the request level.
   const framingOverhead = FRAMING_PER_MESSAGE[input.family] * input.sentPath.length
 
-  const calibratedTextTokens = promptTokens - reasoningEchoHeuristic - framingOverhead
+  const calibratedTextTokens =
+    promptTokens - reasoningEchoHeuristic - toolCallHeuristic - framingOverhead
   if (calibratedTextTokens <= 0) return null
 
   return { chars: sentTextChars, tokens: calibratedTextTokens }

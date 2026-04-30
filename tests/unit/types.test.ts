@@ -1,6 +1,7 @@
 import { describe, expectTypeOf, it } from 'vitest'
 import type {
   Attachment,
+  ChatProviderToolSettings,
   ChatSettings,
   ChatVersions,
   ChildListState,
@@ -13,7 +14,6 @@ import type {
   MutationScope,
   ProviderPreferences,
   ResponseFormat,
-  ServerToolId,
   ToolDefinition,
   ToolExecution,
   TraceMetadata,
@@ -70,7 +70,7 @@ describe('Phase 0 type additions', () => {
     expectTypeOf<ChatSettings['logitBias']>().toEqualTypeOf<Record<string, number> | undefined>()
     expectTypeOf<ChatSettings['autoContinueToolLoop']>().toEqualTypeOf<boolean>()
     expectTypeOf<ChatSettings['trace']>().toEqualTypeOf<TraceMetadata | undefined>()
-    expectTypeOf<ChatSettings['enabledServerToolIds']>().toEqualTypeOf<ServerToolId[]>()
+    expectTypeOf<ChatSettings['tools']>().toEqualTypeOf<ChatProviderToolSettings>()
   })
 
   it('GenerationMeta stores hosted server-tool evidence for message info', () => {

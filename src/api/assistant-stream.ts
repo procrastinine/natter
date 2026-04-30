@@ -1,5 +1,7 @@
 import type { AssistantRequestPlan } from '../core/send-planning'
 import type { ConnectionProfile } from '../core/types'
+import { anthropicOnce, anthropicStream, type AnthropicContext } from './anthropic-messages'
+import type { AnthropicMessagesResultWire, AnthropicStreamChunk } from './anthropic-types'
 import { chatCompletions, chatCompletionsOnce } from './chat-completions'
 import { geminiOnce, geminiStream, type GeminiContext } from './gemini-native'
 import type { GenerateContentResponseWire } from './gemini-types'
@@ -18,11 +20,13 @@ export type AssistantStreamChunk =
   | ChatStreamChunk
   | ResponsesStreamChunk
   | GeminiStreamChunk
+  | AnthropicStreamChunk
 
 type AssistantOnceResult =
   | ChatCompletionResultWire
   | ResponsesResultWire
   | GenerateContentResponseWire
+  | AnthropicMessagesResultWire
 
 interface AssistantDispatchInput {
   connection: ConnectionProfile
@@ -52,6 +56,14 @@ export function openAssistantRequestStream(
       geminiCtx,
       requestPlan.wire as Parameters<typeof geminiStream>[1],
       requestPlan.geminiModelId ?? requestPlan.requestedModel,
+      { ...(signal ? { signal } : {}) },
+    )
+  }
+  if (requestPlan.route?.transport === 'anthropic') {
+    const anthropicCtx: AnthropicContext = ctx
+    return anthropicStream(
+      anthropicCtx,
+      requestPlan.wire as Parameters<typeof anthropicStream>[1],
       { ...(signal ? { signal } : {}) },
     )
   }
@@ -90,6 +102,14 @@ export async function runAssistantRequestOnce(
       geminiCtx,
       requestPlan.wire as Parameters<typeof geminiOnce>[1],
       requestPlan.geminiModelId ?? requestPlan.requestedModel,
+      { ...(signal ? { signal } : {}) },
+    )
+  }
+  if (requestPlan.route?.transport === 'anthropic') {
+    const anthropicCtx: AnthropicContext = ctx
+    return anthropicOnce(
+      anthropicCtx,
+      requestPlan.wire as Parameters<typeof anthropicOnce>[1],
       { ...(signal ? { signal } : {}) },
     )
   }

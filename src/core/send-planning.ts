@@ -1,5 +1,10 @@
 import { applyServerTemplate } from '../api/probe'
-import { chooseApi, type ApiRoute } from './api-choice'
+import { normalizeModelsResponse } from '../api/providers'
+import { resolveBundledCapability } from '../capabilities'
+import { logRequestPlanDebug } from '../lib/debug-streams'
+import { getCachedModels } from '../store/models-cache'
+import { getWorkspaceRepository } from '../store/workspace-repository'
+import { type ApiRoute, chooseApi } from './api-choice'
 import {
   attachmentContextHasRefs,
   attachmentContextIds,
@@ -7,20 +12,39 @@ import {
   resolveAttachmentContextRefs,
 } from './attachments/context'
 import { buildStoredOpenRouterAttachmentWire } from './attachments/stored-openrouter'
-import { resolveBundledCapability } from '../capabilities'
+import { applyContextCutoff } from './context-cutoff'
 import { corsProxyConfigFromPrefs, readGlobalPreferences } from './global-settings'
+import { type ResolvePrivacyForSendResult, resolvePrivacyForSend } from './privacy-request'
+import { applyOutboundContextRewrites } from './prompt-context'
 import {
-  estimateSettingsPromptSize,
   type AttachmentResolver,
+  estimateSettingsPromptSize,
   tokenizerFromSettings,
   UNLIMITED_CONTEXT,
 } from './prompt-size'
-import { resolvePrivacyForSend, type ResolvePrivacyForSendResult } from './privacy-request'
+import {
+  type HostedToolProvider,
+  hasEnabledHostedTools,
+  isOpenAiDirectProfile,
+} from './provider-hosted-tools'
 import { providerDisplayName, providerRoutingRef } from './provider-identity'
 import { isTextCompletionsSelectableFor, quirksFor } from './quirks'
-import { applyOutboundContextRewrites } from './prompt-context'
+import { resolveTextTemplateFromLibrary } from './text-templates'
 import { charsPerToken, readTokenCalibrationGlobal } from './token-calibration'
 import type { PromptEstimateOptions } from './tokens'
+import type {
+  AnthropicMessagesTransformOptions,
+  ChatCompletionsTransformOptions,
+  GeminiNativeTransformOptions,
+  ResponsesTransformOptions,
+} from './transforms'
+import {
+  toAnthropicMessages,
+  toChatCompletions,
+  toGeminiNative,
+  toResponses,
+  toTextCompletions,
+} from './transforms'
 import type {
   Attachment,
   CapabilityDescriptor,
@@ -30,18 +54,6 @@ import type {
   ContentItem,
   Message,
 } from './types'
-import type {
-  ChatCompletionsTransformOptions,
-  GeminiNativeTransformOptions,
-  ResponsesTransformOptions,
-} from './transforms'
-import { toChatCompletions, toGeminiNative, toResponses, toTextCompletions } from './transforms'
-import { applyContextCutoff } from './context-cutoff'
-import { resolveTextTemplateFromLibrary } from './text-templates'
-import { getCachedModels } from '../store/models-cache'
-import { getWorkspaceRepository } from '../store/workspace-repository'
-import { normalizeModelsResponse } from '../api/providers'
-import { logRequestPlanDebug } from '../lib/debug-streams'
 
 function rewriteCompatibleModelId(connection: ConnectionProfile, modelId: string): string {
   if (connection.kind === 'anthropic') {
@@ -201,6 +213,7 @@ export interface AssistantRequestPlan {
   route: ApiRoute | null
   requestedModel: string
   geminiModelId?: string
+  anthropicModelId?: string
   wire: Record<string, unknown>
   outboundPath: Message[]
   outboundTokenizer: ReturnType<typeof tokenizerFromSettings>
@@ -305,6 +318,29 @@ function requestCapabilityFromPrivacy(
   if (maxPromptTokens !== undefined) descriptor.maxPromptTokens = maxPromptTokens
   if (maxCompletionTokens !== undefined) descriptor.maxCompletionTokens = maxCompletionTokens
   return descriptor
+}
+
+function hostedToolsProviderForConnection(
+  connection: ConnectionProfile,
+  settings: ChatSettings,
+): HostedToolProvider | undefined {
+  if (connection.kind === 'openrouter' && hasEnabledHostedTools(settings, 'openrouter')) {
+    return 'openrouter'
+  }
+  if (isOpenAiDirectProfile(connection) && hasEnabledHostedTools(settings, 'openai')) {
+    return 'openai'
+  }
+  if (
+    connection.kind === 'google' &&
+    connection.geminiMode !== 'openai-compat' &&
+    hasEnabledHostedTools(settings, 'google')
+  ) {
+    return 'google'
+  }
+  if (connection.kind === 'anthropic' && hasEnabledHostedTools(settings, 'anthropic')) {
+    return 'anthropic'
+  }
+  return undefined
 }
 
 export async function prepareAssistantRequestPlan(
@@ -583,10 +619,7 @@ async function buildAssistantRequestPlan(
     readTokenCalibrationGlobal(),
     readGlobalPreferences(),
   ])
-  const preCutAttachmentContext = await loadAttachmentEstimateContext(
-    contextPathMessages,
-    settings,
-  )
+  const preCutAttachmentContext = await loadAttachmentEstimateContext(contextPathMessages, settings)
   const disableTextCalibration = preCutAttachmentContext.hasAttachments
   const currentTextCharsPerToken =
     settings.model && !disableTextCalibration
@@ -601,6 +634,7 @@ async function buildAssistantRequestPlan(
     family: outboundTokenizer,
     reasoningInclude: settings.reasoning.include,
     reasoningExcluded: settings.reasoning.exclude === true,
+    includeToolCalls: settings.toolCallContext.include,
   }
   if (outboundQuirks.reasoningPreservationFormat !== undefined) {
     outboundReasoningOpts.reasoningPreservationFormat = outboundQuirks.reasoningPreservationFormat
@@ -628,6 +662,7 @@ async function buildAssistantRequestPlan(
   let requestedModel: string
   let route: ApiRoute | null = null
   let geminiModelId: string | undefined
+  let anthropicModelId: string | undefined
 
   if (useTextProtocol) {
     const requestedTemplateId = settings.textTemplate ?? 'chatml'
@@ -674,6 +709,7 @@ async function buildAssistantRequestPlan(
       }
     }
   } else {
+    const hostedToolsProvider = hostedToolsProviderForConnection(input.connection, settings)
     const outputModalities = outputModalitiesForRoute(input.capabilities)
     const routeCaps = outputModalities
       ? { quirks: quirksFor(settings.model), outputModalities }
@@ -698,7 +734,9 @@ async function buildAssistantRequestPlan(
         stream,
         rewriteSlug,
         allowProviderRouting: input.connection.kind === 'openrouter',
-        allowHostedTools: input.connection.kind === 'openrouter',
+        ...(hostedToolsProvider === 'openrouter' || hostedToolsProvider === 'openai'
+          ? { hostedToolsProvider }
+          : {}),
         ...(input.capabilities ? { capabilities: input.capabilities } : {}),
         ...(routeFormat !== undefined ? { reasoningPreservationFormat: routeFormat } : {}),
         ...(input.transform?.privacy ? { privacy: input.transform.privacy } : {}),
@@ -710,6 +748,7 @@ async function buildAssistantRequestPlan(
       const transformOpts: GeminiNativeTransformOptions = {
         stream,
         rewriteSlug,
+        ...(hostedToolsProvider === 'google' ? { hostedToolsProvider } : {}),
         ...(input.capabilities ? { capabilities: input.capabilities } : {}),
         ...(routeFormat !== undefined ? { reasoningPreservationFormat: routeFormat } : {}),
       }
@@ -717,12 +756,24 @@ async function buildAssistantRequestPlan(
       wire = result.wire
       requestedModel = result.requestedModel
       geminiModelId = result.modelId
+    } else if (route.transport === 'anthropic') {
+      const transformOpts: AnthropicMessagesTransformOptions = {
+        stream,
+        rewriteSlug,
+        ...(hostedToolsProvider === 'anthropic' ? { hostedToolsProvider } : {}),
+        ...(input.capabilities ? { capabilities: input.capabilities } : {}),
+        ...(routeFormat !== undefined ? { reasoningPreservationFormat: routeFormat } : {}),
+      }
+      const result = toAnthropicMessages(settings, outboundPath, transformOpts)
+      wire = result.wire as Record<string, unknown>
+      requestedModel = result.requestedModel
+      anthropicModelId = result.modelId
     } else {
       const transformOpts: ChatCompletionsTransformOptions = {
         stream,
         rewriteSlug,
         allowProviderRouting: input.connection.kind === 'openrouter',
-        allowHostedTools: input.connection.kind === 'openrouter',
+        ...(hostedToolsProvider === 'openrouter' ? { hostedToolsProvider } : {}),
         ...openRouterAttachmentTransform,
         ...(input.capabilities ? { capabilities: input.capabilities } : {}),
         ...(input.transform ?? {}),
@@ -739,6 +790,7 @@ async function buildAssistantRequestPlan(
     route,
     requestedModel,
     ...(geminiModelId ? { geminiModelId } : {}),
+    ...(anthropicModelId ? { anthropicModelId } : {}),
     wire,
     outboundPath,
     outboundTokenizer,

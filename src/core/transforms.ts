@@ -25,6 +25,11 @@ import type {
   GenerationConfig,
   ThinkingConfig,
 } from '../api/gemini-types'
+import type {
+  AnthropicContentBlock,
+  AnthropicMessageWire,
+  AnthropicMessagesRequestWire,
+} from '../api/anthropic-types'
 import type { TextCompletionRequestWire } from '../api/text-completions'
 import type {
   ChatCompletionRequestWire,
@@ -33,6 +38,20 @@ import type {
 } from '../api/types'
 import { isFreeModel } from './model-predicates'
 import type { WireProviderPrivacy } from './privacy-filter'
+import {
+  buildGoogleServerTools,
+  buildAnthropicServerTools,
+  buildOpenAiServerTools,
+  buildOpenRouterServerTools,
+  type HostedToolProvider,
+} from './provider-hosted-tools'
+import {
+  nativeAnthropicToolBlocksForMessage,
+  nativeGeminiToolPartsForMessage,
+  nativeResponsesToolItemsForMessage,
+  type ProviderToolContextTarget,
+  unsupportedToolContextTextForMessage,
+} from './provider-tool-context'
 import { adjustGpt54SamplingGate, quirksFor } from './quirks'
 import { filterReasoningForInclude } from './reasoning'
 import { renderTextPrompt } from './text-templates'
@@ -47,7 +66,6 @@ import type {
   ReasoningDetail,
   ReasoningFormat,
   SamplingKey,
-  ServerToolId,
   TextTemplateConfig,
   ToolCall,
 } from './types'
@@ -74,10 +92,9 @@ export interface ChatCompletionsTransformOptions {
   // the request planner so direct/custom OpenAI-compatible endpoints never see
   // OpenRouter's `provider` extension.
   allowProviderRouting?: boolean
-  // OpenRouter-hosted server tools. Kept separate from provider routing because
-  // direct OpenAI/Anthropic/Gemini profiles also accept `tools`, but this first
-  // pass intentionally does not enable their hosted-tool surfaces.
-  allowHostedTools?: boolean
+  // Provider-hosted server tools. Each provider maps to its native wire shape;
+  // callers must pass the concrete provider instead of a generic boolean.
+  hostedToolsProvider?: HostedToolProvider
   // The carrier format the current route can round-trip for reasoning echo
   // (e.g. `anthropic-claude-v1` when sending to Claude; `openai-responses-v1`
   // for OpenAI Responses). Determined by `caps.quirks.reasoningPreservationFormat`
@@ -139,26 +156,6 @@ const SAMPLING_WIRE_KEY: Readonly<Record<SamplingKey, string>> = Object.freeze({
   dry_penalty_last_n: 'dry_penalty_last_n',
   n_keep: 'n_keep',
 })
-
-const OPENROUTER_SERVER_TOOL_TYPES: Readonly<Partial<Record<ServerToolId, string>>> =
-  Object.freeze({
-    'web-search': 'openrouter:web_search',
-    datetime: 'openrouter:datetime',
-    'web-fetch': 'openrouter:web_fetch',
-  })
-
-function buildOpenRouterServerTools(settings: ChatSettings): Array<{ type: string }> {
-  const tools: Array<{ type: string }> = []
-  const seen = new Set<ServerToolId>()
-  for (const id of settings.enabledServerToolIds) {
-    if (seen.has(id)) continue
-    seen.add(id)
-    const type = OPENROUTER_SERVER_TOOL_TYPES[id]
-    if (!type) continue
-    tools.push({ type })
-  }
-  return tools
-}
 
 // Apply prefill-specific path rewrites before any wire serialization. See
 // `plan/prefill-research.md §P.8.5` (trailing-whitespace trim) and §P.8.6
@@ -296,6 +293,8 @@ interface BuildChatMessagesOptions {
   reasoningPreservationFormat?: ReasoningFormat
   acceptsAnthropicRedactedThinking?: boolean
   attachmentPartsByMessageId?: ReadonlyMap<MessageId, readonly unknown[]>
+  toolContextTarget?: ProviderToolContextTarget
+  includeToolCalls?: boolean
 }
 
 export function buildChatMessages(
@@ -339,9 +338,18 @@ function serializeChatMessage(
   opts: BuildChatMessagesOptions,
 ): Record<string, unknown> {
   const attachmentParts = opts.attachmentPartsByMessageId?.get(message.id) ?? []
+  const unsupportedToolText =
+    message.role === 'assistant'
+      ? unsupportedToolContextTextForMessage(message, opts.toolContextTarget ?? 'text', {
+          includeToolCalls: opts.includeToolCalls,
+        })
+      : null
+  const contentItems = unsupportedToolText
+    ? appendAssistantToolContext(message.content, unsupportedToolText)
+    : message.content
   const entry: Record<string, unknown> = {
     role: toWireRole(message.role),
-    content: serializeContent(message.content, attachmentParts),
+    content: serializeContent(contentItems, attachmentParts),
   }
 
   if (message.role === 'tool') {
@@ -446,6 +454,24 @@ function toWireToolCall(call: ToolCall): Record<string, unknown> {
   }
 }
 
+function appendAssistantToolContext(
+  content: readonly ContentItem[],
+  toolContextText: string,
+): ContentItem[] {
+  const next = structuredClone(content) as ContentItem[]
+  const suffix = `\n\n${toolContextText}`
+  for (let i = next.length - 1; i >= 0; i -= 1) {
+    const item = next[i]
+    if (!item) continue
+    if (item.type === 'text' || item.type === 'output_text') {
+      next[i] = { ...item, text: `${item.text}${suffix}` }
+      return next
+    }
+  }
+  next.push({ type: 'output_text', text: toolContextText })
+  return next
+}
+
 export function toChatCompletions(
   settings: ChatSettings,
   path: readonly Message[],
@@ -466,6 +492,7 @@ export function toChatCompletions(
       ...(opts.attachmentPartsByMessageId
         ? { attachmentPartsByMessageId: opts.attachmentPartsByMessageId }
         : {}),
+      includeToolCalls: settings.toolCallContext.include,
     }),
   }
   if (streaming) wire.stream = true
@@ -489,10 +516,7 @@ export function toChatCompletions(
   if (settings.stop && settings.stop.length > 0 && gate('stop')) {
     wire.stop = [...settings.stop]
   }
-  if (
-    settings.maxCompletionTokens !== undefined &&
-    settings.maxCompletionTokens >= 0
-  ) {
+  if (settings.maxCompletionTokens !== undefined && settings.maxCompletionTokens >= 0) {
     // -1 is the local "unlimited" sentinel; never send it on the wire.
     if (gate('max_completion_tokens')) {
       wire.max_completion_tokens = settings.maxCompletionTokens
@@ -520,15 +544,16 @@ export function toChatCompletions(
   if (settings.responseFormat && gate('response_format')) {
     wire.response_format = toWireResponseFormat(settings.responseFormat)
   }
-  if (opts.allowHostedTools === true) {
+  if (opts.hostedToolsProvider === 'openrouter') {
     const tools = buildOpenRouterServerTools(settings)
     if (tools.length > 0 && gate('tools')) {
+      const toolSettings = settings.tools.openrouter
       wire.tools = tools
-      if (settings.toolChoice !== undefined && gate('tool_choice')) {
-        wire.tool_choice = settings.toolChoice
+      if (toolSettings.toolChoice !== undefined && gate('tool_choice')) {
+        wire.tool_choice = toolSettings.toolChoice
       }
-      if (settings.parallelToolCalls !== undefined && gate('parallel_tool_calls')) {
-        wire.parallel_tool_calls = settings.parallelToolCalls
+      if (toolSettings.parallelToolCalls !== undefined && gate('parallel_tool_calls')) {
+        wire.parallel_tool_calls = toolSettings.parallelToolCalls
       }
     }
   }
@@ -607,7 +632,9 @@ export function toTextCompletions(
 
   const prompt =
     opts.prerenderedPrompt ??
-    (opts.template ? renderTextPrompt(opts.template, settings, path) : fallbackRawPrompt(path))
+    (opts.template
+      ? renderTextPrompt(opts.template, settings, path)
+      : fallbackRawPrompt(path, settings.toolCallContext.include))
 
   const wire: TextCompletionRequestWire = {
     model: requestedModel,
@@ -667,12 +694,16 @@ export function toTextCompletions(
 
 // Walk the visible branch without a template. This is a literal
 // continuation fallback, so the chat-level system prompt is not imported.
-function fallbackRawPrompt(path: readonly Message[]): string {
+function fallbackRawPrompt(path: readonly Message[], includeToolCalls: boolean): string {
   const parts: string[] = []
   for (const msg of path) {
     if (msg.hiddenFromContext === true || msg.deleted) continue
     for (const item of msg.content) {
       if (item.type === 'text' || item.type === 'output_text') parts.push(item.text)
+    }
+    if (msg.role === 'assistant') {
+      const toolText = unsupportedToolContextTextForMessage(msg, 'text', { includeToolCalls })
+      if (toolText) parts.push(toolText)
     }
   }
   return parts.join('')
@@ -788,7 +819,7 @@ export interface ResponsesTransformOptions {
   rewriteSlug?: (slug: string) => string
   privacy?: WireProviderPrivacy
   allowProviderRouting?: boolean
-  allowHostedTools?: boolean
+  hostedToolsProvider?: HostedToolProvider
   // Informs the reasoning-carry-forward filter about which encrypted format the
   // current route round-trips. For Responses the map is:
   //   OpenAI direct       → `openai-responses-v1`
@@ -850,9 +881,17 @@ export function toResponses(
     instructions = settings.systemPrompt
   }
 
+  const toolContextTarget =
+    opts.hostedToolsProvider === 'openrouter' ? 'openrouter-responses' : 'openai-responses'
   for (const message of visible) {
     if (message.role === 'system' || message.role === 'developer') continue
-    const items = messageToResponsesItems(message, settings.reasoning.include, preservationFormat)
+    const items = messageToResponsesItems(
+      message,
+      settings.reasoning.include,
+      preservationFormat,
+      toolContextTarget,
+      settings.toolCallContext.include,
+    )
     input.push(...items)
   }
 
@@ -924,15 +963,29 @@ export function toResponses(
     }
   }
 
-  if (opts.allowHostedTools === true) {
+  if (opts.hostedToolsProvider === 'openrouter') {
     const tools = buildOpenRouterServerTools(settings)
     if (tools.length > 0 && gate('tools')) {
+      const toolSettings = settings.tools.openrouter
       wire.tools = tools
-      if (settings.toolChoice !== undefined && gate('tool_choice')) {
-        wire.tool_choice = settings.toolChoice
+      if (toolSettings.toolChoice !== undefined && gate('tool_choice')) {
+        wire.tool_choice = toolSettings.toolChoice
       }
-      if (settings.parallelToolCalls !== undefined && gate('parallel_tool_calls')) {
-        wire.parallel_tool_calls = settings.parallelToolCalls
+      if (toolSettings.parallelToolCalls !== undefined && gate('parallel_tool_calls')) {
+        wire.parallel_tool_calls = toolSettings.parallelToolCalls
+      }
+    }
+  } else if (opts.hostedToolsProvider === 'openai') {
+    const { tools, include } = buildOpenAiServerTools(settings)
+    if (tools.length > 0 && gate('tools')) {
+      const toolSettings = settings.tools.openai
+      wire.tools = tools
+      if (include.length > 0) wire.include = uniqueStrings([...(wire.include ?? []), ...include])
+      if (toolSettings.toolChoice !== undefined && gate('tool_choice')) {
+        wire.tool_choice = toolSettings.toolChoice
+      }
+      if (toolSettings.parallelToolCalls !== undefined && gate('parallel_tool_calls')) {
+        wire.parallel_tool_calls = toolSettings.parallelToolCalls
       }
     }
   }
@@ -969,6 +1022,10 @@ function toResponsesTextFormat(
   }
 }
 
+function uniqueStrings(values: readonly string[]): string[] {
+  return [...new Set(values)]
+}
+
 // Translate ONE `Message` into one or more Responses input items. Rules:
 //   - user → single `{type:'message', role:'user', content}` item.
 //   - assistant with text + optional reasoning → reasoning item first (if any
@@ -981,6 +1038,11 @@ function messageToResponsesItems(
   message: Message,
   include: ChatSettings['reasoning']['include'],
   preservationFormat: ReasoningFormat | undefined,
+  toolContextTarget: Extract<
+    ProviderToolContextTarget,
+    'openai-responses' | 'openrouter-responses'
+  >,
+  includeToolCalls: boolean,
 ): ResponsesInputItem[] {
   if (message.role === 'tool') {
     const callId = message.toolCalls?.[0]?.id ?? ''
@@ -1003,10 +1065,21 @@ function messageToResponsesItems(
 
   if (message.role === 'assistant') {
     const items: ResponsesInputItem[] = []
+    items.push(
+      ...(nativeResponsesToolItemsForMessage(message, toolContextTarget, {
+        includeToolCalls,
+      }) as ResponsesInputItem[]),
+    )
+    const unsupportedToolText = unsupportedToolContextTextForMessage(message, toolContextTarget, {
+      includeToolCalls,
+    })
 
     // Prefer the verbatim echo item if one was stored.
     if (message.responsesEchoItem) {
-      const echoed = applyIncludeToEchoItem(message.responsesEchoItem, include, preservationFormat)
+      const echoed = appendToolTextToResponsesItem(
+        applyIncludeToEchoItem(message.responsesEchoItem, include, preservationFormat),
+        unsupportedToolText,
+      )
       // When stripping leaves a `reasoning` item with no `encrypted_content`
       // AND no `summary`, the item is empty: nothing of value for the next
       // turn. Skip it so a naked `{type:'reasoning'}` envelope is not sent.
@@ -1051,11 +1124,15 @@ function messageToResponsesItems(
         )
         .map((c) => c.text)
         .join('')
-      if (textContent.length > 0 || !message.toolCalls?.length) {
+      const outputText =
+        unsupportedToolText && textContent.length > 0
+          ? `${textContent}\n\n${unsupportedToolText}`
+          : (unsupportedToolText ?? textContent)
+      if (outputText.length > 0 || !message.toolCalls?.length) {
         const item: ResponsesInputItem = {
           type: 'message',
           role: 'assistant',
-          content: [{ type: 'output_text', text: textContent }],
+          content: [{ type: 'output_text', text: outputText }],
         }
         if (message.phase !== undefined) item.phase = message.phase
         items.push(item)
@@ -1083,6 +1160,25 @@ function messageToResponsesItems(
       content: buildUserContentParts(message.content),
     },
   ]
+}
+
+function appendToolTextToResponsesItem(
+  item: ResponsesInputItem,
+  toolText: string | null,
+): ResponsesInputItem {
+  if (!toolText || item.type !== 'message') return item
+  const content = Array.isArray(item.content) ? [...item.content] : []
+  for (let i = content.length - 1; i >= 0; i -= 1) {
+    const part = content[i]
+    if (!part || typeof part !== 'object') continue
+    const record = part as { type?: unknown; text?: unknown }
+    if (record.type === 'output_text' && typeof record.text === 'string') {
+      content[i] = { ...record, text: `${record.text}\n\n${toolText}` }
+      return { ...item, content }
+    }
+  }
+  content.push({ type: 'output_text', text: toolText })
+  return { ...item, content }
 }
 
 function buildUserContentParts(items: ContentItem[]): unknown[] {
@@ -1164,6 +1260,240 @@ function stripTmpReasoningId<T extends { id?: string }>(detail: T): T {
 }
 
 // ---------------------------------------------------------------------------
+// Anthropic Messages API transform.
+// ---------------------------------------------------------------------------
+
+export interface AnthropicMessagesTransformOptions {
+  capabilities?: CapabilityDescriptor
+  stream?: boolean
+  rewriteSlug?: (slug: string) => string
+  reasoningPreservationFormat?: ReasoningFormat
+  hostedToolsProvider?: HostedToolProvider
+}
+
+interface AnthropicMessagesTransformResult {
+  wire: AnthropicMessagesRequestWire
+  requestedModel: string
+  modelId: string
+}
+
+export function toAnthropicMessages(
+  settings: ChatSettings,
+  path: readonly Message[],
+  opts: AnthropicMessagesTransformOptions = {},
+): AnthropicMessagesTransformResult {
+  const requestedModel = settings.model
+  const rewritten = opts.rewriteSlug ? opts.rewriteSlug(requestedModel) : requestedModel
+  const modelId = normalizeAnthropicModelId(rewritten)
+  const streaming = opts.stream !== false
+  const quirks = quirksFor(requestedModel)
+  const preservationFormat = opts.reasoningPreservationFormat ?? quirks.reasoningPreservationFormat
+
+  const rewrittenPath = applyPrefillWireRewrites(path)
+  const visible = rewrittenPath.filter((m) => m.hiddenFromContext !== true && !m.deleted)
+  const messages: AnthropicMessageWire[] = []
+
+  const systemMessages = visible.filter((m) => m.role === 'system' || m.role === 'developer')
+  let systemText = ''
+  if (systemMessages.length > 0) {
+    systemText = systemMessages
+      .flatMap((m) => m.content)
+      .filter((c): c is Extract<ContentItem, { type: 'text' | 'output_text' }> =>
+        c.type === 'text' || c.type === 'output_text',
+      )
+      .map((c) => c.text)
+      .join('\n\n')
+  } else if (settings.systemPrompt.length > 0) {
+    systemText = settings.systemPrompt
+  }
+
+  for (const message of visible) {
+    if (message.role === 'system' || message.role === 'developer') continue
+    const wireMessages = messageToAnthropicMessages(
+      message,
+      settings.reasoning.include,
+      preservationFormat,
+      settings.toolCallContext.include,
+    )
+    messages.push(...wireMessages)
+  }
+
+  const wire: AnthropicMessagesRequestWire = {
+    model: modelId,
+    max_tokens:
+      settings.maxCompletionTokens !== undefined && settings.maxCompletionTokens > 0
+        ? settings.maxCompletionTokens
+        : 4096,
+    messages,
+  }
+  if (streaming) wire.stream = true
+  if (systemText.length > 0) wire.system = systemText
+
+  if (settings.sampling.temperature !== undefined) wire.temperature = settings.sampling.temperature
+  if (settings.sampling.top_p !== undefined) wire.top_p = settings.sampling.top_p
+  if (settings.sampling.top_k !== undefined) wire.top_k = settings.sampling.top_k
+  if (settings.stop && settings.stop.length > 0) wire.stop_sequences = [...settings.stop]
+
+  const thinking = buildAnthropicThinking(settings)
+  if (thinking) wire.thinking = thinking
+
+  if (opts.hostedToolsProvider === 'anthropic') {
+    const tools = buildAnthropicServerTools(settings)
+    if (tools.length > 0) {
+      wire.tools = tools
+      const toolChoice = anthropicToolChoice(settings.tools.anthropic.toolChoice)
+      if (toolChoice !== undefined) wire.tool_choice = toolChoice
+    }
+  }
+
+  return { wire, requestedModel, modelId }
+}
+
+function normalizeAnthropicModelId(modelId: string): string {
+  const slash = modelId.indexOf('/')
+  return (slash >= 0 ? modelId.slice(slash + 1) : modelId).replace(/(\d)\.(\d)(?=-|$)/g, '$1-$2')
+}
+
+function buildAnthropicThinking(settings: ChatSettings): unknown | undefined {
+  const r = settings.reasoning
+  if (r.mode === 'default') return undefined
+  if (r.mode === 'off') return { type: 'disabled' }
+  const out: Record<string, unknown> = { type: 'enabled' }
+  if (r.maxTokens !== undefined) out.budget_tokens = r.maxTokens
+  return out
+}
+
+function anthropicToolChoice(choice: ChatSettings['tools']['anthropic']['toolChoice']): unknown {
+  if (choice === undefined) return undefined
+  if (choice === 'auto') return { type: 'auto' }
+  if (choice === 'none') return { type: 'none' }
+  if (choice === 'required') return { type: 'any' }
+  return { type: 'tool', name: choice.function.name }
+}
+
+function messageToAnthropicMessages(
+  message: Message,
+  include: ChatSettings['reasoning']['include'],
+  preservationFormat: ReasoningFormat | undefined,
+  includeToolCalls: boolean,
+): AnthropicMessageWire[] {
+  if (message.role === 'tool') {
+    const call = message.toolCalls?.[0]
+    const contentText = message.content
+      .filter((c): c is Extract<ContentItem, { type: 'text' | 'output_text' }> =>
+        c.type === 'text' || c.type === 'output_text',
+      )
+      .map((c) => c.text)
+      .join('')
+    return [
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: call?.id ?? '',
+            content: contentText,
+          },
+        ],
+      },
+    ]
+  }
+
+  if (message.role === 'user') {
+    return [{ role: 'user', content: buildAnthropicUserBlocks(message.content) }]
+  }
+
+  if (message.role === 'assistant') {
+    const content: AnthropicContentBlock[] = []
+    const unsupportedToolText = unsupportedToolContextTextForMessage(message, 'anthropic-claude', {
+      includeToolCalls,
+    })
+
+    if (message.reasoningDetails) {
+      const kept = filterReasoningForInclude(message.reasoningDetails, include, preservationFormat)
+      for (const d of kept) {
+        if (d.type === 'reasoning.text') {
+          if (d.signature && d.text) {
+            content.push({
+              type: 'thinking',
+              thinking: d.text,
+              signature: d.signature,
+            })
+          } else if (include.text && d.text) {
+            content.push({ type: 'thinking', thinking: d.text })
+          }
+        } else if (d.type === 'reasoning.encrypted') {
+          content.push({ type: 'redacted_thinking', data: d.data })
+        }
+      }
+    }
+
+    content.push(
+      ...(nativeAnthropicToolBlocksForMessage(message, { includeToolCalls }) as AnthropicContentBlock[]),
+    )
+
+    const answerText = message.content
+      .filter((c): c is Extract<ContentItem, { type: 'text' | 'output_text' }> =>
+        c.type === 'text' || c.type === 'output_text',
+      )
+      .map((c) => c.text)
+      .join('')
+    const outputText =
+      unsupportedToolText && answerText.length > 0
+        ? `${answerText}\n\n${unsupportedToolText}`
+        : (unsupportedToolText ?? answerText)
+    if (outputText.length > 0) content.push({ type: 'text', text: outputText })
+
+    for (const call of message.toolCalls ?? []) {
+      let input: Record<string, unknown> | undefined
+      try {
+        input = JSON.parse(call.function.arguments)
+      } catch {
+        input = undefined
+      }
+      content.push({
+        type: 'tool_use',
+        id: call.id,
+        name: call.function.name,
+        input: input ?? { arguments: call.function.arguments },
+      })
+    }
+
+    return content.length > 0 ? [{ role: 'assistant', content }] : []
+  }
+
+  return []
+}
+
+function buildAnthropicUserBlocks(items: ContentItem[]): AnthropicContentBlock[] {
+  const blocks: AnthropicContentBlock[] = []
+  for (const item of items) {
+    if (item.type === 'text' || item.type === 'output_text') {
+      blocks.push({ type: 'text', text: item.text })
+    } else if (item.type === 'image_url' && item.url) {
+      const source = anthropicImageSource(item.url)
+      if (source) {
+        blocks.push({
+          type: 'image',
+          source,
+        })
+      }
+    }
+  }
+  return blocks
+}
+
+function anthropicImageSource(url: string): unknown | null {
+  if (/^data:/u.test(url)) {
+    const match = /^data:([^;]+);base64,(.+)$/u.exec(url)
+    if (!match?.[1] || !match[2]) return null
+    return { type: 'base64', media_type: match[1], data: match[2] }
+  }
+  if (/^https?:/iu.test(url)) return { type: 'url', url }
+  return null
+}
+
+// ---------------------------------------------------------------------------
 // Phase 11: `toGeminiNative` — the Google Gemini native generateContent transform.
 // See `plan/phase11-implementation.md §4.5`.
 // ---------------------------------------------------------------------------
@@ -1181,6 +1511,7 @@ export interface GeminiNativeTransformOptions {
   // Gemini 2.5 budget table used when the model quirks entry is missing a
   // custom mapping. Overridable for tests / future model tables.
   thinkingBudgetByEffort?: Partial<Record<EffortLevel, number>>
+  hostedToolsProvider?: HostedToolProvider
 }
 
 interface GeminiNativeTransformResult {
@@ -1294,7 +1625,12 @@ export function toGeminiNative(
 
   for (const message of visible) {
     if (message.role === 'system' || message.role === 'developer') continue
-    const entries = messageToGeminiContents(message, settings.reasoning.include, preservationFormat)
+    const entries = messageToGeminiContents(
+      message,
+      settings.reasoning.include,
+      preservationFormat,
+      settings.toolCallContext.include,
+    )
     contents.push(...entries)
   }
 
@@ -1339,8 +1675,26 @@ export function toGeminiNative(
   if (settings.gemini?.cachedContentName) {
     wire.cachedContent = settings.gemini.cachedContentName
   }
+  if (opts.hostedToolsProvider === 'google') {
+    const { tools, toolConfig } = buildGoogleServerTools(settings, {
+      urlContextText: geminiRequestText(wire),
+    })
+    if (tools.length > 0) {
+      wire.tools = tools
+      if (toolConfig !== undefined) wire.toolConfig = toolConfig
+    }
+  }
 
   return { wire, modelId, requestedModel }
+}
+
+function geminiRequestText(wire: GenerateContentRequestWire): string {
+  const parts = [wire.systemInstruction, ...wire.contents]
+  return parts
+    .flatMap((content) => content?.parts ?? [])
+    .map((part) => ('text' in part && typeof part.text === 'string' ? part.text : ''))
+    .filter(Boolean)
+    .join('\n')
 }
 
 function buildThinkingConfig(
@@ -1448,6 +1802,7 @@ function messageToGeminiContents(
   message: Message,
   include: ChatSettings['reasoning']['include'],
   preservationFormat: ReasoningFormat | undefined,
+  includeToolCalls: boolean,
 ): GeminiContent[] {
   if (message.role === 'tool') {
     const call = message.toolCalls?.[0]
@@ -1483,6 +1838,9 @@ function messageToGeminiContents(
 
   if (message.role === 'assistant') {
     const parts: GeminiPart[] = []
+    const unsupportedToolText = unsupportedToolContextTextForMessage(message, 'google-gemini', {
+      includeToolCalls,
+    })
     // Visible thought summary + plaintext reasoning, coalesced into ONE
     // `{text, thought: true}` part. Earlier passes pushed one part per
     // `reasoning.summary` / `reasoning.text` entry, which produced a noisy
@@ -1517,6 +1875,10 @@ function messageToGeminiContents(
       }
     }
 
+    parts.push(
+      ...(nativeGeminiToolPartsForMessage(message, { includeToolCalls }) as GeminiPart[]),
+    )
+
     // 3. The answer text.
     const answerText = message.content
       .filter(
@@ -1525,8 +1887,12 @@ function messageToGeminiContents(
       )
       .map((c) => c.text)
       .join('')
-    if (answerText.length > 0) {
-      parts.push({ text: answerText })
+    const outputText =
+      unsupportedToolText && answerText.length > 0
+        ? `${answerText}\n\n${unsupportedToolText}`
+        : (unsupportedToolText ?? answerText)
+    if (outputText.length > 0) {
+      parts.push({ text: outputText })
     }
 
     // 4. Tool calls → functionCall parts.

@@ -257,6 +257,11 @@ export function ContextPanel({
             <em>reasoning</em> {estimate.reasoningTokens.toLocaleString()}
           </span>
         ) : null}
+        {estimate.toolCallTokens > 0 ? (
+          <span title="Tool calls and results echoed on the next turn, filtered by the Tool calls row under Include in next turn and per-item eye toggles">
+            <em>tools</em> {estimate.toolCallTokens.toLocaleString()}
+          </span>
+        ) : null}
         {estimate.draftTokens > 0 ? (
           <span>
             <em>draft</em> {estimate.draftTokens.toLocaleString()}

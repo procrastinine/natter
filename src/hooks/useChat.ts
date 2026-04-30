@@ -22,23 +22,34 @@
 // callbacks; components call `sendText({chat, connection, ...})`.
 
 import { useCallback, useRef } from 'react'
-import { openAssistantRequestStream, type AssistantStreamChunk } from '../api/assistant-stream'
+import { type AssistantStreamChunk, openAssistantRequestStream } from '../api/assistant-stream'
 import { ApiError } from '../api/errors'
+import type { AnthropicStreamChunk } from '../api/anthropic-types'
+import type { GeminiStreamChunk } from '../api/gemini-types'
 import {
+  splitAnthropicStream,
   type StreamLaneEvent,
   splitChatStream,
   splitGeminiStream,
   splitResponsesStream,
 } from '../api/stream-transforms'
-import type { GeminiStreamChunk } from '../api/gemini-types'
 import type { ChatStreamChunk, ResponsesStreamChunk } from '../api/types'
 import { cursorKeyOf, groupByParent } from '../core/active-path'
-import { sendUserMessage } from '../core/messages'
 import { readGlobalPreferences } from '../core/global-settings'
+import { sendUserMessage } from '../core/messages'
 import {
+  findMergeTargetIndex,
+  mergeReasoningDetail,
+  normalizeIncomingReasoningDetail,
+} from '../core/reasoning'
+import {
+  providerOutputItemFromResponsesItem,
+  providerOutputItemFromGeminiPart,
+} from '../core/provider-tool-context'
+import {
+  type AssistantRequestPlan,
   NoEligibleProvidersError,
   prepareAssistantRequestPlan,
-  type AssistantRequestPlan,
 } from '../core/send-planning'
 import {
   addSampleToChat,
@@ -48,11 +59,6 @@ import {
   derivePromptSample,
   readTokenCalibrationGlobal,
 } from '../core/token-calibration'
-import {
-  findMergeTargetIndex,
-  mergeReasoningDetail,
-  normalizeIncomingReasoningDetail,
-} from '../core/reasoning'
 import type { PromptEstimateOptions } from '../core/tokens'
 import type { ChatCompletionsTransformOptions } from '../core/transforms'
 import { nextSiblingIndex } from '../core/tree-ops'
@@ -70,28 +76,26 @@ import type {
   Message,
   MessageId,
   MessagePhase,
+  ProviderOutputItem,
   ReasoningDetail,
 } from '../core/types'
-import { newId } from '../lib/ulid'
 import { logStreamDebug, streamDebugEnabled } from '../lib/debug-streams'
+import { newId } from '../lib/ulid'
+import { attachmentScopes, incRefs } from '../store/attachments'
 import { postEvent } from '../store/broadcast'
 import { getBrowserRepository } from '../store/browser-repo'
 import { getChat, loadActiveBranchSnapshot } from '../store/chats'
-import {
-  isFreshStreamLease,
-  STREAM_LEASE_TTL_MS,
-} from '../store/stream-leases'
 import {
   type GeneratedOutputDownloader,
   materializeGeneratedOutputAttachments,
   mergeGeneratedImageAttachmentRefs,
 } from '../store/generated-images'
-import { attachmentScopes, incRefs } from '../store/attachments'
+import type { MessageHeaderPatch, StreamChunkRow } from '../store/repository'
+import { isFreshStreamLease, STREAM_LEASE_TTL_MS } from '../store/stream-leases'
 import { useChatStore } from '../store/zustand/chatStore'
 import { useStreamStore } from '../store/zustand/streamStore'
-import { markLifecycleTarget, startRequestLifecycle } from './requestLifecycle'
 import { useUiStore } from '../store/zustand/uiStore'
-import type { MessageHeaderPatch, StreamChunkRow } from '../store/repository'
+import { markLifecycleTarget, startRequestLifecycle } from './requestLifecycle'
 
 const STREAM_LIVE_UPDATE_INTERVAL_MS = 125
 const STREAM_LIVE_TEXT_GROWTH_CHARS = 2048
@@ -192,6 +196,10 @@ async function* laneStreamForRoute(
     yield* splitGeminiStream(replay as AsyncIterable<GeminiStreamChunk>)
     return
   }
+  if (transport === 'anthropic') {
+    yield* splitAnthropicStream(replay as AsyncIterable<AnthropicStreamChunk>)
+    return
+  }
   yield* splitChatStream(replay as AsyncIterable<ChatStreamChunk>)
 }
 
@@ -201,10 +209,14 @@ function detectStreamTransport(
 ): NonNullable<AssistantRequestPlan['route']>['transport'] | 'openai-chat' {
   if ((chunk as { type?: string }).type === 'event') return 'openai-responses'
   if ((chunk as { type?: string }).type === 'chunk') return 'gemini-native'
+  if ((chunk as { type?: string }).type === 'anthropic_event') return 'anthropic'
   if ((chunk as { type?: string }).type === 'delta') return 'openai-chat'
   if ((chunk as { type?: string }).type === 'buffered_result') {
     const result = (chunk as { result?: Record<string, unknown> }).result
     if (result) {
+      if (Array.isArray((result as { content?: unknown[] }).content) && 'stop_reason' in result) {
+        return 'anthropic'
+      }
       if (Array.isArray((result as { output?: unknown[] }).output) || 'status' in result) {
         return 'openai-responses'
       }
@@ -216,6 +228,7 @@ function detectStreamTransport(
   }
   if (route?.transport === 'openai-responses') return 'openai-responses'
   if (route?.transport === 'gemini-native') return 'gemini-native'
+  if (route?.transport === 'anthropic') return 'anthropic'
   return 'openai-chat'
 }
 
@@ -247,6 +260,7 @@ interface ChatAccumulator {
     format: 'wav' | 'mp3' | 'flac' | 'ogg' | 'm4a' | 'pcm16'
   }
   serverTools: GenerationServerToolCall[]
+  providerOutputItems: ProviderOutputItem[]
   firstTextAt?: number
   reasoningStartedAt?: number
   reasoningFinishedAt?: number
@@ -282,6 +296,7 @@ function createAccumulator(input: {
     reasoningRowById: new Map(),
     generatedContent: [],
     serverTools: [],
+    providerOutputItems: [],
     dirtySinceLastLivePublish: false,
     lastLivePublishedAt: input.now,
     lastLivePublishedTextLen: 0,
@@ -774,7 +789,7 @@ async function openAssistantStreamUnder(
                   family: outboundTokenizer,
                   ...(outboundReasoningOpts ? { reasoningOpts: outboundReasoningOpts } : {}),
                 },
-            }),
+              }),
         })
         finalized = true
         await repo.deleteStreamChunks(streamId).catch(() => {})
@@ -905,11 +920,23 @@ function applyEvent(acc: ChatAccumulator, event: StreamLaneEvent, nowMs: number)
     case 'server-tool':
       recordServerToolStatus(acc, event)
       return
+    case 'server-tool-output':
+      upsertServerTool(acc.serverTools, {
+        type: event.itemType,
+        source: 'provider-output',
+        id: event.itemId,
+        ...(event.status ? { status: event.status } : {}),
+        outputIndex: event.outputIndex,
+        output: structuredClone(event.output),
+      })
+      recordProviderOutputItem(acc, event.itemType, event.output, event.outputIndex)
+      return
     case 'output-item-added':
       recordServerToolOutputItem(acc, event.item, event.outputIndex, 'stream-status')
       return
     case 'output-item-done':
       recordServerToolOutputItem(acc, event.item, event.outputIndex, 'responses-output')
+      recordResponsesOutputItem(acc, event.item, event.outputIndex)
       return
     case 'phase':
       if (event.phase === null) delete acc.phase
@@ -937,11 +964,25 @@ const HOSTED_SERVER_TOOL_ITEM_TYPES = new Set<string>([
   'file_search_call',
   'image_generation_call',
   'code_interpreter_call',
+  'shell_call',
+  'shell_call_output',
   'computer_call',
   'mcp_tool_call',
+  'mcp_call',
+  'google:google_search',
+  'google:url_context',
+  'google:code_execution',
+  'google:google_maps',
   'openrouter:datetime',
   'openrouter:web_fetch',
   'openrouter:web_search',
+  'server_tool_use',
+  'web_search_tool_result',
+  'web_fetch_tool_result',
+  'code_execution_tool_result',
+  'bash_code_execution_tool_result',
+  'text_editor_code_execution_tool_result',
+  'advisor_tool_result',
 ])
 
 function requestHasTools(wire: unknown): boolean {
@@ -988,6 +1029,27 @@ function recordServerToolOutputItem(
     outputIndex,
     output: structuredClone(item),
   })
+}
+
+function recordResponsesOutputItem(acc: ChatAccumulator, item: unknown, outputIndex: number): void {
+  const providerItem = providerOutputItemFromResponsesItem(item, outputIndex)
+  if (!providerItem) return
+  upsertProviderOutputItem(acc.providerOutputItems, providerItem)
+}
+
+function recordProviderOutputItem(
+  acc: ChatAccumulator,
+  type: string,
+  output: unknown,
+  outputIndex: number,
+): void {
+  const providerItem = type.startsWith('google:')
+    ? providerOutputItemFromGeminiPart(type, output, outputIndex)
+    : type === 'server_tool_use' || type.endsWith('_tool_result')
+      ? providerOutputItemFromResponsesItem(output, outputIndex)
+    : null
+  if (!providerItem) return
+  upsertProviderOutputItem(acc.providerOutputItems, providerItem)
 }
 
 function serverToolRecordsFromUsage(usage: ChatUsage | undefined): GenerationServerToolCall[] {
@@ -1044,8 +1106,42 @@ function upsertServerTool(
   }
 }
 
+function upsertProviderOutputItem(
+  records: ProviderOutputItem[],
+  incoming: ProviderOutputItem,
+): void {
+  const key = providerOutputItemKey(incoming)
+  const index = records.findIndex((record) => providerOutputItemKey(record) === key)
+  if (index < 0) {
+    records.push(structuredClone(incoming))
+    return
+  }
+  records[index] = structuredClone(incoming)
+}
+
+function providerOutputItemKey(record: ProviderOutputItem): string {
+  const item = record.item as {
+    id?: unknown
+    call_id?: unknown
+    executableCode?: { id?: unknown }
+    codeExecutionResult?: { id?: unknown }
+  }
+  if (typeof item?.id === 'string') return `id:${item.id}`
+  if (typeof item?.call_id === 'string') return `call:${record.type}:${item.call_id}`
+  if (typeof item?.executableCode?.id === 'string') {
+    return `gemini-code:${item.executableCode.id}:exec`
+  }
+  if (typeof item?.codeExecutionResult?.id === 'string') {
+    return `gemini-code:${item.codeExecutionResult.id}:result`
+  }
+  if (record.outputIndex !== undefined) {
+    return `idx:${record.outputIndex}:${record.type}:${Object.keys(item ?? {}).join(',')}`
+  }
+  return `${record.dialect}:${record.type}:${JSON.stringify(record.item).slice(0, 128)}`
+}
+
 function serverToolRecordKey(record: GenerationServerToolCall): string {
-  if (record.id) return `id:${record.id}`
+  if (record.id) return `id:${record.id}:${record.type}`
   if (record.outputIndex !== undefined) return `idx:${record.outputIndex}:${record.type}`
   return `usage:${record.type}`
 }
@@ -1075,6 +1171,7 @@ function releaseAccumulatorBuffers(acc: ChatAccumulator): void {
   acc.reasoningRowById.clear()
   acc.generatedContent = []
   acc.serverTools = []
+  acc.providerOutputItems = []
   acc.streamChunkBuffer = []
   if (acc.streamChunkFlushTimer) {
     clearTimeout(acc.streamChunkFlushTimer)
@@ -1177,6 +1274,7 @@ function shouldPersistStreamEvent(event: StreamLaneEvent): boolean {
     case 'content-item':
     case 'audio-output':
     case 'server-tool':
+    case 'server-tool-output':
     case 'output-item-added':
     case 'output-item-done':
     case 'error':
@@ -1190,7 +1288,10 @@ function shouldPersistStreamEvent(event: StreamLaneEvent): boolean {
   }
 }
 
-function serializeStreamEvent(event: StreamLaneEvent, acc: ChatAccumulator): StreamLaneEvent | null {
+function serializeStreamEvent(
+  event: StreamLaneEvent,
+  acc: ChatAccumulator,
+): StreamLaneEvent | null {
   if (event.lane === 'meta') {
     const meta: StreamLaneEvent & { lane: 'meta' } = { lane: 'meta' }
     let dirty = false
@@ -1595,6 +1696,10 @@ async function finalize(ctx: FinalizeContext): Promise<void> {
           content: finalContent,
           reasoningDetails: reasoning.length > 0 ? reasoning : undefined,
           phase: accumulator.phase,
+          providerOutputItems:
+            accumulator.providerOutputItems.length > 0
+              ? structuredClone(accumulator.providerOutputItems)
+              : undefined,
         },
         {
           headerPatch,
@@ -1616,6 +1721,9 @@ async function finalize(ctx: FinalizeContext): Promise<void> {
         content: finalContent,
         ...(reasoning.length > 0 ? { reasoningDetails: reasoning } : {}),
         ...(accumulator.phase !== undefined ? { phase: accumulator.phase } : {}),
+        ...(accumulator.providerOutputItems.length > 0
+          ? { providerOutputItems: structuredClone(accumulator.providerOutputItems) }
+          : {}),
       } as Message
     },
   )
@@ -1652,7 +1760,9 @@ function isNonTextContentItem(item: ContentItem): boolean {
 function contentNeedsGeneratedOutputMaterialization(content: readonly ContentItem[]): boolean {
   return content.some(
     (item) =>
-      (item.type === 'output_image' || item.type === 'audio_output' || item.type === 'output_video') &&
+      (item.type === 'output_image' ||
+        item.type === 'audio_output' ||
+        item.type === 'output_video') &&
       !item.attachmentId &&
       typeof item.url === 'string' &&
       item.url.length > 0,
@@ -1813,7 +1923,7 @@ function updatedGeneration(
   if (acc.usage?.cost !== undefined) base.cost = acc.usage.cost
   const serverTools = mergeServerToolRecords([
     ...acc.serverTools,
-    ...serverToolRecordsFromUsage(acc.usage),
+    ...(acc.serverTools.length === 0 ? serverToolRecordsFromUsage(acc.usage) : []),
   ])
   if (serverTools.length > 0) base.serverTools = serverTools
   else delete base.serverTools
@@ -1889,8 +1999,7 @@ export async function recoverOrphans(now = Date.now(), chatId?: ChatId): Promise
           header.id,
           {
             content: recovered.content,
-            reasoningDetails:
-              recovered.reasoning.length > 0 ? recovered.reasoning : undefined,
+            reasoningDetails: recovered.reasoning.length > 0 ? recovered.reasoning : undefined,
             phase: recovered.accumulator.phase,
           },
           {
@@ -1920,7 +2029,12 @@ function replayStreamChunks(
   message: Message,
   chunks: readonly StreamChunkRow[],
   now: number,
-): { accumulator: ChatAccumulator; content: ContentItem[]; reasoning: ReasoningDetail[]; finishedCleanly: boolean } {
+): {
+  accumulator: ChatAccumulator
+  content: ContentItem[]
+  reasoning: ReasoningDetail[]
+  finishedCleanly: boolean
+} {
   const accumulator = createAccumulator({
     initialContent: structuredClone(message.content),
     now,
@@ -1954,6 +2068,7 @@ function replayableStreamEvent(event: unknown): StreamLaneEvent | null {
     case 'content-item':
     case 'audio-output':
     case 'server-tool':
+    case 'server-tool-output':
     case 'output-item-added':
     case 'output-item-done':
     case 'phase':

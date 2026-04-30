@@ -7,6 +7,7 @@ type MessageBodyKey =
   | 'refusal'
   | 'phase'
   | 'responsesEchoItem'
+  | 'providerOutputItems'
 
 export type MessageBodyFields = Pick<Message, MessageBodyKey>
 
@@ -26,6 +27,7 @@ export const MESSAGE_BODY_KEYS: readonly MessageBodyKey[] = [
   'refusal',
   'phase',
   'responsesEchoItem',
+  'providerOutputItems',
 ]
 
 export function splitMessageForStorage(
@@ -51,6 +53,9 @@ export function splitMessageForStorage(
   if (message.responsesEchoItem !== undefined) {
     body.responsesEchoItem = structuredClone(message.responsesEchoItem)
   }
+  if (message.providerOutputItems !== undefined) {
+    body.providerOutputItems = structuredClone(message.providerOutputItems)
+  }
 
   for (const key of MESSAGE_BODY_KEYS) delete header[key]
   return { header, body }
@@ -62,11 +67,13 @@ export function hydrateMessage(header: MessageHeaderRow, body: MessageBodyRow): 
     throw new Error(`MessageBodyChatMismatch:${header.id}:${header.chatId}:${body.chatId}`)
   }
   if (header.nodeVersion !== body.nodeVersion) {
-    throw new Error(`MessageBodyVersionMismatch:${header.id}:${header.nodeVersion}:${body.nodeVersion}`)
+    throw new Error(
+      `MessageBodyVersionMismatch:${header.id}:${header.nodeVersion}:${body.nodeVersion}`,
+    )
   }
 
   const message: Message = {
-    ...(structuredClone(header)),
+    ...structuredClone(header),
     content: structuredClone(body.content),
   }
   if (body.reasoningDetails !== undefined) {
@@ -77,6 +84,9 @@ export function hydrateMessage(header: MessageHeaderRow, body: MessageBodyRow): 
   if (body.phase !== undefined) message.phase = body.phase
   if (body.responsesEchoItem !== undefined) {
     message.responsesEchoItem = structuredClone(body.responsesEchoItem)
+  }
+  if (body.providerOutputItems !== undefined) {
+    message.providerOutputItems = structuredClone(body.providerOutputItems)
   }
   return message
 }

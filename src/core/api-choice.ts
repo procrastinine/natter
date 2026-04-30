@@ -19,6 +19,7 @@
 //   - `caps`: the resolved capability descriptor, carrying the quirks entry
 //     (`reasoningPreservationFormat`, `preferApi`, `requiresResponsesApi`).
 
+import { hasEnabledHostedTools, isOpenAiDirectProfile } from './provider-hosted-tools'
 import { isTextCompletionsSelectableFor, responsesSupportFor } from './quirks'
 import { normalizeReasoningSettings } from './reasoning'
 import type { ApiVariant, ChatSettings, ConnectionProfile, Message, ReasoningFormat } from './types'
@@ -79,6 +80,19 @@ export function chooseApi(
   if (profile.kind === 'openrouter' && caps.outputModalities?.has('audio')) {
     return openAiChat('audio output requires chat-completions streaming')
   }
+  if (isOpenAiDirectProfile(profile) && hasEnabledHostedTools(settings, 'openai')) {
+    return openAiResponses('OpenAI hosted tools require Responses API')
+  }
+  if (
+    profile.kind === 'google' &&
+    profile.geminiMode !== 'openai-compat' &&
+    hasEnabledHostedTools(settings, 'google')
+  ) {
+    return geminiNative('Gemini native required for Google hosted tools')
+  }
+  if (profile.kind === 'anthropic') {
+    return anthropicMessages('Anthropic Messages API')
+  }
 
   // Step 1 — user-pinned chat completions. Wins over everything EXCEPT a
   // model that 404s on chat-completions (`responsesSupport: 'responses-only'`
@@ -92,7 +106,7 @@ export function chooseApi(
   }
 
   // Step 2 — user-pinned responses. Wins over everything except connection
-  // kinds that have no Responses surface (Gemini native, Anthropic future).
+  // kinds that have no Responses surface (Gemini native, Anthropic Messages).
   if (pin === 'responses' && canRunResponses(profile)) {
     return openAiResponses('user pinned Responses')
   }
@@ -132,17 +146,6 @@ export function chooseApi(
   // step is the Gemini-kind default.
   if (profile.kind === 'google' && profile.geminiMode !== 'openai-compat') {
     return geminiNative('Gemini native (generateContent)')
-  }
-
-  // Step 8 — Anthropic Messages API (reserved). Drops through to chat for
-  // now since the adapter doesn't exist yet; a future phase flips this.
-  if (profile.kind === 'anthropic') {
-    // TODO (future phase): switch to anthropic-messages when the adapter
-    // lands. Until then, fall through to OpenAI-compat chat with the
-    // browser-origin opt-in (handled by buildHeaders).
-    return openAiChat(
-      'Anthropic direct — using OpenAI-compat shim until native Messages adapter ships',
-    )
   }
 
   // Step 9 — profile default (OpenAI direct sets this true).
@@ -241,6 +244,10 @@ function openAiResponses(reason: string): ApiRoute {
 
 function geminiNative(reason: string): ApiRoute {
   return { kind: 'gemini-generate', transport: 'gemini-native', reason }
+}
+
+function anthropicMessages(reason: string): ApiRoute {
+  return { kind: 'anthropic-messages', transport: 'anthropic', reason }
 }
 
 function openRouterVideo(reason: string): ApiRoute {

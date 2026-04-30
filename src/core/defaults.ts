@@ -89,8 +89,16 @@ export const DEFAULT_CHAT_SETTINGS: Readonly<ChatSettings> = Object.freeze({
   stripExifOnUpload: true,
   toolContextStrategy: 'echo-all',
   toolContextSummarizeAfterN: 6,
+  toolCallContext: Object.freeze<ChatSettings['toolCallContext']>({
+    include: true,
+  }),
   enabledToolIds: [],
-  enabledServerToolIds: [],
+  tools: Object.freeze<ChatSettings['tools']>({
+    openrouter: Object.freeze({ enabledServerToolIds: [] }),
+    openai: Object.freeze({ enabledServerToolIds: [] }),
+    anthropic: Object.freeze({ enabledServerToolIds: [] }),
+    google: Object.freeze({ enabledServerToolIds: [] }),
+  }),
   enabledPluginIds: [],
   trustedToolIds: [],
   autoContinueToolLoop: true,

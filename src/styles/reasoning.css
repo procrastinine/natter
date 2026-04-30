@@ -76,6 +76,158 @@
   border-color: var(--color-border-default);
 }
 
+[data-ui="tool-evidence"] {
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-surface-2);
+  margin: var(--space-2) 0 var(--space-3);
+  padding: 0;
+  font-size: var(--font-size-sm);
+  color: var(--color-fg-secondary);
+}
+
+[data-ui="tool-evidence-summary"] {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  cursor: pointer;
+  list-style: none;
+}
+
+[data-ui="tool-evidence-summary"]::-webkit-details-marker,
+[data-ui="tool-evidence-section-summary"]::-webkit-details-marker {
+  display: none;
+}
+
+[data-ui="tool-evidence-summary"]::before,
+[data-ui="tool-evidence-section-summary"]::before {
+  content: "";
+  width: 0;
+  height: 0;
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  border-left: 6px solid currentColor;
+  display: inline-block;
+  margin-right: 4px;
+  transform-origin: 25% 50%;
+  transition: transform var(--duration-fast) var(--ease-standard);
+}
+
+[data-ui="tool-evidence"][open] > [data-ui="tool-evidence-summary"]::before,
+[data-ui="tool-evidence-section"][open] > [data-ui="tool-evidence-section-summary"]::before {
+  transform: rotate(90deg);
+}
+
+[data-ui="tool-evidence-badge"],
+[data-ui="tool-evidence-status"] {
+  font-size: var(--font-size-xs);
+  padding: 1px var(--space-2);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-surface-3);
+  color: var(--color-fg-muted);
+  border: 1px solid var(--color-border-subtle);
+  font-weight: var(--font-weight-regular);
+}
+
+[data-ui="tool-evidence-badge"] {
+  margin-left: auto;
+}
+
+[data-ui="tool-evidence-details"] {
+  padding: var(--space-4);
+  border-top: 1px solid var(--color-border-subtle);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+[data-ui="tool-evidence-section"] {
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-surface-1);
+}
+
+[data-ui="tool-evidence-section-summary"] {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  cursor: pointer;
+  list-style: none;
+  color: var(--color-fg-secondary);
+}
+
+[data-ui="tool-evidence-section"][data-hidden="true"] {
+  opacity: 0.65;
+}
+
+[data-ui="tool-evidence-section"][data-hidden="true"] [data-ui="tool-evidence-section-body"] {
+  color: var(--color-fg-muted);
+}
+
+[data-ui="tool-evidence-hide"] {
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  margin-left: auto;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-fg-muted);
+  cursor: pointer;
+}
+
+[data-ui="tool-evidence-hide"]:hover {
+  color: var(--color-fg-primary);
+  background: var(--color-bg-hover, rgba(127, 127, 127, 0.08));
+}
+
+[data-ui="tool-evidence-hide"][data-pressed="true"] {
+  color: var(--color-fg-primary);
+}
+
+[data-ui="tool-evidence-section-body"] {
+  padding: 0 var(--space-3) var(--space-3);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+[data-ui="tool-evidence-row"] {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+[data-ui="tool-evidence-row-label"] {
+  color: var(--color-fg-muted);
+  font-size: var(--font-size-xs);
+}
+
+[data-ui="tool-evidence-row-value"],
+[data-ui="tool-evidence-raw"] pre {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-x: auto;
+  overflow-wrap: break-word;
+  word-break: normal;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  color: var(--color-fg-primary);
+}
+
+[data-ui="tool-evidence-sources"] {
+  margin: 0;
+  padding-left: var(--space-5);
+  overflow-wrap: anywhere;
+}
+
 [data-ui="reasoning-details"] {
   padding: var(--space-4) var(--space-4) var(--space-4);
   border-top: 1px solid var(--color-border-subtle);
@@ -134,7 +286,8 @@
   background: transparent;
   color: var(--color-fg-muted);
   cursor: pointer;
-  transition: color var(--duration-fast) var(--ease-standard),
+  transition:
+    color var(--duration-fast) var(--ease-standard),
     background-color var(--duration-fast) var(--ease-standard);
 }
 
@@ -288,7 +441,7 @@
   color: var(--color-link-hover);
 }
 
-/* Include-in-context checkboxes inside the reasoning settings section. */
+/* Include-in-next-turn checkboxes inside the context settings section. */
 [data-ui="reasoning-include-group"] {
   display: flex;
   flex-direction: column;

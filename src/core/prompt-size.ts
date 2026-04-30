@@ -39,6 +39,7 @@ import { charsPerToken, readPathTextTokenEstimate, type CalibrationMode } from '
 import { clampTokens, safeContent, safeServerTokens } from './token-guards'
 import {
   estimateReasoningEchoTokens,
+  estimateToolCallContextTokens,
   estimateTokens,
   type PromptEstimateOptions,
   type TokenizerFamily,
@@ -69,6 +70,7 @@ export interface PromptSizeEstimateInput {
   reasoningInclude?: ReasoningInclude
   reasoningPreservationFormat?: ReasoningFormat
   reasoningExcluded?: boolean
+  includeToolCalls?: boolean
   // Optional — unlocks attachment-aware image / PDF heuristics. Callers
   // without the attachment table fall through to the fallback values.
   attachmentResolver?: AttachmentResolver
@@ -103,6 +105,7 @@ export interface PromptSizeEstimate {
   draftTokens: number
   mediaTokens: number
   reasoningTokens: number
+  toolCallTokens: number
   total: number
 }
 
@@ -279,20 +282,27 @@ export function estimatePromptSize(input: PromptSizeEstimateInput): PromptSizeEs
       )
     }
     let preBaselineReasoning = 0
+    let preBaselineToolCalls = 0
     if (input.reasoningInclude) {
       const opts: PromptEstimateOptions = {
         family,
         reasoningInclude: input.reasoningInclude,
         reasoningExcluded: input.reasoningExcluded ?? false,
+        includeToolCalls: input.includeToolCalls === true,
       }
       if (input.reasoningPreservationFormat !== undefined) {
         opts.reasoningPreservationFormat = input.reasoningPreservationFormat
       }
       preBaselineReasoning = estimateReasoningEchoTokens(preBaselineVisible, opts)
+      preBaselineToolCalls = estimateToolCallContextTokens(preBaselineVisible, opts)
     }
     let h = Math.max(
       0,
-      baselinePromptTokens - systemTokens - preBaselineMedia - preBaselineReasoning,
+      baselinePromptTokens -
+        systemTokens -
+        preBaselineMedia -
+        preBaselineReasoning -
+        preBaselineToolCalls,
     )
     let media = 0
     const baseline = input.activePathMessages[baselineIdx]
@@ -345,16 +355,19 @@ export function estimatePromptSize(input: PromptSizeEstimateInput): PromptSizeEs
   // flag is on AND whose `hidden` flag is off, gated further by
   // preservation-format match for encrypted carriers.
   let reasoningTokens = 0
+  let toolCallTokens = 0
   if (input.reasoningInclude) {
     const opts: PromptEstimateOptions = {
       family,
       reasoningInclude: input.reasoningInclude,
       reasoningExcluded: input.reasoningExcluded ?? false,
+      includeToolCalls: input.includeToolCalls === true,
     }
     if (input.reasoningPreservationFormat !== undefined) {
       opts.reasoningPreservationFormat = input.reasoningPreservationFormat
     }
     reasoningTokens = estimateReasoningEchoTokens(visiblePath, opts)
+    toolCallTokens = estimateToolCallContextTokens(visiblePath, opts)
   }
 
   return {
@@ -363,7 +376,10 @@ export function estimatePromptSize(input: PromptSizeEstimateInput): PromptSizeEs
     draftTokens: clampTokens(draftTokens),
     mediaTokens: clampTokens(mediaTokens),
     reasoningTokens: clampTokens(reasoningTokens),
-    total: clampTokens(systemTokens + historyTokens + draftTokens + mediaTokens + reasoningTokens),
+    toolCallTokens: clampTokens(toolCallTokens),
+    total: clampTokens(
+      systemTokens + historyTokens + draftTokens + mediaTokens + reasoningTokens + toolCallTokens,
+    ),
   }
 }
 
@@ -397,6 +413,7 @@ export function promptEstimateInputSignature(
     reasoningInclude: input.reasoningInclude ?? null,
     reasoningPreservationFormat: input.reasoningPreservationFormat ?? null,
     reasoningExcluded: input.reasoningExcluded ?? false,
+    includeToolCalls: input.includeToolCalls === true,
     activePathMessages: input.activePathMessages.map((message) =>
       frozenMessageIds.has(message.id)
         ? {
@@ -449,6 +466,7 @@ export function buildSettingsPromptSizeEstimateInput(
     family: tokenizer,
     reasoningInclude: settings.reasoning.include,
     reasoningExcluded: settings.reasoning.exclude === true,
+    includeToolCalls: settings.toolCallContext.include,
   }
   if (quirks.reasoningPreservationFormat !== undefined) {
     reasoningOpts.reasoningPreservationFormat = quirks.reasoningPreservationFormat
@@ -485,6 +503,7 @@ export function buildSettingsPromptSizeEstimateInput(
     ...(baselineInvalidated ? { disablePromptUsageBaseline: true } : {}),
     reasoningInclude: settings.reasoning.include,
     reasoningExcluded: settings.reasoning.exclude === true,
+    includeToolCalls: settings.toolCallContext.include,
     ...(attachmentResolver !== undefined ? { attachmentResolver } : {}),
     currentModelId: settings.model,
     ...(settings.appendPrompt.length > 0 ? { contextRewriteKey: settings.appendPrompt } : {}),

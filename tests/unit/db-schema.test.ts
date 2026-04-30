@@ -1,6 +1,7 @@
 import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { assertNoInlineMessageBodies } from '../../src/backcompat/message-body-split'
+import { migrateProviderOutputItemRows } from '../../src/backcompat/provider-output-items'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import type { Chat, ChatPreset, Message } from '../../src/core/types'
 import type { NatterDb } from '../../src/store/db'
@@ -109,7 +110,7 @@ function registerV1(db: Dexie): void {
 
 function registerV1Through3(db: Dexie): void {
   registerSchema(db)
-  db.version(14)
+  db.version(15)
     .stores({ profiles: 'id, name, kind, lastUsedAt, archived' })
     .upgrade(async (tx) => {
       await tx
@@ -119,7 +120,7 @@ function registerV1Through3(db: Dexie): void {
           if (row.appTitle === undefined) row.appTitle = 'Natter'
         })
     })
-  db.version(15)
+  db.version(16)
     .stores({ settings: '&key' })
     .upgrade(async (tx) => {
       const settings = tx.table<MinimalSetting>('settings')
@@ -191,7 +192,7 @@ describe('Dexie migrations', () => {
     const db = new Dexie(name)
     registerV1Through3(db)
     await db.open()
-    expect(db.verno).toBe(15)
+    expect(db.verno).toBe(16)
     expect(db.tables.map((t) => t.name).includes('settings')).toBe(true)
     const tag = await db.table<MinimalSetting>('settings').get('schemaTag')
     expect(tag).toBeUndefined()
@@ -227,7 +228,7 @@ describe('Dexie migrations', () => {
     const up = new Dexie(name)
     registerV1Through3(up)
     await up.open()
-    expect(up.verno).toBe(15)
+    expect(up.verno).toBe(16)
     const profile = await up.table<MinimalProfile>('profiles').get('P1')
     expect(profile?.appTitle).toBe('CustomTitle') // preserved — synthetic bump only fills undefined
     const tag = await up.table<MinimalSetting>('settings').get('schemaTag')
@@ -237,7 +238,7 @@ describe('Dexie migrations', () => {
     const reopen = new Dexie(name)
     registerV1Through3(reopen)
     await reopen.open()
-    expect(reopen.verno).toBe(15)
+    expect(reopen.verno).toBe(16)
     const tag2 = await reopen.table<MinimalSetting>('settings').get('schemaTag')
     expect(tag2?.value).toBe('preexisting')
     await reopen.delete()
@@ -484,6 +485,234 @@ describe('Dexie migrations', () => {
     expect('usePreferredOrdering' in (directChat?.settings.privacy ?? {})).toBe(false)
     expect('usePreferredOrdering' in (directPreset?.settings.privacy ?? {})).toBe(false)
     await migrated.delete()
+  })
+
+  it('migrates legacy shared server-tool settings into provider-scoped buckets', async () => {
+    const name = `natter-test-provider-tools-mig-${Math.random().toString(36).slice(2)}`
+    await Dexie.delete(name)
+    const legacySettings = cloneDefaultChatSettings() as Chat['settings'] & {
+      tools?: unknown
+      enabledServerToolIds?: string[]
+      toolChoice?: string
+      parallelToolCalls?: boolean
+    }
+    delete (legacySettings as { tools?: unknown }).tools
+    legacySettings.enabledServerToolIds = ['datetime', 'web-fetch']
+    legacySettings.toolChoice = 'auto'
+    legacySettings.parallelToolCalls = false
+
+    const legacy = new Dexie(name)
+    registerLegacyAttachmentsV5(legacy)
+    await legacy.open()
+    await legacy.table<Chat>('chats').put({
+      id: 'chat-tools',
+      title: '',
+      titleStatus: 'untitled',
+      createdAt: 1,
+      updatedAt: 1,
+      lastViewedAt: 1,
+      wordCount: 0,
+      totalCostUsd: 0,
+      metaVersion: 0,
+      summaryVersion: 0,
+      settings: structuredClone(legacySettings),
+      lastUpdatedLeafId: null,
+      lastBranchUpdatedAt: 1,
+      archived: false,
+      pinned: false,
+      folderId: null,
+      tags: [],
+    })
+    await legacy.table<ChatPreset>('presets').put({
+      id: 'preset-tools',
+      name: 'Tools',
+      connectionProfileId: 'profile-tools',
+      settings: structuredClone(legacySettings),
+      createdAt: 1,
+      updatedAt: 1,
+    })
+    legacy.close()
+
+    const migrated = createDbForTests(name)
+    await migrated.open()
+    const chat = await migrated.chats.get('chat-tools')
+    const preset = await migrated.presets.get('preset-tools')
+
+    expect(chat?.settings.tools.openrouter).toEqual({
+      enabledServerToolIds: ['datetime', 'web-fetch'],
+      toolChoice: 'auto',
+      parallelToolCalls: false,
+    })
+    expect(preset?.settings.tools.openrouter).toEqual(chat?.settings.tools.openrouter)
+    expect(chat?.settings.tools.openai).toEqual({ enabledServerToolIds: [] })
+    expect(chat?.settings.tools.anthropic).toEqual({ enabledServerToolIds: [] })
+    expect(chat?.settings.tools.google).toEqual({ enabledServerToolIds: [] })
+    expect(chat?.settings.toolCallContext).toEqual({ include: true })
+    expect(preset?.settings.toolCallContext).toEqual({ include: true })
+    expect('enabledServerToolIds' in ((chat?.settings ?? {}) as Record<string, unknown>)).toBe(
+      false,
+    )
+    expect('toolChoice' in ((chat?.settings ?? {}) as Record<string, unknown>)).toBe(false)
+    expect('parallelToolCalls' in ((chat?.settings ?? {}) as Record<string, unknown>)).toBe(false)
+    await migrated.delete()
+  })
+
+  it('adds provider output items to message bodies during the provider-tools schema migration', async () => {
+    const name = `natter-test-provider-output-items-mig-${Math.random().toString(36).slice(2)}`
+    await Dexie.delete(name)
+    const legacy = new Dexie(name)
+    registerLegacyAttachmentsV5(legacy)
+    await legacy.open()
+    await legacy.table<Chat>('chats').put({
+      id: 'chat-provider-output',
+      title: '',
+      titleStatus: 'untitled',
+      createdAt: 1,
+      updatedAt: 1,
+      lastViewedAt: 1,
+      wordCount: 0,
+      totalCostUsd: 0,
+      metaVersion: 0,
+      summaryVersion: 0,
+      settings: cloneDefaultChatSettings(),
+      lastUpdatedLeafId: 'a1',
+      lastBranchUpdatedAt: 1,
+      archived: false,
+      pinned: false,
+      folderId: null,
+      tags: [],
+    })
+    await legacy.table<Message>('messages').put({
+      id: 'a1',
+      chatId: 'chat-provider-output',
+      parentId: null,
+      siblingIndex: 0,
+      turnId: 'turn-a1',
+      turnIndex: 1,
+      createdAt: 1,
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: '55' }],
+      generation: {
+        id: 'gen-a1',
+        model: 'gpt-5.4-nano',
+        requestedModel: 'gpt-5.4-nano',
+        apiUsed: 'responses',
+        delivery: 'streaming',
+        costSource: 'stream',
+        startedAt: 1,
+        finishedAt: 2,
+        serverTools: [
+          {
+            type: 'code_interpreter_call',
+            source: 'responses-output',
+            id: 'ci_1',
+            status: 'completed',
+            outputIndex: 0,
+            output: {
+              id: 'ci_1',
+              type: 'code_interpreter_call',
+              status: 'completed',
+              code: 'sum(i*i for i in range(6))',
+              outputs: [{ type: 'logs', logs: '55' }],
+            },
+          },
+        ],
+      },
+      nodeVersion: 0,
+      deleted: false,
+    })
+    legacy.close()
+
+    const migrated = createDbForTests(name)
+    await migrated.open()
+    const body = await migrated.messageBodies.get('a1')
+    expect(body?.providerOutputItems).toEqual([
+      {
+        dialect: 'openai-responses',
+        type: 'code_interpreter_call',
+        outputIndex: 0,
+        item: {
+          id: 'ci_1',
+          type: 'code_interpreter_call',
+          status: 'completed',
+          code: 'sum(i*i for i in range(6))',
+          outputs: [{ type: 'logs', logs: '55' }],
+        },
+      },
+    ])
+    await migrated.delete()
+  })
+
+  it('backfills provider output items once on an already-current schema', async () => {
+    const name = `natter-test-provider-output-items-backfill-${Math.random().toString(36).slice(2)}`
+    const db = await freshDb(name)
+    await db.open()
+    const message = {
+      id: 'a1',
+      chatId: 'chat-provider-output',
+      parentId: null,
+      siblingIndex: 0,
+      turnId: 'turn-a1',
+      turnIndex: 1,
+      createdAt: 1,
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: '55' }],
+      generation: {
+        id: 'gen-a1',
+        model: 'gpt-5.4-nano',
+        requestedModel: 'gpt-5.4-nano',
+        apiUsed: 'responses',
+        delivery: 'streaming',
+        costSource: 'stream',
+        startedAt: 1,
+        finishedAt: 2,
+        serverTools: [
+          {
+            type: 'code_interpreter_call',
+            source: 'responses-output',
+            id: 'ci_1',
+            status: 'completed',
+            outputIndex: 0,
+            output: {
+              id: 'ci_1',
+              type: 'code_interpreter_call',
+              status: 'completed',
+              code: 'sum(i*i for i in range(6))',
+              outputs: [{ type: 'logs', logs: '55' }],
+            },
+          },
+        ],
+      },
+      nodeVersion: 0,
+      deleted: false,
+    } as Message
+    const { header, body } = splitMessageForStorage(message)
+    delete body.providerOutputItems
+    await db.messages.put(header)
+    await db.messageBodies.put(body)
+    await db.settings.delete('backfill:provider-output-items-v1')
+
+    await migrateProviderOutputItemRows(db)
+    await migrateProviderOutputItemRows(db)
+
+    expect((await db.settings.get('backfill:provider-output-items-v1'))?.value).toBe(1)
+    expect((await db.messageBodies.get('a1'))?.providerOutputItems).toEqual([
+      {
+        dialect: 'openai-responses',
+        type: 'code_interpreter_call',
+        outputIndex: 0,
+        item: {
+          id: 'ci_1',
+          type: 'code_interpreter_call',
+          status: 'completed',
+          code: 'sum(i*i for i in range(6))',
+          outputs: [{ type: 'logs', logs: '55' }],
+        },
+      },
+    ])
+    await db.delete()
   })
 
   it('migrates old attachment-free and prototype attachment IndexedDB rows automatically', async () => {

@@ -5,10 +5,11 @@ import { IDBFactory } from 'fake-indexeddb'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { effectiveCapabilityFromEndpoints } from '../../src/core/capabilities'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
-import type { ModelEndpoint } from '../../src/core/types'
+import type { ConnectionProfile, ModelEndpoint } from '../../src/core/types'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import { createChat, getChat } from '../../src/store/chats'
 import { __resetDbForTests, openDb } from '../../src/store/db'
+import { ChatModelPanel } from '../../src/ui/settings/ChatModelPanel'
 import { ParamForm } from '../../src/ui/settings/ParamForm'
 
 const DB_NAME = 'natter'
@@ -19,6 +20,26 @@ function makeEndpoint(overrides: Partial<ModelEndpoint> = {}): ModelEndpoint {
     supported_parameters: ['max_tokens', 'verbosity'],
     context_length: 200000,
     pricing: {},
+    ...overrides,
+  }
+}
+
+function makeProfile(overrides: Partial<ConnectionProfile> = {}): ConnectionProfile {
+  return {
+    id: 'profile-1',
+    name: 'Profile',
+    kind: 'openrouter',
+    baseUrl: 'https://openrouter.ai/api/v1',
+    apiKeyRef: 'key-1',
+    defaultHeaders: {},
+    appTitle: 'natter',
+    appUrl: '',
+    usesResponsesApiByDefault: false,
+    supportsEndpointsApi: true,
+    supportsGenerationApi: true,
+    supportsPrivacyScrape: true,
+    createdAt: 0,
+    updatedAt: 0,
     ...overrides,
   }
 }
@@ -120,28 +141,130 @@ describe('ParamForm hosted tools', () => {
     )
     const section = container.querySelector('[data-ui-section="hosted-tools"]')
     expect(section).toBeTruthy()
+    expect(section?.querySelector('h3')?.textContent).toContain('OpenRouter tools')
 
     fireEvent.click(screen.getByLabelText('Web search'))
 
     await waitFor(async () => {
-      expect((await getChat(chat.id))?.settings.enabledServerToolIds).toContain('web-search')
+      expect((await getChat(chat.id))?.settings.tools.openrouter.enabledServerToolIds).toContain(
+        'web-search',
+      )
     })
   })
 
-  it('disables hosted-tool controls outside OpenRouter and text-completions routes', async () => {
+  it('renders direct OpenAI tools and persists them in the OpenAI bucket', async () => {
+    const settings = cloneDefaultChatSettings()
+    settings.model = 'gpt-5.4-nano'
+    const chat = await createChat({ settings })
+    const capability = effectiveCapabilityFromEndpoints(settings.model, [
+      makeEndpoint({ supported_parameters: ['tools', 'tool_choice'] }),
+    ])
+    const profile = makeProfile({
+      kind: 'openai-compatible',
+      baseUrl: 'https://api.openai.com/v1',
+    })
+    const { container } = render(
+      <ParamForm
+        chat={chat}
+        capability={capability}
+        connectionKind="openai-compatible"
+        connectionProfile={profile}
+      />,
+    )
+    const section = container.querySelector('[data-ui-section="hosted-tools"]')
+    expect(section).toBeTruthy()
+    expect(section?.querySelector('h3')?.textContent).toContain('OpenAI tools')
+
+    fireEvent.click(screen.getByLabelText('Web search'))
+
+    await waitFor(async () => {
+      const stored = await getChat(chat.id)
+      expect(stored?.settings.tools.openai.enabledServerToolIds).toContain('web-search')
+      expect(stored?.settings.tools.openrouter.enabledServerToolIds).toEqual([])
+    })
+  })
+
+  it('renders Gemini tools and persists them in the Google bucket', async () => {
+    const settings = cloneDefaultChatSettings()
+    settings.model = 'google/gemini-3.1-flash-lite-preview'
+    const chat = await createChat({ settings })
+    const capability = effectiveCapabilityFromEndpoints(settings.model, [
+      makeEndpoint({ supported_parameters: ['tools', 'tool_choice'] }),
+    ])
+    const profile = makeProfile({
+      kind: 'google',
+      baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+      geminiMode: 'native',
+    })
+    const { container } = render(
+      <ParamForm
+        chat={chat}
+        capability={capability}
+        connectionKind="google"
+        connectionProfile={profile}
+      />,
+    )
+    const section = container.querySelector('[data-ui-section="hosted-tools"]')
+    expect(section).toBeTruthy()
+    expect(section?.querySelector('h3')?.textContent).toContain('Gemini tools')
+
+    fireEvent.click(screen.getByLabelText('Google Search'))
+
+    await waitFor(async () => {
+      const stored = await getChat(chat.id)
+      expect(stored?.settings.tools.google.enabledServerToolIds).toContain('google-search')
+      expect(stored?.settings.tools.openrouter.enabledServerToolIds).toEqual([])
+    })
+  })
+
+  it('renders Anthropic tools and persists them in the Anthropic bucket', async () => {
+    const settings = cloneDefaultChatSettings()
+    settings.model = 'anthropic/claude-haiku-4.5'
+    const chat = await createChat({ settings })
+    const capability = effectiveCapabilityFromEndpoints(settings.model, [
+      makeEndpoint({ supported_parameters: ['tools', 'tool_choice'] }),
+    ])
+    const profile = makeProfile({
+      kind: 'anthropic',
+      baseUrl: 'https://api.anthropic.com/v1',
+    })
+    const { container } = render(
+      <ParamForm
+        chat={chat}
+        capability={capability}
+        connectionKind="anthropic"
+        connectionProfile={profile}
+      />,
+    )
+    const section = container.querySelector('[data-ui-section="hosted-tools"]')
+    expect(section).toBeTruthy()
+    expect(section?.querySelector('h3')?.textContent).toContain('Anthropic tools')
+
+    fireEvent.click(screen.getByLabelText('Web search'))
+
+    await waitFor(async () => {
+      const stored = await getChat(chat.id)
+      expect(stored?.settings.tools.anthropic.enabledServerToolIds).toContain('web-search')
+      expect(stored?.settings.tools.openrouter.enabledServerToolIds).toEqual([])
+    })
+  })
+
+  it('omits hosted-tool controls on unsupported connections and text-completions routes', async () => {
     const settings = cloneDefaultChatSettings()
     settings.model = 'openai/gpt-5.4-nano'
     const chat = await createChat({ settings })
     const capability = effectiveCapabilityFromEndpoints(settings.model, [
       makeEndpoint({ supported_parameters: ['tools', 'tool_choice'] }),
     ])
-    const direct = render(
-      <ParamForm chat={chat} capability={capability} connectionKind="openai-compatible" />,
-    )
-    expect(screen.getByLabelText('Datetime')).toBeDisabled()
-    direct.unmount()
+    for (const connectionKind of ['llama-server', 'custom'] as const) {
+      const rendered = render(
+        <ParamForm chat={chat} capability={capability} connectionKind={connectionKind} />,
+      )
+      expect(rendered.container.querySelector('[data-ui-section="hosted-tools"]')).toBeNull()
+      rendered.unmount()
+    }
 
-    render(
+    const textMode = render(
       <ParamForm
         chat={chat}
         capability={capability}
@@ -149,6 +272,34 @@ describe('ParamForm hosted tools', () => {
         textCompletionsActive
       />,
     )
-    expect(screen.getByLabelText('Web fetch')).toBeDisabled()
+    expect(textMode.container.querySelector('[data-ui-section="hosted-tools"]')).toBeNull()
+  })
+
+  it('omits OpenRouter hosted-tool controls when the selected model does not support tools', async () => {
+    const settings = cloneDefaultChatSettings()
+    settings.model = 'openai/gpt-5.4-nano'
+    const chat = await createChat({ settings })
+    const capability = effectiveCapabilityFromEndpoints(settings.model, [
+      makeEndpoint({ supported_parameters: ['temperature'] }),
+    ])
+    const { container } = render(
+      <ParamForm chat={chat} capability={capability} connectionKind="openrouter" />,
+    )
+
+    expect(container.querySelector('[data-ui-section="hosted-tools"]')).toBeNull()
+  })
+})
+
+describe('ChatModelPanel context tab', () => {
+  it('hides tool-call context controls until a model is selected', async () => {
+    const settings = cloneDefaultChatSettings()
+    settings.model = ''
+    const chat = await createChat({ settings })
+    render(<ChatModelPanel chatId={chat.id} chatSnapshot={chat} onClose={() => undefined} />)
+
+    fireEvent.click(await screen.findByRole('tab', { name: 'Context' }))
+
+    expect(await screen.findByText('Select a model first.')).toBeTruthy()
+    expect(screen.queryByLabelText('Tool calls')).toBeNull()
   })
 })

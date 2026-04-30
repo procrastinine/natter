@@ -80,8 +80,7 @@ export function MessageInfo({ message, staleReplyHint }: MessageInfoProps) {
   }
   const reasoningTok = usage?.completion_tokens_details?.reasoning_tokens
   const hasReasoningBreakout =
-    (typeof reasoningTok === 'number' && reasoningTok > 0) ||
-    normalizedReasoning.length > 0
+    (typeof reasoningTok === 'number' && reasoningTok > 0) || normalizedReasoning.length > 0
   const answerTokens =
     hasReasoningBreakout && usage?.completion_tokens !== undefined && reasoningTok !== undefined
       ? Math.max(0, usage.completion_tokens - reasoningTok)
@@ -206,6 +205,26 @@ function serverToolLabel(type: string): string {
   if (type === 'openrouter:web_search' || type === 'web_search_call') return 'web search'
   if (type === 'openrouter:web_fetch') return 'web fetch'
   if (type === 'openrouter:datetime') return 'datetime'
+  if (type === 'image_generation_call') return 'image generation'
+  if (type === 'code_interpreter_call') return 'code interpreter'
+  if (type === 'shell_call') return 'shell'
+  if (type === 'shell_call_output') return 'shell output'
+  if (type === 'mcp_tool_call' || type === 'mcp_call') return 'remote MCP'
+  if (type === 'google:google_search') return 'Google Search'
+  if (type === 'google:url_context') return 'URL context'
+  if (type === 'google:code_execution') return 'code execution'
+  if (type === 'google:google_maps') return 'Google Maps'
+  if (type === 'server_tool_use') return 'server tool use'
+  if (type === 'web_search_tool_result') return 'web search result'
+  if (type === 'web_fetch_tool_result') return 'web fetch result'
+  if (type === 'advisor_tool_result') return 'advisor result'
+  if (
+    type === 'code_execution_tool_result' ||
+    type === 'bash_code_execution_tool_result' ||
+    type === 'text_editor_code_execution_tool_result'
+  ) {
+    return 'code execution result'
+  }
   return type
 }
 
@@ -274,7 +293,7 @@ function reasoningTimingRow(gen: GenerationMeta | undefined): [string, string] |
   const end =
     gen.firstTextAt !== undefined && gen.firstTextAt >= gen.reasoningStartedAt
       ? gen.firstTextAt
-      : gen.reasoningFinishedAt ?? gen.finishedAt
+      : (gen.reasoningFinishedAt ?? gen.finishedAt)
   if (end === undefined || end <= gen.reasoningStartedAt) return null
   const seconds = ((end - gen.reasoningStartedAt) / 1000).toFixed(2)
   const value =

@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import 'fake-indexeddb/auto'
 import Dexie from 'dexie'
 import { IDBFactory } from 'fake-indexeddb'
@@ -211,8 +211,8 @@ describe('ApiModeSection — two-button toggle', () => {
   })
 })
 
-describe('ReasoningIncludeControls — three-checkbox gating', () => {
-  it('shows three checkboxes for OpenAI-family model (emits encrypted)', async () => {
+describe('ReasoningIncludeControls — include-in-next-turn gating', () => {
+  it('shows reasoning and tool-call checkboxes for OpenAI-family model (emits encrypted)', async () => {
     const settings = cloneDefaultChatSettings()
     settings.model = 'openai/gpt-5.4-nano'
     const chat = await createChat({ settings })
@@ -221,6 +221,28 @@ describe('ReasoningIncludeControls — three-checkbox gating', () => {
     expect(screen.getByLabelText(/Encrypted reasoning/)).toBeTruthy()
     expect(screen.getByLabelText(/Visible summary/)).toBeTruthy()
     expect(screen.getByLabelText(/Visible text/)).toBeTruthy()
+    expect(screen.getByLabelText('Tool calls')).toBeTruthy()
+  })
+
+  it('renders tool calls as part of Include in next turn without a separate section', async () => {
+    const settings = cloneDefaultChatSettings()
+    settings.model = 'plain/model'
+    const chat = await createChat({ settings })
+    const capability = effectiveCapabilityFromEndpoints(settings.model, [
+      makeEndpoint({ supported_parameters: ['temperature'] }),
+    ])
+    render(<ReasoningIncludeControls chat={chat} capability={capability} />)
+
+    expect(screen.getByRole('heading', { name: 'Include in next turn' })).toBeTruthy()
+    expect(screen.getByLabelText('Tool calls')).toBeTruthy()
+    expect(screen.queryByRole('heading', { name: 'Tool calls' })).toBeNull()
+    expect(screen.queryByText('Include tool calls and results in next turn')).toBeNull()
+
+    fireEvent.click(screen.getByLabelText('Tool calls'))
+    await waitFor(async () => {
+      const updated = await getChat(chat.id)
+      expect(updated?.settings.toolCallContext.include).toBe(false)
+    })
   })
 
   it('hides the Encrypted checkbox when the model does not emit encrypted reasoning', async () => {

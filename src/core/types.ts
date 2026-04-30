@@ -186,11 +186,7 @@ export interface ToolCall {
   function: { name: string; arguments: string }
 }
 
-type ToolChoice =
-  | 'none'
-  | 'auto'
-  | 'required'
-  | { type: 'function'; function: { name: string } }
+type ToolChoice = 'none' | 'auto' | 'required' | { type: 'function'; function: { name: string } }
 
 export type ToolExecution =
   | { kind: 'manual' }
@@ -221,7 +217,100 @@ export interface ToolDefinition {
   updatedAt: number
 }
 
-export type ServerToolId = 'web-search' | 'datetime' | 'web-fetch' | 'image-generation'
+export type OpenRouterServerToolId = 'web-search' | 'datetime' | 'web-fetch' | 'image-generation'
+export type OpenAiServerToolId = 'web-search' | 'image-generation' | 'code-interpreter' | 'shell'
+export type AnthropicServerToolId = 'web-search' | 'web-fetch' | 'code-execution' | 'advisor'
+export type GoogleServerToolId = 'google-search' | 'url-context' | 'code-execution' | 'google-maps'
+// Legacy alias for older call sites and persisted rows. New provider-specific
+// code should use the provider bucket's id type instead.
+export type ServerToolId = OpenRouterServerToolId
+
+interface ApproximateLocation {
+  country?: string
+  region?: string
+  city?: string
+  timezone?: string
+}
+
+interface OpenAiToolConfigById {
+  'web-search': {
+    searchContextSize?: 'low' | 'medium' | 'high'
+    allowedDomains?: string[]
+    includeSources?: boolean
+    userLocation?: ApproximateLocation
+  }
+  'image-generation': {
+    model?: 'gpt-image-1' | 'gpt-image-1-mini' | 'gpt-image-1.5'
+    size?: 'auto' | '1024x1024' | '1024x1536' | '1536x1024'
+    quality?: 'auto' | 'low' | 'medium' | 'high'
+    format?: 'png' | 'jpeg' | 'webp'
+    partialImages?: number
+  }
+  'code-interpreter': {
+    maxOutputLength?: number
+  }
+  shell: {
+    networkPolicy?: { type: 'disabled' } | { type: 'allowlist'; allowedDomains: string[] }
+    maxOutputLength?: number
+  }
+}
+
+interface AnthropicToolConfigById {
+  'web-search': {
+    version?: 'web_search_20250305' | 'web_search_20260209'
+    maxUses?: number
+    allowedDomains?: string[]
+    blockedDomains?: string[]
+    userLocation?: ApproximateLocation
+    allowedCallers?: 'direct-only' | 'dynamic-filtering'
+  }
+  'web-fetch': {
+    version?: 'web_fetch_20250910' | 'web_fetch_20260209'
+    maxUses?: number
+    allowedDomains?: string[]
+    blockedDomains?: string[]
+    citationsEnabled?: boolean
+    maxContentTokens?: number
+    allowedCallers?: 'direct-only' | 'dynamic-filtering'
+  }
+  'code-execution': {
+    version?: 'code_execution_20250825' | 'code_execution_20260120'
+  }
+  advisor: {
+    advisorModel: 'claude-opus-4-7'
+  }
+}
+
+interface GoogleToolConfigById {
+  'google-search': {
+    renderSearchEntryPoint?: boolean
+  }
+  'url-context': {
+    maxUrls?: number
+  }
+  'code-execution': Record<string, never>
+  'google-maps': {
+    enableWidget?: boolean
+    location?: { latitude: number; longitude: number }
+  }
+}
+
+interface ProviderToolSettings<
+  TServerToolId extends string,
+  TConfigById extends Partial<Record<TServerToolId, unknown>>,
+> {
+  enabledServerToolIds: TServerToolId[]
+  toolChoice?: ToolChoice
+  parallelToolCalls?: boolean
+  config?: Partial<TConfigById>
+}
+
+export interface ChatProviderToolSettings {
+  openrouter: ProviderToolSettings<OpenRouterServerToolId, Record<string, never>>
+  openai: ProviderToolSettings<OpenAiServerToolId, OpenAiToolConfigById>
+  anthropic: ProviderToolSettings<AnthropicServerToolId, AnthropicToolConfigById>
+  google: ProviderToolSettings<GoogleServerToolId, GoogleToolConfigById>
+}
 
 type PluginId = 'context-compression'
 
@@ -418,13 +507,16 @@ export interface ChatSettings {
   stripExifOnUpload: boolean
   toolContextStrategy: ToolContextStrategy
   toolContextSummarizeAfterN?: number
+  toolCallContext: {
+    include: boolean
+  }
   enabledToolIds: ToolDefinitionId[]
-  enabledServerToolIds: ServerToolId[]
+  // Provider-hosted server tools. Each active provider bucket owns its native
+  // wire mapping and must not reuse another provider's request carrier.
+  tools: ChatProviderToolSettings
   enabledPluginIds: PluginId[]
   trustedToolIds: ToolDefinitionId[]
   autoContinueToolLoop: boolean
-  toolChoice?: ToolChoice
-  parallelToolCalls?: boolean
   responseFormat?: ResponseFormat
   logitBias?: Record<string, number>
   anthropicCache: AnthropicCacheSettings
@@ -512,7 +604,7 @@ export interface TextTemplateConfig {
 
 interface ComposeOverrides {
   enabledToolIds?: ToolDefinitionId[]
-  enabledServerToolIds?: ServerToolId[]
+  tools?: Partial<ChatProviderToolSettings>
   enabledPluginIds?: PluginId[]
 }
 
@@ -759,12 +851,28 @@ interface ApiError {
 
 export interface GenerationServerToolCall {
   type: string
-  source: 'responses-output' | 'stream-status' | 'usage'
+  source: 'responses-output' | 'stream-status' | 'usage' | 'provider-output'
   id?: string
   status?: string
   outputIndex?: number
   requestCount?: number
   output?: unknown
+}
+
+export type ProviderOutputDialect =
+  | 'openai-responses'
+  | 'openrouter-responses'
+  | 'google-gemini'
+  | 'anthropic-claude'
+  | 'unknown'
+
+export interface ProviderOutputItem {
+  dialect: ProviderOutputDialect
+  type: string
+  outputIndex?: number
+  hidden?: boolean
+  edited?: boolean
+  item: unknown
 }
 
 export interface GenerationMeta {
@@ -824,6 +932,7 @@ export interface Message {
   refusal?: string
   phase?: MessagePhase
   responsesEchoItem?: ResponsesOutputItem
+  providerOutputItems?: ProviderOutputItem[]
   attachmentRefs?: MessageAttachmentRef[]
   approval?: MessageApproval
   nodeVersion: number
@@ -1115,12 +1224,7 @@ export interface ChatPreset {
 
 // Prompt slot a PromptPreset fills. Each ChatSettings has one pin slot per
 // kind. Storage is keyed by `id` alone; `kind` filters the picker.
-export type PromptPresetKind =
-  | 'system'
-  | 'append'
-  | 'continue-system'
-  | 'continue-user'
-  | 'prefill'
+export type PromptPresetKind = 'system' | 'append' | 'continue-system' | 'continue-user' | 'prefill'
 
 // A named, workspace-global prompt snapshot. Unlike ChatPreset (per-profile
 // bundle of the full ChatSettings), PromptPresets are kind-scoped and hold

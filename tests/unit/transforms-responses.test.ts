@@ -25,6 +25,20 @@ function settings(overrides: Partial<ChatSettings> = {}): ChatSettings {
   return { ...s, ...overrides }
 }
 
+function openRouterTools(
+  openrouter: Partial<ChatSettings['tools']['openrouter']>,
+): Pick<ChatSettings, 'tools'> {
+  const tools = cloneDefaultChatSettings().tools
+  return { tools: { ...tools, openrouter: { ...tools.openrouter, ...openrouter } } }
+}
+
+function openAiTools(
+  openai: Partial<ChatSettings['tools']['openai']>,
+): Pick<ChatSettings, 'tools'> {
+  const tools = cloneDefaultChatSettings().tools
+  return { tools: { ...tools, openai: { ...tools.openai, ...openai } } }
+}
+
 function user(id: string, text: string): Message {
   return {
     id,
@@ -76,13 +90,13 @@ describe('toResponses — envelope', () => {
     expect(wire.store).toBe(false)
   })
 
-  it("imports system prompt into `instructions`", () => {
+  it('imports system prompt into `instructions`', () => {
     const s = settings({ systemPrompt: 'Be brief.' })
     const { wire } = toResponses(s, [user('u1', 'hi')])
     expect(wire.instructions).toBe('Be brief.')
   })
 
-  it("prefers an inline system message over `settings.systemPrompt`", () => {
+  it('prefers an inline system message over `settings.systemPrompt`', () => {
     const imported: Message = {
       ...user('s1', 'You are helpful.'),
       role: 'system',
@@ -109,14 +123,16 @@ describe('toResponses — envelope', () => {
 
   it('serializes enabled OpenRouter hosted tools only when explicitly allowed', () => {
     const s = settings({
-      enabledServerToolIds: ['web-search', 'datetime', 'web-fetch'],
-      toolChoice: 'auto',
-      parallelToolCalls: true,
+      ...openRouterTools({
+        enabledServerToolIds: ['web-search', 'datetime', 'web-fetch'],
+        toolChoice: 'auto',
+        parallelToolCalls: true,
+      }),
     })
 
     expect(toResponses(s, [user('u1', 'hi')]).wire.tools).toBeUndefined()
 
-    const { wire } = toResponses(s, [user('u1', 'hi')], { allowHostedTools: true })
+    const { wire } = toResponses(s, [user('u1', 'hi')], { hostedToolsProvider: 'openrouter' })
     expect(wire.tools).toEqual([
       { type: 'openrouter:web_search' },
       { type: 'openrouter:datetime' },
@@ -124,6 +140,78 @@ describe('toResponses — envelope', () => {
     ])
     expect(wire.tool_choice).toBe('auto')
     expect(wire.parallel_tool_calls).toBe(true)
+  })
+
+  it('serializes direct OpenAI hosted tools from the OpenAI bucket only', () => {
+    const s = settings({
+      ...openAiTools({
+        enabledServerToolIds: ['web-search', 'image-generation', 'code-interpreter', 'shell'],
+        toolChoice: 'auto',
+        parallelToolCalls: false,
+        config: {
+          'web-search': {
+            searchContextSize: 'high',
+            allowedDomains: ['example.com', ' example.com ', 'docs.example.com'],
+            includeSources: true,
+            userLocation: { country: 'US', region: 'CA', city: 'San Francisco' },
+          },
+          'image-generation': {
+            model: 'gpt-image-1-mini',
+            size: '1024x1024',
+            quality: 'medium',
+            format: 'webp',
+            partialImages: 2,
+          },
+          shell: {
+            networkPolicy: { type: 'allowlist', allowedDomains: ['api.example.com'] },
+          },
+        },
+      }),
+    })
+
+    expect(
+      toResponses(s, [user('u1', 'hi')], { hostedToolsProvider: 'openrouter' }).wire.tools,
+    ).toBeUndefined()
+
+    const { wire } = toResponses(s, [user('u1', 'hi')], { hostedToolsProvider: 'openai' })
+    expect(wire.tools).toEqual([
+      {
+        type: 'web_search',
+        filters: { allowed_domains: ['example.com', 'docs.example.com'] },
+        search_context_size: 'high',
+        user_location: {
+          type: 'approximate',
+          country: 'US',
+          region: 'CA',
+          city: 'San Francisco',
+        },
+      },
+      {
+        type: 'image_generation',
+        model: 'gpt-image-1-mini',
+        quality: 'medium',
+        size: '1024x1024',
+        output_format: 'webp',
+        partial_images: 2,
+      },
+      { type: 'code_interpreter', container: { type: 'auto' } },
+      {
+        type: 'shell',
+        environment: {
+          type: 'container_auto',
+          network_policy: { type: 'allowlist', allowed_domains: ['api.example.com'] },
+        },
+      },
+    ])
+    expect(wire.include).toEqual(
+      expect.arrayContaining([
+        'reasoning.encrypted_content',
+        'web_search_call.action.sources',
+        'code_interpreter_call.outputs',
+      ]),
+    )
+    expect(wire.tool_choice).toBe('auto')
+    expect(wire.parallel_tool_calls).toBe(false)
   })
 })
 
@@ -209,10 +297,12 @@ describe('toResponses — reasoning echo', () => {
       path,
     )
     const items = wire.input as Array<{ type: string; [k: string]: unknown }>
-    const reasoningItem = items.find((i) => i.type === 'reasoning') as {
-      encrypted_content?: string
-      summary?: unknown[]
-    } | undefined
+    const reasoningItem = items.find((i) => i.type === 'reasoning') as
+      | {
+          encrypted_content?: string
+          summary?: unknown[]
+        }
+      | undefined
     expect(reasoningItem).toBeDefined()
     expect(reasoningItem?.encrypted_content).toBeUndefined()
     expect(reasoningItem?.summary).toHaveLength(1)
@@ -377,14 +467,147 @@ describe('toResponses — include header', () => {
 })
 
 describe('toResponses — tool calls + tool outputs', () => {
+  it('keeps direct OpenAI provider tool output items native on Responses', () => {
+    const path: Message[] = [
+      user('u1', 'compute'),
+      assistant('a1', '55', {
+        providerOutputItems: [
+          {
+            dialect: 'openai-responses',
+            type: 'code_interpreter_call',
+            outputIndex: 0,
+            item: {
+              id: 'ci_1',
+              type: 'code_interpreter_call',
+              status: 'completed',
+              code: 'sum(i*i for i in range(6))',
+              outputs: [{ type: 'logs', logs: '55' }],
+            },
+          },
+        ],
+      }),
+      user('u2', 'what was the result?'),
+    ]
+    const { wire } = toResponses(settings(), path, { hostedToolsProvider: 'openai' })
+    const items = wire.input as Array<Record<string, unknown>>
+    expect(items.some((item) => item.type === 'code_interpreter_call')).toBe(true)
+    const assistantMessage = items.find(
+      (item) => item.type === 'message' && item.role === 'assistant',
+    ) as { content?: Array<{ text?: string }> } | undefined
+    expect(assistantMessage?.content?.[0]?.text).toBe('55')
+  })
+
+  it('renders unsupported provider tool output items as assistant text', () => {
+    const path: Message[] = [
+      user('u1', 'compute'),
+      assistant('a1', '55', {
+        providerOutputItems: [
+          {
+            dialect: 'openai-responses',
+            type: 'shell_call_output',
+            outputIndex: 0,
+            item: {
+              id: 'sho_1',
+              type: 'shell_call_output',
+              output: [{ stdout: 'natter-shape-probe.', stderr: '' }],
+            },
+          },
+        ],
+      }),
+    ]
+    const { wire } = toResponses(settings(), path, { hostedToolsProvider: 'openrouter' })
+    const items = wire.input as Array<Record<string, unknown>>
+    expect(items.some((item) => item.type === 'shell_call_output')).toBe(false)
+    const assistantMessage = items.find(
+      (item) => item.type === 'message' && item.role === 'assistant',
+    ) as { content?: Array<{ text?: string }> } | undefined
+    expect(assistantMessage?.content?.[0]?.text).toContain('<tool_call>')
+    expect(assistantMessage?.content?.[0]?.text).toContain('natter-shape-probe.')
+  })
+
+  it('does not replay hidden provider tool output items', () => {
+    const path: Message[] = [
+      user('u1', 'compute'),
+      assistant('a1', '55', {
+        providerOutputItems: [
+          {
+            dialect: 'openai-responses',
+            type: 'code_interpreter_call',
+            hidden: true,
+            item: {
+              id: 'ci_1',
+              type: 'code_interpreter_call',
+              code: 'print(55)',
+            },
+          },
+        ],
+      }),
+    ]
+    const { wire } = toResponses(settings(), path, { hostedToolsProvider: 'openai' })
+    const items = wire.input as Array<Record<string, unknown>>
+    expect(items.some((item) => item.type === 'code_interpreter_call')).toBe(false)
+    expect(JSON.stringify(items)).not.toContain('print(55)')
+  })
+
+  it('falls edited native provider tool output back to tool_call text', () => {
+    const path: Message[] = [
+      user('u1', 'compute'),
+      assistant('a1', '55', {
+        providerOutputItems: [
+          {
+            dialect: 'openai-responses',
+            type: 'code_interpreter_call',
+            edited: true,
+            item: {
+              id: 'ci_1',
+              type: 'code_interpreter_call',
+              code: 'print(55)',
+            },
+          },
+        ],
+      }),
+    ]
+    const { wire } = toResponses(settings(), path, { hostedToolsProvider: 'openai' })
+    const items = wire.input as Array<Record<string, unknown>>
+    expect(items.some((item) => item.type === 'code_interpreter_call')).toBe(false)
+    const assistantMessage = items.find(
+      (item) => item.type === 'message' && item.role === 'assistant',
+    ) as { content?: Array<{ text?: string }> } | undefined
+    expect(assistantMessage?.content?.[0]?.text).toContain('<tool_call>')
+    expect(assistantMessage?.content?.[0]?.text).toContain('Edited: true')
+    expect(assistantMessage?.content?.[0]?.text).toContain('print(55)')
+  })
+
+  it('respects the global tool-call context checkbox', () => {
+    const s = settings({ toolCallContext: { include: false } })
+    const path: Message[] = [
+      user('u1', 'compute'),
+      assistant('a1', '55', {
+        providerOutputItems: [
+          {
+            dialect: 'openai-responses',
+            type: 'code_interpreter_call',
+            item: {
+              id: 'ci_1',
+              type: 'code_interpreter_call',
+              code: 'print(55)',
+            },
+          },
+        ],
+      }),
+    ]
+    const { wire } = toResponses(s, path, { hostedToolsProvider: 'openai' })
+    const items = wire.input as Array<Record<string, unknown>>
+    expect(items.some((item) => item.type === 'code_interpreter_call')).toBe(false)
+    expect(JSON.stringify(items)).not.toContain('<tool_call>')
+    expect(JSON.stringify(items)).not.toContain('print(55)')
+  })
+
   it('assistant tool calls → function_call items', () => {
     const toolCalls: ToolCall[] = [
       { id: 'call_1', type: 'function', function: { name: 'search', arguments: '{"q":"x"}' } },
     ]
-    const path: Message[] = [
-      user('u1', 'search'),
-      assistant('a1', '', { toolCalls }),
-    ]
+    const path: Message[] = [user('u1', 'search'), assistant('a1', '', { toolCalls })]
     const { wire } = toResponses(settings(), path)
     const items = wire.input as Array<{ type: string; [k: string]: unknown }>
     const call = items.find((i) => i.type === 'function_call')

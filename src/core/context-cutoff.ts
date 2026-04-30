@@ -22,7 +22,7 @@
 //      contiguous suffix is the tail.
 //
 // Complexity: O(|path|) across two linear sweeps. Per-message cost
-// computation (text + media + reasoning echo) runs exactly once, then is
+// computation (text + media + reasoning echo + tool-call context) runs exactly once, then is
 // summed into the pair/preamble buckets.
 //
 // `estimateSingleMessageReasoningEchoTokens` in `./tokens.ts` is the only
@@ -49,6 +49,7 @@ import { readPathTextTokenEstimate } from './token-calibration'
 import { clampTokens } from './token-guards'
 import {
   estimateReasoningEchoTokensForMessage,
+  estimateToolCallContextTokensForMessage,
   estimateTokens,
   type PromptEstimateOptions,
   type TokenizerFamily,
@@ -79,6 +80,7 @@ interface MessageCost {
   text: number
   media: number
   reasoning: number
+  toolCalls: number
   total: number
 }
 
@@ -113,7 +115,10 @@ export function messageCost(m: Message, opts: MessageCostOptions): MessageCost {
   const reasoning = opts.reasoningOpts
     ? estimateReasoningEchoTokensForMessage(m, opts.reasoningOpts)
     : 0
-  return { text, media, reasoning, total: text + media + reasoning }
+  const toolCalls = opts.reasoningOpts
+    ? estimateToolCallContextTokensForMessage(m, opts.reasoningOpts)
+    : 0
+  return { text, media, reasoning, toolCalls, total: text + media + reasoning + toolCalls }
 }
 
 interface PairBucket {
@@ -121,6 +126,7 @@ interface PairBucket {
   textTokens: number
   mediaTokens: number
   reasoningTokens: number
+  toolCallTokens: number
   tokens: number
 }
 
@@ -130,7 +136,14 @@ interface GroupedPath {
 }
 
 function emptyBucket(): PairBucket {
-  return { messages: [], textTokens: 0, mediaTokens: 0, reasoningTokens: 0, tokens: 0 }
+  return {
+    messages: [],
+    textTokens: 0,
+    mediaTokens: 0,
+    reasoningTokens: 0,
+    toolCallTokens: 0,
+    tokens: 0,
+  }
 }
 
 function addToBucket(bucket: PairBucket, m: Message, c: MessageCost): void {
@@ -138,6 +151,7 @@ function addToBucket(bucket: PairBucket, m: Message, c: MessageCost): void {
   bucket.textTokens += c.text
   bucket.mediaTokens += c.media
   bucket.reasoningTokens += c.reasoning
+  bucket.toolCallTokens += c.toolCalls
   bucket.tokens += c.total
 }
 
@@ -206,7 +220,8 @@ interface CutoffPlan {
   historyTextTokens: number
   historyMediaTokens: number
   historyReasoningTokens: number
-  // history = preamble + head + tail buckets combined (text + media + reasoning).
+  historyToolCallTokens: number
+  // history = preamble + head + tail buckets combined (text + media + reasoning + tools).
   historyTokens: number
   // total = system + history + draft text + draft media. Does NOT include `reserveTokens`;
   // that's part of the BUDGET side, not what gets sent.
@@ -243,12 +258,14 @@ function buildPlan(
   let historyText = grouped.preamble.textTokens
   let historyMedia = grouped.preamble.mediaTokens
   let historyReasoning = grouped.preamble.reasoningTokens
+  let historyToolCalls = grouped.preamble.toolCallTokens
   for (const p of keptPairs) {
     historyText += p.textTokens
     historyMedia += p.mediaTokens
     historyReasoning += p.reasoningTokens
+    historyToolCalls += p.toolCallTokens
   }
-  const historyTokens = historyText + historyMedia + historyReasoning
+  const historyTokens = historyText + historyMedia + historyReasoning + historyToolCalls
 
   return {
     kept,
@@ -264,6 +281,7 @@ function buildPlan(
     historyTextTokens: clampTokens(historyText),
     historyMediaTokens: clampTokens(historyMedia),
     historyReasoningTokens: clampTokens(historyReasoning),
+    historyToolCallTokens: clampTokens(historyToolCalls),
     historyTokens: clampTokens(historyTokens),
     total: clampTokens(historyTokens + systemTokens + draftTokens + draftMediaTokens),
     reserveTokens: clampTokens(reserveTokens),

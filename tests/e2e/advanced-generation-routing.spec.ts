@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test'
+import { expect, type Page, test } from '@playwright/test'
 import {
   buildSseBody,
   clearIndexedDb,
@@ -10,6 +10,7 @@ import {
 
 const OR_CHAT_MODEL = 'qwen/qwen3-4b'
 const OR_RESPONSES_MODEL = 'openai/gpt-5.4'
+const OPENAI_MODEL = 'gpt-5.4-nano'
 const GOOGLE_MODEL = 'gemini-3.1-flash-lite-preview'
 const LLAMA_MODEL = 'local-qwen3'
 
@@ -274,8 +275,7 @@ test('GUI OpenRouter hosted tools serialize for chat routes but not text complet
   await apiMode.getByRole('button', { name: 'Text completions', exact: true }).click()
   await page.getByRole('tab', { name: 'Generation' }).click()
   const textTools = page.locator('[data-ui-section="hosted-tools"]')
-  await expect(textTools.getByRole('checkbox', { name: 'Web search' })).toBeDisabled()
-  await expect(textTools.getByRole('checkbox', { name: 'Datetime' })).toBeDisabled()
+  await expect(textTools).toHaveCount(0)
   await page.locator('[data-ui="text-template-picker"]').selectOption('raw')
   await page.evaluate(() =>
     (window as unknown as { __debugStreams?: { clearPlans(): void } }).__debugStreams?.clearPlans(),
@@ -298,6 +298,57 @@ test('GUI OpenRouter hosted tools serialize for chat routes but not text complet
   expect(sendPlan.payload.profile).toMatchObject({ kind: 'openrouter' })
   expect(sendPlan.payload.route).toMatchObject({ kind: 'text-completions' })
   expect((sendPlan.payload.request as Record<string, unknown>).tools).toBeUndefined()
+  expectNoConsoleProblems(consoleLines)
+})
+
+test('GUI OpenAI direct hosted tools serialize only as Responses tools', async ({ page }) => {
+  const consoleLines = captureConsole(page)
+  const requests: CapturedRequest[] = []
+  await mockOpenRouterDiscovery(page, OR_CHAT_MODEL)
+  await mockOpenAiDirect(page, requests)
+
+  await seedFirstRun(page, { model: OR_CHAT_MODEL, disablePrivacyFilter: false })
+  await createChatAndOpen(page)
+  await addConnectionThroughGui(page, 'openai-compatible', { key: 'sk-openai-test' })
+  await selectModelThroughSettings(page, OPENAI_MODEL)
+  await page.getByRole('tab', { name: 'Generation' }).click()
+
+  const tools = page.locator('[data-ui-section="hosted-tools"]')
+  await expect(tools).toBeVisible()
+  await expect(tools.locator('h3')).toContainText('OpenAI tools')
+  const webSearch = tools.getByRole('checkbox', { name: 'Web search' })
+  const imageGeneration = tools.getByRole('checkbox', { name: 'Image generation' })
+  await webSearch.click()
+  await imageGeneration.click()
+  await expect(webSearch).toBeChecked()
+  await expect(imageGeneration).toBeChecked()
+  await page.evaluate(() =>
+    (window as unknown as { __debugStreams?: { clearPlans(): void } }).__debugStreams?.clearPlans(),
+  )
+
+  const composer = page.locator('[data-ui="composer-input"]')
+  await composer.fill('OpenAI hosted tools route check')
+  await composer.press('Enter')
+  await expect(page.locator('[data-ui="message"][data-role="assistant"]').first()).toContainText(
+    'openai direct tools ok',
+  )
+
+  expect(requests).toHaveLength(1)
+  expect(requests[0]?.url).toBe('https://api.openai.com/v1/responses')
+  expect(requests[0]?.headers.authorization).toBe('Bearer sk-openai-test')
+  expect(requests[0]?.body.model).toBe(OPENAI_MODEL)
+  expect(requests[0]?.body.provider).toBeUndefined()
+  expect(requests[0]?.body.messages).toBeUndefined()
+  expect(requests[0]?.body.input).toBeDefined()
+  expect(requests[0]?.body.tools).toEqual([{ type: 'web_search' }, { type: 'image_generation' }])
+
+  const plans = await requestPlans(page)
+  const sendPlan = findLastPlan(plans, 'send')
+  expect(sendPlan.payload.profile).toMatchObject({ kind: 'openai-compatible' })
+  expect(sendPlan.payload.route).toMatchObject({ kind: 'responses' })
+  expect(providerSummary(sendPlan).wire).toBeNull()
+  expect(providerSummary(sendPlan).privacy).toMatchObject({ applicable: false })
+  expect(sendPlan.payload.wireShape).toMatchObject({ hasProvider: false, hasInput: true })
   expectNoConsoleProblems(consoleLines)
 })
 
@@ -521,6 +572,16 @@ test('GUI Google native sends generateContent without OpenRouter provider/privac
   await selectModelThroughSettings(page, GOOGLE_MODEL)
   await expect(page.locator('[data-ui-section="provider-picker"]')).toHaveCount(0)
   await expect(page.locator('[data-ui-section="privacy-section"]')).toHaveCount(0)
+  await page.getByRole('tab', { name: 'Generation' }).click()
+  const tools = page.locator('[data-ui-section="hosted-tools"]')
+  await expect(tools).toBeVisible()
+  await expect(tools.locator('h3')).toContainText('Gemini tools')
+  const googleSearch = tools.getByRole('checkbox', { name: 'Google Search' })
+  const urlContext = tools.getByRole('checkbox', { name: 'URL context' })
+  await googleSearch.click()
+  await urlContext.click()
+  await expect(googleSearch).toBeChecked()
+  await expect(urlContext).toBeChecked()
   await page.evaluate(() =>
     (window as unknown as { __debugStreams?: { clearPlans(): void } }).__debugStreams?.clearPlans(),
   )
@@ -542,6 +603,7 @@ test('GUI Google native sends generateContent without OpenRouter provider/privac
   expect(requests[0]?.headers['x-openrouter-title']).toBeUndefined()
   expect(requests[0]?.body.provider).toBeUndefined()
   expect(requests[0]?.body.contents).toBeDefined()
+  expect(requests[0]?.body.tools).toEqual([{ googleSearch: {} }, { urlContext: {} }])
 
   const plans = await requestPlans(page)
   const sendPlan = findLastPlan(plans, 'send')
@@ -553,6 +615,99 @@ test('GUI Google native sends generateContent without OpenRouter provider/privac
     hasProvider: false,
     hasSystemInstruction: false,
   })
+  expectNoConsoleProblems(consoleLines)
+})
+
+test('GUI alternating direct providers keep native tool context provider-specific', async ({
+  page,
+}) => {
+  const consoleLines = captureConsole(page)
+  const openAiRequests: CapturedRequest[] = []
+  const geminiRequests: CapturedRequest[] = []
+  await mockOpenRouterDiscovery(page, OR_CHAT_MODEL)
+  await mockOpenAiAlternatingToolContext(page, openAiRequests)
+  await mockGoogleModels(page)
+  await mockGeminiAlternatingToolContext(page, geminiRequests)
+
+  await seedFirstRun(page, { model: OR_CHAT_MODEL })
+  await createChatAndOpen(page)
+
+  await addConnectionThroughGui(page, 'openai-compatible', { key: 'sk-openai-test' })
+  await selectModelThroughSettings(page, OPENAI_MODEL)
+  await sendAndExpectAssistant(page, 'OpenAI direct tool turn', 'openai searched answer')
+
+  await addConnectionThroughGui(page, 'google', { key: 'sk-google-test', expectedName: 'Google' })
+  await selectModelThroughSettings(page, GOOGLE_MODEL)
+  await sendAndExpectAssistant(page, 'Gemini sees OpenAI tool evidence', 'gemini code answer')
+
+  await switchConnectionThroughGui(page, 'OpenAI')
+  await selectModelThroughSettings(page, OPENAI_MODEL)
+  await sendAndExpectAssistant(page, 'OpenAI sees Gemini text fallback', 'openai shell answer')
+
+  await switchConnectionThroughGui(page, 'Google')
+  await selectModelThroughSettings(page, GOOGLE_MODEL)
+  await sendAndExpectAssistant(page, 'Gemini sees native Gemini and OpenAI text', 'gemini final answer')
+
+  expect(openAiRequests).toHaveLength(2)
+  expect(geminiRequests).toHaveLength(2)
+
+  const firstGeminiWire = JSON.stringify(geminiRequests[0]?.body.contents)
+  expect(firstGeminiWire).toContain('<tool_call>')
+  expect(firstGeminiWire).toContain('Web search')
+  expect(firstGeminiWire).toContain('OpenAI evidence marker')
+  expect(firstGeminiWire).not.toContain('"web_search_call"')
+  expect(firstGeminiWire).not.toContain('"codeExecutionResult"')
+
+  const secondOpenAiInput = openAiRequests[1]?.body.input as Array<Record<string, unknown>>
+  expect(secondOpenAiInput.some((item) => item.type === 'web_search_call')).toBe(true)
+  expect(secondOpenAiInput.some((item) => item.type === 'shell_call')).toBe(false)
+  const secondOpenAiWire = JSON.stringify(secondOpenAiInput)
+  expect(secondOpenAiWire).toContain('<tool_call>')
+  expect(secondOpenAiWire).toContain('Code execution')
+  expect(secondOpenAiWire).toContain('Gemini code evidence marker')
+  expect(secondOpenAiWire).not.toContain('"executableCode"')
+  expect(secondOpenAiWire).not.toContain('"codeExecutionResult"')
+
+  const secondGeminiContents = geminiRequests[1]?.body.contents as Array<Record<string, unknown>>
+  const secondGeminiWire = JSON.stringify(secondGeminiContents)
+  expect(secondGeminiWire).toContain('"executableCode"')
+  expect(secondGeminiWire).toContain('"codeExecutionResult"')
+  expect(secondGeminiWire).toContain('<tool_call>')
+  expect(secondGeminiWire).toContain('Web search')
+  expect(secondGeminiWire).toContain('Shell command')
+  expect(secondGeminiWire).toContain('OpenAI shell marker')
+  expect(secondGeminiWire).not.toContain('"web_search_call"')
+  expect(secondGeminiWire).not.toContain('"shell_call"')
+  expect(secondGeminiWire).not.toContain('"shell_call_output"')
+
+  const chatId = await firstChatId(page)
+  const assistantRows = (await readMessages(page, chatId)).filter((row) => row.role === 'assistant')
+  expect(assistantRows).toHaveLength(4)
+  expect(
+    providerDialects(assistantRows[0] as { providerOutputItems?: Array<{ dialect?: string }> }),
+  ).toEqual(['openai-responses'])
+  expect(
+    providerDialects(assistantRows[1] as { providerOutputItems?: Array<{ dialect?: string }> }),
+  ).toEqual(['google-gemini'])
+  expect(
+    providerDialects(assistantRows[2] as { providerOutputItems?: Array<{ dialect?: string }> }),
+  ).toEqual(['openai-responses'])
+  expect(
+    providerDialects(assistantRows[3] as { providerOutputItems?: Array<{ dialect?: string }> }),
+  ).toEqual([])
+
+  const toolBlocks = page.locator('[data-ui="message"][data-role="assistant"] [data-ui="tool-evidence"]')
+  await expect(toolBlocks).toHaveCount(3)
+  await toolBlocks.first().locator('[data-ui="tool-evidence-summary"]').click()
+  await expect(toolBlocks.first()).toContainText('Web search')
+  await toolBlocks.nth(1).locator('[data-ui="tool-evidence-summary"]').click()
+  await expect(toolBlocks.nth(1)).toContainText('Code execution')
+  await toolBlocks.nth(2).locator('[data-ui="tool-evidence-summary"]').click()
+  await expect(toolBlocks.nth(2)).toContainText('Shell command')
+  await expect(page.locator('[data-ui="message"][data-role="assistant"]').last()).not.toContainText(
+    'Tool results',
+  )
+  await expectNoHorizontalOverflow(page)
   expectNoConsoleProblems(consoleLines)
 })
 
@@ -639,10 +794,10 @@ async function selectModelThroughSettings(page: Page, modelId: string): Promise<
 
 async function addConnectionThroughGui(
   page: Page,
-  kind: 'google' | 'llama-server',
-  opts: { key?: string; baseUrl?: string; expectedName: string },
+  kind: 'openai-compatible' | 'google' | 'llama-server',
+  opts: { key?: string; baseUrl?: string; expectedName?: string },
 ): Promise<void> {
-  await page.locator('[data-ui="connection-row"]').click()
+  await openConnectionDetail(page)
   await page.locator('[data-ui="connection-new"]').click()
   await page.locator('[data-ui="connection-setup-kind"]').selectOption(kind)
   if (opts.baseUrl !== undefined) {
@@ -653,7 +808,65 @@ async function addConnectionThroughGui(
   }
   await page.locator('[data-ui="connection-setup-submit"]').click()
   await page.locator('[data-ui="connection-setup-modal"]').waitFor({ state: 'detached' })
-  await expect(page.locator('[data-ui="connection-name"]')).toContainText(opts.expectedName)
+  if (opts.expectedName !== undefined) {
+    await expect(page.locator('[data-ui="connection-name"]')).toContainText(opts.expectedName)
+  }
+}
+
+async function switchConnectionThroughGui(page: Page, profileName: string): Promise<void> {
+  await openConnectionDetail(page)
+  await page.locator('[data-ui="connection-profile-select"]').selectOption({ label: profileName })
+  await expect(page.locator('[data-ui="connection-name"]')).toContainText(profileName)
+}
+
+async function openConnectionDetail(page: Page): Promise<void> {
+  const detailAction = page.locator('[data-ui="connection-new"]')
+  if (await detailAction.isVisible()) return
+  const row = page.locator('[data-ui="connection-row"]')
+  if ((await row.getAttribute('aria-expanded')) !== 'true') {
+    await row.click()
+  }
+  await expect(detailAction).toBeVisible()
+}
+
+async function sendAndExpectAssistant(
+  page: Page,
+  prompt: string,
+  expected: string,
+): Promise<void> {
+  const before = await page.locator('[data-ui="message"][data-role="assistant"]').count()
+  const composer = page.locator('[data-ui="composer-input"]')
+  await composer.fill(prompt)
+  await composer.press('Enter')
+  const assistant = page.locator('[data-ui="message"][data-role="assistant"]').nth(before)
+  await expect(assistant.locator('[data-ui="message-body"]')).toContainText(expected)
+  await expect(page.locator('[data-ui="abort"]')).toHaveCount(0)
+}
+
+function providerDialects(row: { providerOutputItems?: Array<{ dialect?: string }> }): string[] {
+  const dialects = (row.providerOutputItems ?? [])
+    .map((item) => item.dialect)
+    .filter((dialect): dialect is string => typeof dialect === 'string')
+  return [...new Set(dialects)]
+}
+
+async function expectNoHorizontalOverflow(page: Page): Promise<void> {
+  const overflow = await page.evaluate(() => {
+    const rows = Array.from(
+      document.querySelectorAll<HTMLElement>(
+        '[data-ui="tool-evidence"], [data-ui="tool-evidence-row-value"], [data-ui="tool-evidence-sources"]',
+      ),
+    )
+    return rows
+      .map((node) => ({
+        ui: node.getAttribute('data-ui'),
+        text: node.textContent?.slice(0, 80) ?? '',
+        scrollWidth: node.scrollWidth,
+        clientWidth: node.clientWidth,
+      }))
+      .filter((entry) => entry.scrollWidth > entry.clientWidth + 1)
+  })
+  expect(overflow).toEqual([])
 }
 
 async function waitForProviderOrder(page: Page, expected: string[]): Promise<void> {
@@ -860,6 +1073,96 @@ async function mockOpenRouterResponses(page: Page, requests: CapturedRequest[]):
   })
 }
 
+async function mockOpenAiDirect(page: Page, requests: CapturedRequest[]): Promise<void> {
+  await page.route('https://api.openai.com/v1/models**', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        data: [{ id: OPENAI_MODEL, object: 'model', created: 0, owned_by: 'openai' }],
+      }),
+    })
+  })
+  await page.route('https://api.openai.com/v1/responses', async (route) => {
+    const body = parsePostBody(route.request().postData())
+    requests.push({ url: route.request().url(), body, headers: route.request().headers() })
+    await route.fulfill({
+      status: 200,
+      contentType: 'text/event-stream',
+      headers: { 'x-generation-id': 'adv-openai-tools-1' },
+      body: buildResponsesSse({
+        id: 'adv-openai-tools-1',
+        model: String(body.model ?? ''),
+        text: 'openai direct tools ok',
+        reasoningFragments: [],
+      }),
+    })
+  })
+}
+
+async function mockOpenAiAlternatingToolContext(
+  page: Page,
+  requests: CapturedRequest[],
+): Promise<void> {
+  await page.route('https://api.openai.com/v1/models**', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        data: [{ id: OPENAI_MODEL, object: 'model', created: 0, owned_by: 'openai' }],
+      }),
+    })
+  })
+  await page.route('https://api.openai.com/v1/responses', async (route) => {
+    const body = parsePostBody(route.request().postData())
+    requests.push({ url: route.request().url(), body, headers: route.request().headers() })
+    const idx = requests.length - 1
+    await route.fulfill({
+      status: 200,
+      contentType: 'text/event-stream',
+      headers: { 'x-generation-id': `adv-openai-alt-${idx + 1}` },
+      body:
+        idx === 0
+          ? buildResponsesToolSse({
+              id: 'adv-openai-alt-1',
+              model: String(body.model ?? ''),
+              text: 'openai searched answer',
+              toolItems: [
+                {
+                  id: 'ws_openai_alt_1',
+                  type: 'web_search_call',
+                  status: 'completed',
+                  query: 'OpenAI evidence marker',
+                  results: [{ url: 'https://example.com/openai-evidence-marker' }],
+                },
+              ],
+            })
+          : buildResponsesToolSse({
+              id: 'adv-openai-alt-2',
+              model: String(body.model ?? ''),
+              text: 'openai shell answer',
+              toolItems: [
+                {
+                  id: 'sh_openai_alt_2',
+                  type: 'shell_call',
+                  status: 'completed',
+                  commands: ['printf OpenAI shell marker'],
+                  environment: 'linux',
+                },
+                {
+                  id: 'sho_openai_alt_2',
+                  type: 'shell_call_output',
+                  status: 'completed',
+                  stdout: 'OpenAI shell marker',
+                  stderr: '',
+                  outcome: 'success',
+                },
+              ],
+            }),
+    })
+  })
+}
+
 async function mockGoogleModels(page: Page): Promise<void> {
   await page.route(
     'https://generativelanguage.googleapis.com/v1beta/openai/models**',
@@ -873,6 +1176,74 @@ async function mockGoogleModels(page: Page): Promise<void> {
       })
     },
   )
+}
+
+async function mockGeminiAlternatingToolContext(
+  page: Page,
+  requests: CapturedRequest[],
+): Promise<void> {
+  await page.route('**/models/*:streamGenerateContent?alt=sse', async (route) => {
+    const body = parsePostBody(route.request().postData())
+    requests.push({ url: route.request().url(), body, headers: route.request().headers() })
+    const idx = requests.length - 1
+    await route.fulfill({
+      status: 200,
+      contentType: 'text/event-stream',
+      headers: { 'x-request-id': `gemini-alt-${idx + 1}` },
+      body:
+        idx === 0
+          ? buildGeminiSse([
+              {
+                candidates: [
+                  {
+                    content: {
+                      role: 'model',
+                      parts: [
+                        {
+                          executableCode: {
+                            language: 'PYTHON',
+                            code: 'print("Gemini code evidence marker")',
+                          },
+                        },
+                      ],
+                    },
+                  },
+                ],
+              },
+              {
+                candidates: [
+                  {
+                    content: {
+                      role: 'model',
+                      parts: [
+                        {
+                          codeExecutionResult: {
+                            outcome: 'OUTCOME_OK',
+                            output: 'Gemini code evidence marker',
+                          },
+                        },
+                        { text: 'gemini code answer' },
+                      ],
+                    },
+                    finishReason: 'STOP',
+                  },
+                ],
+                usageMetadata: { promptTokenCount: 12, candidatesTokenCount: 4, totalTokenCount: 16 },
+              },
+            ])
+          : buildGeminiSse([
+              {
+                candidates: [
+                  {
+                    content: { role: 'model', parts: [{ text: 'gemini final answer' }] },
+                    finishReason: 'STOP',
+                  },
+                ],
+                usageMetadata: { promptTokenCount: 12, candidatesTokenCount: 4, totalTokenCount: 16 },
+              },
+            ]),
+    })
+  })
 }
 
 async function mockGeminiNative(page: Page, requests: CapturedRequest[]): Promise<void> {
@@ -1021,6 +1392,74 @@ function buildResponsesSse(input: {
     },
   )
   return events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n`).join('\n')
+}
+
+function buildResponsesToolSse(input: {
+  id: string
+  model: string
+  text: string
+  toolItems: Array<Record<string, unknown> & { type: string }>
+}): string {
+  const events: Array<Record<string, unknown>> = [
+    {
+      type: 'response.created',
+      response: { id: input.id, model: input.model, status: 'in_progress' },
+    },
+  ]
+  input.toolItems.forEach((item, index) => {
+    events.push(
+      {
+        type: 'response.output_item.added',
+        output_index: index,
+        item: { id: item.id, type: item.type, status: 'in_progress' },
+      },
+      {
+        type: 'response.output_item.done',
+        output_index: index,
+        item,
+      },
+    )
+  })
+  const messageIndex = input.toolItems.length
+  events.push(
+    {
+      type: 'response.output_item.added',
+      output_index: messageIndex,
+      item: { id: `${input.id}-msg`, type: 'message', role: 'assistant', status: 'in_progress' },
+    },
+    {
+      type: 'response.output_text.delta',
+      output_index: messageIndex,
+      content_index: 0,
+      delta: input.text,
+    },
+    {
+      type: 'response.output_item.done',
+      output_index: messageIndex,
+      item: {
+        id: `${input.id}-msg`,
+        type: 'message',
+        role: 'assistant',
+        status: 'completed',
+        phase: 'final_answer',
+        content: [{ type: 'output_text', text: input.text }],
+      },
+    },
+    {
+      type: 'response.completed',
+      response: {
+        id: input.id,
+        model: input.model,
+        status: 'completed',
+        usage: { input_tokens: 10, output_tokens: 4, total_tokens: 14 },
+      },
+    },
+  )
+  return events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n`).join('\n')
+}
+
+function buildGeminiSse(frames: Array<Record<string, unknown>>): string {
+  return frames.map((frame) => `data: ${JSON.stringify(frame)}\n`).join('\n')
 }
 
 function openRouterModelsPayload(

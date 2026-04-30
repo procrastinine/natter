@@ -18,6 +18,7 @@ import type {
   CursorMap,
   Message as MessageRow,
   MessageAttachmentRef,
+  ProviderOutputItem,
   ReasoningDetail,
 } from '../../core/types'
 import { dismissAbortReason, updateChatSettings } from '../../store/chats'
@@ -44,6 +45,7 @@ import {
 } from './MessageStreamOverflow'
 import { ProfileGlyph } from './ProfileGlyph'
 import { ReasoningBlock } from './ReasoningBlock'
+import { ToolEvidenceBlock } from './ToolEvidenceBlock'
 
 interface MessageProps {
   chatId: ChatId
@@ -77,6 +79,7 @@ interface MessageProps {
     text: string,
     reasoning?: ReasoningDetail[],
     attachmentRefs?: MessageAttachmentRef[],
+    providerOutputItems?: ProviderOutputItem[],
   ) => Promise<void>
   onEditAndSend?: (
     message: MessageRow,
@@ -193,7 +196,14 @@ function MessageInner({
       ...(renderedReasoningDetails ? { reasoningDetails: renderedReasoningDetails } : {}),
       ...(renderedGeneration ? { generation: renderedGeneration } : {}),
     }
-  }, [showInfo, liveSnapshot, message, renderedContent, renderedReasoningDetails, renderedGeneration])
+  }, [
+    showInfo,
+    liveSnapshot,
+    message,
+    renderedContent,
+    renderedReasoningDetails,
+    renderedGeneration,
+  ])
   const reasoning = useMemo(
     () => normalizeReasoningDetails(renderedReasoningDetails ?? []),
     [renderedReasoningDetails],
@@ -345,8 +355,9 @@ function MessageInner({
       text: string,
       reasoning?: ReasoningDetail[],
       attachmentRefs?: MessageAttachmentRef[],
+      providerOutputItems?: ProviderOutputItem[],
     ) => {
-      await onEditInPlace(message, text, reasoning, attachmentRefs)
+      await onEditInPlace(message, text, reasoning, attachmentRefs, providerOutputItems)
       setEditing(false)
     },
     [message, onEditInPlace],
@@ -361,6 +372,23 @@ function MessageInner({
       void onEditInPlace(message, text, next)
     },
     [message, reasoning, text, onEditInPlace],
+  )
+  const handleToggleToolHidden = useCallback(
+    (itemIndex: number) => {
+      const items = structuredClone(message.providerOutputItems ?? [])
+      if (itemIndex < 0 || itemIndex >= items.length) return
+      const item = items[itemIndex]
+      if (!item) return
+      if (item.hidden === true) {
+        const next = { ...item }
+        delete next.hidden
+        items[itemIndex] = next
+      } else {
+        items[itemIndex] = { ...item, hidden: true }
+      }
+      void onEditInPlace(message, text, undefined, undefined, items)
+    },
+    [message, text, onEditInPlace],
   )
   const handleSaveAndSend = useCallback(
     async (
@@ -444,6 +472,9 @@ function MessageInner({
               : {})}
           />
         ) : null}
+        {collapseMode === 'full' && !editing ? (
+          <ToolEvidenceBlock message={infoMessage} onToggleHidden={handleToggleToolHidden} />
+        ) : null}
         {collapseMode === 'full' && showHiddenReasoningFooter ? (
           <div data-ui="message-hidden-reasoning" role="status">
             <span>
@@ -487,7 +518,10 @@ function MessageInner({
                 }
               : {})}
             {...(message.role === 'assistant'
-              ? { initialReasoning: message.reasoningDetails ?? [] }
+              ? {
+                  initialReasoning: message.reasoningDetails ?? [],
+                  initialProviderOutputItems: message.providerOutputItems ?? [],
+                }
               : {})}
             ariaLabel={`Edit ${message.role} message`}
           />

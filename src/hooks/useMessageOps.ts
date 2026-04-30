@@ -28,6 +28,7 @@ import type {
   AttachmentRef,
   Message,
   MessageId,
+  ProviderOutputItem,
   ReasoningDetail,
 } from '../core/types'
 import { getChat } from '../store/chats'
@@ -59,6 +60,7 @@ export async function editInPlace(
   newText: string,
   reasoning?: ReasoningDetail[],
   attachmentRefs?: AttachmentRef[],
+  providerOutputItems?: ProviderOutputItem[],
 ): Promise<void> {
   const nextContent = writeTextInto(message.content, newText)
   await editMessageContent({
@@ -72,16 +74,25 @@ export async function editInPlace(
   // reasoningDetails directly — this preserves the "never mutate the
   // generation factual record" rule for cost / usage / model while
   // still letting advanced users curate the reasoning carrier.
-  if (reasoning !== undefined) {
+  if (reasoning !== undefined || providerOutputItems !== undefined) {
     const repo = getWorkspaceRepository()
     await repo.runMutation([{ kind: 'message', messageId: message.id }], async (ctx) => {
       const current = await ctx.getMessage(message.id)
       if (!current) return
       const next: Message = { ...current }
-      if (reasoning.length === 0) {
-        delete next.reasoningDetails
-      } else {
-        next.reasoningDetails = reasoning
+      if (reasoning !== undefined) {
+        if (reasoning.length === 0) {
+          delete next.reasoningDetails
+        } else {
+          next.reasoningDetails = reasoning
+        }
+      }
+      if (providerOutputItems !== undefined) {
+        if (providerOutputItems.length === 0) {
+          delete next.providerOutputItems
+        } else {
+          next.providerOutputItems = providerOutputItems
+        }
       }
       await ctx.putMessage(next)
     })

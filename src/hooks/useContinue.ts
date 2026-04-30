@@ -14,7 +14,9 @@
 
 import { openAssistantRequestStream, type AssistantStreamChunk } from '../api/assistant-stream'
 import { ApiError } from '../api/errors'
+import type { AnthropicStreamChunk } from '../api/anthropic-types'
 import {
+  splitAnthropicStream,
   splitChatStream,
   splitGeminiStream,
   splitResponsesStream,
@@ -99,6 +101,10 @@ async function* laneStreamForRoute(
     yield* splitGeminiStream(replay as AsyncIterable<GeminiStreamChunk>)
     return
   }
+  if (kind === 'anthropic_event') {
+    yield* splitAnthropicStream(replay as AsyncIterable<AnthropicStreamChunk>)
+    return
+  }
   if (kind === 'delta') {
     yield* splitChatStream(replay as AsyncIterable<ChatStreamChunk>)
     return
@@ -109,6 +115,10 @@ async function* laneStreamForRoute(
   }
   if (route?.transport === 'gemini-native') {
     yield* splitGeminiStream(replay as AsyncIterable<GeminiStreamChunk>)
+    return
+  }
+  if (route?.transport === 'anthropic') {
+    yield* splitAnthropicStream(replay as AsyncIterable<AnthropicStreamChunk>)
     return
   }
   yield* splitChatStream(replay as AsyncIterable<ChatStreamChunk>)

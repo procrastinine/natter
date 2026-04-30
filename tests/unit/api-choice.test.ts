@@ -5,8 +5,8 @@ import {
   chooseApi,
   isGeminiNative,
   isResponsesCapable,
-  responsesExplanationFor,
   type RouterCapabilities,
+  responsesExplanationFor,
 } from '../../src/core/api-choice'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import type {
@@ -38,11 +38,7 @@ function makeProfile(overrides: Partial<ConnectionProfile> = {}): ConnectionProf
   }
 }
 
-function makeSettings(
-  api: ApiVariant,
-  encryptedInclude = true,
-  model = 'openai/gpt-5.4-nano',
-) {
+function makeSettings(api: ApiVariant, encryptedInclude = true, model = 'openai/gpt-5.4-nano') {
   const s = cloneDefaultChatSettings()
   s.profileId = 'prof'
   s.model = model
@@ -158,7 +154,10 @@ describe('chooseApi matrix', () => {
 
     it('Gemini native with pin: responses — fallback to gemini (no Responses surface)', () => {
       const r = chooseApi(
-        makeProfile({ kind: 'google', baseUrl: 'https://generativelanguage.googleapis.com/v1beta' }),
+        makeProfile({
+          kind: 'google',
+          baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+        }),
         makeSettings('responses'),
         [],
         makeCaps(),
@@ -213,6 +212,56 @@ describe('chooseApi matrix', () => {
       )
       expect(r.kind).toBe('chat-completions')
     })
+
+    it('direct OpenAI hosted tools force Responses over a chat pin', () => {
+      const settings = makeSettings('chat', true, 'gpt-5.4-nano')
+      settings.tools.openai.enabledServerToolIds = ['web-search']
+      const r = chooseApi(
+        makeProfile({
+          kind: 'openai-compatible',
+          baseUrl: 'https://api.openai.com/v1',
+          usesResponsesApiByDefault: false,
+        }),
+        settings,
+        [],
+        makeCaps(),
+      )
+      expect(r.kind).toBe('responses')
+      expect(r.reason).toBe('OpenAI hosted tools require Responses API')
+    })
+
+    it('Google hosted tools force Gemini native over a chat pin', () => {
+      const settings = makeSettings('chat', true, 'google/gemini-3.1-flash-lite-preview')
+      settings.tools.google.enabledServerToolIds = ['google-search']
+      const r = chooseApi(
+        makeProfile({
+          kind: 'google',
+          geminiMode: 'native',
+          baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+        }),
+        settings,
+        [],
+        makeCaps(),
+      )
+      expect(r.kind).toBe('gemini-generate')
+      expect(r.reason).toBe('Gemini native required for Google hosted tools')
+    })
+
+    it('Anthropic direct uses native Messages once the adapter exists', () => {
+      const settings = makeSettings('chat', true, 'claude-haiku-4.5')
+      settings.tools.anthropic.enabledServerToolIds = ['web-search']
+      const r = chooseApi(
+        makeProfile({
+          kind: 'anthropic',
+          baseUrl: 'https://api.anthropic.com/v1',
+        }),
+        settings,
+        [],
+        makeCaps(),
+      )
+      expect(r.kind).toBe('anthropic-messages')
+      expect(r.transport).toBe('anthropic')
+    })
   })
 
   describe('step 6 — prior OpenAI-family encrypted reasoning', () => {
@@ -252,7 +301,11 @@ describe('chooseApi matrix', () => {
   describe('step 7 — Gemini native default', () => {
     it("kind: 'google' + geminiMode: 'native' → gemini-generate", () => {
       const r = chooseApi(
-        makeProfile({ kind: 'google', geminiMode: 'native', baseUrl: 'https://generativelanguage.googleapis.com/v1beta' }),
+        makeProfile({
+          kind: 'google',
+          geminiMode: 'native',
+          baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+        }),
         makeSettings('auto'),
         [],
         makeCaps(),
@@ -262,7 +315,11 @@ describe('chooseApi matrix', () => {
 
     it("kind: 'google' + geminiMode: 'openai-compat' → chat-completions", () => {
       const r = chooseApi(
-        makeProfile({ kind: 'google', geminiMode: 'openai-compat', baseUrl: 'https://generativelanguage.googleapis.com/v1beta' }),
+        makeProfile({
+          kind: 'google',
+          geminiMode: 'openai-compat',
+          baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+        }),
         makeSettings('auto'),
         [],
         makeCaps(),
@@ -272,7 +329,10 @@ describe('chooseApi matrix', () => {
 
     it("kind: 'google' with no geminiMode defaults to native (undefined !== 'openai-compat')", () => {
       const r = chooseApi(
-        makeProfile({ kind: 'google', baseUrl: 'https://generativelanguage.googleapis.com/v1beta' }),
+        makeProfile({
+          kind: 'google',
+          baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+        }),
         makeSettings('auto'),
         [],
         makeCaps(),
@@ -300,12 +360,7 @@ describe('chooseApi matrix', () => {
   describe('step 10 — OR default-to-Responses for OpenAI-family', () => {
     it('OpenRouter + OpenAI-family model with no other hints → responses', () => {
       // gpt-5.4-nano on OR hits step 10 (responsesSupport==='both' AND OR).
-      const r = chooseApi(
-        makeProfile({ kind: 'openrouter' }),
-        makeSettings('auto'),
-        [],
-        makeCaps(),
-      )
+      const r = chooseApi(makeProfile({ kind: 'openrouter' }), makeSettings('auto'), [], makeCaps())
       expect(r.kind).toBe('responses')
       expect(r.reason).toMatch(/OpenRouter/i)
     })
@@ -363,16 +418,24 @@ describe('isGeminiNative', () => {
 
 describe('responsesExplanationFor', () => {
   it('gpt-5.4 hard requirement text', () => {
-    const route = { kind: 'responses' as const, transport: 'openai-responses' as const, reason: 'x' }
-    expect(responsesExplanationFor(route, makeProfile(), makeCaps({ requiresResponsesApi: true }))).toMatch(
-      /required by this model/i,
-    )
+    const route = {
+      kind: 'responses' as const,
+      transport: 'openai-responses' as const,
+      reason: 'x',
+    }
+    expect(
+      responsesExplanationFor(route, makeProfile(), makeCaps({ requiresResponsesApi: true })),
+    ).toMatch(/required by this model/i)
   })
 
   it('preferApi recommendation text', () => {
-    const route = { kind: 'responses' as const, transport: 'openai-responses' as const, reason: 'x' }
-    expect(responsesExplanationFor(route, makeProfile(), makeCaps({ preferApi: 'responses' }))).toMatch(
-      /preserves encrypted reasoning/i,
-    )
+    const route = {
+      kind: 'responses' as const,
+      transport: 'openai-responses' as const,
+      reason: 'x',
+    }
+    expect(
+      responsesExplanationFor(route, makeProfile(), makeCaps({ preferApi: 'responses' })),
+    ).toMatch(/preserves encrypted reasoning/i)
   })
 })

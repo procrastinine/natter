@@ -21,6 +21,8 @@ import type {
   AttachmentRef,
   ContentItem,
   MessageAttachmentRef,
+  ProviderOutputDialect,
+  ProviderOutputItem,
   ReasoningDetail,
 } from '../../core/types'
 import { AttachmentDraftTray } from '../attachments/AttachmentDraftTray'
@@ -34,6 +36,7 @@ interface InlineEditorProps {
     text: string,
     reasoning?: ReasoningDetail[],
     attachmentRefs?: MessageAttachmentRef[],
+    providerOutputItems?: ProviderOutputItem[],
   ) => void | Promise<void>
   onCancel: () => void
   onSaveAndSend?: (
@@ -48,6 +51,7 @@ interface InlineEditorProps {
   // passed back via onSave's second argument. Keep reference stable
   // across renders to avoid resetting the disclosure state.
   initialReasoning?: ReasoningDetail[]
+  initialProviderOutputItems?: ProviderOutputItem[]
   initialAttachmentRefs?: readonly AttachmentRef[] | undefined
   // Prefill toggle for Save & Send. Only applied to user messages
   // (assistants don't have a "send" path). Hidden when the model doesn't
@@ -116,6 +120,16 @@ type EditableReasoning =
       bytes: number
     }
 
+type EditableToolCall = {
+  dialect: ProviderOutputDialect
+  type: string
+  outputIndex: string
+  hidden: boolean
+  rawText: string
+  original: ProviderOutputItem | null
+  originalRawText: string
+}
+
 function toEditable(list: ReasoningDetail[]): EditableReasoning[] {
   return list.map((detail, i) => {
     const hidden = detail.hidden === true
@@ -143,6 +157,21 @@ function toEditable(list: ReasoningDetail[]): EditableReasoning[] {
       hidden,
       original: detail,
       bytes: new Blob([detail.data ?? '']).size,
+    }
+  })
+}
+
+function toEditableToolCalls(list: ProviderOutputItem[]): EditableToolCall[] {
+  return list.map((item) => {
+    const rawText = formatToolItemForEdit(item.item)
+    return {
+      dialect: item.dialect,
+      type: item.type,
+      outputIndex: item.outputIndex === undefined ? '' : String(item.outputIndex),
+      hidden: item.hidden === true,
+      rawText,
+      original: item,
+      originalRawText: rawText,
     }
   })
 }
@@ -177,6 +206,54 @@ function fromEditable(list: EditableReasoning[]): ReasoningDetail[] {
   })
 }
 
+function fromEditableToolCalls(list: EditableToolCall[]): ProviderOutputItem[] {
+  return list.map((row) => {
+    const outputIndex = parseOutputIndex(row.outputIndex)
+    const type = row.type.trim() || 'manual_tool_call'
+    const item = parseToolItemFromEdit(row.rawText)
+    const changed =
+      row.original === null ||
+      row.dialect !== row.original.dialect ||
+      type !== row.original.type ||
+      outputIndex !== row.original.outputIndex ||
+      row.rawText !== row.originalRawText
+    return {
+      dialect: row.dialect,
+      type,
+      ...(outputIndex !== undefined ? { outputIndex } : {}),
+      ...(row.hidden ? { hidden: true } : {}),
+      ...(row.original?.edited === true || changed ? { edited: true } : {}),
+      item,
+    }
+  })
+}
+
+function formatToolItemForEdit(value: unknown): string {
+  if (typeof value === 'string') return value
+  try {
+    return JSON.stringify(value, null, 2)
+  } catch {
+    return String(value)
+  }
+}
+
+function parseToolItemFromEdit(raw: string): unknown {
+  const trimmed = raw.trim()
+  if (trimmed.length === 0) return ''
+  try {
+    return JSON.parse(trimmed)
+  } catch {
+    return raw
+  }
+}
+
+function parseOutputIndex(raw: string): number | undefined {
+  const trimmed = raw.trim()
+  if (trimmed.length === 0) return undefined
+  const parsed = Number(trimmed)
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : undefined
+}
+
 export function InlineEditor({
   initial,
   onSave,
@@ -186,6 +263,7 @@ export function InlineEditor({
   saveAndSendDisabledReason,
   ariaLabel,
   initialReasoning,
+  initialProviderOutputItems,
   initialAttachmentRefs,
   showPrefillButton,
   defaultPrefill,
@@ -196,6 +274,10 @@ export function InlineEditor({
   const [reasoningOpen, setReasoningOpen] = useState(false)
   const [reasoning, setReasoning] = useState<EditableReasoning[]>(() =>
     toEditable(initialReasoning ?? []),
+  )
+  const [toolCallsOpen, setToolCallsOpen] = useState(false)
+  const [toolCalls, setToolCalls] = useState<EditableToolCall[]>(() =>
+    toEditableToolCalls(initialProviderOutputItems ?? []),
   )
   const attachments = useAttachmentDrafts(initialAttachmentRefs)
   const {
@@ -244,6 +326,7 @@ export function InlineEditor({
         text: string,
         reasoning?: ReasoningDetail[],
         attachmentRefs?: MessageAttachmentRef[],
+        providerOutputItems?: ProviderOutputItem[],
       ) => void | Promise<void>,
     ) => {
       // Empty messages are allowed — both Save (in place) and Save & Send
@@ -256,12 +339,24 @@ export function InlineEditor({
       setBusy(true)
       try {
         const nextReasoning = initialReasoning ? fromEditable(reasoning) : undefined
-        await action(trimmed, nextReasoning, attachmentRefs)
+        const nextToolCalls = initialProviderOutputItems
+          ? fromEditableToolCalls(toolCalls)
+          : undefined
+        await action(trimmed, nextReasoning, attachmentRefs, nextToolCalls)
       } finally {
         setBusy(false)
       }
     },
-    [text, busy, uploadingAttachments, initialReasoning, reasoning, attachmentRefs],
+    [
+      text,
+      busy,
+      uploadingAttachments,
+      initialReasoning,
+      reasoning,
+      attachmentRefs,
+      initialProviderOutputItems,
+      toolCalls,
+    ],
   )
   const togglePrefill = useCallback(async () => {
     if (prefillOpen) {
@@ -282,8 +377,20 @@ export function InlineEditor({
     if (JSON.stringify(startingAttachmentRefs) !== JSON.stringify(attachmentRefs)) return false
     if (!initialReasoning) return true
     const nextReasoning = fromEditable(reasoning)
-    return JSON.stringify(initialReasoning) === JSON.stringify(nextReasoning)
-  }, [text, initial, initialReasoning, reasoning, startingAttachmentRefs, attachmentRefs])
+    if (JSON.stringify(initialReasoning) !== JSON.stringify(nextReasoning)) return false
+    if (!initialProviderOutputItems) return true
+    const nextToolCalls = fromEditableToolCalls(toolCalls)
+    return JSON.stringify(initialProviderOutputItems) === JSON.stringify(nextToolCalls)
+  }, [
+    text,
+    initial,
+    initialReasoning,
+    reasoning,
+    startingAttachmentRefs,
+    attachmentRefs,
+    initialProviderOutputItems,
+    toolCalls,
+  ])
   const commitSave = useCallback(() => {
     if (isUnchanged()) {
       onCancel()
@@ -322,6 +429,7 @@ export function InlineEditor({
   )
 
   const showReasoningSection = initialReasoning !== undefined
+  const showToolCallSection = initialProviderOutputItems !== undefined
   const nextReasoningIndex = () => {
     const indices = reasoning.map((r) => r.index)
     return indices.length === 0 ? 0 : Math.max(...indices) + 1
@@ -340,6 +448,33 @@ export function InlineEditor({
   }
   const toggleHidden = (rowIndex: number) => {
     setReasoning((prev) => prev.map((r, i) => (i === rowIndex ? { ...r, hidden: !r.hidden } : r)))
+  }
+  const nextToolCallIndex = () => {
+    const indices = toolCalls
+      .map((r) => parseOutputIndex(r.outputIndex))
+      .filter((value): value is number => value !== undefined)
+    return indices.length === 0 ? 0 : Math.max(...indices) + 1
+  }
+  const addToolCallRow = () => {
+    setToolCalls((prev) => [
+      ...prev,
+      {
+        dialect: 'unknown',
+        type: 'manual_tool_call',
+        outputIndex: String(nextToolCallIndex()),
+        hidden: false,
+        rawText: '{}',
+        original: null,
+        originalRawText: '{}',
+      },
+    ])
+    setToolCallsOpen(true)
+  }
+  const deleteToolCallRow = (rowIndex: number) => {
+    setToolCalls((prev) => prev.filter((_, i) => i !== rowIndex))
+  }
+  const toggleToolCallHidden = (rowIndex: number) => {
+    setToolCalls((prev) => prev.map((r, i) => (i === rowIndex ? { ...r, hidden: !r.hidden } : r)))
   }
 
   return (
@@ -402,6 +537,54 @@ export function InlineEditor({
             ))}
           </div>
           <AddReasoningEntry busy={busy} onAdd={addReasoningRow} />
+        </details>
+      ) : null}
+      {showToolCallSection ? (
+        <details
+          data-ui="inline-editor-tool-calls"
+          open={toolCallsOpen || toolCalls.length === 0}
+          onToggle={(e) => setToolCallsOpen((e.target as HTMLDetailsElement).open)}
+        >
+          <summary>Tool calls ({toolCalls.length})</summary>
+          <div data-ui="inline-editor-tool-call-list">
+            {toolCalls.map((row, i) => (
+              <ToolCallEditorRow
+                key={`${row.dialect}-${row.type}-${i}`}
+                row={row}
+                busy={busy}
+                onChangeDialect={(next) =>
+                  setToolCalls((prev) =>
+                    prev.map((p, idx) => (idx === i ? { ...p, dialect: next } : p)),
+                  )
+                }
+                onChangeType={(next) =>
+                  setToolCalls((prev) =>
+                    prev.map((p, idx) => (idx === i ? { ...p, type: next } : p)),
+                  )
+                }
+                onChangeOutputIndex={(next) =>
+                  setToolCalls((prev) =>
+                    prev.map((p, idx) => (idx === i ? { ...p, outputIndex: next } : p)),
+                  )
+                }
+                onChangeRawText={(next) =>
+                  setToolCalls((prev) =>
+                    prev.map((p, idx) => (idx === i ? { ...p, rawText: next } : p)),
+                  )
+                }
+                onToggleHidden={() => toggleToolCallHidden(i)}
+                onDelete={() => deleteToolCallRow(i)}
+              />
+            ))}
+          </div>
+          <button
+            type="button"
+            data-ui="inline-editor-tool-call-add-button"
+            onClick={addToolCallRow}
+            disabled={busy}
+          >
+            + Add tool call
+          </button>
         </details>
       ) : null}
       {attachmentRefs.length > 0 || uploads.length > 0 ? (
@@ -602,6 +785,114 @@ function ReasoningEditorRow({
           aria-label={`Edit ${label}`}
         />
       )}
+    </div>
+  )
+}
+
+function ToolCallEditorRow({
+  row,
+  busy,
+  onChangeDialect,
+  onChangeType,
+  onChangeOutputIndex,
+  onChangeRawText,
+  onToggleHidden,
+  onDelete,
+}: {
+  row: EditableToolCall
+  busy: boolean
+  onChangeDialect: (next: ProviderOutputDialect) => void
+  onChangeType: (next: string) => void
+  onChangeOutputIndex: (next: string) => void
+  onChangeRawText: (next: string) => void
+  onToggleHidden: () => void
+  onDelete: () => void
+}) {
+  return (
+    <div
+      data-ui="inline-editor-tool-call-row"
+      data-hidden={row.hidden ? 'true' : undefined}
+      data-edited={row.original?.edited === true ? 'true' : undefined}
+    >
+      <div data-ui="inline-editor-reasoning-row-header">
+        <span data-ui="inline-editor-reasoning-label">
+          {row.type || 'Tool call'} · {row.dialect}
+        </span>
+        <div data-ui="inline-editor-reasoning-row-actions">
+          <button
+            type="button"
+            data-ui="icon-button"
+            data-compact
+            data-pressed={row.hidden ? 'true' : undefined}
+            onClick={onToggleHidden}
+            disabled={busy}
+            aria-label={row.hidden ? 'Unhide tool call' : 'Hide tool call'}
+            title={
+              row.hidden
+                ? 'Hidden — preserved on disk, not sent on next turn. Click to unhide.'
+                : 'Hide this tool call or result (kept on disk, skipped on context replay).'
+            }
+          >
+            {row.hidden ? <EyeOffIcon /> : <EyeIcon />}
+          </button>
+          <button
+            type="button"
+            data-ui="icon-button"
+            data-compact
+            data-tone="danger"
+            onClick={onDelete}
+            disabled={busy}
+            aria-label="Delete tool call"
+            title="Delete this tool call"
+          >
+            <TrashSmallIcon />
+          </button>
+        </div>
+      </div>
+      <div data-ui="inline-editor-tool-call-meta">
+        <label>
+          <span>Dialect</span>
+          <select
+            value={row.dialect}
+            onChange={(e) => onChangeDialect(e.target.value as ProviderOutputDialect)}
+            disabled={busy || row.hidden}
+            aria-label="Tool call dialect"
+          >
+            <option value="unknown">unknown</option>
+            <option value="openai-responses">openai-responses</option>
+            <option value="openrouter-responses">openrouter-responses</option>
+            <option value="google-gemini">google-gemini</option>
+            <option value="anthropic-claude">anthropic-claude</option>
+          </select>
+        </label>
+        <label>
+          <span>Type</span>
+          <input
+            value={row.type}
+            onChange={(e) => onChangeType(e.target.value)}
+            disabled={busy || row.hidden}
+            aria-label="Tool call type"
+          />
+        </label>
+        <label>
+          <span>Index</span>
+          <input
+            value={row.outputIndex}
+            onChange={(e) => onChangeOutputIndex(e.target.value)}
+            disabled={busy || row.hidden}
+            inputMode="numeric"
+            aria-label="Tool call output index"
+          />
+        </label>
+      </div>
+      <textarea
+        data-ui="inline-editor-tool-call-input"
+        value={row.rawText}
+        onChange={(e) => onChangeRawText(e.target.value)}
+        rows={5}
+        disabled={busy || row.hidden}
+        aria-label="Edit tool call JSON or text"
+      />
     </div>
   )
 }

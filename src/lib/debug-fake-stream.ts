@@ -1,5 +1,6 @@
 import { navigateToChat } from '../app/router'
-import type { ChatStreamChunk } from '../api/types'
+import type { GeminiStreamChunk } from '../api/gemini-types'
+import type { ChatStreamChunk, ResponsesStreamChunk } from '../api/types'
 import { cloneDefaultChatSettings } from '../core/defaults'
 import type { ChatId, ConnectionProfile } from '../core/types'
 import { sendText, type SendTextResult } from '../hooks/useChat'
@@ -22,6 +23,7 @@ interface DebugFakeStreamOptions {
   prompt?: string
   openChat?: boolean
   reasoningAsSnapshots?: boolean
+  providerFixtureChunks?: unknown[]
 }
 
 interface DebugFakeStreamResult extends SendTextResult {
@@ -56,7 +58,7 @@ export function installDebugFakeStream(): void {
     measure,
   }
   console.info(
-    '%c[debug] window.__debugFakeStream.start({ targetChars: 100000, reasoningChars: 100000, chunkChars: 128, delayMs }) — local lorem stream without an API call.',
+    '%c[debug] window.__debugFakeStream.start({ targetChars: 100000, reasoningChars: 100000, chunkChars: 128, delayMs, providerFixtureChunks }) — local lorem stream without an API call.',
     'color:#888;font-style:italic',
   )
 }
@@ -78,15 +80,17 @@ async function start(options: DebugFakeStreamOptions = {}): Promise<DebugFakeStr
     apiKey: 'debug-fake-key',
     content: [{ type: 'text', text: options.prompt ?? 'Run a local lorem ipsum stress stream.' }],
     openStream: ({ signal }) =>
-      fakeLoremStream({
-        targetChars,
-        reasoningChars,
-        chunkChars,
-        reasoningChunkChars,
-        delayMs,
-        signal,
-        reasoningAsSnapshots: options.reasoningAsSnapshots === true,
-      }),
+      options.providerFixtureChunks
+        ? replayProviderFixtureChunks(options.providerFixtureChunks, signal)
+        : fakeLoremStream({
+            targetChars,
+            reasoningChars,
+            chunkChars,
+            reasoningChunkChars,
+            delayMs,
+            signal,
+            reasoningAsSnapshots: options.reasoningAsSnapshots === true,
+          }),
   })
 
   return { ...result, chatId, targetChars, reasoningChars, chunkChars, reasoningChunkChars }
@@ -217,6 +221,16 @@ async function* fakeLoremStream(args: {
         total_tokens: 8 + Math.ceil((args.targetChars + args.reasoningChars) / 4),
       },
     },
+  }
+}
+
+async function* replayProviderFixtureChunks(
+  chunks: readonly unknown[],
+  signal: AbortSignal,
+): AsyncGenerator<ChatStreamChunk | ResponsesStreamChunk | GeminiStreamChunk> {
+  for (const chunk of chunks) {
+    throwIfAborted(signal)
+    yield structuredClone(chunk) as ChatStreamChunk | ResponsesStreamChunk | GeminiStreamChunk
   }
 }
 

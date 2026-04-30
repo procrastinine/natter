@@ -14,6 +14,7 @@ import { tokenCalibrationKey } from '../../src/core/model-ids'
 import {
   buildSettingsPromptSizeEstimateInput,
   estimatePromptSize,
+  estimateSettingsPromptSize,
   tokenizerFromSettings,
 } from '../../src/core/prompt-size'
 import type {
@@ -56,6 +57,7 @@ function makeMessage(partial: Partial<Message> & { role: MessageRole; text?: str
       : {}),
     ...(partial.generation ? { generation: partial.generation } : {}),
     ...(partial.reasoningDetails ? { reasoningDetails: partial.reasoningDetails } : {}),
+    ...(partial.providerOutputItems ? { providerOutputItems: partial.providerOutputItems } : {}),
     ...(partial.attachmentRefs ? { attachmentRefs: partial.attachmentRefs } : {}),
   }
 }
@@ -939,6 +941,53 @@ describe('estimatePromptSize — reasoning echo accounting', () => {
       tokenizer: DEFAULT_TOKENIZER,
     })
     expect(est.reasoningTokens).toBe(0)
+  })
+
+  it('counts tool-call context with the same global and per-item visibility controls', () => {
+    const visibleTool = makeMessage({
+      role: 'assistant',
+      text: 'done',
+      providerOutputItems: [
+        {
+          dialect: 'openai-responses',
+          type: 'shell_call_output',
+          item: {
+            type: 'shell_call_output',
+            output: [{ stdout: 'natter-shape-probe.' }],
+          },
+        },
+      ],
+    } as never)
+    const hiddenTool = makeMessage({
+      role: 'assistant',
+      text: 'done',
+      providerOutputItems: [
+        {
+          dialect: 'openai-responses',
+          type: 'shell_call_output',
+          hidden: true,
+          item: {
+            type: 'shell_call_output',
+            output: [{ stdout: 'natter-shape-probe.' }],
+          },
+        },
+      ],
+    } as never)
+    const settings = cloneDefaultChatSettings()
+
+    const included = estimateSettingsPromptSize(settings, [visibleTool], '', null)
+    const hidden = estimateSettingsPromptSize(settings, [hiddenTool], '', null)
+    const disabled = estimateSettingsPromptSize(
+      { ...settings, toolCallContext: { include: false } },
+      [visibleTool],
+      '',
+      null,
+    )
+
+    expect(included.toolCallTokens).toBeGreaterThan(0)
+    expect(hidden.toolCallTokens).toBe(0)
+    expect(disabled.toolCallTokens).toBe(0)
+    expect(included.total).toBeGreaterThan(disabled.total)
   })
 })
 

@@ -2,8 +2,8 @@ import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from '../../src/api/errors'
 import type { ChatStreamChunk, ResponsesStreamChunk } from '../../src/api/types'
-import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import { cursorKeyOf } from '../../src/core/active-path'
+import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import { tokenCalibrationKey } from '../../src/core/model-ids'
 import type { ChatSettings, ConnectionProfile, Message } from '../../src/core/types'
 import { recoverOrphans, sendText } from '../../src/hooks/useChat'
@@ -301,87 +301,83 @@ describe('sendText — chat-completions streaming', () => {
     expect(assistant.generation?.abortReason).toBeUndefined()
   })
 
-  it(
-    'streams 100k reasoning and 100k completion in small chunks without per-chunk body rewrites',
-    async () => {
-      const chat = await createChat({ settings: chatSettings() })
-      const targetChars = 100_000
-      const reasoningChars = 100_000
-      const chunkChars = 128
-      const textChunks = patternedChunks('t', targetChars, chunkChars)
-      const reasoningChunks = patternedChunks('r', reasoningChars, chunkChars)
-      const expectedText = textChunks.join('')
-      const expectedReasoning = reasoningChunks.join('')
-      let clock = 1000
-      async function* longStream(): AsyncGenerator<ChatStreamChunk> {
-        for (let index = 0; index < reasoningChunks.length; index += 1) {
-          const offset = index * chunkChars
-          yield {
-            type: 'delta',
-            chunk: {
-              id: `reason-${offset}`,
-              model: 'google/gemini-3.1-flash-lite-preview',
-              choices: [{ delta: { reasoning: reasoningChunks[index] ?? '' } }],
-            },
-          }
-        }
-        for (let index = 0; index < textChunks.length; index += 1) {
-          const offset = index * chunkChars
-          yield {
-            type: 'delta',
-            chunk: {
-              id: `text-${offset}`,
-              model: 'google/gemini-3.1-flash-lite-preview',
-              choices: [{ delta: { content: textChunks[index] ?? '' } }],
-            },
-          }
-        }
+  it('streams 100k reasoning and 100k completion in small chunks without per-chunk body rewrites', async () => {
+    const chat = await createChat({ settings: chatSettings() })
+    const targetChars = 100_000
+    const reasoningChars = 100_000
+    const chunkChars = 128
+    const textChunks = patternedChunks('t', targetChars, chunkChars)
+    const reasoningChunks = patternedChunks('r', reasoningChars, chunkChars)
+    const expectedText = textChunks.join('')
+    const expectedReasoning = reasoningChunks.join('')
+    let clock = 1000
+    async function* longStream(): AsyncGenerator<ChatStreamChunk> {
+      for (let index = 0; index < reasoningChunks.length; index += 1) {
+        const offset = index * chunkChars
         yield {
           type: 'delta',
           chunk: {
-            id: 'done',
+            id: `reason-${offset}`,
             model: 'google/gemini-3.1-flash-lite-preview',
-            choices: [{ delta: {}, finish_reason: 'stop' }],
-            usage: {
-              prompt_tokens: 4,
-              completion_tokens: Math.ceil(targetChars / 4),
-              completion_tokens_details: { reasoning_tokens: Math.ceil(reasoningChars / 4) },
-              total_tokens: 4 + Math.ceil((targetChars + reasoningChars) / 4),
-            },
+            choices: [{ delta: { reasoning: reasoningChunks[index] ?? '' } }],
           },
         }
       }
+      for (let index = 0; index < textChunks.length; index += 1) {
+        const offset = index * chunkChars
+        yield {
+          type: 'delta',
+          chunk: {
+            id: `text-${offset}`,
+            model: 'google/gemini-3.1-flash-lite-preview',
+            choices: [{ delta: { content: textChunks[index] ?? '' } }],
+          },
+        }
+      }
+      yield {
+        type: 'delta',
+        chunk: {
+          id: 'done',
+          model: 'google/gemini-3.1-flash-lite-preview',
+          choices: [{ delta: {}, finish_reason: 'stop' }],
+          usage: {
+            prompt_tokens: 4,
+            completion_tokens: Math.ceil(targetChars / 4),
+            completion_tokens_details: { reasoning_tokens: Math.ceil(reasoningChars / 4) },
+            total_tokens: 4 + Math.ceil((targetChars + reasoningChars) / 4),
+          },
+        },
+      }
+    }
 
-      const result = await sendText({
-        chatId: chat.id,
-        connection: makeProfile(),
-        apiKey: 'sk-test',
-        content: [{ type: 'text', text: 'stress stream' }],
-        openStream: longStream,
-        now: () => ++clock,
-      })
+    const result = await sendText({
+      chatId: chat.id,
+      connection: makeProfile(),
+      apiKey: 'sk-test',
+      content: [{ type: 'text', text: 'stress stream' }],
+      openStream: longStream,
+      now: () => ++clock,
+    })
 
-      expect(result.outcome).toBe('done')
-      expect(useStreamStore.getState().liveByMessageId[result.assistantMessageId]).toBeUndefined()
-      const assistant = requireDefined(
-        await getBrowserRepository().getMessage(result.assistantMessageId),
-        'assistant message',
-      )
-      expect(assistant.content).toEqual([{ type: 'output_text', text: expectedText }])
-      expect(assistant.reasoningDetails).toHaveLength(1)
-      expect(assistant.reasoningDetails?.[0]).toMatchObject({
-        type: 'reasoning.text',
-        id: 'text#default',
-        text: expectedReasoning,
-      })
-      const header = requireDefined(
-        await getBrowserRepository().getMessageHeader(result.assistantMessageId),
-        'assistant header',
-      )
-      expect(header.nodeVersion).toBeLessThanOrEqual(6)
-    },
-    15_000,
-  )
+    expect(result.outcome).toBe('done')
+    expect(useStreamStore.getState().liveByMessageId[result.assistantMessageId]).toBeUndefined()
+    const assistant = requireDefined(
+      await getBrowserRepository().getMessage(result.assistantMessageId),
+      'assistant message',
+    )
+    expect(assistant.content).toEqual([{ type: 'output_text', text: expectedText }])
+    expect(assistant.reasoningDetails).toHaveLength(1)
+    expect(assistant.reasoningDetails?.[0]).toMatchObject({
+      type: 'reasoning.text',
+      id: 'text#default',
+      text: expectedReasoning,
+    })
+    const header = requireDefined(
+      await getBrowserRepository().getMessageHeader(result.assistantMessageId),
+      'assistant header',
+    )
+    expect(header.nodeVersion).toBeLessThanOrEqual(6)
+  }, 15_000)
 
   it('sends assistant prefill through the unified request plan and stores the continuation below it', async () => {
     const chat = await createChat({
@@ -1405,7 +1401,13 @@ describe('sendText — token calibration sample ingest', () => {
         model: 'openai/gpt-5.4',
         api: 'responses',
         systemPrompt: '',
-        enabledServerToolIds: ['web-fetch'],
+        tools: {
+          ...cloneDefaultChatSettings().tools,
+          openrouter: {
+            ...cloneDefaultChatSettings().tools.openrouter,
+            enabledServerToolIds: ['web-fetch'],
+          },
+        },
       }),
     })
     const text = 'X'.repeat(300)
@@ -1470,6 +1472,96 @@ describe('sendText — token calibration sample ingest', () => {
     expect(assistant.cachedTokenEstimate).toBeUndefined()
     const chatRow = await getBrowserRepository().getChat(chat.id)
     expect(chatRow?.tokenCalibration?.[tokenCalibrationKey('openai/gpt-5.4')]).toBeUndefined()
+  })
+
+  it('stores streamed Responses provider output items for later context replay', async () => {
+    const chat = await createChat({
+      settings: chatSettings({
+        profileId: 'prof-openai',
+        model: 'gpt-5.4-nano',
+        systemPrompt: '',
+      }),
+    })
+    await sendText({
+      chatId: chat.id,
+      connection: makeOpenAiProfile(),
+      apiKey: 'sk-test',
+      content: [{ type: 'text', text: 'Search once.' }],
+      openStream: () =>
+        stream(
+          {
+            type: 'event',
+            event: {
+              type: 'response.output_item.done',
+              output_index: 0,
+              item: {
+                id: 'ws_stream_1',
+                type: 'web_search_call',
+                status: 'completed',
+                query: 'streamed provider output marker',
+              },
+            },
+          } as ResponsesStreamChunk,
+          {
+            type: 'event',
+            event: {
+              type: 'response.output_text.delta',
+              output_index: 1,
+              content_index: 0,
+              delta: 'streamed answer',
+            },
+          } as ResponsesStreamChunk,
+          {
+            type: 'event',
+            event: {
+              type: 'response.output_item.done',
+              output_index: 1,
+              item: {
+                id: 'msg_stream_1',
+                type: 'message',
+                role: 'assistant',
+                status: 'completed',
+                content: [{ type: 'output_text', text: 'streamed answer' }],
+              },
+            },
+          } as ResponsesStreamChunk,
+          {
+            type: 'event',
+            event: {
+              type: 'response.completed',
+              response: {
+                id: 'resp_stream_1',
+                model: 'gpt-5.4-nano',
+                status: 'completed',
+                usage: { input_tokens: 10, output_tokens: 4, total_tokens: 14 },
+              },
+            },
+          } as ResponsesStreamChunk,
+        ),
+    })
+
+    const assistant = requireDefined(
+      liveMessagesSortedByCreated(await messagesFor(chat.id)).find(
+        (message) => message.role === 'assistant',
+      ),
+      'assistant',
+    )
+    expect(assistant.generation?.serverTools?.map((tool) => tool.type)).toEqual([
+      'web_search_call',
+    ])
+    expect(assistant.providerOutputItems).toEqual([
+      {
+        dialect: 'openai-responses',
+        type: 'web_search_call',
+        outputIndex: 0,
+        item: {
+          id: 'ws_stream_1',
+          type: 'web_search_call',
+          status: 'completed',
+          query: 'streamed provider output marker',
+        },
+      },
+    ])
   })
 
   it('does not calibrate on an errored stream (no usage / bad signal)', async () => {
