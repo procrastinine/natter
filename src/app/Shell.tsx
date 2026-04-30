@@ -672,10 +672,10 @@ export function Shell() {
   }, [streamingOnActiveChat, abortActiveChat, activeChatId, setEditTreeMode])
 
   // Keep the panel slot reserved whenever the user opened it, regardless
-  // of whether a chat is active. On /new the shell still renders so the
-  // transition out of /new (after materializing a chat) doesn't make the
-  // panel jump in from nowhere. The panel component itself no-ops when
-  // chatId is null.
+  // of whether a chat is active or focus mode is on. On /new the shell still
+  // renders so the transition out of /new (after materializing a chat)
+  // doesn't make the panel jump in from nowhere. The panel component itself
+  // no-ops when chatId is null.
   const showChatModelPanel = chatModelOpen && !activeStorageRoute
 
   return (

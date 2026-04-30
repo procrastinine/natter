@@ -570,20 +570,10 @@ function CloseGlyph() {
 }
 
 function settingsMatch(a: Chat['settings'], b: Chat['settings']): boolean {
-  // Shallow comparison on the high-signal fields that live on the panel.
-  // The full object is intentionally not JSON-stringified; the breadcrumb
-  // only needs a "roughly matches" signal for the "edited" dot.
-  if (a.model !== b.model) return false
-  if (a.systemPrompt !== b.systemPrompt) return false
-  if (stableSettingsString(a.sampling) !== stableSettingsString(b.sampling)) return false
-  if (stableSettingsString(a.reasoning) !== stableSettingsString(b.reasoning)) return false
-  if (a.verbosity !== b.verbosity) return false
-  if (a.maxCompletionTokens !== b.maxCompletionTokens) return false
-  if (stableSettingsString(a.anthropicCache) !== stableSettingsString(b.anthropicCache))
-    return false
-  if (stableSettingsString(a.providerPrefs ?? {}) !== stableSettingsString(b.providerPrefs ?? {}))
-    return false
-  return true
+  // A ChatPreset is a full ChatSettings snapshot, including provider buckets
+  // that may be hidden for the current connection. The edited marker must use
+  // that same whole-settings contract, not a visible-controls subset.
+  return stableSettingsString(a) === stableSettingsString(b)
 }
 
 function stableSettingsString(value: unknown): string {

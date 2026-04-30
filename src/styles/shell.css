@@ -300,10 +300,10 @@
 }
 
 /* Focus / reading mode — when `data-focus-mode="on"` on the app-shell,
- * every piece of chrome disappears so only the message list + the
- * composer (reparented under the scroll region — see Shell.tsx) + the
- * eye toggle itself remain. The composer scrolls with content instead
- * of sticking to the viewport bottom. */
+ * workspace chrome disappears so the message list + the composer
+ * (reparented under the scroll region — see Shell.tsx) + the eye toggle
+ * remain. The chat settings panel is intentionally kept when it was open
+ * so settings can be edited while the transcript is in focus mode. */
 [data-ui="app-shell"][data-focus-mode="on"] > [data-ui="sidebar"],
 [data-ui="app-shell"][data-focus-mode="on"] [data-ui="connection-header"],
 [data-ui="app-shell"][data-focus-mode="on"] [data-ui="chat-title-bar"],
@@ -324,12 +324,16 @@
   padding: var(--space-6) 0;
 }
 
-/* With chrome hidden, the main pane is the entire viewport. The
- * default rules reference `grid-area: main`, so the single-column
- * override needs to keep the name or the main pane auto-places to a
- * junk cell and the content falls out of the layout (seen as right-
- * aligned / half-width prose). Keep only the `main` area. */
+/* With chrome hidden, the main pane is the visible transcript area. The
+ * default rules reference `grid-area: main`, so the override needs to
+ * keep the name or the main pane auto-places to a junk cell and the
+ * content falls out of the layout. */
 [data-ui="app-shell"][data-focus-mode="on"] {
   grid-template-columns: 1fr;
   grid-template-areas: "main";
+}
+
+[data-ui="app-shell"][data-focus-mode="on"][data-chat-model-panel="open"] {
+  grid-template-columns: 1fr var(--settings-pane-width);
+  grid-template-areas: "main chat-model";
 }

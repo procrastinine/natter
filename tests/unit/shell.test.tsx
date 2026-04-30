@@ -5,16 +5,17 @@ import { IDBFactory } from 'fake-indexeddb'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import type { Chat, Message } from '../../src/core/types'
-import { archiveChat, createChat } from '../../src/store/chats'
+import { archiveChat, createChat, updateChatSettings } from '../../src/store/chats'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
 import { createFolder } from '../../src/store/folders'
 import { __resetKeyCacheForTests, createKey } from '../../src/store/keys'
-import { createPreset } from '../../src/store/presets'
+import { createPreset, getPreset } from '../../src/store/presets'
 import { createProfile } from '../../src/store/profiles'
 import { __resetSearchSessionRunnerForTests } from '../../src/store/search-session'
 import { createTag } from '../../src/store/tags'
 import { __resetSearchStoreForTests } from '../../src/store/zustand/searchStore'
+import { useUiStore } from '../../src/store/zustand/uiStore'
 import { readActiveSeedState } from '../../src/ui/header/ConnectionHeader'
 import { App } from '../../src/app/App'
 import { putTestMessageHeaderOnly, putTestMessages } from '../helpers/message-storage'
@@ -29,6 +30,7 @@ describe('shell smoke render', () => {
     __resetKeyCacheForTests()
     __resetSearchSessionRunnerForTests()
     __resetSearchStoreForTests()
+    useUiStore.getState().reset()
     __resetDbForTests()
     window.localStorage.clear()
     window.sessionStorage.clear()
@@ -188,6 +190,52 @@ describe('shell smoke render', () => {
       expect(container.querySelector('[data-ui="app-shell"]')).toHaveAttribute(
         'data-chat-model-panel',
         'closed',
+      )
+    })
+  })
+
+  it('focus mode keeps an open chat settings panel visible', async () => {
+    const chat = await createChat({ settings: cloneDefaultChatSettings() })
+    window.location.hash = `#/chat/${chat.id}`
+    const { container } = render(<App />)
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-role="settings-cog"]')).toBeInTheDocument()
+    })
+    fireEvent.click(container.querySelector('[data-role="settings-cog"]') as HTMLButtonElement)
+    await waitFor(() => {
+      expect(container.querySelector('[data-ui="chat-model-panel"]')).toBeInTheDocument()
+      expect(container.querySelector('[data-ui="app-shell"]')).toHaveAttribute(
+        'data-chat-model-panel',
+        'open',
+      )
+    })
+
+    fireEvent.click(container.querySelector('[data-ui="focus-mode-toggle"]') as HTMLButtonElement)
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-ui="app-shell"]')).toHaveAttribute(
+        'data-focus-mode',
+        'on',
+      )
+      expect(container.querySelector('[data-ui="chat-model-panel"]')).toBeInTheDocument()
+      expect(container.querySelector('[data-ui="app-shell"]')).toHaveAttribute(
+        'data-chat-model-panel',
+        'open',
+      )
+    })
+
+    fireEvent.click(container.querySelector('[data-ui="focus-mode-toggle"]') as HTMLButtonElement)
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-ui="app-shell"]')).toHaveAttribute(
+        'data-focus-mode',
+        'off',
+      )
+      expect(container.querySelector('[data-ui="chat-model-panel"]')).toBeInTheDocument()
+      expect(container.querySelector('[data-ui="app-shell"]')).toHaveAttribute(
+        'data-chat-model-panel',
+        'open',
       )
     })
   })
@@ -756,6 +804,78 @@ describe('shell smoke render', () => {
     })
   })
 
+  it('marks presets edited for visible context toggles and hidden provider tool buckets', async () => {
+    const key = await createKey({ name: 'OpenRouter', plaintextKey: 'sk-or-v1-test' })
+    const profile = await createProfile({
+      name: 'OpenRouter',
+      kind: 'openrouter',
+      baseUrl: 'https://openrouter.ai/api/v1',
+      apiKeyRef: key.id,
+    })
+    const settings = cloneDefaultChatSettings()
+    settings.profileId = profile.id
+    settings.model = 'openai/gpt-5.4-nano'
+    const preset = await createPreset({
+      name: 'Unified settings preset',
+      connectionProfileId: profile.id,
+      settings,
+    })
+    const chat = await createChat({
+      settings: structuredClone(preset.settings),
+      presetId: preset.id,
+    })
+
+    window.location.hash = `#/chat/${chat.id}`
+    const { container } = render(<App />)
+    await waitFor(() => {
+      expect(container.querySelector('[data-role="settings-cog"]')).toBeInTheDocument()
+    })
+    fireEvent.click(container.querySelector('[data-role="settings-cog"]') as HTMLButtonElement)
+    await waitFor(() => {
+      expect(container.querySelector('[data-ui="preset-breadcrumb-button"]')).toBeInTheDocument()
+      expect(container.querySelector('[data-ui="preset-diverged"]')).toBeNull()
+    })
+
+    fireEvent.click(container.querySelector('[data-tab="context"]') as HTMLButtonElement)
+    await waitFor(() => {
+      expect(findLabel(container, 'Tool calls')).toBeTruthy()
+    })
+    fireEvent.click(findLabel(container, 'Tool calls').querySelector('input') as HTMLInputElement)
+
+    await waitFor(async () => {
+      expect((await getDb().chats.get(chat.id))?.settings.toolCallContext.include).toBe(false)
+      expect(container.querySelector('[data-ui="preset-diverged"]')).toBeInTheDocument()
+    })
+
+    await saveCurrentSettingsToCurrentPreset(container)
+    await waitFor(async () => {
+      expect((await getPreset(preset.id))?.settings.toolCallContext.include).toBe(false)
+      expect(container.querySelector('[data-ui="preset-diverged"]')).toBeNull()
+    })
+
+    const stored = await getDb().chats.get(chat.id)
+    if (!stored) throw new Error('Expected chat')
+    await updateChatSettings(chat.id, {
+      tools: {
+        ...stored.settings.tools,
+        openai: {
+          ...stored.settings.tools.openai,
+          enabledServerToolIds: ['web-search'],
+        },
+      },
+    })
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-ui="preset-diverged"]')).toBeInTheDocument()
+    })
+    await saveCurrentSettingsToCurrentPreset(container)
+    await waitFor(async () => {
+      const saved = await getPreset(preset.id)
+      expect(saved?.settings.tools.openai.enabledServerToolIds).toEqual(['web-search'])
+      expect(container.querySelector('[data-ui="preset-diverged"]')).toBeNull()
+    })
+  })
+
   it('loading a preset replaces provider routing sort and clears the edited marker', async () => {
     const key = await createKey({ name: 'OpenRouter', plaintextKey: 'sk-or-v1-test' })
     const profile = await createProfile({
@@ -817,3 +937,26 @@ describe('shell smoke render', () => {
     })
   })
 })
+
+function findLabel(container: HTMLElement, text: string): HTMLLabelElement {
+  const label = Array.from(container.querySelectorAll<HTMLLabelElement>('label')).find((item) =>
+    item.textContent?.includes(text),
+  )
+  if (!label) throw new Error(`Expected label: ${text}`)
+  return label
+}
+
+async function saveCurrentSettingsToCurrentPreset(container: HTMLElement): Promise<void> {
+  const button = container.querySelector('[data-ui="preset-breadcrumb-button"]') as HTMLButtonElement
+  fireEvent.click(button)
+  let saveButton: HTMLButtonElement | undefined
+  await waitFor(() => {
+    const menu = container.querySelector('[data-ui="preset-breadcrumb-menu"]')
+    expect(menu).toBeInTheDocument()
+    saveButton = Array.from(
+      menu?.querySelectorAll<HTMLButtonElement>('[data-ui="field-inline-action"]') ?? [],
+    ).find((item) => item.textContent === 'save')
+    expect(saveButton).toBeDefined()
+  })
+  fireEvent.click(saveButton as HTMLButtonElement)
+}

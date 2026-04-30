@@ -85,9 +85,9 @@ describe('sidebar organization helpers', () => {
     expect(entries[0]).toMatchObject({ kind: 'folder', sortValue: 20, chats: [] })
   })
 
-  it('normalizes legacy and unknown persisted sort values', () => {
+  it('accepts current persisted sort values and rejects legacy or unknown values', () => {
     expect(parseSidebarSortMode('updated-desc')).toBe('updatedAt-desc')
-    expect(parseSidebarSortMode('updated-asc')).toBe('updatedAt-asc')
+    expect(parseSidebarSortMode('updated-asc')).toBe('updatedAt-desc')
     expect(parseSidebarSortMode('wat')).toBe('updatedAt-desc')
     expect(parseSidebarSortMode('totalCostUsd-desc')).toBe('totalCostUsd-desc')
   })

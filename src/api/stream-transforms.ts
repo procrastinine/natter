@@ -1282,7 +1282,7 @@ export async function* splitAnthropicStream(
       case 'ping':
         break
 
-      case 'error':
+      case 'error': {
         const e = ev as Extract<AnthropicEventWire, { type: 'error' }>
         yield {
           lane: 'error',
@@ -1292,6 +1292,7 @@ export async function* splitAnthropicStream(
           ),
         }
         break
+      }
 
       default:
         break

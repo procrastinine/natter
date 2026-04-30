@@ -110,7 +110,7 @@ function registerV1(db: Dexie): void {
 
 function registerV1Through3(db: Dexie): void {
   registerSchema(db)
-  db.version(15)
+  db.version(16)
     .stores({ profiles: 'id, name, kind, lastUsedAt, archived' })
     .upgrade(async (tx) => {
       await tx
@@ -120,7 +120,7 @@ function registerV1Through3(db: Dexie): void {
           if (row.appTitle === undefined) row.appTitle = 'Natter'
         })
     })
-  db.version(16)
+  db.version(17)
     .stores({ settings: '&key' })
     .upgrade(async (tx) => {
       const settings = tx.table<MinimalSetting>('settings')
@@ -180,6 +180,16 @@ function registerLegacyAttachmentsV5(db: Dexie): void {
   })
 }
 
+function registerLegacyChatSettingsV14(db: Dexie): void {
+  db.version(14).stores({
+    chats:
+      'id, updatedAt, createdAt, lastViewedAt, lastUpdatedLeafId, lastBranchUpdatedAt, wordCount, totalCostUsd, archived, pinned, presetId, folderId, *tags',
+    presets: 'id, name, connectionProfileId, lastUsedAt, archived',
+    profiles: 'id, name, kind, lastUsedAt, archived',
+    settings: '&key',
+  })
+}
+
 describe('Dexie migrations', () => {
   it('opens a fresh DB at the highest declared version without replaying upgrade callbacks', async () => {
     // Dexie's contract: on a truly fresh IDB, it creates the union of all
@@ -192,7 +202,7 @@ describe('Dexie migrations', () => {
     const db = new Dexie(name)
     registerV1Through3(db)
     await db.open()
-    expect(db.verno).toBe(16)
+    expect(db.verno).toBe(17)
     expect(db.tables.map((t) => t.name).includes('settings')).toBe(true)
     const tag = await db.table<MinimalSetting>('settings').get('schemaTag')
     expect(tag).toBeUndefined()
@@ -228,7 +238,7 @@ describe('Dexie migrations', () => {
     const up = new Dexie(name)
     registerV1Through3(up)
     await up.open()
-    expect(up.verno).toBe(16)
+    expect(up.verno).toBe(17)
     const profile = await up.table<MinimalProfile>('profiles').get('P1')
     expect(profile?.appTitle).toBe('CustomTitle') // preserved — synthetic bump only fills undefined
     const tag = await up.table<MinimalSetting>('settings').get('schemaTag')
@@ -238,7 +248,7 @@ describe('Dexie migrations', () => {
     const reopen = new Dexie(name)
     registerV1Through3(reopen)
     await reopen.open()
-    expect(reopen.verno).toBe(16)
+    expect(reopen.verno).toBe(17)
     const tag2 = await reopen.table<MinimalSetting>('settings').get('schemaTag')
     expect(tag2?.value).toBe('preexisting')
     await reopen.delete()
@@ -554,6 +564,129 @@ describe('Dexie migrations', () => {
     )
     expect('toolChoice' in ((chat?.settings ?? {}) as Record<string, unknown>)).toBe(false)
     expect('parallelToolCalls' in ((chat?.settings ?? {}) as Record<string, unknown>)).toBe(false)
+    await migrated.delete()
+  })
+
+  it('completes chat and preset settings snapshots in the v15 schema migration', async () => {
+    const name = `natter-test-chat-settings-snapshot-mig-${Math.random().toString(36).slice(2)}`
+    await Dexie.delete(name)
+    const profileId = 'profile-settings-snapshot'
+    const legacySettings = cloneDefaultChatSettings() as Chat['settings'] & {
+      enabledServerToolIds?: string[]
+      toolChoice?: string
+    }
+    legacySettings.profileId = profileId
+    legacySettings.model = 'openai/gpt-5.4-nano'
+    legacySettings.reasoning = {
+      mode: 'default',
+      exclude: false,
+      summary: 'auto',
+      carryForward: 'plaintext',
+    } as unknown as Chat['settings']['reasoning']
+    legacySettings.privacy = {
+      ...legacySettings.privacy,
+      usePreferredOrdering: true,
+    } as unknown as Chat['settings']['privacy']
+    legacySettings.tools = {
+      openai: {
+        enabledServerToolIds: ['web-search'],
+        config: { 'web-search': { includeSources: true } },
+      },
+    } as unknown as Chat['settings']['tools']
+    legacySettings.enabledServerToolIds = ['datetime']
+    legacySettings.toolChoice = 'auto'
+    delete (legacySettings as Partial<Chat['settings']>).toolCallContext
+    delete (legacySettings as Partial<Chat['settings']>).defaultPrefill
+    delete (legacySettings as Partial<Chat['settings']>).continuePrefill
+    delete (legacySettings as Partial<Chat['settings']>).mediaEchoN
+    delete (legacySettings as Partial<Chat['settings']>).toolContextSummarizeAfterN
+    delete (legacySettings as Partial<Chat['settings']>).serviceTier
+
+    const legacy = new Dexie(name)
+    registerLegacyChatSettingsV14(legacy)
+    await legacy.open()
+    await legacy.table('profiles').put({
+      id: profileId,
+      name: 'OpenRouter',
+      kind: 'openrouter',
+      baseUrl: 'https://openrouter.ai/api/v1',
+      apiKeyRef: 'K1',
+      defaultHeaders: {},
+      appTitle: 'Natter',
+      appUrl: '',
+      usesResponsesApiByDefault: false,
+      supportsEndpointsApi: true,
+      supportsGenerationApi: true,
+      supportsPrivacyScrape: true,
+      createdAt: 1,
+      updatedAt: 1,
+    })
+    await legacy.table<Chat>('chats').put({
+      id: 'chat-settings-snapshot',
+      title: '',
+      titleStatus: 'untitled',
+      createdAt: 1,
+      updatedAt: 1,
+      lastViewedAt: 1,
+      wordCount: 0,
+      totalCostUsd: 0,
+      metaVersion: 0,
+      summaryVersion: 0,
+      settings: structuredClone(legacySettings),
+      lastUpdatedLeafId: null,
+      lastBranchUpdatedAt: 1,
+      archived: false,
+      pinned: false,
+      folderId: null,
+      tags: [],
+    })
+    const presetSettings = structuredClone(legacySettings)
+    presetSettings.profileId = 'stale-profile'
+    await legacy.table<ChatPreset>('presets').put({
+      id: 'preset-settings-snapshot',
+      name: 'Snapshot',
+      connectionProfileId: profileId,
+      settings: presetSettings,
+      createdAt: 1,
+      updatedAt: 1,
+    })
+    legacy.close()
+
+    const migrated = createDbForTests(name)
+    await migrated.open()
+    expect(migrated.verno).toBe(15)
+    const chat = await migrated.chats.get('chat-settings-snapshot')
+    const preset = await migrated.presets.get('preset-settings-snapshot')
+    for (const settings of [chat?.settings, preset?.settings]) {
+      expect(settings?.defaultPrefill).toBe('')
+      expect(settings?.continuePrefill).toBe(false)
+      expect(settings?.mediaEchoN).toBe(5)
+      expect(settings?.toolContextSummarizeAfterN).toBe(6)
+      expect(settings?.toolCallContext).toEqual({ include: true })
+      expect(settings?.serviceTier).toBe('auto')
+      expect(settings?.tools.openrouter).toEqual({
+        enabledServerToolIds: ['datetime'],
+        toolChoice: 'auto',
+      })
+      expect(settings?.tools.openai).toEqual({
+        enabledServerToolIds: ['web-search'],
+        config: { 'web-search': { includeSources: true } },
+      })
+      expect(settings?.tools.anthropic).toEqual({ enabledServerToolIds: [] })
+      expect(settings?.tools.google).toEqual({ enabledServerToolIds: [] })
+      expect(settings?.reasoning.include).toEqual({
+        encrypted: false,
+        summary: true,
+        text: true,
+      })
+      expect('carryForward' in ((settings?.reasoning ?? {}) as Record<string, unknown>)).toBe(false)
+      expect('usePreferredOrdering' in ((settings?.privacy ?? {}) as Record<string, unknown>)).toBe(
+        false,
+      )
+      expect('enabledServerToolIds' in ((settings ?? {}) as Record<string, unknown>)).toBe(false)
+      expect('toolChoice' in ((settings ?? {}) as Record<string, unknown>)).toBe(false)
+    }
+    expect(preset?.settings.profileId).toBe(profileId)
     await migrated.delete()
   })
 

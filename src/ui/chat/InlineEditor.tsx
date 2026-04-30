@@ -121,6 +121,7 @@ type EditableReasoning =
     }
 
 type EditableToolCall = {
+  editorId: string
   dialect: ProviderOutputDialect
   type: string
   outputIndex: string
@@ -128,6 +129,13 @@ type EditableToolCall = {
   rawText: string
   original: ProviderOutputItem | null
   originalRawText: string
+}
+
+let nextToolCallEditorRowId = 0
+
+function allocateToolCallEditorId(): string {
+  nextToolCallEditorRowId += 1
+  return `tool-call-editor-${nextToolCallEditorRowId}`
 }
 
 function toEditable(list: ReasoningDetail[]): EditableReasoning[] {
@@ -165,6 +173,7 @@ function toEditableToolCalls(list: ProviderOutputItem[]): EditableToolCall[] {
   return list.map((item) => {
     const rawText = formatToolItemForEdit(item.item)
     return {
+      editorId: allocateToolCallEditorId(),
       dialect: item.dialect,
       type: item.type,
       outputIndex: item.outputIndex === undefined ? '' : String(item.outputIndex),
@@ -459,6 +468,7 @@ export function InlineEditor({
     setToolCalls((prev) => [
       ...prev,
       {
+        editorId: allocateToolCallEditorId(),
         dialect: 'unknown',
         type: 'manual_tool_call',
         outputIndex: String(nextToolCallIndex()),
@@ -549,7 +559,7 @@ export function InlineEditor({
           <div data-ui="inline-editor-tool-call-list">
             {toolCalls.map((row, i) => (
               <ToolCallEditorRow
-                key={`${row.dialect}-${row.type}-${i}`}
+                key={row.editorId}
                 row={row}
                 busy={busy}
                 onChangeDialect={(next) =>

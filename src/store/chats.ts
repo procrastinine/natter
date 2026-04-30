@@ -625,10 +625,9 @@ export async function replaceChatSettings(
   return changed
 }
 
-// Normalize fields that downstream readers assume are well-formed. Today this
-// is just `reasoning` (Phase 11 added required sub-fields after some chat
-// rows were already on disk); future additions go here too. Returns the
-// input verbatim when nothing needs rewriting so referential equality holds.
+// Complete persisted-schema changes belong in Dexie migrations. This write
+// boundary only repairs full-object UI patches that omit required nested
+// reasoning sub-fields before they reach downstream readers.
 function normalizeChatSettings(settings: ChatSettings): ChatSettings {
   const reasoning = normalizeReasoningSettings(settings.reasoning)
   if (reasoning === settings.reasoning) return settings

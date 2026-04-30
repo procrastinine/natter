@@ -90,7 +90,7 @@ export function migrateLegacyProviderSettings(
   const privacyResult = stripLegacyPrivacyProviderRefs(
     applyProviderPrefPrivacyPatch(settings.privacy, normalizedPrefs.privacyPatch),
   )
-  let privacy = privacyResult.privacy
+  const privacy = privacyResult.privacy
   const changed =
     settingsResult.changed ||
     normalizedPrefs.changed ||

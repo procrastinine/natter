@@ -10,6 +10,7 @@ import {
   migrateAttachmentRefRows,
   normalizeLegacyAttachmentRefs,
 } from '../backcompat/attachment-refs'
+import { migrateCurrentChatSettingsSnapshot } from '../backcompat/chat-settings'
 import {
   globalSettingsBackfillMarker,
   migrateGlobalSettingsRows,
@@ -933,6 +934,63 @@ export function registerSchema(db: Dexie): void {
               }
             ).providerOutputItems = migrated
           }
+        })
+    })
+
+  // v15: ChatPreset.settings is the single full ChatSettings snapshot. Backfill
+  // every current defaulted field (including hidden provider-tool buckets) so
+  // live code can compare and save whole settings objects without old-shape
+  // fallbacks.
+  db.version(15)
+    .stores({
+      chats:
+        'id, updatedAt, createdAt, lastViewedAt, lastUpdatedLeafId, lastBranchUpdatedAt, wordCount, totalCostUsd, archived, pinned, presetId, folderId, *tags',
+      messages:
+        'id, chatId, parentId, turnId, [chatId+parentId], [chatId+createdAt], [chatId+turnId], [chatId+deleted]',
+      messageBodies: '&id, chatId, updatedAt, nodeVersion',
+      childLists: 'id, [chatId+parentId], updatedAt',
+      attachments: 'id, contentHash, kind, mime, origin, refCount, createdAt, updatedAt, deletedAt',
+      attachmentBlobs: 'id, attachmentId, role, contentHash, createdAt',
+      attachmentArtifacts: 'artifactId, attachmentId, kind, processorId, createdAt',
+      attachmentJobs:
+        'id, attachmentId, processorId, status, updatedAt, [attachmentId+processorId+inputHash]',
+      profiles: 'id, name, kind, lastUsedAt, archived',
+      presets: 'id, name, connectionProfileId, lastUsedAt, archived',
+      promptPresets: 'id, kind, name, lastUsedAt',
+      folders: 'id, name, sortIndex, lastUsedAt',
+      tags: 'id, &nameLower, lastUsedAt',
+      chatBranchCache: '&chatId, branchLeafId, generatedAt',
+      keys: 'id, name',
+      settings: '&key',
+      streamLeases: '&streamId, chatId, ownerClientId, heartbeatAt',
+      streamChunks: '&id, streamId, chatId, messageId, [streamId+seq], createdAt',
+      models: '&[profileId+queryKey], fetchedAt',
+      endpoints: '&[profileId+modelId], fetchedAt',
+      privacyPolicies: '&[profileId+modelId], fetchedAt',
+      providers: '&profileId, fetchedAt',
+      generations: 'id, chatId, gen_id',
+      presetResolutions: '&[profileId+presetSlug], fetchedAt',
+      drafts: '&chatId, updatedAt',
+    })
+    .upgrade(async (tx) => {
+      await tx
+        .table<Chat>('chats')
+        .toCollection()
+        .modify((chat) => {
+          const result = migrateCurrentChatSettingsSnapshot(chat.settings)
+          if (result.changed) chat.settings = result.settings
+        })
+
+      await tx
+        .table<ChatPreset>('presets')
+        .toCollection()
+        .modify((preset) => {
+          const result = migrateCurrentChatSettingsSnapshot(preset.settings)
+          const profileChanged = result.settings.profileId !== preset.connectionProfileId
+          const settings = profileChanged
+            ? { ...result.settings, profileId: preset.connectionProfileId }
+            : result.settings
+          if (result.changed || profileChanged) preset.settings = settings
         })
     })
 }

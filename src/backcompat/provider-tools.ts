@@ -53,6 +53,7 @@ export function migrateProviderToolSettings(
   }
   const nextTools: ChatProviderToolSettings = {
     openrouter: {
+      ...tools?.openrouter,
       enabledServerToolIds:
         tools?.openrouter?.enabledServerToolIds ?? legacy.enabledServerToolIds ?? [],
       ...(tools?.openrouter?.toolChoice !== undefined
@@ -67,6 +68,7 @@ export function migrateProviderToolSettings(
           : {}),
     },
     openai: {
+      ...tools?.openai,
       enabledServerToolIds: tools?.openai?.enabledServerToolIds ?? [],
       ...(tools?.openai?.toolChoice !== undefined ? { toolChoice: tools.openai.toolChoice } : {}),
       ...(tools?.openai?.parallelToolCalls !== undefined
@@ -74,6 +76,7 @@ export function migrateProviderToolSettings(
         : {}),
     },
     anthropic: {
+      ...tools?.anthropic,
       enabledServerToolIds: tools?.anthropic?.enabledServerToolIds ?? [],
       ...(tools?.anthropic?.toolChoice !== undefined
         ? { toolChoice: tools.anthropic.toolChoice }
@@ -83,6 +86,7 @@ export function migrateProviderToolSettings(
         : {}),
     },
     google: {
+      ...tools?.google,
       enabledServerToolIds: tools?.google?.enabledServerToolIds ?? [],
       ...(tools?.google?.toolChoice !== undefined ? { toolChoice: tools.google.toolChoice } : {}),
       ...(tools?.google?.parallelToolCalls !== undefined
