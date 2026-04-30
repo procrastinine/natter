@@ -1,36 +1,30 @@
-import { useLiveQuery } from 'dexie-react-hooks'
 import {
   defaultRangeExtractor,
-  useVirtualizer,
   type Range,
+  useVirtualizer,
   type VirtualItem,
 } from '@tanstack/react-virtual'
+import { useLiveQuery } from 'dexie-react-hooks'
 import {
+  type DragEvent,
   memo,
+  type ReactNode,
   useCallback,
   useEffect,
   useMemo,
   useRef,
   useState,
-  type DragEvent,
-  type ReactNode,
 } from 'react'
 import { chatHref, makeAnchorClickHandler, navigateHome } from '../../app/router'
 import { exportLastUpdatedChatAsTxt, triggerBrowserDownload } from '../../core/chat-export'
+import { DEFAULT_GLOBAL_PREFERENCES, readGlobalPreferences } from '../../core/global-settings'
 import {
   DEFAULT_SIDEBAR_SORT_MODE,
   SIDEBAR_SORT_OPTIONS,
-  sidebarSortOption,
   type SidebarSortMode,
+  sidebarSortOption,
 } from '../../core/sidebar-sort'
 import type { ChatFolder, ChatId, ChatSidebarRow, ChatTag, FolderId } from '../../core/types'
-import {
-  archiveChat,
-  listChatSidebarRows,
-  moveChatToFolder,
-  setChatTagsFromNames,
-} from '../../store/chats'
-import { abortSearchSession, requestSearchSession } from '../../store/search-session'
 import {
   DEFAULT_SEARCH_FILTERS,
   hasActiveSearchFilters,
@@ -38,7 +32,14 @@ import {
   type SearchFilters,
   type SearchResult,
 } from '../../store/chat-search'
+import {
+  archiveChat,
+  listChatSidebarRows,
+  moveChatToFolder,
+  setChatTagsFromNames,
+} from '../../store/chats'
 import { createFolder, deleteFolder, listFolders, updateFolder } from '../../store/folders'
+import { abortSearchSession, requestSearchSession } from '../../store/search-session'
 import {
   readCollapsedSidebarFolderIds,
   readSidebarSortMode,
@@ -48,9 +49,9 @@ import {
 import { listTags } from '../../store/tags'
 import { startSearchStoreBroadcastListener, useSearchStore } from '../../store/zustand/searchStore'
 import {
+  ChevronIcon,
   CloseIcon,
   DownloadIcon,
-  ChevronIcon,
   FolderIcon,
   MoreVerticalIcon,
   PencilIcon,
@@ -189,7 +190,10 @@ function buildChatVirtualRows(
   return rows
 }
 
-function estimateSidebarVirtualRowSize(row: SidebarVirtualRow | undefined, collapsed: boolean): number {
+function estimateSidebarVirtualRowSize(
+  row: SidebarVirtualRow | undefined,
+  collapsed: boolean,
+): number {
   if (!row) return 56
   switch (row.kind) {
     case 'folder':
@@ -213,7 +217,10 @@ function bindSidebarVirtualRow(node: HTMLLIElement | null, virtual: SidebarVirtu
 function sidebarRangeExtractor(range: Range): number[] {
   const rows = defaultRangeExtractor(range)
   if (rows.length > 0) return rows
-  return Array.from({ length: Math.min(SIDEBAR_INITIAL_VIRTUAL_ROWS, range.count) }, (_, index) => index)
+  return Array.from(
+    { length: Math.min(SIDEBAR_INITIAL_VIRTUAL_ROWS, range.count) },
+    (_, index) => index,
+  )
 }
 
 function fallbackSidebarVirtualItems(
@@ -245,6 +252,7 @@ function estimateSidebarVirtualTotalSize(
 
 export const ChatList = memo(function ChatList({ activeChatId, collapsed }: ChatListProps) {
   const model = useLiveQuery(loadSidebarModel, [], { chats: [], folders: [], tags: [] })
+  const prefs = useLiveQuery(readGlobalPreferences, [], DEFAULT_GLOBAL_PREFERENCES)
   const persistedSortMode = useLiveQuery(readSidebarSortMode, [], DEFAULT_SIDEBAR_SORT_MODE)
   const persistedCollapsedFolderIds = useLiveQuery(
     readCollapsedSidebarFolderIds,
@@ -275,6 +283,7 @@ export const ChatList = memo(function ChatList({ activeChatId, collapsed }: Chat
   const recentMoveTimerRef = useRef<number | null>(null)
   const sortMenuRef = useRef<HTMLDivElement | null>(null)
   const sidebarOrganizerRef = useRef<HTMLDivElement | null>(null)
+  const sidebarWindowLoadRef = useRef<HTMLLIElement | null>(null)
   const preserveSearchExpansionRef = useRef(false)
   const rowMenuButtonRefs = useRef(new Map<ChatId, HTMLButtonElement>())
   const searchSession = useSearchStore((state) => state.session)
@@ -336,6 +345,9 @@ export const ChatList = memo(function ChatList({ activeChatId, collapsed }: Chat
   }, [searchSession?.results, sortMode, sortOptions])
   const rowMetaNow = Date.now()
   const sidebarListRef = useRef<HTMLUListElement | null>(null)
+  const [renderedSidebarRowCount, setRenderedSidebarRowCount] = useState(
+    prefs.sidebarRenderWindowSize,
+  )
   const virtualRows = useMemo<SidebarVirtualRow[]>(() => {
     if (collapsed) {
       return flatRows.map((chat) => ({
@@ -410,25 +422,88 @@ export const ChatList = memo(function ChatList({ activeChatId, collapsed }: Chat
     sortMode,
     sortedSearchResults,
   ])
-  const shouldVirtualizeSidebar = virtualRows.length > SIDEBAR_VIRTUALIZE_THRESHOLD
+  const visibleVirtualRows = useMemo(
+    () => virtualRows.slice(0, Math.min(virtualRows.length, renderedSidebarRowCount)),
+    [renderedSidebarRowCount, virtualRows],
+  )
+  const hiddenSidebarRowCount = Math.max(0, virtualRows.length - visibleVirtualRows.length)
+  const shouldVirtualizeSidebar = visibleVirtualRows.length > SIDEBAR_VIRTUALIZE_THRESHOLD
   const sidebarVirtualizer = useVirtualizer<HTMLUListElement, HTMLLIElement>({
-    count: virtualRows.length,
+    count: visibleVirtualRows.length,
     getScrollElement: () => sidebarListRef.current,
-    estimateSize: (index) => estimateSidebarVirtualRowSize(virtualRows[index], collapsed === true),
-    getItemKey: (index) => virtualRows[index]?.key ?? index,
+    estimateSize: (index) =>
+      estimateSidebarVirtualRowSize(visibleVirtualRows[index], collapsed === true),
+    getItemKey: (index) => visibleVirtualRows[index]?.key ?? index,
     overscan: 8,
     initialRect: { width: 260, height: 720 },
     rangeExtractor: sidebarRangeExtractor,
     enabled: shouldVirtualizeSidebar,
   })
+  const sidebarWindowResetKey = useMemo(
+    () =>
+      JSON.stringify({
+        collapsed: collapsed === true,
+        mode: searchActive ? 'search' : 'browse',
+        sortMode,
+        searchQuery,
+        searchAllBranches,
+        searchIncludeArchived,
+        searchTitleOnly,
+        includeFolderIds,
+        excludeFolderIds,
+        includeTagIds,
+        excludeTagIds,
+        collapsedFolderIds: [...collapsedFolderIds].sort(),
+      }),
+    [
+      collapsed,
+      collapsedFolderIds,
+      excludeFolderIds,
+      excludeTagIds,
+      includeFolderIds,
+      includeTagIds,
+      searchActive,
+      searchAllBranches,
+      searchIncludeArchived,
+      searchQuery,
+      searchTitleOnly,
+      sortMode,
+    ],
+  )
+  const loadMoreSidebarRows = useCallback(() => {
+    setRenderedSidebarRowCount((current) =>
+      Math.min(virtualRows.length, current + prefs.sidebarRenderWindowSize),
+    )
+  }, [prefs.sidebarRenderWindowSize, virtualRows.length])
   useEffect(() => {
     startSearchStoreBroadcastListener()
   }, [])
   useEffect(() => {
+    void sidebarWindowResetKey
+    setRenderedSidebarRowCount(prefs.sidebarRenderWindowSize)
+  }, [prefs.sidebarRenderWindowSize, sidebarWindowResetKey])
+  useEffect(() => {
+    if (prefs.sidebarRenderWindowLoadMode !== 'auto') return
+    if (hiddenSidebarRowCount <= 0) return
+    if (typeof IntersectionObserver === 'undefined') return
+    const root = sidebarListRef.current
+    const target = sidebarWindowLoadRef.current
+    if (!root || !target) return
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) loadMoreSidebarRows()
+      },
+      { root, rootMargin: '0px 0px 240px 0px', threshold: 0 },
+    )
+    observer.observe(target)
+    return () => observer.disconnect()
+  }, [hiddenSidebarRowCount, loadMoreSidebarRows, prefs.sidebarRenderWindowLoadMode])
+  useEffect(() => {
     if (!openActionChatId) return
-    if (virtualRows.some((row) => row.kind === 'chat' && row.chat.id === openActionChatId)) return
+    if (visibleVirtualRows.some((row) => row.kind === 'chat' && row.chat.id === openActionChatId))
+      return
     setOpenActionChatId(null)
-  }, [openActionChatId, virtualRows])
+  }, [openActionChatId, visibleVirtualRows])
   useEffect(() => {
     requestSearchSession({
       query: searchQuery,
@@ -850,15 +925,6 @@ export const ChatList = memo(function ChatList({ activeChatId, collapsed }: Chat
       </li>
     )
   }
-  const renderChatRows = (chats: ChatSidebarRow[]) => {
-    if (!shouldRenderCreatedAtGroups(sortMode)) return chats.map((chat) => renderChatRow(chat))
-    return buildCreatedAtGroups(chats, sortMode).map((group) => (
-      <li key={group.key} data-ui="sidebar-time-group">
-        <div data-ui="sidebar-time-group-label">{group.label}</div>
-        <ul data-ui="sidebar-time-group-list">{group.chats.map((chat) => renderChatRow(chat))}</ul>
-      </li>
-    ))
-  }
   const renderFolderHeaderContents = (row: Extract<SidebarVirtualRow, { kind: 'folder' }>) => {
     const folderCollapsed = collapsedFolderIds.has(row.folder.id)
     const dropState =
@@ -922,8 +988,63 @@ export const ChatList = memo(function ChatList({ activeChatId, collapsed }: Chat
       </fieldset>
     )
   }
+
+  const renderSidebarWindowLoad = () => {
+    if (hiddenSidebarRowCount <= 0) return null
+    return (
+      <li ref={sidebarWindowLoadRef} data-ui="sidebar-window-load">
+        <button type="button" data-ui="load-more-sidebar" onClick={loadMoreSidebarRows}>
+          Load more
+        </button>
+        <span>{hiddenSidebarRowCount} more</span>
+      </li>
+    )
+  }
+
+  const renderStaticSidebarRow = (row: SidebarVirtualRow) => {
+    switch (row.kind) {
+      case 'chat':
+        return renderChatRow(row.chat, row.searchResult, {
+          key: row.key,
+          depth: row.depth,
+        })
+      case 'folder':
+        return (
+          <li key={row.key} data-ui="folder-section">
+            {renderFolderHeaderContents(row)}
+          </li>
+        )
+      case 'time-group':
+        return (
+          <li
+            key={row.key}
+            data-ui="sidebar-time-group"
+            data-sidebar-depth={row.depth === 'folder' ? 'folder' : undefined}
+          >
+            <div data-ui="sidebar-time-group-label">{row.label}</div>
+          </li>
+        )
+      case 'status':
+        return (
+          <li key={row.key} data-ui="sidebar-search-empty">
+            {row.text}
+          </li>
+        )
+      case 'folder-empty':
+        return (
+          <li
+            key={row.key}
+            data-ui="folder-empty"
+            data-sidebar-depth={row.depth === 'folder' ? 'folder' : undefined}
+          >
+            Empty
+          </li>
+        )
+    }
+  }
+
   const renderVirtualSidebarRow = (virtualItem: VirtualItem) => {
-    const row = virtualRows[virtualItem.index]
+    const row = visibleVirtualRows[virtualItem.index]
     if (!row) return null
     const virtual = {
       index: virtualItem.index,
@@ -991,10 +1112,10 @@ export const ChatList = memo(function ChatList({ activeChatId, collapsed }: Chat
     const renderedItems =
       virtualItems.length > 0
         ? virtualItems
-        : fallbackSidebarVirtualItems(virtualRows, collapsed === true)
+        : fallbackSidebarVirtualItems(visibleVirtualRows, collapsed === true)
     const totalSize = Math.max(
       sidebarVirtualizer.getTotalSize(),
-      estimateSidebarVirtualTotalSize(virtualRows, collapsed === true),
+      estimateSidebarVirtualTotalSize(visibleVirtualRows, collapsed === true),
     )
     return (
       <ul
@@ -1003,6 +1124,9 @@ export const ChatList = memo(function ChatList({ activeChatId, collapsed }: Chat
         data-sort-key={sortMode}
         data-search-mode={searchActive ? 'true' : undefined}
         data-virtualized="true"
+        data-render-window-size={prefs.sidebarRenderWindowSize}
+        data-rendered-count={visibleVirtualRows.length}
+        data-total-count={virtualRows.length}
       >
         <li
           data-ui="sidebar-virtual-spacer"
@@ -1012,6 +1136,7 @@ export const ChatList = memo(function ChatList({ activeChatId, collapsed }: Chat
           }}
         />
         {renderedItems.map(renderVirtualSidebarRow)}
+        {renderSidebarWindowLoad()}
       </ul>
     )
   }
@@ -1165,23 +1290,26 @@ export const ChatList = memo(function ChatList({ activeChatId, collapsed }: Chat
     </>
   )
 
-  const renderSearchResults = () => {
-    if (sortedSearchResults.length > 0) {
-      return sortedSearchResults.map((result) => renderChatRow(result.chat, result))
-    }
-    if (searchSession?.status === 'scanning' || searchSession?.status === 'debouncing') {
-      return <li data-ui="sidebar-search-empty">Searching...</li>
-    }
-    return <li data-ui="sidebar-search-empty">No matches</li>
+  const renderStaticSidebarList = () => {
+    return (
+      <ul
+        ref={sidebarListRef}
+        data-ui="chat-list"
+        data-sort-key={sortMode}
+        data-search-mode={searchActive ? 'true' : undefined}
+        data-render-window-size={prefs.sidebarRenderWindowSize}
+        data-rendered-count={visibleVirtualRows.length}
+        data-total-count={virtualRows.length}
+      >
+        {visibleVirtualRows.map(renderStaticSidebarRow)}
+        {renderSidebarWindowLoad()}
+      </ul>
+    )
   }
 
   if (collapsed) {
     if (shouldVirtualizeSidebar) return renderVirtualSidebarList()
-    return (
-      <ul data-ui="chat-list" data-sort-key={sortMode}>
-        {flatRows.map((chat) => renderChatRow(chat))}
-      </ul>
-    )
+    return renderStaticSidebarList()
   }
 
   return (
@@ -1248,39 +1376,7 @@ export const ChatList = memo(function ChatList({ activeChatId, collapsed }: Chat
         </div>
         {renderSearchDetails()}
       </div>
-      {shouldVirtualizeSidebar ? (
-        renderVirtualSidebarList()
-      ) : (
-        <ul
-          data-ui="chat-list"
-          data-sort-key={sortMode}
-          data-search-mode={searchActive ? 'true' : undefined}
-        >
-          {searchActive
-            ? renderSearchResults()
-            : entries.map((entry) => {
-                if (entry.kind === 'chat') return renderChatRow(entry.chat)
-                const folderCollapsed = collapsedFolderIds.has(entry.folder.id)
-                const folderRow: Extract<SidebarVirtualRow, { kind: 'folder' }> = {
-                  kind: 'folder',
-                  key: `static:folder:${entry.folder.id}`,
-                  folder: entry.folder,
-                  chats: entry.chats,
-                }
-                return (
-                  <li key={entry.folder.id} data-ui="folder-section">
-                    {renderFolderHeaderContents(folderRow)}
-                    {!folderCollapsed && entry.chats.length > 0 ? (
-                      <ul data-ui="folder-chat-list">{renderChatRows(entry.chats)}</ul>
-                    ) : null}
-                    {!folderCollapsed && entry.chats.length === 0 ? (
-                      <div data-ui="folder-empty">Empty</div>
-                    ) : null}
-                  </li>
-                )
-              })}
-        </ul>
-      )}
+      {shouldVirtualizeSidebar ? renderVirtualSidebarList() : renderStaticSidebarList()}
       {folderDeleteTarget ? (
         <div data-ui="folder-delete-dialog" role="dialog" aria-label="Delete folder">
           <div data-ui="folder-delete-title">{folderDeleteTarget.name}</div>

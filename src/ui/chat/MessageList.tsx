@@ -1,10 +1,10 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { navigateToChat } from '../../app/router'
 import { cursorKeyOf, groupByParent, indexById } from '../../core/active-path'
 import { resolveLastUpdatedBranchBelow } from '../../core/branch-resolve'
 import type { EffectiveCapability } from '../../core/capabilities'
 import { computeBranchTitle, forkChatFromMessage } from '../../core/chat-fork'
-import type { LongMessageDisplayMode } from '../../core/global-settings'
+import type { LongMessageDisplayMode, RenderWindowLoadMode } from '../../core/global-settings'
 import { swipe } from '../../core/messages'
 import { UNLIMITED_CONTEXT } from '../../core/prompt-size'
 import { prefillClassFor } from '../../core/quirks'
@@ -44,6 +44,8 @@ interface MessageListProps {
   capability?: EffectiveCapability
   prefillRecommendationEndpoints?: readonly ModelEndpoint[]
   longMessageDisplayMode?: LongMessageDisplayMode
+  messageRenderWindowSize: number
+  messageRenderWindowLoadMode: RenderWindowLoadMode
   branchSnapshot: ActiveBranchSnapshot | null
 }
 
@@ -77,6 +79,8 @@ export const MessageList = memo(function MessageList({
   capability,
   prefillRecommendationEndpoints = [],
   longMessageDisplayMode = 'full',
+  messageRenderWindowSize,
+  messageRenderWindowLoadMode,
   branchSnapshot,
 }: MessageListProps) {
   const cursor = useChatStore((state) => state.cursors[chatId] ?? EMPTY_CURSOR)
@@ -132,6 +136,9 @@ export const MessageList = memo(function MessageList({
   // user is navigating. Keeps keyboard shortcuts tied to "the message just
   // clicked" without forcing a controlled-selection state.
   const listRef = useRef<HTMLDivElement | null>(null)
+  const loadOlderRef = useRef<HTMLDivElement | null>(null)
+  const pendingPrependAnchorRef = useRef<{ scrollTop: number; scrollHeight: number } | null>(null)
+  const [renderedMessageCount, setRenderedMessageCount] = useState(messageRenderWindowSize)
   const focusedMessageId = useCallback((): MessageId | null => {
     const el = listRef.current?.querySelector<HTMLElement>('[data-ui="message"]:focus-within')
     return el?.getAttribute('data-message-id') ?? null
@@ -339,11 +346,79 @@ export const MessageList = memo(function MessageList({
   const excludedIds = useMemo(() => {
     return computeExcludedIds(path, chatSettings, capability)
   }, [path, chatSettings, capability])
+  const pathLeafId = path.at(-1)?.id ?? null
+  const messageWindowResetKey = `${chatId}:${pathLeafId ?? ''}`
+  const effectiveRenderedMessageCount = Math.min(path.length, renderedMessageCount)
+  const hiddenOlderCount = Math.max(0, path.length - effectiveRenderedMessageCount)
+  const visiblePath = useMemo(
+    () => path.slice(Math.max(0, path.length - effectiveRenderedMessageCount)),
+    [path, effectiveRenderedMessageCount],
+  )
+  const loadOlderMessages = useCallback(() => {
+    if (hiddenOlderCount <= 0) return
+    const container = listRef.current?.closest<HTMLDivElement>('[data-ui="scroll-region"]')
+    if (container) {
+      pendingPrependAnchorRef.current = {
+        scrollTop: container.scrollTop,
+        scrollHeight: container.scrollHeight,
+      }
+    }
+    setRenderedMessageCount((current) => Math.min(path.length, current + messageRenderWindowSize))
+  }, [hiddenOlderCount, messageRenderWindowSize, path.length])
+
+  useEffect(() => {
+    void messageWindowResetKey
+    setRenderedMessageCount(messageRenderWindowSize)
+    pendingPrependAnchorRef.current = null
+  }, [messageRenderWindowSize, messageWindowResetKey])
+
+  useLayoutEffect(() => {
+    const anchor = pendingPrependAnchorRef.current
+    if (!anchor) return
+    pendingPrependAnchorRef.current = null
+    const container = listRef.current?.closest<HTMLDivElement>('[data-ui="scroll-region"]')
+    if (!container) return
+    const delta = container.scrollHeight - anchor.scrollHeight
+    container.scrollTop = anchor.scrollTop + delta
+  })
+
+  useEffect(() => {
+    if (messageRenderWindowLoadMode !== 'auto') return
+    if (hiddenOlderCount <= 0) return
+    if (typeof IntersectionObserver === 'undefined') return
+    const target = loadOlderRef.current
+    const root = listRef.current?.closest<HTMLDivElement>('[data-ui="scroll-region"]')
+    if (!target || !root) return
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) loadOlderMessages()
+      },
+      { root, rootMargin: '240px 0px 0px 0px', threshold: 0 },
+    )
+    observer.observe(target)
+    return () => observer.disconnect()
+  }, [hiddenOlderCount, loadOlderMessages, messageRenderWindowLoadMode])
 
   return (
-    <div data-ui="message-list" aria-live="polite" ref={listRef}>
-      {path.map((m, idx) => {
-        const prev = path[idx - 1]
+    <div
+      data-ui="message-list"
+      aria-live="polite"
+      ref={listRef}
+      data-render-window-size={messageRenderWindowSize}
+      data-rendered-count={effectiveRenderedMessageCount}
+      data-total-count={path.length}
+    >
+      {hiddenOlderCount > 0 ? (
+        <div ref={loadOlderRef} data-ui="message-window-load">
+          <button type="button" data-ui="load-more-messages" onClick={loadOlderMessages}>
+            Load more
+          </button>
+          <span>{hiddenOlderCount} older</span>
+        </div>
+      ) : null}
+      {visiblePath.map((m, idx) => {
+        const fullIndex = hiddenOlderCount + idx
+        const prev = path[fullIndex - 1]
         const showStaleHint = m.role === 'assistant' && prev && staleHintFor.has(prev.id)
         return (
           <Message

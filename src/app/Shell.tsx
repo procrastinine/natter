@@ -818,6 +818,8 @@ export function Shell() {
                     {...(activeCapability ? { capability: activeCapability } : {})}
                     prefillRecommendationEndpoints={activeEndpoints.endpoints}
                     longMessageDisplayMode={prefs.longMessageDisplayMode}
+                    messageRenderWindowSize={prefs.messageRenderWindowSize}
+                    messageRenderWindowLoadMode={prefs.messageRenderWindowLoadMode}
                   />
                   {effectiveFocusMode ? (
                     <Composer

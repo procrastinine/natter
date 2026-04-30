@@ -3,14 +3,23 @@ import { CloseIcon } from '../icons/Icon'
 import { AppearanceSettings } from './AppearanceSettings'
 import { GeneralSettings } from './GeneralSettings'
 import { ImageAllowlistPanel } from './ImageAllowlistPanel'
+import { PerformanceSettings } from './PerformanceSettings'
 
-type GlobalSettingsTab = 'general' | 'appearance' | 'images'
+type GlobalSettingsTab = 'general' | 'appearance' | 'performance' | 'images'
 
 const TAB_LABELS: Record<GlobalSettingsTab, string> = {
   general: 'General',
   appearance: 'Appearance',
+  performance: 'Performance',
   images: 'Images',
 }
+
+const GLOBAL_SETTINGS_TABS: readonly GlobalSettingsTab[] = [
+  'general',
+  'appearance',
+  'performance',
+  'images',
+]
 
 interface GlobalSettingsModalProps {
   open: boolean
@@ -59,7 +68,7 @@ export function GlobalSettingsModal({ open, onClose }: GlobalSettingsModalProps)
           </button>
         </header>
         <div role="tablist" data-ui="settings-tabs">
-          {(['general', 'appearance', 'images'] as const).map((value) => (
+          {GLOBAL_SETTINGS_TABS.map((value) => (
             <button
               key={value}
               type="button"
@@ -76,6 +85,7 @@ export function GlobalSettingsModal({ open, onClose }: GlobalSettingsModalProps)
         <div role="tabpanel" data-ui="settings-panel" data-active-tab={tab}>
           {tab === 'general' ? <GeneralSettings /> : null}
           {tab === 'appearance' ? <AppearanceSettings /> : null}
+          {tab === 'performance' ? <PerformanceSettings /> : null}
           {tab === 'images' ? <ImageAllowlistPanel /> : null}
         </div>
       </section>

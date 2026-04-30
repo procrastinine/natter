@@ -1030,6 +1030,53 @@ export function registerSchema(db: Dexie): void {
     .upgrade(async (tx) => {
       await tx.table<SettingsRow>('settings').delete('global:auto-scroll-open')
     })
+
+  // v17: Seed render-window defaults for existing workspaces. Fresh DBs can
+  // still rely on read-time defaults because Dexie skips upgrade callbacks
+  // when creating the latest version from scratch.
+  db.version(17)
+    .stores({
+      chats:
+        'id, updatedAt, createdAt, lastViewedAt, lastUpdatedLeafId, lastBranchUpdatedAt, wordCount, totalCostUsd, archived, pinned, presetId, folderId, *tags',
+      messages:
+        'id, chatId, parentId, turnId, [chatId+parentId], [chatId+createdAt], [chatId+turnId], [chatId+deleted]',
+      messageBodies: '&id, chatId, updatedAt, nodeVersion',
+      childLists: 'id, [chatId+parentId], updatedAt',
+      attachments: 'id, contentHash, kind, mime, origin, refCount, createdAt, updatedAt, deletedAt',
+      attachmentBlobs: 'id, attachmentId, role, contentHash, createdAt',
+      attachmentArtifacts: 'artifactId, attachmentId, kind, processorId, createdAt',
+      attachmentJobs:
+        'id, attachmentId, processorId, status, updatedAt, [attachmentId+processorId+inputHash]',
+      profiles: 'id, name, kind, lastUsedAt, archived',
+      presets: 'id, name, connectionProfileId, lastUsedAt, archived',
+      promptPresets: 'id, kind, name, lastUsedAt',
+      folders: 'id, name, sortIndex, lastUsedAt',
+      tags: 'id, &nameLower, lastUsedAt',
+      chatBranchCache: '&chatId, branchLeafId, generatedAt',
+      keys: 'id, name',
+      settings: '&key',
+      streamLeases: '&streamId, chatId, ownerClientId, heartbeatAt',
+      streamChunks: '&id, streamId, chatId, messageId, [streamId+seq], createdAt',
+      models: '&[profileId+queryKey], fetchedAt',
+      endpoints: '&[profileId+modelId], fetchedAt',
+      privacyPolicies: '&[profileId+modelId], fetchedAt',
+      providers: '&profileId, fetchedAt',
+      generations: 'id, chatId, gen_id',
+      presetResolutions: '&[profileId+presetSlug], fetchedAt',
+      drafts: '&chatId, updatedAt',
+    })
+    .upgrade(async (tx) => {
+      const settings = tx.table<SettingsRow>('settings')
+      const defaults: SettingsRow[] = [
+        { key: 'global:message-render-window-size', value: 10 },
+        { key: 'global:sidebar-render-window-size', value: 50 },
+        { key: 'global:message-render-window-load-mode', value: 'auto' },
+        { key: 'global:sidebar-render-window-load-mode', value: 'auto' },
+      ]
+      for (const row of defaults) {
+        if (!(await settings.get(row.key))) await settings.put(row)
+      }
+    })
 }
 
 function organizationDefaultsPatch(

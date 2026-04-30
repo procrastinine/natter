@@ -64,6 +64,8 @@ export type TokenCalibrationMode = 'adaptive' | 'global-only' | 'family-defaults
 
 export type LongMessageDisplayMode = 'full' | 'compact'
 
+export type RenderWindowLoadMode = 'auto' | 'manual'
+
 // Continue prompts injected by Continue-in-place (see `src/hooks/useContinue.ts`).
 // The actual prompts live on `chat.settings.continueSystemPrompt` /
 // `continueUserPrompt` (per-chat, preset-pinnable). These constants remain
@@ -114,6 +116,13 @@ interface GlobalPreferences {
   // Default rendering mode for long/oversized messages when a row mounts
   // or reloads. Manual avatar clicks stay session-local.
   longMessageDisplayMode: LongMessageDisplayMode
+  // Render-window sizes bound expensive DOM work for long transcripts and
+  // large sidebars. The full active branch/sidebar model can still exist in
+  // memory, but React only mounts this many rows before incremental expansion.
+  messageRenderWindowSize: number
+  sidebarRenderWindowSize: number
+  messageRenderWindowLoadMode: RenderWindowLoadMode
+  sidebarRenderWindowLoadMode: RenderWindowLoadMode
   // CORS-proxy base URL prefixed in front of `/{model}/providers` for the
   // privacy scrape. Empty string uses the runtime default: `/_or_scrape`
   // under Vite dev, no live scrape in static builds.
@@ -148,9 +157,18 @@ export const DEFAULT_GLOBAL_PREFERENCES: Readonly<GlobalPreferences> = Object.fr
   recentModels: [],
   tokenCalibrationMode: 'adaptive',
   longMessageDisplayMode: 'full',
+  messageRenderWindowSize: 10,
+  sidebarRenderWindowSize: 50,
+  messageRenderWindowLoadMode: 'auto',
+  sidebarRenderWindowLoadMode: 'auto',
   corsProxyUrl: defaultCorsProxyUrlForRuntime(),
   corsProxySecret: '',
 })
+
+export const MESSAGE_RENDER_WINDOW_SIZE_MIN = 1
+export const MESSAGE_RENDER_WINDOW_SIZE_MAX = 500
+export const SIDEBAR_RENDER_WINDOW_SIZE_MIN = 1
+export const SIDEBAR_RENDER_WINDOW_SIZE_MAX = 1000
 
 const THEME_KEY = 'global:theme'
 const SEND_SHORTCUT_KEY = 'global:send-shortcut'
@@ -164,6 +182,10 @@ const PINNED_MODELS_KEY = 'global:pinned-models'
 const RECENT_MODELS_KEY = 'global:recent-models'
 const TOKEN_CALIBRATION_MODE_KEY = 'global:token-calibration-mode'
 const LONG_MESSAGE_DISPLAY_MODE_KEY = 'global:long-message-display-mode'
+const MESSAGE_RENDER_WINDOW_SIZE_KEY = 'global:message-render-window-size'
+const SIDEBAR_RENDER_WINDOW_SIZE_KEY = 'global:sidebar-render-window-size'
+const MESSAGE_RENDER_WINDOW_LOAD_MODE_KEY = 'global:message-render-window-load-mode'
+const SIDEBAR_RENDER_WINDOW_LOAD_MODE_KEY = 'global:sidebar-render-window-load-mode'
 const CORS_PROXY_URL_KEY = 'global:cors-proxy-url'
 const CORS_PROXY_SECRET_KEY = 'global:cors-proxy-secret'
 
@@ -269,6 +291,28 @@ function longMessageDisplayModeOrDefault(value: unknown): LongMessageDisplayMode
     : DEFAULT_GLOBAL_PREFERENCES.longMessageDisplayMode
 }
 
+const ALLOWED_RENDER_WINDOW_LOAD_MODES: readonly RenderWindowLoadMode[] = ['auto', 'manual']
+
+function renderWindowLoadModeOrDefault(
+  value: unknown,
+  fallback: RenderWindowLoadMode,
+): RenderWindowLoadMode {
+  return ALLOWED_RENDER_WINDOW_LOAD_MODES.includes(value as RenderWindowLoadMode)
+    ? (value as RenderWindowLoadMode)
+    : fallback
+}
+
+function intInRangeOrDefault(value: unknown, fallback: number, min: number, max: number): number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= min && value <= max
+    ? value
+    : fallback
+}
+
+function clampInt(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) return min
+  return Math.min(max, Math.max(min, Math.round(value)))
+}
+
 export async function readGlobalPreferences(): Promise<GlobalPreferences> {
   const [
     theme,
@@ -283,6 +327,10 @@ export async function readGlobalPreferences(): Promise<GlobalPreferences> {
     recent,
     tokenCalibrationMode,
     longMessageDisplayMode,
+    messageRenderWindowSize,
+    sidebarRenderWindowSize,
+    messageRenderWindowLoadMode,
+    sidebarRenderWindowLoadMode,
     corsProxyUrl,
     corsProxySecret,
   ] = await Promise.all([
@@ -298,6 +346,10 @@ export async function readGlobalPreferences(): Promise<GlobalPreferences> {
     getSetting<string[]>(RECENT_MODELS_KEY),
     getSetting<TokenCalibrationMode>(TOKEN_CALIBRATION_MODE_KEY),
     getSetting<LongMessageDisplayMode>(LONG_MESSAGE_DISPLAY_MODE_KEY),
+    getSetting<number>(MESSAGE_RENDER_WINDOW_SIZE_KEY),
+    getSetting<number>(SIDEBAR_RENDER_WINDOW_SIZE_KEY),
+    getSetting<RenderWindowLoadMode>(MESSAGE_RENDER_WINDOW_LOAD_MODE_KEY),
+    getSetting<RenderWindowLoadMode>(SIDEBAR_RENDER_WINDOW_LOAD_MODE_KEY),
     getSetting<string>(CORS_PROXY_URL_KEY),
     getSetting<string>(CORS_PROXY_SECRET_KEY),
   ])
@@ -326,6 +378,26 @@ export async function readGlobalPreferences(): Promise<GlobalPreferences> {
     recentModels: Array.isArray(recent) ? recent.filter((x) => typeof x === 'string') : [],
     tokenCalibrationMode: calibrationModeOrDefault(tokenCalibrationMode),
     longMessageDisplayMode: longMessageDisplayModeOrDefault(longMessageDisplayMode),
+    messageRenderWindowSize: intInRangeOrDefault(
+      messageRenderWindowSize,
+      DEFAULT_GLOBAL_PREFERENCES.messageRenderWindowSize,
+      MESSAGE_RENDER_WINDOW_SIZE_MIN,
+      MESSAGE_RENDER_WINDOW_SIZE_MAX,
+    ),
+    sidebarRenderWindowSize: intInRangeOrDefault(
+      sidebarRenderWindowSize,
+      DEFAULT_GLOBAL_PREFERENCES.sidebarRenderWindowSize,
+      SIDEBAR_RENDER_WINDOW_SIZE_MIN,
+      SIDEBAR_RENDER_WINDOW_SIZE_MAX,
+    ),
+    messageRenderWindowLoadMode: renderWindowLoadModeOrDefault(
+      messageRenderWindowLoadMode,
+      DEFAULT_GLOBAL_PREFERENCES.messageRenderWindowLoadMode,
+    ),
+    sidebarRenderWindowLoadMode: renderWindowLoadModeOrDefault(
+      sidebarRenderWindowLoadMode,
+      DEFAULT_GLOBAL_PREFERENCES.sidebarRenderWindowLoadMode,
+    ),
     corsProxyUrl: typeof corsProxyUrl === 'string' ? corsProxyUrl : defaultCorsProxyUrlForRuntime(),
     corsProxySecret: typeof corsProxySecret === 'string' ? corsProxySecret : '',
   }
@@ -349,6 +421,28 @@ export async function writeCorsProxySecret(value: string): Promise<void> {
 
 export async function writeLongMessageDisplayMode(value: LongMessageDisplayMode): Promise<void> {
   await setSetting(LONG_MESSAGE_DISPLAY_MODE_KEY, value)
+}
+
+export async function writeMessageRenderWindowSize(value: number): Promise<void> {
+  await setSetting(
+    MESSAGE_RENDER_WINDOW_SIZE_KEY,
+    clampInt(value, MESSAGE_RENDER_WINDOW_SIZE_MIN, MESSAGE_RENDER_WINDOW_SIZE_MAX),
+  )
+}
+
+export async function writeSidebarRenderWindowSize(value: number): Promise<void> {
+  await setSetting(
+    SIDEBAR_RENDER_WINDOW_SIZE_KEY,
+    clampInt(value, SIDEBAR_RENDER_WINDOW_SIZE_MIN, SIDEBAR_RENDER_WINDOW_SIZE_MAX),
+  )
+}
+
+export async function writeMessageRenderWindowLoadMode(value: RenderWindowLoadMode): Promise<void> {
+  await setSetting(MESSAGE_RENDER_WINDOW_LOAD_MODE_KEY, value)
+}
+
+export async function writeSidebarRenderWindowLoadMode(value: RenderWindowLoadMode): Promise<void> {
+  await setSetting(SIDEBAR_RENDER_WINDOW_LOAD_MODE_KEY, value)
 }
 
 export async function writeTokenCalibrationMode(value: TokenCalibrationMode): Promise<void> {

@@ -6,6 +6,10 @@ import {
   readGlobalPreferences,
   writeChatMaxWidth,
   writeLongMessageDisplayMode,
+  writeMessageRenderWindowLoadMode,
+  writeMessageRenderWindowSize,
+  writeSidebarRenderWindowLoadMode,
+  writeSidebarRenderWindowSize,
 } from '../../src/core/global-settings'
 import type { DraftRow } from '../../src/core/types'
 import { __resetBroadcastForTests, type BroadcastEvent, onEvent } from '../../src/store/broadcast'
@@ -227,6 +231,20 @@ describe('settings', () => {
     await writeLongMessageDisplayMode('compact')
     expect(await getSetting('global:long-message-display-mode')).toBe('compact')
     expect((await readGlobalPreferences()).longMessageDisplayMode).toBe('compact')
+  })
+
+  it('global preferences preserve render-window controls', async () => {
+    await writeMessageRenderWindowSize(12)
+    await writeSidebarRenderWindowSize(80)
+    await writeMessageRenderWindowLoadMode('manual')
+    await writeSidebarRenderWindowLoadMode('manual')
+    const prefs = await readGlobalPreferences()
+    expect(await getSetting('global:message-render-window-size')).toBe(12)
+    expect(await getSetting('global:sidebar-render-window-size')).toBe(80)
+    expect(prefs.messageRenderWindowSize).toBe(12)
+    expect(prefs.sidebarRenderWindowSize).toBe(80)
+    expect(prefs.messageRenderWindowLoadMode).toBe('manual')
+    expect(prefs.sidebarRenderWindowLoadMode).toBe('manual')
   })
 
   it('marks run-once backcompat tasks complete on a fresh database', async () => {

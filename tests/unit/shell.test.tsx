@@ -3,21 +3,22 @@ import 'fake-indexeddb/auto'
 import Dexie from 'dexie'
 import { IDBFactory } from 'fake-indexeddb'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { App } from '../../src/app/App'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import type { Chat, Message } from '../../src/core/types'
-import { archiveChat, createChat, updateChatSettings } from '../../src/store/chats'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
+import { archiveChat, createChat, updateChatSettings } from '../../src/store/chats'
 import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
 import { createFolder } from '../../src/store/folders'
 import { __resetKeyCacheForTests, createKey } from '../../src/store/keys'
 import { createPreset, getPreset } from '../../src/store/presets'
 import { createProfile } from '../../src/store/profiles'
 import { __resetSearchSessionRunnerForTests } from '../../src/store/search-session'
+import { setSetting } from '../../src/store/settings'
 import { createTag } from '../../src/store/tags'
 import { __resetSearchStoreForTests } from '../../src/store/zustand/searchStore'
 import { useUiStore } from '../../src/store/zustand/uiStore'
 import { readActiveSeedState } from '../../src/ui/header/ConnectionHeader'
-import { App } from '../../src/app/App'
 import { putTestMessageHeaderOnly, putTestMessages } from '../helpers/message-storage'
 
 describe('shell smoke render', () => {
@@ -101,7 +102,10 @@ describe('shell smoke render', () => {
   })
 
   it('renders the active chat without hydrating irrelevant chat or branch bodies', async () => {
-    const active = await createChat({ title: 'Active huge-safe', settings: cloneDefaultChatSettings() })
+    const active = await createChat({
+      title: 'Active huge-safe',
+      settings: cloneDefaultChatSettings(),
+    })
     const other = await createChat({ title: 'Other poison', settings: cloneDefaultChatSettings() })
     const root: Message = {
       id: 'ui-root',
@@ -364,6 +368,7 @@ describe('shell smoke render', () => {
       previewText: `preview ${index}`,
     }))
     await getDb().chats.bulkPut(chats)
+    await setSetting('global:sidebar-render-window-size', 250)
 
     const { container } = render(<App />)
 
@@ -947,7 +952,9 @@ function findLabel(container: HTMLElement, text: string): HTMLLabelElement {
 }
 
 async function saveCurrentSettingsToCurrentPreset(container: HTMLElement): Promise<void> {
-  const button = container.querySelector('[data-ui="preset-breadcrumb-button"]') as HTMLButtonElement
+  const button = container.querySelector(
+    '[data-ui="preset-breadcrumb-button"]',
+  ) as HTMLButtonElement
   fireEvent.click(button)
   let saveButton: HTMLButtonElement | undefined
   await waitFor(() => {
