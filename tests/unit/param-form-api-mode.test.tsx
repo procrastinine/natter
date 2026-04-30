@@ -3,7 +3,11 @@ import 'fake-indexeddb/auto'
 import Dexie from 'dexie'
 import { IDBFactory } from 'fake-indexeddb'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { effectiveCapabilityFromEndpoints } from '../../src/core/capabilities'
+import { resolveBundledCapability } from '../../src/capabilities'
+import {
+  effectiveCapabilityFromDescriptor,
+  effectiveCapabilityFromEndpoints,
+} from '../../src/core/capabilities'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import type { ConnectionProfile, Message, ModelEndpoint } from '../../src/core/types'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
@@ -33,7 +37,6 @@ function makeProfile(kind: ConnectionProfile['kind']): ConnectionProfile {
     defaultHeaders: {},
     appTitle: 'test',
     appUrl: '',
-    usesResponsesApiByDefault: kind === 'openai-compatible',
     supportsEndpointsApi: kind === 'openrouter',
     supportsGenerationApi: kind === 'openrouter',
     supportsPrivacyScrape: kind === 'openrouter',
@@ -110,17 +113,46 @@ describe('ApiModeSection — two-button toggle', () => {
     expect(updated?.settings.api).toBe('text')
   })
 
-  it('does not render on Google native (transport is a connection-level choice)', async () => {
+  it('renders Gemini Native/OpenAI-compat as chat settings and persists compat mode', async () => {
     const settings = cloneDefaultChatSettings()
     settings.model = 'google/gemini-3.1-pro-preview'
+    settings.api = 'gemini-native'
     const chat = await createChat({ settings })
     const capability = effectiveCapabilityFromEndpoints(settings.model, [
       makeEndpoint({ supported_parameters: ['reasoning'] }),
     ])
-    const { container } = render(
+    render(
       <ApiModeSection chat={chat} capability={capability} profile={makeProfile('google')} />,
     )
-    expect(container.querySelector('[data-ui-section="api-mode"]')).toBeNull()
+    expect(screen.getByRole('button', { name: 'Native' }).getAttribute('aria-pressed')).toBe(
+      'true',
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'OpenAI-compat' }))
+    await waitFor(async () => {
+      const updated = await getChat(chat.id)
+      expect(updated?.settings.api).toBe('chat')
+    })
+  })
+
+  it('renders Anthropic Messages/OpenAI-compat as chat settings and persists compat mode', async () => {
+    const settings = cloneDefaultChatSettings()
+    settings.model = 'claude-haiku-4.5'
+    settings.api = 'anthropic-messages'
+    const chat = await createChat({ settings })
+    const capability = effectiveCapabilityFromEndpoints(settings.model, [
+      makeEndpoint({ supported_parameters: ['tools'] }),
+    ])
+    render(
+      <ApiModeSection chat={chat} capability={capability} profile={makeProfile('anthropic')} />,
+    )
+    expect(screen.getByRole('button', { name: 'Messages' }).getAttribute('aria-pressed')).toBe(
+      'true',
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'OpenAI-compat' }))
+    await waitFor(async () => {
+      const updated = await getChat(chat.id)
+      expect(updated?.settings.api).toBe('chat')
+    })
   })
 
   it('persists the pin when the user clicks Chat completions', async () => {
@@ -224,7 +256,7 @@ describe('ReasoningIncludeControls — include-in-next-turn gating', () => {
     expect(screen.getByLabelText('Tool calls')).toBeTruthy()
   })
 
-  it('renders tool calls as part of Include in next turn without a separate section', async () => {
+  it('renders portable plaintext reasoning controls even when the target has no reasoning params', async () => {
     const settings = cloneDefaultChatSettings()
     settings.model = 'plain/model'
     const chat = await createChat({ settings })
@@ -234,6 +266,10 @@ describe('ReasoningIncludeControls — include-in-next-turn gating', () => {
     render(<ReasoningIncludeControls chat={chat} capability={capability} />)
 
     expect(screen.getByRole('heading', { name: 'Include in next turn' })).toBeTruthy()
+    expect(screen.queryByLabelText(/Encrypted reasoning/)).toBeNull()
+    expect(screen.getByLabelText(/Visible summary/)).toBeTruthy()
+    expect(screen.getByLabelText(/Visible text/)).toBeTruthy()
+    expect(screen.getByLabelText(/Send as/)).toBeTruthy()
     expect(screen.getByLabelText('Tool calls')).toBeTruthy()
     expect(screen.queryByRole('heading', { name: 'Tool calls' })).toBeNull()
     expect(screen.queryByText('Include tool calls and results in next turn')).toBeNull()
@@ -257,6 +293,39 @@ describe('ReasoningIncludeControls — include-in-next-turn gating', () => {
     expect(screen.queryByLabelText(/Encrypted reasoning/)).toBeNull()
     expect(screen.getByLabelText(/Visible summary/)).toBeTruthy()
     expect(screen.getByLabelText(/Visible text/)).toBeTruthy()
+  })
+
+  it('shows Gemini native reasoning include options from the bundled thinking capability', async () => {
+    const settings = cloneDefaultChatSettings()
+    settings.model = 'google/gemini-3.1-flash-lite-preview'
+    const chat = await createChat({ settings })
+    const capability = effectiveCapabilityFromDescriptor(
+      settings.model,
+      resolveBundledCapability(
+        {
+          id: 'p',
+          name: 'Google',
+          kind: 'google',
+          baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+          apiKeyRef: 'k',
+          defaultHeaders: {},
+          appTitle: '',
+          appUrl: '',
+          supportsEndpointsApi: false,
+          supportsGenerationApi: false,
+          supportsPrivacyScrape: false,
+          createdAt: 0,
+          updatedAt: 0,
+        },
+        settings.model,
+      ),
+    )
+    render(<ReasoningIncludeControls chat={chat} capability={capability} />)
+    expect(screen.getByLabelText(/Encrypted reasoning/)).toBeTruthy()
+    expect(screen.getByLabelText(/Visible summary/)).toBeTruthy()
+    expect(screen.getByLabelText(/Visible text/)).toBeTruthy()
+    expect(screen.getByLabelText(/Send as/)).toBeTruthy()
+    expect(screen.getByLabelText('Tool calls')).toBeTruthy()
   })
 
   it('hides the Encrypted checkbox for unknown-format models (DeepSeek / Qwen / Gemma)', async () => {

@@ -28,7 +28,6 @@ function makeProfile(overrides: Partial<ConnectionProfile> = {}): ConnectionProf
     defaultHeaders: {},
     appTitle: 'natter',
     appUrl: '',
-    usesResponsesApiByDefault: false,
     supportsEndpointsApi: true,
     supportsGenerationApi: true,
     supportsPrivacyScrape: true,
@@ -220,7 +219,6 @@ describe('chooseApi matrix', () => {
         makeProfile({
           kind: 'openai-compatible',
           baseUrl: 'https://api.openai.com/v1',
-          usesResponsesApiByDefault: false,
         }),
         settings,
         [],
@@ -230,13 +228,16 @@ describe('chooseApi matrix', () => {
       expect(r.reason).toBe('OpenAI hosted tools require Responses API')
     })
 
-    it('Google hosted tools force Gemini native over a chat pin', () => {
-      const settings = makeSettings('chat', true, 'google/gemini-3.1-flash-lite-preview')
+    it('Google hosted tools use Gemini native when the chat is in native mode', () => {
+      const settings = makeSettings(
+        'gemini-native',
+        true,
+        'google/gemini-3.1-flash-lite-preview',
+      )
       settings.tools.google.enabledServerToolIds = ['google-search']
       const r = chooseApi(
         makeProfile({
           kind: 'google',
-          geminiMode: 'native',
           baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
         }),
         settings,
@@ -247,8 +248,8 @@ describe('chooseApi matrix', () => {
       expect(r.reason).toBe('Gemini native required for Google hosted tools')
     })
 
-    it('Anthropic direct uses native Messages once the adapter exists', () => {
-      const settings = makeSettings('chat', true, 'claude-haiku-4.5')
+    it('Anthropic direct uses native Messages when the chat is in Messages mode', () => {
+      const settings = makeSettings('anthropic-messages', true, 'claude-haiku-4.5')
       settings.tools.anthropic.enabledServerToolIds = ['web-search']
       const r = chooseApi(
         makeProfile({
@@ -298,36 +299,34 @@ describe('chooseApi matrix', () => {
     })
   })
 
-  describe('step 7 — Gemini native default', () => {
-    it("kind: 'google' + geminiMode: 'native' → gemini-generate", () => {
+  describe('step 7 — direct provider chat settings modes', () => {
+    it("kind: 'google' + api: 'gemini-native' → gemini-generate", () => {
       const r = chooseApi(
         makeProfile({
           kind: 'google',
-          geminiMode: 'native',
           baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
         }),
-        makeSettings('auto'),
+        makeSettings('gemini-native'),
         [],
         makeCaps(),
       )
       expect(r.transport).toBe('gemini-native')
     })
 
-    it("kind: 'google' + geminiMode: 'openai-compat' → chat-completions", () => {
+    it("kind: 'google' + api: 'chat' → chat-completions", () => {
       const r = chooseApi(
         makeProfile({
           kind: 'google',
-          geminiMode: 'openai-compat',
           baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
         }),
-        makeSettings('auto'),
+        makeSettings('chat'),
         [],
         makeCaps(),
       )
       expect(r.transport).toBe('openai-chat')
     })
 
-    it("kind: 'google' with no geminiMode defaults to native (undefined !== 'openai-compat')", () => {
+    it("kind: 'google' + api: 'auto' defaults to native", () => {
       const r = chooseApi(
         makeProfile({
           kind: 'google',
@@ -339,17 +338,29 @@ describe('chooseApi matrix', () => {
       )
       expect(r.transport).toBe('gemini-native')
     })
+
+    it("kind: 'anthropic' + api: 'chat' → chat-completions", () => {
+      const r = chooseApi(
+        makeProfile({
+          kind: 'anthropic',
+          baseUrl: 'https://api.anthropic.com/v1',
+        }),
+        makeSettings('chat', true, 'claude-haiku-4.5'),
+        [],
+        makeCaps(),
+      )
+      expect(r.transport).toBe('openai-chat')
+    })
   })
 
-  describe('step 9 — profile default', () => {
-    it('OpenAI direct: usesResponsesApiByDefault=true → responses', () => {
+  describe('step 9 — chat settings default', () => {
+    it("OpenAI direct + api: 'responses' → responses", () => {
       const r = chooseApi(
         makeProfile({
           kind: 'openai-compatible',
           baseUrl: 'https://api.openai.com/v1',
-          usesResponsesApiByDefault: true,
         }),
-        makeSettings('auto'),
+        makeSettings('responses'),
         [],
         makeCaps(),
       )
@@ -408,11 +419,15 @@ describe('isResponsesCapable', () => {
 })
 
 describe('isGeminiNative', () => {
-  it('true only when google AND not opted into openai-compat', () => {
-    expect(isGeminiNative(makeProfile({ kind: 'google' }))).toBe(true)
-    expect(isGeminiNative(makeProfile({ kind: 'google', geminiMode: 'native' }))).toBe(true)
-    expect(isGeminiNative(makeProfile({ kind: 'google', geminiMode: 'openai-compat' }))).toBe(false)
-    expect(isGeminiNative(makeProfile({ kind: 'openai-compatible' }))).toBe(false)
+  it("true only when google AND chat settings aren't OpenAI-compat", () => {
+    expect(isGeminiNative(makeProfile({ kind: 'google' }), makeSettings('auto'))).toBe(true)
+    expect(isGeminiNative(makeProfile({ kind: 'google' }), makeSettings('gemini-native'))).toBe(
+      true,
+    )
+    expect(isGeminiNative(makeProfile({ kind: 'google' }), makeSettings('chat'))).toBe(false)
+    expect(isGeminiNative(makeProfile({ kind: 'openai-compatible' }), makeSettings('auto'))).toBe(
+      false,
+    )
   })
 })
 

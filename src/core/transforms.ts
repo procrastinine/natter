@@ -939,20 +939,18 @@ export function toResponses(
   // `include: ['reasoning.encrypted_content']` — required for stateless
   // (`store: false`) Responses to get encrypted_content back. Only emit when
   // the carrier format is OpenAI-family AND the user wants encrypted carry-
-  // forward (either via `include.encrypted` or the per-chat override).
+  // forward.
   const responses = settings.responses
-  const wantsEncryptedInclude =
-    settings.reasoning.include.encrypted && (responses?.includeEncrypted ?? true)
   const isOpenAiFamily =
     preservationFormat === 'openai-responses-v1' ||
     preservationFormat === 'azure-openai-responses-v1' ||
     preservationFormat === 'xai-responses-v1'
-  if (wantsEncryptedInclude && isOpenAiFamily) {
+  if (settings.reasoning.include.encrypted && isOpenAiFamily) {
     wire.include = ['reasoning.encrypted_content']
   }
 
   // `store`: privacy default is `false` (stateless). User-exposed override
-  // on `chat.settings.responses.store`; overrides `usesResponsesApiByDefault`.
+  // on `chat.settings.responses.store`.
   wire.store = responses?.store ?? false
 
   // Response format (OpenAI uses `text.format` on Responses, not `response_format`).
@@ -1221,6 +1219,8 @@ function applyIncludeToEchoItem(
     return next
   }
   const next = { ...(item as ResponsesInputItem) } as ResponsesInputItem & { id?: string }
+  delete next.status
+  delete next.format
   // OpenRouter rewrites item ids to `rs_tmp_*` / `msg_tmp_*` on its proxy.
   // Echoing those back to Azure makes the upstream reject with
   // `Encrypted content item_id did not match the target item id.`; strip
@@ -1937,18 +1937,22 @@ function messageToGeminiContents(
       }
     }
 
-    // Imported-turn escape hatch: Gemini 3 REJECTS requests whose functionCall
-    // parts lack thought_signatures (HTTP 400). When the user opts in on the
-    // chat level, a dummy signature is injected, per
-    // `gemini_docs/guides/thought-signatures.md` FAQ.
+    // Gemini 3 validates echoed functionCall history more strictly than plain
+    // text history: native Gemini either has the real signature above or needs
+    // Google's documented import-compatible sentinel.
     if (
       preservationFormat === 'google-gemini-v1' &&
       parts.some((p) => 'functionCall' in p) &&
       !parts.some((p) => 'thoughtSignature' in (p as object))
     ) {
-      // leave as-is; the escape hatch lives on `chat.settings.gemini
-      //.allowImportedWithoutSignature` (see `api-choice` and toGeminiNative
-      // callers can inject "skip_thought_signature_validator" when set).
+      for (let i = parts.length - 1; i >= 0; i -= 1) {
+        const part = parts[i]
+        if (part && 'functionCall' in part) {
+          ;(part as { thoughtSignature: string }).thoughtSignature =
+            'skip_thought_signature_validator'
+          break
+        }
+      }
     }
 
     return parts.length > 0 ? [{ role: 'model', parts }] : []

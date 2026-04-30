@@ -87,10 +87,11 @@ describe('createProfile', () => {
     expect(profile.supportsEndpointsApi).toBe(true)
     expect(profile.supportsGenerationApi).toBe(true)
     expect(profile.supportsPrivacyScrape).toBe(true)
-    expect(profile.usesResponsesApiByDefault).toBe(false)
+    expect('usesResponsesApiByDefault' in profile).toBe(false)
+    expect('geminiMode' in profile).toBe(false)
   })
 
-  it('flips usesResponsesApiByDefault=true only for api.openai.com', async () => {
+  it('keeps provider transport modes out of connection profiles', async () => {
     const keyId = await fakeKeyId()
     const openai = await createProfile({
       name: 'OpenAI',
@@ -104,8 +105,10 @@ describe('createProfile', () => {
       baseUrl: 'https://my.openai.azure.com/v1',
       apiKeyRef: keyId,
     })
-    expect(openai.usesResponsesApiByDefault).toBe(true)
-    expect(azure.usesResponsesApiByDefault).toBe(false)
+    expect('usesResponsesApiByDefault' in openai).toBe(false)
+    expect('responsesDefaults' in openai).toBe(false)
+    expect('usesResponsesApiByDefault' in azure).toBe(false)
+    expect('responsesDefaults' in azure).toBe(false)
   })
 
   it('broadcasts profile-mutated', async () => {

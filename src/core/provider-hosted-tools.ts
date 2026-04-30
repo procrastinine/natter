@@ -6,17 +6,13 @@ import type {
   OpenAiServerToolId,
   ServerToolId,
 } from './types'
+import { isOpenAiDirectBaseUrl } from './provider-defaults'
 
 export type HostedToolProvider = 'openrouter' | 'openai' | 'anthropic' | 'google'
 
 export function isOpenAiDirectProfile(profile: ConnectionProfile): boolean {
   if (profile.kind !== 'openai-compatible') return false
-  try {
-    const url = new URL(profile.baseUrl)
-    return url.hostname === 'api.openai.com'
-  } catch {
-    return /^https?:\/\/api\.openai\.com(\/|$)/u.test(profile.baseUrl)
-  }
+  return isOpenAiDirectBaseUrl(profile.baseUrl)
 }
 
 export function enabledHostedToolIds(

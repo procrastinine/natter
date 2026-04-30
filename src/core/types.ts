@@ -27,7 +27,13 @@ export type MessageRole = 'system' | 'user' | 'assistant' | 'tool' | 'developer'
 
 export type MessageOrigin = 'user' | 'generated' | 'imported' | 'continued' | 'prefill'
 
-export type ApiVariant = 'auto' | 'chat' | 'responses' | 'text'
+export type ApiVariant =
+  | 'auto'
+  | 'chat'
+  | 'responses'
+  | 'text'
+  | 'gemini-native'
+  | 'anthropic-messages'
 
 export type MessagePhase = 'commentary' | 'final_answer'
 
@@ -551,30 +557,19 @@ export interface ChatSettings {
   // bundled templates so the renderer can use one code path. Empty strings
   // are legitimate (any prefix/suffix may be omitted).
   customTextTemplate?: TextTemplateConfig
-  // OpenAI Responses-API-specific knobs. Seeded from
-  // `ConnectionProfile.responsesDefaults` at new-chat creation. Only read
-  // on the `responses` route; chat-completions ignores the block entirely.
+  // OpenAI Responses-API-specific knobs. Only read on the `responses` route;
+  // chat-completions ignores the block entirely.
   responses?: ResponsesChatSettings
-  // Gemini-specific knobs. Seeded from `ConnectionProfile.geminiDefaults`.
+  // Gemini-specific knobs.
   gemini?: GeminiChatSettings
 }
 
 interface ResponsesChatSettings {
-  /** Emit `include: ['reasoning.encrypted_content']` on the request. Default
-   *  `true` when `reasoning.include.encrypted` is also `true`. Independent
-   *  escape hatch so the user can suppress the include without flipping the
-   *  per-chat reasoning checkbox. */
-  includeEncrypted: boolean
   /** Pass through to OpenAI. Default is `false` (stateless, privacy). */
   store: boolean
 }
 
 interface GeminiChatSettings {
-  /** Imported chats without `thoughtSignature` values on prior turns bypass
-   *  the 400-error validator when this is `true` (the transform passes
-   *  `"skip_thought_signature_validator"` as the signature). Default `false`,
-   *  which surfaces a banner on first stale-reasoning rejection instead. */
-  allowImportedWithoutSignature?: boolean
   /** When set, `cachedContents/<name>` passed as `cachedContent` on the
    *  request. Phase 14 wires the management UI; preserved here for round-trip. */
   cachedContentName?: string
@@ -1181,7 +1176,6 @@ export interface ConnectionProfile {
   appTitle: string
   appUrl: string
   appCategories?: string[]
-  usesResponsesApiByDefault: boolean
   supportsEndpointsApi: boolean
   supportsGenerationApi: boolean
   supportsPrivacyScrape: boolean
@@ -1191,24 +1185,6 @@ export interface ConnectionProfile {
   updatedAt: number
   lastUsedAt?: number
   archived?: boolean
-  /** Google Gemini transport selector. Only meaningful when `kind === 'google'`.
-   *  `native` (default) dispatches to `:generateContent` /
-   *  `:streamGenerateContent?alt=sse` with `x-goog-api-key`. `openai-compat`
-   *  falls back to Gemini's OpenAI-compatible shim at `/v1beta/openai/…`,
-   *  which strips `thoughtSignature` outside tool flows. See
-   *  `plan/phase11-implementation.md §1`. */
-  geminiMode?: 'native' | 'openai-compat'
-  /** Per-profile defaults copied into `chat.settings.responses` at new-chat
-   *  creation. Users edit these from the Connection editor; per-chat overrides
-   *  in `chat.settings.responses` win at send time. */
-  responsesDefaults?: {
-    store: boolean
-    includeEncrypted: boolean
-  }
-  /** Per-profile Gemini defaults copied into `chat.settings.gemini`. */
-  geminiDefaults?: {
-    allowImportedWithoutSignature: boolean
-  }
 }
 
 export interface ChatPreset {

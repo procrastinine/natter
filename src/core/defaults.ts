@@ -8,6 +8,7 @@ import { createKey } from '../store/keys'
 import { createPreset } from '../store/presets'
 import { createProfile } from '../store/profiles'
 import { DEFAULT_CONTINUE_SYSTEM_PROMPT, DEFAULT_CONTINUE_USER_PROMPT } from './global-settings'
+import { withProfileApiDefaults } from './provider-defaults'
 import type {
   ChatPreset,
   ChatSettings,
@@ -108,6 +109,9 @@ export const DEFAULT_CHAT_SETTINGS: Readonly<ChatSettings> = Object.freeze({
   }),
   privacy: DEFAULT_PRIVACY_PREFS,
   api: 'auto',
+  responses: Object.freeze<NonNullable<ChatSettings['responses']>>({
+    store: false,
+  }),
   userIdMode: 'omit',
   serviceTier: 'auto',
 })
@@ -211,7 +215,7 @@ export async function runFirstRunSeed(input: FirstRunSeedInput): Promise<FirstRu
   const preset = await createPreset({
     name: input.presetName ?? `${profile.name} default`,
     connectionProfileId: profile.id,
-    settings,
+    settings: withProfileApiDefaults(settings, profile),
     lastUsedAt: now,
     now,
   })

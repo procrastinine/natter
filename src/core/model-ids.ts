@@ -62,7 +62,16 @@ interface DeterministicStructuralModelIdentity {
 }
 
 function stripOpenRouterVariantSuffix(modelId: string): string {
-  return modelId.replace(/:(free|thinking)$/i, '')
+  return stripProviderResourcePrefix(modelId).replace(/:(free|thinking)$/i, '')
+}
+
+function stripProviderResourcePrefix(modelId: string): string {
+  const trimmed = modelId.trim()
+  return (
+    trimmed.match(/^models\/(.+)$/i)?.[1] ??
+    trimmed.match(/^publishers\/[^/]+\/models\/(.+)$/i)?.[1] ??
+    trimmed
+  )
 }
 
 function rawStructuralModelSlug(modelId: string): string {

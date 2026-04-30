@@ -26,6 +26,10 @@ import {
   providerOutputItemsBackfillMarker,
 } from '../backcompat/provider-output-items'
 import {
+  migrateProviderApiModeProfile,
+  migrateProviderApiModeSettings,
+} from '../backcompat/provider-api-modes'
+import {
   migrateProviderSettingsRow,
   providerCacheKey,
 } from '../backcompat/provider-settings-migration'
@@ -1076,6 +1080,82 @@ export function registerSchema(db: Dexie): void {
       for (const row of defaults) {
         if (!(await settings.get(row.key))) await settings.put(row)
       }
+    })
+
+  // v18: Provider transport mode is chat/preset state, not connection state.
+  // Existing rows are rewritten once so live code never branches on legacy
+  // ConnectionProfile mode/default fields.
+  db.version(18)
+    .stores({
+      chats:
+        'id, updatedAt, createdAt, lastViewedAt, lastUpdatedLeafId, lastBranchUpdatedAt, wordCount, totalCostUsd, archived, pinned, presetId, folderId, *tags',
+      messages:
+        'id, chatId, parentId, turnId, [chatId+parentId], [chatId+createdAt], [chatId+turnId], [chatId+deleted]',
+      messageBodies: '&id, chatId, updatedAt, nodeVersion',
+      childLists: 'id, [chatId+parentId], updatedAt',
+      attachments: 'id, contentHash, kind, mime, origin, refCount, createdAt, updatedAt, deletedAt',
+      attachmentBlobs: 'id, attachmentId, role, contentHash, createdAt',
+      attachmentArtifacts: 'artifactId, attachmentId, kind, processorId, createdAt',
+      attachmentJobs:
+        'id, attachmentId, processorId, status, updatedAt, [attachmentId+processorId+inputHash]',
+      profiles: 'id, name, kind, lastUsedAt, archived',
+      presets: 'id, name, connectionProfileId, lastUsedAt, archived',
+      promptPresets: 'id, kind, name, lastUsedAt',
+      folders: 'id, name, sortIndex, lastUsedAt',
+      tags: 'id, &nameLower, lastUsedAt',
+      chatBranchCache: '&chatId, branchLeafId, generatedAt',
+      keys: 'id, name',
+      settings: '&key',
+      streamLeases: '&streamId, chatId, ownerClientId, heartbeatAt',
+      streamChunks: '&id, streamId, chatId, messageId, [streamId+seq], createdAt',
+      models: '&[profileId+queryKey], fetchedAt',
+      endpoints: '&[profileId+modelId], fetchedAt',
+      privacyPolicies: '&[profileId+modelId], fetchedAt',
+      providers: '&profileId, fetchedAt',
+      generations: 'id, chatId, gen_id',
+      presetResolutions: '&[profileId+presetSlug], fetchedAt',
+      drafts: '&chatId, updatedAt',
+    })
+    .upgrade(async (tx) => {
+      const profileRows = await tx.table<ConnectionProfile>('profiles').toArray()
+      const profilesById = new Map(profileRows.map((profile) => [profile.id, profile]))
+
+      await tx
+        .table<Chat>('chats')
+        .toCollection()
+        .modify((chat) => {
+          const result = migrateProviderApiModeSettings(
+            chat.settings,
+            profilesById.get(chat.settings.profileId),
+          )
+          if (result.changed) chat.settings = result.settings
+        })
+
+      await tx
+        .table<ChatPreset>('presets')
+        .toCollection()
+        .modify((preset) => {
+          const profile = profilesById.get(preset.connectionProfileId)
+          const result = migrateProviderApiModeSettings(preset.settings, profile)
+          const profileChanged = result.settings.profileId !== preset.connectionProfileId
+          if (result.changed || profileChanged) {
+            preset.settings = { ...result.settings, profileId: preset.connectionProfileId }
+          }
+        })
+
+      await tx
+        .table<ConnectionProfile>('profiles')
+        .toCollection()
+        .modify((profile) => {
+          const result = migrateProviderApiModeProfile(profile)
+          if (!result.changed) return
+          const row = profile as ConnectionProfile & Record<string, unknown>
+          Object.assign(row, result.profile)
+          delete row.usesResponsesApiByDefault
+          delete row.geminiMode
+          delete row.responsesDefaults
+          delete row.geminiDefaults
+        })
     })
 }
 

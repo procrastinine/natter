@@ -435,7 +435,7 @@ async function seedOpenRouterDiscovery(
 ): Promise<void> {
   const modelsPayload = openRouterModelsPayload(modelId)
   const endpointsPayload = openRouterEndpointsPayload(modelId)
-  const privacyPayload = { policies: openRouterPolicies(), fetchedAt: Date.now() }
+  const privacyPayload = { policies: openRouterPolicies(modelId), fetchedAt: Date.now() }
   await page.evaluate(
     async ({
       profileId,
@@ -636,7 +636,14 @@ function policy(overrides: Record<string, unknown>): Record<string, unknown> {
 }
 
 async function addOpenAiConnectionThroughGui(page: Page): Promise<void> {
-  await page.locator('[data-ui="connection-row"]').click()
+  const row = page.locator('[data-ui="connection-row"]')
+  if ((await row.count()) === 0) {
+    await page.locator('[data-ui="connection-provider-button"]').click()
+    await expect(row).toBeVisible()
+  }
+  if ((await row.getAttribute('aria-expanded')) !== 'true') {
+    await row.click()
+  }
   await page.locator('[data-ui="connection-new"]').click()
   await page.locator('[data-ui="connection-setup-kind"]').selectOption('openai-compatible')
   await page.locator('[data-ui="connection-setup-key"]').fill('sk-test-openai')

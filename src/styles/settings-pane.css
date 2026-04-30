@@ -368,6 +368,18 @@
   box-sizing: border-box;
 }
 
+[data-ui="hosted-tool-config"][data-tool="advisor"] [data-ui="field-group"] > span {
+  font-size: var(--font-size-xs);
+  line-height: 1.2;
+}
+
+[data-ui="hosted-tool-config"][data-tool="advisor"] select {
+  min-height: 28px;
+  padding: 3px var(--space-2);
+  font-size: var(--font-size-xs);
+  line-height: 1.2;
+}
+
 /* Prompt-slot header pairs the section title with the inline preset picker,
  * so the whole section (title + picker + textarea) reads as one unit. The
  * title is a button — clicking it expands / collapses the section body. The

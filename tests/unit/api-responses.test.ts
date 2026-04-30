@@ -32,7 +32,6 @@ function makeProfile(overrides: Partial<ConnectionProfile> = {}): ConnectionProf
     defaultHeaders: {},
     appTitle: 'natter',
     appUrl: '',
-    usesResponsesApiByDefault: true,
     supportsEndpointsApi: false,
     supportsGenerationApi: false,
     supportsPrivacyScrape: false,

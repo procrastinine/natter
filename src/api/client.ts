@@ -29,7 +29,7 @@ function isAnthropicBrowserOriginProfile(profile: ConnectionProfile): boolean {
 // `x-goog-api-key` (native Gemini), and `x-api-key` (native Anthropic).
 // The transport adapter decides; `buildHeaders` does not infer it from the
 // profile's `kind` because the same Google profile can serve BOTH transports
-// depending on `geminiMode`.
+// depending on the chat's API mode.
 export function buildHeaders(
   profile: ConnectionProfile,
   apiKey: string,

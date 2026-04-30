@@ -36,7 +36,6 @@ function makeProfile(): ConnectionProfile {
     defaultHeaders: {},
     appTitle: 'natter',
     appUrl: 'http://localhost:5173',
-    usesResponsesApiByDefault: false,
     supportsEndpointsApi: true,
     supportsGenerationApi: true,
     supportsPrivacyScrape: true,
@@ -52,7 +51,6 @@ function makeOpenAiProfile(): ConnectionProfile {
     name: 'OpenAI',
     kind: 'openai-compatible',
     baseUrl: 'https://api.openai.com/v1',
-    usesResponsesApiByDefault: true,
     supportsEndpointsApi: false,
     supportsGenerationApi: false,
     supportsPrivacyScrape: false,
@@ -66,11 +64,9 @@ function makeGoogleNativeProfile(): ConnectionProfile {
     name: 'Google',
     kind: 'google',
     baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
-    usesResponsesApiByDefault: false,
     supportsEndpointsApi: false,
     supportsGenerationApi: false,
     supportsPrivacyScrape: false,
-    geminiMode: 'native',
   }
 }
 
@@ -81,7 +77,6 @@ function makeLlamaServerProfile(): ConnectionProfile {
     name: 'llama-server',
     kind: 'llama-server',
     baseUrl: 'http://llama.test/v1',
-    usesResponsesApiByDefault: false,
     supportsEndpointsApi: false,
     supportsGenerationApi: false,
     supportsPrivacyScrape: false,
@@ -580,9 +575,9 @@ describe('sendText — chat-completions streaming', () => {
     expect(assistant?.generation?.id).toBe('resp_1')
   })
 
-  it('uses Responses on OpenAI direct when the profile default says Responses', async () => {
+  it('uses Responses on OpenAI direct when chat settings select Responses', async () => {
     const chat = await createChat({
-      settings: chatSettings({ model: 'gpt-4o', api: 'auto' }),
+      settings: chatSettings({ model: 'gpt-4o', api: 'responses' }),
     })
     let seenRouteKind: string | undefined
     let seenWire: Record<string, unknown> | undefined
@@ -1479,6 +1474,7 @@ describe('sendText — token calibration sample ingest', () => {
       settings: chatSettings({
         profileId: 'prof-openai',
         model: 'gpt-5.4-nano',
+        api: 'responses',
         systemPrompt: '',
       }),
     })

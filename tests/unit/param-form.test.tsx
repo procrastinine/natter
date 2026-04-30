@@ -9,6 +9,7 @@ import type { ConnectionProfile, ModelEndpoint } from '../../src/core/types'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import { createChat, getChat } from '../../src/store/chats'
 import { __resetDbForTests, openDb } from '../../src/store/db'
+import { createProfile } from '../../src/store/profiles'
 import { ChatModelPanel } from '../../src/ui/settings/ChatModelPanel'
 import { ParamForm } from '../../src/ui/settings/ParamForm'
 
@@ -34,7 +35,6 @@ function makeProfile(overrides: Partial<ConnectionProfile> = {}): ConnectionProf
     defaultHeaders: {},
     appTitle: 'natter',
     appUrl: '',
-    usesResponsesApiByDefault: false,
     supportsEndpointsApi: true,
     supportsGenerationApi: true,
     supportsPrivacyScrape: true,
@@ -187,6 +187,7 @@ describe('ParamForm hosted tools', () => {
   it('renders Gemini tools and persists them in the Google bucket', async () => {
     const settings = cloneDefaultChatSettings()
     settings.model = 'google/gemini-3.1-flash-lite-preview'
+    settings.api = 'gemini-native'
     const chat = await createChat({ settings })
     const capability = effectiveCapabilityFromEndpoints(settings.model, [
       makeEndpoint({ supported_parameters: ['tools', 'tool_choice'] }),
@@ -194,7 +195,6 @@ describe('ParamForm hosted tools', () => {
     const profile = makeProfile({
       kind: 'google',
       baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
-      geminiMode: 'native',
     })
     const { container } = render(
       <ParamForm
@@ -220,6 +220,7 @@ describe('ParamForm hosted tools', () => {
   it('renders Anthropic tools and persists them in the Anthropic bucket', async () => {
     const settings = cloneDefaultChatSettings()
     settings.model = 'anthropic/claude-haiku-4.5'
+    settings.api = 'anthropic-messages'
     const chat = await createChat({ settings })
     const capability = effectiveCapabilityFromEndpoints(settings.model, [
       makeEndpoint({ supported_parameters: ['tools', 'tool_choice'] }),
@@ -291,6 +292,30 @@ describe('ParamForm hosted tools', () => {
 })
 
 describe('ChatModelPanel context tab', () => {
+  it('renders the OpenAI Responses store toggle on the Model tab and persists it', async () => {
+    const profile = await createProfile({
+      name: 'OpenAI',
+      kind: 'openai-compatible',
+      baseUrl: 'https://api.openai.com/v1',
+      apiKeyRef: 'key-1',
+    })
+    const settings = cloneDefaultChatSettings()
+    settings.profileId = profile.id
+    settings.model = 'gpt-5.4-nano'
+    settings.api = 'responses'
+    const chat = await createChat({ settings })
+    render(<ChatModelPanel chatId={chat.id} chatSnapshot={chat} onClose={() => undefined} />)
+
+    const checkbox = await screen.findByLabelText(/Pass store: true upstream/)
+    expect(checkbox).not.toBeChecked()
+    fireEvent.click(checkbox)
+
+    await waitFor(async () => {
+      const updated = await getChat(chat.id)
+      expect(updated?.settings.responses?.store).toBe(true)
+    })
+  })
+
   it('hides tool-call context controls until a model is selected', async () => {
     const settings = cloneDefaultChatSettings()
     settings.model = ''

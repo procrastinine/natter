@@ -457,7 +457,7 @@ function HostedToolsSection({
   connectionProfile?: ConnectionProfile | null | undefined
   textCompletionsActive: boolean
 }) {
-  const config = hostedToolUiConfig({ connectionKind, connectionProfile, capability })
+  const config = hostedToolUiConfig({ connectionKind, connectionProfile, chat, capability })
   if (!config || textCompletionsActive) {
     return null
   }
@@ -538,6 +538,7 @@ type HostedToolUiOption = {
 function hostedToolUiConfig(input: {
   connectionKind: ConnectionKind
   connectionProfile?: ConnectionProfile | null | undefined
+  chat: Chat
   capability: EffectiveCapability
 }): {
   provider: HostedToolProvider
@@ -559,10 +560,10 @@ function hostedToolUiConfig(input: {
   ) {
     return { provider: 'openai', title: 'OpenAI tools', options: OPENAI_HOSTED_TOOL_OPTIONS }
   }
-  if (input.connectionKind === 'google' && (!profile || profile.geminiMode !== 'openai-compat')) {
+  if (input.connectionKind === 'google' && input.chat.settings.api !== 'chat') {
     return { provider: 'google', title: 'Gemini tools', options: GOOGLE_HOSTED_TOOL_OPTIONS }
   }
-  if (input.connectionKind === 'anthropic') {
+  if (input.connectionKind === 'anthropic' && input.chat.settings.api !== 'chat') {
     return { provider: 'anthropic', title: 'Anthropic tools', options: ANTHROPIC_HOSTED_TOOL_OPTIONS }
   }
   return null
@@ -876,7 +877,7 @@ function AnthropicHostedToolConfig({
   if (toolId === 'advisor') {
     const advisor = config.advisor ?? { advisorModel: 'claude-opus-4-7' as const }
     return (
-      <div data-ui="hosted-tool-config">
+      <div data-ui="hosted-tool-config" data-tool="advisor">
         <div data-ui="field-group" data-ui-field>
           <span>Advisor model</span>
           <select
@@ -1238,21 +1239,15 @@ function ReasoningSummaryControl({
 // Lives on the Context tab (see `ChatModelPanel` — tabs 2026-04).
 export function ReasoningIncludeControls({
   chat,
-  capability,
 }: {
   chat: Chat
   capability: EffectiveCapability | null
 }) {
   if (!chat.settings.model) return null
 
-  // Only surface reasoning controls when the model actually has a reasoning
-  // param. Otherwise those flags are a no-op, but tool-call context remains
-  // a real context concern for any selected model.
-  const hasReasoning = Boolean(
-    capability?.supportedParameters.has('reasoning') ||
-      capability?.supportedParameters.has('thinking') ||
-      capability?.supportedParameters.has('include_reasoning'),
-  )
+  // Plaintext reasoning is portable: it can stay in a native plaintext
+  // reasoning lane when supported, or be normalized into `<think>` text.
+  // Only encrypted carriers are target-model gated.
   const r = chat.settings.reasoning
   const include = r.include
   const includeToolCalls = chat.settings.toolCallContext.include
@@ -1277,7 +1272,7 @@ export function ReasoningIncludeControls({
       <h3>Include in next turn</h3>
       <div data-ui="field-group" data-ui-field data-ui-group="include-next-turn">
         <div data-ui="reasoning-include-group">
-          {hasReasoning && emitsEncrypted ? (
+          {emitsEncrypted ? (
             <label data-ui="reasoning-checkbox">
               <input
                 type="checkbox"
@@ -1287,44 +1282,40 @@ export function ReasoningIncludeControls({
               <span>Encrypted reasoning</span>
             </label>
           ) : null}
-          {hasReasoning ? (
-            <>
-              <label data-ui="reasoning-checkbox">
-                <input
-                  type="checkbox"
-                  checked={include.summary}
-                  onChange={(e) => updateInclude({ summary: e.target.checked })}
-                />
-                <span>Visible summary</span>
-              </label>
-              <label data-ui="reasoning-checkbox">
-                <input
-                  type="checkbox"
-                  checked={include.text}
-                  onChange={(e) => updateInclude({ text: e.target.checked })}
-                />
-                <span>Visible text</span>
-              </label>
-              <label
-                data-ui="reasoning-checkbox"
-                data-disabled={sendAsThinkDisabled ? 'true' : undefined}
-                title={sendAsThinkTitle}
-              >
-                <input
-                  type="checkbox"
-                  checked={sendAsThinkChecked}
-                  disabled={sendAsThinkDisabled}
-                  onChange={(e) => {
-                    if (textCompletionsActive) return
-                    void updateChatSettings(chat.id, {
-                      reasoning: { ...r, echoAsThinkTags: e.target.checked },
-                    })
-                  }}
-                />
-                <span>Send as &lt;think&gt; tags</span>
-              </label>
-            </>
-          ) : null}
+          <label data-ui="reasoning-checkbox">
+            <input
+              type="checkbox"
+              checked={include.summary}
+              onChange={(e) => updateInclude({ summary: e.target.checked })}
+            />
+            <span>Visible summary</span>
+          </label>
+          <label data-ui="reasoning-checkbox">
+            <input
+              type="checkbox"
+              checked={include.text}
+              onChange={(e) => updateInclude({ text: e.target.checked })}
+            />
+            <span>Visible text</span>
+          </label>
+          <label
+            data-ui="reasoning-checkbox"
+            data-disabled={sendAsThinkDisabled ? 'true' : undefined}
+            title={sendAsThinkTitle}
+          >
+            <input
+              type="checkbox"
+              checked={sendAsThinkChecked}
+              disabled={sendAsThinkDisabled}
+              onChange={(e) => {
+                if (textCompletionsActive) return
+                void updateChatSettings(chat.id, {
+                  reasoning: { ...r, echoAsThinkTags: e.target.checked },
+                })
+              }}
+            />
+            <span>Send as &lt;think&gt; tags</span>
+          </label>
           <label data-ui="reasoning-checkbox">
             <input
               type="checkbox"
@@ -1361,8 +1352,68 @@ export function ApiModeSection({
   activePathMessages?: readonly Message[]
 }) {
   if (!profile) return null
-  // Gemini native picks transport at the connection level — nothing per-chat.
-  if (profile.kind === 'google' && profile.geminiMode !== 'openai-compat') return null
+  if (profile.kind === 'google') {
+    const resolvedKind = chat.settings.api === 'chat' ? 'chat' : 'gemini-native'
+    return (
+      <section data-ui="settings-section" data-ui-section="api-mode">
+        <div data-ui="field-group" data-ui-field>
+          <span>
+            API Mode{' '}
+            <InfoDisclosure title="Native Gemini preserves thought signatures and uses generateContent with x-goog-api-key. OpenAI-compat uses Gemini's chat-completions shim." />
+          </span>
+          <div data-ui="segmented">
+            <button
+              type="button"
+              data-ui="segmented-option"
+              aria-pressed={resolvedKind === 'gemini-native'}
+              onClick={() => void updateChatSettings(chat.id, { api: 'gemini-native' })}
+            >
+              Native
+            </button>
+            <button
+              type="button"
+              data-ui="segmented-option"
+              aria-pressed={resolvedKind === 'chat'}
+              onClick={() => void updateChatSettings(chat.id, { api: 'chat' })}
+            >
+              OpenAI-compat
+            </button>
+          </div>
+        </div>
+      </section>
+    )
+  }
+  if (profile.kind === 'anthropic') {
+    const resolvedKind = chat.settings.api === 'chat' ? 'chat' : 'anthropic-messages'
+    return (
+      <section data-ui="settings-section" data-ui-section="api-mode">
+        <div data-ui="field-group" data-ui-field>
+          <span>
+            API Mode{' '}
+            <InfoDisclosure title="Messages uses Anthropic's native API with x-api-key. OpenAI-compat uses the chat-completions shim." />
+          </span>
+          <div data-ui="segmented">
+            <button
+              type="button"
+              data-ui="segmented-option"
+              aria-pressed={resolvedKind === 'anthropic-messages'}
+              onClick={() => void updateChatSettings(chat.id, { api: 'anthropic-messages' })}
+            >
+              Messages
+            </button>
+            <button
+              type="button"
+              data-ui="segmented-option"
+              aria-pressed={resolvedKind === 'chat'}
+              onClick={() => void updateChatSettings(chat.id, { api: 'chat' })}
+            >
+              OpenAI-compat
+            </button>
+          </div>
+        </div>
+      </section>
+    )
+  }
   if (capability.outputModalities.has('video') || capability.outputModalities.has('audio')) {
     return null
   }

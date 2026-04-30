@@ -11,6 +11,7 @@ import { archiveChat, createChat, updateChatSettings } from '../../src/store/cha
 import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
 import { createFolder } from '../../src/store/folders'
 import { __resetKeyCacheForTests, createKey } from '../../src/store/keys'
+import { putCachedModels } from '../../src/store/models-cache'
 import { createPreset, getPreset } from '../../src/store/presets'
 import { createProfile } from '../../src/store/profiles'
 import { __resetSearchSessionRunnerForTests } from '../../src/store/search-session'
@@ -25,6 +26,7 @@ describe('shell smoke render', () => {
   let errorSpy: ReturnType<typeof vi.spyOn>
   let warnSpy: ReturnType<typeof vi.spyOn>
   const DB_NAME = 'natter'
+  const DIRECT_MODEL_AUTOSELECT_QUERY = {} as const
 
   async function resetAll() {
     __resetBroadcastForTests()
@@ -55,16 +57,17 @@ describe('shell smoke render', () => {
     await resetAll()
   })
 
-  it('mounts sidebar, connection-header, and main-pane regions', () => {
+  it('mounts sidebar, first-run connection action, and main-pane regions', async () => {
     const { container } = render(<App />)
     expect(container.querySelector('[data-ui="app-shell"]')).toBeInTheDocument()
     expect(container.querySelector('[data-ui="sidebar"]')).toBeInTheDocument()
     expect(container.querySelector('[data-ui="main-pane"]')).toBeInTheDocument()
-    // Connection header sits at the top of main-pane (above the chat-title
-    // bar), regardless of whether a connection is configured. This is the
-    // entry point users use to add or edit credentials, so it must always be
-    // mounted.
-    expect(container.querySelector('[data-ui="connection-header"]')).toBeInTheDocument()
+    // With no saved profiles, the old full-width connection header is gone;
+    // only the first-run Add connection action remains.
+    await waitFor(() => {
+      expect(container.querySelector('[data-ui="connection-empty-action"]')).toBeInTheDocument()
+    })
+    expect(container.querySelector('[data-ui="connection-header"]')).not.toBeInTheDocument()
     // The shell no longer renders a separate top-of-shell <header> region —
     // the chat title row (only present when a chat is active) is `[data-ui=
     // "chat-title-bar"]` inside main-pane.
@@ -81,6 +84,169 @@ describe('shell smoke render', () => {
       'data-chat-model-panel',
       'closed',
     )
+  })
+
+  it('renders configured connection access beside the active chat title', async () => {
+    const key = await createKey({
+      name: 'OpenRouter',
+      plaintextKey: 'sk-or-v1-test-0000000000000000000000000000',
+    })
+    const profile = await createProfile({
+      name: 'OpenRouter',
+      kind: 'openrouter',
+      baseUrl: 'https://openrouter.ai/api/v1',
+      apiKeyRef: key.id,
+    })
+    const settings = cloneDefaultChatSettings()
+    settings.profileId = profile.id
+    const chat = await createChat({ settings })
+    window.location.hash = `#/chat/${chat.id}`
+
+    const { container } = render(<App />)
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-ui="connection-provider-button"]')).toBeInTheDocument()
+    })
+    expect(
+      container.querySelector(
+        '[data-ui="main-pane"] > [data-ui="connection-header"][data-state="configured"]',
+      ),
+    ).not.toBeInTheDocument()
+    expect(
+      container.querySelector('[data-ui="connection-provider-button"][data-kind="openrouter"]'),
+    ).toBeInTheDocument()
+
+    fireEvent.click(container.querySelector('[data-ui="connection-provider-button"]') as Element)
+    await waitFor(() => {
+      expect(
+        container.querySelector(
+          '[data-ui="connection-header"][data-state="configured"][data-variant="popover"]',
+        ),
+      ).toBeInTheDocument()
+    })
+  })
+
+  it('auto-selects the crosswalk-equivalent model when switching connections', async () => {
+    const openRouterKey = await createKey({ name: 'OpenRouter', plaintextKey: 'sk-or-v1-test' })
+    const openAiKey = await createKey({ name: 'OpenAI', plaintextKey: 'sk-test' })
+    const openRouter = await createProfile({
+      name: 'OpenRouter',
+      kind: 'openrouter',
+      baseUrl: 'https://openrouter.ai/api/v1',
+      apiKeyRef: openRouterKey.id,
+    })
+    const openAi = await createProfile({
+      name: 'OpenAI',
+      kind: 'openai-compatible',
+      baseUrl: 'https://api.openai.com/v1',
+      apiKeyRef: openAiKey.id,
+    })
+    await putCachedModels(openAi.id, DIRECT_MODEL_AUTOSELECT_QUERY, {
+      data: [{ id: 'gpt-5.4' }, { id: 'gpt-4o' }],
+    })
+    const settings = cloneDefaultChatSettings()
+    settings.profileId = openRouter.id
+    settings.model = 'openai/gpt-5.4'
+    const chat = await createChat({ settings })
+    window.location.hash = `#/chat/${chat.id}`
+
+    const { container } = render(<App />)
+    await waitFor(() => {
+      expect(container.querySelector('[data-ui="connection-provider-button"]')).toBeInTheDocument()
+    })
+    fireEvent.click(container.querySelector('[data-ui="connection-provider-button"]') as Element)
+    await waitFor(() => {
+      expect(container.querySelector('[data-ui="connection-profile-select"]')).toBeInTheDocument()
+    })
+    fireEvent.change(container.querySelector('[data-ui="connection-profile-select"]') as Element, {
+      target: { value: openAi.id },
+    })
+
+    await waitFor(async () => {
+      const stored = await getDb().chats.get(chat.id)
+      expect(stored?.settings.profileId).toBe(openAi.id)
+      expect(stored?.settings.model).toBe('gpt-5.4')
+    })
+  })
+
+  it('leaves the model unselected when the switched connection has no equivalent model', async () => {
+    const openRouterKey = await createKey({ name: 'OpenRouter', plaintextKey: 'sk-or-v1-test' })
+    const anthropicKey = await createKey({ name: 'Anthropic', plaintextKey: 'sk-ant-test' })
+    const openRouter = await createProfile({
+      name: 'OpenRouter',
+      kind: 'openrouter',
+      baseUrl: 'https://openrouter.ai/api/v1',
+      apiKeyRef: openRouterKey.id,
+    })
+    const anthropic = await createProfile({
+      name: 'Anthropic',
+      kind: 'anthropic',
+      baseUrl: 'https://api.anthropic.com/v1',
+      apiKeyRef: anthropicKey.id,
+    })
+    const settings = cloneDefaultChatSettings()
+    settings.profileId = openRouter.id
+    settings.model = 'openai/gpt-5.4'
+    const chat = await createChat({ settings })
+    window.location.hash = `#/chat/${chat.id}`
+
+    const { container } = render(<App />)
+    await waitFor(() => {
+      expect(container.querySelector('[data-ui="connection-provider-button"]')).toBeInTheDocument()
+    })
+    fireEvent.click(container.querySelector('[data-ui="connection-provider-button"]') as Element)
+    await waitFor(() => {
+      expect(container.querySelector('[data-ui="connection-profile-select"]')).toBeInTheDocument()
+    })
+    fireEvent.change(container.querySelector('[data-ui="connection-profile-select"]') as Element, {
+      target: { value: anthropic.id },
+    })
+
+    await waitFor(async () => {
+      const stored = await getDb().chats.get(chat.id)
+      expect(stored?.settings.profileId).toBe(anthropic.id)
+      expect(stored?.settings.model).toBe('')
+    })
+  })
+
+  it('auto-selects an Anthropic direct model from bundled rows when switching from OpenRouter', async () => {
+    const openRouterKey = await createKey({ name: 'OpenRouter', plaintextKey: 'sk-or-v1-test' })
+    const anthropicKey = await createKey({ name: 'Anthropic', plaintextKey: 'sk-ant-test' })
+    const openRouter = await createProfile({
+      name: 'OpenRouter',
+      kind: 'openrouter',
+      baseUrl: 'https://openrouter.ai/api/v1',
+      apiKeyRef: openRouterKey.id,
+    })
+    const anthropic = await createProfile({
+      name: 'Anthropic',
+      kind: 'anthropic',
+      baseUrl: 'https://api.anthropic.com/v1',
+      apiKeyRef: anthropicKey.id,
+    })
+    const settings = cloneDefaultChatSettings()
+    settings.profileId = openRouter.id
+    settings.model = 'anthropic/claude-opus-4.7'
+    const chat = await createChat({ settings })
+    window.location.hash = `#/chat/${chat.id}`
+
+    const { container } = render(<App />)
+    await waitFor(() => {
+      expect(container.querySelector('[data-ui="connection-provider-button"]')).toBeInTheDocument()
+    })
+    fireEvent.click(container.querySelector('[data-ui="connection-provider-button"]') as Element)
+    await waitFor(() => {
+      expect(container.querySelector('[data-ui="connection-profile-select"]')).toBeInTheDocument()
+    })
+    fireEvent.change(container.querySelector('[data-ui="connection-profile-select"]') as Element, {
+      target: { value: anthropic.id },
+    })
+
+    await waitFor(async () => {
+      const stored = await getDb().chats.get(chat.id)
+      expect(stored?.settings.profileId).toBe(anthropic.id)
+      expect(stored?.settings.model).toBe('claude-opus-4.7')
+    })
   })
 
   it('hides the focus-mode toggle on storage pages', () => {

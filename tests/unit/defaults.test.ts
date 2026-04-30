@@ -58,6 +58,9 @@ describe('defaults', () => {
           "mode": "default",
           "summary": "auto",
         },
+        "responses": {
+          "store": false,
+        },
         "sampling": {},
         "serviceTier": "auto",
         "stripExifOnUpload": true,

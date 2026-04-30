@@ -197,7 +197,7 @@ function baseSettings(): ChatSettings {
     protocol: 'chat',
     api: 'auto',
     tools: { enabled: false, functions: [] },
-    responses: { includeEncrypted: false, store: false },
+    responses: { store: false },
   } as unknown as ChatSettings
 }
 
@@ -241,7 +241,7 @@ describe('toResponses — empty echo-item stripping', () => {
         ...baseSettings().reasoning,
         include: { encrypted: true, summary: false, text: false },
       },
-      responses: { includeEncrypted: true, store: false },
+      responses: { store: false },
     }
     const msg = baseAssistantMessage()
     const { wire } = toResponses(settings, [msg])

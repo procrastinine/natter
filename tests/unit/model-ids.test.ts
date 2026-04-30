@@ -14,6 +14,14 @@ describe('model identity normalization', () => {
     expect(canonicalModelSlug('claude-opus-4-7')).toBe('claude-opus-4.7')
     expect(canonicalModelSlug('anthropic/claude-opus-4.7')).toBe('claude-opus-4.7')
     expect(compatModelIdsMatch('claude-opus-4-7', 'anthropic/claude-opus-4.7')).toBe(true)
+    expect(deterministicStructuralModelId('models/gemini-3.1-flash-lite-preview')).toBe(
+      'google:gemini-3.1-flash-lite-preview',
+    )
+    expect(
+      deterministicStructuralModelId(
+        'publishers/google/models/gemini-3.1-flash-lite-preview',
+      ),
+    ).toBe('google:gemini-3.1-flash-lite-preview')
     expect(deterministicStructuralModelId('gpt-5.5')).toBe('openai:gpt-5.5')
     expect(canonicalModelSlug('openai/gpt-5.5-pro')).toBe('gpt-5.5-pro')
     expect(compatModelIdsMatch('gpt-5.5', 'openai/gpt-5.5')).toBe(true)

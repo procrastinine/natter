@@ -38,7 +38,6 @@ function openAiProfile(): ConnectionProfile {
     defaultHeaders: {},
     appTitle: 'natter-live-probe',
     appUrl: 'http://localhost',
-    usesResponsesApiByDefault: true,
     supportsEndpointsApi: false,
     supportsGenerationApi: false,
     supportsPrivacyScrape: false,
@@ -57,7 +56,6 @@ function openRouterProfile(): ConnectionProfile {
     defaultHeaders: {},
     appTitle: 'natter-live-probe',
     appUrl: 'http://localhost',
-    usesResponsesApiByDefault: false,
     supportsEndpointsApi: true,
     supportsGenerationApi: true,
     supportsPrivacyScrape: true,
@@ -76,13 +74,11 @@ function geminiProfile(): ConnectionProfile {
     defaultHeaders: {},
     appTitle: 'natter-live-probe',
     appUrl: '',
-    usesResponsesApiByDefault: false,
     supportsEndpointsApi: false,
     supportsGenerationApi: false,
     supportsPrivacyScrape: false,
     createdAt: 0,
     updatedAt: 0,
-    geminiMode: 'native',
   }
 }
 
@@ -289,10 +285,9 @@ describe.skipIf(!LIVE)(
   'live cross-format — OpenRouter /responses (azure) echoes to OpenAI direct (openai)',
   () => {
     it('reasoning item from OpenRouter proxy survives round-trip to api.openai.com', async () => {
-      // This exercises the `formatsCompatible` allowance: OpenRouter /responses
-      // tags items `azure-openai-responses-v1`, OpenAI direct emits
-      // `openai-responses-v1`. The filter should NOT drop the azure-tagged
-      // item when routing to OpenAI direct.
+      // This exercises the Responses carry-forward allowance across the
+      // OpenRouter proxy and OpenAI direct. OpenRouter has returned both
+      // azure-openai and openai format tags here; both are compatible.
       const orCtx: ResponsesContext = {
         profile: openRouterProfile(),
         apiKey: loadKey('openrouter'),
@@ -313,8 +308,12 @@ describe.skipIf(!LIVE)(
       })
       const reasoning1 = turn1.output?.find((i) => i.type === 'reasoning')
       if (!reasoning1) return
-      // OpenRouter flags the item with `format: 'azure-openai-responses-v1'`.
-      // (Value may be absent on some routes — don't assert, just accept.)
+      const reasoningInput = { ...reasoning1 }
+      delete (reasoningInput as { status?: unknown }).status
+      delete (reasoningInput as { format?: unknown }).format
+      if (/^(rs|msg)_tmp_/.test(String((reasoningInput as { id?: unknown }).id ?? ''))) {
+        delete (reasoningInput as { id?: unknown }).id
+      }
 
       const oaiCtx: ResponsesContext = { profile: openAiProfile(), apiKey: loadKey('openai') }
       const message1 = turn1.output?.find((i) => i.type === 'message')
@@ -327,7 +326,7 @@ describe.skipIf(!LIVE)(
             role: 'user',
             content: [{ type: 'input_text', text: 'Pick an integer 1-9. Just the digit.' }],
           },
-          reasoning1,
+          reasoningInput,
           message1,
           { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Double it.' }] },
         ],
@@ -366,7 +365,7 @@ describe.skipIf(!LIVE)('live — OpenRouter reasoning summary surface', () => {
     const summaryDetail = details.find((d) => d.type === 'reasoning.summary')
     const encryptedDetail = details.find((d) => d.type === 'reasoning.encrypted')
     expect(summaryDetail).toBeDefined()
-    expect(summaryDetail?.format).toBe('azure-openai-responses-v1')
+    expect(['azure-openai-responses-v1', 'openai-responses-v1']).toContain(summaryDetail?.format)
     expect(encryptedDetail).toBeDefined()
   }, 90_000)
 

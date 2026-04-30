@@ -18,6 +18,7 @@ import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } f
 import { type LlamaServerProps, probeLlamaServer } from '../../api/probe'
 import type { EffectiveCapability } from '../../core/capabilities'
 import { DEFAULT_GLOBAL_PREFERENCES, readGlobalPreferences } from '../../core/global-settings'
+import { modelLooksForeignForProfile } from '../../core/model-selection'
 import {
   buildSettingsPromptSizeEstimateInput,
   type PromptSizeEstimate,
@@ -26,6 +27,7 @@ import {
 } from '../../core/prompt-size'
 import { isTextCompletionsSelectableFor } from '../../core/quirks'
 import { readTokenCalibrationGlobal } from '../../core/token-calibration'
+import { isOpenAiDirectProfile } from '../../core/provider-hosted-tools'
 import type {
   Chat,
   ChatId,
@@ -59,6 +61,7 @@ import { useAttachmentResolverForContext } from '../attachments/useAttachmentRes
 import { CloseIcon } from '../icons/Icon'
 import { CachingPanel } from './CachingPanel'
 import { ContextPanel } from './ContextPanel'
+import { InfoDisclosure } from './InfoDisclosure'
 import { LlamaServerSection } from './LlamaServerSection'
 import { ModelPicker } from './ModelPicker'
 import {
@@ -257,10 +260,18 @@ export function ChatModelPanel({ chatId, chatSnapshot = null, onClose }: ChatMod
   //    a connection switch). Shows a generic prompt.
   // When `modelAvailable === null` /models is still loading and the
   // banner is suppressed to avoid flicker.
+  const profileModelMismatch =
+    !!profile &&
+    !!chat.settings.model &&
+    modelLooksForeignForProfile(profile.kind, chat.settings.model)
   const noModel =
-    !chat.settings.model || (profile?.kind === 'llama-server' && modelAvailable === false)
+    !chat.settings.model ||
+    profileModelMismatch ||
+    (profile?.kind === 'llama-server' && modelAvailable === false)
   const unavailableModel =
-    modelAvailable === false && profile?.kind !== 'llama-server' ? chat.settings.model : null
+    modelAvailable === false && !profileModelMismatch && profile?.kind !== 'llama-server'
+      ? chat.settings.model
+      : null
 
   return (
     <aside data-ui="chat-model-panel" aria-label="Chat model settings">
@@ -319,6 +330,9 @@ export function ChatModelPanel({ chatId, chatSnapshot = null, onClose }: ChatMod
                 activePathMessages={activePathMessages}
               />
             ) : null}
+            {profile && isOpenAiDirectProfile(profile) ? (
+              <OpenAiResponsesStoreSection chat={chat} />
+            ) : null}
             {isOpenRouter ? (
               <ProviderPicker
                 chat={chat}
@@ -360,6 +374,29 @@ export function ChatModelPanel({ chatId, chatSnapshot = null, onClose }: ChatMod
         ) : null}
       </div>
     </aside>
+  )
+}
+
+function OpenAiResponsesStoreSection({ chat }: { chat: Chat }) {
+  const responses = chat.settings.responses ?? { store: false }
+  return (
+    <section data-ui="settings-section" data-ui-section="openai-responses-store">
+      <label data-ui="reasoning-checkbox">
+        <input
+          type="checkbox"
+          checked={responses.store}
+          onChange={(event) =>
+            void updateChatSettings(chat.id, {
+              responses: { ...responses, store: event.target.checked },
+            })
+          }
+        />
+        <span>
+          Pass <code>store: true</code> upstream
+        </span>
+        <InfoDisclosure title="OpenAI may retain the response for 30 days. Required for previous_response_id flows; disabled by default so this chat stays stateless unless you opt in." />
+      </label>
+    </section>
   )
 }
 

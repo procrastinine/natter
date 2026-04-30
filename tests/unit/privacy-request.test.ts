@@ -71,7 +71,6 @@ function makeProfile(kind: ConnectionProfile['kind'] = 'openrouter'): Connection
     defaultHeaders: {},
     appTitle: 'natter',
     appUrl: '',
-    usesResponsesApiByDefault: false,
     supportsEndpointsApi: kind === 'openrouter',
     supportsGenerationApi: kind === 'openrouter',
     supportsPrivacyScrape: kind === 'openrouter',

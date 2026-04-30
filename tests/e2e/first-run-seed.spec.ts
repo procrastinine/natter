@@ -7,13 +7,14 @@ test.beforeEach(async ({ page }) => {
   await page.goto('/')
 })
 
-test('app boots without a connection — empty state visible, "Add connection" CTA in header', async ({
+test('app boots without a connection — empty state visible, only Add connection CTA remains', async ({
   page,
 }) => {
-  // No first-run blocker any more: the empty state and connection header are
-  // both visible immediately. The composer is not present yet (no chat).
+  // No first-run blocker and no persistent connection header: only the narrow
+  // add-connection action remains. The composer is not present yet (no chat).
   await expect(page.locator('[data-ui="empty-state"]')).toBeVisible()
-  await expect(page.locator('[data-ui="connection-header"][data-state="unset"]')).toBeVisible()
+  await expect(page.locator('[data-ui="connection-header"]')).toHaveCount(0)
+  await expect(page.locator('[data-ui="connection-empty-action"]')).toBeVisible()
   await expect(page.locator('[data-ui="connection-add"]')).toBeVisible()
 })
 
@@ -29,7 +30,7 @@ test('opening the connection-setup modal requires a key before the submit enable
   await expect(page.locator('[data-ui="connection-setup-submit"]')).toBeEnabled()
 })
 
-test('submitting the connection-setup modal seeds a profile + preset and updates the header', async ({
+test('submitting the connection-setup modal seeds a profile + preset and moves editing to the title icon', async ({
   page,
 }) => {
   await page.locator('[data-ui="connection-add"]').click()
@@ -37,9 +38,18 @@ test('submitting the connection-setup modal seeds a profile + preset and updates
     .locator('[data-ui="connection-setup-key"]')
     .fill('sk-or-v1-test-seed-0000000000000000000000000000')
   await page.locator('[data-ui="connection-setup-submit"]').click()
-  // Modal closes; header reflects the new profile.
+  // Modal closes; the first-run header is removed once a profile exists.
   await page.locator('[data-ui="connection-setup-modal"]').waitFor({ state: 'detached' })
-  await expect(page.locator('[data-ui="connection-header"][data-state="configured"]')).toBeVisible()
+  await expect(page.locator('[data-ui="connection-header"]')).toHaveCount(0)
+  await page.locator('[data-role="new-chat"]').click()
+  await expect(page.locator('[data-ui="connection-provider-button"]')).toBeVisible()
+  await expect(
+    page.locator('[data-ui="connection-provider-button"][data-kind="openrouter"]'),
+  ).toBeVisible()
+  await page.locator('[data-ui="connection-provider-button"]').click()
+  await expect(
+    page.locator('[data-ui="connection-header"][data-state="configured"][data-variant="popover"]'),
+  ).toBeVisible()
   const counts = await page.evaluate(async () => {
     const db = await new Promise<IDBDatabase>((resolve, reject) => {
       const req = indexedDB.open('natter')
@@ -64,7 +74,7 @@ test('submitting the connection-setup modal seeds a profile + preset and updates
   expect(counts).toEqual({ keys: 1, profiles: 1, presets: 1 })
 })
 
-test('seeded profile survives a reload and the connection header stays configured', async ({
+test('seeded profile survives a reload and the title icon stays available', async ({
   page,
 }) => {
   await page.locator('[data-ui="connection-add"]').click()
@@ -72,10 +82,13 @@ test('seeded profile survives a reload and the connection header stays configure
     .locator('[data-ui="connection-setup-key"]')
     .fill('sk-or-v1-test-persist-0000000000000000000000')
   await page.locator('[data-ui="connection-setup-submit"]').click()
-  await expect(page.locator('[data-ui="connection-header"][data-state="configured"]')).toBeVisible()
+  await page.locator('[data-ui="connection-setup-modal"]').waitFor({ state: 'detached' })
+  await expect(page.locator('[data-ui="connection-empty-action"]')).toHaveCount(0)
+  await expect(page.locator('[data-ui="connection-header"]')).toHaveCount(0)
   await page.reload()
-  // Still configured after reload.
-  await expect(page.locator('[data-ui="connection-header"][data-state="configured"]')).toBeVisible()
+  await expect(page.locator('[data-ui="connection-header"]')).toHaveCount(0)
+  await page.locator('[data-role="new-chat"]').click()
+  await expect(page.locator('[data-ui="connection-provider-button"]')).toBeVisible()
   await expect(page.locator('[data-ui="connection-add"]')).toHaveCount(0)
 })
 
@@ -88,7 +101,9 @@ test('whitespace-only key keeps submit disabled; trim happens on save', async ({
   await key.fill('  sk-or-v1-test-whitespace-000000000000000000  ')
   await expect(submit).toBeEnabled()
   await submit.click()
-  await expect(page.locator('[data-ui="connection-header"][data-state="configured"]')).toBeVisible()
+  await page.locator('[data-ui="connection-setup-modal"]').waitFor({ state: 'detached' })
+  await expect(page.locator('[data-ui="connection-empty-action"]')).toHaveCount(0)
+  await expect(page.locator('[data-ui="connection-header"]')).toHaveCount(0)
   const previews = await page.evaluate(async () => {
     const db = await new Promise<IDBDatabase>((resolve, reject) => {
       const req = indexedDB.open('natter')

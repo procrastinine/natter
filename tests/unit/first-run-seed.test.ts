@@ -93,7 +93,9 @@ describe('runFirstRunSeed', () => {
     expect(result.profile.supportsEndpointsApi).toBe(true)
     expect(result.profile.supportsGenerationApi).toBe(true)
     expect(result.profile.supportsPrivacyScrape).toBe(true)
-    expect(result.profile.usesResponsesApiByDefault).toBe(false)
+    expect('usesResponsesApiByDefault' in result.profile).toBe(false)
+    expect(result.preset.settings.api).toBe('auto')
+    expect(result.preset.settings.responses?.store).toBe(false)
   })
 
   it('accepts an optional passphrase; the resulting key is passphrase-protected', async () => {

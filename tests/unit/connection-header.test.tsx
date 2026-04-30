@@ -50,6 +50,16 @@ async function seedProfile(
   })
 }
 
+function connectionButtonMatcher(name: string): RegExp {
+  return new RegExp(`Connection: ${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`)
+}
+
+async function openConnectionPopover(name: string) {
+  const button = await screen.findByRole('button', { name: connectionButtonMatcher(name) })
+  fireEvent.click(button)
+  await screen.findByRole('region', { name: `Connection: ${name}` })
+}
+
 beforeEach(async () => {
   ;(globalThis as unknown as { indexedDB: IDBFactory }).indexedDB = new IDBFactory()
   await resetAll()
@@ -77,9 +87,10 @@ describe('ConnectionHeader', () => {
     fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Local llama' } })
     fireEvent.change(screen.getByLabelText('Provider'), { target: { value: 'llama-server' } })
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
-    await waitFor(() => {
-      expect(screen.getByText('Local llama')).toBeTruthy()
+    await waitFor(async () => {
+      expect(await listProfiles()).toHaveLength(1)
     })
+    expect(screen.queryByText('Add connection')).toBeNull()
     const profiles = await listProfiles()
     const presets = await listPresets()
     expect(profiles).toHaveLength(1)
@@ -104,14 +115,9 @@ describe('ConnectionHeader', () => {
         }),
       )
     })
-    render(<ConnectionHeader />)
-    await waitFor(() => {
-      expect(screen.getByText('OpenRouter')).toBeTruthy()
-    })
-    fireEvent.click(screen.getByText('OpenRouter'))
-    await waitFor(() => {
-      expect(screen.getByRole('button', { name: 'Edit' })).toBeTruthy()
-    })
+    render(<ConnectionHeader variant="title-icon" />)
+    await openConnectionPopover('OpenRouter')
+    expect(screen.getByRole('button', { name: 'Edit' })).toBeTruthy()
     expect(
       screen
         .getByRole('button', { name: 'Edit' })
@@ -155,25 +161,51 @@ describe('ConnectionHeader', () => {
         }),
       )
     })
-    render(<ConnectionHeader />)
-    await waitFor(() => {
-      expect(screen.getByText('Anthropic')).toBeTruthy()
-    })
-    fireEvent.click(screen.getByText('Anthropic'))
+    render(<ConnectionHeader variant="title-icon" />)
+    await openConnectionPopover('Anthropic')
     fireEvent.click(await screen.findByRole('button', { name: 'Test' }))
     await waitFor(() => {
       expect(screen.getByText(/Completed test chat/i)).toBeTruthy()
     })
   })
 
+  it('clears the completed connection test result when switching profiles', async () => {
+    const a = await seedProfile({ name: 'OpenRouter A' })
+    const b = await seedProfile({ name: 'OpenRouter B' })
+    writeActiveProfileId(a.id)
+    vi.spyOn(globalThis, 'fetch').mockImplementation((input) => {
+      const url = String(input)
+      if (url.endsWith('/models')) {
+        return Promise.resolve(jsonResponse({ data: [{ id: 'openai/gpt-4o-mini' }] }))
+      }
+      return Promise.resolve(
+        jsonResponse({
+          id: 'gen-test',
+          model: 'openai/gpt-4o-mini',
+          choices: [{ finish_reason: 'stop', message: { content: 'ok' } }],
+        }),
+      )
+    })
+    render(<ConnectionHeader variant="title-icon" />)
+    await openConnectionPopover('OpenRouter A')
+    fireEvent.click(await screen.findByRole('button', { name: 'Test' }))
+    await waitFor(() => {
+      expect(screen.getByText(/Completed test chat/i)).toBeTruthy()
+    })
+
+    fireEvent.change(screen.getByLabelText('Profile'), { target: { value: b.id } })
+
+    await waitFor(() => {
+      expect(screen.getByText('OpenRouter B')).toBeTruthy()
+    })
+    expect(screen.queryByText(/Completed test chat/i)).toBeNull()
+  })
+
   it('opens a confirmation dialog before deleting a connection', async () => {
     const profile = await seedProfile()
     writeActiveProfileId(profile.id)
-    render(<ConnectionHeader />)
-    await waitFor(() => {
-      expect(screen.getByText('OpenRouter')).toBeTruthy()
-    })
-    fireEvent.click(screen.getByText('OpenRouter'))
+    render(<ConnectionHeader variant="title-icon" />)
+    await openConnectionPopover('OpenRouter')
     fireEvent.click(await screen.findByRole('button', { name: 'Delete connection' }))
     expect(screen.getByRole('dialog', { name: 'Delete connection?' })).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: 'Delete' }))
@@ -185,11 +217,8 @@ describe('ConnectionHeader', () => {
   it('saves in place when the name stays the same and keeps the original key when left blank', async () => {
     const profile = await seedProfile()
     writeActiveProfileId(profile.id)
-    render(<ConnectionHeader />)
-    await waitFor(() => {
-      expect(screen.getByText('OpenRouter')).toBeTruthy()
-    })
-    fireEvent.click(screen.getByText('OpenRouter'))
+    render(<ConnectionHeader variant="title-icon" />)
+    await openConnectionPopover('OpenRouter')
     fireEvent.click(await screen.findByRole('button', { name: 'Edit' }))
     fireEvent.change(screen.getByLabelText('Provider'), {
       target: { value: 'openai-compatible' },
@@ -206,11 +235,8 @@ describe('ConnectionHeader', () => {
   it('saves as new automatically when the name changes and blank key means no key', async () => {
     const profile = await seedProfile()
     writeActiveProfileId(profile.id)
-    render(<ConnectionHeader />)
-    await waitFor(() => {
-      expect(screen.getByText('OpenRouter')).toBeTruthy()
-    })
-    fireEvent.click(screen.getByText('OpenRouter'))
+    render(<ConnectionHeader variant="title-icon" />)
+    await openConnectionPopover('OpenRouter')
     fireEvent.click(await screen.findByRole('button', { name: 'Edit' }))
     fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'OpenRouter copy' } })
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
@@ -231,15 +257,13 @@ describe('ConnectionHeader', () => {
     const a = await seedProfile({ name: 'OpenRouter A' })
     const b = await seedProfile({ name: 'OpenRouter B' })
     writeActiveProfileId(b.id)
-    const { rerender } = render(<ConnectionHeader activeChatProfileId={a.id} />)
-    await waitFor(() => {
-      expect(screen.getByText('OpenRouter A')).toBeTruthy()
-    })
+    const { rerender } = render(
+      <ConnectionHeader variant="title-icon" activeChatProfileId={a.id} />,
+    )
+    await screen.findByRole('button', { name: connectionButtonMatcher('OpenRouter A') })
     expect(readActiveProfileId()).toBe(b.id)
-    rerender(<ConnectionHeader activeChatProfileId={null} />)
-    await waitFor(() => {
-      expect(screen.getByText('OpenRouter B')).toBeTruthy()
-    })
+    rerender(<ConnectionHeader variant="title-icon" activeChatProfileId={null} />)
+    await screen.findByRole('button', { name: connectionButtonMatcher('OpenRouter B') })
   })
 
   it('keeps the previous header state visible while the next profile load is still resolving', async () => {
@@ -271,15 +295,15 @@ describe('ConnectionHeader', () => {
       return listProfilesActual()
     })
 
-    const { rerender } = render(<ConnectionHeader activeChatProfileId={a.id} />)
-    await waitFor(() => {
-      expect(screen.getByText('llama A')).toBeTruthy()
-    })
+    const { rerender } = render(
+      <ConnectionHeader variant="title-icon" activeChatProfileId={a.id} />,
+    )
+    await screen.findByRole('button', { name: connectionButtonMatcher('llama A') })
 
     blockNextLoad = true
-    rerender(<ConnectionHeader activeChatProfileId={null} />)
+    rerender(<ConnectionHeader variant="title-icon" activeChatProfileId={null} />)
     expect(screen.queryByText('No connection configured')).toBeNull()
-    expect(screen.getByText('llama A')).toBeTruthy()
+    expect(screen.getByRole('button', { name: connectionButtonMatcher('llama A') })).toBeTruthy()
 
     await waitFor(() => {
       expect(spy).toHaveBeenCalledTimes(2)
@@ -287,7 +311,7 @@ describe('ConnectionHeader', () => {
     resolveBlockedRows(await listProfilesActual())
 
     await waitFor(() => {
-      expect(screen.getByText('llama B')).toBeTruthy()
+      expect(screen.getByRole('button', { name: connectionButtonMatcher('llama B') })).toBeTruthy()
     })
   })
 })

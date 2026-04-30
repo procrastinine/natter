@@ -38,7 +38,6 @@ function makeProfile(): ConnectionProfile {
     defaultHeaders: {},
     appTitle: 'natter',
     appUrl: 'http://localhost:5173',
-    usesResponsesApiByDefault: false,
     supportsEndpointsApi: true,
     supportsGenerationApi: true,
     supportsPrivacyScrape: true,
@@ -54,7 +53,6 @@ function makeOpenAiProfile(): ConnectionProfile {
     name: 'OpenAI',
     kind: 'openai-compatible',
     baseUrl: 'https://api.openai.com/v1',
-    usesResponsesApiByDefault: true,
     supportsEndpointsApi: false,
     supportsGenerationApi: false,
     supportsPrivacyScrape: false,
@@ -68,11 +66,22 @@ function makeGoogleNativeProfile(): ConnectionProfile {
     name: 'Google',
     kind: 'google',
     baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
-    usesResponsesApiByDefault: false,
     supportsEndpointsApi: false,
     supportsGenerationApi: false,
     supportsPrivacyScrape: false,
-    geminiMode: 'native',
+  }
+}
+
+function makeAnthropicProfile(): ConnectionProfile {
+  return {
+    ...makeProfile(),
+    id: 'prof-anthropic',
+    name: 'Anthropic',
+    kind: 'anthropic',
+    baseUrl: 'https://api.anthropic.com/v1',
+    supportsEndpointsApi: false,
+    supportsGenerationApi: false,
+    supportsPrivacyScrape: false,
   }
 }
 
@@ -430,6 +439,7 @@ describe('almost-live request shape matrix', () => {
       settings: chatSettings({
         profileId: 'prof-openai',
         model: 'gpt-5.4',
+        api: 'responses',
         systemPrompt: SYSTEM_PROMPT,
         appendPrompt: APPEND_PROMPT,
       }),
@@ -465,6 +475,7 @@ describe('almost-live request shape matrix', () => {
       settings: chatSettings({
         profileId: 'prof-google',
         model: 'google/gemini-3.1-flash-lite-preview',
+        api: 'gemini-native',
         systemPrompt: SYSTEM_PROMPT,
         appendPrompt: APPEND_PROMPT,
       }),
@@ -497,6 +508,177 @@ describe('almost-live request shape matrix', () => {
     }>
     expect(contents.map((item) => item.role)).toEqual(['user', 'model', 'user'])
     expect(contents[2]?.parts?.[0]?.text).toBe(`${LOREM_FOLLOWUP}${APPEND_PROMPT}`)
+  })
+
+  it('direct provider mode matrix exposes the expected request shape for every chat-owned API mode', async () => {
+    async function capture(input: {
+      profile: ConnectionProfile
+      settings: Partial<ChatSettings>
+    }): Promise<{
+      route: string | undefined
+      transport: string | undefined
+      geminiModelId: string | undefined
+      wire: Record<string, unknown>
+    }> {
+      const chat = await createChat({
+        settings: chatSettings({
+          profileId: input.profile.id,
+          systemPrompt: SYSTEM_PROMPT,
+          appendPrompt: APPEND_PROMPT,
+          ...input.settings,
+        }),
+      })
+      await seedLinearMessages(chat.id, [
+        { id: `${chat.id}-u1`, role: 'user', text: LOREM_USER },
+        { id: `${chat.id}-a1`, role: 'assistant', text: LOREM_ASSISTANT },
+      ])
+
+      let wire: Record<string, unknown> | undefined
+      let route: string | undefined
+      let transport: string | undefined
+      let geminiModelId: string | undefined
+      await sendText({
+        chatId: chat.id,
+        connection: input.profile,
+        apiKey: 'sk-test',
+        content: [{ type: 'text', text: LOREM_FOLLOWUP }],
+        openStream: (open) => {
+          wire = open.wireBody
+          route = open.route?.kind
+          transport = open.route?.transport
+          geminiModelId = open.geminiModelId
+          return stream({
+            type: 'delta',
+            chunk: {
+              id: `${chat.id}-shape`,
+              choices: [{ delta: { content: 'ok' }, finish_reason: 'stop' }],
+            },
+          })
+        },
+      })
+      expect(wire).toBeDefined()
+      return { route, transport, geminiModelId, wire: wire as Record<string, unknown> }
+    }
+
+    const openAiResponses = await capture({
+      profile: makeOpenAiProfile(),
+      settings: { model: 'gpt-5.4-nano', api: 'responses' },
+    })
+    expect(openAiResponses.route).toBe('responses')
+    expect(openAiResponses.transport).toBe('openai-responses')
+    expect(openAiResponses.wire.provider).toBeUndefined()
+    expect(openAiResponses.wire.messages).toBeUndefined()
+    expect(openAiResponses.wire.instructions).toBe(SYSTEM_PROMPT)
+    expect(openAiResponses.wire.input).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ role: 'user' }),
+        expect.objectContaining({ role: 'assistant' }),
+      ]),
+    )
+
+    const openAiChat = await capture({
+      profile: makeOpenAiProfile(),
+      settings: { model: 'gpt-4o', api: 'chat' },
+    })
+    expect(openAiChat.route).toBe('chat-completions')
+    expect(openAiChat.transport).toBe('openai-chat')
+    expect(openAiChat.wire.provider).toBeUndefined()
+    expect(openAiChat.wire.input).toBeUndefined()
+    expect(openAiChat.wire.messages).toEqual(
+      expect.arrayContaining([
+        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'user', content: LOREM_USER },
+        { role: 'assistant', content: LOREM_ASSISTANT },
+        { role: 'user', content: `${LOREM_FOLLOWUP}${APPEND_PROMPT}` },
+      ]),
+    )
+
+    const googleNative = await capture({
+      profile: makeGoogleNativeProfile(),
+      settings: {
+        model: 'google/gemini-3.1-flash-lite-preview',
+        api: 'gemini-native',
+      },
+    })
+    expect(googleNative.route).toBe('gemini-generate')
+    expect(googleNative.transport).toBe('gemini-native')
+    expect(googleNative.geminiModelId).toBe('gemini-3.1-flash-lite-preview')
+    expect(googleNative.wire.provider).toBeUndefined()
+    expect(googleNative.wire.messages).toBeUndefined()
+    expect(googleNative.wire.input).toBeUndefined()
+    expect(googleNative.wire.systemInstruction).toEqual({
+      role: 'system',
+      parts: [{ text: SYSTEM_PROMPT }],
+    })
+    expect(googleNative.wire.contents).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ role: 'user' }),
+        expect.objectContaining({ role: 'model' }),
+      ]),
+    )
+
+    const googleCompat = await capture({
+      profile: makeGoogleNativeProfile(),
+      settings: {
+        model: 'google/gemini-3.1-flash-lite-preview',
+        api: 'chat',
+      },
+    })
+    expect(googleCompat.route).toBe('chat-completions')
+    expect(googleCompat.transport).toBe('openai-chat')
+    expect(googleCompat.wire.provider).toBeUndefined()
+    expect(googleCompat.wire.contents).toBeUndefined()
+    expect(googleCompat.wire.messages).toEqual(
+      expect.arrayContaining([
+        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'user', content: LOREM_USER },
+        { role: 'assistant', content: LOREM_ASSISTANT },
+        { role: 'user', content: `${LOREM_FOLLOWUP}${APPEND_PROMPT}` },
+      ]),
+    )
+
+    const anthropicMessages = await capture({
+      profile: makeAnthropicProfile(),
+      settings: { model: 'claude-haiku-4.5', api: 'anthropic-messages' },
+    })
+    expect(anthropicMessages.route).toBe('anthropic-messages')
+    expect(anthropicMessages.transport).toBe('anthropic')
+    expect(anthropicMessages.wire.provider).toBeUndefined()
+    expect(anthropicMessages.wire.input).toBeUndefined()
+    expect(anthropicMessages.wire.system).toBe(SYSTEM_PROMPT)
+    expect(anthropicMessages.wire.model).toBe('claude-haiku-4-5')
+    const anthropicNativeMessages = anthropicMessages.wire.messages as Array<{
+      role: string
+      content: Array<{ type: string; text?: string }>
+    }>
+    expect(anthropicNativeMessages.map((message) => message.role)).toEqual([
+      'user',
+      'assistant',
+      'user',
+    ])
+    expect(anthropicNativeMessages[0]?.content?.[0]?.text).toBe(LOREM_USER)
+    expect(anthropicNativeMessages[1]?.content?.[0]?.text).toBe(LOREM_ASSISTANT)
+    expect(anthropicNativeMessages[2]?.content?.[0]?.text).toBe(
+      `${LOREM_FOLLOWUP}${APPEND_PROMPT}`,
+    )
+
+    const anthropicCompat = await capture({
+      profile: makeAnthropicProfile(),
+      settings: { model: 'claude-haiku-4.5', api: 'chat' },
+    })
+    expect(anthropicCompat.route).toBe('chat-completions')
+    expect(anthropicCompat.transport).toBe('openai-chat')
+    expect(anthropicCompat.wire.provider).toBeUndefined()
+    expect(anthropicCompat.wire.input).toBeUndefined()
+    expect(anthropicCompat.wire.model).toBe('claude-haiku-4-5')
+    expect(anthropicCompat.wire.messages).toEqual(
+      expect.arrayContaining([
+        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'user', content: LOREM_USER },
+        { role: 'assistant', content: LOREM_ASSISTANT },
+        { role: 'user', content: `${LOREM_FOLLOWUP}${APPEND_PROMPT}` },
+      ]),
+    )
   })
 
   it('text-completions send captures a rendered prompt with the same rewritten context', async () => {

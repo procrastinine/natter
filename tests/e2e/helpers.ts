@@ -21,10 +21,10 @@ interface SeedOptions {
 
 const DEFAULT_E2E_MODEL = 'google/gemini-3.1-flash-lite-preview:free'
 
-// Open the connection-setup modal from the connection header and submit a
-// stub key. `apiKey` defaults to a harmless placeholder because the
-// route-mocked specs never hit OpenRouter. Use `seedReal(page)` when the spec
-// needs the real key from `key.txt`.
+// Open the first-run Add connection action and submit a stub key. `apiKey`
+// defaults to a harmless placeholder because the route-mocked specs never hit
+// OpenRouter. Use `seedReal(page)` when the spec needs the real key from
+// `key.txt`.
 export async function seedFirstRun(page: Page, opts: SeedOptions = {}): Promise<void> {
   const apiKey = opts.apiKey ?? 'sk-or-v1-test-00000000000000000000000000000000000000000000'
   const model = opts.model ?? DEFAULT_E2E_MODEL
@@ -35,10 +35,11 @@ export async function seedFirstRun(page: Page, opts: SeedOptions = {}): Promise<
   await page.locator('[data-ui="connection-setup-submit"]').click()
   // The modal closes automatically once the seed completes; wait for it.
   await page.locator('[data-ui="connection-setup-modal"]').waitFor({ state: 'detached' })
-  // Connection header now shows the configured profile.
-  await page
-    .locator('[data-ui="connection-header"][data-state="configured"]')
-    .waitFor({ state: 'visible' })
+  // Once configured, the first-run Add connection action disappears; active
+  // chats expose connection editing through the provider icon in the title row.
+  await page.locator('[data-ui="connection-empty-action"]').waitFor({
+    state: 'detached',
+  })
   if (opts.disablePrivacyFilter === false) return
   await page.evaluate(
     async ({ model }) => {
@@ -292,6 +293,7 @@ export async function firstChatId(page: Page): Promise<string> {
 
 export async function clearIndexedDb(page: Page): Promise<void> {
   await page.evaluate(async () => {
+    window.sessionStorage.removeItem('natter:active-seed')
     await new Promise<void>((resolve, reject) => {
       const req = indexedDB.deleteDatabase('natter')
       req.onsuccess = () => resolve()

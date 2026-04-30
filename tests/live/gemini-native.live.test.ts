@@ -35,13 +35,11 @@ function profile(): ConnectionProfile {
     defaultHeaders: {},
     appTitle: 'natter-live-probe',
     appUrl: '',
-    usesResponsesApiByDefault: false,
     supportsEndpointsApi: false,
     supportsGenerationApi: false,
     supportsPrivacyScrape: false,
     createdAt: 0,
     updatedAt: 0,
-    geminiMode: 'native',
   }
 }
 

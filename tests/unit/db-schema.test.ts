@@ -110,7 +110,7 @@ function registerV1(db: Dexie): void {
 
 function registerV1Through3(db: Dexie): void {
   registerSchema(db)
-  db.version(18)
+  db.version(19)
     .stores({ profiles: 'id, name, kind, lastUsedAt, archived' })
     .upgrade(async (tx) => {
       await tx
@@ -120,7 +120,7 @@ function registerV1Through3(db: Dexie): void {
           if (row.appTitle === undefined) row.appTitle = 'Natter'
         })
     })
-  db.version(19)
+  db.version(20)
     .stores({ settings: '&key' })
     .upgrade(async (tx) => {
       const settings = tx.table<MinimalSetting>('settings')
@@ -202,7 +202,7 @@ describe('Dexie migrations', () => {
     const db = new Dexie(name)
     registerV1Through3(db)
     await db.open()
-    expect(db.verno).toBe(19)
+    expect(db.verno).toBe(20)
     expect(db.tables.map((t) => t.name).includes('settings')).toBe(true)
     const tag = await db.table<MinimalSetting>('settings').get('schemaTag')
     expect(tag).toBeUndefined()
@@ -238,7 +238,7 @@ describe('Dexie migrations', () => {
     const up = new Dexie(name)
     registerV1Through3(up)
     await up.open()
-    expect(up.verno).toBe(19)
+    expect(up.verno).toBe(20)
     const profile = await up.table<MinimalProfile>('profiles').get('P1')
     expect(profile?.appTitle).toBe('CustomTitle') // preserved — synthetic bump only fills undefined
     const tag = await up.table<MinimalSetting>('settings').get('schemaTag')
@@ -248,7 +248,7 @@ describe('Dexie migrations', () => {
     const reopen = new Dexie(name)
     registerV1Through3(reopen)
     await reopen.open()
-    expect(reopen.verno).toBe(19)
+    expect(reopen.verno).toBe(20)
     const tag2 = await reopen.table<MinimalSetting>('settings').get('schemaTag')
     expect(tag2?.value).toBe('preexisting')
     await reopen.delete()
@@ -320,7 +320,7 @@ describe('Dexie migrations', () => {
 
     const migrated = createDbForTests(name)
     await migrated.open()
-    expect(migrated.verno).toBe(17)
+    expect(migrated.verno).toBe(18)
     expect((await migrated.settings.get('global:message-render-window-size'))?.value).toBe(33)
     expect((await migrated.settings.get('global:sidebar-render-window-size'))?.value).toBe(50)
     expect((await migrated.settings.get('global:message-render-window-load-mode'))?.value).toBe(
@@ -700,7 +700,7 @@ describe('Dexie migrations', () => {
 
     const migrated = createDbForTests(name)
     await migrated.open()
-    expect(migrated.verno).toBe(17)
+    expect(migrated.verno).toBe(18)
     const chat = await migrated.chats.get('chat-settings-snapshot')
     const preset = await migrated.presets.get('preset-settings-snapshot')
     for (const settings of [chat?.settings, preset?.settings]) {
@@ -733,6 +733,142 @@ describe('Dexie migrations', () => {
       expect('toolChoice' in ((settings ?? {}) as Record<string, unknown>)).toBe(false)
     }
     expect(preset?.settings.profileId).toBe(profileId)
+    await migrated.delete()
+  })
+
+  it('migrates provider API modes from connection profiles into chat and preset settings', async () => {
+    const name = `natter-test-provider-api-mode-mig-${Math.random().toString(36).slice(2)}`
+    await Dexie.delete(name)
+    const directSettings = cloneDefaultChatSettings()
+    directSettings.profileId = 'profile-openai'
+    directSettings.model = 'gpt-4o'
+    directSettings.api = 'auto'
+    directSettings.responses = { includeEncrypted: false, store: false } as unknown as NonNullable<
+      Chat['settings']['responses']
+    >
+    const googleSettings = cloneDefaultChatSettings()
+    googleSettings.profileId = 'profile-google'
+    googleSettings.model = 'google/gemini-3.1-flash-lite-preview'
+    googleSettings.api = 'auto'
+    googleSettings.gemini = {
+      allowImportedWithoutSignature: false,
+    } as unknown as NonNullable<Chat['settings']['gemini']>
+    const anthropicSettings = cloneDefaultChatSettings()
+    anthropicSettings.profileId = 'profile-anthropic'
+    anthropicSettings.model = 'claude-haiku-4.5'
+    anthropicSettings.api = 'auto'
+
+    const legacy = new Dexie(name)
+    registerLegacyChatSettingsV14(legacy)
+    await legacy.open()
+    await legacy.table('profiles').bulkPut([
+      {
+        id: 'profile-openai',
+        name: 'OpenAI',
+        kind: 'openai-compatible',
+        baseUrl: 'https://api.openai.com/v1',
+        apiKeyRef: 'K1',
+        defaultHeaders: {},
+        appTitle: 'Natter',
+        appUrl: '',
+        usesResponsesApiByDefault: true,
+        responsesDefaults: { store: true, includeEncrypted: false },
+        supportsEndpointsApi: false,
+        supportsGenerationApi: false,
+        supportsPrivacyScrape: false,
+        createdAt: 1,
+        updatedAt: 1,
+      },
+      {
+        id: 'profile-google',
+        name: 'Google',
+        kind: 'google',
+        baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+        apiKeyRef: 'K2',
+        defaultHeaders: {},
+        appTitle: 'Natter',
+        appUrl: '',
+        geminiMode: 'openai-compat',
+        geminiDefaults: { allowImportedWithoutSignature: false },
+        supportsEndpointsApi: false,
+        supportsGenerationApi: false,
+        supportsPrivacyScrape: false,
+        createdAt: 1,
+        updatedAt: 1,
+      },
+      {
+        id: 'profile-anthropic',
+        name: 'Anthropic',
+        kind: 'anthropic',
+        baseUrl: 'https://api.anthropic.com/v1',
+        apiKeyRef: 'K3',
+        defaultHeaders: {},
+        appTitle: 'Natter',
+        appUrl: '',
+        supportsEndpointsApi: false,
+        supportsGenerationApi: false,
+        supportsPrivacyScrape: false,
+        createdAt: 1,
+        updatedAt: 1,
+      },
+    ])
+    const chatBase = {
+      title: '',
+      titleStatus: 'untitled' as const,
+      createdAt: 1,
+      updatedAt: 1,
+      lastViewedAt: 1,
+      wordCount: 0,
+      totalCostUsd: 0,
+      metaVersion: 0,
+      summaryVersion: 0,
+      lastUpdatedLeafId: null,
+      lastBranchUpdatedAt: 1,
+      archived: false,
+      pinned: false,
+      folderId: null,
+      tags: [],
+    }
+    await legacy.table<Chat>('chats').bulkPut([
+      { ...chatBase, id: 'chat-openai', settings: directSettings },
+      { ...chatBase, id: 'chat-google', settings: googleSettings },
+      { ...chatBase, id: 'chat-anthropic', settings: anthropicSettings },
+    ])
+    await legacy.table<ChatPreset>('presets').put({
+      id: 'preset-openai',
+      name: 'OpenAI preset',
+      connectionProfileId: 'profile-openai',
+      settings: { ...directSettings, profileId: 'stale-profile' },
+      createdAt: 1,
+      updatedAt: 1,
+    })
+    legacy.close()
+
+    const migrated = createDbForTests(name)
+    await migrated.open()
+    expect(migrated.verno).toBe(18)
+    const openaiChat = await migrated.chats.get('chat-openai')
+    const googleChat = await migrated.chats.get('chat-google')
+    const anthropicChat = await migrated.chats.get('chat-anthropic')
+    const openaiPreset = await migrated.presets.get('preset-openai')
+    expect(openaiChat?.settings.api).toBe('responses')
+    expect(openaiChat?.settings.responses).toEqual({ store: true })
+    expect(
+      'includeEncrypted' in ((openaiChat?.settings.responses ?? {}) as Record<string, unknown>),
+    ).toBe(false)
+    expect(googleChat?.settings.api).toBe('chat')
+    expect(googleChat?.settings.gemini).toBeUndefined()
+    expect(anthropicChat?.settings.api).toBe('anthropic-messages')
+    expect(openaiPreset?.settings.profileId).toBe('profile-openai')
+    expect(openaiPreset?.settings.api).toBe('responses')
+    expect(openaiPreset?.settings.responses).toEqual({ store: true })
+    for (const profile of await migrated.profiles.toArray()) {
+      const row = profile as unknown as Record<string, unknown>
+      expect(row.usesResponsesApiByDefault).toBeUndefined()
+      expect(row.geminiMode).toBeUndefined()
+      expect(row.responsesDefaults).toBeUndefined()
+      expect(row.geminiDefaults).toBeUndefined()
+    }
     await migrated.delete()
   })
 

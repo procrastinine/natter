@@ -32,6 +32,7 @@ import { isTextCompletionsSelectableFor, quirksFor } from './quirks'
 import { resolveTextTemplateFromLibrary } from './text-templates'
 import { charsPerToken, readTokenCalibrationGlobal } from './token-calibration'
 import type { PromptEstimateOptions } from './tokens'
+import { pickEquivalentModelId } from './model-selection'
 import type {
   AnthropicMessagesTransformOptions,
   ChatCompletionsTransformOptions,
@@ -97,12 +98,6 @@ const OPENROUTER_SEND_PARAMETER_SUPERSET = [
   'plugins',
 ] as const
 
-function idsEquivalent(left: string, right: string): boolean {
-  return (
-    left.replace(/(\d)[.-](\d)(?=-|$)/g, '$1:$2') === right.replace(/(\d)[.-](\d)(?=-|$)/g, '$1:$2')
-  )
-}
-
 interface ResolveRequestCapabilityInput {
   profile: ConnectionProfile
   modelId: string
@@ -119,9 +114,9 @@ async function resolveRequestCapability(
   const bundled = resolveBundledCapability(profile, modelId)
   const cachedModels = await getCachedModels(profile.id, DIRECT_CAPABILITY_LOOKUP_QUERY)
   if (!cachedModels) return bundled
-  const liveEntry =
-    normalizeModelsResponse(cachedModels.payload).find((row) => idsEquivalent(row.id, modelId)) ??
-    null
+  const liveModels = normalizeModelsResponse(cachedModels.payload)
+  const equivalentModelId = pickEquivalentModelId(modelId, liveModels)
+  const liveEntry = liveModels.find((row) => row.id === equivalentModelId) ?? null
   if (!liveEntry) return bundled
   const merged: CapabilityDescriptor = { ...bundled }
   if (liveEntry.contextLength !== undefined) {
@@ -332,12 +327,16 @@ function hostedToolsProviderForConnection(
   }
   if (
     connection.kind === 'google' &&
-    connection.geminiMode !== 'openai-compat' &&
+    settings.api !== 'chat' &&
     hasEnabledHostedTools(settings, 'google')
   ) {
     return 'google'
   }
-  if (connection.kind === 'anthropic' && hasEnabledHostedTools(settings, 'anthropic')) {
+  if (
+    connection.kind === 'anthropic' &&
+    settings.api !== 'chat' &&
+    hasEnabledHostedTools(settings, 'anthropic')
+  ) {
     return 'anthropic'
   }
   return undefined

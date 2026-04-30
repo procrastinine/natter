@@ -16,12 +16,13 @@ import {
   normalizeEndpointsResponse,
   normalizeModelsResponse,
 } from '../api/providers'
-import { resolveBundledCapability } from '../capabilities'
+import { listBundledEntries, resolveBundledCapability } from '../capabilities'
 import type { EffectiveCapability } from '../core/capabilities'
 import {
   effectiveCapabilityFromDescriptor,
   effectiveCapabilityFromEndpoints,
 } from '../core/capabilities'
+import { pickEquivalentModelId } from '../core/model-selection'
 import type { CapabilityDescriptor, ModelEndpoint, ProfileId } from '../core/types'
 import { resolveKey } from '../store/keys'
 import {
@@ -41,13 +42,6 @@ const OPENROUTER_CAPABILITY_LOOKUP_QUERY = {
 } as const
 
 const DIRECT_CAPABILITY_LOOKUP_QUERY = {} as const
-
-function idsEquivalent(left: string, right: string): boolean {
-  return (
-    left.replace(/(\d)[.-](\d)(?=-|$)/g, '$1:$2') ===
-    right.replace(/(\d)[.-](\d)(?=-|$)/g, '$1:$2')
-  )
-}
 
 interface UseEndpointsResult {
   descriptor: EndpointsDescriptor | null
@@ -159,16 +153,27 @@ export function useEndpoints(
     [profileId, profile?.kind],
     undefined,
   )
+  const liveModelRows = useMemo<ModelListEntry[]>(() => {
+    return liveModelsRow ? normalizeModelsResponse(liveModelsRow.payload) : []
+  }, [liveModelsRow])
   const liveEntry = useMemo<ModelListEntry | null>(() => {
-    if (!liveModelsRow || !modelId) return null
-    const rows = normalizeModelsResponse(liveModelsRow.payload)
-    return rows.find((r) => idsEquivalent(r.id, modelId)) ?? null
-  }, [liveModelsRow, modelId])
+    if (!modelId) return null
+    const rows = liveModelRows
+    const equivalentModelId = pickEquivalentModelId(modelId, rows)
+    return rows.find((r) => r.id === equivalentModelId) ?? null
+  }, [liveModelRows, modelId])
   const modelAvailable = useMemo<boolean | null>(() => {
-    if (!profileId || !modelId) return null
+    if (!profile || !modelId) return null
+    if (profile.kind !== 'openrouter') {
+      const bundledRows = listBundledEntries(profile.kind).map<ModelListEntry>((entry) => ({
+        id: entry.id,
+        name: entry.name,
+      }))
+      if (pickEquivalentModelId(modelId, [...liveModelRows, ...bundledRows])) return true
+    }
     if (!liveModelsRow) return null
     return liveEntry !== null
-  }, [profileId, modelId, liveModelsRow, liveEntry])
+  }, [profile, modelId, liveModelsRow, liveModelRows, liveEntry])
   const strict = opts.strict === true
   const capability = useMemo<EffectiveCapability | null>(() => {
     if (!profile || !modelId) return null

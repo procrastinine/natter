@@ -1,6 +1,5 @@
 import { useLiveQuery } from 'dexie-react-hooks'
 import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
-import { normalizeModelsResponse } from '../api/providers'
 import { attachmentsDisabledByTextProtocol } from '../core/attachments/context'
 import { cloneDefaultChatSettings } from '../core/defaults'
 import {
@@ -18,6 +17,8 @@ import {
   UNLIMITED_CONTEXT,
 } from '../core/prompt-size'
 import { prefillClassFor } from '../core/quirks'
+import { modelLooksForeignForProfile, pickEquivalentModelId } from '../core/model-selection'
+import { withProfileApiDefaults } from '../core/provider-defaults'
 import { DEFAULT_SIDEBAR_SORT_MODE } from '../core/sidebar-sort'
 import { readTokenCalibrationGlobal } from '../core/token-calibration'
 import type {
@@ -36,7 +37,6 @@ import { newId } from '../lib/ulid'
 import { installChatPreviewMaintainer } from '../store/chat-preview-maintainer'
 import { createChat, getChat, loadActiveBranchSnapshot, updateChatSettings } from '../store/chats'
 import { resolveKeyIfPresent } from '../store/keys'
-import { getCachedModels } from '../store/models-cache'
 import { bumpPresetLastUsedAt, getPreset, pickPreferredPreset } from '../store/presets'
 import { bumpProfileLastUsedAt, countProfiles, getProfile } from '../store/profiles'
 import { installPersistenceRequestOnFirstInteraction } from '../store/quota'
@@ -91,6 +91,19 @@ const EMPTY_CURSOR: CursorMap = Object.freeze({})
 const MODEL_AUTOSELECT_QUERY = {
   outputModalities: ['text', 'image', 'audio', 'file', 'video'],
 } as const
+const DIRECT_MODEL_AUTOSELECT_QUERY = {} as const
+
+interface ActiveModelState {
+  chatId: ChatId
+  profileId: string
+  model: string
+}
+
+interface PendingEquivalentModel {
+  chatId: ChatId
+  profileId: string
+  sourceModel: string
+}
 
 function cursorCacheKey(chatId: ChatId, cursor: CursorMap): string {
   const entries = Object.entries(cursor).sort(([left], [right]) => left.localeCompare(right))
@@ -118,14 +131,15 @@ function hasFileTransfer(dataTransfer: DataTransfer): boolean {
 // has exactly one model.
 function seedSettingsForNewChat(
   presetSettings: Chat['settings'] | undefined,
-  preferredProfileId: string | null,
+  preferredProfile: ConnectionProfile | null,
 ): Chat['settings'] {
   const base = presetSettings ? { ...presetSettings } : cloneDefaultChatSettings()
-  const targetId = preferredProfileId ?? base.profileId
+  const targetId = preferredProfile?.id ?? base.profileId
+  let next = base
   if (targetId && targetId !== base.profileId) {
-    return { ...base, profileId: targetId, model: '' }
+    next = { ...base, profileId: targetId, model: '' }
   }
-  return base
+  return preferredProfile ? withProfileApiDefaults(next, preferredProfile) : next
 }
 
 export function Shell() {
@@ -139,8 +153,13 @@ export function Shell() {
   const streamingOnActiveChat = useStreamStore((s) =>
     activeChatId ? s.hasStreamForChat(activeChatId) : false,
   )
-  const profileCount = useLiveQuery(() => countProfiles({ includeArchived: true }), [], 0)
-  const hasConnection = profileCount > 0
+  const profileCount = useLiveQuery(
+    () => countProfiles({ includeArchived: true }),
+    [],
+    undefined,
+  )
+  const connectionKnown = profileCount !== undefined
+  const hasConnection = connectionKnown && profileCount > 0
   const [chatModelOpen, setChatModelOpen] = useState(false)
   const [globalSettingsOpen, setGlobalSettingsOpen] = useState(false)
   const [composerSeed, setComposerSeed] = useState<string | null>(null)
@@ -207,41 +226,120 @@ export function Shell() {
     { strict: resolvedActiveChatRow?.settings.strictProviderRouting === true },
   )
   const activeCapability = activeEndpoints.capability
-  // Keep the chat's model coherent with its connection: if the connection
-  // serves exactly one model and the chat has no model picked, auto-select
-  // it. This kicks in right after `switchProfile` clears the model on a
-  // connection switch (e.g., OpenRouter → llama-server auto-picks gemma
-  // because llama-server's /v1/models only returns one entry). For
-  // connections with many models the chat stays unselected until the user
-  // picks, and the Chat Settings panel surfaces a "select a model" banner.
+  // Keep the chat's model coherent with its connection. If a profile switch
+  // cleared a model, first try to select the equivalent model from the new
+  // connection's /models list. Fresh no-model chats still get the old
+  // single-model convenience fallback.
   //
-  // `useModels` powers the fetch half — mounting it here triggers a /v1/models
-  // request for whichever profile the chat points at, whether or not the
-  // Model tab is open. The read half goes through `useLiveQuery` →
-  // `getCachedModels` keyed on the CURRENT profileId directly (rather than
-  // reading `useModels.models` which is a derived, slightly-delayed view).
-  // This avoids a race where the chat's profileId has already flipped to
-  // test-or but the cached row is still the old llama-server list, which
-  // would auto-pick gemma back onto the OpenRouter chat.
+  // `useModels` powers both the fetch and read halves so this code sees the
+  // same merged direct-provider list as ModelPicker. That matters for direct
+  // Anthropic/Google, whose live /models rows can be sparse or unavailable
+  // while bundled capability rows are still valid picker choices.
   const activeProfileId = resolvedActiveChatRow?.settings.profileId ?? null
-  useModels(activeProfileId, {
-    query: MODEL_AUTOSELECT_QUERY,
-    enabled: !!resolvedActiveChatRow && !resolvedActiveChatRow.settings.model,
-  })
-  const autoSelectRow = useLiveQuery(
-    () =>
-      activeProfileId
-        ? getCachedModels(activeProfileId, MODEL_AUTOSELECT_QUERY)
-        : Promise.resolve(undefined),
+  const activeProfileForModelList = useLiveQuery(
+    () => (activeProfileId ? getProfile(activeProfileId) : Promise.resolve(undefined)),
     [activeProfileId],
     undefined,
   )
+  const previousActiveModelRef = useRef<ActiveModelState | null>(null)
+  const pendingEquivalentModelRef = useRef<PendingEquivalentModel | null>(null)
+  const activeModelState = useMemo<ActiveModelState | null>(() => {
+    if (!resolvedActiveChatRow?.settings.profileId) return null
+    return {
+      chatId: resolvedActiveChatRow.id,
+      profileId: resolvedActiveChatRow.settings.profileId,
+      model: resolvedActiveChatRow.settings.model,
+    }
+  }, [
+    resolvedActiveChatRow?.id,
+    resolvedActiveChatRow?.settings.profileId,
+    resolvedActiveChatRow?.settings.model,
+  ])
+  useEffect(() => {
+    const previous = previousActiveModelRef.current
+    if (!activeModelState) {
+      previousActiveModelRef.current = null
+      pendingEquivalentModelRef.current = null
+      return
+    }
+    const pending = pendingEquivalentModelRef.current
+    if (
+      previous &&
+      previous.chatId === activeModelState.chatId &&
+      previous.profileId !== activeModelState.profileId &&
+      previous.model
+    ) {
+      pendingEquivalentModelRef.current = {
+        chatId: activeModelState.chatId,
+        profileId: activeModelState.profileId,
+        sourceModel: activeModelState.model || previous.model,
+      }
+    } else if (activeModelState.model) {
+      if (pending?.chatId === activeModelState.chatId) pendingEquivalentModelRef.current = null
+    } else if (
+      pending &&
+      (pending.chatId !== activeModelState.chatId ||
+        pending.profileId !== activeModelState.profileId)
+    ) {
+      pendingEquivalentModelRef.current = null
+    }
+    previousActiveModelRef.current = activeModelState
+  }, [activeModelState])
+  const autoSelectModelsQuery =
+    activeProfileForModelList?.kind === 'openrouter'
+      ? MODEL_AUTOSELECT_QUERY
+      : DIRECT_MODEL_AUTOSELECT_QUERY
+  const autoSelectModels = useModels(activeProfileId, {
+    query: autoSelectModelsQuery,
+    enabled: !!resolvedActiveChatRow && !!activeProfileForModelList,
+  })
   useEffect(() => {
     if (!resolvedActiveChatRow) return
+    if (activeProfileId !== resolvedActiveChatRow.settings.profileId) return
+    const rows = autoSelectModels.models
+    const pendingEquivalent = pendingEquivalentModelRef.current
+    if (resolvedActiveChatRow.settings.model) {
+      if (rows.length === 0) return
+      const equivalentModelId = pickEquivalentModelId(resolvedActiveChatRow.settings.model, rows)
+      if (equivalentModelId && equivalentModelId !== resolvedActiveChatRow.settings.model) {
+        pendingEquivalentModelRef.current = null
+        void updateChatSettings(resolvedActiveChatRow.id, { model: equivalentModelId })
+        return
+      }
+      if (
+        (pendingEquivalent ||
+          (activeProfileForModelList &&
+            modelLooksForeignForProfile(
+              activeProfileForModelList.kind,
+              resolvedActiveChatRow.settings.model,
+            ))) &&
+        !equivalentModelId
+      ) {
+        pendingEquivalentModelRef.current = null
+        void updateChatSettings(resolvedActiveChatRow.id, { model: '' })
+        return
+      }
+      if (!pendingEquivalent) return
+    }
+    if (
+      pendingEquivalent &&
+      pendingEquivalent.chatId === resolvedActiveChatRow.id &&
+      pendingEquivalent.profileId === resolvedActiveChatRow.settings.profileId
+    ) {
+      if (rows.length === 0) return
+      const equivalentModelId = pickEquivalentModelId(pendingEquivalent.sourceModel, rows)
+      pendingEquivalentModelRef.current = null
+      void (async () => {
+        const latest = await getChat(resolvedActiveChatRow.id)
+        if (!latest) return
+        if (latest.settings.profileId !== resolvedActiveChatRow.settings.profileId) return
+        const nextModel = equivalentModelId ?? ''
+        if (latest.settings.model === nextModel) return
+        await updateChatSettings(resolvedActiveChatRow.id, { model: nextModel })
+      })()
+      return
+    }
     if (resolvedActiveChatRow.settings.model) return
-    if (!autoSelectRow) return
-    if (autoSelectRow.profileId !== resolvedActiveChatRow.settings.profileId) return
-    const rows = normalizeModelsResponse(autoSelectRow.payload)
     if (rows.length !== 1) return
     const only = rows[0]
     if (!only) return
@@ -254,7 +352,7 @@ export function Shell() {
       if (latest.settings.profileId !== resolvedActiveChatRow.settings.profileId) return
       await updateChatSettings(resolvedActiveChatRow.id, { model: only.id })
     })()
-  }, [resolvedActiveChatRow, autoSelectRow])
+  }, [resolvedActiveChatRow, activeProfileId, activeProfileForModelList, autoSelectModels.models])
   const activePathMemo = resolvedActiveBranchSnapshot?.branch ?? []
   const composerAttachmentResolver = useAttachmentResolverForContext({
     settings: resolvedActiveChatRow?.settings,
@@ -418,7 +516,7 @@ export function Shell() {
       const preset = remembered.presetId ? await getPreset(remembered.presetId) : undefined
       return {
         preset,
-        settings: structuredClone(remembered.settings),
+        settings: withProfileApiDefaults(structuredClone(remembered.settings), rememberedProfile),
       }
     }
     const preset = await pickPreferredPreset({
@@ -427,7 +525,7 @@ export function Shell() {
     })
     const settings = seedSettingsForNewChat(
       preset?.settings,
-      rememberedProfile ? rememberedProfile.id : null,
+      rememberedProfile ?? null,
     )
     return {
       preset,
@@ -785,13 +883,20 @@ export function Shell() {
           <StorageView route={activeStorageRoute} />
         ) : (
           <>
-            <ConnectionHeader
-              activeChatId={activeChatId}
-              activeChatProfileId={resolvedActiveChatRow?.settings.profileId ?? null}
-            />
+            {connectionKnown && !hasConnection ? (
+              <ConnectionHeader
+                activeChatId={activeChatId}
+                activeChatProfileId={resolvedActiveChatRow?.settings.profileId ?? null}
+              />
+            ) : null}
             {activeChatId ? (
               <>
                 <div data-ui="chat-title-bar">
+                  <ConnectionHeader
+                    variant="title-icon"
+                    activeChatId={activeChatId}
+                    activeChatProfileId={resolvedActiveChatRow?.settings.profileId ?? null}
+                  />
                   <ChatHeader
                     chatId={activeChatId}
                     settingsOpen={chatModelOpen}
@@ -973,6 +1078,7 @@ export function Shell() {
                  * pre-creates the chat from the MRU preset and opens the
                  * model panel against the now-real chat. */}
                 <div data-ui="chat-title-bar">
+                  <ConnectionHeader variant="title-icon" />
                   <span data-ui="chat-title" data-title-status="untitled">
                     <span data-ui="chat-title-label">New chat</span>
                   </span>

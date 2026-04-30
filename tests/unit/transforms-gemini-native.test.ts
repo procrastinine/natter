@@ -572,7 +572,7 @@ describe('toGeminiNative — tool calls + tool results', () => {
     expect(text).toContain('55')
   })
 
-  it('assistant toolCalls → functionCall parts with parsed args', () => {
+  it('assistant toolCalls → functionCall parts with parsed args and missing-signature sentinel', () => {
     const toolCalls: ToolCall[] = [
       {
         id: 'call_1',
@@ -586,6 +586,7 @@ describe('toGeminiNative — tool calls + tool results', () => {
     expect(model.parts).toEqual([
       {
         functionCall: { name: 'search', args: { q: 'consecutive' }, id: 'call_1' },
+        thoughtSignature: 'skip_thought_signature_validator',
       },
     ])
   })

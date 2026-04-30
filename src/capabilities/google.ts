@@ -13,6 +13,7 @@ const GEMINI_3_PARAMS = [
   'top_k',
   'max_output_tokens',
   'stop_sequences',
+  'thinking',
   'response_format',
   'tools',
   'tool_choice',
@@ -25,12 +26,29 @@ const GEMINI_LEGACY_PARAMS = [
   'top_k',
   'max_output_tokens',
   'stop_sequences',
+  'thinking',
   'response_format',
   'tools',
   'tool_choice',
 ]
 
 export const GOOGLE_CAPABILITIES: CapabilityTable = {
+  'gemini-3.1-pro-preview': {
+    id: 'gemini-3.1-pro-preview',
+    name: 'Gemini 3.1 Pro Preview',
+    family: 'google',
+    capability: {
+      supportedParameters: GEMINI_3_PARAMS,
+      streaming: 'supported',
+      contextLength: 1_000_000,
+      maxCompletionTokens: 65_536,
+      pricing: { prompt: '0.00000125', completion: '0.00001' },
+      architecture: {
+        inputModalities: ['text', 'image', 'audio', 'video', 'file'],
+        outputModalities: ['text'],
+      },
+    },
+  },
   'gemini-3.1-pro': {
     id: 'gemini-3.1-pro',
     name: 'Gemini 3.1 Pro',

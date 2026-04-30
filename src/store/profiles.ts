@@ -47,7 +47,6 @@ interface CreateProfileInput {
   appTitle?: string
   appUrl?: string
   appCategories?: string[]
-  usesResponsesApiByDefault?: boolean
   supportsEndpointsApi?: boolean
   supportsGenerationApi?: boolean
   supportsPrivacyScrape?: boolean
@@ -57,13 +56,12 @@ interface CreateProfileInput {
 }
 
 // Kind-specific defaults for connection capabilities. OpenRouter gets the full
-// feature set; OpenAI direct defaults to Responses-first; everything else is
-// conservative. Caller can override any of these in the input.
+// feature set; everything else is conservative. Provider transport modes live
+// on ChatSettings, not on the connection profile.
 function kindDefaults(
   kind: ConnectionKind,
-  baseUrl: string,
+  _baseUrl: string,
 ): {
-  usesResponsesApiByDefault: boolean
   supportsEndpointsApi: boolean
   supportsGenerationApi: boolean
   supportsPrivacyScrape: boolean
@@ -71,15 +69,12 @@ function kindDefaults(
   switch (kind) {
     case 'openrouter':
       return {
-        usesResponsesApiByDefault: false,
         supportsEndpointsApi: true,
         supportsGenerationApi: true,
         supportsPrivacyScrape: true,
       }
     case 'openai-compatible': {
-      const isOpenAiDirect = /^https?:\/\/api\.openai\.com(\/|$)/.test(baseUrl)
       return {
-        usesResponsesApiByDefault: isOpenAiDirect,
         supportsEndpointsApi: false,
         supportsGenerationApi: false,
         supportsPrivacyScrape: false,
@@ -90,7 +85,6 @@ function kindDefaults(
     case 'llama-server':
     case 'custom':
       return {
-        usesResponsesApiByDefault: false,
         supportsEndpointsApi: false,
         supportsGenerationApi: false,
         supportsPrivacyScrape: false,
@@ -110,8 +104,6 @@ export async function createProfile(input: CreateProfileInput): Promise<Connecti
     defaultHeaders: input.defaultHeaders ?? {},
     appTitle: input.appTitle ?? 'llm-api-frontend',
     appUrl: input.appUrl ?? '',
-    usesResponsesApiByDefault:
-      input.usesResponsesApiByDefault ?? defaults.usesResponsesApiByDefault,
     supportsEndpointsApi: input.supportsEndpointsApi ?? defaults.supportsEndpointsApi,
     supportsGenerationApi: input.supportsGenerationApi ?? defaults.supportsGenerationApi,
     supportsPrivacyScrape: input.supportsPrivacyScrape ?? defaults.supportsPrivacyScrape,
@@ -178,9 +170,6 @@ export async function updateProfile(
   if (kindChanged) {
     const effectiveBaseUrl = patch.baseUrl ?? existing.baseUrl
     const defaults = kindDefaults(patch.kind as ConnectionKind, effectiveBaseUrl)
-    if (patch.usesResponsesApiByDefault === undefined) {
-      kindOverrides.usesResponsesApiByDefault = defaults.usesResponsesApiByDefault
-    }
     if (patch.supportsEndpointsApi === undefined) {
       kindOverrides.supportsEndpointsApi = defaults.supportsEndpointsApi
     }

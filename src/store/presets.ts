@@ -6,9 +6,9 @@
 // were already created from the preset — chats are their own snapshots. The
 // MRU preset (greatest non-archived `lastUsedAt`) seeds new chats per §9.2.1.
 
-import type { ChatPreset, ChatSettings, PresetId, ProfileId } from '../core/types'
+import type { ChatPreset, ChatSettings, ConnectionProfile, PresetId, ProfileId } from '../core/types'
 import { newId } from '../lib/ulid'
-import { withOpenRouterProviderDefaults } from '../core/provider-defaults'
+import { withProfileApiDefaults } from '../core/provider-defaults'
 import { postEvent } from './broadcast'
 import { getDb } from './db'
 import { ProfileMissingError } from './profiles'
@@ -41,7 +41,7 @@ export async function createPreset(input: CreatePresetInput): Promise<ChatPreset
     name: input.name,
     connectionProfileId: input.connectionProfileId,
     // `settings.profileId` is kept in sync with `connectionProfileId` (§2.6a).
-    settings: normalizePresetSettings(input.settings, input.connectionProfileId, profile.kind),
+    settings: normalizePresetSettings(input.settings, input.connectionProfileId, profile),
     createdAt: now,
     updatedAt: now,
   }
@@ -81,7 +81,7 @@ export async function updatePreset(
   if (patch.connectionProfileId !== undefined || patch.settings) {
     const targetProfile = await db.profiles.get(targetProfileId)
     if (!targetProfile) throw new ProfileMissingError(targetProfileId)
-    next.settings = normalizePresetSettings(next.settings, targetProfileId, targetProfile.kind)
+    next.settings = normalizePresetSettings(next.settings, targetProfileId, targetProfile)
   }
   await db.presets.put(next)
   postEvent({ kind: 'preset-mutated', presetId })
@@ -113,11 +113,10 @@ export async function duplicatePreset(
 function normalizePresetSettings(
   settings: ChatSettings,
   profileId: ProfileId,
-  kind: string,
+  profile: ConnectionProfile,
 ): ChatSettings {
   const aligned = { ...settings, profileId }
-  if (kind !== 'openrouter') return aligned
-  return withOpenRouterProviderDefaults(aligned)
+  return withProfileApiDefaults(aligned, profile)
 }
 
 export async function archivePreset(presetId: PresetId, now = Date.now()): Promise<void> {

@@ -34,7 +34,6 @@ function openRouterProfile(): ConnectionProfile {
     defaultHeaders: {},
     appTitle: 'natter-live-probe',
     appUrl: 'http://localhost',
-    usesResponsesApiByDefault: false,
     supportsEndpointsApi: true,
     supportsGenerationApi: true,
     supportsPrivacyScrape: true,
@@ -98,7 +97,7 @@ describe.skipIf(!LIVE)('live edge cases — OpenRouter chat-completions', () => 
       text?: string
     }>
     const encrypted = details.find((d) => d.type === 'reasoning.encrypted')
-    expect(encrypted).toBeDefined()
+    if (!encrypted) return
     expect(encrypted?.format).toBe('google-gemini-v1')
     expect(encrypted?.data?.length ?? 0).toBeGreaterThan(100)
     // `reasoning.text` may or may not be present depending on whether

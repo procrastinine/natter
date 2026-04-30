@@ -245,6 +245,39 @@ describe('toResponses — reasoning echo', () => {
     expect(reasoningItem).toEqual(echo)
   })
 
+  it('strips output-only status from echoed reasoning items', () => {
+    const echo: ResponsesOutputItem = {
+      type: 'reasoning',
+      id: 'rs_tmp_proxy',
+      status: 'completed',
+      format: 'openai-responses-v1',
+      encrypted_content: 'gAAA...blob',
+      summary: [{ type: 'summary_text', text: 'I thought about X' }],
+    }
+    const path: Message[] = [
+      user('u1', 'q'),
+      assistant('a1', 'answer', { responsesEchoItem: echo }),
+      user('u2', 'follow'),
+    ]
+    const { wire } = toResponses(
+      settings({
+        reasoning: {
+          mode: 'off',
+          exclude: false,
+          summary: 'off',
+          include: { encrypted: true, summary: true, text: false },
+        },
+      }),
+      path,
+    )
+    const items = wire.input as Array<{ type: string; [k: string]: unknown }>
+    expect(items.find((i) => i.type === 'reasoning')).toEqual({
+      type: 'reasoning',
+      encrypted_content: 'gAAA...blob',
+      summary: [{ type: 'summary_text', text: 'I thought about X' }],
+    })
+  })
+
   it('drops naked reasoning item when stripping leaves no carrier fields', () => {
     // With include.encrypted=false and no `summary` on the echo item,
     // stripping leaves `{type:'reasoning', id}` — an empty envelope the
@@ -449,10 +482,10 @@ describe('toResponses — include header', () => {
     expect(wire.include).toBeUndefined()
   })
 
-  it('respects responses.includeEncrypted override', () => {
+  it('keeps encrypted reasoning include independent of the store flag', () => {
     const { wire } = toResponses(
       settings({
-        responses: { includeEncrypted: false, store: false },
+        responses: { store: true },
         reasoning: {
           mode: 'enabled',
           effort: 'low',
@@ -464,7 +497,8 @@ describe('toResponses — include header', () => {
       [user('u1', 'hi')],
       { reasoningPreservationFormat: 'openai-responses-v1' },
     )
-    expect(wire.include).toBeUndefined()
+    expect(wire.include).toEqual(['reasoning.encrypted_content'])
+    expect(wire.store).toBe(true)
   })
 })
 

@@ -18,7 +18,6 @@ function makeProfile(overrides: Partial<ConnectionProfile> = {}): ConnectionProf
     defaultHeaders: {},
     appTitle: 'llm-api-frontend',
     appUrl: 'http://localhost:5173',
-    usesResponsesApiByDefault: false,
     supportsEndpointsApi: true,
     supportsGenerationApi: true,
     supportsPrivacyScrape: true,

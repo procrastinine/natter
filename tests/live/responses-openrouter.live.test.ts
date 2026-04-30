@@ -40,7 +40,6 @@ function profile(): ConnectionProfile {
     defaultHeaders: {},
     appTitle: 'natter-live-probe',
     appUrl: 'http://localhost',
-    usesResponsesApiByDefault: false,
     supportsEndpointsApi: true,
     supportsGenerationApi: true,
     supportsPrivacyScrape: true,

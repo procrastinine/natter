@@ -1,8 +1,8 @@
 /*
- * header.css — chat-title-bar (chat title + abort + cog) and the connection
- * header (its own collapsible bar above the chat-title-bar). The shell no
- * longer has a separate top-of-shell header row; both elements live inside
- * main-pane (see shell.css).
+ * header.css — chat-title-bar (chat title + actions + connection trigger)
+ * and the connection setup/editor surfaces. The shell no longer has a
+ * separate top-of-shell header row; these elements live inside main-pane
+ * (see shell.css).
  * Owns: [data-ui='chat-title*' | 'settings-cog' | 'abort' | 'connection-*'].
  * See plan/10-ui.md §10.3.
  */
@@ -18,6 +18,63 @@
   gap: var(--space-2);
   min-width: 0;
   flex: 1 1 auto;
+}
+
+[data-ui="connection-title-entry"] {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+}
+
+[data-ui="connection-provider-button"] {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  background: var(--color-bg-surface-1);
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  color: var(--color-fg-secondary);
+  cursor: pointer;
+}
+
+[data-ui="connection-provider-button"]:hover,
+[data-ui="connection-provider-button"][aria-expanded="true"] {
+  background: var(--color-bg-hover);
+  border-color: var(--color-border-subtle);
+  color: var(--color-fg-primary);
+}
+
+[data-ui="connection-provider-button"][data-kind="openrouter"] {
+  color: #94a3b8;
+}
+
+[data-ui="connection-provider-button"][data-kind="openai-compatible"] {
+  color: #0f172a;
+}
+
+[data-theme="dark"] [data-ui="connection-provider-button"][data-kind="openai-compatible"] {
+  color: #f8fafc;
+}
+
+[data-ui="connection-provider-button"][data-kind="anthropic"] {
+  color: #d97757;
+}
+
+[data-ui="connection-provider-button"][data-kind="google"] {
+  color: #8e75b2;
+}
+
+[data-ui="connection-provider-button"][data-kind="llama-server"] {
+  color: #ff8236;
+}
+
+[data-ui="connection-provider-button"][data-kind="custom"] {
+  color: #64748b;
 }
 
 [data-ui="chat-title-label"] {
@@ -319,10 +376,9 @@
 /* ─────────────────────────────────────────────────────────────────────────
  * Connection header
  *
- * Collapsible bar that lives at the very top of the main pane, ABOVE the
- * chat title row. Carries credentials/profile state (it's a connection
- * concern, not a per-chat one) so the user can browse history regardless of
- * whether a key is configured.
+ * With no profiles, only a small Add connection action is shown. Once a
+ * connection exists, the viewer/editor panel is disclosed from the provider
+ * icon beside the active chat title.
  *
  * Collapsed: thin row with chevron + provider + name + host + status.
  * Expanded: thin row + a stacked detail block (viewer / editor) below it.
@@ -336,6 +392,33 @@
   border-bottom: 1px solid var(--color-border-subtle);
   color: var(--color-fg-secondary);
   font-size: var(--font-size-sm);
+}
+
+[data-ui="connection-empty-action"] {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  padding: var(--space-2) var(--space-4);
+}
+
+[data-ui="connection-title-entry"] > [data-ui="connection-header"][data-variant="popover"] {
+  position: absolute;
+  top: calc(100% + var(--space-2));
+  left: 0;
+  z-index: var(--z-dropdown);
+  width: min(560px, calc(100vw - var(--space-8)));
+  max-height: calc(100vh - var(--header-height) - var(--space-8));
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-lg);
+  overflow: hidden;
+}
+
+[data-ui="connection-title-entry"]
+  > [data-ui="connection-header"][data-variant="popover"]
+  [data-ui="connection-detail"] {
+  max-height: calc(100vh - var(--header-height) - 72px);
+  overflow-y: auto;
 }
 
 [data-ui="connection-row"] {
@@ -355,14 +438,6 @@
 
 [data-ui="connection-row"]:hover {
   background: var(--color-bg-hover);
-}
-
-[data-ui="connection-header"][data-state="unset"] [data-ui="connection-row"] {
-  cursor: default;
-}
-
-[data-ui="connection-header"][data-state="unset"] [data-ui="connection-row"]:hover {
-  background: transparent;
 }
 
 [data-ui="connection-chevron"] {
@@ -408,20 +483,10 @@
   background: var(--color-warning);
 }
 
-[data-ui="connection-status-dot"][data-state="unset"] {
-  background: var(--color-fg-muted);
-}
-
 [data-ui="connection-status-text"] {
   color: var(--color-fg-muted);
   font-size: var(--font-size-xs);
   font-variant-numeric: tabular-nums;
-}
-
-[data-ui="connection-empty"] {
-  color: var(--color-fg-muted);
-  font-style: italic;
-  flex: 1 1 auto;
 }
 
 [data-ui="connection-add"] {

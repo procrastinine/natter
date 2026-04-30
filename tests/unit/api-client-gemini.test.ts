@@ -20,7 +20,6 @@ function profile(overrides: Partial<ConnectionProfile> = {}): ConnectionProfile 
     defaultHeaders: {},
     appTitle: 'natter',
     appUrl: 'http://localhost:5173',
-    usesResponsesApiByDefault: false,
     supportsEndpointsApi: false,
     supportsGenerationApi: false,
     supportsPrivacyScrape: false,

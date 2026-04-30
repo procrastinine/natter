@@ -176,7 +176,6 @@ describe('resolveBundledCapability', () => {
         defaultHeaders: {},
         appTitle: '',
         appUrl: '',
-        usesResponsesApiByDefault: false,
         supportsEndpointsApi: false,
         supportsGenerationApi: false,
         supportsPrivacyScrape: false,
@@ -200,7 +199,6 @@ describe('resolveBundledCapability', () => {
         defaultHeaders: {},
         appTitle: '',
         appUrl: '',
-        usesResponsesApiByDefault: true,
         supportsEndpointsApi: false,
         supportsGenerationApi: false,
         supportsPrivacyScrape: false,
@@ -232,7 +230,6 @@ describe('resolveBundledCapability', () => {
         defaultHeaders: {},
         appTitle: '',
         appUrl: '',
-        usesResponsesApiByDefault: false,
         supportsEndpointsApi: false,
         supportsGenerationApi: false,
         supportsPrivacyScrape: false,
@@ -256,7 +253,6 @@ describe('resolveBundledCapability', () => {
         defaultHeaders: {},
         appTitle: '',
         appUrl: '',
-        usesResponsesApiByDefault: false,
         supportsEndpointsApi: false,
         supportsGenerationApi: false,
         supportsPrivacyScrape: false,
@@ -270,7 +266,7 @@ describe('resolveBundledCapability', () => {
     expect(cap.maxCompletionTokens).toBe(8192)
   })
 
-  it('does not advertise unsupported reasoning controls on Google direct', () => {
+  it('advertises Gemini thinking without exposing OpenAI reasoning on Google direct', () => {
     const cap = resolveBundledCapability(
       {
         id: 'p',
@@ -281,7 +277,6 @@ describe('resolveBundledCapability', () => {
         defaultHeaders: {},
         appTitle: '',
         appUrl: '',
-        usesResponsesApiByDefault: false,
         supportsEndpointsApi: false,
         supportsGenerationApi: false,
         supportsPrivacyScrape: false,
@@ -291,7 +286,7 @@ describe('resolveBundledCapability', () => {
       'gemini-2.5-flash',
     )
     expect(cap.supportedParameters).not.toContain('reasoning')
-    expect(cap.supportedParameters).not.toContain('thinking')
+    expect(cap.supportedParameters).toContain('thinking')
   })
 })
 

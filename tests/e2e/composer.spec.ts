@@ -32,6 +32,66 @@ test('empty composer input does not show a vertical scrollbar', async ({ page })
   expect(metrics.scrollHeight).toBeLessThanOrEqual(metrics.clientHeight + 1)
 })
 
+test('composer sections square off internal corners and match divider strength', async ({
+  page,
+}) => {
+  const closedMetrics = await page.locator('[data-ui="composer-body"]').evaluate((el) => {
+    const body = el as HTMLElement
+    const input = body.querySelector('[data-ui="composer-input"]') as HTMLElement
+    const actions = body.querySelector('[data-ui="composer-actions"]') as HTMLElement
+    const bodyStyle = getComputedStyle(body)
+    const inputStyle = getComputedStyle(input)
+    const actionsStyle = getComputedStyle(actions)
+    return {
+      bodyTopLeftRadius: bodyStyle.borderTopLeftRadius,
+      bodyTopRightRadius: bodyStyle.borderTopRightRadius,
+      inputTopLeftRadius: inputStyle.borderTopLeftRadius,
+      inputTopRightRadius: inputStyle.borderTopRightRadius,
+      inputBottomLeftRadius: inputStyle.borderBottomLeftRadius,
+      inputBottomRightRadius: inputStyle.borderBottomRightRadius,
+      bodyBorderTopColor: bodyStyle.borderTopColor,
+      bodyBorderTopWidth: bodyStyle.borderTopWidth,
+      actionsBorderTopColor: actionsStyle.borderTopColor,
+      actionsBorderTopWidth: actionsStyle.borderTopWidth,
+    }
+  })
+
+  expect(closedMetrics.inputTopLeftRadius).toBe(closedMetrics.bodyTopLeftRadius)
+  expect(closedMetrics.inputTopRightRadius).toBe(closedMetrics.bodyTopRightRadius)
+  expect(closedMetrics.inputBottomLeftRadius).toBe('0px')
+  expect(closedMetrics.inputBottomRightRadius).toBe('0px')
+  expect(closedMetrics.actionsBorderTopColor).toBe(closedMetrics.bodyBorderTopColor)
+  expect(closedMetrics.actionsBorderTopWidth).toBe(closedMetrics.bodyBorderTopWidth)
+
+  await page.locator('[data-ui="composer-prefill-toggle"]').click()
+
+  const openMetrics = await page.locator('[data-ui="composer-body"]').evaluate((el) => {
+    const body = el as HTMLElement
+    const prefill = body.querySelector('[data-ui="composer-prefill"]') as HTMLElement
+    const actions = body.querySelector('[data-ui="composer-actions"]') as HTMLElement
+    const bodyStyle = getComputedStyle(body)
+    const prefillStyle = getComputedStyle(prefill)
+    const actionsStyle = getComputedStyle(actions)
+    return {
+      prefillTopLeftRadius: prefillStyle.borderTopLeftRadius,
+      prefillTopRightRadius: prefillStyle.borderTopRightRadius,
+      prefillBorderTopColor: prefillStyle.borderTopColor,
+      prefillBorderTopWidth: prefillStyle.borderTopWidth,
+      actionsBorderTopColor: actionsStyle.borderTopColor,
+      actionsBorderTopWidth: actionsStyle.borderTopWidth,
+      bodyBorderTopColor: bodyStyle.borderTopColor,
+      bodyBorderTopWidth: bodyStyle.borderTopWidth,
+    }
+  })
+
+  expect(openMetrics.prefillTopLeftRadius).toBe('0px')
+  expect(openMetrics.prefillTopRightRadius).toBe('0px')
+  expect(openMetrics.prefillBorderTopColor).toBe(openMetrics.bodyBorderTopColor)
+  expect(openMetrics.prefillBorderTopWidth).toBe(openMetrics.bodyBorderTopWidth)
+  expect(openMetrics.actionsBorderTopColor).toBe(openMetrics.bodyBorderTopColor)
+  expect(openMetrics.actionsBorderTopWidth).toBe(openMetrics.bodyBorderTopWidth)
+})
+
 test('send button enables on non-empty input', async ({ page }) => {
   await page.locator('[data-ui="composer-input"]').fill('x')
   await expect(page.locator('[data-ui="send"]')).toBeEnabled()

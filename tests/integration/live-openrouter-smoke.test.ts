@@ -44,7 +44,6 @@ function liveProfile(): ConnectionProfile {
     defaultHeaders: {},
     appTitle: 'natter-phase-7-smoke',
     appUrl: 'http://localhost:5173',
-    usesResponsesApiByDefault: false,
     supportsEndpointsApi: true,
     supportsGenerationApi: true,
     supportsPrivacyScrape: true,

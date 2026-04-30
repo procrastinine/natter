@@ -9,10 +9,9 @@
 // function is safe to call from memoized selectors.
 //
 // Inputs
-//   - `profile`: a ConnectionProfile; the transport depends on `kind` +
-//     `geminiMode` + `usesResponsesApiByDefault`.
+//   - `profile`: a ConnectionProfile; it supplies endpoint identity only.
 //   - `settings`: the effective ChatSettings for this turn. The user's
-//     explicit `settings.api` pin wins over every model-derived heuristic.
+//     explicit `settings.api` pin owns direct-provider transport modes.
 //   - `path`: the active branch (root → leaf). Checked for prior Responses-
 //     API artifacts (e.g. encrypted reasoning, server-tool outputs) that
 //     would be lost on chat-completions.
@@ -85,13 +84,22 @@ export function chooseApi(
   }
   if (
     profile.kind === 'google' &&
-    profile.geminiMode !== 'openai-compat' &&
+    settings.api !== 'chat' &&
     hasEnabledHostedTools(settings, 'google')
   ) {
     return geminiNative('Gemini native required for Google hosted tools')
   }
+  if (profile.kind === 'google') {
+    if (pin === 'chat') return openAiChat('user pinned Gemini OpenAI-compat')
+    return geminiNative(
+      pin === 'gemini-native' ? 'user pinned Gemini native' : 'Gemini native (generateContent)',
+    )
+  }
   if (profile.kind === 'anthropic') {
-    return anthropicMessages('Anthropic Messages API')
+    if (pin === 'chat') return openAiChat('user pinned Anthropic OpenAI-compat')
+    return anthropicMessages(
+      pin === 'anthropic-messages' ? 'user pinned Anthropic Messages' : 'Anthropic Messages API',
+    )
   }
 
   // Step 1 — user-pinned chat completions. Wins over everything EXCEPT a
@@ -106,7 +114,7 @@ export function chooseApi(
   }
 
   // Step 2 — user-pinned responses. Wins over everything except connection
-  // kinds that have no Responses surface (Gemini native, Anthropic Messages).
+  // kinds that have no Responses surface.
   if (pin === 'responses' && canRunResponses(profile)) {
     return openAiResponses('user pinned Responses')
   }
@@ -141,19 +149,7 @@ export function chooseApi(
     return openAiResponses('prior encrypted reasoning requires Responses to round-trip')
   }
 
-  // Step 7 — Gemini native unless the user explicitly opted into the compat
-  // shim. The pin already handled `responses`/`chat` overrides above; this
-  // step is the Gemini-kind default.
-  if (profile.kind === 'google' && profile.geminiMode !== 'openai-compat') {
-    return geminiNative('Gemini native (generateContent)')
-  }
-
-  // Step 9 — profile default (OpenAI direct sets this true).
-  if (profile.usesResponsesApiByDefault && canRunResponses(profile)) {
-    return openAiResponses('profile default is Responses')
-  }
-
-  // Step 10 — OpenRouter default for OpenAI-family models. Per user
+  // Step 9 — OpenRouter default for OpenAI-family models. Per user
   // directive: on an OpenRouter connection, default to Responses whenever
   // the model is an OpenAI-family model that supports Responses. Non-OpenAI
   // models (Claude, Gemini, DeepSeek, etc.) stay on chat-completions since
@@ -162,7 +158,7 @@ export function chooseApi(
     return openAiResponses('OpenRouter: OpenAI-family model defaults to Responses')
   }
 
-  // Step 11 — default.
+  // Step 10 — default.
   return openAiChat('default (chat completions)')
 }
 
@@ -264,8 +260,8 @@ export function isTextCompletionsCapable(profile: ConnectionProfile, modelId: st
   return canRunTextCompletions(profile, modelId)
 }
 
-export function isGeminiNative(profile: ConnectionProfile): boolean {
-  return profile.kind === 'google' && profile.geminiMode !== 'openai-compat'
+export function isGeminiNative(profile: ConnectionProfile, settings: ChatSettings): boolean {
+  return profile.kind === 'google' && settings.api !== 'chat'
 }
 
 // Short explanation suitable for a UI tooltip.
@@ -282,9 +278,6 @@ export function responsesExplanationFor(
   }
   if (profile.kind === 'openrouter' && route.kind === 'responses') {
     return 'OpenRouter’s /responses beta proxy. Item ids are rewritten; keep a chat on this route for best results.'
-  }
-  if (profile.kind === 'openai-compatible' && profile.usesResponsesApiByDefault) {
-    return 'OpenAI direct: the Responses API is the default transport.'
   }
   return 'Responses API: preserves encrypted reasoning and multi-item output (phase, server tools).'
 }

@@ -36,7 +36,6 @@ function makeProfile(): ConnectionProfile {
     defaultHeaders: {},
     appTitle: 'natter',
     appUrl: '',
-    usesResponsesApiByDefault: false,
     supportsEndpointsApi: true,
     supportsGenerationApi: true,
     supportsPrivacyScrape: true,
@@ -52,7 +51,6 @@ function makeOpenAiProfile(): ConnectionProfile {
     name: 'OpenAI direct',
     kind: 'openai-compatible',
     baseUrl: 'https://api.openai.com/v1',
-    usesResponsesApiByDefault: true,
     supportsEndpointsApi: false,
     supportsGenerationApi: false,
     supportsPrivacyScrape: false,
@@ -66,11 +64,9 @@ function makeGoogleProfile(): ConnectionProfile {
     name: 'Google',
     kind: 'google',
     baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
-    usesResponsesApiByDefault: false,
     supportsEndpointsApi: false,
     supportsGenerationApi: false,
     supportsPrivacyScrape: false,
-    geminiMode: 'native',
   }
 }
 
@@ -81,7 +77,6 @@ function makeAnthropicProfile(): ConnectionProfile {
     name: 'Anthropic',
     kind: 'anthropic',
     baseUrl: 'https://api.anthropic.com/v1',
-    usesResponsesApiByDefault: false,
     supportsEndpointsApi: false,
     supportsGenerationApi: false,
     supportsPrivacyScrape: false,
@@ -499,7 +494,7 @@ describe('resolveRequestPrivacyPlan', () => {
     const chat = makeChat({
       profileId: profile.id,
       model: 'google/gemini-3.1-flash-lite-preview',
-      api: 'chat',
+      api: 'gemini-native',
       tools: {
         ...tools,
         google: {
@@ -534,7 +529,7 @@ describe('resolveRequestPrivacyPlan', () => {
     const chat = makeChat({
       profileId: profile.id,
       model: 'claude-haiku-4.5',
-      api: 'chat',
+      api: 'anthropic-messages',
       ...anthropicTools({
         enabledServerToolIds: ['web-search', 'web-fetch'],
         toolChoice: 'required',
@@ -679,7 +674,7 @@ describe('resolveRequestPrivacyPlan', () => {
       {
         name: 'openai',
         profile: makeOpenAiProfile(),
-        settings: { profileId: 'prof-openai', model: 'gpt-5.4-nano' },
+        settings: { profileId: 'prof-openai', model: 'gpt-5.4-nano', api: 'responses' },
         nativeNeedle: '"code_interpreter_call"',
       },
       {
@@ -688,13 +683,18 @@ describe('resolveRequestPrivacyPlan', () => {
         settings: {
           profileId: 'prof-google',
           model: 'google/gemini-3.1-flash-lite-preview',
+          api: 'gemini-native',
         },
         nativeNeedle: '"executableCode"',
       },
       {
         name: 'anthropic',
         profile: makeAnthropicProfile(),
-        settings: { profileId: 'prof-anthropic', model: 'anthropic/claude-haiku-4.5' },
+        settings: {
+          profileId: 'prof-anthropic',
+          model: 'anthropic/claude-haiku-4.5',
+          api: 'anthropic-messages',
+        },
         nativeNeedle: '"server_tool_use"',
       },
     ] as const

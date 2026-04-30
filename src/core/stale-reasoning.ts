@@ -65,7 +65,7 @@ export function staleReasoningBannerText(provider: StaleReasoningProvider): stri
     return 'The model rejected preserved reasoning from an earlier turn. This can happen after editing history or switching model families.'
   }
   if (provider === 'gemini') {
-    return "Gemini rejected a turn that was missing a thoughtSignature. This can happen on imported chats or after switching the connection's Gemini mode."
+    return 'Gemini rejected a turn that was missing a thoughtSignature. This can happen on imported chats or after switching API mode.'
   }
   return 'The model rejected a request carrying preserved reasoning. This can happen after editing history or switching model families.'
 }

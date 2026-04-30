@@ -823,6 +823,10 @@ async function openConnectionDetail(page: Page): Promise<void> {
   const detailAction = page.locator('[data-ui="connection-new"]')
   if (await detailAction.isVisible()) return
   const row = page.locator('[data-ui="connection-row"]')
+  if ((await row.count()) === 0) {
+    await page.locator('[data-ui="connection-provider-button"]').click()
+    await expect(row).toBeVisible()
+  }
   if ((await row.getAttribute('aria-expanded')) !== 'true') {
     await row.click()
   }

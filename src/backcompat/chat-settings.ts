@@ -107,6 +107,13 @@ export function migrateCurrentChatSettingsSnapshot(
   next.reasoning = mergeReasoning(defaults.reasoning, migratedRaw.reasoning)
   next.tools = mergeToolSettings(defaults.tools, migratedRaw.tools)
   next.toolCallContext = mergeObject(defaults.toolCallContext, migratedRaw.toolCallContext)
+  next.responses = normalizeResponsesSettings(defaults.responses ?? { store: false }, migratedRaw.responses)
+  const gemini = normalizeGeminiSettings(migratedRaw.gemini)
+  if (gemini) {
+    next.gemini = gemini
+  } else {
+    delete next.gemini
+  }
 
   const changed =
     toolResult.changed ||
@@ -200,6 +207,26 @@ function mergeToolSettings(
     anthropic: mergeObject(defaults.anthropic, tools.anthropic),
     google: mergeObject(defaults.google, tools.google),
   }
+}
+
+function normalizeResponsesSettings(
+  defaults: NonNullable<ChatSettings['responses']>,
+  raw: unknown,
+): NonNullable<ChatSettings['responses']> {
+  const source = isRecord(raw) ? raw : {}
+  return {
+    ...defaults,
+    store: source.store === true,
+  }
+}
+
+function normalizeGeminiSettings(raw: unknown): ChatSettings['gemini'] | undefined {
+  if (!isRecord(raw)) return undefined
+  const cachedContentName =
+    typeof raw.cachedContentName === 'string' && raw.cachedContentName.length > 0
+      ? raw.cachedContentName
+      : undefined
+  return cachedContentName ? { cachedContentName } : undefined
 }
 
 function mergeObject<T extends object>(defaults: T, raw: unknown): T {
