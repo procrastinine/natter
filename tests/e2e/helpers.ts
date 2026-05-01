@@ -115,14 +115,13 @@ export async function seedFirstRun(page: Page, opts: SeedOptions = {}): Promise<
   )
 }
 
-// Navigate to the blank-chat surface (`#/new`) and wait for its temporary
-// chat row to materialize. The row owns draft settings while active, stays
-// hidden from the sidebar until first send, and is discarded if the user
-// navigates away without messages.
+// Navigate to the blank-chat surface (`#/new`) and wait for the composer.
+// A no-op visit stays IDB-cold; sending/importing/settings materializes
+// a chat row only when needed.
 export async function createChatAndOpen(page: Page): Promise<void> {
   await page.locator('[data-role="new-chat"]').click()
   await page.locator('[data-ui="composer"]').waitFor({ state: 'visible' })
-  await page.waitForFunction(() => /^#\/chat\//.test(window.location.hash))
+  await page.waitForFunction(() => window.location.hash === '#/new')
 }
 
 export async function sendMessage(page: Page, text: string): Promise<void> {

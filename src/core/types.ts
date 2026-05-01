@@ -649,8 +649,9 @@ export interface Chat {
   tags: TagId[]
   favoriteModels?: string[]
   recentModels?: string[]
-  // Temporary rows back the active `#/new` draft so settings edits have a real
-  // chat owner. If they never receive messages, they are discarded on navigation.
+  // Temporary rows exist only after `#/new` needs a real chat owner for
+  // send/import/settings. If they never receive messages, they are discarded
+  // on navigation.
   temporary?: boolean
   // Denormalized sidebar preview: plaintext of the earliest live user
   // message, trimmed to a generous single-line cap. Populated by `refreshChatPreview`

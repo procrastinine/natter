@@ -88,35 +88,33 @@ describe('shell smoke render', () => {
     expect(container.querySelector('[data-ui="sidebar"]')).toBeInTheDocument()
   })
 
-  it('discards temporary new-chat rows after navigating away without messages', async () => {
+  it('keeps no-op new-chat visits out of IndexedDB', async () => {
     window.location.hash = '#/new'
 
-    render(<App />)
+    const { container } = render(<App />)
 
     await waitFor(() => {
-      expect(window.location.hash).toMatch(/^#\/chat\//)
+      expect(container.querySelector('[data-ui="composer"]')).toBeInTheDocument()
     })
-    const [temporary] = await getDb().chats.toArray()
-    expect(temporary?.temporary).toBe(true)
+    expect(window.location.hash).toBe('#/new')
+    expect(await getDb().chats.count()).toBe(0)
     expect(await getDb().messages.count()).toBe(0)
 
-    const firstId = temporary?.id
     window.location.hash = '#/new'
     window.dispatchEvent(new HashChangeEvent('hashchange'))
 
-    await waitFor(async () => {
-      const rows = await getDb().chats.toArray()
-      expect(rows).toHaveLength(1)
-      expect(rows[0]?.id).not.toBe(firstId)
-      expect(rows[0]?.temporary).toBe(true)
+    await waitFor(() => {
+      expect(container.querySelector('[data-ui="composer"]')).toBeInTheDocument()
     })
+    expect(await getDb().chats.count()).toBe(0)
 
     window.location.hash = '#/'
     window.dispatchEvent(new HashChangeEvent('hashchange'))
 
-    await waitFor(async () => {
-      expect(await getDb().chats.count()).toBe(0)
+    await waitFor(() => {
+      expect(window.location.hash).toBe('#/')
     })
+    expect(await getDb().chats.count()).toBe(0)
   })
 
   it('updates lastViewedAt when a chat route opens', async () => {

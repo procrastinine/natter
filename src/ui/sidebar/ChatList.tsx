@@ -552,13 +552,9 @@ export const ChatList = memo(function ChatList({ activeChatId, collapsed }: Chat
       document.removeEventListener('keydown', closeOnEscape)
     }
   }, [sortMenuOpen])
-  // Hide empty drafts — even the currently-active one. The /new surface
-  // eagerly materializes a chat row so the right-hand settings panel has
-  // something to edit, but the sidebar should stay quiet until the user
-  // actually sends the first message. An earlier `chat.id === activeChatId`
-  // escape-hatch surfaced every eager chat as an "Untitled chat" row the
-  // moment the user clicked New chat, violating the "rows materialize on
-  // first send" contract (see tests/e2e/sidebar.spec.ts).
+  // Hide empty drafts — even the currently-active one. A temporary row can
+  // exist after /new send/import/settings starts, but the sidebar should stay
+  // quiet until the user actually creates a message.
   const handleDelete = useCallback(
     async (chat: ChatSidebarRow) => {
       await archiveChat(chat.id)

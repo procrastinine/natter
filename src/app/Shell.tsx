@@ -439,37 +439,6 @@ export function Shell() {
     }
   }, [])
 
-  // Materialize a temporary chat when the user lands on /new. This gives the
-  // active draft real chat-owned settings, but cleanup above discards it once
-  // the user navigates away without ever creating messages.
-  useEffect(() => {
-    if (!onNewChatSurface) return
-    const abort = new AbortController()
-    const aborted = () => abort.signal.aborted
-    void (async () => {
-      const { preset, settings } = await resolveNewChatSeed()
-      if (aborted()) return
-      writeActiveSeedState({
-        profileId: settings.profileId || null,
-        presetId: preset?.id ?? null,
-        settings,
-      })
-      const chat = await createChat({
-        settings,
-        temporary: true,
-        ...(preset ? { presetId: preset.id } : {}),
-      })
-      if (aborted()) {
-        void discardEmptyDraftChat(chat.id)
-        return
-      }
-      navigateToChat(chat.id)
-    })()
-    return () => {
-      abort.abort()
-    }
-  }, [onNewChatSurface, resolveNewChatSeed])
-
   useEffect(() => {
     applyThemeToDocument(prefs.theme)
   }, [prefs.theme])
@@ -977,8 +946,8 @@ export function Shell() {
               </>
             ) : onNewChatSurface ? (
               <>
-                {/* The new-chat surface still gets a chat-title-bar so the cog
-                 * can open the model panel against the temporary chat row. */}
+                {/* The new-chat surface stays IDB-cold until send/import/settings
+                 * needs a row. */}
                 <div data-ui="chat-title-bar">
                   <ConnectionHeader variant="title-icon" />
                   <span data-ui="chat-title" data-title-status="untitled">
