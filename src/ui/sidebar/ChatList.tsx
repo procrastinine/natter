@@ -6,6 +6,7 @@ import {
 } from '@tanstack/react-virtual'
 import { useLiveQuery } from 'dexie-react-hooks'
 import {
+  type ChangeEvent,
   type DragEvent,
   memo,
   type ReactNode,
@@ -15,7 +16,7 @@ import {
   useRef,
   useState,
 } from 'react'
-import { chatHref, makeAnchorClickHandler, navigateHome } from '../../app/router'
+import { chatHref, makeAnchorClickHandler, navigateHome, navigateToChat } from '../../app/router'
 import { exportLastUpdatedChatAsTxt, triggerBrowserDownload } from '../../core/chat-export'
 import { DEFAULT_GLOBAL_PREFERENCES, readGlobalPreferences } from '../../core/global-settings'
 import {
@@ -39,6 +40,7 @@ import {
   setChatTagsFromNames,
 } from '../../store/chats'
 import { createFolder, deleteFolder, listFolders, updateFolder } from '../../store/folders'
+import { exportChat, importChat } from '../../store/import-export'
 import { abortSearchSession, requestSearchSession } from '../../store/search-session'
 import {
   readCollapsedSidebarFolderIds,
@@ -48,10 +50,12 @@ import {
 } from '../../store/sidebar-preferences'
 import { listTags } from '../../store/tags'
 import { startSearchStoreBroadcastListener, useSearchStore } from '../../store/zustand/searchStore'
+import { useToastStore } from '../../store/zustand/toastStore'
 import {
   ChevronIcon,
   CloseIcon,
   DownloadIcon,
+  FileIcon,
   FolderIcon,
   MoreVerticalIcon,
   PencilIcon,
@@ -60,7 +64,14 @@ import {
   SortIcon,
   TagIcon,
   TrashIcon,
+  UploadIcon,
 } from '../icons/Icon'
+import {
+  importExportErrorMessage,
+  natterJsonFilename,
+  readJsonOrZipFile,
+  triggerJsonDownload,
+} from '../import-export/json-file'
 import {
   buildCreatedAtGroups,
   buildSidebarEntries,
@@ -263,6 +274,7 @@ export const ChatList = memo(function ChatList({ activeChatId, collapsed }: Chat
   const [sortMode, setSortMode] = useState<SidebarSortMode>(DEFAULT_SIDEBAR_SORT_MODE)
   const [sortMenuOpen, setSortMenuOpen] = useState(false)
   const [openActionChatId, setOpenActionChatId] = useState<ChatId | null>(null)
+  const [importingChat, setImportingChat] = useState(false)
   const [collapsedFolderIds, setCollapsedFolderIds] = useState<ReadonlySet<FolderId>>(
     () => new Set(),
   )
@@ -284,10 +296,12 @@ export const ChatList = memo(function ChatList({ activeChatId, collapsed }: Chat
   const recentMoveTimerRef = useRef<number | null>(null)
   const sortMenuRef = useRef<HTMLDivElement | null>(null)
   const sidebarOrganizerRef = useRef<HTMLDivElement | null>(null)
+  const chatImportInputRef = useRef<HTMLInputElement | null>(null)
   const sidebarWindowLoadRef = useRef<HTMLLIElement | null>(null)
   const preserveSearchExpansionRef = useRef(false)
   const rowMenuButtonRefs = useRef(new Map<ChatId, HTMLButtonElement>())
   const searchSession = useSearchStore((state) => state.session)
+  const pushToast = useToastStore((s) => s.push)
   const sortLocale = useMemo(
     () => (typeof navigator === 'undefined' ? 'en-US' : navigator.language),
     [],
@@ -566,6 +580,41 @@ export const ChatList = memo(function ChatList({ activeChatId, collapsed }: Chat
     const { filename, content } = await exportLastUpdatedChatAsTxt(chat.id)
     triggerBrowserDownload(filename, content)
   }, [])
+  const handleExportJson = useCallback(async (chat: ChatSidebarRow) => {
+    const envelope = await exportChat(chat.id)
+    triggerJsonDownload(natterJsonFilename('chat', chat.title, chat.id), envelope)
+  }, [])
+  const handleImportChatFile = useCallback(
+    async (event: ChangeEvent<HTMLInputElement>) => {
+      const input = event.currentTarget
+      const file = input.files?.[0] ?? null
+      input.value = ''
+      if (!file) return
+      setImportingChat(true)
+      try {
+        const values = await readJsonOrZipFile(file)
+        let importedCount = 0
+        let lastChatId: ChatId | null = null
+        for (const value of values) {
+          const result = await importChat(value)
+          importedCount += 1
+          lastChatId = result.chatId
+        }
+        pushToast({
+          level: 'success',
+          text: importedCount === 1 ? 'Imported chat.' : `Imported ${importedCount} chats.`,
+          durationMs: 2500,
+        })
+        if (lastChatId) navigateToChat(lastChatId)
+      } catch (error) {
+        console.error('Failed to import chat JSON/ZIP', error)
+        pushToast({ level: 'danger', text: importExportErrorMessage(error) })
+      } finally {
+        setImportingChat(false)
+      }
+    },
+    [pushToast],
+  )
   const handleCreateFolder = useCallback(async () => {
     const name = window.prompt('Folder name')
     if (!name?.trim()) return
@@ -900,6 +949,18 @@ export const ChatList = memo(function ChatList({ activeChatId, collapsed }: Chat
                   }}
                 >
                   <DownloadIcon size={14} />
+                  <span>Download</span>
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  data-ui="chat-row-export"
+                  onClick={() => {
+                    setOpenActionChatId(null)
+                    void handleExportJson(chat)
+                  }}
+                >
+                  <FileIcon size={14} />
                   <span>Export</span>
                 </button>
                 <button
@@ -1342,6 +1403,24 @@ export const ChatList = memo(function ChatList({ activeChatId, collapsed }: Chat
           <FolderIcon size={14} />
           <PlusIcon size={10} strokeWidth={2.4} />
         </button>
+        <button
+          type="button"
+          data-ui="sidebar-import-chat"
+          aria-label="Import chat JSON or ZIP"
+          title="Import chat JSON or ZIP"
+          disabled={importingChat}
+          onClick={() => chatImportInputRef.current?.click()}
+        >
+          <UploadIcon size={15} />
+        </button>
+        <input
+          ref={chatImportInputRef}
+          data-ui="sidebar-chat-import-input"
+          type="file"
+          accept="application/json,application/zip,.json,.zip"
+          hidden
+          onChange={(event) => void handleImportChatFile(event)}
+        />
         <div data-ui="sidebar-sort" ref={sortMenuRef}>
           <button
             type="button"

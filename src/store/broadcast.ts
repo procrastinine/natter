@@ -46,6 +46,7 @@ export type BroadcastEvent =
   | { kind: 'autotitle-completed'; chatId: ChatId; status: AutoTitleStatus }
   | { kind: 'key-rotated'; keyId: KeyId }
   | { kind: 'settings-mutated'; key: string }
+  | { kind: 'workspace-replaced' }
   | { kind: 'privacy-refreshed'; profileId: ProfileId; modelId: string }
   | { kind: 'models-refreshed'; profileId: ProfileId }
   | {

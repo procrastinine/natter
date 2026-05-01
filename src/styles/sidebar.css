@@ -378,7 +378,7 @@
 
 [data-ui="sidebar-org-toolbar"] {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 24px 24px;
+  grid-template-columns: minmax(0, 1fr) 24px 24px 24px;
   align-items: center;
   gap: var(--space-1);
   padding: var(--space-1) var(--space-3);

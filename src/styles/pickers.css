@@ -143,6 +143,7 @@
   display: flex;
   gap: var(--space-2);
   flex: 0 0 auto;
+  align-items: center;
 }
 
 [data-ui="preset-menu-footer"] {
@@ -151,6 +152,12 @@
   align-items: center;
   border-top: 1px solid var(--color-border-subtle);
   padding-top: var(--space-1);
+}
+
+[data-ui="preset-menu-footer-primary"] {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
 }
 
 /* ---------- Model picker ---------- */

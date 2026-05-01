@@ -62,7 +62,6 @@
 
 [data-ui="storage-overview"],
 [data-ui="storage-chats"],
-[data-ui="storage-backups"],
 [data-ui="archive-manager"] {
   padding: var(--space-5);
   display: flex;
@@ -145,6 +144,25 @@
   font-variant-numeric: tabular-nums;
 }
 
+[data-ui="storage-workspace-actions"] {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+[data-ui="storage-origin-note"] {
+  color: var(--color-fg-muted);
+  font-size: var(--font-size-xs);
+  line-height: var(--line-height-tight);
+}
+
+[data-ui="storage-usage-details"] {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+}
+
 [data-ui="storage-calibration-empty"] {
   color: var(--color-fg-muted);
   font-size: var(--font-size-sm);
@@ -189,7 +207,7 @@
 
 [data-ui="storage-chat-toolbar"] {
   display: grid;
-  grid-template-columns: minmax(220px, 1fr) auto auto;
+  grid-template-columns: minmax(220px, 1fr) auto auto auto;
   align-items: center;
   gap: var(--space-2);
 }
@@ -971,6 +989,17 @@
 
 [data-ui="storage-action"][data-tone="danger"] {
   color: var(--color-danger);
+}
+
+[data-ui="storage-chat-toolbar"] [data-ui="storage-action"] {
+  height: 34px;
+  padding: 0 var(--space-2);
+  font-size: var(--font-size-xs);
+}
+
+[data-ui="storage-chat-toolbar"] [data-ui="icon-button"] {
+  width: 34px;
+  height: 34px;
 }
 
 [data-ui="storage-global-calibration-item"] [data-ui="storage-action"] {

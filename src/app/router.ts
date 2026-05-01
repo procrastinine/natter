@@ -14,7 +14,7 @@
 //   #/storage/attachments/unreferenced → unreferenced attachment cleanup filter
 //   #/storage/attachments/<id>    → attachment details permalink
 //   #/storage/archive              → archived chats / trash
-//   #/storage/backups             → backup / restore / raw dump surface
+//   #/storage/backups             → legacy alias for the storage overview
 //
 // The hash form is intentional: it works on static hosts without server config
 // and matches plan/01-architecture.md. Cursor pins persist in per-tab Zustand

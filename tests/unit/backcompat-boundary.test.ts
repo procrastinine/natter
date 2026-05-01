@@ -3,7 +3,7 @@ import { join, relative, sep } from 'node:path'
 import { describe, expect, it } from 'vitest'
 
 const SRC_ROOT = join(process.cwd(), 'src')
-const ALLOWED_BACKCOMPAT_IMPORTERS = new Set(['store/db.ts'])
+const ALLOWED_BACKCOMPAT_IMPORTERS = new Set(['store/db.ts', 'store/import-export.ts'])
 const SOURCE_EXTENSIONS = new Set(['.ts', '.tsx'])
 
 describe('backcompat boundary', () => {

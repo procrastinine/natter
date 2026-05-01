@@ -21,10 +21,18 @@ import {
 } from '../../src/store/chats'
 import { __resetDbForTests, getDb } from '../../src/store/db'
 import { createFolder } from '../../src/store/folders'
+import { exportChat, exportWorkspaceBackup } from '../../src/store/import-export'
 import { __resetSearchSessionRunnerForTests } from '../../src/store/search-session'
 import { listTags } from '../../src/store/tags'
 import { __resetSearchStoreForTests } from '../../src/store/zustand/searchStore'
 import { StorageView } from '../../src/ui/storage/StorageView'
+import { jsonEntriesZipBlob } from '../../src/ui/import-export/json-file'
+
+const debugNukeMocks = vi.hoisted(() => ({
+  nukeSiteStorage: vi.fn<() => Promise<void>>(),
+}))
+
+vi.mock('../../src/lib/debug-nuke', () => debugNukeMocks)
 
 const DB_NAME = 'natter'
 const originalStorageDescriptor = Object.getOwnPropertyDescriptor(navigator, 'storage')
@@ -40,6 +48,39 @@ function bytes(content: string): Blob {
   return new Blob([new TextEncoder().encode(content)])
 }
 
+function mockBlobDownloads() {
+  const originalCreateObjectURL = URL.createObjectURL
+  const originalRevokeObjectURL = URL.revokeObjectURL
+  const createdBlobs: Blob[] = []
+  Object.defineProperty(URL, 'createObjectURL', {
+    configurable: true,
+    value: vi.fn((blob: Blob) => {
+      createdBlobs.push(blob)
+      return `blob:natter-${createdBlobs.length}`
+    }),
+  })
+  Object.defineProperty(URL, 'revokeObjectURL', {
+    configurable: true,
+    value: vi.fn(),
+  })
+  const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {})
+  return {
+    createdBlobs,
+    clickSpy,
+    restore() {
+      clickSpy.mockRestore()
+      Object.defineProperty(URL, 'createObjectURL', {
+        configurable: true,
+        value: originalCreateObjectURL,
+      })
+      Object.defineProperty(URL, 'revokeObjectURL', {
+        configurable: true,
+        value: originalRevokeObjectURL,
+      })
+    },
+  }
+}
+
 async function resetAll() {
   __resetBrowserRepositoryForTests()
   __resetBroadcastForTests()
@@ -53,8 +94,14 @@ describe('StorageView', () => {
   beforeEach(async () => {
     ;(globalThis as unknown as { indexedDB: IDBFactory }).indexedDB = new IDBFactory()
     await resetAll()
+    debugNukeMocks.nukeSiteStorage.mockReset()
+    debugNukeMocks.nukeSiteStorage.mockResolvedValue(undefined)
     setNavigatorStorage({
-      estimate: vi.fn<StorageManager['estimate']>().mockResolvedValue({ usage: 4096, quota: 8192 }),
+      estimate: vi.fn<StorageManager['estimate']>().mockResolvedValue({
+        usage: 4096,
+        quota: 8192,
+        usageDetails: { indexedDB: 1024, caches: 3072 },
+      } as StorageEstimate),
       persist: vi.fn<StorageManager['persist']>().mockResolvedValue(true),
       persisted: vi.fn<StorageManager['persisted']>().mockResolvedValue(false),
     })
@@ -85,7 +132,13 @@ describe('StorageView', () => {
       const titles = Array.from(container.querySelectorAll('[data-ui="storage-panel-title"]')).map(
         (node) => node.textContent,
       )
-      expect(titles).toEqual(['Mode', 'Space', 'Chats', 'Attachments', 'Global token calibration'])
+      expect(titles).toEqual([
+        'Mode',
+        'Origin space',
+        'Chats',
+        'Attachments',
+        'Global token calibration',
+      ])
       expect(
         container.querySelector('[data-ui="storage-panel"][href="#/storage/chats"]'),
       ).toHaveTextContent('1')
@@ -93,6 +146,10 @@ describe('StorageView', () => {
         container.querySelector('[data-ui="storage-panel"][href="#/storage/attachments"]'),
       ).toHaveTextContent('1 (5 B)')
       expect(container).toHaveTextContent('4.0 KB / 8.0 KB')
+      expect(container).toHaveTextContent('Browser-reported usage / quota')
+      expect(container).toHaveTextContent('Includes all storage for this browser origin')
+      expect(container).toHaveTextContent('IndexedDB')
+      expect(container).toHaveTextContent('Cache API')
       expect(container).toHaveTextContent('0 families')
       expect(
         container.querySelector('[data-ui="storage-panel-row"][data-role="calibration"]'),
@@ -100,10 +157,75 @@ describe('StorageView', () => {
     })
     expect(screen.queryByLabelText('Token calibration mode')).not.toBeInTheDocument()
     expect(container).toHaveTextContent('Request persistence')
+    expect(screen.getByRole('button', { name: 'Export all' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Import all' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Clear all' })).toBeInTheDocument()
+    expect(container.querySelector('[aria-label="Backups"]')).not.toBeInTheDocument()
     expect(container).not.toHaveTextContent('All attachments')
     expect(container).not.toHaveTextContent('Missing')
     expect(container).not.toHaveTextContent('Unreferenced')
     expect(container).not.toHaveTextContent('Archive')
+  })
+
+  it('runs the local data wipe from the overview clear-all action', async () => {
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    render(<StorageView route={{ section: 'overview' }} />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Clear all' }))
+
+    await waitFor(() => {
+      expect(debugNukeMocks.nukeSiteStorage).toHaveBeenCalledTimes(1)
+    })
+    expect(confirmSpy).toHaveBeenCalledWith(
+      expect.stringContaining('Clear all local Natter data for this browser origin?'),
+    )
+  })
+
+  it('exports a full workspace backup from the overview', async () => {
+    await createChat({ id: 'chat-alpha', title: 'Alpha' })
+    const downloads = mockBlobDownloads()
+    try {
+      render(<StorageView route={{ section: 'overview' }} />)
+
+      fireEvent.click(await screen.findByRole('button', { name: 'Export all' }))
+
+      await waitFor(() => expect(downloads.clickSpy).toHaveBeenCalled())
+      expect(downloads.createdBlobs).toHaveLength(1)
+      expect(downloads.createdBlobs[0]?.type).toBe('application/json;charset=utf-8')
+      const exported = JSON.parse(await (downloads.createdBlobs[0] as Blob).text()) as {
+        objectKind: string
+        payload: { chats: unknown[] }
+      }
+      expect(exported.objectKind).toBe('workspace-backup')
+      expect(exported.payload.chats).toHaveLength(1)
+    } finally {
+      downloads.restore()
+    }
+  })
+
+  it('imports a full workspace backup from the overview and replaces the database', async () => {
+    await createChat({ id: 'chat-alpha', title: 'Alpha' })
+    const backup = await exportWorkspaceBackup()
+    await createChat({ id: 'chat-beta', title: 'Beta' })
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true)
+
+    const { container } = render(<StorageView route={{ section: 'overview' }} />)
+    const input = container.querySelector<HTMLInputElement>(
+      '[data-ui="storage-workspace-import-input"]',
+    )
+    expect(input).toBeTruthy()
+
+    fireEvent.change(input as HTMLInputElement, {
+      target: {
+        files: [new File([JSON.stringify(backup)], 'backup.json', { type: 'application/json' })],
+      },
+    })
+
+    await waitFor(async () => {
+      const chats = await getDb().chats.toArray()
+      expect(chats.map((chat) => chat.id)).toEqual(['chat-alpha'])
+    })
+    expect(confirmSpy).toHaveBeenCalled()
   })
 
   it('clears global calibration families from per-chat samples', async () => {
@@ -510,5 +632,131 @@ describe('StorageView', () => {
         value: originalRevokeObjectURL,
       })
     }
+  })
+
+  it('exports a single selected chat as portable JSON from the chats table', async () => {
+    const chat = await createChat({ id: 'chat-alpha', title: 'Alpha', now: 1000 })
+    await getDb().chats.update(chat.id, { titleStatus: 'manual', previewText: 'Alpha preview' })
+    const downloads = mockBlobDownloads()
+    try {
+      const { container } = render(<StorageView route={{ section: 'chats' }} />)
+
+      await waitFor(() => expect(container).toHaveTextContent('Alpha'))
+      const checkbox = container.querySelector<HTMLInputElement>('[data-ui="storage-chat-select"]')
+      fireEvent.click(checkbox as HTMLInputElement)
+      fireEvent.click(screen.getByRole('button', { name: 'Export' }))
+
+      await waitFor(() => expect(downloads.clickSpy).toHaveBeenCalled())
+      expect(downloads.createdBlobs).toHaveLength(1)
+      const exported = JSON.parse(await (downloads.createdBlobs[0] as Blob).text()) as {
+        objectKind: string
+        payload: { chat: { title: string; sourceChatId: string } }
+      }
+      expect(exported.objectKind).toBe('chat')
+      expect(exported.payload.chat).toMatchObject({ title: 'Alpha', sourceChatId: 'chat-alpha' })
+    } finally {
+      downloads.restore()
+    }
+  })
+
+  it('exports multiple selected chats as a ZIP of portable JSON files', async () => {
+    const alpha = await createChat({ id: 'chat-alpha', title: 'Untitled Chat', now: 1000 })
+    const beta = await createChat({ id: 'chat-beta', title: 'Untitled Chat', now: 2000 })
+    await getDb().chats.update(alpha.id, { titleStatus: 'manual', previewText: 'Alpha preview' })
+    await getDb().chats.update(beta.id, { titleStatus: 'manual', previewText: 'Beta preview' })
+    const downloads = mockBlobDownloads()
+    try {
+      const { container } = render(<StorageView route={{ section: 'chats' }} />)
+
+      await waitFor(() => expect(container).toHaveTextContent('Untitled Chat'))
+      const checkboxes = Array.from(
+        container.querySelectorAll<HTMLInputElement>('[data-ui="storage-chat-select"]'),
+      )
+      fireEvent.click(checkboxes[0] as HTMLInputElement)
+      fireEvent.click(checkboxes[1] as HTMLInputElement, { metaKey: true })
+      fireEvent.click(screen.getByRole('button', { name: 'Export' }))
+
+      await waitFor(() => expect(downloads.clickSpy).toHaveBeenCalled())
+      expect(downloads.createdBlobs).toHaveLength(1)
+      expect(downloads.createdBlobs[0]?.type).toBe('application/zip')
+      const entries = unzipSync(
+        new Uint8Array(await (downloads.createdBlobs[0] as Blob).arrayBuffer()),
+      )
+      const filenames = Object.keys(entries).sort()
+      expect(filenames).toHaveLength(2)
+      expect(new Set(filenames).size).toBe(2)
+      expect(filenames.every((filename) => filename.endsWith('.json'))).toBe(true)
+      expect(filenames.some((filename) => filename.includes('-2.json'))).toBe(true)
+      const exported = filenames.map((filename) =>
+        JSON.parse(strFromU8(entries[filename] as Uint8Array)) as {
+          objectKind: string
+          payload: { chat: { sourceChatId: string } }
+        },
+      )
+      expect(exported.every((entry) => entry.objectKind === 'chat')).toBe(true)
+      expect(exported.map((entry) => entry.payload.chat.sourceChatId).sort()).toEqual([
+        'chat-alpha',
+        'chat-beta',
+      ])
+    } finally {
+      downloads.restore()
+    }
+  })
+
+  it('imports a chat JSON export from the chats table', async () => {
+    const source = await createChat({ id: 'chat-alpha', title: 'Alpha', now: 1000 })
+    const envelope = await exportChat(source.id)
+
+    const { container } = render(<StorageView route={{ section: 'chats' }} />)
+    expect(screen.getByRole('button', { name: 'Import chat JSON or ZIP' })).toBeInTheDocument()
+    const input = container.querySelector<HTMLInputElement>('[data-ui="storage-chat-import-input"]')
+    expect(input).toBeTruthy()
+
+    fireEvent.change(input as HTMLInputElement, {
+      target: {
+        files: [new File([JSON.stringify(envelope)], 'chat.json', { type: 'application/json' })],
+      },
+    })
+
+    await waitFor(async () => {
+      const chats = await getDb().chats.orderBy('createdAt').toArray()
+      expect(chats).toHaveLength(2)
+      expect(chats.map((chat) => chat.title)).toEqual(['Alpha', 'Alpha'])
+      expect(chats[1]?.id).not.toBe(source.id)
+    })
+  })
+
+  it('imports a ZIP of chat JSON exports from the chats table', async () => {
+    const alpha = await createChat({ id: 'chat-alpha', title: 'Alpha', now: 1000 })
+    const beta = await createChat({ id: 'chat-beta', title: 'Beta', now: 2000 })
+    const alphaEnvelope = await exportChat(alpha.id)
+    const betaEnvelope = await exportChat(beta.id)
+    const zip = await jsonEntriesZipBlob([
+      { filename: 'alpha.json', value: alphaEnvelope },
+      { filename: 'beta.json', value: betaEnvelope },
+    ])
+    await resetAll()
+
+    const { container } = render(<StorageView route={{ section: 'chats' }} />)
+    const input = container.querySelector<HTMLInputElement>('[data-ui="storage-chat-import-input"]')
+    expect(input).toBeTruthy()
+
+    fireEvent.change(input as HTMLInputElement, {
+      target: {
+        files: [
+          new File([zip], 'chats.zip', {
+            type: 'application/zip',
+          }),
+        ],
+      },
+    })
+
+    await waitFor(async () => {
+      const chats = (await getDb().chats.toArray()).sort((left, right) =>
+        left.title.localeCompare(right.title),
+      )
+      expect(chats.map((chat) => chat.title)).toEqual(['Alpha', 'Beta'])
+      expect(chats.map((chat) => chat.id).sort()).not.toEqual(['chat-alpha', 'chat-beta'])
+    })
   })
 })

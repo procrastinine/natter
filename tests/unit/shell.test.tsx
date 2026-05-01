@@ -10,6 +10,7 @@ import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import { archiveChat, createChat, updateChatSettings } from '../../src/store/chats'
 import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
 import { createFolder } from '../../src/store/folders'
+import { exportChat } from '../../src/store/import-export'
 import { __resetKeyCacheForTests, createKey } from '../../src/store/keys'
 import { putCachedModels } from '../../src/store/models-cache'
 import { createPreset, getPreset } from '../../src/store/presets'
@@ -86,6 +87,33 @@ describe('shell smoke render', () => {
       'data-sidebar-hidden',
     )
     expect(container.querySelector('[data-ui="sidebar"]')).toBeInTheDocument()
+  })
+
+  it('imports a chat from the sidebar toolbar', async () => {
+    const source = await createChat({ id: 'chat-alpha', title: 'Alpha', now: 1000 })
+    const envelope = await exportChat(source.id)
+    window.location.hash = '#/'
+
+    const { container } = render(<App />)
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-ui="sidebar-import-chat"]')).toBeInTheDocument()
+    })
+    const input = container.querySelector<HTMLInputElement>('[data-ui="sidebar-chat-import-input"]')
+    expect(input).toBeTruthy()
+
+    fireEvent.change(input as HTMLInputElement, {
+      target: {
+        files: [new File([JSON.stringify(envelope)], 'chat.json', { type: 'application/json' })],
+      },
+    })
+
+    await waitFor(async () => {
+      const chats = await getDb().chats.orderBy('createdAt').toArray()
+      expect(chats).toHaveLength(2)
+      expect(chats[1]?.id).not.toBe(source.id)
+      expect(window.location.hash).toMatch(/^#\/chat\//)
+    })
   })
 
   it('keeps no-op new-chat visits out of IndexedDB', async () => {

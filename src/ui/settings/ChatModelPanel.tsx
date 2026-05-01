@@ -14,7 +14,15 @@
 // write those edits back to the preset (update or save-as-new).
 
 import { useLiveQuery } from 'dexie-react-hooks'
-import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
+import {
+  type ChangeEvent,
+  useCallback,
+  useDeferredValue,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
 import { type LlamaServerProps, probeLlamaServer } from '../../api/probe'
 import type { EffectiveCapability } from '../../core/capabilities'
 import { DEFAULT_GLOBAL_PREFERENCES, readGlobalPreferences } from '../../core/global-settings'
@@ -39,6 +47,7 @@ import type {
 import { usePrivacyRouting } from '../../hooks/usePrivacyRouting'
 import { useStreamStablePromptEstimate } from '../../hooks/useStreamStablePromptEstimate'
 import { applyChatPreset, setChatPreset, updateChatSettings } from '../../store/chats'
+import { exportChatPreset, importChatPreset } from '../../store/import-export'
 import {
   createPreset,
   deletePreset,
@@ -52,7 +61,13 @@ import { useChatStore } from '../../store/zustand/chatStore'
 import { useStreamStore } from '../../store/zustand/streamStore'
 import { useToastStore } from '../../store/zustand/toastStore'
 import { useAttachmentResolverForContext } from '../attachments/useAttachmentResolver'
-import { CloseIcon } from '../icons/Icon'
+import { CloseIcon, DownloadIcon, UploadIcon } from '../icons/Icon'
+import {
+  importExportErrorMessage,
+  natterJsonFilename,
+  readJsonFile,
+  triggerJsonDownload,
+} from '../import-export/json-file'
 import { CachingPanel } from './CachingPanel'
 import { ContextPanel } from './ContextPanel'
 import { InfoDisclosure } from './InfoDisclosure'
@@ -431,6 +446,7 @@ function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | u
   const pushToast = useToastStore((s) => s.push)
   const presets = useLiveQuery(() => listPresets(), [], [])
   const [pickerOpen, setPickerOpen] = useState(false)
+  const importInputRef = useRef<HTMLInputElement | null>(null)
 
   const diverged = useMemo(() => {
     if (!preset) return true
@@ -481,6 +497,45 @@ function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | u
     pushToast({ level: 'info', text: `Created preset "${p.name}".`, durationMs: 2500 })
     closePicker()
   }, [chat.id, chat.settings, pushToast, closePicker])
+
+  const exportPresetJson = useCallback(
+    async (targetId: string, name: string) => {
+      try {
+        const envelope = await exportChatPreset(targetId)
+        triggerJsonDownload(natterJsonFilename('chat-preset', name, targetId), envelope)
+        pushToast({ level: 'success', text: 'Exported preset JSON.', durationMs: 2500 })
+      } catch (error) {
+        console.error('Failed to export preset JSON', error)
+        pushToast({ level: 'danger', text: importExportErrorMessage(error) })
+      }
+    },
+    [pushToast],
+  )
+
+  const importPresetJson = useCallback(
+    async (event: ChangeEvent<HTMLInputElement>) => {
+      const input = event.currentTarget
+      const file = input.files?.[0] ?? null
+      input.value = ''
+      if (!file) return
+      try {
+        const value = await readJsonFile(file)
+        const result = await importChatPreset(value)
+        pushToast({
+          level: 'success',
+          text: result.profileMatched
+            ? 'Imported preset.'
+            : 'Imported preset with a missing connection.',
+          durationMs: 3000,
+        })
+        closePicker()
+      } catch (error) {
+        console.error('Failed to import preset JSON', error)
+        pushToast({ level: 'danger', text: importExportErrorMessage(error) })
+      }
+    },
+    [closePicker, pushToast],
+  )
 
   const renamePreset = useCallback(async (targetId: string, currentName: string) => {
     const name = window.prompt('Rename preset:', currentName)
@@ -561,6 +616,18 @@ function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | u
                       >
                         <TrashIcon />
                       </button>
+                      <button
+                        type="button"
+                        data-ui="icon-button"
+                        data-compact
+                        data-tone="accent"
+                        data-role="preset-export"
+                        onClick={() => void exportPresetJson(p.id, p.name)}
+                        title="Export preset JSON"
+                        aria-label={`Export preset "${p.name}" JSON`}
+                      >
+                        <DownloadIcon size={13} />
+                      </button>
                     </div>
                   </li>
                 )
@@ -568,9 +635,30 @@ function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | u
             </ul>
           )}
           <div data-ui="preset-menu-footer">
-            <button type="button" data-ui="field-inline-action" onClick={() => void saveAsNew()}>
-              + Save as new…
-            </button>
+            <span data-ui="preset-menu-footer-primary">
+              <button type="button" data-ui="field-inline-action" onClick={() => void saveAsNew()}>
+                + Save as new…
+              </button>
+              <input
+                ref={importInputRef}
+                data-ui="preset-import-input"
+                type="file"
+                accept="application/json,.json"
+                hidden
+                onChange={(event) => void importPresetJson(event)}
+              />
+              <button
+                type="button"
+                data-ui="icon-button"
+                data-compact
+                data-tone="accent"
+                onClick={() => importInputRef.current?.click()}
+                aria-label="Import preset JSON"
+                title="Import preset JSON"
+              >
+                <UploadIcon size={13} />
+              </button>
+            </span>
             <button
               type="button"
               data-ui="icon-button"

@@ -1308,6 +1308,16 @@ export function getDb(): NatterDb {
   return singleton
 }
 
+function resetBackfillState(): void {
+  organizationFieldsBackfillPromise = null
+  messageBodySplitBackfillPromise = null
+  globalSettingsBackfillPromise = null
+  attachmentRefsBackfillPromise = null
+  providerOutputItemsBackfillPromise = null
+  providerToolSettingsBackfillPromise = null
+  tokenCalibrationGlobalBackfillPromise = null
+}
+
 // Explicit open — resolves when the underlying IDBDatabase is ready and the
 // schema has settled. Safe to call repeatedly; Dexie caches the open call.
 export async function openDb(): Promise<NatterDb> {
@@ -1351,19 +1361,17 @@ export async function openDb(): Promise<NatterDb> {
   return db
 }
 
-// Test-only reset so unit tests can swap in their own jsdom-backed IDB.
-export function __resetDbForTests(): void {
+export function closeDb(): void {
   if (singleton) {
     singleton.close()
     singleton = null
   }
-  organizationFieldsBackfillPromise = null
-  messageBodySplitBackfillPromise = null
-  globalSettingsBackfillPromise = null
-  attachmentRefsBackfillPromise = null
-  providerOutputItemsBackfillPromise = null
-  providerToolSettingsBackfillPromise = null
-  tokenCalibrationGlobalBackfillPromise = null
+  resetBackfillState()
+}
+
+// Test-only reset so unit tests can swap in their own jsdom-backed IDB.
+export function __resetDbForTests(): void {
+  closeDb()
 }
 
 // Mint a uniquely-named Dexie instance for integration tests that want to

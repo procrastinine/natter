@@ -1,5 +1,6 @@
 import { useLiveQuery } from 'dexie-react-hooks'
 import {
+  type ChangeEvent,
   Fragment,
   type MouseEvent,
   type ReactNode,
@@ -48,6 +49,7 @@ import type {
   TagId,
   TokenCalibrationSample,
 } from '../../core/types'
+import { nukeSiteStorage } from '../../lib/debug-nuke'
 import {
   type AttachmentReferenceRow,
   batchRelinkAttachmentRefs,
@@ -84,6 +86,12 @@ import {
 } from '../../store/chats'
 import { createFolder, listFolders } from '../../store/folders'
 import {
+  exportChat,
+  exportWorkspaceBackup,
+  importChat,
+  restoreWorkspaceBackup,
+} from '../../store/import-export'
+import {
   estimateQuota,
   isPersisted,
   type QuotaSnapshot,
@@ -117,6 +125,15 @@ import {
   UnarchiveIcon,
   UploadIcon,
 } from '../icons/Icon'
+import {
+  importExportErrorMessage,
+  natterJsonFilename,
+  natterZipFilename,
+  readJsonFile,
+  readJsonOrZipFile,
+  triggerJsonDownload,
+  triggerJsonZipDownload,
+} from '../import-export/json-file'
 import { isEmptySidebarDraft, sortChats } from '../sidebar/chat-organization'
 
 interface StorageViewProps {
@@ -169,6 +186,11 @@ const EMPTY_STORAGE_CHAT_MODEL: StorageChatModel = {
 const EMPTY_GLOBAL_CALIBRATION_MODEL: StorageGlobalCalibrationModel = {
   rows: [],
 }
+const STORAGE_USAGE_DETAIL_LABELS: Record<string, string> = {
+  caches: 'Cache API',
+  indexedDB: 'IndexedDB',
+  serviceWorkerRegistrations: 'Service workers',
+}
 
 async function loadStorageChatModel(): Promise<StorageChatModel> {
   const [rows, chats, folders, tags] = await Promise.all([
@@ -195,6 +217,7 @@ async function loadStorageGlobalCalibrationModel(): Promise<StorageGlobalCalibra
 }
 
 export function StorageView({ route }: StorageViewProps) {
+  const section = route.section === 'backups' ? 'overview' : route.section
   return (
     <main data-ui="storage-view">
       <header data-ui="storage-header">
@@ -206,7 +229,7 @@ export function StorageView({ route }: StorageViewProps) {
           <a
             href={storageHref()}
             onClick={makeAnchorClickHandler(storageHref())}
-            aria-current={route.section === 'overview' ? 'page' : undefined}
+            aria-current={section === 'overview' ? 'page' : undefined}
             aria-label="Overview"
             title="Overview"
           >
@@ -215,7 +238,7 @@ export function StorageView({ route }: StorageViewProps) {
           <a
             href={storageHref({ section: 'chats' })}
             onClick={makeAnchorClickHandler(storageHref({ section: 'chats' }))}
-            aria-current={route.section === 'chats' ? 'page' : undefined}
+            aria-current={section === 'chats' ? 'page' : undefined}
             aria-label="Chats"
             title="Chats"
           >
@@ -224,7 +247,7 @@ export function StorageView({ route }: StorageViewProps) {
           <a
             href={storageHref({ section: 'archive' })}
             onClick={makeAnchorClickHandler(storageHref({ section: 'archive' }))}
-            aria-current={route.section === 'archive' ? 'page' : undefined}
+            aria-current={section === 'archive' ? 'page' : undefined}
             aria-label="Archive"
             title="Archive"
           >
@@ -233,28 +256,20 @@ export function StorageView({ route }: StorageViewProps) {
           <a
             href={storageHref({ section: 'attachments' })}
             onClick={makeAnchorClickHandler(storageHref({ section: 'attachments' }))}
-            aria-current={route.section === 'attachments' ? 'page' : undefined}
+            aria-current={section === 'attachments' ? 'page' : undefined}
             aria-label="Attachments"
             title="Attachments"
           >
             <FileIcon size={15} />
           </a>
-          <a
-            href={storageHref({ section: 'backups' })}
-            onClick={makeAnchorClickHandler(storageHref({ section: 'backups' }))}
-            aria-current={route.section === 'backups' ? 'page' : undefined}
-            aria-label="Backups"
-            title="Backups"
-          >
-            <UploadIcon size={15} />
-          </a>
         </nav>
       </header>
-      {route.section === 'overview' ? <StorageOverview /> : null}
-      {route.section === 'chats' ? <ChatsStorageSurface /> : null}
-      {route.section === 'attachments' ? <AttachmentManager route={route} /> : null}
-      {route.section === 'archive' ? <ArchiveManager /> : null}
-      {route.section === 'backups' ? <BackupSurface /> : null}
+      {section === 'overview' ? <StorageOverview /> : null}
+      {section === 'chats' ? <ChatsStorageSurface /> : null}
+      {section === 'attachments' && route.section === 'attachments' ? (
+        <AttachmentManager route={route} />
+      ) : null}
+      {section === 'archive' ? <ArchiveManager /> : null}
     </main>
   )
 }
@@ -275,6 +290,10 @@ function StorageOverview() {
     'granted' | 'denied' | null
   >(null)
   const [persistenceBusy, setPersistenceBusy] = useState(false)
+  const [workspaceTransferBusy, setWorkspaceTransferBusy] = useState<
+    'export' | 'import' | 'clear' | null
+  >(null)
+  const workspaceImportInputRef = useRef<HTMLInputElement | null>(null)
   const storageMode = 'indexeddb' as const
   const isIndexedDbMode = storageMode === 'indexeddb'
   const localBytes = attachments.reduce((sum, row) => sum + (row.sizeBytes ?? 0), 0)
@@ -321,6 +340,71 @@ function StorageOverview() {
       setPersistenceBusy(false)
     }
   }
+  const handleExportWorkspace = async () => {
+    setWorkspaceTransferBusy('export')
+    try {
+      const backup = await exportWorkspaceBackup()
+      triggerJsonDownload(natterJsonFilename('workspace-backup'), backup)
+      pushToast({ level: 'success', text: 'Exported workspace backup.', durationMs: 2500 })
+    } catch (error) {
+      console.error('Failed to export workspace backup', error)
+      pushToast({
+        level: 'danger',
+        text: importExportErrorMessage(error),
+      })
+    } finally {
+      setWorkspaceTransferBusy(null)
+    }
+  }
+  const handleImportWorkspaceFile = async (event: ChangeEvent<HTMLInputElement>) => {
+    const input = event.currentTarget
+    const file = input.files?.[0] ?? null
+    input.value = ''
+    if (!file) return
+    if (
+      !window.confirm(
+        'Importing this backup replaces all local chats, presets, connections, keys, and attachments. Continue?',
+      )
+    ) {
+      return
+    }
+    setWorkspaceTransferBusy('import')
+    try {
+      const value = await readJsonFile(file)
+      const result = await restoreWorkspaceBackup(value)
+      pushToast({
+        level: 'success',
+        text: `Imported workspace backup (${result.chatCount} chats).`,
+        durationMs: 3000,
+      })
+      navigate(storageHref())
+    } catch (error) {
+      console.error('Failed to import workspace backup', error)
+      pushToast({
+        level: 'danger',
+        text: importExportErrorMessage(error),
+      })
+    } finally {
+      setWorkspaceTransferBusy(null)
+    }
+  }
+  const handleClearWorkspace = async () => {
+    if (
+      !window.confirm(
+        'Clear all local Natter data for this browser origin? This removes chats, presets, connections, keys, attachments, local storage, caches, cookies, and service workers, then reloads.',
+      )
+    ) {
+      return
+    }
+    setWorkspaceTransferBusy('clear')
+    try {
+      await nukeSiteStorage()
+    } catch (error) {
+      console.error('Failed to clear local workspace data', error)
+      pushToast({ level: 'danger', text: importExportErrorMessage(error) })
+      setWorkspaceTransferBusy(null)
+    }
+  }
   const spaceValue = quota ? `${formatBytes(quota.usage)} / ${formatBytes(quota.quota)}` : 'Unknown'
   const persistenceValue =
     persistenceRequestResult === 'denied'
@@ -365,10 +449,57 @@ function StorageOverview() {
                       : 'Request persistence'}
                 </button>
               ) : null}
+              <span data-ui="storage-workspace-actions">
+                <button
+                  type="button"
+                  data-ui="storage-action"
+                  onClick={() => void handleExportWorkspace()}
+                  disabled={workspaceTransferBusy !== null}
+                  title="Export the full IndexedDB workspace"
+                >
+                  <DownloadIcon size={14} />
+                  {workspaceTransferBusy === 'export' ? 'Exporting' : 'Export all'}
+                </button>
+                <button
+                  type="button"
+                  data-ui="storage-action"
+                  onClick={() => workspaceImportInputRef.current?.click()}
+                  disabled={workspaceTransferBusy !== null}
+                  title="Import a full workspace backup"
+                >
+                  <UploadIcon size={14} />
+                  {workspaceTransferBusy === 'import' ? 'Importing' : 'Import all'}
+                </button>
+                <button
+                  type="button"
+                  data-ui="storage-action"
+                  data-tone="danger"
+                  onClick={() => void handleClearWorkspace()}
+                  disabled={workspaceTransferBusy !== null}
+                  title="Clear all local Natter data and reload"
+                >
+                  <TrashIcon size={14} />
+                  {workspaceTransferBusy === 'clear' ? 'Clearing' : 'Clear all'}
+                </button>
+              </span>
+              <input
+                ref={workspaceImportInputRef}
+                data-ui="storage-workspace-import-input"
+                type="file"
+                accept="application/json,.json"
+                hidden
+                onChange={(event) => void handleImportWorkspaceFile(event)}
+              />
             </>
           ) : null}
         </StoragePanel>
-        <StoragePanel title="Space" value={spaceValue} detail="Total / quota" />
+        <StoragePanel
+          title="Origin space"
+          value={spaceValue}
+          detail="Browser-reported usage / quota"
+        >
+          <StorageUsageDetails quota={quota} />
+        </StoragePanel>
         <StoragePanel
           title="Chats"
           value={String(chats.length)}
@@ -384,6 +515,33 @@ function StorageOverview() {
         <StorageGlobalCalibrationPanel />
       </div>
     </section>
+  )
+}
+
+function StorageUsageDetails({ quota }: { quota: QuotaSnapshot | null }) {
+  const entries = quota
+    ? Object.entries(quota.usageDetails)
+        .filter(([, bytes]) => bytes > 0)
+        .sort((left, right) => right[1] - left[1])
+    : []
+  return (
+    <>
+      <span data-ui="storage-origin-note">
+        Includes all storage for this browser origin; the estimate can include browser overhead and
+        may lag after deletion.
+      </span>
+      {entries.length > 0 ? (
+        <span data-ui="storage-usage-details">
+          {entries.map(([key, bytes]) => (
+            <StoragePanelMetric
+              key={key}
+              label={STORAGE_USAGE_DETAIL_LABELS[key] ?? key}
+              value={formatBytes(bytes)}
+            />
+          ))}
+        </span>
+      ) : null}
+    </>
   )
 }
 
@@ -501,6 +659,7 @@ function StoragePanelMetric({
 }
 
 function ChatsStorageSurface() {
+  const pushToast = useToastStore((s) => s.push)
   const model = useLiveQuery(loadStorageChatModel, [], EMPTY_STORAGE_CHAT_MODEL)
   const persistedSortMode = useLiveQuery(readSidebarSortMode, [], DEFAULT_SIDEBAR_SORT_MODE)
   const [sortMode, setSortMode] = useState<SidebarSortMode>(DEFAULT_SIDEBAR_SORT_MODE)
@@ -518,6 +677,7 @@ function ChatsStorageSurface() {
   const [busyChatAction, setBusyChatAction] = useState<string | null>(null)
   const [busyCalibration, setBusyCalibration] = useState<string | null>(null)
   const selectAllRef = useRef<HTMLInputElement | null>(null)
+  const chatImportInputRef = useRef<HTMLInputElement | null>(null)
   const searchSession = useSearchStore((state) => state.session)
   const sortLocale = useMemo(
     () => (typeof navigator === 'undefined' ? 'en-US' : navigator.language),
@@ -752,6 +912,71 @@ function ChatsStorageSurface() {
       triggerBrowserBlobDownload(filename, blob)
     })
   }, [selectedChats, withBusyChatAction])
+  const handleExportSelection = useCallback(async () => {
+    const chats = selectedChats
+    if (chats.length === 0) return
+    const actionId = chats.length === 1 ? `export:${chats[0]?.id}` : 'bulk:export-json'
+    await withBusyChatAction(actionId, async () => {
+      try {
+        if (chats.length === 1) {
+          const chat = chats[0]
+          if (!chat) return
+          const envelope = await exportChat(chat.id)
+          triggerJsonDownload(natterJsonFilename('chat', displayChatTitle(chat), chat.id), envelope)
+          pushToast({ level: 'success', text: 'Exported chat JSON.', durationMs: 2500 })
+          return
+        }
+        const entries = await Promise.all(
+          chats.map(async (chat) => ({
+            filename: natterJsonFilename('chat', displayChatTitle(chat), chat.id),
+            value: await exportChat(chat.id),
+          })),
+        )
+        await triggerJsonZipDownload(natterZipFilename('chats'), entries)
+        pushToast({
+          level: 'success',
+          text: `Exported ${chats.length} chat JSON files.`,
+          durationMs: 2500,
+        })
+      } catch (error) {
+        console.error('Failed to export chat JSON', error)
+        pushToast({ level: 'danger', text: importExportErrorMessage(error) })
+      }
+    })
+  }, [pushToast, selectedChats, withBusyChatAction])
+  const handleImportChatFile = useCallback(
+    async (event: ChangeEvent<HTMLInputElement>) => {
+      const input = event.currentTarget
+      const file = input.files?.[0] ?? null
+      input.value = ''
+      if (!file) return
+      setBusyChatAction('import')
+      try {
+        const values = await readJsonOrZipFile(file)
+        let importedCount = 0
+        let lastChatId = ''
+        for (const value of values) {
+          const result = await importChat(value)
+          importedCount += 1
+          lastChatId = result.chatId
+        }
+        pushToast({
+          level: 'success',
+          text:
+            importedCount === 1
+              ? `Imported chat ${shortId(lastChatId)}.`
+              : `Imported ${importedCount} chats.`,
+          durationMs: 3000,
+        })
+      } catch (error) {
+        console.error('Failed to import chat JSON/ZIP', error)
+        pushToast({ level: 'danger', text: importExportErrorMessage(error) })
+      } finally {
+        setBusyChatAction(null)
+      }
+    },
+    [pushToast],
+  )
   const handleMoveSelection = useCallback(async () => {
     if (selectedChats.length === 0) return
     const defaultName = sharedFolderName(selectedChats, folderById)
@@ -879,6 +1104,26 @@ function ChatsStorageSurface() {
             ))}
           </select>
         </label>
+        <button
+          type="button"
+          data-ui="icon-button"
+          data-size="lg"
+          data-role="chat-import"
+          disabled={Boolean(busyChatAction)}
+          onClick={() => chatImportInputRef.current?.click()}
+          aria-label="Import chat JSON or ZIP"
+          title="Import chat JSON or ZIP"
+        >
+          <UploadIcon size={16} />
+        </button>
+        <input
+          ref={chatImportInputRef}
+          data-ui="storage-chat-import-input"
+          type="file"
+          accept="application/json,application/zip,.json,.zip"
+          hidden
+          onChange={(event) => void handleImportChatFile(event)}
+        />
         <span data-ui="storage-chat-count">
           {searchTextActive || searchHasFilters ? tableRows.length : live} live / {archived}{' '}
           archived
@@ -970,6 +1215,20 @@ function ChatsStorageSurface() {
             >
               <DownloadIcon size={14} />
               Download
+            </button>
+            <button
+              type="button"
+              data-ui="storage-chat-bulk-export"
+              disabled={Boolean(busyChatAction)}
+              onClick={() => void handleExportSelection()}
+              title={
+                selectedChats.length === 1
+                  ? 'Export selected chat JSON'
+                  : 'Export selected chats as a JSON ZIP'
+              }
+            >
+              <FileIcon size={14} />
+              Export
             </button>
             <button
               type="button"
@@ -1389,14 +1648,6 @@ function chatPassesStorageFilters(chat: ChatSidebarRow, filters: SearchFilters):
   }
   if (chat.tags.some((tagId) => filters.excludeTagIds.includes(tagId))) return false
   return true
-}
-
-function BackupSurface() {
-  return (
-    <section data-ui="storage-backups">
-      <p data-ui="helper">Backup, restore, and raw dump controls land with daemon storage.</p>
-    </section>
-  )
 }
 
 function ArchiveManager() {

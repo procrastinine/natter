@@ -9,11 +9,46 @@ import type { ConnectionProfile, ModelEndpoint } from '../../src/core/types'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import { createChat, getChat } from '../../src/store/chats'
 import { __resetDbForTests, openDb } from '../../src/store/db'
+import { exportChatPreset } from '../../src/store/import-export'
+import { createPreset, listPresets } from '../../src/store/presets'
 import { createProfile } from '../../src/store/profiles'
 import { ChatModelPanel } from '../../src/ui/settings/ChatModelPanel'
 import { ParamForm } from '../../src/ui/settings/ParamForm'
 
 const DB_NAME = 'natter'
+
+function mockBlobDownloads() {
+  const originalCreateObjectURL = URL.createObjectURL
+  const originalRevokeObjectURL = URL.revokeObjectURL
+  const createdBlobs: Blob[] = []
+  Object.defineProperty(URL, 'createObjectURL', {
+    configurable: true,
+    value: vi.fn((blob: Blob) => {
+      createdBlobs.push(blob)
+      return `blob:natter-${createdBlobs.length}`
+    }),
+  })
+  Object.defineProperty(URL, 'revokeObjectURL', {
+    configurable: true,
+    value: vi.fn(),
+  })
+  const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {})
+  return {
+    createdBlobs,
+    clickSpy,
+    restore() {
+      clickSpy.mockRestore()
+      Object.defineProperty(URL, 'createObjectURL', {
+        configurable: true,
+        value: originalCreateObjectURL,
+      })
+      Object.defineProperty(URL, 'revokeObjectURL', {
+        configurable: true,
+        value: originalRevokeObjectURL,
+      })
+    },
+  }
+}
 
 function makeEndpoint(overrides: Partial<ModelEndpoint> = {}): ModelEndpoint {
   return {
@@ -326,5 +361,79 @@ describe('ChatModelPanel context tab', () => {
 
     expect(await screen.findByText('Select a model first.')).toBeTruthy()
     expect(screen.queryByLabelText('Tool calls')).toBeNull()
+  })
+
+  it('exports chat settings presets from the preset menu', async () => {
+    const profile = await createProfile({
+      name: 'OpenRouter',
+      kind: 'openrouter',
+      baseUrl: 'https://openrouter.ai/api/v1',
+      apiKeyRef: 'key-1',
+    })
+    const settings = cloneDefaultChatSettings()
+    settings.profileId = profile.id
+    settings.model = 'openai/gpt-4o'
+    const preset = await createPreset({
+      name: 'Portable',
+      connectionProfileId: profile.id,
+      settings,
+    })
+    const chat = await createChat({ settings, presetId: preset.id })
+    const downloads = mockBlobDownloads()
+    try {
+      render(<ChatModelPanel chatId={chat.id} chatSnapshot={chat} onClose={() => undefined} />)
+
+      fireEvent.click(await screen.findByRole('button', { name: /Preset:/ }))
+      fireEvent.click(
+        await screen.findByRole('button', { name: 'Export preset "Portable" JSON' }),
+      )
+
+      await waitFor(() => expect(downloads.clickSpy).toHaveBeenCalled())
+      expect(downloads.createdBlobs).toHaveLength(1)
+      const exported = JSON.parse(await (downloads.createdBlobs[0] as Blob).text()) as {
+        objectKind: string
+        payload: { name: string; sourcePresetId: string }
+      }
+      expect(exported.objectKind).toBe('chat-preset')
+      expect(exported.payload).toMatchObject({ name: 'Portable', sourcePresetId: preset.id })
+    } finally {
+      downloads.restore()
+    }
+  })
+
+  it('imports chat settings presets from the preset menu', async () => {
+    const profile = await createProfile({
+      name: 'OpenRouter',
+      kind: 'openrouter',
+      baseUrl: 'https://openrouter.ai/api/v1',
+      apiKeyRef: 'key-1',
+    })
+    const settings = cloneDefaultChatSettings()
+    settings.profileId = profile.id
+    settings.model = 'openai/gpt-4o'
+    const preset = await createPreset({
+      name: 'Portable',
+      connectionProfileId: profile.id,
+      settings,
+    })
+    const envelope = await exportChatPreset(preset.id)
+    const chat = await createChat({ settings, presetId: preset.id })
+    const { container } = render(
+      <ChatModelPanel chatId={chat.id} chatSnapshot={chat} onClose={() => undefined} />,
+    )
+
+    fireEvent.click(await screen.findByRole('button', { name: /Preset:/ }))
+    const input = container.querySelector<HTMLInputElement>('[data-ui="preset-import-input"]')
+    expect(input).toBeTruthy()
+    fireEvent.change(input as HTMLInputElement, {
+      target: {
+        files: [new File([JSON.stringify(envelope)], 'preset.json', { type: 'application/json' })],
+      },
+    })
+
+    await waitFor(async () => {
+      const presets = await listPresets()
+      expect(presets.map((row) => row.name).sort()).toEqual(['Portable', 'Portable (2)'])
+    })
   })
 })

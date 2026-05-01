@@ -10,6 +10,7 @@ export interface QuotaSnapshot {
   quota: number
   ratio: number
   level: QuotaLevel
+  usageDetails: Record<string, number>
 }
 
 function storageManager(): StorageManager | undefined {
@@ -31,12 +32,26 @@ export async function estimateQuota(): Promise<QuotaSnapshot | null> {
   const est = await storage.estimate()
   const usage = est.usage ?? 0
   const quota = est.quota ?? 0
+  const usageDetails = normalizeUsageDetails(
+    (est as StorageEstimate & { usageDetails?: Record<string, unknown> }).usageDetails,
+  )
   return {
     usage,
     quota,
     ratio: quota > 0 ? usage / quota : 0,
     level: classifyQuota(usage, quota),
+    usageDetails,
   }
+}
+
+function normalizeUsageDetails(value: Record<string, unknown> | undefined): Record<string, number> {
+  if (!value) return {}
+  return Object.fromEntries(
+    Object.entries(value).filter(
+      (entry): entry is [string, number] =>
+        typeof entry[1] === 'number' && Number.isFinite(entry[1]) && entry[1] >= 0,
+    ),
+  )
 }
 
 export function storagePersistenceAvailable(): boolean {

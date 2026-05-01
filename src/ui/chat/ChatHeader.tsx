@@ -2,20 +2,27 @@ import { useLiveQuery } from 'dexie-react-hooks'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { exportChatAsTxt, triggerBrowserDownload } from '../../core/chat-export'
 import { aggregateCalibrationSamples } from '../../core/token-calibration'
-import type { ChatId, CursorMap } from '../../core/types'
+import type { ChatId, CursorMap, TokenCalibrationSample } from '../../core/types'
 import { getChat, setChatTagsFromNames, setManualTitle } from '../../store/chats'
+import { exportChat } from '../../store/import-export'
 import { listTags } from '../../store/tags'
 import { useChatStore } from '../../store/zustand/chatStore'
-import type { TokenCalibrationSample } from '../../core/types'
+import { useToastStore } from '../../store/zustand/toastStore'
 import {
   CloseIcon,
   CogIcon,
   DownloadIcon,
   EditTreeIcon,
+  FileIcon,
   InfoIcon,
   PencilIcon,
   TagIcon,
 } from '../icons/Icon'
+import {
+  importExportErrorMessage,
+  natterJsonFilename,
+  triggerJsonDownload,
+} from '../import-export/json-file'
 import { HeaderPrivacyBadge } from './HeaderPrivacyBadge'
 
 function formatCalibrationRatio(sample: TokenCalibrationSample): string {
@@ -60,6 +67,7 @@ export function ChatHeader({
   const [showInfo, setShowInfo] = useState(false)
   const inputRef = useRef<HTMLInputElement | null>(null)
   const titleLabelRef = useRef<HTMLButtonElement | null>(null)
+  const pushToast = useToastStore((s) => s.push)
 
   // Cancel any in-progress title edit when the active chat changes — otherwise
   // the editor would stay open against the next chat's title (confusing).
@@ -108,6 +116,20 @@ export function ChatHeader({
     const { filename, content } = await exportChatAsTxt(chat.id, cursor)
     triggerBrowserDownload(filename, content)
   }, [chat, cursor])
+  const handleExportJson = useCallback(async () => {
+    if (!chat) return
+    try {
+      const envelope = await exportChat(chat.id)
+      triggerJsonDownload(
+        natterJsonFilename('chat', chat.title || 'Untitled chat', chat.id),
+        envelope,
+      )
+      pushToast({ level: 'success', text: 'Exported chat JSON.', durationMs: 2500 })
+    } catch (error) {
+      console.error('Failed to export chat JSON', error)
+      pushToast({ level: 'danger', text: importExportErrorMessage(error) })
+    }
+  }, [chat, pushToast])
   const handleEditTags = useCallback(async () => {
     if (!chat) return
     const tags = await listTags()
@@ -215,6 +237,16 @@ export function ChatHeader({
         onClick={() => void handleDownload()}
       >
         <DownloadIcon size={18} />
+      </button>
+      <button
+        type="button"
+        data-ui="icon-button"
+        data-role="chat-export"
+        aria-label="Export chat JSON"
+        title="Export chat JSON"
+        onClick={() => void handleExportJson()}
+      >
+        <FileIcon size={18} />
       </button>
       <button
         type="button"
