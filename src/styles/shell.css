@@ -338,3 +338,92 @@
   grid-template-columns: 1fr var(--settings-pane-width);
   grid-template-areas: "main chat-model";
 }
+
+[data-ui="mobile-panel-scrim"] {
+  display: none;
+}
+
+@media (max-width: 700px) {
+  [data-ui="app-shell"],
+  [data-ui="app-shell"][data-chat-model-panel="open"],
+  [data-ui="app-shell"][data-sidebar="collapsed"],
+  [data-ui="app-shell"][data-sidebar="collapsed"][data-chat-model-panel="open"] {
+    --mobile-sidebar-width: min(420px, 92vw);
+
+    grid-template-columns: 1fr;
+    grid-template-areas: "main";
+    overflow: hidden;
+  }
+
+  [data-ui="app-shell"][data-sidebar="expanded"]:has(
+      [data-ui="sidebar-org-toolbar"][data-search-expanded="true"]
+    ),
+  [data-ui="app-shell"][data-sidebar="expanded"][data-chat-model-panel="open"]:has(
+      [data-ui="sidebar-org-toolbar"][data-search-expanded="true"]
+    ) {
+    grid-template-columns: 1fr;
+  }
+
+  [data-ui="app-shell"] > [data-ui="sidebar"] {
+    position: fixed;
+    inset: 0 auto 0 0;
+    z-index: var(--z-settings-pane);
+    width: var(--mobile-sidebar-width);
+    max-width: 92vw;
+    transform: translateX(-100%);
+    pointer-events: none;
+    border-right: 1px solid var(--color-border-default);
+    box-shadow: var(--shadow-overlay);
+    transition:
+      transform var(--duration-normal) var(--ease-decelerate),
+      opacity var(--duration-fast) var(--ease-standard);
+  }
+
+  [data-ui="app-shell"][data-mobile-sidebar="open"] > [data-ui="sidebar"] {
+    transform: translateX(0);
+    pointer-events: auto;
+  }
+
+  [data-ui="app-shell"] > [data-ui="main-pane"] {
+    grid-area: main;
+    min-width: 0;
+  }
+
+  [data-ui="app-shell"] > [data-ui="chat-model-panel"] {
+    position: fixed;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    z-index: var(--z-settings-pane);
+    width: min(var(--settings-pane-width), calc(100vw - var(--space-6)));
+    max-width: 100vw;
+    box-shadow: var(--shadow-overlay);
+  }
+
+  [data-ui="mobile-panel-scrim"] {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: var(--z-header);
+    border: 0;
+    border-radius: 0;
+    padding: 0;
+    background: color-mix(in srgb, var(--color-bg-app) 38%, transparent);
+    backdrop-filter: var(--backdrop-blur-overlay);
+    -webkit-backdrop-filter: var(--backdrop-blur-overlay);
+    cursor: default;
+  }
+
+  [data-ui="focus-mode-toggle"] {
+    display: none;
+  }
+
+  [data-ui="main-pane"] > [data-ui="scroll-region"],
+  [data-ui="main-pane"] > [data-ui="message-list"] {
+    padding: var(--space-4) var(--space-3);
+  }
+
+  [data-ui="main-pane"] > [data-ui="composer"] {
+    padding: var(--space-3);
+  }
+}

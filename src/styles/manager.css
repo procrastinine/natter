@@ -1138,3 +1138,16 @@
     flex-direction: column;
   }
 }
+
+@media (max-width: 700px) {
+  [data-ui="storage-header"] {
+    gap: var(--space-2);
+    padding: 0 var(--space-3);
+  }
+
+  [data-ui="storage-nav"] a {
+    width: 32px;
+    height: 32px;
+    padding: 0;
+  }
+}

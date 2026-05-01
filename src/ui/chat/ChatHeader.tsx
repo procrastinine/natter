@@ -1,5 +1,5 @@
 import { useLiveQuery } from 'dexie-react-hooks'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { exportChatAsTxt, triggerBrowserDownload } from '../../core/chat-export'
 import { aggregateCalibrationSamples } from '../../core/token-calibration'
 import type { ChatId, CursorMap, TokenCalibrationSample } from '../../core/types'
@@ -15,6 +15,7 @@ import {
   EditTreeIcon,
   FileIcon,
   InfoIcon,
+  MenuIcon,
   PencilIcon,
   TagIcon,
 } from '../icons/Icon'
@@ -47,6 +48,7 @@ interface ChatHeaderProps {
   onToggleSettings: () => void
   editTreeActive?: boolean
   onToggleEditTree?: () => void
+  mobileConnectionControl?: ReactNode
 }
 
 export function ChatHeader({
@@ -55,6 +57,7 @@ export function ChatHeader({
   onToggleSettings,
   editTreeActive,
   onToggleEditTree,
+  mobileConnectionControl,
 }: ChatHeaderProps) {
   const chat = useLiveQuery(
     () => (chatId ? getChat(chatId) : Promise.resolve(undefined)),
@@ -65,8 +68,10 @@ export function ChatHeader({
   const [editing, setEditing] = useState(false)
   const [draftTitle, setDraftTitle] = useState('')
   const [showInfo, setShowInfo] = useState(false)
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
   const inputRef = useRef<HTMLInputElement | null>(null)
   const titleLabelRef = useRef<HTMLButtonElement | null>(null)
+  const mobileMenuRef = useRef<HTMLDivElement | null>(null)
   const pushToast = useToastStore((s) => s.push)
 
   // Cancel any in-progress title edit when the active chat changes — otherwise
@@ -76,6 +81,7 @@ export function ChatHeader({
     setEditing(false)
     setDraftTitle('')
     setShowInfo(false)
+    setMobileMenuOpen(false)
   }, [chatId])
 
   useEffect(() => {
@@ -142,6 +148,24 @@ export function ChatHeader({
     if (value === null) return
     await setChatTagsFromNames(chat.id, tagNamesFromPrompt(value))
   }, [chat])
+
+  useEffect(() => {
+    if (!mobileMenuOpen) return
+    const onPointerDown = (event: PointerEvent) => {
+      const root = mobileMenuRef.current
+      if (!root || root.contains(event.target as Node)) return
+      setMobileMenuOpen(false)
+    }
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setMobileMenuOpen(false)
+    }
+    document.addEventListener('pointerdown', onPointerDown)
+    document.addEventListener('keydown', onKeyDown)
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown)
+      document.removeEventListener('keydown', onKeyDown)
+    }
+  }, [mobileMenuOpen])
 
   const displayTitle = chat?.title?.trim().length ? chat.title : 'Untitled chat'
 
@@ -227,7 +251,9 @@ export function ChatHeader({
       >
         <TagIcon size={18} />
       </button>
-      <HeaderPrivacyBadge chatId={chat.id} />
+      <span data-ui="desktop-header-privacy">
+        <HeaderPrivacyBadge chatId={chat.id} />
+      </span>
       <button
         type="button"
         data-ui="icon-button"
@@ -270,6 +296,104 @@ export function ChatHeader({
       >
         <CogIcon size={20} />
       </button>
+      <div data-ui="chat-controls-menu-root" ref={mobileMenuRef}>
+        <button
+          type="button"
+          data-ui="icon-button"
+          data-role="chat-controls-menu"
+          aria-label="Open chat controls"
+          aria-haspopup="dialog"
+          aria-expanded={mobileMenuOpen}
+          title="Chat controls"
+          onClick={() => setMobileMenuOpen((open) => !open)}
+        >
+          <MenuIcon size={20} />
+        </button>
+        {mobileMenuOpen ? (
+          <div data-ui="chat-controls-menu" role="dialog" aria-label="Chat controls">
+            {mobileConnectionControl ? (
+              <section data-ui="chat-controls-menu-section" data-section="connection">
+                <div data-ui="chat-controls-menu-connection">{mobileConnectionControl}</div>
+              </section>
+            ) : null}
+            <button
+              type="button"
+              data-ui="mobile-menu-action"
+              onClick={() => {
+                beginEdit()
+                setMobileMenuOpen(false)
+              }}
+            >
+              <PencilIcon size={16} />
+              <span>Rename chat</span>
+            </button>
+            {onToggleEditTree ? (
+              <button
+                type="button"
+                data-ui="mobile-menu-action"
+                aria-pressed={!!editTreeActive}
+                onClick={() => {
+                  onToggleEditTree()
+                  setMobileMenuOpen(false)
+                }}
+              >
+                <EditTreeIcon size={16} />
+                <span>{editTreeActive ? 'Exit edit tree' : 'Edit tree'}</span>
+              </button>
+            ) : null}
+            <button
+              type="button"
+              data-ui="mobile-menu-action"
+              onClick={() => {
+                setMobileMenuOpen(false)
+                void handleEditTags()
+              }}
+            >
+              <TagIcon size={16} />
+              <span>Tags</span>
+            </button>
+            <div data-ui="mobile-menu-action" data-kind="privacy">
+              <span data-ui="mobile-menu-action-icon">
+                <HeaderPrivacyBadge chatId={chat.id} />
+              </span>
+              <span>Privacy</span>
+            </div>
+            <button
+              type="button"
+              data-ui="mobile-menu-action"
+              onClick={() => {
+                setMobileMenuOpen(false)
+                void handleDownload()
+              }}
+            >
+              <DownloadIcon size={16} />
+              <span>Download .txt</span>
+            </button>
+            <button
+              type="button"
+              data-ui="mobile-menu-action"
+              onClick={() => {
+                setMobileMenuOpen(false)
+                void handleExportJson()
+              }}
+            >
+              <FileIcon size={16} />
+              <span>Export JSON</span>
+            </button>
+            <button
+              type="button"
+              data-ui="mobile-menu-action"
+              onClick={() => {
+                setShowInfo(true)
+                setMobileMenuOpen(false)
+              }}
+            >
+              <InfoIcon size={16} />
+              <span>Chat info</span>
+            </button>
+          </div>
+        ) : null}
+      </div>
       {showInfo ? (
         <div data-ui="chat-info-popover" role="dialog" aria-label="Chat info">
           <div data-ui="chat-info-popover-header">

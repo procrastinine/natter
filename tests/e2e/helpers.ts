@@ -5,7 +5,7 @@
 // assertions. Live-API specs live in `*.live.spec.ts` and gate on
 // `process.env.RUN_LIVE === '1'`.
 
-import type { Page } from '@playwright/test'
+import { expect, type Page } from '@playwright/test'
 
 export interface IndexedDbDump {
   dbName: string
@@ -134,9 +134,11 @@ export async function sendMessage(page: Page, text: string): Promise<void> {
 // sidebar. Useful for tests that just need any chat to exist before exercising
 // some other feature (title editing, settings drawer, etc.).
 export async function createChatAndSend(page: Page, text: string): Promise<void> {
+  const expectedRows = (await page.locator('[data-ui="chat-row"]').count()) + 1
   await createChatAndOpen(page)
   await sendMessage(page, text)
-  await page.locator('[data-ui="chat-row"]').first().waitFor({ state: 'visible' })
+  await page.locator('[data-ui="abort"]').waitFor({ state: 'detached' })
+  await expect(page.locator('[data-ui="chat-row"]')).toHaveCount(expectedRows)
 }
 
 interface SseDelta {

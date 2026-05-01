@@ -404,7 +404,7 @@ async function runConnectionTest(opts: {
 interface ConnectionHeaderProps {
   activeChatId?: ChatId | null
   activeChatProfileId?: ProfileId | null
-  variant?: 'empty-action' | 'title-icon'
+  variant?: 'empty-action' | 'title-icon' | 'mobile-menu'
 }
 
 export function ConnectionHeader({
@@ -430,6 +430,7 @@ export function ConnectionHeader({
   const [probeState, setProbeState] = useState<ProbeState>({ kind: 'idle' })
   const [deleteBusy, setDeleteBusy] = useState(false)
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false)
+  const detailId = `connection-title-detail-${useId().replace(/:/g, '')}`
   const titleEntryRef = useRef<HTMLDivElement | null>(null)
   const probeRunRef = useRef(0)
   const hasConnection = state.profile !== null
@@ -578,7 +579,7 @@ export function ConnectionHeader({
   if (!hasConnection || !state.profile) {
     if (variant === 'title-icon') return null
     return (
-      <div data-ui="connection-empty-action">
+      <div data-ui="connection-empty-action" data-variant={variant}>
         <button type="button" data-ui="connection-add" onClick={() => setSetupOpen(true)}>
           Add connection
         </button>
@@ -595,19 +596,9 @@ export function ConnectionHeader({
 
   const { profile, profiles, hasKey } = state
   const status: 'ready' | 'no-key' = hasKey || !kindRequiresKey(profile.kind) ? 'ready' : 'no-key'
-  if (variant !== 'title-icon') return null
-  const detailId = 'connection-title-detail'
-  const connectionRow = (
-    <button
-      type="button"
-      data-ui="connection-row"
-      aria-expanded={open}
-      aria-controls={detailId}
-      onClick={() => setOpen((v) => !v)}
-    >
-      <span data-ui="connection-chevron" aria-hidden="true">
-        <ChevronIcon size={14} rotate={open ? 90 : 0} />
-      </span>
+  const detailOpen = variant === 'mobile-menu' || open
+  const connectionSummary = (
+    <>
       <span data-ui="connection-name" title={profile.name}>
         {profile.name}
       </span>
@@ -630,9 +621,31 @@ export function ConnectionHeader({
         aria-hidden="true"
       />
       <span data-ui="connection-status-text">{status === 'ready' ? 'ready' : 'no key'}</span>
-    </button>
+    </>
   )
-  const connectionDetail = open ? (
+  const connectionRow =
+    variant === 'mobile-menu' ? (
+      <div data-ui="connection-row" data-static="true">
+        <span data-ui="connection-inline-icon" aria-hidden="true">
+          <ConnectionKindIcon kind={profile.kind} size={16} />
+        </span>
+        {connectionSummary}
+      </div>
+    ) : (
+      <button
+        type="button"
+        data-ui="connection-row"
+        aria-expanded={open}
+        aria-controls={detailId}
+        onClick={() => setOpen((v) => !v)}
+      >
+        <span data-ui="connection-chevron" aria-hidden="true">
+          <ChevronIcon size={14} rotate={open ? 90 : 0} />
+        </span>
+        {connectionSummary}
+      </button>
+    )
+  const connectionDetail = detailOpen ? (
     <div data-ui="connection-detail" id={detailId}>
       <ProfileSwitcher
         profiles={profiles}
@@ -662,7 +675,43 @@ export function ConnectionHeader({
       )}
     </div>
   ) : null
+  const connectionDialogs = (
+    <>
+      {setupOpen ? (
+        <ConnectionSetupModal
+          hasExistingConnections={profiles.length > 0}
+          onClose={() => setSetupOpen(false)}
+          onSaved={applySaveResult}
+        />
+      ) : null}
+      {deleteConfirmOpen ? (
+        <ConnectionDeleteDialog
+          profileName={profile.name}
+          busy={deleteBusy}
+          onCancel={() => setDeleteConfirmOpen(false)}
+          onConfirm={deleteCurrentProfile}
+        />
+      ) : null}
+    </>
+  )
 
+  if (variant === 'mobile-menu') {
+    return (
+      <section
+        data-ui="connection-header"
+        data-state="configured"
+        data-open="true"
+        data-variant="mobile-menu"
+        aria-label={`Connection: ${profile.name}`}
+      >
+        {connectionRow}
+        {connectionDetail}
+        {connectionDialogs}
+      </section>
+    )
+  }
+
+  if (variant !== 'title-icon') return null
   return (
     <div data-ui="connection-title-entry" ref={titleEntryRef}>
       <button
@@ -689,21 +738,7 @@ export function ConnectionHeader({
           {connectionDetail}
         </section>
       ) : null}
-      {setupOpen ? (
-        <ConnectionSetupModal
-          hasExistingConnections={profiles.length > 0}
-          onClose={() => setSetupOpen(false)}
-          onSaved={applySaveResult}
-        />
-      ) : null}
-      {deleteConfirmOpen ? (
-        <ConnectionDeleteDialog
-          profileName={profile.name}
-          busy={deleteBusy}
-          onCancel={() => setDeleteConfirmOpen(false)}
-          onConfirm={deleteCurrentProfile}
-        />
-      ) : null}
+      {connectionDialogs}
     </div>
   )
 }
@@ -858,9 +893,10 @@ function ProfileSwitcher({ profiles, activeId, onSwitch, onCreateNew }: ProfileS
         type="button"
         data-ui="connection-new"
         onClick={onCreateNew}
+        aria-label="Add new connection profile"
         title="Add a new connection profile"
       >
-        + New profile
+        +
       </button>
     </div>
   )

@@ -365,7 +365,11 @@ export function SearchIcon({ size = 18, ariaLabel }: IconProps) {
 
 export function PlusIcon({ size = 18, strokeWidth = 1.6, ariaLabel }: IconProps) {
   return (
-    <BaseSvg size={size} strokeWidth={strokeWidth} {...(ariaLabel ? { 'aria-label': ariaLabel } : {})}>
+    <BaseSvg
+      size={size}
+      strokeWidth={strokeWidth}
+      {...(ariaLabel ? { 'aria-label': ariaLabel } : {})}
+    >
       <path d="M12 5v14" />
       <path d="M5 12h14" />
     </BaseSvg>
@@ -428,6 +432,28 @@ export function MoreVerticalIcon({ size = 18, ariaLabel }: IconProps) {
       <circle cx="12" cy="5" r="1.3" fill="currentColor" stroke="none" />
       <circle cx="12" cy="12" r="1.3" fill="currentColor" stroke="none" />
       <circle cx="12" cy="19" r="1.3" fill="currentColor" stroke="none" />
+    </BaseSvg>
+  )
+}
+
+export function MenuIcon({ size = 18, ariaLabel }: IconProps) {
+  return (
+    <BaseSvg size={size} {...(ariaLabel ? { 'aria-label': ariaLabel } : {})}>
+      <path d="M4 7h16" />
+      <path d="M4 12h16" />
+      <path d="M4 17h16" />
+    </BaseSvg>
+  )
+}
+
+export function SidebarIcon({ size = 18, ariaLabel }: IconProps) {
+  return (
+    <BaseSvg size={size} {...(ariaLabel ? { 'aria-label': ariaLabel } : {})}>
+      <rect x="4" y="4" width="16" height="16" rx="2" />
+      <path d="M9 4v16" />
+      <path d="M6.5 9h0.01" />
+      <path d="M6.5 12h0.01" />
+      <path d="M6.5 15h0.01" />
     </BaseSvg>
   )
 }

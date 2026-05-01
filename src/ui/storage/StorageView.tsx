@@ -119,6 +119,7 @@ import {
   FolderIcon,
   MessageSquareIcon,
   SearchIcon,
+  SidebarIcon,
   SortIcon,
   TagIcon,
   TrashIcon,
@@ -138,6 +139,7 @@ import { isEmptySidebarDraft, sortChats } from '../sidebar/chat-organization'
 
 interface StorageViewProps {
   route: StorageRoute
+  onOpenSidebar?: () => void
 }
 
 type ManagerFilter =
@@ -216,11 +218,20 @@ async function loadStorageGlobalCalibrationModel(): Promise<StorageGlobalCalibra
   }
 }
 
-export function StorageView({ route }: StorageViewProps) {
+export function StorageView({ route, onOpenSidebar }: StorageViewProps) {
   const section = route.section === 'backups' ? 'overview' : route.section
   return (
     <main data-ui="storage-view">
       <header data-ui="storage-header">
+        <button
+          type="button"
+          data-ui="icon-button"
+          data-role="mobile-sidebar-toggle"
+          aria-label="Open sidebar"
+          onClick={onOpenSidebar}
+        >
+          <SidebarIcon size={17} />
+        </button>
         <span data-ui="storage-title">
           <DatabaseIcon size={18} />
           Storage

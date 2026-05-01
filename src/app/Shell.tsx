@@ -1,5 +1,5 @@
 import { useLiveQuery } from 'dexie-react-hooks'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { attachmentsDisabledByTextProtocol } from '../core/attachments/context'
 import { cloneDefaultChatSettings } from '../core/defaults'
 import {
@@ -70,7 +70,14 @@ import {
   readActiveSeedState,
   writeActiveSeedState,
 } from '../ui/header/ConnectionHeader'
-import { ChevronIcon, CogIcon, DatabaseIcon, NewChatIcon } from '../ui/icons/Icon'
+import {
+  ChevronIcon,
+  CogIcon,
+  DatabaseIcon,
+  MenuIcon,
+  NewChatIcon,
+  SidebarIcon,
+} from '../ui/icons/Icon'
 import { ChatModelPanel } from '../ui/settings/ChatModelPanel'
 import { GlobalSettingsModal } from '../ui/settings/GlobalSettingsModal'
 import { ChatList } from '../ui/sidebar/ChatList'
@@ -87,6 +94,7 @@ import {
 } from './router'
 
 const SIDEBAR_COLLAPSED_STORAGE_KEY = 'natter:sidebar-collapsed'
+const MOBILE_SHELL_QUERY = '(max-width: 700px)'
 // Stable empty reference so useSyncExternalStore selectors don't allocate a
 // fresh `{}` each render (React 19 flags that as infinite re-render).
 const EMPTY_CURSOR: CursorMap = Object.freeze({})
@@ -121,6 +129,28 @@ function hasFileTransfer(dataTransfer: DataTransfer): boolean {
   return Array.from(dataTransfer.types).includes('Files')
 }
 
+function useMediaQuery(query: string): boolean {
+  const [matches, setMatches] = useState(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return false
+    return window.matchMedia(query).matches
+  })
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return
+    const media = window.matchMedia(query)
+    setMatches(media.matches)
+    const onChange = () => setMatches(media.matches)
+    if (typeof media.addEventListener === 'function') {
+      media.addEventListener('change', onChange)
+      return () => media.removeEventListener('change', onChange)
+    }
+    media.addListener(onChange)
+    return () => media.removeListener(onChange)
+  }, [query])
+
+  return matches
+}
+
 // Seed settings for a new chat from this tab's remembered default first,
 // then fall back to the workspace-global MRU preset. The remembered seed
 // tracks the most recently viewed chat in this tab (including preset-backed
@@ -149,8 +179,10 @@ export function Shell() {
   const route = useRoute()
   const activeChatId = route.kind === 'chat' ? route.chatId : null
   const activeStorageRoute = route.kind === 'storage' ? route.storage : null
+  const activeStorageRouteKey = activeStorageRoute ? storageHref(activeStorageRoute) : null
   const focusModeAvailable = !activeStorageRoute
   const onNewChatSurface = route.kind === 'new'
+  const isNarrowScreen = useMediaQuery(MOBILE_SHELL_QUERY)
   useBranchUrlSync(activeChatId)
   const { send, sendFrom } = useChat()
   const streamingOnActiveChat = useStreamStore((s) =>
@@ -161,6 +193,7 @@ export function Shell() {
   const hasConnection = connectionKnown && profileCount > 0
   const [chatModelOpen, setChatModelOpen] = useState(false)
   const [globalSettingsOpen, setGlobalSettingsOpen] = useState(false)
+  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false)
   const [composerSeed, setComposerSeed] = useState<string | null>(null)
   const [composerDroppedFiles, setComposerDroppedFiles] = useState<ComposerDroppedFiles | null>(
     null,
@@ -170,7 +203,7 @@ export function Shell() {
   const editTreeMode = useUiStore((s) => s.editTreeMode)
   const setEditTreeMode = useUiStore((s) => s.setEditTreeMode)
   const focusMode = useUiStore((s) => s.focusMode)
-  const effectiveFocusMode = focusMode && focusModeAvailable
+  const effectiveFocusMode = !isNarrowScreen && focusMode && focusModeAvailable
   const pushBanner = useToastStore((s) => s.pushBanner)
   const pushToast = useToastStore((s) => s.push)
   const clearBannersByKind = useToastStore((s) => s.clearBannersByKind)
@@ -364,6 +397,14 @@ export function Shell() {
   }, [activeStorageRoute, chatModelOpen])
 
   useEffect(() => {
+    if (!isNarrowScreen) setMobileSidebarOpen(false)
+  }, [isNarrowScreen])
+
+  useEffect(() => {
+    setMobileSidebarOpen(false)
+  }, [activeChatId, activeStorageRouteKey, onNewChatSurface])
+
+  useEffect(() => {
     installChatPreviewMaintainer()
     installStreamLeaseListener()
   }, [])
@@ -438,6 +479,22 @@ export function Shell() {
       settings,
     }
   }, [])
+
+  const openSettingsForNewChat = useCallback(async () => {
+    const { preset, settings } = await resolveNewChatSeed()
+    writeActiveSeedState({
+      profileId: settings.profileId || null,
+      presetId: preset?.id ?? null,
+      settings,
+    })
+    const chat = await createChat({
+      settings,
+      temporary: true,
+      ...(preset ? { presetId: preset.id } : {}),
+    })
+    navigateToChat(chat.id)
+    setChatModelOpen(true)
+  }, [resolveNewChatSeed])
 
   useEffect(() => {
     applyThemeToDocument(prefs.theme)
@@ -676,35 +733,70 @@ export function Shell() {
   // doesn't make the panel jump in from nowhere. The panel component itself
   // no-ops when chatId is null.
   const showChatModelPanel = chatModelOpen && !activeStorageRoute
+  const effectiveSidebarCollapsed = isNarrowScreen ? false : sidebarCollapsed
+  const mobilePanelOpen = isNarrowScreen && (mobileSidebarOpen || showChatModelPanel)
+  const closeMobilePanels = useCallback(() => {
+    setMobileSidebarOpen(false)
+    setChatModelOpen(false)
+  }, [])
+  const activeMobileConnectionControl =
+    connectionKnown && activeChatId ? (
+      <ConnectionHeader
+        variant="mobile-menu"
+        activeChatId={activeChatId}
+        activeChatProfileId={resolvedActiveChatRow?.settings.profileId ?? null}
+      />
+    ) : null
+  const newChatMobileConnectionControl = connectionKnown ? (
+    <ConnectionHeader variant="mobile-menu" />
+  ) : null
 
   return (
     <div
       data-ui="app-shell"
       data-chat-model-panel={showChatModelPanel ? 'open' : 'closed'}
-      data-sidebar={sidebarCollapsed ? 'collapsed' : 'expanded'}
+      data-sidebar={effectiveSidebarCollapsed ? 'collapsed' : 'expanded'}
+      data-mobile-sidebar={mobileSidebarOpen ? 'open' : 'closed'}
       data-focus-mode={effectiveFocusMode ? 'on' : 'off'}
     >
       <aside
         data-ui="sidebar"
-        data-collapsed={sidebarCollapsed}
+        data-collapsed={effectiveSidebarCollapsed}
         data-sort-key={sidebarSortMode}
         aria-label="Chats"
+        aria-hidden={isNarrowScreen && !mobileSidebarOpen ? true : undefined}
       >
         <div data-ui="sidebar-header">
-          {sidebarCollapsed ? null : (
-            <a data-ui="brand" href={homeHref()} onClick={makeAnchorClickHandler(homeHref())}>
-              natter
-            </a>
-          )}
+          <a data-ui="brand" href={homeHref()} onClick={makeAnchorClickHandler(homeHref())}>
+            natter
+          </a>
           <button
             type="button"
             data-ui="icon-button"
             data-role="sidebar-toggle"
-            aria-label={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
-            title={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
-            onClick={() => setSidebarCollapsed((v) => !v)}
+            aria-label={
+              isNarrowScreen
+                ? 'Close sidebar'
+                : sidebarCollapsed
+                  ? 'Expand sidebar'
+                  : 'Collapse sidebar'
+            }
+            title={
+              isNarrowScreen
+                ? 'Close sidebar'
+                : sidebarCollapsed
+                  ? 'Expand sidebar'
+                  : 'Collapse sidebar'
+            }
+            onClick={() => {
+              if (isNarrowScreen) {
+                setMobileSidebarOpen(false)
+                return
+              }
+              setSidebarCollapsed((v) => !v)
+            }}
           >
-            <ChevronIcon size={16} rotate={sidebarCollapsed ? 0 : 180} />
+            <ChevronIcon size={16} rotate={effectiveSidebarCollapsed ? 0 : 180} />
           </button>
           <a
             data-ui="icon-button"
@@ -718,7 +810,7 @@ export function Shell() {
             <NewChatIcon size={18} />
           </a>
         </div>
-        <ChatList activeChatId={activeChatId} collapsed={sidebarCollapsed} />
+        <ChatList activeChatId={activeChatId} collapsed={effectiveSidebarCollapsed} />
         <div data-ui="sidebar-footer">
           <button
             type="button"
@@ -728,7 +820,7 @@ export function Shell() {
             onClick={() => setGlobalSettingsOpen(true)}
           >
             <CogIcon size={18} />
-            {sidebarCollapsed ? null : <span>Settings</span>}
+            <span>Settings</span>
           </button>
           <a
             href={storageHref()}
@@ -759,10 +851,13 @@ export function Shell() {
         }}
       >
         {activeStorageRoute ? (
-          <StorageView route={activeStorageRoute} />
+          <StorageView
+            route={activeStorageRoute}
+            onOpenSidebar={() => setMobileSidebarOpen(true)}
+          />
         ) : (
           <>
-            {connectionKnown && !hasConnection ? (
+            {connectionKnown && !hasConnection && !isNarrowScreen ? (
               <ConnectionHeader
                 activeChatId={activeChatId}
                 activeChatProfileId={resolvedActiveChatRow?.settings.profileId ?? null}
@@ -771,6 +866,17 @@ export function Shell() {
             {activeChatId ? (
               <>
                 <div data-ui="chat-title-bar">
+                  <button
+                    type="button"
+                    data-ui="icon-button"
+                    data-role="mobile-sidebar-toggle"
+                    aria-label="Open chats sidebar"
+                    aria-expanded={mobileSidebarOpen}
+                    title="Chats"
+                    onClick={() => setMobileSidebarOpen(true)}
+                  >
+                    <SidebarIcon size={20} />
+                  </button>
                   <ConnectionHeader
                     variant="title-icon"
                     activeChatId={activeChatId}
@@ -782,6 +888,7 @@ export function Shell() {
                     onToggleSettings={() => setChatModelOpen((v) => !v)}
                     editTreeActive={editTreeMode}
                     onToggleEditTree={() => setEditTreeMode(!editTreeMode)}
+                    mobileConnectionControl={activeMobileConnectionControl}
                   />
                 </div>
                 <EditTreeToolbar />
@@ -949,6 +1056,17 @@ export function Shell() {
                 {/* The new-chat surface stays IDB-cold until send/import/settings
                  * needs a row. */}
                 <div data-ui="chat-title-bar">
+                  <button
+                    type="button"
+                    data-ui="icon-button"
+                    data-role="mobile-sidebar-toggle"
+                    aria-label="Open chats sidebar"
+                    aria-expanded={mobileSidebarOpen}
+                    title="Chats"
+                    onClick={() => setMobileSidebarOpen(true)}
+                  >
+                    <SidebarIcon size={20} />
+                  </button>
                   <ConnectionHeader variant="title-icon" />
                   <span data-ui="chat-title" data-title-status="untitled">
                     <span data-ui="chat-title-label">New chat</span>
@@ -960,26 +1078,11 @@ export function Shell() {
                     data-role="settings-cog"
                     aria-label="Open model panel"
                     title="Model settings"
-                    onClick={() => {
-                      void (async () => {
-                        const { preset, settings } = await resolveNewChatSeed()
-                        writeActiveSeedState({
-                          profileId: settings.profileId || null,
-                          presetId: preset?.id ?? null,
-                          settings,
-                        })
-                        const chat = await createChat({
-                          settings,
-                          temporary: true,
-                          ...(preset ? { presetId: preset.id } : {}),
-                        })
-                        navigateToChat(chat.id)
-                        setChatModelOpen(true)
-                      })()
-                    }}
+                    onClick={() => void openSettingsForNewChat()}
                   >
                     <CogIcon size={20} />
                   </button>
+                  <MobileNewChatControls connectionControl={newChatMobileConnectionControl} />
                 </div>
                 <EmptyState onPick={(text) => setComposerSeed(text)} />
                 <Composer
@@ -998,11 +1101,49 @@ export function Shell() {
                 />
               </>
             ) : (
-              <EmptyState onPick={(text) => setComposerSeed(text)} />
+              <>
+                <div data-ui="chat-title-bar" data-mobile-home="true">
+                  <button
+                    type="button"
+                    data-ui="icon-button"
+                    data-role="mobile-sidebar-toggle"
+                    aria-label="Open chats sidebar"
+                    aria-expanded={mobileSidebarOpen}
+                    title="Chats"
+                    onClick={() => setMobileSidebarOpen(true)}
+                  >
+                    <SidebarIcon size={20} />
+                  </button>
+                  <span data-ui="chat-title" data-title-status="manual">
+                    <span data-ui="chat-title-label">natter</span>
+                  </span>
+                  <span data-ui="header-spacer" />
+                  <button
+                    type="button"
+                    data-ui="icon-button"
+                    data-role="settings-cog"
+                    aria-label="Open model panel"
+                    title="Model settings"
+                    onClick={() => void openSettingsForNewChat()}
+                  >
+                    <CogIcon size={20} />
+                  </button>
+                  <MobileNewChatControls connectionControl={newChatMobileConnectionControl} />
+                </div>
+                <EmptyState onPick={(text) => setComposerSeed(text)} />
+              </>
             )}
           </>
         )}
       </main>
+      {mobilePanelOpen ? (
+        <button
+          type="button"
+          data-ui="mobile-panel-scrim"
+          aria-label="Close mobile side panel"
+          onClick={closeMobilePanels}
+        />
+      ) : null}
       {showChatModelPanel ? (
         <ChatModelPanel
           chatId={activeChatId}
@@ -1049,7 +1190,58 @@ export function Shell() {
         />
       ) : null}
       <ToastTray />
-      {focusModeAvailable ? <FocusModeToggle /> : null}
+      {focusModeAvailable && !isNarrowScreen ? <FocusModeToggle /> : null}
+    </div>
+  )
+}
+
+function MobileNewChatControls({ connectionControl }: { connectionControl: ReactNode }) {
+  const [open, setOpen] = useState(false)
+  const rootRef = useRef<HTMLDivElement | null>(null)
+
+  useEffect(() => {
+    if (!open) return
+    const onPointerDown = (event: PointerEvent) => {
+      const root = rootRef.current
+      if (!root || root.contains(event.target as Node)) return
+      setOpen(false)
+    }
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setOpen(false)
+    }
+    document.addEventListener('pointerdown', onPointerDown)
+    document.addEventListener('keydown', onKeyDown)
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown)
+      document.removeEventListener('keydown', onKeyDown)
+    }
+  }, [open])
+
+  return (
+    <div data-ui="chat-controls-menu-root" ref={rootRef}>
+      <button
+        type="button"
+        data-ui="icon-button"
+        data-role="chat-controls-menu"
+        aria-label="Open chat controls"
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        title="Chat controls"
+        onClick={() => setOpen((value) => !value)}
+      >
+        <MenuIcon size={20} />
+      </button>
+      {open ? (
+        <div data-ui="chat-controls-menu" role="dialog" aria-label="Chat controls">
+          {connectionControl ? (
+            <section data-ui="chat-controls-menu-section" data-section="connection">
+              <div data-ui="chat-controls-menu-connection">{connectionControl}</div>
+            </section>
+          ) : (
+            <div data-ui="mobile-menu-empty">No connection loaded.</div>
+          )}
+        </div>
+      ) : null}
     </div>
   )
 }

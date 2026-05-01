@@ -1040,6 +1040,11 @@ button[data-ui="folder-main"]:active:not(:disabled) {
   padding: var(--space-2);
 }
 
+[data-ui="sidebar"][data-collapsed="true"] [data-ui="brand"],
+[data-ui="sidebar"][data-collapsed="true"] [data-ui="open-global-settings"] span {
+  display: none;
+}
+
 [data-ui="sidebar"][data-collapsed="true"] [data-ui="chat-row-link"] {
   padding: var(--space-3) var(--space-2);
   align-items: center;
