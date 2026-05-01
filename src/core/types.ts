@@ -223,7 +223,7 @@ export interface ToolDefinition {
   updatedAt: number
 }
 
-export type OpenRouterServerToolId = 'web-search' | 'datetime' | 'web-fetch' | 'image-generation'
+type OpenRouterServerToolId = 'web-search' | 'datetime' | 'web-fetch' | 'image-generation'
 export type OpenAiServerToolId = 'web-search' | 'image-generation' | 'code-interpreter' | 'shell'
 export type AnthropicServerToolId = 'web-search' | 'web-fetch' | 'code-execution' | 'advisor'
 export type GoogleServerToolId = 'google-search' | 'url-context' | 'code-execution' | 'google-maps'
@@ -649,6 +649,9 @@ export interface Chat {
   tags: TagId[]
   favoriteModels?: string[]
   recentModels?: string[]
+  // Temporary rows back the active `#/new` draft so settings edits have a real
+  // chat owner. If they never receive messages, they are discarded on navigation.
+  temporary?: boolean
   // Denormalized sidebar preview: plaintext of the earliest live user
   // message, trimmed to a generous single-line cap. Populated by `refreshChatPreview`
   // whenever a user message is created, edited, or deleted. The sidebar
@@ -856,7 +859,7 @@ export interface GenerationServerToolCall {
   output?: unknown
 }
 
-export interface GenerationTokenCalibration {
+interface GenerationTokenCalibration {
   sampleId: string
   modelId: string
   calibrationKey: string

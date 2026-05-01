@@ -8,7 +8,7 @@ import {
   type MessageHeaderRow,
 } from '../store/message-storage'
 
-export const MESSAGE_BODY_SPLIT_BACKFILL_KEY = 'backfill:message-body-split-v1'
+const MESSAGE_BODY_SPLIT_BACKFILL_KEY = 'backfill:message-body-split-v1'
 
 export function messageBodySplitBackfillMarker(): SettingsRow {
   return { key: MESSAGE_BODY_SPLIT_BACKFILL_KEY, value: 1 }

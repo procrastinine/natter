@@ -2,7 +2,7 @@ import type { ChatProviderToolSettings, ChatSettings } from '../core/types'
 import type { Chat, ChatPreset } from '../core/types'
 import type { NatterDb, SettingsRow } from '../store/db'
 
-export const PROVIDER_TOOL_SETTINGS_BACKFILL_KEY = 'backfill:provider-tool-settings-v2'
+const PROVIDER_TOOL_SETTINGS_BACKFILL_KEY = 'backfill:provider-tool-settings-v2'
 
 export function providerToolSettingsBackfillMarker(): SettingsRow {
   return { key: PROVIDER_TOOL_SETTINGS_BACKFILL_KEY, value: 1 }
@@ -25,7 +25,7 @@ export async function migrateProviderToolSettingsRows(db: NatterDb): Promise<voi
   })
 }
 
-type LegacyToolSettings = ChatSettings & {
+type LegacyToolSettings = Omit<ChatSettings, 'toolCallContext' | 'tools'> & {
   enabledServerToolIds?: ChatSettings['tools']['openrouter']['enabledServerToolIds']
   toolChoice?: ChatSettings['tools']['openrouter']['toolChoice']
   parallelToolCalls?: ChatSettings['tools']['openrouter']['parallelToolCalls']
@@ -38,7 +38,7 @@ type LegacyToolSettings = ChatSettings & {
   }>
 }
 
-export interface ProviderToolSettingsMigrationResult {
+interface ProviderToolSettingsMigrationResult {
   settings: ChatSettings
   changed: boolean
 }
@@ -124,11 +124,12 @@ function hasCurrentToolCallContext(
 function hasCurrentToolBuckets(
   tools: LegacyToolSettings['tools'],
 ): tools is ChatProviderToolSettings {
+  if (!tools) return false
   return (
-    hasToolBucket(tools?.openrouter) &&
-    hasToolBucket(tools?.openai) &&
-    hasToolBucket(tools?.anthropic) &&
-    hasToolBucket(tools?.google)
+    hasToolBucket(tools.openrouter) &&
+    hasToolBucket(tools.openai) &&
+    hasToolBucket(tools.anthropic) &&
+    hasToolBucket(tools.google)
   )
 }
 

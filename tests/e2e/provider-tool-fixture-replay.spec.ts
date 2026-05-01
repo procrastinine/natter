@@ -131,9 +131,7 @@ test('tool evidence supports per-item visibility and edit/create in the inline e
 
   await expect(evidence).toContainText('edited')
   rows = await readMessages(page, result.chatId)
-  storedAssistant = rows.filter((row) => row.role === 'assistant').at(-1) as
-    | { providerOutputItems?: Array<{ hidden?: boolean; edited?: boolean; item?: unknown }> }
-    | undefined
+  storedAssistant = rows.filter((row) => row.role === 'assistant').at(-1)
   expect(storedAssistant?.providerOutputItems?.[0]?.hidden).toBeUndefined()
   expect(storedAssistant?.providerOutputItems?.[0]?.edited).toBe(true)
   expect(JSON.stringify(storedAssistant?.providerOutputItems?.[0]?.item)).toContain(

@@ -17,20 +17,20 @@ test.beforeEach(async ({ page }) => {
   })
 })
 
-test('clicking new-chat navigates to a blank composer without creating a chat row', async ({
+test('clicking new-chat navigates to a blank composer without creating a visible chat row', async ({
   page,
 }) => {
   await expect(page.locator('[data-ui="chat-row"]')).toHaveCount(0)
   await createChatAndOpen(page)
-  // Composer is ready, but no chat row yet — rows materialize on first send.
+  // Composer is ready, but no visible sidebar row yet — rows surface on first send.
   await expect(page.locator('[data-ui="composer"]')).toBeVisible()
   await expect(page.locator('[data-ui="chat-row"]')).toHaveCount(0)
 })
 
-test('chat rows materialize only on first send (no spam from repeated new-chat clicks)', async ({
+test('chat rows become visible only on first send (no spam from repeated new-chat clicks)', async ({
   page,
 }) => {
-  // Three #/new visits with NO send → still zero rows.
+  // Three #/new visits with NO send → still zero visible rows.
   await createChatAndOpen(page)
   await createChatAndOpen(page)
   await createChatAndOpen(page)

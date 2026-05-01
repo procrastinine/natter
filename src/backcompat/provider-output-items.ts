@@ -3,7 +3,7 @@ import type { GenerationMeta, ProviderOutputItem } from '../core/types'
 import type { NatterDb, SettingsRow } from '../store/db'
 import type { MessageBodyRow } from '../store/message-storage'
 
-export const PROVIDER_OUTPUT_ITEMS_BACKFILL_KEY = 'backfill:provider-output-items-v1'
+const PROVIDER_OUTPUT_ITEMS_BACKFILL_KEY = 'backfill:provider-output-items-v1'
 
 export function providerOutputItemsBackfillMarker(): SettingsRow {
   return { key: PROVIDER_OUTPUT_ITEMS_BACKFILL_KEY, value: 1 }

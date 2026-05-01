@@ -57,7 +57,7 @@ describe('StorageView', () => {
       estimate: vi.fn<StorageManager['estimate']>().mockResolvedValue({ usage: 4096, quota: 8192 }),
       persist: vi.fn<StorageManager['persist']>().mockResolvedValue(true),
       persisted: vi.fn<StorageManager['persisted']>().mockResolvedValue(false),
-    } as Partial<StorageManager>)
+    })
   })
 
   afterEach(async () => {

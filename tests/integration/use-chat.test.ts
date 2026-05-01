@@ -1497,7 +1497,7 @@ describe('sendText — token calibration sample ingest', () => {
                 query: 'streamed provider output marker',
               },
             },
-          } as ResponsesStreamChunk,
+          },
           {
             type: 'event',
             event: {
@@ -1506,7 +1506,7 @@ describe('sendText — token calibration sample ingest', () => {
               content_index: 0,
               delta: 'streamed answer',
             },
-          } as ResponsesStreamChunk,
+          },
           {
             type: 'event',
             event: {
@@ -1520,7 +1520,7 @@ describe('sendText — token calibration sample ingest', () => {
                 content: [{ type: 'output_text', text: 'streamed answer' }],
               },
             },
-          } as ResponsesStreamChunk,
+          },
           {
             type: 'event',
             event: {
@@ -1532,7 +1532,7 @@ describe('sendText — token calibration sample ingest', () => {
                 usage: { input_tokens: 10, output_tokens: 4, total_tokens: 14 },
               },
             },
-          } as ResponsesStreamChunk,
+          },
         ),
     })
 

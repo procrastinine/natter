@@ -8,17 +8,9 @@
 // call sites don't have to remember the key names.
 
 import { getSetting, setSetting } from '../store/settings'
-import {
-  type CorsProxyConfig,
-  DEFAULT_CORS_PROXY_URL,
-  DEV_CORS_PROXY_URL,
-  PUBLIC_CORS_PROXY_URL,
-} from './cors-proxy'
+import { DEFAULT_CORS_PROXY_URL, type CorsProxyConfig, DEV_CORS_PROXY_URL } from './cors-proxy'
 
-// Re-exports for browser callers that group their preference imports
-// here. The canonical source lives in `./cors-proxy` so daemon-mode and
-// `api/privacy-scrape.ts` can pull these in without dragging in IDB.
-export { DEFAULT_CORS_PROXY_URL, DEV_CORS_PROXY_URL, PUBLIC_CORS_PROXY_URL }
+export { DEV_CORS_PROXY_URL }
 
 export type ThemePreference = 'system' | 'light' | 'dark' | 'high-contrast'
 

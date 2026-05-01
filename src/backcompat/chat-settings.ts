@@ -7,7 +7,7 @@ const LEGACY_PRIVACY_KEYS = ['usePreferredOrdering'] as const
 
 type LegacyReasoningCarryForward = 'off' | 'plaintext' | 'encrypted' | 'auto'
 
-export interface ChatSettingsMigrationResult {
+interface ChatSettingsMigrationResult {
   settings: ChatSettings
   changed: boolean
 }
@@ -92,7 +92,7 @@ export function migrateCurrentChatSettingsSnapshot(
   preLegacy.anthropicCache = mergeObject(defaults.anthropicCache, raw.anthropicCache)
   preLegacy.privacy = mergeObject(defaults.privacy, raw.privacy)
   preLegacy.reasoning = isRecord(raw.reasoning)
-    ? (raw.reasoning as ChatSettings['reasoning'])
+    ? (raw.reasoning)
     : defaults.reasoning
   preLegacy.tools = mergeToolSettings(defaults.tools, raw.tools)
   preLegacy.toolCallContext = mergeObject(defaults.toolCallContext, raw.toolCallContext)
@@ -232,11 +232,11 @@ function normalizeGeminiSettings(raw: unknown): ChatSettings['gemini'] | undefin
 function mergeObject<T extends object>(defaults: T, raw: unknown): T {
   const next = structuredClone(defaults)
   const out = next as Record<string, unknown>
-  if (!isRecord(raw)) return next as T
+  if (!isRecord(raw)) return next
   for (const [key, value] of Object.entries(raw)) {
     if (value !== undefined) out[key] = value
   }
-  return next as T
+  return next
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -68,14 +68,14 @@ describe('storage probes (fallback when navigator.storage is unavailable)', () =
     setNavigatorStorage({
       persist: vi.fn(),
       persisted: vi.fn(),
-    } as Partial<StorageManager>)
+    })
     expect(storagePersistenceAvailable()).toBe(true)
   })
 
   it('wraps the browser persistence calls', async () => {
     const persist = vi.fn<StorageManager['persist']>().mockResolvedValue(true)
     const persisted = vi.fn<StorageManager['persisted']>().mockResolvedValue(true)
-    setNavigatorStorage({ persist, persisted } as Partial<StorageManager>)
+    setNavigatorStorage({ persist, persisted })
 
     expect(await requestPersist()).toBe(true)
     expect(await isPersisted()).toBe(true)

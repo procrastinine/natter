@@ -1,7 +1,7 @@
 import type { MessageAttachmentRef } from '../core/types'
 import type { NatterDb, SettingsRow } from '../store/db'
 
-export const ATTACHMENT_REFS_BACKFILL_KEY = 'backfill:attachment-refs-v1'
+const ATTACHMENT_REFS_BACKFILL_KEY = 'backfill:attachment-refs-v1'
 
 export function attachmentRefsBackfillMarker(): SettingsRow {
   return { key: ATTACHMENT_REFS_BACKFILL_KEY, value: 1 }

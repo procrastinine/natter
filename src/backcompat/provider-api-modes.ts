@@ -16,7 +16,7 @@ type LegacyConnectionProfile = ConnectionProfile & {
   }
 }
 
-export interface ProviderApiModeMigrationResult {
+interface ProviderApiModeMigrationResult {
   settings: ChatSettings
   changed: boolean
 }

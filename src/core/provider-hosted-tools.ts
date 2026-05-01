@@ -15,7 +15,7 @@ export function isOpenAiDirectProfile(profile: ConnectionProfile): boolean {
   return isOpenAiDirectBaseUrl(profile.baseUrl)
 }
 
-export function enabledHostedToolIds(
+function enabledHostedToolIds(
   settings: ChatSettings,
   provider: HostedToolProvider,
 ): readonly string[] {
@@ -50,7 +50,7 @@ export function buildOpenRouterServerTools(settings: ChatSettings): Array<{ type
   return tools
 }
 
-export interface OpenAiServerToolsWire {
+interface OpenAiServerToolsWire {
   tools: unknown[]
   include: string[]
 }

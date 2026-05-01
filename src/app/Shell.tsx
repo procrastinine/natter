@@ -34,8 +34,11 @@ import { newId } from '../lib/ulid'
 import { installChatPreviewMaintainer } from '../store/chat-preview-maintainer'
 import {
   createChat,
+  discardEmptyDraftChat,
+  discardEmptyDraftChats,
   getChat,
   loadActiveBranchWindowSnapshot,
+  markChatPermanent,
   touchLastViewed,
   updateChatSettings,
 } from '../store/chats'
@@ -365,6 +368,23 @@ export function Shell() {
     installStreamLeaseListener()
   }, [])
 
+  const previousActiveChatIdRef = useRef<ChatId | null>(activeChatId)
+  useEffect(() => {
+    const previous = previousActiveChatIdRef.current
+    previousActiveChatIdRef.current = activeChatId
+    if (!previous || previous === activeChatId) return
+    void discardEmptyDraftChat(previous).catch((error: unknown) => {
+      console.error('Failed to discard empty draft chat', error)
+    })
+  }, [activeChatId])
+
+  useEffect(() => {
+    if (onNewChatSurface) return
+    void discardEmptyDraftChats({ exceptChatId: activeChatId }).catch((error: unknown) => {
+      console.error('Failed to discard stale empty draft chats', error)
+    })
+  }, [activeChatId, onNewChatSurface])
+
   useEffect(() => {
     if (!activeChatId) return
     void recoverOrphans(Date.now(), activeChatId).catch(() => {})
@@ -419,19 +439,16 @@ export function Shell() {
     }
   }, [])
 
-  // Auto-materialize a chat when the user lands on /new. Eager creation
-  // means the settings panel always has a real Chat row to edit, so every
-  // control on the right pane (model / context / generation) works before
-  // the first message is even typed. Empty chats are hidden from the
-  // sidebar (see ChatList — filters out rows with no previewText), so
-  // this doesn't litter the workspace with Untitled rows even if the
-  // user bails without sending.
+  // Materialize a temporary chat when the user lands on /new. This gives the
+  // active draft real chat-owned settings, but cleanup above discards it once
+  // the user navigates away without ever creating messages.
   useEffect(() => {
     if (!onNewChatSurface) return
-    let cancelled = false
+    const abort = new AbortController()
+    const aborted = () => abort.signal.aborted
     void (async () => {
       const { preset, settings } = await resolveNewChatSeed()
-      if (cancelled) return
+      if (aborted()) return
       writeActiveSeedState({
         profileId: settings.profileId || null,
         presetId: preset?.id ?? null,
@@ -439,13 +456,17 @@ export function Shell() {
       })
       const chat = await createChat({
         settings,
+        temporary: true,
         ...(preset ? { presetId: preset.id } : {}),
       })
-      if (cancelled) return
+      if (aborted()) {
+        void discardEmptyDraftChat(chat.id)
+        return
+      }
       navigateToChat(chat.id)
     })()
     return () => {
-      cancelled = true
+      abort.abort()
     }
   }, [onNewChatSurface, resolveNewChatSeed])
 
@@ -541,7 +562,7 @@ export function Shell() {
       if (!profile) {
         return failSend('send: connection profile missing', { profileId: chat.settings.profileId })
       }
-      let apiKey = ''
+      let apiKey: string
       try {
         apiKey = (await resolveKeyIfPresent(profile.apiKeyRef)) ?? ''
         if (profileRequiresKey(profile.kind) && !apiKey) {
@@ -565,6 +586,7 @@ export function Shell() {
         if (result.outcome !== 'done') {
           console.info('send: stream ended with outcome', result.outcome, result.error?.kind)
         }
+        if (chat.temporary) await markChatPermanent(activeChatId)
       } catch (err) {
         return failSend('send: pipeline threw', err)
       }
@@ -591,7 +613,7 @@ export function Shell() {
       if (!profile) {
         return failSend('send: connection profile missing', { profileId: settings.profileId })
       }
-      let apiKey = ''
+      let apiKey: string
       try {
         apiKey = (await resolveKeyIfPresent(profile.apiKeyRef)) ?? ''
         if (profileRequiresKey(profile.kind) && !apiKey) {
@@ -607,6 +629,7 @@ export function Shell() {
       })
       const chat = await createChat({
         settings,
+        temporary: true,
         ...(preset ? { presetId: preset.id } : {}),
       })
       navigateToChat(chat.id)
@@ -625,6 +648,7 @@ export function Shell() {
         if (result.outcome !== 'done') {
           console.info('send: stream ended with outcome', result.outcome, result.error?.kind)
         }
+        await markChatPermanent(chat.id)
       } catch (err) {
         return failSend('send: pipeline threw', err)
       }
@@ -759,7 +783,7 @@ export function Shell() {
         onDrop={(event) => {
           if (activeStorageRoute || (!activeChatId && !onNewChatSurface)) return
           if (!hasFileTransfer(event.dataTransfer)) return
-          const files = Array.from(event.dataTransfer.files ?? [])
+          const files = Array.from(event.dataTransfer.files)
           if (files.length === 0) return
           event.preventDefault()
           setComposerDroppedFiles({ id: newId(), files })
@@ -954,10 +978,7 @@ export function Shell() {
             ) : onNewChatSurface ? (
               <>
                 {/* The new-chat surface still gets a chat-title-bar so the cog
-                 * (model panel), download, and chat-info actions are reachable
-                 * before the chat row materializes. Clicking the cog
-                 * pre-creates the chat from the MRU preset and opens the
-                 * model panel against the now-real chat. */}
+                 * can open the model panel against the temporary chat row. */}
                 <div data-ui="chat-title-bar">
                   <ConnectionHeader variant="title-icon" />
                   <span data-ui="chat-title" data-title-status="untitled">
@@ -970,19 +991,22 @@ export function Shell() {
                     data-role="settings-cog"
                     aria-label="Open model panel"
                     title="Model settings"
-                    onClick={async () => {
-                      const { preset, settings } = await resolveNewChatSeed()
-                      writeActiveSeedState({
-                        profileId: settings.profileId || null,
-                        presetId: preset?.id ?? null,
-                        settings,
-                      })
-                      const chat = await createChat({
-                        settings,
-                        ...(preset ? { presetId: preset.id } : {}),
-                      })
-                      navigateToChat(chat.id)
-                      setChatModelOpen(true)
+                    onClick={() => {
+                      void (async () => {
+                        const { preset, settings } = await resolveNewChatSeed()
+                        writeActiveSeedState({
+                          profileId: settings.profileId || null,
+                          presetId: preset?.id ?? null,
+                          settings,
+                        })
+                        const chat = await createChat({
+                          settings,
+                          temporary: true,
+                          ...(preset ? { presetId: preset.id } : {}),
+                        })
+                        navigateToChat(chat.id)
+                        setChatModelOpen(true)
+                      })()
                     }}
                   >
                     <CogIcon size={20} />
@@ -1035,8 +1059,8 @@ export function Shell() {
           slot={{ kind: 'at-end' }}
           cursor={EMPTY_CURSOR}
           materializeChat={async () => {
-            // Fire ONLY when the user clicks Import. Cancel leaves the
-            // workspace untouched — no empty "untitled chat" rows.
+            // Fire only when the user clicks Import; if import never writes
+            // messages, the temporary row is discarded on navigation.
             const { preset, settings } = await resolveNewChatSeed()
             writeActiveSeedState({
               profileId: settings.profileId || null,
@@ -1045,6 +1069,7 @@ export function Shell() {
             })
             const chat = await createChat({
               settings,
+              temporary: true,
               ...(preset ? { presetId: preset.id } : {}),
             })
             navigateToChat(chat.id)

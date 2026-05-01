@@ -7,7 +7,7 @@ export type ProviderToolContextTarget =
   | 'anthropic-claude'
   | 'text'
 
-export interface ToolEvidenceSection {
+interface ToolEvidenceSection {
   key: string
   itemIndex: number
   label: string
@@ -25,7 +25,7 @@ type ToolEvidenceSectionBase = Omit<
   'itemIndex' | 'dialect' | 'hidden' | 'edited'
 >
 
-export interface ProviderToolContextOptions {
+interface ProviderToolContextOptions {
   includeToolCalls?: boolean | undefined
 }
 
@@ -41,7 +41,7 @@ const OPENAI_RESPONSES_CONTEXT_TYPES = new Set([
   'mcp_call',
 ])
 
-export function providerOutputItemsForMessage(message: Message): ProviderOutputItem[] {
+function providerOutputItemsForMessage(message: Message): ProviderOutputItem[] {
   return structuredClone(message.providerOutputItems ?? [])
 }
 
@@ -179,14 +179,14 @@ export function renderProviderOutputItemsAsText(items: readonly ProviderOutputIt
   return blocks.join('\n\n').slice(0, 12_000)
 }
 
-export function shouldIncludeProviderOutputItem(
+function shouldIncludeProviderOutputItem(
   item: ProviderOutputItem,
   opts: ProviderToolContextOptions = {},
 ): boolean {
   return opts.includeToolCalls !== false && item.hidden !== true
 }
 
-export function isNativeProviderOutputForContext(
+function isNativeProviderOutputForContext(
   item: ProviderOutputItem,
   target: ProviderToolContextTarget,
   opts: ProviderToolContextOptions = {},
@@ -232,7 +232,7 @@ function stripGeminiThoughtSignature(value: unknown): unknown {
   return out
 }
 
-export function isNativeProviderOutput(
+function isNativeProviderOutput(
   item: ProviderOutputItem,
   target: ProviderToolContextTarget,
 ): boolean {

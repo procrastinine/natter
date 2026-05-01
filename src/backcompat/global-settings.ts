@@ -1,6 +1,6 @@
 import type { NatterDb, SettingsRow } from '../store/db'
 
-export const GLOBAL_SETTINGS_BACKFILL_KEY = 'backfill:global-settings-v1'
+const GLOBAL_SETTINGS_BACKFILL_KEY = 'backfill:global-settings-v1'
 
 const RETIRED_AUTO_SCROLL_OPEN_KEY = 'global:auto-scroll-open'
 const AUTO_SCROLL_STREAM_KEY = 'global:auto-scroll-stream'

@@ -3,7 +3,7 @@
 // which must stay daemon-portable) can pull these in without dragging
 // in IDB, Dexie, or any browser-only state via `core/global-settings.ts`.
 //
-// `core/global-settings.ts` re-exports the same names for browser callers
+// `core/global-settings.ts` re-exports the dev default for browser callers
 // that already group their preference imports there.
 
 // CORS proxy used for the OpenRouter privacy scrape (see
@@ -14,8 +14,6 @@
 // `corsProxySecret` is non-empty the scrape sends `X-Proxy-Secret: <secret>`
 // so a custom bouncer can require auth.
 export const DEV_CORS_PROXY_URL = '/_or_scrape'
-export const PUBLIC_CORS_PROXY_URL =
-  'https://corsproxy.io/?url=https://openrouter.ai/{model}/providers'
 export const DEFAULT_CORS_PROXY_URL = ''
 export const CORS_PROXY_SECRET_HEADER = 'X-Proxy-Secret'
 

@@ -2,7 +2,7 @@ import { tokenCalibrationKeyForStoredRecordKey } from '../core/model-ids'
 import type { Chat, GlobalTokenCalibration, TokenCalibrationSample } from '../core/types'
 import type { NatterDb, SettingsRow } from '../store/db'
 
-export const TOKEN_CALIBRATION_GLOBAL_BACKFILL_KEY = 'backfill:token-calibration-global-v1'
+const TOKEN_CALIBRATION_GLOBAL_BACKFILL_KEY = 'backfill:token-calibration-global-v1'
 const GLOBAL_TOKEN_CALIBRATION_KEY = 'global:token-calibration'
 
 export function tokenCalibrationGlobalBackfillMarker(): SettingsRow {

@@ -26,7 +26,7 @@ describe('GeneralSettings', () => {
   it('keeps token calibration mode in global settings without family controls', async () => {
     render(<GeneralSettings />)
 
-    const mode = (await screen.findByLabelText('Mode')) as HTMLSelectElement
+    const mode = await screen.findByLabelText<HTMLSelectElement>('Mode')
     expect(screen.getByText('Token calibration')).toBeInTheDocument()
     expect(mode.value).toBe('adaptive')
 

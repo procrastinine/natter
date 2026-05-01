@@ -4,7 +4,7 @@
 //
 // Routes:
 //   #/             → home (launcher / sample prompts; no chat selected)
-//   #/new          → blank-chat surface (NO chat row created until first send)
+//   #/new          → blank-chat surface backed by a temporary chat row
 //   #/chat/<id>                   → open chat with no specific cursor pin
 //   #/chat/<id>/message/<msgId>   → open chat with cursor pinned at <msgId>
 //   #/storage                     → workspace/storage overview

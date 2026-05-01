@@ -14,6 +14,14 @@ test-results
 # Generated local attachment corpus for Phase 12 experiments.
 tests/fixtures/attachments/
 
+# Local development probes. Keep these runnable on disk, but out of commits.
+scripts/dump-indexeddb-console.js
+scripts/probe-provider-server-tools.mjs
+
+# Local IndexedDB exports used for manual storage/debug replay.
+natter_export.json
+natter-indexeddb-*.json
+
 .DS_Store
 *.log
 

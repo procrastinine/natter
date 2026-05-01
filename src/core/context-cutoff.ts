@@ -76,7 +76,7 @@ export interface MessageCostOptions {
   disableTextCalibration?: boolean
 }
 
-export interface MessageCost {
+interface MessageCost {
   text: number
   media: number
   reasoning: number

@@ -3,7 +3,7 @@
 export const QUOTA_WARN_RATIO = 0.8
 export const QUOTA_HARD_WARN_RATIO = 0.95
 
-export type QuotaLevel = 'ok' | 'warn' | 'hard-warn'
+type QuotaLevel = 'ok' | 'warn' | 'hard-warn'
 
 export interface QuotaSnapshot {
   usage: number
@@ -72,7 +72,7 @@ export async function isPersisted(): Promise<boolean> {
 
 let persistOncePromise: Promise<boolean> | null = null
 
-export function requestPersistOnce(): Promise<boolean> {
+function requestPersistOnce(): Promise<boolean> {
   if (persistOncePromise) return persistOncePromise
   persistOncePromise = requestPersist()
   return persistOncePromise

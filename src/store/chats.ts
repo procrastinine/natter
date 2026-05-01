@@ -21,6 +21,7 @@ import type {
   ChatSettings,
   ChatSidebarRow,
   ChatTag,
+  DraftRow,
   FolderId,
   Message,
   MessageId,
@@ -73,6 +74,7 @@ interface CreateChatInput {
   title?: string
   settings?: ChatSettings
   presetId?: PresetId
+  temporary?: boolean
   now?: number
 }
 
@@ -103,6 +105,7 @@ export async function createChat(input: CreateChatInput = {}): Promise<Chat> {
     tags: [],
   }
   if (input.presetId !== undefined) chat.presetId = input.presetId
+  if (input.temporary === true) chat.temporary = true
   await db.chats.put(chat)
   postEvent({
     kind: 'chat-mutated',
@@ -186,6 +189,97 @@ export async function listChatSidebarRows(
     if (isDatabaseClosedError(error)) return []
     throw error
   }
+}
+
+function isEmptyDraftRow(draft: DraftRow | undefined): boolean {
+  if (!draft) return true
+  if (draft.text.trim().length > 0) return false
+  if (draft.attachmentRefs.length > 0) return false
+  return true
+}
+
+function isEmptyMaterializedDraftChat(chat: Chat): boolean {
+  const hasCalibration = Object.keys(chat.tokenCalibration ?? {}).length > 0
+  const legacyHiddenDraft =
+    chat.presetId === undefined &&
+    chat.title.trim().length === 0 &&
+    chat.titleStatus === 'untitled' &&
+    (chat.previewText === undefined || chat.previewText === '')
+  return (
+    (chat.temporary === true || legacyHiddenDraft) &&
+    chat.lastUpdatedLeafId === null &&
+    chat.wordCount === 0 &&
+    chat.totalCostUsd === 0 &&
+    !hasCalibration
+  )
+}
+
+export async function discardEmptyDraftChat(chatId: ChatId): Promise<boolean> {
+  const deleted = await discardEmptyDraftChats({ chatIds: [chatId] })
+  return deleted.includes(chatId)
+}
+
+export async function discardEmptyDraftChats({
+  chatIds,
+  exceptChatId = null,
+}: {
+  chatIds?: readonly ChatId[] | undefined
+  exceptChatId?: ChatId | null | undefined
+} = {}): Promise<ChatId[]> {
+  const db = getDb()
+  const candidates =
+    chatIds === undefined
+      ? await db.chats.toArray()
+      : (await db.chats.bulkGet([...new Set(chatIds)])).filter((chat): chat is Chat =>
+          Boolean(chat),
+        )
+  const rows = candidates.filter(
+    (chat) => chat.id !== exceptChatId && isEmptyMaterializedDraftChat(chat),
+  )
+  if (rows.length === 0) return []
+  const deleted: ChatId[] = []
+  await db.transaction(
+    'rw',
+    [
+      db.chatBranchCache,
+      db.chats,
+      db.childLists,
+      db.drafts,
+      db.messageBodies,
+      db.messages,
+      db.streamChunks,
+      db.streamLeases,
+    ],
+    async () => {
+      for (const chat of rows) {
+        const [latest, draft] = await Promise.all([
+          db.messages.where('chatId').equals(chat.id).first(),
+          db.drafts.get(chat.id),
+        ])
+        if (latest || !isEmptyDraftRow(draft)) continue
+        await db.messages.where('chatId').equals(chat.id).delete()
+        await db.messageBodies.where('chatId').equals(chat.id).delete()
+        await db.drafts.delete(chat.id)
+        await db.chatBranchCache.delete(chat.id)
+        await db.childLists.filter((row) => row.chatId === chat.id).delete()
+        await db.streamChunks.where('chatId').equals(chat.id).delete()
+        await db.streamLeases.where('chatId').equals(chat.id).delete()
+        await db.chats.delete(chat.id)
+        deleted.push(chat.id)
+      }
+    },
+  )
+  for (const chatId of deleted) postEvent({ kind: 'chat-deleted', chatId })
+  return deleted
+}
+
+export async function markChatPermanent(chatId: ChatId): Promise<void> {
+  const repo = getWorkspaceRepository()
+  await repo.runMutation([{ kind: 'chat-meta', chatId }], async (ctx) => {
+    const chat = await ctx.getChat(chatId)
+    if (!chat?.temporary) return
+    ctx.patchChatMeta(chatId, { temporary: false })
+  })
 }
 
 // Load every message row for a chat, including tombstones. Callers filter
@@ -366,18 +460,6 @@ function messageHeaderTreeKey(headers: readonly MessageHeaderRow[]): string {
       ].join(':'),
     )
     .join('|')
-}
-
-// Draft reads. Writes go through the repo's runMutation with the `draft`
-// scope. Read stays on `getDb()` so `useLiveQuery` can track the drafts
-// table for the typing indicator.
-export async function getChatDraft(chatId: ChatId) {
-  try {
-    return await getDb().drafts.get(chatId)
-  } catch (error) {
-    if (isDatabaseClosedError(error)) return undefined
-    throw error
-  }
 }
 
 // Soft-deletes a chat by setting `archived: true` (the reversible variant).

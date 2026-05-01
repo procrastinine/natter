@@ -779,7 +779,7 @@ async function buildAssistantRequestPlan(
         ...(routeFormat !== undefined ? { reasoningPreservationFormat: routeFormat } : {}),
       }
       const result = toAnthropicMessages(settings, outboundPath, transformOpts)
-      wire = result.wire as Record<string, unknown>
+      wire = result.wire
       requestedModel = result.requestedModel
       anthropicModelId = result.modelId
     } else {

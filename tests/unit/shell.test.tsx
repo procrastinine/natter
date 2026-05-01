@@ -2,7 +2,7 @@ import { cleanup, fireEvent, render, waitFor } from '@testing-library/react'
 import 'fake-indexeddb/auto'
 import Dexie from 'dexie'
 import { IDBFactory } from 'fake-indexeddb'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from 'vitest'
 import { App } from '../../src/app/App'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import type { Chat, Message } from '../../src/core/types'
@@ -23,8 +23,8 @@ import { readActiveSeedState } from '../../src/ui/header/ConnectionHeader'
 import { putTestMessageHeaderOnly, putTestMessages } from '../helpers/message-storage'
 
 describe('shell smoke render', () => {
-  let errorSpy: ReturnType<typeof vi.spyOn>
-  let warnSpy: ReturnType<typeof vi.spyOn>
+  let errorSpy: MockInstance<typeof console.error>
+  let warnSpy: MockInstance<typeof console.warn>
   const DB_NAME = 'natter'
   const DIRECT_MODEL_AUTOSELECT_QUERY = {} as const
 
@@ -86,6 +86,37 @@ describe('shell smoke render', () => {
       'data-sidebar-hidden',
     )
     expect(container.querySelector('[data-ui="sidebar"]')).toBeInTheDocument()
+  })
+
+  it('discards temporary new-chat rows after navigating away without messages', async () => {
+    window.location.hash = '#/new'
+
+    render(<App />)
+
+    await waitFor(() => {
+      expect(window.location.hash).toMatch(/^#\/chat\//)
+    })
+    const [temporary] = await getDb().chats.toArray()
+    expect(temporary?.temporary).toBe(true)
+    expect(await getDb().messages.count()).toBe(0)
+
+    const firstId = temporary?.id
+    window.location.hash = '#/new'
+    window.dispatchEvent(new HashChangeEvent('hashchange'))
+
+    await waitFor(async () => {
+      const rows = await getDb().chats.toArray()
+      expect(rows).toHaveLength(1)
+      expect(rows[0]?.id).not.toBe(firstId)
+      expect(rows[0]?.temporary).toBe(true)
+    })
+
+    window.location.hash = '#/'
+    window.dispatchEvent(new HashChangeEvent('hashchange'))
+
+    await waitFor(async () => {
+      expect(await getDb().chats.count()).toBe(0)
+    })
   })
 
   it('updates lastViewedAt when a chat route opens', async () => {
@@ -796,19 +827,16 @@ describe('shell smoke render', () => {
     fireEvent.mouseDown(filterToggles)
     fireEvent.blur(input, { relatedTarget: document.body })
     expect(container.querySelector('[data-ui="sidebar-search-filters"]')).toBeInTheDocument()
-    let rowLink: HTMLAnchorElement | null = null
-    await waitFor(() => {
-      rowLink =
-        Array.from(container.querySelectorAll<HTMLAnchorElement>('[data-ui="chat-row-link"]')).find(
-          (link) => link.getAttribute('href') === `#/chat/${chat.id}`,
-        ) ?? null
-      expect(rowLink).toBeInTheDocument()
+    const rowLink = await waitFor(() => {
+      const found = Array.from(
+        container.querySelectorAll<HTMLAnchorElement>('[data-ui="chat-row-link"]'),
+      ).find((link) => link.getAttribute('href') === `#/chat/${chat.id}`)
+      if (!found) throw new Error('Expected chat row link')
+      return found
     })
-    if (!rowLink) throw new Error('Expected chat row link')
-    const selectedRowLink = rowLink
-    fireEvent.mouseDown(selectedRowLink)
-    fireEvent.blur(input, { relatedTarget: selectedRowLink })
-    fireEvent.click(selectedRowLink)
+    fireEvent.mouseDown(rowLink)
+    fireEvent.blur(input, { relatedTarget: rowLink })
+    fireEvent.click(rowLink)
     await waitFor(() => {
       expect(window.location.hash).toBe(`#/chat/${chat.id}`)
     })
@@ -1160,7 +1188,7 @@ describe('shell smoke render', () => {
     await waitFor(() => {
       loadButton = Array.from(
         container.querySelectorAll<HTMLButtonElement>('[data-ui="preset-menu-load"]'),
-      ).find((button) => button.textContent?.includes('Price preset'))
+      ).find((button) => button.textContent.includes('Price preset'))
       expect(loadButton).toBeDefined()
     })
     fireEvent.click(loadButton as HTMLButtonElement)
@@ -1226,7 +1254,7 @@ describe('shell smoke render', () => {
     await waitFor(() => {
       loadButton = Array.from(
         container.querySelectorAll<HTMLButtonElement>('[data-ui="preset-menu-load"]'),
-      ).find((button) => button.textContent?.includes('OpenRouter preset'))
+      ).find((button) => button.textContent.includes('OpenRouter preset'))
       expect(loadButton).toBeDefined()
     })
     fireEvent.click(loadButton as HTMLButtonElement)
@@ -1244,7 +1272,7 @@ describe('shell smoke render', () => {
 
 function findLabel(container: HTMLElement, text: string): HTMLLabelElement {
   const label = Array.from(container.querySelectorAll<HTMLLabelElement>('label')).find((item) =>
-    item.textContent?.includes(text),
+    item.textContent.includes(text),
   )
   if (!label) throw new Error(`Expected label: ${text}`)
   return label

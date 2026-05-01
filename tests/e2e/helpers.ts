@@ -94,7 +94,7 @@ export async function seedFirstRun(page: Page, opts: SeedOptions = {}): Promise<
           presetId?: string | null
           settings?: Record<string, unknown> | null
         }
-        const settings = (parsed.settings ?? {})
+        const settings = parsed.settings ?? {}
         const privacy = (settings.privacy ?? {}) as Record<string, unknown>
         window.sessionStorage.setItem(
           'natter:active-seed',
@@ -115,13 +115,10 @@ export async function seedFirstRun(page: Page, opts: SeedOptions = {}): Promise<
   )
 }
 
-// Navigate to the blank-chat surface (`#/new`) and wait for the composer to
-// render. The Shell eagerly materializes a Chat row on `/new` so the right-
-// side settings panel has something to edit — the row is hidden from the
-// sidebar until first send (previewText gates visibility). Awaiting the URL
-// to settle on `/#/chat/:id` before returning is load-bearing: otherwise
-// `fill()` can target the /new composer just before the eager-create
-// navigates, and the /chat composer mounts fresh with empty text.
+// Navigate to the blank-chat surface (`#/new`) and wait for its temporary
+// chat row to materialize. The row owns draft settings while active, stays
+// hidden from the sidebar until first send, and is discarded if the user
+// navigates away without messages.
 export async function createChatAndOpen(page: Page): Promise<void> {
   await page.locator('[data-role="new-chat"]').click()
   await page.locator('[data-ui="composer"]').waitFor({ state: 'visible' })

@@ -26,8 +26,8 @@ interface ImportModalProps {
   defaultRole?: MessageRole
   // Optional late-binding chat creator. When provided and `chatId` is
   // null, invoked ONCE on commit to materialize the chat row, right
-  // before the import mutation runs. Cancel / close never calls it,
-  // so a user who bails on the import leaves no empty chat behind.
+  // before the import mutation runs. Cancel / close never calls it;
+  // route-level temporary-chat cleanup owns empty-row disposal.
   materializeChat?: () => Promise<ChatId>
   onClose: () => void
   onDone?: () => void

@@ -22,13 +22,13 @@ import { readGlobalPreferences } from '../core/global-settings'
 import { getDb } from './db'
 import { hydrateMessages, type MessageBodyRow, type MessageHeaderRow } from './message-storage'
 
-export interface ActiveBranchHeaderSnapshot {
+interface ActiveBranchHeaderSnapshot {
   chatId: string
   allHeaders: MessageHeaderRow[]
   branchHeaders: MessageHeaderRow[]
 }
 
-export interface SendContextSnapshot {
+interface SendContextSnapshot {
   pathMessages: Message[]
   loadedBodyIds: MessageId[]
   usedFullBranch: boolean

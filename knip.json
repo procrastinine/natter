@@ -1,11 +1,5 @@
 {
   "$schema": "https://unpkg.com/knip@6/schema.json",
-  "ignore": [
-    "dist/**",
-    "test-results/**",
-    ".playwright-cli/**",
-    "scripts/dump-indexeddb-console.js"
-  ],
   "ignoreDependencies": [
     "@swc/core"
   ]

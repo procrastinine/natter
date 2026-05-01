@@ -345,9 +345,9 @@ describe('ReasoningIncludeControls — include-in-next-turn gating', () => {
     const chat = await createChat({ settings })
     const capability = effectiveCapabilityFromEndpoints(settings.model, [makeEndpoint()])
     render(<ReasoningIncludeControls chat={chat} capability={capability} />)
-    expect((screen.getByLabelText(/Encrypted reasoning/) as HTMLInputElement).disabled).toBe(false)
-    expect((screen.getByLabelText(/Visible summary/) as HTMLInputElement).disabled).toBe(false)
-    expect((screen.getByLabelText(/Visible text/) as HTMLInputElement).disabled).toBe(false)
+    expect(screen.getByLabelText<HTMLInputElement>(/Encrypted reasoning/).disabled).toBe(false)
+    expect(screen.getByLabelText<HTMLInputElement>(/Visible summary/).disabled).toBe(false)
+    expect(screen.getByLabelText<HTMLInputElement>(/Visible text/).disabled).toBe(false)
   })
 
   it('locks Send as think on for text completions', async () => {
@@ -360,7 +360,7 @@ describe('ReasoningIncludeControls — include-in-next-turn gating', () => {
     const capability = effectiveCapabilityFromEndpoints(settings.model, [makeEndpoint()])
     render(<ReasoningIncludeControls chat={chat} capability={capability} />)
 
-    const sendAsThink = screen.getByLabelText(/Send as/) as HTMLInputElement
+    const sendAsThink = screen.getByLabelText<HTMLInputElement>(/Send as/)
     expect(sendAsThink.checked).toBe(true)
     expect(sendAsThink.disabled).toBe(true)
   })

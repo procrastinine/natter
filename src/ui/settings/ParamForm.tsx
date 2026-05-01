@@ -26,7 +26,6 @@ import {
 } from '../../core/quirks'
 import type {
   Chat,
-  ChatProviderToolSettings,
   AnthropicServerToolId,
   ConnectionKind,
   ConnectionProfile,
@@ -485,7 +484,7 @@ function HostedToolsSection({
           ...bucket,
           enabledServerToolIds: next,
         },
-      } as ChatProviderToolSettings,
+      },
     })
   }
 

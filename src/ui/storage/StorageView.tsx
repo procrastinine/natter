@@ -650,7 +650,7 @@ function ChatsStorageSurface() {
           : field === 'title'
             ? 'asc'
             : 'desc'
-      handleSelectSortMode(`${field}-${direction}` as SidebarSortMode)
+      handleSelectSortMode(`${field}-${direction}`)
     },
     [handleSelectSortMode, sortMode],
   )
