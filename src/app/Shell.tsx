@@ -1,5 +1,5 @@
 import { useLiveQuery } from 'dexie-react-hooks'
-import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { attachmentsDisabledByTextProtocol } from '../core/attachments/context'
 import { cloneDefaultChatSettings } from '../core/defaults'
 import {
@@ -12,15 +12,13 @@ import {
   readGlobalPreferences,
 } from '../core/global-settings'
 import {
-  buildSettingsPromptSizeEstimateInput,
-  type PromptSizeEstimateInput,
-  UNLIMITED_CONTEXT,
-} from '../core/prompt-size'
+  forceEquivalentModelIdForConnection,
+  modelLooksForeignForProfile,
+  pickEquivalentModelId,
+} from '../core/model-selection'
 import { prefillClassFor } from '../core/quirks'
-import { modelLooksForeignForProfile, pickEquivalentModelId } from '../core/model-selection'
 import { withProfileApiDefaults } from '../core/provider-defaults'
 import { DEFAULT_SIDEBAR_SORT_MODE } from '../core/sidebar-sort'
-import { readTokenCalibrationGlobal } from '../core/token-calibration'
 import type {
   Chat,
   ChatId,
@@ -32,22 +30,26 @@ import { useBranchUrlSync } from '../hooks/useBranchUrlSync'
 import { recoverOrphans, useChat } from '../hooks/useChat'
 import { useEndpoints } from '../hooks/useEndpoints'
 import { useModels } from '../hooks/useModels'
-import { useStreamStablePromptEstimate } from '../hooks/useStreamStablePromptEstimate'
 import { newId } from '../lib/ulid'
 import { installChatPreviewMaintainer } from '../store/chat-preview-maintainer'
-import { createChat, getChat, loadActiveBranchSnapshot, updateChatSettings } from '../store/chats'
+import {
+  createChat,
+  getChat,
+  loadActiveBranchWindowSnapshot,
+  touchLastViewed,
+  updateChatSettings,
+} from '../store/chats'
 import { resolveKeyIfPresent } from '../store/keys'
 import { bumpPresetLastUsedAt, getPreset, pickPreferredPreset } from '../store/presets'
 import { bumpProfileLastUsedAt, countProfiles, getProfile } from '../store/profiles'
 import { installPersistenceRequestOnFirstInteraction } from '../store/quota'
-import type { ActiveBranchSnapshot } from '../store/repository'
+import type { ActiveBranchWindowSnapshot } from '../store/repository'
 import { readSidebarSortMode } from '../store/sidebar-preferences'
 import { installStreamLeaseListener, requestAbortForChat } from '../store/stream-leases'
 import { useChatStore } from '../store/zustand/chatStore'
 import { useStreamStore } from '../store/zustand/streamStore'
 import { useToastStore } from '../store/zustand/toastStore'
 import { useUiStore } from '../store/zustand/uiStore'
-import { useAttachmentResolverForContext } from '../ui/attachments/useAttachmentResolver'
 import { BannerTray } from '../ui/chat/BannerTray'
 import { ChatHeader } from '../ui/chat/ChatHeader'
 import { Composer, type ComposerDroppedFiles } from '../ui/chat/Composer'
@@ -93,16 +95,14 @@ const MODEL_AUTOSELECT_QUERY = {
 } as const
 const DIRECT_MODEL_AUTOSELECT_QUERY = {} as const
 
-interface ActiveModelState {
-  chatId: ChatId
-  profileId: string
-  model: string
+interface ActiveBranchWindowSnapshotResult {
+  key: string
+  snapshot: ActiveBranchWindowSnapshot
 }
 
-interface PendingEquivalentModel {
+interface ActiveProfileState {
   chatId: ChatId
   profileId: string
-  sourceModel: string
 }
 
 function cursorCacheKey(chatId: ChatId, cursor: CursorMap): string {
@@ -153,19 +153,12 @@ export function Shell() {
   const streamingOnActiveChat = useStreamStore((s) =>
     activeChatId ? s.hasStreamForChat(activeChatId) : false,
   )
-  const profileCount = useLiveQuery(
-    () => countProfiles({ includeArchived: true }),
-    [],
-    undefined,
-  )
+  const profileCount = useLiveQuery(() => countProfiles({ includeArchived: true }), [], undefined)
   const connectionKnown = profileCount !== undefined
   const hasConnection = connectionKnown && profileCount > 0
   const [chatModelOpen, setChatModelOpen] = useState(false)
   const [globalSettingsOpen, setGlobalSettingsOpen] = useState(false)
   const [composerSeed, setComposerSeed] = useState<string | null>(null)
-  const [composerDraft, setComposerDraft] = useState('')
-  const [composerPrefillDraft, setComposerPrefillDraft] = useState('')
-  const [composerAttachmentRefs, setComposerAttachmentRefs] = useState<MessageAttachmentRef[]>([])
   const [composerDroppedFiles, setComposerDroppedFiles] = useState<ComposerDroppedFiles | null>(
     null,
   )
@@ -181,11 +174,8 @@ export function Shell() {
   const activeCursor = useChatStore((s) =>
     activeChatId ? (s.cursors[activeChatId] ?? EMPTY_CURSOR) : EMPTY_CURSOR,
   )
-  // Single subscriptions for the active chat's row + message set. Earlier
-  // there were three overlapping `useLiveQuery` calls (trailingLeaf,
-  // activeChatRow, tokenBudgetIndicator) each loading the chat/messages
-  // on its own. Now downstream derivations share one observable per
-  // table, cutting redundant IDB reads and observer lifecycles.
+  // Keep a single active chat-row subscription. Expensive body loading is
+  // handled by the message-window query below, not by draft/token observers.
   const activeChatRow = useLiveQuery(
     async () => (activeChatId ? await getChat(activeChatId) : undefined),
     [activeChatId],
@@ -198,28 +188,56 @@ export function Shell() {
   }, [activeChatRow])
   const resolvedActiveChatRow =
     activeChatRow ?? (activeChatId ? chatSnapshotCacheRef.current.get(activeChatId) : undefined)
-  const activeBranchSnapshot = useLiveQuery(
-    () =>
-      activeChatId ? loadActiveBranchSnapshot(activeChatId, activeCursor) : Promise.resolve(null),
-    [activeChatId, activeCursor],
-    null,
+  const loadedPrefs = useLiveQuery(readGlobalPreferences, [], undefined)
+  const prefs = loadedPrefs ?? DEFAULT_GLOBAL_PREFERENCES
+  const [messageBodyWindowLimit, setMessageBodyWindowLimit] = useState(
+    DEFAULT_GLOBAL_PREFERENCES.messageRenderWindowSize,
   )
+  const effectiveMessageBodyWindowLimit = Math.max(1, messageBodyWindowLimit)
   const activeCursorCacheKey = activeChatId ? cursorCacheKey(activeChatId, activeCursor) : null
-  const branchSnapshotCacheRef = useRef(new Map<string, ActiveBranchSnapshot>())
+  const activeBranchWindowQueryKey = activeCursorCacheKey
+    ? JSON.stringify([activeCursorCacheKey, effectiveMessageBodyWindowLimit])
+    : null
+  const activeBranchWindowResult = useLiveQuery(
+    async (): Promise<ActiveBranchWindowSnapshotResult | null> => {
+      if (!activeChatId || !activeBranchWindowQueryKey) return null
+      const snapshot = await loadActiveBranchWindowSnapshot(activeChatId, activeCursor, {
+        offset: -1,
+        limit: effectiveMessageBodyWindowLimit,
+      })
+      return { key: activeBranchWindowQueryKey, snapshot }
+    },
+    [activeChatId, activeCursor, effectiveMessageBodyWindowLimit, activeBranchWindowQueryKey],
+    null as ActiveBranchWindowSnapshotResult | null,
+  )
+  const branchSnapshotCacheRef = useRef(new Map<string, ActiveBranchWindowSnapshot>())
   useEffect(() => {
-    if (!activeBranchSnapshot) return
-    if (activeBranchSnapshot.chatId !== activeChatId) return
+    if (!activeBranchWindowResult) return
+    if (activeBranchWindowResult.snapshot.chatId !== activeChatId) return
     branchSnapshotCacheRef.current.set(
-      cursorCacheKey(activeBranchSnapshot.chatId, activeCursor),
-      activeBranchSnapshot,
+      activeBranchWindowResult.key,
+      activeBranchWindowResult.snapshot,
     )
-  }, [activeBranchSnapshot, activeChatId, activeCursor])
+  }, [activeBranchWindowResult, activeChatId])
   const resolvedActiveBranchSnapshot =
-    activeBranchSnapshot?.chatId === activeChatId
-      ? activeBranchSnapshot
-      : activeCursorCacheKey
-        ? (branchSnapshotCacheRef.current.get(activeCursorCacheKey) ?? null)
+    activeBranchWindowResult?.key === activeBranchWindowQueryKey
+      ? activeBranchWindowResult.snapshot
+      : activeBranchWindowQueryKey
+        ? (branchSnapshotCacheRef.current.get(activeBranchWindowQueryKey) ?? null)
         : null
+  const activeBranchLength = resolvedActiveBranchSnapshot?.branchLength ?? 0
+  const messageBodyWindowResetKey = activeCursorCacheKey ?? '__none__'
+  useEffect(() => {
+    void messageBodyWindowResetKey
+    setMessageBodyWindowLimit(Math.max(1, prefs.messageRenderWindowSize))
+  }, [messageBodyWindowResetKey, prefs.messageRenderWindowSize])
+  const loadOlderMessageWindow = useCallback(() => {
+    const increment = Math.max(1, prefs.messageRenderWindowSize)
+    const nextLimit = effectiveMessageBodyWindowLimit + increment
+    setMessageBodyWindowLimit(
+      activeBranchLength > 0 ? Math.min(activeBranchLength, nextLimit) : nextLimit,
+    )
+  }, [activeBranchLength, effectiveMessageBodyWindowLimit, prefs.messageRenderWindowSize])
   const activeEndpoints = useEndpoints(
     resolvedActiveChatRow?.settings.profileId ?? null,
     resolvedActiveChatRow?.settings.model || null,
@@ -241,50 +259,6 @@ export function Shell() {
     [activeProfileId],
     undefined,
   )
-  const previousActiveModelRef = useRef<ActiveModelState | null>(null)
-  const pendingEquivalentModelRef = useRef<PendingEquivalentModel | null>(null)
-  const activeModelState = useMemo<ActiveModelState | null>(() => {
-    if (!resolvedActiveChatRow?.settings.profileId) return null
-    return {
-      chatId: resolvedActiveChatRow.id,
-      profileId: resolvedActiveChatRow.settings.profileId,
-      model: resolvedActiveChatRow.settings.model,
-    }
-  }, [
-    resolvedActiveChatRow?.id,
-    resolvedActiveChatRow?.settings.profileId,
-    resolvedActiveChatRow?.settings.model,
-  ])
-  useEffect(() => {
-    const previous = previousActiveModelRef.current
-    if (!activeModelState) {
-      previousActiveModelRef.current = null
-      pendingEquivalentModelRef.current = null
-      return
-    }
-    const pending = pendingEquivalentModelRef.current
-    if (
-      previous &&
-      previous.chatId === activeModelState.chatId &&
-      previous.profileId !== activeModelState.profileId &&
-      previous.model
-    ) {
-      pendingEquivalentModelRef.current = {
-        chatId: activeModelState.chatId,
-        profileId: activeModelState.profileId,
-        sourceModel: activeModelState.model || previous.model,
-      }
-    } else if (activeModelState.model) {
-      if (pending?.chatId === activeModelState.chatId) pendingEquivalentModelRef.current = null
-    } else if (
-      pending &&
-      (pending.chatId !== activeModelState.chatId ||
-        pending.profileId !== activeModelState.profileId)
-    ) {
-      pendingEquivalentModelRef.current = null
-    }
-    previousActiveModelRef.current = activeModelState
-  }, [activeModelState])
   const autoSelectModelsQuery =
     activeProfileForModelList?.kind === 'openrouter'
       ? MODEL_AUTOSELECT_QUERY
@@ -293,53 +267,65 @@ export function Shell() {
     query: autoSelectModelsQuery,
     enabled: !!resolvedActiveChatRow && !!activeProfileForModelList,
   })
+  const previousActiveProfileStateRef = useRef<ActiveProfileState | null>(null)
+  const pendingProfileSwitchRef = useRef<ActiveProfileState | null>(null)
   useEffect(() => {
     if (!resolvedActiveChatRow) return
+    const activeProfileState: ActiveProfileState = {
+      chatId: resolvedActiveChatRow.id,
+      profileId: resolvedActiveChatRow.settings.profileId,
+    }
+    const previousProfileState = previousActiveProfileStateRef.current
+    if (
+      previousProfileState &&
+      previousProfileState.chatId === activeProfileState.chatId &&
+      previousProfileState.profileId !== activeProfileState.profileId
+    ) {
+      pendingProfileSwitchRef.current = activeProfileState
+    }
+    previousActiveProfileStateRef.current = activeProfileState
+    if (!activeProfileForModelList) return
     if (activeProfileId !== resolvedActiveChatRow.settings.profileId) return
+    if (activeProfileForModelList.id !== activeProfileId) return
+    const pendingProfileSwitch = pendingProfileSwitchRef.current
+    const shouldReconcileExistingModel =
+      pendingProfileSwitch?.chatId === activeProfileState.chatId &&
+      pendingProfileSwitch.profileId === activeProfileState.profileId
     const rows = autoSelectModels.models
-    const pendingEquivalent = pendingEquivalentModelRef.current
     if (resolvedActiveChatRow.settings.model) {
+      if (!shouldReconcileExistingModel) return
       if (rows.length === 0) return
       const equivalentModelId = pickEquivalentModelId(resolvedActiveChatRow.settings.model, rows)
-      if (equivalentModelId && equivalentModelId !== resolvedActiveChatRow.settings.model) {
-        pendingEquivalentModelRef.current = null
-        void updateChatSettings(resolvedActiveChatRow.id, { model: equivalentModelId })
-        return
-      }
-      if (
-        (pendingEquivalent ||
-          (activeProfileForModelList &&
-            modelLooksForeignForProfile(
+      const normalizedEquivalentModelId = equivalentModelId
+        ? (forceEquivalentModelIdForConnection(equivalentModelId, activeProfileForModelList.kind) ??
+          equivalentModelId)
+        : null
+      const nextModel = normalizedEquivalentModelId
+        ? normalizedEquivalentModelId === resolvedActiveChatRow.settings.model
+          ? null
+          : normalizedEquivalentModelId
+        : modelLooksForeignForProfile(
               activeProfileForModelList.kind,
               resolvedActiveChatRow.settings.model,
-            ))) &&
-        !equivalentModelId
-      ) {
-        pendingEquivalentModelRef.current = null
-        void updateChatSettings(resolvedActiveChatRow.id, { model: '' })
+            )
+          ? ''
+          : null
+      if (nextModel === null) {
+        pendingProfileSwitchRef.current = null
         return
       }
-      if (!pendingEquivalent) return
-    }
-    if (
-      pendingEquivalent &&
-      pendingEquivalent.chatId === resolvedActiveChatRow.id &&
-      pendingEquivalent.profileId === resolvedActiveChatRow.settings.profileId
-    ) {
-      if (rows.length === 0) return
-      const equivalentModelId = pickEquivalentModelId(pendingEquivalent.sourceModel, rows)
-      pendingEquivalentModelRef.current = null
+      pendingProfileSwitchRef.current = null
       void (async () => {
         const latest = await getChat(resolvedActiveChatRow.id)
         if (!latest) return
         if (latest.settings.profileId !== resolvedActiveChatRow.settings.profileId) return
-        const nextModel = equivalentModelId ?? ''
-        if (latest.settings.model === nextModel) return
+        if (latest.settings.model !== resolvedActiveChatRow.settings.model) return
         await updateChatSettings(resolvedActiveChatRow.id, { model: nextModel })
       })()
       return
     }
-    if (resolvedActiveChatRow.settings.model) return
+    pendingProfileSwitchRef.current = null
+    if (resolvedActiveChatRow.presetId) return
     if (rows.length !== 1) return
     const only = rows[0]
     if (!only) return
@@ -353,114 +339,10 @@ export function Shell() {
       await updateChatSettings(resolvedActiveChatRow.id, { model: only.id })
     })()
   }, [resolvedActiveChatRow, activeProfileId, activeProfileForModelList, autoSelectModels.models])
-  const activePathMemo = resolvedActiveBranchSnapshot?.branch ?? []
-  const composerAttachmentResolver = useAttachmentResolverForContext({
-    settings: resolvedActiveChatRow?.settings,
-    messages: activePathMemo,
-    draftAttachmentRefs: composerAttachmentRefs,
-  })
-  const prefs = useLiveQuery(readGlobalPreferences, [], DEFAULT_GLOBAL_PREFERENCES)
-  const globalCalibration = useLiveQuery(readTokenCalibrationGlobal, [], null)
+  const activePathHeaders = resolvedActiveBranchSnapshot?.branchHeaders ?? []
   const sidebarSortMode = useLiveQuery(readSidebarSortMode, [], DEFAULT_SIDEBAR_SORT_MODE)
-  const trailingLeaf = useMemo(() => activePathMemo.at(-1) ?? null, [activePathMemo])
+  const trailingLeaf = useMemo(() => activePathHeaders.at(-1) ?? null, [activePathHeaders])
   const trailingUserMessage = trailingLeaf?.role === 'user' ? trailingLeaf : null
-  const streamActivityKey = useStreamStore((s) =>
-    activeChatId
-      ? Object.values(s.activeByStreamId)
-          .filter((stream) => stream.chatId === activeChatId)
-          .map((stream) => (stream.messageId ? `m:${stream.messageId}` : `s:${stream.streamId}`))
-          .sort()
-          .join('|')
-      : '',
-  )
-  // Pre-cut the active path via the head+tail cutoff so the composer
-  // gauge reflects what will actually be sent (matches the Context-tab
-  // gauge). `providerCap` lets the cutoff resolve even when the user
-  // hasn't typed a `customMaxContext`; null until capability loads, then
-  // the memo re-runs.
-  const composerProviderCap =
-    activeCapability?.maxPromptTokens ?? activeCapability?.contextLength ?? null
-  const tokenEstimateInput = useMemo<PromptSizeEstimateInput | null>(() => {
-    if (!resolvedActiveChatRow) return null
-    // Roll the prefill draft into `draftText` so the token gauge reflects
-    // both inputs the user is about to send. The wire transform sends the
-    // prefill as a separate assistant turn but token-wise it's just bytes;
-    // adding to draftText is the cheapest accurate accounting.
-    const combinedDraft =
-      composerPrefillDraft.length > 0 ? `${composerDraft}\n${composerPrefillDraft}` : composerDraft
-    return buildSettingsPromptSizeEstimateInput(
-      resolvedActiveChatRow.settings,
-      activePathMemo,
-      combinedDraft,
-      null,
-      composerProviderCap,
-      composerAttachmentResolver,
-      {
-        chatTokenCalibration: resolvedActiveChatRow.tokenCalibration,
-        globalCalibration,
-        mode: prefs.tokenCalibrationMode,
-      },
-      composerAttachmentRefs,
-    )
-  }, [
-    resolvedActiveChatRow,
-    activePathMemo,
-    composerDraft,
-    composerPrefillDraft,
-    composerAttachmentRefs,
-    composerProviderCap,
-    composerAttachmentResolver,
-    globalCalibration,
-    prefs.tokenCalibrationMode,
-  ])
-  const deferredTokenEstimateInput = useDeferredValue(tokenEstimateInput)
-  const tokenEstimate = useStreamStablePromptEstimate(
-    resolvedActiveChatRow?.id,
-    deferredTokenEstimateInput,
-    streamActivityKey,
-  )
-  // Token indicator for the composer. Shares `estimatePromptSize` with
-  // the Context tab's gauge, so the number the user sees in the composer
-  // matches the Context tab exactly — including the provider-calibrated
-  // baseline, the hiddenFromContext filtering, and the edit-aware
-  // fallback. Budget resolution:
-  //
-  //   1. Prefer the user's `customMaxContext` — it's explicit intent.
-  //   2. Otherwise use the provider-derived cap from live /endpoints.
-  //   3. If the capability hasn't loaded yet AND the user hasn't set a
-  //      custom cap, return `undefined` so the Composer hides the
-  //      indicator entirely instead of collapsing to a bogus 128k
-  //      default. Transient flickers from "894k → 104k" during a model
-  //      switch were the bug driving this.
-  const tokenBudgetIndicator = useMemo(() => {
-    if (!resolvedActiveChatRow) return undefined
-    const providerCap = activeCapability?.maxPromptTokens ?? activeCapability?.contextLength
-    const customMaxStored = resolvedActiveChatRow.settings.customMaxContext
-    // `-1` is the "no local cap" sentinel — hide the composer gauge budget
-    // (the label renders just the used count) rather than pretending the
-    // provider cap applies when the user explicitly opted out.
-    if (customMaxStored === UNLIMITED_CONTEXT) {
-      // Fall through with a large modelCap but it will still be capped via max
-      // completion below; the composer checks `budget <= used ? undefined
-      // : budget - used` so an effectively unbounded number is fed in.
-    }
-    const modelCapRaw = customMaxStored === UNLIMITED_CONTEXT ? undefined : customMaxStored
-    const modelCap = modelCapRaw ?? providerCap
-    if (modelCap === undefined && customMaxStored !== UNLIMITED_CONTEXT) return undefined
-    const providerCompletionCap =
-      activeCapability?.maxCompletionTokens ?? activeCapability?.contextLength ?? modelCap ?? 0
-    const maxCompletionStored = resolvedActiveChatRow.settings.maxCompletionTokens
-    const maxCompletion =
-      maxCompletionStored === UNLIMITED_CONTEXT
-        ? 0
-        : (maxCompletionStored ?? Math.min(4096, providerCompletionCap))
-    const budget =
-      customMaxStored === UNLIMITED_CONTEXT
-        ? Number.POSITIVE_INFINITY
-        : Math.max(0, (modelCap ?? 0) - maxCompletion)
-    if (!tokenEstimate) return undefined
-    return { used: tokenEstimate.total, budget }
-  }, [resolvedActiveChatRow, activeCapability, tokenEstimate])
   const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() => {
     if (typeof window === 'undefined') return false
     return window.localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === '1'
@@ -486,6 +368,13 @@ export function Shell() {
   useEffect(() => {
     if (!activeChatId) return
     void recoverOrphans(Date.now(), activeChatId).catch(() => {})
+  }, [activeChatId])
+
+  useEffect(() => {
+    if (!activeChatId) return
+    void touchLastViewed(activeChatId).catch((error: unknown) => {
+      console.error('Failed to update chat viewed timestamp', error)
+    })
   }, [activeChatId])
 
   const lastSeedSignatureRef = useRef<string>('')
@@ -523,10 +412,7 @@ export function Shell() {
       presetId: remembered.presetId,
       profileId: rememberedProfile ? rememberedProfile.id : null,
     })
-    const settings = seedSettingsForNewChat(
-      preset?.settings,
-      rememberedProfile ?? null,
-    )
+    const settings = seedSettingsForNewChat(preset?.settings, rememberedProfile ?? null)
     return {
       preset,
       settings,
@@ -924,7 +810,10 @@ export function Shell() {
                     prefillRecommendationEndpoints={activeEndpoints.endpoints}
                     longMessageDisplayMode={prefs.longMessageDisplayMode}
                     messageRenderWindowSize={prefs.messageRenderWindowSize}
-                    messageRenderWindowLoadMode={prefs.messageRenderWindowLoadMode}
+                    messageRenderWindowLoadMode={
+                      loadedPrefs ? prefs.messageRenderWindowLoadMode : 'manual'
+                    }
+                    onLoadOlderMessages={loadOlderMessageWindow}
                   />
                   {effectiveFocusMode ? (
                     <Composer
@@ -938,10 +827,7 @@ export function Shell() {
                         : { sendBlockedReason: 'Add a connection to send messages.' })}
                       seed={composerSeed}
                       onSeedConsumed={() => setComposerSeed(null)}
-                      onDraftChange={setComposerDraft}
-                      onPrefillDraftChange={setComposerPrefillDraft}
                       attachmentScopeKey={activeChatId}
-                      onAttachmentDraftChange={setComposerAttachmentRefs}
                       attachmentsDisabled={attachmentsDisabledForActiveChat}
                       attachmentsDisabledReason="Attachments are unavailable with Text completions."
                       droppedFiles={composerDroppedFiles}
@@ -962,7 +848,6 @@ export function Shell() {
                             ) : null,
                           }
                         : {})}
-                      {...(tokenBudgetIndicator ? { tokenBudget: tokenBudgetIndicator } : {})}
                       trailingUserMessage={Boolean(trailingUserMessage)}
                       {...(trailingUserMessage && hasConnection
                         ? {
@@ -1004,10 +889,7 @@ export function Shell() {
                       : { sendBlockedReason: 'Add a connection to send messages.' })}
                     seed={composerSeed}
                     onSeedConsumed={() => setComposerSeed(null)}
-                    onDraftChange={setComposerDraft}
-                    onPrefillDraftChange={setComposerPrefillDraft}
                     attachmentScopeKey={activeChatId}
-                    onAttachmentDraftChange={setComposerAttachmentRefs}
                     attachmentsDisabled={attachmentsDisabledForActiveChat}
                     attachmentsDisabledReason="Attachments are unavailable with Text completions."
                     droppedFiles={composerDroppedFiles}
@@ -1028,7 +910,6 @@ export function Shell() {
                           ) : null,
                         }
                       : {})}
-                    {...(tokenBudgetIndicator ? { tokenBudget: tokenBudgetIndicator } : {})}
                     trailingUserMessage={Boolean(trailingUserMessage)}
                     {...(trailingUserMessage && hasConnection
                       ? {
@@ -1116,15 +997,11 @@ export function Shell() {
                     : { sendBlockedReason: 'Add a connection to send messages.' })}
                   seed={composerSeed}
                   onSeedConsumed={() => setComposerSeed(null)}
-                  onDraftChange={setComposerDraft}
-                  onPrefillDraftChange={setComposerPrefillDraft}
                   attachmentScopeKey="new"
-                  onAttachmentDraftChange={setComposerAttachmentRefs}
                   droppedFiles={composerDroppedFiles}
                   onDroppedFilesConsumed={handleDroppedFilesConsumed}
                   sendShortcut={prefs.sendShortcut}
                   onImportAtEnd={() => setImportAtEndOpen(true)}
-                  {...(tokenBudgetIndicator ? { tokenBudget: tokenBudgetIndicator } : {})}
                 />
               </>
             ) : (
@@ -1137,6 +1014,7 @@ export function Shell() {
         <ChatModelPanel
           chatId={activeChatId}
           chatSnapshot={resolvedActiveChatRow ?? null}
+          profileSnapshot={activeProfileForModelList ?? null}
           onClose={() => setChatModelOpen(false)}
         />
       ) : null}

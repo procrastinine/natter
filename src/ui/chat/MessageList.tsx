@@ -28,7 +28,7 @@ import {
   regenerateFromMessage,
 } from '../../hooks/useMessageOps'
 import { getChat, listChatSidebarRows } from '../../store/chats'
-import type { ActiveBranchSnapshot } from '../../store/repository'
+import type { ActiveBranchWindowSnapshot } from '../../store/repository'
 import { useChatStore } from '../../store/zustand/chatStore'
 import { useStreamStore } from '../../store/zustand/streamStore'
 import { useToastStore } from '../../store/zustand/toastStore'
@@ -46,7 +46,8 @@ interface MessageListProps {
   longMessageDisplayMode?: LongMessageDisplayMode
   messageRenderWindowSize: number
   messageRenderWindowLoadMode: RenderWindowLoadMode
-  branchSnapshot: ActiveBranchSnapshot | null
+  branchSnapshot: ActiveBranchWindowSnapshot | null
+  onLoadOlderMessages: () => void
 }
 
 // Stable reference so `useChatStore(selector)` doesn't allocate a fresh `{}`
@@ -82,11 +83,16 @@ export const MessageList = memo(function MessageList({
   messageRenderWindowSize,
   messageRenderWindowLoadMode,
   branchSnapshot,
+  onLoadOlderMessages,
 }: MessageListProps) {
   const cursor = useChatStore((state) => state.cursors[chatId] ?? EMPTY_CURSOR)
-  const messages = useStableMessageRows(branchSnapshot?.branch ?? [])
+  const messages = useStableMessageRows(branchSnapshot?.branchWindow ?? [])
   const treeMessages = useMemo(
     () => (branchSnapshot?.allHeaders ?? []) as unknown as MessageRow[],
+    [branchSnapshot],
+  )
+  const branchHeaders = useMemo(
+    () => (branchSnapshot?.branchHeaders ?? []) as unknown as MessageRow[],
     [branchSnapshot],
   )
   const streamGenerationBusy = useStreamStore((state) => state.hasStreamForChat(chatId))
@@ -109,7 +115,10 @@ export const MessageList = memo(function MessageList({
     return live
   }, [byParent])
   const branchTreeKey = useMemo(() => branchSnapshot?.treeKey ?? '', [branchSnapshot])
-  const path = messages
+  const visiblePath = messages
+  const hiddenOlderCount = branchSnapshot?.windowOffset ?? 0
+  const branchLength = branchSnapshot?.branchLength ?? visiblePath.length
+  const path = visiblePath
   const hasAnyReasoningDetails = useMemo(
     () => path.some((m) => (m.reasoningDetails?.length ?? 0) > 0),
     [path],
@@ -138,7 +147,6 @@ export const MessageList = memo(function MessageList({
   const listRef = useRef<HTMLDivElement | null>(null)
   const loadOlderRef = useRef<HTMLDivElement | null>(null)
   const pendingPrependAnchorRef = useRef<{ scrollTop: number; scrollHeight: number } | null>(null)
-  const [renderedMessageCount, setRenderedMessageCount] = useState(messageRenderWindowSize)
   const focusedMessageId = useCallback((): MessageId | null => {
     const el = listRef.current?.querySelector<HTMLElement>('[data-ui="message"]:focus-within')
     return el?.getAttribute('data-message-id') ?? null
@@ -333,27 +341,21 @@ export const MessageList = memo(function MessageList({
 
   const roleMismatchIdsOnPath = useMemo(() => {
     const set = new Set<MessageId>()
-    for (let i = 1; i < path.length; i += 1) {
-      const prev = path[i - 1] as MessageRow
-      const cur = path[i] as MessageRow
+    for (let i = Math.max(1, hiddenOlderCount); i < hiddenOlderCount + visiblePath.length; i += 1) {
+      const prev = branchHeaders[i - 1]
+      const cur = branchHeaders[i]
+      if (!prev || !cur) continue
       if (prev.role === cur.role) {
         set.add(cur.id)
       }
     }
     return set
-  }, [path])
+  }, [branchHeaders, hiddenOlderCount, visiblePath.length])
 
   const excludedIds = useMemo(() => {
-    return computeExcludedIds(path, chatSettings, capability)
-  }, [path, chatSettings, capability])
-  const pathLeafId = path.at(-1)?.id ?? null
-  const messageWindowResetKey = `${chatId}:${pathLeafId ?? ''}`
-  const effectiveRenderedMessageCount = Math.min(path.length, renderedMessageCount)
-  const hiddenOlderCount = Math.max(0, path.length - effectiveRenderedMessageCount)
-  const visiblePath = useMemo(
-    () => path.slice(Math.max(0, path.length - effectiveRenderedMessageCount)),
-    [path, effectiveRenderedMessageCount],
-  )
+    return computeExcludedIds(branchHeaders, chatSettings, capability)
+  }, [branchHeaders, chatSettings, capability])
+  const effectiveRenderedMessageCount = visiblePath.length
   const loadOlderMessages = useCallback(() => {
     if (hiddenOlderCount <= 0) return
     const container = listRef.current?.closest<HTMLDivElement>('[data-ui="scroll-region"]')
@@ -363,16 +365,12 @@ export const MessageList = memo(function MessageList({
         scrollHeight: container.scrollHeight,
       }
     }
-    setRenderedMessageCount((current) => Math.min(path.length, current + messageRenderWindowSize))
-  }, [hiddenOlderCount, messageRenderWindowSize, path.length])
+    onLoadOlderMessages()
+  }, [hiddenOlderCount, onLoadOlderMessages])
 
-  useEffect(() => {
-    void messageWindowResetKey
-    setRenderedMessageCount(messageRenderWindowSize)
-    pendingPrependAnchorRef.current = null
-  }, [messageRenderWindowSize, messageWindowResetKey])
-
+  const visiblePathLength = visiblePath.length
   useLayoutEffect(() => {
+    void visiblePathLength
     const anchor = pendingPrependAnchorRef.current
     if (!anchor) return
     pendingPrependAnchorRef.current = null
@@ -380,7 +378,7 @@ export const MessageList = memo(function MessageList({
     if (!container) return
     const delta = container.scrollHeight - anchor.scrollHeight
     container.scrollTop = anchor.scrollTop + delta
-  })
+  }, [visiblePathLength])
 
   useEffect(() => {
     if (messageRenderWindowLoadMode !== 'auto') return
@@ -406,7 +404,7 @@ export const MessageList = memo(function MessageList({
       ref={listRef}
       data-render-window-size={messageRenderWindowSize}
       data-rendered-count={effectiveRenderedMessageCount}
-      data-total-count={path.length}
+      data-total-count={branchLength}
     >
       {hiddenOlderCount > 0 ? (
         <div ref={loadOlderRef} data-ui="message-window-load">
@@ -418,7 +416,7 @@ export const MessageList = memo(function MessageList({
       ) : null}
       {visiblePath.map((m, idx) => {
         const fullIndex = hiddenOlderCount + idx
-        const prev = path[fullIndex - 1]
+        const prev = branchHeaders[fullIndex - 1]
         const showStaleHint = m.role === 'assistant' && prev && staleHintFor.has(prev.id)
         return (
           <Message
@@ -529,8 +527,19 @@ function useStableMessageRows(messages: readonly MessageRow[]): readonly Message
 // - The first `keepFirstPairs * 2` messages are pinned.
 // - The walk goes backward from the end, accumulating, until the budget
 //   overflows; everything untouched is "excluded".
+type ContextEstimateRow = Pick<
+  MessageRow,
+  | 'id'
+  | 'hiddenFromContext'
+  | 'content'
+  | 'originalCharCount'
+  | 'charCountDelta'
+  | 'cachedTokenEstimate'
+  | 'originalTokenEstimate'
+>
+
 function computeExcludedIds(
-  path: readonly MessageRow[],
+  path: readonly ContextEstimateRow[],
   settings: import('../../core/types').ChatSettings,
   capability?: EffectiveCapability,
 ): Set<MessageId> {
@@ -555,9 +564,22 @@ function computeExcludedIds(
   const budget = modelCap !== undefined ? Math.max(0, modelCap - maxCompletion) : undefined
   const strategy = settings.contextStrategy
   const keepFirst = Math.max(0, (strategy.keepFirstPairs ?? 0) * 2)
-  const tokensFor = (m: MessageRow): number => {
+  const tokensFor = (m: ContextEstimateRow): number => {
+    if (typeof m.cachedTokenEstimate === 'number' && Number.isFinite(m.cachedTokenEstimate)) {
+      return Math.max(0, Math.ceil(m.cachedTokenEstimate))
+    }
+    if (typeof m.originalTokenEstimate === 'number' && Number.isFinite(m.originalTokenEstimate)) {
+      return Math.max(0, Math.ceil(m.originalTokenEstimate))
+    }
+    if (typeof m.originalCharCount === 'number' && Number.isFinite(m.originalCharCount)) {
+      const delta =
+        typeof m.charCountDelta === 'number' && Number.isFinite(m.charCountDelta)
+          ? m.charCountDelta
+          : 0
+      return Math.ceil(Math.max(0, m.originalCharCount + delta) / 4)
+    }
     let chars = 0
-    for (const item of m.content) {
+    for (const item of m.content ?? []) {
       if (item.type === 'text' || item.type === 'output_text') chars += item.text.length
     }
     return Math.ceil(chars / 4)

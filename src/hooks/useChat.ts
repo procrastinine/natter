@@ -22,38 +22,39 @@
 // callbacks; components call `sendText({chat, connection, ...})`.
 
 import { useCallback, useRef } from 'react'
+import type { AnthropicStreamChunk } from '../api/anthropic-types'
 import { type AssistantStreamChunk, openAssistantRequestStream } from '../api/assistant-stream'
 import { ApiError } from '../api/errors'
-import type { AnthropicStreamChunk } from '../api/anthropic-types'
 import type { GeminiStreamChunk } from '../api/gemini-types'
 import {
-  splitAnthropicStream,
   type StreamLaneEvent,
+  splitAnthropicStream,
   splitChatStream,
   splitGeminiStream,
   splitResponsesStream,
 } from '../api/stream-transforms'
 import type { ChatStreamChunk, ResponsesStreamChunk } from '../api/types'
-import { cursorKeyOf, groupByParent } from '../core/active-path'
+import { activePath, cursorKeyOf, groupByParent } from '../core/active-path'
 import { readGlobalPreferences } from '../core/global-settings'
 import { sendUserMessage } from '../core/messages'
+import { tokenCalibrationKey } from '../core/model-ids'
+import {
+  providerOutputItemFromGeminiPart,
+  providerOutputItemFromResponsesItem,
+} from '../core/provider-tool-context'
 import {
   findMergeTargetIndex,
   mergeReasoningDetail,
   normalizeIncomingReasoningDetail,
 } from '../core/reasoning'
 import {
-  providerOutputItemFromResponsesItem,
-  providerOutputItemFromGeminiPart,
-} from '../core/provider-tool-context'
-import {
   type AssistantRequestPlan,
   NoEligibleProvidersError,
   prepareAssistantRequestPlan,
 } from '../core/send-planning'
 import {
+  addAcceptedSampleToGlobal,
   addSampleToChat,
-  addSampleToGlobal,
   calibrationFieldsForCreate,
   deriveCompletionSample,
   derivePromptSample,
@@ -84,13 +85,14 @@ import { newId } from '../lib/ulid'
 import { attachmentScopes, incRefs } from '../store/attachments'
 import { postEvent } from '../store/broadcast'
 import { getBrowserRepository } from '../store/browser-repo'
-import { getChat, loadActiveBranchSnapshot } from '../store/chats'
+import { getChat, loadMessageHeaders } from '../store/chats'
 import {
   type GeneratedOutputDownloader,
   materializeGeneratedOutputAttachments,
   mergeGeneratedImageAttachmentRefs,
 } from '../store/generated-images'
 import type { MessageHeaderPatch, StreamChunkRow } from '../store/repository'
+import { loadActiveBranchHeaderSnapshot, loadSendContextForBranch } from '../store/send-context'
 import { isFreshStreamLease, STREAM_LEASE_TTL_MS } from '../store/stream-leases'
 import { useChatStore } from '../store/zustand/chatStore'
 import { useStreamStore } from '../store/zustand/streamStore'
@@ -389,9 +391,8 @@ export async function sendText(input: SendTextInput): Promise<SendTextResult> {
     if (!chat) throw new Error(`sendText: chat not found: ${input.chatId}`)
 
     const cursor = useChatStore.getState().getCursor(input.chatId) ?? {}
-    const branchSnapshot = await loadActiveBranchSnapshot(input.chatId, cursor)
-    const path = branchSnapshot.branch
-    const parentId = path.at(-1)?.id ?? null
+    const branchSnapshot = await loadActiveBranchHeaderSnapshot(input.chatId, cursor)
+    const parentId = branchSnapshot.branchHeaders.at(-1)?.id ?? null
     const createdAt = now()
     const userMessageId = newId()
     const userTurnId = newId()
@@ -421,9 +422,13 @@ export async function sendText(input: SendTextInput): Promise<SendTextResult> {
           turnId: userTurnId,
         })
       : null
-    const plannedPath = pendingPrefill
-      ? [...path, pendingUser, pendingPrefill]
-      : [...path, pendingUser]
+    const sendContext = await loadSendContextForBranch({
+      chat,
+      branchHeaders: branchSnapshot.branchHeaders,
+      ...(input.capabilities ? { capabilities: input.capabilities } : {}),
+      pendingMessages: pendingPrefill ? [pendingUser, pendingPrefill] : [pendingUser],
+    })
+    const plannedPath = sendContext.pathMessages
     let requestPlan: AssistantRequestPlan
     try {
       requestPlan = (
@@ -431,6 +436,7 @@ export async function sendText(input: SendTextInput): Promise<SendTextResult> {
           chat,
           connection: input.connection,
           pathMessages: plannedPath,
+          preCutAttachmentIds: sendContext.preCutAttachmentIds,
           draftText: '',
           debugSource: 'send',
           ...(input.capabilities ? { capabilities: input.capabilities } : {}),
@@ -487,22 +493,25 @@ export async function sendFromMessage(input: SendFromMessageInput): Promise<Send
   try {
     const chat = await getChat(input.chatId)
     if (!chat) throw new Error(`sendText: chat not found: ${input.chatId}`)
-    const repo = getBrowserRepository()
-    const parent = await repo.getMessage(input.parentMessageId)
+    const allHeaders = await loadMessageHeaders(input.chatId)
+    const byId = new Map(allHeaders.map((header) => [header.id, header]))
+    const parent = byId.get(input.parentMessageId)
     if (!parent || parent.chatId !== input.chatId || parent.deleted) {
       throw new Error(`sendFrom: parent ${input.parentMessageId} unavailable`)
     }
     const baseCursor = useChatStore.getState().getCursor(input.chatId) ?? {}
     const cursor: Record<string, MessageId> = { ...baseCursor }
-    let cur: Message | undefined = parent
+    let cur: (typeof allHeaders)[number] | undefined = parent
     while (cur) {
       cursor[cursorKeyOf(cur.parentId)] = cur.id
-      cur = cur.parentId ? await repo.getMessage(cur.parentId) : undefined
+      cur = cur.parentId ? byId.get(cur.parentId) : undefined
     }
-    const branchSnapshot = await loadActiveBranchSnapshot(input.chatId, cursor)
-    const path = branchSnapshot.branch
-    const parentIdx = path.findIndex((m) => m.id === parent.id)
-    const rawOutboundPath = parentIdx >= 0 ? path.slice(0, parentIdx + 1) : path
+    const branchHeaders = activePath(allHeaders as unknown as Message[], cursor).map(
+      (message) => message as unknown as (typeof allHeaders)[number],
+    )
+    const parentIdx = branchHeaders.findIndex((m) => m.id === parent.id)
+    const rawOutboundHeaders =
+      parentIdx >= 0 ? branchHeaders.slice(0, parentIdx + 1) : branchHeaders
     const hasPrefill = (input.prefillContent?.length ?? 0) > 0
     const prefillMessageId = hasPrefill ? newId() : null
     const createdAt = (input.now ?? Date.now)()
@@ -518,7 +527,13 @@ export async function sendFromMessage(input: SendFromMessageInput): Promise<Send
             turnId: parent.turnId,
           })
         : null
-    const plannedPath = pendingPrefill ? [...rawOutboundPath, pendingPrefill] : rawOutboundPath
+    const sendContext = await loadSendContextForBranch({
+      chat,
+      branchHeaders: rawOutboundHeaders,
+      ...(input.capabilities ? { capabilities: input.capabilities } : {}),
+      pendingMessages: pendingPrefill ? [pendingPrefill] : [],
+    })
+    const plannedPath = sendContext.pathMessages
     let requestPlan: AssistantRequestPlan
     try {
       requestPlan = (
@@ -526,6 +541,7 @@ export async function sendFromMessage(input: SendFromMessageInput): Promise<Send
           chat,
           connection: input.connection,
           pathMessages: plannedPath,
+          preCutAttachmentIds: sendContext.preCutAttachmentIds,
           draftText: '',
           debugSource: 'send-from-message',
           ...(input.capabilities ? { capabilities: input.capabilities } : {}),
@@ -775,21 +791,31 @@ async function openAssistantStreamUnder(
           ...(abortReason ? { abortReason } : {}),
           ...(streamError ? { error: streamError } : {}),
           now: now(),
-          ...(hasAttachmentContext ||
-          hasNonTextOutbound ||
-          requestHasTools(wire) ||
-          accumulator.generatedContent.some(isNonTextContentItem) ||
-          hasAudioOutput(accumulator)
-            ? {}
-            : {
-                calibrationInputs: {
-                  outboundPath,
-                  systemPrompt: requestSettings.systemPrompt,
-                  modelId: requestSettings.model,
-                  family: outboundTokenizer,
-                  ...(outboundReasoningOpts ? { reasoningOpts: outboundReasoningOpts } : {}),
-                },
-              }),
+          ...(() => {
+            const completionCalibrationBlocked =
+              accumulatorHasCompletionCalibrationBlockers(accumulator)
+            const promptCalibrationBlocked =
+              hasAttachmentContext ||
+              hasNonTextOutbound ||
+              requestHasTools(wire) ||
+              pathHasToolArtifacts(outboundPath) ||
+              completionCalibrationBlocked
+            const promptCalibrationAllowed = !promptCalibrationBlocked
+            const completionCalibrationAllowed = !completionCalibrationBlocked
+            return promptCalibrationAllowed || completionCalibrationAllowed
+              ? {
+                  calibrationInputs: {
+                    outboundPath,
+                    systemPrompt: requestSettings.systemPrompt,
+                    modelId: requestSettings.model,
+                    family: outboundTokenizer,
+                    promptCalibrationAllowed,
+                    completionCalibrationAllowed,
+                    ...(outboundReasoningOpts ? { reasoningOpts: outboundReasoningOpts } : {}),
+                  },
+                }
+              : {}
+          })(),
         })
         finalized = true
         await repo.deleteStreamChunks(streamId).catch(() => {})
@@ -991,10 +1017,38 @@ function requestHasTools(wire: unknown): boolean {
   return Array.isArray(tools) && tools.length > 0
 }
 
+function providerOutputItemHasToolArtifact(item: ProviderOutputItem): boolean {
+  return HOSTED_SERVER_TOOL_ITEM_TYPES.has(item.type) || item.type.endsWith('_tool_result')
+}
+
+function messageHasToolArtifacts(message: Message): boolean {
+  if (message.role === 'tool') return true
+  if ((message.toolCalls?.length ?? 0) > 0) return true
+  if ((message.generation?.serverTools?.length ?? 0) > 0) return true
+  if (message.providerOutputItems?.some(providerOutputItemHasToolArtifact)) return true
+  if (message.reasoningDetails?.some((detail) => detail.id?.startsWith('tool_'))) return true
+  return false
+}
+
+function pathHasToolArtifacts(path: readonly Message[]): boolean {
+  return path.some(messageHasToolArtifacts)
+}
+
 function hasServerToolUsage(usage: ChatUsage | undefined): boolean {
   if (!usage?.server_tool_use || typeof usage.server_tool_use !== 'object') return false
   return Object.values(usage.server_tool_use).some(
     (value) => typeof value === 'number' && Number.isFinite(value) && value > 0,
+  )
+}
+
+function accumulatorHasCompletionCalibrationBlockers(acc: ChatAccumulator): boolean {
+  return (
+    acc.finishReason === 'tool_calls' ||
+    acc.generatedContent.some(isNonTextContentItem) ||
+    hasAudioOutput(acc) ||
+    acc.serverTools.length > 0 ||
+    hasServerToolUsage(acc.usage) ||
+    acc.providerOutputItems.some(providerOutputItemHasToolArtifact)
   )
 }
 
@@ -1047,7 +1101,7 @@ function recordProviderOutputItem(
     ? providerOutputItemFromGeminiPart(type, output, outputIndex)
     : type === 'server_tool_use' || type.endsWith('_tool_result')
       ? providerOutputItemFromResponsesItem(output, outputIndex)
-    : null
+      : null
   if (!providerItem) return
   upsertProviderOutputItem(acc.providerOutputItems, providerItem)
 }
@@ -1553,6 +1607,8 @@ interface FinalizeContext extends FlushContext {
     systemPrompt: string
     modelId: string
     family: import('../core/tokens').TokenizerFamily
+    promptCalibrationAllowed: boolean
+    completionCalibrationAllowed: boolean
     reasoningOpts?: PromptEstimateOptions
   }
 }
@@ -1628,13 +1684,15 @@ async function finalize(ctx: FinalizeContext): Promise<void> {
   // `originalModelId` / `cachedTokenEstimate` are populated so the next
   // gauge tick can read the cache directly instead of re-multiplying
   // chars × ratio.
-  // This block only runs for text-only sends; multimodal input/output is
-  // excluded before `calibrationInputs` is passed into finalize.
+  // This block only runs when the assistant side is text-only. Multimodal
+  // or tool output can still preserve generation usage, but it must not
+  // seed text calibration caches.
   let assistantCalibrationFields: ReturnType<typeof calibrationFieldsForCreate> | null = null
-  const toolCalibrationBlocked =
+  const completionCalibrationBlocked =
     calibrationInputs !== undefined &&
-    (accumulator.serverTools.length > 0 || hasServerToolUsage(accumulator.usage))
-  if (outcome === 'done' && calibrationInputs && !toolCalibrationBlocked) {
+    (accumulatorHasCompletionCalibrationBlockers(accumulator) ||
+      finalContent.some(isNonTextContentItem))
+  if (outcome === 'done' && calibrationInputs && !completionCalibrationBlocked) {
     try {
       const [chatForRatio, globalCal, prefs] = await Promise.all([
         repo.getChat(chatId),
@@ -1735,7 +1793,7 @@ async function finalize(ctx: FinalizeContext): Promise<void> {
   if (
     outcome === 'done' &&
     calibrationInputs &&
-    !toolCalibrationBlocked &&
+    !completionCalibrationBlocked &&
     persistedAssistant !== null &&
     accumulator.usage
   ) {
@@ -1746,6 +1804,7 @@ async function finalize(ctx: FinalizeContext): Promise<void> {
         assistantMessage: persistedAssistant,
         usage: accumulator.usage,
         calibrationInputs,
+        now,
       })
     } catch {
       // Non-fatal: calibration failure must not surface to the user.
@@ -1775,31 +1834,35 @@ async function ingestCalibrationSample(args: {
   assistantMessage: Message
   usage: ChatUsage
   calibrationInputs: NonNullable<FinalizeContext['calibrationInputs']>
+  now: number
 }): Promise<void> {
-  const { repo, chatId, assistantMessage, usage, calibrationInputs } = args
-  if (
-    calibrationInputs.outboundPath.some((message) => message.content.some(isNonTextContentItem)) ||
-    assistantMessage.content.some(isNonTextContentItem)
-  ) {
-    return
-  }
+  const { repo, chatId, assistantMessage, usage, calibrationInputs, now } = args
+  if (assistantMessage.generation?.tokenCalibration) return
 
-  const promptSample = derivePromptSample({
-    sentPath: calibrationInputs.outboundPath,
-    systemPrompt: calibrationInputs.systemPrompt,
-    usage,
-    family: calibrationInputs.family,
-    modelId: calibrationInputs.modelId,
-    mediaTokens: 0,
-    ...(calibrationInputs.reasoningOpts
-      ? { reasoningEchoOpts: calibrationInputs.reasoningOpts }
-      : {}),
-  })
-  const completionSample = deriveCompletionSample({
-    assistantMessage,
-    usage,
-    family: calibrationInputs.family,
-  })
+  const calibrationKey = tokenCalibrationKey(calibrationInputs.modelId)
+  const promptSample = calibrationInputs.promptCalibrationAllowed
+    ? derivePromptSample({
+        sentPath: calibrationInputs.outboundPath,
+        systemPrompt: calibrationInputs.systemPrompt,
+        usage,
+        family: calibrationInputs.family,
+        modelId: calibrationInputs.modelId,
+        mediaTokens: 0,
+        ...(calibrationInputs.reasoningOpts
+          ? { reasoningEchoOpts: calibrationInputs.reasoningOpts }
+          : {}),
+      })
+    : null
+  const completionSample =
+    calibrationInputs.completionCalibrationAllowed &&
+    !assistantMessage.content.some(isNonTextContentItem) &&
+    !messageHasToolArtifacts(assistantMessage)
+      ? deriveCompletionSample({
+          assistantMessage,
+          usage,
+          family: calibrationInputs.family,
+        })
+      : null
 
   if (promptSample === null && completionSample === null) return
 
@@ -1808,43 +1871,86 @@ async function ingestCalibrationSample(args: {
   // `metaVersion` doesn't bump and a sidebar broadcast doesn't fire just
   // for a calibration delta.
   const acceptedSamples: Array<{ chars: number; tokens: number }> = []
-  await repo.runMutation([{ kind: 'chat-meta', chatId }], async (inner) => {
-    const chat = await inner.getChat(chatId)
-    if (!chat) return
-    const staged = {
-      tokenCalibration: { ...(chat.tokenCalibration ?? {}) },
-    }
-    if (promptSample !== null) {
-      const outcome = addSampleToChat(
-        staged,
-        calibrationInputs.modelId,
-        promptSample.chars,
-        promptSample.tokens,
-      )
-      if (outcome.accepted) acceptedSamples.push(promptSample)
-    }
-    if (completionSample !== null) {
-      const outcome = addSampleToChat(
-        staged,
-        calibrationInputs.modelId,
-        completionSample.chars,
-        completionSample.tokens,
-      )
-      if (outcome.accepted) acceptedSamples.push(completionSample)
-    }
-    if (acceptedSamples.length > 0) {
-      inner.patchChatMeta(
-        chatId,
-        { tokenCalibration: staged.tokenCalibration },
-        { touchVisibleState: false, broadcast: false },
-      )
-    }
-  })
+  await repo.runMutation(
+    [
+      { kind: 'chat-meta', chatId },
+      { kind: 'message', messageId: assistantMessage.id },
+    ],
+    async (inner) => {
+      const assistantHeader = await inner.getMessageHeader(assistantMessage.id)
+      if (!assistantHeader?.generation || assistantHeader.generation.tokenCalibration) return
+
+      let promptAccepted = false
+      let completionAccepted = false
+      const localAcceptedSamples: Array<{ chars: number; tokens: number }> = []
+      const chat = await inner.getChat(chatId)
+      if (!chat) return
+      const staged = {
+        tokenCalibration: { ...(chat.tokenCalibration ?? {}) },
+      }
+      if (promptSample !== null) {
+        const outcome = addSampleToChat(
+          staged,
+          calibrationInputs.modelId,
+          promptSample.chars,
+          promptSample.tokens,
+          now,
+        )
+        if (outcome.accepted) {
+          localAcceptedSamples.push(promptSample)
+          promptAccepted = true
+        }
+      }
+      if (completionSample !== null) {
+        const outcome = addSampleToChat(
+          staged,
+          calibrationInputs.modelId,
+          completionSample.chars,
+          completionSample.tokens,
+          now,
+        )
+        if (outcome.accepted) {
+          localAcceptedSamples.push(completionSample)
+          completionAccepted = true
+        }
+      }
+      if (localAcceptedSamples.length > 0) {
+        inner.patchChatMeta(
+          chatId,
+          { tokenCalibration: staged.tokenCalibration },
+          { touchVisibleState: false, broadcast: false },
+        )
+        await inner.patchMessageBody(
+          assistantMessage.id,
+          {},
+          {
+            headerPatch: {
+              generation: {
+                ...assistantHeader.generation,
+                tokenCalibration: {
+                  sampleId: assistantMessage.id,
+                  modelId: calibrationInputs.modelId,
+                  calibrationKey,
+                  promptSample: promptAccepted,
+                  completionSample: completionAccepted,
+                  sampleCount: localAcceptedSamples.length,
+                  appliedAt: now,
+                },
+              },
+            },
+            touchChatSummary: false,
+            broadcast: false,
+          },
+        )
+        acceptedSamples.push(...localAcceptedSamples)
+      }
+    },
+  )
 
   // Step 2: roll up to global AFTER the chat mutation closes — separate
   // transaction on the settings table.
   for (const s of acceptedSamples) {
-    await addSampleToGlobal(calibrationInputs.modelId, s.chars, s.tokens)
+    await addAcceptedSampleToGlobal(calibrationInputs.modelId, s.chars, s.tokens, now)
   }
 }
 

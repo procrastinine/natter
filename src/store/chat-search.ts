@@ -185,7 +185,7 @@ export const DEFAULT_SEARCH_FILTERS: SearchFilters = {
 const SNIPPET_BEFORE = 60
 const SNIPPET_AFTER = 120
 const FALLBACK_SNIPPET_CHARS = 180
-const TITLE_PASS_YIELD_INTERVAL = 64
+const SEARCH_YIELD_BUDGET_MS = 12
 
 export function cloneSearchFilters(filters: SearchFilters = DEFAULT_SEARCH_FILTERS): SearchFilters {
   return {
@@ -245,6 +245,7 @@ export async function searchChats(input: SearchChatsInput): Promise<ChatSearchOu
   let completedCount = 0
   const resultsByChat = new Map<ChatId, SearchResult>()
   const remaining: Chat[] = []
+  const yieldController = createSearchYieldController()
 
   input.onUpdate?.({
     kind: 'started',
@@ -279,7 +280,7 @@ export async function searchChats(input: SearchChatsInput): Promise<ChatSearchOu
     } else {
       remaining.push(chat)
     }
-    if (index > 0 && index % TITLE_PASS_YIELD_INTERVAL === 0) await yieldToEventLoop()
+    await yieldController.maybeYield()
   }
 
   const concurrency = boundedConcurrency(input.concurrency)
@@ -327,7 +328,7 @@ export async function searchChats(input: SearchChatsInput): Promise<ChatSearchOu
           candidateCount: candidates.length,
         })
       }
-      await yieldToEventLoop()
+      await yieldController.maybeYield()
     }
   }
 
@@ -796,8 +797,43 @@ function boundedConcurrency(value: number | undefined): number {
   return Math.max(2, Math.min(8, hardware - 1))
 }
 
+function searchNowMs(): number {
+  return typeof performance === 'undefined' ? Date.now() : performance.now()
+}
+
+function createSearchYieldController(): { maybeYield: () => Promise<void> } {
+  let lastYieldAt = searchNowMs()
+  return {
+    async maybeYield() {
+      if (searchNowMs() - lastYieldAt < SEARCH_YIELD_BUDGET_MS) return
+      lastYieldAt = searchNowMs()
+      await yieldToEventLoop()
+      lastYieldAt = searchNowMs()
+    },
+  }
+}
+
 async function yieldToEventLoop(): Promise<void> {
-  await new Promise<void>((resolve) => setTimeout(resolve, 0))
+  const scheduler = (
+    globalThis as typeof globalThis & { scheduler?: { yield?: () => Promise<void> } }
+  ).scheduler
+  if (typeof scheduler?.yield === 'function') {
+    await scheduler.yield()
+    return
+  }
+  if (typeof MessageChannel !== 'undefined') {
+    await new Promise<void>((resolve) => {
+      const channel = new MessageChannel()
+      channel.port1.onmessage = () => {
+        channel.port1.close()
+        channel.port2.close()
+        resolve()
+      }
+      channel.port2.postMessage(undefined)
+    })
+    return
+  }
+  await Promise.resolve()
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {

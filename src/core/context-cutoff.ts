@@ -56,7 +56,7 @@ import {
 } from './tokens'
 import type { AttachmentRef, ChatSettings, Message, MessageId } from './types'
 
-interface MessageCostOptions {
+export interface MessageCostOptions {
   family: TokenizerFamily
   // Optional — when omitted, reasoning contributes 0 (same policy as
   // `estimatePromptSize` when `reasoningInclude` is absent).
@@ -76,7 +76,7 @@ interface MessageCostOptions {
   disableTextCalibration?: boolean
 }
 
-interface MessageCost {
+export interface MessageCost {
   text: number
   media: number
   reasoning: number
@@ -291,7 +291,7 @@ function buildPlan(
   }
 }
 
-function resolveCutoff(settings: ChatSettings, providerCap: number | null): number {
+export function resolveCutoff(settings: ChatSettings, providerCap: number | null): number {
   if (providerCap !== null) return resolveContextCap(settings.customMaxContext, providerCap)
   if (settings.customMaxContext === UNLIMITED_CONTEXT) return Number.POSITIVE_INFINITY
   if (typeof settings.customMaxContext === 'number' && settings.customMaxContext > 0) {

@@ -38,14 +38,13 @@ describe('Composer', () => {
     await waitFor(() => expect(input).toHaveValue('keep this draft'))
   })
 
-  it('reports live draft changes for prompt-budget estimation', () => {
-    const onDraftChange = vi.fn()
-    render(<Composer onSubmit={() => {}} onDraftChange={onDraftChange} />)
+  it('updates the live character count without prompt-budget callbacks', () => {
+    render(<Composer onSubmit={() => {}} />)
     const input = screen.getByRole('textbox')
 
     fireEvent.change(input, { target: { value: 'count this draft' } })
 
-    expect(onDraftChange).toHaveBeenLastCalledWith('count this draft')
+    expect(screen.getByText('16 chars')).toBeInTheDocument()
   })
 
   it('does not show an empty autosized textarea scrollbar', () => {

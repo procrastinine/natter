@@ -74,6 +74,71 @@ describe('shell smoke render', () => {
     expect(container.querySelector('[data-ui="header"]')).toBeNull()
   })
 
+  it('keeps the sidebar on the storage chats page', async () => {
+    window.location.hash = '#/storage/chats'
+
+    const { container } = render(<App />)
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-ui="storage-chats"]')).toBeInTheDocument()
+    })
+    expect(container.querySelector('[data-ui="app-shell"]')).not.toHaveAttribute(
+      'data-sidebar-hidden',
+    )
+    expect(container.querySelector('[data-ui="sidebar"]')).toBeInTheDocument()
+  })
+
+  it('updates lastViewedAt when a chat route opens', async () => {
+    const chat = await createChat({ id: 'chat-viewed', title: 'Viewed', now: 1000 })
+    await getDb().chats.update(chat.id, {
+      previewText: 'Viewed preview',
+      updatedAt: 5000,
+      lastViewedAt: 1000,
+    })
+    window.location.hash = `#/chat/${chat.id}`
+
+    render(<App />)
+
+    await waitFor(async () => {
+      const stored = await getDb().chats.get(chat.id)
+      expect(stored?.lastViewedAt).toBeGreaterThan(1000)
+      expect(stored?.updatedAt).toBe(5000)
+    })
+  })
+
+  it('does not rewrite an existing chat model just because the chat route opens', async () => {
+    const openAiKey = await createKey({ name: 'OpenAI', plaintextKey: 'sk-test' })
+    const openAi = await createProfile({
+      name: 'OpenAI',
+      kind: 'openai-compatible',
+      baseUrl: 'https://api.openai.com/v1',
+      apiKeyRef: openAiKey.id,
+    })
+    await putCachedModels(openAi.id, DIRECT_MODEL_AUTOSELECT_QUERY, {
+      data: [{ id: 'gpt-5.4' }],
+    })
+    const settings = cloneDefaultChatSettings()
+    settings.profileId = openAi.id
+    settings.model = 'openai/gpt-5.4'
+    const chat = await createChat({ id: 'chat-model-viewed', title: 'Viewed model', settings })
+    await getDb().chats.update(chat.id, {
+      updatedAt: 5000,
+      lastViewedAt: 1000,
+    })
+    window.location.hash = `#/chat/${chat.id}`
+
+    render(<App />)
+
+    await waitFor(async () => {
+      const stored = await getDb().chats.get(chat.id)
+      expect(stored?.lastViewedAt).toBeGreaterThan(1000)
+    })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    const stored = await getDb().chats.get(chat.id)
+    expect(stored?.settings.model).toBe('openai/gpt-5.4')
+    expect(stored?.updatedAt).toBe(5000)
+  })
+
   it('does NOT render the chat-model panel or global-settings modal by default', () => {
     const { container } = render(<App />)
     expect(container.querySelector('[data-ui="chat-model-panel"]')).not.toBeInTheDocument()
@@ -1105,6 +1170,74 @@ describe('shell smoke render', () => {
       expect(row?.presetId).toBe(presetB.id)
       expect(row?.settings.providerPrefs).toEqual({ sort: 'price' })
       expect(container.querySelector('[data-ui="preset-diverged"]')).toBeNull()
+    })
+  })
+
+  it('loading a saved preset from another connection applies its model in one click', async () => {
+    const openRouterKey = await createKey({ name: 'OpenRouter', plaintextKey: 'sk-or-v1-test' })
+    const googleKey = await createKey({ name: 'Google', plaintextKey: 'sk-google-test' })
+    const openRouter = await createProfile({
+      name: 'OpenRouter',
+      kind: 'openrouter',
+      baseUrl: 'https://openrouter.ai/api/v1',
+      apiKeyRef: openRouterKey.id,
+    })
+    const google = await createProfile({
+      name: 'Google',
+      kind: 'google',
+      baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',
+      apiKeyRef: googleKey.id,
+    })
+
+    const googleSettings = cloneDefaultChatSettings()
+    googleSettings.profileId = google.id
+    googleSettings.model = 'google/gemini-3.1-flash-lite-preview'
+    const googlePreset = await createPreset({
+      name: 'Google preset',
+      connectionProfileId: google.id,
+      settings: googleSettings,
+    })
+    const openRouterSettings = cloneDefaultChatSettings()
+    openRouterSettings.profileId = openRouter.id
+    openRouterSettings.model = 'openai/gpt-5.4-nano'
+    const openRouterPreset = await createPreset({
+      name: 'OpenRouter preset',
+      connectionProfileId: openRouter.id,
+      settings: openRouterSettings,
+    })
+    const chat = await createChat({
+      settings: structuredClone(googlePreset.settings),
+      presetId: googlePreset.id,
+    })
+
+    window.location.hash = `#/chat/${chat.id}`
+    const { container } = render(<App />)
+    await waitFor(() => {
+      expect(container.querySelector('[data-role="settings-cog"]')).toBeInTheDocument()
+    })
+    fireEvent.click(container.querySelector('[data-role="settings-cog"]') as HTMLButtonElement)
+    await waitFor(() => {
+      expect(container.querySelector('[data-ui="preset-breadcrumb-button"]')).toBeInTheDocument()
+    })
+    fireEvent.click(
+      container.querySelector('[data-ui="preset-breadcrumb-button"]') as HTMLButtonElement,
+    )
+    let loadButton: HTMLButtonElement | undefined
+    await waitFor(() => {
+      loadButton = Array.from(
+        container.querySelectorAll<HTMLButtonElement>('[data-ui="preset-menu-load"]'),
+      ).find((button) => button.textContent?.includes('OpenRouter preset'))
+      expect(loadButton).toBeDefined()
+    })
+    fireEvent.click(loadButton as HTMLButtonElement)
+
+    await waitFor(async () => {
+      const row = await getDb().chats.get(chat.id)
+      expect(row?.presetId).toBe(openRouterPreset.id)
+      expect(row?.settings.profileId).toBe(openRouter.id)
+      expect(row?.settings.model).toBe('openai/gpt-5.4-nano')
+      expect(container.querySelector('[data-ui="preset-diverged"]')).toBeNull()
+      expect(container.textContent).not.toContain('Pick a model for OpenRouter')
     })
   })
 })

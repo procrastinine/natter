@@ -6,9 +6,10 @@ import { IDBFactory } from 'fake-indexeddb'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { effectiveCapabilityFromEndpoints } from '../../src/core/capabilities'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
+import { estimateSettingsPromptSize, type PromptSizeEstimate } from '../../src/core/prompt-size'
 import type { Message, MessageAttachmentRef, ModelEndpoint } from '../../src/core/types'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
-import { createChat, getChat } from '../../src/store/chats'
+import { createChat, getChat, loadActiveBranchSnapshot } from '../../src/store/chats'
 import { __resetDbForTests, openDb } from '../../src/store/db'
 import { ContextPanel } from '../../src/ui/settings/ContextPanel'
 import { putTestMessages } from '../helpers/message-storage'
@@ -91,8 +92,26 @@ function LiveContextPanel({
   capability: ReturnType<typeof effectiveCapabilityFromEndpoints>
 }) {
   const chat = useLiveQuery(() => getChat(chatId), [chatId], undefined)
+  const branchSnapshot = useLiveQuery(() => loadActiveBranchSnapshot(chatId, {}), [chatId], null)
+  const estimate: PromptSizeEstimate | null =
+    chat && branchSnapshot
+      ? estimateSettingsPromptSize(
+          chat.settings,
+          branchSnapshot.branch,
+          '',
+          null,
+          capability?.maxPromptTokens ?? capability?.contextLength ?? null,
+        )
+      : null
   if (!chat) return null
-  return <ContextPanel chat={chat} capability={capability} endpointTokenizer={null} />
+  return (
+    <ContextPanel
+      chat={chat}
+      capability={capability}
+      endpointTokenizer={null}
+      estimateOverride={estimate}
+    />
+  )
 }
 
 async function resetAll() {
@@ -117,8 +136,14 @@ describe('ContextPanel slider persistence', () => {
     settings.model = 'openai/gpt-4o-mini'
     const chat = await createChat({ settings })
     const capability = effectiveCapabilityFromEndpoints(settings.model, [makeEndpoint()])
+    const estimate = estimateSettingsPromptSize(settings, [], '', null)
     const { container } = render(
-      <ContextPanel chat={chat} capability={capability} endpointTokenizer={null} />,
+      <ContextPanel
+        chat={chat}
+        capability={capability}
+        endpointTokenizer={null}
+        estimateOverride={estimate}
+      />,
     )
 
     const sliders = container.querySelectorAll<HTMLInputElement>('[data-ui="slider"]')

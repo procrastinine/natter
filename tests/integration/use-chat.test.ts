@@ -1542,9 +1542,7 @@ describe('sendText — token calibration sample ingest', () => {
       ),
       'assistant',
     )
-    expect(assistant.generation?.serverTools?.map((tool) => tool.type)).toEqual([
-      'web_search_call',
-    ])
+    expect(assistant.generation?.serverTools?.map((tool) => tool.type)).toEqual(['web_search_call'])
     expect(assistant.providerOutputItems).toEqual([
       {
         dialect: 'openai-responses',
@@ -1583,7 +1581,7 @@ describe('sendText — token calibration sample ingest', () => {
     expect(chatRow?.tokenCalibration?.[tokenCalibrationKey('openai/gpt-4o')]).toBeUndefined()
   })
 
-  it('does not calibrate when the sent path includes non-text input', async () => {
+  it('calibrates only completion when the sent path includes non-text input', async () => {
     const chat = await createChat({
       settings: chatSettings({ model: 'openai/gpt-4o', systemPrompt: '' }),
     })
@@ -1612,10 +1610,15 @@ describe('sendText — token calibration sample ingest', () => {
         ),
     })
     const chatRow = await getBrowserRepository().getChat(chat.id)
-    expect(chatRow?.tokenCalibration?.[tokenCalibrationKey('openai/gpt-4o')]).toBeUndefined()
+    expect(chatRow?.tokenCalibration?.[tokenCalibrationKey('openai/gpt-4o')]?.sampleCount).toBe(1)
     const [user, assistant] = liveMessagesSortedByCreated(await messagesFor(chat.id))
     expect(user?.originalCalibrationKey).toBeUndefined()
-    expect(assistant?.originalCalibrationKey).toBeUndefined()
+    expect(assistant?.originalCalibrationKey).toBe(tokenCalibrationKey('openai/gpt-4o'))
+    expect(assistant?.generation?.tokenCalibration).toMatchObject({
+      promptSample: false,
+      completionSample: true,
+      sampleCount: 1,
+    })
   })
 
   it('does not calibrate when the assistant output includes a generated image', async () => {

@@ -29,6 +29,7 @@ test('chat transcript mounts only the newest message window and loads older batc
   })
 
   await page.goto(`/#/chat/${chatId}`)
+  await page.reload()
   await expect(page.locator('[data-ui="message"]')).toHaveCount(10)
   await expect(page.locator('[data-ui="message"]').first()).toContainText('window message 14')
   await expect(page.locator('[data-ui="message-list"]')).toHaveAttribute('data-total-count', '24')
@@ -46,6 +47,28 @@ test('chat transcript mounts only the newest message window and loads older batc
   await expect(page.locator('[data-ui="load-more-messages"]')).toHaveCount(0)
 })
 
+test('switching message variants re-renders the selected branch window', async ({ page }) => {
+  const chatId = await seedBranchedChat(page)
+
+  await page.goto(`/#/chat/${chatId}/message/A2`)
+  await page.reload()
+  await expect(page.locator('[data-ui="message"]')).toHaveCount(3)
+  await expect(page.locator('[data-ui="message"]').nth(1)).toContainText('branch A user')
+  await expect(page.locator('[data-ui="message"]').nth(2)).toContainText('branch A assistant')
+
+  await page
+    .locator('[data-ui="message"]')
+    .filter({ hasText: 'branch A user' })
+    .getByLabel('Next variant')
+    .click()
+
+  await expect(page.locator('[data-ui="message"]')).toHaveCount(3)
+  await expect(page.locator('[data-ui="message"]').nth(1)).toContainText('branch B user')
+  await expect(page.locator('[data-ui="message"]').nth(2)).toContainText('branch B assistant')
+  await expect(page.locator('[data-ui="message-list"]')).toHaveAttribute('data-rendered-count', '3')
+  await expect(page.locator('[data-ui="message-list"]')).toHaveAttribute('data-total-count', '3')
+})
+
 test('sidebar mounts only the first row window and loads more rows manually', async ({ page }) => {
   await seedSidebarChats(page, {
     chatCount: 65,
@@ -55,6 +78,7 @@ test('sidebar mounts only the first row window and loads more rows manually', as
     },
   })
   await page.goto('/')
+  await page.reload()
 
   await expect(page.locator('[data-ui="chat-row"]')).toHaveCount(50)
   await expect(page.locator('[data-ui="chat-list"]')).toHaveAttribute('data-total-count', '65')
@@ -157,6 +181,138 @@ async function seedLinearChat(
     }
     return chatId
   }, input)
+}
+
+async function seedBranchedChat(page: Page): Promise<string> {
+  return page.evaluate(async () => {
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const req = indexedDB.open('natter')
+      req.onsuccess = () => resolve(req.result)
+      req.onerror = () => reject(req.error)
+    })
+    const now = Date.now()
+    const chatId = 'render-window-branch-chat'
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const tx = db.transaction(
+          ['presets', 'settings', 'chats', 'messages', 'messageBodies'],
+          'readwrite',
+        )
+        const presets = tx.objectStore('presets')
+        const settingsStore = tx.objectStore('settings')
+        const chats = tx.objectStore('chats')
+        const messages = tx.objectStore('messages')
+        const messageBodies = tx.objectStore('messageBodies')
+        const presetsReq = presets.getAll()
+        presetsReq.onsuccess = () => {
+          const preset = (presetsReq.result as Array<{ id?: string; settings?: unknown }>)[0]
+          const chatSettings = structuredClone(preset?.settings ?? {})
+          settingsStore.put({ key: 'global:message-render-window-size', value: 3 })
+          settingsStore.put({ key: 'global:message-render-window-load-mode', value: 'manual' })
+          chats.put({
+            id: chatId,
+            title: 'Render branch window chat',
+            titleStatus: 'manual',
+            createdAt: now,
+            updatedAt: now + 4,
+            lastViewedAt: now + 4,
+            wordCount: 12,
+            totalCostUsd: 0,
+            metaVersion: 0,
+            summaryVersion: 0,
+            settings: chatSettings,
+            presetId: preset?.id,
+            lastUpdatedLeafId: 'B2',
+            lastBranchUpdatedAt: now + 4,
+            archived: false,
+            pinned: false,
+            folderId: null,
+            tags: [],
+            previewText: 'branch B assistant',
+          })
+          const rows = [
+            {
+              id: 'root',
+              parentId: null,
+              siblingIndex: 0,
+              turnIndex: 0,
+              role: 'system',
+              origin: 'system',
+              text: 'root instruction',
+            },
+            {
+              id: 'A1',
+              parentId: 'root',
+              siblingIndex: 0,
+              turnIndex: 1,
+              role: 'user',
+              origin: 'user',
+              text: 'branch A user',
+            },
+            {
+              id: 'A2',
+              parentId: 'A1',
+              siblingIndex: 0,
+              turnIndex: 2,
+              role: 'assistant',
+              origin: 'generated',
+              text: 'branch A assistant',
+            },
+            {
+              id: 'B1',
+              parentId: 'root',
+              siblingIndex: 1,
+              turnIndex: 1,
+              role: 'user',
+              origin: 'user',
+              text: 'branch B user',
+            },
+            {
+              id: 'B2',
+              parentId: 'B1',
+              siblingIndex: 0,
+              turnIndex: 2,
+              role: 'assistant',
+              origin: 'generated',
+              text: 'branch B assistant',
+            },
+          ] as const
+          rows.forEach((row, index) => {
+            const createdAt = now + index
+            messages.put({
+              id: row.id,
+              chatId,
+              parentId: row.parentId,
+              siblingIndex: row.siblingIndex,
+              turnId: `turn-${row.id}`,
+              turnIndex: row.turnIndex,
+              createdAt,
+              role: row.role,
+              origin: row.origin,
+              nodeVersion: 0,
+              deleted: false,
+            })
+            messageBodies.put({
+              id: row.id,
+              chatId,
+              nodeVersion: 0,
+              updatedAt: createdAt,
+              content:
+                row.role === 'assistant'
+                  ? [{ type: 'output_text', text: row.text }]
+                  : [{ type: 'text', text: row.text }],
+            })
+          })
+        }
+        tx.oncomplete = () => resolve()
+        tx.onerror = () => reject(tx.error)
+        tx.onabort = () => reject(tx.error)
+      })
+    } finally {
+      db.close()
+    }
+    return chatId
+  })
 }
 
 async function seedSidebarChats(

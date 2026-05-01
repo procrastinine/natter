@@ -23,6 +23,7 @@ import { newId } from '../../src/lib/ulid'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
 import {
+  applyChatPreset,
   getMessage as getStoredMessage,
   loadChatMessages,
   replaceChatSettings,
@@ -183,6 +184,38 @@ describe('updateChatSettings', () => {
     const updated = await getChat(chat.id)
     expect(updated?.settings.providerPrefs).toEqual({ sort: 'price' })
     expect(updated?.settings.verbosity).toBeUndefined()
+  })
+
+  it('applies a preset snapshot and preset id atomically without rewriting no-ops', async () => {
+    const settings = cloneDefaultChatSettings()
+    settings.profileId = 'profile-a'
+    settings.model = 'google/gemini-3.1-flash-lite-preview'
+    const chat = await seedChat({ settings, presetId: 'preset-a' })
+    const presetSettings = cloneDefaultChatSettings()
+    presetSettings.profileId = 'profile-b'
+    presetSettings.model = 'openai/gpt-5.4-nano'
+    presetSettings.providerPrefs = { sort: 'price' }
+
+    const changed = await applyChatPreset(chat.id, 'preset-b', presetSettings, 500)
+
+    expect(changed).toBe(true)
+    const updated = await getChat(chat.id)
+    expect(updated?.presetId).toBe('preset-b')
+    expect(updated?.settings.profileId).toBe('profile-b')
+    expect(updated?.settings.model).toBe('openai/gpt-5.4-nano')
+    expect(updated?.settings.providerPrefs).toEqual({ sort: 'price' })
+    const appliedUpdatedAt = updated?.updatedAt
+    expect(appliedUpdatedAt).toBeGreaterThan(100)
+
+    const unchanged = await applyChatPreset(
+      chat.id,
+      'preset-b',
+      structuredClone(presetSettings),
+      900,
+    )
+
+    expect(unchanged).toBe(false)
+    expect((await getChat(chat.id))?.updatedAt).toBe(appliedUpdatedAt)
   })
 })
 

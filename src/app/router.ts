@@ -8,6 +8,7 @@
 //   #/chat/<id>                   → open chat with no specific cursor pin
 //   #/chat/<id>/message/<msgId>   → open chat with cursor pinned at <msgId>
 //   #/storage                     → workspace/storage overview
+//   #/storage/chats               → chat storage manager
 //   #/storage/attachments         → attachment manager
 //   #/storage/attachments/missing → missing attachment cleanup filter
 //   #/storage/attachments/unreferenced → unreferenced attachment cleanup filter
@@ -25,6 +26,7 @@ import type { AttachmentId, ChatId, MessageId } from '../core/types'
 
 export type StorageRoute =
   | { section: 'overview' }
+  | { section: 'chats' }
   | { section: 'attachments'; filter?: 'missing' | 'unreferenced'; attachmentId?: AttachmentId }
   | { section: 'archive' }
   | { section: 'backups' }
@@ -45,6 +47,9 @@ export function parseRoute(hash: string): Route {
   if (parts.length === 1 && parts[0] === 'new') return { kind: 'new' }
   if (parts[0] === 'storage') {
     if (parts.length === 1) return { kind: 'storage', storage: { section: 'overview' } }
+    if (parts[1] === 'chats' && parts.length === 2) {
+      return { kind: 'storage', storage: { section: 'chats' } }
+    }
     if (parts[1] === 'attachments') {
       if (parts.length === 2) return { kind: 'storage', storage: { section: 'attachments' } }
       if (parts[2] === 'missing') {
@@ -118,6 +123,7 @@ export function attachmentHref(attachmentId: AttachmentId): string {
 
 function storageRouteToHref(route: StorageRoute): string {
   if (route.section === 'overview') return '#/storage'
+  if (route.section === 'chats') return '#/storage/chats'
   if (route.section === 'archive') return '#/storage/archive'
   if (route.section === 'backups') return '#/storage/backups'
   if (route.attachmentId) {

@@ -8,8 +8,8 @@ import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import { __resetDbForTests, openDb } from '../../src/store/db'
 import { __resetKeyCacheForTests, createKey, getKey } from '../../src/store/keys'
 import { listPresets } from '../../src/store/presets'
-import { createProfile, getProfile, listProfiles } from '../../src/store/profiles'
 import * as profileStore from '../../src/store/profiles'
+import { createProfile, getProfile, listProfiles } from '../../src/store/profiles'
 import {
   ConnectionHeader,
   readActiveProfileId,
@@ -90,7 +90,10 @@ describe('ConnectionHeader', () => {
     await waitFor(async () => {
       expect(await listProfiles()).toHaveLength(1)
     })
-    expect(screen.queryByText('Add connection')).toBeNull()
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog', { name: 'Add connection' })).not.toBeInTheDocument()
+    })
+    expect(screen.queryByRole('button', { name: 'Add connection' })).toBeNull()
     const profiles = await listProfiles()
     const presets = await listPresets()
     expect(profiles).toHaveLength(1)

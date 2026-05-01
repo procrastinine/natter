@@ -265,7 +265,9 @@ function hasUnsafeUrlContextTarget(text: string | undefined): boolean {
     try {
       const url = new URL(match[0])
       if (isUnsafeUrlContextHost(url.hostname)) return true
-    } catch {}
+    } catch {
+      // Ignore URL-looking substrings that are not valid URLs.
+    }
   }
   return false
 }

@@ -4,7 +4,9 @@ import { runAssistantRequestOnce } from '../../api/assistant-stream'
 import { fetchModels } from '../../api/models'
 import { probeLlamaServer } from '../../api/probe'
 import { normalizeModelsResponse } from '../../api/providers'
+import { listBundledEntries } from '../../capabilities'
 import { cloneDefaultChatSettings } from '../../core/defaults'
+import { forceEquivalentModelIdForConnection } from '../../core/model-selection'
 import { defaultApiForProfile, withProfileApiDefaults } from '../../core/provider-defaults'
 import { prepareAssistantRequestPlan } from '../../core/send-planning'
 import type {
@@ -18,7 +20,7 @@ import type {
   ProfileId,
 } from '../../core/types'
 import { newId } from '../../lib/ulid'
-import { updateChatSettings } from '../../store/chats'
+import { getChat, updateChatSettings } from '../../store/chats'
 import { createKey, getKey, resolveKey } from '../../store/keys'
 import { createPreset } from '../../store/presets'
 import {
@@ -60,9 +62,8 @@ interface ActiveSeedState {
 function normalizeActiveSeedState(value: unknown): ActiveSeedState | null {
   if (!value || typeof value !== 'object') return null
   const candidate = value as { profileId?: unknown; presetId?: unknown; settings?: unknown }
-  const profileId =
-    typeof candidate.profileId === 'string' ? (candidate.profileId) : null
-  const presetId = typeof candidate.presetId === 'string' ? (candidate.presetId) : null
+  const profileId = typeof candidate.profileId === 'string' ? candidate.profileId : null
+  const presetId = typeof candidate.presetId === 'string' ? candidate.presetId : null
   const rawSettings =
     candidate.settings && typeof candidate.settings === 'object'
       ? (candidate.settings as ChatSettings)
@@ -120,6 +121,12 @@ export function writeActiveProfileId(id: ProfileId | null): void {
   nextSettings.profileId = id
   if (currentProfileId && currentProfileId !== id) nextSettings.model = ''
   writeActiveSeedState({ profileId: id, presetId: null, settings: nextSettings })
+}
+
+function chatIdFromHash(): ChatId | null {
+  if (typeof window === 'undefined') return null
+  const match = /^#\/chat\/([^/?#]+)/u.exec(window.location.hash)
+  return match?.[1] ?? null
 }
 
 async function loadHeaderState(
@@ -433,6 +440,7 @@ export function ConnectionHeader({
     setProbeState({ kind: 'idle' })
   }, [])
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: selectedProfileId is the profile-change trigger for resetting transient editor state.
   useEffect(() => {
     setEditing(false)
     resetProbeState()
@@ -455,14 +463,26 @@ export function ConnectionHeader({
       writeActiveProfileId(id)
       setActiveId(id)
       await bumpProfileLastUsedAt(id)
-      if (!activeChatId) return
-      const profile = state.profiles.find((candidate) => candidate.id === id) ?? (await getProfile(id))
+      const targetChatId = activeChatId ?? chatIdFromHash()
+      if (!targetChatId) return
+      const profile =
+        state.profiles.find((candidate) => candidate.id === id) ?? (await getProfile(id))
+      const chat = await getChat(targetChatId)
+      const shouldResetModel = opts.resetModel || (!!chat && chat.settings.profileId !== id)
       const patch: { profileId: ProfileId; model?: string; api?: ChatSettings['api'] } = {
         profileId: id,
       }
-      if (opts.resetModel) patch.model = ''
-      if (profile && opts.resetModel) patch.api = defaultApiForProfile(profile)
-      await updateChatSettings(activeChatId, patch)
+      if (profile && shouldResetModel) {
+        const candidates = listBundledEntries(profile.kind).map((entry) => ({ id: entry.id }))
+        patch.model = chat?.settings.model
+          ? (forceEquivalentModelIdForConnection(chat.settings.model, profile.kind, candidates) ??
+            '')
+          : ''
+        patch.api = defaultApiForProfile(profile)
+      } else if (shouldResetModel) {
+        patch.model = ''
+      }
+      await updateChatSettings(targetChatId, patch)
     },
     [activeChatId, state.profiles],
   )
@@ -485,6 +505,28 @@ export function ConnectionHeader({
       setSetupOpen(false)
       if (result.activate) {
         await activateProfile(result.profileId, { resetModel: result.resetModel })
+        const targetChatId = activeChatId ?? chatIdFromHash()
+        if (targetChatId && result.resetModel) {
+          const [profile, chat] = await Promise.all([
+            getProfile(result.profileId),
+            getChat(targetChatId),
+          ])
+          if (profile && chat) {
+            const candidates = listBundledEntries(profile.kind).map((entry) => ({ id: entry.id }))
+            const model = chat.settings.model
+              ? (forceEquivalentModelIdForConnection(
+                  chat.settings.model,
+                  profile.kind,
+                  candidates,
+                ) ?? '')
+              : ''
+            await updateChatSettings(targetChatId, {
+              profileId: result.profileId,
+              model,
+              api: defaultApiForProfile(profile),
+            })
+          }
+        }
         return
       }
       if (activeChatId && activeChatProfileId === result.profileId && result.resetModel) {

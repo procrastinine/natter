@@ -40,10 +40,14 @@ import {
   tokenCalibrationKey,
   tokenCalibrationKeyForStoredRecordKey,
 } from './model-ids'
-import { estimateReasoningEchoTokensForMessage, estimateToolCallContextTokensForMessage } from './tokens'
 import { clampTokens, safeContent, safeLen, safeServerTokens } from './token-guards'
 import type { PromptEstimateOptions, TokenizerFamily } from './tokens'
-import { charPerToken, tokenizerFamily } from './tokens'
+import {
+  charPerToken,
+  estimateReasoningEchoTokensForMessage,
+  estimateToolCallContextTokensForMessage,
+  tokenizerFamily,
+} from './tokens'
 import type { ChatUsage, GlobalTokenCalibration, Message, TokenCalibrationSample } from './types'
 
 // Physical bounds on a plausible chars/token ratio. Anything outside this
@@ -420,47 +424,102 @@ export function addSampleToChat(
   return { accepted: true }
 }
 
-// Apply a sample to the global rollup. Reads + writes the settings key.
-// Must be called OUTSIDE any active Dexie transaction on a different
-// table. Swallows errors so calibration failure never escapes.
-export async function addSampleToGlobal(
+function normalizeGlobalPayload(
+  stored: GlobalTokenCalibration | undefined,
+): GlobalTokenCalibration {
+  return stored && typeof stored === 'object' && stored.version === 1
+    ? {
+        version: 1,
+        updatedAt: finiteNumber(stored.updatedAt) ? stored.updatedAt : 0,
+        byModel:
+          stored.byModel && typeof stored.byModel === 'object'
+            ? (normalizedCalibrationSamples(stored.byModel) ?? {})
+            : {},
+      }
+    : emptyGlobal()
+}
+
+function subtractValidatedSample(
+  sample: TokenCalibrationSample,
+  removed: TokenCalibrationSample,
+  now: number,
+): TokenCalibrationSample | undefined {
+  const totalTextChars = sample.totalTextChars - removed.totalTextChars
+  const totalTextTokens = sample.totalTextTokens - removed.totalTextTokens
+  const sampleCount = sample.sampleCount - removed.sampleCount
+  if (totalTextChars <= 0 || totalTextTokens <= 0 || sampleCount <= 0) return undefined
+  const lastRatio = totalTextChars / totalTextTokens
+  const next: TokenCalibrationSample = {
+    totalTextChars,
+    totalTextTokens,
+    sampleCount,
+    updatedAt: now,
+  }
+  if (Number.isFinite(lastRatio) && lastRatio > 0) next.lastRatio = lastRatio
+  return next
+}
+
+// Call after `addSampleToChat()` accepts the same observation. The global
+// settings row is a materialized rollup of per-chat samples, so this path
+// adds exactly the accepted per-chat delta instead of running an independent
+// global outlier gate that could make the rollup drift.
+export async function addAcceptedSampleToGlobal(
   modelId: string,
   chars: number,
   tokens: number,
   now: number = Date.now(),
 ): Promise<void> {
   try {
+    const validatedTokens = safeServerTokens(tokens)
+    if (
+      typeof chars !== 'number' ||
+      !Number.isFinite(chars) ||
+      chars <= 0 ||
+      validatedTokens === undefined ||
+      validatedTokens <= 0
+    ) {
+      return
+    }
     const calibrationKey = tokenCalibrationKey(modelId)
     await updateSetting<GlobalTokenCalibration>(GLOBAL_KEY, (stored) => {
-      const global =
-        stored && typeof stored === 'object' && stored.version === 1
-          ? {
-              version: 1 as const,
-              updatedAt: finiteNumber(stored.updatedAt) ? stored.updatedAt : 0,
-              byModel:
-                stored.byModel && typeof stored.byModel === 'object'
-                  ? (normalizedCalibrationSamples(stored.byModel) ?? {})
-                  : {},
-            }
-          : emptyGlobal()
+      const global = normalizeGlobalPayload(stored)
       let globalSample = global.byModel[calibrationKey]
       if (!globalSample) {
         globalSample = emptySample()
         global.byModel[calibrationKey] = globalSample
       }
-      // Reuse the same validation as per-chat so bad samples don't
-      // infiltrate the global rollup either. The existing sample is
-      // passed for outlier-gate context.
-      const currentSample =
-        aggregateSamplesForCalibrationKey(global.byModel, calibrationKey) ?? globalSample
-      const outcome = validateSample(modelId, chars, tokens, currentSample)
-      if (!outcome.accepted) return global
-      applyValidatedSample(globalSample, chars, tokens, now)
+      applyValidatedSample(globalSample, chars, validatedTokens, now)
       global.updatedAt = now
       return global
     })
   } catch {
-    // Non-fatal: per-chat sample still lands even if global rollup fails.
+    // Non-fatal: per-chat sample remains the source of truth.
+  }
+}
+
+export async function subtractSamplesFromTokenCalibrationGlobal(
+  samples: Record<string, TokenCalibrationSample> | undefined,
+  now: number = Date.now(),
+): Promise<void> {
+  const removedByFamily = aggregateCalibrationSamples(samples)
+  if (Object.keys(removedByFamily).length === 0) return
+  try {
+    await updateSetting<GlobalTokenCalibration>(GLOBAL_KEY, (stored) => {
+      const global = normalizeGlobalPayload(stored)
+      let changed = false
+      for (const [calibrationKey, removed] of Object.entries(removedByFamily)) {
+        const current = aggregateSamplesForCalibrationKey(global.byModel, calibrationKey)
+        if (!current) continue
+        const next = subtractValidatedSample(current, removed, now)
+        if (next) global.byModel[calibrationKey] = next
+        else delete global.byModel[calibrationKey]
+        changed = true
+      }
+      if (changed) global.updatedAt = now
+      return global
+    })
+  } catch {
+    // Non-fatal: estimation falls back through remaining per-chat samples.
   }
 }
 
@@ -476,7 +535,7 @@ export async function addSampleToChatAndGlobal(
 ): Promise<SampleIngestOutcome> {
   const outcome = addSampleToChat(chat, modelId, chars, tokens, now)
   if (outcome.accepted) {
-    await addSampleToGlobal(modelId, chars, tokens, now)
+    await addAcceptedSampleToGlobal(modelId, chars, tokens, now)
   }
   return outcome
 }

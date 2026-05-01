@@ -41,9 +41,9 @@ export interface ScrollRegionHandle {
 }
 
 const DEFAULT_THRESHOLD_PX = 48
-const OPEN_FOLLOW_GRACE_MS = 6_000
-const STREAM_FOLLOW_GRACE_MS = 4_000
 const USER_SCROLL_INTENT_MS = 750
+const SETTLE_REQUIRED_STABLE_FRAMES = 2
+const SETTLE_MAX_FRAME_CHECKS = 8
 
 type PositionSource = 'layout' | 'observer' | 'resize' | 'scroll'
 type ScrollDebugEvent =
@@ -118,22 +118,18 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
   const didOpenRef = useRef(false)
   const resetKeyRef = useRef(resetKey)
   const followFrameRef = useRef<number | null>(null)
-  const settleFrameRef = useRef<number | null>(null)
-  const settleFollowUntilRef = useRef(0)
+  const settleCheckFrameRef = useRef<number | null>(null)
+  const settleFollowPendingRef = useRef(false)
+  const settleLastHeightRef = useRef<number | null>(null)
+  const settleStableFramesRef = useRef(0)
+  const settleFrameChecksRef = useRef(0)
   const userScrollIntentUntilRef = useRef(0)
   const thresholdRef = useRef(pinThresholdPx ?? DEFAULT_THRESHOLD_PX)
   const autoScrollOnStreamRef = useRef(autoScrollOnStream)
   const streamActiveRef = useRef(streamActive)
   const previousStreamActiveRef = useRef(streamActive)
-  const streamFollowGraceUntilRef = useRef(streamActive ? Number.POSITIVE_INFINITY : 0)
   thresholdRef.current = pinThresholdPx ?? DEFAULT_THRESHOLD_PX
   autoScrollOnStreamRef.current = autoScrollOnStream
-  if (streamActive) {
-    streamFollowGraceUntilRef.current = Number.POSITIVE_INFINITY
-  } else if (previousStreamActiveRef.current) {
-    streamFollowGraceUntilRef.current = nowMs() + STREAM_FOLLOW_GRACE_MS
-  }
-  previousStreamActiveRef.current = streamActive
   streamActiveRef.current = streamActive
 
   const debugScroll = useCallback(
@@ -148,11 +144,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
         streamActive: streamActiveRef.current,
         autoScrollOnStream: autoScrollOnStreamRef.current,
         userScrollIntentMsRemaining: Math.max(0, userScrollIntentUntilRef.current - timestamp),
-        streamGraceMsRemaining:
-          streamFollowGraceUntilRef.current === Number.POSITIVE_INFINITY
-            ? 'infinity'
-            : Math.max(0, streamFollowGraceUntilRef.current - timestamp),
-        settleMsRemaining: Math.max(0, settleFollowUntilRef.current - timestamp),
+        settlePending: settleFollowPendingRef.current,
         metrics: container
           ? {
               scrollTop: container.scrollTop,
@@ -193,10 +185,12 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
         smooth,
         targetTop: top,
       })
-      container.scrollTo({
-        top,
-        behavior: smooth ? 'smooth' : 'auto',
-      })
+      if (typeof container.scrollTo === 'function') {
+        container.scrollTo({
+          top,
+          behavior: smooth ? 'smooth' : 'auto',
+        })
+      }
       if (!smooth) container.scrollTop = top
       followIntentRef.current = true
       setScrollStateNow('follow', opts?.reason ?? 'scroll.to-bottom')
@@ -206,31 +200,22 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
 
   const shouldFollowContentGrowth = useCallback(() => {
     if (!followIntentRef.current) return false
-    if (nowMs() <= settleFollowUntilRef.current) return true
-    if (!autoScrollOnStreamRef.current) return false
-    if (streamActiveRef.current) return true
-    return nowMs() <= streamFollowGraceUntilRef.current
+    if (streamActiveRef.current) return autoScrollOnStreamRef.current
+    return settleFollowPendingRef.current || stateRef.current === 'follow'
   }, [])
 
-  const settleActive = useCallback(() => nowMs() <= settleFollowUntilRef.current, [])
+  const settleActive = useCallback(() => settleFollowPendingRef.current, [])
 
-  const startFollowSettle = useCallback(
-    (durationMs = STREAM_FOLLOW_GRACE_MS, reason = 'stream') => {
-      settleFollowUntilRef.current = Math.max(settleFollowUntilRef.current, nowMs() + durationMs)
-      debugScroll('follow.settle.start', { durationMs, reason })
-      if (settleFrameRef.current !== null) return
-      const tick = () => {
-        settleFrameRef.current = null
-        if (!shouldFollowContentGrowth()) return
-        debugScroll('follow.settle.tick', { reason })
-        scrollToBottomNow({ smooth: false, reason: `settle:${reason}` })
-        if (nowMs() > settleFollowUntilRef.current) return
-        settleFrameRef.current = requestAnimationFrame(tick)
-      }
-      settleFrameRef.current = requestAnimationFrame(tick)
-    },
-    [debugScroll, scrollToBottomNow, shouldFollowContentGrowth],
-  )
+  const clearFollowSettle = useCallback(() => {
+    settleFollowPendingRef.current = false
+    settleLastHeightRef.current = null
+    settleStableFramesRef.current = 0
+    settleFrameChecksRef.current = 0
+    if (settleCheckFrameRef.current !== null) {
+      cancelAnimationFrame(settleCheckFrameRef.current)
+      settleCheckFrameRef.current = null
+    }
+  }, [])
 
   const scheduleFollowScroll = useCallback(() => {
     if (followFrameRef.current !== null) return
@@ -242,6 +227,54 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       scrollToBottomNow({ smooth: false, reason: 'scheduled-follow' })
     })
   }, [debugScroll, scrollToBottomNow, shouldFollowContentGrowth])
+
+  const scheduleSettleCheck = useCallback(
+    (reason = 'stream') => {
+      if (settleCheckFrameRef.current !== null) return
+      const check = () => {
+        settleCheckFrameRef.current = null
+        if (!settleFollowPendingRef.current) return
+        const container = containerRef.current
+        if (!container) {
+          clearFollowSettle()
+          return
+        }
+        const height = container.scrollHeight
+        const stable = settleLastHeightRef.current === height
+        settleLastHeightRef.current = height
+        settleStableFramesRef.current = stable ? settleStableFramesRef.current + 1 : 0
+        settleFrameChecksRef.current += 1
+        debugScroll('follow.settle.tick', {
+          reason,
+          height,
+          stableFrames: settleStableFramesRef.current,
+          frameChecks: settleFrameChecksRef.current,
+        })
+        if (
+          settleStableFramesRef.current >= SETTLE_REQUIRED_STABLE_FRAMES ||
+          settleFrameChecksRef.current >= SETTLE_MAX_FRAME_CHECKS
+        ) {
+          clearFollowSettle()
+          return
+        }
+        scheduleFollowScroll()
+        settleCheckFrameRef.current = requestAnimationFrame(check)
+      }
+      settleCheckFrameRef.current = requestAnimationFrame(check)
+    },
+    [clearFollowSettle, debugScroll, scheduleFollowScroll],
+  )
+
+  const startFollowSettle = useCallback(
+    (reason = 'stream') => {
+      clearFollowSettle()
+      settleFollowPendingRef.current = true
+      debugScroll('follow.settle.start', { reason })
+      scheduleFollowScroll()
+      scheduleSettleCheck(reason)
+    },
+    [clearFollowSettle, debugScroll, scheduleFollowScroll, scheduleSettleCheck],
+  )
 
   const updateFromScrollPosition = useCallback(
     (source: PositionSource) => {
@@ -279,7 +312,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
     didOpenRef.current = true
     debugScroll('open.bottom')
     scrollToBottomNow({ smooth: false, reason: 'open' })
-    startFollowSettle(OPEN_FOLLOW_GRACE_MS, 'open')
+    startFollowSettle('open')
     return true
   }, [debugScroll, scrollToBottomNow, setScrollStateNow, startFollowSettle])
 
@@ -292,6 +325,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       resetKeyRef.current = resetKey
       didOpenRef.current = false
       followIntentRef.current = true
+      clearFollowSettle()
     }
     if (completeOpenScrollIfReady()) return
     updateFromScrollPosition('layout')
@@ -397,7 +431,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       userScrollIntentUntilRef.current = nowMs() + USER_SCROLL_INTENT_MS
       if (followIntentRef.current) {
         followIntentRef.current = false
-        settleFollowUntilRef.current = 0
+        clearFollowSettle()
         debugScroll('user-follow-cancel', { event })
       }
       debugScroll(event)
@@ -416,7 +450,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       container.removeEventListener('touchmove', onTouchMove)
       container.removeEventListener('scroll', onScroll)
     }
-  }, [debugScroll, updateFromScrollPosition])
+  }, [clearFollowSettle, debugScroll, updateFromScrollPosition])
 
   useLayoutEffect(() => {
     if (!autoScrollOnStream || !streamActive || !followIntentRef.current) return
@@ -425,12 +459,13 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
   }, [autoScrollOnStream, debugScroll, streamActive, scrollToBottomNow])
 
   useLayoutEffect(() => {
-    if (streamActive) return
+    const wasActive = previousStreamActiveRef.current
+    previousStreamActiveRef.current = streamActive
+    if (streamActive || !wasActive) return
     if (!autoScrollOnStream) return
     if (!followIntentRef.current) return
-    if (nowMs() > streamFollowGraceUntilRef.current) return
     debugScroll('stream-settle-start')
-    startFollowSettle()
+    startFollowSettle('stream')
   }, [autoScrollOnStream, debugScroll, streamActive, startFollowSettle])
 
   const scrollToBottom = useCallback(
@@ -466,9 +501,9 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
   useEffect(() => {
     return () => {
       if (followFrameRef.current !== null) cancelAnimationFrame(followFrameRef.current)
-      if (settleFrameRef.current !== null) cancelAnimationFrame(settleFrameRef.current)
+      clearFollowSettle()
     }
-  }, [])
+  }, [clearFollowSettle])
 
   return (
     <div ref={containerRef} data-ui="scroll-region" data-scroll-state={state}>

@@ -53,6 +53,7 @@ import type {
   ChatSettings,
   ConnectionProfile,
   ContentItem,
+  AttachmentId,
   Message,
 } from './types'
 
@@ -140,6 +141,7 @@ interface RequestPrivacyPlanInput {
   activePathMessages: Message[]
   draftText: string
   settings?: ChatSettings
+  preCutAttachmentIds?: readonly AttachmentId[]
   signal?: AbortSignal
 }
 
@@ -159,6 +161,7 @@ export async function resolveRequestPrivacyPlan(
     const attachmentContext = await loadAttachmentEstimateContext(
       input.activePathMessages,
       settings,
+      input.preCutAttachmentIds,
     )
     const est = estimateSettingsPromptSize(
       settings,
@@ -172,6 +175,8 @@ export async function resolveRequestPrivacyPlan(
         globalCalibration,
         mode: globalPrefs.tokenCalibrationMode,
       },
+      undefined,
+      input.preCutAttachmentIds,
     )
     const reserveRaw = settings.maxCompletionTokens
     const reserve = reserveRaw === UNLIMITED_CONTEXT ? 0 : (reserveRaw ?? 0)
@@ -200,6 +205,7 @@ interface AssistantRequestPlanInput {
   settings?: ChatSettings
   stream?: boolean
   debugSource?: string
+  preCutAttachmentIds?: readonly AttachmentId[]
 }
 
 export interface AssistantRequestPlan {
@@ -353,6 +359,7 @@ export async function prepareAssistantRequestPlan(
       activePathMessages: input.pathMessages,
       draftText: input.draftText ?? '',
       settings,
+      ...(input.preCutAttachmentIds ? { preCutAttachmentIds: input.preCutAttachmentIds } : {}),
       ...(input.signal ? { signal: input.signal } : {}),
     }),
     input.capabilities || !settings.model
@@ -502,16 +509,20 @@ function outputModalitiesForRoute(
 async function loadAttachmentEstimateContext(
   messages: readonly Message[],
   settings: ChatSettings,
+  preCutAttachmentIds: readonly AttachmentId[] = [],
 ): Promise<{ resolver?: AttachmentResolver; hasAttachments: boolean }> {
-  const ids = attachmentContextIds({
-    messages,
-    policy: attachmentContextPolicyForSettings(settings),
-  })
-  if (ids.length === 0) return { hasAttachments: false }
+  const ids = new Set<AttachmentId>(
+    attachmentContextIds({
+      messages,
+      policy: attachmentContextPolicyForSettings(settings),
+    }),
+  )
+  for (const id of preCutAttachmentIds) ids.add(id)
+  if (ids.size === 0) return { hasAttachments: false }
   const repo = getWorkspaceRepository()
-  const byId = new Map<string, Attachment>()
+  const byId = new Map<AttachmentId, Attachment>()
   await Promise.all(
-    ids.map(async (id) => {
+    [...ids].map(async (id) => {
       const attachment = await repo.getAttachment(id)
       if (attachment) byId.set(id, attachment)
     }),
@@ -618,7 +629,11 @@ async function buildAssistantRequestPlan(
     readTokenCalibrationGlobal(),
     readGlobalPreferences(),
   ])
-  const preCutAttachmentContext = await loadAttachmentEstimateContext(contextPathMessages, settings)
+  const preCutAttachmentContext = await loadAttachmentEstimateContext(
+    contextPathMessages,
+    settings,
+    input.preCutAttachmentIds,
+  )
   const disableTextCalibration = preCutAttachmentContext.hasAttachments
   const currentTextCharsPerToken =
     settings.model && !disableTextCalibration

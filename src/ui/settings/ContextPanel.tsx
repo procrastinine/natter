@@ -6,7 +6,7 @@
 // Layout (top-to-bottom):
 // - Live gauge: used / (effective prompt budget). Colors escalate over
 //   75% (warn) and 95% (danger). Compact breakdown row: system / history /
-//   media / draft.
+//   media.
 // - Model context cap: compact one-liner showing the provider's cap and
 //   the currently-effective budget.
 // - Max context slider + numeric input (custom cap ≤ model cap). Drives
@@ -21,27 +21,18 @@
 // All values are pinned to the effective capability; `validateChatSettings`
 // re-clamps when the model changes.
 
-import { useLiveQuery } from 'dexie-react-hooks'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import type { EffectiveCapability } from '../../core/capabilities'
-import { DEFAULT_GLOBAL_PREFERENCES, readGlobalPreferences } from '../../core/global-settings'
-import {
-  estimateSettingsPromptSize,
-  type PromptSizeEstimate,
-  UNLIMITED_CONTEXT,
-} from '../../core/prompt-size'
-import { readTokenCalibrationGlobal } from '../../core/token-calibration'
-import type { Chat, Message } from '../../core/types'
-import { getChatDraft, loadActiveBranchSnapshot, updateChatSettings } from '../../store/chats'
-import { useChatStore } from '../../store/zustand/chatStore'
-import { useAttachmentResolverForContext } from '../attachments/useAttachmentResolver'
+import { type PromptSizeEstimate, UNLIMITED_CONTEXT } from '../../core/prompt-size'
+import type { Chat } from '../../core/types'
+import { updateChatSettings } from '../../store/chats'
 import { InfoDisclosure } from './InfoDisclosure'
 
 interface ContextPanelProps {
   chat: Chat
   capability: EffectiveCapability | null
   endpointTokenizer: string | null | undefined
-  estimateOverride?: PromptSizeEstimate | null
+  estimateOverride: PromptSizeEstimate | null
   // Middle-out is an OpenRouter plugin (`plugins:[{id:'context-compression'}]`);
   // the checkbox only makes sense on an OpenRouter connection.
   showMiddleOut?: boolean
@@ -50,77 +41,10 @@ interface ContextPanelProps {
 export function ContextPanel({
   chat,
   capability,
-  endpointTokenizer,
-  estimateOverride = null,
+  estimateOverride,
   showMiddleOut = false,
 }: ContextPanelProps) {
-  const needsLocalEstimate = estimateOverride === null
-  const cursor = useChatStore((s) =>
-    needsLocalEstimate ? (s.cursors[chat.id] ?? EMPTY_CURSOR) : EMPTY_CURSOR,
-  )
-  const branchSnapshot = useLiveQuery(
-    () =>
-      needsLocalEstimate ? loadActiveBranchSnapshot(chat.id, cursor) : Promise.resolve(null),
-    [chat.id, needsLocalEstimate, cursor],
-    null,
-  )
-  const draft = useLiveQuery(
-    () => (needsLocalEstimate ? getChatDraft(chat.id) : Promise.resolve(undefined)),
-    [chat.id, needsLocalEstimate],
-    undefined,
-  )
-  const prefs = useLiveQuery(
-    () =>
-      needsLocalEstimate ? readGlobalPreferences() : Promise.resolve(DEFAULT_GLOBAL_PREFERENCES),
-    [needsLocalEstimate],
-    DEFAULT_GLOBAL_PREFERENCES,
-  )
-  const globalCalibration = useLiveQuery(
-    () => (needsLocalEstimate ? readTokenCalibrationGlobal() : Promise.resolve(null)),
-    [needsLocalEstimate],
-    null,
-  )
-  // Flatten capability to a single providerCap number so the memo's
-  // dependency array is primitive (capability objects can re-render the
-  // parent without changing their prompt-cap). `null` disables cutoff when
-  // capability hasn't loaded; once it does, the memo re-runs.
-  const providerCap = capability?.maxPromptTokens ?? capability?.contextLength ?? null
-  const localPath = needsLocalEstimate ? (branchSnapshot?.branch ?? EMPTY_MESSAGES) : EMPTY_MESSAGES
-  const attachmentResolver = useAttachmentResolverForContext({
-    settings: chat.settings,
-    messages: localPath,
-    draftAttachmentRefs: draft?.attachmentRefs,
-    enabled: needsLocalEstimate,
-  })
-  const localEstimate = useMemo(() => {
-    if (!needsLocalEstimate) return null
-    return estimateSettingsPromptSize(
-      chat.settings,
-      localPath,
-      draft?.text ?? '',
-      endpointTokenizer ?? null,
-      providerCap,
-      attachmentResolver,
-      {
-        chatTokenCalibration: chat.tokenCalibration,
-        globalCalibration,
-        mode: prefs.tokenCalibrationMode,
-      },
-      draft?.attachmentRefs,
-    )
-  }, [
-    needsLocalEstimate,
-    localPath,
-    chat.settings,
-    chat.tokenCalibration,
-    draft,
-    endpointTokenizer,
-    providerCap,
-    attachmentResolver,
-    globalCalibration,
-    prefs.tokenCalibrationMode,
-  ])
-  const estimate = estimateOverride ?? localEstimate
+  const estimate = estimateOverride
 
   if (!chat.settings.model) {
     return (
@@ -189,13 +113,13 @@ export function ContextPanel({
   const keepFirstPairs = strategy.keepFirstPairs ?? 0
   const useMiddleOut = strategy.useOpenRouterMiddleOut === true
   const effectivePromptBudget = Number.isFinite(effectiveMax)
-    ? Math.max(0, (effectiveMax) - storedMaxCompletion)
+    ? Math.max(0, effectiveMax - storedMaxCompletion)
     : Number.POSITIVE_INFINITY
 
   const usedTokens = estimate.total
   const budgetPct =
     Number.isFinite(effectivePromptBudget) && effectivePromptBudget > 0
-      ? usedTokens / (effectivePromptBudget)
+      ? usedTokens / effectivePromptBudget
       : 0
   const overBudget = Number.isFinite(effectivePromptBudget) && usedTokens > effectivePromptBudget
   const warnLevel: 'ok' | 'warn' | 'danger' = overBudget
@@ -518,6 +442,3 @@ function NumberSlider({
 }
 
 const SLIDER_COMMIT_DEBOUNCE_MS = 200
-
-const EMPTY_CURSOR = Object.freeze({}) as Readonly<Record<string, string>>
-const EMPTY_MESSAGES: Message[] = []

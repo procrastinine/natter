@@ -5,35 +5,43 @@
 // repository boundary. Visible chat-row writes go through `WorkspaceRepository`
 // so browser mode already matches the future daemon contract.
 
-import { cloneDefaultChatSettings } from '../core/defaults'
 import { activePath } from '../core/active-path'
+import { cloneDefaultChatSettings } from '../core/defaults'
+import { tokenCalibrationKeyForStoredRecordKey } from '../core/model-ids'
 import { normalizeReasoningSettings } from '../core/reasoning'
+import {
+  aggregateCalibrationSamples,
+  readTokenCalibrationGlobal,
+  subtractSamplesFromTokenCalibrationGlobal,
+  writeTokenCalibrationGlobal,
+} from '../core/token-calibration'
 import type {
   Chat,
   ChatId,
-  ChatSidebarRow,
   ChatSettings,
+  ChatSidebarRow,
   ChatTag,
   FolderId,
   Message,
   MessageId,
   PresetId,
   TagId,
+  TokenCalibrationSample,
 } from '../core/types'
 import { newId } from '../lib/ulid'
 import { postEvent } from './broadcast'
 import { getDb, openDb } from './db'
-import type {
-  ActiveBranchBodyWindow,
-  ActiveBranchSnapshot,
-  ActiveBranchWindowSnapshot,
-} from './repository'
 import {
   hydrateMessage,
   hydrateMessages,
   type MessageBodyRow,
   type MessageHeaderRow,
 } from './message-storage'
+import type {
+  ActiveBranchBodyWindow,
+  ActiveBranchSnapshot,
+  ActiveBranchWindowSnapshot,
+} from './repository'
 import { getWorkspaceRepository } from './workspace-repository'
 
 type OptionalKeys<T> = {
@@ -48,7 +56,9 @@ type ChatSettingsPatch = {
 
 function isDatabaseClosedError(error: unknown): boolean {
   const candidate = error as { name?: unknown; inner?: { name?: unknown } } | null
-  return candidate?.name === 'DatabaseClosedError' || candidate?.inner?.name === 'DatabaseClosedError'
+  return (
+    candidate?.name === 'DatabaseClosedError' || candidate?.inner?.name === 'DatabaseClosedError'
+  )
 }
 
 interface ChatSidebarListOptions {
@@ -265,7 +275,8 @@ function branchWindowRange(
   window: ActiveBranchBodyWindow,
 ): { start: number; end: number; limit: number } {
   const limit = Math.max(0, Math.floor(window.limit))
-  const start = Math.max(0, Math.min(total, Math.floor(window.offset)))
+  const offset = Math.floor(window.offset)
+  const start = offset < 0 ? Math.max(0, total - limit) : Math.max(0, Math.min(total, offset))
   return { start, end: Math.min(total, start + limit), limit }
 }
 
@@ -390,12 +401,30 @@ export async function unarchiveChat(chatId: ChatId, now = Date.now()): Promise<v
   })
 }
 
-export async function deleteArchivedChatPermanently(chatId: ChatId): Promise<boolean> {
-  return getWorkspaceRepository().deleteArchivedChat(chatId)
+export async function deleteArchivedChatPermanently(
+  chatId: ChatId,
+  now = Date.now(),
+): Promise<boolean> {
+  const repo = getWorkspaceRepository()
+  const chat = await repo.getChat(chatId)
+  const deleted = await repo.deleteArchivedChat(chatId)
+  if (deleted) {
+    await subtractSamplesFromTokenCalibrationGlobal(chat?.tokenCalibration, now)
+  }
+  return deleted
 }
 
-export async function emptyArchivedChats(): Promise<ChatId[]> {
-  const result = await getWorkspaceRepository().emptyArchivedChats()
+export async function emptyArchivedChats(now = Date.now()): Promise<ChatId[]> {
+  const repo = getWorkspaceRepository()
+  const archivedById = new Map(
+    (await repo.listChats()).filter((chat) => chat.archived).map((chat) => [chat.id, chat]),
+  )
+  const result = await repo.emptyArchivedChats()
+  const removedCalibration: Record<string, TokenCalibrationSample> = {}
+  for (const chatId of result.deletedChatIds) {
+    accumulateCalibrationSamples(removedCalibration, archivedById.get(chatId)?.tokenCalibration)
+  }
+  await subtractSamplesFromTokenCalibrationGlobal(removedCalibration, now)
   return result.deletedChatIds
 }
 
@@ -413,6 +442,32 @@ export async function moveChatToFolder(
     changed = true
     ctx.patchChatMeta(chatId, { folderId, updatedAt: now })
   })
+  if (changed && folderId) {
+    await repo.updateFolder(folderId, { lastUsedAt: now, now })
+  }
+  return changed
+}
+
+export async function moveChatsToFolder(
+  chatIds: readonly ChatId[],
+  folderId: FolderId | null,
+  now = Date.now(),
+): Promise<boolean> {
+  const uniqueChatIds = [...new Set(chatIds)]
+  if (uniqueChatIds.length === 0) return false
+  const repo = getWorkspaceRepository()
+  let changed = false
+  await repo.runMutation(
+    uniqueChatIds.map((chatId) => ({ kind: 'chat-meta' as const, chatId })),
+    async (ctx) => {
+      for (const chatId of uniqueChatIds) {
+        const chat = await ctx.getChat(chatId)
+        if (!chat || (chat.folderId ?? null) === folderId) continue
+        changed = true
+        ctx.patchChatMeta(chatId, { folderId, updatedAt: now })
+      }
+    },
+  )
   if (changed && folderId) {
     await repo.updateFolder(folderId, { lastUsedAt: now, now })
   }
@@ -445,8 +500,51 @@ export async function setChatTagsFromNames(
   names: readonly string[],
   now = Date.now(),
 ): Promise<TagId[]> {
-  const normalizedNames = uniqueTagNames(names)
   const repo = getWorkspaceRepository()
+  const tagIds = await resolveChatTagIds(repo, names, now)
+  await setChatTags(chatId, tagIds, now)
+  await pruneUnusedTags(repo)
+  return tagIds
+}
+
+export async function setChatsTagsFromNames(
+  chatIds: readonly ChatId[],
+  names: readonly string[],
+  now = Date.now(),
+): Promise<TagId[]> {
+  const uniqueChatIds = [...new Set(chatIds)]
+  const repo = getWorkspaceRepository()
+  const tagIds = await resolveChatTagIds(repo, names, now)
+  const uniqueTagIds = [...new Set(tagIds)]
+  if (uniqueChatIds.length > 0) {
+    let changed = false
+    await repo.runMutation(
+      uniqueChatIds.map((chatId) => ({ kind: 'chat-meta' as const, chatId })),
+      async (ctx) => {
+        for (const chatId of uniqueChatIds) {
+          const chat = await ctx.getChat(chatId)
+          if (!chat || sameStringList(chat.tags, uniqueTagIds)) continue
+          changed = true
+          ctx.patchChatMeta(chatId, { tags: uniqueTagIds, updatedAt: now })
+        }
+      },
+    )
+    if (changed) {
+      await Promise.all(
+        uniqueTagIds.map((tagId) => repo.updateTag(tagId, { lastUsedAt: now, now })),
+      )
+    }
+  }
+  await pruneUnusedTags(repo)
+  return uniqueTagIds
+}
+
+async function resolveChatTagIds(
+  repo: Pick<ReturnType<typeof getWorkspaceRepository>, 'listTags' | 'createTag'>,
+  names: readonly string[],
+  now: number,
+): Promise<TagId[]> {
+  const normalizedNames = uniqueTagNames(names)
   const knownTags = await repo.listTags()
   const byLower = new Map(knownTags.map((tag) => [tag.nameLower, tag]))
   const tagIds: TagId[] = []
@@ -461,9 +559,155 @@ export async function setChatTagsFromNames(
     byLower.set(created.nameLower, created)
     tagIds.push(created.id)
   }
-  await setChatTags(chatId, tagIds, now)
-  await pruneUnusedTags(repo)
   return tagIds
+}
+
+export async function clearChatTokenCalibration(
+  chatId: ChatId,
+  calibrationKey?: string,
+  now = Date.now(),
+): Promise<boolean> {
+  const repo = getWorkspaceRepository()
+  let changed = false
+  const removedSamples: Record<string, TokenCalibrationSample> = {}
+  await repo.runMutation([{ kind: 'chat-meta', chatId }], async (ctx) => {
+    const chat = await ctx.getChat(chatId)
+    if (!chat) return
+    const current = chat.tokenCalibration ?? {}
+    const entries = Object.entries(current)
+    if (!calibrationKey) {
+      if (entries.length === 0) return
+      changed = true
+      Object.assign(removedSamples, current)
+      ctx.patchChatMeta(
+        chatId,
+        { tokenCalibration: {} },
+        { touchVisibleState: false, broadcast: true },
+      )
+      return
+    }
+
+    const next: Record<string, TokenCalibrationSample> = {}
+    for (const [storedKey, sample] of entries) {
+      if (tokenCalibrationKeyForStoredRecordKey(storedKey) === calibrationKey) {
+        changed = true
+        removedSamples[storedKey] = sample
+        continue
+      }
+      next[storedKey] = sample
+    }
+    if (!changed) return
+    ctx.patchChatMeta(
+      chatId,
+      { tokenCalibration: aggregateCalibrationSamples(next) },
+      { touchVisibleState: false, broadcast: true },
+    )
+  })
+  if (changed) {
+    await subtractSamplesFromTokenCalibrationGlobal(removedSamples, now)
+  }
+  return changed
+}
+
+export async function clearTokenCalibrationFamilyEverywhere(
+  calibrationKey: string,
+  now = Date.now(),
+): Promise<{ globalChanged: boolean; chatCount: number }> {
+  const repo = getWorkspaceRepository()
+  const [global, chats] = await Promise.all([readTokenCalibrationGlobal(), repo.listChats()])
+  const globalNext = calibrationRecordWithoutFamily(global.byModel, calibrationKey)
+  if (globalNext.changed) {
+    await writeTokenCalibrationGlobal({
+      version: 1,
+      updatedAt: now,
+      byModel: globalNext.samples,
+    })
+  }
+  const affected = chats
+    .map((chat) => ({
+      chat,
+      next: calibrationRecordWithoutFamily(chat.tokenCalibration, calibrationKey),
+    }))
+    .filter((row) => row.next.changed)
+  if (affected.length > 0) {
+    await repo.runMutation(
+      affected.map(({ chat }) => ({ kind: 'chat-meta' as const, chatId: chat.id })),
+      async (ctx) => {
+        for (const { chat, next } of affected) {
+          ctx.patchChatMeta(
+            chat.id,
+            { tokenCalibration: aggregateCalibrationSamples(next.samples) },
+            { touchVisibleState: false, broadcast: true },
+          )
+        }
+      },
+    )
+  }
+  return { globalChanged: globalNext.changed, chatCount: affected.length }
+}
+
+export async function clearAllTokenCalibrationEverywhere(
+  now = Date.now(),
+): Promise<{ globalChanged: boolean; chatCount: number }> {
+  const repo = getWorkspaceRepository()
+  const [global, chats] = await Promise.all([readTokenCalibrationGlobal(), repo.listChats()])
+  const globalChanged = Object.keys(global.byModel).length > 0
+  if (globalChanged) {
+    await writeTokenCalibrationGlobal({ version: 1, updatedAt: now, byModel: {} })
+  }
+  const affected = chats.filter((chat) => Object.keys(chat.tokenCalibration ?? {}).length > 0)
+  if (affected.length > 0) {
+    await repo.runMutation(
+      affected.map((chat) => ({ kind: 'chat-meta' as const, chatId: chat.id })),
+      async (ctx) => {
+        for (const chat of affected) {
+          ctx.patchChatMeta(
+            chat.id,
+            { tokenCalibration: {} },
+            { touchVisibleState: false, broadcast: true },
+          )
+        }
+      },
+    )
+  }
+  return { globalChanged, chatCount: affected.length }
+}
+
+function calibrationRecordWithoutFamily(
+  samples: Record<string, TokenCalibrationSample> | undefined,
+  calibrationKey: string,
+): { changed: boolean; samples: Record<string, TokenCalibrationSample> } {
+  const next: Record<string, TokenCalibrationSample> = {}
+  let changed = false
+  for (const [storedKey, sample] of Object.entries(samples ?? {})) {
+    if (tokenCalibrationKeyForStoredRecordKey(storedKey) === calibrationKey) {
+      changed = true
+      continue
+    }
+    next[storedKey] = sample
+  }
+  return { changed, samples: next }
+}
+
+function accumulateCalibrationSamples(
+  target: Record<string, TokenCalibrationSample>,
+  samples: Record<string, TokenCalibrationSample> | undefined,
+): void {
+  for (const [key, sample] of Object.entries(aggregateCalibrationSamples(samples))) {
+    const current = target[key]
+    if (!current) {
+      target[key] = { ...sample }
+      continue
+    }
+    current.totalTextChars += sample.totalTextChars
+    current.totalTextTokens += sample.totalTextTokens
+    current.sampleCount += sample.sampleCount
+    if (sample.updatedAt >= current.updatedAt) {
+      current.updatedAt = sample.updatedAt
+      if (sample.lastRatio !== undefined) current.lastRatio = sample.lastRatio
+      else delete current.lastRatio
+    }
+  }
 }
 
 // Record a chat-open event per §2.1.2 rule 1. Bumps `lastViewedAt` only and is
@@ -570,6 +814,31 @@ export async function setChatPreset(
   })
 }
 
+export async function applyChatPreset(
+  chatId: ChatId,
+  presetId: PresetId,
+  settings: ChatSettings,
+  now = Date.now(),
+): Promise<boolean> {
+  const repo = getWorkspaceRepository()
+  let changed = false
+  await repo.runMutation([{ kind: 'chat-meta', chatId }], async (ctx) => {
+    const chat = await ctx.getChat(chatId)
+    if (!chat) return
+    const nextSettings = normalizeChatSettings(structuredClone(settings))
+    if ((chat.presetId ?? null) === presetId && sameChatSettings(chat.settings, nextSettings)) {
+      return
+    }
+    changed = true
+    ctx.patchChatMeta(chatId, {
+      settings: nextSettings,
+      presetId,
+      updatedAt: now,
+    })
+  })
+  return changed
+}
+
 export async function updateChatSettings(
   chatId: ChatId,
   patch: ChatSettingsPatch,
@@ -615,7 +884,7 @@ export async function replaceChatSettings(
     const chat = await ctx.getChat(chatId)
     if (!chat) return
     const nextSettings = normalizeChatSettings(structuredClone(settings))
-    if (JSON.stringify(chat.settings) === JSON.stringify(nextSettings)) return
+    if (sameChatSettings(chat.settings, nextSettings)) return
     changed = true
     ctx.patchChatMeta(chatId, {
       settings: nextSettings,
@@ -645,6 +914,25 @@ function sameSettingsFor(
     }
   }
   return true
+}
+
+function sameChatSettings(prev: ChatSettings, next: ChatSettings): boolean {
+  return stableSettingsString(prev) === stableSettingsString(next)
+}
+
+function stableSettingsString(value: unknown): string {
+  return JSON.stringify(sortObjectKeys(value))
+}
+
+function sortObjectKeys(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortObjectKeys)
+  if (!value || typeof value !== 'object') return value
+  const out: Record<string, unknown> = {}
+  for (const key of Object.keys(value).sort()) {
+    const child = (value as Record<string, unknown>)[key]
+    if (child !== undefined) out[key] = sortObjectKeys(child)
+  }
+  return out
 }
 
 function sameStringList(left: readonly string[], right: readonly string[]): boolean {

@@ -24,7 +24,7 @@ import {
 } from '../api/stream-transforms'
 import type { GeminiStreamChunk } from '../api/gemini-types'
 import type { ChatStreamChunk, ResponsesStreamChunk } from '../api/types'
-import { cursorKeyOf } from '../core/active-path'
+import { activePath, cursorKeyOf } from '../core/active-path'
 import { readGlobalPreferences, resolveContinueSystemPromptTemplate } from '../core/global-settings'
 // `globalPrefs` is still read for token-calibration mode; continue prompts
 // moved to `chat.settings` in the prompt-preset refactor.
@@ -39,7 +39,8 @@ import type { ChatId, ConnectionProfile, ContentItem, Message, MessageId } from 
 import { newId } from '../lib/ulid'
 import { postEvent } from '../store/broadcast'
 import { getBrowserRepository } from '../store/browser-repo'
-import { dismissAbortReason, getChat, loadActiveBranchSnapshot } from '../store/chats'
+import { dismissAbortReason, getChat, loadMessageHeaders } from '../store/chats'
+import { loadSendContextForBranch } from '../store/send-context'
 import { useChatStore } from '../store/zustand/chatStore'
 import { useStreamStore } from '../store/zustand/streamStore'
 import { useUiStore } from '../store/zustand/uiStore'
@@ -131,25 +132,32 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
   if (!chat) {
     throw new Error(`continue: chat not found: ${input.chatId}`)
   }
+  const allHeaders = await loadMessageHeaders(input.chatId)
+  const byId = new Map(allHeaders.map((header) => [header.id, header]))
+  const targetHeader = byId.get(input.targetMessageId)
+  if (!targetHeader || targetHeader.chatId !== input.chatId || targetHeader.deleted) {
+    throw new Error(`continue: target ${input.targetMessageId} unavailable`)
+  }
+  if (targetHeader.role !== 'assistant') {
+    throw new Error('continue: target must be an assistant message')
+  }
   const target = await repo.getMessage(input.targetMessageId)
   if (!target || target.chatId !== input.chatId || target.deleted) {
     throw new Error(`continue: target ${input.targetMessageId} unavailable`)
-  }
-  if (target.role !== 'assistant') {
-    throw new Error('continue: target must be an assistant message')
   }
 
   const baseCursor = useChatStore.getState().getCursor(input.chatId) ?? {}
   // Pin the cursor so the active-path walk ends at the target. Without
   // this, a fresh chat (no cursor) might resolve a different leaf.
   const cursor: Record<string, MessageId> = { ...baseCursor }
-  let cur: Message | undefined = target
+  let cur: (typeof allHeaders)[number] | undefined = targetHeader
   while (cur) {
     cursor[cursorKeyOf(cur.parentId)] = cur.id
-    cur = cur.parentId ? await repo.getMessage(cur.parentId) : undefined
+    cur = cur.parentId ? byId.get(cur.parentId) : undefined
   }
-  const branchSnapshot = await loadActiveBranchSnapshot(input.chatId, cursor)
-  const path = branchSnapshot.branch
+  const path = activePath(allHeaders as unknown as Message[], cursor).map(
+    (message) => message as unknown as (typeof allHeaders)[number],
+  )
   // Truncate the path at the target so downstream descendants that
   // happen to share siblingIndex 0 are excluded.
   const targetIdx = path.findIndex((m) => m.id === target.id)
@@ -195,22 +203,25 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
         ),
       }
   let continuePath: Message[]
+  let pendingMessages: Message[] = []
+  let preCutAttachmentIds: string[] = []
+  const mapHydratedMessage = usePrefillContinue
+    ? (message: Message): Message =>
+        message.id === target.id ? { ...message, origin: 'prefill' } : message
+    : undefined
   if (usePrefillContinue) {
-    // Clone the trailing assistant turn with origin: 'prefill' so the
-    // transform's trailing-whitespace trim fires. The stored message stays
-    // `origin: 'generated'` — this clone is wire-only.
-    const tail = upstream.at(-1)
-    if (tail) {
-      const cloned: Message = { ...tail, origin: 'prefill' }
-      continuePath = [...upstream.slice(0, -1), cloned]
-    } else {
-      continuePath = upstream
-    }
+    const sendContext = await loadSendContextForBranch({
+      chat,
+      branchHeaders: upstream,
+      settings: settingsForContinue,
+      ...(mapHydratedMessage ? { mapHydratedMessage } : {}),
+    })
+    continuePath = sendContext.pathMessages
+    preCutAttachmentIds = sendContext.preCutAttachmentIds
   } else {
-    continuePath =
+    pendingMessages =
       continueUserPrompt.trim().length > 0
         ? [
-            ...upstream,
             {
               id: `continue-user:${target.id}`,
               chatId: input.chatId,
@@ -226,7 +237,15 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
               deleted: false,
             },
           ]
-        : upstream
+        : []
+    const sendContext = await loadSendContextForBranch({
+      chat,
+      branchHeaders: upstream,
+      settings: settingsForContinue,
+      pendingMessages,
+    })
+    continuePath = sendContext.pathMessages
+    preCutAttachmentIds = sendContext.preCutAttachmentIds
   }
   const lifecycle = startRequestLifecycle({
     chatId: input.chatId,
@@ -242,6 +261,7 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
       chat,
       connection: input.connection,
       pathMessages: continuePath,
+      preCutAttachmentIds,
       settings: settingsForContinue,
       draftText: '',
       debugSource: 'continue',

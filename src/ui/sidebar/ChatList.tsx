@@ -252,7 +252,8 @@ function estimateSidebarVirtualTotalSize(
 
 export const ChatList = memo(function ChatList({ activeChatId, collapsed }: ChatListProps) {
   const model = useLiveQuery(loadSidebarModel, [], { chats: [], folders: [], tags: [] })
-  const prefs = useLiveQuery(readGlobalPreferences, [], DEFAULT_GLOBAL_PREFERENCES)
+  const loadedPrefs = useLiveQuery(readGlobalPreferences, [], undefined)
+  const prefs = loadedPrefs ?? DEFAULT_GLOBAL_PREFERENCES
   const persistedSortMode = useLiveQuery(readSidebarSortMode, [], DEFAULT_SIDEBAR_SORT_MODE)
   const persistedCollapsedFolderIds = useLiveQuery(
     readCollapsedSidebarFolderIds,
@@ -471,10 +472,10 @@ export const ChatList = memo(function ChatList({ activeChatId, collapsed }: Chat
     ],
   )
   const loadMoreSidebarRows = useCallback(() => {
-    setRenderedSidebarRowCount((current) =>
-      Math.min(virtualRows.length, current + prefs.sidebarRenderWindowSize),
+    setRenderedSidebarRowCount(
+      Math.min(virtualRows.length, renderedSidebarRowCount + prefs.sidebarRenderWindowSize),
     )
-  }, [prefs.sidebarRenderWindowSize, virtualRows.length])
+  }, [prefs.sidebarRenderWindowSize, renderedSidebarRowCount, virtualRows.length])
   useEffect(() => {
     startSearchStoreBroadcastListener()
   }, [])
@@ -483,7 +484,7 @@ export const ChatList = memo(function ChatList({ activeChatId, collapsed }: Chat
     setRenderedSidebarRowCount(prefs.sidebarRenderWindowSize)
   }, [prefs.sidebarRenderWindowSize, sidebarWindowResetKey])
   useEffect(() => {
-    if (prefs.sidebarRenderWindowLoadMode !== 'auto') return
+    if (!loadedPrefs || prefs.sidebarRenderWindowLoadMode !== 'auto') return
     if (hiddenSidebarRowCount <= 0) return
     if (typeof IntersectionObserver === 'undefined') return
     const root = sidebarListRef.current
@@ -497,7 +498,7 @@ export const ChatList = memo(function ChatList({ activeChatId, collapsed }: Chat
     )
     observer.observe(target)
     return () => observer.disconnect()
-  }, [hiddenSidebarRowCount, loadMoreSidebarRows, prefs.sidebarRenderWindowLoadMode])
+  }, [hiddenSidebarRowCount, loadedPrefs, loadMoreSidebarRows, prefs.sidebarRenderWindowLoadMode])
   useEffect(() => {
     if (!openActionChatId) return
     if (visibleVirtualRows.some((row) => row.kind === 'chat' && row.chat.id === openActionChatId))

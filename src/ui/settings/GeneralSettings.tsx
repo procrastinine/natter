@@ -19,11 +19,32 @@ import {
   writeTokenCalibrationMode,
 } from '../../core/global-settings'
 import { InfoDisclosure } from './InfoDisclosure'
-import { TokenCalibrationSettings } from './TokenCalibrationSettings'
 
 const SHORTCUT_OPTIONS: ReadonlyArray<{ value: SendShortcut; label: string }> = [
   { value: 'enter', label: 'Enter sends · Shift+Enter inserts a newline' },
   { value: 'cmd-enter', label: 'Cmd/Ctrl+Enter sends · Enter inserts a newline' },
+]
+
+const CALIBRATION_MODE_OPTIONS: ReadonlyArray<{
+  value: TokenCalibrationMode
+  label: string
+  helper: string
+}> = [
+  {
+    value: 'adaptive',
+    label: 'Chat, then global',
+    helper: 'Use chat-specific samples first, then the global family rollup.',
+  },
+  {
+    value: 'global-only',
+    label: 'Global only',
+    helper: 'Ignore per-chat samples and use only the global family rollup.',
+  },
+  {
+    value: 'family-defaults-only',
+    label: 'Family defaults only',
+    helper: 'Disable learned calibration and use built-in tokenizer-family defaults.',
+  },
 ]
 
 export function GeneralSettings() {
@@ -94,10 +115,30 @@ export function GeneralSettings() {
           </label>
         </div>
       </div>
-      <TokenCalibrationSettings
-        mode={prefs.tokenCalibrationMode}
-        onModeChange={onTokenCalibrationMode}
-      />
+      <div data-ui="settings-section">
+        <h3>Token calibration</h3>
+        <div data-ui="field-group">
+          <label htmlFor="token-calibration-mode">Mode</label>
+          <select
+            id="token-calibration-mode"
+            data-ui="token-calibration-mode"
+            value={prefs.tokenCalibrationMode}
+            onChange={(e) => void onTokenCalibrationMode(e.target.value as TokenCalibrationMode)}
+          >
+            {CALIBRATION_MODE_OPTIONS.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+          <span data-ui="helper">
+            {
+              CALIBRATION_MODE_OPTIONS.find((option) => option.value === prefs.tokenCalibrationMode)
+                ?.helper
+            }
+          </span>
+        </div>
+      </div>
       <div data-ui="settings-section">
         <h3>
           Privacy-page proxy

@@ -46,6 +46,7 @@ import {
   tokenizerFamily,
 } from './tokens'
 import type {
+  AttachmentId,
   AttachmentRef,
   ChatSettings,
   GlobalTokenCalibration,
@@ -442,16 +443,20 @@ export function buildSettingsPromptSizeEstimateInput(
   attachmentResolver?: AttachmentResolver,
   calibration?: TokenEstimateCalibrationContext,
   draftAttachmentRefs?: readonly AttachmentRef[],
+  preCutAttachmentIds?: readonly AttachmentId[],
 ): PromptSizeEstimateInput {
   const quirks = quirksFor(settings.model)
   const tokenizer = tokenizerFromSettings(settings, endpointTokenizer ?? null)
   const contextPathMessages = applyOutboundContextRewrites(activePathMessages, settings)
   const attachmentPolicy = attachmentContextPolicyForSettings(settings)
-  const contextHasAttachments = attachmentContextHasRefs({
-    messages: contextPathMessages,
-    policy: attachmentPolicy,
-    ...(draftAttachmentRefs ? { draft: { refs: draftAttachmentRefs, role: 'user' } } : {}),
-  })
+  const preCutHasAttachments = (preCutAttachmentIds?.length ?? 0) > 0
+  const contextHasAttachments =
+    preCutHasAttachments ||
+    attachmentContextHasRefs({
+      messages: contextPathMessages,
+      policy: attachmentPolicy,
+      ...(draftAttachmentRefs ? { draft: { refs: draftAttachmentRefs, role: 'user' } } : {}),
+    })
   const currentTextCharsPerToken =
     calibration && settings.model && !contextHasAttachments
       ? charsPerToken(
@@ -529,6 +534,7 @@ export function estimateSettingsPromptSize(
   attachmentResolver?: AttachmentResolver,
   calibration?: TokenEstimateCalibrationContext,
   draftAttachmentRefs?: readonly AttachmentRef[],
+  preCutAttachmentIds?: readonly AttachmentId[],
 ): PromptSizeEstimate {
   return estimatePromptSize(
     buildSettingsPromptSizeEstimateInput(
@@ -540,6 +546,7 @@ export function estimateSettingsPromptSize(
       attachmentResolver,
       calibration,
       draftAttachmentRefs,
+      preCutAttachmentIds,
     ),
   )
 }

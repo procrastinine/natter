@@ -317,6 +317,14 @@ export function PaperclipIcon({ size = 18, ariaLabel }: IconProps) {
   )
 }
 
+export function MessageSquareIcon({ size = 18, ariaLabel }: IconProps) {
+  return (
+    <BaseSvg size={size} {...(ariaLabel ? { 'aria-label': ariaLabel } : {})}>
+      <path d="M21 15a2 2 0 0 1-2 2H8l-5 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+    </BaseSvg>
+  )
+}
+
 export function DatabaseIcon({ size = 18, ariaLabel }: IconProps) {
   return (
     <BaseSvg size={size} {...(ariaLabel ? { 'aria-label': ariaLabel } : {})}>

@@ -38,14 +38,7 @@ import type {
 } from '../../core/types'
 import { usePrivacyRouting } from '../../hooks/usePrivacyRouting'
 import { useStreamStablePromptEstimate } from '../../hooks/useStreamStablePromptEstimate'
-import {
-  getChat,
-  getChatDraft,
-  loadActiveBranchSnapshot,
-  replaceChatSettings,
-  setChatPreset,
-  updateChatSettings,
-} from '../../store/chats'
+import { applyChatPreset, setChatPreset, updateChatSettings } from '../../store/chats'
 import {
   createPreset,
   deletePreset,
@@ -54,6 +47,7 @@ import {
   updatePreset,
 } from '../../store/presets'
 import { getProfile } from '../../store/profiles'
+import { loadActiveBranchHeaderSnapshot, loadSendContextForBranch } from '../../store/send-context'
 import { useChatStore } from '../../store/zustand/chatStore'
 import { useStreamStore } from '../../store/zustand/streamStore'
 import { useToastStore } from '../../store/zustand/toastStore'
@@ -64,11 +58,7 @@ import { ContextPanel } from './ContextPanel'
 import { InfoDisclosure } from './InfoDisclosure'
 import { LlamaServerSection } from './LlamaServerSection'
 import { ModelPicker } from './ModelPicker'
-import {
-  ApiModeSection,
-  ParamForm,
-  ReasoningIncludeControls,
-} from './ParamForm'
+import { ApiModeSection, ParamForm, ReasoningIncludeControls } from './ParamForm'
 import { PromptsTab } from './PromptsTab'
 import { ProviderPicker } from './ProviderPicker'
 
@@ -78,6 +68,7 @@ interface ChatModelPanelProps {
   // already handles undefined chat / profile / preset.
   chatId: ChatId | null
   chatSnapshot?: Chat | null
+  profileSnapshot?: ConnectionProfile | null
   onClose: () => void
 }
 
@@ -85,22 +76,19 @@ type Tab = 'model' | 'context' | 'prompts' | 'generation'
 const EMPTY_CURSOR = Object.freeze({}) as Readonly<Record<string, string>>
 const EMPTY_MESSAGES: Message[] = []
 
-export function ChatModelPanel({ chatId, chatSnapshot = null, onClose }: ChatModelPanelProps) {
-  const liveChat = useLiveQuery(
-    async () => (chatId ? await getChat(chatId) : undefined),
-    [chatId],
-    undefined,
-  )
-  const chatCacheRef = useRef(new Map<ChatId, Chat>())
-  useEffect(() => {
-    if (!liveChat) return
-    chatCacheRef.current.set(liveChat.id, liveChat)
-  }, [liveChat])
-  const chat = liveChat ?? chatSnapshot ?? (chatId ? chatCacheRef.current.get(chatId) : undefined)
+export function ChatModelPanel({
+  chatSnapshot = null,
+  profileSnapshot = null,
+  onClose,
+}: ChatModelPanelProps) {
+  const chat = chatSnapshot ?? undefined
 
+  const snapshotProfile =
+    chat && profileSnapshot?.id === chat.settings.profileId ? profileSnapshot : null
   const liveProfile = useLiveQuery(
-    () => (chat ? getProfile(chat.settings.profileId) : Promise.resolve(undefined)),
-    [chat?.settings.profileId],
+    () =>
+      !snapshotProfile && chat ? getProfile(chat.settings.profileId) : Promise.resolve(undefined),
+    [chat?.settings.profileId, snapshotProfile?.id],
     undefined,
   )
   const profileCacheRef = useRef(new Map<string, ConnectionProfile>())
@@ -109,6 +97,7 @@ export function ChatModelPanel({ chatId, chatSnapshot = null, onClose }: ChatMod
     profileCacheRef.current.set(liveProfile.id, liveProfile)
   }, [liveProfile])
   const profile =
+    snapshotProfile ??
     liveProfile ??
     (chat?.settings.profileId ? profileCacheRef.current.get(chat.settings.profileId) : undefined)
   const [llamaProps, setLlamaProps] = useState<LlamaServerProps | null>(null)
@@ -142,21 +131,43 @@ export function ChatModelPanel({ chatId, chatSnapshot = null, onClose }: ChatMod
   const routing = usePrivacyRouting(chat)
   const { capability, descriptor, modelAvailable } = routing
   const endpointTokenizer = descriptor?.architecture?.tokenizer ?? null
-  const cursor = useChatStore((s) => (chat ? (s.cursors[chat.id] ?? EMPTY_CURSOR) : EMPTY_CURSOR))
-  const activeBranchSnapshot = useLiveQuery(
-    () => (chat ? loadActiveBranchSnapshot(chat.id, cursor) : Promise.resolve(null)),
-    [chat?.id, cursor],
+  const [tab, setTab] = useState<Tab>('model')
+  const needsPromptEstimate = !!chat && tab === 'context'
+  const canEstimatePrompt =
+    needsPromptEstimate &&
+    !!capability &&
+    (capability.contextLength !== undefined ||
+      capability.maxPromptTokens !== undefined ||
+      capability.maxCompletionTokens !== undefined)
+  const cursor = useChatStore((s) =>
+    chat && canEstimatePrompt ? (s.cursors[chat.id] ?? EMPTY_CURSOR) : EMPTY_CURSOR,
+  )
+  const activeSendContext = useLiveQuery(
+    async () => {
+      if (!chat || !canEstimatePrompt) return null
+      const branch = await loadActiveBranchHeaderSnapshot(chat.id, cursor)
+      return loadSendContextForBranch({
+        chat,
+        branchHeaders: branch.branchHeaders,
+        capabilities: capability,
+      })
+    },
+    [chat, canEstimatePrompt, cursor, capability],
     null,
   )
-  const draft = useLiveQuery(
-    () => (chat ? getChatDraft(chat.id) : Promise.resolve(undefined)),
-    [chat?.id],
-    undefined,
+  const prefs = useLiveQuery(
+    () =>
+      canEstimatePrompt ? readGlobalPreferences() : Promise.resolve(DEFAULT_GLOBAL_PREFERENCES),
+    [canEstimatePrompt],
+    DEFAULT_GLOBAL_PREFERENCES,
   )
-  const prefs = useLiveQuery(readGlobalPreferences, [], DEFAULT_GLOBAL_PREFERENCES)
-  const globalCalibration = useLiveQuery(readTokenCalibrationGlobal, [], null)
+  const globalCalibration = useLiveQuery(
+    () => (canEstimatePrompt ? readTokenCalibrationGlobal() : Promise.resolve(null)),
+    [canEstimatePrompt],
+    null,
+  )
   const streamActivityKey = useStreamStore((s) =>
-    chat
+    chat && canEstimatePrompt
       ? Object.values(s.activeByStreamId)
           .filter((stream) => stream.chatId === chat.id)
           .map((stream) => (stream.messageId ? `m:${stream.messageId}` : `s:${stream.streamId}`))
@@ -164,19 +175,20 @@ export function ChatModelPanel({ chatId, chatSnapshot = null, onClose }: ChatMod
           .join('|')
       : '',
   )
-  const activePathMessages = activeBranchSnapshot?.branch ?? EMPTY_MESSAGES
+  const activePathMessages = canEstimatePrompt
+    ? (activeSendContext?.pathMessages ?? EMPTY_MESSAGES)
+    : EMPTY_MESSAGES
   const attachmentResolver = useAttachmentResolverForContext({
     settings: chat?.settings,
     messages: activePathMessages,
-    draftAttachmentRefs: draft?.attachmentRefs,
-    enabled: Boolean(chat),
+    enabled: canEstimatePrompt,
   })
   const promptEstimateInput = useMemo<PromptSizeEstimateInput | null>(() => {
-    if (!chat) return null
+    if (!chat || !canEstimatePrompt) return null
     return buildSettingsPromptSizeEstimateInput(
       chat.settings,
       activePathMessages,
-      draft?.text ?? '',
+      '',
       endpointTokenizer,
       capability?.maxPromptTokens ?? capability?.contextLength ?? null,
       attachmentResolver,
@@ -185,17 +197,19 @@ export function ChatModelPanel({ chatId, chatSnapshot = null, onClose }: ChatMod
         globalCalibration,
         mode: prefs.tokenCalibrationMode,
       },
-      draft?.attachmentRefs,
+      undefined,
+      activeSendContext?.preCutAttachmentIds,
     )
   }, [
     chat,
+    canEstimatePrompt,
     activePathMessages,
-    draft,
     endpointTokenizer,
     capability,
     attachmentResolver,
     globalCalibration,
     prefs,
+    activeSendContext,
   ])
   const deferredPromptEstimateInput = useDeferredValue(promptEstimateInput)
   const promptEstimate = useStreamStablePromptEstimate(
@@ -204,12 +218,11 @@ export function ChatModelPanel({ chatId, chatSnapshot = null, onClose }: ChatMod
     streamActivityKey,
   )
   const providerNeededTokens = useMemo(() => {
-    if (!chat || !promptEstimate) return undefined
+    if (!chat || !promptEstimate) return null
     const reserveRaw = chat.settings.maxCompletionTokens
     const reserve = reserveRaw === UNLIMITED_CONTEXT ? 0 : (reserveRaw ?? 0)
     return promptEstimate.total + reserve
   }, [chat, promptEstimate])
-  const [tab, setTab] = useState<Tab>('model')
 
   const handleModelPick = useCallback(
     async (modelId: string) => {
@@ -334,13 +347,7 @@ export function ChatModelPanel({ chatId, chatSnapshot = null, onClose }: ChatMod
               <OpenAiResponsesStoreSection chat={chat} />
             ) : null}
             {isOpenRouter ? (
-              <ProviderPicker
-                chat={chat}
-                routing={routing}
-                {...(providerNeededTokens !== undefined
-                  ? { neededTokens: providerNeededTokens }
-                  : {})}
-              />
+              <ProviderPicker chat={chat} routing={routing} neededTokens={providerNeededTokens} />
             ) : null}
             {profile?.kind === 'llama-server' ? (
               <LlamaServerSection chat={chat} profile={profile} />
@@ -436,12 +443,10 @@ function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | u
     async (targetId: string) => {
       const target = await getPreset(targetId)
       if (!target) return
-      await replaceChatSettings(chat.id, {
+      await applyChatPreset(chat.id, target.id, {
         ...target.settings,
         profileId: target.connectionProfileId,
       })
-      // presetId isn't inside settings; set via chats store directly
-      await setChatPreset(chat.id, target.id)
       closePicker()
     },
     [chat.id, closePicker],

@@ -16,14 +16,9 @@ interface ComposerProps {
     text: string,
     opts?: { prefillText?: string; attachmentRefs?: MessageAttachmentRef[] },
   ) => void | Promise<void>
-  onDraftChange?: (text: string) => void
   seed?: string | null
   onSeedConsumed?: () => void
   sendShortcut?: SendShortcut
-  // Live token usage surfaced next to the char count so the user sees
-  // context pressure without opening the Context tab. Undefined = don't
-  // render (e.g. no chat yet, no tokenizer).
-  tokenBudget?: { used: number; budget: number }
   // Optional floating accessory rendered inside the composer's positioning
   // context (e.g. the "Jump to latest" pill). Floats above the body
   // regardless of how tall the composer is dragged.
@@ -56,13 +51,7 @@ interface ComposerProps {
   defaultPrefill?: string
   prefillScopeKey?: string | null
   prefillSettingsPrompt?: ReactNode
-  // Fires whenever the prefill textarea changes (or is cleared). Mirrors
-  // `onDraftChange` for the main textarea so the token-budget estimate can
-  // include the prefill in its sum. Empty string when the prefill panel is
-  // closed (so the consumer can drop it from the count).
-  onPrefillDraftChange?: (text: string) => void
   attachmentScopeKey?: string | null
-  onAttachmentDraftChange?: (refs: MessageAttachmentRef[]) => void
   attachmentsDisabled?: boolean
   attachmentsDisabledReason?: string
   droppedFiles?: ComposerDroppedFiles | null
@@ -150,25 +139,10 @@ function setComposerTextareaHeight(el: HTMLTextAreaElement, height: number): voi
   el.style.overflowY = el.scrollHeight > effectiveHeight + 1 ? 'auto' : 'hidden'
 }
 
-// Compact short-form for the composer's tok indicator so the
-// "used/budget" pair stays readable in a ~60px slot. Breakpoints match
-// the model-picker context column (`983k`, `1.0M`, `1.2M`, `200k`) so
-// the user sees the same shape in both places.
-function formatTokenCount(n: number): string {
-  if (!Number.isFinite(n) || n < 0) return '0'
-  if (n >= 1_000_000) {
-    const m = n / 1_000_000
-    return m >= 10 ? `${Math.round(m)}M` : `${m.toFixed(1)}M`
-  }
-  if (n >= 1000) return `${Math.round(n / 1000)}k`
-  return String(Math.round(n))
-}
-
 export function Composer({
   disabled,
   sendBlockedReason,
   onSubmit,
-  onDraftChange,
   seed,
   onSeedConsumed,
   sendShortcut = 'enter',
@@ -180,14 +154,11 @@ export function Composer({
   trailingUserMessage,
   autoSize = false,
   autoSizeVariant = 'normal',
-  tokenBudget,
   showPrefillButton,
   defaultPrefill,
   prefillScopeKey,
   prefillSettingsPrompt,
-  onPrefillDraftChange,
   attachmentScopeKey,
-  onAttachmentDraftChange,
   attachmentsDisabled = false,
   attachmentsDisabledReason = 'Attachments are unavailable for this request mode.',
   droppedFiles,
@@ -230,28 +201,17 @@ export function Composer({
     }
   }, [seed, onSeedConsumed])
   useEffect(() => {
-    onDraftChange?.(text)
-  }, [text, onDraftChange])
-  // Mirror prefill changes to the parent so the token-budget gauge reflects
-  // the combined input. Reports an empty string when the prefill panel is
-  // closed — even when the prefill draft has content, hidden = excluded.
-  useEffect(() => {
-    onPrefillDraftChange?.(prefillOpen ? prefillText : '')
-  }, [prefillOpen, prefillText, onPrefillDraftChange])
-  useEffect(() => {
     if (lastPrefillScopeRef.current === prefillScopeKey) return
     lastPrefillScopeRef.current = prefillScopeKey
     lastSeededDefaultRef.current = defaultPrefill
     setPrefillOpen(false)
     setPrefillText(defaultPrefill ?? '')
-    onPrefillDraftChange?.('')
-  }, [prefillScopeKey, defaultPrefill, onPrefillDraftChange])
+  }, [prefillScopeKey, defaultPrefill])
   useEffect(() => {
     if (showPrefillButton) return
     setPrefillOpen(false)
     setPrefillText(defaultPrefill ?? '')
-    onPrefillDraftChange?.('')
-  }, [showPrefillButton, defaultPrefill, onPrefillDraftChange])
+  }, [showPrefillButton, defaultPrefill])
   // Re-seed the prefill textarea from `defaultPrefill` whenever the value
   // changes (e.g. chat switch, settings edit) AND the user hasn't typed
   // anything custom yet. Skip when the prefill area is open and the user
@@ -340,14 +300,10 @@ export function Composer({
     if (attachmentsDisabled) setPickerOpen(false)
   }, [attachmentsDisabled])
   useEffect(() => {
-    onAttachmentDraftChange?.(attachmentRefs)
-  }, [attachmentRefs, onAttachmentDraftChange])
-  useEffect(() => {
     if (lastAttachmentScopeRef.current === attachmentScopeKey) return
     lastAttachmentScopeRef.current = attachmentScopeKey
     clearAttachments()
-    onAttachmentDraftChange?.([])
-  }, [attachmentScopeKey, clearAttachments, onAttachmentDraftChange])
+  }, [attachmentScopeKey, clearAttachments])
   const uploadingAttachments = uploads.some((upload) => upload.state === 'uploading')
   const sendBlocked =
     Boolean(sendBlockedReason) ||
@@ -556,22 +512,6 @@ export function Composer({
           <span data-ui="token-counter" aria-live="polite">
             {text.trim().length + (prefillOpen ? prefillText.length : 0)} chars
           </span>
-          {tokenBudget ? (
-            <span
-              data-ui="token-counter"
-              data-warn={
-                tokenBudget.used > tokenBudget.budget
-                  ? 'danger'
-                  : tokenBudget.budget > 0 && tokenBudget.used / tokenBudget.budget > 0.75
-                    ? 'warn'
-                    : undefined
-              }
-              aria-live="polite"
-              title={`${tokenBudget.used.toLocaleString()} / ${tokenBudget.budget.toLocaleString()} tokens`}
-            >
-              {formatTokenCount(tokenBudget.used)}/{formatTokenCount(tokenBudget.budget)} tok
-            </span>
-          ) : null}
           {showPrefillButton ? (
             <button
               type="button"

@@ -21,14 +21,14 @@ import {
   migrateInlineMessageBodies,
 } from '../backcompat/message-body-split'
 import {
+  migrateProviderApiModeProfile,
+  migrateProviderApiModeSettings,
+} from '../backcompat/provider-api-modes'
+import {
   migrateProviderOutputItemRows,
   migrateProviderOutputItemsFromGeneration,
   providerOutputItemsBackfillMarker,
 } from '../backcompat/provider-output-items'
-import {
-  migrateProviderApiModeProfile,
-  migrateProviderApiModeSettings,
-} from '../backcompat/provider-api-modes'
 import {
   migrateProviderSettingsRow,
   providerCacheKey,
@@ -38,6 +38,10 @@ import {
   migrateProviderToolSettingsRows,
   providerToolSettingsBackfillMarker,
 } from '../backcompat/provider-tools'
+import {
+  rebuildTokenCalibrationGlobalRows,
+  tokenCalibrationGlobalBackfillMarker,
+} from '../backcompat/token-calibration-global'
 import { findLastUpdatedLeafId } from '../core/active-path'
 import { buildBranchMessages } from '../core/branch-flatten'
 import {
@@ -152,6 +156,7 @@ export function registerSchema(db: Dexie): void {
         globalSettingsBackfillMarker(),
         providerOutputItemsBackfillMarker(),
         providerToolSettingsBackfillMarker(),
+        tokenCalibrationGlobalBackfillMarker(),
       ])
   })
 
@@ -1291,6 +1296,7 @@ let globalSettingsBackfillPromise: Promise<void> | null = null
 let attachmentRefsBackfillPromise: Promise<void> | null = null
 let providerOutputItemsBackfillPromise: Promise<void> | null = null
 let providerToolSettingsBackfillPromise: Promise<void> | null = null
+let tokenCalibrationGlobalBackfillPromise: Promise<void> | null = null
 const ORGANIZATION_FIELDS_BACKFILL_KEY = 'backfill:organization-fields-v1'
 
 function organizationFieldsBackfillMarker(): SettingsRow {
@@ -1337,6 +1343,11 @@ export async function openDb(): Promise<NatterDb> {
     throw err
   })
   await providerToolSettingsBackfillPromise
+  tokenCalibrationGlobalBackfillPromise ??= rebuildTokenCalibrationGlobalRows(db).catch((err) => {
+    tokenCalibrationGlobalBackfillPromise = null
+    throw err
+  })
+  await tokenCalibrationGlobalBackfillPromise
   return db
 }
 
@@ -1352,6 +1363,7 @@ export function __resetDbForTests(): void {
   attachmentRefsBackfillPromise = null
   providerOutputItemsBackfillPromise = null
   providerToolSettingsBackfillPromise = null
+  tokenCalibrationGlobalBackfillPromise = null
 }
 
 // Mint a uniquely-named Dexie instance for integration tests that want to

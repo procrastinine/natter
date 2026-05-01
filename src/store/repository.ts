@@ -221,6 +221,7 @@ export interface ActiveBranchSnapshot {
 }
 
 export interface ActiveBranchBodyWindow {
+  // Negative offsets anchor the window to the newest branch messages.
   offset: number
   limit: number
 }

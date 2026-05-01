@@ -18,11 +18,8 @@
 // leaving sort/order intact. Reset clears provider order/ignore overrides and
 // privacy-side manual overrides while restoring the default Price sort.
 
-import { useLiveQuery } from 'dexie-react-hooks'
 import { useCallback, useMemo, useState } from 'react'
-import { DEFAULT_GLOBAL_PREFERENCES, readGlobalPreferences } from '../../core/global-settings'
 import { DEFAULT_OPENROUTER_PROVIDER_SORT } from '../../core/provider-defaults'
-import { estimateSettingsPromptSize, UNLIMITED_CONTEXT } from '../../core/prompt-size'
 import {
   endpointMatchesProviderRef,
   providerDisplayLabel,
@@ -31,12 +28,9 @@ import {
   providerRoutingRef,
   resolveProviderRefsToRoutingRefs,
 } from '../../core/provider-identity'
-import { readTokenCalibrationGlobal } from '../../core/token-calibration'
-import type { Chat, Message, ModelEndpoint, ProviderPreferences, SortBy } from '../../core/types'
+import type { Chat, ModelEndpoint, ProviderPreferences, SortBy } from '../../core/types'
 import type { UsePrivacyRoutingResult } from '../../hooks/usePrivacyRouting'
-import { getChatDraft, loadActiveBranchSnapshot, updateChatSettings } from '../../store/chats'
-import { useChatStore } from '../../store/zustand/chatStore'
-import { useAttachmentResolverForContext } from '../attachments/useAttachmentResolver'
+import { updateChatSettings } from '../../store/chats'
 import { LockIcon } from '../icons/Icon'
 import { InfoDisclosure } from './InfoDisclosure'
 import { PrivacySection } from './PrivacySection'
@@ -50,11 +44,9 @@ import {
 interface ProviderPickerProps {
   chat: Chat
   routing: UsePrivacyRoutingResult
-  neededTokens?: number
+  neededTokens: number | null
 }
 
-const EMPTY_CURSOR = Object.freeze({}) as Readonly<Record<string, string>>
-const EMPTY_MESSAGES: Message[] = []
 const SORT_OPTIONS: ReadonlyArray<{ value: SortBy; label: string }> = [
   { value: 'price', label: 'Price' },
   { value: 'throughput', label: 'Throughput' },
@@ -64,7 +56,7 @@ const SORT_OPTIONS: ReadonlyArray<{ value: SortBy; label: string }> = [
 export function ProviderPicker({
   chat,
   routing,
-  neededTokens: neededTokensOverride,
+  neededTokens: neededTokensRaw,
 }: ProviderPickerProps) {
   const { endpoints, filter, loading, isFreeModel, scrapeApplicable, liveScrapeEnabled, refresh } =
     routing
@@ -90,79 +82,9 @@ export function ProviderPicker({
           }),
     [displayOrdered, filter, prefs, chat.settings.privacy, loading, scrapeApplicable],
   )
-  const needsLocalNeededTokens = neededTokensOverride === undefined
-
-  const cursor = useChatStore((s) =>
-    needsLocalNeededTokens ? (s.cursors[chat.id] ?? EMPTY_CURSOR) : EMPTY_CURSOR,
-  )
-  const branchSnapshot = useLiveQuery(
-    () =>
-      needsLocalNeededTokens ? loadActiveBranchSnapshot(chat.id, cursor) : Promise.resolve(null),
-    [chat.id, needsLocalNeededTokens, cursor],
-    null,
-  )
-  const draft = useLiveQuery(
-    () => (needsLocalNeededTokens ? getChatDraft(chat.id) : Promise.resolve(undefined)),
-    [chat.id, needsLocalNeededTokens],
-    undefined,
-  )
-  const globalPrefs = useLiveQuery(
-    () =>
-      needsLocalNeededTokens
-        ? readGlobalPreferences()
-        : Promise.resolve(DEFAULT_GLOBAL_PREFERENCES),
-    [needsLocalNeededTokens],
-    DEFAULT_GLOBAL_PREFERENCES,
-  )
-  const globalCalibration = useLiveQuery(
-    () => (needsLocalNeededTokens ? readTokenCalibrationGlobal() : Promise.resolve(null)),
-    [needsLocalNeededTokens],
-    null,
-  )
-  const localPath = needsLocalNeededTokens
-    ? (branchSnapshot?.branch ?? EMPTY_MESSAGES)
-    : EMPTY_MESSAGES
-  const attachmentResolver = useAttachmentResolverForContext({
-    settings: chat.settings,
-    messages: localPath,
-    draftAttachmentRefs: draft?.attachmentRefs,
-    enabled: needsLocalNeededTokens,
-  })
-  // Provider filter uses the CURRENT estimate (tokens that would actually
-  // be sent right now, including reasoning echo) + the reserved completion budget.
-  // This means a provider whose context can't fit the user's declared
-  // `customMaxContext` ceiling is NOT filtered out if the live prompt is
-  // smaller, the provider stays available while the chat is short.
-  const neededTokens = useMemo(() => {
-    if (neededTokensOverride !== undefined) return neededTokensOverride
-    const est = estimateSettingsPromptSize(
-      chat.settings,
-      localPath,
-      draft?.text ?? '',
-      routing.descriptor?.architecture?.tokenizer ?? null,
-      null,
-      attachmentResolver,
-      {
-        chatTokenCalibration: chat.tokenCalibration,
-        globalCalibration,
-        mode: globalPrefs.tokenCalibrationMode,
-      },
-      draft?.attachmentRefs,
-    )
-    const reserveRaw = chat.settings.maxCompletionTokens
-    const reserve = reserveRaw === UNLIMITED_CONTEXT ? 0 : (reserveRaw ?? 0)
-    return est.total + reserve
-  }, [
-    neededTokensOverride,
-    localPath,
-    chat.settings,
-    chat.tokenCalibration,
-    draft,
-    routing.descriptor?.architecture?.tokenizer,
-    attachmentResolver,
-    globalCalibration,
-    globalPrefs.tokenCalibrationMode,
-  ])
+  // Provider filtering ignores unsent draft text; the live composer only
+  // tracks characters, while the full token estimate is recomputed on send.
+  const neededTokens = neededTokensRaw ?? undefined
 
   const updatePrefs = useCallback(
     (patch: Partial<ProviderPreferences>) => {
@@ -337,7 +259,8 @@ export function ProviderPicker({
         <ul data-ui="provider-picker-list">
           {rows.map((row) => {
             const epCap = row.endpoint.max_prompt_tokens ?? row.endpoint.context_length
-            const insufficient = epCap !== undefined && epCap > 0 && neededTokens > epCap
+            const insufficient =
+              neededTokens !== undefined && epCap !== undefined && epCap > 0 && neededTokens > epCap
             const ref = providerRoutingRef(row.endpoint)
             const key = providerEndpointKey(row.endpoint)
             const label = providerDisplayLabel(row.endpoint, endpoints)

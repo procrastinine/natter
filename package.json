@@ -31,6 +31,7 @@
     "@tanstack/react-virtual": "^3.13.24",
     "dexie": "^4.4.2",
     "dexie-react-hooks": "^4.4.0",
+    "fflate": "^0.8.2",
     "katex": "^0.16.45",
     "react": "^19.2.5",
     "react-dom": "^19.2.5",

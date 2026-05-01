@@ -699,9 +699,11 @@ export interface TokenCalibrationSample {
 }
 
 // Global calibration rollup. Stored in the settings table under key
-// `tokenCalibrationGlobal`. Updated incrementally per send so the cost
-// is O(1) per sample, not O(totalChats). See `plan/03-storage.md` for
-// the settings-table contract.
+// `global:token-calibration`. It is a materialized sum of per-chat
+// calibration samples: accepted samples add one delta, chat clears subtract
+// the removed samples, and whole-family clears scan only for that explicit
+// operation. Normal reads stay O(number of calibrated families), not
+// O(totalChats).
 export interface GlobalTokenCalibration {
   version: 1
   updatedAt: number
@@ -854,6 +856,16 @@ export interface GenerationServerToolCall {
   output?: unknown
 }
 
+export interface GenerationTokenCalibration {
+  sampleId: string
+  modelId: string
+  calibrationKey: string
+  promptSample: boolean
+  completionSample: boolean
+  sampleCount: number
+  appliedAt: number
+}
+
 export type ProviderOutputDialect =
   | 'openai-responses'
   | 'openrouter-responses'
@@ -897,6 +909,7 @@ export interface GenerationMeta {
   error?: ApiError
   abortReason?: AbortReason
   serverTools?: GenerationServerToolCall[]
+  tokenCalibration?: GenerationTokenCalibration
 }
 
 // Minimal echo envelope for a Responses API output item. The full variant list

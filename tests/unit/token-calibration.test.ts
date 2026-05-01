@@ -10,8 +10,10 @@
 // - freshTokenEstimate() is pure — covers div-by-zero + clamp.
 
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { rebuildGlobalCalibration } from '../../src/backcompat/token-calibration-global'
 import { tokenCalibrationKey } from '../../src/core/model-ids'
 import {
+  addAcceptedSampleToGlobal,
   addSampleToChatAndGlobal,
   aggregateCalibrationSamples,
   applyValidatedSample,
@@ -22,13 +24,14 @@ import {
   derivePromptSample,
   FRAMING_PER_MESSAGE,
   freshTokenEstimate,
-  messageTextCharCount,
   MIN_SAMPLE_CHARS,
   MIN_SAMPLES_CHAT,
   MIN_SAMPLES_GLOBAL,
+  messageTextCharCount,
   OUTLIER_FACTOR,
   RATIO_BOUNDS,
   readTokenCalibrationGlobal,
+  subtractSamplesFromTokenCalibrationGlobal,
   tokenizerFamilyForModel,
   validateSample,
   writeTokenCalibrationGlobal,
@@ -167,9 +170,10 @@ describe('validateSample — physical bounds', () => {
 describe('validateSample — family bounds', () => {
   it('rejects Claude sample at 4.6 (above family hi = 4.5)', () => {
     // 460 chars / 100 tokens = 4.6 → outside Claude [2.0, 4.5]
-    expect(
-      validateSample('anthropic/claude-opus-4.7', 460, 100, undefined),
-    ).toEqual({ accepted: false, skipReason: 'bad-ratio-family' })
+    expect(validateSample('anthropic/claude-opus-4.7', 460, 100, undefined)).toEqual({
+      accepted: false,
+      skipReason: 'bad-ratio-family',
+    })
   })
 
   it('accepts Claude sample at 3.5 (inside family bounds)', () => {
@@ -182,9 +186,10 @@ describe('validateSample — family bounds', () => {
   })
 
   it('rejects GPT sample at 5.5 (above GPT hi)', () => {
-    expect(
-      validateSample('openai/gpt-4o', 550, 100, undefined),
-    ).toEqual({ accepted: false, skipReason: 'bad-ratio-family' })
+    expect(validateSample('openai/gpt-4o', 550, 100, undefined)).toEqual({
+      accepted: false,
+      skipReason: 'bad-ratio-family',
+    })
   })
 })
 
@@ -279,10 +284,9 @@ describe('charsPerToken — calibration mode', () => {
   }
 
   it("'adaptive' uses per-chat when samples exist", () => {
-    expect(charsPerToken('openai/gpt-4o', chatWithSample, globalWithSample, 'adaptive')).toBeCloseTo(
-      4.0,
-      5,
-    )
+    expect(
+      charsPerToken('openai/gpt-4o', chatWithSample, globalWithSample, 'adaptive'),
+    ).toBeCloseTo(4.0, 5)
   })
 
   it('reads legacy exact-model rows through the resolved family bucket', () => {
@@ -296,7 +300,10 @@ describe('charsPerToken — calibration mode', () => {
         },
       },
     }
-    expect(charsPerToken('google/gemini-3.1-pro-preview', chat, null, 'adaptive')).toBeCloseTo(4.0, 5)
+    expect(charsPerToken('google/gemini-3.1-pro-preview', chat, null, 'adaptive')).toBeCloseTo(
+      4.0,
+      5,
+    )
   })
 
   it('aggregates mixed stored keys onto the display bucket', () => {
@@ -341,18 +348,17 @@ describe('charsPerToken — calibration mode', () => {
   })
 
   it('undefined mode behaves as adaptive', () => {
-    expect(
-      charsPerToken('openai/gpt-4o', chatWithSample, globalWithSample, undefined),
-    ).toBeCloseTo(4.0, 5)
+    expect(charsPerToken('openai/gpt-4o', chatWithSample, globalWithSample, undefined)).toBeCloseTo(
+      4.0,
+      5,
+    )
   })
 })
 
 describe('charsPerToken — tiered fallback', () => {
   it('tier 3 anchor when no samples at all', () => {
     expect(charsPerToken('openai/gpt-4o', null, null)).toBe(RATIO_BOUNDS.gpt.anchor)
-    expect(charsPerToken('anthropic/claude-opus-4.7', null, null)).toBe(
-      RATIO_BOUNDS.claude.anchor,
-    )
+    expect(charsPerToken('anthropic/claude-opus-4.7', null, null)).toBe(RATIO_BOUNDS.claude.anchor)
     expect(charsPerToken('weird/model', null, null)).toBe(RATIO_BOUNDS.unknown.anchor)
   })
 
@@ -891,6 +897,51 @@ describe('calibrationFieldsForEdit', () => {
 })
 
 describe('persistence round-trip', () => {
+  it('rebuilds the global materialized rollup directly from per-chat samples', () => {
+    const openAiKey = tokenCalibrationKey('openai/gpt-4o')
+    const global = rebuildGlobalCalibration([
+      {
+        tokenCalibration: {
+          'openai/gpt-4o': {
+            totalTextChars: 300,
+            totalTextTokens: 100,
+            sampleCount: 1,
+            lastRatio: 3,
+            updatedAt: 10,
+          },
+        },
+      },
+      {
+        tokenCalibration: {
+          [openAiKey]: {
+            totalTextChars: 700,
+            totalTextTokens: 200,
+            sampleCount: 2,
+            lastRatio: 3.5,
+            updatedAt: 20,
+          },
+          'broken/key': {
+            totalTextChars: 0,
+            totalTextTokens: 0,
+            sampleCount: 0,
+            updatedAt: 30,
+          },
+        },
+      },
+    ])
+
+    expect(global.updatedAt).toBe(20)
+    expect(global.byModel[openAiKey]).toMatchObject({
+      totalTextChars: 1_000,
+      totalTextTokens: 300,
+      sampleCount: 3,
+      lastRatio: 3.5,
+      updatedAt: 20,
+    })
+    expect(global.byModel['openai/gpt-4o']).toBeUndefined()
+    expect(global.byModel['broken/key']).toBeUndefined()
+  })
+
   it('writeTokenCalibrationGlobal / readTokenCalibrationGlobal preserves shape', async () => {
     const value: GlobalTokenCalibration = {
       version: 1,
@@ -948,5 +999,105 @@ describe('persistence round-trip', () => {
       sampleCount: 1,
     })
     expect(readBack.byModel['moonshotai/kimi-k2.6']).toBeUndefined()
+  })
+
+  it('rolls accepted per-chat samples into global without a second ingest gate', async () => {
+    await writeTokenCalibrationGlobal({
+      version: 1,
+      updatedAt: 10,
+      byModel: {
+        [tokenCalibrationKey('openai/gpt-4o')]: {
+          totalTextChars: 350,
+          totalTextTokens: 100,
+          sampleCount: 3,
+          updatedAt: 10,
+        },
+      },
+    })
+
+    await addAcceptedSampleToGlobal('openai/gpt-4o', 50, 20, 20)
+
+    const readBack = await readTokenCalibrationGlobal()
+    expect(readBack.byModel[tokenCalibrationKey('openai/gpt-4o')]).toMatchObject({
+      totalTextChars: 400,
+      totalTextTokens: 120,
+      sampleCount: 4,
+      lastRatio: 2.5,
+      updatedAt: 20,
+    })
+  })
+
+  it('subtracts cleared per-chat samples from the global materialized rollup', async () => {
+    await writeTokenCalibrationGlobal({
+      version: 1,
+      updatedAt: 10,
+      byModel: {
+        [tokenCalibrationKey('openai/gpt-4o')]: {
+          totalTextChars: 1_000,
+          totalTextTokens: 250,
+          sampleCount: 4,
+          updatedAt: 10,
+        },
+        [tokenCalibrationKey('google/gemini-2.5-pro-preview')]: {
+          totalTextChars: 900,
+          totalTextTokens: 300,
+          sampleCount: 3,
+          updatedAt: 10,
+        },
+      },
+    })
+
+    await subtractSamplesFromTokenCalibrationGlobal(
+      {
+        'openai/gpt-4o': {
+          totalTextChars: 250,
+          totalTextTokens: 50,
+          sampleCount: 1,
+          updatedAt: 5,
+        },
+      },
+      30,
+    )
+
+    const readBack = await readTokenCalibrationGlobal()
+    expect(readBack.byModel[tokenCalibrationKey('openai/gpt-4o')]).toMatchObject({
+      totalTextChars: 750,
+      totalTextTokens: 200,
+      sampleCount: 3,
+      updatedAt: 30,
+    })
+    expect(
+      readBack.byModel[tokenCalibrationKey('google/gemini-2.5-pro-preview')]?.sampleCount,
+    ).toBe(3)
+  })
+
+  it('removes a global family when subtracting all remaining chat samples', async () => {
+    await writeTokenCalibrationGlobal({
+      version: 1,
+      updatedAt: 10,
+      byModel: {
+        [tokenCalibrationKey('openai/gpt-4o')]: {
+          totalTextChars: 500,
+          totalTextTokens: 100,
+          sampleCount: 2,
+          updatedAt: 10,
+        },
+      },
+    })
+
+    await subtractSamplesFromTokenCalibrationGlobal(
+      {
+        [tokenCalibrationKey('openai/gpt-4o')]: {
+          totalTextChars: 500,
+          totalTextTokens: 100,
+          sampleCount: 2,
+          updatedAt: 10,
+        },
+      },
+      30,
+    )
+
+    const readBack = await readTokenCalibrationGlobal()
+    expect(readBack.byModel[tokenCalibrationKey('openai/gpt-4o')]).toBeUndefined()
   })
 })

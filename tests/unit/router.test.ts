@@ -46,6 +46,10 @@ describe('parseRoute', () => {
       kind: 'storage',
       storage: { section: 'overview' },
     })
+    expect(parseRoute('#/storage/chats')).toEqual({
+      kind: 'storage',
+      storage: { section: 'chats' },
+    })
     expect(parseRoute('#/storage/attachments')).toEqual({
       kind: 'storage',
       storage: { section: 'attachments' },
@@ -92,6 +96,7 @@ describe('routeToHref / convenience helpers', () => {
 
   it('round-trips storage hrefs', () => {
     expect(storageHref()).toBe('#/storage')
+    expect(storageHref({ section: 'chats' })).toBe('#/storage/chats')
     expect(storageHref({ section: 'attachments' })).toBe('#/storage/attachments')
     expect(storageHref({ section: 'attachments', filter: 'missing' })).toBe(
       '#/storage/attachments/missing',
@@ -111,6 +116,7 @@ describe('routeToHref / convenience helpers', () => {
       '#/chat/A',
       '#/chat/A/message/B',
       '#/storage',
+      '#/storage/chats',
       '#/storage/attachments',
       '#/storage/attachments/missing',
       '#/storage/attachments/unreferenced',

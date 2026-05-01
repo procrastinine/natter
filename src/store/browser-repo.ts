@@ -82,6 +82,8 @@ interface ChatMutationState {
   beforeChat: Chat
   beforeMessages?: Message[]
   afterMessages?: Message[]
+  wordCountDeltas: Map<MessageId, number>
+  totalCostDelta: number
   visibleMetaPatch: Partial<Chat>
   hiddenMetaPatch: Partial<Chat>
   summaryPatch: Partial<Chat>
@@ -197,7 +199,8 @@ function branchWindowRange(
   window: ActiveBranchBodyWindow,
 ): { start: number; end: number; limit: number } {
   const limit = Math.max(0, Math.floor(window.limit))
-  const start = Math.max(0, Math.min(total, Math.floor(window.offset)))
+  const offset = Math.floor(window.offset)
+  const start = offset < 0 ? Math.max(0, total - limit) : Math.max(0, Math.min(total, offset))
   return { start, end: Math.min(total, start + limit), limit }
 }
 
@@ -422,6 +425,22 @@ function removeMessage(messages: Message[], messageId: MessageId): void {
   messages.splice(index, 1)
 }
 
+function messageCost(message: Message): number {
+  return message.deleted ? 0 : (message.generation?.cost ?? 0)
+}
+
+function recordMessageSummaryDeltas(
+  state: ChatMutationState | undefined,
+  messageId: MessageId,
+  before: Message,
+  after: Message,
+): void {
+  if (!state) return
+  const delta = countMessagesWords([after]) - countMessagesWords([before])
+  state.wordCountDeltas.set(messageId, (state.wordCountDeltas.get(messageId) ?? 0) + delta)
+  state.totalCostDelta += messageCost(after) - messageCost(before)
+}
+
 function computeTotalCostUsd(messages: readonly Message[]): number {
   let total = 0
   for (const message of messages) {
@@ -642,6 +661,21 @@ function shouldBumpLastBranchUpdatedAt(
   return false
 }
 
+function shouldBumpLastBranchUpdatedAtFromHeaders(
+  beforeChat: Chat,
+  nextLeafId: MessageId | null,
+  branchHeaders: readonly MessageHeaderRow[],
+  changedMessageIds: ReadonlySet<MessageId>,
+): boolean {
+  if (nextLeafId !== beforeChat.lastUpdatedLeafId) return true
+  if (nextLeafId === null || changedMessageIds.size === 0) return false
+  const branchIds = new Set(branchHeaders.map((header) => header.id))
+  for (const messageId of changedMessageIds) {
+    if (branchIds.has(messageId)) return true
+  }
+  return false
+}
+
 async function writeBranchCacheForSummary(
   tx: Transaction,
   chatId: ChatId,
@@ -662,6 +696,60 @@ async function writeBranchCacheForSummary(
       generatedAt: now,
     }),
   )
+}
+
+async function maybeRefreshBranchCacheForHeaderSummary(input: {
+  tx: Transaction
+  chatId: ChatId
+  branchLeafId: MessageId | null
+  branchHeaders: readonly MessageHeaderRow[]
+  beforeChat: Chat
+  now: number
+}): Promise<{ refreshed: boolean; cache?: ChatBranchCache }> {
+  const table = input.tx.table<ChatBranchCache, ChatId>('chatBranchCache')
+  const existing = await table.get(input.chatId)
+  if (!existing) return { refreshed: false }
+  if (input.branchLeafId === null) {
+    await table.delete(input.chatId)
+    return { refreshed: true }
+  }
+  if (
+    existing.branchLeafId !== input.branchLeafId ||
+    existing.generatedAt < input.beforeChat.lastBranchUpdatedAt
+  ) {
+    return { refreshed: false }
+  }
+  const branchMessages = await hydrateStoredMessages(
+    input.branchHeaders,
+    input.tx.table<MessageBodyRow, MessageId>('messageBodies'),
+  )
+  const cache = buildBranchCacheRow({
+    chatId: input.chatId,
+    branchLeafId: input.branchLeafId,
+    messages: branchMessages,
+    generatedAt: input.now,
+  })
+  await table.put(cache)
+  return { refreshed: true, cache }
+}
+
+async function branchHeadersByLeafInTransaction(
+  tx: Transaction,
+  chatId: ChatId,
+  leafId: MessageId | null,
+): Promise<MessageHeaderRow[]> {
+  if (leafId === null) return []
+  const table = tx.table<MessageHeaderRow, MessageId>('messages')
+  const branch: MessageHeaderRow[] = []
+  let currentId: MessageId | null = leafId
+  while (currentId !== null) {
+    const header: MessageHeaderRow | undefined = await table.get(currentId)
+    if (!header || header.chatId !== chatId || header.deleted) break
+    branch.push(cloneMessageHeader(header))
+    currentId = header.parentId
+  }
+  branch.reverse()
+  return branch
 }
 
 async function getWorkspaceMetaRow(): Promise<StoredWorkspaceMeta> {
@@ -823,9 +911,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
       chatId === undefined
         ? await db.streamLeases.toArray()
         : await db.streamLeases.where('chatId').equals(chatId).toArray()
-    return rows
-      .filter(isStreamLeaseRow)
-      .map((lease) => ({ ...lease }))
+    return rows.filter(isStreamLeaseRow).map((lease) => ({ ...lease }))
   }
 
   async appendStreamChunks(chunks: readonly StreamChunkRow[]): Promise<void> {
@@ -1415,6 +1501,8 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
           const beforeChat = await loadChatOrThrow(tx.table<Chat, ChatId>('chats'), chatId)
           const state: ChatMutationState = {
             beforeChat,
+            wordCountDeltas: new Map<MessageId, number>(),
+            totalCostDelta: 0,
             visibleMetaPatch: {},
             hiddenMetaPatch: {},
             summaryPatch: {},
@@ -1608,7 +1696,8 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
               const moved =
                 existing.parentId !== clone.parentId || existing.siblingIndex !== clone.siblingIndex
               const deletionChanged = existing.deleted !== clone.deleted
-              if (!touchChatSummary && (moved || deletionChanged)) {
+              const leafOrderingChanged = existing.createdAt !== clone.createdAt
+              if (!touchChatSummary && (moved || deletionChanged || leafOrderingChanged)) {
                 throw new Error(`DeferredMessageWriteRequiresStableTree:${clone.id}`)
               }
               if (moved || deletionChanged) {
@@ -1624,8 +1713,16 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
                 stableStringify(existing) !== stableStringify(comparableSplit.header) ||
                 stableStringify(existingBody) !== stableStringify(comparableSplit.body)
               if (!changed) return
-              if (touchChatSummary) {
+              if (touchChatSummary && (moved || deletionChanged || leafOrderingChanged)) {
                 await ensureMessageSnapshots(state as ChatMutationState)
+              }
+              if (touchChatSummary && !moved && !deletionChanged && !leafOrderingChanged) {
+                recordMessageSummaryDeltas(
+                  state,
+                  clone.id,
+                  hydrateStoredMessage(existing, existingBody),
+                  clone,
+                )
               }
               clone.nodeVersion = existing.nodeVersion + 1
               const { header, body } = splitMessageForStorage(clone, { updatedAt: now })
@@ -1685,8 +1782,12 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
             const state =
               touchChatSummary || broadcast ? await ensureChatState(existing.chatId) : undefined
             const nextHeader = applyMessageHeaderPatch(existing, headerPatch)
-            const existingBody = replaceBody ? undefined : await bodyTable.get(messageId)
+            const existingBody =
+              replaceBody && !touchChatSummary ? undefined : await bodyTable.get(messageId)
             if (!replaceBody && !existingBody) throw new Error(`MessageBodyMissing:${messageId}`)
+            if (replaceBody && touchChatSummary && !existingBody) {
+              throw new Error(`MessageBodyMissing:${messageId}`)
+            }
             let nextBody: MessageBodyRow
             if (!replaceBody) {
               const patchedBody = applyMessageBodyPatch(existingBody as MessageBodyRow, patch)
@@ -1703,15 +1804,28 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
                 nodeVersion: nextHeader.nodeVersion,
                 updatedAt: now,
               }
+              if (touchChatSummary) {
+                recordMessageSummaryDeltas(
+                  state,
+                  messageId,
+                  hydrateStoredMessage(existing, existingBody as MessageBodyRow),
+                  hydrateStoredMessage(nextHeader, nextBody),
+                )
+              }
             } else {
               nextHeader.nodeVersion = existing.nodeVersion + 1
               nextBody = replacementMessageBody(nextHeader, patch, {
                 nodeVersion: nextHeader.nodeVersion,
                 updatedAt: now,
               })
-            }
-            if (touchChatSummary) {
-              await ensureMessageSnapshots(state as ChatMutationState)
+              if (touchChatSummary) {
+                recordMessageSummaryDeltas(
+                  state,
+                  messageId,
+                  hydrateStoredMessage(existing, existingBody as MessageBodyRow),
+                  hydrateStoredMessage(nextHeader, nextBody),
+                )
+              }
             }
             await headerTable.put(nextHeader)
             await bodyTable.put(nextBody)
@@ -1915,26 +2029,64 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
           }
 
           if (state.messageSummaryDirty) {
-            const afterMessages =
-              state.afterMessages ?? (await listMessagesInTransaction(tx, chatId))
-            const nextLeafId = findLastUpdatedLeafId(afterMessages)
-            next.lastUpdatedLeafId = nextLeafId
-            next.wordCount = countMessagesWords(buildBranchMessages(afterMessages, nextLeafId))
-            next.totalCostUsd = computeTotalCostUsd(afterMessages)
-            const beforeMessages = state.beforeMessages ?? []
-            const lastBranchUpdatedAtChanged = shouldBumpLastBranchUpdatedAt(
-              state.beforeChat,
-              beforeMessages,
-              afterMessages,
-              state.changedMessageIds,
-            )
-            if (lastBranchUpdatedAtChanged) {
-              next.lastBranchUpdatedAt = now
-            }
-            if (nextLeafId !== state.beforeChat.lastUpdatedLeafId || lastBranchUpdatedAtChanged) {
-              await writeBranchCacheForSummary(tx, chatId, nextLeafId, afterMessages, now)
-              wroteWorkspaceState = true
-              pendingBranchCacheEvents.add(chatId)
+            if (state.afterMessages) {
+              const afterMessages = state.afterMessages
+              const nextLeafId = findLastUpdatedLeafId(afterMessages)
+              next.lastUpdatedLeafId = nextLeafId
+              next.wordCount = countMessagesWords(buildBranchMessages(afterMessages, nextLeafId))
+              next.totalCostUsd = computeTotalCostUsd(afterMessages)
+              const beforeMessages = state.beforeMessages ?? []
+              const lastBranchUpdatedAtChanged = shouldBumpLastBranchUpdatedAt(
+                state.beforeChat,
+                beforeMessages,
+                afterMessages,
+                state.changedMessageIds,
+              )
+              if (lastBranchUpdatedAtChanged) {
+                next.lastBranchUpdatedAt = now
+              }
+              if (nextLeafId !== state.beforeChat.lastUpdatedLeafId || lastBranchUpdatedAtChanged) {
+                await writeBranchCacheForSummary(tx, chatId, nextLeafId, afterMessages, now)
+                wroteWorkspaceState = true
+                pendingBranchCacheEvents.add(chatId)
+              }
+            } else {
+              const nextLeafId = state.beforeChat.lastUpdatedLeafId
+              const branchHeaders = await branchHeadersByLeafInTransaction(tx, chatId, nextLeafId)
+              next.lastUpdatedLeafId = nextLeafId
+              let wordCountDelta = 0
+              const branchIds = new Set(branchHeaders.map((header) => header.id))
+              for (const [messageId, delta] of state.wordCountDeltas) {
+                if (branchIds.has(messageId)) wordCountDelta += delta
+              }
+              next.wordCount = Math.max(0, current.wordCount + wordCountDelta)
+              next.totalCostUsd = Math.max(0, current.totalCostUsd + state.totalCostDelta)
+              const lastBranchUpdatedAtChanged = shouldBumpLastBranchUpdatedAtFromHeaders(
+                state.beforeChat,
+                nextLeafId,
+                branchHeaders,
+                state.changedMessageIds,
+              )
+              if (lastBranchUpdatedAtChanged) {
+                next.lastBranchUpdatedAt = now
+              }
+              if (nextLeafId !== state.beforeChat.lastUpdatedLeafId || lastBranchUpdatedAtChanged) {
+                const refreshResult = await maybeRefreshBranchCacheForHeaderSummary({
+                  tx,
+                  chatId,
+                  branchLeafId: nextLeafId,
+                  branchHeaders,
+                  beforeChat: state.beforeChat,
+                  now,
+                })
+                if (refreshResult.cache) {
+                  next.wordCount = refreshResult.cache.wordCount
+                }
+                if (refreshResult.refreshed) {
+                  wroteWorkspaceState = true
+                  pendingBranchCacheEvents.add(chatId)
+                }
+              }
             }
           }
 
