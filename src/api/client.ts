@@ -11,7 +11,8 @@ import type { CallOpts } from './types'
 const DEFAULT_TIMEOUT_MS = 120_000
 const DEFAULT_RETRY_CAP_MS = 5_000
 
-type LocalNetworkRequestInit = RequestInit & { targetAddressSpace?: 'local' }
+type TargetAddressSpace = 'local' | 'loopback'
+type LocalNetworkRequestInit = RequestInit & { targetAddressSpace?: TargetAddressSpace }
 
 function isAnthropicBrowserOriginProfile(profile: ConnectionProfile): boolean {
   if (profile.kind === 'anthropic') return true
@@ -76,47 +77,47 @@ export function buildHeaders(
   return headers
 }
 
-function isPrivateOrLoopbackIpv4(hostname: string): boolean {
+function parseIpv4(hostname: string): [number, number, number, number] | null {
   const parts = hostname.split('.')
-  if (parts.length !== 4) return false
+  if (parts.length !== 4) return null
   const bytes = parts.map((part) => Number(part))
   if (bytes.some((byte, index) => !/^\d+$/.test(parts[index] ?? '') || byte < 0 || byte > 255)) {
-    return false
+    return null
   }
-  const a = bytes[0] ?? -1
-  const b = bytes[1] ?? -1
-  if (a === 10 || a === 127) return true
-  if (a === 169) return b === 254
-  if (a === 172) return b >= 16 && b <= 31
-  return a === 192 && b === 168
+  return bytes as [number, number, number, number]
 }
 
-function isLocalNetworkHostname(hostname: string): boolean {
+function targetAddressSpaceForHostname(hostname: string): TargetAddressSpace | null {
   const host = hostname.toLowerCase().replace(/^\[|\]$/g, '')
-  const isIpv6 = host.includes(':')
-  return (
-    host === 'localhost' ||
-    host.endsWith('.localhost') ||
-    host.endsWith('.local') ||
-    (isIpv6 &&
-      (host === '::1' ||
-        host.startsWith('fe80:') ||
-        host.startsWith('fc') ||
-        host.startsWith('fd'))) ||
-    isPrivateOrLoopbackIpv4(host)
-  )
+  const ipv4 = parseIpv4(host)
+  if (ipv4) {
+    const [a, b] = ipv4
+    if (a === 127) return 'loopback'
+    if (a === 10) return 'local'
+    if (a === 169) return b === 254 ? 'local' : null
+    if (a === 172) return b >= 16 && b <= 31 ? 'local' : null
+    return a === 192 && b === 168 ? 'local' : null
+  }
+  if (host === 'localhost' || host.endsWith('.localhost') || host === '::1') return 'loopback'
+  if (host.endsWith('.local')) return 'local'
+  if (!host.includes(':')) return null
+  if (host.startsWith('fe80:') || host.startsWith('fc') || host.startsWith('fd')) return 'local'
+  return null
+}
+
+function targetAddressSpaceForUrl(url: string): TargetAddressSpace | null {
+  const parsed = new URL(url)
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null
+  return targetAddressSpaceForHostname(parsed.hostname)
 }
 
 function annotateLocalNetworkFetch(url: string, init: RequestInit): RequestInit {
   try {
-    const parsed = new URL(url)
-    if (
-      (parsed.protocol === 'http:' || parsed.protocol === 'https:') &&
-      isLocalNetworkHostname(parsed.hostname)
-    ) {
+    const targetAddressSpace = targetAddressSpaceForUrl(url)
+    if (targetAddressSpace) {
       const annotated: LocalNetworkRequestInit = {
         ...(init as LocalNetworkRequestInit),
-        targetAddressSpace: 'local',
+        targetAddressSpace,
       }
       return annotated
     }

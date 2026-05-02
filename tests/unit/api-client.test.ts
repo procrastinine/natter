@@ -115,10 +115,18 @@ describe('buildHeaders', () => {
 })
 
 describe('fetchWithTimeout', () => {
-  it('marks loopback fetches as intentional local-network requests', async () => {
+  it('marks loopback fetches with the loopback target address space', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response('ok'))
     vi.stubGlobal('fetch', fetchMock)
     await fetchWithTimeout('http://127.0.0.1:8080/v1/models', {}, { timeoutMs: 0 })
+    const init = fetchMock.mock.calls[0]?.[1] as RequestInit & { targetAddressSpace?: string }
+    expect(init.targetAddressSpace).toBe('loopback')
+  })
+
+  it('marks private-LAN fetches with the local target address space', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response('ok'))
+    vi.stubGlobal('fetch', fetchMock)
+    await fetchWithTimeout('http://192.168.1.20:8080/v1/models', {}, { timeoutMs: 0 })
     const init = fetchMock.mock.calls[0]?.[1] as RequestInit & { targetAddressSpace?: string }
     expect(init.targetAddressSpace).toBe('local')
   })
