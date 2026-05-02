@@ -11,6 +11,8 @@ import type { CallOpts } from './types'
 const DEFAULT_TIMEOUT_MS = 120_000
 const DEFAULT_RETRY_CAP_MS = 5_000
 
+type LocalNetworkRequestInit = RequestInit & { targetAddressSpace?: 'local' }
+
 function isAnthropicBrowserOriginProfile(profile: ConnectionProfile): boolean {
   if (profile.kind === 'anthropic') return true
   try {
@@ -74,6 +76,56 @@ export function buildHeaders(
   return headers
 }
 
+function isPrivateOrLoopbackIpv4(hostname: string): boolean {
+  const parts = hostname.split('.')
+  if (parts.length !== 4) return false
+  const bytes = parts.map((part) => Number(part))
+  if (bytes.some((byte, index) => !/^\d+$/.test(parts[index] ?? '') || byte < 0 || byte > 255)) {
+    return false
+  }
+  const a = bytes[0] ?? -1
+  const b = bytes[1] ?? -1
+  if (a === 10 || a === 127) return true
+  if (a === 169) return b === 254
+  if (a === 172) return b >= 16 && b <= 31
+  return a === 192 && b === 168
+}
+
+function isLocalNetworkHostname(hostname: string): boolean {
+  const host = hostname.toLowerCase().replace(/^\[|\]$/g, '')
+  const isIpv6 = host.includes(':')
+  return (
+    host === 'localhost' ||
+    host.endsWith('.localhost') ||
+    host.endsWith('.local') ||
+    (isIpv6 &&
+      (host === '::1' ||
+        host.startsWith('fe80:') ||
+        host.startsWith('fc') ||
+        host.startsWith('fd'))) ||
+    isPrivateOrLoopbackIpv4(host)
+  )
+}
+
+function annotateLocalNetworkFetch(url: string, init: RequestInit): RequestInit {
+  try {
+    const parsed = new URL(url)
+    if (
+      (parsed.protocol === 'http:' || parsed.protocol === 'https:') &&
+      isLocalNetworkHostname(parsed.hostname)
+    ) {
+      const annotated: LocalNetworkRequestInit = {
+        ...(init as LocalNetworkRequestInit),
+        targetAddressSpace: 'local',
+      }
+      return annotated
+    }
+  } catch {
+    // Relative URLs are same-origin app requests, not cross-origin local-network targets.
+  }
+  return init
+}
+
 // Linked-abort helper. AbortSignal.any isn't available everywhere (jsdom
 // versions vary), and "user aborted" must be distinguishable from "timeout
 // fired" AFTER fetch throws; fetch itself only exposes a single AbortError.
@@ -116,7 +168,7 @@ export async function fetchWithTimeout(
   const timer = timeoutMs > 0 ? setTimeout(() => timeoutCtl.abort(), timeoutMs) : undefined
   const link = linkSignals([opts.signal, timeoutCtl.signal])
   try {
-    return await fetch(url, { ...init, signal: link.signal })
+    return await fetch(url, annotateLocalNetworkFetch(url, { ...init, signal: link.signal }))
   } catch (e) {
     if (timeoutCtl.signal.aborted && !opts.signal?.aborted) {
       throw normalizeError(e, { midStream: false, cause: 'timeout' })

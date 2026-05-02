@@ -115,6 +115,22 @@ describe('buildHeaders', () => {
 })
 
 describe('fetchWithTimeout', () => {
+  it('marks loopback fetches as intentional local-network requests', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response('ok'))
+    vi.stubGlobal('fetch', fetchMock)
+    await fetchWithTimeout('http://127.0.0.1:8080/v1/models', {}, { timeoutMs: 0 })
+    const init = fetchMock.mock.calls[0]?.[1] as RequestInit & { targetAddressSpace?: string }
+    expect(init.targetAddressSpace).toBe('local')
+  })
+
+  it('does not mark public API fetches as local-network requests', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response('ok'))
+    vi.stubGlobal('fetch', fetchMock)
+    await fetchWithTimeout('https://openrouter.ai/api/v1/models', {}, { timeoutMs: 0 })
+    const init = fetchMock.mock.calls[0]?.[1] as RequestInit & { targetAddressSpace?: string }
+    expect(init.targetAddressSpace).toBeUndefined()
+  })
+
   it('yields ApiError(kind:timeout) when the timer fires before fetch resolves', async () => {
     vi.stubGlobal(
       'fetch',
