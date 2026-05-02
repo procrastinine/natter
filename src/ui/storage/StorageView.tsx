@@ -96,11 +96,14 @@ import {
   isPersisted,
   type QuotaSnapshot,
   requestPersist,
+  requestNotificationPermissionForStoragePersistence,
   storagePersistenceAvailable,
+  storagePersistenceNotificationMayHelp,
 } from '../../store/quota'
 import type { AttachmentBundle } from '../../store/repository'
 import { abortSearchSession, requestSearchSession } from '../../store/search-session'
 import { readSidebarSortMode, writeSidebarSortMode } from '../../store/sidebar-preferences'
+import { getWorkspaceRepository } from '../../store/workspace-repository'
 import { listTags } from '../../store/tags'
 import { startSearchStoreBroadcastListener, useSearchStore } from '../../store/zustand/searchStore'
 import { useToastStore } from '../../store/zustand/toastStore'
@@ -293,6 +296,7 @@ function StorageOverview() {
     [],
     [],
   )
+  const workspaceMeta = useLiveQuery(() => getWorkspaceRepository().getWorkspaceMeta(), [], null)
   const [quota, setQuota] = useState<QuotaSnapshot | null>(null)
   const [persistence, setPersistence] = useState<
     'checking' | 'unsupported' | 'persistent' | 'best-effort'
@@ -305,10 +309,16 @@ function StorageOverview() {
     'export' | 'import' | 'clear' | null
   >(null)
   const workspaceImportInputRef = useRef<HTMLInputElement | null>(null)
-  const storageMode = 'indexeddb' as const
-  const isIndexedDbMode = storageMode === 'indexeddb'
+  const isIndexedDbMode = workspaceMeta?.backendKind === 'browser-idb'
   const localBytes = attachments.reduce((sum, row) => sum + (row.sizeBytes ?? 0), 0)
   useEffect(() => {
+    if (!workspaceMeta) return
+    if (!isIndexedDbMode) {
+      setQuota(null)
+      setPersistence('unsupported')
+      setPersistenceRequestResult(null)
+      return
+    }
     let active = true
     void Promise.all([
       estimateQuota(),
@@ -323,8 +333,13 @@ function StorageOverview() {
     return () => {
       active = false
     }
-  }, [])
+  }, [isIndexedDbMode, workspaceMeta])
   const handleRequestPersistence = async () => {
+    if (!isIndexedDbMode) {
+      setPersistence('unsupported')
+      setPersistenceRequestResult(null)
+      return
+    }
     if (!storagePersistenceAvailable()) {
       setPersistence('unsupported')
       setPersistenceRequestResult(null)
@@ -332,6 +347,7 @@ function StorageOverview() {
     }
     setPersistenceBusy(true)
     try {
+      await requestNotificationPermissionForStoragePersistence()
       const granted = await requestPersist()
       const persisted = granted || (await isPersisted())
       setPersistence(persisted ? 'persistent' : 'best-effort')
@@ -433,10 +449,19 @@ function StorageOverview() {
   else if (persistence === 'persistent') persistenceDetail = 'Eviction protected'
   else if (persistence === 'best-effort') persistenceDetail = 'Browser may evict under pressure'
   else if (persistence === 'unsupported') persistenceDetail = 'API unavailable'
+  const showPersistenceHelp =
+    isIndexedDbMode && persistence !== 'persistent' && storagePersistenceNotificationMayHelp()
+  const modeValue =
+    workspaceMeta?.backendKind === 'browser-idb'
+      ? 'IndexedDB'
+      : workspaceMeta
+        ? 'Daemon'
+        : 'Checking'
+  const modeDetail = workspaceMeta?.backendKind === 'browser-idb' ? 'Browser workspace' : 'Workspace'
   return (
     <section data-ui="storage-overview">
       <div data-ui="storage-panel-row">
-        <StoragePanel title="Mode" value="IndexedDB" detail="Browser workspace">
+        <StoragePanel title="Mode" value={modeValue} detail={modeDetail}>
           {isIndexedDbMode ? (
             <>
               <StoragePanelMetric
@@ -459,6 +484,13 @@ function StorageOverview() {
                       ? 'Request again'
                       : 'Request persistence'}
                 </button>
+              ) : null}
+              {showPersistenceHelp ? (
+                <span data-ui="storage-persistence-help">
+                  For Chromium and Safari, allowing notifications if prompted, bookmarking this
+                  page, installing Natter as an app, or regular use may help the browser grant
+                  persistent storage.
+                </span>
               ) : null}
               <span data-ui="storage-workspace-actions">
                 <button

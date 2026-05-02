@@ -157,6 +157,12 @@
   line-height: var(--line-height-tight);
 }
 
+[data-ui="storage-persistence-help"] {
+  color: var(--color-fg-muted);
+  font-size: var(--font-size-xs);
+  line-height: var(--line-height-tight);
+}
+
 [data-ui="storage-usage-details"] {
   display: flex;
   flex-wrap: wrap;

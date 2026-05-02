@@ -5,11 +5,15 @@ import {
   isPersisted,
   QUOTA_HARD_WARN_RATIO,
   QUOTA_WARN_RATIO,
+  requestNotificationPermissionForStoragePersistence,
   requestPersist,
   storagePersistenceAvailable,
+  storagePersistenceNotificationMayHelp,
 } from '../../src/store/quota'
 
 const originalStorageDescriptor = Object.getOwnPropertyDescriptor(navigator, 'storage')
+const originalUserAgentDescriptor = Object.getOwnPropertyDescriptor(navigator, 'userAgent')
+const originalNotificationDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'Notification')
 
 function setNavigatorStorage(storage: Partial<StorageManager> | undefined): void {
   Object.defineProperty(navigator, 'storage', {
@@ -18,12 +22,46 @@ function setNavigatorStorage(storage: Partial<StorageManager> | undefined): void
   })
 }
 
+function setNavigatorUserAgent(userAgent: string): void {
+  Object.defineProperty(navigator, 'userAgent', {
+    configurable: true,
+    value: userAgent,
+  })
+}
+
+function setNotificationApi(
+  permission: NotificationPermission,
+  requestPermissionResult: NotificationPermission = permission,
+) {
+  const requestPermission = vi
+    .fn<() => Promise<NotificationPermission>>()
+    .mockResolvedValue(requestPermissionResult)
+  Object.defineProperty(globalThis, 'Notification', {
+    configurable: true,
+    value: {
+      permission,
+      requestPermission,
+    },
+  })
+  return { requestPermission }
+}
+
 afterEach(() => {
   vi.restoreAllMocks()
   if (originalStorageDescriptor) {
     Object.defineProperty(navigator, 'storage', originalStorageDescriptor)
   } else {
     Reflect.deleteProperty(navigator, 'storage')
+  }
+  if (originalUserAgentDescriptor) {
+    Object.defineProperty(navigator, 'userAgent', originalUserAgentDescriptor)
+  } else {
+    Reflect.deleteProperty(navigator, 'userAgent')
+  }
+  if (originalNotificationDescriptor) {
+    Object.defineProperty(globalThis, 'Notification', originalNotificationDescriptor)
+  } else {
+    Reflect.deleteProperty(globalThis, 'Notification')
   }
 })
 
@@ -81,5 +119,30 @@ describe('storage probes (fallback when navigator.storage is unavailable)', () =
     expect(await isPersisted()).toBe(true)
     expect(persist).toHaveBeenCalledTimes(1)
     expect(persisted).toHaveBeenCalledTimes(1)
+  })
+
+  it('requests notification permission for Chromium and Safari persistence requests only', async () => {
+    setNavigatorUserAgent(
+      'Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36',
+    )
+    const chromeNotification = setNotificationApi('default', 'granted')
+
+    expect(storagePersistenceNotificationMayHelp()).toBe(true)
+    expect(await requestNotificationPermissionForStoragePersistence()).toBe('granted')
+    expect(chromeNotification.requestPermission).toHaveBeenCalledTimes(1)
+
+    setNavigatorUserAgent('Mozilla/5.0 AppleWebKit/605.1.15 Version/18.0 Safari/605.1.15')
+    const safariNotification = setNotificationApi('default', 'denied')
+
+    expect(storagePersistenceNotificationMayHelp()).toBe(true)
+    expect(await requestNotificationPermissionForStoragePersistence()).toBe('denied')
+    expect(safariNotification.requestPermission).toHaveBeenCalledTimes(1)
+
+    setNavigatorUserAgent('Mozilla/5.0 Gecko/20100101 Firefox/145.0')
+    const firefoxNotification = setNotificationApi('default', 'granted')
+
+    expect(storagePersistenceNotificationMayHelp()).toBe(false)
+    expect(await requestNotificationPermissionForStoragePersistence()).toBe('skipped')
+    expect(firefoxNotification.requestPermission).not.toHaveBeenCalled()
   })
 })

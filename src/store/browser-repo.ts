@@ -74,9 +74,7 @@ export class ChatMissingError extends Error {
   }
 }
 
-interface StoredWorkspaceMeta extends WorkspaceMeta {
-  backendKind: 'browser-idb'
-}
+type StoredWorkspaceMeta = WorkspaceMeta & { backendKind: 'browser-idb' }
 
 interface ChatMutationState {
   beforeChat: Chat

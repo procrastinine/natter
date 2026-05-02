@@ -4,6 +4,13 @@ export const QUOTA_WARN_RATIO = 0.8
 export const QUOTA_HARD_WARN_RATIO = 0.95
 
 type QuotaLevel = 'ok' | 'warn' | 'hard-warn'
+type PersistenceHelpBrowser = 'chromium' | 'safari' | 'other'
+
+export type StoragePersistenceNotificationPermission =
+  | NotificationPermission
+  | 'unsupported'
+  | 'skipped'
+  | 'error'
 
 export interface QuotaSnapshot {
   usage: number
@@ -59,6 +66,57 @@ export function storagePersistenceAvailable(): boolean {
   return (
     !!storage && typeof storage.persist === 'function' && typeof storage.persisted === 'function'
   )
+}
+
+function storagePersistenceHelpBrowser(): PersistenceHelpBrowser {
+  if (typeof navigator === 'undefined') return 'other'
+  const brands = (navigator as { userAgentData?: { brands?: Array<{ brand: string }> } })
+    .userAgentData?.brands
+  if (
+    brands?.some(({ brand }) =>
+      /Chromium|Google Chrome|Microsoft Edge|Opera|Brave/i.test(brand),
+    )
+  ) {
+    return 'chromium'
+  }
+  const userAgent = navigator.userAgent
+  if (/\b(?:Chrome|Chromium|Edg|OPR|SamsungBrowser)\//.test(userAgent)) return 'chromium'
+  if (
+    /\bSafari\//.test(userAgent) &&
+    !/\b(?:Chrome|Chromium|CriOS|FxiOS|Edg|OPR|SamsungBrowser)\//.test(userAgent)
+  ) {
+    return 'safari'
+  }
+  return 'other'
+}
+
+export function storagePersistenceNotificationMayHelp(): boolean {
+  const browser = storagePersistenceHelpBrowser()
+  return browser === 'chromium' || browser === 'safari'
+}
+
+export async function requestNotificationPermissionForStoragePersistence(): Promise<StoragePersistenceNotificationPermission> {
+  if (!storagePersistenceNotificationMayHelp()) return 'skipped'
+  const notificationApi = (
+    globalThis as {
+      Notification?: {
+        permission?: NotificationPermission
+        requestPermission?: () => Promise<NotificationPermission>
+      }
+    }
+  ).Notification
+  if (!notificationApi || typeof notificationApi.requestPermission !== 'function') {
+    return 'unsupported'
+  }
+  if (notificationApi.permission === 'granted' || notificationApi.permission === 'denied') {
+    return notificationApi.permission
+  }
+  if (notificationApi.permission !== 'default') return 'unsupported'
+  try {
+    return await notificationApi.requestPermission()
+  } catch {
+    return 'error'
+  }
 }
 
 // Best-effort request for persistent storage. Browsers may prompt the user or

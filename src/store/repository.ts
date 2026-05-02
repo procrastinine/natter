@@ -26,6 +26,7 @@ import type { MessageBodyFields, MessageHeaderRow } from './message-storage'
 
 export interface WorkspaceMeta {
   workspaceId: string
+  backendKind: 'browser-idb' | 'daemon' | 'unknown'
   lastMutationAt: number
   mutationCounter: number
 }

@@ -49,6 +49,7 @@ import { installPersistenceRequestOnFirstInteraction } from '../store/quota'
 import type { ActiveBranchWindowSnapshot } from '../store/repository'
 import { readSidebarSortMode } from '../store/sidebar-preferences'
 import { installStreamLeaseListener, requestAbortForChat } from '../store/stream-leases'
+import { getWorkspaceRepository } from '../store/workspace-repository'
 import { useChatStore } from '../store/zustand/chatStore'
 import { useStreamStore } from '../store/zustand/streamStore'
 import { useToastStore } from '../store/zustand/toastStore'
@@ -522,7 +523,23 @@ export function Shell() {
     applyBaseFontSizeToDocument(prefs.baseFontSize)
   }, [prefs.baseFontSize])
 
-  useEffect(() => installPersistenceRequestOnFirstInteraction(), [])
+  useEffect(() => {
+    let active = true
+    let cleanup = () => {}
+    void getWorkspaceRepository()
+      .getWorkspaceMeta()
+      .then((meta) => {
+        if (!active || meta.backendKind !== 'browser-idb') return
+        cleanup = installPersistenceRequestOnFirstInteraction()
+      })
+      .catch((error: unknown) => {
+        console.error('Failed to inspect workspace backend for persistence request', error)
+      })
+    return () => {
+      active = false
+      cleanup()
+    }
+  }, [])
 
   // Persist the panel's open/closed state across route transitions —
   // in particular, navigating to /new or between chats shouldn't auto-

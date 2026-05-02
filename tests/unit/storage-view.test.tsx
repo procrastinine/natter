@@ -22,8 +22,13 @@ import {
 import { __resetDbForTests, getDb } from '../../src/store/db'
 import { createFolder } from '../../src/store/folders'
 import { exportChat, exportWorkspaceBackup } from '../../src/store/import-export'
+import type { WorkspaceRepository } from '../../src/store/repository'
 import { __resetSearchSessionRunnerForTests } from '../../src/store/search-session'
 import { listTags } from '../../src/store/tags'
+import {
+  __resetWorkspaceRepositoryForTests,
+  __setWorkspaceRepositoryForTests,
+} from '../../src/store/workspace-repository'
 import { __resetSearchStoreForTests } from '../../src/store/zustand/searchStore'
 import { jsonEntriesZipBlob } from '../../src/ui/import-export/json-file'
 import { StorageView } from '../../src/ui/storage/StorageView'
@@ -36,12 +41,52 @@ vi.mock('../../src/lib/debug-nuke', () => debugNukeMocks)
 
 const DB_NAME = 'natter'
 const originalStorageDescriptor = Object.getOwnPropertyDescriptor(navigator, 'storage')
+const originalUserAgentDescriptor = Object.getOwnPropertyDescriptor(navigator, 'userAgent')
+const originalNotificationDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'Notification')
 
 function setNavigatorStorage(storage: Partial<StorageManager> | undefined): void {
   Object.defineProperty(navigator, 'storage', {
     configurable: true,
     value: storage,
   })
+}
+
+function setNavigatorUserAgent(userAgent: string): void {
+  Object.defineProperty(navigator, 'userAgent', {
+    configurable: true,
+    value: userAgent,
+  })
+}
+
+function setNotificationApi(
+  permission: NotificationPermission,
+  requestPermissionResult: NotificationPermission = permission,
+) {
+  const requestPermission = vi
+    .fn<() => Promise<NotificationPermission>>()
+    .mockResolvedValue(requestPermissionResult)
+  Object.defineProperty(globalThis, 'Notification', {
+    configurable: true,
+    value: {
+      permission,
+      requestPermission,
+    },
+  })
+  return { requestPermission }
+}
+
+function setDaemonWorkspaceRepository(): WorkspaceRepository {
+  const repo = {
+    getWorkspaceMeta: vi.fn().mockResolvedValue({
+      workspaceId: 'daemon:natter',
+      backendKind: 'daemon',
+      lastMutationAt: 0,
+      mutationCounter: 0,
+    }),
+    listChats: vi.fn().mockResolvedValue([]),
+  } as unknown as WorkspaceRepository
+  __setWorkspaceRepositoryForTests(repo)
+  return repo
 }
 
 function bytes(content: string): Blob {
@@ -82,6 +127,7 @@ function mockBlobDownloads() {
 }
 
 async function resetAll() {
+  __resetWorkspaceRepositoryForTests()
   __resetBrowserRepositoryForTests()
   __resetBroadcastForTests()
   __resetSearchSessionRunnerForTests()
@@ -114,6 +160,16 @@ describe('StorageView', () => {
       Object.defineProperty(navigator, 'storage', originalStorageDescriptor)
     } else {
       Reflect.deleteProperty(navigator, 'storage')
+    }
+    if (originalUserAgentDescriptor) {
+      Object.defineProperty(navigator, 'userAgent', originalUserAgentDescriptor)
+    } else {
+      Reflect.deleteProperty(navigator, 'userAgent')
+    }
+    if (originalNotificationDescriptor) {
+      Object.defineProperty(globalThis, 'Notification', originalNotificationDescriptor)
+    } else {
+      Reflect.deleteProperty(globalThis, 'Notification')
     }
     await resetAll()
   })
@@ -167,6 +223,64 @@ describe('StorageView', () => {
     expect(container).not.toHaveTextContent('Archive')
   })
 
+  it('requests notification permission and shows Chromium/Safari persistence hints in browser mode', async () => {
+    const persist = vi.fn<StorageManager['persist']>().mockResolvedValue(false)
+    const persisted = vi.fn<StorageManager['persisted']>().mockResolvedValue(false)
+    setNavigatorStorage({
+      estimate: vi.fn<StorageManager['estimate']>().mockResolvedValue({
+        usage: 4096,
+        quota: 8192,
+      } as StorageEstimate),
+      persist,
+      persisted,
+    })
+    setNavigatorUserAgent(
+      'Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36',
+    )
+    const notification = setNotificationApi('default', 'granted')
+
+    const { container } = render(<StorageView route={{ section: 'overview' }} />)
+
+    await waitFor(() => {
+      expect(container).toHaveTextContent('bookmarking this page')
+      expect(container).toHaveTextContent('installing Natter as an app')
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Request persistence' }))
+
+    await waitFor(() => {
+      expect(notification.requestPermission).toHaveBeenCalledTimes(1)
+      expect(persist).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  it('hides browser persistence actions outside IndexedDB mode', async () => {
+    const persist = vi.fn<StorageManager['persist']>().mockResolvedValue(true)
+    setNavigatorStorage({
+      estimate: vi.fn<StorageManager['estimate']>().mockResolvedValue({
+        usage: 4096,
+        quota: 8192,
+      } as StorageEstimate),
+      persist,
+      persisted: vi.fn<StorageManager['persisted']>().mockResolvedValue(false),
+    })
+    setNavigatorUserAgent(
+      'Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36',
+    )
+    const notification = setNotificationApi('default', 'granted')
+    setDaemonWorkspaceRepository()
+
+    const { container } = render(<StorageView route={{ section: 'overview' }} />)
+
+    await waitFor(() => {
+      expect(container).toHaveTextContent('Daemon')
+    })
+    expect(screen.queryByRole('button', { name: 'Request persistence' })).not.toBeInTheDocument()
+    expect(container).not.toHaveTextContent('bookmarking this page')
+    expect(notification.requestPermission).not.toHaveBeenCalled()
+    expect(persist).not.toHaveBeenCalled()
+  })
+
   it('runs the local data wipe from the overview clear-all action', async () => {
     const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true)
     render(<StorageView route={{ section: 'overview' }} />)
@@ -210,12 +324,14 @@ describe('StorageView', () => {
     const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true)
 
     const { container } = render(<StorageView route={{ section: 'overview' }} />)
-    const input = container.querySelector<HTMLInputElement>(
-      '[data-ui="storage-workspace-import-input"]',
-    )
-    expect(input).toBeTruthy()
+    let input: HTMLInputElement | null = null
+    await waitFor(() => {
+      input = container.querySelector<HTMLInputElement>('[data-ui="storage-workspace-import-input"]')
+      expect(input).toBeTruthy()
+    })
+    if (!input) throw new Error('expected workspace import input')
 
-    fireEvent.change(input as HTMLInputElement, {
+    fireEvent.change(input, {
       target: {
         files: [new File([JSON.stringify(backup)], 'backup.json', { type: 'application/json' })],
       },
