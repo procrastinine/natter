@@ -226,7 +226,7 @@ export function Composer({
   }, [defaultPrefill, prefillOpen])
   // When the user closes prefill, reset the text to the chat's default so
   // the next open isn't haunted by stale text. (Send already clears it.)
-  const togglePrefill = useCallback(async () => {
+  const togglePrefill = useCallback(() => {
     const next = !prefillOpen
     if (next) {
       // Seed from the chat's default if the user's prefill draft is empty.

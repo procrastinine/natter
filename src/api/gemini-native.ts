@@ -67,7 +67,7 @@ async function dispatch(
   if (opts.timeoutMs !== undefined) fetchOpts.timeoutMs = opts.timeoutMs
   const response = await fetchWithTimeout(url, init, fetchOpts)
   if (!response.ok) {
-    const body = await response.json().catch(() => ({
+    const body: unknown = await response.json().catch(() => ({
       error: { code: response.status, message: response.statusText },
     }))
     throw normalizeError(body, { midStream: false, httpStatus: response.status })

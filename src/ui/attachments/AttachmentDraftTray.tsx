@@ -1,6 +1,6 @@
 import { useState } from 'react'
-import type { Attachment, MessageAttachmentRef } from '../../core/types'
 import { attachmentHref, makeAnchorClickHandler } from '../../app/router'
+import type { Attachment, MessageAttachmentRef } from '../../core/types'
 import { CloseIcon, DatabaseIcon, EyeIcon, EyeOffIcon, TrashIcon, UploadIcon } from '../icons/Icon'
 import { AttachmentPicker } from './AttachmentPicker'
 import { AttachmentPreview } from './AttachmentPreview'

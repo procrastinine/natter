@@ -10,11 +10,11 @@ import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { DIRECT_OPENROUTER_BASE } from '../../src/core/cors-proxy'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
+import { writeCorsProxyUrl } from '../../src/core/global-settings'
 import type { ChatSettings, ConnectionProfile } from '../../src/core/types'
 import { sendText } from '../../src/hooks/useChat'
-import { DIRECT_OPENROUTER_BASE } from '../../src/core/cors-proxy'
-import { writeCorsProxyUrl } from '../../src/core/global-settings'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import {
   __resetBrowserRepositoryForTests,
@@ -62,7 +62,12 @@ function liveSettings(): ChatSettings {
     // sometimes hedge on temperature: 0; that's fine.
     sampling: { temperature: 0 },
     maxCompletionTokens: 16,
-    reasoning: { mode: 'off', exclude: false, summary: 'off', include: { encrypted: false, summary: false, text: false } },
+    reasoning: {
+      mode: 'off',
+      exclude: false,
+      summary: 'off',
+      include: { encrypted: false, summary: false, text: false },
+    },
   }
 }
 

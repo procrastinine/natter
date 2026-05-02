@@ -278,7 +278,7 @@ async function generatedOutputMigrationContext(message: Message): Promise<
     if (!apiKey || !isOpenRouterVideoPollingUrl(url, profile.baseUrl)) return []
     const response = await fetch(url, { headers: headersFor(url) })
     if (!response.ok) return []
-    const body = await response.json().catch(() => null)
+    const body: unknown = await response.json().catch(() => null)
     return videoContentUrlsFromJob(body)
   }
   return { downloader, videoUrlResolver }
@@ -368,9 +368,7 @@ async function localizeReferencedGeneratedOutputAttachments(
     if (!blob) continue
     const mime =
       blob.type ||
-      (kind === 'image'
-        ? remoteImage(sourceUrl)?.mime
-        : remoteMedia(sourceUrl, kind)?.mime) ||
+      (kind === 'image' ? remoteImage(sourceUrl)?.mime : remoteMedia(sourceUrl, kind)?.mime) ||
       attachment.mime
     const filename =
       kind === 'image'

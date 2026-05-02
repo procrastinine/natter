@@ -39,11 +39,7 @@ export function PrefillSettingsPrompt({
         >
           Apply
         </button>
-        <button
-          type="button"
-          data-ui="field-inline-action"
-          onClick={() => setDismissed(true)}
-        >
+        <button type="button" data-ui="field-inline-action" onClick={() => setDismissed(true)}>
           Dismiss
         </button>
       </div>

@@ -91,8 +91,7 @@ export function useEndpoints(
     !!profile && !!modelId && profile.kind === 'openrouter' && profile.supportsEndpointsApi
 
   useEffect(() => {
-    if (!enabled) return
-    if (!profile || !modelId) return
+    if (!enabled || !profile || !modelId) return
     const fetchedAt = cachedRow?.fetchedAt
     const fresh = fetchedAt !== undefined && isFresh(fetchedAt, ENDPOINTS_TTL_MS)
     const forceRefresh = refreshToken !== handledRefreshTokenRef.current
@@ -101,7 +100,7 @@ export function useEndpoints(
     if (forceRefresh) handledRefreshTokenRef.current = refreshToken
     setInFlight(true)
     setError(null)
-    ;(async () => {
+    void (async () => {
       try {
         // dedupedEndpointsFetch shares the Promise across sibling mounts
         // so two components refreshing the same (profileId, modelId)
@@ -112,10 +111,14 @@ export function useEndpoints(
           return fetchEndpoints({ profile, apiKey }, modelId)
         })
       } catch (err) {
-        if (cancelled) return
+        if (cancelled) {
+          return
+        }
         setError(err instanceof Error ? err.message : 'refresh failed')
       } finally {
-        if (!cancelled) setInFlight(false)
+        if (!cancelled) {
+          setInFlight(false)
+        }
       }
     })()
     return () => {

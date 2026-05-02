@@ -31,8 +31,7 @@ export function migrateProviderApiModeSettings(
   const next: ChatSettings = {
     ...current,
     responses: {
-      store:
-        current.responses?.store === true || legacyProfile?.responsesDefaults?.store === true,
+      store: current.responses?.store === true || legacyProfile?.responsesDefaults?.store === true,
     },
   }
 

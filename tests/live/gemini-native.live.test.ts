@@ -5,9 +5,9 @@
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { beforeAll, describe, expect, it } from 'vitest'
-import { geminiOnce, geminiStream, type GeminiContext } from '../../src/api/gemini-native'
+import { type GeminiContext, geminiOnce, geminiStream } from '../../src/api/gemini-native'
 import type { GeminiContent, GeminiPart } from '../../src/api/gemini-types'
-import { splitGeminiStream, type StreamLaneEvent } from '../../src/api/stream-transforms'
+import { type StreamLaneEvent, splitGeminiStream } from '../../src/api/stream-transforms'
 import type { ConnectionProfile } from '../../src/core/types'
 
 const LIVE = process.env.LIVE === '1'
@@ -205,9 +205,7 @@ describe.skipIf(!LIVE)('live — Gemini native generateContent', () => {
       },
       'gemini-3.1-flash-lite-preview',
     )
-    const call = turn1.candidates?.[0]?.content.parts.find(
-      (p) => 'functionCall' in p,
-    ) as
+    const call = turn1.candidates?.[0]?.content.parts.find((p) => 'functionCall' in p) as
       | {
           functionCall?: { name: string; args?: Record<string, unknown>; id?: string }
           thoughtSignature?: string

@@ -129,11 +129,7 @@ describe('API routing hints', () => {
 
 describe('Effort enums (live-probe verified)', () => {
   it('GPT-5.4 family: none|low|medium|high|xhigh — NO minimal (live probe 4)', () => {
-    for (const m of [
-      'openai/gpt-5.4',
-      'openai/gpt-5.4-nano',
-      'openai/gpt-5.4-mini',
-    ]) {
+    for (const m of ['openai/gpt-5.4', 'openai/gpt-5.4-nano', 'openai/gpt-5.4-mini']) {
       expect(allowedEffortFor(m)).toEqual(['none', 'low', 'medium', 'high', 'xhigh'])
     }
     // gpt-5.4-pro shares the same effort enum.

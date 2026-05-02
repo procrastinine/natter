@@ -39,7 +39,8 @@ describe('generation request path audit', () => {
       'api/responses.ts',
       'api/text-completions.ts',
     ])
-    const adapterImport = /from ['"][^'"]*(chat-completions|gemini-native|responses|text-completions)['"]/u
+    const adapterImport =
+      /from ['"][^'"]*(chat-completions|gemini-native|responses|text-completions)['"]/u
     const adapterCall =
       /\b(chatCompletions|chatCompletionsOnce|geminiStream|geminiOnce|responses|responsesOnce|textCompletions|textCompletionsOnce)\s*\(/u
     const failures: string[] = []

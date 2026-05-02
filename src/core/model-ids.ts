@@ -80,9 +80,7 @@ function rawStructuralModelSlug(modelId: string): string {
   return slash >= 0 ? withoutVariant.slice(slash + 1) : withoutVariant
 }
 
-function splitCanonicalModelKey(
-  key: string,
-): { provider: string; slug: string } | null {
+function splitCanonicalModelKey(key: string): { provider: string; slug: string } | null {
   const separator = key.indexOf(':')
   if (separator <= 0 || separator === key.length - 1) return null
   return {
@@ -363,7 +361,10 @@ function isTokenizerFamilyKey(key: string): boolean {
 // collapse onto their family key; everything else stays on the canonical
 // structural model identity.
 export function tokenCalibrationKey(modelId: string, providerHint?: string | null): string {
-  return bestGuessTokenizerFamilyKey(modelId, providerHint) ?? deterministicStructuralModelId(modelId, providerHint)
+  return (
+    bestGuessTokenizerFamilyKey(modelId, providerHint) ??
+    deterministicStructuralModelId(modelId, providerHint)
+  )
 }
 
 // Backcompat resolver for persisted calibration rows: old rows may still be

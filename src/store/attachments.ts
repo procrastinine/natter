@@ -7,9 +7,9 @@ import {
   sha256Hex as sha256BytesHex,
 } from '../core/attachments/process'
 import type {
+  ProcessAttachmentResult,
   AttachmentArtifact as ProcessedArtifact,
   AttachmentProcessingState as ProcessedState,
-  ProcessAttachmentResult,
 } from '../core/attachments/types'
 import type {
   Attachment,

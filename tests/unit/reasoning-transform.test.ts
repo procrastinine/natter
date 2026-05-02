@@ -14,7 +14,9 @@ import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import { toChatCompletions } from '../../src/core/transforms'
 import type { ChatSettings, ReasoningMode } from '../../src/core/types'
 
-function makeSettings(overrides: Partial<ChatSettings['reasoning']> & { mode: ReasoningMode }): ChatSettings {
+function makeSettings(
+  overrides: Partial<ChatSettings['reasoning']> & { mode: ReasoningMode },
+): ChatSettings {
   const s = cloneDefaultChatSettings()
   s.reasoning = {
     mode: overrides.mode,

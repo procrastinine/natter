@@ -6,10 +6,7 @@ describe('MessageContent', () => {
   it('renders generated output images even when the text lane is empty', () => {
     const url = 'data:image/png;base64,abc123'
     const { container } = render(
-      <MessageContent
-        content={[{ type: 'output_image', url, prompt: 'red square' }]}
-        text=""
-      />,
+      <MessageContent content={[{ type: 'output_image', url, prompt: 'red square' }]} text="" />,
     )
     const image = container.querySelector('[data-ui="message-output-image"] img')
     expect(image?.getAttribute('src')).toBe(url)

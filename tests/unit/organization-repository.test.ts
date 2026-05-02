@@ -8,6 +8,7 @@ import {
   __resetBrowserRepositoryForTests,
   getBrowserRepository,
 } from '../../src/store/browser-repo'
+import { setChatTagsFromNames } from '../../src/store/chats'
 import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
 import {
   __resetFolderStoreForTests,
@@ -16,7 +17,6 @@ import {
   listFolders,
   updateFolder,
 } from '../../src/store/folders'
-import { setChatTagsFromNames } from '../../src/store/chats'
 import {
   __resetTagStoreForTests,
   createTag,

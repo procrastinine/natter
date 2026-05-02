@@ -2,11 +2,7 @@ import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
-import {
-  createChat,
-  listChatSidebarRows,
-  projectChatSidebarRow,
-} from '../../src/store/chats'
+import { createChat, listChatSidebarRows, projectChatSidebarRow } from '../../src/store/chats'
 import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
 
 const DB_NAME = 'natter'

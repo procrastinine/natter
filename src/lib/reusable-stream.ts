@@ -35,14 +35,18 @@ export class ReusableStream<T> {
     const me = { offset: 0, wake: () => {} }
     this.consumers.push(me)
     try {
-      while (true) {
+      for (;;) {
         while (me.offset < this.buffer.length) {
           const next = this.buffer[me.offset]
           me.offset += 1
           yield next as T
         }
         if (this.finished) {
-          if (this.error !== undefined) throw this.error
+          if (this.error !== undefined) {
+            throw this.error instanceof Error
+              ? this.error
+              : new Error(unknownStreamErrorMessage(this.error))
+          }
           return
         }
         await new Promise<void>((resolve) => {
@@ -53,5 +57,15 @@ export class ReusableStream<T> {
       const idx = this.consumers.indexOf(me)
       if (idx !== -1) this.consumers.splice(idx, 1)
     }
+  }
+}
+
+function unknownStreamErrorMessage(value: unknown): string {
+  if (typeof value === 'string') return value
+  try {
+    const serialized = JSON.stringify(value)
+    return typeof serialized === 'string' ? serialized : '[non-error stream failure]'
+  } catch {
+    return '[non-error stream failure]'
   }
 }

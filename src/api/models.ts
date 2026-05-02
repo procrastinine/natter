@@ -67,7 +67,7 @@ async function fetchJson(
   const init: RequestInit = { method: 'GET', headers }
   const response = await fetchWithTimeout(url, init, opts)
   if (!response.ok) {
-    const body = await response.json().catch(() => ({
+    const body: unknown = await response.json().catch(() => ({
       error: { code: response.status, message: response.statusText },
     }))
     throw normalizeError(body, {
@@ -75,7 +75,7 @@ async function fetchJson(
       httpStatus: response.status,
     })
   }
-  return response.json()
+  return response.json() as Promise<unknown>
 }
 
 export async function fetchModels(

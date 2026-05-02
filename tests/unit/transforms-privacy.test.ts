@@ -91,9 +91,7 @@ describe('toChatCompletions — privacy wire fragment', () => {
       stream: false,
       allowProviderRouting: true,
     })
-    expect(
-      (wire.provider as Record<string, unknown> | undefined)?.allow_fallbacks,
-    ).toBe(false)
+    expect((wire.provider as Record<string, unknown> | undefined)?.allow_fallbacks).toBe(false)
   })
 
   it('allowFallbacks:true does not emit the field (matches OpenRouter default)', () => {

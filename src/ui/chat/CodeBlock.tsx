@@ -53,7 +53,7 @@ export function CodeBlock({ code, language, fileName }: CodeBlockProps) {
             >
               Highlight anyway
             </button>
-            <button type="button" data-ui="code-toolbar-copy" onClick={onCopy}>
+            <button type="button" data-ui="code-toolbar-copy" onClick={() => void onCopy()}>
               Copy
             </button>
             <button type="button" data-ui="code-toolbar-download" onClick={onDownload}>
@@ -75,7 +75,7 @@ export function CodeBlock({ code, language, fileName }: CodeBlockProps) {
       <div data-ui="code-toolbar">
         <span data-ui="code-toolbar-language">{language ?? 'text'}</span>
         <div data-ui="code-toolbar-actions">
-          <button type="button" data-ui="code-toolbar-copy" onClick={onCopy}>
+          <button type="button" data-ui="code-toolbar-copy" onClick={() => void onCopy()}>
             Copy
           </button>
           <button type="button" data-ui="code-toolbar-download" onClick={onDownload}>
@@ -92,6 +92,8 @@ export function CodeBlock({ code, language, fileName }: CodeBlockProps) {
 
 function extensionFor(language: string | undefined): string {
   switch (language) {
+    case undefined:
+      return 'txt'
     case 'ts':
     case 'typescript':
       return 'ts'

@@ -635,7 +635,10 @@ describe('resolveRequestPrivacyPlan', () => {
         },
       },
     ]
-    const path = [makeMessage('Use the tool evidence.'), makeAssistantWithProviderOutput(providerOutputItems)]
+    const path = [
+      makeMessage('Use the tool evidence.'),
+      makeAssistantWithProviderOutput(providerOutputItems),
+    ]
 
     const openRouterProfile = makeProfile()
     await putCachedEndpoints(openRouterProfile.id, 'anthropic/claude-haiku-4.5', {

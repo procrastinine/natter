@@ -24,7 +24,7 @@ describe('CodeBlock', () => {
     render(<CodeBlock code={huge} language="txt" />)
     expect(screen.getByRole('button', { name: /highlight anyway/i })).toBeTruthy()
     const body = document.querySelector('[data-ui="code-block-body"]')
-    expect(body?.textContent?.split('\n').length).toBeLessThanOrEqual(22)
+    expect(body?.textContent.split('\n').length).toBeLessThanOrEqual(22)
   })
 
   it('after "Highlight anyway", renders the full text without the truncated prefix marker', () => {

@@ -135,21 +135,20 @@ describe('toAnthropicMessages', () => {
     const { wire } = toAnthropicMessages(settings(), [prior, user('u2', 'continue')], {
       reasoningPreservationFormat: 'anthropic-claude-v1',
     })
-    expect(wire.messages[0]).toMatchObject({
-      role: 'assistant',
-      content: [
-        {
-          type: 'server_tool_use',
-          id: 'srvtoolu_1',
-          name: 'web_search',
-          input: { query: 'docs' },
-        },
-        expect.objectContaining({
-          type: 'text',
-          text: expect.stringContaining('<tool_call>'),
-        }),
-      ],
+    const firstMessage = wire.messages[0]
+    expect(firstMessage?.role).toBe('assistant')
+    const content = firstMessage?.content
+    if (!Array.isArray(content)) throw new Error('expected assistant content blocks')
+    expect(content[0]).toEqual({
+      type: 'server_tool_use',
+      id: 'srvtoolu_1',
+      name: 'web_search',
+      input: { query: 'docs' },
     })
+    const textBlock = content.find((block) => block.type === 'text')
+    expect(textBlock?.type).toBe('text')
+    expect(typeof textBlock?.text).toBe('string')
+    expect(textBlock?.text).toContain('<tool_call>')
     expect(JSON.stringify(wire)).toContain('Dialect: google-gemini')
   })
 

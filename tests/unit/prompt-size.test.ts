@@ -164,7 +164,9 @@ describe('estimatePromptSize — fallback branch', () => {
       },
     ])
     expect(withAppend.historyTokens).toBeGreaterThan(without.historyTokens)
-    expect(withAppend.total).toBe(without.total + (withAppend.historyTokens - without.historyTokens))
+    expect(withAppend.total).toBe(
+      without.total + (withAppend.historyTokens - without.historyTokens),
+    )
   })
 
   it('applies appendPrompt before cutoff so appended tokens can evict an overflowing pair', () => {

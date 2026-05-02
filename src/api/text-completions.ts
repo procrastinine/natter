@@ -12,7 +12,7 @@
 // reducers can keep their one shape.
 
 import type { ConnectionProfile } from '../core/types'
-import { logStreamDebug, startStreamDebug, type StreamDebugTrace } from '../lib/debug-streams'
+import { logStreamDebug, type StreamDebugTrace, startStreamDebug } from '../lib/debug-streams'
 import { buildHeaders, fetchWithTimeout } from './client'
 import { normalizeError } from './errors'
 import { parseSSE } from './sse'
@@ -67,7 +67,7 @@ async function dispatch(
   if (opts.timeoutMs !== undefined) fetchOpts.timeoutMs = opts.timeoutMs
   const response = await fetchWithTimeout(url, init, fetchOpts)
   if (!response.ok) {
-    const body = await response.json().catch(() => ({
+    const body: unknown = await response.json().catch(() => ({
       error: { code: response.status, message: response.statusText },
     }))
     throw normalizeError(body, { midStream: false, httpStatus: response.status })

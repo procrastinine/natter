@@ -4,8 +4,8 @@ import {
   canonicalCompatModelId,
   canonicalModelSlug,
   compatModelIdsMatch,
-  deterministicStructuralModelIdentity,
   deterministicStructuralModelId,
+  deterministicStructuralModelIdentity,
   tokenCalibrationKey,
 } from '../../src/core/model-ids'
 
@@ -18,9 +18,7 @@ describe('model identity normalization', () => {
       'google:gemini-3.1-flash-lite-preview',
     )
     expect(
-      deterministicStructuralModelId(
-        'publishers/google/models/gemini-3.1-flash-lite-preview',
-      ),
+      deterministicStructuralModelId('publishers/google/models/gemini-3.1-flash-lite-preview'),
     ).toBe('google:gemini-3.1-flash-lite-preview')
     expect(deterministicStructuralModelId('gpt-5.5')).toBe('openai:gpt-5.5')
     expect(canonicalModelSlug('openai/gpt-5.5-pro')).toBe('gpt-5.5-pro')
@@ -77,9 +75,7 @@ describe('model identity normalization', () => {
     expect(deterministicStructuralModelId('moonshotai/kimi-k2')).toBe('moonshotai:kimi-k2')
     expect(deterministicStructuralModelId('moonshotai/kimi-k2:free')).toBe('moonshotai:kimi-k2')
     expect(deterministicStructuralModelId('minimax/minimax-m1')).toBe('minimax:minimax-m1')
-    expect(deterministicStructuralModelId('mistralai/mistral-nemo')).toBe(
-      'mistralai:mistral-nemo',
-    )
+    expect(deterministicStructuralModelId('mistralai/mistral-nemo')).toBe('mistralai:mistral-nemo')
     expect(deterministicStructuralModelId('mistralai/mistral-small-3.2-24b-instruct')).toBe(
       'mistralai:mistral-small-3.2-24b-instruct',
     )
@@ -100,9 +96,7 @@ describe('model identity normalization', () => {
   })
 
   it('keeps llama fine-tunes in the llama tokenizer family', () => {
-    expect(deterministicStructuralModelId('llama-euryale-70b')).toBe(
-      'meta-llama:llama-euryale-70b',
-    )
+    expect(deterministicStructuralModelId('llama-euryale-70b')).toBe('meta-llama:llama-euryale-70b')
     expect(bestGuessTokenizerFamilyKey('llama-euryale-70b')).toBe('oss:llama3')
   })
 

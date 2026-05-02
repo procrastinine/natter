@@ -18,13 +18,13 @@ import type {
   MessageAttachmentRef,
 } from '../../src/core/types'
 import { editInPlace } from '../../src/hooks/useMessageOps'
+import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import {
   createChat,
   listChatSidebarRows,
   loadActiveBranchSnapshot,
   loadActiveBranchWindowSnapshot,
 } from '../../src/store/chats'
-import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
 import { hydrateMessages, splitMessageForStorage } from '../../src/store/message-storage'
 import {

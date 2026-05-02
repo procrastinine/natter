@@ -714,7 +714,7 @@ export async function clearTokenCalibrationFamilyEverywhere(
   if (affected.length > 0) {
     await repo.runMutation(
       affected.map(({ chat }) => ({ kind: 'chat-meta' as const, chatId: chat.id })),
-      async (ctx) => {
+      (ctx) => {
         for (const { chat, next } of affected) {
           ctx.patchChatMeta(
             chat.id,
@@ -741,7 +741,7 @@ export async function clearAllTokenCalibrationEverywhere(
   if (affected.length > 0) {
     await repo.runMutation(
       affected.map((chat) => ({ kind: 'chat-meta' as const, chatId: chat.id })),
-      async (ctx) => {
+      (ctx) => {
         for (const chat of affected) {
           ctx.patchChatMeta(
             chat.id,

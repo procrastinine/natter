@@ -90,7 +90,7 @@ test('orphan in-flight message is marked tab-close on next mount', async ({ page
             req.onerror = () => reject(req.error)
           },
         )
-        return row?.generation?.abortReason === 'tab-close'
+        return row.generation?.abortReason === 'tab-close'
       } finally {
         db.close()
       }

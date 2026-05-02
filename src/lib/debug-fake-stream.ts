@@ -1,9 +1,9 @@
-import { navigateToChat } from '../app/router'
 import type { GeminiStreamChunk } from '../api/gemini-types'
 import type { ChatStreamChunk, ResponsesStreamChunk } from '../api/types'
+import { navigateToChat } from '../app/router'
 import { cloneDefaultChatSettings } from '../core/defaults'
 import type { ChatId, ConnectionProfile } from '../core/types'
-import { sendText, type SendTextResult } from '../hooks/useChat'
+import { type SendTextResult, sendText } from '../hooks/useChat'
 import { createChat } from '../store/chats'
 import { putCachedEndpoints } from '../store/models-cache'
 import { createProfile, getProfile } from '../store/profiles'
@@ -229,6 +229,7 @@ async function* replayProviderFixtureChunks(
   signal: AbortSignal,
 ): AsyncGenerator<ChatStreamChunk | ResponsesStreamChunk | GeminiStreamChunk> {
   for (const chunk of chunks) {
+    await Promise.resolve()
     throwIfAborted(signal)
     yield structuredClone(chunk) as ChatStreamChunk | ResponsesStreamChunk | GeminiStreamChunk
   }

@@ -8,14 +8,16 @@
 
 import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type * as ModelsModule from '../../src/api/models'
 import { fetchEndpoints } from '../../src/api/models'
+import type * as PrivacyScrapeModule from '../../src/api/privacy-scrape'
 import { fetchPrivacyScrape } from '../../src/api/privacy-scrape'
-import { DEV_CORS_PROXY_URL, type CorsProxyConfig } from '../../src/core/cors-proxy'
+import { type CorsProxyConfig, DEV_CORS_PROXY_URL } from '../../src/core/cors-proxy'
+import { cloneDefaultChatSettings, cloneDefaultPrivacyPrefs } from '../../src/core/defaults'
 import {
   PrivacyDiscoveryUnavailableError,
   resolvePrivacyForSend,
 } from '../../src/core/privacy-request'
-import { cloneDefaultChatSettings, cloneDefaultPrivacyPrefs } from '../../src/core/defaults'
 import type { Chat, ConnectionProfile } from '../../src/core/types'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import { __resetDbForTests, openDb } from '../../src/store/db'
@@ -26,14 +28,12 @@ import {
 } from '../../src/store/privacy-cache'
 
 vi.mock('../../src/api/models', async () => {
-  const actual = await vi.importActual<typeof import('../../src/api/models')>('../../src/api/models')
+  const actual = await vi.importActual<typeof ModelsModule>('../../src/api/models')
   return { ...actual, fetchEndpoints: vi.fn() }
 })
 
 vi.mock('../../src/api/privacy-scrape', async () => {
-  const actual = await vi.importActual<typeof import('../../src/api/privacy-scrape')>(
-    '../../src/api/privacy-scrape',
-  )
+  const actual = await vi.importActual<typeof PrivacyScrapeModule>('../../src/api/privacy-scrape')
   return { ...actual, fetchPrivacyScrape: vi.fn() }
 })
 
@@ -240,9 +240,9 @@ describe('resolvePrivacyForSend', () => {
     const chat = makeChat()
     const profile = makeProfile()
 
-    await expect(resolvePrivacyForSend({ chat, profile, proxy: TEST_PROXY })).rejects.toBeInstanceOf(
-      PrivacyDiscoveryUnavailableError,
-    )
+    await expect(
+      resolvePrivacyForSend({ chat, profile, proxy: TEST_PROXY }),
+    ).rejects.toBeInstanceOf(PrivacyDiscoveryUnavailableError)
   })
 
   it('runs the filter and builds a wire block when both caches are warm', async () => {

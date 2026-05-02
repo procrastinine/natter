@@ -11,7 +11,7 @@ import type {
 
 export const DRAFT_ATTACHMENT_CONTEXT_ID = '__draft__'
 
-type AttachmentContextOwnerId = MessageId | typeof DRAFT_ATTACHMENT_CONTEXT_ID
+type AttachmentContextOwnerId = MessageId
 
 interface AttachmentContextPolicy {
   mediaContextStrategy?: MediaContextStrategy

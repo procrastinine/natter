@@ -3,13 +3,7 @@ import tseslint from 'typescript-eslint'
 
 export default tseslint.config(
   {
-    ignores: [
-      'dist/**',
-      'node_modules/**',
-      'test-results/**',
-      '.playwright-cli/**',
-      'coverage/**',
-    ],
+    ignores: ['dist/**', 'node_modules/**', 'test-results/**', '.playwright-cli/**', 'coverage/**'],
   },
   js.configs.recommended,
   ...tseslint.configs.recommendedTypeChecked,
@@ -53,6 +47,7 @@ export default tseslint.config(
   {
     files: ['tests/**/*.{ts,tsx}'],
     rules: {
+      '@typescript-eslint/prefer-promise-reject-errors': 'off',
       '@typescript-eslint/require-await': 'off',
       '@typescript-eslint/unbound-method': 'off',
     },

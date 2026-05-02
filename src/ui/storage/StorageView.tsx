@@ -448,7 +448,7 @@ function StorageOverview() {
                 <button
                   type="button"
                   data-ui="storage-action"
-                  onClick={handleRequestPersistence}
+                  onClick={() => void handleRequestPersistence()}
                   disabled={persistenceBusy || persistence === 'persistent'}
                   title="Request persistent browser storage"
                 >

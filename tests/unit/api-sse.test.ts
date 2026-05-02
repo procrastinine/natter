@@ -120,11 +120,9 @@ describe('parseSSE', () => {
     const reader = {
       read: () =>
         new Promise<ReadableStreamReadResult<Uint8Array>>((_, reject) => {
-          controller.signal.addEventListener(
-            'abort',
-            () => reject(new TypeError('terminated')),
-            { once: true },
-          )
+          controller.signal.addEventListener('abort', () => reject(new TypeError('terminated')), {
+            once: true,
+          })
         }),
       cancel: async () => {
         cancelCalled = true

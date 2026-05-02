@@ -117,7 +117,13 @@ export async function probeLlamaServer(
     const response = await fetchWithTimeout(url, init, fetchOpts)
     const elapsed = Math.round(performance.now() - started)
     if (!response.ok) {
-      return { kind: 'error', status: response.status, message: response.statusText, rootUrl: root, elapsedMs: elapsed }
+      return {
+        kind: 'error',
+        status: response.status,
+        message: response.statusText,
+        rootUrl: root,
+        elapsedMs: elapsed,
+      }
     }
     const body = (await response.json().catch(() => null)) as unknown
     const props = parseLlamaServerProps(body)
@@ -125,7 +131,8 @@ export async function probeLlamaServer(
       return {
         kind: 'error',
         status: response.status,
-        message: 'Server responded but does not look like llama-server (no chat_template or default_generation_settings).',
+        message:
+          'Server responded but does not look like llama-server (no chat_template or default_generation_settings).',
         rootUrl: root,
         elapsedMs: elapsed,
       }

@@ -205,9 +205,7 @@ function shouldReplayProviderOutputNative(
   if (target === 'openrouter-responses') return false
   if (item.edited !== true) return true
   return (
-    target === 'openai-responses' ||
-    target === 'google-gemini' ||
-    target === 'anthropic-claude'
+    target === 'openai-responses' || target === 'google-gemini' || target === 'anthropic-claude'
   )
 }
 

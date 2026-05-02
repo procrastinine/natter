@@ -105,8 +105,8 @@ describe('ConnectionHeader', () => {
   it('shows Edit, Test, and Delete in viewer mode and tests non-llama connections', async () => {
     const profile = await seedProfile()
     writeActiveProfileId(profile.id)
-    vi.spyOn(globalThis, 'fetch').mockImplementation((input) => {
-      const url = String(input)
+    vi.spyOn(globalThis, 'fetch').mockImplementation((input: string | URL | Request) => {
+      const url = input instanceof Request ? input.url : String(input)
       if (url.endsWith('/models')) {
         return Promise.resolve(jsonResponse({ data: [{ id: 'openai/gpt-4o-mini' }] }))
       }
@@ -146,8 +146,8 @@ describe('ConnectionHeader', () => {
       key: 'sk-ant-test',
     })
     writeActiveProfileId(profile.id)
-    vi.spyOn(globalThis, 'fetch').mockImplementation((input) => {
-      const url = String(input)
+    vi.spyOn(globalThis, 'fetch').mockImplementation((input: string | URL | Request) => {
+      const url = input instanceof Request ? input.url : String(input)
       if (url.endsWith('/models')) {
         return Promise.resolve(
           new Response(JSON.stringify({ error: { message: 'Invalid bearer token' } }), {
@@ -176,8 +176,8 @@ describe('ConnectionHeader', () => {
     const a = await seedProfile({ name: 'OpenRouter A' })
     const b = await seedProfile({ name: 'OpenRouter B' })
     writeActiveProfileId(a.id)
-    vi.spyOn(globalThis, 'fetch').mockImplementation((input) => {
-      const url = String(input)
+    vi.spyOn(globalThis, 'fetch').mockImplementation((input: string | URL | Request) => {
+      const url = input instanceof Request ? input.url : String(input)
       if (url.endsWith('/models')) {
         return Promise.resolve(jsonResponse({ data: [{ id: 'openai/gpt-4o-mini' }] }))
       }

@@ -646,7 +646,11 @@ test('GUI alternating direct providers keep native tool context provider-specifi
 
   await switchConnectionThroughGui(page, 'Google')
   await selectModelThroughSettings(page, GOOGLE_MODEL)
-  await sendAndExpectAssistant(page, 'Gemini sees native Gemini and OpenAI text', 'gemini final answer')
+  await sendAndExpectAssistant(
+    page,
+    'Gemini sees native Gemini and OpenAI text',
+    'gemini final answer',
+  )
 
   expect(openAiRequests).toHaveLength(2)
   expect(geminiRequests).toHaveLength(2)
@@ -696,7 +700,9 @@ test('GUI alternating direct providers keep native tool context provider-specifi
     providerDialects(assistantRows[3] as { providerOutputItems?: Array<{ dialect?: string }> }),
   ).toEqual([])
 
-  const toolBlocks = page.locator('[data-ui="message"][data-role="assistant"] [data-ui="tool-evidence"]')
+  const toolBlocks = page.locator(
+    '[data-ui="message"][data-role="assistant"] [data-ui="tool-evidence"]',
+  )
   await expect(toolBlocks).toHaveCount(3)
   await toolBlocks.first().locator('[data-ui="tool-evidence-summary"]').click()
   await expect(toolBlocks.first()).toContainText('Web search')
@@ -833,11 +839,7 @@ async function openConnectionDetail(page: Page): Promise<void> {
   await expect(detailAction).toBeVisible()
 }
 
-async function sendAndExpectAssistant(
-  page: Page,
-  prompt: string,
-  expected: string,
-): Promise<void> {
+async function sendAndExpectAssistant(page: Page, prompt: string, expected: string): Promise<void> {
   const before = await page.locator('[data-ui="message"][data-role="assistant"]').count()
   const composer = page.locator('[data-ui="composer-input"]')
   await composer.fill(prompt)
@@ -864,7 +866,7 @@ async function expectNoHorizontalOverflow(page: Page): Promise<void> {
     return rows
       .map((node) => ({
         ui: node.getAttribute('data-ui'),
-        text: node.textContent?.slice(0, 80) ?? '',
+        text: node.textContent.slice(0, 80),
         scrollWidth: node.scrollWidth,
         clientWidth: node.clientWidth,
       }))
@@ -1003,7 +1005,7 @@ async function mockChatCompletionsCapture(
       body: buildSseBody([
         {
           id: `adv-chat-${idx + 1}`,
-          model: String(body.model ?? ''),
+          model: stringField(body, 'model'),
           provider: 'Alpha ZDR',
           content: replies[idx] ?? 'ok',
         },
@@ -1060,7 +1062,7 @@ async function mockOpenRouterResponses(page: Page, requests: CapturedRequest[]):
         idx === 0
           ? buildResponsesSse({
               id: 'adv-resp-1',
-              model: String(body.model ?? ''),
+              model: stringField(body, 'model'),
               text: 'CJK answer from responses.',
               reasoningFragments: Array.from(
                 { length: 120 },
@@ -1069,7 +1071,7 @@ async function mockOpenRouterResponses(page: Page, requests: CapturedRequest[]):
             })
           : buildResponsesSse({
               id: 'adv-resp-2',
-              model: String(body.model ?? ''),
+              model: stringField(body, 'model'),
               text: ' Continued via responses.',
               reasoningFragments: [],
             }),
@@ -1096,7 +1098,7 @@ async function mockOpenAiDirect(page: Page, requests: CapturedRequest[]): Promis
       headers: { 'x-generation-id': 'adv-openai-tools-1' },
       body: buildResponsesSse({
         id: 'adv-openai-tools-1',
-        model: String(body.model ?? ''),
+        model: stringField(body, 'model'),
         text: 'openai direct tools ok',
         reasoningFragments: [],
       }),
@@ -1129,7 +1131,7 @@ async function mockOpenAiAlternatingToolContext(
         idx === 0
           ? buildResponsesToolSse({
               id: 'adv-openai-alt-1',
-              model: String(body.model ?? ''),
+              model: stringField(body, 'model'),
               text: 'openai searched answer',
               toolItems: [
                 {
@@ -1143,7 +1145,7 @@ async function mockOpenAiAlternatingToolContext(
             })
           : buildResponsesToolSse({
               id: 'adv-openai-alt-2',
-              model: String(body.model ?? ''),
+              model: stringField(body, 'model'),
               text: 'openai shell answer',
               toolItems: [
                 {
@@ -1232,7 +1234,11 @@ async function mockGeminiAlternatingToolContext(
                     finishReason: 'STOP',
                   },
                 ],
-                usageMetadata: { promptTokenCount: 12, candidatesTokenCount: 4, totalTokenCount: 16 },
+                usageMetadata: {
+                  promptTokenCount: 12,
+                  candidatesTokenCount: 4,
+                  totalTokenCount: 16,
+                },
               },
             ])
           : buildGeminiSse([
@@ -1243,7 +1249,11 @@ async function mockGeminiAlternatingToolContext(
                     finishReason: 'STOP',
                   },
                 ],
-                usageMetadata: { promptTokenCount: 12, candidatesTokenCount: 4, totalTokenCount: 16 },
+                usageMetadata: {
+                  promptTokenCount: 12,
+                  candidatesTokenCount: 4,
+                  totalTokenCount: 16,
+                },
               },
             ]),
     })
@@ -1334,7 +1344,7 @@ function buildResponsesSse(input: {
   text: string
   reasoningFragments: string[]
 }): string {
-  const events: Array<Record<string, unknown>> = [
+  const events: Array<Record<string, unknown> & { type: string }> = [
     {
       type: 'response.created',
       response: { id: input.id, model: input.model, status: 'in_progress' },
@@ -1404,7 +1414,7 @@ function buildResponsesToolSse(input: {
   text: string
   toolItems: Array<Record<string, unknown> & { type: string }>
 }): string {
-  const events: Array<Record<string, unknown>> = [
+  const events: Array<Record<string, unknown> & { type: string }> = [
     {
       type: 'response.created',
       response: { id: input.id, model: input.model, status: 'in_progress' },
@@ -1594,6 +1604,11 @@ function policy(overrides: Record<string, unknown>): Record<string, unknown> {
 function parsePostBody(raw: string | null): Record<string, unknown> {
   if (!raw) return {}
   return JSON.parse(raw) as Record<string, unknown>
+}
+
+function stringField(record: Record<string, unknown>, key: string): string {
+  const value = record[key]
+  return typeof value === 'string' ? value : ''
 }
 
 async function requestPlans(page: Page): Promise<PlanEntry[]> {

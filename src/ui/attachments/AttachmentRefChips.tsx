@@ -1,14 +1,14 @@
 import { useLiveQuery } from 'dexie-react-hooks'
 import { useState } from 'react'
+import { attachmentHref, makeAnchorClickHandler } from '../../app/router'
 import type { AttachmentRef, ChatId, MessageId } from '../../core/types'
+import { liveAttachmentRefs } from '../../store/attachment-refs'
 import {
   detachAttachmentRef,
   relinkAttachmentRef,
   setAttachmentRefVisibility,
 } from '../../store/attachments'
-import { liveAttachmentRefs } from '../../store/attachment-refs'
 import { getBrowserRepository } from '../../store/browser-repo'
-import { attachmentHref, makeAnchorClickHandler } from '../../app/router'
 import { DatabaseIcon, EyeIcon, EyeOffIcon, TrashIcon } from '../icons/Icon'
 import { AttachmentPicker } from './AttachmentPicker'
 import { AttachmentPreview } from './AttachmentPreview'

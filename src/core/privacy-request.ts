@@ -29,7 +29,7 @@ import {
   getCachedPrivacyPolicy,
   PRIVACY_POLICY_TTL_MS,
 } from '../store/privacy-cache'
-import { isCorsProxyDisabled, type CorsProxyConfig } from './cors-proxy'
+import { type CorsProxyConfig, isCorsProxyDisabled } from './cors-proxy'
 import { isFreeModel } from './model-predicates'
 import {
   buildWireProviderPrivacy,
@@ -160,7 +160,7 @@ export async function resolvePrivacyForSend(
       // filter exclusions stay intact. The UI still shows the provider as
       // "checked" because the settings row is unchanged; the grey badge
       // plus this transient ignore are what keep the send honest.
-      const base: { ignore?: string[] } = (wire ?? { ignore: [] })
+      const base: { ignore?: string[] } = wire ?? { ignore: [] }
       const next = new Set<string>(base.ignore ?? [])
       for (const name of insufficient) next.add(name)
       const merged: WireProviderPrivacy = { ...(wire ?? {}), ignore: [...next] }

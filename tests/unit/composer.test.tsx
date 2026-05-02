@@ -92,7 +92,9 @@ describe('Composer', () => {
     fireEvent.submit(container.querySelector('[data-ui="composer"]') as HTMLFormElement)
 
     await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
-    const options = onSubmit.mock.calls[0]?.[1]
+    const options = onSubmit.mock.calls[0]?.[1] as
+      | { attachmentRefs?: Array<{ includeInContext: boolean }> }
+      | undefined
     expect(options?.attachmentRefs).toHaveLength(1)
     expect(options?.attachmentRefs?.[0]).toMatchObject({ includeInContext: true })
   })
@@ -123,8 +125,11 @@ describe('Composer', () => {
     })
 
     await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1))
-    expect(onSave.mock.calls[0]?.[2]).toHaveLength(1)
-    expect(onSave.mock.calls[0]?.[2]?.[0]).toMatchObject({ includeInContext: true })
+    const attachmentRefs = onSave.mock.calls[0]?.[2] as
+      | Array<{ includeInContext: boolean }>
+      | undefined
+    expect(attachmentRefs).toHaveLength(1)
+    expect(attachmentRefs?.[0]).toMatchObject({ includeInContext: true })
   })
 
   it('preserves provider sealed fields when editing tool-call JSON', async () => {

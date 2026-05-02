@@ -104,18 +104,21 @@ async function mockModelLists(page: Page): Promise<void> {
       body: JSON.stringify({ data: [] }),
     })
   })
-  await page.route('https://generativelanguage.googleapis.com/v1beta/openai/models**', async (route) => {
-    await route.fulfill({
-      status: 200,
-      contentType: 'application/json',
-      body: JSON.stringify({
-        data: [
-          { id: 'models/gemini-3.1-pro-preview', object: 'model', created: 0 },
-          { id: 'models/gemini-3.1-flash-lite-preview', object: 'model', created: 0 },
-        ],
-      }),
-    })
-  })
+  await page.route(
+    'https://generativelanguage.googleapis.com/v1beta/openai/models**',
+    async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          data: [
+            { id: 'models/gemini-3.1-pro-preview', object: 'model', created: 0 },
+            { id: 'models/gemini-3.1-flash-lite-preview', object: 'model', created: 0 },
+          ],
+        }),
+      })
+    },
+  )
   await page.route('https://api.openai.com/v1/models**', async (route) => {
     await route.fulfill({
       status: 200,
@@ -165,14 +168,15 @@ async function startUnavailableWarningRecorder(page: Page): Promise<void> {
       __providerCrosswalkObserver?: MutationObserver
     }
     const w = window as RecorderWindow
-    w.__providerCrosswalkWarnings = []
+    const warnings: string[] = []
+    w.__providerCrosswalkWarnings = warnings
     w.__providerCrosswalkObserver?.disconnect()
     const record = () => {
       for (const el of document.querySelectorAll(
         '[data-ui="notice-banner"][data-tone="warning"]',
       )) {
-        const text = el.textContent?.trim() ?? ''
-        if (text.includes("isn't served")) w.__providerCrosswalkWarnings?.push(text)
+        const text = el.textContent.trim()
+        if (text.includes("isn't served")) warnings.push(text)
       }
     }
     const observer = new MutationObserver(record)
@@ -251,7 +255,10 @@ async function readLatestChatSettings(page: Page): Promise<{ model: string; prof
         const tx = db.transaction('chats', 'readonly')
         const req = tx.objectStore('chats').get(id)
         req.onsuccess = () => {
-          const settings = (req.result?.settings ?? {}) as { model?: string; profileId?: string }
+          const row = req.result as
+            | { settings?: { model?: string; profileId?: string } }
+            | undefined
+          const settings = row?.settings ?? {}
           resolve({ model: settings.model ?? '', profileId: settings.profileId ?? '' })
         }
         req.onerror = () => reject(req.error)

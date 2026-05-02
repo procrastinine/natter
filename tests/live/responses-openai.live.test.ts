@@ -5,12 +5,9 @@
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { beforeAll, describe, expect, it } from 'vitest'
-import { responses, responsesOnce, type ResponsesContext } from '../../src/api/responses'
-import { splitResponsesStream, type StreamLaneEvent } from '../../src/api/stream-transforms'
-import type {
-  ResponsesEventWire,
-  ResponsesInputItem,
-} from '../../src/api/types'
+import { type ResponsesContext, responses, responsesOnce } from '../../src/api/responses'
+import { type StreamLaneEvent, splitResponsesStream } from '../../src/api/stream-transforms'
+import type { ResponsesEventWire, ResponsesInputItem } from '../../src/api/types'
 import type { ConnectionProfile } from '../../src/core/types'
 
 const LIVE = process.env.LIVE === '1'
@@ -82,7 +79,7 @@ describe.skipIf(!LIVE)('live — OpenAI direct Responses (gpt-5.4-nano)', () => 
     expect(typeof reasoning?.encrypted_content).toBe('string')
     expect(reasoning?.summary).toBeDefined()
     expect(Array.isArray(reasoning?.summary)).toBe(true)
-    expect((reasoning?.summary as unknown[])?.length).toBeGreaterThan(0)
+    expect((reasoning?.summary as unknown[]).length).toBeGreaterThan(0)
     expect(message?.phase).toBe('final_answer')
   }, 90_000)
 
@@ -136,9 +133,7 @@ describe.skipIf(!LIVE)('live — OpenAI direct Responses (gpt-5.4-nano)', () => 
     await expect(
       responsesOnce(ctx, {
         model: 'gpt-5.4-nano',
-        input: [
-          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hi' }] },
-        ],
+        input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hi' }] }],
         max_output_tokens: 30,
         reasoning: { effort: 'minimal' },
         store: false,
@@ -322,9 +317,7 @@ describe.skipIf(!LIVE)('live — OpenAI direct Responses (gpt-5.4-nano)', () => 
     await expect(
       responsesOnce(ctx, {
         model: 'gpt-5.4-nano',
-        input: [
-          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hi' }] },
-        ],
+        input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hi' }] }],
         max_output_tokens: 30,
         reasoning: { effort: 'medium' },
         temperature: 0.7,

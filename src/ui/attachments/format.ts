@@ -30,14 +30,9 @@ export function storageLabel(attachment: Attachment): string {
 }
 
 export function kindLabel(kind: AttachmentKind): string {
-  switch (kind) {
-    case 'plaintext':
-      return 'text'
-    case 'presentation':
-      return 'slides'
-    default:
-      return kind
-  }
+  if (kind === 'plaintext') return 'text'
+  if (kind === 'presentation') return 'slides'
+  return kind
 }
 
 export function shortId(id: string): string {

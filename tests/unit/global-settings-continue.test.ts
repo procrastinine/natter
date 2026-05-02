@@ -30,10 +30,7 @@ describe('resolveContinueSystemPromptTemplate', () => {
 
   it('expands placeholder occurrences verbatim, including inside code blocks', () => {
     expect(
-      resolveContinueSystemPromptTemplate(
-        'Header\n```\n[SYSTEM_PROMPT]\n```',
-        'original system',
-      ),
+      resolveContinueSystemPromptTemplate('Header\n```\n[SYSTEM_PROMPT]\n```', 'original system'),
     ).toBe('Header\n```\noriginal system\n```')
   })
 })

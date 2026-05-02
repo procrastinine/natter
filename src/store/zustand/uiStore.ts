@@ -120,9 +120,7 @@ export const useUiStore = create<UiStoreState>((set) => ({
   dismissBanner: (entry) =>
     set((state) => {
       if (
-        state.dismissedBanners.some(
-          (d) => d.kind === entry.kind && d.profileId === entry.profileId,
-        )
+        state.dismissedBanners.some((d) => d.kind === entry.kind && d.profileId === entry.profileId)
       ) {
         return state
       }

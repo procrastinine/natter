@@ -89,7 +89,7 @@ export function useModels(
     let cancelled = false
     setInFlight(true)
     setError(null)
-    ;(async () => {
+    void (async () => {
       try {
         // dedupedModelsFetch shares the Promise across sibling mounts so
         // two components refreshing the same key at once hit the network
@@ -97,14 +97,20 @@ export function useModels(
         // the owning component unmounted.
         await dedupedModelsFetch(profile.id, query, () => loadModelsPayload(profile, query))
       } catch (err) {
-        if (cancelled) return
+        if (cancelled) {
+          return
+        }
         if (profile.kind === 'llama-server') {
           await clearCachedModels(profile.id, query)
-          if (cancelled) return
+          if (cancelled) {
+            return
+          }
         }
         setError(err instanceof Error ? err.message : 'refresh failed')
       } finally {
-        if (!cancelled) setInFlight(false)
+        if (!cancelled) {
+          setInFlight(false)
+        }
       }
     })()
     return () => {

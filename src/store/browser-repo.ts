@@ -30,17 +30,17 @@ import { withMutationLocks } from './locks'
 import {
   hydrateMessage,
   hydrateMessages,
-  splitMessageForStorage,
   type MessageBodyRow,
   type MessageHeaderRow,
+  splitMessageForStorage,
 } from './message-storage'
 import type {
+  ActiveBranchBodyWindow,
+  ActiveBranchSnapshot,
+  ActiveBranchWindowSnapshot,
   AttachmentBundle,
   AttachmentSearchPage,
   AttachmentSearchQuery,
-  ActiveBranchSnapshot,
-  ActiveBranchBodyWindow,
-  ActiveBranchWindowSnapshot,
   ChatMutationSummary,
   CreateFolderInput,
   CreateTagInput,
@@ -583,7 +583,8 @@ function resolveMutationTables(
         return db.settings as Table<unknown, unknown>
     }
     const exhaustive: never = name
-    throw new Error(`UnknownMutationTable:${exhaustive}`)
+    void exhaustive
+    throw new Error('UnknownMutationTable')
   })
 }
 

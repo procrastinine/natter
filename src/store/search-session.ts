@@ -1,11 +1,11 @@
 import {
-  searchChats,
   type ChatSearchUpdate,
   type SearchFilters,
   type SearchScope,
+  searchChats,
 } from './chat-search'
 import type { WorkspaceRepository } from './repository'
-import { useSearchStore, type SearchSession } from './zustand/searchStore'
+import { type SearchSession, useSearchStore } from './zustand/searchStore'
 
 interface SearchSessionRequest {
   query: string
@@ -69,7 +69,7 @@ async function runSearchSession(
 
   try {
     await runSearchPass(session, input, controller.signal)
-    while (true) {
+    for (;;) {
       const current = useSearchStore.getState().session
       if (!current || current.queryId !== session.queryId) return
       const tailPassChatIds = current.tailPassChatIds
@@ -81,10 +81,12 @@ async function runSearchSession(
       useSearchStore.getState().setStatus('done')
     }
   } catch (error) {
-    if ((error as { name?: string })?.name === 'AbortError') {
+    if ((error as { name?: string }).name === 'AbortError') {
       if (activeQueryId === session.queryId) useSearchStore.getState().abort()
     } else if (activeQueryId === session.queryId) {
-      useSearchStore.getState().setStatus('error', error instanceof Error ? error.message : String(error))
+      useSearchStore
+        .getState()
+        .setStatus('error', error instanceof Error ? error.message : String(error))
     }
   } finally {
     if (activeQueryId === session.queryId) {

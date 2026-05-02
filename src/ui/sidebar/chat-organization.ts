@@ -1,11 +1,11 @@
-import type { ChatFolder, ChatSidebarRow } from '../../core/types'
 import {
   DEFAULT_SIDEBAR_SORT_MODE,
   isCreatedAtSidebarSort,
+  type SidebarSortMode,
   sidebarSortDirection,
   sidebarSortField,
-  type SidebarSortMode,
 } from '../../core/sidebar-sort'
+import type { ChatFolder, ChatSidebarRow } from '../../core/types'
 
 type SidebarSortValue = number | string
 

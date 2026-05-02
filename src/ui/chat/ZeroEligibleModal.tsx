@@ -59,29 +59,20 @@ export function ZeroEligibleModal({ chatId }: ZeroEligibleModalProps) {
         </header>
         <div data-ui="zero-eligible-body">
           <p>
-            Every provider for <code>{modelLabel}</code> either trains on prompts,
-            retains for an unknown period, or was manually ignored. The request
-            was blocked, the chat won&rsquo;t silently route to a training provider.
+            Every provider for <code>{modelLabel}</code> either trains on prompts, retains for an
+            unknown period, or was manually ignored. The request was blocked, the chat won&rsquo;t
+            silently route to a training provider.
           </p>
           <p data-ui="helper">Pick a fix:</p>
         </div>
         <footer data-ui="zero-eligible-actions">
-          <button
-            type="button"
-            data-ui="field-inline-action"
-            onClick={() => void disablePareto()}
-          >
+          <button type="button" data-ui="field-inline-action" onClick={() => void disablePareto()}>
             Disable Pareto for this chat
           </button>
           <button type="button" data-ui="field-inline-action" onClick={close}>
             Show the picker
           </button>
-          <button
-            ref={okRef}
-            type="button"
-            data-ui="primary-button"
-            onClick={close}
-          >
+          <button ref={okRef} type="button" data-ui="primary-button" onClick={close}>
             OK
           </button>
         </footer>

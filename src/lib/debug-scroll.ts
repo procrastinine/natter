@@ -53,8 +53,12 @@ async function copyText(text: string): Promise<string> {
     ) {
       throw new DOMException('Document is not focused.', 'NotAllowedError')
     }
-    if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
-      await navigator.clipboard.writeText(text)
+    const clipboard =
+      typeof navigator !== 'undefined'
+        ? (navigator as Navigator & { clipboard?: Clipboard }).clipboard
+        : undefined
+    if (clipboard?.writeText) {
+      await clipboard.writeText(text)
     }
   } catch (err) {
     if (typeof window !== 'undefined') {

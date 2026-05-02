@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest'
+import { migrateLegacyProviderSettings } from '../../src/backcompat/provider-settings-migration'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import { filterEndpointsByPrivacy } from '../../src/core/privacy-filter'
 import { DEFAULT_OPENROUTER_PROVIDER_SORT } from '../../src/core/provider-defaults'
-import { migrateLegacyProviderSettings } from '../../src/backcompat/provider-settings-migration'
 import type { ChatSettings, DataPolicy, ModelEndpoint } from '../../src/core/types'
 import { buildPickerRows } from '../../src/ui/settings/provider-picker-rows'
 

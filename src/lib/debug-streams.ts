@@ -45,7 +45,7 @@ interface StreamDebugApi {
   copyPlans(): Promise<string>
   plans(): RequestPlanDebugEntry[]
   lastPlan(): RequestPlanDebugEntry | null
-  lastRequest(): unknown | null
+  lastRequest(): unknown
 }
 
 let seq = 0
@@ -75,9 +75,7 @@ function requestPlanDebugEnabled(): boolean {
   }
 }
 
-export function streamDebugEnabled(
-  profile?: Pick<ConnectionProfile, 'debugRequests'>  ,
-): boolean {
+export function streamDebugEnabled(profile?: Pick<ConnectionProfile, 'debugRequests'>): boolean {
   return profile?.debugRequests === true || globalDebugEnabled()
 }
 
@@ -351,8 +349,12 @@ async function copyDumpText(text: string): Promise<string> {
     ) {
       throw new DOMException('Document is not focused.', 'NotAllowedError')
     }
-    if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
-      await navigator.clipboard.writeText(text)
+    const clipboard =
+      typeof navigator !== 'undefined'
+        ? (navigator as Navigator & { clipboard?: Clipboard }).clipboard
+        : undefined
+    if (clipboard?.writeText) {
+      await clipboard.writeText(text)
     }
   } catch (err) {
     if (typeof window !== 'undefined') {
@@ -469,7 +471,7 @@ export function installDebugStreams(): void {
   )
 }
 
-function requestFromPlanPayload(payload: unknown): unknown | undefined {
+function requestFromPlanPayload(payload: unknown): unknown {
   if (!payload || typeof payload !== 'object') return undefined
   return (payload as { request?: unknown }).request
 }

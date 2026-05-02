@@ -121,12 +121,8 @@ describe('ApiModeSection — two-button toggle', () => {
     const capability = effectiveCapabilityFromEndpoints(settings.model, [
       makeEndpoint({ supported_parameters: ['reasoning'] }),
     ])
-    render(
-      <ApiModeSection chat={chat} capability={capability} profile={makeProfile('google')} />,
-    )
-    expect(screen.getByRole('button', { name: 'Native' }).getAttribute('aria-pressed')).toBe(
-      'true',
-    )
+    render(<ApiModeSection chat={chat} capability={capability} profile={makeProfile('google')} />)
+    expect(screen.getByRole('button', { name: 'Native' }).getAttribute('aria-pressed')).toBe('true')
     fireEvent.click(screen.getByRole('button', { name: 'OpenAI-compat' }))
     await waitFor(async () => {
       const updated = await getChat(chat.id)
@@ -182,10 +178,10 @@ describe('ApiModeSection — two-button toggle', () => {
     const capability = effectiveCapabilityFromEndpoints(settings.model, [makeEndpoint()])
     const originalConfirm = window.confirm
     let prompted = false
-    window.confirm = (() => {
+    window.confirm = () => {
       prompted = true
       return true
-    })
+    }
     try {
       render(
         <ApiModeSection chat={chat} capability={capability} profile={makeProfile('openrouter')} />,

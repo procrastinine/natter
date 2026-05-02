@@ -74,9 +74,7 @@ test('submitting the connection-setup modal seeds a profile + preset and moves e
   expect(counts).toEqual({ keys: 1, profiles: 1, presets: 1 })
 })
 
-test('seeded profile survives a reload and the title icon stays available', async ({
-  page,
-}) => {
+test('seeded profile survives a reload and the title icon stays available', async ({ page }) => {
   await page.locator('[data-ui="connection-add"]').click()
   await page
     .locator('[data-ui="connection-setup-key"]')

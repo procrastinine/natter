@@ -19,10 +19,7 @@ interface PromptsTabProps {
   prefillRecommendationEndpoints?: readonly ModelEndpoint[] | undefined
 }
 
-export function PromptsTab({
-  chat,
-  prefillRecommendationEndpoints = [],
-}: PromptsTabProps) {
+export function PromptsTab({ chat, prefillRecommendationEndpoints = [] }: PromptsTabProps) {
   const prefillSupportedForModel = chat.settings.model
     ? prefillClassFor(chat.settings.model) !== 'unsupported'
     : false

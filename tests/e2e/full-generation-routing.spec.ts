@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test'
+import { expect, type Page, test } from '@playwright/test'
 import { buildSseBody, clearIndexedDb, createChatAndOpen, seedFirstRun } from './helpers'
 
 const OSS_MODEL = 'qwen/qwen3-4b'
@@ -273,7 +273,7 @@ async function mockChatCompletions(
       body: buildSseBody([
         {
           id: `gui-chat-${idx + 1}`,
-          model: String(body.model ?? ''),
+          model: stringField(body, 'model'),
           provider: 'Alpha ZDR',
           content: replies[idx] ?? 'ok',
         },
@@ -401,6 +401,11 @@ function buildResponsesSse(text: string): string {
 function parsePostBody(raw: string | null): Record<string, unknown> {
   if (!raw) return {}
   return JSON.parse(raw) as Record<string, unknown>
+}
+
+function stringField(record: Record<string, unknown>, key: string): string {
+  const value = record[key]
+  return typeof value === 'string' ? value : ''
 }
 
 async function activeProfileId(page: Page): Promise<string> {

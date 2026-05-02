@@ -8,18 +8,18 @@
 
 import { useLiveQuery } from 'dexie-react-hooks'
 import { useEffect, useRef, useState } from 'react'
-import type { Chat, ChatId } from '../../core/types'
+import type { PrivacyTier } from '../../core/privacy-filter'
 import { providerDisplayLabel, providerEndpointKey } from '../../core/provider-identity'
-import { getChat } from '../../store/chats'
+import type { Chat, ChatId } from '../../core/types'
 import { usePrivacyRouting } from '../../hooks/usePrivacyRouting'
+import { getChat } from '../../store/chats'
 import { CloseIcon, LockIcon, LockOpenIcon } from '../icons/Icon'
 import {
-  tierToLockLabel,
-  reasonsToTooltip,
-  type PickerRow,
   buildPickerRows,
+  type PickerRow,
+  reasonsToTooltip,
+  tierToLockLabel,
 } from '../settings/provider-picker-rows'
-import type { PrivacyTier } from '../../core/privacy-filter'
 
 interface HeaderPrivacyBadgeProps {
   chatId: ChatId
@@ -94,9 +94,7 @@ function Inner({ chat }: { chat: Chat }) {
     : []
   const kept = rows.filter((r) => r.state === 'kept')
   const badgeTier: PrivacyTier = kept.length > 0 ? worstTier(kept) : loading ? 'unavailable' : 'red'
-  const label = kept.length === 0 && !loading
-    ? 'No eligible providers'
-    : tierToLockLabel(badgeTier)
+  const label = kept.length === 0 && !loading ? 'No eligible providers' : tierToLockLabel(badgeTier)
 
   return (
     <div data-ui="header-privacy-badge">
@@ -137,11 +135,7 @@ function Inner({ chat }: { chat: Chat }) {
             ) : (
               <ul data-ui="header-privacy-list">
                 {rows.map((r) => (
-                  <PopoverRow
-                    key={providerEndpointKey(r.endpoint)}
-                    row={r}
-                    endpoints={endpoints}
-                  />
+                  <PopoverRow key={providerEndpointKey(r.endpoint)} row={r} endpoints={endpoints} />
                 ))}
               </ul>
             )}

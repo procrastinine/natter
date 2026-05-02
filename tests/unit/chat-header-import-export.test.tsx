@@ -73,11 +73,7 @@ describe('ChatHeader import/export controls', () => {
     const downloads = mockBlobDownloads()
     try {
       render(
-        <ChatHeader
-          chatId={chat.id}
-          settingsOpen={false}
-          onToggleSettings={() => undefined}
-        />,
+        <ChatHeader chatId={chat.id} settingsOpen={false} onToggleSettings={() => undefined} />,
       )
 
       fireEvent.click(await screen.findByRole('button', { name: 'Export chat JSON' }))

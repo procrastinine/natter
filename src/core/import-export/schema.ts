@@ -22,13 +22,13 @@ export const NATTER_EXPORT_SCHEMA_VERSION = 1
 
 export type NatterExportObjectKind = 'workspace-backup' | 'chat' | 'chat-preset'
 
-export interface ExportSourceMeta {
+interface ExportSourceMeta {
   app: 'natter'
   backendKind: 'browser-idb' | 'daemon' | 'unknown'
   workspaceId?: string
 }
 
-export interface NatterExportEnvelopeBase<TKind extends NatterExportObjectKind, TPayload> {
+interface NatterExportEnvelopeBase<TKind extends NatterExportObjectKind, TPayload> {
   objectKind: TKind
   exportSchemaVersion: typeof NATTER_EXPORT_SCHEMA_VERSION
   appStorageSchemaVersion: number
@@ -72,7 +72,7 @@ export interface PortableAttachmentBundle {
   jobs: AttachmentJob[]
 }
 
-export interface PortableChatHeader {
+interface PortableChatHeader {
   sourceChatId: string
   title: string
   createdAt: number
@@ -101,7 +101,7 @@ export interface PortableChatPresetPayload {
   connectionSketch?: ConnectionSketch
 }
 
-export interface WorkspaceSettingsRow {
+interface WorkspaceSettingsRow {
   key: string
   value: unknown
 }

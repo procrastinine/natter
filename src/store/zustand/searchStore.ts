@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import type { ChatId } from '../../core/types'
+import { onEvent } from '../broadcast'
 import {
   cloneSearchFilters,
   hasSearchWork,
@@ -7,7 +8,6 @@ import {
   type SearchResult,
   type SearchScope,
 } from '../chat-search'
-import { onEvent } from '../broadcast'
 
 type SearchStatus = 'idle' | 'debouncing' | 'scanning' | 'done' | 'aborted' | 'error'
 

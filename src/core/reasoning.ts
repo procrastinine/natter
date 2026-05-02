@@ -1,9 +1,4 @@
-import type {
-  ReasoningDetail,
-  ReasoningFormat,
-  ReasoningInclude,
-  ReasoningSettings,
-} from './types'
+import type { ReasoningDetail, ReasoningFormat, ReasoningInclude, ReasoningSettings } from './types'
 
 // Phase 11: the three-checkbox `ReasoningInclude` policy. See
 // `plan/phase11-implementation.md §2`.
@@ -60,7 +55,9 @@ export function normalizeReasoningSettings(
     ...(input as ReasoningSettings),
     mode: input.mode ?? 'default',
     exclude: input.exclude ?? false,
-    include: needsInclude ? defaultReasoningInclude(undefined) : (input.include as ReasoningInclude),
+    include: needsInclude
+      ? defaultReasoningInclude(undefined)
+      : (input.include as ReasoningInclude),
   }
   return next
 }

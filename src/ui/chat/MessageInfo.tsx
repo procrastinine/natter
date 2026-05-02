@@ -233,7 +233,7 @@ function formatServerToolOutput(tool: GenerationServerToolCall): string {
   try {
     return JSON.stringify(payload, null, 2)
   } catch {
-    return String(payload)
+    return '[unserializable server tool output]'
   }
 }
 

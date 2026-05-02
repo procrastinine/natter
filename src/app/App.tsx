@@ -1,5 +1,5 @@
-import { Shell } from './Shell'
 import { RenderingPreferencesProvider } from '../ui/settings/RenderingSettings'
+import { Shell } from './Shell'
 
 export function App() {
   return (

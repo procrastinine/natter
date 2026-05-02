@@ -10,12 +10,12 @@
 import { useLiveQuery } from 'dexie-react-hooks'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { fetchPrivacyScrape, readCachedPrivacyPayload } from '../api/privacy-scrape'
+import { isCorsProxyDisabled } from '../core/cors-proxy'
 import {
   corsProxyConfigFromPrefs,
   DEFAULT_GLOBAL_PREFERENCES,
   readGlobalPreferences,
 } from '../core/global-settings'
-import { isCorsProxyDisabled } from '../core/cors-proxy'
 import { isFreeModel } from '../core/model-predicates'
 import type { DataPolicy, ProfileId } from '../core/types'
 import type { CachedPrivacyPolicyRow } from '../store/db'
@@ -113,7 +113,7 @@ export function usePrivacyPolicies(
     if (forceRefresh) handledRefreshTokenRef.current = refreshToken
     setInFlight(true)
     setError(null)
-    ;(async () => {
+    void (async () => {
       try {
         await dedupedPrivacyFetch(
           profile.id,
@@ -135,10 +135,14 @@ export function usePrivacyPolicies(
           },
         )
       } catch (err) {
-        if (cancelled) return
+        if (cancelled) {
+          return
+        }
         setError(err instanceof Error ? err.message : 'privacy scrape failed')
       } finally {
-        if (!cancelled) setInFlight(false)
+        if (!cancelled) {
+          setInFlight(false)
+        }
       }
     })()
     return () => {

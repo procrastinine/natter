@@ -150,7 +150,9 @@ export function firstPositiveMatch(
   return best
 }
 
-function tokenizeSearchQuery(raw: string): { ok: true; tokens: Token[] } | { ok: false; error: SearchQueryParseError } {
+function tokenizeSearchQuery(
+  raw: string,
+): { ok: true; tokens: Token[] } | { ok: false; error: SearchQueryParseError } {
   const tokens: Token[] = []
   let index = 0
   while (index < raw.length) {

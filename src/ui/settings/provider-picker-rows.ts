@@ -8,15 +8,12 @@
 // order matches `endpoints` (the caller decides how to sort upstream).
 
 import {
-  privacyTierForPolicy,
   type ExclusionReason,
   type PrivacyFilterResult,
   type PrivacyTier,
+  privacyTierForPolicy,
 } from '../../core/privacy-filter'
-import {
-  endpointMatchesAnyProviderRef,
-  providerEndpointKey,
-} from '../../core/provider-identity'
+import { endpointMatchesAnyProviderRef, providerEndpointKey } from '../../core/provider-identity'
 import type { DataPolicy, ModelEndpoint, PrivacyPrefs, ProviderPreferences } from '../../core/types'
 
 type PickerRowState = 'kept' | 'auto-excluded' | 'no-filter'
@@ -112,14 +109,12 @@ function applyManualPickerState(
   if (!userTouchedPicker && !hasOnly) return row
 
   const ignoredByPicker =
-    userTouchedPicker && endpointMatchesAnyProviderRef(row.endpoint, providerPrefs?.ignore, endpoints)
+    userTouchedPicker &&
+    endpointMatchesAnyProviderRef(row.endpoint, providerPrefs?.ignore, endpoints)
   if (ignoredByPicker) {
     return { ...row, state: 'auto-excluded', reasons: ['user-ignored'] }
   }
-  if (
-    hasOnly &&
-    !endpointMatchesAnyProviderRef(row.endpoint, providerPrefs?.only, endpoints)
-  ) {
+  if (hasOnly && !endpointMatchesAnyProviderRef(row.endpoint, providerPrefs?.only, endpoints)) {
     return { ...row, state: 'auto-excluded', reasons: ['not-in-only-list'] }
   }
 

@@ -22,7 +22,7 @@ export async function* parseSSE(
   let eventName: string | undefined
   let dataParts: string[] = []
   let aborted = signal?.aborted ?? false
-  let abortReason = signal?.reason
+  let abortReason: unknown = signal?.reason
 
   const throwIfAborted = () => {
     if (!aborted) return
@@ -30,7 +30,7 @@ export async function* parseSSE(
     throw new DOMException('aborted', 'AbortError')
   }
 
-  const flushEvent = (): SSEEvent | null => {
+  const flushEvent = (): Extract<SSEEvent, { kind: 'data' }> | null => {
     if (dataParts.length === 0) {
       eventName = undefined
       return null
@@ -47,7 +47,7 @@ export async function* parseSSE(
   const onAbort = () => {
     aborted = true
     abortReason = signal?.reason
-    void reader.cancel(signal?.reason).catch(() => {})
+    void reader.cancel(abortReason).catch(() => {})
   }
 
   try {
@@ -56,7 +56,7 @@ export async function* parseSSE(
     } else if (aborted) {
       onAbort()
     }
-    while (true) {
+    for (;;) {
       throwIfAborted()
       let readResult: ReadableStreamReadResult<Uint8Array>
       try {
@@ -74,7 +74,7 @@ export async function* parseSSE(
       if (done) break
       buffer += decoder.decode(value, { stream: true })
 
-      while (true) {
+      for (;;) {
         const match = /\r?\n/.exec(buffer)
         if (!match) break
         const line = buffer.slice(0, match.index)
@@ -83,7 +83,7 @@ export async function* parseSSE(
         if (line === '') {
           const ev = flushEvent()
           if (ev) {
-            if (ev.kind === 'data' && ev.data === '[DONE]') return
+            if (ev.data === '[DONE]') return
             yield ev
           }
           continue
@@ -114,7 +114,7 @@ export async function* parseSSE(
     }
     // Unterminated terminal event (no trailing blank line).
     const ev = flushEvent()
-    if (ev && !(ev.kind === 'data' && ev.data === '[DONE]')) yield ev
+    if (ev && ev.data !== '[DONE]') yield ev
   } finally {
     signal?.removeEventListener('abort', onAbort)
     reader.cancel().catch(() => {})

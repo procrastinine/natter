@@ -115,7 +115,7 @@ describe('MessageHeader (quiet header — role + state pills only)', () => {
 describe('MessageInfo (revealed by ⓘ — full factual record)', () => {
   it('renders model, prompt+completion+answer+reasoning+cache token counts, timing, and cost', () => {
     const { container } = render(<MessageInfo message={makeAssistant()} />)
-    const text = container.textContent ?? ''
+    const text = container.textContent
     expect(text).toMatch(/anthropic\/claude-opus-4\.7/)
     expect(text).toMatch(/Prompt tokens/)
     expect(text).toMatch(/100/)
@@ -142,7 +142,7 @@ describe('MessageInfo (revealed by ⓘ — full factual record)', () => {
 
   it('omits model/tokens/cost on user messages but still shows the created timestamp', () => {
     const { container } = render(<MessageInfo message={makeUser()} />)
-    const text = container.textContent ?? ''
+    const text = container.textContent
     expect(text).not.toMatch(/Model/)
     expect(text).not.toMatch(/Cost/)
     expect(text).toMatch(/Created/)
@@ -194,7 +194,7 @@ describe('MessageInfo (revealed by ⓘ — full factual record)', () => {
       },
     ]
     const { container } = render(<MessageInfo message={msg} />)
-    const text = container.textContent ?? ''
+    const text = container.textContent
     expect(text).toMatch(/Tool calls/)
     expect(text).toMatch(/web fetch/)
     expect(text).toMatch(/wf_1/)

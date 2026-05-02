@@ -68,8 +68,8 @@ export function ImageAllowlistPanel() {
       <h3>
         Image whitelist
         <InfoDisclosure title="Image whitelist">
-          Images from origins not on this whitelist are replaced with a blocked-image stub.
-          Built-in origins are always allowed.
+          Images from origins not on this whitelist are replaced with a blocked-image stub. Built-in
+          origins are always allowed.
         </InfoDisclosure>
       </h3>
       <div data-ui="image-allowlist-add">

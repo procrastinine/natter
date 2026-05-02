@@ -424,19 +424,18 @@ export function addSampleToChat(
   return { accepted: true }
 }
 
-function normalizeGlobalPayload(
-  stored: GlobalTokenCalibration | undefined,
-): GlobalTokenCalibration {
-  return stored && typeof stored === 'object' && stored.version === 1
-    ? {
-        version: 1,
-        updatedAt: finiteNumber(stored.updatedAt) ? stored.updatedAt : 0,
-        byModel:
-          stored.byModel && typeof stored.byModel === 'object'
-            ? (normalizedCalibrationSamples(stored.byModel) ?? {})
-            : {},
-      }
-    : emptyGlobal()
+function normalizeGlobalPayload(stored: unknown): GlobalTokenCalibration {
+  if (!stored || typeof stored !== 'object') return emptyGlobal()
+  const row = stored as Partial<GlobalTokenCalibration>
+  if (row.version !== 1) return emptyGlobal()
+  return {
+    version: 1,
+    updatedAt: finiteNumber(row.updatedAt) ? row.updatedAt : 0,
+    byModel:
+      row.byModel && typeof row.byModel === 'object'
+        ? (normalizedCalibrationSamples(row.byModel) ?? {})
+        : {},
+  }
 }
 
 function subtractValidatedSample(
@@ -551,18 +550,19 @@ function emptyGlobal(): GlobalTokenCalibration {
 }
 
 export async function readTokenCalibrationGlobal(): Promise<GlobalTokenCalibration> {
-  const raw = await getSetting<GlobalTokenCalibration>(GLOBAL_KEY)
+  const raw = await getSetting<unknown>(GLOBAL_KEY)
   if (!raw || typeof raw !== 'object') return emptyGlobal()
   // Minimal validation — version check only; individual samples are
   // consumed through `ratioFromSample` which already guards against bad
   // values.
-  if (raw.version !== 1) return emptyGlobal()
+  const row = raw as Partial<GlobalTokenCalibration>
+  if (row.version !== 1) return emptyGlobal()
   return {
     version: 1,
-    updatedAt: typeof raw.updatedAt === 'number' ? raw.updatedAt : 0,
+    updatedAt: typeof row.updatedAt === 'number' ? row.updatedAt : 0,
     byModel:
-      raw.byModel && typeof raw.byModel === 'object'
-        ? (normalizedCalibrationSamples(raw.byModel) ?? {})
+      row.byModel && typeof row.byModel === 'object'
+        ? (normalizedCalibrationSamples(row.byModel) ?? {})
         : {},
   }
 }

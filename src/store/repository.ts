@@ -14,12 +14,12 @@ import type {
   ChatTag,
   ChatVersions,
   ChildListState,
+  CursorMap,
   DraftRow,
   FolderId,
   Message,
   MessageId,
   MutationScope,
-  CursorMap,
   TagId,
 } from '../core/types'
 import type { MessageBodyFields, MessageHeaderRow } from './message-storage'

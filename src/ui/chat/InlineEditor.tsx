@@ -227,9 +227,7 @@ function fromEditableToolCalls(list: EditableToolCall[]): ProviderOutputItem[] {
       outputIndex !== row.original.outputIndex ||
       row.rawText !== row.originalRawText
     const outputItem =
-      row.original && changed
-        ? preserveProviderSealedFields(row.original.item, item)
-        : item
+      row.original && changed ? preserveProviderSealedFields(row.original.item, item) : item
     return {
       dialect: row.dialect,
       type,
@@ -394,7 +392,7 @@ export function InlineEditor({
       toolCalls,
     ],
   )
-  const togglePrefill = useCallback(async () => {
+  const togglePrefill = useCallback(() => {
     if (prefillOpen) {
       setPrefillOpen(false)
       return

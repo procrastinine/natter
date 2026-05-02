@@ -113,9 +113,7 @@ describe('responses() streaming', () => {
       (e) =>
         e.type === 'response.output_item.added' &&
         (e as { item?: { type?: string } }).item?.type === 'reasoning',
-    ) as
-      | (ResponsesEventWire & { item?: { encrypted_content?: string } })
-      | undefined
+    ) as (ResponsesEventWire & { item?: { encrypted_content?: string } }) | undefined
     expect(reasoningItemAdded?.item?.encrypted_content).toMatch(/^gAAA/)
 
     // `output_item.done` for the reasoning item should carry the FINAL
@@ -124,9 +122,7 @@ describe('responses() streaming', () => {
       (e) =>
         e.type === 'response.output_item.done' &&
         (e as { item?: { type?: string } }).item?.type === 'reasoning',
-    ) as
-      | (ResponsesEventWire & { item?: { encrypted_content?: string } })
-      | undefined
+    ) as (ResponsesEventWire & { item?: { encrypted_content?: string } }) | undefined
     expect(reasoningItemDone?.item?.encrypted_content).toBeDefined()
     expect(reasoningItemDone?.item?.encrypted_content?.length).toBeGreaterThan(0)
 
@@ -134,8 +130,11 @@ describe('responses() streaming', () => {
   })
 
   it('yields a buffered_result when the upstream answers JSON despite stream:true', async () => {
-    const buffered = JSON.parse(readFileSync(PROBE6_PATH, 'utf8'))
-    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(buffered)))
+    const buffered = JSON.parse(readFileSync(PROBE6_PATH, 'utf8')) as unknown as ResponsesResultWire
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => jsonResponse(buffered)),
+    )
 
     const chunks: ResponsesStreamChunk[] = []
     for await (const chunk of responses(ctx(), {
@@ -177,7 +176,8 @@ describe('responses() streaming', () => {
           {
             error: {
               code: 'unsupported_value',
-              message: "Unsupported value: 'minimal' is not supported with the 'gpt-5.4-nano' model.",
+              message:
+                "Unsupported value: 'minimal' is not supported with the 'gpt-5.4-nano' model.",
             },
           },
           400,
@@ -204,6 +204,11 @@ describe('responsesOnce', () => {
     )
     const result = await responsesOnce(ctx(), { model: 'm', input: 'x', stream: true })
     expect(result).toEqual(buffered)
-    expect(JSON.parse(seenBodies[0] ?? '{}').stream).toBe(false)
+    expect(parseRequestBody(seenBodies[0]).stream).toBe(false)
   })
 })
+
+function parseRequestBody(raw: string | undefined): { stream?: unknown } {
+  const parsed = JSON.parse(raw ?? '{}') as unknown
+  return parsed && typeof parsed === 'object' ? parsed : {}
+}

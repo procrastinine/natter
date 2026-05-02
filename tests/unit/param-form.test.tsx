@@ -384,9 +384,7 @@ describe('ChatModelPanel context tab', () => {
       render(<ChatModelPanel chatId={chat.id} chatSnapshot={chat} onClose={() => undefined} />)
 
       fireEvent.click(await screen.findByRole('button', { name: /Preset:/ }))
-      fireEvent.click(
-        await screen.findByRole('button', { name: 'Export preset "Portable" JSON' }),
-      )
+      fireEvent.click(await screen.findByRole('button', { name: 'Export preset "Portable" JSON' }))
 
       await waitFor(() => expect(downloads.clickSpy).toHaveBeenCalled())
       expect(downloads.createdBlobs).toHaveLength(1)

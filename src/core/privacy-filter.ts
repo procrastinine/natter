@@ -18,16 +18,15 @@
 // and produces a decision. The scraper and hook layers feed it; the
 // request composer consumes `buildWireProviderPrivacy`.
 
-import { synthesizeDataPolicy } from './privacy'
+import { dominates, synthesizeDataPolicy } from './privacy'
+import { fallbackDataPolicyForEndpoint } from './privacy-fallbacks'
 import {
   endpointMatchesAnyProviderRef,
   providerPolicyLookupKeys,
   providerRoutingRef,
   resolveProviderRefsToRoutingRefs,
 } from './provider-identity'
-import { fallbackDataPolicyForEndpoint } from './privacy-fallbacks'
 import type { DataPolicy, ModelEndpoint, PrivacyPrefs } from './types'
-import { dominates } from './privacy'
 
 export type ExclusionReason =
   | 'training'
@@ -165,13 +164,7 @@ function resolveEndpointPolicy(
 // kept endpoints' policies in the UI. `open` means "privacy filter doesn't
 // apply" (free model); `unavailable` means kept endpoints exist but no
 // data_policy survives through to describe them.
-export type PrivacyTier =
-  | 'green'
-  | 'yellow'
-  | 'orange'
-  | 'red'
-  | 'open'
-  | 'unavailable'
+export type PrivacyTier = 'green' | 'yellow' | 'orange' | 'red' | 'open' | 'unavailable'
 
 export function privacyTierForPolicy(
   policy: DataPolicy | undefined,
@@ -190,8 +183,7 @@ export function privacyTierForPolicy(
   if (!policy) return 'unavailable'
   if (policy.training || policy.trainingOpenRouter) return 'red'
   const userIds = policy.requiresUserIDs === true
-  const retainsUnknownPeriod =
-    policy.retainsPrompts && policy.retentionDays === undefined
+  const retainsUnknownPeriod = policy.retainsPrompts && policy.retentionDays === undefined
   if (retainsUnknownPeriod) return 'orange'
   if (userIds) return 'orange'
   if (policy.retainsPrompts) return 'yellow'
@@ -247,7 +239,9 @@ export function buildWireProviderPrivacy(
     ? uniqueStrings([...existingIgnore])
     : uniqueStrings([...autoIgnore])
   const allowedAfterManualOverride = userTookOver
-    ? allEndpoints.some((endpoint) => !endpointMatchesAnyProviderRef(endpoint, mergedIgnore, allEndpoints))
+    ? allEndpoints.some(
+        (endpoint) => !endpointMatchesAnyProviderRef(endpoint, mergedIgnore, allEndpoints),
+      )
     : false
   const wire: WireProviderPrivacy = {
     zeroEligible: userTookOver && allowedAfterManualOverride ? false : result.zeroEligible,

@@ -96,9 +96,7 @@ function prefillThinkBlock(
   const parts = reasoningPlainParts(details)
   if (parts.length === 0) return null
   const body = parts.join('\n\n')
-  return hasAssistantResponseContent(content)
-    ? `<think>\n${body}\n</think>`
-    : `<think>\n${body}`
+  return hasAssistantResponseContent(content) ? `<think>\n${body}\n</think>` : `<think>\n${body}`
 }
 
 function reasoningPlainParts(details: readonly ReasoningDetail[]): string[] {

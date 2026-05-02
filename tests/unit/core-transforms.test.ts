@@ -469,7 +469,7 @@ describe('buildChatMessages', () => {
       },
     ]
     const { wire } = toChatCompletions(settings(), path)
-    const assistantMessage = wire.messages?.find(
+    const assistantMessage = wire.messages.find(
       (message) => (message as { role?: string }).role === 'assistant',
     ) as { content?: string } | undefined
     expect(assistantMessage?.content).toContain('<tool_call>')

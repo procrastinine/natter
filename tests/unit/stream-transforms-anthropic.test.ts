@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { splitAnthropicStream, type StreamLaneEvent } from '../../src/api/stream-transforms'
 import type { AnthropicStreamChunk } from '../../src/api/anthropic-types'
+import { type StreamLaneEvent, splitAnthropicStream } from '../../src/api/stream-transforms'
 
 async function* asAsync<T>(items: Iterable<T>): AsyncIterable<T> {
   for (const item of items) yield item
@@ -97,15 +97,18 @@ describe('splitAnthropicStream', () => {
             },
             { type: 'text', text: 'final' },
           ],
-          usage: { input_tokens: 10, output_tokens: 20, server_tool_use: { web_search_requests: 1 } },
+          usage: {
+            input_tokens: 10,
+            output_tokens: 20,
+            server_tool_use: { web_search_requests: 1 },
+          },
         },
       },
     ]
     const lanes = await collect(splitAnthropicStream(asAsync(chunks)))
 
     const reasoning = lanes.filter(
-      (lane): lane is Extract<StreamLaneEvent, { lane: 'reasoning' }> =>
-        lane.lane === 'reasoning',
+      (lane): lane is Extract<StreamLaneEvent, { lane: 'reasoning' }> => lane.lane === 'reasoning',
     )
     expect(reasoning.some((lane) => lane.textDelta === 'signed thought')).toBe(true)
     expect(

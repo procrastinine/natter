@@ -111,16 +111,14 @@ export function ReasoningBlock({
       data-pinned={pinnedOpen ? 'true' : undefined}
       open={open}
       onToggle={(e) => {
-        const isOpen = (e.currentTarget).open
+        const isOpen = e.currentTarget.open
         setOpen(isOpen)
         setPinnedOpen(true)
       }}
     >
       <summary data-ui="reasoning-summary">
         <span data-ui="reasoning-title">Reasoning</span>
-        <span data-ui="reasoning-count">
-          · {total}
-        </span>
+        <span data-ui="reasoning-count">· {total}</span>
         {totalEncryptedBytes > 0 ? (
           <span
             data-ui="reasoning-lock"
@@ -210,7 +208,10 @@ function ReasoningRow({
       data-reasoning-kind={kind}
       data-hidden={hidden ? 'true' : undefined}
     >
-      <p data-ui="reasoning-row-body" {...(kind === 'encrypted' ? { 'data-state': 'encrypted' } : {})}>
+      <p
+        data-ui="reasoning-row-body"
+        {...(kind === 'encrypted' ? { 'data-state': 'encrypted' } : {})}
+      >
         {children}
       </p>
       {onToggleHidden ? (

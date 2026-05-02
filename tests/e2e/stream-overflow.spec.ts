@@ -60,7 +60,9 @@ test('oversized stream lane auto-compacts and the avatar cycles compact -> peek 
           settings.put({ key: 'global:long-message-display-mode', value: 'compact' })
           const getPresetsReq = presets.getAll()
           getPresetsReq.onsuccess = () => {
-            const preset = getPresetsReq.result?.[0]
+            const preset = (
+              getPresetsReq.result as Array<{ id: string; settings?: Record<string, unknown> }>
+            )[0]
             if (!preset?.settings) {
               reject(new Error('missing seed preset'))
               return

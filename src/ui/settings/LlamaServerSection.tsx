@@ -6,7 +6,7 @@
 //   and /v1/completions at dispatch time.
 // Text-template editing lives on the Generation tab next to Stop sequences.
 
-import type { Chat, ConnectionProfile } from '../../core/types'
+import type { Chat, ChatSettings, ConnectionProfile } from '../../core/types'
 import { updateChatSettings } from '../../store/chats'
 
 interface LlamaServerSectionProps {
@@ -28,9 +28,7 @@ export function LlamaServerSection({ chat }: LlamaServerSectionProps) {
     // Write undefined when matching the server default to keep payloads
     // clean (and to avoid the preset drift that would otherwise flag
     // the chat as diverged from a preset that doesn't carry the field).
-    const patch: Partial<import('../../core/types').ChatSettings> = next
-      ? {}
-      : { cachePrompt: false }
+    const patch: Partial<ChatSettings> = next ? {} : { cachePrompt: false }
     if (next && chat.settings.cachePrompt !== undefined) {
       // Unset an explicit `false` by rewriting the sub-object without it.
       // updateChatSettings merges top-level, so deleting a key via patch

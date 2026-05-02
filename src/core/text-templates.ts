@@ -4,6 +4,8 @@
 // or any client-rendered template here. OpenRouter has no embedded template
 // surface, so it always uses a client-rendered built-in or saved user template.
 
+import { newId } from '../lib/ulid'
+import { getSetting, updateSetting } from '../store/settings'
 import { filterReasoningForInclude } from './reasoning'
 import type {
   ChatSettings,
@@ -12,8 +14,6 @@ import type {
   TextTemplateConfig,
   TextTemplateId,
 } from './types'
-import { newId } from '../lib/ulid'
-import { getSetting, updateSetting } from '../store/settings'
 
 interface TextTemplateDescriptor extends TextTemplateConfig {
   id: TextTemplateId
@@ -609,7 +609,6 @@ function tokenizeTemplate(source: string): TemplateToken[] {
       break
     }
     pushTextToken(tokens, source.slice(index, nextIndex), stripNextText)
-    stripNextText = false
     const kind: TemplateToken['kind'] = source.startsWith('{{', nextIndex) ? 'expr' : 'stmt'
     const close = kind === 'expr' ? '}}' : '%}'
     let bodyStart = nextIndex + 2
@@ -706,7 +705,8 @@ function renderForStatement(
   if (!variable || !expression) return ''
   const iterable = evaluateTemplateValue(expression, context)
   if (!Array.isArray(iterable)) return ''
-  return iterable
+  const values = iterable as unknown[]
+  return values
     .map((item, index) =>
       renderTokenRange(tokens, start, end, {
         ...context,
@@ -715,8 +715,8 @@ function renderForStatement(
           index0: index,
           index: index + 1,
           first: index === 0,
-          last: index === iterable.length - 1,
-          length: iterable.length,
+          last: index === values.length - 1,
+          length: values.length,
         },
       }),
     )

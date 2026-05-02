@@ -5,14 +5,7 @@ import type {
   WorkspaceBackupEnvelope,
 } from '../core/import-export/schema'
 import { assertEnvelopeKind } from '../core/import-export/schema'
-import type {
-  AttachmentId,
-  ChatId,
-  FolderId,
-  PresetId,
-  ProfileId,
-  TagId,
-} from '../core/types'
+import type { AttachmentId, ChatId, FolderId, PresetId, ProfileId, TagId } from '../core/types'
 import { getBrowserImportExportBackend } from './browser-import-export'
 
 export interface ImportChatOptions {
@@ -72,33 +65,27 @@ export interface WorkspaceImportExportBackend {
   ): Promise<RestoreWorkspaceBackupResult>
 }
 
-let override: WorkspaceImportExportBackend | null = null
-
 function backend(): WorkspaceImportExportBackend {
-  return override ?? getBrowserImportExportBackend()
-}
-
-export function __setImportExportBackendForTests(next: WorkspaceImportExportBackend | null): void {
-  override = next
+  return getBrowserImportExportBackend()
 }
 
 export function __resetImportExportBackendForTests(): void {
-  override = null
+  // Retained for test cleanup symmetry while import/export uses the browser backend directly.
 }
 
-export function parseChatExportEnvelope(value: unknown): ChatExportEnvelope {
+function parseChatExportEnvelope(value: unknown): ChatExportEnvelope {
   const envelope = migrateNatterExportEnvelope(value)
   assertEnvelopeKind(envelope, 'chat')
   return envelope
 }
 
-export function parseChatPresetExportEnvelope(value: unknown): ChatPresetExportEnvelope {
+function parseChatPresetExportEnvelope(value: unknown): ChatPresetExportEnvelope {
   const envelope = migrateNatterExportEnvelope(value)
   assertEnvelopeKind(envelope, 'chat-preset')
   return envelope
 }
 
-export function parseWorkspaceBackupEnvelope(value: unknown): WorkspaceBackupEnvelope {
+function parseWorkspaceBackupEnvelope(value: unknown): WorkspaceBackupEnvelope {
   const envelope = migrateNatterExportEnvelope(value)
   assertEnvelopeKind(envelope, 'workspace-backup')
   return envelope

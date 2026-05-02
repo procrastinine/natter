@@ -11,11 +11,8 @@
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import type {
-  GeminiStreamChunk,
-  GenerateContentResponseWire,
-} from '../../src/api/gemini-types'
-import { splitGeminiStream, type StreamLaneEvent } from '../../src/api/stream-transforms'
+import type { GeminiStreamChunk, GenerateContentResponseWire } from '../../src/api/gemini-types'
+import { type StreamLaneEvent, splitGeminiStream } from '../../src/api/stream-transforms'
 
 const PROBE8 = resolve(__dirname, '../../../plan/phase11-probes/08-gemini-native-stream.sse')
 const PROBE3 = resolve(__dirname, '../../../plan/phase11-probes/03-gemini-native.json')
@@ -87,14 +84,10 @@ describe('splitGeminiStream — coalesces thought:true parts into one summary ro
     // continuous summary.
     const frames: GenerateContentResponseWire[] = [
       {
-        candidates: [
-          { content: { role: 'model', parts: [{ text: 'Thought A', thought: true }] } },
-        ],
+        candidates: [{ content: { role: 'model', parts: [{ text: 'Thought A', thought: true }] } }],
       },
       {
-        candidates: [
-          { content: { role: 'model', parts: [{ text: 'Thought B', thought: true }] } },
-        ],
+        candidates: [{ content: { role: 'model', parts: [{ text: 'Thought B', thought: true }] } }],
       },
       {
         candidates: [

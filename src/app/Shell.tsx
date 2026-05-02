@@ -1,5 +1,5 @@
 import { useLiveQuery } from 'dexie-react-hooks'
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { attachmentsDisabledByTextProtocol } from '../core/attachments/context'
 import { cloneDefaultChatSettings } from '../core/defaults'
 import {
@@ -16,8 +16,8 @@ import {
   modelLooksForeignForProfile,
   pickEquivalentModelId,
 } from '../core/model-selection'
-import { prefillClassFor } from '../core/quirks'
 import { withProfileApiDefaults } from '../core/provider-defaults'
+import { prefillClassFor } from '../core/quirks'
 import { DEFAULT_SIDEBAR_SORT_MODE } from '../core/sidebar-sort'
 import type {
   Chat,
@@ -182,6 +182,13 @@ export function Shell() {
   const activeStorageRouteKey = activeStorageRoute ? storageHref(activeStorageRoute) : null
   const focusModeAvailable = !activeStorageRoute
   const onNewChatSurface = route.kind === 'new'
+  const activeSurfaceKey = activeChatId
+    ? `chat:${activeChatId}`
+    : activeStorageRouteKey
+      ? `storage:${activeStorageRouteKey}`
+      : onNewChatSurface
+        ? 'new'
+        : 'empty'
   const isNarrowScreen = useMediaQuery(MOBILE_SHELL_QUERY)
   useBranchUrlSync(activeChatId)
   const { send, sendFrom } = useChat()
@@ -400,9 +407,12 @@ export function Shell() {
     if (!isNarrowScreen) setMobileSidebarOpen(false)
   }, [isNarrowScreen])
 
+  const previousActiveSurfaceKeyRef = useRef(activeSurfaceKey)
   useEffect(() => {
+    if (previousActiveSurfaceKeyRef.current === activeSurfaceKey) return
+    previousActiveSurfaceKeyRef.current = activeSurfaceKey
     setMobileSidebarOpen(false)
-  }, [activeChatId, activeStorageRouteKey, onNewChatSurface])
+  }, [activeSurfaceKey])
 
   useEffect(() => {
     installChatPreviewMaintainer()

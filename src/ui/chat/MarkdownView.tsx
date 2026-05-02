@@ -150,12 +150,12 @@ function getStreamingPlugins(singleDollarTextMath: boolean) {
 function rewriteBlockedImages(md: string, allowed: string[]): string {
   const mdImagePattern = /!\[([^\]]*)\]\(([^)\s]+)(\s+"[^"]*")?\)/g
   const htmlImagePattern = /<img\b[^>]*\bsrc=["']([^"']+)["'][^>]*\/?>/gi
-  const replaceMd = md.replace(mdImagePattern, (match, alt, url) => {
+  const replaceMd = md.replace(mdImagePattern, (match: string, alt: string, url: string) => {
     return isImageOriginAllowed(url, allowed)
       ? match
       : `\n\n> \u26a0 Blocked image from \`${safeOrigin(url)}\`${alt ? ` (alt: ${alt})` : ''}\n\n`
   })
-  return replaceMd.replace(htmlImagePattern, (_match, url) => {
+  return replaceMd.replace(htmlImagePattern, (_match: string, url: string) => {
     return isImageOriginAllowed(url, allowed)
       ? _match
       : `\n\n> \u26a0 Blocked image from \`${safeOrigin(url)}\`\n\n`
@@ -188,7 +188,7 @@ function promoteDisplayMath(md: string): string {
       if (i % 2 === 1) return part
       return part.replace(
         /(?<!\\)\$\$([\s\S]+?)(?<!\\)\$\$/g,
-        (_m, inner) => `\n\n$$\n${inner.trim()}\n$$\n\n`,
+        (_m: string, inner: string) => `\n\n$$\n${inner.trim()}\n$$\n\n`,
       )
     })
     .join('')

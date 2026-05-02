@@ -10,12 +10,12 @@ import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { beforeAll, describe, expect, it } from 'vitest'
 import {
+  type ChatCompletionsContext,
   chatCompletions,
   chatCompletionsOnce,
-  type ChatCompletionsContext,
 } from '../../src/api/chat-completions'
-import { responsesOnce, type ResponsesContext } from '../../src/api/responses'
-import { geminiOnce, type GeminiContext } from '../../src/api/gemini-native'
+import { type GeminiContext, geminiOnce } from '../../src/api/gemini-native'
+import { type ResponsesContext, responsesOnce } from '../../src/api/responses'
 import type { ResponsesInputItem } from '../../src/api/types'
 import type { ConnectionProfile } from '../../src/core/types'
 
@@ -191,9 +191,7 @@ describe.skipIf(!LIVE)('live cross-model — Gemini native (tier swap)', () => {
     const turn1 = await geminiOnce(
       ctx,
       {
-        contents: [
-          { role: 'user', parts: [{ text: 'Pick a primary color. One word.' }] },
-        ],
+        contents: [{ role: 'user', parts: [{ text: 'Pick a primary color. One word.' }] }],
         generationConfig: {
           maxOutputTokens: 200,
           thinkingConfig: { thinkingLevel: 'low', includeThoughts: true },
@@ -226,9 +224,7 @@ describe.skipIf(!LIVE)('live cross-model — Gemini native (tier swap)', () => {
     const result = await geminiOnce(
       ctx,
       {
-        contents: [
-          { role: 'user', parts: [{ text: 'What is 1+1? Just the number.' }] },
-        ],
+        contents: [{ role: 'user', parts: [{ text: 'What is 1+1? Just the number.' }] }],
         generationConfig: {
           maxOutputTokens: 100,
           thinkingConfig: { thinkingBudget: -1, includeThoughts: true },
@@ -258,7 +254,9 @@ describe.skipIf(!LIVE)('live cross-model — Anthropic via OpenRouter (cross-tie
       reasoning: { enabled: true, max_tokens: 1000 },
     })
     const msg1 = turn1.choices?.[0]?.message
-    const details1 = msg1?.reasoning_details as Array<{ type?: string; signature?: string }> | undefined
+    const details1 = msg1?.reasoning_details as
+      | Array<{ type?: string; signature?: string }>
+      | undefined
     const signed = details1?.find((d) => d.type === 'reasoning.text' && !!d.signature)
     if (!signed) return // some routes skip reasoning for trivial prompts
 
@@ -311,7 +309,8 @@ describe.skipIf(!LIVE)(
       const reasoningInput = { ...reasoning1 }
       delete (reasoningInput as { status?: unknown }).status
       delete (reasoningInput as { format?: unknown }).format
-      if (/^(rs|msg)_tmp_/.test(String((reasoningInput as { id?: unknown }).id ?? ''))) {
+      const reasoningInputId = (reasoningInput as { id?: unknown }).id
+      if (typeof reasoningInputId === 'string' && /^(rs|msg)_tmp_/.test(reasoningInputId)) {
         delete (reasoningInput as { id?: unknown }).id
       }
 

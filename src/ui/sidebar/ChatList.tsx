@@ -1398,7 +1398,7 @@ export const ChatList = memo(function ChatList({ activeChatId, collapsed }: Chat
           type="button"
           aria-label="New folder"
           title="New folder"
-          onClick={handleCreateFolder}
+          onClick={() => void handleCreateFolder()}
         >
           <FolderIcon size={14} />
           <PlusIcon size={10} strokeWidth={2.4} />

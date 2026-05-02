@@ -1,20 +1,19 @@
 import type { AssistantRequestPlan } from '../core/send-planning'
 import type { ConnectionProfile } from '../core/types'
-import { anthropicOnce, anthropicStream, type AnthropicContext } from './anthropic-messages'
+import { type AnthropicContext, anthropicOnce, anthropicStream } from './anthropic-messages'
 import type { AnthropicMessagesResultWire, AnthropicStreamChunk } from './anthropic-types'
 import { chatCompletions, chatCompletionsOnce } from './chat-completions'
-import { geminiOnce, geminiStream, type GeminiContext } from './gemini-native'
-import type { GenerateContentResponseWire } from './gemini-types'
+import { type GeminiContext, geminiOnce, geminiStream } from './gemini-native'
+import type { GeminiStreamChunk, GenerateContentResponseWire } from './gemini-types'
 import { responses, responsesOnce } from './responses'
 import { textCompletions, textCompletionsOnce } from './text-completions'
-import { videoGeneration } from './video-generation'
 import type {
   ChatCompletionResultWire,
   ChatStreamChunk,
   ResponsesResultWire,
   ResponsesStreamChunk,
 } from './types'
-import type { GeminiStreamChunk } from './gemini-types'
+import { videoGeneration } from './video-generation'
 
 export type AssistantStreamChunk =
   | ChatStreamChunk
@@ -68,11 +67,9 @@ export function openAssistantRequestStream(
     )
   }
   if (requestPlan.route?.transport === 'openrouter-video') {
-    return videoGeneration(
-      ctx,
-      requestPlan.wire as Parameters<typeof videoGeneration>[1],
-      { ...(signal ? { signal } : {}) },
-    )
+    return videoGeneration(ctx, requestPlan.wire as Parameters<typeof videoGeneration>[1], {
+      ...(signal ? { signal } : {}),
+    })
   }
   return chatCompletions(ctx, requestPlan.wire as Parameters<typeof chatCompletions>[1], {
     ...(signal ? { signal } : {}),
@@ -85,11 +82,9 @@ export async function runAssistantRequestOnce(
   const { connection, apiKey, requestPlan, signal } = input
   const ctx = { profile: connection, apiKey }
   if (requestPlan.useTextProtocol) {
-    return textCompletionsOnce(
-      ctx,
-      requestPlan.wire as Parameters<typeof textCompletionsOnce>[1],
-      { ...(signal ? { signal } : {}) },
-    )
+    return textCompletionsOnce(ctx, requestPlan.wire as Parameters<typeof textCompletionsOnce>[1], {
+      ...(signal ? { signal } : {}),
+    })
   }
   if (requestPlan.route?.transport === 'openai-responses') {
     return responsesOnce(ctx, requestPlan.wire as Parameters<typeof responsesOnce>[1], {
@@ -107,18 +102,14 @@ export async function runAssistantRequestOnce(
   }
   if (requestPlan.route?.transport === 'anthropic') {
     const anthropicCtx: AnthropicContext = ctx
-    return anthropicOnce(
-      anthropicCtx,
-      requestPlan.wire as Parameters<typeof anthropicOnce>[1],
-      { ...(signal ? { signal } : {}) },
-    )
+    return anthropicOnce(anthropicCtx, requestPlan.wire as Parameters<typeof anthropicOnce>[1], {
+      ...(signal ? { signal } : {}),
+    })
   }
   if (requestPlan.route?.transport === 'openrouter-video') {
     throw new Error('runAssistantRequestOnce: video generation is an asynchronous streaming route')
   }
-  return chatCompletionsOnce(
-    ctx,
-    requestPlan.wire as Parameters<typeof chatCompletionsOnce>[1],
-    { ...(signal ? { signal } : {}) },
-  )
+  return chatCompletionsOnce(ctx, requestPlan.wire as Parameters<typeof chatCompletionsOnce>[1], {
+    ...(signal ? { signal } : {}),
+  })
 }

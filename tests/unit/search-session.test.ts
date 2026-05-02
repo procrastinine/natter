@@ -1,11 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import type { Chat, ChatBranchCache, Message } from '../../src/core/types'
+import type { WorkspaceRepository } from '../../src/store/repository'
 import {
   __resetSearchSessionRunnerForTests,
   requestSearchSession,
 } from '../../src/store/search-session'
-import type { WorkspaceRepository } from '../../src/store/repository'
 import { __resetSearchStoreForTests, useSearchStore } from '../../src/store/zustand/searchStore'
 
 afterEach(() => {
@@ -93,7 +93,12 @@ describe('search session runner', () => {
     const repository = repo({
       chats: [
         chat({ id: 'title', title: 'alpha title' }),
-        chat({ id: 'body', title: 'body', lastUpdatedLeafId: 'body-message', lastBranchUpdatedAt: 5 }),
+        chat({
+          id: 'body',
+          title: 'body',
+          lastUpdatedLeafId: 'body-message',
+          lastBranchUpdatedAt: 5,
+        }),
       ],
       messages: { body: slowMessages },
     })
@@ -114,9 +119,12 @@ describe('search session runner', () => {
 
     releaseMessages()
     await waitFor(() => useSearchStore.getState().session?.status === 'done')
-    expect(useSearchStore.getState().session?.results.map((result) => result.chatId).sort()).toEqual(
-      ['body', 'title'],
-    )
+    expect(
+      useSearchStore
+        .getState()
+        .session?.results.map((result) => result.chatId)
+        .sort(),
+    ).toEqual(['body', 'title'])
   })
 })
 

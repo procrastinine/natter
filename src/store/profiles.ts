@@ -138,9 +138,7 @@ export async function listProfiles(
 // used for reactive "is a connection configured?" checks that don't need
 // the row contents. Goes through the store layer so daemon-mode can wire a
 // COUNT query behind the same signature.
-export async function countProfiles(
-  opts: { includeArchived?: boolean } = {},
-): Promise<number> {
+export async function countProfiles(opts: { includeArchived?: boolean } = {}): Promise<number> {
   const rows = await getDb().profiles.toArray()
   return opts.includeArchived ? rows.length : rows.filter((p) => p.archived !== true).length
 }

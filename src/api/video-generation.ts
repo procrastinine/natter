@@ -35,10 +35,10 @@ function videoGenerationUrl(profile: ConnectionProfile): string {
   return `${base}/videos`
 }
 
-async function readJsonResponse(response: Response): Promise<Record<string, unknown>> {
+async function readJsonResponse(response: Response): Promise<unknown> {
   return response.json().catch(() => ({
     error: { code: response.status, message: response.statusText },
-  }))
+  })) as Promise<unknown>
 }
 
 async function postVideoGeneration(
@@ -220,13 +220,13 @@ function errorMessage(error: unknown): string | undefined {
 function delay(ms: number, signal: AbortSignal | undefined): Promise<void> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
-      reject(signal.reason ?? new DOMException('Aborted', 'AbortError'))
+      reject(abortError(signal))
       return
     }
     const timer = setTimeout(done, ms)
     const onAbort = () => {
       clearTimeout(timer)
-      reject(signal?.reason ?? new DOMException('Aborted', 'AbortError'))
+      reject(signal ? abortError(signal) : new DOMException('Aborted', 'AbortError'))
     }
     function done() {
       signal?.removeEventListener('abort', onAbort)
@@ -234,4 +234,8 @@ function delay(ms: number, signal: AbortSignal | undefined): Promise<void> {
     }
     signal?.addEventListener('abort', onAbort, { once: true })
   })
+}
+
+function abortError(signal: AbortSignal): Error | DOMException {
+  return signal.reason instanceof Error ? signal.reason : new DOMException('Aborted', 'AbortError')
 }

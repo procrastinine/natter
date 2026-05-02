@@ -124,12 +124,11 @@ export function normalizeEndpoint(raw: unknown): ModelEndpoint | null {
   }
   const id = asString(obj.id)
   if (id) endpoint.id = id
-  const providerDisplayName = asString(obj.provider_display_name) ?? asString(asRecord(obj.provider_info)?.displayName)
+  const providerDisplayName =
+    asString(obj.provider_display_name) ?? asString(asRecord(obj.provider_info)?.displayName)
   if (providerDisplayName) endpoint.provider_display_name = providerDisplayName
   const providerSlug =
-    asString(obj.provider_slug) ??
-    asString(obj.tag) ??
-    asString(asRecord(obj.provider_info)?.slug)
+    asString(obj.provider_slug) ?? asString(obj.tag) ?? asString(asRecord(obj.provider_info)?.slug)
   if (providerSlug) endpoint.provider_slug = providerSlug
   const providerModelId = asString(obj.provider_model_id)
   if (providerModelId) endpoint.provider_model_id = providerModelId

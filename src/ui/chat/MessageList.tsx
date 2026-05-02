@@ -540,7 +540,7 @@ type ContextEstimateRow = Pick<
 
 function computeExcludedIds(
   path: readonly ContextEstimateRow[],
-  settings: import('../../core/types').ChatSettings,
+  settings: ChatSettings,
   capability?: EffectiveCapability,
 ): Set<MessageId> {
   const out = new Set<MessageId>()

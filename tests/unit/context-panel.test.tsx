@@ -100,7 +100,7 @@ function LiveContextPanel({
           branchSnapshot.branch,
           '',
           null,
-          capability?.maxPromptTokens ?? capability?.contextLength ?? null,
+          capability.maxPromptTokens ?? capability.contextLength ?? null,
         )
       : null
   if (!chat) return null
@@ -172,11 +172,7 @@ describe('ContextPanel slider persistence', () => {
     await waitFor(() => {
       expect(container.textContent).toContain('media')
     })
-    const initialUsed = Number(
-      container
-        .querySelector('[data-ui="context-gauge-label"] strong')
-        ?.textContent?.replaceAll(',', ''),
-    )
+    const initialUsed = readGaugeValue(container)
     expect(initialUsed).toBeGreaterThan(1000)
 
     fireEvent.click(getByRole('button', { name: 'Off' }))
@@ -184,11 +180,13 @@ describe('ContextPanel slider persistence', () => {
     await waitFor(() => {
       expect(container.textContent).not.toContain('media')
     })
-    const afterOff = Number(
-      container
-        .querySelector('[data-ui="context-gauge-label"] strong')
-        ?.textContent?.replaceAll(',', ''),
-    )
+    const afterOff = readGaugeValue(container)
     expect(initialUsed - afterOff).toBe(1000)
   })
 })
+
+function readGaugeValue(container: HTMLElement): number {
+  const label = container.querySelector('[data-ui="context-gauge-label"] strong')
+  if (!label) throw new Error('missing context gauge label')
+  return Number(label.textContent.replaceAll(',', ''))
+}

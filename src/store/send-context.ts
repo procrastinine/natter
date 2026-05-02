@@ -3,11 +3,12 @@ import {
   attachmentContextPolicyForSettings,
   resolveAttachmentContextRefs,
 } from '../core/attachments/context'
-import { messageCost, resolveCutoff, type MessageCostOptions } from '../core/context-cutoff'
+import { type MessageCostOptions, messageCost, resolveCutoff } from '../core/context-cutoff'
+import { readGlobalPreferences } from '../core/global-settings'
 import type { AttachmentResolver } from '../core/media-context-tokens'
-import { quirksFor } from '../core/quirks'
 import { applyOutboundContextRewrites } from '../core/prompt-context'
 import { tokenizerFromSettings, UNLIMITED_CONTEXT } from '../core/prompt-size'
+import { quirksFor } from '../core/quirks'
 import { charsPerToken, readTokenCalibrationGlobal } from '../core/token-calibration'
 import { estimateTokens, type PromptEstimateOptions } from '../core/tokens'
 import type {
@@ -18,7 +19,6 @@ import type {
   Message,
   MessageId,
 } from '../core/types'
-import { readGlobalPreferences } from '../core/global-settings'
 import { getDb } from './db'
 import { hydrateMessages, type MessageBodyRow, type MessageHeaderRow } from './message-storage'
 

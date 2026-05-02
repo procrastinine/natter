@@ -63,18 +63,14 @@ export function buildOpenRouterContentPart(
       : undefined
   }
 
-  if (result.openRouter.contextForm === 'input_audio') {
-    if (!bytes) return undefined
-    return {
-      type: 'input_audio',
-      input_audio: {
-        data: base64Encode(bytes),
-        format: audioFormat(attachment.mime, attachment.extension),
-      },
-    }
+  if (!bytes) return undefined
+  return {
+    type: 'input_audio',
+    input_audio: {
+      data: base64Encode(bytes),
+      format: audioFormat(attachment.mime, attachment.extension),
+    },
   }
-
-  return undefined
 }
 
 export function buildOpenRouterPdfPlugin(
@@ -94,7 +90,8 @@ function base64Encode(bytes: Uint8Array): string {
   let output = ''
   let index = 0
   while (index + 2 < bytes.length) {
-    const chunk = ((bytes[index] ?? 0) << 16) | ((bytes[index + 1] ?? 0) << 8) | (bytes[index + 2] ?? 0)
+    const chunk =
+      ((bytes[index] ?? 0) << 16) | ((bytes[index + 1] ?? 0) << 8) | (bytes[index + 2] ?? 0)
     output +=
       alphabet.charAt((chunk >> 18) & 63) +
       alphabet.charAt((chunk >> 12) & 63) +
@@ -113,7 +110,10 @@ function base64Encode(bytes: Uint8Array): string {
   return output
 }
 
-function sourceUrlOrDataUrl(result: ProcessAttachmentResult, bytes?: Uint8Array): string | undefined {
+function sourceUrlOrDataUrl(
+  result: ProcessAttachmentResult,
+  bytes?: Uint8Array,
+): string | undefined {
   const attachment = result.attachment
   if (attachment.storageState === 'remote-url' && attachment.sourceUrl) return attachment.sourceUrl
   return bytes ? dataUrl(attachment.mime, bytes) : undefined

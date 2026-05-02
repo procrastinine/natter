@@ -1,14 +1,14 @@
 // Anthropic Messages API adapter.
 
 import type { ConnectionProfile } from '../core/types'
-import { buildHeaders, fetchWithTimeout } from './client'
-import { normalizeError } from './errors'
-import { parseSSE } from './sse'
 import type {
   AnthropicMessagesRequestWire,
   AnthropicMessagesResultWire,
   AnthropicStreamChunk,
 } from './anthropic-types'
+import { buildHeaders, fetchWithTimeout } from './client'
+import { normalizeError } from './errors'
+import { parseSSE } from './sse'
 import type { CallOpts } from './types'
 
 export interface AnthropicContext {
@@ -44,7 +44,9 @@ async function dispatch(
     authScheme: 'anthropic-native',
     overrideHeaders: {
       'anthropic-version': '2023-06-01',
-      ...(betaHeaderForRequest(req) ? { 'anthropic-beta': betaHeaderForRequest(req) as string } : {}),
+      ...(betaHeaderForRequest(req)
+        ? { 'anthropic-beta': betaHeaderForRequest(req) as string }
+        : {}),
       ...(opts.overrideHeaders ?? {}),
     },
   })
@@ -59,7 +61,7 @@ async function dispatch(
     ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
   })
   if (!response.ok) {
-    const body = await response.json().catch(() => ({
+    const body: unknown = await response.json().catch(() => ({
       error: { type: String(response.status), message: response.statusText },
     }))
     throw normalizeError(body, { midStream: false, httpStatus: response.status })

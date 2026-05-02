@@ -1,5 +1,5 @@
-import type { ConnectionKind } from './types'
 import { deterministicStructuralModelId, deterministicStructuralModelIdentity } from './model-ids'
+import type { ConnectionKind } from './types'
 
 interface ModelCandidate {
   id: string

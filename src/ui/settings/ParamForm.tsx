@@ -25,8 +25,8 @@ import {
   responsesSupportFor,
 } from '../../core/quirks'
 import type {
-  Chat,
   AnthropicServerToolId,
+  Chat,
   ConnectionKind,
   ConnectionProfile,
   GoogleServerToolId,
@@ -563,7 +563,11 @@ function hostedToolUiConfig(input: {
     return { provider: 'google', title: 'Gemini tools', options: GOOGLE_HOSTED_TOOL_OPTIONS }
   }
   if (input.connectionKind === 'anthropic' && input.chat.settings.api !== 'chat') {
-    return { provider: 'anthropic', title: 'Anthropic tools', options: ANTHROPIC_HOSTED_TOOL_OPTIONS }
+    return {
+      provider: 'anthropic',
+      title: 'Anthropic tools',
+      options: ANTHROPIC_HOSTED_TOOL_OPTIONS,
+    }
   }
   return null
 }
@@ -898,9 +902,12 @@ function anthropicAdvisorAvailable(modelId: string): boolean {
     .replace(/^anthropic\//u, '')
     .replace(/(\d)\.(\d)(?=-|$)/g, '$1-$2')
     .replace(/-\d{8}$/u, '')
-  return new Set(['claude-haiku-4-5', 'claude-sonnet-4-6', 'claude-opus-4-6', 'claude-opus-4-7']).has(
-    normalized,
-  )
+  return new Set([
+    'claude-haiku-4-5',
+    'claude-sonnet-4-6',
+    'claude-opus-4-6',
+    'claude-opus-4-7',
+  ]).has(normalized)
 }
 
 function NumberField({
@@ -1634,7 +1641,7 @@ function LogitBiasSection({ chat, capability }: { chat: Chat; capability: Effect
       return
     }
     try {
-      const parsed = JSON.parse(draft)
+      const parsed: unknown = JSON.parse(draft)
       if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
         setErrorMsg('Must be an object of token → bias pairs')
         return
@@ -1657,7 +1664,7 @@ function LogitBiasSection({ chat, capability }: { chat: Chat; capability: Effect
       const text = typeof reader.result === 'string' ? reader.result : ''
       setDraft(text)
       try {
-        const parsed = JSON.parse(text)
+        const parsed: unknown = JSON.parse(text)
         if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
           setErrorMsg('Must be an object of token → bias pairs')
           return

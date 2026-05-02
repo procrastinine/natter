@@ -201,28 +201,18 @@ function usePromptSlot(
     [chat.id, draft, flushDraftBeforeAction, pushToast, slot.kind, slot.pinKey],
   )
 
-  const renamePreset = useCallback(
-    async (targetId: string, currentName: string) => {
-      const name = window.prompt('Rename preset:', currentName)
-      if (!name?.trim() || name === currentName) return
-      await updatePromptPreset(targetId, { name: name.trim() })
-    },
-    [],
-  )
+  const renamePreset = useCallback(async (targetId: string, currentName: string) => {
+    const name = window.prompt('Rename preset:', currentName)
+    if (!name?.trim() || name === currentName) return
+    await updatePromptPreset(targetId, { name: name.trim() })
+  }, [])
 
-  const deletePresetWithConfirm = useCallback(
-    async (targetId: string, name: string) => {
-      if (
-        !window.confirm(
-          `Delete preset "${name}"? Chats pinned to it keep their current text.`,
-        )
-      ) {
-        return
-      }
-      await deletePromptPreset(targetId)
-    },
-    [],
-  )
+  const deletePresetWithConfirm = useCallback(async (targetId: string, name: string) => {
+    if (!window.confirm(`Delete preset "${name}"? Chats pinned to it keep their current text.`)) {
+      return
+    }
+    await deletePromptPreset(targetId)
+  }, [])
 
   return {
     draft,
@@ -303,8 +293,8 @@ export function SystemPromptEditor({
         <>
           {s.toastVisible ? (
             <div data-ui="settings-toast" role="status">
-              System prompt updated, it takes effect on the next send. Earlier responses used
-              the previous prompt.
+              System prompt updated, it takes effect on the next send. Earlier responses used the
+              previous prompt.
             </div>
           ) : null}
           <div data-ui="field-group">
@@ -449,9 +439,9 @@ export function PrefillPromptEditor({
             <h3>Prefill</h3>
           </button>
           <InfoDisclosure title="Prefill">
-            Seeds the prefill box when prefill opens on this chat. The Continue-prefill toggle
-            below sends the existing assistant message as a real prefill turn during Continue,
-            instead of the continue-prompt template.
+            Seeds the prefill box when prefill opens on this chat. The Continue-prefill toggle below
+            sends the existing assistant message as a real prefill turn during Continue, instead of
+            the continue-prompt template.
           </InfoDisclosure>
         </div>
         {expanded ? (
@@ -529,8 +519,8 @@ export function ContinueSystemPromptEditor({
             <h3>Continue system prompt</h3>
           </button>
           <InfoDisclosure title="Continue system prompt">
-            Used by Continue-in-place. [SYSTEM_PROMPT] expands to this chat's system prompt;
-            blank sends none.
+            Used by Continue-in-place. [SYSTEM_PROMPT] expands to this chat's system prompt; blank
+            sends none.
           </InfoDisclosure>
         </div>
         {expanded ? (
@@ -603,8 +593,8 @@ export function ContinueUserPromptEditor({
             <h3>Continue user prompt</h3>
           </button>
           <InfoDisclosure title="Continue user prompt">
-            Synthetic trailing user message appended during Continue-in-place. Blank falls back
-            to the legacy double-assistant shape.
+            Synthetic trailing user message appended during Continue-in-place. Blank falls back to
+            the legacy double-assistant shape.
           </InfoDisclosure>
         </div>
         {expanded ? (
@@ -796,12 +786,7 @@ function TrashIcon() {
 function CloseGlyph() {
   return (
     <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false" width="13" height="13">
-      <path
-        d="M4 4l8 8M12 4l-8 8"
-        stroke="currentColor"
-        strokeWidth="1.4"
-        strokeLinecap="round"
-      />
+      <path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
     </svg>
   )
 }

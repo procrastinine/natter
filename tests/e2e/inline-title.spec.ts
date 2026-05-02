@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test'
+import { expect, type Page, test } from '@playwright/test'
 import {
   buildSseBody,
   clearIndexedDb,
@@ -142,10 +142,7 @@ test('title commit bumps updatedAt + metaVersion, leaves branch state untouched,
   expect(Number(after.lastBranchUpdatedAt)).toBe(Number(before.lastBranchUpdatedAt))
 })
 
-async function readChat(
-  page: import('@playwright/test').Page,
-  chatId: string,
-): Promise<Record<string, unknown>> {
+async function readChat(page: Page, chatId: string): Promise<Record<string, unknown>> {
   return page.evaluate(async (id) => {
     const db = await new Promise<IDBDatabase>((resolve, reject) => {
       const req = indexedDB.open('natter')

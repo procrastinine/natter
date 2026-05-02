@@ -57,7 +57,11 @@ vi.mock('../../src/store/settings', () => {
   }
 })
 
-function makeLegacyMessage(role: MessageRole, text: string, partial: Partial<Message> = {}): Message {
+function makeLegacyMessage(
+  role: MessageRole,
+  text: string,
+  partial: Partial<Message> = {},
+): Message {
   return {
     id: `legacy-${Math.random().toString(36).slice(2, 8)}`,
     chatId: 'chat-1',
@@ -125,10 +129,7 @@ describe('backcompat — calibration resolver against pre-Phase-B chat', () => {
 
 describe('backcompat — gauge against pre-Phase-B message rows', () => {
   it('estimatePromptSize: fresh-path works on legacy messages (no crash, no NaN)', () => {
-    const path = [
-      makeLegacyMessage('user', 'hello'),
-      makeLegacyMessage('assistant', 'hi there'),
-    ]
+    const path = [makeLegacyMessage('user', 'hello'), makeLegacyMessage('assistant', 'hi there')]
     const est = estimatePromptSize({
       systemPrompt: 'you are kind',
       activePathMessages: path,
@@ -165,12 +166,7 @@ describe('backcompat — gauge against pre-Phase-B message rows', () => {
 
   it('estimateSettingsPromptSize: wires through attachment resolver + currentModelId without crashing', () => {
     const path = [makeLegacyMessage('user', 'hello')]
-    const est = estimateSettingsPromptSize(
-      makeLegacyChatSettings(),
-      path,
-      '',
-      'cl100k_base',
-    )
+    const est = estimateSettingsPromptSize(makeLegacyChatSettings(), path, '', 'cl100k_base')
     expect(Number.isFinite(est.total)).toBe(true)
   })
 })

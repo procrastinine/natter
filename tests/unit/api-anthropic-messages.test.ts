@@ -58,10 +58,11 @@ describe('anthropicStream', () => {
     vi.stubGlobal(
       'fetch',
       vi.fn(async (url: string, init: RequestInit) => {
+        if (typeof init.body !== 'string') throw new Error('expected string request body')
         seen.push({
           url,
           headers: init.headers as Record<string, string>,
-          body: JSON.parse(String(init.body)),
+          body: JSON.parse(init.body) as unknown,
         })
         return sseResponse('')
       }),
@@ -106,7 +107,10 @@ describe('anthropicStream', () => {
       'data: {"type":"message_stop"}',
       '',
     ].join('\n')
-    vi.stubGlobal('fetch', vi.fn(async () => sseResponse(body, { 'anthropic-request-id': 'req_1' })))
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => sseResponse(body, { 'anthropic-request-id': 'req_1' })),
+    )
 
     const chunks: AnthropicStreamChunk[] = []
     for await (const chunk of anthropicStream(ctx(), {

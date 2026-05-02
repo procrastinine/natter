@@ -8,7 +8,7 @@
 // call sites don't have to remember the key names.
 
 import { getSetting, setSetting } from '../store/settings'
-import { DEFAULT_CORS_PROXY_URL, type CorsProxyConfig, DEV_CORS_PROXY_URL } from './cors-proxy'
+import { type CorsProxyConfig, DEFAULT_CORS_PROXY_URL, DEV_CORS_PROXY_URL } from './cors-proxy'
 
 export { DEV_CORS_PROXY_URL }
 

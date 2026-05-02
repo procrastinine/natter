@@ -18,13 +18,17 @@ describe('assert', () => {
   })
 
   it('narrows the type for TypeScript callers', () => {
-    const v: string | null = 'x'
+    const v: string | null = maybeString()
     assert(v !== null, 'v is null')
     // After the assert, v must be typed as string — the real test is that this
     // file compiles under strict mode; the expect is incidental.
     expect(v.length).toBe(1)
   })
 })
+
+function maybeString(): string | null {
+  return 'x'
+}
 
 describe('assertNever', () => {
   it('throws with the unexpected variant stringified', () => {

@@ -27,7 +27,8 @@ export class AttachmentLibrary {
 
   constructor(snapshot?: AttachmentLibrarySnapshot) {
     if (!snapshot) return
-    for (const result of snapshot.attachments) this.results.set(result.attachment.id, cloneResult(result))
+    for (const result of snapshot.attachments)
+      this.results.set(result.attachment.id, cloneResult(result))
     for (const ref of snapshot.refs) this.refs.set(ref.refId, { ...ref })
   }
 
@@ -72,10 +73,7 @@ export class AttachmentLibrary {
       if (query.filters?.kind && attachment.kind !== query.filters.kind) return false
       if (query.filters?.mime && attachment.mime !== query.filters.mime) return false
       if (query.filters?.origin && attachment.origin !== query.filters.origin) return false
-      if (
-        query.filters?.storageState &&
-        attachment.storageState !== query.filters.storageState
-      ) {
+      if (query.filters?.storageState && attachment.storageState !== query.filters.storageState) {
         return false
       }
       if (
@@ -90,10 +88,16 @@ export class AttachmentLibrary {
       ) {
         return false
       }
-      if (query.filters?.minRefCount !== undefined && attachment.refCount < query.filters.minRefCount) {
+      if (
+        query.filters?.minRefCount !== undefined &&
+        attachment.refCount < query.filters.minRefCount
+      ) {
         return false
       }
-      if (query.filters?.maxRefCount !== undefined && attachment.refCount > query.filters.maxRefCount) {
+      if (
+        query.filters?.maxRefCount !== undefined &&
+        attachment.refCount > query.filters.maxRefCount
+      ) {
         return false
       }
       if (terms.length === 0) return true
@@ -135,7 +139,11 @@ export class AttachmentLibrary {
     this.bumpRefCount(existing.attachmentId, -1)
   }
 
-  setRefVisibility(refId: string, includeInContext: boolean, now = Date.now()): MessageAttachmentRef {
+  setRefVisibility(
+    refId: string,
+    includeInContext: boolean,
+    now = Date.now(),
+  ): MessageAttachmentRef {
     const ref = requireRef(this.refs, refId)
     const updated = { ...ref, includeInContext, updatedAt: now }
     this.refs.set(refId, updated)
@@ -319,7 +327,10 @@ function cloneResult(result: ProcessAttachmentResult): ProcessAttachmentResult {
     attachment: cloneAttachment(result.attachment),
     artifacts: result.artifacts.map(cloneArtifact),
     processing: result.processing.map((state) => ({ ...state })),
-    openRouter: { ...result.openRouter, requiredProcessors: [...result.openRouter.requiredProcessors] },
+    openRouter: {
+      ...result.openRouter,
+      requiredProcessors: [...result.openRouter.requiredProcessors],
+    },
   }
 }
 
@@ -338,7 +349,10 @@ function cloneArtifact(artifact: ProcessAttachmentResult['artifacts'][number]) {
   }
 }
 
-function rekeyResult(result: ProcessAttachmentResult, attachmentId: string): ProcessAttachmentResult {
+function rekeyResult(
+  result: ProcessAttachmentResult,
+  attachmentId: string,
+): ProcessAttachmentResult {
   const previousId = result.attachment.id
   return {
     ...cloneResult(result),

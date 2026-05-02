@@ -18,14 +18,7 @@
 
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { useLiveQuery } from 'dexie-react-hooks'
-import {
-  useCallback,
-  useDeferredValue,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from 'react'
+import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
 import type { ModelListEntry } from '../../api/providers'
 import {
   DEFAULT_PINNED_MODELS,
@@ -179,31 +172,25 @@ export function ModelPicker({ chat, profileKind, onPick, onPickForPreset }: Mode
     overscan: 8,
   })
 
-  const togglePin = useCallback(
-    async (modelId: string) => {
-      const current = (await readGlobalPreferences()).pinnedModels
-      if (current.includes(modelId)) {
-        await writePinnedModels(current.filter((x) => x !== modelId))
-      } else {
-        await writePinnedModels([...current, modelId])
-      }
-    },
-    [],
-  )
+  const togglePin = useCallback(async (modelId: string) => {
+    const current = (await readGlobalPreferences()).pinnedModels
+    if (current.includes(modelId)) {
+      await writePinnedModels(current.filter((x) => x !== modelId))
+    } else {
+      await writePinnedModels([...current, modelId])
+    }
+  }, [])
 
-  const movePin = useCallback(
-    async (modelId: string, delta: 1 | -1) => {
-      const current = [...(await readGlobalPreferences()).pinnedModels]
-      const idx = current.indexOf(modelId)
-      if (idx < 0) return
-      const to = Math.max(0, Math.min(current.length - 1, idx + delta))
-      if (to === idx) return
-      current.splice(idx, 1)
-      current.splice(to, 0, modelId)
-      await writePinnedModels(current)
-    },
-    [],
-  )
+  const movePin = useCallback(async (modelId: string, delta: 1 | -1) => {
+    const current = [...(await readGlobalPreferences()).pinnedModels]
+    const idx = current.indexOf(modelId)
+    if (idx < 0) return
+    const to = Math.max(0, Math.min(current.length - 1, idx + delta))
+    if (to === idx) return
+    current.splice(idx, 1)
+    current.splice(to, 0, modelId)
+    await writePinnedModels(current)
+  }, [])
 
   const clearRecentHistory = useCallback(async () => {
     await writeRecentModels([])

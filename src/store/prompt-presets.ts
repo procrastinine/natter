@@ -82,9 +82,7 @@ interface CreatePromptPresetInput {
   lastUsedAt?: number
 }
 
-export async function createPromptPreset(
-  input: CreatePromptPresetInput,
-): Promise<PromptPreset> {
+export async function createPromptPreset(input: CreatePromptPresetInput): Promise<PromptPreset> {
   const now = input.now ?? Date.now()
   const preset: PromptPreset = {
     id: input.id ?? newId(),
@@ -100,15 +98,11 @@ export async function createPromptPreset(
   return preset
 }
 
-export async function getPromptPreset(
-  presetId: PromptPresetId,
-): Promise<PromptPreset | undefined> {
+export async function getPromptPreset(presetId: PromptPresetId): Promise<PromptPreset | undefined> {
   return getDb().promptPresets.get(presetId)
 }
 
-export async function listPromptPresets(
-  kind?: PromptPresetKind,
-): Promise<PromptPreset[]> {
+export async function listPromptPresets(kind?: PromptPresetKind): Promise<PromptPreset[]> {
   const table = getDb().promptPresets
   const rows = kind ? await table.where('kind').equals(kind).toArray() : await table.toArray()
   rows.sort((a, b) => a.name.localeCompare(b.name))
@@ -132,50 +126,44 @@ export async function updatePromptPreset(
   const now = opts.now ?? Date.now()
   const touchedChats: Chat[] = []
   const touchedChatPresetIds: string[] = []
-  const result = await db.transaction(
-    'rw',
-    db.promptPresets,
-    db.chats,
-    db.presets,
-    async () => {
-      const existing = await db.promptPresets.get(presetId)
-      if (!existing) throw new PromptPresetMissingError(presetId)
-      const next: PromptPreset = {
-        ...existing,
-        ...patch,
-        id: existing.id,
-        kind: existing.kind,
-        createdAt: existing.createdAt,
-        updatedAt: now,
+  const result = await db.transaction('rw', db.promptPresets, db.chats, db.presets, async () => {
+    const existing = await db.promptPresets.get(presetId)
+    if (!existing) throw new PromptPresetMissingError(presetId)
+    const next: PromptPreset = {
+      ...existing,
+      ...patch,
+      id: existing.id,
+      kind: existing.kind,
+      createdAt: existing.createdAt,
+      updatedAt: now,
+    }
+    await db.promptPresets.put(next)
+    if (patch.text !== undefined && patch.text !== existing.text) {
+      const slot = SLOTS[existing.kind]
+      const chatHits: Chat[] = []
+      await db.chats.toCollection().each((chat) => {
+        if (chat.settings[slot.pinKey] === presetId) chatHits.push(chat)
+      })
+      for (const chat of chatHits) {
+        const nextSettings: ChatSettings = { ...chat.settings }
+        ;(nextSettings as unknown as Record<string, unknown>)[slot.textKey] = patch.text
+        const written: Chat = { ...chat, settings: nextSettings, updatedAt: now }
+        await db.chats.put(written)
+        touchedChats.push(written)
       }
-      await db.promptPresets.put(next)
-      if (patch.text !== undefined && patch.text !== existing.text) {
-        const slot = SLOTS[existing.kind]
-        const chatHits: Chat[] = []
-        await db.chats.toCollection().each((chat) => {
-          if (chat.settings[slot.pinKey] === presetId) chatHits.push(chat)
-        })
-        for (const chat of chatHits) {
-          const nextSettings: ChatSettings = { ...chat.settings }
-          ;(nextSettings as unknown as Record<string, unknown>)[slot.textKey] = patch.text
-          const written: Chat = { ...chat, settings: nextSettings, updatedAt: now }
-          await db.chats.put(written)
-          touchedChats.push(written)
-        }
-        const presetHits: ChatPreset[] = []
-        await db.presets.toCollection().each((preset) => {
-          if (preset.settings[slot.pinKey] === presetId) presetHits.push(preset)
-        })
-        for (const preset of presetHits) {
-          const nextSettings: ChatSettings = { ...preset.settings }
-          ;(nextSettings as unknown as Record<string, unknown>)[slot.textKey] = patch.text
-          await db.presets.put({ ...preset, settings: nextSettings, updatedAt: now })
-          touchedChatPresetIds.push(preset.id)
-        }
+      const presetHits: ChatPreset[] = []
+      await db.presets.toCollection().each((preset) => {
+        if (preset.settings[slot.pinKey] === presetId) presetHits.push(preset)
+      })
+      for (const preset of presetHits) {
+        const nextSettings: ChatSettings = { ...preset.settings }
+        ;(nextSettings as unknown as Record<string, unknown>)[slot.textKey] = patch.text
+        await db.presets.put({ ...preset, settings: nextSettings, updatedAt: now })
+        touchedChatPresetIds.push(preset.id)
       }
-      return next
-    },
-  )
+    }
+    return next
+  })
   postEvent({ kind: 'prompt-preset-mutated', promptPresetId: presetId })
   for (const chat of touchedChats) {
     postEvent({

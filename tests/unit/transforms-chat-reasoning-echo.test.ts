@@ -55,7 +55,10 @@ function userMessage(id: string, text: string): Message {
   }
 }
 
-function withInclude(include: ReasoningInclude, overrides: Partial<ChatSettings> = {}): ChatSettings {
+function withInclude(
+  include: ReasoningInclude,
+  overrides: Partial<ChatSettings> = {},
+): ChatSettings {
   const s = cloneDefaultChatSettings()
   s.profileId = 'prof'
   s.model = 'anthropic/claude-haiku-4.5'
@@ -161,12 +164,20 @@ describe('filterReasoningForInclude', () => {
       { type: 'reasoning.summary', id: 'r_s', summary: 'gist' },
       { type: 'reasoning.text', id: 'r_t', text: 'verbose' },
     ]
-    expect(filterReasoningForInclude(details, { encrypted: false, summary: true, text: false }, undefined)).toEqual([
-      { type: 'reasoning.summary', id: 'r_s', summary: 'gist' },
-    ])
-    expect(filterReasoningForInclude(details, { encrypted: false, summary: false, text: true }, undefined)).toEqual([
-      { type: 'reasoning.text', id: 'r_t', text: 'verbose' },
-    ])
+    expect(
+      filterReasoningForInclude(
+        details,
+        { encrypted: false, summary: true, text: false },
+        undefined,
+      ),
+    ).toEqual([{ type: 'reasoning.summary', id: 'r_s', summary: 'gist' }])
+    expect(
+      filterReasoningForInclude(
+        details,
+        { encrypted: false, summary: false, text: true },
+        undefined,
+      ),
+    ).toEqual([{ type: 'reasoning.text', id: 'r_t', text: 'verbose' }])
   })
 
   it('all-false drops everything', () => {
@@ -176,7 +187,11 @@ describe('filterReasoningForInclude', () => {
       { type: 'reasoning.encrypted', id: 'r_e', data: 'c', format: 'anthropic-claude-v1' },
     ]
     expect(
-      filterReasoningForInclude(details, { encrypted: false, summary: false, text: false }, 'anthropic-claude-v1'),
+      filterReasoningForInclude(
+        details,
+        { encrypted: false, summary: false, text: false },
+        'anthropic-claude-v1',
+      ),
     ).toEqual([])
   })
 
@@ -337,9 +352,7 @@ describe('buildChatMessages / toChatCompletions — reasoning echo', () => {
   it('drops reasoning_details field when include is all-false', () => {
     const path: Message[] = [
       userMessage('u1', 'x'),
-      assistantWithReasoning('a1', 'y', [
-        { type: 'reasoning.text', id: 'r', text: 'think' },
-      ]),
+      assistantWithReasoning('a1', 'y', [{ type: 'reasoning.text', id: 'r', text: 'think' }]),
     ]
     const messages = buildChatMessages(
       withInclude({ encrypted: false, summary: false, text: false }),
@@ -356,7 +369,10 @@ describe('buildChatMessages / toChatCompletions — reasoning echo', () => {
         { type: 'reasoning.encrypted', id: 'r', data: 'blob', format: 'anthropic-claude-v1' },
       ]),
     ]
-    const messages = buildChatMessages(withInclude({ encrypted: true, summary: false, text: false }), path)
+    const messages = buildChatMessages(
+      withInclude({ encrypted: true, summary: false, text: false }),
+      path,
+    )
     // No format passed → encrypted dropped.
     expect(messages[1]).not.toHaveProperty('reasoning_details')
   })
@@ -394,7 +410,10 @@ describe('buildChatMessages / toChatCompletions — reasoning echo', () => {
       userMessage('u1', 'x'),
       assistantWithReasoning('a1', '', [], toolCalls),
     ]
-    const messages = buildChatMessages(withInclude({ encrypted: false, summary: false, text: false }), path)
+    const messages = buildChatMessages(
+      withInclude({ encrypted: false, summary: false, text: false }),
+      path,
+    )
     const echoed = messages[1] as Record<string, unknown>
     expect(echoed.tool_calls).toEqual([
       {
@@ -425,7 +444,10 @@ describe('buildChatMessages / toChatCompletions — reasoning echo', () => {
       deleted: false,
     }
     const path: Message[] = [userMessage('u1', 'x'), toolMessage]
-    const messages = buildChatMessages(withInclude({ encrypted: false, summary: false, text: false }), path)
+    const messages = buildChatMessages(
+      withInclude({ encrypted: false, summary: false, text: false }),
+      path,
+    )
     const echoed = messages[1] as Record<string, unknown>
     expect(echoed.role).toBe('tool')
     expect(echoed.tool_call_id).toBe('call_9')
@@ -441,17 +463,18 @@ describe('buildChatMessages / toChatCompletions — reasoning echo', () => {
         phase: 'final_answer',
       },
     ]
-    const { wire } = toChatCompletions(withInclude({ encrypted: false, summary: false, text: false }), path, {})
+    const { wire } = toChatCompletions(
+      withInclude({ encrypted: false, summary: false, text: false }),
+      path,
+      {},
+    )
     const echoed = (wire.messages as Record<string, unknown>[])[1]
     expect(echoed).not.toHaveProperty('phase')
   })
 })
 
 describe('echoAsThinkTags — universal-compat transport', () => {
-  function withEchoAsThink(
-    include: ReasoningInclude,
-    echoAsThinkTags: boolean,
-  ): ChatSettings {
+  function withEchoAsThink(include: ReasoningInclude, echoAsThinkTags: boolean): ChatSettings {
     const s = withInclude(include)
     s.reasoning = { ...s.reasoning, echoAsThinkTags }
     return s

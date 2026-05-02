@@ -4,8 +4,8 @@ import {
   hydrateMessage,
   hydrateMessages,
   MESSAGE_BODY_KEYS,
-  splitMessageForStorage,
   type MessageHeaderRow,
+  splitMessageForStorage,
 } from '../../src/store/message-storage'
 
 function message(overrides: Partial<Message> = {}): Message {

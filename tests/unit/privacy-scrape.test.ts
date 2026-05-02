@@ -93,15 +93,15 @@ describe('privacyScrapeUrl', () => {
   })
 
   it('expands the bare proxy.corsfix.com host into the ?url= template', () => {
-    expect(
-      privacyScrapeUrl(makeProxy({ url: 'proxy.corsfix.com' }), 'openai/gpt-5.4'),
-    ).toBe('https://proxy.corsfix.com/?url=https://openrouter.ai/openai/gpt-5.4/providers')
+    expect(privacyScrapeUrl(makeProxy({ url: 'proxy.corsfix.com' }), 'openai/gpt-5.4')).toBe(
+      'https://proxy.corsfix.com/?url=https://openrouter.ai/openai/gpt-5.4/providers',
+    )
   })
 
   it('accepts known-bouncer hosts with explicit https:// scheme', () => {
-    expect(
-      privacyScrapeUrl(makeProxy({ url: 'https://corsproxy.io' }), 'openai/gpt-5.4'),
-    ).toBe('https://corsproxy.io/?url=https://openrouter.ai/openai/gpt-5.4/providers')
+    expect(privacyScrapeUrl(makeProxy({ url: 'https://corsproxy.io' }), 'openai/gpt-5.4')).toBe(
+      'https://corsproxy.io/?url=https://openrouter.ai/openai/gpt-5.4/providers',
+    )
   })
 
   it('accepts known-bouncer hosts case-insensitively', () => {
@@ -340,9 +340,7 @@ describe('fetchPrivacyScrape (injected fetch)', () => {
   it('surfaces non-2xx as an error', async () => {
     const proxy = makeProxy()
     const fetchImpl = async () => new Response('not found', { status: 404 })
-    await expect(
-      fetchPrivacyScrape({ proxy, fetchImpl }, 'unknown/model'),
-    ).rejects.toThrow()
+    await expect(fetchPrivacyScrape({ proxy, fetchImpl }, 'unknown/model')).rejects.toThrow()
   })
 
   it('returns an empty policies map when the page had nothing to parse', async () => {
@@ -363,7 +361,7 @@ describe('fetchPrivacyScrape (injected fetch)', () => {
       return new Response('<html></html>', { status: 200 })
     }
     await fetchPrivacyScrape({ proxy, fetchImpl }, 'openai/gpt-5.4')
-    expect((observed as Record<string, string>)?.[CORS_PROXY_SECRET_HEADER]).toBe('s3kr3t')
+    expect((observed as Record<string, string>)[CORS_PROXY_SECRET_HEADER]).toBe('s3kr3t')
   })
 
   it('omits X-Proxy-Secret when the secret is empty', async () => {
@@ -374,6 +372,6 @@ describe('fetchPrivacyScrape (injected fetch)', () => {
       return new Response('<html></html>', { status: 200 })
     }
     await fetchPrivacyScrape({ proxy, fetchImpl }, 'openai/gpt-5.4')
-    expect((observed as Record<string, string>)?.[CORS_PROXY_SECRET_HEADER]).toBeUndefined()
+    expect((observed as Record<string, string>)[CORS_PROXY_SECRET_HEADER]).toBeUndefined()
   })
 })

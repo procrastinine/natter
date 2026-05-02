@@ -30,8 +30,8 @@ export type AnthropicContentBlock = Record<string, unknown> & {
 
 export interface AnthropicMessagesResultWire {
   id?: string
-  type?: 'message' | string
-  role?: 'assistant' | string
+  type?: string
+  role?: string
   model?: string
   content?: AnthropicContentBlock[]
   stop_reason?: string | null
@@ -78,7 +78,11 @@ export type AnthropicEventWire =
     }
   | {
       type: 'message_delta'
-      delta?: { stop_reason?: string | null; stop_sequence?: string | null; [extra: string]: unknown }
+      delta?: {
+        stop_reason?: string | null
+        stop_sequence?: string | null
+        [extra: string]: unknown
+      }
       usage?: AnthropicUsageWire
     }
   | {

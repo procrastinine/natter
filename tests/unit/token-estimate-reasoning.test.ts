@@ -51,14 +51,13 @@ function opts(
     | 'openai-responses-v1'
     | 'anthropic-claude-v1'
     | 'google-gemini-v1'
-    | 'unknown'
-    | undefined = 'openai-responses-v1',
+    | 'unknown' = 'openai-responses-v1',
   excluded = false,
 ): PromptEstimateOptions {
   return {
     family: 'gpt',
     reasoningInclude: include,
-    ...(fmt !== undefined ? { reasoningPreservationFormat: fmt } : {}),
+    reasoningPreservationFormat: fmt,
     reasoningExcluded: excluded,
   }
 }

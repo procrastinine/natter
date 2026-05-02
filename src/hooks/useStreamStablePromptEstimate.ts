@@ -1,9 +1,9 @@
 import { useMemo, useRef } from 'react'
 import {
   estimatePromptSize,
-  promptEstimateInputSignature,
   type PromptSizeEstimate,
   type PromptSizeEstimateInput,
+  promptEstimateInputSignature,
 } from '../core/prompt-size'
 import type { ChatId } from '../core/types'
 
@@ -52,7 +52,11 @@ export function useStreamStablePromptEstimate(
       return null
     }
     const cached = cacheRef.current
-    if (streamActivityKey.length > 0 && cached.chatId === nextChatId && cached.signature === signature) {
+    if (
+      streamActivityKey.length > 0 &&
+      cached.chatId === nextChatId &&
+      cached.signature === signature
+    ) {
       return cached.value
     }
     const nextValue = estimatePromptSize(input)

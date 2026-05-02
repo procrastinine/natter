@@ -1,5 +1,5 @@
 import { useLiveQuery } from 'dexie-react-hooks'
-import { createContext, useCallback, useEffect, type ReactNode, useState } from 'react'
+import { createContext, type ReactNode, useCallback, useEffect, useState } from 'react'
 import { getSetting, setSetting } from '../../store/settings'
 import { InfoDisclosure } from './InfoDisclosure'
 
@@ -40,9 +40,7 @@ async function readRenderingPreferences(): Promise<RenderingPreferences> {
   return { ...DEFAULT_RENDERING_PREFS, ...(stored ?? {}) }
 }
 
-async function writeRenderingPreferences(
-  next: Partial<RenderingPreferences>,
-): Promise<void> {
+async function writeRenderingPreferences(next: Partial<RenderingPreferences>): Promise<void> {
   publishRenderingPreferences({ ...latestRenderingPreferences, ...next })
   const current = await readRenderingPreferences()
   const updated = { ...current, ...next }
@@ -97,8 +95,8 @@ export function RenderingSettings() {
             />
             <span>Single-dollar LaTeX markdown</span>
             <InfoDisclosure title="Single-dollar LaTeX markdown">
-              When on, $...$ renders as inline math. Keep off for price-heavy chats; use
-              $$...$$ for math.
+              When on, $...$ renders as inline math. Keep off for price-heavy chats; use $$...$$ for
+              math.
             </InfoDisclosure>
           </label>
         </div>

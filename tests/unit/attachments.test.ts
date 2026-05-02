@@ -12,8 +12,8 @@ import {
   deleteUnreferencedAttachment,
   diffAttachmentRefs,
   getAttachmentBundle,
-  ingestAttachmentBytes,
   incRefs,
+  ingestAttachmentBytes,
   putAttachment,
   reapOrphanedAttachments,
   relinkAttachmentRef,
@@ -421,7 +421,10 @@ describe('reapOrphanedAttachments', () => {
 describe('misc attachment helpers', () => {
   it('diffAttachmentRefs returns increment and decrement sets', () => {
     expect(
-      diffAttachmentRefs([attachmentRef('A'), attachmentRef('B')], [attachmentRef('B'), attachmentRef('C')]),
+      diffAttachmentRefs(
+        [attachmentRef('A'), attachmentRef('B')],
+        [attachmentRef('B'), attachmentRef('C')],
+      ),
     ).toEqual({
       toInc: ['C'],
       toDec: ['A'],

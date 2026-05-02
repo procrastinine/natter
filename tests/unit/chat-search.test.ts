@@ -2,9 +2,9 @@ import { describe, expect, it, vi } from 'vitest'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import type { Chat, ChatBranchCache, ChatFolder, ChatTag, Message } from '../../src/core/types'
 import {
+  type ChatSearchUpdate,
   DEFAULT_SEARCH_FILTERS,
   searchChats,
-  type ChatSearchUpdate,
 } from '../../src/store/chat-search'
 import type { WorkspaceRepository } from '../../src/store/repository'
 
@@ -124,7 +124,12 @@ describe('chat search backend', () => {
     const repository = repo({
       chats: [
         chat({ id: 'title', title: 'alpha title', lastUpdatedLeafId: null }),
-        chat({ id: 'body', title: 'body', lastUpdatedLeafId: 'body-message', lastBranchUpdatedAt: 5 }),
+        chat({
+          id: 'body',
+          title: 'body',
+          lastUpdatedLeafId: 'body-message',
+          lastBranchUpdatedAt: 5,
+        }),
       ],
       messages: { body: slowMessages },
     })
@@ -139,14 +144,13 @@ describe('chat search backend', () => {
     })
     await new Promise((resolve) => setTimeout(resolve, 0))
 
-    expect(updates).toContainEqual(
-      expect.objectContaining({
-        kind: 'hit',
-        queryId: 'q-stream',
-        completedCount: 1,
-        result: expect.objectContaining({ chatId: 'title', source: 'title' }),
-      }),
+    const titleHit = updates.find(
+      (update): update is Extract<ChatSearchUpdate, { kind: 'hit' }> =>
+        update.kind === 'hit' && update.result.chatId === 'title',
     )
+    expect(titleHit?.queryId).toBe('q-stream')
+    expect(titleHit?.completedCount).toBe(1)
+    expect(titleHit?.result.source).toBe('title')
     expect(updates.some((update) => update.kind === 'done')).toBe(false)
 
     releaseMessages()

@@ -1,3 +1,4 @@
+import { isOpenAiDirectBaseUrl } from './provider-defaults'
 import type {
   AnthropicServerToolId,
   ChatSettings,
@@ -6,7 +7,6 @@ import type {
   OpenAiServerToolId,
   ServerToolId,
 } from './types'
-import { isOpenAiDirectBaseUrl } from './provider-defaults'
 
 export type HostedToolProvider = 'openrouter' | 'openai' | 'anthropic' | 'google'
 
@@ -86,7 +86,7 @@ export function buildOpenAiServerTools(settings: ChatSettings): OpenAiServerTool
     } else if (id === 'code-interpreter') {
       tools.push({ type: 'code_interpreter', container: { type: 'auto' } })
       include.push('code_interpreter_call.outputs')
-    } else if (id === 'shell') {
+    } else {
       const toolConfig = config.shell
       const networkPolicy = toolConfig?.networkPolicy
       const environment: Record<string, unknown> = {
@@ -132,7 +132,7 @@ export function buildGoogleServerTools(
       tools.push({ urlContext: {} })
     } else if (id === 'code-execution') {
       tools.push({ codeExecution: {} })
-    } else if (id === 'google-maps') {
+    } else {
       const maps = config['google-maps']
       tools.push({ googleMaps: { ...(maps?.enableWidget === true ? { enableWidget: true } : {}) } })
       if (maps?.location) {
@@ -200,7 +200,7 @@ export function buildAnthropicServerTools(settings: ChatSettings): unknown[] {
         type: code.version ?? 'code_execution_20250825',
         name: 'code_execution',
       })
-    } else if (id === 'advisor') {
+    } else {
       if (!anthropicAdvisorAvailable(settings.model)) continue
       const advisor = config.advisor ?? { advisorModel: 'claude-opus-4-7' as const }
       tools.push({
@@ -219,9 +219,12 @@ function anthropicAdvisorAvailable(modelId: string): boolean {
     .replace(/^anthropic\//u, '')
     .replace(/(\d)\.(\d)(?=-|$)/g, '$1-$2')
     .replace(/-\d{8}$/u, '')
-  return new Set(['claude-haiku-4-5', 'claude-sonnet-4-6', 'claude-opus-4-6', 'claude-opus-4-7']).has(
-    normalized,
-  )
+  return new Set([
+    'claude-haiku-4-5',
+    'claude-sonnet-4-6',
+    'claude-opus-4-6',
+    'claude-opus-4-7',
+  ]).has(normalized)
 }
 
 function approximateLocationWire(location: unknown): Record<string, string> | null {

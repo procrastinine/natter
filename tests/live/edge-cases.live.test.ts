@@ -5,14 +5,11 @@ import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { beforeAll, describe, expect, it } from 'vitest'
 import {
+  type ChatCompletionsContext,
   chatCompletions,
   chatCompletionsOnce,
-  type ChatCompletionsContext,
 } from '../../src/api/chat-completions'
-import type {
-  ChatCompletionChunkWire,
-  ChatCompletionResultWire,
-} from '../../src/api/types'
+import type { ChatCompletionChunkWire, ChatCompletionResultWire } from '../../src/api/types'
 import type { ConnectionProfile } from '../../src/core/types'
 
 const LIVE = process.env.LIVE === '1'
@@ -98,8 +95,8 @@ describe.skipIf(!LIVE)('live edge cases — OpenRouter chat-completions', () => 
     }>
     const encrypted = details.find((d) => d.type === 'reasoning.encrypted')
     if (!encrypted) return
-    expect(encrypted?.format).toBe('google-gemini-v1')
-    expect(encrypted?.data?.length ?? 0).toBeGreaterThan(100)
+    expect(encrypted.format).toBe('google-gemini-v1')
+    expect(encrypted.data?.length ?? 0).toBeGreaterThan(100)
     // `reasoning.text` may or may not be present depending on whether
     // OpenRouter's upstream emitted a thought summary — don't assert.
   }, 90_000)
@@ -172,7 +169,7 @@ describe.skipIf(!LIVE)('live edge cases — OpenRouter chat-completions', () => 
       messages: [
         {
           role: 'user',
-          content: 'What\'s 6+7? Show carry.',
+          content: "What's 6+7? Show carry.",
         },
       ],
       max_tokens: 300,
@@ -180,10 +177,12 @@ describe.skipIf(!LIVE)('live edge cases — OpenRouter chat-completions', () => 
     })
     const msg1 = turn1.choices?.[0]?.message
     expect(msg1).toBeDefined()
-    const details1 = msg1?.reasoning_details as Array<{
-      type?: string
-      signature?: string
-    }> | undefined
+    const details1 = msg1?.reasoning_details as
+      | Array<{
+          type?: string
+          signature?: string
+        }>
+      | undefined
     // Haiku 4.5 returns reasoning.text with signature. Echo verbatim.
     const echoedMessage = {
       role: 'assistant',

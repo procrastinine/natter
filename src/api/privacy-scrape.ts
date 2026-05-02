@@ -162,9 +162,7 @@ export function parsePrivacyPage(html: string): Record<string, DataPolicy> {
   }
 
   // Strategy B: `__NEXT_DATA__` JSON block (Pages router).
-  const nextDataMatch = html.match(
-    /<script[^>]*id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/,
-  )
+  const nextDataMatch = html.match(/<script[^>]*id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/)
   if (nextDataMatch?.[1]) {
     const parsed = safeParseObject(nextDataMatch[1])
     if (parsed) walkForPolicies(parsed, out)
@@ -173,8 +171,7 @@ export function parsePrivacyPage(html: string): Record<string, DataPolicy> {
   // Strategy C: RSC flight chunks. We merge every push payload and run
   // `scanProviderPairs` on the concatenation.
   const flightChunks: string[] = []
-  const flightRe =
-    /self\.__next_f\.push\(\[\s*\d+\s*,\s*(["'])((?:\\.|(?!\1)[^\\])*)\1\s*\]\)/g
+  const flightRe = /self\.__next_f\.push\(\[\s*\d+\s*,\s*(["'])((?:\\.|(?!\1)[^\\])*)\1\s*\]\)/g
   for (const match of html.matchAll(flightRe)) {
     const quote = match[1]
     const raw = match[2]
@@ -365,19 +362,14 @@ export function normalizeDataPolicy(raw: Record<string, unknown>): DataPolicy | 
     asBool(raw.openrouter_training) ??
     asBool(raw.trainsOnOpenRouter)
   const retainsPrompts =
-    asBool(raw.retains_prompts) ??
-    asBool(raw.retainsPrompts) ??
-    asBool(raw.retains)
-  const canPublish =
-    asBool(raw.can_publish) ?? asBool(raw.canPublish) ?? asBool(raw.publishes)
+    asBool(raw.retains_prompts) ?? asBool(raw.retainsPrompts) ?? asBool(raw.retains)
+  const canPublish = asBool(raw.can_publish) ?? asBool(raw.canPublish) ?? asBool(raw.publishes)
   const requiresUserIDs =
     asBool(raw.requires_user_ids) ??
     asBool(raw.requiresUserIDs) ??
     asBool(raw.requiresUserIds) ??
     asBool(raw.user_ids_required)
-  const retentionDays = asPositiveInt(
-    raw.retention_days ?? raw.retentionDays ?? raw.retention,
-  )
+  const retentionDays = asPositiveInt(raw.retention_days ?? raw.retentionDays ?? raw.retention)
   const tos = asString(raw.terms_of_service_url ?? raw.termsOfServiceURL ?? raw.tos)
   const pp = asString(raw.privacy_policy_url ?? raw.privacyPolicyURL ?? raw.privacy)
 
@@ -443,9 +435,7 @@ interface CachedPrivacyPayload {
   fetchedAt: number
 }
 
-export function readCachedPrivacyPayload(
-  raw: unknown,
-): CachedPrivacyPayload | null {
+export function readCachedPrivacyPayload(raw: unknown): CachedPrivacyPayload | null {
   if (!raw || typeof raw !== 'object') return null
   const rec = raw as Record<string, unknown>
   const policies = rec.policies

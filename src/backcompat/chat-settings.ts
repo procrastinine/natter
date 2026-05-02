@@ -91,9 +91,7 @@ export function migrateCurrentChatSettingsSnapshot(
   preLegacy.contextStrategy = mergeObject(defaults.contextStrategy, raw.contextStrategy)
   preLegacy.anthropicCache = mergeObject(defaults.anthropicCache, raw.anthropicCache)
   preLegacy.privacy = mergeObject(defaults.privacy, raw.privacy)
-  preLegacy.reasoning = isRecord(raw.reasoning)
-    ? (raw.reasoning)
-    : defaults.reasoning
+  preLegacy.reasoning = isRecord(raw.reasoning) ? raw.reasoning : defaults.reasoning
   preLegacy.tools = mergeToolSettings(defaults.tools, raw.tools)
   preLegacy.toolCallContext = mergeObject(defaults.toolCallContext, raw.toolCallContext)
 
@@ -107,7 +105,10 @@ export function migrateCurrentChatSettingsSnapshot(
   next.reasoning = mergeReasoning(defaults.reasoning, migratedRaw.reasoning)
   next.tools = mergeToolSettings(defaults.tools, migratedRaw.tools)
   next.toolCallContext = mergeObject(defaults.toolCallContext, migratedRaw.toolCallContext)
-  next.responses = normalizeResponsesSettings(defaults.responses ?? { store: false }, migratedRaw.responses)
+  next.responses = normalizeResponsesSettings(
+    defaults.responses ?? { store: false },
+    migratedRaw.responses,
+  )
   const gemini = normalizeGeminiSettings(migratedRaw.gemini)
   if (gemini) {
     next.gemini = gemini
@@ -133,7 +134,8 @@ export function migrateLegacyCarryForwardToInclude(
       return { encrypted: false, summary: true, text: true }
     case 'encrypted':
       return { encrypted: true, summary: false, text: false }
-    default:
+    case 'auto':
+    case undefined:
       return defaultReasoningInclude(preservationFormat)
   }
 }
@@ -196,10 +198,7 @@ function mergeReasoning(
   return normalizeReasoningSettings(merged)
 }
 
-function mergeToolSettings(
-  defaults: ChatSettings['tools'],
-  raw: unknown,
-): ChatSettings['tools'] {
+function mergeToolSettings(defaults: ChatSettings['tools'], raw: unknown): ChatSettings['tools'] {
   const tools = isRecord(raw) ? raw : {}
   return {
     openrouter: mergeObject(defaults.openrouter, tools.openrouter),

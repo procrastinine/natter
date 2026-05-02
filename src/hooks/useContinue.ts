@@ -12,29 +12,29 @@
 // reasoning is discarded (it describes the meta-instruction, not the
 // original turn).
 
-import { openAssistantRequestStream, type AssistantStreamChunk } from '../api/assistant-stream'
-import { ApiError } from '../api/errors'
 import type { AnthropicStreamChunk } from '../api/anthropic-types'
+import { type AssistantStreamChunk, openAssistantRequestStream } from '../api/assistant-stream'
+import { ApiError } from '../api/errors'
+import type { GeminiStreamChunk } from '../api/gemini-types'
 import {
+  type StreamLaneEvent,
   splitAnthropicStream,
   splitChatStream,
   splitGeminiStream,
   splitResponsesStream,
-  type StreamLaneEvent,
 } from '../api/stream-transforms'
-import type { GeminiStreamChunk } from '../api/gemini-types'
 import type { ChatStreamChunk, ResponsesStreamChunk } from '../api/types'
 import { activePath, cursorKeyOf } from '../core/active-path'
 import { readGlobalPreferences, resolveContinueSystemPromptTemplate } from '../core/global-settings'
-// `globalPrefs` is still read for token-calibration mode; continue prompts
-// moved to `chat.settings` in the prompt-preset refactor.
-import { calibrationFieldsForEdit, readTokenCalibrationGlobal } from '../core/token-calibration'
+import { prefillClassFor } from '../core/quirks'
 import {
   type AssistantRequestPlan,
   NoEligibleProvidersError,
   prepareAssistantRequestPlan,
 } from '../core/send-planning'
-import { prefillClassFor } from '../core/quirks'
+// `globalPrefs` is still read for token-calibration mode; continue prompts
+// moved to `chat.settings` in the prompt-preset refactor.
+import { calibrationFieldsForEdit, readTokenCalibrationGlobal } from '../core/token-calibration'
 import type { ChatId, ConnectionProfile, ContentItem, Message, MessageId } from '../core/types'
 import { newId } from '../lib/ulid'
 import { postEvent } from '../store/broadcast'
@@ -203,8 +203,8 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
         ),
       }
   let continuePath: Message[]
-  let pendingMessages: Message[] = []
-  let preCutAttachmentIds: string[] = []
+  let pendingMessages: Message[]
+  let preCutAttachmentIds: string[]
   const mapHydratedMessage = usePrefillContinue
     ? (message: Message): Message =>
         message.id === target.id ? { ...message, origin: 'prefill' } : message

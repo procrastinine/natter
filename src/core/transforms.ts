@@ -19,17 +19,17 @@
 //   have to retouch transform callers.)
 
 import type {
+  AnthropicContentBlock,
+  AnthropicMessagesRequestWire,
+  AnthropicMessageWire,
+} from '../api/anthropic-types'
+import type {
   GeminiContent,
   GeminiPart,
   GenerateContentRequestWire,
   GenerationConfig,
   ThinkingConfig,
 } from '../api/gemini-types'
-import type {
-  AnthropicContentBlock,
-  AnthropicMessageWire,
-  AnthropicMessagesRequestWire,
-} from '../api/anthropic-types'
 import type { TextCompletionRequestWire } from '../api/text-completions'
 import type {
   ChatCompletionRequestWire,
@@ -39,8 +39,8 @@ import type {
 import { isFreeModel } from './model-predicates'
 import type { WireProviderPrivacy } from './privacy-filter'
 import {
-  buildGoogleServerTools,
   buildAnthropicServerTools,
+  buildGoogleServerTools,
   buildOpenAiServerTools,
   buildOpenRouterServerTools,
   type HostedToolProvider,
@@ -1302,8 +1302,9 @@ export function toAnthropicMessages(
   if (systemMessages.length > 0) {
     systemText = systemMessages
       .flatMap((m) => m.content)
-      .filter((c): c is Extract<ContentItem, { type: 'text' | 'output_text' }> =>
-        c.type === 'text' || c.type === 'output_text',
+      .filter(
+        (c): c is Extract<ContentItem, { type: 'text' | 'output_text' }> =>
+          c.type === 'text' || c.type === 'output_text',
       )
       .map((c) => c.text)
       .join('\n\n')
@@ -1358,7 +1359,7 @@ function normalizeAnthropicModelId(modelId: string): string {
   return (slash >= 0 ? modelId.slice(slash + 1) : modelId).replace(/(\d)\.(\d)(?=-|$)/g, '$1-$2')
 }
 
-function buildAnthropicThinking(settings: ChatSettings): unknown | undefined {
+function buildAnthropicThinking(settings: ChatSettings): Record<string, unknown> | undefined {
   const r = settings.reasoning
   if (r.mode === 'default') return undefined
   if (r.mode === 'off') return { type: 'disabled' }
@@ -1384,8 +1385,9 @@ function messageToAnthropicMessages(
   if (message.role === 'tool') {
     const call = message.toolCalls?.[0]
     const contentText = message.content
-      .filter((c): c is Extract<ContentItem, { type: 'text' | 'output_text' }> =>
-        c.type === 'text' || c.type === 'output_text',
+      .filter(
+        (c): c is Extract<ContentItem, { type: 'text' | 'output_text' }> =>
+          c.type === 'text' || c.type === 'output_text',
       )
       .map((c) => c.text)
       .join('')
@@ -1433,12 +1435,15 @@ function messageToAnthropicMessages(
     }
 
     content.push(
-      ...(nativeAnthropicToolBlocksForMessage(message, { includeToolCalls }) as AnthropicContentBlock[]),
+      ...(nativeAnthropicToolBlocksForMessage(message, {
+        includeToolCalls,
+      }) as AnthropicContentBlock[]),
     )
 
     const answerText = message.content
-      .filter((c): c is Extract<ContentItem, { type: 'text' | 'output_text' }> =>
-        c.type === 'text' || c.type === 'output_text',
+      .filter(
+        (c): c is Extract<ContentItem, { type: 'text' | 'output_text' }> =>
+          c.type === 'text' || c.type === 'output_text',
       )
       .map((c) => c.text)
       .join('')
@@ -1451,7 +1456,11 @@ function messageToAnthropicMessages(
     for (const call of message.toolCalls ?? []) {
       let input: Record<string, unknown> | undefined
       try {
-        input = JSON.parse(call.function.arguments)
+        const parsed: unknown = JSON.parse(call.function.arguments)
+        input =
+          parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+            ? (parsed as Record<string, unknown>)
+            : undefined
       } catch {
         input = undefined
       }
@@ -1487,7 +1496,9 @@ function buildAnthropicUserBlocks(items: ContentItem[]): AnthropicContentBlock[]
   return blocks
 }
 
-function anthropicImageSource(url: string): unknown | null {
+function anthropicImageSource(
+  url: string,
+): { type: 'base64'; media_type: string; data: string } | { type: 'url'; url: string } | null {
   if (/^data:/u.test(url)) {
     const match = /^data:([^;]+);base64,(.+)$/u.exec(url)
     if (!match?.[1] || !match[2]) return null
@@ -1816,7 +1827,11 @@ function messageToGeminiContents(
       .join('')
     let response: Record<string, unknown>
     try {
-      response = JSON.parse(responseText)
+      const parsed: unknown = JSON.parse(responseText)
+      response =
+        parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+          ? (parsed as Record<string, unknown>)
+          : { result: responseText }
     } catch {
       response = { result: responseText }
     }
@@ -1879,9 +1894,7 @@ function messageToGeminiContents(
       }
     }
 
-    parts.push(
-      ...(nativeGeminiToolPartsForMessage(message, { includeToolCalls }) as GeminiPart[]),
-    )
+    parts.push(...(nativeGeminiToolPartsForMessage(message, { includeToolCalls }) as GeminiPart[]))
 
     // 3. The answer text.
     const answerText = message.content
@@ -1903,7 +1916,11 @@ function messageToGeminiContents(
     for (const call of message.toolCalls ?? []) {
       let args: Record<string, unknown> | undefined
       try {
-        args = JSON.parse(call.function.arguments)
+        const parsed: unknown = JSON.parse(call.function.arguments)
+        args =
+          parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+            ? (parsed as Record<string, unknown>)
+            : undefined
       } catch {
         args = undefined
       }

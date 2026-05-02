@@ -9,8 +9,8 @@
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { beforeAll, describe, expect, it } from 'vitest'
-import { responses, responsesOnce, type ResponsesContext } from '../../src/api/responses'
-import { splitResponsesStream, type StreamLaneEvent } from '../../src/api/stream-transforms'
+import { type ResponsesContext, responses, responsesOnce } from '../../src/api/responses'
+import { type StreamLaneEvent, splitResponsesStream } from '../../src/api/stream-transforms'
 import type { ResponsesEventWire, ResponsesInputItem } from '../../src/api/types'
 import type { ConnectionProfile } from '../../src/core/types'
 

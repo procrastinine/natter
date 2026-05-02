@@ -2,10 +2,10 @@ import { describe, expect, it } from 'vitest'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import {
   EMPTY_TEXT_TEMPLATE,
-  TEXT_TEMPLATES,
-  RAW_TEXT_TEMPLATE_SOURCE,
   editableTextTemplateConfig,
+  RAW_TEXT_TEMPLATE_SOURCE,
   renderTextPrompt,
+  TEXT_TEMPLATES,
   templateSourceForConfig,
 } from '../../src/core/text-templates'
 import { toTextCompletions } from '../../src/core/transforms'

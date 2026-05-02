@@ -136,14 +136,7 @@ function attachmentInputIsIds(
 
 type MessageTreeRow = Pick<
   Message,
-  | 'id'
-  | 'parentId'
-  | 'siblingIndex'
-  | 'turnId'
-  | 'turnIndex'
-  | 'createdAt'
-  | 'role'
-  | 'deleted'
+  'id' | 'parentId' | 'siblingIndex' | 'turnId' | 'turnIndex' | 'createdAt' | 'role' | 'deleted'
 >
 
 function groupTreeRowsByParent(

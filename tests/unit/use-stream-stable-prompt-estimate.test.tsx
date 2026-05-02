@@ -97,7 +97,7 @@ describe('useStreamStablePromptEstimate', () => {
     })
 
     expect(result.current).not.toEqual(frozen)
-    expect((result.current?.total ?? 0)).toBeGreaterThan(frozen?.total ?? 0)
+    expect(result.current?.total ?? 0).toBeGreaterThan(frozen?.total ?? 0)
   })
 
   it('still updates during a stream when a different message changes discretely', () => {
@@ -139,7 +139,7 @@ describe('useStreamStablePromptEstimate', () => {
     })
 
     expect(result.current).not.toEqual(frozen)
-    expect((result.current?.total ?? 0)).toBeGreaterThan(frozen?.total ?? 0)
+    expect(result.current?.total ?? 0).toBeGreaterThan(frozen?.total ?? 0)
   })
 
   it('updates during a stream when the streamed message itself changes via a discrete visibility toggle', () => {
@@ -170,11 +170,14 @@ describe('useStreamStablePromptEstimate', () => {
 
     const frozen = result.current
     rerender({
-      input: makeInput([{ ...user }, { ...streamingAssistant, hiddenFromContext: true, nodeVersion: 3 }]),
+      input: makeInput([
+        { ...user },
+        { ...streamingAssistant, hiddenFromContext: true, nodeVersion: 3 },
+      ]),
       streamActivityKey: 'm:A1',
     })
 
     expect(result.current).not.toEqual(frozen)
-    expect((result.current?.total ?? 0)).toBeLessThan(frozen?.total ?? Number.POSITIVE_INFINITY)
+    expect(result.current?.total ?? 0).toBeLessThan(frozen?.total ?? Number.POSITIVE_INFINITY)
   })
 })

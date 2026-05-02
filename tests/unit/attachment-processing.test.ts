@@ -2,6 +2,11 @@ import { existsSync, readFileSync } from 'node:fs'
 import { basename, join } from 'node:path'
 import { DecompressionStream as NodeDecompressionStream } from 'node:stream/web'
 import { describe, expect, it } from 'vitest'
+import type {
+  AttachmentArtifact,
+  AttachmentKind,
+  ProcessAttachmentResult,
+} from '../../src/core/attachments'
 import {
   AttachmentLibrary,
   buildOpenRouterContentPart,
@@ -9,11 +14,6 @@ import {
   classifyAttachment,
   processAttachment,
   sniffMime,
-} from '../../src/core/attachments'
-import type {
-  AttachmentArtifact,
-  AttachmentKind,
-  ProcessAttachmentResult,
 } from '../../src/core/attachments'
 
 interface ManifestEntry {
@@ -172,12 +172,12 @@ describeWithFixtures('attachment processing corpus', () => {
 
     const speech = await processFixture('audio/sample-speech.wav')
     expect(speech.attachment.sizeBytes).toBeGreaterThan(4096)
-    expect(
-      metadataOf<{ durationMs: number; channels: number }>(speech, 'audio-metadata-v1'),
-    ).toMatchObject({
-      durationMs: expect.any(Number),
-      channels: 1,
-    })
+    const speechMetadata = metadataOf<{ durationMs: number; channels: number }>(
+      speech,
+      'audio-metadata-v1',
+    )
+    expect(typeof speechMetadata.durationMs).toBe('number')
+    expect(speechMetadata.channels).toBe(1)
     expect(speech.attachment.durationMs).toBeGreaterThan(1500)
   })
 

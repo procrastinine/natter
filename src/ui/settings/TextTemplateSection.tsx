@@ -1,19 +1,19 @@
 import { useLiveQuery } from 'dexie-react-hooks'
-import { useEffect, useMemo, useState, type ReactNode } from 'react'
+import { type ReactNode, useEffect, useMemo, useState } from 'react'
 import type { LlamaServerProps } from '../../api/probe'
+import { textCompletionsNeedsReasoningOffFor } from '../../core/quirks'
 import {
   BUILTIN_TEXT_TEMPLATE_ORDER,
-  EMPTY_TEXT_TEMPLATE,
-  TEXT_TEMPLATES,
   createSavedTextTemplate,
   deleteSavedTextTemplate,
+  EMPTY_TEXT_TEMPLATE,
   editableTextTemplateConfig,
   readSavedTextTemplates,
-  templateSourceForConfig,
   type SavedTextTemplate,
+  TEXT_TEMPLATES,
+  templateSourceForConfig,
   updateSavedTextTemplate,
 } from '../../core/text-templates'
-import { textCompletionsNeedsReasoningOffFor } from '../../core/quirks'
 import type { Chat, TextTemplateConfig, TextTemplateId } from '../../core/types'
 import { updateChatSettings } from '../../store/chats'
 import { InfoDisclosure } from './InfoDisclosure'
@@ -135,16 +135,16 @@ export function TextTemplateSection({
         </div>
       ) : null}
       <div data-ui="inline-actions">
-        <button type="button" data-ui="secondary-button" onClick={createBlank}>
+        <button type="button" data-ui="secondary-button" onClick={() => void createBlank()}>
           New template
         </button>
         {selectedConfig ? (
-          <button type="button" data-ui="secondary-button" onClick={saveAsNew}>
+          <button type="button" data-ui="secondary-button" onClick={() => void saveAsNew()}>
             Save as new
           </button>
         ) : null}
         {selectedSaved ? (
-          <button type="button" data-ui="secondary-button" onClick={deleteCurrent}>
+          <button type="button" data-ui="secondary-button" onClick={() => void deleteCurrent()}>
             Delete saved
           </button>
         ) : null}

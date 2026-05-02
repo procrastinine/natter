@@ -1,10 +1,5 @@
+import type { AttachmentId, AttachmentRef, MessageAttachmentRef, MessageId } from '../core/types'
 import { newId } from '../lib/ulid'
-import type {
-  AttachmentId,
-  AttachmentRef,
-  MessageAttachmentRef,
-  MessageId,
-} from '../core/types'
 
 interface AttachmentRefOwner {
   messageId?: MessageId
@@ -27,9 +22,7 @@ export function attachmentIdsOf(refs: readonly AttachmentRef[] | undefined): Att
   return refs.map(attachmentIdOf)
 }
 
-export function uniqueAttachmentIdsOf(
-  refs: readonly AttachmentRef[] | undefined,
-): AttachmentId[] {
+export function uniqueAttachmentIdsOf(refs: readonly AttachmentRef[] | undefined): AttachmentId[] {
   return [...new Set(attachmentIdsOf(refs))]
 }
 

@@ -35,7 +35,11 @@ afterEach(async () => {
 
 // Build a deferred Promise so the test controls completion timing and
 // can assert "only one fetch in flight."
-function deferred<T>(): { promise: Promise<T>; resolve: (v: T) => void; reject: (e: unknown) => void } {
+function deferred<T>(): {
+  promise: Promise<T>
+  resolve: (v: T) => void
+  reject: (e: unknown) => void
+} {
   let resolve!: (v: T) => void
   let reject!: (e: unknown) => void
   const promise = new Promise<T>((res, rej) => {

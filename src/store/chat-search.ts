@@ -1,17 +1,14 @@
-import {
-  buildBranchCacheRow,
-  messageRenderableText,
-} from '../core/branch-flatten'
+import { buildBranchCacheRow, messageRenderableText } from '../core/branch-flatten'
 import {
   firstPositiveMatch,
   hasNegativeTextTerms,
   hasPositiveTextTerms,
   parseSearchQuery,
-  textMatchesClauses,
   type SearchNameClause,
   type SearchQuery,
   type SearchQueryParseError,
   type SearchTextClause,
+  textMatchesClauses,
 } from '../core/search-query'
 import type {
   Chat,
@@ -240,7 +237,8 @@ export async function searchChats(input: SearchChatsInput): Promise<ChatSearchOu
 
   const chatIdFilter = input.chatIds ? new Set(input.chatIds) : null
   const candidates = chats.filter(
-    (chat) => (!chatIdFilter || chatIdFilter.has(chat.id)) && chatPassesStaticFilters(chat, context),
+    (chat) =>
+      (!chatIdFilter || chatIdFilter.has(chat.id)) && chatPassesStaticFilters(chat, context),
   )
   let completedCount = 0
   const resultsByChat = new Map<ChatId, SearchResult>()
@@ -388,10 +386,7 @@ async function scanLastUpdatedBranchChat(
   return buildResult(resultInput)
 }
 
-async function scanAllBranchesChat(
-  chat: Chat,
-  context: ScanContext,
-): Promise<SearchResult | null> {
+async function scanAllBranchesChat(chat: Chat, context: ScanContext): Promise<SearchResult | null> {
   throwIfAborted(context.signal)
   const messages = await context.repo.listMessages(chat.id)
   throwIfAborted(context.signal)
@@ -680,7 +675,10 @@ async function freshLastUpdatedBranchMatches(chat: Chat, context: ScanContext): 
 function buildAllBranchesCorpus(
   messages: readonly Message[],
   signal?: AbortSignal,
-): { text: string; messages: Array<{ message: Message; text: string; start: number; end: number }> } {
+): {
+  text: string
+  messages: Array<{ message: Message; text: string; start: number; end: number }>
+} {
   const liveMessages = messages
     .filter((message) => !message.deleted)
     .sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id))
@@ -841,5 +839,7 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
 }
 
 function isAbortError(error: unknown): boolean {
-  return error instanceof ChatSearchAbortedError || (error as { name?: string })?.name === 'AbortError'
+  return (
+    error instanceof ChatSearchAbortedError || (error as { name?: string })?.name === 'AbortError'
+  )
 }

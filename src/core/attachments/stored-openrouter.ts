@@ -2,9 +2,9 @@ import type { AttachmentBundle } from '../../store/repository'
 import type { Attachment, AttachmentArtifact } from '../types'
 import { buildOpenRouterContentPart, buildOpenRouterPdfPlugin } from './openrouter'
 import type {
+  ProcessAttachmentResult,
   AttachmentArtifact as ProcessedArtifact,
   AttachmentProcessingState as ProcessedState,
-  ProcessAttachmentResult,
 } from './types'
 
 interface StoredOpenRouterAttachmentWire {

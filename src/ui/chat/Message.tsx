@@ -16,8 +16,8 @@ import { detectStaleReasoning, staleReasoningBannerText } from '../../core/stale
 import type {
   ChatId,
   CursorMap,
-  Message as MessageRow,
   MessageAttachmentRef,
+  Message as MessageRow,
   ProviderOutputItem,
   ReasoningDetail,
 } from '../../core/types'

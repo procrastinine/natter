@@ -8,8 +8,8 @@ import type {
   MessageRole,
   ReasoningDetail,
 } from '../../src/core/types'
-import { continueAssistantInPlace } from '../../src/hooks/useContinue'
 import { sendFromMessage, sendText } from '../../src/hooks/useChat'
+import { continueAssistantInPlace } from '../../src/hooks/useContinue'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import {
   __resetBrowserRepositoryForTests,
@@ -144,7 +144,10 @@ interface SeedMessage {
   reasoningDetails?: ReasoningDetail[]
 }
 
-async function seedLinearMessages(chatId: string, specs: readonly SeedMessage[]): Promise<Message[]> {
+async function seedLinearMessages(
+  chatId: string,
+  specs: readonly SeedMessage[],
+): Promise<Message[]> {
   const repo = getBrowserRepository()
   const rows: Message[] = []
   let parentId: string | null = null
@@ -507,7 +510,9 @@ describe('almost-live request shape matrix', () => {
       parts: Array<{ text?: string }>
     }>
     expect(contents.map((item) => item.role)).toEqual(['user', 'model', 'user'])
-    expect(contents[2]?.parts?.[0]?.text).toBe(`${LOREM_FOLLOWUP}${APPEND_PROMPT}`)
+    expect(requireAt(requireAt(contents, 2).parts, 0).text).toBe(
+      `${LOREM_FOLLOWUP}${APPEND_PROMPT}`,
+    )
   })
 
   it('direct provider mode matrix exposes the expected request shape for every chat-owned API mode', async () => {
@@ -656,9 +661,9 @@ describe('almost-live request shape matrix', () => {
       'assistant',
       'user',
     ])
-    expect(anthropicNativeMessages[0]?.content?.[0]?.text).toBe(LOREM_USER)
-    expect(anthropicNativeMessages[1]?.content?.[0]?.text).toBe(LOREM_ASSISTANT)
-    expect(anthropicNativeMessages[2]?.content?.[0]?.text).toBe(
+    expect(requireAt(requireAt(anthropicNativeMessages, 0).content, 0).text).toBe(LOREM_USER)
+    expect(requireAt(requireAt(anthropicNativeMessages, 1).content, 0).text).toBe(LOREM_ASSISTANT)
+    expect(requireAt(requireAt(anthropicNativeMessages, 2).content, 0).text).toBe(
       `${LOREM_FOLLOWUP}${APPEND_PROMPT}`,
     )
 
@@ -743,6 +748,12 @@ describe('almost-live request shape matrix', () => {
     expect(wire?.max_tokens).toBe(64)
   })
 })
+
+function requireAt<T>(items: readonly T[], index: number): T {
+  const item = items[index]
+  if (item === undefined) throw new Error(`missing item at index ${index}`)
+  return item
+}
 
 describe('send action routing', () => {
   it('sendFromMessage reuses the same privacy/provider selection workflow as normal sends', async () => {
@@ -901,17 +912,21 @@ describe('send action routing', () => {
     expect((seenWire as { provider?: { ignore?: string[] } }).provider?.ignore).toContain(
       'Filtered Host',
     )
-    const chatMessages = (seenWire as {
-      messages?: Array<{ role: string; content: string }>
-    }).messages
-    const responseInput = (seenWire as {
-      input?: Array<{
-        type: string
-        role?: string
-        content?: Array<{ type: string; text?: string }>
-      }>
-      instructions?: string
-    }).input
+    const chatMessages = (
+      seenWire as {
+        messages?: Array<{ role: string; content: string }>
+      }
+    ).messages
+    const responseInput = (
+      seenWire as {
+        input?: Array<{
+          type: string
+          role?: string
+          content?: Array<{ type: string; text?: string }>
+        }>
+        instructions?: string
+      }
+    ).input
     if (chatMessages) {
       expect(chatMessages).toEqual([
         {
@@ -996,9 +1011,11 @@ describe('send action routing', () => {
 
     const expectedTemplate =
       'Continue exactly from the last assistant message.\n\nThe original system prompt (for reference):\n```\nORIGINAL SYSTEM PROMPT SHOULD APPEAR IN A CODE BLOCK\n```'
-    const chatMessages = (seenWire as {
-      messages?: Array<{ role: string; content: string }>
-    }).messages
+    const chatMessages = (
+      seenWire as {
+        messages?: Array<{ role: string; content: string }>
+      }
+    ).messages
     if (chatMessages) {
       expect(chatMessages[0]).toEqual({ role: 'system', content: expectedTemplate })
     } else {
@@ -1057,17 +1074,21 @@ describe('send action routing', () => {
     expect((seenWire as { provider?: { ignore?: string[] } }).provider?.ignore).toContain(
       'Filtered Host',
     )
-    const chatMessages = (seenWire as {
-      messages?: Array<{ role: string; content: string }>
-    }).messages
-    const responseInput = (seenWire as {
-      input?: Array<{
-        type: string
-        role?: string
-        content?: Array<{ type: string; text?: string }>
-      }>
-      instructions?: string
-    }).input
+    const chatMessages = (
+      seenWire as {
+        messages?: Array<{ role: string; content: string }>
+      }
+    ).messages
+    const responseInput = (
+      seenWire as {
+        input?: Array<{
+          type: string
+          role?: string
+          content?: Array<{ type: string; text?: string }>
+        }>
+        instructions?: string
+      }
+    ).input
     if (chatMessages) {
       expect(chatMessages).toEqual([
         { role: 'user', content: 'hello' },
@@ -1094,7 +1115,9 @@ describe('send action routing', () => {
         },
       ])
     }
-    expect(JSON.stringify(seenWire)).not.toContain('Continue exactly from the last assistant message.')
+    expect(JSON.stringify(seenWire)).not.toContain(
+      'Continue exactly from the last assistant message.',
+    )
     expect(JSON.stringify(seenWire)).not.toContain('ORIGINAL SYSTEM PROMPT SHOULD APPEAR')
     const updated = await getBrowserRepository().getMessage(assistant.id)
     expect(updated?.content).toEqual([{ type: 'output_text', text: 'partial more' }])

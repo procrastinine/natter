@@ -139,9 +139,7 @@ describe('ReasoningBlock', () => {
       { type: 'reasoning.text', text: 'third', id: 't-1' },
     ]
     const onToggle = vi.fn()
-    const { container } = render(
-      <ReasoningBlock details={details} onToggleHidden={onToggle} />,
-    )
+    const { container } = render(<ReasoningBlock details={details} onToggleHidden={onToggle} />)
     openSummary(container)
     const hideButtons = container.querySelectorAll('[data-ui="reasoning-row-hide"]')
     expect(hideButtons).toHaveLength(3)

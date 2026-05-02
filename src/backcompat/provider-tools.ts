@@ -1,5 +1,4 @@
-import type { ChatProviderToolSettings, ChatSettings } from '../core/types'
-import type { Chat, ChatPreset } from '../core/types'
+import type { Chat, ChatPreset, ChatProviderToolSettings, ChatSettings } from '../core/types'
 import type { NatterDb, SettingsRow } from '../store/db'
 
 const PROVIDER_TOOL_SETTINGS_BACKFILL_KEY = 'backfill:provider-tool-settings-v2'

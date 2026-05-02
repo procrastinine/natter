@@ -6,20 +6,20 @@ import {
   stripPromptPresetPins,
 } from '../core/import-export/flatten'
 import {
-  NATTER_EXPORT_SCHEMA_VERSION,
   type ChatExportEnvelope,
   type ChatPresetExportEnvelope,
   type ConnectionSketch,
+  NATTER_EXPORT_SCHEMA_VERSION,
   type NatterExportEnvelope,
   type NatterExportObjectKind,
   type PortableAttachmentBlob,
   type PortableAttachmentBundle,
-  type PortableChatPresetPayload,
   type PortableChatPayload,
+  type PortableChatPresetPayload,
   type PortableFolderSketch,
   type PortableTagSketch,
-  type WorkspaceBackupPayload,
   type WorkspaceBackupEnvelope,
+  type WorkspaceBackupPayload,
 } from '../core/import-export/schema'
 import { readSavedTextTemplates } from '../core/text-templates'
 import type {
@@ -46,7 +46,7 @@ import type {
 } from '../core/types'
 import { newId } from '../lib/ulid'
 import { postEvent } from './broadcast'
-import { childListKey, openDb, type NatterDb } from './db'
+import { childListKey, type NatterDb, openDb } from './db'
 import type {
   ImportChatOptions,
   ImportChatPresetOptions,
@@ -56,11 +56,7 @@ import type {
   RestoreWorkspaceBackupResult,
   WorkspaceImportExportBackend,
 } from './import-export'
-import {
-  hydrateMessages,
-  splitMessageForStorage,
-  type MessageBodyRow,
-} from './message-storage'
+import { hydrateMessages, type MessageBodyRow, splitMessageForStorage } from './message-storage'
 import { PresetMissingError } from './presets'
 
 const WORKSPACE_META_KEY = 'workspace-meta'
@@ -130,7 +126,9 @@ class BrowserImportExportBackend implements WorkspaceImportExportBackend {
           savedTextTemplates,
         }),
         ...(snapshot.chat.color ? { color: snapshot.chat.color } : {}),
-        ...(snapshot.chat.favoriteModels ? { favoriteModels: [...snapshot.chat.favoriteModels] } : {}),
+        ...(snapshot.chat.favoriteModels
+          ? { favoriteModels: [...snapshot.chat.favoriteModels] }
+          : {}),
         ...(snapshot.chat.recentModels ? { recentModels: [...snapshot.chat.recentModels] } : {}),
       },
       messages: snapshot.messages,
@@ -151,16 +149,23 @@ class BrowserImportExportBackend implements WorkspaceImportExportBackend {
     const now = options.now ?? Date.now()
     const payload = envelope.payload
     validatePortableMessages(payload.messages)
-    const resolvedProfile = await resolveProfileId(db, payload.chat.settings, payload.connectionSketch, {
-      targetProfileId: options.targetProfileId,
-    })
+    const resolvedProfile = await resolveProfileId(
+      db,
+      payload.chat.settings,
+      payload.connectionSketch,
+      {
+        targetProfileId: options.targetProfileId,
+      },
+    )
 
     const attachmentRows = await prepareImportedAttachments(db, payload.attachments)
     const attachmentIdMap = Object.fromEntries(
       attachmentRows.map((row) => [row.sourceAttachmentId, row.targetAttachmentId]),
     )
     const chatId = newId()
-    const messageIdMap = Object.fromEntries(payload.messages.map((message) => [message.id, newId()]))
+    const messageIdMap = Object.fromEntries(
+      payload.messages.map((message) => [message.id, newId()]),
+    )
     const turnIdMap = new Map<string, string>()
     const messages = payload.messages.map((message) =>
       remapImportedMessage(message, {
@@ -236,7 +241,8 @@ class BrowserImportExportBackend implements WorkspaceImportExportBackend {
             refCount,
           }
           await db.attachments.put(attachment)
-          if (imported.bundle.blobs.length > 0) await db.attachmentBlobs.bulkPut(imported.bundle.blobs)
+          if (imported.bundle.blobs.length > 0)
+            await db.attachmentBlobs.bulkPut(imported.bundle.blobs)
           if (imported.bundle.artifacts.length > 0) {
             await db.attachmentArtifacts.bulkPut(imported.bundle.artifacts)
           }
@@ -263,7 +269,9 @@ class BrowserImportExportBackend implements WorkspaceImportExportBackend {
           folderId: folderId ?? null,
           tags: tagIds,
           ...(payload.chat.color ? { color: payload.chat.color } : {}),
-          ...(payload.chat.favoriteModels ? { favoriteModels: [...payload.chat.favoriteModels] } : {}),
+          ...(payload.chat.favoriteModels
+            ? { favoriteModels: [...payload.chat.favoriteModels] }
+            : {}),
           ...(payload.chat.recentModels ? { recentModels: [...payload.chat.recentModels] } : {}),
           previewText: branchCache.previewText,
         }
@@ -367,28 +375,28 @@ class BrowserImportExportBackend implements WorkspaceImportExportBackend {
   async exportWorkspaceBackup(): Promise<WorkspaceBackupEnvelope> {
     const db = await openDb()
     const snapshot = await db.transaction('r', db.tables, async () => {
-        const headers = await db.messages.toArray()
-        const bodies = (await db.messageBodies.bulkGet(headers.map((row) => row.id))).filter(
-          (row): row is MessageBodyRow => row !== undefined,
-        )
-        return {
-          chats: await db.chats.toArray(),
-          messages: sortMessages(hydrateMessages(headers, bodies)),
-          childLists: await db.childLists.toArray(),
-          chatBranchCache: await db.chatBranchCache.toArray(),
-          attachmentBundles: await storedAttachmentBundles(
-            db,
-            (await db.attachments.toArray()).map((row) => row.id),
-          ),
-          profiles: await db.profiles.toArray(),
-          presets: await db.presets.toArray(),
-          promptPresets: await db.promptPresets.toArray(),
-          folders: await db.folders.toArray(),
-          tags: await db.tags.toArray(),
-          drafts: await db.drafts.toArray(),
-          keys: await db.keys.toArray(),
-          settings: await db.settings.toArray(),
-        }
+      const headers = await db.messages.toArray()
+      const bodies = (await db.messageBodies.bulkGet(headers.map((row) => row.id))).filter(
+        (row): row is MessageBodyRow => row !== undefined,
+      )
+      return {
+        chats: await db.chats.toArray(),
+        messages: sortMessages(hydrateMessages(headers, bodies)),
+        childLists: await db.childLists.toArray(),
+        chatBranchCache: await db.chatBranchCache.toArray(),
+        attachmentBundles: await storedAttachmentBundles(
+          db,
+          (await db.attachments.toArray()).map((row) => row.id),
+        ),
+        profiles: await db.profiles.toArray(),
+        presets: await db.presets.toArray(),
+        promptPresets: await db.promptPresets.toArray(),
+        folders: await db.folders.toArray(),
+        tags: await db.tags.toArray(),
+        drafts: await db.drafts.toArray(),
+        keys: await db.keys.toArray(),
+        settings: await db.settings.toArray(),
+      }
     })
 
     return envelope(db, 'workspace-backup', {
@@ -418,7 +426,9 @@ class BrowserImportExportBackend implements WorkspaceImportExportBackend {
     const attachmentBundles = await Promise.all(
       envelope.payload.attachments.map((bundle) => storedBundleFromPortable(bundle)),
     )
-    const splitMessages = envelope.payload.messages.map((message) => splitMessageForStorage(message))
+    const splitMessages = envelope.payload.messages.map((message) =>
+      splitMessageForStorage(message),
+    )
     await db.transaction('rw', db.tables, async () => {
       for (const table of db.tables) await table.clear()
       if (envelope.payload.folders.length > 0) await db.folders.bulkPut(envelope.payload.folders)
@@ -766,10 +776,8 @@ async function storedBundleFromPortableWithNewIds(
   const artifacts = bundle.artifacts.map((artifact) =>
     rewriteArtifactForImport(artifact, targetAttachmentId, blobIdMap, artifactIdMap),
   )
-  const jobs = bundle.jobs.map((job) =>
-    rewriteJobForImport(job, targetAttachmentId, artifactIdMap),
-  )
-  await verifyPortableBundleIntegrity(attachment, blobs)
+  const jobs = bundle.jobs.map((job) => rewriteJobForImport(job, targetAttachmentId, artifactIdMap))
+  verifyPortableBundleIntegrity(attachment, blobs)
   return { attachment, blobs, artifacts, jobs }
 }
 
@@ -794,10 +802,10 @@ async function storedBlob(blob: PortableAttachmentBlob): Promise<AttachmentBlob>
   }
 }
 
-async function verifyPortableBundleIntegrity(
+function verifyPortableBundleIntegrity(
   attachment: Attachment,
   blobs: readonly AttachmentBlob[],
-): Promise<void> {
+): void {
   if (!attachment.contentHash) return
   const originalBlobId =
     attachment.storage.kind === 'local-blob'

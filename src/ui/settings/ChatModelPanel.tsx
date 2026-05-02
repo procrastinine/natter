@@ -33,9 +33,9 @@ import {
   type PromptSizeEstimateInput,
   UNLIMITED_CONTEXT,
 } from '../../core/prompt-size'
+import { isOpenAiDirectProfile } from '../../core/provider-hosted-tools'
 import { isTextCompletionsSelectableFor } from '../../core/quirks'
 import { readTokenCalibrationGlobal } from '../../core/token-calibration'
-import { isOpenAiDirectProfile } from '../../core/provider-hosted-tools'
 import type {
   Chat,
   ChatId,

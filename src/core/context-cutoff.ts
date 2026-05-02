@@ -40,17 +40,17 @@ import {
   resolveAttachmentContextRefs,
 } from './attachments/context'
 import {
+  type AttachmentResolver,
   mediaTokensForMessage,
   mediaTokensForRefs,
-  type AttachmentResolver,
 } from './media-context-tokens'
 import { resolveContextCap, UNLIMITED_CONTEXT } from './prompt-size'
 import { readPathTextTokenEstimate } from './token-calibration'
 import { clampTokens } from './token-guards'
 import {
   estimateReasoningEchoTokensForMessage,
-  estimateToolCallContextTokensForMessage,
   estimateTokens,
+  estimateToolCallContextTokensForMessage,
   type PromptEstimateOptions,
   type TokenizerFamily,
 } from './tokens'

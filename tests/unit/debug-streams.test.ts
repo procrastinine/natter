@@ -13,7 +13,7 @@ declare global {
       copy(): Promise<string>
       plans(): Array<{ label: string; payload: unknown }>
       lastPlan(): { label: string; payload: unknown } | null
-      lastRequest(): unknown | null
+      lastRequest(): unknown
     }
     __debugStreamsLastCopyText?: string
   }

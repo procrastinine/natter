@@ -177,33 +177,22 @@
       "shareLevel": "official"
     },
     {
-      "canonicalModelKeys": [
-        "z-ai:chatglm2-6b",
-        "z-ai:chatglm3-6b"
-      ],
+      "canonicalModelKeys": ["z-ai:chatglm2-6b", "z-ai:chatglm3-6b"],
       "key": "oss:chatglm2-3",
       "shareLevel": "exact"
     },
     {
-      "canonicalModelKeys": [
-        "qwen:codeqwen1.5-7b"
-      ],
+      "canonicalModelKeys": ["qwen:codeqwen1.5-7b"],
       "key": "oss:codeqwen1.5",
       "shareLevel": "exact"
     },
     {
-      "canonicalModelKeys": [
-        "deepseek:deepseek-coder-v2",
-        "deepseek:deepseek-v2.5"
-      ],
+      "canonicalModelKeys": ["deepseek:deepseek-coder-v2", "deepseek:deepseek-v2.5"],
       "key": "oss:deepseek-coder-v2",
       "shareLevel": "exact"
     },
     {
-      "canonicalModelKeys": [
-        "deepseek:deepseek-math-7b-instruct",
-        "deepseek:deepseek-v2"
-      ],
+      "canonicalModelKeys": ["deepseek:deepseek-math-7b-instruct", "deepseek:deepseek-v2"],
       "key": "oss:deepseek-v2",
       "shareLevel": "exact"
     },
@@ -243,16 +232,12 @@
       "shareLevel": "exact"
     },
     {
-      "canonicalModelKeys": [
-        "z-ai:glm-4-32b"
-      ],
+      "canonicalModelKeys": ["z-ai:glm-4-32b"],
       "key": "oss:glm-4-32b",
       "shareLevel": "exact"
     },
     {
-      "canonicalModelKeys": [
-        "z-ai:glm-4-9b"
-      ],
+      "canonicalModelKeys": ["z-ai:glm-4-9b"],
       "key": "oss:glm-4-9b",
       "shareLevel": "exact"
     },
@@ -270,19 +255,12 @@
       "shareLevel": "exact"
     },
     {
-      "canonicalModelKeys": [
-        "z-ai:glm-5",
-        "z-ai:glm-5-turbo",
-        "z-ai:glm-5.1",
-        "z-ai:glm-5v-turbo"
-      ],
+      "canonicalModelKeys": ["z-ai:glm-5", "z-ai:glm-5-turbo", "z-ai:glm-5.1", "z-ai:glm-5v-turbo"],
       "key": "oss:glm-5",
       "shareLevel": "exact"
     },
     {
-      "canonicalModelKeys": [
-        "moonshotai:kimi-audio-7b"
-      ],
+      "canonicalModelKeys": ["moonshotai:kimi-audio-7b"],
       "key": "oss:kimi-audio",
       "shareLevel": "exact"
     },
@@ -299,9 +277,7 @@
       "shareLevel": "exact"
     },
     {
-      "canonicalModelKeys": [
-        "meta-llama:llama-guard-4-12b"
-      ],
+      "canonicalModelKeys": ["meta-llama:llama-guard-4-12b"],
       "key": "oss:llama-guard-4",
       "shareLevel": "exact"
     },
@@ -355,9 +331,7 @@
       "shareLevel": "exact"
     },
     {
-      "canonicalModelKeys": [
-        "minimax:minimax-m1"
-      ],
+      "canonicalModelKeys": ["minimax:minimax-m1"],
       "key": "oss:minimax-m1",
       "shareLevel": "exact"
     },
@@ -374,17 +348,12 @@
       "shareLevel": "exact"
     },
     {
-      "canonicalModelKeys": [
-        "minimax:synlogic-r1"
-      ],
+      "canonicalModelKeys": ["minimax:synlogic-r1"],
       "key": "oss:minimax-synlogic",
       "shareLevel": "exact"
     },
     {
-      "canonicalModelKeys": [
-        "minimax:minimax-text-01",
-        "minimax:minimax-vl-01"
-      ],
+      "canonicalModelKeys": ["minimax:minimax-text-01", "minimax:minimax-vl-01"],
       "key": "oss:minimax-text-vl",
       "shareLevel": "exact"
     },
@@ -444,11 +413,7 @@
       "shareLevel": "effective"
     },
     {
-      "canonicalModelKeys": [
-        "qwen:qwen-14b",
-        "qwen:qwen-72b",
-        "qwen:qwen-7b"
-      ],
+      "canonicalModelKeys": ["qwen:qwen-14b", "qwen:qwen-72b", "qwen:qwen-7b"],
       "key": "oss:qwen-legacy-tiktoken",
       "shareLevel": "exact"
     },

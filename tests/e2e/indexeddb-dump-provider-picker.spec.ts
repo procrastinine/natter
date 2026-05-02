@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs'
-import { expect, test, type Page } from '@playwright/test'
-import { importIndexedDbDump, type IndexedDbDump } from './helpers'
+import { expect, type Page, test } from '@playwright/test'
+import { type IndexedDbDump, importIndexedDbDump } from './helpers'
 
 const dumpPath = process.env.NATTER_IDB_DUMP
 const ANTHROPIC_MODEL = 'anthropic/claude-opus-4.7'
@@ -18,11 +18,13 @@ test('restored IndexedDB dump can check the exact Anthropic provider row', async
   await routeOpenRouterFromDump(page, dump)
   await importIndexedDbDump(page, dump)
   await page.goto('/')
-  await expect.poll(() => legacyProviderSettingsSummary(page)).toEqual({
-    legacyChats: [],
-    legacyPresets: [],
-    legacyDisplayRefs: [],
-  })
+  await expect
+    .poll(() => legacyProviderSettingsSummary(page))
+    .toEqual({
+      legacyChats: [],
+      legacyPresets: [],
+      legacyDisplayRefs: [],
+    })
 
   await openMostRecentChat(page)
 
@@ -106,15 +108,26 @@ async function legacyProviderSettingsSummary(page: Page): Promise<{
           const legacyDisplayRefs: string[] = []
           for (const chat of chatReq.result as Array<{
             id: string
-            settings?: { privacy?: { ignoreProviders?: string[]; onlyProviders?: string[] }; providerPrefs?: { ignore?: string[]; only?: string[]; order?: string[] } }
+            settings?: {
+              privacy?: { ignoreProviders?: string[]; onlyProviders?: string[] }
+              providerPrefs?: { ignore?: string[]; only?: string[]; order?: string[] }
+            }
           }>) {
-            if ((chat.settings?.privacy?.ignoreProviders?.length ?? 0) > 0) legacyChats.push(chat.id)
+            if ((chat.settings?.privacy?.ignoreProviders?.length ?? 0) > 0)
+              legacyChats.push(chat.id)
             if ((chat.settings?.privacy?.onlyProviders?.length ?? 0) > 0) legacyChats.push(chat.id)
-            collectLegacyDisplayRefs(`chat:${chat.id}`, chat.settings?.providerPrefs, legacyDisplayRefs)
+            collectLegacyDisplayRefs(
+              `chat:${chat.id}`,
+              chat.settings?.providerPrefs,
+              legacyDisplayRefs,
+            )
           }
           for (const preset of presetReq.result as Array<{
             id: string
-            settings?: { privacy?: { ignoreProviders?: string[]; onlyProviders?: string[] }; providerPrefs?: { ignore?: string[]; only?: string[]; order?: string[] } }
+            settings?: {
+              privacy?: { ignoreProviders?: string[]; onlyProviders?: string[] }
+              providerPrefs?: { ignore?: string[]; only?: string[]; order?: string[] }
+            }
           }>) {
             if ((preset.settings?.privacy?.ignoreProviders?.length ?? 0) > 0) {
               legacyPresets.push(preset.id)
@@ -122,7 +135,11 @@ async function legacyProviderSettingsSummary(page: Page): Promise<{
             if ((preset.settings?.privacy?.onlyProviders?.length ?? 0) > 0) {
               legacyPresets.push(preset.id)
             }
-            collectLegacyDisplayRefs(`preset:${preset.id}`, preset.settings?.providerPrefs, legacyDisplayRefs)
+            collectLegacyDisplayRefs(
+              `preset:${preset.id}`,
+              preset.settings?.providerPrefs,
+              legacyDisplayRefs,
+            )
           }
           resolve({ legacyChats, legacyPresets, legacyDisplayRefs })
         }
@@ -158,11 +175,12 @@ async function openMostRecentChat(page: Page): Promise<void> {
         const tx = db.transaction('chats', 'readonly')
         const req = tx.objectStore('chats').getAll()
         req.onsuccess = () => {
-          const rows = (req.result as Array<{
-            id: string
-            updatedAt?: number
-          }>)
-            .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))
+          const rows = (
+            req.result as Array<{
+              id: string
+              updatedAt?: number
+            }>
+          ).sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))
           resolve(rows[0]?.id ?? '')
         }
         req.onerror = () => reject(req.error)
@@ -209,10 +227,12 @@ async function routeOpenRouterFromDump(page: Page, dump: IndexedDbDump): Promise
     const row = privacyRows.find((row) =>
       target.includes((row as { modelId?: string }).modelId ?? '\u0000'),
     ) as { payload?: { policies?: Record<string, unknown> } } | undefined
-    const providers = Object.entries(row?.payload?.policies ?? {}).map(([provider_name, data_policy]) => ({
-      provider_name,
-      data_policy,
-    }))
+    const providers = Object.entries(row?.payload?.policies ?? {}).map(
+      ([provider_name, data_policy]) => ({
+        provider_name,
+        data_policy,
+      }),
+    )
     await route.fulfill({
       status: 200,
       contentType: 'text/html',

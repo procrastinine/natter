@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test'
+import { expect, type Page, test } from '@playwright/test'
 import {
   buildSseBody,
   clearIndexedDb,
@@ -46,27 +46,40 @@ test('edited system prompt shows up in the NEXT /chat/completions body', async (
   await page.waitForTimeout(500)
   await page.locator('[data-role="settings-pane-close"]').click()
   await sendMessage(page, 'second')
-  await expect
-    .poll(() => bodies.length, { timeout: 5000 })
-    .toBeGreaterThanOrEqual(2)
+  await expect.poll(() => bodies.length, { timeout: 5000 }).toBeGreaterThanOrEqual(2)
   await expect(page.locator('[data-ui="message"][data-role="assistant"]').nth(1)).toContainText(
     'reply-2',
   )
 
   expect(bodies.length).toBeGreaterThanOrEqual(2)
-  const firstBody = JSON.parse(bodies[0] ?? '{}')
-  const secondBody = JSON.parse(bodies[1] ?? '{}')
+  const firstBody = parseCapturedChatBody(bodies[0])
+  const secondBody = parseCapturedChatBody(bodies[1])
 
   // First send had no system prompt.
-  const firstSystem = (firstBody.messages ?? []).find((m: { role: string }) => m.role === 'system')
+  const firstSystem = firstBody.messages.find((m) => m.role === 'system')
   expect(firstSystem).toBeUndefined()
 
   // Second send carries the edited system prompt.
-  const secondSystem = (secondBody.messages ?? []).find(
-    (m: { role: string }) => m.role === 'system',
-  )
+  const secondSystem = secondBody.messages.find((m) => m.role === 'system')
   expect(secondSystem?.content ?? '').toContain('You are a terse copy editor.')
 })
+
+function parseCapturedChatBody(raw: string | undefined): {
+  messages: Array<{ role: string; content?: unknown }>
+} {
+  const parsed: unknown = JSON.parse(raw ?? '{}')
+  if (!parsed || typeof parsed !== 'object') return { messages: [] }
+  const messages = (parsed as { messages?: unknown }).messages
+  if (!Array.isArray(messages)) return { messages: [] }
+  return {
+    messages: messages.filter(
+      (message): message is { role: string; content?: unknown } =>
+        !!message &&
+        typeof message === 'object' &&
+        typeof (message as { role?: unknown }).role === 'string',
+    ),
+  }
+}
 
 test('committing a system prompt bumps updatedAt + metaVersion and leaves branch state untouched', async ({
   page,
@@ -119,10 +132,7 @@ test('the one-off toast appears after the first edit and disappears on subsequen
   })
 })
 
-async function readChat(
-  page: import('@playwright/test').Page,
-  chatId: string,
-): Promise<Record<string, unknown>> {
+async function readChat(page: Page, chatId: string): Promise<Record<string, unknown>> {
   return page.evaluate(async (id) => {
     const db = await new Promise<IDBDatabase>((resolve, reject) => {
       const req = indexedDB.open('natter')

@@ -59,9 +59,7 @@ describe('InlineReasoningLifter', () => {
   it('leaves content alone when tag appears mid-content (auto-detect safety)', () => {
     const lifter = createInlineReasoningLifter()
     const out = drain(lifter, ['Here is a literal <think> tag</think>.'])
-    expect(out).toEqual([
-      { kind: 'text', text: 'Here is a literal <think> tag</think>.' },
-    ])
+    expect(out).toEqual([{ kind: 'text', text: 'Here is a literal <think> tag</think>.' }])
   })
 
   it('auto-detects reasoning after leading whitespace', () => {
@@ -74,9 +72,7 @@ describe('InlineReasoningLifter', () => {
   it('flushes unclosed <think> at end of stream to reasoning lane', () => {
     const lifter = createInlineReasoningLifter()
     const out = drain(lifter, ['<think>truncated mid-reason'])
-    expect(out).toEqual([
-      { kind: 'reasoning', text: 'truncated mid-reason' },
-    ])
+    expect(out).toEqual([{ kind: 'reasoning', text: 'truncated mid-reason' }])
   })
 
   it('respects custom tag set (no auto-detect via registry)', () => {
@@ -97,9 +93,7 @@ describe('InlineReasoningLifter', () => {
 
   it('handles multiple sequential reasoning blocks (non-auto-detect mode)', () => {
     const lifter = createInlineReasoningLifter({ tags: ['think'], autoDetect: false })
-    const out = drain(lifter, [
-      '<think>one</think>mid<think>two</think>end',
-    ])
+    const out = drain(lifter, ['<think>one</think>mid<think>two</think>end'])
     expect(out).toEqual([
       { kind: 'reasoning', text: 'one' },
       { kind: 'text', text: 'mid' },
@@ -144,9 +138,7 @@ describe('InlineReasoningLifter', () => {
     // the second into the answer lane. After arming on the first block,
     // the lifter scans for further open tags.
     const lifter = createInlineReasoningLifter()
-    const out = drain(lifter, [
-      '<think>step 1</think>partial answer<think>step 2</think>final',
-    ])
+    const out = drain(lifter, ['<think>step 1</think>partial answer<think>step 2</think>final'])
     expect(out).toEqual([
       { kind: 'reasoning', text: 'step 1' },
       { kind: 'text', text: 'partial answer' },
@@ -160,9 +152,7 @@ describe('InlineReasoningLifter', () => {
     // that quotes `<think>` mid-answer (e.g. explaining the syntax) keeps
     // those characters in the content lane verbatim.
     const lifter = createInlineReasoningLifter()
-    const out = drain(lifter, [
-      'Tags like <think>example</think> are used by DeepSeek.',
-    ])
+    const out = drain(lifter, ['Tags like <think>example</think> are used by DeepSeek.'])
     expect(out).toEqual([
       { kind: 'text', text: 'Tags like <think>example</think> are used by DeepSeek.' },
     ])
@@ -170,11 +160,7 @@ describe('InlineReasoningLifter', () => {
 
   it('handles three sibling reasoning blocks in auto-detect (chunked across feeds)', () => {
     const lifter = createInlineReasoningLifter()
-    const out = drain(lifter, [
-      '<think>a</think>x',
-      '<think>b</think>y',
-      '<think>c</think>z',
-    ])
+    const out = drain(lifter, ['<think>a</think>x', '<think>b</think>y', '<think>c</think>z'])
     expect(out).toEqual([
       { kind: 'reasoning', text: 'a' },
       { kind: 'text', text: 'x' },
@@ -206,9 +192,7 @@ describe('InlineReasoningLifter', () => {
   it('orphan </think> with no preceding open is plain content (auto-detect)', () => {
     const lifter = createInlineReasoningLifter()
     const out = drain(lifter, ['answer with stray </think> in it'])
-    expect(out).toEqual([
-      { kind: 'text', text: 'answer with stray </think> in it' },
-    ])
+    expect(out).toEqual([{ kind: 'text', text: 'answer with stray </think> in it' }])
   })
 
   it('explicit-mode also handles three sibling blocks (regression guard)', () => {

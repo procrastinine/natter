@@ -3,10 +3,7 @@ import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { buildBranchCacheRow } from '../../src/core/branch-flatten'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
-import {
-  EMPTY_TEXT_TEMPLATE,
-  createSavedTextTemplate,
-} from '../../src/core/text-templates'
+import { createSavedTextTemplate, EMPTY_TEXT_TEMPLATE } from '../../src/core/text-templates'
 import type {
   Chat,
   ChatFolder,
@@ -21,21 +18,17 @@ import type {
 import { newId } from '../../src/lib/ulid'
 import { getAttachmentBundle, ingestAttachmentBytes } from '../../src/store/attachments'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
+import { __resetBrowserImportExportBackendForTests } from '../../src/store/browser-import-export'
+import { __resetBrowserRepositoryForTests } from '../../src/store/browser-repo'
+import { __resetDbForTests, childListKey, getDb, openDb } from '../../src/store/db'
 import {
-  __resetBrowserImportExportBackendForTests,
-} from '../../src/store/browser-import-export'
-import {
-  __resetBrowserRepositoryForTests,
-} from '../../src/store/browser-repo'
-import { childListKey, __resetDbForTests, getDb, openDb } from '../../src/store/db'
-import {
+  __resetImportExportBackendForTests,
   exportChat,
   exportChatPreset,
   exportWorkspaceBackup,
   importChat,
   importChatPreset,
   restoreWorkspaceBackup,
-  __resetImportExportBackendForTests,
 } from '../../src/store/import-export'
 import { __resetKeyCacheForTests, createKey } from '../../src/store/keys'
 import { hydrateMessages } from '../../src/store/message-storage'
@@ -311,7 +304,9 @@ async function messagesForChat(chatId: string): Promise<Message[]> {
 }
 
 function fileItem(items: readonly ContentItem[]): Extract<ContentItem, { type: 'file' }> {
-  const item = items.find((row): row is Extract<ContentItem, { type: 'file' }> => row.type === 'file')
+  const item = items.find(
+    (row): row is Extract<ContentItem, { type: 'file' }> => row.type === 'file',
+  )
   if (!item) throw new Error('file item missing')
   return item
 }
@@ -322,7 +317,7 @@ async function blobText(blob: Blob): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader()
     reader.onerror = () => reject(reader.error ?? new Error('BlobReadFailed'))
-    reader.onload = () => resolve(String(reader.result ?? ''))
+    reader.onload = () => resolve(typeof reader.result === 'string' ? reader.result : '')
     reader.readAsText(blob)
   })
 }

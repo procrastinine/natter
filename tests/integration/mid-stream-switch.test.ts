@@ -60,7 +60,12 @@ function settings(
     ...base,
     profileId: 'prof-s1',
     model,
-    reasoning: { mode: 'off', exclude: false, summary: 'off', include: { encrypted: false, summary: false, text: false } },
+    reasoning: {
+      mode: 'off',
+      exclude: false,
+      summary: 'off',
+      include: { encrypted: false, summary: false, text: false },
+    },
     ...overrides,
   }
 }
@@ -117,7 +122,10 @@ async function getMessage(id: string): Promise<Message> {
   return row
 }
 
-async function seedOpenRouterDiscovery(profileId: string, models: readonly string[]): Promise<void> {
+async function seedOpenRouterDiscovery(
+  profileId: string,
+  models: readonly string[],
+): Promise<void> {
   for (const modelId of models) {
     await putCachedEndpoints(profileId, modelId, {
       id: modelId,

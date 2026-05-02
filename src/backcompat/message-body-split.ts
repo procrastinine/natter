@@ -3,9 +3,9 @@ import type { Message } from '../core/types'
 import type { NatterDb, SettingsRow } from '../store/db'
 import {
   MESSAGE_BODY_KEYS,
-  splitMessageForStorage,
   type MessageBodyRow,
   type MessageHeaderRow,
+  splitMessageForStorage,
 } from '../store/message-storage'
 
 const MESSAGE_BODY_SPLIT_BACKFILL_KEY = 'backfill:message-body-split-v1'
@@ -42,11 +42,7 @@ export async function backfillMissingMessageBodies(db: NatterDb): Promise<void> 
         continue
       }
       if (!hasInlineBodyFields(row)) throw new Error(`MessageBodyMissing:${String(row.id)}`)
-      await splitAndStoreLegacyMessage(
-        db.messages,
-        db.messageBodies,
-        row,
-      )
+      await splitAndStoreLegacyMessage(db.messages, db.messageBodies, row)
     }
     await db.settings.put(messageBodySplitBackfillMarker())
   })

@@ -21,7 +21,6 @@ import { nextSiblingIndex, TreeChangedError } from '../../src/core/tree-ops'
 import type { Chat, ChatId, Message, MessageId, MessageRole } from '../../src/core/types'
 import { newId } from '../../src/lib/ulid'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
-import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
 import {
   applyChatPreset,
   getMessage as getStoredMessage,
@@ -29,6 +28,7 @@ import {
   replaceChatSettings,
   updateChatSettings,
 } from '../../src/store/chats'
+import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
 import { splitMessageForStorage } from '../../src/store/message-storage'
 
 const DB_NAME = 'natter'

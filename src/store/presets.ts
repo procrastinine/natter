@@ -6,9 +6,15 @@
 // were already created from the preset — chats are their own snapshots. The
 // MRU preset (greatest non-archived `lastUsedAt`) seeds new chats per §9.2.1.
 
-import type { ChatPreset, ChatSettings, ConnectionProfile, PresetId, ProfileId } from '../core/types'
-import { newId } from '../lib/ulid'
 import { withProfileApiDefaults } from '../core/provider-defaults'
+import type {
+  ChatPreset,
+  ChatSettings,
+  ConnectionProfile,
+  PresetId,
+  ProfileId,
+} from '../core/types'
+import { newId } from '../lib/ulid'
 import { postEvent } from './broadcast'
 import { getDb } from './db'
 import { ProfileMissingError } from './profiles'
@@ -181,10 +187,9 @@ export async function pickMruPresetForProfile(profileId: ProfileId): Promise<Cha
   return pickDefaultPreset(active.filter((p) => p.connectionProfileId === profileId))
 }
 
-export async function pickPreferredPreset(opts: {
-  presetId?: PresetId | null
-  profileId?: ProfileId | null
-} = {}): Promise<ChatPreset | null> {
+export async function pickPreferredPreset(
+  opts: { presetId?: PresetId | null; profileId?: ProfileId | null } = {},
+): Promise<ChatPreset | null> {
   if (opts.presetId) {
     const preset = await getPreset(opts.presetId)
     if (

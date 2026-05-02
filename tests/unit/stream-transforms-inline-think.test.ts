@@ -25,7 +25,10 @@ describe('splitChatStream — inline <think> lifting', () => {
     const source = fromChunks([
       {
         type: 'delta',
-        chunk: { id: 'g1', choices: [{ delta: { content: '<think>pondering...</think>The answer is 42.' } }] },
+        chunk: {
+          id: 'g1',
+          choices: [{ delta: { content: '<think>pondering...</think>The answer is 42.' } }],
+        },
       },
       { type: 'delta', chunk: { id: 'g1', choices: [{ delta: {}, finish_reason: 'stop' }] } },
     ])
@@ -46,7 +49,10 @@ describe('splitChatStream — inline <think> lifting', () => {
   it('handles <think> open split across chunks', async () => {
     const source = fromChunks([
       { type: 'delta', chunk: { id: 'g', choices: [{ delta: { content: '<thi' } }] } },
-      { type: 'delta', chunk: { id: 'g', choices: [{ delta: { content: 'nk>reason</think>ans' } }] } },
+      {
+        type: 'delta',
+        chunk: { id: 'g', choices: [{ delta: { content: 'nk>reason</think>ans' } }] },
+      },
     ])
     const events = await collect(splitChatStream(source))
     const reasoning = events
@@ -87,7 +93,10 @@ describe('splitChatStream — inline <think> lifting', () => {
   it('leaves regular content untouched when no leading tag', async () => {
     const source = fromChunks([
       { type: 'delta', chunk: { id: 'g', choices: [{ delta: { content: 'Hello, ' } }] } },
-      { type: 'delta', chunk: { id: 'g', choices: [{ delta: { content: 'world! <think> in mid</think>' } }] } },
+      {
+        type: 'delta',
+        chunk: { id: 'g', choices: [{ delta: { content: 'world! <think> in mid</think>' } }] },
+      },
       { type: 'delta', chunk: { id: 'g', choices: [{ delta: {}, finish_reason: 'stop' }] } },
     ])
     const events = await collect(splitChatStream(source))
@@ -107,7 +116,10 @@ describe('splitChatStream — inline <think> lifting', () => {
 
   it('caller can disable the lifter by passing []', async () => {
     const source = fromChunks([
-      { type: 'delta', chunk: { id: 'g', choices: [{ delta: { content: '<think>raw</think>answer' } }] } },
+      {
+        type: 'delta',
+        chunk: { id: 'g', choices: [{ delta: { content: '<think>raw</think>answer' } }] },
+      },
       { type: 'delta', chunk: { id: 'g', choices: [{ delta: {}, finish_reason: 'stop' }] } },
     ])
     const events = await collect(splitChatStream(source, { inlineReasoningTags: [] }))
@@ -122,7 +134,10 @@ describe('splitChatStream — inline <think> lifting', () => {
     const source = fromChunks([
       {
         type: 'delta',
-        chunk: { id: 'g', choices: [{ delta: { content: 'prelude <analysis>body</analysis> rest' } }] },
+        chunk: {
+          id: 'g',
+          choices: [{ delta: { content: 'prelude <analysis>body</analysis> rest' } }],
+        },
       },
       { type: 'delta', chunk: { id: 'g', choices: [{ delta: {}, finish_reason: 'stop' }] } },
     ])
@@ -246,9 +261,7 @@ describe('splitChatStream — inline <think> lifting', () => {
             {
               delta: {
                 reasoning: 'Scalar is different.',
-                reasoning_details: [
-                  { type: 'reasoning.text', text: 'Details text.' },
-                ],
+                reasoning_details: [{ type: 'reasoning.text', text: 'Details text.' }],
               },
             },
           ],
@@ -290,8 +303,8 @@ describe('splitChatStream — inline <think> lifting', () => {
     )
     const detail = reasoning.find((e) => Array.isArray(e.details))
     expect(detail).toBeDefined()
-    expect(
-      (detail?.details?.[0] as { text?: string } | undefined)?.text,
-    ).toBe('<think>literal in details</think>')
+    expect((detail?.details?.[0] as { text?: string } | undefined)?.text).toBe(
+      '<think>literal in details</think>',
+    )
   })
 })

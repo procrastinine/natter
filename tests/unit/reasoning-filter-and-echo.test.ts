@@ -11,12 +11,7 @@
 import { describe, expect, it } from 'vitest'
 import { filterReasoningForInclude } from '../../src/core/reasoning'
 import { toResponses } from '../../src/core/transforms'
-import type {
-  ChatSettings,
-  Message,
-  ReasoningDetail,
-  ReasoningInclude,
-} from '../../src/core/types'
+import type { ChatSettings, Message, ReasoningDetail, ReasoningInclude } from '../../src/core/types'
 
 function detail(d: Partial<ReasoningDetail> & { type: ReasoningDetail['type'] }): ReasoningDetail {
   return d as ReasoningDetail
@@ -227,10 +222,12 @@ describe('toResponses — empty echo-item stripping', () => {
     const settings = baseSettings()
     const msg = baseAssistantMessage()
     const { wire } = toResponses(settings, [msg])
-    const reasoningItems = ((Array.isArray(wire.input) ? wire.input : []) as Array<{
-      type?: string
-      [k: string]: unknown
-    }>).filter((i) => i.type === 'reasoning')
+    const reasoningItems = (
+      (Array.isArray(wire.input) ? wire.input : []) as Array<{
+        type?: string
+        [k: string]: unknown
+      }>
+    ).filter((i) => i.type === 'reasoning')
     expect(reasoningItems).toHaveLength(0)
   })
 
@@ -245,10 +242,12 @@ describe('toResponses — empty echo-item stripping', () => {
     }
     const msg = baseAssistantMessage()
     const { wire } = toResponses(settings, [msg])
-    const reasoningItems = ((Array.isArray(wire.input) ? wire.input : []) as Array<{
-      type?: string
-      [k: string]: unknown
-    }>).filter((i) => i.type === 'reasoning')
+    const reasoningItems = (
+      (Array.isArray(wire.input) ? wire.input : []) as Array<{
+        type?: string
+        [k: string]: unknown
+      }>
+    ).filter((i) => i.type === 'reasoning')
     expect(reasoningItems).toHaveLength(1)
     expect((reasoningItems[0] as { encrypted_content?: string }).encrypted_content).toBe('blob')
     // OpenAI /v1/responses requires `summary` to be present on reasoning
@@ -267,10 +266,12 @@ describe('toResponses — empty echo-item stripping', () => {
     }
     const msg = baseAssistantMessage()
     const { wire } = toResponses(settings, [msg])
-    const reasoningItems = ((Array.isArray(wire.input) ? wire.input : []) as Array<{
-      type?: string
-      [k: string]: unknown
-    }>).filter((i) => i.type === 'reasoning')
+    const reasoningItems = (
+      (Array.isArray(wire.input) ? wire.input : []) as Array<{
+        type?: string
+        [k: string]: unknown
+      }>
+    ).filter((i) => i.type === 'reasoning')
     expect(reasoningItems).toHaveLength(1)
     // Encrypted stripped.
     expect((reasoningItems[0] as { encrypted_content?: string }).encrypted_content).toBeUndefined()

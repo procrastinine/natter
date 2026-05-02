@@ -53,7 +53,9 @@ test('mirrored Claude reasoning renders once in the UI and shows reasoning time 
         }
         const getPresetsReq = presets.getAll()
         getPresetsReq.onsuccess = () => {
-          const preset = getPresetsReq.result?.[0]
+          const preset = (
+            getPresetsReq.result as Array<{ id: string; settings?: Record<string, unknown> }>
+          )[0]
           if (!preset?.settings) {
             reject(new Error('missing seed preset'))
             return

@@ -47,7 +47,10 @@ describe('backcompat boundary', () => {
 })
 
 function importsBackcompat(source: string): boolean {
-  return /from\s+['"][^'"]*backcompat\//.test(source) || /import\s*\([^)]*['"][^'"]*backcompat\//.test(source)
+  return (
+    /from\s+['"][^'"]*backcompat\//.test(source) ||
+    /import\s*\([^)]*['"][^'"]*backcompat\//.test(source)
+  )
 }
 
 function sourceFiles(dir: string): string[] {

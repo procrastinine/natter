@@ -148,8 +148,7 @@ export function AppearanceSettings() {
             Chat width{' '}
             <span data-ui="field-value">{chatMaxWidthLabel(prefFromSliderPosition(position))}</span>
             <InfoDisclosure title="Chat width">
-              Maximum width of the centered reading column. Drag to the right edge for full
-              width.
+              Maximum width of the centered reading column. Drag to the right edge for full width.
             </InfoDisclosure>
           </label>
           <input
@@ -167,8 +166,8 @@ export function AppearanceSettings() {
           <label htmlFor="long-message-display">
             Long messages
             <InfoDisclosure title="Long messages">
-              Controls whether long messages reload as full text or as an avatar-expandable
-              compact preview.
+              Controls whether long messages reload as full text or as an avatar-expandable compact
+              preview.
             </InfoDisclosure>
           </label>
           <select
@@ -193,8 +192,8 @@ export function AppearanceSettings() {
           <label htmlFor="font-family">
             Font family
             <InfoDisclosure title="Font family">
-              Applies to the chat transcript, composer, and sidebar. Code blocks keep the
-              monospace family from the rendering theme.
+              Applies to the chat transcript, composer, and sidebar. Code blocks keep the monospace
+              family from the rendering theme.
             </InfoDisclosure>
           </label>
           <select

@@ -1,7 +1,7 @@
 import { strFromU8, strToU8, unzipSync, Zip, ZipDeflate } from 'fflate'
 import { triggerBrowserBlobDownload } from '../../core/chat-export'
 
-export interface JsonZipEntry {
+interface JsonZipEntry {
   filename: string
   value: unknown
 }
@@ -108,11 +108,7 @@ function isJsonZipEntry(filename: string): boolean {
   return !lower.endsWith('/') && lower.endsWith('.json')
 }
 
-function uniqueJsonZipFilename(
-  filename: string,
-  index: number,
-  seen: Map<string, number>,
-): string {
+function uniqueJsonZipFilename(filename: string, index: number, seen: Map<string, number>): string {
   const sanitized = filename.replaceAll(/[\\/:*?"<>|]/g, '-').trim() || `chat-${index + 1}.json`
   const candidate = sanitized.toLocaleLowerCase().endsWith('.json')
     ? sanitized

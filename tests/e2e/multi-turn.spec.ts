@@ -23,7 +23,7 @@ test('second turn inlines the first user + assistant messages', async ({ page })
   let turn = 0
   await page.route('**/api/v1/chat/completions', async (route, req) => {
     turn += 1
-    bodies.push(JSON.parse(req.postData() ?? '{}'))
+    bodies.push(parseChatCompletionBody(req.postData()))
     const reply = turn === 1 ? 'AURORA' : 'BOREALIS'
     await route.fulfill({
       contentType: 'text/event-stream',
@@ -63,7 +63,7 @@ test('three-turn conversation carries the full history', async ({ page }) => {
   let turn = 0
   await page.route('**/api/v1/chat/completions', async (route, req) => {
     turn += 1
-    bodies.push(JSON.parse(req.postData() ?? '{}'))
+    bodies.push(parseChatCompletionBody(req.postData()))
     const reply = ['one', 'two', 'three'][turn - 1] ?? 'done'
     await route.fulfill({
       contentType: 'text/event-stream',
@@ -101,3 +101,9 @@ test('three-turn conversation carries the full history', async ({ page }) => {
     'user',
   ])
 })
+
+function parseChatCompletionBody(raw: string | null): {
+  messages: Array<{ role: string; content: string }>
+} {
+  return JSON.parse(raw ?? '{}') as { messages: Array<{ role: string; content: string }> }
+}

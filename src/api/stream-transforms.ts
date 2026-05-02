@@ -18,8 +18,7 @@
 
 import { isOpenAiResponsesFamilyFormat } from '../core/reasoning'
 import { createInlineReasoningLifter, type InlineReasoningLifter } from '../core/reasoning-inline'
-import type { ContentItem, MessagePhase } from '../core/types'
-import { type ApiError, normalizeError } from './errors'
+import type { ContentItem, MessagePhase, ReasoningFormat } from '../core/types'
 import type {
   AnthropicContentBlock,
   AnthropicEventWire,
@@ -27,6 +26,7 @@ import type {
   AnthropicStreamChunk,
   AnthropicUsageWire,
 } from './anthropic-types'
+import { type ApiError, normalizeError } from './errors'
 import type {
   GeminiContent,
   GeminiPart,
@@ -555,7 +555,7 @@ function reasoningDetailsMirrorText(
       detail.type === 'reasoning.summary' &&
       typeof detail.summary === 'string' &&
       typeof detail.format === 'string' &&
-      isOpenAiResponsesFamilyFormat(detail.format as import('../core/types').ReasoningFormat)
+      isOpenAiResponsesFamilyFormat(detail.format as ReasoningFormat)
     ) {
       mergedSummary += detail.summary
       sawOpenAiSummary = true
@@ -594,17 +594,15 @@ function imageUrlFromChatImage(image: unknown): string | null {
   if (!image || typeof image !== 'object') return null
   const record = image as {
     url?: unknown
-    image_url?: { url?: unknown } | unknown
+    image_url?: unknown
     b64_json?: unknown
   }
   if (typeof record.url === 'string') return normalizeImageUrlOrBase64(record.url)
-  if (
-    record.image_url &&
-    typeof record.image_url === 'object' &&
-    typeof (record.image_url as { url?: unknown }).url === 'string' &&
-    ((record.image_url as { url?: string }).url?.length ?? 0) > 0
-  ) {
-    return normalizeImageUrlOrBase64((record.image_url as { url: string }).url)
+  if (record.image_url && typeof record.image_url === 'object') {
+    const nestedUrl = (record.image_url as { url?: unknown }).url
+    if (typeof nestedUrl === 'string' && nestedUrl.length > 0) {
+      return normalizeImageUrlOrBase64(nestedUrl)
+    }
   }
   if (typeof record.b64_json === 'string' && record.b64_json.length > 0) {
     return `data:image/png;base64,${record.b64_json}`
@@ -617,7 +615,7 @@ function videoUrlFromChatVideo(video: unknown): string | null {
   if (!video || typeof video !== 'object') return null
   const record = video as {
     url?: unknown
-    video_url?: { url?: unknown } | unknown
+    video_url?: unknown
     content_url?: unknown
   }
   if (typeof record.url === 'string') return normalizeMediaUrl(record.url)
@@ -1248,8 +1246,7 @@ export async function* splitAnthropicStream(
 
       case 'content_block_delta': {
         const e = ev as Extract<AnthropicEventWire, { type: 'content_block_delta' }>
-        const state =
-          blocks.get(e.index) ?? createAnthropicBlockState(e.index, { type: 'unknown' })
+        const state = blocks.get(e.index) ?? createAnthropicBlockState(e.index, { type: 'unknown' })
         blocks.set(e.index, state)
         yield* applyAnthropicBlockDelta(state, e.delta)
         break
@@ -1287,7 +1284,9 @@ export async function* splitAnthropicStream(
         yield {
           lane: 'error',
           error: normalizeError(
-            { error: { code: e.error?.type, message: e.error?.message ?? 'Anthropic stream error' } },
+            {
+              error: { code: e.error?.type, message: e.error?.message ?? 'Anthropic stream error' },
+            },
             { midStream: true },
           ),
         }
@@ -1519,7 +1518,10 @@ function remapAnthropicUsage(u: AnthropicUsageWire): ChatCompletionUsageWire {
   if (typeof u.input_tokens === 'number' && typeof u.output_tokens === 'number') {
     out.total_tokens = u.input_tokens + u.output_tokens
   }
-  if (typeof u.cache_read_input_tokens === 'number' || typeof u.cache_creation_input_tokens === 'number') {
+  if (
+    typeof u.cache_read_input_tokens === 'number' ||
+    typeof u.cache_creation_input_tokens === 'number'
+  ) {
     out.prompt_tokens_details = {
       cached_tokens:
         (typeof u.cache_read_input_tokens === 'number' ? u.cache_read_input_tokens : 0) +

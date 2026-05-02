@@ -18,8 +18,8 @@
 // identity comes from the shared cross-provider resolver in `model-ids.ts`, so
 // OpenRouter aliases and direct-provider ids do not drift apart.
 
-import type { EffortLevel, ReasoningFormat, VerbosityLevel } from './types'
 import { canonicalCompatModelId, canonicalModelSlug } from './model-ids'
+import type { EffortLevel, ReasoningFormat, VerbosityLevel } from './types'
 
 // Assistant-prefill classification. See `plan/prefill-research.md §P.8.1`.
 // `native`  — prefill works transparently (Claude < 4.6, Gemini).

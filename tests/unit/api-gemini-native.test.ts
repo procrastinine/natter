@@ -4,15 +4,8 @@
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import {
-  type GeminiContext,
-  geminiOnce,
-  geminiStream,
-} from '../../src/api/gemini-native'
-import type {
-  GeminiStreamChunk,
-  GenerateContentResponseWire,
-} from '../../src/api/gemini-types'
+import { type GeminiContext, geminiOnce, geminiStream } from '../../src/api/gemini-native'
+import type { GeminiStreamChunk, GenerateContentResponseWire } from '../../src/api/gemini-types'
 import type { ConnectionProfile } from '../../src/core/types'
 
 const PROBE8 = resolve(__dirname, '../../../plan/phase11-probes/08-gemini-native-stream.sse')
@@ -124,7 +117,10 @@ describe('geminiStream — URL & headers', () => {
 describe('geminiStream — probe 8 round-trip', () => {
   it('parses the captured SSE into typed chunks with a final thoughtSignature', async () => {
     const body = readFileSync(PROBE8, 'utf8')
-    vi.stubGlobal('fetch', vi.fn(async () => sseResponse(body)))
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => sseResponse(body)),
+    )
 
     const chunks: GeminiStreamChunk[] = []
     for await (const ch of geminiStream(
@@ -142,7 +138,7 @@ describe('geminiStream — probe 8 round-trip', () => {
     // The final part in the captured fixture has thoughtSignature + empty text +
     // finishReason: STOP — this is the Gemini 3 "signature on last part" rule.
     const lastPart = lastChunk.chunk.candidates?.[0]?.content.parts.slice(-1)[0]
-    const signature = (lastPart as { thoughtSignature?: string })?.thoughtSignature
+    const signature = (lastPart as { thoughtSignature?: string }).thoughtSignature
     expect(signature).toBeDefined()
     expect(signature?.length).toBeGreaterThan(100)
     expect(lastChunk.chunk.candidates?.[0]?.finishReason).toBe('STOP')
@@ -153,7 +149,10 @@ describe('geminiStream — probe 8 round-trip', () => {
 describe('geminiOnce — probe 3 buffered', () => {
   it('returns the full GenerateContentResponseWire body', async () => {
     const buffered = JSON.parse(readFileSync(PROBE3, 'utf8')) as GenerateContentResponseWire
-    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(buffered)))
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => jsonResponse(buffered)),
+    )
     const result = await geminiOnce(ctx(), { contents: [] }, 'gemini-3.1-flash-lite-preview')
     expect(result).toEqual(buffered)
   })

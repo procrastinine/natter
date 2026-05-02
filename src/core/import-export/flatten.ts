@@ -1,9 +1,5 @@
-import {
-  EMPTY_TEXT_TEMPLATE,
-  TEXT_TEMPLATES,
-  type SavedTextTemplate,
-} from '../text-templates'
-import type { ChatSettings, PromptPresetId } from '../types'
+import { EMPTY_TEXT_TEMPLATE, type SavedTextTemplate, TEXT_TEMPLATES } from '../text-templates'
+import type { ChatSettings } from '../types'
 
 const PROMPT_PIN_KEYS = [
   'systemPromptPresetId',
@@ -13,7 +9,7 @@ const PROMPT_PIN_KEYS = [
   'defaultPrefillPresetId',
 ] as const satisfies readonly (keyof ChatSettings)[]
 
-export interface FlattenChatSettingsOptions {
+interface FlattenChatSettingsOptions {
   savedTextTemplates?: readonly SavedTextTemplate[]
 }
 
@@ -40,10 +36,6 @@ export function stripPromptPresetPins(settings: ChatSettings): ChatSettings {
   return settings
 }
 
-export function chatSettingsHasPromptPresetPins(settings: ChatSettings): boolean {
-  return PROMPT_PIN_KEYS.some((key) => typeof settings[key] === 'string')
-}
-
 function flattenTextTemplate(
   settings: ChatSettings,
   savedTextTemplates: readonly SavedTextTemplate[],
@@ -58,17 +50,4 @@ function flattenTextTemplate(
   settings.customTextTemplate = structuredClone(
     saved?.config ?? settings.customTextTemplate ?? EMPTY_TEXT_TEMPLATE,
   )
-}
-
-export function promptPresetIdKeys(): readonly (keyof ChatSettings)[] {
-  return PROMPT_PIN_KEYS
-}
-
-export function promptPresetIdsInSettings(settings: ChatSettings): PromptPresetId[] {
-  const ids: PromptPresetId[] = []
-  for (const key of PROMPT_PIN_KEYS) {
-    const value = settings[key]
-    if (typeof value === 'string') ids.push(value)
-  }
-  return ids
 }

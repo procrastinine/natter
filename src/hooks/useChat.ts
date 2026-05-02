@@ -60,7 +60,7 @@ import {
   derivePromptSample,
   readTokenCalibrationGlobal,
 } from '../core/token-calibration'
-import type { PromptEstimateOptions } from '../core/tokens'
+import type { PromptEstimateOptions, TokenizerFamily } from '../core/tokens'
 import type { ChatCompletionsTransformOptions } from '../core/transforms'
 import { nextSiblingIndex } from '../core/tree-ops'
 import type {
@@ -1388,20 +1388,18 @@ function isRecoverableOutputItem(item: unknown): boolean {
 }
 
 function streamEventTextLength(event: StreamLaneEvent): number {
-  switch (event.lane) {
-    case 'text':
-      return event.text.length
-    case 'reasoning':
-      return (
-        (event.textDelta?.length ?? 0) +
-        (event.summaryDelta?.length ?? 0) +
-        (event.encryptedDelta?.length ?? 0)
-      )
-    case 'audio-output':
-      return (event.dataDelta?.length ?? 0) + (event.transcriptDelta?.length ?? 0)
-    default:
-      return 0
+  if (event.lane === 'text') return event.text.length
+  if (event.lane === 'reasoning') {
+    return (
+      (event.textDelta?.length ?? 0) +
+      (event.summaryDelta?.length ?? 0) +
+      (event.encryptedDelta?.length ?? 0)
+    )
   }
+  if (event.lane === 'audio-output') {
+    return (event.dataDelta?.length ?? 0) + (event.transcriptDelta?.length ?? 0)
+  }
+  return 0
 }
 
 function flushStreamChunksSoon(
@@ -1451,8 +1449,7 @@ async function flushStreamChunks(
   const batch = acc.streamChunkBuffer
   acc.streamChunkBuffer = []
   acc.bufferedStreamChunkTextLen = 0
-  let flush: Promise<void>
-  flush = repo
+  const flush: Promise<void> = repo
     .appendStreamChunks(batch)
     .catch((err) => {
       acc.streamChunkBuffer = [...batch, ...acc.streamChunkBuffer]
@@ -1606,7 +1603,7 @@ interface FinalizeContext extends FlushContext {
     outboundPath: readonly Message[]
     systemPrompt: string
     modelId: string
-    family: import('../core/tokens').TokenizerFamily
+    family: TokenizerFamily
     promptCalibrationAllowed: boolean
     completionCalibrationAllowed: boolean
     reasoningOpts?: PromptEstimateOptions

@@ -45,10 +45,7 @@ function chatSettingsFor(profileId: ProfileId): ChatSettings {
   return s
 }
 
-async function seedChat(
-  profileId: ProfileId,
-  patch: Partial<ChatSettings> = {},
-): Promise<Chat> {
+async function seedChat(profileId: ProfileId, patch: Partial<ChatSettings> = {}): Promise<Chat> {
   const db = await openDb()
   const chat: Chat = {
     id: newId(),
@@ -122,9 +119,9 @@ describe('listPromptPresets', () => {
 
 describe('updatePromptPreset', () => {
   it('rejects an update to a missing preset', async () => {
-    await expect(
-      updatePromptPreset('missing', { text: 'x' }),
-    ).rejects.toBeInstanceOf(PromptPresetMissingError)
+    await expect(updatePromptPreset('missing', { text: 'x' })).rejects.toBeInstanceOf(
+      PromptPresetMissingError,
+    )
   })
 
   it('rename does not propagate to pinned chats', async () => {
@@ -239,9 +236,9 @@ describe('deletePromptPreset', () => {
     const rowBundle = await getDb().presets.get(bundle.id)
     expect(rowBundle?.settings.systemPromptPresetId).toBeUndefined()
     expect(rowBundle?.settings.systemPrompt).toBe('canonical')
-    expect(seen.some((ev) => ev.kind === 'prompt-preset-deleted' && ev.promptPresetId === preset.id)).toBe(
-      true,
-    )
+    expect(
+      seen.some((ev) => ev.kind === 'prompt-preset-deleted' && ev.promptPresetId === preset.id),
+    ).toBe(true)
   })
 })
 

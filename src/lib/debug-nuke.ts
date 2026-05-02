@@ -26,7 +26,12 @@ export async function nukeSiteStorage(opts: NukeOptions = {}): Promise<void> {
   tasks.push(
     (async () => {
       closeDb()
-      const dbs = (await indexedDB.databases?.()) ?? []
+      const listDatabases = (
+        indexedDB as unknown as {
+          databases?: () => Promise<IDBDatabaseInfo[]>
+        }
+      ).databases
+      const dbs = listDatabases ? await listDatabases.call(indexedDB) : []
       const names = new Set(dbs.flatMap((db) => (db.name ? [db.name] : [])))
       // Belt-and-braces: explicitly nuke the natter db in case enumeration
       // returned an empty list (Safari < 17 lacks indexedDB.databases()).

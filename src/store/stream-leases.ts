@@ -73,7 +73,9 @@ export function startStreamLease(input: {
       startedAt: input.startedAt,
       heartbeatAt: Date.now(),
     }
-    void getWorkspaceRepository().upsertStreamLease(lease).catch(() => {})
+    void getWorkspaceRepository()
+      .upsertStreamLease(lease)
+      .catch(() => {})
   }
   write()
   heartbeatTimers.set(input.streamId, setInterval(write, STREAM_LEASE_HEARTBEAT_MS))
@@ -81,7 +83,9 @@ export function startStreamLease(input: {
 
 export function stopStreamLease(streamId: string): void {
   stopHeartbeatTimer(streamId)
-  void getWorkspaceRepository().deleteStreamLease(streamId).catch(() => {})
+  void getWorkspaceRepository()
+    .deleteStreamLease(streamId)
+    .catch(() => {})
 }
 
 async function freshStreamLeases(chatId?: ChatId, now = Date.now()): Promise<StreamLeaseRow[]> {

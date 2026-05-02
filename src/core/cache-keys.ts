@@ -23,14 +23,17 @@ function normalizeList(input: readonly string[] | undefined): string[] {
 
 // Object-key-sorted JSON so `{a:1,b:2}` and `{b:2,a:1}` produce the same string.
 function stableStringify(value: unknown): string {
-  return JSON.stringify(value, (_key, v) => {
-    if (v && typeof v === 'object' && !Array.isArray(v)) {
-      const sorted: Record<string, unknown> = {}
-      for (const k of Object.keys(v as Record<string, unknown>).sort()) {
-        sorted[k] = (v as Record<string, unknown>)[k]
+  return (
+    JSON.stringify(value, (_key: string, v: unknown) => {
+      if (v && typeof v === 'object' && !Array.isArray(v)) {
+        const record = v as Record<string, unknown>
+        const sorted: Record<string, unknown> = {}
+        for (const k of Object.keys(record).sort()) {
+          sorted[k] = record[k]
+        }
+        return sorted
       }
-      return sorted
-    }
-    return v
-  })
+      return v
+    }) ?? 'undefined'
+  )
 }

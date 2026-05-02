@@ -2,9 +2,7 @@
 
 import { describe, expect, it } from 'vitest'
 import { migrateLegacyCarryForwardToInclude } from '../../src/backcompat/chat-settings'
-import {
-  defaultReasoningInclude,
-} from '../../src/core/reasoning'
+import { defaultReasoningInclude } from '../../src/core/reasoning'
 
 describe('migrateLegacyCarryForwardToInclude', () => {
   it("'off' → all false", () => {

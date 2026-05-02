@@ -22,10 +22,10 @@ import {
   insertSibling,
 } from '../core/messages'
 import type {
+  AttachmentRef,
   ChatId,
   ConnectionProfile,
   ContentItem,
-  AttachmentRef,
   Message,
   MessageId,
   ProviderOutputItem,

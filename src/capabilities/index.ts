@@ -9,8 +9,8 @@
 //
 // ConnectionProfile.capabilityOverrides wins on top of the resolved row.
 
-import type { CapabilityDescriptor, ConnectionKind, ConnectionProfile } from '../core/types'
 import { canonicalModelSlug, compatModelIdsMatch, structuralModelSlug } from '../core/model-ids'
+import type { CapabilityDescriptor, ConnectionKind, ConnectionProfile } from '../core/types'
 import { ANTHROPIC_CAPABILITIES } from './anthropic'
 import { DEFAULT_CUSTOM_CAPABILITY } from './custom'
 import { GOOGLE_CAPABILITIES } from './google'
@@ -41,10 +41,7 @@ function defaultCapabilityFor(kind: ConnectionKind): CapabilityDescriptor {
   return kind === 'llama-server' ? DEFAULT_LLAMA_SERVER_CAPABILITY : DEFAULT_CUSTOM_CAPABILITY
 }
 
-function lookupBundledEntry(
-  kind: ConnectionKind,
-  modelId: string,
-): BundledModelEntry | undefined {
+function lookupBundledEntry(kind: ConnectionKind, modelId: string): BundledModelEntry | undefined {
   const table = tableFor(kind)
   if (!table) return undefined
   const direct =

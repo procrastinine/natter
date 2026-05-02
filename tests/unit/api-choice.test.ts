@@ -229,11 +229,7 @@ describe('chooseApi matrix', () => {
     })
 
     it('Google hosted tools use Gemini native when the chat is in native mode', () => {
-      const settings = makeSettings(
-        'gemini-native',
-        true,
-        'google/gemini-3.1-flash-lite-preview',
-      )
+      const settings = makeSettings('gemini-native', true, 'google/gemini-3.1-flash-lite-preview')
       settings.tools.google.enabledServerToolIds = ['google-search']
       const r = chooseApi(
         makeProfile({

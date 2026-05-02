@@ -2,6 +2,7 @@ import { renderHook, waitFor } from '@testing-library/react'
 import Dexie from 'dexie'
 import { IDBFactory } from 'fake-indexeddb'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type * as PrivacyScrapeModule from '../../src/api/privacy-scrape'
 import { fetchPrivacyScrape } from '../../src/api/privacy-scrape'
 import { usePrivacyPolicies } from '../../src/hooks/usePrivacyPolicies'
 import { newId } from '../../src/lib/ulid'
@@ -16,9 +17,7 @@ import {
 import { createProfile } from '../../src/store/profiles'
 
 vi.mock('../../src/api/privacy-scrape', async () => {
-  const actual = await vi.importActual<typeof import('../../src/api/privacy-scrape')>(
-    '../../src/api/privacy-scrape',
-  )
+  const actual = await vi.importActual<typeof PrivacyScrapeModule>('../../src/api/privacy-scrape')
   return { ...actual, fetchPrivacyScrape: vi.fn() }
 })
 

@@ -38,7 +38,7 @@ describe('MarkdownView', () => {
     const { container } = render(
       <MarkdownView content="![alt text](https://tracker.example.com/pixel.gif)" />,
     )
-    const text = container.textContent ?? ''
+    const text = container.textContent
     expect(text).toMatch(/Blocked image from/)
     expect(container.querySelector('img[src*="tracker.example.com"]')).toBeNull()
   })

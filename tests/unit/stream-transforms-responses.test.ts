@@ -4,7 +4,7 @@
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { splitResponsesStream, type StreamLaneEvent } from '../../src/api/stream-transforms'
+import { type StreamLaneEvent, splitResponsesStream } from '../../src/api/stream-transforms'
 import type {
   ResponsesEventWire,
   ResponsesResultWire,

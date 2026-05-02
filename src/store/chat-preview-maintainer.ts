@@ -24,7 +24,7 @@ function scheduleRefresh(chatId: ChatId): void {
   if (existing !== undefined) clearTimeout(existing)
   const timer = setTimeout(() => {
     timers.delete(chatId)
-    void refreshChatPreview(chatId).catch((err) => {
+    void refreshChatPreview(chatId).catch((err: unknown) => {
       console.error('refreshChatPreview failed', { chatId, err })
     })
   }, REFRESH_DEBOUNCE_MS)

@@ -121,13 +121,9 @@ export function AttachmentPicker({
                 key={attachment.id}
                 type="button"
                 data-ui="attachment-picker-row"
-                onClick={async () => {
+                onClick={() => {
                   setBusyId(attachment.id)
-                  try {
-                    await onPick(attachment)
-                  } finally {
-                    setBusyId(null)
-                  }
+                  void Promise.resolve(onPick(attachment)).finally(() => setBusyId(null))
                 }}
                 disabled={busyId !== null}
                 title={`${attachment.id}\n${attachment.mime}`}

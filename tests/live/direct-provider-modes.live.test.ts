@@ -4,11 +4,8 @@
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { beforeAll, describe, expect, it } from 'vitest'
-import { anthropicOnce, type AnthropicContext } from '../../src/api/anthropic-messages'
-import {
-  chatCompletionsOnce,
-  type ChatCompletionsContext,
-} from '../../src/api/chat-completions'
+import { type AnthropicContext, anthropicOnce } from '../../src/api/anthropic-messages'
+import { type ChatCompletionsContext, chatCompletionsOnce } from '../../src/api/chat-completions'
 import type { ConnectionProfile } from '../../src/core/types'
 
 const LIVE = process.env.LIVE === '1'

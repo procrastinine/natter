@@ -76,11 +76,7 @@ describe('quirks registry', () => {
   it('Gemini 3 Pro allowedEffort is low/medium/high (no minimal, no xhigh)', () => {
     // Per Google's Vertex thinking docs: Gemini 3 Pro / 3.1 Pro have NO
     // `minimal` level — only low/medium/high. Pro cannot be disabled.
-    expect(allowedEffortFor('google/gemini-3.1-pro-preview')).toEqual([
-      'low',
-      'medium',
-      'high',
-    ])
+    expect(allowedEffortFor('google/gemini-3.1-pro-preview')).toEqual(['low', 'medium', 'high'])
     // Prefix match also catches -customtools variant.
     expect(allowedEffortFor('google/gemini-3.1-pro-preview-customtools')).toEqual([
       'low',

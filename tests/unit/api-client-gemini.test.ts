@@ -64,7 +64,7 @@ describe('buildHeaders — Gemini native branch', () => {
     expect(h['X-Custom']).toBe('c')
   })
 
-  it("overrideHeaders win over defaultHeaders", () => {
+  it('overrideHeaders win over defaultHeaders', () => {
     const h = buildHeaders(profile({ defaultHeaders: { 'X-Custom': 'from-default' } }), 'K', {
       overrideHeaders: { 'X-Custom': 'from-override' },
       authScheme: 'gemini-native',
@@ -72,7 +72,7 @@ describe('buildHeaders — Gemini native branch', () => {
     expect(h['X-Custom']).toBe('from-override')
   })
 
-  it("Content-Type is set on POST regardless of scheme", () => {
+  it('Content-Type is set on POST regardless of scheme', () => {
     const h = buildHeaders(profile(), 'K', { method: 'POST', authScheme: 'gemini-native' })
     expect(h['Content-Type']).toBe('application/json')
   })

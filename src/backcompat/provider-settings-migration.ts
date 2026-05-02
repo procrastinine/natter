@@ -2,7 +2,6 @@ import { readCachedPrivacyPayload } from '../api/privacy-scrape'
 import { normalizeEndpointsResponse } from '../api/providers'
 import { filterEndpointsByPrivacy, type PrivacyFilterResult } from '../core/privacy-filter'
 import { DEFAULT_OPENROUTER_PROVIDER_SORT } from '../core/provider-defaults'
-import { migrateLegacyChatSettings } from './chat-settings'
 import {
   endpointMatchesAnyProviderRef,
   providerEndpointKey,
@@ -19,6 +18,7 @@ import type {
   SortBy,
 } from '../core/types'
 import type { CachedEndpointsRow, CachedPrivacyPolicyRow } from '../store/db'
+import { migrateLegacyChatSettings } from './chat-settings'
 
 type LegacyPrivacyPrefs = ChatSettings['privacy'] & {
   ignoreProviders?: string[]
@@ -103,7 +103,11 @@ export function migrateLegacyProviderSettings(
       : { settings, changed: false }
   }
 
-  if (endpoints.length > 0 && context.model && hasPolicyCoverage(endpoints, context.policies ?? {})) {
+  if (
+    endpoints.length > 0 &&
+    context.model &&
+    hasPolicyCoverage(endpoints, context.policies ?? {})
+  ) {
     const oldFilter = filterEndpointsByPrivacy({
       model: context.model,
       endpoints,
@@ -122,7 +126,10 @@ export function migrateLegacyProviderSettings(
     }
     delete providerPrefs.only
   } else if (endpoints.length > 0) {
-    const migratedIgnore = normalizeRefs([...normalizeArray(providerPrefs.ignore), ...legacyIgnore], endpoints)
+    const migratedIgnore = normalizeRefs(
+      [...normalizeArray(providerPrefs.ignore), ...legacyIgnore],
+      endpoints,
+    )
     const ignoredOutsideOnly = ignoredOutsideOnlyRefs(legacyOnly, endpoints)
     const mergedIgnore = uniqueStrings([...migratedIgnore, ...ignoredOutsideOnly])
     providerPrefs = { ...providerPrefs }
@@ -134,8 +141,14 @@ export function migrateLegacyProviderSettings(
     }
     delete providerPrefs.only
   } else {
-    const migratedIgnore = normalizeRefs([...normalizeArray(providerPrefs.ignore), ...legacyIgnore], endpoints)
-    const migratedOnly = normalizeRefs([...normalizeArray(providerPrefs.only), ...legacyOnly], endpoints)
+    const migratedIgnore = normalizeRefs(
+      [...normalizeArray(providerPrefs.ignore), ...legacyIgnore],
+      endpoints,
+    )
+    const migratedOnly = normalizeRefs(
+      [...normalizeArray(providerPrefs.only), ...legacyOnly],
+      endpoints,
+    )
     providerPrefs = { ...providerPrefs }
     if (migratedIgnore.length > 0) {
       providerPrefs.ignore = migratedIgnore
@@ -224,9 +237,7 @@ function normalizeProviderSort(
   defaultSort: SortBy | undefined,
 ): { sort: ProviderPreferences['sort'] | undefined; changed: boolean } {
   if (value === undefined) {
-    return defaultSort
-      ? { sort: defaultSort, changed: true }
-      : { sort: undefined, changed: false }
+    return defaultSort ? { sort: defaultSort, changed: true } : { sort: undefined, changed: false }
   }
   const fallback = defaultSort ?? undefined
   if (typeof value === 'string') {
@@ -285,10 +296,7 @@ function effectiveIgnoredRoutingRefs(
   return uniqueStrings(out)
 }
 
-function normalizeRefs(
-  refs: readonly string[],
-  endpoints: readonly ModelEndpoint[],
-): string[] {
+function normalizeRefs(refs: readonly string[], endpoints: readonly ModelEndpoint[]): string[] {
   if (refs.length === 0) return []
   if (endpoints.length > 0) {
     return resolveProviderRefsToRoutingRefs(endpoints, refs, { preserveUnknown: true })
@@ -354,7 +362,7 @@ function hasPolicyCoverage(
 }
 
 function normalizeArray(value: readonly string[] | undefined): string[] {
-  return Array.isArray(value) ? value.filter((ref) => ref.trim().length > 0) : []
+  return value?.filter((ref) => ref.trim().length > 0) ?? []
 }
 
 function uniqueStrings(values: readonly string[]): string[] {

@@ -6,15 +6,15 @@
 // in isolation from the filter wiring.
 
 import { useCallback, useMemo } from 'react'
-import type { EffectiveCapability } from '../core/capabilities'
 import type { EndpointsDescriptor } from '../api/providers'
-import type { Chat, ModelEndpoint } from '../core/types'
+import type { EffectiveCapability } from '../core/capabilities'
 import {
   buildWireProviderPrivacy,
   filterEndpointsByPrivacy,
   type PrivacyFilterResult,
   type WireProviderPrivacy,
 } from '../core/privacy-filter'
+import type { Chat, ModelEndpoint } from '../core/types'
 import { useEndpoints } from './useEndpoints'
 import { usePrivacyPolicies } from './usePrivacyPolicies'
 
@@ -57,15 +57,7 @@ export function usePrivacyRouting(chat: Chat | null | undefined): UsePrivacyRout
       privacy: chat.settings.privacy,
       missingPolicyMode: pol.error ? 'offline-worst-case' : 'unavailable',
     })
-  }, [
-    pol.scrapeApplicable,
-    pol.loading,
-    pol.error,
-    pol.policies,
-    modelId,
-    ep.endpoints,
-    chat,
-  ])
+  }, [pol.scrapeApplicable, pol.loading, pol.error, pol.policies, modelId, ep.endpoints, chat])
 
   const wire = useMemo<WireProviderPrivacy | null>(() => {
     if (!chat) return null

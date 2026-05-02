@@ -25,8 +25,8 @@ import { exportChat, exportWorkspaceBackup } from '../../src/store/import-export
 import { __resetSearchSessionRunnerForTests } from '../../src/store/search-session'
 import { listTags } from '../../src/store/tags'
 import { __resetSearchStoreForTests } from '../../src/store/zustand/searchStore'
-import { StorageView } from '../../src/ui/storage/StorageView'
 import { jsonEntriesZipBlob } from '../../src/ui/import-export/json-file'
+import { StorageView } from '../../src/ui/storage/StorageView'
 
 const debugNukeMocks = vi.hoisted(() => ({
   nukeSiteStorage: vi.fn<() => Promise<void>>(),
@@ -687,11 +687,12 @@ describe('StorageView', () => {
       expect(new Set(filenames).size).toBe(2)
       expect(filenames.every((filename) => filename.endsWith('.json'))).toBe(true)
       expect(filenames.some((filename) => filename.includes('-2.json'))).toBe(true)
-      const exported = filenames.map((filename) =>
-        JSON.parse(strFromU8(entries[filename] as Uint8Array)) as {
-          objectKind: string
-          payload: { chat: { sourceChatId: string } }
-        },
+      const exported = filenames.map(
+        (filename) =>
+          JSON.parse(strFromU8(entries[filename] as Uint8Array)) as {
+            objectKind: string
+            payload: { chat: { sourceChatId: string } }
+          },
       )
       expect(exported.every((entry) => entry.objectKind === 'chat')).toBe(true)
       expect(exported.map((entry) => entry.payload.chat.sourceChatId).sort()).toEqual([

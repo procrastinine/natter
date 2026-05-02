@@ -75,9 +75,7 @@ const KNOWN_BOUNCERS: ReadonlyArray<KnownBouncer> = [
 export function matchKnownBouncer(raw: string): KnownBouncer | undefined {
   const stripped = raw.trim().replace(/\/+$/, '')
   if (stripped.length === 0) return undefined
-  const candidate = /^[a-z][a-z0-9+.-]*:\/\//i.test(stripped)
-    ? stripped
-    : `https://${stripped}`
+  const candidate = /^[a-z][a-z0-9+.-]*:\/\//i.test(stripped) ? stripped : `https://${stripped}`
   let parsed: URL
   try {
     parsed = new URL(candidate)

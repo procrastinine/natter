@@ -29,18 +29,18 @@ import {
 } from './attachments/context'
 import { computeCutoffPlan } from './context-cutoff'
 import {
+  type AttachmentResolver,
   mediaTokensForMessage,
   mediaTokensForRefs,
-  type AttachmentResolver,
 } from './media-context-tokens'
-import { quirksFor } from './quirks'
 import { applyOutboundContextRewrites } from './prompt-context'
-import { charsPerToken, readPathTextTokenEstimate, type CalibrationMode } from './token-calibration'
+import { quirksFor } from './quirks'
+import { type CalibrationMode, charsPerToken, readPathTextTokenEstimate } from './token-calibration'
 import { clampTokens, safeContent, safeServerTokens } from './token-guards'
 import {
   estimateReasoningEchoTokens,
-  estimateToolCallContextTokens,
   estimateTokens,
+  estimateToolCallContextTokens,
   type PromptEstimateOptions,
   type TokenizerFamily,
   tokenizerFamily,

@@ -15,6 +15,7 @@
 // any retained endpoint (see §7.2 rationale); pinning a single endpoint
 // uses that endpoint's set directly.
 
+import { providerRoutingRef } from './provider-identity'
 import {
   allowedEffortFor,
   allowedVerbosityFor,
@@ -23,7 +24,6 @@ import {
   quirksFor,
   reasoningToggleableFor,
 } from './quirks'
-import { providerRoutingRef } from './provider-identity'
 import type {
   CapabilityDescriptor,
   ChatSettings,
@@ -161,9 +161,7 @@ export function effectiveCapabilityFromEndpoints(
   const numericAgg = opts.strict ? minDefined : maxDefined
   const contextLength = numericAgg(endpoints.map((e) => positiveCap(e.context_length)))
   const maxPromptTokens = numericAgg(endpoints.map((e) => positiveCap(e.max_prompt_tokens)))
-  const maxCompletionTokens = numericAgg(
-    endpoints.map((e) => positiveCap(e.max_completion_tokens)),
-  )
+  const maxCompletionTokens = numericAgg(endpoints.map((e) => positiveCap(e.max_completion_tokens)))
   const supportsImplicitCaching =
     endpoints.length > 0 && endpoints.every((e) => e.supports_implicit_caching === true)
   const pr = pricingRange(endpoints, 'prompt')
@@ -192,7 +190,8 @@ export function effectiveCapabilityFromEndpoints(
   if (maxCompletionTokens !== undefined) cap.maxCompletionTokens = maxCompletionTokens
   if (Object.keys(pricingMin).length > 0) cap.pricingMin = pricingMin
   if (Object.keys(pricingRangeObj).length > 0) cap.pricingRange = pricingRangeObj
-  if (endpoints.length === 1 && endpoints[0]) cap.singleProviderPin = providerRoutingRef(endpoints[0])
+  if (endpoints.length === 1 && endpoints[0])
+    cap.singleProviderPin = providerRoutingRef(endpoints[0])
   return cap
 }
 
@@ -338,11 +337,7 @@ export function validateChatSettings(
     }
   }
 
-  if (
-    stored.reasoning.mode === 'off' &&
-    stored.model &&
-    !reasoningToggleableFor(stored.model)
-  ) {
+  if (stored.reasoning.mode === 'off' && stored.model && !reasoningToggleableFor(stored.model)) {
     nextReasoning = { ...nextReasoning, mode: 'enabled' }
     issues.push({
       kind: 'clamped-enum',

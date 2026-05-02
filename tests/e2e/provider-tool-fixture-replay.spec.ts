@@ -134,9 +134,7 @@ test('tool evidence supports per-item visibility and edit/create in the inline e
   storedAssistant = rows.filter((row) => row.role === 'assistant').at(-1)
   expect(storedAssistant?.providerOutputItems?.[0]?.hidden).toBeUndefined()
   expect(storedAssistant?.providerOutputItems?.[0]?.edited).toBe(true)
-  expect(JSON.stringify(storedAssistant?.providerOutputItems?.[0]?.item)).toContain(
-    'edited-marker',
-  )
+  expect(JSON.stringify(storedAssistant?.providerOutputItems?.[0]?.item)).toContain('edited-marker')
   expect(storedAssistant?.providerOutputItems?.at(-1)?.edited).toBe(true)
   expect(JSON.stringify(storedAssistant?.providerOutputItems?.at(-1)?.item)).toContain(
     'created-marker',

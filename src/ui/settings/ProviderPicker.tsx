@@ -36,9 +36,9 @@ import { InfoDisclosure } from './InfoDisclosure'
 import { PrivacySection } from './PrivacySection'
 import {
   buildPickerRows,
+  type PickerRow,
   reasonsToTooltip,
   tierToLockLabel,
-  type PickerRow,
 } from './provider-picker-rows'
 
 interface ProviderPickerProps {

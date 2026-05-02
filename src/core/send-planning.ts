@@ -14,6 +14,7 @@ import {
 import { buildStoredOpenRouterAttachmentWire } from './attachments/stored-openrouter'
 import { applyContextCutoff } from './context-cutoff'
 import { corsProxyConfigFromPrefs, readGlobalPreferences } from './global-settings'
+import { pickEquivalentModelId } from './model-selection'
 import { type ResolvePrivacyForSendResult, resolvePrivacyForSend } from './privacy-request'
 import { applyOutboundContextRewrites } from './prompt-context'
 import {
@@ -32,7 +33,6 @@ import { isTextCompletionsSelectableFor, quirksFor } from './quirks'
 import { resolveTextTemplateFromLibrary } from './text-templates'
 import { charsPerToken, readTokenCalibrationGlobal } from './token-calibration'
 import type { PromptEstimateOptions } from './tokens'
-import { pickEquivalentModelId } from './model-selection'
 import type {
   AnthropicMessagesTransformOptions,
   ChatCompletionsTransformOptions,
@@ -48,12 +48,12 @@ import {
 } from './transforms'
 import type {
   Attachment,
+  AttachmentId,
   CapabilityDescriptor,
   Chat,
   ChatSettings,
   ConnectionProfile,
   ContentItem,
-  AttachmentId,
   Message,
 } from './types'
 

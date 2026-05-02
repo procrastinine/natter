@@ -10,12 +10,12 @@
 //   - Explicit offline fallback → synthesized worst-case, flagged `unknown-policy`
 
 import { describe, expect, it } from 'vitest'
+import { cloneDefaultPrivacyPrefs } from '../../src/core/defaults'
 import {
   buildWireProviderPrivacy,
   filterEndpointsByPrivacy,
   privacyTierForPolicy,
 } from '../../src/core/privacy-filter'
-import { cloneDefaultPrivacyPrefs } from '../../src/core/defaults'
 import type { DataPolicy, ModelEndpoint } from '../../src/core/types'
 
 function ep(provider_name: string, overrides: Partial<ModelEndpoint> = {}): ModelEndpoint {
