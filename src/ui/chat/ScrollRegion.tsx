@@ -33,6 +33,10 @@ interface ScrollRegionProps {
   // user switches chats via sidebar), the next content-load triggers
   // another one-shot open-scroll.
   resetKey?: string | number | null
+  // Identity of the currently rendered branch tail. A stream can become
+  // active before the new streamed row is mounted; this lets bottom-follow
+  // attach when that row actually appears.
+  streamFollowKey?: string | number | null
 }
 
 export interface ScrollRegionHandle {
@@ -65,6 +69,7 @@ type ScrollDebugEvent =
   | 'touchmove'
   | 'native-scroll'
   | 'stream-start'
+  | 'stream-tail'
   | 'stream-settle-start'
   | 'user-follow-cancel'
   | 'visibility'
@@ -103,6 +108,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
     autoScrollOnStream = true,
     streamActive = false,
     resetKey = null,
+    streamFollowKey = null,
   },
   ref,
 ) {
@@ -128,6 +134,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
   const autoScrollOnStreamRef = useRef(autoScrollOnStream)
   const streamActiveRef = useRef(streamActive)
   const previousStreamActiveRef = useRef(streamActive)
+  const streamFollowKeyRef = useRef(streamFollowKey)
   thresholdRef.current = pinThresholdPx ?? DEFAULT_THRESHOLD_PX
   autoScrollOnStreamRef.current = autoScrollOnStream
   streamActiveRef.current = streamActive
@@ -457,6 +464,22 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
     debugScroll('stream-start')
     scrollToBottomNow({ smooth: false, reason: 'stream-start' })
   }, [autoScrollOnStream, debugScroll, streamActive, scrollToBottomNow])
+
+  useLayoutEffect(() => {
+    if (Object.is(streamFollowKeyRef.current, streamFollowKey)) return
+    debugScroll('stream-tail', { from: streamFollowKeyRef.current, to: streamFollowKey })
+    streamFollowKeyRef.current = streamFollowKey
+    if (!autoScrollOnStream || !streamActive || !followIntentRef.current) return
+    scrollToBottomNow({ smooth: false, reason: 'stream-tail' })
+    startFollowSettle('stream-tail')
+  }, [
+    autoScrollOnStream,
+    debugScroll,
+    scrollToBottomNow,
+    startFollowSettle,
+    streamActive,
+    streamFollowKey,
+  ])
 
   useLayoutEffect(() => {
     const wasActive = previousStreamActiveRef.current

@@ -255,6 +255,7 @@ export function Shell() {
     null as ActiveBranchWindowSnapshotResult | null,
   )
   const branchSnapshotCacheRef = useRef(new Map<string, ActiveBranchWindowSnapshot>())
+  const lastBranchSnapshotByChatRef = useRef(new Map<ChatId, ActiveBranchWindowSnapshot>())
   useEffect(() => {
     if (!activeBranchWindowResult) return
     if (activeBranchWindowResult.snapshot.chatId !== activeChatId) return
@@ -262,14 +263,22 @@ export function Shell() {
       activeBranchWindowResult.key,
       activeBranchWindowResult.snapshot,
     )
+    lastBranchSnapshotByChatRef.current.set(
+      activeBranchWindowResult.snapshot.chatId,
+      activeBranchWindowResult.snapshot,
+    )
   }, [activeBranchWindowResult, activeChatId])
-  const resolvedActiveBranchSnapshot =
+  const exactActiveBranchSnapshot =
     activeBranchWindowResult?.key === activeBranchWindowQueryKey
       ? activeBranchWindowResult.snapshot
       : activeBranchWindowQueryKey
         ? (branchSnapshotCacheRef.current.get(activeBranchWindowQueryKey) ?? null)
         : null
+  const resolvedActiveBranchSnapshot =
+    exactActiveBranchSnapshot ??
+    (activeChatId ? (lastBranchSnapshotByChatRef.current.get(activeChatId) ?? null) : null)
   const activeBranchLength = resolvedActiveBranchSnapshot?.branchLength ?? 0
+  const activeBranchTailId = resolvedActiveBranchSnapshot?.branchHeaders.at(-1)?.id ?? null
   const messageBodyWindowResetKey = activeCursorCacheKey ?? '__none__'
   useEffect(() => {
     void messageBodyWindowResetKey
@@ -926,6 +935,7 @@ export function Shell() {
                   autoScrollOnStream={prefs.autoScrollOnStream}
                   streamActive={streamingOnActiveChat}
                   resetKey={activeChatId}
+                  streamFollowKey={activeBranchTailId}
                   onStateChange={setScrollState}
                 >
                   <MessageList

@@ -1,5 +1,5 @@
 import { expect, type Page, test } from '@playwright/test'
-import { clearIndexedDb, seedFirstRun } from './helpers'
+import { buildSseBody, clearIndexedDb, seedFirstRun, seedLinearChat, sendMessage } from './helpers'
 
 test.beforeEach(async ({ page }) => {
   await page.goto('/')
@@ -22,6 +22,9 @@ test('chat transcript mounts only the newest message window and loads older batc
 }) => {
   const chatId = await seedLinearChat(page, {
     messageCount: 24,
+    chatId: 'render-window-chat',
+    title: 'Render window chat',
+    textPrefix: 'window message',
     settings: {
       'global:message-render-window-size': 10,
       'global:message-render-window-load-mode': 'manual',
@@ -45,6 +48,56 @@ test('chat transcript mounts only the newest message window and loads older batc
   await page.locator('[data-ui="load-more-messages"]').click()
   await expect(page.locator('[data-ui="message"]')).toHaveCount(24)
   await expect(page.locator('[data-ui="load-more-messages"]')).toHaveCount(0)
+})
+
+test('send and regenerate keep the transcript mounted while the branch window reloads', async ({
+  page,
+}) => {
+  let requestCount = 0
+  await page.route('**/api/v1/chat/completions', async (route) => {
+    requestCount += 1
+    await new Promise((resolve) => setTimeout(resolve, 120))
+    const text = requestCount === 1 ? 'sent answer' : 'regenerated answer'
+    await route.fulfill({
+      contentType: 'text/event-stream',
+      body: buildSseBody([
+        { id: `render-window-${requestCount}`, content: text },
+        { finish: 'stop' },
+      ]),
+    })
+  })
+  const chatId = await seedLinearChat(page, {
+    messageCount: 24,
+    chatId: 'render-window-chat',
+    title: 'Render window chat',
+    textPrefix: 'window message',
+    settings: {
+      'global:message-render-window-size': 10,
+      'global:message-render-window-load-mode': 'manual',
+    },
+  })
+
+  await page.goto(`/#/chat/${chatId}`)
+  await page.reload()
+  await expect(page.locator('[data-ui="message"]')).toHaveCount(10)
+
+  await startMessageCountRecorder(page)
+  await sendMessage(page, 'new prompt')
+  await expect(
+    page.locator('[data-ui="message"]').last().locator('[data-ui="message-body"]'),
+  ).toContainText('sent answer')
+  await expect(await stopMessageCountRecorder(page)).not.toContain(0)
+
+  await startMessageCountRecorder(page)
+  await page
+    .locator('[data-ui="message"][data-role="assistant"]')
+    .last()
+    .locator('[data-action="regenerate"]')
+    .click()
+  await expect(
+    page.locator('[data-ui="message"]').last().locator('[data-ui="message-body"]'),
+  ).toContainText('regenerated answer')
+  await expect(await stopMessageCountRecorder(page)).not.toContain(0)
 })
 
 test('switching message variants re-renders the selected branch window', async ({ page }) => {
@@ -89,98 +142,36 @@ test('sidebar mounts only the first row window and loads more rows manually', as
   await expect(page.locator('[data-ui="load-more-sidebar"]')).toHaveCount(0)
 })
 
-async function seedLinearChat(
-  page: Page,
-  input: {
-    messageCount: number
-    settings?: Record<string, unknown>
-  },
-): Promise<string> {
-  return page.evaluate(async ({ messageCount, settings }) => {
-    const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const req = indexedDB.open('natter')
-      req.onsuccess = () => resolve(req.result)
-      req.onerror = () => reject(req.error)
-    })
-    const now = Date.now()
-    const chatId = 'render-window-chat'
-    try {
-      await new Promise<void>((resolve, reject) => {
-        const tx = db.transaction(
-          ['presets', 'settings', 'chats', 'messages', 'messageBodies'],
-          'readwrite',
-        )
-        const presets = tx.objectStore('presets')
-        const settingsStore = tx.objectStore('settings')
-        const chats = tx.objectStore('chats')
-        const messages = tx.objectStore('messages')
-        const messageBodies = tx.objectStore('messageBodies')
-        const presetsReq = presets.getAll()
-        presetsReq.onsuccess = () => {
-          const preset = (presetsReq.result as Array<{ id?: string; settings?: unknown }>)[0]
-          const chatSettings = structuredClone(preset?.settings ?? {})
-          for (const [key, value] of Object.entries(settings ?? {})) {
-            settingsStore.put({ key, value })
-          }
-          const lastMessageId = `msg-${String(messageCount - 1).padStart(3, '0')}`
-          chats.put({
-            id: chatId,
-            title: 'Render window chat',
-            titleStatus: 'manual',
-            createdAt: now,
-            updatedAt: now + messageCount,
-            lastViewedAt: now + messageCount,
-            wordCount: messageCount * 2,
-            totalCostUsd: 0,
-            metaVersion: 0,
-            summaryVersion: 0,
-            settings: chatSettings,
-            presetId: preset?.id,
-            lastUpdatedLeafId: lastMessageId,
-            lastBranchUpdatedAt: now + messageCount,
-            archived: false,
-            pinned: false,
-            folderId: null,
-            tags: [],
-            previewText: 'window message 0',
-          })
-          let parentId: string | null = null
-          for (let i = 0; i < messageCount; i += 1) {
-            const id = `msg-${String(i).padStart(3, '0')}`
-            const role = i % 2 === 0 ? 'user' : 'assistant'
-            const createdAt = now + i
-            messages.put({
-              id,
-              chatId,
-              parentId,
-              siblingIndex: 0,
-              turnId: `turn-${String(i).padStart(3, '0')}`,
-              turnIndex: i,
-              createdAt,
-              role,
-              origin: role === 'user' ? 'user' : 'generated',
-              nodeVersion: 0,
-              deleted: false,
-            })
-            messageBodies.put({
-              id,
-              chatId,
-              nodeVersion: 0,
-              updatedAt: createdAt,
-              content: [{ type: 'text', text: `window message ${i}` }],
-            })
-            parentId = id
-          }
-        }
-        tx.oncomplete = () => resolve()
-        tx.onerror = () => reject(tx.error)
-        tx.onabort = () => reject(tx.error)
-      })
-    } finally {
-      db.close()
+async function startMessageCountRecorder(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const win = window as Window & {
+      __messageCountSamples?: number[]
+      __stopMessageCountSamples?: () => void
     }
-    return chatId
-  }, input)
+    win.__stopMessageCountSamples?.()
+    const samples: number[] = []
+    const sample = () => samples.push(document.querySelectorAll('[data-ui="message"]').length)
+    const root = document.querySelector('[data-ui="message-list"]')
+    const observer = root ? new MutationObserver(sample) : null
+    observer?.observe(root as Node, { childList: true, subtree: true })
+    sample()
+    win.__messageCountSamples = samples
+    win.__stopMessageCountSamples = () => observer?.disconnect()
+  })
+}
+
+async function stopMessageCountRecorder(page: Page): Promise<number[]> {
+  return page.evaluate(() => {
+    const win = window as Window & {
+      __messageCountSamples?: number[]
+      __stopMessageCountSamples?: () => void
+    }
+    win.__stopMessageCountSamples?.()
+    const samples = win.__messageCountSamples ?? []
+    delete win.__messageCountSamples
+    delete win.__stopMessageCountSamples
+    return samples
+  })
 }
 
 async function seedBranchedChat(page: Page): Promise<string> {

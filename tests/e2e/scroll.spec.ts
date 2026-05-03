@@ -5,6 +5,7 @@ import {
   createChatAndOpen,
   mockChatCompletions,
   seedFirstRun,
+  seedLinearChat,
   sendMessage,
 } from './helpers'
 
@@ -124,10 +125,7 @@ test('reopening an overflowing chat snaps to the branch leaf instead of preservi
   await expect(region).toHaveAttribute('data-scroll-state', 'pinned')
 
   await page.locator('[data-role="new-chat"]').click()
-  await page.waitForFunction(
-    (hash) => /^#\/chat\//.test(window.location.hash) && window.location.hash !== hash,
-    originalHash,
-  )
+  await page.waitForFunction(() => window.location.hash === '#/new')
   await page.evaluate((hash) => {
     window.location.hash = hash
   }, originalHash)
@@ -194,5 +192,94 @@ test('incremental streams keep following content growth that renders below the S
   await expect(region).toHaveAttribute('data-scroll-state', 'follow', { timeout: 3000 })
   await expect
     .poll(() => scrollDistanceFromBottom(region), { timeout: 3000 })
+    .toBeLessThanOrEqual(4)
+})
+
+test('incremental streams keep following after a long windowed chat appends a tail', async ({
+  page,
+}) => {
+  const chatId = await seedLinearChat(page, {
+    messageCount: 24,
+    chatId: 'scroll-window-chat',
+    title: 'Scroll window chat',
+    textPrefix: 'scroll window message',
+    assistantContentType: 'output_text',
+    settings: {
+      'global:message-render-window-size': 10,
+      'global:message-render-window-load-mode': 'manual',
+    },
+  })
+  await page.goto(`/#/chat/${chatId}`)
+  await page.reload()
+  const chunks = Array.from({ length: 24 }, (_, i) =>
+    chunkFrame(
+      `tail stream block ${i}\n${'token '.repeat(320)}\n\n`,
+      i === 23 ? 'stop' : undefined,
+    ),
+  )
+  await mockIncrementalChatCompletions(page, chunks, 35)
+  const region = page.locator('[data-ui="scroll-region"]')
+  await expect(page.locator('[data-ui="message"]')).toHaveCount(10)
+  await expect
+    .poll(() => scrollDistanceFromBottom(region), { timeout: 5000 })
+    .toBeLessThanOrEqual(4)
+
+  await sendMessage(page, 'append a streamed tail')
+  await expect(
+    page
+      .locator('[data-ui="message"][data-role="assistant"]')
+      .last()
+      .locator('[data-ui="message-body"]'),
+  ).toContainText('tail stream block 23', { timeout: 10000 })
+  await expect(region).toHaveAttribute('data-scroll-state', 'follow', { timeout: 3000 })
+  await expect
+    .poll(() => scrollDistanceFromBottom(region), { timeout: 5000 })
+    .toBeLessThanOrEqual(4)
+})
+
+test('incremental regenerate keeps following after a long windowed chat switches the tail sibling', async ({
+  page,
+}) => {
+  const chatId = await seedLinearChat(page, {
+    messageCount: 24,
+    chatId: 'scroll-window-chat',
+    title: 'Scroll window chat',
+    textPrefix: 'scroll window message',
+    assistantContentType: 'output_text',
+    settings: {
+      'global:message-render-window-size': 10,
+      'global:message-render-window-load-mode': 'manual',
+    },
+  })
+
+  await page.goto(`/#/chat/${chatId}`)
+  await page.reload()
+  const chunks = Array.from({ length: 24 }, (_, i) =>
+    chunkFrame(
+      `regenerate stream block ${i}\n${'token '.repeat(320)}\n\n`,
+      i === 23 ? 'stop' : undefined,
+    ),
+  )
+  await mockIncrementalChatCompletions(page, chunks, 35)
+  const region = page.locator('[data-ui="scroll-region"]')
+  await expect(page.locator('[data-ui="message"]')).toHaveCount(10)
+  await expect
+    .poll(() => scrollDistanceFromBottom(region), { timeout: 5000 })
+    .toBeLessThanOrEqual(4)
+
+  await page
+    .locator('[data-ui="message"][data-role="assistant"]')
+    .last()
+    .locator('[data-action="regenerate"]')
+    .click()
+  await expect(
+    page
+      .locator('[data-ui="message"][data-role="assistant"]')
+      .last()
+      .locator('[data-ui="message-body"]'),
+  ).toContainText('regenerate stream block 23', { timeout: 10000 })
+  await expect(region).toHaveAttribute('data-scroll-state', 'follow', { timeout: 3000 })
+  await expect
+    .poll(() => scrollDistanceFromBottom(region), { timeout: 5000 })
     .toBeLessThanOrEqual(4)
 })

@@ -216,6 +216,112 @@ export async function mockChatCompletions(page: Page, options: MockChatOptions):
   })
 }
 
+export async function seedLinearChat(
+  page: Page,
+  input: {
+    messageCount: number
+    settings?: Record<string, unknown>
+    chatId?: string
+    title?: string
+    textPrefix?: string
+    assistantContentType?: 'text' | 'output_text'
+  },
+): Promise<string> {
+  return page.evaluate(async (seed) => {
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const req = indexedDB.open('natter')
+      req.onsuccess = () => resolve(req.result)
+      req.onerror = () => reject(req.error)
+    })
+    const now = Date.now()
+    const chatId = seed.chatId ?? 'linear-window-chat'
+    const title = seed.title ?? 'Linear window chat'
+    const textPrefix = seed.textPrefix ?? 'window message'
+    const assistantContentType = seed.assistantContentType ?? 'text'
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const tx = db.transaction(
+          ['presets', 'settings', 'chats', 'messages', 'messageBodies'],
+          'readwrite',
+        )
+        const presets = tx.objectStore('presets')
+        const settingsStore = tx.objectStore('settings')
+        const chats = tx.objectStore('chats')
+        const messages = tx.objectStore('messages')
+        const messageBodies = tx.objectStore('messageBodies')
+        const presetsReq = presets.getAll()
+        presetsReq.onsuccess = () => {
+          const preset = (presetsReq.result as Array<{ id?: string; settings?: unknown }>)[0]
+          const chatSettings = structuredClone(preset?.settings ?? {})
+          for (const [key, value] of Object.entries(seed.settings ?? {})) {
+            settingsStore.put({ key, value })
+          }
+          const lastMessageId = `msg-${String(seed.messageCount - 1).padStart(3, '0')}`
+          chats.put({
+            id: chatId,
+            title,
+            titleStatus: 'manual',
+            createdAt: now,
+            updatedAt: now + seed.messageCount,
+            lastViewedAt: now + seed.messageCount,
+            wordCount: seed.messageCount * 2,
+            totalCostUsd: 0,
+            metaVersion: 0,
+            summaryVersion: 0,
+            settings: chatSettings,
+            presetId: preset?.id,
+            lastUpdatedLeafId: lastMessageId,
+            lastBranchUpdatedAt: now + seed.messageCount,
+            archived: false,
+            pinned: false,
+            folderId: null,
+            tags: [],
+            previewText: `${textPrefix} 0`,
+          })
+          let parentId: string | null = null
+          for (let i = 0; i < seed.messageCount; i += 1) {
+            const id = `msg-${String(i).padStart(3, '0')}`
+            const role = i % 2 === 0 ? 'user' : 'assistant'
+            const createdAt = now + i
+            messages.put({
+              id,
+              chatId,
+              parentId,
+              siblingIndex: 0,
+              turnId: `turn-${String(i).padStart(3, '0')}`,
+              turnIndex: i,
+              createdAt,
+              role,
+              origin: role === 'user' ? 'user' : 'generated',
+              nodeVersion: 0,
+              deleted: false,
+            })
+            messageBodies.put({
+              id,
+              chatId,
+              nodeVersion: 0,
+              updatedAt: createdAt,
+              content: [
+                {
+                  type: role === 'assistant' ? assistantContentType : 'text',
+                  text: `${textPrefix} ${i}`,
+                },
+              ],
+            })
+            parentId = id
+          }
+        }
+        tx.oncomplete = () => resolve()
+        tx.onerror = () => reject(tx.error)
+        tx.onabort = () => reject(tx.error)
+      })
+    } finally {
+      db.close()
+    }
+    return chatId
+  }, input)
+}
+
 // Read a chat's messages table via the page's IndexedDB. Returns the
 // promoted-to-top-of-type array so tests can filter / assert by role.
 export async function readMessages(
