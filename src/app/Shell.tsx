@@ -64,7 +64,7 @@ import { useToastStore } from '../store/zustand/toastStore'
 import { useUiStore } from '../store/zustand/uiStore'
 import { BannerTray } from '../ui/chat/BannerTray'
 import { ChatHeader } from '../ui/chat/ChatHeader'
-import { Composer, type ComposerDroppedFiles } from '../ui/chat/Composer'
+import { Composer, moveComposerDraft, type ComposerDroppedFiles } from '../ui/chat/Composer'
 import { EditTreeToolbar } from '../ui/chat/EditTreeToolbar'
 import { EmptyState } from '../ui/chat/EmptyState'
 import { FocusModeToggle } from '../ui/chat/FocusModeToggle'
@@ -409,6 +409,11 @@ export function Shell() {
     return window.localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === '1'
   })
   const scrollRef = useRef<ScrollRegionHandle>(null)
+  const activeComposerDraftKey = activeChatId
+    ? `chat:${activeChatId}`
+    : onNewChatSurface
+      ? 'new'
+      : null
   const abortActiveChat = useCallback(() => {
     if (!activeChatId) return
     const aborted = requestAbortForChat(activeChatId)
@@ -523,6 +528,7 @@ export function Shell() {
         temporary: true,
         ...(preset ? { presetId: preset.id } : {}),
       })
+      moveComposerDraft('new', `chat:${chat.id}`)
       navigateToChat(chat.id)
       setChatModelOpen(true)
     })()
@@ -1007,6 +1013,7 @@ export function Shell() {
                         : { sendBlockedReason: 'Add a connection to send messages.' })}
                       seed={composerSeed}
                       onSeedConsumed={() => setComposerSeed(null)}
+                      draftKey={activeComposerDraftKey}
                       attachmentScopeKey={activeChatId}
                       attachmentsDisabled={attachmentsDisabledForActiveChat}
                       attachmentsDisabledReason="Attachments are unavailable with Text completions."
@@ -1069,6 +1076,7 @@ export function Shell() {
                       : { sendBlockedReason: 'Add a connection to send messages.' })}
                     seed={composerSeed}
                     onSeedConsumed={() => setComposerSeed(null)}
+                    draftKey={activeComposerDraftKey}
                     attachmentScopeKey={activeChatId}
                     attachmentsDisabled={attachmentsDisabledForActiveChat}
                     attachmentsDisabledReason="Attachments are unavailable with Text completions."
@@ -1173,6 +1181,7 @@ export function Shell() {
                     : { sendBlockedReason: 'Add a connection to send messages.' })}
                   seed={composerSeed}
                   onSeedConsumed={() => setComposerSeed(null)}
+                  draftKey={activeComposerDraftKey}
                   attachmentScopeKey="new"
                   droppedFiles={composerDroppedFiles}
                   onDroppedFilesConsumed={handleDroppedFilesConsumed}

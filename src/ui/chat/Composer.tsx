@@ -16,6 +16,7 @@ interface ComposerProps {
     text: string,
     opts?: { prefillText?: string; attachmentRefs?: MessageAttachmentRef[] },
   ) => void | Promise<void>
+  draftKey?: string | null
   seed?: string | null
   onSeedConsumed?: () => void
   sendShortcut?: SendShortcut
@@ -139,10 +140,34 @@ function setComposerTextareaHeight(el: HTMLTextAreaElement, height: number): voi
   el.style.overflowY = el.scrollHeight > effectiveHeight + 1 ? 'auto' : 'hidden'
 }
 
+// Per-tab only: route switches preserve drafts without writing IDB or making
+// the app shell re-render on every keystroke. A full reload clears the map.
+const composerDrafts = new Map<string, string>()
+
+function readComposerDraft(key: string | null | undefined): string {
+  return key ? (composerDrafts.get(key) ?? '') : ''
+}
+
+function writeComposerDraft(key: string | null | undefined, text: string): void {
+  if (!key) return
+  if (text.length === 0) {
+    composerDrafts.delete(key)
+    return
+  }
+  composerDrafts.set(key, text)
+}
+
+export function moveComposerDraft(fromKey: string, toKey: string): void {
+  const text = composerDrafts.get(fromKey)
+  composerDrafts.delete(fromKey)
+  if (text && text.length > 0) composerDrafts.set(toKey, text)
+}
+
 export function Composer({
   disabled,
   sendBlockedReason,
   onSubmit,
+  draftKey = null,
   seed,
   onSeedConsumed,
   sendShortcut = 'enter',
@@ -164,7 +189,7 @@ export function Composer({
   droppedFiles,
   onDroppedFilesConsumed,
 }: ComposerProps) {
-  const [text, setText] = useState('')
+  const [text, setText] = useState(() => readComposerDraft(draftKey))
   const [pickerOpen, setPickerOpen] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [prefillOpen, setPrefillOpen] = useState(false)
@@ -187,9 +212,31 @@ export function Composer({
   const profile = AUTO_SIZE_PROFILES[autoSizeVariant]
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
   const dragStateRef = useRef<{ startY: number; startHeight: number } | null>(null)
+  const latestTextRef = useRef(text)
+  const draftKeyRef = useRef<string | null>(draftKey)
+  useEffect(() => {
+    latestTextRef.current = text
+  }, [text])
+  const setComposerText = useCallback(
+    (value: string | ((current: string) => string)) => {
+      const next = typeof value === 'function' ? value(latestTextRef.current) : value
+      latestTextRef.current = next
+      setText(next)
+      writeComposerDraft(draftKeyRef.current, next)
+    },
+    [],
+  )
+  useEffect(() => {
+    if (draftKeyRef.current === draftKey) return
+    writeComposerDraft(draftKeyRef.current, latestTextRef.current)
+    draftKeyRef.current = draftKey
+    const next = readComposerDraft(draftKey)
+    latestTextRef.current = next
+    setText(next)
+  }, [draftKey])
   useEffect(() => {
     if (seed && seed.length > 0) {
-      setText(seed)
+      setComposerText(seed)
       onSeedConsumed?.()
       requestAnimationFrame(() => {
         const el = textareaRef.current
@@ -199,7 +246,7 @@ export function Composer({
         el.setSelectionRange(pos, pos)
       })
     }
-  }, [seed, onSeedConsumed])
+  }, [seed, onSeedConsumed, setComposerText])
   useEffect(() => {
     if (lastPrefillScopeRef.current === prefillScopeKey) return
     lastPrefillScopeRef.current = prefillScopeKey
@@ -342,7 +389,7 @@ export function Composer({
     // trailing whitespace anyway, so an empty prefill turn would be a
     // no-op-then-confuse-the-model).
     const prefillOut = prefillOpen && prefillText.trim().length > 0 ? prefillText : ''
-    setText('')
+    setComposerText('')
     if (!attachmentsDisabled) clearAttachments()
     if (prefillOut.length > 0) {
       setPrefillText(defaultPrefill ?? '')
@@ -354,7 +401,7 @@ export function Composer({
         ...(refsOut.length > 0 ? { attachmentRefs: refsOut } : {}),
       })
     } catch (err) {
-      setText((current) => (current.length === 0 ? out : current))
+      setComposerText((current) => (current.length === 0 ? out : current))
       if (refsOut.length > 0) restoreAttachments(refsOut, rowsOut)
       if (prefillOut.length > 0) setPrefillText(prefillOut)
       console.error('composer submit failed', err)
@@ -376,6 +423,7 @@ export function Composer({
     attachmentsDisabled,
     clearAttachments,
     restoreAttachments,
+    setComposerText,
   ])
   const sendButtonLabel = emptyWithTrailingUser
     ? 'Reply ⏎'
@@ -456,7 +504,7 @@ export function Composer({
           ref={textareaRef}
           data-ui="composer-input"
           value={text}
-          onChange={(e) => setText(e.target.value)}
+          onChange={(e) => setComposerText(e.target.value)}
           placeholder="Ask anything…"
           disabled={disabled}
           rows={autoSize ? 1 : undefined}

@@ -62,7 +62,8 @@ function chatMaxWidthLabel(value: ChatMaxWidth): string {
 }
 
 export function AppearanceSettings() {
-  const prefs = useLiveQuery(readGlobalPreferences, [], DEFAULT_GLOBAL_PREFERENCES)
+  const loadedPrefs = useLiveQuery(readGlobalPreferences, [], undefined)
+  const prefs = loadedPrefs ?? DEFAULT_GLOBAL_PREFERENCES
 
   const onTheme = useCallback(async (value: ThemePreference) => {
     applyThemeToDocument(value)
@@ -86,17 +87,19 @@ export function AppearanceSettings() {
   const [position, setPosition] = useState<number>(() => sliderPositionFromPref(prefs.chatMaxWidth))
   const writeQueueRef = useRef<Promise<void>>(Promise.resolve())
   const pendingChatMaxWidthRef = useRef<ChatMaxWidth | null>(null)
+  const loadedChatMaxWidth = loadedPrefs?.chatMaxWidth
   useEffect(() => {
+    if (loadedChatMaxWidth === undefined) return
     if (
       pendingChatMaxWidthRef.current !== null &&
-      prefs.chatMaxWidth !== pendingChatMaxWidthRef.current
+      loadedChatMaxWidth !== pendingChatMaxWidthRef.current
     ) {
       return
     }
     pendingChatMaxWidthRef.current = null
-    setPosition(sliderPositionFromPref(prefs.chatMaxWidth))
-    applyChatMaxWidthToDocument(prefs.chatMaxWidth)
-  }, [prefs.chatMaxWidth])
+    setPosition(sliderPositionFromPref(loadedChatMaxWidth))
+    applyChatMaxWidthToDocument(loadedChatMaxWidth)
+  }, [loadedChatMaxWidth])
   const onChatMaxWidth = useCallback((raw: string) => {
     const next = Number.parseInt(raw, 10)
     if (!Number.isFinite(next)) return
@@ -120,6 +123,14 @@ export function AppearanceSettings() {
         },
       )
   }, [])
+  const renderedPosition =
+    loadedPrefs && pendingChatMaxWidthRef.current === null
+      ? sliderPositionFromPref(loadedPrefs.chatMaxWidth)
+      : position
+
+  if (!loadedPrefs) {
+    return <div data-ui="settings-section" data-loading="true" aria-busy="true" />
+  }
 
   return (
     <>
@@ -146,7 +157,9 @@ export function AppearanceSettings() {
         <div data-ui="field-group">
           <label htmlFor="chat-max-width">
             Chat width{' '}
-            <span data-ui="field-value">{chatMaxWidthLabel(prefFromSliderPosition(position))}</span>
+            <span data-ui="field-value">
+              {chatMaxWidthLabel(prefFromSliderPosition(renderedPosition))}
+            </span>
             <InfoDisclosure title="Chat width">
               Maximum width of the centered reading column. Drag to the right edge for full width.
             </InfoDisclosure>
@@ -158,7 +171,7 @@ export function AppearanceSettings() {
             min={CHAT_MAX_WIDTH_MIN}
             max={CHAT_MAX_WIDTH_FULL_POSITION}
             step={CHAT_MAX_WIDTH_STEP}
-            value={position}
+            value={renderedPosition}
             onChange={(e) => onChatMaxWidth(e.target.value)}
           />
         </div>

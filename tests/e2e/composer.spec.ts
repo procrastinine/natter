@@ -97,6 +97,43 @@ test('send button enables on non-empty input', async ({ page }) => {
   await expect(page.locator('[data-ui="send"]')).toBeEnabled()
 })
 
+test('new-chat draft survives materializing chat settings', async ({ page }) => {
+  const input = page.locator('[data-ui="composer-input"]')
+  await input.fill('draft before opening settings')
+
+  await page.locator('[data-role="settings-cog"]').click()
+
+  await page.waitForFunction(() => window.location.hash.startsWith('#/chat/'))
+  await expect(page.locator('[data-ui="chat-model-panel"]')).toBeVisible()
+  await expect(page.locator('[data-ui="composer-input"]')).toHaveValue(
+    'draft before opening settings',
+  )
+})
+
+test('composer drafts are preserved separately for new and existing chats', async ({ page }) => {
+  await mockChatCompletions(page, {
+    body: buildSseBody([{ id: 'draft-keying', content: 'ok', finish: 'stop' }]),
+  })
+  const input = page.locator('[data-ui="composer-input"]')
+  await input.fill('first turn')
+  await page.locator('[data-ui="send"]').click()
+  await expect(page.locator('[data-ui="message"][data-role="assistant"]')).toBeVisible()
+
+  await input.fill('existing chat unsent draft')
+  await page.locator('[data-role="new-chat"]').click()
+  await page.waitForFunction(() => window.location.hash === '#/new')
+  await page.locator('[data-ui="composer-input"]').fill('new chat unsent draft')
+
+  await page.locator('[data-ui="chat-row-link"]').first().click()
+  await expect(page.locator('[data-ui="composer-input"]')).toHaveValue(
+    'existing chat unsent draft',
+  )
+
+  await page.locator('[data-role="new-chat"]').click()
+  await page.waitForFunction(() => window.location.hash === '#/new')
+  await expect(page.locator('[data-ui="composer-input"]')).toHaveValue('new chat unsent draft')
+})
+
 test('Enter submits; Shift+Enter inserts a newline', async ({ page }) => {
   await mockChatCompletions(page, {
     body: buildSseBody([{ id: 'g', content: 'ok' }, { finish: 'stop' }]),

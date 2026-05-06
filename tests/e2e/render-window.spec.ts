@@ -17,6 +17,66 @@ test('global settings exposes render-window controls on the Performance tab', as
   await expect(page.getByLabel('First rows')).toHaveValue('50')
 })
 
+test('opening Appearance settings does not reapply the default chat width', async ({ page }) => {
+  await page.evaluate(async () => {
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const req = indexedDB.open('natter')
+      req.onsuccess = () => resolve(req.result)
+      req.onerror = () => reject(req.error)
+    })
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const tx = db.transaction(['settings'], 'readwrite')
+        tx.objectStore('settings').put({ key: 'global:chat-max-width', value: 1280 })
+        tx.oncomplete = () => resolve()
+        tx.onerror = () => reject(tx.error)
+        tx.onabort = () => reject(tx.error)
+      })
+    } finally {
+      db.close()
+    }
+  })
+  await page.reload()
+  await page.waitForFunction(
+    () => document.documentElement.style.getPropertyValue('--message-max-width') === '1280px',
+  )
+  await page.evaluate(() => {
+    const w = window as typeof window & {
+      __chatWidthMutations?: string[]
+      __chatWidthObserver?: MutationObserver
+    }
+    w.__chatWidthMutations = []
+    w.__chatWidthObserver?.disconnect()
+    w.__chatWidthObserver = new MutationObserver(() => {
+      w.__chatWidthMutations?.push(
+        document.documentElement.style.getPropertyValue('--message-max-width'),
+      )
+    })
+    w.__chatWidthObserver.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ['style'],
+    })
+  })
+
+  await page.locator('[data-ui="open-global-settings"]').click()
+  await page.locator('[data-ui="settings-tab"][data-tab="appearance"]').click()
+
+  await expect(page.locator('[data-ui="chat-max-width-slider"]')).toHaveValue('1280')
+  await page.waitForTimeout(100)
+  const mutations = await page.evaluate(() => {
+    const w = window as typeof window & {
+      __chatWidthMutations?: string[]
+      __chatWidthObserver?: MutationObserver
+    }
+    w.__chatWidthObserver?.disconnect()
+    return w.__chatWidthMutations ?? []
+  })
+  expect(mutations).not.toContain('920px')
+  await expect.poll(() =>
+    page.evaluate(() => document.documentElement.style.getPropertyValue('--message-max-width')),
+  ).toBe('1280px')
+})
+
 test('chat transcript mounts only the newest message window and loads older batches manually', async ({
   page,
 }) => {

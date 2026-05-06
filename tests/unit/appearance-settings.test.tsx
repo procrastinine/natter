@@ -1,6 +1,11 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { DEFAULT_GLOBAL_PREFERENCES } from '../../src/core/global-settings'
 import { AppearanceSettings } from '../../src/ui/settings/AppearanceSettings'
+
+const liveQueryState = vi.hoisted(() => ({
+  value: undefined as unknown,
+}))
 
 vi.mock('../../src/store/settings', () => {
   const state = new Map<string, unknown>()
@@ -22,8 +27,8 @@ vi.mock('../../src/store/settings', () => {
 
 vi.mock('dexie-react-hooks', () => {
   return {
-    useLiveQuery: <T,>(_query: () => Promise<T>, _deps: unknown[], initial: T): T | undefined => {
-      return initial
+    useLiveQuery: <T,>(): T | undefined => {
+      return liveQueryState.value as T | undefined
     },
   }
 })
@@ -31,10 +36,20 @@ vi.mock('dexie-react-hooks', () => {
 beforeEach(async () => {
   const mod = (await import('../../src/store/settings')) as unknown as { __reset(): void }
   mod.__reset()
+  liveQueryState.value = DEFAULT_GLOBAL_PREFERENCES
   document.documentElement.style.removeProperty('--message-max-width')
 })
 
 describe('AppearanceSettings', () => {
+  it('does not apply fallback layout preferences while storage is still loading', () => {
+    liveQueryState.value = undefined
+
+    render(<AppearanceSettings />)
+
+    expect(screen.queryByLabelText(/Chat width/, { selector: 'input' })).not.toBeInTheDocument()
+    expect(document.documentElement.style.getPropertyValue('--message-max-width')).toBe('')
+  })
+
   it('persists chat width immediately when the slider changes', async () => {
     render(<AppearanceSettings />)
     const slider = screen.getByLabelText(/Chat width/, { selector: 'input' })
