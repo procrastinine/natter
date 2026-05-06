@@ -486,6 +486,38 @@ describe('shell smoke render', () => {
     })
   })
 
+  it('keeps the chat settings panel attached when new chat is clicked while it is open', async () => {
+    const chat = await createChat({ settings: cloneDefaultChatSettings() })
+    window.location.hash = `#/chat/${chat.id}`
+    const { container } = render(<App />)
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-role="settings-cog"]')).toBeInTheDocument()
+    })
+    fireEvent.click(container.querySelector('[data-role="settings-cog"]') as HTMLButtonElement)
+    await waitFor(() => {
+      expect(container.querySelector('[data-ui="settings-pane-title"]')).toHaveTextContent(
+        'Chat settings',
+      )
+    })
+
+    fireEvent.click(container.querySelector('[data-role="new-chat"]') as HTMLAnchorElement)
+
+    await waitFor(() => {
+      expect(window.location.hash).toMatch(/^#\/chat\//)
+      expect(window.location.hash).not.toBe(`#/chat/${chat.id}`)
+      expect(container.querySelector('[data-ui="settings-pane-title"]')).toHaveTextContent(
+        'Chat settings',
+      )
+      expect(container.querySelector('[data-ui="model-picker"]')).toBeInTheDocument()
+    })
+    const newChatId = window.location.hash.replace('#/chat/', '')
+    await waitFor(async () => {
+      const stored = await getDb().chats.get(newChatId)
+      expect(stored?.temporary).toBe(true)
+    })
+  })
+
   it('focus mode keeps an open chat settings panel visible', async () => {
     const chat = await createChat({ settings: cloneDefaultChatSettings() })
     window.location.hash = `#/chat/${chat.id}`

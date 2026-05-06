@@ -46,6 +46,8 @@ export interface ScrollRegionHandle {
 
 const DEFAULT_THRESHOLD_PX = 48
 const USER_SCROLL_INTENT_MS = 750
+const PROGRAMMATIC_SCROLL_GRACE_MS = 250
+const SMOOTH_PROGRAMMATIC_SCROLL_GRACE_MS = 1200
 const SETTLE_REQUIRED_STABLE_FRAMES = 2
 const SETTLE_MAX_FRAME_CHECKS = 8
 
@@ -130,6 +132,9 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
   const settleStableFramesRef = useRef(0)
   const settleFrameChecksRef = useRef(0)
   const userScrollIntentUntilRef = useRef(0)
+  const programmaticScrollUntilRef = useRef(0)
+  const programmaticScrollTargetRef = useRef<number | null>(null)
+  const programmaticSmoothScrollRef = useRef(false)
   const thresholdRef = useRef(pinThresholdPx ?? DEFAULT_THRESHOLD_PX)
   const autoScrollOnStreamRef = useRef(autoScrollOnStream)
   const streamActiveRef = useRef(streamActive)
@@ -151,6 +156,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
         streamActive: streamActiveRef.current,
         autoScrollOnStream: autoScrollOnStreamRef.current,
         userScrollIntentMsRemaining: Math.max(0, userScrollIntentUntilRef.current - timestamp),
+        programmaticScrollMsRemaining: Math.max(0, programmaticScrollUntilRef.current - timestamp),
         settlePending: settleFollowPendingRef.current,
         metrics: container
           ? {
@@ -187,6 +193,10 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       if (!container) return
       const smooth = opts?.smooth ?? false
       const top = bottomScrollTop(container)
+      programmaticScrollUntilRef.current =
+        nowMs() + (smooth ? SMOOTH_PROGRAMMATIC_SCROLL_GRACE_MS : PROGRAMMATIC_SCROLL_GRACE_MS)
+      programmaticScrollTargetRef.current = top
+      programmaticSmoothScrollRef.current = smooth
       debugScroll('scroll.to-bottom', {
         reason: opts?.reason ?? 'unknown',
         smooth,
@@ -294,7 +304,29 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
         setScrollStateNow('follow', source)
         return
       }
-      const userScrollIntentActive = nowMs() <= userScrollIntentUntilRef.current
+      const timestamp = nowMs()
+      const userScrollIntentActive = timestamp <= userScrollIntentUntilRef.current
+      const programmaticScrollActive = timestamp <= programmaticScrollUntilRef.current
+      const programmaticTarget = programmaticScrollTargetRef.current
+      const programmaticInstantScroll =
+        programmaticScrollActive &&
+        !programmaticSmoothScrollRef.current &&
+        programmaticTarget !== null &&
+        Math.abs(container.scrollTop - programmaticTarget) <= 4
+      const programmaticSmoothScroll =
+        programmaticScrollActive && programmaticSmoothScrollRef.current
+      const nativeScrollIntent =
+        source === 'scroll' && !programmaticInstantScroll && !programmaticSmoothScroll
+      if (nativeScrollIntent) {
+        followIntentRef.current = false
+        programmaticScrollUntilRef.current = 0
+        programmaticScrollTargetRef.current = null
+        programmaticSmoothScrollRef.current = false
+        clearFollowSettle()
+        debugScroll('user-follow-cancel', { event: 'native-scroll' })
+        setScrollStateNow('pinned', source)
+        return
+      }
       if (shouldFollowContentGrowth() && !userScrollIntentActive) {
         scheduleFollowScroll()
         return
@@ -302,7 +334,13 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       followIntentRef.current = false
       setScrollStateNow('pinned', source)
     },
-    [debugScroll, scheduleFollowScroll, setScrollStateNow, shouldFollowContentGrowth],
+    [
+      clearFollowSettle,
+      debugScroll,
+      scheduleFollowScroll,
+      setScrollStateNow,
+      shouldFollowContentGrowth,
+    ],
   )
 
   const completeOpenScrollIfReady = useCallback(() => {
@@ -436,6 +474,9 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
     if (!container) return
     const markUserScrollIntent = (event: 'wheel' | 'touchmove') => {
       userScrollIntentUntilRef.current = nowMs() + USER_SCROLL_INTENT_MS
+      programmaticScrollUntilRef.current = 0
+      programmaticScrollTargetRef.current = null
+      programmaticSmoothScrollRef.current = false
       if (followIntentRef.current) {
         followIntentRef.current = false
         clearFollowSettle()

@@ -153,6 +153,53 @@ test('reopening an overflowing chat snaps to the branch leaf instead of preservi
     .toBeLessThanOrEqual(4)
 })
 
+test('browser find-style native scroll can move upward from the open bottom state', async ({
+  page,
+}) => {
+  const huge = Array.from({ length: 180 }, (_, i) => `browser-find-line ${i}`).join('\n\n')
+  await mockChatCompletions(page, {
+    body: buildSseBody([{ id: 'find-scroll-1', content: huge, finish: 'stop' }]),
+  })
+  await createChatAndOpen(page)
+  await sendMessage(page, 'make a searchable long chat')
+  await expect(
+    page
+      .locator('[data-ui="message"][data-role="assistant"]')
+      .first()
+      .locator('[data-ui="message-body"]'),
+  ).toContainText('browser-find-line 179')
+  const region = page.locator('[data-ui="scroll-region"]')
+  await expect
+    .poll(() => scrollDistanceFromBottom(region), { timeout: 5000 })
+    .toBeLessThanOrEqual(4)
+
+  // Headless Chromium's `window.find()` does not reliably scroll nested
+  // containers; this exercises the same non-wheel native scroll path.
+  await page
+    .locator('[data-ui="message-body"] p', { hasText: /^browser-find-line 5$/ })
+    .scrollIntoViewIfNeeded()
+  await expect(region).toHaveAttribute('data-scroll-state', 'pinned', { timeout: 3000 })
+  await expect
+    .poll(() => scrollDistanceFromBottom(region), { timeout: 3000 })
+    .toBeGreaterThan(200)
+
+  await page.evaluate(() => {
+    const content = document.querySelector('[data-ui="scroll-content"]')
+    const sentinel = document.querySelector('[data-ui="scroll-sentinel"]')
+    if (!content || !sentinel) throw new Error('Scroll content missing')
+    const lateBlock = document.createElement('div')
+    lateBlock.setAttribute('data-ui', 'late-find-growth')
+    lateBlock.style.height = '900px'
+    lateBlock.textContent = 'late browser-find growth'
+    content.insertBefore(lateBlock, sentinel)
+  })
+  await page.waitForTimeout(400)
+  await expect(region).toHaveAttribute('data-scroll-state', 'pinned', { timeout: 3000 })
+  await expect
+    .poll(() => scrollDistanceFromBottom(region), { timeout: 3000 })
+    .toBeGreaterThan(200)
+})
+
 test('incremental streams keep following content growth that renders below the ScrollRegion parent', async ({
   page,
 }) => {

@@ -1,5 +1,13 @@
 import { useLiveQuery } from 'dexie-react-hooks'
-import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import {
+  type MouseEvent,
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
 import { attachmentsDisabledByTextProtocol } from '../core/attachments/context'
 import { cloneDefaultChatSettings } from '../core/defaults'
 import {
@@ -500,21 +508,57 @@ export function Shell() {
     }
   }, [])
 
+  const openingNewChatSettingsRef = useRef<Promise<void> | null>(null)
   const openSettingsForNewChat = useCallback(async () => {
-    const { preset, settings } = await resolveNewChatSeed()
-    writeActiveSeedState({
-      profileId: settings.profileId || null,
-      presetId: preset?.id ?? null,
-      settings,
-    })
-    const chat = await createChat({
-      settings,
-      temporary: true,
-      ...(preset ? { presetId: preset.id } : {}),
-    })
-    navigateToChat(chat.id)
-    setChatModelOpen(true)
+    if (openingNewChatSettingsRef.current) return openingNewChatSettingsRef.current
+    const task = (async () => {
+      const { preset, settings } = await resolveNewChatSeed()
+      writeActiveSeedState({
+        profileId: settings.profileId || null,
+        presetId: preset?.id ?? null,
+        settings,
+      })
+      const chat = await createChat({
+        settings,
+        temporary: true,
+        ...(preset ? { presetId: preset.id } : {}),
+      })
+      navigateToChat(chat.id)
+      setChatModelOpen(true)
+    })()
+    openingNewChatSettingsRef.current = task
+    try {
+      await task
+    } finally {
+      if (openingNewChatSettingsRef.current === task) openingNewChatSettingsRef.current = null
+    }
   }, [resolveNewChatSeed])
+
+  const openNewChat = useCallback(() => {
+    if (chatModelOpen) {
+      void openSettingsForNewChat()
+      return
+    }
+    navigateNew()
+  }, [chatModelOpen, openSettingsForNewChat])
+
+  const handleNewChatClick = useCallback(
+    (event: MouseEvent<HTMLAnchorElement>) => {
+      if (
+        event.defaultPrevented ||
+        event.button !== 0 ||
+        event.metaKey ||
+        event.ctrlKey ||
+        event.shiftKey ||
+        event.altKey
+      ) {
+        return
+      }
+      event.preventDefault()
+      openNewChat()
+    },
+    [openNewChat],
+  )
 
   useEffect(() => {
     applyThemeToDocument(prefs.theme)
@@ -728,7 +772,7 @@ export function Shell() {
       const isTyping = activeTag === 'input' || activeTag === 'textarea'
       if (e.key === 'n' && (e.metaKey || e.ctrlKey) && !e.shiftKey && !isTyping) {
         e.preventDefault()
-        navigateNew()
+        openNewChat()
       }
       if (e.key === ',' && (e.metaKey || e.ctrlKey)) {
         e.preventDefault()
@@ -761,14 +805,12 @@ export function Shell() {
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [streamingOnActiveChat, abortActiveChat, activeChatId, setEditTreeMode])
+  }, [streamingOnActiveChat, abortActiveChat, activeChatId, setEditTreeMode, openNewChat])
 
-  // Keep the panel slot reserved whenever the user opened it, regardless
-  // of whether a chat is active or focus mode is on. On /new the shell still
-  // renders so the transition out of /new (after materializing a chat)
-  // doesn't make the panel jump in from nowhere. The panel component itself
-  // no-ops when chatId is null.
-  const showChatModelPanel = chatModelOpen && !activeStorageRoute
+  // Keep the panel slot reserved whenever an active chat has the panel open,
+  // including focus mode. Chat settings are per-chat, so routes without an
+  // active chat hide the pane instead of showing the null-chat placeholder.
+  const showChatModelPanel = chatModelOpen && !!activeChatId && !activeStorageRoute
   const effectiveSidebarCollapsed = isNarrowScreen ? false : sidebarCollapsed
   const mobilePanelOpen = isNarrowScreen && (mobileSidebarOpen || showChatModelPanel)
   const closeMobilePanels = useCallback(() => {
@@ -841,7 +883,7 @@ export function Shell() {
             rel="noopener"
             aria-label="New chat"
             title="New chat"
-            onClick={makeAnchorClickHandler(newChatHref())}
+            onClick={handleNewChatClick}
           >
             <NewChatIcon size={18} />
           </a>
