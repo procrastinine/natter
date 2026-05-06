@@ -38,7 +38,6 @@ import { isTextCompletionsSelectableFor } from '../../core/quirks'
 import { readTokenCalibrationGlobal } from '../../core/token-calibration'
 import type {
   Chat,
-  ChatId,
   ChatPreset,
   ConnectionKind,
   ConnectionProfile,
@@ -78,11 +77,7 @@ import { PromptsTab } from './PromptsTab'
 import { ProviderPicker } from './ProviderPicker'
 
 interface ChatModelPanelProps {
-  // Null while the user is on /new before the chat row has materialized.
-  // The panel renders a placeholder in that case; the rest of the wiring
-  // already handles undefined chat / profile / preset.
-  chatId: ChatId | null
-  chatSnapshot?: Chat | null
+  chatSnapshot: Chat
   profileSnapshot?: ConnectionProfile | null
   onClose: () => void
 }
@@ -92,11 +87,11 @@ const EMPTY_CURSOR = Object.freeze({}) as Readonly<Record<string, string>>
 const EMPTY_MESSAGES: Message[] = []
 
 export function ChatModelPanel({
-  chatSnapshot = null,
+  chatSnapshot,
   profileSnapshot = null,
   onClose,
 }: ChatModelPanelProps) {
-  const chat = chatSnapshot ?? undefined
+  const chat = chatSnapshot
 
   const snapshotProfile =
     chat && profileSnapshot?.id === chat.settings.profileId ? profileSnapshot : null
@@ -241,7 +236,6 @@ export function ChatModelPanel({
 
   const handleModelPick = useCallback(
     async (modelId: string) => {
-      if (!chat) return
       if (chat.settings.model === modelId) return
       await updateChatSettings(chat.id, { model: modelId })
     },
@@ -250,7 +244,6 @@ export function ChatModelPanel({
 
   const handleModelPickForPreset = useCallback(
     async (modelId: string) => {
-      if (!chat) return
       if (!chat.presetId) return
       const p = await getPreset(chat.presetId)
       if (!p) return
@@ -261,15 +254,6 @@ export function ChatModelPanel({
     },
     [chat],
   )
-
-  if (!chat) {
-    return (
-      <aside data-ui="chat-model-panel" aria-label="Chat model settings">
-        <PanelHeader onClose={onClose} title="Model settings" />
-        <div data-ui="settings-panel" />
-      </aside>
-    )
-  }
 
   const isOpenRouter = profile?.kind === 'openrouter'
   const textTemplateMode =
@@ -302,7 +286,7 @@ export function ChatModelPanel({
       : null
 
   return (
-    <aside data-ui="chat-model-panel" aria-label="Chat model settings">
+    <aside data-ui="chat-model-panel" aria-label="Chat settings">
       <PanelHeader onClose={onClose} title="Chat settings" />
       <PresetBreadcrumb chat={chat} preset={preset ?? undefined} />
       {unavailableModel ? (

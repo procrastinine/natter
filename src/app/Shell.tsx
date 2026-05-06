@@ -810,7 +810,8 @@ export function Shell() {
   // Keep the panel slot reserved whenever an active chat has the panel open,
   // including focus mode. Chat settings are per-chat, so routes without an
   // active chat hide the pane instead of showing the null-chat placeholder.
-  const showChatModelPanel = chatModelOpen && !!activeChatId && !activeStorageRoute
+  const showChatModelPanel =
+    chatModelOpen && !!activeChatId && !!resolvedActiveChatRow && !activeStorageRoute
   const effectiveSidebarCollapsed = isNarrowScreen ? false : sidebarCollapsed
   const mobilePanelOpen = isNarrowScreen && (mobileSidebarOpen || showChatModelPanel)
   const closeMobilePanels = useCallback(() => {
@@ -1155,8 +1156,8 @@ export function Shell() {
                     type="button"
                     data-ui="icon-button"
                     data-role="settings-cog"
-                    aria-label="Open model panel"
-                    title="Model settings"
+                    aria-label="Open chat settings"
+                    title="Chat settings"
                     onClick={() => void openSettingsForNewChat()}
                   >
                     <CogIcon size={20} />
@@ -1201,8 +1202,8 @@ export function Shell() {
                     type="button"
                     data-ui="icon-button"
                     data-role="settings-cog"
-                    aria-label="Open model panel"
-                    title="Model settings"
+                    aria-label="Open chat settings"
+                    title="Chat settings"
                     onClick={() => void openSettingsForNewChat()}
                   >
                     <CogIcon size={20} />
@@ -1225,8 +1226,7 @@ export function Shell() {
       ) : null}
       {showChatModelPanel ? (
         <ChatModelPanel
-          chatId={activeChatId}
-          chatSnapshot={resolvedActiveChatRow ?? null}
+          chatSnapshot={resolvedActiveChatRow}
           profileSnapshot={activeProfileForModelList ?? null}
           onClose={() => setChatModelOpen(false)}
         />

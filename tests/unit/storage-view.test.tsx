@@ -9,7 +9,7 @@ import {
   readTokenCalibrationGlobal,
   writeTokenCalibrationGlobal,
 } from '../../src/core/token-calibration'
-import { ingestAttachmentBytes } from '../../src/store/attachments'
+import { createRemoteAttachment, ingestAttachmentBytes } from '../../src/store/attachments'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import { __resetBrowserRepositoryForTests } from '../../src/store/browser-repo'
 import {
@@ -221,6 +221,30 @@ describe('StorageView', () => {
     expect(container).not.toHaveTextContent('Missing')
     expect(container).not.toHaveTextContent('Unreferenced')
     expect(container).not.toHaveTextContent('Archive')
+  })
+
+  it('triggers attachment download from the details panel', async () => {
+    const attachment = await createRemoteAttachment({
+      url: 'https://example.test/note.txt',
+      filename: 'note.txt',
+      mime: 'text/plain',
+      now: 10,
+    })
+    const appendSpy = vi.spyOn(document.body, 'appendChild')
+    const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {})
+
+    render(<StorageView route={{ section: 'attachments', attachmentId: attachment.id }} />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Download note.txt' }))
+
+    await waitFor(() => expect(clickSpy).toHaveBeenCalled())
+    const anchor = appendSpy.mock.calls
+      .map(([node]) => node)
+      .find(
+        (node): node is HTMLAnchorElement =>
+          node instanceof HTMLAnchorElement && node.download === 'note.txt',
+      )
+    expect(anchor?.href).toBe('https://example.test/note.txt')
   })
 
   it('requests notification permission and shows Chromium/Safari persistence hints in browser mode', async () => {

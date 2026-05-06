@@ -339,7 +339,7 @@ describe('ChatModelPanel context tab', () => {
     settings.model = 'gpt-5.4-nano'
     settings.api = 'responses'
     const chat = await createChat({ settings })
-    render(<ChatModelPanel chatId={chat.id} chatSnapshot={chat} onClose={() => undefined} />)
+    render(<ChatModelPanel chatSnapshot={chat} onClose={() => undefined} />)
 
     const checkbox = await screen.findByLabelText(/Pass store: true upstream/)
     expect(checkbox).not.toBeChecked()
@@ -355,7 +355,7 @@ describe('ChatModelPanel context tab', () => {
     const settings = cloneDefaultChatSettings()
     settings.model = ''
     const chat = await createChat({ settings })
-    render(<ChatModelPanel chatId={chat.id} chatSnapshot={chat} onClose={() => undefined} />)
+    render(<ChatModelPanel chatSnapshot={chat} onClose={() => undefined} />)
 
     fireEvent.click(await screen.findByRole('tab', { name: 'Context' }))
 
@@ -381,7 +381,7 @@ describe('ChatModelPanel context tab', () => {
     const chat = await createChat({ settings, presetId: preset.id })
     const downloads = mockBlobDownloads()
     try {
-      render(<ChatModelPanel chatId={chat.id} chatSnapshot={chat} onClose={() => undefined} />)
+      render(<ChatModelPanel chatSnapshot={chat} onClose={() => undefined} />)
 
       fireEvent.click(await screen.findByRole('button', { name: /Preset:/ }))
       fireEvent.click(await screen.findByRole('button', { name: 'Export preset "Portable" JSON' }))
@@ -417,7 +417,7 @@ describe('ChatModelPanel context tab', () => {
     const envelope = await exportChatPreset(preset.id)
     const chat = await createChat({ settings, presetId: preset.id })
     const { container } = render(
-      <ChatModelPanel chatId={chat.id} chatSnapshot={chat} onClose={() => undefined} />,
+      <ChatModelPanel chatSnapshot={chat} onClose={() => undefined} />,
     )
 
     fireEvent.click(await screen.findByRole('button', { name: /Preset:/ }))

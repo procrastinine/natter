@@ -289,9 +289,9 @@ export function ChatHeader({
         type="button"
         data-ui="icon-button"
         data-role="settings-cog"
-        aria-label="Toggle chat model panel"
+        aria-label="Toggle chat settings"
         aria-expanded={settingsOpen}
-        title="Model settings"
+        title="Chat settings"
         onClick={onToggleSettings}
       >
         <CogIcon size={20} />

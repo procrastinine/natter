@@ -38,6 +38,7 @@ import {
 } from '../../core/token-calibration'
 import type {
   Attachment,
+  AttachmentBlob,
   AttachmentKind,
   Chat,
   ChatFolder,
@@ -2073,6 +2074,22 @@ function AttachmentDetails({
   onReplaceUpload: () => void
   onDelete: (attachment: Attachment) => void | Promise<void>
 }) {
+  const pushToast = useToastStore((s) => s.push)
+  const [downloadBusy, setDownloadBusy] = useState(false)
+  const canDownload = Boolean(attachment && attachment.storage.kind !== 'missing')
+  const handleDownload = useCallback(async () => {
+    if (!attachment || !canDownload) return
+    setDownloadBusy(true)
+    try {
+      await downloadAttachment(attachment)
+    } catch (error) {
+      console.error('Failed to download attachment', error)
+      pushToast({ level: 'danger', text: 'Attachment download failed.' })
+    } finally {
+      setDownloadBusy(false)
+    }
+  }, [attachment, canDownload, pushToast])
+
   if (!attachment) {
     return (
       <aside data-ui="attachment-details">
@@ -2110,6 +2127,18 @@ function AttachmentDetails({
         ) : null}
       </dl>
       <div data-ui="attachment-lifecycle-actions">
+        {canDownload ? (
+          <button
+            type="button"
+            data-ui="storage-action"
+            disabled={downloadBusy}
+            aria-label={`Download ${attachment.filename}`}
+            onClick={() => void handleDownload()}
+          >
+            <DownloadIcon size={14} />
+            {downloadBusy ? 'Downloading...' : 'Download'}
+          </button>
+        ) : null}
         <button type="button" data-ui="storage-action" onClick={onReplaceUpload}>
           <UploadIcon size={14} />
           Replace
@@ -2206,6 +2235,73 @@ function Meta({ label, value }: { label: string; value: string }) {
       <dd>{value}</dd>
     </div>
   )
+}
+
+async function downloadAttachment(attachment: Attachment): Promise<void> {
+  if (attachment.storage.kind === 'missing') throw new Error(`AttachmentMissing:${attachment.id}`)
+  if (attachment.storage.kind === 'remote-url') {
+    triggerRemoteAttachmentDownload(attachment.filename, attachment.storage.url)
+    return
+  }
+
+  const bundle = await getBrowserRepository().getAttachmentBundle(attachment.id)
+  const blobRow = selectAttachmentDownloadBlob(attachment, bundle)
+  if (!blobRow) throw new Error(`AttachmentBlobMissing:${attachment.id}`)
+  const blob = await attachmentDownloadBlob(blobRow)
+  triggerBrowserBlobDownload(attachment.filename, blob)
+}
+
+async function attachmentDownloadBlob(blobRow: AttachmentBlob): Promise<Blob> {
+  if (blobRow.blob.type || !blobRow.mime) return blobRow.blob
+  if (typeof blobRow.blob.slice === 'function') {
+    return blobRow.blob.slice(0, blobRow.blob.size, blobRow.mime)
+  }
+  if (typeof blobRow.blob.arrayBuffer === 'function') {
+    return new Blob([await blobRow.blob.arrayBuffer()], { type: blobRow.mime })
+  }
+  if (typeof blobRow.blob.text === 'function') {
+    return new Blob([await blobRow.blob.text()], { type: blobRow.mime })
+  }
+  if (typeof FileReader !== 'undefined') {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader()
+      reader.onerror = () => reject(reader.error ?? new Error('BlobReadFailed'))
+      reader.onload = () => {
+        if (!(reader.result instanceof ArrayBuffer)) {
+          reject(new Error('BlobReadFailed'))
+          return
+        }
+        resolve(new Blob([reader.result], { type: blobRow.mime }))
+      }
+      reader.readAsArrayBuffer(blobRow.blob)
+    })
+  }
+  throw new Error('BlobReadUnsupported')
+}
+
+function selectAttachmentDownloadBlob(
+  attachment: Attachment,
+  bundle: AttachmentBundle | undefined,
+) {
+  if (!bundle || attachment.storage.kind !== 'local-blob') return undefined
+  const blobId = attachment.storage.blobId
+  return (
+    bundle.blobs.find((row) => row.id === blobId) ??
+    bundle.blobs.find((row) => row.role === 'original') ??
+    bundle.blobs.find((row) => row.role === 'normalized') ??
+    bundle.blobs[0]
+  )
+}
+
+function triggerRemoteAttachmentDownload(filename: string, url: string): void {
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  a.target = '_blank'
+  a.rel = 'noreferrer'
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
 }
 
 function filterToSearch(filter: ManagerFilter) {
