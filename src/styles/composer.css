@@ -1,9 +1,9 @@
 /*
  * composer.css — composer shell, attachment chips, send row, token counter,
  *                lock banner placement.
- * Owns: [data-ui='composer'|'composer-input'|'attachment-chip'|'attachment-menu'|
- *              'token-counter'|'composer-actions'|'image-output-settings'|
- *              'video-cost-notice'].
+ * Owns: [data-ui='composer'|'composer-input-shell'|'composer-input'|
+ *              'attachment-chip'|'attachment-menu'|'token-counter'|
+ *              'composer-actions'|'image-output-settings'|'video-cost-notice'].
  * See plan/10-ui.md §10.7.
  */
 
@@ -286,11 +286,21 @@
   display: none;
 }
 
+/* The backing layer matches the input surface. On macOS, native elastic
+ * textarea scrolling can expose the parent behind the textarea; keeping
+ * that parent gray prevents a white flash at the rubber-band edge. */
+[data-ui="composer-input-shell"] {
+  background: var(--color-bg-surface-2);
+  border-radius: var(--radius-md) var(--radius-md) 0 0;
+  overflow: hidden;
+}
+
 /* Textarea region is the actual input; gets a light gray surface so it
  * reads as the "type here" affordance distinct from the surrounding
  * chrome. Focus ring is inset so the highlight stays *inside* the
  * textarea — the wrapping card doesn't change. */
 [data-ui="composer-input"] {
+  display: block;
   width: 100%;
   resize: none;
   font: inherit;

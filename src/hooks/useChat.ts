@@ -2,9 +2,10 @@
 // `plan/13-delivery.md §13.2.7`.
 //
 // Lifecycle (text-only Phase 7):
-//   1. Persist the user message (via messages.sendUserMessage) and an assistant
-//      placeholder (via continueAssistant-style append under the user) — both
-//      rows are durable BEFORE the fetch opens (`plan/13 §13.2.2 first-token-latency`).
+//   1. Persist the user message (via messages.sendUserMessage) before request
+//      planning so slow discovery/preflight still has a visible sent turn.
+//      Persist the assistant placeholder (via continueAssistant-style append
+//      under the user) before the fetch opens.
 //   2. Compose the wire body from the active path via `send-planning`.
 //   3. Open the stream through the single assistant dispatcher. Feed chunks
 //      through `splitChatStream` into an
@@ -42,6 +43,7 @@ import {
   providerOutputItemFromGeminiPart,
   providerOutputItemFromResponsesItem,
 } from '../core/provider-tool-context'
+import { hasEnabledHostedTools, isOpenAiDirectProfile } from '../core/provider-hosted-tools'
 import {
   findMergeTargetIndex,
   mergeReasoningDetail,
@@ -68,6 +70,7 @@ import type {
   AttachmentRef,
   CapabilityDescriptor,
   ChatId,
+  ChatSettings,
   ChatUsage,
   ConnectionProfile,
   ContentItem,
@@ -112,35 +115,6 @@ function routeApiUsed(route: AssistantRequestPlan['route']): GenerationMeta['api
   if (route?.kind === 'video-generation') return 'video-generation'
   if (route?.kind === 'text-completions') return 'completion'
   return 'chat'
-}
-
-function pendingUserMessage(input: {
-  chatId: ChatId
-  parentId: MessageId | null
-  siblingIndex: number
-  content: ContentItem[]
-  attachmentRefs?: AttachmentRef[]
-  createdAt: number
-  messageId: MessageId
-  turnId: string
-}): Message {
-  return {
-    id: input.messageId,
-    chatId: input.chatId,
-    parentId: input.parentId,
-    siblingIndex: input.siblingIndex,
-    turnId: input.turnId,
-    turnIndex: 0,
-    createdAt: input.createdAt,
-    role: 'user',
-    origin: 'user',
-    content: input.content,
-    ...(input.attachmentRefs && input.attachmentRefs.length > 0
-      ? { attachmentRefs: structuredClone(input.attachmentRefs) }
-      : {}),
-    nodeVersion: 0,
-    deleted: false,
-  }
 }
 
 function pendingPrefillMessage(input: {
@@ -391,30 +365,33 @@ export async function sendText(input: SendTextInput): Promise<SendTextResult> {
     if (!chat) throw new Error(`sendText: chat not found: ${input.chatId}`)
 
     const cursor = useChatStore.getState().getCursor(input.chatId) ?? {}
-    const branchSnapshot = await loadActiveBranchHeaderSnapshot(input.chatId, cursor)
-    const parentId = branchSnapshot.branchHeaders.at(-1)?.id ?? null
     const createdAt = now()
     const userMessageId = newId()
     const userTurnId = newId()
-    const pendingUser = pendingUserMessage({
+    const skipTurnCalibration = settingsMayRequestTools(input.connection, chat.settings)
+    const userMsg = await sendUserMessage({
       chatId: input.chatId,
-      parentId,
-      siblingIndex: nextSiblingIndex(
-        groupByParent(branchSnapshot.allHeaders as unknown as Message[]),
-        parentId,
-      ),
+      cursor,
       content: input.content,
       ...(input.attachmentRefs ? { attachmentRefs: input.attachmentRefs } : {}),
-      createdAt,
+      now: createdAt,
       messageId: userMessageId,
       turnId: userTurnId,
+      ...(skipTurnCalibration ? { skipCalibration: true } : {}),
     })
+    const cursorAfterUser = {
+      ...cursor,
+      ...userMsg.effects.cursorUpdates,
+    }
+    useChatStore.getState().setCursor(input.chatId, cursorAfterUser)
+
+    const branchSnapshot = await loadActiveBranchHeaderSnapshot(input.chatId, cursorAfterUser)
     const hasPrefill = (input.prefillContent?.length ?? 0) > 0
     const prefillMessageId = hasPrefill ? newId() : null
     const pendingPrefill = hasPrefill
       ? pendingPrefillMessage({
           chatId: input.chatId,
-          parentId: userMessageId,
+          parentId: userMsg.messageId,
           siblingIndex: 0,
           content: input.prefillContent ?? [],
           createdAt,
@@ -426,7 +403,7 @@ export async function sendText(input: SendTextInput): Promise<SendTextResult> {
       chat,
       branchHeaders: branchSnapshot.branchHeaders,
       ...(input.capabilities ? { capabilities: input.capabilities } : {}),
-      pendingMessages: pendingPrefill ? [pendingUser, pendingPrefill] : [pendingUser],
+      pendingMessages: pendingPrefill ? [pendingPrefill] : [],
     })
     const plannedPath = sendContext.pathMessages
     let requestPlan: AssistantRequestPlan
@@ -448,23 +425,6 @@ export async function sendText(input: SendTextInput): Promise<SendTextResult> {
       throwWithZeroEligibleUi(input.chatId, err)
     }
     if (lifecycle.signal.aborted) throw new DOMException('Request aborted.', 'AbortError')
-    const skipTurnCalibration = requestHasTools(requestPlan.wire)
-
-    const userMsg = await sendUserMessage({
-      chatId: input.chatId,
-      cursor,
-      content: input.content,
-      ...(input.attachmentRefs ? { attachmentRefs: input.attachmentRefs } : {}),
-      now: createdAt,
-      messageId: userMessageId,
-      turnId: userTurnId,
-      ...(skipTurnCalibration ? { skipCalibration: true } : {}),
-    })
-    const cursorAfterUser = {
-      ...cursor,
-      ...userMsg.effects.cursorUpdates,
-    }
-    useChatStore.getState().setCursor(input.chatId, cursorAfterUser)
 
     return await openAssistantStreamUnder({
       ...input,
@@ -1015,6 +975,19 @@ function requestHasTools(wire: unknown): boolean {
   if (!wire || typeof wire !== 'object') return false
   const tools = (wire as { tools?: unknown }).tools
   return Array.isArray(tools) && tools.length > 0
+}
+
+function settingsMayRequestTools(connection: ConnectionProfile, settings: ChatSettings): boolean {
+  if (settings.enabledToolIds.length > 0) return true
+  if (connection.kind === 'openrouter') return hasEnabledHostedTools(settings, 'openrouter')
+  if (isOpenAiDirectProfile(connection)) return hasEnabledHostedTools(settings, 'openai')
+  if (connection.kind === 'google' && settings.api !== 'chat') {
+    return hasEnabledHostedTools(settings, 'google')
+  }
+  if (connection.kind === 'anthropic' && settings.api !== 'chat') {
+    return hasEnabledHostedTools(settings, 'anthropic')
+  }
+  return false
 }
 
 function providerOutputItemHasToolArtifact(item: ProviderOutputItem): boolean {

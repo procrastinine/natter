@@ -7,7 +7,7 @@
 // - which enum values inside `reasoning.effort` / `verbosity` are actually
 //   honored (vs silently remapped down)
 // - adaptive-only reasoning (Claude 4.6/4.7 ignore effort)
-// - Responses-API-required models (GPT-5.3-Codex / 5.4 / 5.4-Pro)
+// - Responses-API-required models (GPT-5.3-Codex / 5.4+ Pro)
 // - cache min-token floors per Anthropic variant
 // - `cache_control` top-level vs per-block requirement per endpoint (Bedrock
 //   / Vertex need per-block)
@@ -57,7 +57,7 @@ interface QuirksEntry {
   // undefined means "no narrowing; use the full superset".
   allowedEffort?: readonly EffortLevel[]
   allowedVerbosity?: readonly VerbosityLevel[]
-  // Some models refuse chat-completions and require /responses (GPT-5.4 family).
+  // Some models refuse chat-completions and require /responses (GPT-5.4+ pro family).
   requiresResponsesApi?: boolean
   // Soft preference. The api-choice matrix flips to Responses unless the
   // user pinned `chat`. Less aggressive than `requiresResponsesApi` (which
@@ -84,7 +84,7 @@ interface QuirksEntry {
   // not honored. One floor per variant per CLAUDE.md.
   cacheMinTokens?: number
   // `phase` field must be persisted verbatim across Responses-API turns
-  // (GPT-5.4 family; dropping phase causes early stopping).
+  // (GPT-5.4+ family; dropping phase causes early stopping).
   persistsResponsesPhase?: boolean
   // Same as `persistsResponsesPhase`; Phase 11 introduces the preferred
   // spelling. Kept as a separate field so callers can assert on the
@@ -106,7 +106,7 @@ interface QuirksEntry {
   // the UI can keep rendering the reasoning panel on `responses` (where
   // the same model DOES return reasoning).
   hiddenReasoningOnChatApi?: boolean
-  // GPT-5.4 family (including 5.3-codex, 5.4, 5.4-pro, 5.4-mini, 5.4-nano):
+  // GPT-5.3-codex / GPT-5.4+ family:
   // `temperature`, `top_p`, `logprobs`, `top_k` are ONLY accepted when
   // `reasoning.effort === 'none'`. With any other effort the API rejects
   // the request. The transform strips them at wire time.
@@ -125,13 +125,13 @@ interface QuirksEntry {
   // OpenRouter the same table applies. OR accepts /responses on any model
   // via translation, but /responses gives no benefit on non-OpenAI models,
   // so they are treated as chat-only).
-  //   'responses-only' — model 404s on chat-completions (gpt-5.4-pro, 5.3-codex,
+  //   'responses-only' — model 404s on chat-completions (gpt-5.5-pro, 5.4-pro, 5.3-codex,
   //                      5.2-codex, 5.2-pro, 5.1-codex, 5.1-codex-max, 5-codex,
   //                      5-pro, o1-pro, o3-pro, *-deep-research).
   //   'chat-only'      — `*-chat-latest`, gpt-3.5-turbo-instruct, and every
   //                      non-OpenAI-family model (Claude, Gemini, DeepSeek,
   //                      Qwen, Grok, GLM, Kimi, MiniMax, Gemma).
-  //   'both'           — gpt-5.4, 5.4-mini, 5.4-nano, 5.3, 5.2, 5.1, 5,
+  //   'both'           — gpt-5.5, 5.4, 5.4-mini, 5.4-nano, 5.3, 5.2, 5.1, 5,
   //                      5-mini/nano, 4.1, 4o, 4, 4-turbo, 3.5-turbo,
   //                      o1, o3, o3-mini, o4-mini.
   // Unset defaults to 'chat-only'.
@@ -235,53 +235,11 @@ const REGISTRY: Record<string, QuirksEntry> = {
     acceptsAnthropicRedactedThinking: true,
   },
 
-  // OpenAI GPT-5.x family — Responses API required, persist phase, strict
-  // `gpt54SamplingGate` (temperature/top_p/logprobs only when effort:'none').
+  // OpenAI GPT-5.3 / older GPT-5 entries that are not covered by the
+  // shared GPT-5.4+ fallback below.
   // Effort enum authoritative from `openai_docs/pages/docs/guides/latest-model.md`
   // + live probe 4: `none (default) | low | medium | high | xhigh`, NO
   // `minimal`. Verbosity: low/medium/high/xhigh (no max; max is Claude-only).
-  'gpt-5.4-pro': {
-    requiresResponsesApi: true,
-    persistsResponsesPhase: true,
-    requiresPhaseEcho: true,
-    gpt54SamplingGate: true,
-    allowedEffort: ['none', 'low', 'medium', 'high', 'xhigh'],
-    allowedVerbosity: ['low', 'medium', 'high', 'xhigh'],
-    reasoningPreservationFormat: 'openai-responses-v1',
-    responsesSupport: 'responses-only',
-  },
-  // gpt-5.4 family (non-pro): chat-completions accepts the model but drops
-  // `phase`. Slug heuristic gives 'both' (toggle shown); `preferApi:
-  // 'responses'` + `persistsResponsesPhase: true` make the auto-route
-  // default to Responses. Users who pin chat explicitly trip the
-  // confirmation dialog in `ApiModeSection`.
-  'gpt-5.4-nano': {
-    persistsResponsesPhase: true,
-    requiresPhaseEcho: true,
-    gpt54SamplingGate: true,
-    preferApi: 'responses',
-    allowedEffort: ['none', 'low', 'medium', 'high', 'xhigh'],
-    allowedVerbosity: ['low', 'medium', 'high', 'xhigh'],
-    reasoningPreservationFormat: 'openai-responses-v1',
-  },
-  'gpt-5.4-mini': {
-    persistsResponsesPhase: true,
-    requiresPhaseEcho: true,
-    gpt54SamplingGate: true,
-    preferApi: 'responses',
-    allowedEffort: ['none', 'low', 'medium', 'high', 'xhigh'],
-    allowedVerbosity: ['low', 'medium', 'high', 'xhigh'],
-    reasoningPreservationFormat: 'openai-responses-v1',
-  },
-  'gpt-5.4': {
-    persistsResponsesPhase: true,
-    requiresPhaseEcho: true,
-    gpt54SamplingGate: true,
-    preferApi: 'responses',
-    allowedEffort: ['none', 'low', 'medium', 'high', 'xhigh'],
-    allowedVerbosity: ['low', 'medium', 'high', 'xhigh'],
-    reasoningPreservationFormat: 'openai-responses-v1',
-  },
   'gpt-5.3-codex': {
     requiresResponsesApi: true,
     persistsResponsesPhase: true,
@@ -528,6 +486,28 @@ const GEMMA_DEFAULT: QuirksEntry = {
 }
 const GEMMA_PATTERN = /^gemma(?:[-_\d.]|$)/
 
+// Shared OpenAI GPT-5.4+ family behavior: non-pro models prefer Responses
+// for encrypted reasoning + `phase`; pro models require Responses.
+const GPT_54_PLUS_PATTERN =
+  /^gpt-5[:.](?:[4-9]|\d{2,})(?:$|-(?:pro|mini|nano|chat-latest|\d{8}|\d{4}-\d{2}-\d{2})(?:$|-))/
+const GPT_54_PLUS_BASE: QuirksEntry = {
+  persistsResponsesPhase: true,
+  requiresPhaseEcho: true,
+  gpt54SamplingGate: true,
+  allowedEffort: ['none', 'low', 'medium', 'high', 'xhigh'],
+  allowedVerbosity: ['low', 'medium', 'high', 'xhigh'],
+  reasoningPreservationFormat: 'openai-responses-v1',
+}
+
+function openAiGpt54PlusFamilyQuirks(normalized: string): QuirksEntry | null {
+  if (!GPT_54_PLUS_PATTERN.test(normalized)) return null
+  if (normalized.endsWith('-chat-latest')) return { responsesSupport: 'chat-only' }
+  if (/-pro(?:$|-)/.test(normalized)) {
+    return { ...GPT_54_PLUS_BASE, requiresResponsesApi: true, responsesSupport: 'responses-only' }
+  }
+  return { ...GPT_54_PLUS_BASE, preferApi: 'responses' }
+}
+
 export function quirksFor(modelId: string): QuirksEntry {
   const normalized = canonicalCompatModelId(modelId)
   for (const key of REGISTRY_KEYS_BY_LENGTH) {
@@ -537,6 +517,8 @@ export function quirksFor(modelId: string): QuirksEntry {
       if (entry) return entry
     }
   }
+  const openAiGpt54Plus = openAiGpt54PlusFamilyQuirks(normalized)
+  if (openAiGpt54Plus) return openAiGpt54Plus
   if (GEMMA_PATTERN.test(normalized)) return GEMMA_DEFAULT
   if (OSS_THINKING_PATTERN.test(normalized)) return OSS_THINKING_DEFAULT
   return {}
@@ -738,10 +720,10 @@ function isKnownOpenWeightTextFamily(slug: string): boolean {
 }
 
 // Strip sampling params that are gated behind `reasoning.effort === 'none'` on
-// the GPT-5.4 family. Call this BEFORE dispatching. Mutates the request.
+// GPT-5.3-codex / GPT-5.4+ family. Call this BEFORE dispatching. Mutates the request.
 //
 // Gate contract per `plan/phase11-implementation.md §4.6`:
-//   `gpt-5.4{,-pro,-mini,-nano}`, `gpt-5.3-codex` accept `temperature`,
+//   `gpt-5.5{,-pro}`, `gpt-5.4{,-pro,-mini,-nano}`, `gpt-5.3-codex` accept `temperature`,
 //   `top_p`, `logprobs`, `top_k` ONLY when `reasoning.effort === 'none'`.
 //   Any other effort value makes the API return HTTP 400.
 export function adjustGpt54SamplingGate(

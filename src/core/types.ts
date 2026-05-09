@@ -1209,6 +1209,7 @@ export interface ChatPreset {
   name: string
   connectionProfileId: ProfileId
   settings: ChatSettings
+  sortIndex: number
   createdAt: number
   updatedAt: number
   lastUsedAt?: number

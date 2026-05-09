@@ -194,7 +194,7 @@ async function seedOpenRouterDiscovery(
 }
 
 describe('sendText — chat-completions streaming', () => {
-  it('registers a pre-stream lifecycle so Stop can abort template preflight before rows are written', async () => {
+  it('persists the user row while Stop can still abort template preflight before the stream opens', async () => {
     const chat = await createChat({
       settings: chatSettings({
         profileId: 'prof-llama',
@@ -242,12 +242,63 @@ describe('sendText — chat-completions streaming', () => {
     const active = useStreamStore.getState().listByChat(chat.id)
     expect(active).toHaveLength(1)
     expect(active[0]?.messageId).toBeUndefined()
-    expect(await messagesFor(chat.id)).toEqual([])
+    const midMessages = liveMessagesSortedByCreated(await messagesFor(chat.id))
+    expect(midMessages).toHaveLength(1)
+    expect(midMessages[0]).toMatchObject({
+      role: 'user',
+      content: [{ type: 'text', text: 'hello' }],
+    })
     expect(useStreamStore.getState().abortChat(chat.id)).toBe(1)
     await expect(sendPromise).rejects.toMatchObject({ kind: 'abort' })
     expect(openStream).not.toHaveBeenCalled()
     expect(useStreamStore.getState().hasStreamForChat(chat.id)).toBe(false)
-    expect(await messagesFor(chat.id)).toEqual([])
+    expect(liveMessagesSortedByCreated(await messagesFor(chat.id))).toHaveLength(1)
+  })
+
+  it('creates the assistant placeholder before a slow stream yields its first chunk', async () => {
+    const chat = await createChat({ settings: chatSettings() })
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    let markOpened!: () => void
+    const opened = new Promise<void>((resolve) => {
+      markOpened = resolve
+    })
+
+    const sendPromise = sendText({
+      chatId: chat.id,
+      connection: makeProfile(),
+      apiKey: 'sk-test',
+      content: [{ type: 'text', text: 'slow start' }],
+      openStream: () =>
+        (async function* () {
+          markOpened()
+          await gate
+          const chunk: ChatStreamChunk = {
+            type: 'delta',
+            chunk: {
+              id: 'gen-slow-start',
+              choices: [{ delta: { content: 'ready' }, finish_reason: 'stop' }],
+            },
+          }
+          yield chunk
+        })(),
+    })
+    await opened
+
+    const midMessages = liveMessagesSortedByCreated(await messagesFor(chat.id))
+    expect(midMessages.map((message) => message.role)).toEqual(['user', 'assistant'])
+    const user = requireDefined(midMessages[0], 'user row')
+    const assistant = requireDefined(midMessages[1], 'assistant row')
+    expect(user.content).toEqual([{ type: 'text', text: 'slow start' }])
+    expect(assistant.parentId).toBe(user.id)
+    expect(assistant.content).toEqual([{ type: 'output_text', text: '' }])
+    expect(useStreamStore.getState().listByChat(chat.id)[0]?.messageId).toBe(assistant.id)
+    expect(useChatStore.getState().getCursor(chat.id)?.[cursorKeyOf(user.id)]).toBe(assistant.id)
+
+    release()
+    await expect(sendPromise).resolves.toMatchObject({ outcome: 'done' })
   })
 
   it('persists user message + assistant text; writes generation metadata', async () => {

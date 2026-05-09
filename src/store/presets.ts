@@ -33,6 +33,7 @@ interface CreatePresetInput {
   name: string
   connectionProfileId: ProfileId
   settings: ChatSettings
+  sortIndex?: number
   now?: number
   lastUsedAt?: number
 }
@@ -48,6 +49,7 @@ export async function createPreset(input: CreatePresetInput): Promise<ChatPreset
     connectionProfileId: input.connectionProfileId,
     // `settings.profileId` is kept in sync with `connectionProfileId` (§2.6a).
     settings: normalizePresetSettings(input.settings, input.connectionProfileId, profile),
+    sortIndex: input.sortIndex ?? (await nextPresetSortIndex(db)),
     createdAt: now,
     updatedAt: now,
   }
@@ -63,7 +65,8 @@ export async function getPreset(presetId: PresetId): Promise<ChatPreset | undefi
 
 export async function listPresets(opts: { includeArchived?: boolean } = {}): Promise<ChatPreset[]> {
   const rows = await getDb().presets.toArray()
-  return opts.includeArchived ? rows : rows.filter((p) => p.archived !== true)
+  const visible = opts.includeArchived ? rows : rows.filter((p) => p.archived !== true)
+  return sortPresetsForPicker(visible)
 }
 
 export async function updatePreset(
@@ -106,6 +109,7 @@ export async function duplicatePreset(
     id: newId(),
     name: opts.name ?? `${source.name} (copy)`,
     settings: { ...source.settings },
+    sortIndex: await nextPresetSortIndex(),
     createdAt: now,
     updatedAt: now,
   }
@@ -114,6 +118,41 @@ export async function duplicatePreset(
   await getDb().presets.put(copy)
   postEvent({ kind: 'preset-mutated', presetId: copy.id })
   return copy
+}
+
+export async function reorderPresets(
+  orderedIds: readonly PresetId[],
+  opts: { now?: number } = {},
+): Promise<void> {
+  const db = getDb()
+  const ids = Array.from(new Set(orderedIds))
+  const rows = await db.presets.bulkGet(ids)
+  const now = opts.now ?? Date.now()
+  const updates: ChatPreset[] = []
+  for (const [index, id] of ids.entries()) {
+    const row = rows[index]
+    if (!row) throw new PresetMissingError(id)
+    if (row.sortIndex === index) continue
+    updates.push({ ...row, sortIndex: index, updatedAt: now })
+  }
+  if (updates.length === 0) return
+  await db.presets.bulkPut(updates)
+  for (const row of updates) {
+    postEvent({ kind: 'preset-mutated', presetId: row.id })
+  }
+}
+
+async function nextPresetSortIndex(db = getDb()): Promise<number> {
+  const rows = await db.presets.toArray()
+  return rows.length === 0 ? 0 : Math.max(...rows.map((row) => row.sortIndex)) + 1
+}
+
+function sortPresetsForPicker(rows: ChatPreset[]): ChatPreset[] {
+  return rows.sort((left, right) => {
+    if (left.sortIndex !== right.sortIndex) return left.sortIndex - right.sortIndex
+    if (left.createdAt !== right.createdAt) return left.createdAt - right.createdAt
+    return left.id.localeCompare(right.id)
+  })
 }
 
 function normalizePresetSettings(

@@ -32,7 +32,7 @@ import {
 } from '../../src/store/import-export'
 import { __resetKeyCacheForTests, createKey } from '../../src/store/keys'
 import { hydrateMessages } from '../../src/store/message-storage'
-import { createPreset } from '../../src/store/presets'
+import { createPreset, listPresets } from '../../src/store/presets'
 import { createProfile } from '../../src/store/profiles'
 import { createPromptPreset } from '../../src/store/prompt-presets'
 import { putTestMessages } from '../helpers/message-storage'
@@ -376,6 +376,31 @@ describe('chat preset export/import', () => {
     expect(row?.settings.profileId).toBe(sourceProfile.id)
     expect(row?.settings.systemPrompt).toBe('System text')
     expect(row?.settings).not.toHaveProperty('systemPromptPresetId')
+  })
+
+  it('does not export picker order and imports uploaded presets at the end', async () => {
+    const profile = await fakeProfile()
+    const settings = await flattenedSettings(profile.id)
+    const first = await createPreset({
+      name: 'First',
+      connectionProfileId: profile.id,
+      settings,
+      now: 100,
+    })
+    const second = await createPreset({
+      name: 'Second',
+      connectionProfileId: profile.id,
+      settings,
+      now: 200,
+    })
+    const exported = await exportChatPreset(first.id)
+
+    expect(exported.payload).not.toHaveProperty('sortIndex')
+
+    const result = await importChatPreset(exported, { targetProfileId: profile.id, now: 300 })
+    const rows = await listPresets()
+    expect(rows.map((row) => row.id)).toEqual([first.id, second.id, result.presetId])
+    expect(rows.at(-1)?.sortIndex).toBeGreaterThan(second.sortIndex)
   })
 })
 

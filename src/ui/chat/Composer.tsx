@@ -500,35 +500,37 @@ export function Composer({
       />
       {floatingAccessory ?? null}
       <div data-ui="composer-body">
-        <textarea
-          ref={textareaRef}
-          data-ui="composer-input"
-          value={text}
-          onChange={(e) => setComposerText(e.target.value)}
-          placeholder="Ask anything…"
-          disabled={disabled}
-          rows={autoSize ? 1 : undefined}
-          onKeyDown={(e) => {
-            if (e.key !== 'Enter') return
-            const isCmd = e.metaKey || e.ctrlKey
-            if (sendShortcut === 'cmd-enter') {
+        <div data-ui="composer-input-shell">
+          <textarea
+            ref={textareaRef}
+            data-ui="composer-input"
+            value={text}
+            onChange={(e) => setComposerText(e.target.value)}
+            placeholder="Ask anything…"
+            disabled={disabled}
+            rows={autoSize ? 1 : undefined}
+            onKeyDown={(e) => {
+              if (e.key !== 'Enter') return
+              const isCmd = e.metaKey || e.ctrlKey
+              if (sendShortcut === 'cmd-enter') {
+                if (isCmd) {
+                  e.preventDefault()
+                  void send()
+                }
+                return
+              }
               if (isCmd) {
                 e.preventDefault()
                 void send()
+                return
               }
-              return
-            }
-            if (isCmd) {
-              e.preventDefault()
-              void send()
-              return
-            }
-            if (!e.shiftKey) {
-              e.preventDefault()
-              void send()
-            }
-          }}
-        />
+              if (!e.shiftKey) {
+                e.preventDefault()
+                void send()
+              }
+            }}
+          />
+        </div>
         {prefillOpen ? (
           <>
             {prefillSettingsPrompt}

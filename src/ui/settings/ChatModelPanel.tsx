@@ -16,6 +16,7 @@
 import { useLiveQuery } from 'dexie-react-hooks'
 import {
   type ChangeEvent,
+  type PointerEvent,
   useCallback,
   useDeferredValue,
   useEffect,
@@ -42,6 +43,7 @@ import type {
   ConnectionKind,
   ConnectionProfile,
   Message,
+  PresetId,
 } from '../../core/types'
 import { usePrivacyRouting } from '../../hooks/usePrivacyRouting'
 import { useStreamStablePromptEstimate } from '../../hooks/useStreamStablePromptEstimate'
@@ -52,6 +54,7 @@ import {
   deletePreset,
   getPreset,
   listPresets,
+  reorderPresets,
   updatePreset,
 } from '../../store/presets'
 import { getProfile } from '../../store/profiles'
@@ -60,7 +63,7 @@ import { useChatStore } from '../../store/zustand/chatStore'
 import { useStreamStore } from '../../store/zustand/streamStore'
 import { useToastStore } from '../../store/zustand/toastStore'
 import { useAttachmentResolverForContext } from '../attachments/useAttachmentResolver'
-import { CloseIcon, DownloadIcon, UploadIcon } from '../icons/Icon'
+import { CloseIcon, DownloadIcon, GripVerticalIcon, UploadIcon } from '../icons/Icon'
 import {
   importExportErrorMessage,
   natterJsonFilename,
@@ -426,11 +429,42 @@ function PanelHeader({ title, onClose }: { title: string; onClose: () => void })
 // Preset control: shows the current preset + picker menu for load / save /
 // rename / delete / new. Chat settings diverge freely; the preset is the
 // shared snapshot the user can write back to or swap from.
+interface PresetDragState {
+  draggedId: PresetId | null
+  orderedIds: PresetId[]
+  pointerId?: number
+  status: 'dragging' | 'settling'
+}
+
 function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | undefined }) {
   const pushToast = useToastStore((s) => s.push)
   const presets = useLiveQuery(() => listPresets(), [], [])
+  const [dragState, setDragState] = useState<PresetDragState | null>(null)
+  const dragStateRef = useRef<PresetDragState | null>(null)
+  const presetItemRefs = useRef(new Map<PresetId, HTMLLIElement>())
   const [pickerOpen, setPickerOpen] = useState(false)
   const importInputRef = useRef<HTMLInputElement | null>(null)
+  const visiblePresets = useMemo(
+    () => orderPresetsForDragPreview(presets, dragState?.orderedIds),
+    [presets, dragState?.orderedIds],
+  )
+
+  useEffect(() => {
+    dragStateRef.current = dragState
+  }, [dragState])
+
+  useEffect(() => {
+    if (dragState?.status !== 'settling') return
+    if (
+      !sameOrderedIds(
+        dragState.orderedIds,
+        presets.map((p) => p.id),
+      )
+    )
+      return
+    dragStateRef.current = null
+    setDragState(null)
+  }, [dragState, presets])
 
   const diverged = useMemo(() => {
     if (!preset) return true
@@ -534,6 +568,82 @@ function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | u
     await deletePreset(targetId)
   }, [])
 
+  const beginPresetDrag = useCallback(
+    (event: PointerEvent<HTMLButtonElement>, presetId: PresetId) => {
+      if (event.button !== 0) return
+      event.preventDefault()
+      event.currentTarget.setPointerCapture?.(event.pointerId)
+      const nextState: PresetDragState = {
+        draggedId: presetId,
+        orderedIds: visiblePresets.map((p) => p.id),
+        pointerId: event.pointerId,
+        status: 'dragging',
+      }
+      dragStateRef.current = nextState
+      setDragState(nextState)
+    },
+    [visiblePresets],
+  )
+
+  const updatePresetDragPosition = useCallback((event: PointerEvent<HTMLButtonElement>) => {
+    const current = dragStateRef.current
+    if (
+      !current ||
+      current.status !== 'dragging' ||
+      current.draggedId === null ||
+      current.pointerId !== event.pointerId
+    ) {
+      return
+    }
+    event.preventDefault()
+    const orderedIds = reorderPresetIdsForPointer(
+      current.orderedIds,
+      current.draggedId,
+      event.clientY,
+      presetItemRefs.current,
+    )
+    if (orderedIds === current.orderedIds) return
+    const nextState: PresetDragState = { ...current, orderedIds }
+    dragStateRef.current = nextState
+    setDragState(nextState)
+  }, [])
+
+  const commitPresetDrag = useCallback(async () => {
+    const current = dragStateRef.current
+    if (!current || current.status !== 'dragging') return
+    const liveIds = presets.map((p) => p.id)
+    const liveIdSet = new Set(liveIds)
+    const orderedIds = current.orderedIds.filter((id) => liveIdSet.has(id))
+    const unchanged = orderedIds.length !== liveIds.length || sameOrderedIds(orderedIds, liveIds)
+    if (unchanged) {
+      dragStateRef.current = null
+      setDragState(null)
+      return
+    }
+    const settlingState: PresetDragState = { draggedId: null, orderedIds, status: 'settling' }
+    dragStateRef.current = settlingState
+    setDragState(settlingState)
+    try {
+      await reorderPresets(orderedIds)
+    } catch (error) {
+      dragStateRef.current = null
+      setDragState(null)
+      console.error('Failed to reorder presets', error)
+      pushToast({ level: 'danger', text: 'Could not save preset order.' })
+    }
+  }, [presets, pushToast])
+
+  const endPresetDrag = useCallback(
+    (event: PointerEvent<HTMLButtonElement>) => {
+      const current = dragStateRef.current
+      event.preventDefault()
+      if (current?.pointerId !== event.pointerId) return
+      event.currentTarget.releasePointerCapture?.(event.pointerId)
+      void commitPresetDrag()
+    },
+    [commitPresetDrag],
+  )
+
   return (
     <div data-ui="preset-breadcrumb">
       <button
@@ -556,17 +666,46 @@ function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | u
             <p data-ui="helper">No presets yet.</p>
           ) : (
             <ul>
-              {presets.map((p) => {
+              {visiblePresets.map((p) => {
                 const isCurrent = preset?.id === p.id
+                const isDragging = dragState?.draggedId === p.id
                 return (
-                  <li key={p.id} data-current={isCurrent ? 'true' : undefined}>
+                  <li
+                    key={p.id}
+                    ref={(node) => {
+                      if (node) presetItemRefs.current.set(p.id, node)
+                      else presetItemRefs.current.delete(p.id)
+                    }}
+                    data-ui="preset-menu-item"
+                    data-preset-id={p.id}
+                    data-current={isCurrent ? 'true' : undefined}
+                    data-dragging={isDragging ? 'true' : undefined}
+                    data-settling={
+                      dragState?.status === 'settling' && dragState.orderedIds.includes(p.id)
+                        ? 'true'
+                        : undefined
+                    }
+                  >
+                    <button
+                      type="button"
+                      data-ui="preset-drag-handle"
+                      aria-label={`Drag preset "${p.name}" to reorder`}
+                      title="Drag to reorder"
+                      onClick={(event) => event.preventDefault()}
+                      onPointerDown={(event) => beginPresetDrag(event, p.id)}
+                      onPointerMove={updatePresetDragPosition}
+                      onPointerUp={endPresetDrag}
+                      onPointerCancel={endPresetDrag}
+                    >
+                      <GripVerticalIcon size={14} />
+                    </button>
                     <button
                       type="button"
                       data-ui="preset-menu-load"
                       onClick={() => void loadPreset(p.id)}
                       title={isCurrent ? 'Already loaded' : 'Load preset'}
                     >
-                      {isCurrent ? '●' : '○'} {p.name}
+                      {p.name}
                     </button>
                     <div data-ui="preset-menu-actions">
                       <button
@@ -681,6 +820,51 @@ function CloseGlyph() {
       <path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
     </svg>
   )
+}
+
+function orderPresetsForDragPreview(
+  presets: readonly ChatPreset[],
+  orderedIds: readonly PresetId[] | undefined,
+): ChatPreset[] {
+  if (!orderedIds) return [...presets]
+  const byId = new Map(presets.map((p) => [p.id, p]))
+  const ordered: ChatPreset[] = []
+  for (const id of orderedIds) {
+    const preset = byId.get(id)
+    if (preset) ordered.push(preset)
+  }
+  const seen = new Set(ordered.map((p) => p.id))
+  for (const preset of presets) {
+    if (!seen.has(preset.id)) ordered.push(preset)
+  }
+  return ordered
+}
+
+function reorderPresetIdsForPointer(
+  orderedIds: readonly PresetId[],
+  draggedId: PresetId,
+  clientY: number,
+  itemRefs: ReadonlyMap<PresetId, HTMLLIElement>,
+): PresetId[] {
+  const withoutDragged = orderedIds.filter((id) => id !== draggedId)
+  if (withoutDragged.length === orderedIds.length) return orderedIds as PresetId[]
+  let insertAt = withoutDragged.length
+  for (const [index, id] of withoutDragged.entries()) {
+    const node = itemRefs.get(id)
+    if (!node) continue
+    const rect = node.getBoundingClientRect()
+    if (clientY < rect.top + rect.height / 2) {
+      insertAt = index
+      break
+    }
+  }
+  const next = [...withoutDragged.slice(0, insertAt), draggedId, ...withoutDragged.slice(insertAt)]
+  return sameOrderedIds(next, orderedIds) ? (orderedIds as PresetId[]) : next
+}
+
+function sameOrderedIds(left: readonly PresetId[], right: readonly PresetId[]): boolean {
+  if (left.length !== right.length) return false
+  return left.every((id, index) => id === right[index])
 }
 
 function settingsMatch(a: Chat['settings'], b: Chat['settings']): boolean {

@@ -399,6 +399,85 @@ describe('ChatModelPanel context tab', () => {
     }
   })
 
+  it('reorders chat settings presets by dragging rows in the preset menu', async () => {
+    const profile = await createProfile({
+      name: 'OpenRouter',
+      kind: 'openrouter',
+      baseUrl: 'https://openrouter.ai/api/v1',
+      apiKeyRef: 'key-1',
+    })
+    const settings = cloneDefaultChatSettings()
+    settings.profileId = profile.id
+    settings.model = 'openai/gpt-4o'
+    const first = await createPreset({
+      name: 'First',
+      connectionProfileId: profile.id,
+      settings,
+      now: 10,
+    })
+    const second = await createPreset({
+      name: 'Second',
+      connectionProfileId: profile.id,
+      settings,
+      now: 20,
+    })
+    const third = await createPreset({
+      name: 'Third',
+      connectionProfileId: profile.id,
+      settings,
+      now: 30,
+    })
+    const chat = await createChat({ settings, presetId: first.id })
+    const { container } = render(<ChatModelPanel chatSnapshot={chat} onClose={() => undefined} />)
+    const presetNames = () =>
+      Array.from(container.querySelectorAll<HTMLButtonElement>('[data-ui="preset-menu-load"]')).map(
+        (button) => (button.textContent ?? '').trim(),
+      )
+
+    fireEvent.click(await screen.findByRole('button', { name: /Preset:/ }))
+    await waitFor(() => {
+      expect(presetNames()).toEqual(['First', 'Second', 'Third'])
+    })
+
+    const firstRow = container.querySelector<HTMLElement>(
+      `[data-ui="preset-menu-item"][data-preset-id="${first.id}"]`,
+    )
+    const secondRow = container.querySelector<HTMLElement>(
+      `[data-ui="preset-menu-item"][data-preset-id="${second.id}"]`,
+    )
+    const thirdRow = container.querySelector<HTMLElement>(
+      `[data-ui="preset-menu-item"][data-preset-id="${third.id}"]`,
+    )
+    expect(firstRow).toBeTruthy()
+    expect(secondRow).toBeTruthy()
+    expect(thirdRow).toBeTruthy()
+    Object.defineProperty(firstRow, 'getBoundingClientRect', {
+      configurable: true,
+      value: () => ({ top: 0, bottom: 20, height: 20, left: 0, right: 200, width: 200 }),
+    })
+    Object.defineProperty(secondRow, 'getBoundingClientRect', {
+      configurable: true,
+      value: () => ({ top: 20, bottom: 40, height: 20, left: 0, right: 200, width: 200 }),
+    })
+    Object.defineProperty(thirdRow, 'getBoundingClientRect', {
+      configurable: true,
+      value: () => ({ top: 40, bottom: 60, height: 20, left: 0, right: 200, width: 200 }),
+    })
+
+    const thirdHandle = await screen.findByRole('button', {
+      name: 'Drag preset "Third" to reorder',
+    })
+    fireEvent.pointerDown(thirdHandle, { pointerId: 1, button: 0, clientY: 50 })
+    fireEvent.pointerMove(thirdHandle, { pointerId: 1, clientY: -1 })
+    expect(presetNames()).toEqual(['Third', 'First', 'Second'])
+    fireEvent.pointerUp(thirdHandle, { pointerId: 1, clientY: -1 })
+    expect(presetNames()).toEqual(['Third', 'First', 'Second'])
+
+    await waitFor(async () => {
+      expect((await listPresets()).map((p) => p.id)).toEqual([third.id, first.id, second.id])
+    })
+  })
+
   it('imports chat settings presets from the preset menu', async () => {
     const profile = await createProfile({
       name: 'OpenRouter',
@@ -416,9 +495,7 @@ describe('ChatModelPanel context tab', () => {
     })
     const envelope = await exportChatPreset(preset.id)
     const chat = await createChat({ settings, presetId: preset.id })
-    const { container } = render(
-      <ChatModelPanel chatSnapshot={chat} onClose={() => undefined} />,
-    )
+    const { container } = render(<ChatModelPanel chatSnapshot={chat} onClose={() => undefined} />)
 
     fireEvent.click(await screen.findByRole('button', { name: /Preset:/ }))
     const input = container.querySelector<HTMLInputElement>('[data-ui="preset-import-input"]')

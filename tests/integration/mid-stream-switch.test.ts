@@ -369,6 +369,7 @@ describe('preset-edit mid-stream', () => {
       name: 'P1',
       connectionProfileId: 'prof-s1',
       settings: settings('model-s1'),
+      sortIndex: 0,
       createdAt: 1,
       updatedAt: 1,
     })

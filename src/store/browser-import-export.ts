@@ -356,6 +356,7 @@ class BrowserImportExportBackend implements WorkspaceImportExportBackend {
       name: await uniquePresetName(db, payload.name),
       connectionProfileId: resolvedProfile.profileId,
       settings: normalizedImportedSettings(payload.settings, resolvedProfile.profileId),
+      sortIndex: await nextPresetSortIndex(db),
       createdAt: now,
       updatedAt: now,
       archived: false,
@@ -652,6 +653,11 @@ async function uniquePresetName(db: NatterDb, name: string): Promise<string> {
     const candidate = `${base} (${i})`
     if (!existing.has(candidate)) return candidate
   }
+}
+
+async function nextPresetSortIndex(db: NatterDb): Promise<number> {
+  const rows = await db.presets.toArray()
+  return rows.length === 0 ? 0 : Math.max(...rows.map((row) => row.sortIndex)) + 1
 }
 
 async function storedAttachmentBundles(

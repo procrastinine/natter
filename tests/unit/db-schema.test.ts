@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { assertNoInlineMessageBodies } from '../../src/backcompat/message-body-split'
 import { migrateProviderOutputItemRows } from '../../src/backcompat/provider-output-items'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
-import type { Chat, ChatPreset, Message } from '../../src/core/types'
+import type { Chat, Message } from '../../src/core/types'
 import type { NatterDb } from '../../src/store/db'
 import {
   __resetDbForTests,
@@ -110,7 +110,7 @@ function registerV1(db: Dexie): void {
 
 function registerV1Through3(db: Dexie): void {
   registerSchema(db)
-  db.version(19)
+  db.version(20)
     .stores({ profiles: 'id, name, kind, lastUsedAt, archived' })
     .upgrade(async (tx) => {
       await tx
@@ -120,7 +120,7 @@ function registerV1Through3(db: Dexie): void {
           if (row.appTitle === undefined) row.appTitle = 'Natter'
         })
     })
-  db.version(20)
+  db.version(21)
     .stores({ settings: '&key' })
     .upgrade(async (tx) => {
       const settings = tx.table<MinimalSetting>('settings')
@@ -202,7 +202,7 @@ describe('Dexie migrations', () => {
     const db = new Dexie(name)
     registerV1Through3(db)
     await db.open()
-    expect(db.verno).toBe(20)
+    expect(db.verno).toBe(21)
     expect(db.tables.map((t) => t.name).includes('settings')).toBe(true)
     const tag = await db.table<MinimalSetting>('settings').get('schemaTag')
     expect(tag).toBeUndefined()
@@ -238,7 +238,7 @@ describe('Dexie migrations', () => {
     const up = new Dexie(name)
     registerV1Through3(up)
     await up.open()
-    expect(up.verno).toBe(20)
+    expect(up.verno).toBe(21)
     const profile = await up.table<MinimalProfile>('profiles').get('P1')
     expect(profile?.appTitle).toBe('CustomTitle') // preserved — synthetic bump only fills undefined
     const tag = await up.table<MinimalSetting>('settings').get('schemaTag')
@@ -248,7 +248,7 @@ describe('Dexie migrations', () => {
     const reopen = new Dexie(name)
     registerV1Through3(reopen)
     await reopen.open()
-    expect(reopen.verno).toBe(20)
+    expect(reopen.verno).toBe(21)
     const tag2 = await reopen.table<MinimalSetting>('settings').get('schemaTag')
     expect(tag2?.value).toBe('preexisting')
     await reopen.delete()
@@ -320,7 +320,7 @@ describe('Dexie migrations', () => {
 
     const migrated = createDbForTests(name)
     await migrated.open()
-    expect(migrated.verno).toBe(18)
+    expect(migrated.verno).toBe(19)
     expect((await migrated.settings.get('global:message-render-window-size'))?.value).toBe(33)
     expect((await migrated.settings.get('global:sidebar-render-window-size'))?.value).toBe(50)
     expect((await migrated.settings.get('global:message-render-window-load-mode'))?.value).toBe(
@@ -385,7 +385,7 @@ describe('Dexie migrations', () => {
       folderId: null,
       tags: [],
     })
-    await v3.table<ChatPreset>('presets').put({
+    await v3.table<Record<string, unknown>>('presets').put({
       id: 'preset-1',
       name: 'Preset',
       connectionProfileId: profileId,
@@ -505,7 +505,7 @@ describe('Dexie migrations', () => {
         tags: [],
       },
     ])
-    await legacy.table<ChatPreset>('presets').bulkPut([
+    await legacy.table<Record<string, unknown>>('presets').bulkPut([
       {
         id: 'preset-or',
         name: 'OpenRouter Preset',
@@ -579,7 +579,7 @@ describe('Dexie migrations', () => {
       folderId: null,
       tags: [],
     })
-    await legacy.table<ChatPreset>('presets').put({
+    await legacy.table<Record<string, unknown>>('presets').put({
       id: 'preset-tools',
       name: 'Tools',
       connectionProfileId: 'profile-tools',
@@ -688,7 +688,7 @@ describe('Dexie migrations', () => {
     })
     const presetSettings = structuredClone(legacySettings)
     presetSettings.profileId = 'stale-profile'
-    await legacy.table<ChatPreset>('presets').put({
+    await legacy.table<Record<string, unknown>>('presets').put({
       id: 'preset-settings-snapshot',
       name: 'Snapshot',
       connectionProfileId: profileId,
@@ -700,7 +700,7 @@ describe('Dexie migrations', () => {
 
     const migrated = createDbForTests(name)
     await migrated.open()
-    expect(migrated.verno).toBe(18)
+    expect(migrated.verno).toBe(19)
     const chat = await migrated.chats.get('chat-settings-snapshot')
     const preset = await migrated.presets.get('preset-settings-snapshot')
     for (const settings of [chat?.settings, preset?.settings]) {
@@ -834,7 +834,7 @@ describe('Dexie migrations', () => {
       { ...chatBase, id: 'chat-google', settings: googleSettings },
       { ...chatBase, id: 'chat-anthropic', settings: anthropicSettings },
     ])
-    await legacy.table<ChatPreset>('presets').put({
+    await legacy.table<Record<string, unknown>>('presets').put({
       id: 'preset-openai',
       name: 'OpenAI preset',
       connectionProfileId: 'profile-openai',
@@ -846,7 +846,7 @@ describe('Dexie migrations', () => {
 
     const migrated = createDbForTests(name)
     await migrated.open()
-    expect(migrated.verno).toBe(18)
+    expect(migrated.verno).toBe(19)
     const openaiChat = await migrated.chats.get('chat-openai')
     const googleChat = await migrated.chats.get('chat-google')
     const anthropicChat = await migrated.chats.get('chat-anthropic')
@@ -869,6 +869,49 @@ describe('Dexie migrations', () => {
       expect(row.responsesDefaults).toBeUndefined()
       expect(row.geminiDefaults).toBeUndefined()
     }
+    await migrated.delete()
+  })
+
+  it('migrates chat preset picker order into dense sortIndex values', async () => {
+    const name = `natter-test-preset-sort-index-mig-${Math.random().toString(36).slice(2)}`
+    await Dexie.delete(name)
+    const settings = cloneDefaultChatSettings()
+    settings.profileId = 'profile-openai'
+    settings.model = 'gpt-4o'
+
+    const legacy = new Dexie(name)
+    registerLegacyChatSettingsV14(legacy)
+    await legacy.open()
+    await legacy.table<Record<string, unknown>>('presets').bulkPut([
+      {
+        id: 'preset-second',
+        name: 'Second',
+        connectionProfileId: 'profile-openai',
+        settings,
+        createdAt: 20,
+        updatedAt: 20,
+      },
+      {
+        id: 'preset-first',
+        name: 'First',
+        connectionProfileId: 'profile-openai',
+        settings,
+        createdAt: 10,
+        updatedAt: 10,
+      },
+    ])
+    legacy.close()
+
+    const migrated = createDbForTests(name)
+    await migrated.open()
+    expect(migrated.verno).toBe(19)
+    const rows = (await migrated.presets.toArray()).sort(
+      (left, right) => left.sortIndex - right.sortIndex,
+    )
+    expect(rows.map((row) => [row.id, row.sortIndex])).toEqual([
+      ['preset-first', 0],
+      ['preset-second', 1],
+    ])
     await migrated.delete()
   })
 

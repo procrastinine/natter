@@ -19,7 +19,7 @@
 // inline editor body lives inside <Message> so the row can swap the
 // content block for a textarea cleanly.
 
-import { useCallback, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { Message, MessageId } from '../../core/types'
 import { applyStructuralSnapshot, snapshotMessages } from '../../core/undo'
 import {
@@ -36,6 +36,7 @@ import { useToastStore } from '../../store/zustand/toastStore'
 import { useUiStore } from '../../store/zustand/uiStore'
 import {
   BranchIcon,
+  CheckIcon,
   CopyIcon,
   EyeIcon,
   EyeOffIcon,
@@ -48,6 +49,8 @@ import {
 import { ConfirmDeleteDialog } from './ConfirmDeleteDialog'
 
 export type InsertSlot = 'before' | 'after' | 'sibling'
+
+const COPY_CONFIRM_MS = 2500
 
 interface MessageActionsProps {
   message: Message
@@ -169,6 +172,7 @@ export function MessageActions(props: MessageActionsProps) {
   } = props
   const [copied, setCopied] = useState(false)
   const [confirmOpen, setConfirmOpen] = useState(false)
+  const copyTimerRef = useRef<number | null>(null)
   const isAssistant = message.role === 'assistant'
   const abortReason = message.generation?.abortReason
   const runDelete = useRunDelete(chatId, message, cursor, roleMismatch)
@@ -180,9 +184,30 @@ export function MessageActions(props: MessageActionsProps) {
       .trim()
       .slice(0, 200) || `(empty ${message.role} message)`
 
+  const markCopied = useCallback(() => {
+    if (copyTimerRef.current !== null) {
+      window.clearTimeout(copyTimerRef.current)
+    }
+    setCopied(true)
+    copyTimerRef.current = window.setTimeout(() => {
+      setCopied(false)
+      copyTimerRef.current = null
+    }, COPY_CONFIRM_MS)
+  }, [])
+
+  useEffect(
+    () => () => {
+      if (copyTimerRef.current !== null) {
+        window.clearTimeout(copyTimerRef.current)
+      }
+    },
+    [],
+  )
+
   const handleCopy = useCallback(async () => {
     if (onCopy) {
       await onCopy()
+      markCopied()
       return
     }
     const plain = message.content
@@ -190,14 +215,13 @@ export function MessageActions(props: MessageActionsProps) {
       .join('')
     try {
       await navigator.clipboard.writeText(plain)
-      setCopied(true)
-      window.setTimeout(() => setCopied(false), 1500)
+      markCopied()
     } catch {
       // navigator.clipboard can reject in non-secure contexts; swallow
       // rather than surface a banner — the user can select+copy as a
       // fallback.
     }
-  }, [message.content, onCopy])
+  }, [markCopied, message.content, onCopy])
 
   const disabledTitle = disabledReason ?? 'Add a connection to send messages.'
   const generationDisabled = !hasConnection || generationBusy
@@ -228,7 +252,7 @@ export function MessageActions(props: MessageActionsProps) {
         aria-label={copied ? 'Copied' : 'Copy message'}
         title={copied ? 'Copied' : 'Copy'}
       >
-        <CopyIcon size={14} />
+        {copied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
       </button>
       <button
         type="button"

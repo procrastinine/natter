@@ -19,6 +19,7 @@ import {
   pickMruPreset,
   pickMruPresetForProfile,
   pickPreferredPreset,
+  reorderPresets,
   unarchivePreset,
   updatePreset,
 } from '../../src/store/presets'
@@ -178,6 +179,63 @@ describe('listPresets', () => {
     })
     await archivePreset(preset.id)
     expect((await getPreset(preset.id))?.id).toBe(preset.id)
+  })
+
+  it('orders visible presets by manual sortIndex', async () => {
+    const profileId = await fakeProfileId()
+    const first = await createPreset({
+      name: 'first',
+      connectionProfileId: profileId,
+      settings: settingsFor(profileId),
+      now: 100,
+      sortIndex: 20,
+    })
+    const second = await createPreset({
+      name: 'second',
+      connectionProfileId: profileId,
+      settings: settingsFor(profileId),
+      now: 200,
+      sortIndex: 10,
+    })
+
+    expect((await listPresets()).map((p) => p.id)).toEqual([second.id, first.id])
+  })
+})
+
+describe('reorderPresets', () => {
+  it('persists drag order without changing MRU default selection', async () => {
+    const profileId = await fakeProfileId()
+    const olderMru = await createPreset({
+      name: 'older-mru',
+      connectionProfileId: profileId,
+      settings: settingsFor(profileId),
+      lastUsedAt: 1000,
+    })
+    const newestMru = await createPreset({
+      name: 'newest-mru',
+      connectionProfileId: profileId,
+      settings: settingsFor(profileId),
+      lastUsedAt: 9000,
+    })
+    const neverUsed = await createPreset({
+      name: 'never-used',
+      connectionProfileId: profileId,
+      settings: settingsFor(profileId),
+    })
+
+    await reorderPresets([neverUsed.id, olderMru.id, newestMru.id], { now: 300 })
+
+    expect((await listPresets()).map((p) => p.id)).toEqual([
+      neverUsed.id,
+      olderMru.id,
+      newestMru.id,
+    ])
+    expect((await pickMruPreset())?.id).toBe(newestMru.id)
+    expect((await getPreset(neverUsed.id))?.updatedAt).toBe(300)
+  })
+
+  it('rejects missing preset ids', async () => {
+    await expect(reorderPresets(['missing'])).rejects.toBeInstanceOf(PresetMissingError)
   })
 })
 

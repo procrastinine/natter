@@ -10,6 +10,7 @@ import {
   adjustGpt54SamplingGate,
   allowedEffortFor,
   allowedVerbosityFor,
+  emitsEncryptedReasoningFor,
   quirksFor,
   reasoningPreservationFormatFor,
 } from '../../src/core/quirks'
@@ -105,6 +106,25 @@ describe('API routing hints', () => {
       expect(q.requiresPhaseEcho).toBe(true)
       expect(q.gpt54SamplingGate).toBe(true)
     }
+  })
+
+  it('GPT-5.5 inherits GPT-5.4 Responses and encrypted-reasoning behavior', () => {
+    const q = quirksFor('openai/gpt-5.5')
+    expect(q).toMatchObject({
+      preferApi: 'responses',
+      persistsResponsesPhase: true,
+      requiresPhaseEcho: true,
+      gpt54SamplingGate: true,
+      reasoningPreservationFormat: 'openai-responses-v1',
+    })
+    expect(quirksFor('openai/gpt-5.5-pro').requiresResponsesApi).toBe(true)
+    expect(allowedEffortFor('openai/gpt-5.5')).toEqual(['none', 'low', 'medium', 'high', 'xhigh'])
+    expect(allowedVerbosityFor('openai/gpt-5.5')).toEqual(['low', 'medium', 'high', 'xhigh'])
+    expect(emitsEncryptedReasoningFor('openai/gpt-5.5')).toBe('always')
+    expect(reasoningPreservationFormatFor('openai/gpt-5.5-2026-05-08')).toBe(
+      'openai-responses-v1',
+    )
+    expect(reasoningPreservationFormatFor('openai/gpt-5.5-llama')).toBeUndefined()
   })
 
   it('o-series prefers Responses for encrypted reasoning', () => {

@@ -1162,6 +1162,52 @@ export function registerSchema(db: Dexie): void {
           delete row.geminiDefaults
         })
     })
+
+  // v19: ChatPreset picker order is a first-class row field. Backfill dense
+  // indices once so live preset listing never has to branch on legacy rows.
+  db.version(19)
+    .stores({
+      chats:
+        'id, updatedAt, createdAt, lastViewedAt, lastUpdatedLeafId, lastBranchUpdatedAt, wordCount, totalCostUsd, archived, pinned, presetId, folderId, *tags',
+      messages:
+        'id, chatId, parentId, turnId, [chatId+parentId], [chatId+createdAt], [chatId+turnId], [chatId+deleted]',
+      messageBodies: '&id, chatId, updatedAt, nodeVersion',
+      childLists: 'id, [chatId+parentId], updatedAt',
+      attachments: 'id, contentHash, kind, mime, origin, refCount, createdAt, updatedAt, deletedAt',
+      attachmentBlobs: 'id, attachmentId, role, contentHash, createdAt',
+      attachmentArtifacts: 'artifactId, attachmentId, kind, processorId, createdAt',
+      attachmentJobs:
+        'id, attachmentId, processorId, status, updatedAt, [attachmentId+processorId+inputHash]',
+      profiles: 'id, name, kind, lastUsedAt, archived',
+      presets: 'id, name, connectionProfileId, sortIndex, lastUsedAt, archived',
+      promptPresets: 'id, kind, name, lastUsedAt',
+      folders: 'id, name, sortIndex, lastUsedAt',
+      tags: 'id, &nameLower, lastUsedAt',
+      chatBranchCache: '&chatId, branchLeafId, generatedAt',
+      keys: 'id, name',
+      settings: '&key',
+      streamLeases: '&streamId, chatId, ownerClientId, heartbeatAt',
+      streamChunks: '&id, streamId, chatId, messageId, [streamId+seq], createdAt',
+      models: '&[profileId+queryKey], fetchedAt',
+      endpoints: '&[profileId+modelId], fetchedAt',
+      privacyPolicies: '&[profileId+modelId], fetchedAt',
+      providers: '&profileId, fetchedAt',
+      generations: 'id, chatId, gen_id',
+      presetResolutions: '&[profileId+presetSlug], fetchedAt',
+      drafts: '&chatId, updatedAt',
+    })
+    .upgrade(async (tx) => {
+      const table = tx.table<ChatPreset>('presets')
+      const rows = await table.toArray()
+      rows.sort((left, right) => {
+        const bySort =
+          numberOr(left.sortIndex, left.createdAt) - numberOr(right.sortIndex, right.createdAt)
+        if (bySort !== 0) return bySort
+        const byCreatedAt = left.createdAt - right.createdAt
+        return byCreatedAt !== 0 ? byCreatedAt : left.id.localeCompare(right.id)
+      })
+      await table.bulkPut(rows.map((row, sortIndex) => ({ ...row, sortIndex })))
+    })
 }
 
 function organizationDefaultsPatch(

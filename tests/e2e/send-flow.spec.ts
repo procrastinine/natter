@@ -51,6 +51,42 @@ test('happy path: streamed SSE renders and persists the final row', async ({ pag
   expect(assistantRow.generation.cost).toBeCloseTo(0.00001)
 })
 
+test('delayed stream start keeps the sent turn visible before first bytes arrive', async ({
+  page,
+}) => {
+  let releaseResponse!: () => void
+  const responseGate = new Promise<void>((resolve) => {
+    releaseResponse = resolve
+  })
+  let markRequestSeen!: () => void
+  const requestSeen = new Promise<void>((resolve) => {
+    markRequestSeen = resolve
+  })
+  await page.route('**/api/v1/chat/completions', async (route) => {
+    markRequestSeen()
+    await responseGate
+    await route.fulfill({
+      contentType: 'text/event-stream',
+      body: buildSseBody([{ id: 'gen-delay', content: 'finally started', finish: 'stop' }]),
+    })
+  })
+  await createChatAndOpen(page)
+  await sendMessage(page, 'slow network')
+  await requestSeen
+
+  const user = page.locator('[data-ui="message"][data-role="user"]').first()
+  await expect(user.locator('[data-ui="message-body"]')).toHaveText('slow network')
+  await expect(page.locator('[data-ui="message"][data-role="assistant"]').first()).toBeVisible()
+
+  const chatId = await firstChatId(page)
+  const midRows = await readMessages(page, chatId)
+  expect(midRows.map((row) => row.role)).toEqual(['user', 'assistant'])
+
+  releaseResponse()
+  const assistant = page.locator('[data-ui="message"][data-role="assistant"]').first()
+  await expect(assistant.locator('[data-ui="message-body"]')).toHaveText('finally started')
+})
+
 test('buffered JSON fallback renders the same final content as streaming', async ({ page }) => {
   await mockChatCompletions(page, {
     json: {

@@ -129,6 +129,14 @@ export function CopyIcon({ size = 18, ariaLabel }: IconProps) {
   )
 }
 
+export function CheckIcon({ size = 18, ariaLabel }: IconProps) {
+  return (
+    <BaseSvg size={size} {...(ariaLabel ? { 'aria-label': ariaLabel } : {})}>
+      <polyline points="20 6 9 17 4 12" />
+    </BaseSvg>
+  )
+}
+
 // Reload / regenerate (single semicircular arrow with a chevron tip).
 export function ReloadIcon({ size = 18, ariaLabel }: IconProps) {
   return (
@@ -422,6 +430,19 @@ export function SortIcon({ size = 18, ariaLabel }: IconProps) {
       <polyline points="4 7 7 4 10 7" />
       <path d="M17 20V4" />
       <polyline points="14 17 17 20 20 17" />
+    </BaseSvg>
+  )
+}
+
+export function GripVerticalIcon({ size = 18, ariaLabel }: IconProps) {
+  return (
+    <BaseSvg size={size} {...(ariaLabel ? { 'aria-label': ariaLabel } : {})}>
+      <circle cx="9" cy="5" r="1" fill="currentColor" stroke="none" />
+      <circle cx="9" cy="12" r="1" fill="currentColor" stroke="none" />
+      <circle cx="9" cy="19" r="1" fill="currentColor" stroke="none" />
+      <circle cx="15" cy="5" r="1" fill="currentColor" stroke="none" />
+      <circle cx="15" cy="12" r="1" fill="currentColor" stroke="none" />
+      <circle cx="15" cy="19" r="1" fill="currentColor" stroke="none" />
     </BaseSvg>
   )
 }

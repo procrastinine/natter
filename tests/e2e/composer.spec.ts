@@ -32,9 +32,35 @@ test('empty composer input does not show a vertical scrollbar', async ({ page })
   expect(metrics.scrollHeight).toBeLessThanOrEqual(metrics.clientHeight + 1)
 })
 
+test('composer input overscroll backing matches the input surface', async ({ page }) => {
+  const metrics = await page.locator('[data-ui="composer-input"]').evaluate((el) => {
+    const input = el as HTMLTextAreaElement
+    const shell = input.parentElement as HTMLElement | null
+    const inputStyle = getComputedStyle(input)
+    const shellStyle = shell ? getComputedStyle(shell) : null
+    return {
+      inputBackground: inputStyle.backgroundColor,
+      shellBackground: shellStyle?.backgroundColor ?? '',
+      shellOverflowY: shellStyle?.overflowY ?? '',
+      shellUi: shell?.dataset.ui ?? '',
+    }
+  })
+
+  expect(metrics.shellUi).toBe('composer-input-shell')
+  expect(metrics.shellBackground).toBe(metrics.inputBackground)
+  expect(metrics.shellOverflowY).toBe('hidden')
+})
+
 test('composer sections square off internal corners and match divider strength', async ({
   page,
 }) => {
+  await mockChatCompletions(page, {
+    body: buildSseBody([{ id: 'composer-style-setup', content: 'ok', finish: 'stop' }]),
+  })
+  await page.locator('[data-ui="composer-input"]').fill('style setup')
+  await page.locator('[data-ui="send"]').click()
+  await expect(page.locator('[data-ui="message"][data-role="assistant"]')).toBeVisible()
+
   const closedMetrics = await page.locator('[data-ui="composer-body"]').evaluate((el) => {
     const body = el as HTMLElement
     const input = body.querySelector('[data-ui="composer-input"]') as HTMLElement
