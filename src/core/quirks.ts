@@ -6,7 +6,8 @@
 // What it CAN'T report:
 // - which enum values inside `reasoning.effort` / `verbosity` are actually
 //   honored (vs silently remapped down)
-// - adaptive-only reasoning (Claude 4.6/4.7 ignore effort)
+// - adaptive reasoning (Claude 4.6/4.7 ignore reasoning.effort; 4.7 also
+//   ignores/removes manual budgets)
 // - Responses-API-required models (GPT-5.3-Codex / 5.4+ Pro)
 // - cache min-token floors per Anthropic variant
 // - `cache_control` top-level vs per-block requirement per endpoint (Bedrock
@@ -77,8 +78,8 @@ interface QuirksEntry {
   //  - `unknown` (DeepSeek-R1 / Qwen3 / Gemma): no opaque round-trip exists;
   //    plaintext `<think>` tags only.
   reasoningPreservationFormat?: ReasoningFormat
-  // Claude 4.6 / 4.7 use adaptive reasoning: `reasoning` is in
-  // supported_parameters but `effort` is silently ignored.
+  // Claude 4.7 uses adaptive-only reasoning: `reasoning` is in
+  // supported_parameters but `effort` and `max_tokens` are silently ignored.
   adaptiveReasoningOnly?: boolean
   // Anthropic cache floor: "cache_control" below this token count is
   // not honored. One floor per variant per CLAUDE.md.
@@ -180,18 +181,18 @@ const REGISTRY: Record<string, QuirksEntry> = {
     cacheMinTokens: 4096,
     reasoningPreservationFormat: 'anthropic-claude-v1',
   },
-  // Anthropic 4.6 — adaptive-only reasoning. Verbosity `max` is new on
+  // Anthropic 4.6 — adaptive reasoning is recommended and
+  // `reasoning.effort` is ignored, but manual budget reasoning is still
+  // accepted when `reasoning.max_tokens` is set. Verbosity `max` is new on
   // 4.6; `xhigh` falls back to `high` so it is dropped from the allowed
   // set to avoid rendering a button that silently no-ops.
   'claude-opus-4.6': {
-    adaptiveReasoningOnly: true,
     allowedEffort: [],
     allowedVerbosity: ['low', 'medium', 'high', 'max'],
     cacheMinTokens: 4096,
     reasoningPreservationFormat: 'anthropic-claude-v1',
   },
   'claude-sonnet-4.6': {
-    adaptiveReasoningOnly: true,
     allowedEffort: [],
     allowedVerbosity: ['low', 'medium', 'high', 'max'],
     cacheMinTokens: 2048,

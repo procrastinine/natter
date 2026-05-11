@@ -486,8 +486,9 @@
 
 [data-ui="provider-picker-row-head"] {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: var(--space-2);
+  min-width: 0;
 }
 
 [data-ui="provider-picker-row-actions"] {
@@ -522,10 +523,11 @@
 
 [data-ui="provider-picker-toggle"] {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: var(--space-2);
   cursor: pointer;
-  flex: 0 0 auto;
+  flex: 1 1 auto;
+  min-width: 0;
 }
 
 [data-ui="provider-picker-row"][data-insufficient-context="true"]
@@ -612,6 +614,7 @@
   flex: 0 0 auto;
   line-height: 0;
   color: var(--color-fg-muted);
+  margin-top: 1px;
 }
 
 [data-ui="provider-picker-lock"][data-privacy-tier="green"] {
@@ -640,6 +643,8 @@
 
 [data-ui="provider-picker-toggle"] input[type="checkbox"] {
   accent-color: var(--color-accent);
+  flex: 0 0 auto;
+  margin-top: 2px;
 }
 
 [data-ui="provider-picker-details"] {
@@ -670,9 +675,17 @@
 }
 
 [data-ui="provider-picker-name"] {
+  display: -webkit-box;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow-wrap: anywhere;
   font-weight: var(--font-weight-semibold);
   color: var(--color-fg-primary);
   font-size: var(--font-size-sm);
+  line-height: 1.25;
 }
 
 [data-ui="provider-picker-stats"] {

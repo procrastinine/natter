@@ -1009,6 +1009,7 @@ function ReasoningSection({ chat, capability }: { chat: Chat; capability: Effect
   const supportsReasoning =
     capability.supportedParameters.has('reasoning') ||
     capability.supportedParameters.has('thinking')
+  const supportsBudget = supportsReasoning && !adaptiveOnly
   // Models in the P.7 reasoning-required list reject `reasoning.enabled:
   // false` outright (or accept it silently while still emitting reasoning
   // tokens). Hide the "off" mode so the UI doesn't offer a setting that
@@ -1019,9 +1020,14 @@ function ReasoningSection({ chat, capability }: { chat: Chat; capability: Effect
   const modes = (['default', 'off', 'enabled', 'effort', 'budget'] as const).filter((m) => {
     if (m === 'off') return reasoningToggleable
     if (m === 'effort') return effortChoices.length > 0
-    if (m === 'budget') return supportsReasoning
+    if (m === 'budget') return supportsBudget
     return true
   })
+  const modeInfo = adaptiveOnly
+    ? 'This model uses adaptive thinking when enabled; effort and budget are ignored.'
+    : effortChoices.length === 0 && supportsBudget
+      ? 'Enabled uses adaptive thinking. Budget uses a fixed token cap.'
+      : null
   const r = chat.settings.reasoning
   const updateReasoning = (patch: Partial<typeof r>) => {
     void updateChatSettings(chat.id, { reasoning: { ...r, ...patch } })
@@ -1029,60 +1035,49 @@ function ReasoningSection({ chat, capability }: { chat: Chat; capability: Effect
   return (
     <section data-ui="settings-section" data-ui-section="reasoning">
       <h3>Reasoning</h3>
-      {adaptiveOnly ? (
-        // Claude 4.6/4.7: the model picks its own effort. Exposing Mode +
-        // Effort would mislead the user into thinking their clicks matter.
-        // The section header + the include/summary sub-controls below are
-        // still rendered (they DO matter, Anthropic returns signed reasoning
-        // text that can be echoed on the next turn).
-        <div data-ui="field-group" data-ui-field>
-          <span data-ui="helper">This model decides reasoning effort automatically.</span>
+      <div data-ui="field-group" data-ui-field>
+        <span>
+          Mode {modeInfo ? <InfoDisclosure title={modeInfo} /> : null}
+        </span>
+        <div data-ui="segmented">
+          {modes.map((m) => (
+            <button
+              key={m}
+              type="button"
+              data-ui="segmented-option"
+              aria-pressed={r.mode === m}
+              onClick={() => updateReasoning({ mode: m })}
+            >
+              {m}
+            </button>
+          ))}
         </div>
-      ) : (
-        <>
-          <div data-ui="field-group" data-ui-field>
-            <span>Mode</span>
-            <div data-ui="segmented">
-              {modes.map((m) => (
-                <button
-                  key={m}
-                  type="button"
-                  data-ui="segmented-option"
-                  aria-pressed={r.mode === m}
-                  onClick={() => updateReasoning({ mode: m })}
-                >
-                  {m}
-                </button>
-              ))}
-            </div>
+      </div>
+      {r.mode === 'effort' && effortChoices.length > 0 ? (
+        <div data-ui="field-group" data-ui-field>
+          <span>Effort</span>
+          <div data-ui="segmented">
+            {effortChoices.map((e) => (
+              <button
+                key={e}
+                type="button"
+                data-ui="segmented-option"
+                aria-pressed={r.effort === e}
+                onClick={() => updateReasoning({ effort: e })}
+              >
+                {e}
+              </button>
+            ))}
           </div>
-          {r.mode === 'effort' && effortChoices.length > 0 ? (
-            <div data-ui="field-group" data-ui-field>
-              <span>Effort</span>
-              <div data-ui="segmented">
-                {effortChoices.map((e) => (
-                  <button
-                    key={e}
-                    type="button"
-                    data-ui="segmented-option"
-                    aria-pressed={r.effort === e}
-                    onClick={() => updateReasoning({ effort: e })}
-                  >
-                    {e}
-                  </button>
-                ))}
-              </div>
-            </div>
-          ) : null}
-          {r.mode === 'budget' ? (
-            <ReasoningBudgetControl
-              max={capability.maxCompletionTokens ?? 32000}
-              value={r.maxTokens}
-              onCommit={(next) => updateReasoning({ maxTokens: next })}
-            />
-          ) : null}
-        </>
-      )}
+        </div>
+      ) : null}
+      {r.mode === 'budget' && supportsBudget ? (
+        <ReasoningBudgetControl
+          max={capability.maxCompletionTokens ?? 32000}
+          value={r.maxTokens}
+          onCommit={(next) => updateReasoning({ maxTokens: next })}
+        />
+      ) : null}
       <ReasoningSummaryControl chat={chat} capability={capability} />
     </section>
   )

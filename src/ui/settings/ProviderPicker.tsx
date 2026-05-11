@@ -496,7 +496,9 @@ function ProviderRow({
               : {})}
           />
           {row.state !== 'no-filter' ? <PrivacyLock tier={row.tier} title={lockTitle} /> : null}
-          <span data-ui="provider-picker-name">{label}</span>
+          <span data-ui="provider-picker-name" title={label}>
+            {label}
+          </span>
         </label>
         <div data-ui="provider-picker-row-actions">
           <button

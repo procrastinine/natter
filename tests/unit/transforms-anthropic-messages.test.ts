@@ -67,6 +67,49 @@ describe('toAnthropicMessages', () => {
     expect(wire.model).toBe('claude-haiku-4-5')
   })
 
+  it('uses adaptive thinking and output_config effort for Claude 4.7', () => {
+    const s = settings({
+      model: 'anthropic/claude-opus-4.7',
+      verbosity: 'xhigh',
+      reasoning: { ...settings().reasoning, mode: 'enabled', summary: 'auto' },
+    })
+    const { wire } = toAnthropicMessages(s, [user('u1', 'hard problem')])
+    expect(wire.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
+    expect(wire.output_config).toEqual({ effort: 'xhigh' })
+  })
+
+  it('uses manual budget thinking for Claude 4.6 only when a budget is set', () => {
+    const s = settings({
+      model: 'anthropic/claude-opus-4.6',
+      reasoning: { ...settings().reasoning, mode: 'budget', maxTokens: 4096 },
+    })
+    const { wire } = toAnthropicMessages(s, [user('u1', 'hard problem')])
+    expect(wire.thinking).toEqual({
+      type: 'enabled',
+      budget_tokens: 4096,
+      display: 'summarized',
+    })
+  })
+
+  it('gates stale Anthropic Messages sampling against current capabilities', () => {
+    const s = settings({
+      model: 'anthropic/claude-opus-4.7',
+      sampling: { temperature: 0.2, top_p: 0.8, top_k: 20 },
+      reasoning: { ...settings().reasoning, mode: 'enabled' },
+    })
+    const { wire } = toAnthropicMessages(s, [user('u1', 'hi')], {
+      capabilities: {
+        supportedParameters: ['max_tokens', 'thinking', 'verbosity'],
+        streaming: 'supported',
+        architecture: { inputModalities: ['text'], outputModalities: ['text'] },
+      },
+    })
+    expect(wire.temperature).toBeUndefined()
+    expect(wire.top_p).toBeUndefined()
+    expect(wire.top_k).toBeUndefined()
+    expect(wire.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
+  })
+
   it('moves system/developer text to top-level system and serializes user content blocks', () => {
     const system = { ...user('s1', 'Be terse.'), role: 'system' as const }
     const { wire } = toAnthropicMessages(settings(), [system, user('u1', 'Hello')])

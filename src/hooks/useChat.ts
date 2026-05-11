@@ -2,10 +2,11 @@
 // `plan/13-delivery.md §13.2.7`.
 //
 // Lifecycle (text-only Phase 7):
-//   1. Persist the user message (via messages.sendUserMessage) before request
-//      planning so slow discovery/preflight still has a visible sent turn.
-//      Persist the assistant placeholder (via continueAssistant-style append
-//      under the user) before the fetch opens.
+//   1. Run a cached zero-eligible privacy preflight, then persist the user
+//      message (via messages.sendUserMessage) before full request planning so
+//      slow discovery/preflight still has a visible sent turn. Persist the
+//      assistant placeholder (via continueAssistant-style append under the
+//      user) before the fetch opens.
 //   2. Compose the wire body from the active path via `send-planning`.
 //   3. Open the stream through the single assistant dispatcher. Feed chunks
 //      through `splitChatStream` into an
@@ -27,6 +28,8 @@ import type { AnthropicStreamChunk } from '../api/anthropic-types'
 import { type AssistantStreamChunk, openAssistantRequestStream } from '../api/assistant-stream'
 import { ApiError } from '../api/errors'
 import type { GeminiStreamChunk } from '../api/gemini-types'
+import { readCachedPrivacyPayload } from '../api/privacy-scrape'
+import { normalizeEndpointsResponse } from '../api/providers'
 import {
   type StreamLaneEvent,
   splitAnthropicStream,
@@ -37,8 +40,10 @@ import {
 import type { ChatStreamChunk, ResponsesStreamChunk } from '../api/types'
 import { activePath, cursorKeyOf, groupByParent } from '../core/active-path'
 import { readGlobalPreferences } from '../core/global-settings'
+import { isFreeModel } from '../core/model-predicates'
 import { sendUserMessage } from '../core/messages'
 import { tokenCalibrationKey } from '../core/model-ids'
+import { buildWireProviderPrivacy, filterEndpointsByPrivacy } from '../core/privacy-filter'
 import {
   providerOutputItemFromGeminiPart,
   providerOutputItemFromResponsesItem,
@@ -69,6 +74,7 @@ import type {
   AbortReason,
   AttachmentRef,
   CapabilityDescriptor,
+  Chat,
   ChatId,
   ChatSettings,
   ChatUsage,
@@ -94,6 +100,8 @@ import {
   materializeGeneratedOutputAttachments,
   mergeGeneratedImageAttachmentRefs,
 } from '../store/generated-images'
+import { getCachedEndpoints, ENDPOINTS_TTL_MS, isFresh } from '../store/models-cache'
+import { getCachedPrivacyPolicy } from '../store/privacy-cache'
 import type { MessageHeaderPatch, StreamChunkRow } from '../store/repository'
 import { loadActiveBranchHeaderSnapshot, loadSendContextForBranch } from '../store/send-context'
 import { isFreshStreamLease, STREAM_LEASE_TTL_MS } from '../store/stream-leases'
@@ -147,6 +155,46 @@ function throwWithZeroEligibleUi(chatId: ChatId, err: unknown): never {
     useUiStore.getState().setZeroEligibleChatId(chatId)
   }
   throw err
+}
+
+async function throwIfCachedPrivacyPreflightZeroEligible(input: {
+  chat: Chat
+  connection: ConnectionProfile
+}): Promise<void> {
+  const { chat, connection } = input
+  if (
+    connection.kind !== 'openrouter' ||
+    !chat.settings.model ||
+    isFreeModel(chat.settings.model)
+  ) {
+    return
+  }
+  const endpointsRow = await getCachedEndpoints(connection.id, chat.settings.model)
+  if (!endpointsRow || !isFresh(endpointsRow.fetchedAt, ENDPOINTS_TTL_MS)) return
+  const descriptor = normalizeEndpointsResponse(endpointsRow.payload)
+  const endpoints = descriptor?.endpoints ?? []
+  if (endpoints.length === 0) return
+
+  const privacyRow = await getCachedPrivacyPolicy(connection.id, chat.settings.model)
+  const cachedPayload = privacyRow ? readCachedPrivacyPayload(privacyRow.payload) : null
+  const policies = cachedPayload?.policies ?? {}
+  const hasCachedPolicies = Object.keys(policies).length > 0
+  if (!hasCachedPolicies && endpoints.some((endpoint) => !endpoint.data_policy)) return
+
+  const filter = filterEndpointsByPrivacy({
+    model: chat.settings.model,
+    endpoints,
+    policies,
+    privacy: chat.settings.privacy,
+  })
+  const prefs = chat.settings.providerPrefs
+  const wire = buildWireProviderPrivacy(filter, chat.settings.privacy, {
+    userTouchedPicker: prefs?.ignoreOverridesFilter === true,
+    ...(prefs?.ignore ? { existingIgnore: prefs.ignore } : {}),
+    ...(prefs?.only ? { existingOnly: prefs.only } : {}),
+    ...(prefs?.order ? { existingOrder: prefs.order } : {}),
+  })
+  if (wire.zeroEligible) throwWithZeroEligibleUi(chat.id, new NoEligibleProvidersError())
 }
 
 async function* laneStreamForRoute(
@@ -369,6 +417,7 @@ export async function sendText(input: SendTextInput): Promise<SendTextResult> {
     const userMessageId = newId()
     const userTurnId = newId()
     const skipTurnCalibration = settingsMayRequestTools(input.connection, chat.settings)
+    await throwIfCachedPrivacyPreflightZeroEligible({ chat, connection: input.connection })
     const userMsg = await sendUserMessage({
       chatId: input.chatId,
       cursor,

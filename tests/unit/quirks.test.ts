@@ -32,6 +32,7 @@ describe('quirks registry', () => {
   it('adaptive-only models narrow allowedEffort to []', () => {
     expect(allowedEffortFor('anthropic/claude-opus-4.7')).toEqual([])
     expect(allowedEffortFor('claude-sonnet-4.6')).toEqual([])
+    expect(quirksFor('claude-opus-4.6').adaptiveReasoningOnly).toBeUndefined()
   })
 
   it('Claude 4.7 verbosity includes "max" and "xhigh"', () => {

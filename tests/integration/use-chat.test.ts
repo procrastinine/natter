@@ -255,6 +255,81 @@ describe('sendText — chat-completions streaming', () => {
     expect(liveMessagesSortedByCreated(await messagesFor(chat.id))).toHaveLength(1)
   })
 
+  it('persists a huge OpenRouter user row before cold provider discovery resolves', async () => {
+    const profile: ConnectionProfile = {
+      ...makeProfile(),
+      id: 'prof-cold',
+      apiKeyRef: 'key-cold',
+    }
+    const chat = await createChat({
+      settings: chatSettings({
+        profileId: profile.id,
+        model: 'openai/gpt-4o',
+      }),
+    })
+    const hugeText = `long-start ${'x'.repeat(512 * 1024)} long-end`
+    let markDiscoveryStarted!: () => void
+    const discoveryStarted = new Promise<void>((resolve) => {
+      markDiscoveryStarted = resolve
+    })
+    let discoverySawUser = false
+    const fetchMock = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      discoverySawUser = liveMessagesSortedByCreated(await messagesFor(chat.id)).some((message) => {
+        const item = message.content[0]
+        return (
+          message.role === 'user' &&
+          item?.type === 'text' &&
+          item.text.length === hugeText.length &&
+          item.text.startsWith('long-start') &&
+          item.text.endsWith('long-end')
+        )
+      })
+      markDiscoveryStarted()
+      const signal = init?.signal ?? (url instanceof Request ? url.signal : undefined)
+      return new Promise<Response>((_resolve, reject) => {
+        const rejectAbort = () => reject(new DOMException('aborted', 'AbortError'))
+        if (signal?.aborted) {
+          rejectAbort()
+          return
+        }
+        signal?.addEventListener('abort', rejectAbort, { once: true })
+      })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const openStream = vi.fn(() =>
+      stream<ChatStreamChunk>({
+        type: 'delta',
+        chunk: {
+          id: 'should-not-open',
+          choices: [{ delta: { content: 'nope' }, finish_reason: 'stop' }],
+        },
+      }),
+    )
+    const controller = new AbortController()
+
+    const sendPromise = sendText({
+      chatId: chat.id,
+      connection: profile,
+      apiKey: 'sk-test',
+      content: [{ type: 'text', text: hugeText }],
+      openStream,
+      signal: controller.signal,
+    })
+    await discoveryStarted
+
+    expect(discoverySawUser).toBe(true)
+    const midMessages = liveMessagesSortedByCreated(await messagesFor(chat.id))
+    expect(midMessages).toHaveLength(1)
+    expect(midMessages[0]?.role).toBe('user')
+    const item = midMessages[0]?.content[0]
+    expect(item?.type).toBe('text')
+    expect(item?.type === 'text' ? item.text.length : 0).toBe(hugeText.length)
+    expect(openStream).not.toHaveBeenCalled()
+
+    controller.abort()
+    await expect(sendPromise).rejects.toMatchObject({ cause: { kind: 'abort' } })
+  })
+
   it('creates the assistant placeholder before a slow stream yields its first chunk', async () => {
     const chat = await createChat({ settings: chatSettings() })
     let release!: () => void

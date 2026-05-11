@@ -97,6 +97,48 @@ afterEach(async () => {
 })
 
 describe('ParamForm verbosity reset', () => {
+  it('exposes an enabled reasoning mode for adaptive Claude 4.7', async () => {
+    const settings = cloneDefaultChatSettings()
+    settings.model = 'anthropic/claude-opus-4.7'
+    const chat = await createChat({ settings })
+    const capability = effectiveCapabilityFromEndpoints(settings.model, [
+      makeEndpoint({ supported_parameters: ['reasoning', 'verbosity', 'max_tokens'] }),
+    ])
+    const { container } = render(<ParamForm chat={chat} capability={capability} />)
+    const section = container.querySelector('[data-ui-section="reasoning"]')
+    expect(section).toBeTruthy()
+    const modeControl = section?.querySelector('[data-ui="field-group"] [data-ui="segmented"]')
+    const labels = Array.from(
+      modeControl?.querySelectorAll<HTMLButtonElement>('[data-ui="segmented-option"]') ?? [],
+    ).map((button) => button.textContent)
+    expect(labels).toEqual(['default', 'off', 'enabled'])
+    expect(section?.textContent).not.toContain('effort and budget are ignored')
+    expect(section?.querySelector('[data-ui="info-hint"]')?.getAttribute('title')).toContain(
+      'effort and budget are ignored',
+    )
+  })
+
+  it('keeps fixed reasoning budgets available for Claude 4.6', async () => {
+    const settings = cloneDefaultChatSettings()
+    settings.model = 'anthropic/claude-opus-4.6'
+    const chat = await createChat({ settings })
+    const capability = effectiveCapabilityFromEndpoints(settings.model, [
+      makeEndpoint({ supported_parameters: ['reasoning', 'verbosity', 'max_tokens'] }),
+    ])
+    const { container } = render(<ParamForm chat={chat} capability={capability} />)
+    const section = container.querySelector('[data-ui-section="reasoning"]')
+    expect(section).toBeTruthy()
+    const modeControl = section?.querySelector('[data-ui="field-group"] [data-ui="segmented"]')
+    const labels = Array.from(
+      modeControl?.querySelectorAll<HTMLButtonElement>('[data-ui="segmented-option"]') ?? [],
+    ).map((button) => button.textContent)
+    expect(labels).toEqual(['default', 'off', 'enabled', 'budget'])
+    expect(section?.textContent).not.toContain('Budget uses a fixed token cap')
+    expect(section?.querySelector('[data-ui="info-hint"]')?.getAttribute('title')).toContain(
+      'Budget uses a fixed token cap',
+    )
+  })
+
   it('renders a leftmost default option for Claude verbosity controls', async () => {
     const settings = cloneDefaultChatSettings()
     settings.model = 'anthropic/claude-opus-4.6'

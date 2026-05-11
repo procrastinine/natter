@@ -557,6 +557,55 @@ test('GUI duplicate provider display names stay independently selectable by slug
   expectNoConsoleProblems(consoleLines)
 })
 
+test('GUI provider picker wraps long duplicate provider labels inside the settings panel', async ({
+  page,
+}) => {
+  const consoleLines = captureConsole(page)
+  await mockOpenRouterDiscovery(page, OR_CHAT_MODEL, {
+    endpointsPayload: longDuplicateProviderEndpointsPayload(OR_CHAT_MODEL),
+    policyRows: longDuplicateProviderPolicyRows(),
+  })
+
+  await seedFirstRun(page, { model: OR_CHAT_MODEL, disablePrivacyFilter: false })
+  await createChatAndOpen(page)
+  await openSettingsPanel(page)
+
+  const longRow = page
+    .locator('[data-ui="provider-picker-row"]')
+    .filter({ hasText: 'Amazon Bedrock (amazon-bedrock/eu-west-1)' })
+  await expect(longRow).toBeVisible()
+
+  const metrics = await longRow.evaluate((row) => {
+    const panel = row.closest<HTMLElement>('[data-ui="chat-model-panel"]')
+    const name = row.querySelector<HTMLElement>('[data-ui="provider-picker-name"]')
+    const actions = row.querySelector<HTMLElement>('[data-ui="provider-picker-row-actions"]')
+    if (!panel || !name || !actions) throw new Error('provider row layout nodes missing')
+    const rowRect = row.getBoundingClientRect()
+    const panelRect = panel.getBoundingClientRect()
+    const nameRect = name.getBoundingClientRect()
+    const actionsRect = actions.getBoundingClientRect()
+    const style = getComputedStyle(name)
+    return {
+      actionsLeft: actionsRect.left,
+      lineClamp: style.webkitLineClamp,
+      lineHeight: Number.parseFloat(style.lineHeight),
+      nameHeight: nameRect.height,
+      nameRight: nameRect.right,
+      panelRight: panelRect.right,
+      rowRight: rowRect.right,
+    }
+  })
+
+  expect(metrics.lineClamp).toBe('2')
+  expect(metrics.rowRight).toBeLessThanOrEqual(metrics.panelRight + 1)
+  expect(metrics.nameRight).toBeLessThanOrEqual(metrics.actionsLeft - 2)
+  expect(metrics.nameHeight).toBeGreaterThan(metrics.lineHeight * 1.5)
+  expect(metrics.nameHeight).toBeLessThanOrEqual(metrics.lineHeight * 2 + 2)
+  expect(
+    consoleLines.filter((line) => line.startsWith('error:') || line.startsWith('warning:')),
+  ).toEqual([])
+})
+
 test('GUI Google native sends generateContent without OpenRouter provider/privacy wire', async ({
   page,
 }) => {
@@ -1554,6 +1603,36 @@ function duplicateAnthropicEndpointsPayload(modelId: string): Record<string, unk
   }
 }
 
+function longDuplicateProviderEndpointsPayload(modelId: string): Record<string, unknown> {
+  const supported = ['provider', 'temperature', 'max_completion_tokens']
+  return {
+    data: {
+      id: modelId,
+      name: modelId,
+      context_length: 131_072,
+      architecture: {
+        input_modalities: ['text'],
+        output_modalities: ['text'],
+        tokenizer: 'qwen3',
+      },
+      endpoints: [
+        endpoint('Amazon Bedrock', 131_072, supported, {
+          tag: 'amazon-bedrock/eu-west-1',
+          data_policy: policy({}),
+        }),
+        endpoint('Amazon Bedrock', 131_072, supported, {
+          tag: 'amazon-bedrock/us-east-1',
+          data_policy: policy({}),
+        }),
+        endpoint('Anthropic', 131_072, supported, {
+          tag: 'anthropic',
+          data_policy: policy({ requiresUserIDs: true }),
+        }),
+      ],
+    },
+  }
+}
+
 function endpoint(
   provider_name: string,
   context_length: number,
@@ -1587,6 +1666,26 @@ function openRouterProviderPolicyRows(): Array<Record<string, unknown>> {
     provider_name,
     data_policy,
   }))
+}
+
+function longDuplicateProviderPolicyRows(): Array<Record<string, unknown>> {
+  return [
+    {
+      provider_name: 'Amazon Bedrock',
+      provider_slug: 'amazon-bedrock/eu-west-1',
+      data_policy: policy({}),
+    },
+    {
+      provider_name: 'Amazon Bedrock',
+      provider_slug: 'amazon-bedrock/us-east-1',
+      data_policy: policy({}),
+    },
+    {
+      provider_name: 'Anthropic',
+      provider_slug: 'anthropic',
+      data_policy: policy({ requiresUserIDs: true }),
+    },
+  ]
 }
 
 function policy(overrides: Record<string, unknown>): Record<string, unknown> {

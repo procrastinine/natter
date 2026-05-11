@@ -1292,6 +1292,11 @@ export function toAnthropicMessages(
   const streaming = opts.stream !== false
   const quirks = quirksFor(requestedModel)
   const preservationFormat = opts.reasoningPreservationFormat ?? quirks.reasoningPreservationFormat
+  const supported = opts.capabilities?.supportedParameters
+  const gate = (param: string): boolean => {
+    if (!supported) return true
+    return supported.includes(param)
+  }
 
   const rewrittenPath = applyPrefillWireRewrites(path)
   const visible = rewrittenPath.filter((m) => m.hiddenFromContext !== true && !m.deleted)
@@ -1334,13 +1339,22 @@ export function toAnthropicMessages(
   if (streaming) wire.stream = true
   if (systemText.length > 0) wire.system = systemText
 
-  if (settings.sampling.temperature !== undefined) wire.temperature = settings.sampling.temperature
-  if (settings.sampling.top_p !== undefined) wire.top_p = settings.sampling.top_p
-  if (settings.sampling.top_k !== undefined) wire.top_k = settings.sampling.top_k
-  if (settings.stop && settings.stop.length > 0) wire.stop_sequences = [...settings.stop]
+  if (settings.sampling.temperature !== undefined && gate('temperature')) {
+    wire.temperature = settings.sampling.temperature
+  }
+  if (settings.sampling.top_p !== undefined && gate('top_p')) wire.top_p = settings.sampling.top_p
+  if (settings.sampling.top_k !== undefined && gate('top_k')) wire.top_k = settings.sampling.top_k
+  if (settings.stop && settings.stop.length > 0 && gate('stop_sequences')) {
+    wire.stop_sequences = [...settings.stop]
+  }
 
-  const thinking = buildAnthropicThinking(settings)
-  if (thinking) wire.thinking = thinking
+  if (gate('thinking')) {
+    const thinking = buildAnthropicThinking(settings)
+    if (thinking) wire.thinking = thinking
+  }
+  if (settings.verbosity !== undefined && gate('verbosity')) {
+    wire.output_config = { effort: settings.verbosity }
+  }
 
   if (opts.hostedToolsProvider === 'anthropic') {
     const tools = buildAnthropicServerTools(settings)
@@ -1363,9 +1377,35 @@ function buildAnthropicThinking(settings: ChatSettings): Record<string, unknown>
   const r = settings.reasoning
   if (r.mode === 'default') return undefined
   if (r.mode === 'off') return { type: 'disabled' }
+
+  const modelId = normalizeAnthropicModelId(settings.model)
+  const isClaude47 = /^claude-opus-4-7(?:-|$)/u.test(modelId)
+  const isClaude46 = /^claude-(?:opus|sonnet)-4-6(?:-|$)/u.test(modelId)
+
+  if (isClaude47) return anthropicAdaptiveThinking(r)
+  if (isClaude46 && r.mode !== 'budget') return anthropicAdaptiveThinking(r)
+  if (isClaude46 && r.maxTokens === undefined) return anthropicAdaptiveThinking(r)
+
   const out: Record<string, unknown> = { type: 'enabled' }
   if (r.maxTokens !== undefined) out.budget_tokens = r.maxTokens
+  const display = anthropicThinkingDisplay(r)
+  if (display) out.display = display
   return out
+}
+
+function anthropicAdaptiveThinking(r: ChatSettings['reasoning']): Record<string, unknown> {
+  const out: Record<string, unknown> = { type: 'adaptive' }
+  const display = anthropicThinkingDisplay(r)
+  if (display) out.display = display
+  return out
+}
+
+function anthropicThinkingDisplay(
+  r: ChatSettings['reasoning'],
+): 'summarized' | 'omitted' | undefined {
+  if (r.exclude || r.summary === 'off') return 'omitted'
+  if (r.summary !== undefined) return 'summarized'
+  return undefined
 }
 
 function anthropicToolChoice(choice: ChatSettings['tools']['anthropic']['toolChoice']): unknown {
