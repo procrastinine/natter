@@ -83,7 +83,7 @@ export async function mergeTagInto(
       if (!current) return
       const currentNext = mergeTagIds(current.tags, sourceTagId, targetTagId)
       if (sameStringList(current.tags, currentNext)) return
-      ctx.patchChatMeta(chat.id, { tags: currentNext, updatedAt: now })
+      ctx.patchChatMeta(chat.id, { tags: currentNext }, { touchSummary: false })
     })
     affectedChatIds.push(chat.id)
   }

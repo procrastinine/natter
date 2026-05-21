@@ -1237,9 +1237,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
         const next: Chat = {
           ...row,
           tags: nextTags,
-          updatedAt: now,
           metaVersion: row.metaVersion + 1,
-          summaryVersion: row.summaryVersion + 1,
         }
         await chats.put(next)
         changedChats.push(next)
@@ -1581,7 +1579,11 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
           },
 
           patchChatMeta: (chatId, patch, options = {}) => {
-            const { touchVisibleState = true, broadcast = touchVisibleState } = options
+            const {
+              touchVisibleState = true,
+              touchSummary = touchVisibleState,
+              broadcast = touchVisibleState || touchSummary,
+            } = options
             assertScope({ kind: 'chat-meta', chatId })
             const state = requireChatState(chatId)
             const current = {
@@ -1598,7 +1600,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
                 ...applied,
               }
               state.visibleMetaDirty = true
-              state.summaryVersionDirty = true
+              state.summaryVersionDirty ||= touchSummary
             } else {
               const applied = changedPatch(current, stripMetaPatch(patch))
               if (!applied) return

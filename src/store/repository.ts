@@ -98,6 +98,7 @@ export interface AttachmentBundle {
 
 interface ChatMetaPatchOptions {
   touchVisibleState?: boolean
+  touchSummary?: boolean
   broadcast?: boolean
 }
 

@@ -1,4 +1,4 @@
-import { expect, type Page, test } from '@playwright/test'
+import { expect, type Locator, type Page, test } from '@playwright/test'
 import { buildSseBody, clearIndexedDb, seedFirstRun, seedLinearChat, sendMessage } from './helpers'
 
 test.beforeEach(async ({ page }) => {
@@ -201,6 +201,105 @@ test('sidebar mounts only the first row window and loads more rows manually', as
   await expect(page.locator('[data-ui="chat-row"]')).toHaveCount(65)
   await expect(page.locator('[data-ui="load-more-sidebar"]')).toHaveCount(0)
 })
+
+test('sidebar keeps a loaded row anchored when folders toggle and tag rows grow', async ({
+  page,
+}) => {
+  await seedSidebarScrollMutationFixture(page)
+  await page.goto('/')
+  await page.reload()
+
+  await page.locator('[data-ui="load-more-sidebar"]').click()
+  await page.locator('[data-ui="load-more-sidebar"]').click()
+  await page.locator('[data-ui="load-more-sidebar"]').click()
+  await expect(page.locator('[data-ui="chat-list"]')).toHaveAttribute('data-virtualized', 'true')
+  await scrollSidebarUntilText(page, 'Far folder')
+
+  const farFolder = page.locator('[data-ui="folder-section"]').filter({ hasText: 'Far folder' })
+  const farFolderButton = farFolder.locator('[data-ui="folder-main"]')
+  await expect(farFolderButton).toBeVisible()
+  await alignSidebarRowNearTop(farFolder)
+
+  const beforeExpand = await sidebarRowMetrics(farFolder)
+  await farFolderButton.click()
+  await expect(farFolderButton).toHaveAttribute('aria-expanded', 'true')
+  await page.waitForTimeout(80)
+  const afterExpand = await sidebarRowMetrics(farFolder)
+  expect(afterExpand.renderedCount).toBeGreaterThan(200)
+  expect(afterExpand.scrollTop).toBeGreaterThan(1000)
+  expect(Math.abs(afterExpand.top - beforeExpand.top)).toBeLessThan(6)
+
+  await farFolderButton.click()
+  await expect(farFolderButton).toHaveAttribute('aria-expanded', 'false')
+  await page.waitForTimeout(80)
+  const afterCollapse = await sidebarRowMetrics(farFolder)
+  expect(afterCollapse.renderedCount).toBeGreaterThan(200)
+  expect(afterCollapse.scrollTop).toBeGreaterThan(1000)
+  expect(Math.abs(afterCollapse.top - beforeExpand.top)).toBeLessThan(6)
+
+  const tagTarget = page.locator('[data-ui="chat-row"]').filter({ hasText: 'Tag target chat' })
+  await scrollSidebarUntilText(page, 'Tag target chat')
+  await expect(tagTarget).toBeVisible()
+  await alignSidebarRowNearTop(tagTarget)
+  const beforeTags = await sidebarRowMetrics(tagTarget)
+
+  page.once('dialog', (dialog) => dialog.accept('Alpha, Beta, Gamma'))
+  await tagTarget.hover()
+  await tagTarget.locator('[data-ui="chat-row-menu-button"]').click()
+  await page.locator('[data-ui="chat-row-tags-button"]').click()
+  await expect(tagTarget.locator('[data-ui="chat-row-tag"]')).toHaveCount(3)
+  await page.waitForTimeout(80)
+
+  const afterTags = await sidebarRowMetrics(tagTarget)
+  expect(afterTags.renderedCount).toBeGreaterThan(200)
+  expect(afterTags.scrollTop).toBeGreaterThan(1000)
+  expect(Math.abs(afterTags.top - beforeTags.top)).toBeLessThan(6)
+})
+
+async function alignSidebarRowNearTop(row: Locator): Promise<void> {
+  await row.evaluate((node) => {
+    const list = node.closest('[data-ui="chat-list"]') as HTMLElement | null
+    if (!list) return
+    const rowRect = node.getBoundingClientRect()
+    const listRect = list.getBoundingClientRect()
+    list.scrollTop += rowRect.top - listRect.top - 72
+  })
+}
+
+async function scrollSidebarUntilText(page: Page, text: string): Promise<void> {
+  const list = page.locator('[data-ui="chat-list"]')
+  const matchingRows = page.locator('[data-sidebar-row-key]').filter({ hasText: text })
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    if ((await matchingRows.count()) > 0) return
+    await list.evaluate(
+      (node, attemptIndex) => {
+        const maxScrollTop = Math.max(0, node.scrollHeight - node.clientHeight)
+        node.scrollTop = Math.min(maxScrollTop, attemptIndex * 520)
+      },
+      attempt,
+    )
+    await page.waitForTimeout(40)
+  }
+  throw new Error(`Could not render sidebar row containing ${text}`)
+}
+
+async function sidebarRowMetrics(row: Locator): Promise<{
+  top: number
+  scrollTop: number
+  renderedCount: number
+}> {
+  return row.evaluate((node) => {
+    const list = node.closest('[data-ui="chat-list"]') as HTMLElement | null
+    if (!list) throw new Error('Sidebar list not found')
+    const rowRect = node.getBoundingClientRect()
+    const listRect = list.getBoundingClientRect()
+    return {
+      top: rowRect.top - listRect.top,
+      scrollTop: list.scrollTop,
+      renderedCount: Number(list.dataset.renderedCount ?? 0),
+    }
+  })
+}
 
 async function startMessageCountRecorder(page: Page): Promise<void> {
   await page.evaluate(() => {
@@ -425,4 +524,91 @@ async function seedSidebarChats(
       db.close()
     }
   }, input)
+}
+
+async function seedSidebarScrollMutationFixture(page: Page): Promise<void> {
+  await page.evaluate(async () => {
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const req = indexedDB.open('natter')
+      req.onsuccess = () => resolve(req.result)
+      req.onerror = () => reject(req.error)
+    })
+    const now = Date.now()
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const tx = db.transaction(['presets', 'settings', 'folders', 'chats'], 'readwrite')
+        const presets = tx.objectStore('presets')
+        const settingsStore = tx.objectStore('settings')
+        const folders = tx.objectStore('folders')
+        const chats = tx.objectStore('chats')
+        const presetsReq = presets.getAll()
+        presetsReq.onsuccess = () => {
+          const preset = (presetsReq.result as Array<{ id?: string; settings?: unknown }>)[0]
+          const chatSettings = structuredClone(preset?.settings ?? {})
+          settingsStore.put({ key: 'global:sidebar-render-window-size', value: 75 })
+          settingsStore.put({ key: 'global:sidebar-render-window-load-mode', value: 'manual' })
+          settingsStore.put({ key: 'sidebar:collapsed-folders', value: ['far-folder'] })
+          folders.put({
+            id: 'far-folder',
+            name: 'Far folder',
+            sortIndex: 0,
+            createdAt: now + 795,
+            updatedAt: now + 795,
+            lastUsedAt: now + 795,
+          })
+          for (let i = 0; i < 230; i += 1) {
+            chats.put({
+              id: `sidebar-scroll-chat-${String(i).padStart(3, '0')}`,
+              title: i === 210 ? 'Tag target chat' : `Sidebar scroll chat ${String(i)}`,
+              titleStatus: 'manual',
+              createdAt: now + 1000 - i,
+              updatedAt: now + 1000 - i,
+              lastViewedAt: now + 1000 - i,
+              wordCount: 10,
+              totalCostUsd: 0,
+              metaVersion: 0,
+              summaryVersion: 0,
+              settings: structuredClone(chatSettings),
+              presetId: preset?.id,
+              lastUpdatedLeafId: null,
+              lastBranchUpdatedAt: now + 1000 - i,
+              archived: false,
+              pinned: false,
+              folderId: null,
+              tags: [],
+              previewText: `sidebar scroll preview ${i}`,
+            })
+          }
+          for (let i = 0; i < 6; i += 1) {
+            chats.put({
+              id: `far-folder-chat-${i}`,
+              title: `Far folder chat ${i}`,
+              titleStatus: 'manual',
+              createdAt: now + 795 - i,
+              updatedAt: now + 795 - i,
+              lastViewedAt: now + 795 - i,
+              wordCount: 10,
+              totalCostUsd: 0,
+              metaVersion: 0,
+              summaryVersion: 0,
+              settings: structuredClone(chatSettings),
+              presetId: preset?.id,
+              lastUpdatedLeafId: null,
+              lastBranchUpdatedAt: now + 795 - i,
+              archived: false,
+              pinned: false,
+              folderId: 'far-folder',
+              tags: [],
+              previewText: `far folder preview ${i}`,
+            })
+          }
+        }
+        tx.oncomplete = () => resolve()
+        tx.onerror = () => reject(tx.error)
+        tx.onabort = () => reject(tx.error)
+      })
+    } finally {
+      db.close()
+    }
+  })
 }

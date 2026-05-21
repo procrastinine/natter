@@ -569,7 +569,7 @@ async function setChatTags(
     if (!chat) return
     if (sameStringList(chat.tags, uniqueTagIds)) return
     changed = true
-    ctx.patchChatMeta(chatId, { tags: uniqueTagIds, updatedAt: now })
+    ctx.patchChatMeta(chatId, { tags: uniqueTagIds }, { touchSummary: false })
   })
   if (changed) {
     await Promise.all(uniqueTagIds.map((tagId) => repo.updateTag(tagId, { lastUsedAt: now, now })))
@@ -607,7 +607,7 @@ export async function setChatsTagsFromNames(
           const chat = await ctx.getChat(chatId)
           if (!chat || sameStringList(chat.tags, uniqueTagIds)) continue
           changed = true
-          ctx.patchChatMeta(chatId, { tags: uniqueTagIds, updatedAt: now })
+          ctx.patchChatMeta(chatId, { tags: uniqueTagIds }, { touchSummary: false })
         }
       },
     )
