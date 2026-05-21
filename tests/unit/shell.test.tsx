@@ -1,9 +1,10 @@
-import { cleanup, fireEvent, render, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, waitFor } from '@testing-library/react'
 import 'fake-indexeddb/auto'
 import Dexie from 'dexie'
 import { IDBFactory } from 'fake-indexeddb'
 import { afterEach, beforeEach, describe, expect, it, type MockInstance, vi } from 'vitest'
 import { App } from '../../src/app/App'
+import { cursorKeyOf } from '../../src/core/active-path'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import type { Chat, Message } from '../../src/core/types'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
@@ -12,6 +13,7 @@ import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
 import { createFolder } from '../../src/store/folders'
 import { exportChat } from '../../src/store/import-export'
 import { __resetKeyCacheForTests, createKey } from '../../src/store/keys'
+import { splitMessageForStorage } from '../../src/store/message-storage'
 import { putCachedModels } from '../../src/store/models-cache'
 import { createPreset, getPreset } from '../../src/store/presets'
 import { createProfile } from '../../src/store/profiles'
@@ -530,6 +532,93 @@ describe('shell smoke render', () => {
       expect(window.location.hash).toBe(`#/chat/${chat.id}/message/${originalLeaf.id}`)
       expect(queryByText('original branch answer')).toBeInTheDocument()
       expect(queryByText('newer sibling answer')).not.toBeInTheDocument()
+    })
+  })
+
+  it('does not overwrite a local cursor advance before the new leaf is observable', async () => {
+    const chat = await createChat({
+      title: 'Local Advance',
+      settings: cloneDefaultChatSettings(),
+      now: 1,
+    })
+    const root: Message = {
+      id: 'advance-root',
+      chatId: chat.id,
+      parentId: null,
+      siblingIndex: 0,
+      turnId: 'advance-root',
+      turnIndex: 0,
+      createdAt: 2,
+      role: 'user',
+      origin: 'user',
+      content: [{ type: 'text', text: 'advance prompt' }],
+      nodeVersion: 0,
+      deleted: false,
+    }
+    const originalLeaf: Message = {
+      ...root,
+      id: 'advance-original-leaf',
+      parentId: root.id,
+      siblingIndex: 0,
+      turnId: 'advance-original-leaf',
+      createdAt: 3,
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: 'old local answer' }],
+    }
+    const localLeaf: Message = {
+      ...originalLeaf,
+      id: 'advance-local-leaf',
+      siblingIndex: 1,
+      turnId: 'advance-local-leaf',
+      createdAt: 4,
+      content: [{ type: 'output_text', text: 'new local answer' }],
+    }
+    await putTestMessages([root, originalLeaf])
+    await getDb().chats.put({
+      ...chat,
+      titleStatus: 'manual',
+      previewText: 'advance prompt',
+      lastUpdatedLeafId: originalLeaf.id,
+      lastBranchUpdatedAt: 3,
+      updatedAt: 3,
+    })
+    window.location.hash = `#/chat/${chat.id}`
+
+    const { findByText, queryByText } = render(<App />)
+
+    expect(await findByText('old local answer')).toBeInTheDocument()
+    await waitFor(() => {
+      expect(window.location.hash).toBe(`#/chat/${chat.id}/message/${originalLeaf.id}`)
+    })
+
+    act(() => {
+      useChatStore.getState().setCursor(chat.id, {
+        [cursorKeyOf(null)]: root.id,
+        [cursorKeyOf(root.id)]: localLeaf.id,
+      })
+    })
+
+    expect(useChatStore.getState().getCursor(chat.id)?.[cursorKeyOf(root.id)]).toBe(localLeaf.id)
+
+    const { header, body } = splitMessageForStorage(localLeaf)
+    const db = getDb()
+    await db.transaction('rw', db.messages, db.messageBodies, async () => {
+      await db.messages.put(header)
+      await db.messageBodies.put(body)
+    })
+    await getDb().chats.put({
+      ...chat,
+      titleStatus: 'manual',
+      previewText: 'advance prompt',
+      lastUpdatedLeafId: localLeaf.id,
+      lastBranchUpdatedAt: 4,
+      updatedAt: 4,
+    })
+
+    await waitFor(() => {
+      expect(window.location.hash).toBe(`#/chat/${chat.id}/message/${localLeaf.id}`)
+      expect(queryByText('new local answer')).toBeInTheDocument()
     })
   })
 

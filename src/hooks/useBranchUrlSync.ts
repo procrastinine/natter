@@ -58,14 +58,6 @@ export function useBranchUrlSync(chatId: ChatId | null): void {
     const path = activePath(rows, cursor)
     const leaf = path.at(-1)
     if (!leaf) return
-    // Bare chat routes start with an empty cursor. Pin the branch once it
-    // renders so a later cross-tab sibling does not become this tab's new
-    // default just because it has a greater `createdAt`.
-    const draft = { ...cursor }
-    seedCursorAtMessage(rows, leaf.id, draft)
-    if (!cursorEqual(cursor, draft)) {
-      useChatStore.getState().setCursor(chatId, draft)
-    }
     const desired = chatHref(chatId, leaf.id)
     if (window.location.hash === desired) return
     replaceRoute(desired)
@@ -97,10 +89,34 @@ export function useBranchUrlSync(chatId: ChatId | null): void {
     }
   }
 
+  // Bare chat routes start without a URL pin. Materialize the initially
+  // rendered default branch into this tab's cursor once, so later cross-tab
+  // siblings do not become this tab's default. This must stay out of the
+  // cursor→URL path: local sends advance the cursor before Dexie's live query
+  // necessarily exposes the new row.
+  const pinBareRouteDefault = useRef<(() => void) | null>(null)
+  pinBareRouteDefault.current = () => {
+    if (!chatId || typeof window === 'undefined') return
+    const rows = messagesRef.current
+    if (rows.length === 0) return
+    const route = parseRoute(window.location.hash)
+    if (route.kind !== 'chat' || route.chatId !== chatId || route.pinnedMessageId) return
+    const cursor = useChatStore.getState().getCursor(chatId) ?? {}
+    if (Object.keys(cursor).length > 0) return
+    const leaf = activePath(rows, cursor).at(-1)
+    if (!leaf) return
+    const draft = { ...cursor }
+    seedCursorAtMessage(rows, leaf.id, draft)
+    if (!cursorEqual(cursor, draft)) {
+      useChatStore.getState().setCursor(chatId, draft)
+    }
+  }
+
   // On mount / chatId change / messages load: seed then write.
   // biome-ignore lint/correctness/useExhaustiveDependencies: chatId/messages changes intentionally trigger the ref-backed URL sync.
   useEffect(() => {
     seedCursorFromUrl.current?.()
+    pinBareRouteDefault.current?.()
     writeUrlFromCursor.current?.()
   }, [chatId, messages])
 
@@ -124,6 +140,7 @@ export function useBranchUrlSync(chatId: ChatId | null): void {
   useEffect(() => {
     const onHashChange = () => {
       seedCursorFromUrl.current?.()
+      pinBareRouteDefault.current?.()
       writeUrlFromCursor.current?.()
     }
     window.addEventListener('hashchange', onHashChange)
