@@ -189,6 +189,38 @@ describe('toGeminiNative — thinkingConfig (Gemini 3)', () => {
     expect(wire.generationConfig?.thinkingConfig?.thinkingLevel).toBe('minimal')
   })
 
+  it('detects Gemini 3.x Flash and Pro slugs generically', () => {
+    const flash = toGeminiNative(
+      settings({
+        model: 'google/gemini-3.5-flash',
+        reasoning: {
+          mode: 'enabled',
+          effort: 'medium',
+          exclude: false,
+          summary: 'off',
+          include: { encrypted: true, summary: false, text: false },
+        },
+      }),
+      [user('u1', 'hi')],
+    )
+    expect(flash.wire.generationConfig?.thinkingConfig?.thinkingLevel).toBe('medium')
+
+    const pro = toGeminiNative(
+      settings({
+        model: 'google/gemini-3.5-pro-preview',
+        reasoning: {
+          mode: 'enabled',
+          effort: 'minimal',
+          exclude: false,
+          summary: 'off',
+          include: { encrypted: true, summary: false, text: false },
+        },
+      }),
+      [user('u1', 'hi')],
+    )
+    expect(pro.wire.generationConfig?.thinkingConfig?.thinkingLevel).toBe('low')
+  })
+
   it("settings.reasoning.summary !== 'off' → includeThoughts:true", () => {
     const { wire } = toGeminiNative(
       settings({

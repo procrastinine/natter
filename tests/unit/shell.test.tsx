@@ -18,6 +18,7 @@ import { createProfile } from '../../src/store/profiles'
 import { __resetSearchSessionRunnerForTests } from '../../src/store/search-session'
 import { setSetting } from '../../src/store/settings'
 import { createTag } from '../../src/store/tags'
+import { useChatStore } from '../../src/store/zustand/chatStore'
 import { __resetSearchStoreForTests } from '../../src/store/zustand/searchStore'
 import { useUiStore } from '../../src/store/zustand/uiStore'
 import { readActiveSeedState } from '../../src/ui/header/ConnectionHeader'
@@ -34,6 +35,7 @@ describe('shell smoke render', () => {
     __resetKeyCacheForTests()
     __resetSearchSessionRunnerForTests()
     __resetSearchStoreForTests()
+    useChatStore.getState().reset()
     useUiStore.getState().reset()
     __resetDbForTests()
     window.localStorage.clear()
@@ -455,6 +457,80 @@ describe('shell smoke render', () => {
 
     expect(await findByText('visible active prompt')).toBeInTheDocument()
     expect(await findByText('visible active answer')).toBeInTheDocument()
+  })
+
+  it('keeps an open default branch pinned when a newer sibling leaf arrives', async () => {
+    const chat = await createChat({
+      title: 'Pinned Branch',
+      settings: cloneDefaultChatSettings(),
+      now: 1,
+    })
+    const root: Message = {
+      id: 'pin-root',
+      chatId: chat.id,
+      parentId: null,
+      siblingIndex: 0,
+      turnId: 'pin-root',
+      turnIndex: 0,
+      createdAt: 2,
+      role: 'user',
+      origin: 'user',
+      content: [{ type: 'text', text: 'pin prompt' }],
+      nodeVersion: 0,
+      deleted: false,
+    }
+    const originalLeaf: Message = {
+      ...root,
+      id: 'pin-original-leaf',
+      parentId: root.id,
+      siblingIndex: 0,
+      turnId: 'pin-original-leaf',
+      createdAt: 3,
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: 'original branch answer' }],
+    }
+    const newerSibling: Message = {
+      ...originalLeaf,
+      id: 'pin-newer-sibling',
+      siblingIndex: 1,
+      turnId: 'pin-newer-sibling',
+      createdAt: 4,
+      content: [{ type: 'output_text', text: 'newer sibling answer' }],
+    }
+    await putTestMessages([root, originalLeaf])
+    await getDb().chats.put({
+      ...chat,
+      titleStatus: 'manual',
+      previewText: 'pin prompt',
+      lastUpdatedLeafId: originalLeaf.id,
+      lastBranchUpdatedAt: 3,
+      updatedAt: 3,
+    })
+    window.location.hash = `#/chat/${chat.id}`
+
+    const { findByText, queryByText } = render(<App />)
+
+    expect(await findByText('original branch answer')).toBeInTheDocument()
+    await waitFor(() => {
+      expect(window.location.hash).toBe(`#/chat/${chat.id}/message/${originalLeaf.id}`)
+    })
+
+    await putTestMessages([newerSibling])
+    await getDb().chats.put({
+      ...chat,
+      titleStatus: 'manual',
+      previewText: 'pin prompt',
+      lastUpdatedLeafId: newerSibling.id,
+      lastBranchUpdatedAt: 4,
+      updatedAt: 4,
+    })
+
+    await waitFor(() => {
+      expect(window.location.hash).toBe(`#/chat/${chat.id}/message/${originalLeaf.id}`)
+      expect(queryByText('original branch answer')).toBeInTheDocument()
+      expect(queryByText('newer sibling answer')).not.toBeInTheDocument()
+    })
   })
 
   it('auto-closes the chat settings panel on storage routes', async () => {

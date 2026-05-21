@@ -288,6 +288,30 @@ describe('resolveBundledCapability', () => {
     expect(cap.supportedParameters).not.toContain('reasoning')
     expect(cap.supportedParameters).toContain('thinking')
   })
+
+  it('bundles Gemini 3.5 Flash for Google direct profiles', () => {
+    const cap = resolveBundledCapability(
+      {
+        id: 'p',
+        name: 'Google',
+        kind: 'google',
+        baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',
+        apiKeyRef: 'k',
+        defaultHeaders: {},
+        appTitle: '',
+        appUrl: '',
+        supportsEndpointsApi: false,
+        supportsGenerationApi: false,
+        supportsPrivacyScrape: false,
+        createdAt: 0,
+        updatedAt: 0,
+      },
+      'gemini-3.5-flash',
+    )
+    expect(cap.supportedParameters).toContain('thinking')
+    expect(cap.maxCompletionTokens).toBe(65536)
+    expect(cap.contextLength).toBe(1_048_576)
+  })
 })
 
 describe('validateChatSettings', () => {

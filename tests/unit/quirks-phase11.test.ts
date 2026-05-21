@@ -64,6 +64,7 @@ describe('reasoningPreservationFormat', () => {
       'google/gemini-3.1-pro-preview',
       'google/gemini-3.1-pro-preview-customtools',
       'google/gemini-3.1-flash-lite-preview',
+      'google/gemini-3.5-flash',
       'google/gemini-3-pro-preview',
       'google/gemini-3-flash-preview',
       'google/gemini-2.5-pro',
@@ -125,6 +126,12 @@ describe('API routing hints', () => {
       'openai-responses-v1',
     )
     expect(reasoningPreservationFormatFor('openai/gpt-5.5-llama')).toBeUndefined()
+  })
+
+  it('Gemini 3.x Flash releases inherit encrypted reasoning without a registry row', () => {
+    expect(reasoningPreservationFormatFor('google/gemini-3.5-flash')).toBe('google-gemini-v1')
+    expect(emitsEncryptedReasoningFor('google/gemini-3.5-flash')).toBe('always')
+    expect(emitsEncryptedReasoningFor('google/gemini-2.5-flash')).toBe('never')
   })
 
   it('o-series prefers Responses for encrypted reasoning', () => {

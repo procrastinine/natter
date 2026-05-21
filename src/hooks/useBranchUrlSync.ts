@@ -27,6 +27,12 @@ import type { ChatId, Message } from '../core/types'
 import { loadMessageHeaders } from '../store/chats'
 import { useChatStore } from '../store/zustand/chatStore'
 
+function cursorEqual(left: Record<string, string>, right: Record<string, string>): boolean {
+  const leftEntries = Object.entries(left)
+  if (leftEntries.length !== Object.keys(right).length) return false
+  return leftEntries.every(([key, value]) => right[key] === value)
+}
+
 export function useBranchUrlSync(chatId: ChatId | null): void {
   const messages = useLiveQuery(
     () => (chatId ? loadMessageHeaders(chatId) : Promise.resolve([])),
@@ -52,6 +58,14 @@ export function useBranchUrlSync(chatId: ChatId | null): void {
     const path = activePath(rows, cursor)
     const leaf = path.at(-1)
     if (!leaf) return
+    // Bare chat routes start with an empty cursor. Pin the branch once it
+    // renders so a later cross-tab sibling does not become this tab's new
+    // default just because it has a greater `createdAt`.
+    const draft = { ...cursor }
+    seedCursorAtMessage(rows, leaf.id, draft)
+    if (!cursorEqual(cursor, draft)) {
+      useChatStore.getState().setCursor(chatId, draft)
+    }
     const desired = chatHref(chatId, leaf.id)
     if (window.location.hash === desired) return
     replaceRoute(desired)
@@ -75,16 +89,12 @@ export function useBranchUrlSync(chatId: ChatId | null): void {
     seededRef.current.add(key)
     const target = rows.find((m) => m.id === route.pinnedMessageId)
     if (!target || target.deleted) return
-    // "Already on path" guard — a new-tab URL might happen to name a
-    // message that IS already on the default active path, in which
-    // case the cursor doesn't need to be touched at all. This also makes
-    // the seed idempotent when a cursor-change race fires mid-flight.
     const cursor = useChatStore.getState().getCursor(chatId) ?? {}
-    const currentPath = activePath(rows, cursor)
-    if (currentPath.some((m) => m.id === target.id)) return
     const draft = { ...cursor }
     seedCursorAtMessage(rows, route.pinnedMessageId, draft)
-    useChatStore.getState().setCursor(chatId, draft)
+    if (!cursorEqual(cursor, draft)) {
+      useChatStore.getState().setCursor(chatId, draft)
+    }
   }
 
   // On mount / chatId change / messages load: seed then write.

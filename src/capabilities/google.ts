@@ -33,6 +33,22 @@ const GEMINI_LEGACY_PARAMS = [
 ]
 
 export const GOOGLE_CAPABILITIES: CapabilityTable = {
+  'gemini-3.5-flash': {
+    id: 'gemini-3.5-flash',
+    name: 'Gemini 3.5 Flash',
+    family: 'google',
+    capability: {
+      supportedParameters: GEMINI_3_PARAMS,
+      streaming: 'supported',
+      contextLength: 1_048_576,
+      maxCompletionTokens: 65_536,
+      pricing: { prompt: '0.0000015', completion: '0.000009' },
+      architecture: {
+        inputModalities: ['text', 'image', 'audio', 'video', 'file'],
+        outputModalities: ['text'],
+      },
+    },
+  },
   'gemini-3.1-pro-preview': {
     id: 'gemini-3.1-pro-preview',
     name: 'Gemini 3.1 Pro Preview',

@@ -1622,19 +1622,18 @@ type GeminiFamily =
 
 // Detect Gemini family for thinking-config branching. Per Google's thinking
 // docs:
-//   - Gemini 3 uses `thinkingLevel` (enum): Pro = low/med/high;
+//   - Gemini 3.x uses `thinkingLevel` (enum): Pro = low/med/high;
 //     Flash/Flash-Lite = minimal/low/med/high.
 //   - Gemini 2.5 uses `thinkingBudget` (int); Pro can't disable, Flash can
 //     disable via 0, Flash-Lite can't disable (floor 512).
-// Order matters: check `flash-lite` before `flash` since the former's slug
-// also matches the latter's prefix.
+// Gemini 3 Flash-Lite intentionally shares the Flash enum path; for 2.5,
+// check `flash-lite` before `flash` since the former's slug also matches
+// the latter's prefix.
 function geminiFamily(modelId: string): GeminiFamily {
   const slash = modelId.indexOf('/')
   const stripped = (slash >= 0 ? modelId.slice(slash + 1) : modelId).toLowerCase()
-  if (stripped.startsWith('gemini-3-pro')) return 'gemini-3-pro'
-  if (stripped.startsWith('gemini-3.1-pro')) return 'gemini-3-pro'
-  if (stripped.startsWith('gemini-3-flash')) return 'gemini-3-flash'
-  if (stripped.startsWith('gemini-3.1-flash')) return 'gemini-3-flash'
+  if (/^gemini-3(?:[.-]\d+)?-pro(?:$|-)/u.test(stripped)) return 'gemini-3-pro'
+  if (/^gemini-3(?:[.-]\d+)?-flash(?:$|-)/u.test(stripped)) return 'gemini-3-flash'
   if (stripped.startsWith('gemini-2.5-flash-lite')) return 'gemini-2.5-flash-lite'
   if (stripped.startsWith('gemini-2.5-flash')) return 'gemini-2.5-flash'
   if (stripped.startsWith('gemini-2.5-pro')) return 'gemini-2.5-pro'

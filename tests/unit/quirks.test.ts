@@ -84,10 +84,21 @@ describe('quirks registry', () => {
       'medium',
       'high',
     ])
+    expect(allowedEffortFor('google/gemini-3.5-pro-preview')).toEqual([
+      'low',
+      'medium',
+      'high',
+    ])
   })
 
   it('Gemini 3 Flash allowedEffort includes minimal', () => {
     expect(allowedEffortFor('google/gemini-3.1-flash-lite-preview')).toEqual([
+      'minimal',
+      'low',
+      'medium',
+      'high',
+    ])
+    expect(allowedEffortFor('google/gemini-3.5-flash')).toEqual([
       'minimal',
       'low',
       'medium',
@@ -118,6 +129,7 @@ describe('quirks registry', () => {
     expect(prefillClassFor('openai/gpt-5.4')).toBe('unsupported')
     expect(prefillClassFor('openai/gpt-oss-120b')).toBe('unsupported')
     expect(prefillClassFor('google/gemini-3.1-flash-lite-preview')).toBe('native')
+    expect(prefillClassFor('google/gemini-3.5-flash')).toBe('native')
     expect(prefillClassFor('deepseek/deepseek-r1')).toBe('oss-reasoning-required')
     expect(prefillClassFor('z-ai/glm-5.1')).toBe('oss-toggleable')
   })
@@ -125,6 +137,7 @@ describe('quirks registry', () => {
   it('marks reasoning-required models as non-toggleable', () => {
     expect(reasoningToggleableFor('deepseek/deepseek-r1')).toBe(false)
     expect(reasoningToggleableFor('google/gemini-3.1-flash-lite-preview')).toBe(false)
+    expect(reasoningToggleableFor('google/gemini-3.5-flash')).toBe(false)
     expect(reasoningToggleableFor('z-ai/glm-5.1')).toBe(true)
   })
 

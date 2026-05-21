@@ -375,10 +375,9 @@ const REGISTRY: Record<string, QuirksEntry> = {
   //     cannot be disabled).
   //   - Flash / Flash-Lite tier: `thinkingLevel` enum adds `minimal` (soft
   //     disable; still no hard-disable path).
-  // Split keys so the UI renders the right effort buttons per-family. The
-  // transform in `core/transforms.ts` independently clamps invalid effort
-  // values for Pro. Canonicalization maps `3.1` → `3:1` so the 3.1 key
-  // doesn't accidentally match `gemini-3-…` and vice versa.
+  // Split keys so the UI renders the right effort buttons per-family. New
+  // Gemini 3.x minor releases are handled by `gemini3FamilyQuirks` below;
+  // these rows only pin the already-known slugs.
   'gemini-3.1-pro': {
     allowedEffort: ['low', 'medium', 'high'],
     reasoningPreservationFormat: 'google-gemini-v1',
@@ -392,16 +391,6 @@ const REGISTRY: Record<string, QuirksEntry> = {
     reasoningPreservationFormat: 'google-gemini-v1',
   },
   'gemini-3-flash': {
-    allowedEffort: ['minimal', 'low', 'medium', 'high'],
-    reasoningPreservationFormat: 'google-gemini-v1',
-  },
-  // Fallback catch-alls for any unknown Gemini 3.x variant: take the
-  // conservative (Flash-style) enum that includes minimal.
-  'gemini-3.1': {
-    allowedEffort: ['minimal', 'low', 'medium', 'high'],
-    reasoningPreservationFormat: 'google-gemini-v1',
-  },
-  'gemini-3': {
     allowedEffort: ['minimal', 'low', 'medium', 'high'],
     reasoningPreservationFormat: 'google-gemini-v1',
   },
@@ -509,6 +498,26 @@ function openAiGpt54PlusFamilyQuirks(normalized: string): QuirksEntry | null {
   return { ...GPT_54_PLUS_BASE, preferApi: 'responses' }
 }
 
+const GEMINI_3_PRO_PATTERN = /^gemini-3(?::\d+)?-pro(?:$|-)/
+const GEMINI_3_FLASH_PATTERN = /^gemini-3(?::\d+)?-flash(?:$|-)/
+const GEMINI_3_ANY_PATTERN = /^gemini-3(?::\d+)?(?:$|-)/
+
+function gemini3FamilyQuirks(normalized: string): QuirksEntry | null {
+  if (GEMINI_3_PRO_PATTERN.test(normalized)) {
+    return {
+      allowedEffort: ['low', 'medium', 'high'],
+      reasoningPreservationFormat: 'google-gemini-v1',
+    }
+  }
+  if (GEMINI_3_FLASH_PATTERN.test(normalized) || GEMINI_3_ANY_PATTERN.test(normalized)) {
+    return {
+      allowedEffort: ['minimal', 'low', 'medium', 'high'],
+      reasoningPreservationFormat: 'google-gemini-v1',
+    }
+  }
+  return null
+}
+
 export function quirksFor(modelId: string): QuirksEntry {
   const normalized = canonicalCompatModelId(modelId)
   for (const key of REGISTRY_KEYS_BY_LENGTH) {
@@ -520,6 +529,8 @@ export function quirksFor(modelId: string): QuirksEntry {
   }
   const openAiGpt54Plus = openAiGpt54PlusFamilyQuirks(normalized)
   if (openAiGpt54Plus) return openAiGpt54Plus
+  const gemini3 = gemini3FamilyQuirks(normalized)
+  if (gemini3) return gemini3
   if (GEMMA_PATTERN.test(normalized)) return GEMMA_DEFAULT
   if (OSS_THINKING_PATTERN.test(normalized)) return OSS_THINKING_DEFAULT
   return {}
