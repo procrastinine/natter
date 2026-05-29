@@ -42,6 +42,22 @@ const CLAUDE_LEGACY_PARAMS = [
 ]
 
 export const ANTHROPIC_CAPABILITIES: CapabilityTable = {
+  'claude-opus-4.8': {
+    id: 'claude-opus-4.8',
+    name: 'Claude Opus 4.8',
+    family: 'anthropic',
+    capability: {
+      supportedParameters: CLAUDE_4_7_PARAMS,
+      streaming: 'supported',
+      contextLength: 1_000_000,
+      maxCompletionTokens: 128_000,
+      pricing: { prompt: '0.000005', completion: '0.000025' },
+      architecture: {
+        inputModalities: ['text', 'image', 'file'],
+        outputModalities: ['text'],
+      },
+    },
+  },
   'claude-opus-4.7': {
     id: 'claude-opus-4.7',
     name: 'Claude Opus 4.7',

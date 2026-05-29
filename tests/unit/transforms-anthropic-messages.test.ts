@@ -78,6 +78,18 @@ describe('toAnthropicMessages', () => {
     expect(wire.output_config).toEqual({ effort: 'xhigh' })
   })
 
+  it('uses adaptive thinking for Claude Opus 4.8 without a per-model branch', () => {
+    const s = settings({
+      model: 'anthropic/claude-opus-4.8',
+      verbosity: 'max',
+      reasoning: { ...settings().reasoning, mode: 'budget', maxTokens: 4096, summary: 'auto' },
+    })
+    const { modelId, wire } = toAnthropicMessages(s, [user('u1', 'hard problem')])
+    expect(modelId).toBe('claude-opus-4-8')
+    expect(wire.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
+    expect(wire.output_config).toEqual({ effort: 'max' })
+  })
+
   it('uses manual budget thinking for Claude 4.6 only when a budget is set', () => {
     const s = settings({
       model: 'anthropic/claude-opus-4.6',

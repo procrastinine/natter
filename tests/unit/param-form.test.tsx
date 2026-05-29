@@ -118,6 +118,22 @@ describe('ParamForm verbosity reset', () => {
     )
   })
 
+  it('keeps future adaptive Claude Opus releases on the enabled-only reasoning UI', async () => {
+    const settings = cloneDefaultChatSettings()
+    settings.model = 'anthropic/claude-opus-4.8'
+    const chat = await createChat({ settings })
+    const capability = effectiveCapabilityFromEndpoints(settings.model, [
+      makeEndpoint({ supported_parameters: ['reasoning', 'verbosity', 'max_tokens'] }),
+    ])
+    const { container } = render(<ParamForm chat={chat} capability={capability} />)
+    const section = container.querySelector('[data-ui-section="reasoning"]')
+    const modeControl = section?.querySelector('[data-ui="field-group"] [data-ui="segmented"]')
+    const labels = Array.from(
+      modeControl?.querySelectorAll<HTMLButtonElement>('[data-ui="segmented-option"]') ?? [],
+    ).map((button) => button.textContent)
+    expect(labels).toEqual(['default', 'off', 'enabled'])
+  })
+
   it('keeps fixed reasoning budgets available for Claude 4.6', async () => {
     const settings = cloneDefaultChatSettings()
     settings.model = 'anthropic/claude-opus-4.6'

@@ -242,6 +242,39 @@ describe('resolveBundledCapability', () => {
     expect(cap.maxCompletionTokens).toBe(32000)
   })
 
+  it('bundles Claude Opus 4.8 for Anthropic direct profiles', () => {
+    const cap = resolveBundledCapability(
+      {
+        id: 'p',
+        name: 'Anthropic',
+        kind: 'anthropic',
+        baseUrl: 'https://api.anthropic.com/v1',
+        apiKeyRef: 'k',
+        defaultHeaders: {},
+        appTitle: '',
+        appUrl: '',
+        supportsEndpointsApi: false,
+        supportsGenerationApi: false,
+        supportsPrivacyScrape: false,
+        createdAt: 0,
+        updatedAt: 0,
+      },
+      'claude-opus-4-8',
+    )
+    expect(cap.supportedParameters).toEqual([
+      'max_tokens',
+      'stop_sequences',
+      'tools',
+      'tool_choice',
+      'thinking',
+      'verbosity',
+      'cache_control',
+    ])
+    expect(cap.supportedParameters).not.toContain('temperature')
+    expect(cap.contextLength).toBe(1_000_000)
+    expect(cap.maxCompletionTokens).toBe(128_000)
+  })
+
   it('matches versioned Anthropic compatibility ids instead of falling back to custom defaults', () => {
     const cap = resolveBundledCapability(
       {

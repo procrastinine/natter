@@ -24,6 +24,22 @@ describe('quirks registry', () => {
     expect(a.adaptiveReasoningOnly).toBe(true)
   })
 
+  it('Claude Opus 4.8 inherits Opus 4.7+ adaptive-only quirks', () => {
+    for (const model of [
+      'anthropic/claude-opus-4.8',
+      'claude-opus-4-8',
+      'claude-opus-4-8-20260528',
+      'anthropic/claude-opus-4.9',
+    ]) {
+      const q = quirksFor(model)
+      expect(q.adaptiveReasoningOnly).toBe(true)
+      expect(q.allowedEffort).toEqual([])
+      expect(q.allowedVerbosity).toEqual(['low', 'medium', 'high', 'xhigh', 'max'])
+      expect(q.cacheMinTokens).toBe(4096)
+      expect(q.reasoningPreservationFormat).toBe('anthropic-claude-v1')
+    }
+  })
+
   it('treats Anthropic compatibility ids with hyphens as the same model', () => {
     expect(quirksFor('anthropic/claude-opus-4-7')).toEqual(quirksFor('anthropic/claude-opus-4.7'))
     expect(allowedEffortFor('claude-sonnet-4-6')).toEqual([])
@@ -31,6 +47,7 @@ describe('quirks registry', () => {
 
   it('adaptive-only models narrow allowedEffort to []', () => {
     expect(allowedEffortFor('anthropic/claude-opus-4.7')).toEqual([])
+    expect(allowedEffortFor('anthropic/claude-opus-4.8')).toEqual([])
     expect(allowedEffortFor('claude-sonnet-4.6')).toEqual([])
     expect(quirksFor('claude-opus-4.6').adaptiveReasoningOnly).toBeUndefined()
   })
@@ -39,6 +56,13 @@ describe('quirks registry', () => {
     // Per OpenRouter 4.7 migration doc (llms-full.txt line 18450–18451):
     // 4.7 supports both xhigh (new) and max (inherited from 4.6).
     expect(allowedVerbosityFor('claude-opus-4.7')).toEqual([
+      'low',
+      'medium',
+      'high',
+      'xhigh',
+      'max',
+    ])
+    expect(allowedVerbosityFor('claude-opus-4.8')).toEqual([
       'low',
       'medium',
       'high',
@@ -68,6 +92,7 @@ describe('quirks registry', () => {
   })
 
   it('cacheMinTokens picks up per-variant floors', () => {
+    expect(cacheMinTokensFor('anthropic/claude-opus-4.8')).toBe(4096)
     expect(cacheMinTokensFor('anthropic/claude-opus-4.7')).toBe(4096)
     expect(cacheMinTokensFor('anthropic/claude-sonnet-4.6')).toBe(2048)
     expect(cacheMinTokensFor('anthropic/claude-sonnet-4.5')).toBe(1024)
@@ -84,11 +109,7 @@ describe('quirks registry', () => {
       'medium',
       'high',
     ])
-    expect(allowedEffortFor('google/gemini-3.5-pro-preview')).toEqual([
-      'low',
-      'medium',
-      'high',
-    ])
+    expect(allowedEffortFor('google/gemini-3.5-pro-preview')).toEqual(['low', 'medium', 'high'])
   })
 
   it('Gemini 3 Flash allowedEffort includes minimal', () => {
@@ -126,6 +147,8 @@ describe('quirks registry', () => {
   it('classifies assistant-prefill support by model family', () => {
     expect(prefillClassFor('anthropic/claude-haiku-4.5')).toBe('native')
     expect(prefillClassFor('anthropic/claude-opus-4.7')).toBe('unsupported')
+    expect(prefillClassFor('anthropic/claude-opus-4.8')).toBe('unsupported')
+    expect(prefillClassFor('anthropic/claude-opus-4.10')).toBe('unsupported')
     expect(prefillClassFor('openai/gpt-5.4')).toBe('unsupported')
     expect(prefillClassFor('openai/gpt-oss-120b')).toBe('unsupported')
     expect(prefillClassFor('google/gemini-3.1-flash-lite-preview')).toBe('native')

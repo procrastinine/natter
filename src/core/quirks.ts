@@ -6,8 +6,8 @@
 // What it CAN'T report:
 // - which enum values inside `reasoning.effort` / `verbosity` are actually
 //   honored (vs silently remapped down)
-// - adaptive reasoning (Claude 4.6/4.7 ignore reasoning.effort; 4.7 also
-//   ignores/removes manual budgets)
+// - adaptive reasoning (Claude 4.6/4.7+ ignore reasoning.effort; 4.7+ also
+//   reject or remove manual budgets)
 // - Responses-API-required models (GPT-5.3-Codex / 5.4+ Pro)
 // - cache min-token floors per Anthropic variant
 // - `cache_control` top-level vs per-block requirement per endpoint (Bedrock
@@ -78,8 +78,8 @@ interface QuirksEntry {
   //  - `unknown` (DeepSeek-R1 / Qwen3 / Gemma): no opaque round-trip exists;
   //    plaintext `<think>` tags only.
   reasoningPreservationFormat?: ReasoningFormat
-  // Claude 4.7 uses adaptive-only reasoning: `reasoning` is in
-  // supported_parameters but `effort` and `max_tokens` are silently ignored.
+  // Claude 4.7+ uses adaptive-only reasoning: `reasoning` is in
+  // supported_parameters but `effort` and `max_tokens` are ignored or rejected.
   adaptiveReasoningOnly?: boolean
   // Anthropic cache floor: "cache_control" below this token count is
   // not honored. One floor per variant per CLAUDE.md.
@@ -168,19 +168,21 @@ interface QuirksEntry {
 
 // Match order: longest prefix wins so "claude-opus-4.7" doesn't accidentally
 // pick up a rule for "claude-opus". Map is iterated by descending key length.
+const CLAUDE_OPUS_47_PLUS_QUIRKS: QuirksEntry = {
+  adaptiveReasoningOnly: true,
+  allowedEffort: [],
+  allowedVerbosity: ['low', 'medium', 'high', 'xhigh', 'max'],
+  cacheMinTokens: 4096,
+  reasoningPreservationFormat: 'anthropic-claude-v1',
+}
+
 const REGISTRY: Record<string, QuirksEntry> = {
-  // Anthropic 4.7 — no temperature/top_p/top_k (already filtered by the
+  // Anthropic Opus 4.7+ — no temperature/top_p/top_k (already filtered by the
   // API). Reasoning is adaptive-only. Supports BOTH xhigh (4.7-exclusive)
-  // and max (inherited from 4.6+) verbosity, per OpenRouter's 4.7
-  // migration doc (llms-full.txt line 18451): both 4.6 and 4.7 rows
-  // list `verbosity: 'max'` as Supported.
-  'claude-opus-4.7': {
-    adaptiveReasoningOnly: true,
-    allowedEffort: [],
-    allowedVerbosity: ['low', 'medium', 'high', 'xhigh', 'max'],
-    cacheMinTokens: 4096,
-    reasoningPreservationFormat: 'anthropic-claude-v1',
-  },
+  // and max (inherited from 4.6+) verbosity, per OpenRouter's 4.7 migration
+  // doc and the 2026-05-28 Opus 4.8 live probe. Future Opus 4.x minors are
+  // handled by `claudeFamilyQuirks`; keep this row only for the known slug.
+  'claude-opus-4.7': CLAUDE_OPUS_47_PLUS_QUIRKS,
   // Anthropic 4.6 — adaptive reasoning is recommended and
   // `reasoning.effort` is ignored, but manual budget reasoning is still
   // accepted when `reasoning.max_tokens` is set. Verbosity `max` is new on
@@ -518,6 +520,37 @@ function gemini3FamilyQuirks(normalized: string): QuirksEntry | null {
   return null
 }
 
+interface ClaudeVersion {
+  family: 'opus' | 'sonnet' | 'haiku'
+  major: number
+  minor: number
+}
+
+function claudeVersionFor(normalized: string): ClaudeVersion | null {
+  const match = normalized.match(/^claude-(opus|sonnet|haiku)-(\d+)(?:[-.:](\d+))?(?:-|$)/u)
+  if (!match?.[1] || !match[2]) return null
+  const major = Number(match[2])
+  const minor = match[3] ? Number(match[3]) : 0
+  if (!Number.isInteger(major) || !Number.isInteger(minor)) return null
+  return { family: match[1] as ClaudeVersion['family'], major, minor }
+}
+
+function claudeVersionAtLeast(version: ClaudeVersion, major: number, minor: number): boolean {
+  return version.major > major || (version.major === major && version.minor >= minor)
+}
+
+function claudeFamilyQuirks(normalized: string): QuirksEntry | null {
+  const version = claudeVersionFor(normalized)
+  if (!version) return null
+  if (version.family === 'opus' && claudeVersionAtLeast(version, 4, 7)) {
+    return CLAUDE_OPUS_47_PLUS_QUIRKS
+  }
+  if (claudeVersionAtLeast(version, 3, 7)) {
+    return { reasoningPreservationFormat: 'anthropic-claude-v1' }
+  }
+  return null
+}
+
 export function quirksFor(modelId: string): QuirksEntry {
   const normalized = canonicalCompatModelId(modelId)
   for (const key of REGISTRY_KEYS_BY_LENGTH) {
@@ -529,6 +562,8 @@ export function quirksFor(modelId: string): QuirksEntry {
   }
   const openAiGpt54Plus = openAiGpt54PlusFamilyQuirks(normalized)
   if (openAiGpt54Plus) return openAiGpt54Plus
+  const claude = claudeFamilyQuirks(normalized)
+  if (claude) return claude
   const gemini3 = gemini3FamilyQuirks(normalized)
   if (gemini3) return gemini3
   if (GEMMA_PATTERN.test(normalized)) return GEMMA_DEFAULT
@@ -602,9 +637,6 @@ export function emitsEncryptedReasoningFor(modelId: string): 'always' | 'tools-o
 // rule so new Claude releases inherit the right classification without
 // someone touching this file. The version separator is either `.` (raw)
 // or `:` (compat-normalized by `canonicalCompatModelId`), both accepted.
-const CLAUDE_NO_PREFILL_PATTERN =
-  /^claude-(?:opus|sonnet|haiku)-(?:[5-9](?:$|[-.:])|4[.:](?:[6-9]|\d{2,}))/
-
 // OpenAI GPT / o-series / chatgpt / gpt-oss all ignore assistant prefill —
 // `openai/gpt-oss-*` is harmony-blocked (every provider), and everything else
 // in the family returns a fresh answer (probe r1/r2). Safest blanket rule:
@@ -646,7 +678,8 @@ export function prefillClassFor(modelId: string): PrefillClass {
   const q = quirksFor(modelId)
   if (q.prefillClass) return q.prefillClass
   const slug = canonicalCompatModelId(modelId)
-  if (CLAUDE_NO_PREFILL_PATTERN.test(slug)) return 'unsupported'
+  const claude = claudeVersionFor(slug)
+  if (claude && claudeVersionAtLeast(claude, 4, 6)) return 'unsupported'
   if (OPENAI_PREFILL_UNSUPPORTED_PATTERN.test(slug)) return 'unsupported'
   if (slug.startsWith('claude-')) return 'native'
   if (slug.startsWith('gemini-')) return 'native'

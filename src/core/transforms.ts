@@ -1378,11 +1378,12 @@ function buildAnthropicThinking(settings: ChatSettings): Record<string, unknown>
   if (r.mode === 'default') return undefined
   if (r.mode === 'off') return { type: 'disabled' }
 
+  const quirks = quirksFor(settings.model)
+  if (quirks.adaptiveReasoningOnly === true) return anthropicAdaptiveThinking(r)
+
   const modelId = normalizeAnthropicModelId(settings.model)
-  const isClaude47 = /^claude-opus-4-7(?:-|$)/u.test(modelId)
   const isClaude46 = /^claude-(?:opus|sonnet)-4-6(?:-|$)/u.test(modelId)
 
-  if (isClaude47) return anthropicAdaptiveThinking(r)
   if (isClaude46 && r.mode !== 'budget') return anthropicAdaptiveThinking(r)
   if (isClaude46 && r.maxTokens === undefined) return anthropicAdaptiveThinking(r)
 

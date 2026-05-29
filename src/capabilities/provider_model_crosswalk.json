@@ -37,6 +37,12 @@
       "openrouter": ["anthropic/claude-opus-4.7"]
     },
     {
+      "anthropic": ["claude-opus-4-8"],
+      "google": [],
+      "openai": [],
+      "openrouter": ["anthropic/claude-opus-4.8"]
+    },
+    {
       "anthropic": ["claude-sonnet-4-20250514"],
       "google": [],
       "openai": [],

@@ -45,6 +45,8 @@ describe('reasoningPreservationFormat', () => {
 
   it('Anthropic Claude 4.x → anthropic-claude-v1', () => {
     for (const model of [
+      'anthropic/claude-opus-4.8',
+      'anthropic/claude-opus-4.9',
       'anthropic/claude-opus-4.7',
       'anthropic/claude-opus-4.6',
       'anthropic/claude-sonnet-4.6',
@@ -122,9 +124,7 @@ describe('API routing hints', () => {
     expect(allowedEffortFor('openai/gpt-5.5')).toEqual(['none', 'low', 'medium', 'high', 'xhigh'])
     expect(allowedVerbosityFor('openai/gpt-5.5')).toEqual(['low', 'medium', 'high', 'xhigh'])
     expect(emitsEncryptedReasoningFor('openai/gpt-5.5')).toBe('always')
-    expect(reasoningPreservationFormatFor('openai/gpt-5.5-2026-05-08')).toBe(
-      'openai-responses-v1',
-    )
+    expect(reasoningPreservationFormatFor('openai/gpt-5.5-2026-05-08')).toBe('openai-responses-v1')
     expect(reasoningPreservationFormatFor('openai/gpt-5.5-llama')).toBeUndefined()
   })
 

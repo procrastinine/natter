@@ -14,6 +14,8 @@ describe('model identity normalization', () => {
     expect(canonicalModelSlug('claude-opus-4-7')).toBe('claude-opus-4.7')
     expect(canonicalModelSlug('anthropic/claude-opus-4.7')).toBe('claude-opus-4.7')
     expect(compatModelIdsMatch('claude-opus-4-7', 'anthropic/claude-opus-4.7')).toBe(true)
+    expect(canonicalModelSlug('claude-opus-4-8')).toBe('claude-opus-4.8')
+    expect(compatModelIdsMatch('claude-opus-4-8', 'anthropic/claude-opus-4.8')).toBe(true)
     expect(deterministicStructuralModelId('models/gemini-3.1-flash-lite-preview')).toBe(
       'google:gemini-3.1-flash-lite-preview',
     )
@@ -104,6 +106,7 @@ describe('model identity normalization', () => {
     expect(tokenCalibrationKey('openai/gpt-4o')).toBe('openai:o200k_base')
     expect(tokenCalibrationKey('google/gemini-2.5-pro-preview-05-06')).toBe('google:gemma3')
     expect(tokenCalibrationKey('llama-euryale-70b')).toBe('oss:llama3')
+    expect(tokenCalibrationKey('claude-opus-4-8')).toBe('anthropic:claude-opus-4.8')
     expect(tokenCalibrationKey('anthropic/claude-opus-4.7')).toBe('anthropic:claude-opus-4.7')
   })
 })
