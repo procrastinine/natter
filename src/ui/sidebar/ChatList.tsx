@@ -548,11 +548,20 @@ export const ChatList = memo(function ChatList({ activeChatId, collapsed }: Chat
       sortMode,
     ],
   )
-  const loadMoreSidebarRows = useCallback(() => {
-    setRenderedSidebarRowCount(
-      Math.min(virtualRows.length, renderedSidebarRowCount + prefs.sidebarRenderWindowSize),
-    )
-  }, [prefs.sidebarRenderWindowSize, renderedSidebarRowCount, virtualRows.length])
+  const loadMoreSidebarRows = useCallback(
+    (source?: Element | null) => {
+      queueSidebarScrollAnchor(source)
+      setRenderedSidebarRowCount(
+        Math.min(virtualRows.length, renderedSidebarRowCount + prefs.sidebarRenderWindowSize),
+      )
+    },
+    [
+      prefs.sidebarRenderWindowSize,
+      queueSidebarScrollAnchor,
+      renderedSidebarRowCount,
+      virtualRows.length,
+    ],
+  )
   useEffect(() => {
     startSearchStoreBroadcastListener()
   }, [])
@@ -566,7 +575,10 @@ export const ChatList = memo(function ChatList({ activeChatId, collapsed }: Chat
     const root = sidebarListRef.current
     if (!anchor || !root) return
 
-    restoreSidebarScrollAnchor(root, anchor)
+    if (!restoreSidebarScrollAnchor(root, anchor) && shouldVirtualizeSidebar) {
+      const anchorIndex = visibleVirtualRows.findIndex((row) => row.key === anchor.key)
+      if (anchorIndex >= 0) sidebarVirtualizer.scrollToIndex(anchorIndex, { align: 'start' })
+    }
     if (typeof window.requestAnimationFrame !== 'function') {
       pendingSidebarScrollAnchorRef.current = null
       return
@@ -586,7 +598,7 @@ export const ChatList = memo(function ChatList({ activeChatId, collapsed }: Chat
       window.cancelAnimationFrame(firstFrame)
       if (secondFrame) window.cancelAnimationFrame(secondFrame)
     }
-  }, [sidebarAnchorRestoreKey])
+  }, [shouldVirtualizeSidebar, sidebarAnchorRestoreKey, sidebarVirtualizer, visibleVirtualRows])
   useEffect(() => {
     if (!loadedPrefs || prefs.sidebarRenderWindowLoadMode !== 'auto') return
     if (hiddenSidebarRowCount <= 0) return
@@ -596,7 +608,7 @@ export const ChatList = memo(function ChatList({ activeChatId, collapsed }: Chat
     if (!root || !target) return
     const observer = new IntersectionObserver(
       (entries) => {
-        if (entries.some((entry) => entry.isIntersecting)) loadMoreSidebarRows()
+        if (entries.some((entry) => entry.isIntersecting)) loadMoreSidebarRows(target)
       },
       { root, rootMargin: '0px 0px 240px 0px', threshold: 0 },
     )
@@ -1154,7 +1166,11 @@ export const ChatList = memo(function ChatList({ activeChatId, collapsed }: Chat
     if (hiddenSidebarRowCount <= 0) return null
     return (
       <li ref={sidebarWindowLoadRef} data-ui="sidebar-window-load">
-        <button type="button" data-ui="load-more-sidebar" onClick={loadMoreSidebarRows}>
+        <button
+          type="button"
+          data-ui="load-more-sidebar"
+          onClick={(event) => loadMoreSidebarRows(event.currentTarget)}
+        >
           Load more
         </button>
         <span>{hiddenSidebarRowCount} more</span>
@@ -1280,10 +1296,10 @@ export const ChatList = memo(function ChatList({ activeChatId, collapsed }: Chat
       virtualItems.length > 0
         ? virtualItems
         : fallbackSidebarVirtualItems(visibleVirtualRows, collapsed === true)
-    const totalSize = Math.max(
-      sidebarVirtualizer.getTotalSize(),
-      estimateSidebarVirtualTotalSize(visibleVirtualRows, collapsed === true),
-    )
+    const totalSize =
+      virtualItems.length > 0
+        ? sidebarVirtualizer.getTotalSize()
+        : estimateSidebarVirtualTotalSize(visibleVirtualRows, collapsed === true)
     return (
       <ul
         ref={sidebarListRef}

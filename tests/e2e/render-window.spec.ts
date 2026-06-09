@@ -202,6 +202,58 @@ test('sidebar mounts only the first row window and loads more rows manually', as
   await expect(page.locator('[data-ui="load-more-sidebar"]')).toHaveCount(0)
 })
 
+test('sidebar keeps scroll position when auto-load crosses virtualization threshold', async ({
+  page,
+}) => {
+  await seedSidebarChats(page, {
+    chatCount: 230,
+    settings: {
+      'global:sidebar-render-window-size': 75,
+      'global:sidebar-render-window-load-mode': 'auto',
+    },
+  })
+  await page.goto('/')
+  await page.reload()
+
+  const list = page.locator('[data-ui="chat-list"]')
+  await expect(list).not.toHaveAttribute('data-virtualized', 'true')
+  await scrollSidebarToAutoLoadedVirtualRows(page)
+
+  const metrics = await list.evaluate((node) => ({
+    renderedCount: Number(node.dataset.renderedCount ?? 0),
+    scrollTop: node.scrollTop,
+  }))
+  expect(metrics.renderedCount).toBeGreaterThan(200)
+  expect(metrics.scrollTop).toBeGreaterThan(500)
+})
+
+test('virtualized sidebar bottom tracks mixed folder and tag row heights', async ({ page }) => {
+  await seedMixedHeightSidebarRows(page)
+  await page.goto('/')
+  await page.reload()
+
+  const list = page.locator('[data-ui="chat-list"]')
+  await expect(list).toHaveAttribute('data-virtualized', 'true')
+  await expect(page.locator('[data-ui="chat-row-tag"]').first()).toBeVisible()
+
+  await assertSidebarBottomHasNoBlankTail(page, 'expanded folder')
+
+  await scrollSidebarUntilText(page, 'Height check folder')
+  const folderButton = page
+    .locator('[data-ui="folder-section"]')
+    .filter({ hasText: 'Height check folder' })
+    .locator('[data-ui="folder-main"]')
+  await expect(folderButton).toHaveAttribute('aria-expanded', 'true')
+  await folderButton.click()
+  await expect(folderButton).toHaveAttribute('aria-expanded', 'false')
+  await assertSidebarBottomHasNoBlankTail(page, 'collapsed folder')
+
+  await scrollSidebarUntilText(page, 'Height check folder')
+  await folderButton.click()
+  await expect(folderButton).toHaveAttribute('aria-expanded', 'true')
+  await assertSidebarBottomHasNoBlankTail(page, 're-expanded folder')
+})
+
 test('sidebar keeps a loaded row anchored when folders toggle and tag rows grow', async ({
   page,
 }) => {
@@ -256,6 +308,45 @@ test('sidebar keeps a loaded row anchored when folders toggle and tag rows grow'
   expect(Math.abs(afterTags.top - beforeTags.top)).toBeLessThan(6)
 })
 
+async function assertSidebarBottomHasNoBlankTail(page: Page, label: string): Promise<void> {
+  const list = page.locator('[data-ui="chat-list"]')
+  await settleSidebarMeasurementsToBottom(list)
+  const metrics = await list.evaluate((node) => {
+    const listRect = node.getBoundingClientRect()
+    const visibleRows = Array.from(
+      node.querySelectorAll<HTMLElement>('[data-sidebar-row-key]'),
+    ).filter((row) => {
+      const rowRect = row.getBoundingClientRect()
+      return rowRect.bottom > listRect.top && rowRect.top < listRect.bottom
+    })
+    const lastVisibleBottom = visibleRows.reduce((bottom, row) => {
+      const rowBottom = row.getBoundingClientRect().bottom
+      return Math.max(bottom, rowBottom)
+    }, listRect.top)
+    return {
+      blankTail: listRect.bottom - lastVisibleBottom,
+      maxScrollTop: Math.max(0, node.scrollHeight - node.clientHeight),
+      scrollTop: node.scrollTop,
+      visibleRows: visibleRows.length,
+    }
+  })
+  expect(metrics.visibleRows, label).toBeGreaterThan(0)
+  expect(metrics.scrollTop, label).toBeGreaterThanOrEqual(metrics.maxScrollTop - 1)
+  expect(metrics.blankTail, label).toBeLessThan(12)
+}
+
+async function scrollSidebarToAutoLoadedVirtualRows(page: Page): Promise<void> {
+  const list = page.locator('[data-ui="chat-list"]')
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    await list.evaluate((node) => {
+      node.scrollTop = Math.max(0, node.scrollHeight - node.clientHeight)
+    })
+    await page.waitForTimeout(120)
+    if ((await list.getAttribute('data-virtualized')) === 'true') return
+  }
+  throw new Error('Sidebar did not auto-load into virtualized mode')
+}
+
 async function alignSidebarRowNearTop(row: Locator): Promise<void> {
   await row.evaluate((node) => {
     const list = node.closest('[data-ui="chat-list"]') as HTMLElement | null
@@ -281,6 +372,25 @@ async function scrollSidebarUntilText(page: Page, text: string): Promise<void> {
     await page.waitForTimeout(40)
   }
   throw new Error(`Could not render sidebar row containing ${text}`)
+}
+
+async function settleSidebarMeasurementsToBottom(list: Locator): Promise<void> {
+  await list.evaluate(async (node) => {
+    let target = 0
+    for (let step = 0; step < 120; step += 1) {
+      const maxScrollTop = Math.max(0, node.scrollHeight - node.clientHeight)
+      node.scrollTop = Math.min(maxScrollTop, target)
+      await new Promise<void>((resolve) => {
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+      })
+      if (target >= maxScrollTop) break
+      target += 180
+    }
+    node.scrollTop = Math.max(0, node.scrollHeight - node.clientHeight)
+    await new Promise<void>((resolve) => {
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+    })
+  })
 }
 
 async function sidebarRowMetrics(row: Locator): Promise<{
@@ -524,6 +634,110 @@ async function seedSidebarChats(
       db.close()
     }
   }, input)
+}
+
+async function seedMixedHeightSidebarRows(page: Page): Promise<void> {
+  await page.evaluate(async () => {
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const req = indexedDB.open('natter')
+      req.onsuccess = () => resolve(req.result)
+      req.onerror = () => reject(req.error)
+    })
+    const now = Date.now()
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const tx = db.transaction(['presets', 'settings', 'folders', 'tags', 'chats'], 'readwrite')
+        const presets = tx.objectStore('presets')
+        const settingsStore = tx.objectStore('settings')
+        const folders = tx.objectStore('folders')
+        const tags = tx.objectStore('tags')
+        const chats = tx.objectStore('chats')
+        const presetsReq = presets.getAll()
+        presetsReq.onsuccess = () => {
+          const preset = (presetsReq.result as Array<{ id?: string; settings?: unknown }>)[0]
+          const chatSettings = structuredClone(preset?.settings ?? {})
+          settingsStore.put({ key: 'global:sidebar-render-window-size', value: 320 })
+          settingsStore.put({ key: 'global:sidebar-render-window-load-mode', value: 'manual' })
+          folders.put({
+            id: 'height-check-folder',
+            name: 'Height check folder',
+            sortIndex: 0,
+            createdAt: now - 100,
+            updatedAt: now - 100,
+            lastUsedAt: now - 100,
+          })
+          const tagRows = [
+            { id: 'height-tag-alpha', name: 'Alpha' },
+            { id: 'height-tag-beta', name: 'Beta' },
+            { id: 'height-tag-gamma', name: 'Gamma' },
+            { id: 'height-tag-delta', name: 'Delta' },
+          ]
+          for (const [index, tag] of tagRows.entries()) {
+            tags.put({
+              id: tag.id,
+              name: tag.name,
+              nameLower: tag.name.toLowerCase(),
+              createdAt: now + index,
+              updatedAt: now + index,
+              lastUsedAt: now + index,
+            })
+          }
+          const tagIds = tagRows.map((tag) => tag.id)
+          for (let i = 0; i < 210; i += 1) {
+            chats.put({
+              id: `mixed-height-root-chat-${String(i).padStart(3, '0')}`,
+              title: `Mixed height root ${String(i).padStart(3, '0')}`,
+              titleStatus: 'manual',
+              createdAt: now - i,
+              updatedAt: now - i,
+              lastViewedAt: now - i,
+              wordCount: 10,
+              totalCostUsd: 0,
+              metaVersion: 0,
+              summaryVersion: 0,
+              settings: structuredClone(chatSettings),
+              presetId: preset?.id,
+              lastUpdatedLeafId: null,
+              lastBranchUpdatedAt: now - i,
+              archived: false,
+              pinned: false,
+              folderId: null,
+              tags: i % 4 === 0 ? tagIds : i % 5 === 0 ? [tagIds[0]] : [],
+              previewText: `mixed root preview ${i}`,
+            })
+          }
+          for (let i = 0; i < 40; i += 1) {
+            chats.put({
+              id: `mixed-height-folder-chat-${String(i).padStart(3, '0')}`,
+              title: `Mixed height folder ${String(i).padStart(3, '0')}`,
+              titleStatus: 'manual',
+              createdAt: now - 90 - i,
+              updatedAt: now - 90 - i,
+              lastViewedAt: now - 90 - i,
+              wordCount: 10,
+              totalCostUsd: 0,
+              metaVersion: 0,
+              summaryVersion: 0,
+              settings: structuredClone(chatSettings),
+              presetId: preset?.id,
+              lastUpdatedLeafId: null,
+              lastBranchUpdatedAt: now - 90 - i,
+              archived: false,
+              pinned: false,
+              folderId: 'height-check-folder',
+              tags: i % 3 === 0 ? tagIds.slice(0, 3) : [],
+              previewText: `mixed folder preview ${i}`,
+            })
+          }
+        }
+        tx.oncomplete = () => resolve()
+        tx.onerror = () => reject(tx.error)
+        tx.onabort = () => reject(tx.error)
+      })
+    } finally {
+      db.close()
+    }
+  })
 }
 
 async function seedSidebarScrollMutationFixture(page: Page): Promise<void> {
