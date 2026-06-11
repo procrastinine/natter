@@ -257,6 +257,7 @@ function preferredProviderHintFromDecoratedSlug(modelSlug: string): string | nul
 
 const FAMILY_GUESS_RULES: ReadonlyArray<{ match: RegExp; provider: string; familyKey?: string }> =
   Object.freeze([
+    { match: /^claude(?:-|$)/i, provider: 'anthropic' },
     { match: /^gemma-3(?:n)?(?:-|$)/i, provider: 'google', familyKey: 'google:gemma3' },
     { match: /^gemma-4(?:-|$)/i, provider: 'google', familyKey: 'google:gemma4' },
     {
@@ -357,6 +358,18 @@ function isTokenizerFamilyKey(key: string): boolean {
   return TOKENIZER_FAMILY_KEY_SET.has(key)
 }
 
+function stripRepeatedProviderDecoration(provider: string, slug: string): string {
+  const escaped = provider.replace(/[-]/g, '\\-')
+  const pattern = new RegExp(`^${escaped}[\\s_:.\\/-]+(.+)$`, 'i')
+  let current = slug
+  for (;;) {
+    const match = current.match(pattern)
+    const next = match?.[1]
+    if (!next) return current
+    current = next
+  }
+}
+
 // Durable storage key for token calibration. Known shared-tokenizer families
 // collapse onto their family key; everything else stays on the canonical
 // structural model identity.
@@ -374,5 +387,11 @@ export function tokenCalibrationKeyForStoredRecordKey(
   storedKey: string,
   providerHint?: string | null,
 ): string {
-  return isTokenizerFamilyKey(storedKey) ? storedKey : tokenCalibrationKey(storedKey, providerHint)
+  if (isTokenizerFamilyKey(storedKey)) return storedKey
+  const parts = splitCanonicalModelKey(storedKey)
+  if (parts) {
+    const slug = stripRepeatedProviderDecoration(parts.provider, parts.slug)
+    return tokenCalibrationKey(`${parts.provider}/${slug}`, parts.provider)
+  }
+  return tokenCalibrationKey(storedKey, providerHint)
 }

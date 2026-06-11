@@ -47,6 +47,8 @@ describe('reasoningPreservationFormat', () => {
     for (const model of [
       'anthropic/claude-opus-4.8',
       'anthropic/claude-opus-4.9',
+      'anthropic/claude-fable-5',
+      'anthropic/claude-5-fable-20260609',
       'anthropic/claude-opus-4.7',
       'anthropic/claude-opus-4.6',
       'anthropic/claude-sonnet-4.6',

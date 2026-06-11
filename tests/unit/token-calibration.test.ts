@@ -10,7 +10,10 @@
 // - freshTokenEstimate() is pure — covers div-by-zero + clamp.
 
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { rebuildGlobalCalibration } from '../../src/backcompat/token-calibration-global'
+import {
+  canonicalizeTokenCalibrationSamples,
+  rebuildGlobalCalibration,
+} from '../../src/backcompat/token-calibration-global'
 import { tokenCalibrationKey } from '../../src/core/model-ids'
 import {
   addAcceptedSampleToGlobal,
@@ -326,6 +329,37 @@ describe('charsPerToken — calibration mode', () => {
       totalTextTokens: 300,
       sampleCount: 3,
       updatedAt: 20,
+    })
+  })
+
+  it('collapses repeated provider prefixes in persisted Claude calibration keys', () => {
+    const fableKey = tokenCalibrationKey('anthropic/claude-fable-5')
+    const result = canonicalizeTokenCalibrationSamples({
+      'anthropic:claude-fable-5': {
+        totalTextChars: 300,
+        totalTextTokens: 100,
+        sampleCount: 1,
+        lastRatio: 3,
+        updatedAt: 10,
+      },
+      'anthropic:anthropic:anthropic:claude-fable-5': {
+        totalTextChars: 600,
+        totalTextTokens: 200,
+        sampleCount: 2,
+        lastRatio: 3,
+        updatedAt: 20,
+      },
+    })
+
+    expect(result.changed).toBe(true)
+    expect(result.samples).toEqual({
+      [fableKey]: {
+        totalTextChars: 900,
+        totalTextTokens: 300,
+        sampleCount: 3,
+        lastRatio: 3,
+        updatedAt: 20,
+      },
     })
   })
 

@@ -24,12 +24,15 @@ describe('quirks registry', () => {
     expect(a.adaptiveReasoningOnly).toBe(true)
   })
 
-  it('Claude Opus 4.8 inherits Opus 4.7+ adaptive-only quirks', () => {
+  it('Claude Opus 4.8 and Fable 5 inherit adaptive-only quirks', () => {
     for (const model of [
       'anthropic/claude-opus-4.8',
       'claude-opus-4-8',
       'claude-opus-4-8-20260528',
       'anthropic/claude-opus-4.9',
+      'anthropic/claude-fable-5',
+      'claude-fable-5',
+      'claude-5-fable-20260609',
     ]) {
       const q = quirksFor(model)
       expect(q.adaptiveReasoningOnly).toBe(true)
@@ -48,6 +51,7 @@ describe('quirks registry', () => {
   it('adaptive-only models narrow allowedEffort to []', () => {
     expect(allowedEffortFor('anthropic/claude-opus-4.7')).toEqual([])
     expect(allowedEffortFor('anthropic/claude-opus-4.8')).toEqual([])
+    expect(allowedEffortFor('anthropic/claude-fable-5')).toEqual([])
     expect(allowedEffortFor('claude-sonnet-4.6')).toEqual([])
     expect(quirksFor('claude-opus-4.6').adaptiveReasoningOnly).toBeUndefined()
   })
@@ -63,6 +67,13 @@ describe('quirks registry', () => {
       'max',
     ])
     expect(allowedVerbosityFor('claude-opus-4.8')).toEqual([
+      'low',
+      'medium',
+      'high',
+      'xhigh',
+      'max',
+    ])
+    expect(allowedVerbosityFor('claude-fable-5')).toEqual([
       'low',
       'medium',
       'high',
@@ -93,6 +104,7 @@ describe('quirks registry', () => {
 
   it('cacheMinTokens picks up per-variant floors', () => {
     expect(cacheMinTokensFor('anthropic/claude-opus-4.8')).toBe(4096)
+    expect(cacheMinTokensFor('anthropic/claude-fable-5')).toBe(4096)
     expect(cacheMinTokensFor('anthropic/claude-opus-4.7')).toBe(4096)
     expect(cacheMinTokensFor('anthropic/claude-sonnet-4.6')).toBe(2048)
     expect(cacheMinTokensFor('anthropic/claude-sonnet-4.5')).toBe(1024)
@@ -148,6 +160,7 @@ describe('quirks registry', () => {
     expect(prefillClassFor('anthropic/claude-haiku-4.5')).toBe('native')
     expect(prefillClassFor('anthropic/claude-opus-4.7')).toBe('unsupported')
     expect(prefillClassFor('anthropic/claude-opus-4.8')).toBe('unsupported')
+    expect(prefillClassFor('anthropic/claude-fable-5')).toBe('unsupported')
     expect(prefillClassFor('anthropic/claude-opus-4.10')).toBe('unsupported')
     expect(prefillClassFor('openai/gpt-5.4')).toBe('unsupported')
     expect(prefillClassFor('openai/gpt-oss-120b')).toBe('unsupported')

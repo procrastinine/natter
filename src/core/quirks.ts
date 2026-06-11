@@ -521,18 +521,26 @@ function gemini3FamilyQuirks(normalized: string): QuirksEntry | null {
 }
 
 interface ClaudeVersion {
-  family: 'opus' | 'sonnet' | 'haiku'
+  family: 'opus' | 'sonnet' | 'haiku' | 'fable'
   major: number
   minor: number
 }
 
 function claudeVersionFor(normalized: string): ClaudeVersion | null {
-  const match = normalized.match(/^claude-(opus|sonnet|haiku)-(\d+)(?:[-.:](\d+))?(?:-|$)/u)
-  if (!match?.[1] || !match[2]) return null
-  const major = Number(match[2])
-  const minor = match[3] ? Number(match[3]) : 0
+  const familyFirst = normalized.match(
+    /^claude-(opus|sonnet|haiku|fable)-(\d+)(?:[-.:](\d+))?(?:-|$)/u,
+  )
+  const versionFirst = normalized.match(
+    /^claude-(\d+)(?:[-.:](\d+))?-(opus|sonnet|haiku|fable)(?:-|$)/u,
+  )
+  const family = familyFirst?.[1] ?? versionFirst?.[3]
+  const majorText = familyFirst?.[2] ?? versionFirst?.[1]
+  const minorText = familyFirst?.[3] ?? versionFirst?.[2]
+  if (!family || !majorText) return null
+  const major = Number(majorText)
+  const minor = minorText ? Number(minorText) : 0
   if (!Number.isInteger(major) || !Number.isInteger(minor)) return null
-  return { family: match[1] as ClaudeVersion['family'], major, minor }
+  return { family: family as ClaudeVersion['family'], major, minor }
 }
 
 function claudeVersionAtLeast(version: ClaudeVersion, major: number, minor: number): boolean {
@@ -543,6 +551,9 @@ function claudeFamilyQuirks(normalized: string): QuirksEntry | null {
   const version = claudeVersionFor(normalized)
   if (!version) return null
   if (version.family === 'opus' && claudeVersionAtLeast(version, 4, 7)) {
+    return CLAUDE_OPUS_47_PLUS_QUIRKS
+  }
+  if (version.family === 'fable' && claudeVersionAtLeast(version, 5, 0)) {
     return CLAUDE_OPUS_47_PLUS_QUIRKS
   }
   if (claudeVersionAtLeast(version, 3, 7)) {

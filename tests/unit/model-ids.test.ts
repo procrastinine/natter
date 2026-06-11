@@ -7,6 +7,7 @@ import {
   deterministicStructuralModelId,
   deterministicStructuralModelIdentity,
   tokenCalibrationKey,
+  tokenCalibrationKeyForStoredRecordKey,
 } from '../../src/core/model-ids'
 
 describe('model identity normalization', () => {
@@ -42,6 +43,10 @@ describe('model identity normalization', () => {
     expect(deterministicStructuralModelId('openai/new-model-1:free')).toBe('openai:new-model-1')
     expect(deterministicStructuralModelId('brand-new-model', 'google')).toBe(
       'google:brand-new-model',
+    )
+    expect(deterministicStructuralModelId('claude-fable-5')).toBe('anthropic:claude-fable-5')
+    expect(deterministicStructuralModelId('anthropic/claude-fable-5')).toBe(
+      'anthropic:claude-fable-5',
     )
     expect(deterministicStructuralModelId('totally-unknown-model')).toBe('totally-unknown-model')
     expect(deterministicStructuralModelIdentity('qwen/new-model-preview').compatKey).toBe(
@@ -108,5 +113,21 @@ describe('model identity normalization', () => {
     expect(tokenCalibrationKey('llama-euryale-70b')).toBe('oss:llama3')
     expect(tokenCalibrationKey('claude-opus-4-8')).toBe('anthropic:claude-opus-4.8')
     expect(tokenCalibrationKey('anthropic/claude-opus-4.7')).toBe('anthropic:claude-opus-4.7')
+    expect(tokenCalibrationKey('anthropic/claude-fable-5')).toBe('anthropic:claude-fable-5')
+  })
+
+  it('keeps persisted calibration keys idempotent', () => {
+    expect(tokenCalibrationKeyForStoredRecordKey('anthropic:claude-fable-5')).toBe(
+      'anthropic:claude-fable-5',
+    )
+    expect(tokenCalibrationKeyForStoredRecordKey('anthropic:anthropic:claude-fable-5')).toBe(
+      'anthropic:claude-fable-5',
+    )
+    expect(
+      tokenCalibrationKeyForStoredRecordKey(
+        'anthropic:anthropic:anthropic:anthropic:claude-fable-5',
+      ),
+    ).toBe('anthropic:claude-fable-5')
+    expect(tokenCalibrationKeyForStoredRecordKey('openai:gpt-4o')).toBe('openai:o200k_base')
   })
 })

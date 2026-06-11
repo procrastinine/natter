@@ -137,12 +137,13 @@ describe('effectiveCapabilityFromEndpoints', () => {
       provider_name: 'Anthropic',
       supported_parameters: ['max_tokens', 'verbosity', 'thinking'],
     })
-    const cap = effectiveCapabilityFromEndpoints('anthropic/claude-opus-4.7', [ep])
-    expect(cap.allowedEffort).toEqual([])
-    // 4.7 supports all four extension levels — xhigh (4.7-exclusive) and
-    // max (inherited from 4.6+). See llms-full.txt line 18451.
-    expect(cap.allowedVerbosity).toEqual(['low', 'medium', 'high', 'xhigh', 'max'])
-    expect(cap.quirks.adaptiveReasoningOnly).toBe(true)
+    for (const model of ['anthropic/claude-opus-4.7', 'anthropic/claude-fable-5']) {
+      const cap = effectiveCapabilityFromEndpoints(model, [ep])
+      expect(cap.allowedEffort).toEqual([])
+      // 4.7+ / Fable 5 support all four extension levels — xhigh and max.
+      expect(cap.allowedVerbosity).toEqual(['low', 'medium', 'high', 'xhigh', 'max'])
+      expect(cap.quirks.adaptiveReasoningOnly).toBe(true)
+    }
   })
 
   it('aggregates pricing range from multiple endpoints', () => {

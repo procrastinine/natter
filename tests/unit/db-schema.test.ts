@@ -2,8 +2,10 @@ import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { assertNoInlineMessageBodies } from '../../src/backcompat/message-body-split'
 import { migrateProviderOutputItemRows } from '../../src/backcompat/provider-output-items'
+import { canonicalizeTokenCalibrationRows } from '../../src/backcompat/token-calibration-global'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
-import type { Chat, Message } from '../../src/core/types'
+import { tokenCalibrationKey } from '../../src/core/model-ids'
+import type { Chat, GlobalTokenCalibration, Message } from '../../src/core/types'
 import type { NatterDb } from '../../src/store/db'
 import {
   __resetDbForTests,
@@ -1070,6 +1072,109 @@ describe('Dexie migrations', () => {
         },
       },
     ])
+    await db.delete()
+  })
+
+  it('canonicalizes token calibration keys once on an already-current schema', async () => {
+    const name = `natter-test-token-calibration-backfill-${Math.random().toString(36).slice(2)}`
+    const db = await freshDb(name)
+    await db.open()
+    const fableKey = tokenCalibrationKey('anthropic/claude-fable-5')
+    await db.chats.put({
+      id: 'chat-calib',
+      title: 'Calib',
+      titleStatus: 'untitled',
+      createdAt: 1,
+      updatedAt: 1,
+      lastViewedAt: 1,
+      wordCount: 0,
+      totalCostUsd: 0,
+      metaVersion: 0,
+      summaryVersion: 0,
+      settings: cloneDefaultChatSettings(),
+      lastUpdatedLeafId: 'm1',
+      lastBranchUpdatedAt: 1,
+      archived: false,
+      pinned: false,
+      folderId: null,
+      tags: [],
+      tokenCalibration: {
+        'anthropic:claude-fable-5': {
+          totalTextChars: 300,
+          totalTextTokens: 100,
+          sampleCount: 1,
+          lastRatio: 3,
+          updatedAt: 10,
+        },
+        'anthropic:anthropic:anthropic:claude-fable-5': {
+          totalTextChars: 600,
+          totalTextTokens: 200,
+          sampleCount: 2,
+          lastRatio: 3,
+          updatedAt: 20,
+        },
+      },
+    } as Chat)
+    const message = {
+      id: 'm1',
+      chatId: 'chat-calib',
+      parentId: null,
+      siblingIndex: 0,
+      turnId: 'turn-m1',
+      turnIndex: 0,
+      createdAt: 1,
+      role: 'user',
+      origin: 'user',
+      content: [{ type: 'text', text: 'hello' }],
+      nodeVersion: 0,
+      deleted: false,
+      originalCalibrationKey: 'anthropic:anthropic:claude-fable-5',
+    } as Message
+    const { header, body } = splitMessageForStorage(message)
+    await db.messages.put(header)
+    await db.messageBodies.put(body)
+    await db.settings.put({
+      key: 'global:token-calibration',
+      value: {
+        version: 1,
+        updatedAt: 20,
+        byModel: {
+          'anthropic:anthropic:claude-fable-5': {
+            totalTextChars: 900,
+            totalTextTokens: 300,
+            sampleCount: 3,
+            lastRatio: 3,
+            updatedAt: 20,
+          },
+        },
+      } satisfies GlobalTokenCalibration,
+    })
+    await db.settings.delete('backfill:token-calibration-canonicalize-v1')
+
+    await canonicalizeTokenCalibrationRows(db)
+    await canonicalizeTokenCalibrationRows(db)
+
+    const chat = await db.chats.get('chat-calib')
+    expect(chat?.tokenCalibration).toEqual({
+      [fableKey]: {
+        totalTextChars: 900,
+        totalTextTokens: 300,
+        sampleCount: 3,
+        lastRatio: 3,
+        updatedAt: 20,
+      },
+    })
+    expect((await db.messages.get('m1'))?.originalCalibrationKey).toBe(fableKey)
+    const global = (await db.settings.get('global:token-calibration'))
+      ?.value as GlobalTokenCalibration
+    expect(global.byModel[fableKey]).toMatchObject({
+      totalTextChars: 900,
+      totalTextTokens: 300,
+      sampleCount: 3,
+      lastRatio: 3,
+      updatedAt: 20,
+    })
+    expect((await db.settings.get('backfill:token-calibration-canonicalize-v1'))?.value).toBe(1)
     await db.delete()
   })
 

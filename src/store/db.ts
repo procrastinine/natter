@@ -39,6 +39,8 @@ import {
   providerToolSettingsBackfillMarker,
 } from '../backcompat/provider-tools'
 import {
+  canonicalizeTokenCalibrationRows,
+  tokenCalibrationCanonicalizeBackfillMarker,
   rebuildTokenCalibrationGlobalRows,
   tokenCalibrationGlobalBackfillMarker,
 } from '../backcompat/token-calibration-global'
@@ -157,6 +159,7 @@ export function registerSchema(db: Dexie): void {
         providerOutputItemsBackfillMarker(),
         providerToolSettingsBackfillMarker(),
         tokenCalibrationGlobalBackfillMarker(),
+        tokenCalibrationCanonicalizeBackfillMarker(),
       ])
   })
 
@@ -1343,6 +1346,7 @@ let attachmentRefsBackfillPromise: Promise<void> | null = null
 let providerOutputItemsBackfillPromise: Promise<void> | null = null
 let providerToolSettingsBackfillPromise: Promise<void> | null = null
 let tokenCalibrationGlobalBackfillPromise: Promise<void> | null = null
+let tokenCalibrationCanonicalizeBackfillPromise: Promise<void> | null = null
 const ORGANIZATION_FIELDS_BACKFILL_KEY = 'backfill:organization-fields-v1'
 
 function organizationFieldsBackfillMarker(): SettingsRow {
@@ -1362,6 +1366,7 @@ function resetBackfillState(): void {
   providerOutputItemsBackfillPromise = null
   providerToolSettingsBackfillPromise = null
   tokenCalibrationGlobalBackfillPromise = null
+  tokenCalibrationCanonicalizeBackfillPromise = null
 }
 
 // Explicit open — resolves when the underlying IDBDatabase is ready and the
@@ -1404,6 +1409,13 @@ export async function openDb(): Promise<NatterDb> {
     throw err
   })
   await tokenCalibrationGlobalBackfillPromise
+  tokenCalibrationCanonicalizeBackfillPromise ??= canonicalizeTokenCalibrationRows(db).catch(
+    (err) => {
+      tokenCalibrationCanonicalizeBackfillPromise = null
+      throw err
+    },
+  )
+  await tokenCalibrationCanonicalizeBackfillPromise
   return db
 }
 

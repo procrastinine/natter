@@ -252,6 +252,7 @@ describe('settings', () => {
     expect(await getSetting('backfill:message-body-split-v1')).toBe(1)
     expect(await getSetting('backfill:organization-fields-v1')).toBe(1)
     expect(await getSetting('backfill:global-settings-v1')).toBe(1)
+    expect(await getSetting('backfill:token-calibration-canonicalize-v1')).toBe(1)
   })
 
   it('migrates the retired auto-scroll setting once before live reads', async () => {
