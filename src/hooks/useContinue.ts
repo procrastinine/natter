@@ -46,6 +46,9 @@ import { useStreamStore } from '../store/zustand/streamStore'
 import { useUiStore } from '../store/zustand/uiStore'
 import { markLifecycleTarget, startRequestLifecycle } from './requestLifecycle'
 
+const CONTINUE_LIVE_UPDATE_INTERVAL_MS = 125
+const CONTINUE_LIVE_TEXT_GROWTH_CHARS = 2048
+
 interface ContinueInPlaceInput {
   chatId: ChatId
   targetMessageId: MessageId
@@ -289,8 +292,8 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
       abort: abortStream,
     })
 
-    let buffer = ''
     const baseText = existingTextOf(target)
+    let buffer = ''
     const openStream =
       devOnlyOpenStreamOverride(input.openStream) ??
       ((open) =>
@@ -301,8 +304,23 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
           signal: open.signal,
         }))
 
-    let lastFlushedAt = now()
-    let lastFlushedLen = 0
+    let lastPublishedAt = now()
+    let lastPublishedLen = 0
+
+    const publishLiveSnapshot = (publishedAt: number) => {
+      const combined = baseText + buffer
+      useStreamStore.getState().setLiveSnapshot({
+        streamId,
+        chatId: input.chatId,
+        messageId: target.id,
+        content: appendTextOnto(target.content, combined),
+        textLength: combined.length,
+        reasoningLength: 0,
+        updatedAt: publishedAt,
+      })
+      lastPublishedAt = publishedAt
+      lastPublishedLen = buffer.length
+    }
 
     flush = async (final: boolean) => {
       const combined = baseText + buffer
@@ -343,8 +361,7 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
           )
         }
       })
-      lastFlushedAt = now()
-      lastFlushedLen = buffer.length
+      if (final) publishLiveSnapshot(now())
     }
 
     const chunkIter = openStream({
@@ -356,15 +373,18 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
       ...(geminiModelId ? { geminiModelId } : {}),
     })
     for await (const event of laneStreamForRoute(route, chunkIter)) {
+      const eventNow = now()
       if (event.lane === 'text') {
         buffer += event.text
       } else if (event.lane === 'error') {
         outcome = 'error'
         break
       }
-      // Flush every ~200ms or 4KB of growth.
-      if (now() - lastFlushedAt >= 200 || buffer.length - lastFlushedLen >= 4096) {
-        await flush(false)
+      if (
+        eventNow - lastPublishedAt >= CONTINUE_LIVE_UPDATE_INTERVAL_MS ||
+        buffer.length - lastPublishedLen >= CONTINUE_LIVE_TEXT_GROWTH_CHARS
+      ) {
+        publishLiveSnapshot(eventNow)
       }
     }
     await flush(true)
@@ -389,6 +409,7 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
     }
   } finally {
     useStreamStore.getState().clearActive(lifecycle.streamId)
+    useStreamStore.getState().clearLiveSnapshot(target.id)
     postEvent({
       kind: 'stream-ended',
       chatId: input.chatId,

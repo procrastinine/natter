@@ -64,7 +64,7 @@ import { useToastStore } from '../store/zustand/toastStore'
 import { useUiStore } from '../store/zustand/uiStore'
 import { BannerTray } from '../ui/chat/BannerTray'
 import { ChatHeader } from '../ui/chat/ChatHeader'
-import { Composer, moveComposerDraft, type ComposerDroppedFiles } from '../ui/chat/Composer'
+import { Composer, type ComposerDroppedFiles, moveComposerDraft } from '../ui/chat/Composer'
 import { EditTreeToolbar } from '../ui/chat/EditTreeToolbar'
 import { EmptyState } from '../ui/chat/EmptyState'
 import { FocusModeToggle } from '../ui/chat/FocusModeToggle'
@@ -114,6 +114,10 @@ const MODEL_AUTOSELECT_QUERY = {
   outputModalities: ['text', 'image', 'audio', 'file', 'video'],
 } as const
 const DIRECT_MODEL_AUTOSELECT_QUERY = {} as const
+const POST_STREAM_TRANSCRIPT_RECYCLE_CHARS = 100_000
+const POST_STREAM_TRANSCRIPT_RECYCLE_DELAY_MS = 250
+const TRANSCRIPT_RECYCLE_REMOUNT_DELAY_MS = 50
+const RECYCLE_TRANSCRIPT_EVENT = 'natter:recycle-transcript'
 
 interface ActiveBranchWindowSnapshotResult {
   key: string
@@ -204,6 +208,16 @@ export function Shell() {
   const streamingOnActiveChat = useStreamStore((s) =>
     activeChatId ? s.hasStreamForChat(activeChatId) : false,
   )
+  const activeStreamLivePayloadChars = useStreamStore((s) => {
+    if (!activeChatId) return 0
+    let max = 0
+    for (const messageId in s.liveByMessageId) {
+      const snapshot = s.liveByMessageId[messageId]
+      if (!snapshot || snapshot.chatId !== activeChatId) continue
+      max = Math.max(max, snapshot.textLength + snapshot.reasoningLength)
+    }
+    return max
+  })
   const profileCount = useLiveQuery(() => countProfiles({ includeArchived: true }), [], undefined)
   const connectionKnown = profileCount !== undefined
   const hasConnection = connectionKnown && profileCount > 0
@@ -215,7 +229,14 @@ export function Shell() {
     null,
   )
   const [scrollState, setScrollState] = useState<ScrollState>('follow')
+  const [transcriptRenderEpoch, setTranscriptRenderEpoch] = useState(0)
+  const [transcriptMounted, setTranscriptMounted] = useState(true)
+  const [transcriptPlaceholderHeight, setTranscriptPlaceholderHeight] = useState(0)
   const [importAtEndOpen, setImportAtEndOpen] = useState(false)
+  const streamPeakPayloadCharsRef = useRef(0)
+  const streamWasActiveRef = useRef(false)
+  const transcriptRecycleTimerRef = useRef<number | null>(null)
+  const transcriptRemountTimerRef = useRef<number | null>(null)
   const editTreeMode = useUiStore((s) => s.editTreeMode)
   const setEditTreeMode = useUiStore((s) => s.setEditTreeMode)
   const focusMode = useUiStore((s) => s.focusMode)
@@ -264,18 +285,105 @@ export function Shell() {
   )
   const branchSnapshotCacheRef = useRef(new Map<string, ActiveBranchWindowSnapshot>())
   const lastBranchSnapshotByChatRef = useRef(new Map<ChatId, ActiveBranchWindowSnapshot>())
+  const recycleTranscriptRenderTree = useCallback(() => {
+    if (transcriptRemountTimerRef.current !== null) {
+      window.clearTimeout(transcriptRemountTimerRef.current)
+      transcriptRemountTimerRef.current = null
+    }
+    const list = document.querySelector<HTMLElement>('[data-ui="message-list"]')
+    setTranscriptPlaceholderHeight(list?.offsetHeight ?? 0)
+    branchSnapshotCacheRef.current.clear()
+    lastBranchSnapshotByChatRef.current.clear()
+    setTranscriptMounted(false)
+    transcriptRemountTimerRef.current = window.setTimeout(() => {
+      transcriptRemountTimerRef.current = null
+      setTranscriptRenderEpoch((epoch) => epoch + 1)
+      setTranscriptMounted(true)
+      setTranscriptPlaceholderHeight(0)
+    }, TRANSCRIPT_RECYCLE_REMOUNT_DELAY_MS)
+  }, [])
+  useEffect(() => {
+    window.addEventListener(RECYCLE_TRANSCRIPT_EVENT, recycleTranscriptRenderTree)
+    return () => window.removeEventListener(RECYCLE_TRANSCRIPT_EVENT, recycleTranscriptRenderTree)
+  }, [recycleTranscriptRenderTree])
+  useEffect(() => {
+    if (!activeChatId) {
+      branchSnapshotCacheRef.current.clear()
+      lastBranchSnapshotByChatRef.current.clear()
+      return
+    }
+    branchSnapshotCacheRef.current.clear()
+    lastBranchSnapshotByChatRef.current.clear()
+  }, [activeChatId])
   useEffect(() => {
     if (!activeBranchWindowResult) return
     if (activeBranchWindowResult.snapshot.chatId !== activeChatId) return
+    branchSnapshotCacheRef.current.clear()
     branchSnapshotCacheRef.current.set(
       activeBranchWindowResult.key,
       activeBranchWindowResult.snapshot,
     )
+    lastBranchSnapshotByChatRef.current.clear()
     lastBranchSnapshotByChatRef.current.set(
       activeBranchWindowResult.snapshot.chatId,
       activeBranchWindowResult.snapshot,
     )
   }, [activeBranchWindowResult, activeChatId])
+  useEffect(() => {
+    void activeChatId
+    streamPeakPayloadCharsRef.current = 0
+    streamWasActiveRef.current = false
+    if (transcriptRecycleTimerRef.current !== null) {
+      window.clearTimeout(transcriptRecycleTimerRef.current)
+      transcriptRecycleTimerRef.current = null
+    }
+    setTranscriptMounted(true)
+    setTranscriptPlaceholderHeight(0)
+  }, [activeChatId])
+  useEffect(() => {
+    return () => {
+      if (transcriptRecycleTimerRef.current !== null) {
+        window.clearTimeout(transcriptRecycleTimerRef.current)
+        transcriptRecycleTimerRef.current = null
+      }
+      if (transcriptRemountTimerRef.current !== null) {
+        window.clearTimeout(transcriptRemountTimerRef.current)
+        transcriptRemountTimerRef.current = null
+      }
+    }
+  }, [])
+  useEffect(() => {
+    if (!activeChatId) return
+    streamPeakPayloadCharsRef.current = Math.max(
+      streamPeakPayloadCharsRef.current,
+      activeStreamLivePayloadChars,
+    )
+    if (streamingOnActiveChat) {
+      if (transcriptRecycleTimerRef.current !== null) {
+        window.clearTimeout(transcriptRecycleTimerRef.current)
+        transcriptRecycleTimerRef.current = null
+      }
+      streamWasActiveRef.current = true
+      return
+    }
+    if (!streamWasActiveRef.current) return
+    streamWasActiveRef.current = false
+    const peak = streamPeakPayloadCharsRef.current
+    streamPeakPayloadCharsRef.current = 0
+    if (peak < POST_STREAM_TRANSCRIPT_RECYCLE_CHARS) return
+    if (transcriptRecycleTimerRef.current !== null) {
+      window.clearTimeout(transcriptRecycleTimerRef.current)
+    }
+    transcriptRecycleTimerRef.current = window.setTimeout(() => {
+      transcriptRecycleTimerRef.current = null
+      recycleTranscriptRenderTree()
+    }, POST_STREAM_TRANSCRIPT_RECYCLE_DELAY_MS)
+  }, [
+    activeChatId,
+    activeStreamLivePayloadChars,
+    recycleTranscriptRenderTree,
+    streamingOnActiveChat,
+  ])
   const exactActiveBranchSnapshot =
     activeBranchWindowResult?.key === activeBranchWindowQueryKey
       ? activeBranchWindowResult.snapshot
@@ -987,20 +1095,28 @@ export function Shell() {
                   streamFollowKey={activeBranchTailId}
                   onStateChange={setScrollState}
                 >
-                  <MessageList
-                    chatId={activeChatId}
-                    chatSettings={resolvedActiveChatRow?.settings ?? cloneDefaultChatSettings()}
-                    hasConnection={hasConnection}
-                    branchSnapshot={resolvedActiveBranchSnapshot}
-                    {...(activeCapability ? { capability: activeCapability } : {})}
-                    prefillRecommendationEndpoints={activeEndpoints.endpoints}
-                    longMessageDisplayMode={prefs.longMessageDisplayMode}
-                    messageRenderWindowSize={prefs.messageRenderWindowSize}
-                    messageRenderWindowLoadMode={
-                      loadedPrefs ? prefs.messageRenderWindowLoadMode : 'manual'
-                    }
-                    onLoadOlderMessages={loadOlderMessageWindow}
-                  />
+                  {transcriptMounted ? (
+                    <MessageList
+                      key={`${activeChatId}:${transcriptRenderEpoch}`}
+                      chatId={activeChatId}
+                      chatSettings={resolvedActiveChatRow?.settings ?? cloneDefaultChatSettings()}
+                      hasConnection={hasConnection}
+                      branchSnapshot={resolvedActiveBranchSnapshot}
+                      {...(activeCapability ? { capability: activeCapability } : {})}
+                      prefillRecommendationEndpoints={activeEndpoints.endpoints}
+                      longMessageDisplayMode={prefs.longMessageDisplayMode}
+                      messageRenderWindowSize={prefs.messageRenderWindowSize}
+                      messageRenderWindowLoadMode={
+                        loadedPrefs ? prefs.messageRenderWindowLoadMode : 'manual'
+                      }
+                      onLoadOlderMessages={loadOlderMessageWindow}
+                    />
+                  ) : (
+                    <div
+                      data-ui="message-list-recycling"
+                      style={{ minHeight: transcriptPlaceholderHeight }}
+                    />
+                  )}
                   {effectiveFocusMode ? (
                     <Composer
                       onSubmit={handleSubmit}

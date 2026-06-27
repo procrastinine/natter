@@ -40,15 +40,15 @@ import {
 import type { ChatStreamChunk, ResponsesStreamChunk } from '../api/types'
 import { activePath, cursorKeyOf, groupByParent } from '../core/active-path'
 import { readGlobalPreferences } from '../core/global-settings'
-import { isFreeModel } from '../core/model-predicates'
 import { sendUserMessage } from '../core/messages'
 import { tokenCalibrationKey } from '../core/model-ids'
+import { isFreeModel } from '../core/model-predicates'
 import { buildWireProviderPrivacy, filterEndpointsByPrivacy } from '../core/privacy-filter'
+import { hasEnabledHostedTools, isOpenAiDirectProfile } from '../core/provider-hosted-tools'
 import {
   providerOutputItemFromGeminiPart,
   providerOutputItemFromResponsesItem,
 } from '../core/provider-tool-context'
-import { hasEnabledHostedTools, isOpenAiDirectProfile } from '../core/provider-hosted-tools'
 import {
   findMergeTargetIndex,
   mergeReasoningDetail,
@@ -100,7 +100,7 @@ import {
   materializeGeneratedOutputAttachments,
   mergeGeneratedImageAttachmentRefs,
 } from '../store/generated-images'
-import { getCachedEndpoints, ENDPOINTS_TTL_MS, isFresh } from '../store/models-cache'
+import { ENDPOINTS_TTL_MS, getCachedEndpoints, isFresh } from '../store/models-cache'
 import { getCachedPrivacyPolicy } from '../store/privacy-cache'
 import type { MessageHeaderPatch, StreamChunkRow } from '../store/repository'
 import { loadActiveBranchHeaderSnapshot, loadSendContextForBranch } from '../store/send-context'
@@ -112,6 +112,7 @@ import { markLifecycleTarget, startRequestLifecycle } from './requestLifecycle'
 
 const STREAM_LIVE_UPDATE_INTERVAL_MS = 125
 const STREAM_LIVE_TEXT_GROWTH_CHARS = 2048
+const STREAM_LIVE_TEXT_SECTION_CHARS = 20_000
 const STREAM_CHUNK_FLUSH_INTERVAL_MS = 150
 const STREAM_CHUNK_FLUSH_MAX_ROWS = 256
 const STREAM_CHUNK_FLUSH_MAX_TEXT_CHARS = 128 * 1024
@@ -261,9 +262,8 @@ function detectStreamTransport(
 // phases can extend without changing the lifecycle.
 interface ChatAccumulator {
   initialContent: ContentItem[]
-  textChunks: string[]
+  textSections: string[]
   textLength: number
-  textSnapshot: string
   // Ordered list of reasoning details accumulated so far. Streaming deltas
   // from Responses / Gemini-native lanes carry a stable synthetic id when
   // possible, so incremental text/summary/encrypted fragments and buffered
@@ -313,9 +313,8 @@ function createAccumulator(input: {
 }): ChatAccumulator {
   return {
     initialContent: input.initialContent,
-    textChunks: [],
+    textSections: [],
     textLength: 0,
-    textSnapshot: '',
     reasoningList: [],
     reasoningRowById: new Map(),
     generatedContent: [],
@@ -1224,24 +1223,35 @@ function serverToolRecordKey(record: GenerationServerToolCall): string {
 
 function appendStreamText(acc: ChatAccumulator, text: string): void {
   if (text.length === 0) return
-  acc.textChunks.push(text)
+  appendTextToSections(acc.textSections, text)
   acc.textLength += text.length
 }
 
+function appendTextToSections(sections: string[], text: string): void {
+  let offset = 0
+  while (offset < text.length) {
+    const lastIndex = sections.length - 1
+    const last = lastIndex >= 0 ? (sections[lastIndex] ?? '') : ''
+    const room = STREAM_LIVE_TEXT_SECTION_CHARS - last.length
+    if (room <= 0) {
+      sections.push('')
+      continue
+    }
+    const nextOffset = Math.min(text.length, offset + room)
+    const part = text.slice(offset, nextOffset)
+    if (lastIndex >= 0) sections[lastIndex] = `${last}${part}`
+    else sections.push(part)
+    offset = nextOffset
+  }
+}
+
 function streamTextSnapshot(acc: ChatAccumulator): string {
-  if (acc.textChunks.length === 0) return acc.textSnapshot
-  acc.textSnapshot =
-    acc.textSnapshot.length === 0
-      ? acc.textChunks.join('')
-      : `${acc.textSnapshot}${acc.textChunks.join('')}`
-  acc.textChunks = []
-  return acc.textSnapshot
+  return acc.textSections.join('')
 }
 
 function releaseAccumulatorBuffers(acc: ChatAccumulator): void {
   acc.initialContent = []
-  acc.textChunks = []
-  acc.textSnapshot = ''
+  acc.textSections = []
   acc.textLength = 0
   acc.reasoningList = []
   acc.reasoningRowById.clear()
@@ -1290,10 +1300,9 @@ function publishLiveSnapshot(ctx: {
 }): void {
   const { accumulator } = ctx
   const reasoning = collectReasoning(accumulator)
-  const streamedText = streamTextSnapshot(accumulator)
-  const content = assistantContentWithStreamPrefix(
+  const content = assistantContentWithStreamSections(
     accumulator.initialContent,
-    streamedText,
+    accumulator.textSections,
     streamPreviewGeneratedContent(accumulator.generatedContent),
   )
   useStreamStore.getState().setLiveSnapshot({
@@ -1515,6 +1524,42 @@ function assistantContentWithStreamPrefix(
     ...structuredClone(nonText),
     ...structuredClone(generatedContent),
   ]
+}
+
+function assistantContentWithStreamSections(
+  initialContent: readonly ContentItem[],
+  streamedSections: readonly string[],
+  generatedContent: readonly ContentItem[] = [],
+): ContentItem[] {
+  const prefix = initialContent
+    .filter(
+      (item): item is Extract<ContentItem, { type: 'text' | 'output_text' }> =>
+        item.type === 'text' || item.type === 'output_text',
+    )
+    .map((item) => item.text)
+    .join('')
+  const nonText = initialContent.filter(
+    (item) => item.type !== 'text' && item.type !== 'output_text',
+  )
+  const textItems: ContentItem[] = []
+  if (prefix.length > 0) {
+    const first = streamedSections[0]
+    if (first !== undefined) {
+      textItems.push({ type: 'output_text', text: `${prefix}${first}` })
+      for (let i = 1; i < streamedSections.length; i += 1) {
+        const section = streamedSections[i]
+        if (section) textItems.push({ type: 'output_text', text: section })
+      }
+    } else {
+      textItems.push({ type: 'output_text', text: prefix })
+    }
+  } else {
+    for (const section of streamedSections) {
+      if (section.length > 0) textItems.push({ type: 'output_text', text: section })
+    }
+  }
+  if (textItems.length === 0) textItems.push({ type: 'output_text', text: '' })
+  return [...textItems, ...structuredClone(nonText), ...structuredClone(generatedContent)]
 }
 
 function streamPreviewGeneratedContent(generatedContent: readonly ContentItem[]): ContentItem[] {

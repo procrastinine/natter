@@ -2,11 +2,14 @@ import type { GeminiStreamChunk } from '../api/gemini-types'
 import type { ChatStreamChunk, ResponsesStreamChunk } from '../api/types'
 import { navigateToChat } from '../app/router'
 import { cloneDefaultChatSettings } from '../core/defaults'
-import type { ChatId, ConnectionProfile } from '../core/types'
-import { type SendTextResult, sendText } from '../hooks/useChat'
+import type { ChatId, ConnectionProfile, MessageId } from '../core/types'
+import { type SendTextResult, sendFromMessage, sendText } from '../hooks/useChat'
 import { createChat } from '../store/chats'
 import { putCachedEndpoints } from '../store/models-cache'
 import { createProfile, getProfile } from '../store/profiles'
+import { useChatStore } from '../store/zustand/chatStore'
+import { useStreamStore } from '../store/zustand/streamStore'
+import { useUiStore } from '../store/zustand/uiStore'
 
 const DEBUG_PROFILE_ID = 'debug-fake-stream-profile'
 const DEBUG_MODEL_ID = 'debug/fake-lorem-stream'
@@ -15,6 +18,7 @@ const LOREM =
 
 interface DebugFakeStreamOptions {
   chatId?: ChatId
+  parentMessageId?: MessageId
   targetChars?: number
   reasoningChars?: number
   chunkChars?: number
@@ -40,10 +44,41 @@ interface DebugMemoryMeasurement {
   jsHeapSizeLimit?: number
 }
 
+interface DebugStoreSnapshot {
+  chatStore: {
+    chatCursorCount: number
+    cursorEntryCount: number
+  }
+  streamStore: {
+    activeCount: number
+    liveSnapshotCount: number
+    liveTextLength: number
+    liveReasoningLength: number
+    liveSetCount: number
+    liveClearCount: number
+    maxLiveTextLength: number
+    maxLiveReasoningLength: number
+  }
+  uiStore: {
+    activeChatId: ChatId | null
+  }
+}
+
 interface DebugFakeStreamApi {
   start(options?: DebugFakeStreamOptions): Promise<DebugFakeStreamResult>
   measure(): DebugMemoryMeasurement
+  state(): DebugStoreSnapshot
+  resetStats(): void
+  recycleTranscript(): void
 }
+
+const streamStats = {
+  liveSetCount: 0,
+  liveClearCount: 0,
+  maxLiveTextLength: 0,
+  maxLiveReasoningLength: 0,
+}
+let streamStatsInstalled = false
 
 declare global {
   interface Window {
@@ -53,14 +88,81 @@ declare global {
 
 export function installDebugFakeStream(): void {
   if (typeof window === 'undefined') return
+  installStreamStats()
   window.__debugFakeStream = {
     start,
     measure,
+    state,
+    resetStats,
+    recycleTranscript,
   }
   console.info(
-    '%c[debug] window.__debugFakeStream.start({ targetChars: 100000, reasoningChars: 100000, chunkChars: 128, delayMs, providerFixtureChunks }) — local lorem stream without an API call.',
+    '%c[debug] window.__debugFakeStream.start({ targetChars: 100000, reasoningChars: 100000, chunkChars: 128, delayMs, providerFixtureChunks }) — local lorem stream without an API call. window.__debugFakeStream.recycleTranscript() remounts the active transcript without reloading.',
     'color:#888;font-style:italic',
   )
+}
+
+function installStreamStats(): void {
+  if (streamStatsInstalled) return
+  streamStatsInstalled = true
+  const current = useStreamStore.getState()
+  const originalSetLiveSnapshot = current.setLiveSnapshot
+  const originalClearLiveSnapshot = current.clearLiveSnapshot
+  useStreamStore.setState({
+    setLiveSnapshot: (snapshot) => {
+      streamStats.liveSetCount += 1
+      streamStats.maxLiveTextLength = Math.max(streamStats.maxLiveTextLength, snapshot.textLength)
+      streamStats.maxLiveReasoningLength = Math.max(
+        streamStats.maxLiveReasoningLength,
+        snapshot.reasoningLength,
+      )
+      originalSetLiveSnapshot(snapshot)
+    },
+    clearLiveSnapshot: (messageId) => {
+      streamStats.liveClearCount += 1
+      originalClearLiveSnapshot(messageId)
+    },
+  })
+}
+
+function resetStats(): void {
+  streamStats.liveSetCount = 0
+  streamStats.liveClearCount = 0
+  streamStats.maxLiveTextLength = 0
+  streamStats.maxLiveReasoningLength = 0
+}
+
+function recycleTranscript(): void {
+  window.dispatchEvent(new Event('natter:recycle-transcript'))
+}
+
+function state(): DebugStoreSnapshot {
+  const chatState = useChatStore.getState()
+  const streamState = useStreamStore.getState()
+  const uiState = useUiStore.getState()
+  const liveSnapshots = Object.values(streamState.liveByMessageId)
+  return {
+    chatStore: {
+      chatCursorCount: Object.keys(chatState.cursors).length,
+      cursorEntryCount: Object.values(chatState.cursors).reduce(
+        (sum, cursor) => sum + Object.keys(cursor).length,
+        0,
+      ),
+    },
+    streamStore: {
+      activeCount: Object.keys(streamState.activeByStreamId).length,
+      liveSnapshotCount: liveSnapshots.length,
+      liveTextLength: liveSnapshots.reduce((sum, snapshot) => sum + snapshot.textLength, 0),
+      liveReasoningLength: liveSnapshots.reduce(
+        (sum, snapshot) => sum + snapshot.reasoningLength,
+        0,
+      ),
+      ...streamStats,
+    },
+    uiStore: {
+      activeChatId: uiState.activeChatId,
+    },
+  }
 }
 
 async function start(options: DebugFakeStreamOptions = {}): Promise<DebugFakeStreamResult> {
@@ -74,24 +176,36 @@ async function start(options: DebugFakeStreamOptions = {}): Promise<DebugFakeStr
   const chatId = options.chatId ?? (await createDebugChat(connection.id)).id
   if (options.openChat !== false) navigateToChat(chatId)
 
-  const result = await sendText({
-    chatId,
-    connection,
-    apiKey: 'debug-fake-key',
-    content: [{ type: 'text', text: options.prompt ?? 'Run a local lorem ipsum stress stream.' }],
-    openStream: ({ signal }) =>
-      options.providerFixtureChunks
-        ? replayProviderFixtureChunks(options.providerFixtureChunks, signal)
-        : fakeLoremStream({
-            targetChars,
-            reasoningChars,
-            chunkChars,
-            reasoningChunkChars,
-            delayMs,
-            signal,
-            reasoningAsSnapshots: options.reasoningAsSnapshots === true,
-          }),
-  })
+  const openStream = ({ signal }: { signal: AbortSignal }) =>
+    options.providerFixtureChunks
+      ? replayProviderFixtureChunks(options.providerFixtureChunks, signal)
+      : fakeLoremStream({
+          targetChars,
+          reasoningChars,
+          chunkChars,
+          reasoningChunkChars,
+          delayMs,
+          signal,
+          reasoningAsSnapshots: options.reasoningAsSnapshots === true,
+        })
+
+  const result = options.parentMessageId
+    ? await sendFromMessage({
+        chatId,
+        connection,
+        apiKey: 'debug-fake-key',
+        parentMessageId: options.parentMessageId,
+        openStream,
+      })
+    : await sendText({
+        chatId,
+        connection,
+        apiKey: 'debug-fake-key',
+        content: [
+          { type: 'text', text: options.prompt ?? 'Run a local lorem ipsum stress stream.' },
+        ],
+        openStream,
+      })
 
   return { ...result, chatId, targetChars, reasoningChars, chunkChars, reasoningChunkChars }
 }

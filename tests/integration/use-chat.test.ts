@@ -500,6 +500,72 @@ describe('sendText — chat-completions streaming', () => {
     expect(header.nodeVersion).toBeLessThanOrEqual(6)
   }, 15_000)
 
+  it('publishes large live text as bounded sections and stores one final text item', async () => {
+    const chat = await createChat({ settings: chatSettings() })
+    const first = 'a'.repeat(20_000)
+    const second = 'b'.repeat(5_000)
+    let clock = 1000
+    let release!: () => void
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    let pause!: () => void
+    const paused = new Promise<void>((resolve) => {
+      pause = resolve
+    })
+    async function* longStream(): AsyncGenerator<ChatStreamChunk> {
+      yield {
+        type: 'delta',
+        chunk: {
+          id: 'large-live-1',
+          model: 'google/gemini-3.1-flash-lite-preview',
+          choices: [{ delta: { content: first } }],
+        },
+      }
+      yield {
+        type: 'delta',
+        chunk: {
+          id: 'large-live-2',
+          model: 'google/gemini-3.1-flash-lite-preview',
+          choices: [{ delta: { content: second } }],
+        },
+      }
+      pause()
+      await blocked
+      yield {
+        type: 'delta',
+        chunk: {
+          id: 'large-live-done',
+          model: 'google/gemini-3.1-flash-lite-preview',
+          choices: [{ delta: {}, finish_reason: 'stop' }],
+        },
+      }
+    }
+    const sendPromise = sendText({
+      chatId: chat.id,
+      connection: makeProfile(),
+      apiKey: 'sk-test',
+      content: [{ type: 'text', text: 'large live sections' }],
+      openStream: longStream,
+      now: () => ++clock,
+    })
+    await paused
+    await eventually(() => {
+      const live = Object.values(useStreamStore.getState().liveByMessageId)[0]
+      expect(live?.content).toEqual([
+        { type: 'output_text', text: first },
+        { type: 'output_text', text: second },
+      ])
+    })
+    release()
+    const result = await sendPromise
+    const assistant = requireDefined(
+      await getBrowserRepository().getMessage(result.assistantMessageId),
+      'assistant message',
+    )
+    expect(assistant.content).toEqual([{ type: 'output_text', text: `${first}${second}` }])
+  })
+
   it('sends assistant prefill through the unified request plan and stores the continuation below it', async () => {
     const chat = await createChat({
       settings: chatSettings({

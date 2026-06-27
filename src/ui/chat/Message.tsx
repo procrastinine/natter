@@ -35,7 +35,11 @@ import { AttachmentRefChips } from '../attachments/AttachmentRefChips'
 import { BranchControls } from './BranchControls'
 import { InlineEditor, plaintextOf } from './InlineEditor'
 import { type InsertSlot, MessageActions, MessageEditTreeActions } from './MessageActions'
-import { MessageContent, messageTextFromContent } from './MessageContent'
+import {
+  MessageContent,
+  messageTextFromContent,
+  messageTextSegmentsFromContent,
+} from './MessageContent'
 import { MessageHeader } from './MessageHeader'
 import { MessageInfo } from './MessageInfo'
 import {
@@ -208,9 +212,20 @@ function MessageInner({
     () => normalizeReasoningDetails(renderedReasoningDetails ?? []),
     [renderedReasoningDetails],
   )
-  const text = useMemo(() => messageTextFromContent(renderedContent), [renderedContent])
+  const textSegments = useMemo(
+    () => messageTextSegmentsFromContent(renderedContent),
+    [renderedContent],
+  )
+  const textLength = useMemo(
+    () => textSegments.reduce((sum, segment) => sum + segment.length, 0),
+    [textSegments],
+  )
+  const text = useMemo(
+    () => (isStreaming ? '' : textSegments.join('')),
+    [isStreaming, textSegments],
+  )
   const hasContent =
-    text.length > 0 ||
+    textLength > 0 ||
     renderedContent.some(
       (item) =>
         item.type === 'output_image' ||
@@ -335,8 +350,8 @@ function MessageInner({
     handleCopyError,
   ])
   const collapseProfile = useMemo(
-    () => collapseProfileFor(text.length, { streaming: isStreaming, longMessageDisplayMode }),
-    [isStreaming, longMessageDisplayMode, text.length],
+    () => collapseProfileFor(textLength, { streaming: isStreaming, longMessageDisplayMode }),
+    [isStreaming, longMessageDisplayMode, textLength],
   )
   const manualCollapseRef = useRef(false)
   const [collapseMode, setCollapseMode] = useState<MessageCollapseMode>(collapseProfile.defaultMode)
@@ -369,9 +384,9 @@ function MessageInner({
     (detailIndex: number) => {
       if (detailIndex < 0 || detailIndex >= reasoning.length) return
       const next = reasoning.map((d, i) => (i === detailIndex ? { ...d, hidden: !d.hidden } : d))
-      void onEditInPlace(message, text, next)
+      void onEditInPlace(message, messageTextFromContent(renderedContent), next)
     },
-    [message, reasoning, text, onEditInPlace],
+    [message, reasoning, renderedContent, onEditInPlace],
   )
   const handleToggleToolHidden = useCallback(
     (itemIndex: number) => {
@@ -386,9 +401,15 @@ function MessageInner({
       } else {
         items[itemIndex] = { ...item, hidden: true }
       }
-      void onEditInPlace(message, text, undefined, undefined, items)
+      void onEditInPlace(
+        message,
+        messageTextFromContent(renderedContent),
+        undefined,
+        undefined,
+        items,
+      )
     },
-    [message, text, onEditInPlace],
+    [message, renderedContent, onEditInPlace],
   )
   const handleSaveAndSend = useCallback(
     async (
@@ -529,6 +550,7 @@ function MessageInner({
           <MessageContent
             content={renderedContent}
             text={text}
+            textSegments={isStreaming ? textSegments : undefined}
             streaming={isStreaming}
             collapseMode={collapseMode}
             messageId={message.id}

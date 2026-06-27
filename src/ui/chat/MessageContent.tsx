@@ -12,6 +12,7 @@ import type { MessageCollapseMode } from './MessageStreamOverflow'
 interface MessageContentProps {
   content: ContentItem[]
   text: string
+  textSegments?: readonly string[] | undefined
   streaming?: boolean
   collapseMode?: MessageCollapseMode
   messageId?: MessageId | undefined
@@ -28,39 +29,58 @@ const outputObjectUrlCache = new Map<
 >()
 
 export function messageTextFromContent(content: ContentItem[]): string {
+  return messageTextSegmentsFromContent(content).join('')
+}
+
+export function messageTextSegmentsFromContent(content: readonly ContentItem[]): string[] {
   if (content.length === 1) {
     const only = content[0]
-    return only && (only.type === 'text' || only.type === 'output_text') ? only.text : ''
+    return only && (only.type === 'text' || only.type === 'output_text') ? [only.text] : []
   }
-  let text = ''
+  const segments: string[] = []
   for (const item of content) {
-    if (item.type === 'text' || item.type === 'output_text') text += item.text
+    if (item.type === 'text' || item.type === 'output_text') segments.push(item.text)
   }
-  return text
+  return segments
 }
 
 export function MessageContent({
   content,
   text,
+  textSegments,
   streaming = false,
   collapseMode = 'full',
   messageId,
   attachmentRefs,
 }: MessageContentProps) {
+  const markdownSegments = textSegments && textSegments.length > 0 ? textSegments : undefined
+  const textLength = markdownSegments
+    ? markdownSegments.reduce((sum, segment) => sum + segment.length, 0)
+    : text.length
   const images = useMemo(() => outputImagesFromContent(content), [content])
   const audios = useMemo(() => outputAudiosFromContent(content), [content])
   const videos = useMemo(() => outputVideosFromContent(content), [content])
   const mediaRefs = useMemo(() => liveAttachmentRefs(attachmentRefs), [attachmentRefs])
   const compactText = useMemo(
-    () => (collapseMode === 'compact' ? previewSlice(text, COMPACT_PREVIEW_CHARS) : ''),
-    [collapseMode, text],
+    () =>
+      collapseMode === 'compact'
+        ? markdownSegments
+          ? previewSliceFromSegments(markdownSegments, COMPACT_PREVIEW_CHARS)
+          : previewSlice(text, COMPACT_PREVIEW_CHARS)
+        : '',
+    [collapseMode, text, markdownSegments],
   )
   const peekText = useMemo(
     () =>
       collapseMode === 'peek'
-        ? previewFirstLine(text, images.length + audios.length + videos.length)
+        ? markdownSegments
+          ? previewFirstLineFromSegments(
+              markdownSegments,
+              images.length + audios.length + videos.length,
+            )
+          : previewFirstLine(text, images.length + audios.length + videos.length)
         : '',
-    [collapseMode, text, images.length, audios.length, videos.length],
+    [collapseMode, text, markdownSegments, images.length, audios.length, videos.length],
   )
   if (collapseMode === 'peek') {
     return (
@@ -83,12 +103,37 @@ export function MessageContent({
   }
   return (
     <div data-ui="message-body" data-role="content">
-      {text.length > 0 ? <MarkdownView content={text} streaming={streaming} /> : null}
+      {textLength > 0 ? (
+        <MarkdownView content={text} contentSegments={markdownSegments} streaming={streaming} />
+      ) : null}
       <OutputImages images={images} messageId={messageId} attachmentRefs={mediaRefs} />
       <OutputAudios audios={audios} messageId={messageId} attachmentRefs={mediaRefs} />
       <OutputVideos videos={videos} messageId={messageId} attachmentRefs={mediaRefs} />
     </div>
   )
+}
+
+function previewSliceFromSegments(segments: readonly string[], maxChars: number): string {
+  let out = ''
+  for (const segment of segments) {
+    if (out.length >= maxChars) break
+    out += segment.slice(0, maxChars - out.length)
+  }
+  return previewSlice(out, maxChars)
+}
+
+function previewFirstLineFromSegments(segments: readonly string[], mediaCount: number): string {
+  let out = ''
+  for (const segment of segments) {
+    const newline = segment.indexOf('\n')
+    if (newline >= 0) {
+      out += segment.slice(0, newline)
+      break
+    }
+    out += segment
+    if (out.length > PEEK_PREVIEW_CHARS) break
+  }
+  return previewFirstLine(out, mediaCount)
 }
 
 function previewSlice(text: string, maxChars: number): string {

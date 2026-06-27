@@ -13,6 +13,10 @@
   overflow-wrap: anywhere;
 }
 
+[data-ui="markdown-segment"] {
+  display: contents;
+}
+
 [data-ui="markdown"] h1,
 [data-ui="markdown"] h2,
 [data-ui="markdown"] h3,

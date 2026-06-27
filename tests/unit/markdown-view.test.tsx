@@ -1,6 +1,6 @@
 import { render } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
-import { MarkdownView } from '../../src/ui/chat/MarkdownView'
+import { MarkdownView, STREAMING_MARKDOWN_SEGMENT_CHARS } from '../../src/ui/chat/MarkdownView'
 import {
   DEFAULT_RENDERING_PREFS,
   RenderingPreferencesContext,
@@ -32,6 +32,65 @@ describe('MarkdownView', () => {
     expect(container.querySelector('[data-ui="markdown"]')?.getAttribute('data-streaming')).toBe(
       null,
     )
+  })
+
+  it('freezes oversized live stream prefixes and keeps the tail streaming', () => {
+    const content = `# Heading\n\n${'x'.repeat(STREAMING_MARKDOWN_SEGMENT_CHARS + 1)}`
+    const { container } = render(<MarkdownView content={content} streaming />)
+
+    expect(container.querySelector('[data-ui="markdown"]')?.getAttribute('data-overflow')).toBe(
+      'streaming-segmented',
+    )
+    const segments = container.querySelectorAll('[data-ui="markdown-segment"]')
+    expect(segments).toHaveLength(2)
+    expect(segments[0]?.getAttribute('data-mode')).toBe('static')
+    expect(segments[1]?.getAttribute('data-mode')).toBe('streaming')
+    expect(container.querySelector('h1')?.textContent).toContain('Heading')
+  })
+
+  it('refreshes the frozen live-stream prefix as the live window advances', () => {
+    const content = `# Heading\n\n${'x'.repeat(STREAMING_MARKDOWN_SEGMENT_CHARS * 2 + 1)}`
+    const { container } = render(<MarkdownView content={content} streaming />)
+
+    const segments = container.querySelectorAll('[data-ui="markdown-segment"]')
+    expect(segments).toHaveLength(2)
+    expect(segments[0]?.getAttribute('data-mode')).toBe('static')
+    expect(Number(segments[0]?.getAttribute('data-length'))).toBeGreaterThan(
+      STREAMING_MARKDOWN_SEGMENT_CHARS,
+    )
+    expect(segments[1]?.getAttribute('data-mode')).toBe('streaming')
+  })
+
+  it('prefers safe boundaries for segmented live-stream content', () => {
+    const content = `${'a'.repeat(STREAMING_MARKDOWN_SEGMENT_CHARS - 100)}\n\n${'b'.repeat(200)}`
+    const { container } = render(
+      <MarkdownView
+        content=""
+        contentSegments={[
+          content.slice(0, STREAMING_MARKDOWN_SEGMENT_CHARS),
+          content.slice(STREAMING_MARKDOWN_SEGMENT_CHARS),
+        ]}
+        streaming
+      />,
+    )
+
+    const segments = container.querySelectorAll('[data-ui="markdown-segment"]')
+    expect(segments).toHaveLength(2)
+    expect(Number(segments[0]?.getAttribute('data-length'))).toBe(
+      STREAMING_MARKDOWN_SEGMENT_CHARS - 98,
+    )
+    expect(segments[1]?.getAttribute('data-mode')).toBe('streaming')
+  })
+
+  it('returns oversized stream content to Markdown after the stream completes', () => {
+    const content = `# Heading\n\n${'x'.repeat(STREAMING_MARKDOWN_SEGMENT_CHARS + 1)}`
+    const { container } = render(<MarkdownView content={content} streaming={false} />)
+
+    expect(container.querySelector('[data-ui="markdown"]')?.getAttribute('data-overflow')).toBe(
+      'full',
+    )
+    expect(container.querySelectorAll('[data-ui="markdown-segment"]')).toHaveLength(1)
+    expect(container.querySelector('h1')?.textContent).toContain('Heading')
   })
 
   it('blocks images from unlisted origins with a visible fallback', () => {

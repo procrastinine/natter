@@ -2,7 +2,7 @@ import { createCjkPlugin } from '@streamdown/cjk'
 import { createCodePlugin } from '@streamdown/code'
 import { createMathPlugin } from '@streamdown/math'
 import { createMermaidPlugin } from '@streamdown/mermaid'
-import { useContext, useMemo } from 'react'
+import { type MutableRefObject, memo, useContext, useMemo, useRef } from 'react'
 import type { Components } from 'streamdown'
 import { Streamdown } from 'streamdown'
 import { DEFAULT_IMAGE_ORIGINS, isImageOriginAllowed } from '../../core/image-allowlist'
@@ -11,8 +11,33 @@ import { RenderingPreferencesContext } from '../settings/RenderingSettings'
 
 interface MarkdownViewProps {
   content: string
+  contentSegments?: readonly string[] | undefined
   streaming?: boolean
   allowImageOrigins?: string[]
+}
+
+export const STREAMING_MARKDOWN_SEGMENT_CHARS = 20_000
+const STREAMING_MARKDOWN_CUT_LOOKBACK = 4_000
+
+interface MarkdownSegment {
+  id: string
+  content: string
+  streaming: boolean
+}
+
+interface MarkdownSegmentViewProps {
+  content: string
+  streaming: boolean
+  plugins: ReturnType<typeof buildPlugins> | ReturnType<typeof buildStreamingPlugins>
+  components: Components
+  shikiTheme: [ShikiThemeChoice, ShikiThemeChoice]
+  rendererKey: string
+}
+
+interface PrefixSegmentCache {
+  target: number
+  refs: readonly string[]
+  content: string
 }
 
 // CJK plugin: adds remark plugins that make Chinese/Japanese/Korean text
@@ -44,32 +69,17 @@ function isExternalUrl(href: string | undefined): boolean {
   }
 }
 
-const components: Components = {
-  a: ({ href, children, node: _node, ...props }) => {
-    if (isExternalUrl(href)) {
-      return (
-        <a {...props} href={href} target="_blank" rel="noopener noreferrer">
-          {children}
-        </a>
-      )
-    }
-    return (
-      <a {...props} href={href}>
-        {children}
-      </a>
-    )
-  },
-}
-
-export function MarkdownView({ content, streaming = false, allowImageOrigins }: MarkdownViewProps) {
+export function MarkdownView({
+  content,
+  contentSegments,
+  streaming = false,
+  allowImageOrigins,
+}: MarkdownViewProps) {
   const allowed = useMemo(
     () => [...DEFAULT_IMAGE_ORIGINS, ...(allowImageOrigins ?? [])],
     [allowImageOrigins],
   )
-  const safeContent = useMemo(
-    () => promoteDisplayMath(rewriteBlockedImages(content, allowed)),
-    [content, allowed],
-  )
+  const components = useMemo(() => buildComponents(allowed), [allowed])
   // Syntax-highlighting themes are controlled by the user's rendering
   // preferences (Settings → Rendering). Streamdown ships a
   // `CodeHighlighterPlugin` interface but no built-in implementation —
@@ -83,18 +93,62 @@ export function MarkdownView({ content, streaming = false, allowImageOrigins }: 
     () => [renderingPrefs.shikiLight, renderingPrefs.shikiDark],
     [renderingPrefs.shikiLight, renderingPrefs.shikiDark],
   )
-  const plugins = useMemo(
-    () =>
-      streaming
-        ? getStreamingPlugins(renderingPrefs.singleDollarTextMath)
-        : getPlugins(shikiTheme, renderingPrefs.singleDollarTextMath),
-    [streaming, shikiTheme, renderingPrefs.singleDollarTextMath],
+  const staticPlugins = useMemo(
+    () => getPlugins(shikiTheme, renderingPrefs.singleDollarTextMath),
+    [shikiTheme, renderingPrefs.singleDollarTextMath],
   )
-  const rendererKey = `${shikiTheme.join('::')}::single-dollar=${
+  const streamingPlugins = useMemo(
+    () => getStreamingPlugins(renderingPrefs.singleDollarTextMath),
+    [renderingPrefs.singleDollarTextMath],
+  )
+  const baseRendererKey = `${shikiTheme.join('::')}::single-dollar=${
     renderingPrefs.singleDollarTextMath ? 'on' : 'off'
-  }::mode=${streaming ? 'streaming' : 'static'}`
+  }`
+  const prefixSegmentCacheRef = useRef<PrefixSegmentCache | null>(null)
+  const segments = useMemo(
+    () =>
+      streaming && contentSegments && contentSegments.length > 0
+        ? segmentMarkdownSections(contentSegments, prefixSegmentCacheRef)
+        : segmentMarkdown(content, streaming),
+    [content, contentSegments, streaming],
+  )
+  const segmented = segments.length > 1
+
   return (
-    <div data-ui="markdown" data-overflow="full">
+    <div data-ui="markdown" data-overflow={segmented ? 'streaming-segmented' : 'full'}>
+      {segments.map((segment) => {
+        const segmentMode = segment.streaming ? 'streaming' : 'static'
+        return (
+          <MarkdownSegmentView
+            key={segment.id}
+            content={segment.content}
+            streaming={segment.streaming}
+            plugins={segment.streaming ? streamingPlugins : staticPlugins}
+            components={components}
+            shikiTheme={shikiTheme}
+            rendererKey={`${baseRendererKey}::mode=${segmentMode}`}
+          />
+        )
+      })}
+    </div>
+  )
+}
+
+const MarkdownSegmentView = memo(function MarkdownSegmentView({
+  content,
+  streaming,
+  plugins,
+  components,
+  shikiTheme,
+  rendererKey,
+}: MarkdownSegmentViewProps) {
+  const safeContent = useMemo(() => promoteDisplayMath(content), [content])
+  return (
+    <div
+      data-ui="markdown-segment"
+      data-mode={streaming ? 'streaming' : 'static'}
+      data-length={content.length}
+    >
       <Streamdown
         key={rendererKey}
         mode={streaming ? 'streaming' : 'static'}
@@ -106,6 +160,162 @@ export function MarkdownView({ content, streaming = false, allowImageOrigins }: 
       </Streamdown>
     </div>
   )
+})
+
+function buildComponents(allowed: string[]): Components {
+  return {
+    a: ({ href, children, node: _node, ...props }) => {
+      if (isExternalUrl(href)) {
+        return (
+          <a {...props} href={href} target="_blank" rel="noopener noreferrer">
+            {children}
+          </a>
+        )
+      }
+      return (
+        <a {...props} href={href}>
+          {children}
+        </a>
+      )
+    },
+    img: ({ src, alt, node: _node, ...props }) => {
+      if (!src) return null
+      if (!isImageOriginAllowed(src, allowed)) {
+        return (
+          <span data-ui="blocked-image">
+            Blocked image from <code>{safeOrigin(src)}</code>
+            {alt ? ` (alt: ${alt})` : null}
+          </span>
+        )
+      }
+      return <img {...props} src={src} alt={alt} />
+    },
+  }
+}
+
+function segmentMarkdown(content: string, streaming: boolean): MarkdownSegment[] {
+  if (!streaming || content.length <= STREAMING_MARKDOWN_SEGMENT_CHARS) {
+    return [{ id: '0-live', content, streaming }]
+  }
+  const prefixTarget =
+    Math.floor((content.length - 1) / STREAMING_MARKDOWN_SEGMENT_CHARS) *
+    STREAMING_MARKDOWN_SEGMENT_CHARS
+  const cut = findSegmentCut(content, 0, prefixTarget)
+  return [
+    {
+      id: `0-${cut}`,
+      content: content.slice(0, cut),
+      streaming: false,
+    },
+    {
+      id: `${cut}-live`,
+      content: content.slice(cut),
+      streaming: true,
+    },
+  ]
+}
+
+function segmentMarkdownSections(
+  contentSegments: readonly string[],
+  cacheRef: MutableRefObject<PrefixSegmentCache | null>,
+): MarkdownSegment[] {
+  const totalLength = contentSegments.reduce((sum, segment) => sum + segment.length, 0)
+  if (totalLength <= STREAMING_MARKDOWN_SEGMENT_CHARS) {
+    return [{ id: '0-live', content: contentSegments.join(''), streaming: true }]
+  }
+  const prefixTarget =
+    Math.floor((totalLength - 1) / STREAMING_MARKDOWN_SEGMENT_CHARS) *
+    STREAMING_MARKDOWN_SEGMENT_CHARS
+  const rawSplit = splitTextSegmentsAt(contentSegments, prefixTarget)
+  const rawPrefixContent = rawSplit.prefixRefs.join('')
+  const cut = findSegmentCut(rawPrefixContent, 0, prefixTarget)
+  const { prefixRefs, tailRefs } =
+    cut === prefixTarget ? rawSplit : splitTextSegmentsAt(contentSegments, cut)
+  const cached = cacheRef.current
+  const prefixContent =
+    cached && cached.target === cut && sameStringRefs(cached.refs, prefixRefs)
+      ? cached.content
+      : cut === prefixTarget
+        ? rawPrefixContent
+        : prefixRefs.join('')
+  if (cached?.content !== prefixContent) {
+    cacheRef.current = { target: cut, refs: prefixRefs, content: prefixContent }
+  }
+  return [
+    {
+      id: `0-${cut}`,
+      content: prefixContent,
+      streaming: false,
+    },
+    {
+      id: `${cut}-live`,
+      content: tailRefs.join(''),
+      streaming: true,
+    },
+  ]
+}
+
+function splitTextSegmentsAt(
+  segments: readonly string[],
+  target: number,
+): { prefixRefs: string[]; tailRefs: string[] } {
+  const prefixRefs: string[] = []
+  const tailRefs: string[] = []
+  let consumed = 0
+  for (const segment of segments) {
+    const nextConsumed = consumed + segment.length
+    if (nextConsumed <= target) {
+      prefixRefs.push(segment)
+    } else if (consumed < target) {
+      const splitAt = target - consumed
+      prefixRefs.push(segment.slice(0, splitAt))
+      tailRefs.push(segment.slice(splitAt))
+    } else {
+      tailRefs.push(segment)
+    }
+    consumed = nextConsumed
+  }
+  return { prefixRefs, tailRefs }
+}
+
+function sameStringRefs(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((value, index) => value === b[index])
+}
+
+function findSegmentCut(content: string, start: number, target: number): number {
+  const minCut = Math.max(start + 1, target - STREAMING_MARKDOWN_CUT_LOOKBACK)
+  const blankLineCut = content.lastIndexOf('\n\n', target)
+  if (blankLineCut >= minCut) {
+    const cut = blankLineCut + 2
+    if (!hasOpenFence(content, start, cut)) return cut
+  }
+  const lineCut = content.lastIndexOf('\n', target)
+  if (lineCut >= minCut) {
+    const cut = lineCut + 1
+    if (!hasOpenFence(content, start, cut)) return cut
+  }
+  return target
+}
+
+function hasOpenFence(content: string, start: number, end: number): boolean {
+  let openMarker: string | null = null
+  const lines = content.slice(start, end).split('\n')
+  for (const line of lines) {
+    const match = line.match(/^[ \t]{0,3}(`{3,}|~{3,})/)
+    if (!match) continue
+    const marker = match[1]
+    if (!marker) continue
+    const markerKind = marker[0]
+    if (!markerKind) continue
+    if (!openMarker) {
+      openMarker = marker
+      continue
+    }
+    if (openMarker.startsWith(markerKind) && marker.length >= openMarker.length) {
+      openMarker = null
+    }
+  }
+  return openMarker !== null
 }
 
 function buildPlugins(themes: [ShikiThemeChoice, ShikiThemeChoice], singleDollarTextMath: boolean) {
@@ -140,26 +350,6 @@ function getStreamingPlugins(singleDollarTextMath: boolean) {
   const created = buildStreamingPlugins(singleDollarTextMath)
   streamingPluginCache.set(key, created)
   return created
-}
-
-// Pre-process images: any `![alt](url)` or `<img src="url">` pointing at a
-// non-allowlisted origin is replaced with a stub that the markdown renderer
-// turns into a visible "blocked image from <origin>" affordance. The
-// rewrite happens BEFORE Streamdown parses so the final DOM never contains
-// a tracking pixel.
-function rewriteBlockedImages(md: string, allowed: string[]): string {
-  const mdImagePattern = /!\[([^\]]*)\]\(([^)\s]+)(\s+"[^"]*")?\)/g
-  const htmlImagePattern = /<img\b[^>]*\bsrc=["']([^"']+)["'][^>]*\/?>/gi
-  const replaceMd = md.replace(mdImagePattern, (match: string, alt: string, url: string) => {
-    return isImageOriginAllowed(url, allowed)
-      ? match
-      : `\n\n> \u26a0 Blocked image from \`${safeOrigin(url)}\`${alt ? ` (alt: ${alt})` : ''}\n\n`
-  })
-  return replaceMd.replace(htmlImagePattern, (_match: string, url: string) => {
-    return isImageOriginAllowed(url, allowed)
-      ? _match
-      : `\n\n> \u26a0 Blocked image from \`${safeOrigin(url)}\`\n\n`
-  })
 }
 
 function safeOrigin(url: string): string {

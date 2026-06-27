@@ -437,6 +437,61 @@ describe('almost-live request shape matrix', () => {
     expect(JSON.stringify(wire)).not.toContain('opaque-carrier')
   })
 
+  it('continueAssistantInPlace keeps large continuations out of the IndexedDB hot path', async () => {
+    await warmOpenRouterPrivacy('openai/gpt-4o')
+    const chat = await createChat({
+      settings: chatSettings({
+        continueSystemPrompt: 'Continue exactly from the last assistant message.',
+        continueUserPrompt: '',
+      }),
+    })
+    const [, assistant] = await seedLinearMessages(chat.id, [
+      { id: 'large-cont-u1', role: 'user', text: LOREM_USER },
+      { id: 'large-cont-a1', role: 'assistant', text: LOREM_ASSISTANT },
+    ])
+    const target = requireDefined(assistant, 'seeded assistant')
+    const chunks = Array.from({ length: 48 }, (_, index) =>
+      `chunk-${index}:`.padEnd(128, String(index % 10)),
+    )
+    const expectedContinuation = chunks.join('')
+
+    await continueAssistantInPlace({
+      chatId: chat.id,
+      targetMessageId: target.id,
+      connection: makeProfile(),
+      apiKey: 'sk-test',
+      openStream: () =>
+        (async function* () {
+          for (let i = 0; i < chunks.length; i += 1) {
+            yield {
+              type: 'delta' as const,
+              chunk: {
+                id: `large-cont-${i}`,
+                choices: [{ delta: { content: chunks[i] ?? '' } }],
+              },
+            }
+          }
+          yield {
+            type: 'delta' as const,
+            chunk: {
+              id: 'large-cont-done',
+              choices: [{ delta: {}, finish_reason: 'stop' }],
+            },
+          }
+        })(),
+    })
+
+    const updated = requireDefined(
+      await getBrowserRepository().getMessage(target.id),
+      'continued assistant',
+    )
+    expect(updated.nodeVersion).toBe(1)
+    expect(updated.content).toEqual([
+      { type: 'output_text', text: `${LOREM_ASSISTANT}${expectedContinuation}` },
+    ])
+    expect(useStreamStore.getState().liveByMessageId[target.id]).toBeUndefined()
+  })
+
   it('Responses and Gemini native sends expose valid transport-specific request shapes', async () => {
     const openAiChat = await createChat({
       settings: chatSettings({
