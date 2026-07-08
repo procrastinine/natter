@@ -128,3 +128,24 @@ test('global rendering setting enables single-dollar math', async ({ page }) => 
   await expect(assistant.locator('.katex')).toHaveCount(1)
   await expect(assistant).toContainText('x+y')
 })
+
+test('global rendering setting renders single newlines as line breaks', async ({ page }) => {
+  await mockChatCompletions(page, {
+    body: buildSseBody([{ id: 'single-newline', content: 'Line one\nLine two', finish: 'stop' }]),
+  })
+  await createChatAndOpen(page)
+  await sendMessage(page, 'show two lines')
+
+  const assistant = page.locator('[data-ui="message"][data-role="assistant"]').first()
+  await expect(assistant.locator('p br')).toHaveCount(0)
+
+  await page.locator('[data-ui="open-global-settings"]').click()
+  await page.locator('[data-ui="settings-tab"][data-tab="appearance"]').click()
+  const toggle = page.getByLabel('Single newline as line break')
+  await expect(toggle).not.toBeChecked()
+  await toggle.check()
+  await expect(toggle).toBeChecked()
+  await page.locator('[data-role="global-settings-close"]').click()
+
+  await expect(assistant.locator('p br')).toHaveCount(1)
+})

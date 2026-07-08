@@ -106,13 +106,16 @@ interface MinimalSetting {
   value: unknown
 }
 
+const SYNTHETIC_PROFILE_BACKFILL_VERSION = 1000
+const SYNTHETIC_SETTINGS_SEED_VERSION = 1001
+
 function registerV1(db: Dexie): void {
   registerSchema(db)
 }
 
 function registerV1Through3(db: Dexie): void {
   registerSchema(db)
-  db.version(20)
+  db.version(SYNTHETIC_PROFILE_BACKFILL_VERSION)
     .stores({ profiles: 'id, name, kind, lastUsedAt, archived' })
     .upgrade(async (tx) => {
       await tx
@@ -122,7 +125,7 @@ function registerV1Through3(db: Dexie): void {
           if (row.appTitle === undefined) row.appTitle = 'Natter'
         })
     })
-  db.version(21)
+  db.version(SYNTHETIC_SETTINGS_SEED_VERSION)
     .stores({ settings: '&key' })
     .upgrade(async (tx) => {
       const settings = tx.table<MinimalSetting>('settings')
@@ -204,7 +207,7 @@ describe('Dexie migrations', () => {
     const db = new Dexie(name)
     registerV1Through3(db)
     await db.open()
-    expect(db.verno).toBe(21)
+    expect(db.verno).toBe(SYNTHETIC_SETTINGS_SEED_VERSION)
     expect(db.tables.map((t) => t.name).includes('settings')).toBe(true)
     const tag = await db.table<MinimalSetting>('settings').get('schemaTag')
     expect(tag).toBeUndefined()
@@ -240,7 +243,7 @@ describe('Dexie migrations', () => {
     const up = new Dexie(name)
     registerV1Through3(up)
     await up.open()
-    expect(up.verno).toBe(21)
+    expect(up.verno).toBe(SYNTHETIC_SETTINGS_SEED_VERSION)
     const profile = await up.table<MinimalProfile>('profiles').get('P1')
     expect(profile?.appTitle).toBe('CustomTitle') // preserved — synthetic bump only fills undefined
     const tag = await up.table<MinimalSetting>('settings').get('schemaTag')
@@ -250,7 +253,7 @@ describe('Dexie migrations', () => {
     const reopen = new Dexie(name)
     registerV1Through3(reopen)
     await reopen.open()
-    expect(reopen.verno).toBe(21)
+    expect(reopen.verno).toBe(SYNTHETIC_SETTINGS_SEED_VERSION)
     const tag2 = await reopen.table<MinimalSetting>('settings').get('schemaTag')
     expect(tag2?.value).toBe('preexisting')
     await reopen.delete()
@@ -322,7 +325,7 @@ describe('Dexie migrations', () => {
 
     const migrated = createDbForTests(name)
     await migrated.open()
-    expect(migrated.verno).toBe(19)
+    expect(migrated.verno).toBe(20)
     expect((await migrated.settings.get('global:message-render-window-size'))?.value).toBe(33)
     expect((await migrated.settings.get('global:sidebar-render-window-size'))?.value).toBe(50)
     expect((await migrated.settings.get('global:message-render-window-load-mode'))?.value).toBe(
@@ -702,7 +705,7 @@ describe('Dexie migrations', () => {
 
     const migrated = createDbForTests(name)
     await migrated.open()
-    expect(migrated.verno).toBe(19)
+    expect(migrated.verno).toBe(20)
     const chat = await migrated.chats.get('chat-settings-snapshot')
     const preset = await migrated.presets.get('preset-settings-snapshot')
     for (const settings of [chat?.settings, preset?.settings]) {
@@ -848,7 +851,7 @@ describe('Dexie migrations', () => {
 
     const migrated = createDbForTests(name)
     await migrated.open()
-    expect(migrated.verno).toBe(19)
+    expect(migrated.verno).toBe(20)
     const openaiChat = await migrated.chats.get('chat-openai')
     const googleChat = await migrated.chats.get('chat-google')
     const anthropicChat = await migrated.chats.get('chat-anthropic')
@@ -906,7 +909,7 @@ describe('Dexie migrations', () => {
 
     const migrated = createDbForTests(name)
     await migrated.open()
-    expect(migrated.verno).toBe(19)
+    expect(migrated.verno).toBe(20)
     const rows = (await migrated.presets.toArray()).sort(
       (left, right) => left.sortIndex - right.sortIndex,
     )
@@ -914,6 +917,35 @@ describe('Dexie migrations', () => {
       ['preset-first', 0],
       ['preset-second', 1],
     ])
+    await migrated.delete()
+  })
+
+  it('adds the single-newline rendering preference during schema upgrade', async () => {
+    const name = `natter-test-rendering-prefs-mig-${Math.random().toString(36).slice(2)}`
+    await Dexie.delete(name)
+
+    const legacy = new Dexie(name)
+    registerLegacyChatSettingsV14(legacy)
+    await legacy.open()
+    await legacy.table<MinimalSetting>('settings').put({
+      key: 'rendering-preferences',
+      value: {
+        shikiLight: 'tokyo-night',
+        shikiDark: 'dracula',
+        singleDollarTextMath: true,
+      },
+    })
+    legacy.close()
+
+    const migrated = createDbForTests(name)
+    await migrated.open()
+    expect(migrated.verno).toBe(20)
+    expect((await migrated.settings.get('rendering-preferences'))?.value).toEqual({
+      shikiLight: 'tokyo-night',
+      shikiDark: 'dracula',
+      singleDollarTextMath: true,
+      singleNewlineHardBreaks: false,
+    })
     await migrated.delete()
   })
 

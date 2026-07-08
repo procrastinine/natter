@@ -40,8 +40,8 @@ import {
 } from '../backcompat/provider-tools'
 import {
   canonicalizeTokenCalibrationRows,
-  tokenCalibrationCanonicalizeBackfillMarker,
   rebuildTokenCalibrationGlobalRows,
+  tokenCalibrationCanonicalizeBackfillMarker,
   tokenCalibrationGlobalBackfillMarker,
 } from '../backcompat/token-calibration-global'
 import { findLastUpdatedLeafId } from '../core/active-path'
@@ -50,6 +50,10 @@ import {
   DEFAULT_CONTINUE_SYSTEM_PROMPT,
   DEFAULT_CONTINUE_USER_PROMPT,
 } from '../core/global-settings'
+import {
+  normalizeRenderingPreferences,
+  RENDERING_PREFERENCES_KEY,
+} from '../core/rendering-preferences'
 import type {
   Attachment,
   AttachmentArtifact,
@@ -1211,6 +1215,49 @@ export function registerSchema(db: Dexie): void {
       })
       await table.bulkPut(rows.map((row, sortIndex) => ({ ...row, sortIndex })))
     })
+
+  // v20: rendering-preferences gained a visible line-break option. Normalize
+  // any existing blob so old rows have a concrete false default.
+  db.version(20)
+    .stores({
+      chats:
+        'id, updatedAt, createdAt, lastViewedAt, lastUpdatedLeafId, lastBranchUpdatedAt, wordCount, totalCostUsd, archived, pinned, presetId, folderId, *tags',
+      messages:
+        'id, chatId, parentId, turnId, [chatId+parentId], [chatId+createdAt], [chatId+turnId], [chatId+deleted]',
+      messageBodies: '&id, chatId, updatedAt, nodeVersion',
+      childLists: 'id, [chatId+parentId], updatedAt',
+      attachments: 'id, contentHash, kind, mime, origin, refCount, createdAt, updatedAt, deletedAt',
+      attachmentBlobs: 'id, attachmentId, role, contentHash, createdAt',
+      attachmentArtifacts: 'artifactId, attachmentId, kind, processorId, createdAt',
+      attachmentJobs:
+        'id, attachmentId, processorId, status, updatedAt, [attachmentId+processorId+inputHash]',
+      profiles: 'id, name, kind, lastUsedAt, archived',
+      presets: 'id, name, connectionProfileId, sortIndex, lastUsedAt, archived',
+      promptPresets: 'id, kind, name, lastUsedAt',
+      folders: 'id, name, sortIndex, lastUsedAt',
+      tags: 'id, &nameLower, lastUsedAt',
+      chatBranchCache: '&chatId, branchLeafId, generatedAt',
+      keys: 'id, name',
+      settings: '&key',
+      streamLeases: '&streamId, chatId, ownerClientId, heartbeatAt',
+      streamChunks: '&id, streamId, chatId, messageId, [streamId+seq], createdAt',
+      models: '&[profileId+queryKey], fetchedAt',
+      endpoints: '&[profileId+modelId], fetchedAt',
+      privacyPolicies: '&[profileId+modelId], fetchedAt',
+      providers: '&profileId, fetchedAt',
+      generations: 'id, chatId, gen_id',
+      presetResolutions: '&[profileId+presetSlug], fetchedAt',
+      drafts: '&chatId, updatedAt',
+    })
+    .upgrade(async (tx) => {
+      const settings = tx.table<SettingsRow>('settings')
+      const row = await settings.get(RENDERING_PREFERENCES_KEY)
+      if (!row) return
+      const next = normalizeRenderingPreferences(row.value)
+      if (!jsonValuesEqual(row.value, next)) {
+        await settings.put({ key: RENDERING_PREFERENCES_KEY, value: next })
+      }
+    })
 }
 
 function organizationDefaultsPatch(
@@ -1283,6 +1330,10 @@ function isFiniteNumber(value: unknown): value is number {
 
 function numberOr(value: unknown, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback
+}
+
+function jsonValuesEqual(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right)
 }
 
 const PREVIEW_MAX_CHARS = 240

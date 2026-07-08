@@ -39,6 +39,11 @@ describe('RenderingSettings', () => {
     expect(screen.getByLabelText('Single-dollar LaTeX markdown')).not.toBeChecked()
   })
 
+  it('shows single-newline hard breaks disabled by default', () => {
+    render(<RenderingSettings />)
+    expect(screen.getByLabelText('Single newline as line break')).not.toBeChecked()
+  })
+
   it('writes the single-dollar math preference when toggled', async () => {
     render(<RenderingSettings />)
     fireEvent.click(screen.getByLabelText('Single-dollar LaTeX markdown'))
@@ -48,6 +53,19 @@ describe('RenderingSettings', () => {
     await waitFor(() => {
       expect(mod.__get('rendering-preferences')).toMatchObject({
         singleDollarTextMath: true,
+      })
+    })
+  })
+
+  it('writes the single-newline hard-break preference when toggled', async () => {
+    render(<RenderingSettings />)
+    fireEvent.click(screen.getByLabelText('Single newline as line break'))
+    const mod = (await import('../../src/store/settings')) as unknown as {
+      __get(key: string): unknown
+    }
+    await waitFor(() => {
+      expect(mod.__get('rendering-preferences')).toMatchObject({
+        singleNewlineHardBreaks: true,
       })
     })
   })

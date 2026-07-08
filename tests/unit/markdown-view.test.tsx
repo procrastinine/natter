@@ -165,6 +165,22 @@ describe('MarkdownView', () => {
     expect(container.textContent).toContain('x+y')
   })
 
+  it('keeps single newlines as soft breaks by default', () => {
+    const { container } = render(<MarkdownView content={'alpha\nbeta'} />)
+    expect(container.querySelector('p br')).toBeNull()
+  })
+
+  it('renders single newlines as hard breaks when the rendering preference is enabled', () => {
+    const { container } = render(
+      <RenderingPreferencesContext.Provider
+        value={{ ...DEFAULT_RENDERING_PREFS, singleNewlineHardBreaks: true }}
+      >
+        <MarkdownView content={'alpha\nbeta'} />
+      </RenderingPreferencesContext.Provider>,
+    )
+    expect(container.querySelector('p br')).toBeTruthy()
+  })
+
   it('re-renders mounted markdown when the single-dollar preference changes', () => {
     const content = 'Use $x + y$ here.'
     const { container, rerender } = render(
@@ -184,5 +200,26 @@ describe('MarkdownView', () => {
       </RenderingPreferencesContext.Provider>,
     )
     expect(container.querySelector('.katex')).toBeTruthy()
+  })
+
+  it('re-renders mounted markdown when the newline preference changes', () => {
+    const content = 'alpha\nbeta'
+    const { container, rerender } = render(
+      <RenderingPreferencesContext.Provider
+        value={{ ...DEFAULT_RENDERING_PREFS, singleNewlineHardBreaks: false }}
+      >
+        <MarkdownView content={content} />
+      </RenderingPreferencesContext.Provider>,
+    )
+    expect(container.querySelector('p br')).toBeNull()
+
+    rerender(
+      <RenderingPreferencesContext.Provider
+        value={{ ...DEFAULT_RENDERING_PREFS, singleNewlineHardBreaks: true }}
+      >
+        <MarkdownView content={content} />
+      </RenderingPreferencesContext.Provider>,
+    )
+    expect(container.querySelector('p br')).toBeTruthy()
   })
 })

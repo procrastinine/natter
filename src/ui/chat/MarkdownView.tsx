@@ -3,8 +3,8 @@ import { createCodePlugin } from '@streamdown/code'
 import { createMathPlugin } from '@streamdown/math'
 import { createMermaidPlugin } from '@streamdown/mermaid'
 import { type MutableRefObject, memo, useContext, useMemo, useRef } from 'react'
-import type { Components } from 'streamdown'
-import { Streamdown } from 'streamdown'
+import type { Components, StreamdownProps } from 'streamdown'
+import { defaultRemarkPlugins, Streamdown } from 'streamdown'
 import { DEFAULT_IMAGE_ORIGINS, isImageOriginAllowed } from '../../core/image-allowlist'
 import type { ShikiThemeChoice } from '../settings/RenderingSettings'
 import { RenderingPreferencesContext } from '../settings/RenderingSettings'
@@ -30,6 +30,7 @@ interface MarkdownSegmentViewProps {
   streaming: boolean
   plugins: ReturnType<typeof buildPlugins> | ReturnType<typeof buildStreamingPlugins>
   components: Components
+  remarkPlugins: StreamdownProps['remarkPlugins']
   shikiTheme: [ShikiThemeChoice, ShikiThemeChoice]
   rendererKey: string
 }
@@ -55,6 +56,7 @@ const mermaidPlugin = createMermaidPlugin({
 
 const pluginCache = new Map<string, ReturnType<typeof buildPlugins>>()
 const streamingPluginCache = new Map<string, ReturnType<typeof buildStreamingPlugins>>()
+const defaultRemarkPluginList = Object.values(defaultRemarkPlugins)
 
 function isExternalUrl(href: string | undefined): boolean {
   if (!href) return false
@@ -103,7 +105,14 @@ export function MarkdownView({
   )
   const baseRendererKey = `${shikiTheme.join('::')}::single-dollar=${
     renderingPrefs.singleDollarTextMath ? 'on' : 'off'
-  }`
+  }::single-newline-breaks=${renderingPrefs.singleNewlineHardBreaks ? 'on' : 'off'}`
+  const remarkPlugins = useMemo(
+    () =>
+      renderingPrefs.singleNewlineHardBreaks
+        ? [...defaultRemarkPluginList, singleNewlineHardBreaksRemarkPlugin]
+        : undefined,
+    [renderingPrefs.singleNewlineHardBreaks],
+  )
   const prefixSegmentCacheRef = useRef<PrefixSegmentCache | null>(null)
   const segments = useMemo(
     () =>
@@ -125,6 +134,7 @@ export function MarkdownView({
             streaming={segment.streaming}
             plugins={segment.streaming ? streamingPlugins : staticPlugins}
             components={components}
+            remarkPlugins={remarkPlugins}
             shikiTheme={shikiTheme}
             rendererKey={`${baseRendererKey}::mode=${segmentMode}`}
           />
@@ -139,6 +149,7 @@ const MarkdownSegmentView = memo(function MarkdownSegmentView({
   streaming,
   plugins,
   components,
+  remarkPlugins,
   shikiTheme,
   rendererKey,
 }: MarkdownSegmentViewProps) {
@@ -154,6 +165,7 @@ const MarkdownSegmentView = memo(function MarkdownSegmentView({
         mode={streaming ? 'streaming' : 'static'}
         plugins={plugins}
         components={components}
+        {...(remarkPlugins ? { remarkPlugins } : {})}
         shikiTheme={shikiTheme}
       >
         {safeContent}
@@ -191,6 +203,43 @@ function buildComponents(allowed: string[]): Components {
       return <img {...props} src={src} alt={alt} />
     },
   }
+}
+
+interface MarkdownAstNode {
+  type?: string
+  value?: unknown
+  children?: MarkdownAstNode[]
+}
+
+function singleNewlineHardBreaksRemarkPlugin() {
+  return (tree: MarkdownAstNode) => {
+    replaceSoftLineEndings(tree)
+  }
+}
+
+function replaceSoftLineEndings(node: MarkdownAstNode): void {
+  if (!Array.isArray(node.children)) return
+  for (let i = 0; i < node.children.length; i += 1) {
+    const child = node.children[i]
+    if (child?.type === 'text' && typeof child.value === 'string' && child.value.includes('\n')) {
+      const replacement = splitTextNodeOnLineEndings(child.value)
+      node.children.splice(i, 1, ...replacement)
+      i += replacement.length - 1
+      continue
+    }
+    if (child) replaceSoftLineEndings(child)
+  }
+}
+
+function splitTextNodeOnLineEndings(value: string): MarkdownAstNode[] {
+  const parts = value.split('\n')
+  const nodes: MarkdownAstNode[] = []
+  for (let i = 0; i < parts.length; i += 1) {
+    const part = parts[i]
+    if (part) nodes.push({ type: 'text', value: part })
+    if (i < parts.length - 1) nodes.push({ type: 'break' })
+  }
+  return nodes
 }
 
 function segmentMarkdown(content: string, streaming: boolean): MarkdownSegment[] {

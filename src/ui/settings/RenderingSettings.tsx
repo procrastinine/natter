@@ -1,26 +1,22 @@
 import { useLiveQuery } from 'dexie-react-hooks'
 import { createContext, type ReactNode, useCallback, useEffect, useState } from 'react'
+import {
+  DEFAULT_RENDERING_PREFS,
+  normalizeRenderingPreferences,
+  RENDERING_PREFERENCES_KEY,
+  type RenderingPreferences,
+  SHIKI_THEME_CHOICES,
+  type ShikiThemeChoice,
+} from '../../core/rendering-preferences'
 import { getSetting, setSetting } from '../../store/settings'
 import { InfoDisclosure } from './InfoDisclosure'
 
-export type ShikiThemeChoice = 'github-light' | 'github-dark' | 'tokyo-night' | 'dracula'
-
-interface RenderingPreferences {
-  shikiLight: ShikiThemeChoice
-  shikiDark: ShikiThemeChoice
-  singleDollarTextMath: boolean
-}
-
-export const DEFAULT_RENDERING_PREFS: RenderingPreferences = {
-  shikiLight: 'github-light',
-  shikiDark: 'github-dark',
-  singleDollarTextMath: false,
-}
+export type { RenderingPreferences, ShikiThemeChoice }
+export { DEFAULT_RENDERING_PREFS }
 
 export const RenderingPreferencesContext =
   createContext<RenderingPreferences>(DEFAULT_RENDERING_PREFS)
 
-const STORAGE_KEY = 'rendering-preferences'
 type RenderingPreferencesListener = (prefs: RenderingPreferences) => void
 const renderingPreferencesListeners = new Set<RenderingPreferencesListener>()
 let latestRenderingPreferences = DEFAULT_RENDERING_PREFS
@@ -36,15 +32,15 @@ function subscribeRenderingPreferences(listener: RenderingPreferencesListener): 
 }
 
 async function readRenderingPreferences(): Promise<RenderingPreferences> {
-  const stored = await getSetting<Partial<RenderingPreferences>>(STORAGE_KEY)
-  return { ...DEFAULT_RENDERING_PREFS, ...(stored ?? {}) }
+  const stored = await getSetting<unknown>(RENDERING_PREFERENCES_KEY)
+  return normalizeRenderingPreferences(stored)
 }
 
 async function writeRenderingPreferences(next: Partial<RenderingPreferences>): Promise<void> {
   publishRenderingPreferences({ ...latestRenderingPreferences, ...next })
   const current = await readRenderingPreferences()
   const updated = { ...current, ...next }
-  await setSetting(STORAGE_KEY, updated)
+  await setSetting(RENDERING_PREFERENCES_KEY, updated)
   publishRenderingPreferences(updated)
 }
 
@@ -80,10 +76,29 @@ export function RenderingSettings() {
   const onSingleDollarTextMath = useCallback((value: boolean) => {
     void writeRenderingPreferences({ singleDollarTextMath: value })
   }, [])
+  const onSingleNewlineHardBreaks = useCallback((value: boolean) => {
+    void writeRenderingPreferences({ singleNewlineHardBreaks: value })
+  }, [])
   return (
     <div data-ui="settings-section" data-ui-section="rendering-settings">
       <h3>Rendering</h3>
       <div data-ui="rendering-settings">
+        <div data-ui="field-group">
+          <label data-ui="toggle-row" htmlFor="single-newline-hard-breaks">
+            <input
+              id="single-newline-hard-breaks"
+              data-ui="single-newline-hard-breaks"
+              type="checkbox"
+              checked={prefs.singleNewlineHardBreaks}
+              onChange={(e) => onSingleNewlineHardBreaks(e.target.checked)}
+            />
+            <span>Single newline as line break</span>
+            <InfoDisclosure title="Single newline as line break">
+              When on, markdown soft line endings render as visible line breaks. Paragraph breaks
+              still use blank lines.
+            </InfoDisclosure>
+          </label>
+        </div>
         <div data-ui="field-group">
           <label data-ui="toggle-row" htmlFor="single-dollar-text-math">
             <input
@@ -108,7 +123,7 @@ export function RenderingSettings() {
             value={prefs.shikiLight}
             onChange={(e) => onLight(e.target.value as ShikiThemeChoice)}
           >
-            {THEME_CHOICES.map((v) => (
+            {SHIKI_THEME_CHOICES.map((v) => (
               <option key={v} value={v}>
                 {v}
               </option>
@@ -123,7 +138,7 @@ export function RenderingSettings() {
             value={prefs.shikiDark}
             onChange={(e) => onDark(e.target.value as ShikiThemeChoice)}
           >
-            {THEME_CHOICES.map((v) => (
+            {SHIKI_THEME_CHOICES.map((v) => (
               <option key={v} value={v}>
                 {v}
               </option>
@@ -134,5 +149,3 @@ export function RenderingSettings() {
     </div>
   )
 }
-
-const THEME_CHOICES: ShikiThemeChoice[] = ['github-light', 'github-dark', 'tokyo-night', 'dracula']
