@@ -57,11 +57,10 @@ interface ComposerProps {
   attachmentsDisabledReason?: string
   droppedFiles?: ComposerDroppedFiles | null
   onDroppedFilesConsumed?: (id: string) => void
-  // When true, the textarea starts at the variant's default height
-  // and auto-grows with content up to the variant's auto-grow cap. The
-  // drag handle remains visible; dragging sets a MINIMUM floor that
-  // content can still grow past (see `useLayoutEffect` below for the
-  // `max(content, floor)` semantics).
+  // When true, the textarea starts at the variant's default height and
+  // auto-grows with content up to the variant's cap until the user resizes it.
+  // A manual resize becomes an explicit viewport height; excess content
+  // scrolls inside the textarea.
   autoSize?: boolean
   // Which auto-size profile to use when `autoSize` is true. Different
   // surfaces have different natural sizes:
@@ -71,7 +70,7 @@ interface ComposerProps {
   //     focus mode the composer IS the bottom of the reading lane
   //     (scrolls with content, no sticky footer), so a bigger default
   //     and a bigger ceiling are useful for drafting.
-  // Each variant has its own localStorage key for the floor so user
+  // Each variant has its own localStorage key for the height so user
   // drags in one mode don't leak into the other.
   autoSizeVariant?: AutoSizeVariant
 }
@@ -84,21 +83,21 @@ export interface ComposerDroppedFiles {
 }
 
 interface AutoSizeProfile {
-  defaultFloor: number
+  autoMinHeight: number
   autoGrowMax: number
   storageKey: string
 }
 
 const AUTO_SIZE_PROFILES: Record<AutoSizeVariant, AutoSizeProfile> = {
   normal: {
-    defaultFloor: 0,
+    autoMinHeight: 0,
     autoGrowMax: 240,
     storageKey: 'natter:composer-floor',
   },
   focus: {
-    defaultFloor: 200,
+    autoMinHeight: 200,
     autoGrowMax: 480,
-    storageKey: 'natter:composer-floor-focus',
+    storageKey: 'natter:composer-height-focus',
   },
 }
 
@@ -116,22 +115,40 @@ function readSavedHeight(): number {
   return clampFixedHeight(parsed)
 }
 
-function readSavedFloor(variant: AutoSizeVariant): number {
+function readSavedManualHeight(variant: AutoSizeVariant): number | null {
   const profile = AUTO_SIZE_PROFILES[variant]
-  if (typeof window === 'undefined') return profile.defaultFloor
+  if (typeof window === 'undefined') return null
   const raw = window.localStorage.getItem(profile.storageKey)
-  if (!raw) return profile.defaultFloor
+  if (!raw) return null
   const parsed = Number.parseInt(raw, 10)
-  if (!Number.isFinite(parsed)) return profile.defaultFloor
-  return clampFloorHeight(parsed)
+  if (!Number.isFinite(parsed) || parsed <= 0) return null
+  return Math.min(COMPOSER_MAX_HEIGHT, parsed)
 }
 
 function clampFixedHeight(value: number): number {
   return Math.min(COMPOSER_MAX_HEIGHT, Math.max(COMPOSER_MIN_HEIGHT, value))
 }
 
-function clampFloorHeight(value: number): number {
-  return Math.max(0, Math.min(COMPOSER_MAX_HEIGHT, value))
+function clampComposerHeight(value: number, minHeight: number): number {
+  return Math.min(COMPOSER_MAX_HEIGHT, Math.max(minHeight, value))
+}
+
+function cssPixels(value: string, fallback = 0): number {
+  const parsed = Number.parseFloat(value)
+  return Number.isFinite(parsed) ? parsed : fallback
+}
+
+function oneLineTextareaHeight(el: HTMLTextAreaElement): number {
+  const style = getComputedStyle(el)
+  const fontSize = cssPixels(style.fontSize, 16)
+  const lineHeight = cssPixels(style.lineHeight, fontSize * 1.2)
+  return Math.ceil(
+    lineHeight +
+      cssPixels(style.paddingTop) +
+      cssPixels(style.paddingBottom) +
+      cssPixels(style.borderTopWidth) +
+      cssPixels(style.borderBottomWidth),
+  )
 }
 
 function setComposerTextareaHeight(el: HTMLTextAreaElement, height: number): void {
@@ -202,16 +219,22 @@ export function Composer({
   const lastAttachmentScopeRef = useRef<string | null | undefined>(attachmentScopeKey)
   const prefillTextareaRef = useRef<HTMLTextAreaElement | null>(null)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
-  // In auto-size mode this is a minimum FLOOR (per-variant default).
-  // In fixed mode it's the absolute textarea height. Drag updates it
-  // in both modes; persistence uses separate localStorage keys
-  // per variant so a value written in one doesn't leak into the other.
-  const [height, setHeight] = useState<number>(() =>
-    autoSize ? readSavedFloor(autoSizeVariant) : readSavedHeight(),
-  )
   const profile = AUTO_SIZE_PROFILES[autoSizeVariant]
+  // A null auto-size height means content-driven sizing. The first manual
+  // resize stores an exact viewport height; fixed mode always has a value.
+  const [height, setHeight] = useState<number | null>(() =>
+    autoSize ? readSavedManualHeight(autoSizeVariant) : readSavedHeight(),
+  )
+  const [renderedHeight, setRenderedHeight] = useState(() =>
+    autoSize ? profile.autoMinHeight : (height ?? COMPOSER_DEFAULT_HEIGHT),
+  )
+  const [resizeMinHeight, setResizeMinHeight] = useState(() => (autoSize ? 1 : COMPOSER_MIN_HEIGHT))
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
-  const dragStateRef = useRef<{ startY: number; startHeight: number } | null>(null)
+  const dragStateRef = useRef<{
+    minHeight: number
+    startY: number
+    startHeight: number
+  } | null>(null)
   const latestTextRef = useRef(text)
   const draftKeyRef = useRef<string | null>(draftKey)
   useEffect(() => {
@@ -287,7 +310,11 @@ export function Composer({
   useEffect(() => {
     if (typeof window === 'undefined') return
     const key = autoSize ? profile.storageKey : COMPOSER_HEIGHT_STORAGE_KEY
-    window.localStorage.setItem(key, String(Math.round(height)))
+    if (autoSize && height === null) {
+      window.localStorage.removeItem(key)
+      return
+    }
+    window.localStorage.setItem(key, String(Math.round(height ?? COMPOSER_DEFAULT_HEIGHT)))
   }, [autoSize, profile.storageKey, height])
   // Drive the textarea height imperatively (via the DOM ref). The visual
   // size is dynamic — either drag-updated+persisted or content-driven —
@@ -296,28 +323,50 @@ export function Composer({
   // height lands before paint (prevents a one-frame tall flash during
   // keystrokes in auto-size mode).
   //
-  // Auto-size semantics: `height` acts as a MINIMUM floor set by the
-  // drag handle. The textarea auto-grows from one line up to
-  // COMPOSER_AUTO_SIZE_MAX as content arrives; whichever is taller of
-  // (content-auto-grown, floor) wins. So:
-  //   - empty + no drag (floor=0) → 1 line
-  //   - empty + dragged to 200px → 200px (floor wins)
-  //   - typed 15 lines + dragged to 200 → 240 (cap, content wins)
-  //   - dragged back to 0 → collapses to whatever content needs
+  // Auto-size semantics: null auto-grows from the profile minimum to its cap;
+  // a manual value is an exact viewport height and overflows internally.
+  // Constrain the `height: auto` measurement so its forced layout cannot
+  // transiently resize the sibling transcript and clamp its bottom scroll.
   // biome-ignore lint/correctness/useExhaustiveDependencies: text changes alter textarea scrollHeight.
   useLayoutEffect(() => {
     const el = textareaRef.current
     if (!el) return
+    const oneLineHeight = oneLineTextareaHeight(el)
+    const minHeight = autoSize ? oneLineHeight : COMPOSER_MIN_HEIGHT
+    setResizeMinHeight((current) => (current === minHeight ? current : minHeight))
     if (autoSize) {
+      if (height !== null) {
+        const manualHeight = Math.ceil(clampComposerHeight(height, oneLineHeight))
+        el.style.minHeight = `${manualHeight}px`
+        el.style.maxHeight = `${manualHeight}px`
+        setComposerTextareaHeight(el, manualHeight)
+        setRenderedHeight((current) => (current === manualHeight ? current : manualHeight))
+        if (manualHeight === oneLineHeight && el.scrollHeight <= manualHeight + 1) {
+          setHeight(null)
+        } else if (manualHeight !== height) {
+          setHeight(manualHeight)
+        }
+        return
+      }
+      const autoMinHeight = Math.max(oneLineHeight, profile.autoMinHeight)
+      el.style.minHeight = `${autoMinHeight}px`
+      el.style.maxHeight = `${Math.max(autoMinHeight, profile.autoGrowMax)}px`
       el.style.height = 'auto'
       el.style.overflowY = 'hidden'
       const contentHeight = Math.min(el.scrollHeight, profile.autoGrowMax)
-      const effective = Math.max(contentHeight, height)
-      setComposerTextareaHeight(el, effective)
+      const effectiveHeight = Math.max(autoMinHeight, contentHeight)
+      setComposerTextareaHeight(el, effectiveHeight)
+      setRenderedHeight((current) =>
+        current === effectiveHeight ? current : Math.ceil(effectiveHeight),
+      )
       return
     }
-    setComposerTextareaHeight(el, height)
-  }, [autoSize, profile.autoGrowMax, height, text])
+    el.style.minHeight = ''
+    el.style.maxHeight = ''
+    const fixedHeight = height ?? COMPOSER_DEFAULT_HEIGHT
+    setComposerTextareaHeight(el, fixedHeight)
+    setRenderedHeight((current) => (current === fixedHeight ? current : Math.ceil(fixedHeight)))
+  }, [autoSize, profile.autoGrowMax, profile.autoMinHeight, height, text])
   const trimmed = text.trim()
   const attachments = useAttachmentDrafts()
   const {
@@ -438,20 +487,22 @@ export function Composer({
     (e: React.PointerEvent<HTMLDivElement>) => {
       e.preventDefault()
       e.currentTarget.setPointerCapture(e.pointerId)
-      dragStateRef.current = { startY: e.clientY, startHeight: height }
+      const textarea = textareaRef.current
+      dragStateRef.current = {
+        minHeight: autoSize && textarea ? oneLineTextareaHeight(textarea) : COMPOSER_MIN_HEIGHT,
+        startY: e.clientY,
+        startHeight: textarea?.getBoundingClientRect().height ?? renderedHeight,
+      }
     },
-    [height],
+    [autoSize, renderedHeight],
   )
-  const handlePointerMove = useCallback(
-    (e: React.PointerEvent<HTMLDivElement>) => {
-      const drag = dragStateRef.current
-      if (!drag) return
-      const delta = drag.startY - e.clientY
-      const next = drag.startHeight + delta
-      setHeight(autoSize ? clampFloorHeight(next) : clampFixedHeight(next))
-    },
-    [autoSize],
-  )
+  const handlePointerMove = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    const drag = dragStateRef.current
+    if (!drag) return
+    const delta = drag.startY - e.clientY
+    const next = drag.startHeight + delta
+    setHeight(clampComposerHeight(next, drag.minHeight))
+  }, [])
   const handlePointerUp = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
     if (!dragStateRef.current) return
     e.currentTarget.releasePointerCapture(e.pointerId)
@@ -459,15 +510,21 @@ export function Composer({
   }, [])
   const handleResizeKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLHRElement>) => {
+      if (autoSize && e.key === 'Enter') {
+        e.preventDefault()
+        setHeight(null)
+        return
+      }
       if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return
       e.preventDefault()
       const step = e.shiftKey ? 40 : 10
       const delta = e.key === 'ArrowUp' ? step : -step
-      setHeight((current) =>
-        autoSize ? clampFloorHeight(current + delta) : clampFixedHeight(current + delta),
-      )
+      const textarea = textareaRef.current
+      const minHeight = autoSize && textarea ? oneLineTextareaHeight(textarea) : COMPOSER_MIN_HEIGHT
+      const start = textarea?.getBoundingClientRect().height ?? renderedHeight
+      setHeight(clampComposerHeight(start + delta, minHeight))
     },
-    [autoSize],
+    [autoSize, renderedHeight],
   )
 
   return (
@@ -481,21 +538,23 @@ export function Composer({
     >
       <hr
         data-ui="composer-resize-handle"
+        data-resize-mode={autoSize && height === null ? 'auto' : 'manual'}
         aria-orientation="horizontal"
-        aria-label="Resize composer"
-        aria-valuemin={autoSize ? 0 : COMPOSER_MIN_HEIGHT}
+        aria-label={autoSize ? 'Resize composer; press Enter for automatic height' : 'Resize composer'}
+        aria-keyshortcuts={autoSize ? 'Enter' : undefined}
+        aria-valuemin={resizeMinHeight}
         aria-valuemax={COMPOSER_MAX_HEIGHT}
-        aria-valuenow={Math.round(height)}
+        aria-valuenow={Math.round(renderedHeight)}
+        aria-valuetext={`${autoSize && height === null ? 'Automatic' : 'Manual'}, ${Math.round(renderedHeight)} pixels`}
         tabIndex={0}
-        title={
-          autoSize
-            ? 'Drag to set a minimum height (content still auto-grows above it)'
-            : 'Drag to resize'
-        }
+        title={autoSize ? 'Drag to resize; double-click for automatic height' : 'Drag to resize'}
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
         onPointerCancel={handlePointerUp}
+        onDoubleClick={() => {
+          if (autoSize) setHeight(null)
+        }}
         onKeyDown={handleResizeKeyDown}
       />
       {floatingAccessory ?? null}

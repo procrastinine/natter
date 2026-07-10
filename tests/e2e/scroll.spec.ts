@@ -153,6 +153,56 @@ test('reopening an overflowing chat snaps to the branch leaf instead of preservi
     .toBeLessThanOrEqual(4)
 })
 
+test('typing in an expanded composer keeps an overflowing transcript at the bottom', async ({
+  page,
+}) => {
+  const chatId = await seedLinearChat(page, {
+    messageCount: 24,
+    chatId: 'expanded-composer-scroll-chat',
+    title: 'Expanded composer scroll chat',
+    textPrefix: 'expanded composer message',
+    assistantContentType: 'output_text',
+    settings: {
+      'global:message-render-window-size': 10,
+      'global:message-render-window-load-mode': 'manual',
+    },
+  })
+  await page.goto(`/#/chat/${chatId}`)
+  await page.reload()
+  await expect(page.locator('[data-ui="message"]')).toHaveCount(10)
+
+  const region = page.locator('[data-ui="scroll-region"]')
+  const input = page.locator('[data-ui="composer-input"]')
+  const resizeHandle = page.locator('[data-ui="composer-resize-handle"]')
+  await resizeHandle.focus()
+  for (let i = 0; i < 8; i += 1) await resizeHandle.press('Shift+ArrowUp')
+  const expandedHeight = await input.evaluate((node) => node.clientHeight)
+  expect(expandedHeight).toBeGreaterThan(300)
+
+  await input.click()
+  await region.evaluate((node) => {
+    node.scrollTop = node.scrollHeight
+  })
+  await expect
+    .poll(() => region.evaluate((node) => node.scrollHeight > node.clientHeight + 20))
+    .toBe(true)
+  await expect.poll(() => scrollDistanceFromBottom(region)).toBeLessThanOrEqual(4)
+  await expect(region).toHaveAttribute('data-scroll-state', 'follow')
+
+  for (const key of ['x', 'Backspace']) {
+    await input.press(key)
+    await page.evaluate(
+      () =>
+        new Promise<void>((resolve) =>
+          requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+        ),
+    )
+    expect(await scrollDistanceFromBottom(region), `after ${key}`).toBeLessThanOrEqual(4)
+    expect(await input.evaluate((node) => node.clientHeight)).toBe(expandedHeight)
+    await expect(region).toHaveAttribute('data-scroll-state', 'follow')
+  }
+})
+
 test('browser find-style native scroll can move upward from the open bottom state', async ({
   page,
 }) => {

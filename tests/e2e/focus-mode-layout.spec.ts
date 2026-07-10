@@ -34,6 +34,24 @@ test('focus mode keeps an open chat settings panel visible', async ({ page }) =>
   await expect(page.locator('[data-ui="chat-model-panel"]')).toBeVisible()
 })
 
+test('focus composer keeps auto-growing until the user resizes it', async ({ page }) => {
+  await startDebugChat(page)
+  await page.getByRole('button', { name: 'Enter reading mode' }).click()
+
+  const input = page.locator('[data-ui="composer-input"]')
+  await expect(input).toHaveCSS('height', '200px')
+  await input.fill(Array.from({ length: 12 }, (_, index) => `focus draft ${index}`).join('\n'))
+
+  const metrics = await input.evaluate((node) => ({
+    clientHeight: node.clientHeight,
+    overflowY: getComputedStyle(node).overflowY,
+    scrollHeight: node.scrollHeight,
+  }))
+  expect(metrics.clientHeight).toBeGreaterThan(200)
+  expect(metrics.scrollHeight).toBeLessThanOrEqual(metrics.clientHeight + 1)
+  expect(metrics.overflowY).toBe('hidden')
+})
+
 async function startDebugChat(page: Page): Promise<void> {
   await page.evaluate(async () => {
     const api = (

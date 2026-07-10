@@ -32,6 +32,63 @@ test('empty composer input does not show a vertical scrollbar', async ({ page })
   expect(metrics.scrollHeight).toBeLessThanOrEqual(metrics.clientHeight + 1)
 })
 
+test('composer can be resized below its content and scrolls internally', async ({ page }) => {
+  const input = page.locator('[data-ui="composer-input"]')
+  const oneLineHeight = await input.evaluate((node) => node.clientHeight)
+  const draft = Array.from({ length: 7 }, (_, index) => `draft line ${index}`).join('\n')
+  await input.fill(draft)
+  const grownMetrics = await input.evaluate((node) => ({
+    clientHeight: node.clientHeight,
+    overflowY: getComputedStyle(node).overflowY,
+    scrollHeight: node.scrollHeight,
+  }))
+  expect(grownMetrics.clientHeight).toBeGreaterThan(oneLineHeight)
+  expect(grownMetrics.scrollHeight).toBeLessThanOrEqual(grownMetrics.clientHeight + 1)
+  expect(grownMetrics.overflowY).toBe('hidden')
+
+  const resizeHandle = page.locator('[data-ui="composer-resize-handle"]')
+  await expect(resizeHandle).toHaveAttribute('aria-valuemin', String(oneLineHeight))
+  await expect(resizeHandle).toHaveAttribute('data-resize-mode', 'auto')
+  const handleBox = await resizeHandle.boundingBox()
+  if (!handleBox) throw new Error('Composer resize handle is not visible')
+  const handleX = handleBox.x + handleBox.width / 2
+  const handleY = handleBox.y + handleBox.height / 2
+  await page.mouse.move(handleX, handleY)
+  await page.mouse.down()
+  await page.mouse.move(handleX, handleY + grownMetrics.clientHeight - oneLineHeight, { steps: 4 })
+  await page.mouse.up()
+
+  expect(await input.evaluate((node) => node.clientHeight)).toBe(oneLineHeight)
+  await expect(resizeHandle).toHaveAttribute('aria-valuenow', String(oneLineHeight))
+  await expect(resizeHandle).toHaveAttribute('data-resize-mode', 'manual')
+  await expect(input).toHaveValue(draft)
+  const metrics = await input.evaluate((node) => ({
+    clientHeight: node.clientHeight,
+    overflowY: getComputedStyle(node).overflowY,
+    scrollHeight: node.scrollHeight,
+  }))
+  expect(metrics.scrollHeight).toBeGreaterThan(metrics.clientHeight)
+  expect(metrics.overflowY).toBe('auto')
+  await input.evaluate((node) => {
+    node.scrollTop = node.scrollHeight
+  })
+  expect(await input.evaluate((node) => node.scrollTop)).toBeGreaterThan(0)
+
+  await input.press('x')
+  await input.press('Backspace')
+  expect(await input.evaluate((node) => node.clientHeight)).toBe(oneLineHeight)
+  await expect(input).toHaveCSS('overflow-y', 'auto')
+
+  await resizeHandle.dblclick()
+  await expect(resizeHandle).toHaveAttribute('data-resize-mode', 'auto')
+  const resetHeight = await input.evaluate((node) => node.clientHeight)
+  expect(resetHeight).toBeGreaterThan(oneLineHeight)
+  await expect(input).toHaveCSS('overflow-y', 'hidden')
+
+  await input.fill(`${draft}\nnew automatic line`)
+  expect(await input.evaluate((node) => node.clientHeight)).toBeGreaterThan(resetHeight)
+})
+
 test('composer input overscroll backing matches the input surface', async ({ page }) => {
   const metrics = await page.locator('[data-ui="composer-input"]').evaluate((el) => {
     const input = el as HTMLTextAreaElement
