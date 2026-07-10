@@ -9,6 +9,9 @@ import type { PrivacyFilterResult } from '../../src/core/privacy-filter'
 import type { DataPolicy, ModelEndpoint } from '../../src/core/types'
 import {
   buildPickerRows,
+  ignoredProviderRefsAfterBulkDeselect,
+  isLowQuantization,
+  isUnknownQuantization,
   reasonLabel,
   reasonsToTooltip,
   tierToLockLabel,
@@ -273,6 +276,76 @@ describe('buildPickerRows', () => {
       providerPrefs: { ignore: ['Anthropic'], ignoreOverridesFilter: true },
     })
     expect(legacy.map((r) => r.state)).toEqual(['auto-excluded', 'auto-excluded'])
+  })
+})
+
+describe('provider-picker bulk quantization helpers', () => {
+  it('classifies low and unknown quantization labels from OpenRouter endpoints', () => {
+    expect(isLowQuantization('fp4')).toBe(true)
+    expect(isLowQuantization('int4')).toBe(true)
+    expect(isLowQuantization('GPTQ-Int4')).toBe(true)
+    expect(isLowQuantization('Q4_K_M')).toBe(true)
+    expect(isLowQuantization('fp8')).toBe(false)
+    expect(isLowQuantization('bf16')).toBe(false)
+    expect(isLowQuantization('unknown')).toBe(false)
+    expect(isLowQuantization(undefined)).toBe(false)
+
+    expect(isUnknownQuantization('unknown')).toBe(true)
+    expect(isUnknownQuantization(undefined)).toBe(true)
+    expect(isUnknownQuantization('fp4')).toBe(false)
+  })
+
+  it('deselects low quantizations relative to the current selected rows', () => {
+    const deepseek = ep('DeepSeek', { provider_slug: 'deepseek', quantization: 'unknown' })
+    const streamlake = ep('StreamLake', { provider_slug: 'streamlake/fp8', quantization: 'fp8' })
+    const deepinfra = ep('DeepInfra', { provider_slug: 'deepinfra/fp4', quantization: 'fp4' })
+    const endpoints = [deepseek, streamlake, deepinfra]
+    const filter: PrivacyFilterResult = {
+      kept: endpoints.map((endpoint) => ({
+        endpoint,
+        policy: POLICY_CLEAN,
+        policySynthesized: false,
+      })),
+      excluded: [],
+      zeroEligible: false,
+    }
+    const providerPrefs = {
+      ignore: ['streamlake/fp8', 'missing-provider'],
+      ignoreOverridesFilter: true,
+    }
+    const rows = buildPickerRows(endpoints, filter, { providerPrefs })
+
+    expect(
+      ignoredProviderRefsAfterBulkDeselect(rows, endpoints, providerPrefs, (endpoint) =>
+        isLowQuantization(endpoint.quantization),
+      ),
+    ).toEqual(['streamlake/fp8', 'missing-provider', 'deepinfra/fp4'])
+  })
+
+  it('deselects unknown quantizations without reselecting existing ignores', () => {
+    const deepseek = ep('DeepSeek', { provider_slug: 'deepseek', quantization: 'unknown' })
+    const atlas = ep('AtlasCloud', { provider_slug: 'atlas-cloud/fp4', quantization: 'fp4' })
+    const endpoints = [deepseek, atlas]
+    const filter: PrivacyFilterResult = {
+      kept: endpoints.map((endpoint) => ({
+        endpoint,
+        policy: POLICY_CLEAN,
+        policySynthesized: false,
+      })),
+      excluded: [],
+      zeroEligible: false,
+    }
+    const providerPrefs = {
+      ignore: ['atlas-cloud/fp4'],
+      ignoreOverridesFilter: true,
+    }
+    const rows = buildPickerRows(endpoints, filter, { providerPrefs })
+
+    expect(
+      ignoredProviderRefsAfterBulkDeselect(rows, endpoints, providerPrefs, (endpoint) =>
+        isUnknownQuantization(endpoint.quantization),
+      ),
+    ).toEqual(['atlas-cloud/fp4', 'deepseek'])
   })
 })
 

@@ -13,7 +13,12 @@ import {
   type PrivacyTier,
   privacyTierForPolicy,
 } from '../../core/privacy-filter'
-import { endpointMatchesAnyProviderRef, providerEndpointKey } from '../../core/provider-identity'
+import {
+  endpointMatchesAnyProviderRef,
+  providerEndpointKey,
+  providerRoutingRef,
+  resolveProviderRefsToRoutingRefs,
+} from '../../core/provider-identity'
 import type { DataPolicy, ModelEndpoint, PrivacyPrefs, ProviderPreferences } from '../../core/types'
 
 type PickerRowState = 'kept' | 'auto-excluded' | 'no-filter'
@@ -182,4 +187,40 @@ export function tierToLockLabel(tier: PrivacyTier): string {
     case 'unavailable':
       return 'Privacy data unavailable'
   }
+}
+
+export function isLowQuantization(quantization: string | undefined): boolean {
+  const q = quantization?.trim().toLowerCase()
+  if (!q || q === 'unknown') return false
+  return /(^|[^a-z0-9])(?:int[1-4]|uint[1-4]|fp[1-4]|nf[1-4]|q[1-4]|[1-4]\s*[-_ ]?bit|[1-4]b|nvfp4|mxfp4)([^a-z0-9]|$)/u.test(
+    q,
+  )
+}
+
+export function isUnknownQuantization(quantization: string | undefined): boolean {
+  const q = quantization?.trim().toLowerCase()
+  return !q || q === 'unknown'
+}
+
+export function ignoredProviderRefsAfterBulkDeselect(
+  rows: readonly PickerRow[],
+  endpoints: readonly ModelEndpoint[],
+  providerPrefs: ProviderPreferences | undefined,
+  shouldDeselect: (endpoint: ModelEndpoint) => boolean,
+): string[] {
+  const ignored = new Set<string>()
+  for (const row of rows) {
+    if (row.state !== 'kept') ignored.add(providerRoutingRef(row.endpoint))
+  }
+  for (const ref of resolveProviderRefsToRoutingRefs(endpoints, providerPrefs?.ignore, {
+    preserveUnknown: true,
+  })) {
+    ignored.add(ref)
+  }
+  for (const row of rows) {
+    if (row.state === 'kept' && shouldDeselect(row.endpoint)) {
+      ignored.add(providerRoutingRef(row.endpoint))
+    }
+  }
+  return [...ignored]
 }

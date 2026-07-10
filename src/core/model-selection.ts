@@ -42,6 +42,14 @@ export function forceEquivalentModelIdForConnection(
   const targetProvider = providerForConnectionKind(kind)
   if (!targetProvider) return null
   if (identity.provider !== targetProvider) return null
+  // OpenRouter encodes GPT-5.6 Pro as a routing alias; native OpenAI uses
+  // `reasoning.mode: "pro"` and has no corresponding model slug.
+  if (
+    kind === 'openai-compatible' &&
+    /^gpt-5:6-(?:sol|terra|luna)-pro$/u.test(identity.compatSlug)
+  ) {
+    return null
+  }
   return normalizeForcedModelIdForConnection(identity.slug, kind)
 }
 

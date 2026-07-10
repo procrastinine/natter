@@ -13,6 +13,8 @@ import {
   emitsEncryptedReasoningFor,
   quirksFor,
   reasoningPreservationFormatFor,
+  reasoningToggleableFor,
+  responsesSupportFor,
 } from '../../src/core/quirks'
 
 describe('reasoningPreservationFormat', () => {
@@ -22,6 +24,9 @@ describe('reasoningPreservationFormat', () => {
       'openai/gpt-5.4-nano',
       'openai/gpt-5.4-mini',
       'openai/gpt-5.4-pro',
+      'openai/gpt-5.6-sol',
+      'openai/gpt-5.6-terra',
+      'openai/gpt-5.6-luna',
       'openai/gpt-5.3-codex',
       'openai/gpt-5.3',
       'openai/gpt-5.2',
@@ -48,6 +53,7 @@ describe('reasoningPreservationFormat', () => {
       'anthropic/claude-opus-4.8',
       'anthropic/claude-opus-4.9',
       'anthropic/claude-fable-5',
+      'anthropic/claude-sonnet-5',
       'anthropic/claude-5-fable-20260609',
       'anthropic/claude-opus-4.7',
       'anthropic/claude-opus-4.6',
@@ -120,14 +126,51 @@ describe('API routing hints', () => {
       persistsResponsesPhase: true,
       requiresPhaseEcho: true,
       gpt54SamplingGate: true,
+      defaultReasoningEffort: 'medium',
       reasoningPreservationFormat: 'openai-responses-v1',
     })
     expect(quirksFor('openai/gpt-5.5-pro').requiresResponsesApi).toBe(true)
     expect(allowedEffortFor('openai/gpt-5.5')).toEqual(['none', 'low', 'medium', 'high', 'xhigh'])
-    expect(allowedVerbosityFor('openai/gpt-5.5')).toEqual(['low', 'medium', 'high', 'xhigh'])
+    expect(allowedEffortFor('openai/gpt-5.5-pro')).toEqual(['medium', 'high', 'xhigh'])
+    expect(quirksFor('openai/gpt-5.5-pro').defaultReasoningEffort).toBe('high')
+    expect(allowedVerbosityFor('openai/gpt-5.5')).toEqual(['low', 'medium', 'high'])
+    expect(reasoningToggleableFor('openai/gpt-5.5-pro')).toBe(false)
     expect(emitsEncryptedReasoningFor('openai/gpt-5.5')).toBe('always')
-    expect(reasoningPreservationFormatFor('openai/gpt-5.5-2026-05-08')).toBe('openai-responses-v1')
+    expect(reasoningPreservationFormatFor('openai/gpt-5.5-2026-04-23')).toBe('openai-responses-v1')
     expect(reasoningPreservationFormatFor('openai/gpt-5.5-llama')).toBeUndefined()
+  })
+
+  it('GPT-5.6 named tiers add max effort and inherit Responses preservation', () => {
+    for (const model of [
+      'openai/gpt-5.6',
+      'openai/gpt-5.6-sol',
+      'openai/gpt-5.6-terra',
+      'openai/gpt-5.6-luna',
+    ]) {
+      expect(quirksFor(model)).toMatchObject({
+        preferApi: 'responses',
+        persistsResponsesPhase: true,
+        requiresPhaseEcho: true,
+        gpt54SamplingGate: true,
+        defaultReasoningEffort: 'medium',
+        reasoningPreservationFormat: 'openai-responses-v1',
+      })
+      expect(allowedEffortFor(model)).toEqual(['none', 'low', 'medium', 'high', 'xhigh', 'max'])
+      expect(allowedVerbosityFor(model)).toEqual(['low', 'medium', 'high'])
+      expect(emitsEncryptedReasoningFor(model)).toBe('always')
+    }
+    for (const tier of ['sol', 'terra', 'luna']) {
+      const model = `openai/gpt-5.6-${tier}-pro`
+      const pro = quirksFor(model)
+      expect(pro.preferApi).toBe('responses')
+      expect(pro.requiresResponsesApi).toBeUndefined()
+      expect(responsesSupportFor(model)).toBe('both')
+    }
+    expect(reasoningPreservationFormatFor('openai/gpt-5.6-sol-20260709')).toBe(
+      'openai-responses-v1',
+    )
+    expect(reasoningPreservationFormatFor('openai/gpt-5.6-stellar')).toBeUndefined()
+    expect(reasoningPreservationFormatFor('openai/gpt-5.6-llama')).toBeUndefined()
   })
 
   it('Gemini 3.x Flash releases inherit encrypted reasoning without a registry row', () => {
@@ -175,8 +218,8 @@ describe('Effort enums (live-probe verified)', () => {
     expect(allowedEffortFor('openai/gpt-5.3-codex')).toEqual(['low', 'medium', 'high', 'xhigh'])
   })
 
-  it('GPT-5.4 verbosity: low/medium/high/xhigh (no max — Claude-only)', () => {
-    expect(allowedVerbosityFor('openai/gpt-5.4')).toEqual(['low', 'medium', 'high', 'xhigh'])
+  it('GPT-5.4 verbosity: low/medium/high', () => {
+    expect(allowedVerbosityFor('openai/gpt-5.4')).toEqual(['low', 'medium', 'high'])
     expect(allowedVerbosityFor('openai/gpt-5.3-codex')).toEqual([])
   })
 })
@@ -192,6 +235,32 @@ describe('adjustGpt54SamplingGate', () => {
     }
     adjustGpt54SamplingGate(req, 'openai/gpt-5.4-nano')
     expect(req).toEqual({ reasoning: { effort: 'medium' } })
+  })
+
+  it('applies the sampling gate to GPT-5.6 named tiers', () => {
+    const req: Record<string, unknown> = {
+      reasoning: { effort: 'max' },
+      temperature: 0.7,
+      top_p: 0.9,
+      logprobs: 1,
+    }
+    adjustGpt54SamplingGate(req, 'openai/gpt-5.6-luna')
+    expect(req).toEqual({ reasoning: { effort: 'max' } })
+  })
+
+  it('uses each family default when reasoning.effort is omitted', () => {
+    const gpt54: Record<string, unknown> = { temperature: 0.7 }
+    const gpt55: Record<string, unknown> = { temperature: 0.7 }
+    const gpt55Pro: Record<string, unknown> = { temperature: 0.7 }
+    const gpt56: Record<string, unknown> = { temperature: 0.7 }
+    adjustGpt54SamplingGate(gpt54, 'openai/gpt-5.4')
+    adjustGpt54SamplingGate(gpt55, 'openai/gpt-5.5')
+    adjustGpt54SamplingGate(gpt55Pro, 'openai/gpt-5.5-pro')
+    adjustGpt54SamplingGate(gpt56, 'openai/gpt-5.6-sol')
+    expect(gpt54).toEqual({ temperature: 0.7 })
+    expect(gpt55).toEqual({})
+    expect(gpt55Pro).toEqual({})
+    expect(gpt56).toEqual({})
   })
 
   it('keeps sampling params when effort === "none"', () => {

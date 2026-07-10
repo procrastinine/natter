@@ -93,4 +93,31 @@ describe('model selection identity', () => {
       ]),
     ).toBe('models/gemini-3.1-pro-preview')
   })
+
+  it('normalizes GPT-5.6 standard tiers without inventing native Pro slugs', () => {
+    expect(
+      forceEquivalentModelIdForConnection('openai/gpt-5.6', 'openai-compatible', [
+        { id: 'gpt-5.6-sol' },
+        { id: 'gpt-5.6-terra' },
+        { id: 'gpt-5.6-luna' },
+      ]),
+    ).toBe('gpt-5.6-sol')
+    for (const tier of ['sol', 'terra', 'luna']) {
+      expect(
+        forceEquivalentModelIdForConnection(`openai/gpt-5.6-${tier}`, 'openai-compatible', [
+          { id: `gpt-5.6-${tier}` },
+        ]),
+      ).toBe(`gpt-5.6-${tier}`)
+      expect(
+        forceEquivalentModelIdForConnection(`gpt-5.6-${tier}`, 'openrouter', [
+          { id: `openai/gpt-5.6-${tier}` },
+        ]),
+      ).toBe(`openai/gpt-5.6-${tier}`)
+      expect(
+        forceEquivalentModelIdForConnection(`openai/gpt-5.6-${tier}-pro`, 'openai-compatible', [
+          { id: `gpt-5.6-${tier}` },
+        ]),
+      ).toBeNull()
+    }
+  })
 })

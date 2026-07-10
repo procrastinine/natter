@@ -607,6 +607,8 @@ async function openAssistantStreamUnder(
     hasAttachmentContext,
   } = requestPlan
   const placeholderApiUsed: 'chat' | 'completion' = useTextProtocol ? 'completion' : 'chat'
+  const delivery =
+    route?.transport === 'openai-responses' && wire.stream !== true ? 'buffered' : 'streaming'
   const initialAssistantContent = input.initialAssistantContent ?? []
   const initialStoredContent = assistantContentWithStreamPrefix(initialAssistantContent, '')
   const hasNonTextOutbound = outboundPath.some((message) =>
@@ -639,7 +641,7 @@ async function openAssistantStreamUnder(
           model: chat.settings.model,
           requestedModel: chat.settings.model,
           apiUsed: placeholderApiUsed,
-          delivery: 'streaming',
+          delivery,
           costSource: 'stream',
           startedAt: now(),
         },

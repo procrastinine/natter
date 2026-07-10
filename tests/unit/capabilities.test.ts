@@ -7,7 +7,12 @@ import {
   validateChatSettings,
 } from '../../src/core/capabilities'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
-import type { ChatSettings, ModelEndpoint } from '../../src/core/types'
+import type {
+  ChatSettings,
+  ConnectionKind,
+  ConnectionProfile,
+  ModelEndpoint,
+} from '../../src/core/types'
 
 function makeEndpoint(overrides: Partial<ModelEndpoint> = {}): ModelEndpoint {
   return {
@@ -16,6 +21,26 @@ function makeEndpoint(overrides: Partial<ModelEndpoint> = {}): ModelEndpoint {
     context_length: 128000,
     pricing: { prompt: '0.0000025', completion: '0.00001' },
     ...overrides,
+  }
+}
+
+function makeDirectProfile(
+  kind: Extract<ConnectionKind, 'anthropic' | 'openai-compatible'>,
+): ConnectionProfile {
+  return {
+    id: `direct-${kind}`,
+    name: kind,
+    kind,
+    baseUrl: kind === 'anthropic' ? 'https://api.anthropic.com/v1' : 'https://api.openai.com/v1',
+    apiKeyRef: 'k',
+    defaultHeaders: {},
+    appTitle: '',
+    appUrl: '',
+    supportsEndpointsApi: false,
+    supportsGenerationApi: false,
+    supportsPrivacyScrape: false,
+    createdAt: 0,
+    updatedAt: 0,
   }
 }
 
@@ -274,6 +299,57 @@ describe('resolveBundledCapability', () => {
     expect(cap.supportedParameters).not.toContain('temperature')
     expect(cap.contextLength).toBe(1_000_000)
     expect(cap.maxCompletionTokens).toBe(128_000)
+  })
+
+  it('bundles Claude Sonnet 5 for Anthropic direct profiles', () => {
+    const cap = resolveBundledCapability(makeDirectProfile('anthropic'), 'claude-sonnet-5')
+    expect(cap.supportedParameters).toEqual([
+      'max_tokens',
+      'stop_sequences',
+      'tools',
+      'tool_choice',
+      'thinking',
+      'verbosity',
+      'cache_control',
+    ])
+    expect(cap.supportedParameters).not.toContain('temperature')
+    expect(cap.contextLength).toBe(1_000_000)
+    expect(cap.maxCompletionTokens).toBe(128_000)
+    expect(cap.architecture).toEqual({
+      inputModalities: ['text', 'image', 'file'],
+      outputModalities: ['text'],
+    })
+  })
+
+  it('normalizes native GPT-5.5 and GPT-5.6 descriptors through one capability shape', () => {
+    const profile = makeDirectProfile('openai-compatible')
+    const expected = [
+      ['gpt-5.5', '0.000005', '0.00003', 'supported'],
+      ['gpt-5.5-pro', '0.00003', '0.00018', 'buffered-only'],
+      ['gpt-5.6', '0.000005', '0.00003', 'supported'],
+      ['gpt-5.6-sol', '0.000005', '0.00003', 'supported'],
+      ['gpt-5.6-terra', '0.0000025', '0.000015', 'supported'],
+      ['gpt-5.6-luna', '0.000001', '0.000006', 'supported'],
+    ] as const
+    for (const [model, prompt, completion, streaming] of expected) {
+      const cap = resolveBundledCapability(profile, model)
+      expect(cap.contextLength, model).toBe(1_050_000)
+      expect(cap.maxCompletionTokens, model).toBe(128_000)
+      expect(cap.pricing, model).toEqual({ prompt, completion })
+      expect(cap.streaming, model).toBe(streaming)
+      expect(cap.architecture, model).toEqual({
+        inputModalities: ['text', 'image'],
+        outputModalities: ['text'],
+      })
+      expect(cap.supportedParameters, model).toContain('reasoning')
+      expect(cap.supportedParameters, model).toContain('verbosity')
+      expect(cap.supportedParameters, model).toContain('tools')
+      if (model === 'gpt-5.5-pro') {
+        expect(cap.supportedParameters, model).not.toContain('temperature')
+      } else {
+        expect(cap.supportedParameters, model).toContain('temperature')
+      }
+    }
   })
 
   it('matches versioned Anthropic compatibility ids instead of falling back to custom defaults', () => {

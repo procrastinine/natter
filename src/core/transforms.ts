@@ -819,6 +819,7 @@ export interface ResponsesTransformOptions {
   rewriteSlug?: (slug: string) => string
   privacy?: WireProviderPrivacy
   allowProviderRouting?: boolean
+  allowOpenRouterExtensions?: boolean
   hostedToolsProvider?: HostedToolProvider
   // Informs the reasoning-carry-forward filter about which encrypted format the
   // current route round-trips. For Responses the map is:
@@ -923,7 +924,7 @@ export function toResponses(
 
   // Reasoning: build the sub-object if mode !== 'default'. (Same rule as chat.)
   if (gate('reasoning')) {
-    const reasoningBody = buildResponsesReasoning(settings)
+    const reasoningBody = buildResponsesReasoning(settings, opts.allowOpenRouterExtensions === true)
     if (reasoningBody) wire.reasoning = reasoningBody
   }
 
@@ -996,15 +997,19 @@ export function toResponses(
 
 function buildResponsesReasoning(
   settings: ChatSettings,
+  allowOpenRouterExtensions: boolean,
 ): ResponsesRequestWire['reasoning'] | undefined {
   const r = settings.reasoning
   if (r.mode === 'default') return undefined
-  if (r.mode === 'off') return { enabled: false }
-  const body: NonNullable<ResponsesRequestWire['reasoning']> = { enabled: true }
+  if (r.mode === 'off') {
+    return allowOpenRouterExtensions ? { enabled: false } : { effort: 'none' }
+  }
+  const body: NonNullable<ResponsesRequestWire['reasoning']> = {}
+  if (allowOpenRouterExtensions) body.enabled = true
   if (r.effort !== undefined) body.effort = r.effort
-  if (r.exclude) body.exclude = true
+  if (allowOpenRouterExtensions && r.exclude) body.exclude = true
   if (r.summary && r.summary !== 'off') body.summary = r.summary
-  return body
+  return Object.keys(body).length > 0 ? body : undefined
 }
 
 function toResponsesTextFormat(
@@ -1589,6 +1594,7 @@ const BUDGET_TABLE_GEMINI_2_5_FLASH: Partial<Record<EffortLevel, number>> = {
   medium: 2048,
   high: 8192,
   xhigh: 24576,
+  max: 24576,
   none: 0,
 }
 const BUDGET_TABLE_GEMINI_2_5_PRO: Partial<Record<EffortLevel, number>> = {
@@ -1598,6 +1604,7 @@ const BUDGET_TABLE_GEMINI_2_5_PRO: Partial<Record<EffortLevel, number>> = {
   medium: 2048,
   high: 8192,
   xhigh: 32768,
+  max: 32768,
 }
 const BUDGET_TABLE_GEMINI_2_5_FLASH_LITE: Partial<Record<EffortLevel, number>> = {
   // Flash-Lite floor is 512; minimal clamps up to the floor.
@@ -1606,6 +1613,7 @@ const BUDGET_TABLE_GEMINI_2_5_FLASH_LITE: Partial<Record<EffortLevel, number>> =
   medium: 2048,
   high: 8192,
   xhigh: 24576,
+  max: 24576,
 }
 
 // Kept for back-compat with callers that passed a single table via
@@ -1821,6 +1829,7 @@ function mapEffortToThinkingLevelPro(effort: EffortLevel): 'low' | 'medium' | 'h
       return 'medium'
     case 'high':
     case 'xhigh':
+    case 'max':
       return 'high'
     default:
       return 'medium'
@@ -1840,6 +1849,7 @@ function mapEffortToThinkingLevelFlash(effort: EffortLevel): 'minimal' | 'low' |
       return 'medium'
     case 'high':
     case 'xhigh':
+    case 'max':
       return 'high'
     default:
       return 'medium'

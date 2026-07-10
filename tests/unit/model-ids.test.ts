@@ -26,6 +26,13 @@ describe('model identity normalization', () => {
     expect(deterministicStructuralModelId('gpt-5.5')).toBe('openai:gpt-5.5')
     expect(canonicalModelSlug('openai/gpt-5.5-pro')).toBe('gpt-5.5-pro')
     expect(compatModelIdsMatch('gpt-5.5', 'openai/gpt-5.5')).toBe(true)
+    expect(canonicalModelSlug('gpt-5.5-2026-04-23')).toBe('gpt-5.5')
+    expect(canonicalModelSlug('gpt-5.5-pro-2026-04-23')).toBe('gpt-5.5-pro')
+    expect(canonicalModelSlug('gpt-5.6')).toBe('gpt-5.6-sol')
+    expect(deterministicStructuralModelId('gpt-5.6')).toBe('openai:gpt-5.6-sol')
+    expect(deterministicStructuralModelId('openai/gpt-5.6-sol')).toBe('openai:gpt-5.6-sol')
+    expect(deterministicStructuralModelId('gpt-5.6-terra')).toBe('openai:gpt-5.6-terra')
+    expect(deterministicStructuralModelId('gpt-5.6-luna')).toBe('openai:gpt-5.6-luna')
   })
 
   it('maps Anthropic dated ids onto the undated OpenRouter slug', () => {

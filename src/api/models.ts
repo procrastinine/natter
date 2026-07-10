@@ -63,7 +63,15 @@ async function fetchJson(
   ctx: DiscoveryContext,
   opts: { signal?: AbortSignal; timeoutMs?: number } = {},
 ): Promise<unknown> {
-  const headers = buildHeaders(ctx.profile, ctx.apiKey, { method: 'GET' })
+  const headers = buildHeaders(ctx.profile, ctx.apiKey, {
+    method: 'GET',
+    ...(ctx.profile.kind === 'anthropic'
+      ? {
+          authScheme: 'anthropic-native' as const,
+          overrideHeaders: { 'anthropic-version': '2023-06-01' },
+        }
+      : {}),
+  })
   const init: RequestInit = { method: 'GET', headers }
   const response = await fetchWithTimeout(url, init, opts)
   if (!response.ok) {

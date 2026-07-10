@@ -5,12 +5,14 @@
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { openAssistantRequestStream } from '../../src/api/assistant-stream'
 import { type ResponsesContext, responses, responsesOnce } from '../../src/api/responses'
 import type {
   ResponsesEventWire,
   ResponsesResultWire,
   ResponsesStreamChunk,
 } from '../../src/api/types'
+import type { AssistantRequestPlan } from '../../src/core/send-planning'
 import type { ConnectionProfile } from '../../src/core/types'
 
 const PROBE5_PATH = resolve(
@@ -204,6 +206,33 @@ describe('responsesOnce', () => {
     )
     const result = await responsesOnce(ctx(), { model: 'm', input: 'x', stream: true })
     expect(result).toEqual(buffered)
+    expect(parseRequestBody(seenBodies[0]).stream).toBe(false)
+  })
+
+  it('feeds buffered-only Responses through the shared stream consumer shape', async () => {
+    const seenBodies: string[] = []
+    const buffered = { id: 'resp_1', status: 'completed', output: [] }
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url: string, init: RequestInit) => {
+        if (typeof init.body === 'string') seenBodies.push(init.body)
+        return jsonResponse(buffered)
+      }),
+    )
+    const requestPlan = {
+      useTextProtocol: false,
+      route: { kind: 'responses', transport: 'openai-responses', reason: 'buffered-only model' },
+      wire: { model: 'gpt-5.5-pro', input: 'x' },
+    } as unknown as AssistantRequestPlan
+    const chunks = []
+    for await (const chunk of openAssistantRequestStream({
+      connection: makeProfile(),
+      apiKey: 'sk-test',
+      requestPlan,
+    })) {
+      chunks.push(chunk)
+    }
+    expect(chunks).toEqual([{ type: 'buffered_result', result: buffered }])
     expect(parseRequestBody(seenBodies[0]).stream).toBe(false)
   })
 })

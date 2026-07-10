@@ -90,6 +90,18 @@ describe('toAnthropicMessages', () => {
     expect(wire.output_config).toEqual({ effort: 'max' })
   })
 
+  it('uses the shared adaptive-only path for Claude Sonnet 5', () => {
+    const s = settings({
+      model: 'anthropic/claude-sonnet-5',
+      verbosity: 'xhigh',
+      reasoning: { ...settings().reasoning, mode: 'budget', maxTokens: 4096, summary: 'auto' },
+    })
+    const { modelId, wire } = toAnthropicMessages(s, [user('u1', 'hard problem')])
+    expect(modelId).toBe('claude-sonnet-5')
+    expect(wire.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
+    expect(wire.output_config).toEqual({ effort: 'xhigh' })
+  })
+
   it('uses manual budget thinking for Claude 4.6 only when a budget is set', () => {
     const s = settings({
       model: 'anthropic/claude-opus-4.6',

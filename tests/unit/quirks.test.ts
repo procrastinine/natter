@@ -43,6 +43,22 @@ describe('quirks registry', () => {
     }
   })
 
+  it('Claude Sonnet 5 inherits adaptive-only quirks with the Sonnet cache floor', () => {
+    for (const model of [
+      'anthropic/claude-sonnet-5',
+      'claude-sonnet-5-20260630',
+      'claude-5-sonnet-20260630',
+      'anthropic/claude-sonnet-5.1',
+    ]) {
+      const q = quirksFor(model)
+      expect(q.adaptiveReasoningOnly).toBe(true)
+      expect(q.allowedEffort).toEqual([])
+      expect(q.allowedVerbosity).toEqual(['low', 'medium', 'high', 'xhigh', 'max'])
+      expect(q.cacheMinTokens).toBe(1024)
+      expect(q.reasoningPreservationFormat).toBe('anthropic-claude-v1')
+    }
+  })
+
   it('treats Anthropic compatibility ids with hyphens as the same model', () => {
     expect(quirksFor('anthropic/claude-opus-4-7')).toEqual(quirksFor('anthropic/claude-opus-4.7'))
     expect(allowedEffortFor('claude-sonnet-4-6')).toEqual([])
@@ -52,6 +68,7 @@ describe('quirks registry', () => {
     expect(allowedEffortFor('anthropic/claude-opus-4.7')).toEqual([])
     expect(allowedEffortFor('anthropic/claude-opus-4.8')).toEqual([])
     expect(allowedEffortFor('anthropic/claude-fable-5')).toEqual([])
+    expect(allowedEffortFor('anthropic/claude-sonnet-5')).toEqual([])
     expect(allowedEffortFor('claude-sonnet-4.6')).toEqual([])
     expect(quirksFor('claude-opus-4.6').adaptiveReasoningOnly).toBeUndefined()
   })
@@ -73,7 +90,8 @@ describe('quirks registry', () => {
       'xhigh',
       'max',
     ])
-    expect(allowedVerbosityFor('claude-fable-5')).toEqual([
+    expect(allowedVerbosityFor('claude-fable-5')).toEqual(['low', 'medium', 'high', 'xhigh', 'max'])
+    expect(allowedVerbosityFor('claude-sonnet-5')).toEqual([
       'low',
       'medium',
       'high',
@@ -105,6 +123,7 @@ describe('quirks registry', () => {
   it('cacheMinTokens picks up per-variant floors', () => {
     expect(cacheMinTokensFor('anthropic/claude-opus-4.8')).toBe(4096)
     expect(cacheMinTokensFor('anthropic/claude-fable-5')).toBe(4096)
+    expect(cacheMinTokensFor('anthropic/claude-sonnet-5')).toBe(1024)
     expect(cacheMinTokensFor('anthropic/claude-opus-4.7')).toBe(4096)
     expect(cacheMinTokensFor('anthropic/claude-sonnet-4.6')).toBe(2048)
     expect(cacheMinTokensFor('anthropic/claude-sonnet-4.5')).toBe(1024)
@@ -161,6 +180,7 @@ describe('quirks registry', () => {
     expect(prefillClassFor('anthropic/claude-opus-4.7')).toBe('unsupported')
     expect(prefillClassFor('anthropic/claude-opus-4.8')).toBe('unsupported')
     expect(prefillClassFor('anthropic/claude-fable-5')).toBe('unsupported')
+    expect(prefillClassFor('anthropic/claude-sonnet-5')).toBe('unsupported')
     expect(prefillClassFor('anthropic/claude-opus-4.10')).toBe('unsupported')
     expect(prefillClassFor('openai/gpt-5.4')).toBe('unsupported')
     expect(prefillClassFor('openai/gpt-oss-120b')).toBe('unsupported')

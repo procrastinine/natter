@@ -5,7 +5,7 @@
 // Only the most-used models are listed. Users who need others can add
 // entries via ConnectionProfile.capabilityOverrides.
 
-import type { CapabilityTable } from './types'
+import type { BundledModelEntry, CapabilityTable } from './types'
 
 const TOOLS = ['tools', 'tool_choice', 'parallel_tool_calls'] as const
 
@@ -21,6 +21,46 @@ const GPT_5_4_PARAMS = [
   'verbosity',
   ...TOOLS,
 ] as const
+
+const GPT_5_5_PLUS_PARAMS = [
+  'temperature',
+  'top_p',
+  'logprobs',
+  'max_completion_tokens',
+  'response_format',
+  'reasoning',
+  'verbosity',
+  ...TOOLS,
+] as const
+
+const GPT_5_5_PRO_PARAMS = GPT_5_5_PLUS_PARAMS.filter(
+  (parameter) => !['temperature', 'top_p', 'logprobs'].includes(parameter),
+)
+
+function gpt55PlusEntry(
+  id: string,
+  name: string,
+  pricing: { prompt: string; completion: string },
+  streaming: 'supported' | 'buffered-only' = 'supported',
+  supportedParameters: readonly string[] = GPT_5_5_PLUS_PARAMS,
+): BundledModelEntry {
+  return {
+    id,
+    name,
+    family: 'openai',
+    capability: {
+      supportedParameters: [...supportedParameters],
+      streaming,
+      contextLength: 1_050_000,
+      maxCompletionTokens: 128_000,
+      pricing,
+      architecture: {
+        inputModalities: ['text', 'image'],
+        outputModalities: ['text'],
+      },
+    },
+  }
+}
 
 // GPT-4o and older: classic chat-completions top-level param set.
 const GPT_4O_PARAMS = [
@@ -39,6 +79,29 @@ const GPT_4O_PARAMS = [
 ] as const
 
 export const OPENAI_CAPABILITIES: CapabilityTable = {
+  'gpt-5.6-sol': gpt55PlusEntry('gpt-5.6-sol', 'GPT-5.6 Sol', {
+    prompt: '0.000005',
+    completion: '0.00003',
+  }),
+  'gpt-5.6-terra': gpt55PlusEntry('gpt-5.6-terra', 'GPT-5.6 Terra', {
+    prompt: '0.0000025',
+    completion: '0.000015',
+  }),
+  'gpt-5.6-luna': gpt55PlusEntry('gpt-5.6-luna', 'GPT-5.6 Luna', {
+    prompt: '0.000001',
+    completion: '0.000006',
+  }),
+  'gpt-5.5': gpt55PlusEntry('gpt-5.5', 'GPT-5.5', {
+    prompt: '0.000005',
+    completion: '0.00003',
+  }),
+  'gpt-5.5-pro': gpt55PlusEntry(
+    'gpt-5.5-pro',
+    'GPT-5.5 Pro',
+    { prompt: '0.00003', completion: '0.00018' },
+    'buffered-only',
+    GPT_5_5_PRO_PARAMS,
+  ),
   'gpt-5.4': {
     id: 'gpt-5.4',
     name: 'GPT-5.4',

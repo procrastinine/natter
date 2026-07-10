@@ -39,6 +39,9 @@ export function openAssistantRequestStream(
 ): AsyncIterable<AssistantStreamChunk> {
   const { connection, apiKey, requestPlan, signal } = input
   const ctx = { profile: connection, apiKey }
+  if (requestPlan.route?.transport === 'openai-responses' && requestPlan.wire.stream !== true) {
+    return bufferedAssistantRequest(input)
+  }
   if (requestPlan.useTextProtocol) {
     return textCompletions(ctx, requestPlan.wire as Parameters<typeof textCompletions>[1], {
       ...(signal ? { signal } : {}),
@@ -74,6 +77,13 @@ export function openAssistantRequestStream(
   return chatCompletions(ctx, requestPlan.wire as Parameters<typeof chatCompletions>[1], {
     ...(signal ? { signal } : {}),
   })
+}
+
+async function* bufferedAssistantRequest(
+  input: AssistantDispatchInput,
+): AsyncGenerator<AssistantStreamChunk> {
+  const result = await runAssistantRequestOnce(input)
+  yield { type: 'buffered_result', result } as AssistantStreamChunk
 }
 
 export async function runAssistantRequestOnce(

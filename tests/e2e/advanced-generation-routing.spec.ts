@@ -557,6 +557,62 @@ test('GUI duplicate provider display names stay independently selectable by slug
   expectNoConsoleProblems(consoleLines)
 })
 
+test('GUI provider quantization bulk actions update the selected provider list', async ({
+  page,
+}) => {
+  const consoleLines = captureConsole(page)
+  const requests: CapturedRequest[] = []
+  await mockOpenRouterDiscovery(page, OR_CHAT_MODEL, {
+    endpointsPayload: quantizedDeepSeekEndpointsPayload(OR_CHAT_MODEL),
+    policyRows: quantizedDeepSeekPolicyRows(),
+  })
+  await mockChatCompletionsCapture(page, requests, ['quantization provider ok'])
+
+  await seedFirstRun(page, { model: OR_CHAT_MODEL, disablePrivacyFilter: false })
+  await createChatAndOpen(page)
+  await openSettingsPanel(page)
+
+  const unknownRow = page.locator('[data-ui="provider-picker-row"]').filter({ hasText: 'DeepSeek' })
+  const fp8Row = page.locator('[data-ui="provider-picker-row"]').filter({ hasText: 'StreamLake' })
+  const fp4Row = page.locator('[data-ui="provider-picker-row"]').filter({ hasText: 'DeepInfra' })
+  await expect(unknownRow).toHaveAttribute('data-allowed', 'true')
+  await expect(fp8Row).toHaveAttribute('data-allowed', 'true')
+  await expect(fp4Row).toHaveAttribute('data-allowed', 'true')
+
+  await page.getByRole('button', { name: 'Deselect low quant' }).click()
+  await expect(unknownRow).toHaveAttribute('data-allowed', 'true')
+  await expect(fp8Row).toHaveAttribute('data-allowed', 'true')
+  await expect(fp4Row).toHaveAttribute('data-allowed', 'false')
+
+  await page.getByRole('button', { name: 'Deselect unknown quant' }).click()
+  await expect(unknownRow).toHaveAttribute('data-allowed', 'false')
+  await expect(fp8Row).toHaveAttribute('data-allowed', 'true')
+  await expect(fp4Row).toHaveAttribute('data-allowed', 'false')
+
+  await page.evaluate(() =>
+    (window as unknown as { __debugStreams?: { clearPlans(): void } }).__debugStreams?.clearPlans(),
+  )
+  const composer = page.locator('[data-ui="composer-input"]')
+  await composer.fill('quantization provider route check')
+  await composer.press('Enter')
+  await expect(page.locator('[data-ui="message"][data-role="assistant"]').first()).toContainText(
+    'quantization provider ok',
+  )
+
+  expect(requests).toHaveLength(1)
+  const provider = requests[0]?.body.provider as { ignore?: string[] }
+  expect(provider.ignore).toEqual(expect.arrayContaining(['deepinfra/fp4', 'deepseek']))
+  expect(provider.ignore).not.toContain('streamlake/fp8')
+  expect(provider).not.toHaveProperty('quantizations')
+
+  const plans = await requestPlans(page)
+  const sendPlan = findLastPlan(plans, 'send')
+  const plannedProvider = providerSummary(sendPlan).wire as { ignore?: string[] }
+  expect(plannedProvider.ignore).toEqual(expect.arrayContaining(['deepinfra/fp4', 'deepseek']))
+  expect(plannedProvider.ignore).not.toContain('streamlake/fp8')
+  expectNoConsoleProblems(consoleLines)
+})
+
 test('GUI provider picker wraps long duplicate provider labels inside the settings panel', async ({
   page,
 }) => {
@@ -1633,6 +1689,39 @@ function longDuplicateProviderEndpointsPayload(modelId: string): Record<string, 
   }
 }
 
+function quantizedDeepSeekEndpointsPayload(modelId: string): Record<string, unknown> {
+  const supported = ['provider', 'temperature', 'max_completion_tokens']
+  return {
+    data: {
+      id: modelId,
+      name: modelId,
+      context_length: 1_048_576,
+      architecture: {
+        input_modalities: ['text'],
+        output_modalities: ['text'],
+        tokenizer: 'deepseek',
+      },
+      endpoints: [
+        endpoint('DeepSeek', 1_048_576, supported, {
+          tag: 'deepseek',
+          quantization: 'unknown',
+          data_policy: policy({}),
+        }),
+        endpoint('StreamLake', 1_024_000, supported, {
+          tag: 'streamlake/fp8',
+          quantization: 'fp8',
+          data_policy: policy({}),
+        }),
+        endpoint('DeepInfra', 1_048_576, supported, {
+          tag: 'deepinfra/fp4',
+          quantization: 'fp4',
+          data_policy: policy({}),
+        }),
+      ],
+    },
+  }
+}
+
 function endpoint(
   provider_name: string,
   context_length: number,
@@ -1684,6 +1773,26 @@ function longDuplicateProviderPolicyRows(): Array<Record<string, unknown>> {
       provider_name: 'Anthropic',
       provider_slug: 'anthropic',
       data_policy: policy({ requiresUserIDs: true }),
+    },
+  ]
+}
+
+function quantizedDeepSeekPolicyRows(): Array<Record<string, unknown>> {
+  return [
+    {
+      provider_name: 'DeepSeek',
+      provider_slug: 'deepseek',
+      data_policy: policy({}),
+    },
+    {
+      provider_name: 'StreamLake',
+      provider_slug: 'streamlake/fp8',
+      data_policy: policy({}),
+    },
+    {
+      provider_name: 'DeepInfra',
+      provider_slug: 'deepinfra/fp4',
+      data_policy: policy({}),
     },
   ]
 }

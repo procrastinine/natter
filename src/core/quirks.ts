@@ -49,15 +49,18 @@ export const FULL_EFFORT: readonly EffortLevel[] = [
   'medium',
   'high',
   'xhigh',
+  'max',
 ]
 
 export const FULL_VERBOSITY: readonly VerbosityLevel[] = ['low', 'medium', 'high', 'xhigh', 'max']
 
 interface QuirksEntry {
-  // Empty array means "reasoning.effort is ignored" (adaptive-only).
+  // Empty array means there is no separate reasoning-effort control. Adaptive-only
+  // Claude models expose the same output_config.effort scale once via verbosity.
   // undefined means "no narrowing; use the full superset".
   allowedEffort?: readonly EffortLevel[]
   allowedVerbosity?: readonly VerbosityLevel[]
+  defaultReasoningEffort?: EffortLevel
   // Some models refuse chat-completions and require /responses (GPT-5.4+ pro family).
   requiresResponsesApi?: boolean
   // Soft preference. The api-choice matrix flips to Responses unless the
@@ -168,12 +171,21 @@ interface QuirksEntry {
 
 // Match order: longest prefix wins so "claude-opus-4.7" doesn't accidentally
 // pick up a rule for "claude-opus". Map is iterated by descending key length.
-const CLAUDE_OPUS_47_PLUS_QUIRKS: QuirksEntry = {
+const CLAUDE_ADAPTIVE_ONLY_QUIRKS: QuirksEntry = {
   adaptiveReasoningOnly: true,
   allowedEffort: [],
   allowedVerbosity: ['low', 'medium', 'high', 'xhigh', 'max'],
-  cacheMinTokens: 4096,
   reasoningPreservationFormat: 'anthropic-claude-v1',
+}
+
+const CLAUDE_OPUS_47_PLUS_QUIRKS: QuirksEntry = {
+  ...CLAUDE_ADAPTIVE_ONLY_QUIRKS,
+  cacheMinTokens: 4096,
+}
+
+const CLAUDE_SONNET_5_PLUS_QUIRKS: QuirksEntry = {
+  ...CLAUDE_ADAPTIVE_ONLY_QUIRKS,
+  cacheMinTokens: 1024,
 }
 
 const REGISTRY: Record<string, QuirksEntry> = {
@@ -478,26 +490,47 @@ const GEMMA_DEFAULT: QuirksEntry = {
 }
 const GEMMA_PATTERN = /^gemma(?:[-_\d.]|$)/
 
-// Shared OpenAI GPT-5.4+ family behavior: non-pro models prefer Responses
-// for encrypted reasoning + `phase`; pro models require Responses.
+// Shared OpenAI GPT-5.4+ family behavior: ordinary models prefer Responses
+// for encrypted reasoning + `phase`; version-level Pro models require it.
 const GPT_54_PLUS_PATTERN =
-  /^gpt-5[:.](?:[4-9]|\d{2,})(?:$|-(?:pro|mini|nano|chat-latest|\d{8}|\d{4}-\d{2}-\d{2})(?:$|-))/
+  /^gpt-5[:.](?:[4-9]|\d{2,})(?:$|-(?:pro|mini|nano|sol|terra|luna|chat-latest|\d{8}|\d{4}-\d{2}-\d{2})(?:$|-))/
+const GPT_56_PLUS_PATTERN = /^gpt-5[:.](?:[6-9]|\d{2,})(?:$|-)/
+const GPT_55_PLUS_PATTERN = /^gpt-5[:.](?:[5-9]|\d{2,})(?:$|-)/
+const GPT_56_PLUS_EFFORT: readonly EffortLevel[] = ['none', 'low', 'medium', 'high', 'xhigh', 'max']
+const GPT_55_PRO_EFFORT: readonly EffortLevel[] = ['medium', 'high', 'xhigh']
 const GPT_54_PLUS_BASE: QuirksEntry = {
   persistsResponsesPhase: true,
   requiresPhaseEcho: true,
   gpt54SamplingGate: true,
   allowedEffort: ['none', 'low', 'medium', 'high', 'xhigh'],
-  allowedVerbosity: ['low', 'medium', 'high', 'xhigh'],
+  allowedVerbosity: ['low', 'medium', 'high'],
   reasoningPreservationFormat: 'openai-responses-v1',
 }
 
 function openAiGpt54PlusFamilyQuirks(normalized: string): QuirksEntry | null {
   if (!GPT_54_PLUS_PATTERN.test(normalized)) return null
   if (normalized.endsWith('-chat-latest')) return { responsesSupport: 'chat-only' }
-  if (/-pro(?:$|-)/.test(normalized)) {
-    return { ...GPT_54_PLUS_BASE, requiresResponsesApi: true, responsesSupport: 'responses-only' }
+  const base: QuirksEntry = {
+    ...GPT_54_PLUS_BASE,
+    ...(GPT_55_PLUS_PATTERN.test(normalized) ? { defaultReasoningEffort: 'medium' } : {}),
+    ...(GPT_56_PLUS_PATTERN.test(normalized) ? { allowedEffort: GPT_56_PLUS_EFFORT } : {}),
   }
-  return { ...GPT_54_PLUS_BASE, preferApi: 'responses' }
+  if (/^gpt-5[:.]\d+-pro(?:$|-)/u.test(normalized)) {
+    const isGpt55Pro = /^gpt-5[:.]5-pro(?:$|-)/u.test(normalized)
+    return {
+      ...base,
+      ...(isGpt55Pro
+        ? {
+            allowedEffort: GPT_55_PRO_EFFORT,
+            defaultReasoningEffort: 'high' as const,
+            reasoningToggleable: false,
+          }
+        : {}),
+      requiresResponsesApi: true,
+      responsesSupport: 'responses-only',
+    }
+  }
+  return { ...base, preferApi: 'responses' }
 }
 
 const GEMINI_3_PRO_PATTERN = /^gemini-3(?::\d+)?-pro(?:$|-)/
@@ -555,6 +588,9 @@ function claudeFamilyQuirks(normalized: string): QuirksEntry | null {
   }
   if (version.family === 'fable' && claudeVersionAtLeast(version, 5, 0)) {
     return CLAUDE_OPUS_47_PLUS_QUIRKS
+  }
+  if (version.family === 'sonnet' && claudeVersionAtLeast(version, 5, 0)) {
+    return CLAUDE_SONNET_5_PLUS_QUIRKS
   }
   if (claudeVersionAtLeast(version, 3, 7)) {
     return { reasoningPreservationFormat: 'anthropic-claude-v1' }
@@ -789,7 +825,7 @@ export function adjustGpt54SamplingGate(
   const entry = typeof modelOrEntry === 'string' ? quirksFor(modelOrEntry) : modelOrEntry
   if (!entry.gpt54SamplingGate) return
   const reasoning = req.reasoning as { effort?: string } | undefined
-  const effort = reasoning?.effort ?? 'none'
+  const effort = reasoning?.effort ?? entry.defaultReasoningEffort ?? 'none'
   if (effort === 'none') return
   delete req.temperature
   delete req.top_p

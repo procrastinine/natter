@@ -4,6 +4,7 @@ import {
   type ReactNode,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -517,6 +518,7 @@ export function Shell() {
     return window.localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === '1'
   })
   const scrollRef = useRef<ScrollRegionHandle>(null)
+  const transcriptPlaceholderRef = useRef<HTMLDivElement | null>(null)
   const activeComposerDraftKey = activeChatId
     ? `chat:${activeChatId}`
     : onNewChatSurface
@@ -539,6 +541,12 @@ export function Shell() {
   }, [isNarrowScreen])
 
   const previousActiveSurfaceKeyRef = useRef(activeSurfaceKey)
+  useLayoutEffect(() => {
+    const placeholder = transcriptPlaceholderRef.current
+    if (!placeholder) return
+    placeholder.style.minHeight = `${transcriptPlaceholderHeight}px`
+  }, [transcriptPlaceholderHeight])
+
   useEffect(() => {
     if (previousActiveSurfaceKeyRef.current === activeSurfaceKey) return
     previousActiveSurfaceKeyRef.current = activeSurfaceKey
@@ -1113,8 +1121,8 @@ export function Shell() {
                     />
                   ) : (
                     <div
+                      ref={transcriptPlaceholderRef}
                       data-ui="message-list-recycling"
-                      style={{ minHeight: transcriptPlaceholderHeight }}
                     />
                   )}
                   {effectiveFocusMode ? (

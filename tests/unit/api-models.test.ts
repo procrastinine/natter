@@ -223,6 +223,23 @@ describe('fetch adapters', () => {
     expect(headers['X-OpenRouter-Title']).toBeUndefined()
   })
 
+  it('uses native Anthropic authentication for model discovery', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(jsonResponse({ data: [] }))
+    await fetchModels({
+      profile: makeProfile({
+        kind: 'anthropic',
+        baseUrl: 'https://api.anthropic.com/v1',
+      }),
+      apiKey: 'anthropic-key',
+    })
+    const [url, init] = fetchSpy.mock.calls[0] ?? []
+    expect(url).toBe('https://api.anthropic.com/v1/models')
+    const headers = (init as RequestInit).headers as Record<string, string>
+    expect(headers['x-api-key']).toBe('anthropic-key')
+    expect(headers['anthropic-version']).toBe('2023-06-01')
+    expect(headers.Authorization).toBeUndefined()
+  })
+
   it('fetchEndpoints uses the model id in the URL', async () => {
     const fetchSpy = vi
       .spyOn(globalThis, 'fetch')

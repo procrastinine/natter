@@ -411,6 +411,35 @@ describe('toResponses — phase round-trip', () => {
   })
 })
 
+describe('toResponses — reasoning dialect', () => {
+  it('omits OpenRouter-only reasoning fields on native Responses', () => {
+    const s = settings({
+      reasoning: {
+        mode: 'effort',
+        effort: 'high',
+        exclude: true,
+        summary: 'auto',
+        include: { encrypted: true, summary: false, text: false },
+      },
+    })
+    expect(toResponses(s, [user('u1', 'hi')]).wire.reasoning).toEqual({
+      effort: 'high',
+      summary: 'auto',
+    })
+    expect(
+      toResponses(s, [user('u1', 'hi')], { allowOpenRouterExtensions: true }).wire.reasoning,
+    ).toEqual({ enabled: true, effort: 'high', exclude: true, summary: 'auto' })
+  })
+
+  it('uses each provider dialect to turn reasoning off', () => {
+    expect(toResponses(settings(), [user('u1', 'hi')]).wire.reasoning).toEqual({ effort: 'none' })
+    expect(
+      toResponses(settings(), [user('u1', 'hi')], { allowOpenRouterExtensions: true }).wire
+        .reasoning,
+    ).toEqual({ enabled: false })
+  })
+})
+
 describe('toResponses — gpt54SamplingGate', () => {
   it('strips temperature/top_p/logprobs when effort != none on gpt-5.4', () => {
     const s = settings({
@@ -444,6 +473,23 @@ describe('toResponses — gpt54SamplingGate', () => {
     const { wire } = toResponses(s, [user('u1', 'hi')])
     expect(wire.temperature).toBe(0.5)
     expect(wire.top_p).toBe(0.8)
+  })
+
+  it('passes GPT-5.6 max effort through the existing Responses transform', () => {
+    const s = settings({
+      model: 'openai/gpt-5.6-terra',
+      sampling: { temperature: 0.5 },
+      reasoning: {
+        mode: 'effort',
+        effort: 'max',
+        exclude: false,
+        summary: 'off',
+        include: { encrypted: true, summary: false, text: false },
+      },
+    })
+    const { wire } = toResponses(s, [user('u1', 'hi')])
+    expect(wire.reasoning).toEqual({ effort: 'max' })
+    expect(wire.temperature).toBeUndefined()
   })
 })
 

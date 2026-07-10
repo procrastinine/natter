@@ -156,6 +156,7 @@ describe('toGeminiNative — thinkingConfig (Gemini 3)', () => {
       ['medium', 'medium'],
       ['high', 'high'],
       ['xhigh', 'high'], // clamped
+      ['max', 'high'], // clamped
     ]
     for (const [effort, expected] of cases) {
       const { wire } = toGeminiNative(
@@ -270,6 +271,7 @@ describe('toGeminiNative — thinkingConfig (Gemini 2.5)', () => {
       ['medium', 2048],
       ['high', 8192],
       ['xhigh', 24576],
+      ['max', 24576],
       ['none', 0],
     ]
     for (const [effort, expected] of cases) {

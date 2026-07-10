@@ -99,7 +99,7 @@ export type SamplingKey =
   | 'dry_penalty_last_n'
   | 'n_keep'
 
-export type EffortLevel = 'xhigh' | 'high' | 'medium' | 'low' | 'minimal' | 'none'
+export type EffortLevel = 'max' | 'xhigh' | 'high' | 'medium' | 'low' | 'minimal' | 'none'
 
 export type VerbosityLevel = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 

@@ -428,6 +428,24 @@ describe('resolveRequestPrivacyPlan', () => {
     expect(requestPlan.wire.parallel_tool_calls).toBeUndefined()
   })
 
+  it('plans GPT-5.5 Pro as a buffered native Responses request', async () => {
+    const profile = makeOpenAiProfile()
+    const chat = makeChat({
+      profileId: profile.id,
+      model: 'gpt-5.5-pro',
+      api: 'responses',
+    })
+    const { requestPlan } = await prepareAssistantRequestPlan({
+      chat,
+      connection: profile,
+      pathMessages: [makeMessage('solve this carefully')],
+      draftText: '',
+    })
+
+    expect(requestPlan.route?.kind).toBe('responses')
+    expect(requestPlan.wire.stream).toBeUndefined()
+  })
+
   it('carries OpenAI hosted tools only on direct OpenAI Responses plans', async () => {
     const profile = makeOpenAiProfile()
     const tools = cloneDefaultChatSettings().tools

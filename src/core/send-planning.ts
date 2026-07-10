@@ -374,9 +374,12 @@ export async function prepareAssistantRequestPlan(
   }
   const mergedTransform = mergePrivacyTransform(input.transform, privacyPlan.privacy)
   const requestCapability = resolvedCapability ?? requestCapabilityFromPrivacy(privacyPlan.privacy)
+  const streamsByDefault = requestCapability?.streaming !== 'buffered-only'
+  const stream = input.stream ?? streamsByDefault
   const requestPlan = await buildAssistantRequestPlan({
     ...input,
     settings,
+    stream,
     ...(requestCapability ? { capabilities: requestCapability } : {}),
     ...(mergedTransform ? { transform: mergedTransform } : {}),
   })
@@ -748,6 +751,7 @@ async function buildAssistantRequestPlan(
         stream,
         rewriteSlug,
         allowProviderRouting: input.connection.kind === 'openrouter',
+        allowOpenRouterExtensions: input.connection.kind === 'openrouter',
         ...(hostedToolsProvider === 'openrouter' || hostedToolsProvider === 'openai'
           ? { hostedToolsProvider }
           : {}),

@@ -57,6 +57,10 @@ pnpm dev
 | `pnpm e2e` | Playwright end-to-end suite |
 | `pnpm typecheck` | `tsc -b --noEmit` across all projects |
 | `pnpm lint` | Biome lint |
+| `pnpm deps:refresh` | update dependencies with pnpm supply-chain guards, then print audit/outdated/build-script info |
+| `pnpm deps:refresh -- --check` | print the same dependency info without updating |
+| `pnpm deps:audit` | npm advisory audit at `moderate` and above |
+| `pnpm deps:outdated` | list dependency updates visible under the current pnpm policy |
 | `pnpm format` | Biome format (write) |
 | `pnpm check` | Biome lint + format + organize imports |
 

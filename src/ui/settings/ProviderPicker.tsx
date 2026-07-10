@@ -15,8 +15,9 @@
 // appear on the wire. The visible picker sorts every row by the same metric,
 // including blocked rows, so toggling a provider doesn't move it around.
 // Bulk select/deselect writes the same manual ignore override as row clicks,
-// leaving sort/order intact. Reset clears provider order/ignore overrides and
-// privacy-side manual overrides while restoring the default Price sort.
+// leaving sort/order intact. Quantization bulk actions are just selection
+// filters over that same ignore list, not provider.quantizations writes. Reset
+// clears provider order/ignore overrides while restoring the default Price sort.
 
 import { useCallback, useMemo, useState } from 'react'
 import { DEFAULT_OPENROUTER_PROVIDER_SORT } from '../../core/provider-defaults'
@@ -36,6 +37,9 @@ import { InfoDisclosure } from './InfoDisclosure'
 import { PrivacySection } from './PrivacySection'
 import {
   buildPickerRows,
+  ignoredProviderRefsAfterBulkDeselect,
+  isLowQuantization,
+  isUnknownQuantization,
   type PickerRow,
   reasonsToTooltip,
   tierToLockLabel,
@@ -161,10 +165,12 @@ export function ProviderPicker({
 
   const resetPrefs = useCallback(() => {
     // Reset clears every override this panel can produce: provider
-    // order, manual ignore, the user-touched flag, and non-default sort.
+    // order, manual ignore, quantization routing, the user-touched flag,
+    // strict mode, and non-default sort.
     // After reset the picker falls back to Price + the filter's default — kept providers checked,
     // auto-excluded providers unchecked.
     void updateChatSettings(chat.id, {
+      strictProviderRouting: undefined,
       providerPrefs: { sort: DEFAULT_OPENROUTER_PROVIDER_SORT },
     })
   }, [chat.id])
@@ -181,6 +187,35 @@ export function ProviderPicker({
     },
     [chat.id, chat.settings.providerPrefs, displayOrdered],
   )
+  const selectedLowQuantizationCount = useMemo(
+    () =>
+      rows.filter((row) => row.state === 'kept' && isLowQuantization(row.endpoint.quantization))
+        .length,
+    [rows],
+  )
+  const selectedUnknownQuantizationCount = useMemo(
+    () =>
+      rows.filter((row) => row.state === 'kept' && isUnknownQuantization(row.endpoint.quantization))
+        .length,
+    [rows],
+  )
+  const deselectProvidersWhere = useCallback(
+    (shouldDeselect: (endpoint: ModelEndpoint) => boolean) => {
+      const nextPrefs: ProviderPreferences = {
+        ...(chat.settings.providerPrefs ?? {}),
+        ignore: ignoredProviderRefsAfterBulkDeselect(
+          rows,
+          endpoints,
+          chat.settings.providerPrefs,
+          shouldDeselect,
+        ),
+        ignoreOverridesFilter: true,
+      }
+      delete nextPrefs.only
+      void updateChatSettings(chat.id, { providerPrefs: nextPrefs })
+    },
+    [chat.id, chat.settings.providerPrefs, endpoints, rows],
+  )
 
   if (!chat.settings.model) return null
 
@@ -188,9 +223,13 @@ export function ProviderPicker({
     prefs.sort !== undefined &&
     JSON.stringify(prefs.sort) !== JSON.stringify(DEFAULT_OPENROUTER_PROVIDER_SORT)
   const hasOverrides =
+    chat.settings.strictProviderRouting !== undefined ||
     prefs.ignoreOverridesFilter === true ||
     (prefs.ignore?.length ?? 0) > 0 ||
+    (prefs.only?.length ?? 0) > 0 ||
     (prefs.order?.length ?? 0) > 0 ||
+    (prefs.quantizations?.length ?? 0) > 0 ||
+    prefs.requireParameters !== undefined ||
     sortOverridden
 
   return (
@@ -318,6 +357,42 @@ export function ProviderPicker({
           title={rows.length === 0 ? 'No providers to deselect' : 'Deselect all providers'}
         >
           Deselect all
+        </button>
+        <button
+          type="button"
+          data-ui="field-inline-action"
+          onClick={() =>
+            deselectProvidersWhere((endpoint) => isLowQuantization(endpoint.quantization))
+          }
+          disabled={selectedLowQuantizationCount === 0}
+          aria-disabled={selectedLowQuantizationCount === 0}
+          title={
+            selectedLowQuantizationCount === 0
+              ? 'No selected low-quantization providers'
+              : `Deselect ${selectedLowQuantizationCount} selected low-quantization provider${
+                  selectedLowQuantizationCount === 1 ? '' : 's'
+                }`
+          }
+        >
+          Deselect low quant
+        </button>
+        <button
+          type="button"
+          data-ui="field-inline-action"
+          onClick={() =>
+            deselectProvidersWhere((endpoint) => isUnknownQuantization(endpoint.quantization))
+          }
+          disabled={selectedUnknownQuantizationCount === 0}
+          aria-disabled={selectedUnknownQuantizationCount === 0}
+          title={
+            selectedUnknownQuantizationCount === 0
+              ? 'No selected unknown-quantization providers'
+              : `Deselect ${selectedUnknownQuantizationCount} selected unknown-quantization provider${
+                  selectedUnknownQuantizationCount === 1 ? '' : 's'
+                }`
+          }
+        >
+          Deselect unknown quant
         </button>
         {/*
           Always shown so users can "reset to default" at any time,
