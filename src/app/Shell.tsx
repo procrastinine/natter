@@ -4,6 +4,7 @@ import {
   type ReactNode,
   useCallback,
   useEffect,
+  useInsertionEffect,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -690,11 +691,11 @@ export function Shell() {
     applyChatMaxWidthToDocument(prefs.chatMaxWidth)
   }, [prefs.chatMaxWidth])
 
-  useEffect(() => {
+  useInsertionEffect(() => {
     applyFontFamilyToDocument(prefs.fontFamily)
   }, [prefs.fontFamily])
 
-  useEffect(() => {
+  useInsertionEffect(() => {
     applyBaseFontSizeToDocument(prefs.baseFontSize)
   }, [prefs.baseFontSize])
 
@@ -1120,10 +1121,7 @@ export function Shell() {
                       onLoadOlderMessages={loadOlderMessageWindow}
                     />
                   ) : (
-                    <div
-                      ref={transcriptPlaceholderRef}
-                      data-ui="message-list-recycling"
-                    />
+                    <div ref={transcriptPlaceholderRef} data-ui="message-list-recycling" />
                   )}
                   {effectiveFocusMode ? (
                     <Composer
@@ -1132,6 +1130,7 @@ export function Shell() {
                       onAbort={abortActiveChat}
                       autoSize
                       autoSizeVariant="focus"
+                      autoSizeMeasurementKey={`${prefs.fontFamily}:${prefs.baseFontSize}`}
                       {...(hasConnection
                         ? {}
                         : { sendBlockedReason: 'Add a connection to send messages.' })}
@@ -1195,6 +1194,7 @@ export function Shell() {
                     streaming={streamingOnActiveChat}
                     onAbort={abortActiveChat}
                     autoSize
+                    autoSizeMeasurementKey={`${prefs.fontFamily}:${prefs.baseFontSize}`}
                     {...(hasConnection
                       ? {}
                       : { sendBlockedReason: 'Add a connection to send messages.' })}
@@ -1300,6 +1300,7 @@ export function Shell() {
                 <Composer
                   onSubmit={handleNewChatSubmit}
                   autoSize
+                  autoSizeMeasurementKey={`${prefs.fontFamily}:${prefs.baseFontSize}`}
                   {...(hasConnection
                     ? {}
                     : { sendBlockedReason: 'Add a connection to send messages.' })}

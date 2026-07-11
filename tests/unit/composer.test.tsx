@@ -71,6 +71,51 @@ describe('Composer', () => {
     }
   })
 
+  it('keeps one-line height stable across empty versus text scroll-height rounding', () => {
+    const descriptor = Object.getOwnPropertyDescriptor(
+      HTMLTextAreaElement.prototype,
+      'scrollHeight',
+    )
+    const nativeGetComputedStyle = window.getComputedStyle
+    vi.spyOn(window, 'getComputedStyle').mockImplementation((element) => {
+      const style = nativeGetComputedStyle(element)
+      return new Proxy(style, {
+        get(target, property, receiver) {
+          if (property === 'fontSize') return '15px'
+          if (property === 'lineHeight') return '22.5px'
+          if (property === 'paddingTop' || property === 'paddingBottom') return '12px'
+          if (property === 'borderTopWidth' || property === 'borderBottomWidth') return '0px'
+          return Reflect.get(target, property, receiver)
+        },
+      })
+    })
+    Object.defineProperty(HTMLTextAreaElement.prototype, 'scrollHeight', {
+      configurable: true,
+      get() {
+        return this.value.length === 0 ? 47 : 49
+      },
+    })
+    try {
+      render(<Composer autoSize onSubmit={() => {}} />)
+      const input = screen.getByRole('textbox')
+      expect(input.style.height).toBe('47px')
+
+      fireEvent.change(input, { target: { value: 'x' } })
+      expect(input.style.height).toBe('47px')
+      expect(input.style.overflowY).toBe('hidden')
+
+      fireEvent.change(input, { target: { value: '' } })
+      expect(input.style.height).toBe('47px')
+      expect(input.style.overflowY).toBe('hidden')
+    } finally {
+      if (descriptor) {
+        Object.defineProperty(HTMLTextAreaElement.prototype, 'scrollHeight', descriptor)
+      } else {
+        Reflect.deleteProperty(HTMLTextAreaElement.prototype, 'scrollHeight')
+      }
+    }
+  })
+
   it('uploads selected files, shows a file tile, and sends attachment refs', async () => {
     const onSubmit = vi.fn().mockResolvedValue(undefined)
     const { container } = render(<Composer onSubmit={onSubmit} />)

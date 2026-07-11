@@ -1,3 +1,5 @@
+// @vitest-environment node
+
 import { Blob as NodeBlob } from 'node:buffer'
 import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'

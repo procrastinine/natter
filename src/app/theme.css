@@ -40,6 +40,8 @@
 
 @import "../styles/utilities.css";
 
+@source not "../../tests";
+
 /* Tailwind 4 auto-scans the project tree, but not node_modules. Streamdown's
  * compiled components (ul `list-disc`, strong `font-semibold`, tables, etc.)
  * need those utilities emitted in the bundle or the markdown pipeline renders

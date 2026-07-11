@@ -73,6 +73,7 @@ interface ComposerProps {
   // Each variant has its own localStorage key for the height so user
   // drags in one mode don't leak into the other.
   autoSizeVariant?: AutoSizeVariant
+  autoSizeMeasurementKey?: string
 }
 
 type AutoSizeVariant = 'normal' | 'focus'
@@ -138,23 +139,39 @@ function cssPixels(value: string, fallback = 0): number {
   return Number.isFinite(parsed) ? parsed : fallback
 }
 
-function oneLineTextareaHeight(el: HTMLTextAreaElement): number {
+interface TextareaLineMetrics {
+  lineHeight: number
+  oneLineHeight: number
+}
+
+function textareaLineMetrics(el: HTMLTextAreaElement): TextareaLineMetrics {
   const style = getComputedStyle(el)
   const fontSize = cssPixels(style.fontSize, 16)
   const lineHeight = cssPixels(style.lineHeight, fontSize * 1.2)
-  return Math.ceil(
-    lineHeight +
-      cssPixels(style.paddingTop) +
-      cssPixels(style.paddingBottom) +
-      cssPixels(style.borderTopWidth) +
-      cssPixels(style.borderBottomWidth),
-  )
+  return {
+    lineHeight,
+    oneLineHeight: Math.ceil(
+      lineHeight +
+        cssPixels(style.paddingTop) +
+        cssPixels(style.paddingBottom) +
+        cssPixels(style.borderTopWidth) +
+        cssPixels(style.borderBottomWidth),
+    ),
+  }
 }
 
-function setComposerTextareaHeight(el: HTMLTextAreaElement, height: number): void {
+function oneLineTextareaHeight(el: HTMLTextAreaElement): number {
+  return textareaLineMetrics(el).oneLineHeight
+}
+
+function setComposerTextareaHeight(
+  el: HTMLTextAreaElement,
+  height: number,
+  measuredContentHeight = el.scrollHeight,
+): void {
   const effectiveHeight = Math.ceil(height)
   el.style.height = `${effectiveHeight}px`
-  el.style.overflowY = el.scrollHeight > effectiveHeight + 1 ? 'auto' : 'hidden'
+  el.style.overflowY = measuredContentHeight > effectiveHeight + 1 ? 'auto' : 'hidden'
 }
 
 // Per-tab only: route switches preserve drafts without writing IDB or making
@@ -196,6 +213,7 @@ export function Composer({
   trailingUserMessage,
   autoSize = false,
   autoSizeVariant = 'normal',
+  autoSizeMeasurementKey,
   showPrefillButton,
   defaultPrefill,
   prefillScopeKey,
@@ -240,15 +258,12 @@ export function Composer({
   useEffect(() => {
     latestTextRef.current = text
   }, [text])
-  const setComposerText = useCallback(
-    (value: string | ((current: string) => string)) => {
-      const next = typeof value === 'function' ? value(latestTextRef.current) : value
-      latestTextRef.current = next
-      setText(next)
-      writeComposerDraft(draftKeyRef.current, next)
-    },
-    [],
-  )
+  const setComposerText = useCallback((value: string | ((current: string) => string)) => {
+    const next = typeof value === 'function' ? value(latestTextRef.current) : value
+    latestTextRef.current = next
+    setText(next)
+    writeComposerDraft(draftKeyRef.current, next)
+  }, [])
   useEffect(() => {
     if (draftKeyRef.current === draftKey) return
     writeComposerDraft(draftKeyRef.current, latestTextRef.current)
@@ -331,7 +346,7 @@ export function Composer({
   useLayoutEffect(() => {
     const el = textareaRef.current
     if (!el) return
-    const oneLineHeight = oneLineTextareaHeight(el)
+    const { lineHeight, oneLineHeight } = textareaLineMetrics(el)
     const minHeight = autoSize ? oneLineHeight : COMPOSER_MIN_HEIGHT
     setResizeMinHeight((current) => (current === minHeight ? current : minHeight))
     if (autoSize) {
@@ -353,9 +368,15 @@ export function Composer({
       el.style.maxHeight = `${Math.max(autoMinHeight, profile.autoGrowMax)}px`
       el.style.height = 'auto'
       el.style.overflowY = 'hidden'
-      const contentHeight = Math.min(el.scrollHeight, profile.autoGrowMax)
+      const measuredContentHeight = el.scrollHeight
+      // Browser rounding can move a single line by a few scrollHeight pixels.
+      const normalizedContentHeight =
+        measuredContentHeight - oneLineHeight < lineHeight / 2
+          ? oneLineHeight
+          : measuredContentHeight
+      const contentHeight = Math.min(normalizedContentHeight, profile.autoGrowMax)
       const effectiveHeight = Math.max(autoMinHeight, contentHeight)
-      setComposerTextareaHeight(el, effectiveHeight)
+      setComposerTextareaHeight(el, effectiveHeight, normalizedContentHeight)
       setRenderedHeight((current) =>
         current === effectiveHeight ? current : Math.ceil(effectiveHeight),
       )
@@ -366,7 +387,7 @@ export function Composer({
     const fixedHeight = height ?? COMPOSER_DEFAULT_HEIGHT
     setComposerTextareaHeight(el, fixedHeight)
     setRenderedHeight((current) => (current === fixedHeight ? current : Math.ceil(fixedHeight)))
-  }, [autoSize, profile.autoGrowMax, profile.autoMinHeight, height, text])
+  }, [autoSize, autoSizeMeasurementKey, profile.autoGrowMax, profile.autoMinHeight, height, text])
   const trimmed = text.trim()
   const attachments = useAttachmentDrafts()
   const {
@@ -540,7 +561,9 @@ export function Composer({
         data-ui="composer-resize-handle"
         data-resize-mode={autoSize && height === null ? 'auto' : 'manual'}
         aria-orientation="horizontal"
-        aria-label={autoSize ? 'Resize composer; press Enter for automatic height' : 'Resize composer'}
+        aria-label={
+          autoSize ? 'Resize composer; press Enter for automatic height' : 'Resize composer'
+        }
         aria-keyshortcuts={autoSize ? 'Enter' : undefined}
         aria-valuemin={resizeMinHeight}
         aria-valuemax={COMPOSER_MAX_HEIGHT}

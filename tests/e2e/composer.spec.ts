@@ -32,6 +32,75 @@ test('empty composer input does not show a vertical scrollbar', async ({ page })
   expect(metrics.scrollHeight).toBeLessThanOrEqual(metrics.clientHeight + 1)
 })
 
+test.describe('retina composer sizing', () => {
+  test.use({ deviceScaleFactor: 2 })
+
+  test('first character keeps the automatic one-line composer at the same height', async ({
+    context,
+    page,
+  }) => {
+    await page.evaluate(async () => {
+      const db = await new Promise<IDBDatabase>((resolve, reject) => {
+        const request = indexedDB.open('natter')
+        request.onsuccess = () => resolve(request.result)
+        request.onerror = () => reject(request.error)
+      })
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const transaction = db.transaction('settings', 'readwrite')
+          transaction.objectStore('settings').put({ key: 'global:base-font-size', value: 18 })
+          transaction.oncomplete = () => resolve()
+          transaction.onerror = () => reject(transaction.error)
+          transaction.onabort = () => reject(transaction.error)
+        })
+      } finally {
+        db.close()
+      }
+    })
+    const freshPage = await context.newPage()
+    await freshPage.goto('/#/new')
+    const input = freshPage.locator('[data-ui="composer-input"]')
+    const resizeHandle = freshPage.locator('[data-ui="composer-resize-handle"]')
+    await input.waitFor({ state: 'visible' })
+    const settle = () =>
+      freshPage.evaluate(
+        () =>
+          new Promise<void>((resolve) =>
+            requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+          ),
+      )
+    const heights = () =>
+      input.evaluate((node) => ({
+        ariaNow: document
+          .querySelector('[data-ui="composer-resize-handle"]')
+          ?.getAttribute('aria-valuenow'),
+        body: node.closest('[data-ui="composer-body"]')?.getBoundingClientRect().height,
+        client: node.clientHeight,
+        composer: node.closest('[data-ui="composer"]')?.getBoundingClientRect().height,
+        input: node.getBoundingClientRect().height,
+        shell: node.parentElement?.getBoundingClientRect().height,
+      }))
+
+    await expect.poll(() => input.evaluate((node) => getComputedStyle(node).fontSize)).toBe('18px')
+    await input.focus()
+    await settle()
+    await expect(resizeHandle).toHaveAttribute('data-resize-mode', 'auto')
+    const blank = await heights()
+
+    await input.press('x')
+    await expect(input).toHaveValue('x')
+    await settle()
+    const typed = await heights()
+    expect(typed).toEqual(blank)
+
+    await input.press('Backspace')
+    await expect(input).toHaveValue('')
+    await settle()
+    expect(await heights()).toEqual(blank)
+    await expect(resizeHandle).toHaveAttribute('data-resize-mode', 'auto')
+  })
+})
+
 test('composer can be resized below its content and scrolls internally', async ({ page }) => {
   const input = page.locator('[data-ui="composer-input"]')
   const oneLineHeight = await input.evaluate((node) => node.clientHeight)
@@ -208,9 +277,7 @@ test('composer drafts are preserved separately for new and existing chats', asyn
   await page.locator('[data-ui="composer-input"]').fill('new chat unsent draft')
 
   await page.locator('[data-ui="chat-row-link"]').first().click()
-  await expect(page.locator('[data-ui="composer-input"]')).toHaveValue(
-    'existing chat unsent draft',
-  )
+  await expect(page.locator('[data-ui="composer-input"]')).toHaveValue('existing chat unsent draft')
 
   await page.locator('[data-role="new-chat"]').click()
   await page.waitForFunction(() => window.location.hash === '#/new')
