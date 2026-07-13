@@ -1,6 +1,7 @@
 import { memo, useCallback, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { Message, MessageRole } from '../../core/types'
-import { useStreamStore } from '../../store/zustand/streamStore'
+import { useRetainedMessageStreamProjection } from '../../hooks/useMessageStreamProjection'
+import { getStreamClientId } from '../../store/stream-leases'
 import { AttachmentRefChips } from '../attachments/AttachmentRefChips'
 import {
   BranchIcon,
@@ -39,6 +40,8 @@ export interface BranchTreeInspectorProps {
   onToggleReasoningDetailHidden?: (detailIndex: number) => void | Promise<void>
   onToggleProviderOutputItemHidden?: (itemIndex: number) => void | Promise<void>
   hasConnection?: boolean
+  generationBusy?: boolean
+  streamOnActivePath?: boolean
   searchQuery?: string
   searchMatched?: boolean
 }
@@ -132,6 +135,8 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
   onToggleReasoningDetailHidden,
   onToggleProviderOutputItemHidden,
   hasConnection = false,
+  generationBusy = false,
+  streamOnActivePath = true,
   searchQuery,
   searchMatched = false,
 }: BranchTreeInspectorProps) {
@@ -143,11 +148,50 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
   const [occurrenceCount, setOccurrenceCount] = useState(0)
   const [totalOccurrenceCount, setTotalOccurrenceCount] = useState(0)
   const [currentOccurrence, setCurrentOccurrence] = useState(-1)
-  const streamTargetBusy = useStreamStore((state) =>
-    state.isTargetActive(message.chatId, message.id),
+  const [activeStream, liveSnapshot] = useRetainedMessageStreamProjection(
+    message,
+    message.role === 'assistant',
   )
-  const liveSnapshot = useStreamStore((state) => state.liveByMessageId[message.id])
+  const persistedStreamBusy =
+    message.generation?.status === 'streaming' && message.generation.finishedAt === undefined
+  const streamTargetBusy =
+    activeStream !== undefined || persistedStreamBusy || liveSnapshot !== undefined
+  const requestBusy = generationBusy || streamTargetBusy
+  const remoteStreaming =
+    activeStream !== undefined && activeStream.ownerClientId !== getStreamClientId()
   const liveReasoningRows = liveSnapshot?.reasoningRows
+  const showOriginalFailure = !message.continuationAttempts?.some(
+    (attempt) => attempt.status === 'done' && attempt.unappliedText === undefined,
+  )
+  const finalError = showOriginalFailure ? message.generation?.error : undefined
+  const finalAbort = showOriginalFailure ? message.generation?.abortReason : undefined
+  const streamStatus: { text: string; tone?: 'warning' | 'error' } | null = remoteStreaming
+    ? { text: 'This response is currently streaming in another tab.' }
+    : activeStream && !streamOnActivePath
+      ? { text: 'Streaming on another branch. Open this branch to follow live output.' }
+      : activeStream
+        ? liveSnapshot
+          ? { text: 'Streaming response…' }
+          : { text: 'Waiting for response…' }
+        : persistedStreamBusy
+          ? liveSnapshot || !generationBusy
+            ? { text: 'Finishing response…' }
+            : { text: 'Preparing response…' }
+          : liveSnapshot
+            ? { text: 'Finishing response…' }
+            : finalError
+              ? {
+                  text: `Error${finalError.statusCode ? ` ${finalError.statusCode}` : ''}: ${finalError.message}`,
+                  tone: 'error',
+                }
+              : finalAbort === 'user'
+                ? {
+                    text: 'Cancelled — partial response kept above. Continue to resume.',
+                    tone: 'warning',
+                  }
+                : finalAbort
+                  ? { text: `Stream interrupted (${finalAbort}).`, tone: 'warning' }
+                  : null
   const contentRef = useRef<HTMLElement | null>(null)
   const searchRangesRef = useRef<Range[]>([])
   const searchToolsRef = useRef<InspectorSearchTools | null>(null)
@@ -358,12 +402,17 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
       'Unable to save this edit.',
     )
   const saveEditAndSend = (text: string) =>
-    submitEdit(
-      text,
-      onEditAndSend,
-      'Wait for the current generation to finish before sending again.',
-      'Unable to send this edit.',
-    )
+    requestBusy
+      ? setEditError({
+          messageId: message.id,
+          text: 'Wait for the current generation to finish before sending again.',
+        })
+      : submitEdit(
+          text,
+          onEditAndSend,
+          'Wait for the current generation to finish before sending again.',
+          'Unable to send this edit.',
+        )
 
   return (
     <aside
@@ -435,8 +484,14 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
               data-ui="branch-tree-inspector-action"
               data-action="regenerate"
               aria-label="Regenerate response"
-              title={!hasConnection ? 'Add a connection to regenerate.' : 'Regenerate response'}
-              disabled={!hasConnection}
+              title={
+                !hasConnection
+                  ? 'Add a connection to regenerate.'
+                  : requestBusy
+                    ? 'A request is already running for this chat.'
+                    : 'Regenerate response'
+              }
+              disabled={!hasConnection || requestBusy}
               onClick={() => void onRegenerate()}
             >
               <ReloadIcon size={15} />
@@ -451,11 +506,13 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
               title={
                 streamTargetBusy
                   ? "Can't continue while streaming."
-                  : hasConnection
-                    ? 'Continue this assistant message'
-                    : 'Add a connection to continue.'
+                  : generationBusy
+                    ? 'A request is already running for this chat.'
+                    : hasConnection
+                      ? 'Continue this assistant message'
+                      : 'Add a connection to continue.'
               }
-              disabled={!hasConnection || streamTargetBusy}
+              disabled={!hasConnection || requestBusy}
               onClick={() => void onContinue()}
             >
               <SendIcon size={15} />
@@ -521,6 +578,16 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
           </button>
         </div>
       </header>
+
+      {streamStatus ? (
+        <div
+          role="status"
+          data-ui="branch-tree-inspector-stream-status"
+          data-state={streamStatus.tone}
+        >
+          {streamStatus.text}
+        </div>
+      ) : null}
 
       <div data-ui="branch-tree-inspector-scroll">
         <section
@@ -619,10 +686,10 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
                 {...(message.role === 'user' && onEditAndSend
                   ? {
                       onSaveAndSend: (text: string) => saveEditAndSend(text),
-                      saveAndSendDisabled: !hasConnection || streamTargetBusy,
+                      saveAndSendDisabled: !hasConnection || requestBusy,
                       ...(!hasConnection
                         ? { saveAndSendDisabledReason: 'Add a connection to send messages.' }
-                        : streamTargetBusy
+                        : requestBusy
                           ? {
                               saveAndSendDisabledReason:
                                 'Wait for this generation to finish before sending again.',

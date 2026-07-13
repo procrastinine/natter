@@ -44,6 +44,30 @@ describe('seedCursorAtMessage', () => {
     expect(cursor[M(2)]).toBe(M(5))
     expect(resolveActiveLeafId(msgs, cursor)).toBe(M(5))
   })
+
+  it('can replace remembered descendants with the newest containing leaf', () => {
+    const msgs: Message[] = [
+      mkMessage({ id: M(1), parentId: null, siblingIndex: 0, createdAt: 1 }),
+      mkMessage({ id: M(2), parentId: M(1), siblingIndex: 0, createdAt: 2 }),
+      mkMessage({ id: M(3), parentId: M(1), siblingIndex: 1, createdAt: 3 }),
+      mkMessage({ id: M(4), parentId: M(2), siblingIndex: 0, createdAt: 4 }),
+      mkMessage({ id: M(5), parentId: M(2), siblingIndex: 1, createdAt: 8 }),
+      mkMessage({ id: M(6), parentId: M(3), siblingIndex: 0, createdAt: 9 }),
+    ]
+    const cursor: CursorMap = {
+      [M(1)]: M(2),
+      [M(2)]: M(4),
+      [M(3)]: M(6),
+    }
+
+    seedCursorAtMessage(msgs, M(2), cursor, { preserveDescendantPins: false })
+
+    expect(cursor[ROOT_CURSOR_KEY]).toBe(M(1))
+    expect(cursor[M(1)]).toBe(M(2))
+    expect(cursor[M(2)]).toBe(M(5))
+    expect(cursor[M(3)]).toBe(M(6))
+    expect(resolveActiveLeafId(msgs, cursor)).toBe(M(5))
+  })
 })
 
 describe('resolveLastUpdatedBranchBelow', () => {

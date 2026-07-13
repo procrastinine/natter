@@ -1,4 +1,5 @@
 import {
+  Activity,
   lazy,
   type MouseEvent,
   type ReactNode,
@@ -191,7 +192,17 @@ const CHAT_SNAPSHOT_CACHE_MAX_ENTRIES = 16
 
 interface ActiveBranchWindowSnapshotResult {
   key: string
+  cursorKey: string
   snapshot: ActiveBranchWindowSnapshot
+}
+
+interface LastBranchSnapshot {
+  cursorKey: string
+  snapshot: ActiveBranchWindowSnapshot
+}
+
+interface ActiveBranchSnapshotOverride extends ActiveBranchWindowSnapshotResult {
+  queryResultAtSet: ActiveBranchWindowSnapshotResult | null
 }
 
 interface ActiveProfileState {
@@ -319,6 +330,9 @@ export function Shell() {
   const [transcriptPlaceholderHeight, setTranscriptPlaceholderHeight] = useState(0)
   const [importAtEndOpen, setImportAtEndOpen] = useState(false)
   const [treeInsertTarget, setTreeInsertTarget] = useState<TreeInsertTarget | null>(null)
+  const [retainedAlternateViewsChatId, setRetainedAlternateViewsChatId] = useState<ChatId | null>(
+    null,
+  )
   const streamPeakPayloadCharsRef = useRef(0)
   const streamWasActiveRef = useRef(false)
   const transcriptRecycleTimerRef = useRef<number | null>(null)
@@ -331,7 +345,8 @@ export function Shell() {
   const treeViewActive = activeChatId !== null && treeViewChatId === activeChatId
   const setEphemeralActiveChatId = useUiStore((s) => s.setActiveChatId)
   const focusMode = useUiStore((s) => s.focusMode)
-  const effectiveFocusMode = !treeViewActive && !isNarrowScreen && focusMode && focusModeAvailable
+  const transcriptFocusMode = !isNarrowScreen && focusMode && focusModeAvailable
+  const effectiveFocusMode = !treeViewActive && transcriptFocusMode
   const pushBanner = useToastStore((s) => s.pushBanner)
   const pushToast = useToastStore((s) => s.push)
   const clearBannersByKind = useToastStore((s) => s.clearBannersByKind)
@@ -389,26 +404,36 @@ export function Shell() {
   const activeChatHasTranscript = resolvedActiveChatRow?.lastUpdatedLeafId != null
   const activeCursorCacheKey =
     activeChatId && activeChatHasTranscript ? cursorCacheKey(activeChatId, activeCursor) : null
-  const activeBranchWindowQueryKey = activeCursorCacheKey
-    ? treeViewActive
-      ? null
-      : JSON.stringify([activeCursorCacheKey, effectiveMessageBodyWindowLimit])
-    : null
+  const alternateViewsRetained = retainedAlternateViewsChatId === activeChatId
+  const activeBranchWindowQueryKey =
+    activeCursorCacheKey && (!treeViewActive || streamingOnActiveChat || alternateViewsRetained)
+      ? JSON.stringify([activeCursorCacheKey, effectiveMessageBodyWindowLimit])
+      : null
   const activeBranchWindowResult = useRepositoryQuery(
     JSON.stringify(['active-branch-window', activeChatId, activeBranchWindowQueryKey]),
     async (): Promise<ActiveBranchWindowSnapshotResult | null> => {
-      if (!activeChatId || !activeBranchWindowQueryKey) return null
+      const cursorKey = activeCursorCacheKey
+      if (!activeChatId || !activeBranchWindowQueryKey || !cursorKey) return null
       const snapshot = await loadActiveBranchWindowSnapshot(activeChatId, activeCursor, {
         offset: -1,
         limit: effectiveMessageBodyWindowLimit,
       })
-      return { key: activeBranchWindowQueryKey, snapshot }
+      return { key: activeBranchWindowQueryKey, cursorKey, snapshot }
     },
     null as ActiveBranchWindowSnapshotResult | null,
     chatMessageDependencies(activeChatId),
   )
+  const activeBranchWindowResultRef = useRef(activeBranchWindowResult)
+  activeBranchWindowResultRef.current = activeBranchWindowResult
+  const [activeBranchSnapshotOverride, setActiveBranchSnapshotOverride] =
+    useState<ActiveBranchSnapshotOverride | null>(null)
+  useEffect(() => {
+    setActiveBranchSnapshotOverride((current) =>
+      current && current.queryResultAtSet !== activeBranchWindowResult ? null : current,
+    )
+  }, [activeBranchWindowResult])
   const branchSnapshotCacheRef = useRef(new Map<string, ActiveBranchWindowSnapshot>())
-  const lastBranchSnapshotByChatRef = useRef(new Map<ChatId, ActiveBranchWindowSnapshot>())
+  const lastBranchSnapshotByChatRef = useRef(new Map<ChatId, LastBranchSnapshot>())
   const recycleTranscriptRenderTree = useCallback(() => {
     if (transcriptRemountTimerRef.current !== null) {
       window.clearTimeout(transcriptRemountTimerRef.current)
@@ -434,15 +459,15 @@ export function Shell() {
     if (!activeChatId) {
       branchSnapshotCacheRef.current.clear()
       lastBranchSnapshotByChatRef.current.clear()
+      setActiveBranchSnapshotOverride(null)
       return
     }
     branchSnapshotCacheRef.current.clear()
     lastBranchSnapshotByChatRef.current.clear()
+    setActiveBranchSnapshotOverride(null)
   }, [activeChatId])
   useEffect(() => {
     if (!treeViewActive) return
-    branchSnapshotCacheRef.current.clear()
-    lastBranchSnapshotByChatRef.current.clear()
     setTreeInsertTarget(null)
   }, [treeViewActive])
   useEffect(() => {
@@ -454,10 +479,10 @@ export function Shell() {
       activeBranchWindowResult.snapshot,
     )
     lastBranchSnapshotByChatRef.current.clear()
-    lastBranchSnapshotByChatRef.current.set(
-      activeBranchWindowResult.snapshot.chatId,
-      activeBranchWindowResult.snapshot,
-    )
+    lastBranchSnapshotByChatRef.current.set(activeBranchWindowResult.snapshot.chatId, {
+      cursorKey: activeBranchWindowResult.cursorKey,
+      snapshot: activeBranchWindowResult.snapshot,
+    })
   }, [activeBranchWindowResult, activeChatId])
   useEffect(() => {
     void activeChatId
@@ -525,15 +550,21 @@ export function Shell() {
     treeViewActive,
   ])
   const exactActiveBranchSnapshot =
-    activeBranchWindowResult?.key === activeBranchWindowQueryKey
-      ? activeBranchWindowResult.snapshot
-      : activeBranchWindowQueryKey
-        ? (branchSnapshotCacheRef.current.get(activeBranchWindowQueryKey) ?? null)
-        : null
-  const resolvedActiveBranchSnapshot = treeViewActive
-    ? null
-    : (exactActiveBranchSnapshot ??
-      (activeChatId ? (lastBranchSnapshotByChatRef.current.get(activeChatId) ?? null) : null))
+    activeBranchSnapshotOverride?.key === activeBranchWindowQueryKey
+      ? activeBranchSnapshotOverride.snapshot
+      : activeBranchWindowResult?.key === activeBranchWindowQueryKey
+        ? activeBranchWindowResult.snapshot
+        : activeBranchWindowQueryKey
+          ? (branchSnapshotCacheRef.current.get(activeBranchWindowQueryKey) ?? null)
+          : null
+  const lastActiveBranchSnapshot = activeChatId
+    ? lastBranchSnapshotByChatRef.current.get(activeChatId)
+    : undefined
+  const matchingLastActiveBranchSnapshot =
+    lastActiveBranchSnapshot?.cursorKey === activeCursorCacheKey
+      ? lastActiveBranchSnapshot.snapshot
+      : null
+  const resolvedActiveBranchSnapshot = exactActiveBranchSnapshot ?? matchingLastActiveBranchSnapshot
   const activeBranchLength = resolvedActiveBranchSnapshot?.branchLength ?? 0
   const activeBranchTailId = resolvedActiveBranchSnapshot?.branchHeaders.at(-1)?.id ?? null
   const messageBodyWindowResetKey = activeCursorCacheKey ?? '__none__'
@@ -1145,6 +1176,25 @@ export function Shell() {
     () => new Map(activeTreeHeaders.map((header) => [header.id, header])),
     [activeTreeHeaders],
   )
+  const refreshTranscriptForTreeHandoff = useCallback(async () => {
+    if (!activeChatId) return
+    const cursor = useChatStore.getState().getCursor(activeChatId) ?? {}
+    const cursorKey = cursorCacheKey(activeChatId, cursor)
+    const key = JSON.stringify([cursorKey, effectiveMessageBodyWindowLimit])
+    const snapshot = await loadActiveBranchWindowSnapshot(activeChatId, cursor, {
+      offset: -1,
+      limit: effectiveMessageBodyWindowLimit,
+    })
+    if (useUiStore.getState().activeChatId !== activeChatId) return
+    const latestCursor = useChatStore.getState().getCursor(activeChatId) ?? {}
+    if (cursorCacheKey(activeChatId, latestCursor) !== cursorKey) return
+    setActiveBranchSnapshotOverride({
+      key,
+      cursorKey,
+      snapshot,
+      queryResultAtSet: activeBranchWindowResultRef.current,
+    })
+  }, [activeChatId, effectiveMessageBodyWindowLimit])
   const activateTreeNode = useCallback(
     (messageId: MessageId) => {
       if (!activeChatId) return
@@ -1152,7 +1202,9 @@ export function Shell() {
       if (!header || header.deleted) return
       const current = useChatStore.getState().getCursor(activeChatId) ?? {}
       const next = { ...current }
-      seedCursorAtMessage(activeTreeHeaders as unknown as Message[], messageId, next)
+      seedCursorAtMessage(activeTreeHeaders as unknown as Message[], messageId, next, {
+        preserveDescendantPins: false,
+      })
       useChatStore.getState().setCursor(activeChatId, next)
     },
     [activeChatId, activeTreeHeaders, treeHeaderById],
@@ -1575,40 +1627,62 @@ export function Shell() {
                     treeViewActive={treeViewActive}
                     onTreeViewIntent={preloadBranchTreeView}
                     onToggleTreeView={() => {
-                      if (!treeViewActive) setEditTreeMode(false)
-                      setTreeViewChatId(treeViewActive ? null : activeChatId)
+                      setRetainedAlternateViewsChatId(activeChatId)
+                      if (!treeViewActive) {
+                        setEditTreeMode(false)
+                        setTreeViewChatId(activeChatId)
+                        return
+                      }
+                      void refreshTranscriptForTreeHandoff()
+                        .catch(() => undefined)
+                        .finally(() => {
+                          if (useUiStore.getState().treeViewChatId === activeChatId) {
+                            setTreeViewChatId(null)
+                          }
+                        })
                     }}
                     mobileConnectionControl={activeMobileConnectionControl}
                   />
                 </div>
                 {!treeViewActive ? <EditTreeToolbar /> : null}
                 <BannerTray />
-                {treeViewActive ? (
-                  <Suspense fallback={<SurfaceLoading label="Loading conversation tree…" />}>
-                    <BranchTreeView
-                      chatId={activeChatId}
-                      headers={activeTreeHeaders}
-                      cursor={activeCursor}
-                      expanded={treeExpanded}
-                      previewFontFamily={fontFamilyStack(prefs.fontFamily)}
-                      onActivateNode={activateTreeNode}
-                      onInsertAtSharedTrunk={insertAtSharedTreeTrunk}
-                      onInsertAtChildLeg={insertAtTreeChildLeg}
-                      onInsertAfterLeaf={insertAfterTreeLeaf}
-                      onEditMessage={editTreeMessage}
-                      onEditAndSendMessage={editAndSendTreeMessage}
-                      onDeleteNode={deleteTreeNode}
-                      onRegenerateMessage={regenerateTreeMessage}
-                      onContinueMessage={continueTreeMessage}
-                      onForkMessage={forkTreeMessage}
-                      onToggleMessageContextVisibility={toggleTreeMessageContextVisibility}
-                      onToggleReasoningDetailHidden={toggleTreeReasoningDetailHidden}
-                      onToggleProviderOutputItemHidden={toggleTreeProviderOutputItemHidden}
-                      hasConnection={hasConnection}
-                    />
-                  </Suspense>
-                ) : (
-                  <>
+                {treeViewActive || alternateViewsRetained ? (
+                  <Activity
+                    name={`conversation-tree:${activeChatId}`}
+                    mode={treeViewActive ? 'visible' : 'hidden'}
+                  >
+                    <Suspense fallback={<SurfaceLoading label="Loading conversation tree…" />}>
+                      <BranchTreeView
+                        chatId={activeChatId}
+                        headers={activeTreeHeaders}
+                        cursor={activeCursor}
+                        expanded={treeExpanded}
+                        previewFontFamily={fontFamilyStack(prefs.fontFamily)}
+                        onActivateNode={activateTreeNode}
+                        onInsertAtSharedTrunk={insertAtSharedTreeTrunk}
+                        onInsertAtChildLeg={insertAtTreeChildLeg}
+                        onInsertAfterLeaf={insertAfterTreeLeaf}
+                        onEditMessage={editTreeMessage}
+                        onEditAndSendMessage={editAndSendTreeMessage}
+                        onDeleteNode={deleteTreeNode}
+                        onRegenerateMessage={regenerateTreeMessage}
+                        onContinueMessage={continueTreeMessage}
+                        onForkMessage={forkTreeMessage}
+                        onToggleMessageContextVisibility={toggleTreeMessageContextVisibility}
+                        onToggleReasoningDetailHidden={toggleTreeReasoningDetailHidden}
+                        onToggleProviderOutputItemHidden={toggleTreeProviderOutputItemHidden}
+                        onAbort={abortActiveChat}
+                        followActiveStreamOnMount={streamingOnActiveChat}
+                        hasConnection={hasConnection}
+                      />
+                    </Suspense>
+                  </Activity>
+                ) : null}
+                {!treeViewActive || alternateViewsRetained ? (
+                  <Activity
+                    name={`conversation-transcript:${activeChatId}`}
+                    mode={treeViewActive ? 'hidden' : 'visible'}
+                  >
                     <ScrollRegion
                       key={activeChatId}
                       ref={scrollRef}
@@ -1619,27 +1693,31 @@ export function Shell() {
                       onStateChange={setScrollState}
                     >
                       {transcriptMounted && activeChatHasTranscript ? (
-                        <Suspense fallback={<SurfaceLoading label="Loading conversation…" />}>
-                          <MessageList
-                            key={`${activeChatId}:${transcriptRenderEpoch}`}
-                            chatId={activeChatId}
-                            chatSettings={resolvedActiveChatRow.settings}
-                            hasConnection={hasConnection}
-                            branchSnapshot={resolvedActiveBranchSnapshot}
-                            {...(activeCapability ? { capability: activeCapability } : {})}
-                            prefillRecommendationEndpoints={activeEndpoints.endpoints}
-                            longMessageDisplayMode={prefs.longMessageDisplayMode}
-                            messageRenderWindowSize={prefs.messageRenderWindowSize}
-                            messageRenderWindowLoadMode={
-                              loadedPrefs ? prefs.messageRenderWindowLoadMode : 'manual'
-                            }
-                            onLoadOlderMessages={loadOlderMessageWindow}
-                          />
-                        </Suspense>
+                        resolvedActiveBranchSnapshot ? (
+                          <Suspense fallback={<SurfaceLoading label="Loading conversation…" />}>
+                            <MessageList
+                              key={`${activeChatId}:${transcriptRenderEpoch}`}
+                              chatId={activeChatId}
+                              chatSettings={resolvedActiveChatRow.settings}
+                              hasConnection={hasConnection}
+                              branchSnapshot={resolvedActiveBranchSnapshot}
+                              {...(activeCapability ? { capability: activeCapability } : {})}
+                              prefillRecommendationEndpoints={activeEndpoints.endpoints}
+                              longMessageDisplayMode={prefs.longMessageDisplayMode}
+                              messageRenderWindowSize={prefs.messageRenderWindowSize}
+                              messageRenderWindowLoadMode={
+                                loadedPrefs ? prefs.messageRenderWindowLoadMode : 'manual'
+                              }
+                              onLoadOlderMessages={loadOlderMessageWindow}
+                            />
+                          </Suspense>
+                        ) : (
+                          <SurfaceLoading label="Loading conversation…" />
+                        )
                       ) : (
                         <div ref={transcriptPlaceholderRef} data-ui="message-list-recycling" />
                       )}
-                      {effectiveFocusMode ? (
+                      {transcriptFocusMode ? (
                         <Composer
                           onSubmit={handleSubmit}
                           streaming={streamingOnActiveChat}
@@ -1709,7 +1787,7 @@ export function Shell() {
                         />
                       ) : null}
                     </ScrollRegion>
-                    {effectiveFocusMode ? null : (
+                    {transcriptFocusMode ? null : (
                       <Composer
                         onSubmit={handleSubmit}
                         streaming={streamingOnActiveChat}
@@ -1790,8 +1868,8 @@ export function Shell() {
                         }
                       />
                     )}
-                  </>
-                )}
+                  </Activity>
+                ) : null}
               </>
             ) : onNewChatSurface ? (
               <>

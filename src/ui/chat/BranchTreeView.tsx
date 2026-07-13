@@ -33,6 +33,7 @@ import {
   PersonIcon,
   RobotIcon,
   SearchIcon,
+  StopIcon,
 } from '../icons/Icon'
 import { TreeDensityToggle } from './TreeDensityToggle'
 
@@ -129,6 +130,8 @@ export interface BranchTreeViewProps {
   onToggleMessageContextVisibility?: BranchTreeMessageAction
   onToggleReasoningDetailHidden?: BranchTreeMessageIndexedAction
   onToggleProviderOutputItemHidden?: BranchTreeMessageIndexedAction
+  onAbort?: () => void
+  followActiveStreamOnMount?: boolean
   hasConnection?: boolean
   className?: string
 }
@@ -165,11 +168,24 @@ interface PendingRequestLeafFollow {
   initialStreamIds: ReadonlySet<string>
 }
 
+interface EntryStreamFollow {
+  chatId: ChatId
+  openedAt: number
+  streamIds: ReadonlySet<string>
+  messageIds: ReadonlySet<MessageId>
+  acceptHydratedStream: boolean
+  state: 'pending' | 'done' | 'cancelled'
+}
+
 function pendingRequestMatchesToken(
   pending: PendingRequestLeafFollow | null,
   token: number,
 ): boolean {
   return pending?.token === token
+}
+
+function cancelEntryStreamFollow(follow: EntryStreamFollow | null): void {
+  if (follow?.state === 'pending') follow.state = 'cancelled'
 }
 
 interface SharedConnector {
@@ -289,6 +305,10 @@ function sameRevisionMap(
 
 function roleLabel(role: MessageRole): string {
   return role.charAt(0).toLocaleUpperCase() + role.slice(1)
+}
+
+function headerHasPendingGeneration(header: MessageHeaderRow): boolean {
+  return header.generation?.status === 'streaming' && header.generation.finishedAt === undefined
 }
 
 function lowerBoundNodeX(row: readonly BranchTreeLayoutNode[], target: number): number {
@@ -455,6 +475,8 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
   onToggleMessageContextVisibility,
   onToggleReasoningDetailHidden,
   onToggleProviderOutputItemHidden,
+  onAbort,
+  followActiveStreamOnMount = false,
   hasConnection = false,
   className,
 }: BranchTreeViewProps) {
@@ -477,6 +499,7 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
   const initialCenterKeyRef = useRef('')
   const lastExternalSelectionRef = useRef<MessageId | null>(null)
   const previewScopeRef = useRef({ chatId, repository })
+  const selectionScopeChatIdRef = useRef(chatId)
   const panGestureRef = useRef<PanGesture | null>(null)
   const suppressCanvasClickRef = useRef(false)
   const structuralNodesRef = useRef<readonly BranchTreeSourceNode[]>([])
@@ -486,6 +509,7 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
   const inspectedStreamRevisionRef = useRef<{ id: MessageId; version: number } | null>(null)
   const requestLeafFollowTokenRef = useRef(0)
   const pendingRequestLeafFollowRef = useRef<PendingRequestLeafFollow | null>(null)
+  const entryStreamFollowRef = useRef<EntryStreamFollow | null>(null)
   const messageLoadTailRef = useRef<Promise<void>>(Promise.resolve())
   const lastSearchQueryRef = useRef('')
   const [viewport, setViewport] = useState<Viewport>(EMPTY_VIEWPORT)
@@ -504,8 +528,13 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
   const [hoveredConnectorKey, setHoveredConnectorKey] = useState<string | null>(null)
   const [query, setQuery] = useState('')
   const selectChatStreams = useMemo(() => {
+    let previousActiveByStreamId:
+      | ReturnType<typeof useStreamStore.getState>['activeByStreamId']
+      | null = null
     let previous: ReturnType<typeof useStreamStore.getState>['activeByStreamId'][string][] = []
     return (state: ReturnType<typeof useStreamStore.getState>) => {
+      if (state.activeByStreamId === previousActiveByStreamId) return previous
+      previousActiveByStreamId = state.activeByStreamId
       const next = Object.values(state.activeByStreamId).filter(
         (stream) => stream.chatId === chatId,
       )
@@ -525,6 +554,36 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
     for (const stream of chatStreams) if (stream.messageId) ids.add(stream.messageId)
     return ids
   }, [chatStreams])
+  const persistedStreamTargetIds = useMemo(() => {
+    const ids = new Set<MessageId>()
+    for (const header of headers) if (headerHasPendingGeneration(header)) ids.add(header.id)
+    return ids
+  }, [headers])
+  if (entryStreamFollowRef.current?.chatId !== chatId) {
+    entryStreamFollowRef.current = {
+      chatId,
+      openedAt: Date.now(),
+      streamIds: new Set(chatStreams.map((stream) => stream.streamId)),
+      messageIds: new Set(persistedStreamTargetIds),
+      acceptHydratedStream:
+        followActiveStreamOnMount || chatStreams.length > 0 || persistedStreamTargetIds.size > 0,
+      state: selectedNodeId === undefined ? 'pending' : 'cancelled',
+    }
+  }
+  const entryStreamFollow = entryStreamFollowRef.current
+  if (
+    entryStreamFollow.state === 'pending' &&
+    (followActiveStreamOnMount || chatStreams.length > 0 || persistedStreamTargetIds.size > 0)
+  ) {
+    entryStreamFollow.acceptHydratedStream = true
+  }
+  const busyMessageIds = useMemo(() => {
+    if (persistedStreamTargetIds.size === 0) return activeStreamTargetIds
+    const ids = new Set(activeStreamTargetIds)
+    for (const id of persistedStreamTargetIds) ids.add(id)
+    return ids
+  }, [activeStreamTargetIds, persistedStreamTargetIds])
+  const generationBusy = chatStreams.length > 0 || persistedStreamTargetIds.size > 0
   const deferredQuery = useDeferredValue(query)
   const normalizedQuery = deferredQuery.trim()
   const [matches, setMatches] = useState<MessageId[]>([])
@@ -601,12 +660,12 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
   }, [activePathIds, layout])
   const streamBusyParentIds = useMemo(() => {
     const parents = new Set<MessageId>()
-    for (const messageId of activeStreamTargetIds) {
+    for (const messageId of busyMessageIds) {
       const parentId = layout.byId.get(messageId)?.parentId
       if (parentId) parents.add(parentId)
     }
     return parents
-  }, [activeStreamTargetIds, layout])
+  }, [busyMessageIds, layout])
   const effectiveSelectedNodeId =
     selectedNodeId === undefined ? localSelectedNodeId : selectedNodeId
   const selectedHeader = effectiveSelectedNodeId
@@ -615,8 +674,7 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
   const liveSelectedHeader = selectedHeader?.deleted ? undefined : selectedHeader
   const inspectedMessageId = liveSelectedHeader?.id ?? null
   const selectedNodeVersion = liveSelectedHeader?.nodeVersion ?? null
-  const selectedStreamActive =
-    inspectedMessageId !== null && activeStreamTargetIds.has(inspectedMessageId)
+  const selectedStreamActive = inspectedMessageId !== null && busyMessageIds.has(inspectedMessageId)
   if (inspectedMessageId === null || selectedNodeVersion === null) {
     inspectedStreamRevisionRef.current = null
   } else if (!selectedStreamActive) {
@@ -718,16 +776,19 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
 
   useEffect(() => {
     if (selectedNodeId === null) {
+      cancelEntryStreamFollow(entryStreamFollowRef.current)
       lastExternalSelectionRef.current = null
       return
     }
     if (selectedNodeId === undefined || lastExternalSelectionRef.current === selectedNodeId) return
+    cancelEntryStreamFollow(entryStreamFollowRef.current)
     lastExternalSelectionRef.current = selectedNodeId
     centerNode(selectedNodeId)
   }, [centerNode, selectedNodeId])
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: chat identity is the reset trigger.
   useEffect(() => {
+    if (selectionScopeChatIdRef.current === chatId) return
+    selectionScopeChatIdRef.current = chatId
     requestLeafFollowTokenRef.current += 1
     pendingRequestLeafFollowRef.current = null
     setLocalSelectedNodeId(null)
@@ -930,13 +991,14 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
     const inFlight = expandedPreviewInFlightKeysRef.current
     for (const node of visibleNodes) {
       const header = headerById.get(node.id)
-      if (!header || cachedPreviewFor(header) !== undefined) continue
+      if (!header || busyMessageIds.has(node.id) || cachedPreviewFor(header) !== undefined) continue
       const key = previewKeyFor(header)
       if (!inFlight.has(key)) queue.set(key, header)
     }
     pumpExpandedPreviewQueue()
   }, [
     cachedPreviewFor,
+    busyMessageIds,
     expanded,
     headerById,
     previewKeyFor,
@@ -956,6 +1018,12 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
   const openPreview = useCallback(
     (header: MessageHeaderRow) => {
       if (expanded) return
+      if (busyMessageIds.has(header.id)) {
+        const key = `streaming\u0000${chatId}\u0000${header.id}`
+        activePreviewKeyRef.current = key
+        setActivePreview({ key, messageId: header.id, text: 'Streaming response…' })
+        return
+      }
       const key = previewKeyFor(header)
       activePreviewKeyRef.current = key
       const cached = cachedPreviewFor(header)
@@ -978,7 +1046,7 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
         },
       )
     },
-    [cachedPreviewFor, expanded, loadPreview, previewKeyFor],
+    [busyMessageIds, cachedPreviewFor, chatId, expanded, loadPreview, previewKeyFor],
   )
 
   const closePreview = useCallback(
@@ -990,7 +1058,13 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
     [activePreview],
   )
 
-  const inspectMessage = useCallback(
+  const cancelAutomaticFollow = useCallback(() => {
+    cancelEntryStreamFollow(entryStreamFollowRef.current)
+    requestLeafFollowTokenRef.current += 1
+    pendingRequestLeafFollowRef.current = null
+  }, [])
+
+  const selectMessage = useCallback(
     (messageId: MessageId) => {
       activePreviewKeyRef.current = null
       setActivePreview(null)
@@ -1001,16 +1075,25 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
     [onSelectNode],
   )
 
+  const inspectMessage = useCallback(
+    (messageId: MessageId) => {
+      cancelAutomaticFollow()
+      selectMessage(messageId)
+    },
+    [cancelAutomaticFollow, selectMessage],
+  )
+
   const inspectAndCenterMessage = useCallback(
     (messageId: MessageId) => {
-      inspectMessage(messageId)
+      selectMessage(messageId)
       centerNodeRef.current(messageId)
     },
-    [inspectMessage],
+    [selectMessage],
   )
 
   const runRequestAndFollowLeaf = useCallback(
     async (action: () => MessageId | undefined | Promise<MessageId | undefined>): Promise<void> => {
+      cancelAutomaticFollow()
       const token = requestLeafFollowTokenRef.current + 1
       requestLeafFollowTokenRef.current = token
       pendingRequestLeafFollowRef.current = {
@@ -1029,7 +1112,7 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
         }
       }
     },
-    [inspectAndCenterMessage],
+    [cancelAutomaticFollow, inspectAndCenterMessage],
   )
 
   useEffect(() => {
@@ -1044,6 +1127,44 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
       return
     }
   }, [activeLeafId, chatStreams, inspectAndCenterMessage])
+
+  useEffect(() => {
+    const follow = entryStreamFollowRef.current
+    if (!follow || follow.chatId !== chatId || follow.state !== 'pending' || !activeLeafId) return
+    const streams = chatStreams
+      .filter(
+        (candidate) =>
+          (follow.streamIds.has(candidate.streamId) ||
+            (follow.acceptHydratedStream && candidate.startedAt <= follow.openedAt)) &&
+          candidate.messageId !== undefined &&
+          activePathIds.has(candidate.messageId) &&
+          layout.byId.has(candidate.messageId),
+      )
+      .sort((left, right) => right.startedAt - left.startedAt)
+    const stream = streams.find((candidate) => candidate.messageId === activeLeafId) ?? streams[0]
+    const messageId =
+      stream?.messageId ??
+      ((follow.messageIds.has(activeLeafId) ||
+        (follow.acceptHydratedStream &&
+          persistedStreamTargetIds.has(activeLeafId) &&
+          (headerById.get(activeLeafId)?.generation?.startedAt ?? Number.POSITIVE_INFINITY) <=
+            follow.openedAt)) &&
+      layout.byId.has(activeLeafId)
+        ? activeLeafId
+        : undefined)
+    if (!messageId) return
+    follow.state = 'done'
+    inspectAndCenterMessage(messageId)
+  }, [
+    activeLeafId,
+    activePathIds,
+    chatId,
+    chatStreams,
+    headerById,
+    inspectAndCenterMessage,
+    layout,
+    persistedStreamTargetIds,
+  ])
 
   useEffect(() => {
     if (normalizedQuery.length === 0) {
@@ -1121,19 +1242,21 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
   const goToMatch = useCallback(
     (direction: -1 | 1) => {
       if (matches.length === 0) return
+      cancelAutomaticFollow()
       const current = matchIndex < 0 ? 0 : matchIndex
       const next = (current + direction + matches.length) % matches.length
       setMatchIndex(next)
       const messageId = matches[next]
       if (messageId) inspectAndCenterMessage(messageId)
     },
-    [inspectAndCenterMessage, matchIndex, matches],
+    [cancelAutomaticFollow, inspectAndCenterMessage, matchIndex, matches],
   )
 
   const clearSelection = useCallback(() => {
+    cancelAutomaticFollow()
     setLocalSelectedNodeId(null)
     onSelectNode?.(null)
-  }, [onSelectNode])
+  }, [cancelAutomaticFollow, onSelectNode])
 
   useEffect(() => {
     if (!inspectedMessageId) return
@@ -1147,8 +1270,11 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
   }, [clearSelection, inspectedMessageId])
 
   const activateNode = useCallback(
-    (messageId: MessageId) => runAction(() => onActivateNode(messageId)),
-    [onActivateNode],
+    (messageId: MessageId) => {
+      cancelAutomaticFollow()
+      runAction(() => onActivateNode(messageId))
+    },
+    [cancelAutomaticFollow, onActivateNode],
   )
 
   const setInspectorWidthFromClientX = useCallback((clientX: number) => {
@@ -1404,7 +1530,10 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
             aria-controls="branch-tree-canvas"
             aria-busy={searching}
             data-ui="branch-tree-search-input"
-            onChange={(event) => setQuery(event.currentTarget.value)}
+            onChange={(event) => {
+              cancelAutomaticFollow()
+              setQuery(event.currentTarget.value)
+            }}
             onKeyDown={(event) => {
               if (event.key === 'Enter') {
                 event.preventDefault()
@@ -1413,6 +1542,7 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
                 if (query.length > 0) {
                   event.preventDefault()
                   event.stopPropagation()
+                  cancelAutomaticFollow()
                   setQuery('')
                 }
               }
@@ -1424,6 +1554,7 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
               aria-label="Clear tree search"
               data-ui="branch-tree-search-clear"
               onClick={() => {
+                cancelAutomaticFollow()
                 setQuery('')
                 searchInputRef.current?.focus()
               }}
@@ -1465,6 +1596,18 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
             <ChevronIcon size={15} />
           </button>
         </search>
+        {chatStreams.length > 0 && onAbort ? (
+          <button
+            type="button"
+            data-ui="branch-tree-stop"
+            aria-label="Stop generating"
+            title="Stop generating"
+            onClick={onAbort}
+          >
+            <StopIcon size={14} />
+            <span>Stop</span>
+          </button>
+        ) : null}
       </div>
 
       <div
@@ -1496,7 +1639,7 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
           >
             {layout.nodes.length === 0 ? (
               <div role="status" data-ui="branch-tree-empty">
-                This chat has no messages yet.
+                {generationBusy ? 'Preparing response…' : 'This chat has no messages yet.'}
               </div>
             ) : (
               <svg
@@ -1587,7 +1730,7 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
                     : null}
                   {onInsertAtChildLeg
                     ? visibleConnectors.children.map((connector) => {
-                        const streamBusy = activeStreamTargetIds.has(connector.childId)
+                        const streamBusy = busyMessageIds.has(connector.childId)
                         return (
                           // biome-ignore lint/a11y/useSemanticElements: SVG has no native button element; this group exposes the visible marker as one keyboard-operable target.
                           <g
@@ -1634,7 +1777,7 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
                   {onInsertAfterLeaf
                     ? visibleNodes.map((node) => {
                         if ((layout.childrenByParent.get(node.id)?.length ?? 0) > 0) return null
-                        const streamBusy = activeStreamTargetIds.has(node.id)
+                        const streamBusy = busyMessageIds.has(node.id)
                         const markerKey = `leaf:${node.id}`
                         const x = node.x + node.width / 2
                         const startY = node.y + node.height
@@ -1694,9 +1837,11 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
                   {visibleNodes.map((node) => {
                     const header = headerById.get(node.id)
                     if (!header) return null
-                    const cachedPreview = cachedPreviewFor(header)
-                    const previewText =
-                      cachedPreview === undefined
+                    const streaming = busyMessageIds.has(node.id)
+                    const cachedPreview = streaming ? undefined : cachedPreviewFor(header)
+                    const previewText = streaming
+                      ? 'Streaming response…'
+                      : cachedPreview === undefined
                         ? 'Loading preview…'
                         : cachedPreview.length > 0
                           ? cachedPreview
@@ -1715,12 +1860,13 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
                           data-message-id={node.id}
                           data-role={header.role}
                           data-hidden-from-context={header.hiddenFromContext || undefined}
+                          data-streaming={streaming || undefined}
                           data-active-path={onActivePath || undefined}
                           data-current-leaf={currentLeaf || undefined}
                           data-selected={selected || undefined}
                           data-search-match={searchMatch || undefined}
                           data-current-match={currentMatch || undefined}
-                          aria-label={`${roleLabel(header.role)} message${header.hiddenFromContext ? ', hidden from context' : ''}${selected ? ', inspected' : ''}${currentLeaf ? ', current leaf' : ''}${cachedPreview ? `: ${cachedPreview.slice(0, 160)}` : ''}`}
+                          aria-label={`${roleLabel(header.role)} message${header.hiddenFromContext ? ', hidden from context' : ''}${streaming ? ', streaming' : ''}${selected ? ', inspected' : ''}${currentLeaf ? ', current leaf' : ''}${cachedPreview ? `: ${cachedPreview.slice(0, 160)}` : ''}`}
                           aria-current={currentLeaf ? 'true' : undefined}
                           onClick={(event) => {
                             if (
@@ -1763,7 +1909,9 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
                                 width={node.width}
                                 fontFamily={previewFontFamily}
                                 cacheKey={
-                                  cachedPreview === undefined ? undefined : previewKeyFor(header)
+                                  streaming || cachedPreview === undefined
+                                    ? undefined
+                                    : previewKeyFor(header)
                                 }
                               />
                             </Suspense>
@@ -1839,6 +1987,8 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
                     searchQuery={normalizedQuery}
                     searchMatched={matchSet.has(inspectedMessageId)}
                     hasConnection={hasConnection}
+                    generationBusy={generationBusy}
+                    streamOnActivePath={activePathIds.has(inspectedMessageId)}
                     onClose={clearSelection}
                     onActivate={handleInspectorActivate}
                     {...(onEditMessage ? { onEdit: onEditMessage } : {})}

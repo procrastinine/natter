@@ -1,7 +1,9 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { StrictMode } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Message, MessageId, MessageRole } from '../../src/core/types'
 import type { MessageHeaderRow } from '../../src/store/message-storage'
+import { getStreamClientId } from '../../src/store/stream-leases'
 import { useStreamStore } from '../../src/store/zustand/streamStore'
 import { BranchTreeInspector } from '../../src/ui/chat/BranchTreeInspector'
 import { type BranchTreeRepository, BranchTreeView } from '../../src/ui/chat/BranchTreeView'
@@ -55,6 +57,19 @@ afterEach(() => {
 function fullMessageFor(messageId: string): Message | undefined {
   const row = smallTree.find((header) => header.id === messageId)
   return row ? { ...row, content: [{ type: 'text', text: `Full ${messageId}` }] } : undefined
+}
+
+function streamingGeneration(): NonNullable<Message['generation']> {
+  return {
+    id: 'generation-streaming',
+    model: 'vendor/tree-model',
+    requestedModel: 'vendor/tree-model',
+    apiUsed: 'chat',
+    delivery: 'streaming',
+    status: 'streaming',
+    costSource: 'stream',
+    startedAt: 4,
+  }
 }
 
 describe('BranchTreeView', () => {
@@ -297,7 +312,7 @@ describe('BranchTreeView', () => {
         chatId: 'chat-1',
         messageId: 'regenerated',
         startedAt: 4,
-        ownerClientId: 'client-1',
+        ownerClientId: getStreamClientId(),
       })
     })
     view.rerender(
@@ -327,6 +342,466 @@ describe('BranchTreeView', () => {
     )
 
     act(() => resolveRequest?.('regenerated'))
+  })
+
+  it('opens the current streaming leaf when tree view mounts mid-response', async () => {
+    act(() => {
+      useStreamStore.getState().setActive({
+        streamId: 'already-streaming',
+        chatId: 'chat-1',
+        messageId: 'left',
+        startedAt: 4,
+        ownerClientId: getStreamClientId(),
+      })
+      useStreamStore.getState().setLiveSnapshot({
+        streamId: 'already-streaming',
+        chatId: 'chat-1',
+        messageId: 'left',
+        content: [{ type: 'output_text', text: 'Already streaming in transcript mode.' }],
+        textLength: 37,
+        reasoningLength: 0,
+        updatedAt: 5,
+      })
+    })
+
+    render(
+      <StrictMode>
+        <BranchTreeView
+          chatId="chat-1"
+          headers={smallTree}
+          cursor={{ root: 'left' }}
+          expanded={false}
+          repository={repository()}
+          onActivateNode={() => undefined}
+        />
+      </StrictMode>,
+    )
+
+    await waitFor(() =>
+      expect(document.querySelector('[data-message-id="left"]')).toHaveAttribute(
+        'data-selected',
+        'true',
+      ),
+    )
+    await waitFor(() =>
+      expect(document.querySelector('[data-ui="branch-tree-inspector"]')).toHaveAttribute(
+        'data-message-id',
+        'left',
+      ),
+    )
+    expect(document.querySelector('[data-ui="branch-tree-inspector"]')).toHaveTextContent(
+      'Already streaming in transcript mode.',
+    )
+  })
+
+  it('follows an initially untargeted stream once its target header becomes available', async () => {
+    let headers = smallTree
+    const getMessage = vi.fn(async (messageId: string): Promise<Message | undefined> => {
+      const row = headers.find((candidate) => candidate.id === messageId)
+      return row
+        ? { ...row, content: [{ type: 'output_text', text: `Full ${messageId}` }] }
+        : undefined
+    })
+    const treeRepository = repository({ getMessage })
+    act(() => {
+      useStreamStore.getState().setActive({
+        streamId: 'waiting-for-target',
+        chatId: 'chat-1',
+        startedAt: 4,
+        ownerClientId: getStreamClientId(),
+      })
+    })
+    const view = render(
+      <BranchTreeView
+        chatId="chat-1"
+        headers={headers}
+        cursor={{ root: 'left' }}
+        expanded={false}
+        repository={treeRepository}
+        onActivateNode={() => undefined}
+      />,
+    )
+    expect(document.querySelector('[data-selected="true"]')).not.toBeInTheDocument()
+
+    act(() => {
+      useStreamStore.getState().setActive({
+        streamId: 'waiting-for-target',
+        chatId: 'chat-1',
+        messageId: 'stream-leaf',
+        startedAt: 4,
+        ownerClientId: getStreamClientId(),
+      })
+    })
+    await act(async () => Promise.resolve())
+    expect(document.querySelector('[data-selected="true"]')).not.toBeInTheDocument()
+
+    headers = [...smallTree, header('stream-leaf', 'root', 2, 'assistant', 5)]
+    view.rerender(
+      <BranchTreeView
+        chatId="chat-1"
+        headers={headers}
+        cursor={{ root: 'stream-leaf' }}
+        expanded={false}
+        repository={treeRepository}
+        onActivateNode={() => undefined}
+      />,
+    )
+
+    await waitFor(() =>
+      expect(document.querySelector('[data-message-id="stream-leaf"]')).toHaveAttribute(
+        'data-selected',
+        'true',
+      ),
+    )
+    await waitFor(() =>
+      expect(document.querySelector('[data-ui="branch-tree-inspector"]')).toHaveAttribute(
+        'data-message-id',
+        'stream-leaf',
+      ),
+    )
+  })
+
+  it('follows an existing stream that hydrates after the initial empty render', async () => {
+    let headers: MessageHeaderRow[] = []
+    const getMessage = vi.fn(async (messageId: string): Promise<Message | undefined> => {
+      const row = headers.find((candidate) => candidate.id === messageId)
+      return row
+        ? { ...row, content: [{ type: 'output_text', text: `Hydrated ${messageId}` }] }
+        : undefined
+    })
+    const treeRepository = repository({ getMessage })
+    const view = render(
+      <StrictMode>
+        <BranchTreeView
+          chatId="chat-1"
+          headers={headers}
+          cursor={{}}
+          expanded={false}
+          repository={treeRepository}
+          onActivateNode={() => undefined}
+        />
+      </StrictMode>,
+    )
+    expect(document.querySelector('[data-selected="true"]')).not.toBeInTheDocument()
+
+    act(() => {
+      useStreamStore.getState().setActive({
+        streamId: 'late-hydrated-stream',
+        chatId: 'chat-1',
+        messageId: 'hydrated-leaf',
+        startedAt: 4,
+        ownerClientId: 'remote-client',
+      })
+    })
+    headers = [
+      header('hydrated-root', null, 0, 'user', 1),
+      {
+        ...header('hydrated-leaf', 'hydrated-root', 0, 'assistant', 2),
+        generation: streamingGeneration(),
+      },
+    ]
+    view.rerender(
+      <StrictMode>
+        <BranchTreeView
+          chatId="chat-1"
+          headers={headers}
+          cursor={{ 'hydrated-root': 'hydrated-leaf' }}
+          expanded={false}
+          repository={treeRepository}
+          onActivateNode={() => undefined}
+        />
+      </StrictMode>,
+    )
+
+    await waitFor(() =>
+      expect(document.querySelector('[data-message-id="hydrated-leaf"]')).toHaveAttribute(
+        'data-selected',
+        'true',
+      ),
+    )
+    expect(document.querySelector('[data-ui="branch-tree-inspector"]')).toHaveAttribute(
+      'data-message-id',
+      'hydrated-leaf',
+    )
+  })
+
+  it('does not steal focus for a stream that starts after opening an idle tree', async () => {
+    let headers: MessageHeaderRow[] = smallTree
+    const treeRepository = repository({
+      getMessage: vi.fn(async (messageId: string): Promise<Message | undefined> => {
+        const row = headers.find((candidate) => candidate.id === messageId)
+        return row ? { ...row, content: [{ type: 'text', text: `Full ${messageId}` }] } : undefined
+      }),
+    })
+    const view = render(
+      <StrictMode>
+        <BranchTreeView
+          chatId="chat-1"
+          headers={headers}
+          cursor={{ root: 'left' }}
+          expanded={false}
+          repository={treeRepository}
+          onActivateNode={() => undefined}
+        />
+      </StrictMode>,
+    )
+    expect(document.querySelector('[data-selected="true"]')).not.toBeInTheDocument()
+
+    const startedAfterTreeOpened = Date.now() + 60_000
+    act(() => {
+      useStreamStore.getState().setActive({
+        streamId: 'future-stream',
+        chatId: 'chat-1',
+        messageId: 'left',
+        startedAt: startedAfterTreeOpened,
+        ownerClientId: 'remote-client',
+      })
+    })
+    headers = headers.map((row) =>
+      row.id === 'left'
+        ? {
+            ...row,
+            generation: { ...streamingGeneration(), startedAt: startedAfterTreeOpened },
+          }
+        : row,
+    )
+    view.rerender(
+      <StrictMode>
+        <BranchTreeView
+          chatId="chat-1"
+          headers={headers}
+          cursor={{ root: 'left' }}
+          expanded={false}
+          repository={treeRepository}
+          onActivateNode={() => undefined}
+        />
+      </StrictMode>,
+    )
+
+    await waitFor(() =>
+      expect(document.querySelector('[data-message-id="left"]')).toHaveAttribute(
+        'data-streaming',
+        'true',
+      ),
+    )
+    expect(document.querySelector('[data-selected="true"]')).not.toBeInTheDocument()
+    expect(document.querySelector('[data-ui="branch-tree-inspector"]')).not.toBeInTheDocument()
+  })
+
+  it('ignores off-path and other-chat streams when choosing an initial inspector target', async () => {
+    act(() => {
+      useStreamStore.getState().setActive({
+        streamId: 'off-path',
+        chatId: 'chat-1',
+        messageId: 'right',
+        startedAt: 4,
+        ownerClientId: getStreamClientId(),
+      })
+      useStreamStore.getState().setActive({
+        streamId: 'other-chat',
+        chatId: 'chat-elsewhere',
+        messageId: 'left',
+        startedAt: 5,
+        ownerClientId: 'client-2',
+      })
+    })
+
+    render(
+      <BranchTreeView
+        chatId="chat-1"
+        headers={smallTree}
+        cursor={{ root: 'left' }}
+        expanded={false}
+        repository={repository()}
+        onActivateNode={() => undefined}
+      />,
+    )
+    await act(async () => Promise.resolve())
+
+    expect(document.querySelector('[data-selected="true"]')).not.toBeInTheDocument()
+    expect(document.querySelector('[data-ui="branch-tree-inspector"]')).not.toBeInTheDocument()
+  })
+
+  it('inspects an off-path stream without activating its branch', async () => {
+    const activate = vi.fn()
+    act(() => {
+      useStreamStore.getState().setActive({
+        streamId: 'inspect-off-path',
+        chatId: 'chat-1',
+        messageId: 'right',
+        startedAt: 4,
+        ownerClientId: getStreamClientId(),
+      })
+    })
+
+    render(
+      <BranchTreeView
+        chatId="chat-1"
+        headers={smallTree}
+        cursor={{ root: 'left' }}
+        expanded={false}
+        repository={repository()}
+        onActivateNode={activate}
+      />,
+    )
+
+    fireEvent.click(document.querySelector('[data-message-id="right"]') as Element)
+
+    expect(document.querySelector('[data-message-id="right"]')).toHaveAttribute(
+      'data-selected',
+      'true',
+    )
+    expect(document.querySelector('[data-message-id="left"]')).toHaveAttribute(
+      'data-current-leaf',
+      'true',
+    )
+    expect(activate).not.toHaveBeenCalled()
+    await waitFor(() =>
+      expect(document.querySelector('[data-ui="branch-tree-inspector"]')).toHaveAttribute(
+        'data-message-id',
+        'right',
+      ),
+    )
+    expect(
+      document.querySelector('[data-ui="branch-tree-inspector-stream-status"]'),
+    ).toHaveTextContent('Streaming on another branch. Open this branch to follow live output.')
+    fireEvent.click(screen.getByRole('button', { name: 'Open this branch' }))
+    expect(activate).toHaveBeenCalledOnce()
+    expect(activate).toHaveBeenCalledWith('right')
+  })
+
+  it('does not let a late stream target replace an explicit manual selection', async () => {
+    act(() => {
+      useStreamStore.getState().setActive({
+        streamId: 'late-manual-target',
+        chatId: 'chat-1',
+        startedAt: 4,
+        ownerClientId: getStreamClientId(),
+      })
+    })
+    render(
+      <BranchTreeView
+        chatId="chat-1"
+        headers={smallTree}
+        cursor={{ root: 'left' }}
+        expanded={false}
+        repository={repository()}
+        onActivateNode={() => undefined}
+      />,
+    )
+    fireEvent.click(document.querySelector('[data-message-id="root"]') as Element)
+    await waitFor(() =>
+      expect(document.querySelector('[data-ui="branch-tree-inspector"]')).toHaveAttribute(
+        'data-message-id',
+        'root',
+      ),
+    )
+
+    act(() => {
+      useStreamStore.getState().setActive({
+        streamId: 'late-manual-target',
+        chatId: 'chat-1',
+        messageId: 'left',
+        startedAt: 4,
+        ownerClientId: getStreamClientId(),
+      })
+    })
+    await act(async () => Promise.resolve())
+
+    expect(document.querySelector('[data-message-id="root"]')).toHaveAttribute(
+      'data-selected',
+      'true',
+    )
+    expect(document.querySelector('[data-ui="branch-tree-inspector"]')).toHaveAttribute(
+      'data-message-id',
+      'root',
+    )
+  })
+
+  it('keeps an explicitly closed streaming inspector closed', async () => {
+    act(() => {
+      useStreamStore.getState().setActive({
+        streamId: 'closed-stream',
+        chatId: 'chat-1',
+        messageId: 'left',
+        startedAt: 4,
+        ownerClientId: getStreamClientId(),
+      })
+    })
+    render(
+      <BranchTreeView
+        chatId="chat-1"
+        headers={smallTree}
+        cursor={{ root: 'left' }}
+        expanded={false}
+        repository={repository()}
+        onActivateNode={() => undefined}
+      />,
+    )
+    fireEvent.click(await screen.findByRole('button', { name: 'Close message inspector' }))
+    await waitFor(() =>
+      expect(document.querySelector('[data-ui="branch-tree-inspector"]')).not.toBeInTheDocument(),
+    )
+
+    act(() => {
+      useStreamStore.getState().setActive({
+        streamId: 'closed-stream',
+        chatId: 'chat-1',
+        messageId: 'left',
+        startedAt: 4,
+        heartbeatAt: 6,
+        ownerClientId: getStreamClientId(),
+      })
+    })
+    await act(async () => Promise.resolve())
+
+    expect(document.querySelector('[data-selected="true"]')).not.toBeInTheDocument()
+    expect(document.querySelector('[data-ui="branch-tree-inspector"]')).not.toBeInTheDocument()
+  })
+
+  it('does not cache an empty preview while its message is streaming', async () => {
+    let committed = false
+    const getMessageTextPreview = vi.fn(async (messageId: string) => {
+      if (messageId === 'left') return committed ? 'Committed streaming output' : ''
+      return `Preview ${messageId}`
+    })
+    act(() => {
+      useStreamStore.getState().setActive({
+        streamId: 'empty-preview-stream',
+        chatId: 'chat-1',
+        messageId: 'left',
+        startedAt: 4,
+        ownerClientId: getStreamClientId(),
+      })
+    })
+    render(
+      <BranchTreeView
+        chatId="chat-1"
+        headers={smallTree}
+        cursor={{ root: 'left' }}
+        expanded
+        repository={repository({ getMessageTextPreview })}
+        onActivateNode={() => undefined}
+      />,
+    )
+
+    const leftPreview = () =>
+      document.querySelector('[data-message-id="left"] [data-ui="branch-tree-node-preview"]')
+    await waitFor(() => expect(leftPreview()).not.toHaveTextContent('Loading preview…'))
+    expect(leftPreview()).not.toHaveTextContent('No text content')
+    const callsWhileStreaming = getMessageTextPreview.mock.calls.filter(
+      ([messageId]) => messageId === 'left',
+    ).length
+
+    committed = true
+    act(() => useStreamStore.getState().clearActive('empty-preview-stream'))
+
+    await waitFor(() =>
+      expect(
+        getMessageTextPreview.mock.calls.filter(([messageId]) => messageId === 'left'),
+      ).toHaveLength(callsWhileStreaming + 1),
+    )
+    await waitFor(() => expect(leftPreview()).toHaveTextContent('Committed streaming output'))
   })
 
   it('bounds retained preview text even if a repository violates the preview-length contract', async () => {
@@ -686,6 +1161,49 @@ describe('BranchTreeView', () => {
     expect(leafTarget).toHaveAttribute('tabindex', '-1')
     fireEvent.click(leafTarget)
     expect(insertAfterLeaf).not.toHaveBeenCalled()
+  })
+
+  it('treats an uncommitted persisted streaming generation as busy without an active lease', async () => {
+    const streamingLeaf = {
+      ...header('left', 'root', 0, 'assistant', 2),
+      generation: streamingGeneration(),
+    }
+    const headers = [header('root', null, 0, 'user', 1), streamingLeaf]
+    const getMessage = vi.fn(async (messageId: string): Promise<Message | undefined> => {
+      const row = headers.find((candidate) => candidate.id === messageId)
+      return row
+        ? { ...row, content: [{ type: 'output_text', text: 'Persisted prefix.' }] }
+        : undefined
+    })
+    render(
+      <BranchTreeView
+        chatId="chat-1"
+        headers={headers}
+        cursor={{ root: 'left' }}
+        expanded={false}
+        repository={repository({ getMessage })}
+        onActivateNode={() => undefined}
+        onInsertAfterLeaf={() => undefined}
+        onEditMessage={() => undefined}
+        onDeleteNode={() => undefined}
+        onContinueMessage={() => undefined}
+        hasConnection
+      />,
+    )
+
+    const append = screen.getByRole('button', { name: 'Add message after this leaf' })
+    expect(append).toHaveAttribute('data-parent-id', 'left')
+    expect(append).toHaveAttribute('aria-disabled', 'true')
+
+    fireEvent.click(document.querySelector('[data-message-id="left"]') as Element)
+    await waitFor(() =>
+      expect(
+        document.querySelector('[data-ui="branch-tree-inspector-stream-status"]'),
+      ).toHaveTextContent('Preparing response…'),
+    )
+    expect(screen.getByRole('button', { name: 'Edit message' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Delete message' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Continue from here' })).toBeDisabled()
   })
 
   it('uses one centered insertion target for a parent with only one child', () => {

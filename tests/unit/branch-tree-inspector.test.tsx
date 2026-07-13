@@ -1,6 +1,8 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { StrictMode } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Message } from '../../src/core/types'
+import { getStreamClientId } from '../../src/store/stream-leases'
 import { useStreamStore } from '../../src/store/zustand/streamStore'
 import { BranchTreeInspector } from '../../src/ui/chat/BranchTreeInspector'
 
@@ -445,7 +447,7 @@ describe('BranchTreeInspector', () => {
       updatedAt: 2,
     })
 
-    const { container } = render(
+    const view = render(
       <BranchTreeInspector
         message={row}
         onClose={() => undefined}
@@ -460,6 +462,7 @@ describe('BranchTreeInspector', () => {
         hasConnection
       />,
     )
+    const { container } = view
 
     expect(container.querySelector('[data-ui="markdown"]')).toHaveTextContent(
       'Live inspector output.',
@@ -479,16 +482,386 @@ describe('BranchTreeInspector', () => {
     expect(reasoning).not.toHaveTextContent('Persisted reasoning.')
     expect(screen.getByRole('button', { name: 'Hide this reasoning block' })).toBeDisabled()
     expect(screen.getByRole('button', { name: 'Hide tool call' })).toBeDisabled()
-    expect(screen.getByRole('button', { name: 'Regenerate response' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Regenerate response' })).toBeDisabled()
     expect(screen.getByRole('button', { name: 'Branch this chat from here' })).toBeEnabled()
 
     useStreamStore.getState().clearLiveSnapshot(row.id)
     expect(screen.getByRole('button', { name: 'Hide this reasoning block' })).toBeDisabled()
     useStreamStore.getState().clearActive('stream-1')
+    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('Finishing response…'))
+    expect(screen.getByRole('button', { name: 'Hide this reasoning block' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Hide tool call' })).toBeDisabled()
+
+    view.rerender(
+      <BranchTreeInspector
+        message={{
+          ...row,
+          nodeVersion: row.nodeVersion + 1,
+          content: [{ type: 'output_text', text: 'Live inspector output.' }],
+          reasoningDetails: [{ type: 'reasoning.text', text: 'Live reasoning.' }],
+        }}
+        onClose={() => undefined}
+        onEdit={() => undefined}
+        onDelete={() => undefined}
+        onRegenerate={() => undefined}
+        onContinue={() => undefined}
+        onForkChat={() => undefined}
+        onToggleContextVisibility={() => undefined}
+        onToggleReasoningDetailHidden={() => undefined}
+        onToggleProviderOutputItemHidden={() => undefined}
+        hasConnection
+      />,
+    )
     await waitFor(() =>
       expect(screen.getByRole('button', { name: 'Hide this reasoning block' })).toBeEnabled(),
     )
     expect(screen.getByRole('button', { name: 'Hide tool call' })).toBeEnabled()
+  })
+
+  it('distinguishes local waiting, local streaming, off-path, and remote stream states', async () => {
+    const row = message()
+    act(() => {
+      useStreamStore.getState().setActive({
+        streamId: 'status-stream',
+        chatId: row.chatId,
+        messageId: row.id,
+        startedAt: 1,
+        ownerClientId: getStreamClientId(),
+      })
+    })
+    const view = render(
+      <BranchTreeInspector message={row} onClose={() => undefined} streamOnActivePath />,
+    )
+
+    expect(screen.getByRole('status')).toHaveTextContent('Waiting for response…')
+
+    act(() => {
+      useStreamStore.getState().setLiveSnapshot({
+        streamId: 'status-stream',
+        chatId: row.chatId,
+        messageId: row.id,
+        content: [{ type: 'output_text', text: 'Live status content.' }],
+        textLength: 20,
+        reasoningLength: 0,
+        updatedAt: 2,
+      })
+    })
+    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('Streaming response…'))
+
+    view.rerender(
+      <BranchTreeInspector message={row} onClose={() => undefined} streamOnActivePath={false} />,
+    )
+    expect(screen.getByRole('status')).toHaveTextContent(
+      'Streaming on another branch. Open this branch to follow live output.',
+    )
+
+    act(() => {
+      useStreamStore.getState().setActive({
+        streamId: 'status-stream',
+        chatId: row.chatId,
+        messageId: row.id,
+        startedAt: 1,
+        ownerClientId: 'different-tab-client',
+      })
+    })
+    await waitFor(() =>
+      expect(screen.getByRole('status')).toHaveTextContent(
+        'This response is currently streaming in another tab.',
+      ),
+    )
+    expect(screen.getByRole('status')).toHaveAttribute(
+      'data-ui',
+      'branch-tree-inspector-stream-status',
+    )
+  })
+
+  it('retains the last live snapshot until the committed message prop arrives', async () => {
+    const completedGeneration = message().generation
+    if (!completedGeneration) throw new Error('Expected generated message metadata')
+    const { finishedAt: _finishedAt, ...pendingGeneration } = completedGeneration
+    const row = message({ generation: { ...pendingGeneration, status: 'streaming' } })
+    act(() => {
+      useStreamStore.getState().setActive({
+        streamId: 'commit-gap-stream',
+        chatId: row.chatId,
+        messageId: row.id,
+        startedAt: 1,
+        ownerClientId: getStreamClientId(),
+      })
+      useStreamStore.getState().setLiveSnapshot({
+        streamId: 'commit-gap-stream',
+        chatId: row.chatId,
+        messageId: row.id,
+        content: [{ type: 'output_text', text: 'Last complete live snapshot.' }],
+        textLength: 28,
+        reasoningLength: 0,
+        updatedAt: 2,
+      })
+    })
+    const view = render(
+      <BranchTreeInspector
+        message={row}
+        onClose={() => undefined}
+        generationBusy
+        streamOnActivePath
+      />,
+    )
+    expect(screen.getByText('Last complete live snapshot.')).toBeInTheDocument()
+
+    act(() => {
+      useStreamStore.getState().clearLiveSnapshot(row.id)
+      useStreamStore.getState().clearActive('commit-gap-stream')
+    })
+
+    expect(screen.getByText('Last complete live snapshot.')).toBeInTheDocument()
+    expect(screen.queryByText('Inspector body.')).not.toBeInTheDocument()
+    expect(screen.getByRole('status')).toHaveTextContent('Finishing response…')
+
+    view.rerender(
+      <BranchTreeInspector
+        message={message({
+          nodeVersion: 2,
+          content: [{ type: 'output_text', text: 'Committed snapshot content.' }],
+          generation: {
+            ...completedGeneration,
+            status: 'done',
+            finishedAt: 1_700_000_002_000,
+          },
+        })}
+        onClose={() => undefined}
+        generationBusy={false}
+        streamOnActivePath
+      />,
+    )
+
+    await waitFor(() => expect(screen.getByText('Committed snapshot content.')).toBeInTheDocument())
+    expect(screen.queryByText('Last complete live snapshot.')).not.toBeInTheDocument()
+  })
+
+  it('settles a committed snapshot before the live store clears under StrictMode', async () => {
+    const completedGeneration = message().generation
+    if (!completedGeneration) throw new Error('Expected generated message metadata')
+    const { finishedAt: _finishedAt, ...pendingGeneration } = completedGeneration
+    const pending = message({ generation: { ...pendingGeneration, status: 'streaming' } })
+    act(() => {
+      useStreamStore.getState().setActive({
+        streamId: 'commit-first-stream',
+        chatId: pending.chatId,
+        messageId: pending.id,
+        startedAt: 1,
+        ownerClientId: getStreamClientId(),
+      })
+      useStreamStore.getState().setLiveSnapshot({
+        streamId: 'commit-first-stream',
+        chatId: pending.chatId,
+        messageId: pending.id,
+        content: [{ type: 'output_text', text: 'Commit-first live snapshot.' }],
+        textLength: 27,
+        reasoningLength: 0,
+        updatedAt: 2,
+      })
+    })
+    const view = render(
+      <StrictMode>
+        <BranchTreeInspector
+          message={pending}
+          onClose={() => undefined}
+          onEdit={() => undefined}
+          generationBusy
+        />
+      </StrictMode>,
+    )
+    expect(screen.getByText('Commit-first live snapshot.')).toBeInTheDocument()
+
+    view.rerender(
+      <StrictMode>
+        <BranchTreeInspector
+          message={message({
+            nodeVersion: pending.nodeVersion + 1,
+            content: [{ type: 'output_text', text: 'Commit-first persisted snapshot.' }],
+            generation: {
+              ...completedGeneration,
+              status: 'done',
+              finishedAt: 1_700_000_002_000,
+            },
+          })}
+          onClose={() => undefined}
+          onEdit={() => undefined}
+        />
+      </StrictMode>,
+    )
+    expect(screen.getByText('Commit-first persisted snapshot.')).toBeInTheDocument()
+
+    act(() => {
+      useStreamStore.getState().clearActive('commit-first-stream')
+      useStreamStore.getState().clearLiveSnapshot(pending.id)
+    })
+    await waitFor(() => expect(screen.queryByText('Finishing response…')).not.toBeInTheDocument())
+    expect(screen.getByRole('button', { name: 'Edit message' })).toBeEnabled()
+  })
+
+  it('hands the last live snapshot across a view unmount until the committed row arrives', async () => {
+    const completedGeneration = message().generation
+    if (!completedGeneration) throw new Error('Expected generated message metadata')
+    const { finishedAt: _finishedAt, ...pendingGeneration } = completedGeneration
+    const pending = message({ generation: { ...pendingGeneration, status: 'streaming' } })
+    act(() => {
+      useStreamStore.getState().setActive({
+        streamId: 'cross-view-stream',
+        chatId: pending.chatId,
+        messageId: pending.id,
+        startedAt: 1,
+        ownerClientId: getStreamClientId(),
+      })
+      useStreamStore.getState().setLiveSnapshot({
+        streamId: 'cross-view-stream',
+        chatId: pending.chatId,
+        messageId: pending.id,
+        content: [{ type: 'output_text', text: 'Visible before changing views.' }],
+        textLength: 30,
+        reasoningLength: 0,
+        updatedAt: 2,
+      })
+    })
+    const firstView = render(
+      <BranchTreeInspector message={pending} onClose={() => undefined} generationBusy />,
+    )
+    expect(screen.getByText('Visible before changing views.')).toBeInTheDocument()
+    firstView.unmount()
+
+    act(() => {
+      useStreamStore.getState().clearLiveSnapshot(pending.id)
+      useStreamStore.getState().clearActive('cross-view-stream')
+    })
+    const nextView = render(
+      <BranchTreeInspector message={pending} onClose={() => undefined} generationBusy={false} />,
+    )
+    expect(screen.getByText('Visible before changing views.')).toBeInTheDocument()
+    expect(screen.queryByText('Inspector body.')).not.toBeInTheDocument()
+    expect(screen.getByRole('status')).toHaveTextContent('Finishing response…')
+
+    nextView.rerender(
+      <BranchTreeInspector
+        message={message({
+          nodeVersion: pending.nodeVersion + 1,
+          content: [{ type: 'output_text', text: 'Committed after changing views.' }],
+          generation: {
+            ...completedGeneration,
+            status: 'done',
+            finishedAt: 1_700_000_002_000,
+          },
+        })}
+        onClose={() => undefined}
+      />,
+    )
+    await waitFor(() =>
+      expect(screen.getByText('Committed after changing views.')).toBeInTheDocument(),
+    )
+    expect(screen.queryByText('Visible before changing views.')).not.toBeInTheDocument()
+  })
+
+  it('treats persisted streaming generation state as target-busy without an active lease', () => {
+    const row = message()
+    if (!row.generation) throw new Error('Expected generated message metadata')
+    const { finishedAt: _finishedAt, ...pendingGeneration } = row.generation
+    render(
+      <BranchTreeInspector
+        message={message({
+          generation: {
+            ...pendingGeneration,
+            status: 'streaming',
+          },
+        })}
+        onClose={() => undefined}
+        onEdit={() => undefined}
+        onDelete={() => undefined}
+        onContinue={() => undefined}
+        hasConnection
+      />,
+    )
+
+    expect(screen.getByRole('status')).toHaveTextContent('Finishing response…')
+    expect(screen.getByRole('button', { name: 'Edit message' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Delete message' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Continue from here' })).toBeDisabled()
+  })
+
+  it('surfaces committed provider errors and aborts after streaming ends', () => {
+    const generation = message().generation
+    if (!generation) throw new Error('Expected generated message metadata')
+    const view = render(
+      <BranchTreeInspector
+        message={message({
+          content: [],
+          generation: {
+            ...generation,
+            status: 'error',
+            error: {
+              category: 'provider',
+              code: 'upstream_error',
+              message: 'Provider rejected the request.',
+              statusCode: 503,
+            },
+          },
+        })}
+        onClose={() => undefined}
+      />,
+    )
+    expect(screen.getByRole('status')).toHaveTextContent(
+      'Error 503: Provider rejected the request.',
+    )
+    expect(screen.getByRole('status')).toHaveAttribute('data-state', 'error')
+
+    view.rerender(
+      <BranchTreeInspector
+        message={message({
+          content: [],
+          generation: { ...generation, status: 'abort', abortReason: 'user' },
+        })}
+        onClose={() => undefined}
+      />,
+    )
+    expect(screen.getByRole('status')).toHaveTextContent(
+      'Cancelled — partial response kept above. Continue to resume.',
+    )
+    expect(screen.getByRole('status')).toHaveAttribute('data-state', 'warning')
+  })
+
+  it('disables every model-request action while another generation is busy', () => {
+    const onRegenerate = vi.fn()
+    const onContinue = vi.fn()
+    const assistant = render(
+      <BranchTreeInspector
+        message={message()}
+        onClose={() => undefined}
+        onRegenerate={onRegenerate}
+        onContinue={onContinue}
+        hasConnection
+        generationBusy
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Regenerate response' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Continue from here' }))
+    expect(screen.getByRole('button', { name: 'Regenerate response' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Continue from here' })).toBeDisabled()
+    expect(onRegenerate).not.toHaveBeenCalled()
+    expect(onContinue).not.toHaveBeenCalled()
+    assistant.unmount()
+
+    render(
+      <BranchTreeInspector
+        message={message({ role: 'user', origin: 'user' })}
+        onClose={() => undefined}
+        onEdit={() => undefined}
+        onEditAndSend={() => undefined}
+        hasConnection
+        generationBusy
+      />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Edit message' }))
+    expect(screen.getByRole('button', { name: 'Save' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Save & Send' })).toBeDisabled()
   })
 
   it('does not rebuild bounded prefixes or search ranges for cumulative streaming snapshots', () => {

@@ -265,6 +265,46 @@ describe('stream accumulator', () => {
     })
   })
 
+  it('preserves an existing Claude prefix when a cumulative candidate is not authoritative', () => {
+    const accumulator = createStreamAccumulator({ initialContent: [], now: 0 })
+    applyStreamAccumulatorEvent(
+      accumulator,
+      {
+        lane: 'reasoning',
+        detailsMode: 'delta',
+        details: [
+          {
+            type: 'reasoning.text',
+            index: 0,
+            format: 'anthropic-claude-v1',
+            text: 'EARLY ',
+          },
+        ],
+      },
+      1,
+    )
+    applyStreamAccumulatorEvent(
+      accumulator,
+      {
+        lane: 'reasoning',
+        detailsMode: 'cumulative',
+        details: [
+          {
+            type: 'reasoning.text',
+            index: 0,
+            format: 'anthropic-claude-v1',
+            text: 'LATER tail',
+          },
+        ],
+      },
+      2,
+    )
+
+    expect(projectStreamAccumulatorFinal(accumulator).reasoningDetails?.[0]).toMatchObject({
+      text: 'EARLY LATER tail',
+    })
+  })
+
   it('segments growing text for live projection and collapses it for final projection', () => {
     const initialContent: ContentItem[] = [
       { type: 'text', text: 'prefill-' },

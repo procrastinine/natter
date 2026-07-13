@@ -519,6 +519,37 @@ describe('stream leases', () => {
     expect(clearLiveSnapshot).not.toHaveBeenCalled()
   })
 
+  it('does not let an older stream-ended event clear a newer snapshot for the same message', () => {
+    installStreamLeaseListener()
+    useStreamStore.getState().setActive({
+      streamId: 'S-new',
+      chatId: 'C1',
+      messageId: 'M-shared',
+      ownerClientId: 'other-tab',
+      startedAt: 2,
+    })
+    useStreamStore.getState().setLiveSnapshot({
+      streamId: 'S-new',
+      chatId: 'C1',
+      messageId: 'M-shared',
+      content: [{ type: 'output_text', text: 'new reasoning' }],
+      textLength: 13,
+      reasoningLength: 0,
+      updatedAt: 3,
+    })
+
+    postEvent({
+      kind: 'stream-ended',
+      chatId: 'C1',
+      streamId: 'S-old',
+      messageId: 'M-shared',
+      outcome: 'done',
+    })
+
+    expect(useStreamStore.getState().getActive('S-new')).toBeDefined()
+    expect(useStreamStore.getState().liveByMessageId['M-shared']?.streamId).toBe('S-new')
+  })
+
   it('does not resurrect an ended stream from an older lease refresh result', async () => {
     let releaseList!: (leases: StreamLeaseRow[]) => void
     const listStarted = deferred()

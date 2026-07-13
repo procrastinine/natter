@@ -21,6 +21,7 @@ import type {
   Message as MessageRow,
   ReasoningDetail,
 } from '../../core/types'
+import { useRetainedMessageStreamProjection } from '../../hooks/useMessageStreamProjection'
 import { dismissAbortReason, updateChatSettings } from '../../store/chats'
 import {
   generatedOutputAttachmentIds,
@@ -28,7 +29,6 @@ import {
   normalizeGeneratedImageOutputAttachmentRefs,
 } from '../../store/generated-images'
 import { getStreamClientId } from '../../store/stream-leases'
-import { useStreamStore } from '../../store/zustand/streamStore'
 import { useToastStore } from '../../store/zustand/toastStore'
 import { useUiStore } from '../../store/zustand/uiStore'
 import { AttachmentRefChips } from '../attachments/AttachmentRefChips'
@@ -175,11 +175,9 @@ function MessageInner({
   // caller passes it in; otherwise the store is checked. Either way, the
   // resolved value drives streaming render mode plus reasoning/collapse
   // affordances.
-  const activeStream = useStreamStore((s) =>
-    message.role === 'assistant' ? s.getTargetActive(chatId, message.id) : undefined,
-  )
-  const liveSnapshot = useStreamStore((s) =>
-    message.role === 'assistant' ? s.liveByMessageId[message.id] : undefined,
+  const [activeStream, liveSnapshot] = useRetainedMessageStreamProjection(
+    message,
+    message.role === 'assistant',
   )
   const storeStreaming = activeStream !== undefined
   const isStreaming = streaming === true || storeStreaming

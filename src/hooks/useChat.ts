@@ -747,7 +747,7 @@ async function openAssistantStreamUnder(
     cleanup: (result) => {
       if (result.journalCleanupPending) input.lifecyclePreserveLease()
       useStreamStore.getState().clearActive(streamId)
-      clearLiveSnapshotIfPresent(assistantId)
+      clearLiveSnapshotIfPresent(assistantId, streamId)
       postEvent({
         kind: 'stream-ended',
         chatId: input.chatId,
@@ -910,7 +910,7 @@ function prepareLiveSnapshot(ctx: {
   now: number
 }): (() => void) | undefined {
   if (useUiStore.getState().activeChatId !== ctx.chatId) {
-    clearLiveSnapshotIfPresent(ctx.messageId)
+    clearLiveSnapshotIfPresent(ctx.messageId, ctx.streamId)
     return undefined
   }
   const preparedCursor = useChatStore.getState().getCursor(ctx.chatId) ?? {}
@@ -920,7 +920,7 @@ function prepareLiveSnapshot(ctx: {
         preparedCursor[key] !== undefined && preparedCursor[key] !== selectedMessageId,
     )
   ) {
-    clearLiveSnapshotIfPresent(ctx.messageId)
+    clearLiveSnapshotIfPresent(ctx.messageId, ctx.streamId)
     return undefined
   }
   const projection = projectStreamAccumulatorLive(ctx.accumulator, {
@@ -930,7 +930,7 @@ function prepareLiveSnapshot(ctx: {
   })
   return () => {
     if (useUiStore.getState().activeChatId !== ctx.chatId) {
-      clearLiveSnapshotIfPresent(ctx.messageId)
+      clearLiveSnapshotIfPresent(ctx.messageId, ctx.streamId)
       return
     }
     const cursor = useChatStore.getState().getCursor(ctx.chatId) ?? {}
@@ -940,7 +940,7 @@ function prepareLiveSnapshot(ctx: {
           cursor[key] !== undefined && cursor[key] !== selectedMessageId,
       )
     ) {
-      clearLiveSnapshotIfPresent(ctx.messageId)
+      clearLiveSnapshotIfPresent(ctx.messageId, ctx.streamId)
       return
     }
     useStreamStore.getState().setLiveSnapshot({

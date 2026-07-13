@@ -355,7 +355,7 @@ function applyStreamEnded(event: Extract<BroadcastEvent, { kind: 'stream-ended' 
   remoteObservationRevisionByStreamId.delete(event.streamId)
   reportedExpiredStreamIds.delete(event.streamId)
   useStreamStore.getState().clearActive(event.streamId)
-  if (event.messageId) clearLiveSnapshotIfPresent(event.messageId)
+  if (event.messageId) clearLiveSnapshotIfPresent(event.messageId, event.streamId)
   scheduleRemoteExpiryRefresh()
 }
 

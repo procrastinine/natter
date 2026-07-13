@@ -515,6 +515,243 @@ describe('shell smoke render', () => {
     await waitFor(() => expect(useUiStore.getState().editTreeMode).toBe(false))
   })
 
+  it('keeps the branch cursor and tree workspace state across view roundtrips', async () => {
+    const chat = await createChat({
+      id: 'chat-retained-tree-view',
+      title: 'Retained tree view',
+      settings: cloneDefaultChatSettings(),
+      now: 1,
+    })
+    const root: Message = {
+      id: 'retained-tree-root',
+      chatId: chat.id,
+      parentId: null,
+      siblingIndex: 0,
+      turnId: 'retained-tree-root',
+      turnIndex: 0,
+      createdAt: 2,
+      role: 'user',
+      origin: 'user',
+      content: [{ type: 'text', text: 'retained tree prompt' }],
+      nodeVersion: 0,
+      deleted: false,
+    }
+    const selectedLeaf: Message = {
+      ...root,
+      id: 'retained-tree-selected-leaf',
+      parentId: root.id,
+      siblingIndex: 0,
+      turnId: 'retained-tree-selected-leaf',
+      createdAt: 4,
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: 'selected branch answer' }],
+    }
+    const inspectedSibling: Message = {
+      ...selectedLeaf,
+      id: 'retained-tree-inspected-sibling',
+      siblingIndex: 1,
+      turnId: 'retained-tree-inspected-sibling',
+      createdAt: 3,
+      content: [{ type: 'output_text', text: 'inspected sibling answer' }],
+    }
+    await putTestMessages([root, selectedLeaf, inspectedSibling])
+    await getDb().chats.put({
+      ...chat,
+      titleStatus: 'manual',
+      lastUpdatedLeafId: selectedLeaf.id,
+      lastBranchUpdatedAt: selectedLeaf.createdAt,
+      updatedAt: selectedLeaf.createdAt,
+    })
+    window.location.hash = `#/chat/${chat.id}/message/${selectedLeaf.id}`
+
+    const { container, findByText } = render(<App />)
+
+    expect(await findByText('selected branch answer')).toBeInTheDocument()
+    await waitFor(() => {
+      expect(useChatStore.getState().getCursor(chat.id)).toEqual({
+        [cursorKeyOf(null)]: root.id,
+        [cursorKeyOf(root.id)]: selectedLeaf.id,
+      })
+    })
+    const cursorBeforeToggle = { ...useChatStore.getState().getCursor(chat.id) }
+    const treeButton = container.querySelector(
+      '[data-role="chat-branch-tree"]',
+    ) as HTMLButtonElement
+
+    fireEvent.click(treeButton)
+    await waitFor(() => {
+      expect(container.querySelector('[data-ui="branch-tree-view"]')).toBeVisible()
+    })
+    fireEvent.click(
+      container.querySelector(`[data-message-id="${inspectedSibling.id}"]`) as Element,
+    )
+    await waitFor(() => {
+      expect(container.querySelector('[data-ui="branch-tree-inspector"]')).toHaveAttribute(
+        'data-message-id',
+        inspectedSibling.id,
+      )
+    })
+    const searchInput = container.querySelector(
+      '[data-ui="branch-tree-search-input"]',
+    ) as HTMLInputElement
+    fireEvent.change(searchInput, { target: { value: 'state-retention-query' } })
+    expect(searchInput).toHaveValue('state-retention-query')
+    expect(useChatStore.getState().getCursor(chat.id)).toEqual(cursorBeforeToggle)
+
+    fireEvent.click(treeButton)
+    await waitFor(() => {
+      expect(container.querySelector('[data-ui="message-list"]')).toBeVisible()
+      expect(container.querySelector('[data-ui="branch-tree-view"]')).not.toBeVisible()
+    })
+    expect(useChatStore.getState().getCursor(chat.id)).toEqual(cursorBeforeToggle)
+
+    fireEvent.click(treeButton)
+    await waitFor(() => {
+      expect(container.querySelector('[data-ui="branch-tree-view"]')).toBeVisible()
+    })
+    expect(container.querySelector('[data-ui="branch-tree-search-input"]')).toHaveValue(
+      'state-retention-query',
+    )
+    expect(container.querySelector('[data-ui="branch-tree-inspector"]')).toHaveAttribute(
+      'data-message-id',
+      inspectedSibling.id,
+    )
+    expect(useChatStore.getState().getCursor(chat.id)).toEqual(cursorBeforeToggle)
+
+    fireEvent.click(container.querySelector(`[data-message-id="${selectedLeaf.id}"]`) as Element)
+    await waitFor(() => {
+      expect(container.querySelector('[data-ui="branch-tree-inspector"]')).toHaveAttribute(
+        'data-message-id',
+        selectedLeaf.id,
+      )
+    })
+    fireEvent.click(
+      container.querySelector(
+        '[data-ui="branch-tree-inspector"] [data-action="toggle-visible"]',
+      ) as Element,
+    )
+    await waitFor(() => {
+      expect(
+        container.querySelector(
+          `[data-ui="branch-tree-node"][data-message-id="${selectedLeaf.id}"]`,
+        ),
+      ).toHaveAttribute('data-hidden-from-context', 'true')
+    })
+
+    fireEvent.click(treeButton)
+    await waitFor(() => {
+      expect(container.querySelector('[data-ui="message-list"]')).toBeVisible()
+    })
+    const activeMessage = container.querySelector(
+      `[data-ui="message"][data-message-id="${selectedLeaf.id}"]`,
+    )
+    expect(activeMessage?.querySelector('[data-action="toggle-visible"]')).toHaveAttribute(
+      'aria-label',
+      'Show in context (send to model)',
+    )
+    expect(useChatStore.getState().getCursor(chat.id)).toEqual(cursorBeforeToggle)
+  })
+
+  it('returns to the active streaming branch when tree view interrupts its reload', async () => {
+    const chat = await createChat({
+      id: 'chat-stream-tree-handoff',
+      title: 'Streaming tree handoff',
+      settings: cloneDefaultChatSettings(),
+      now: 1,
+    })
+    const root: Message = {
+      id: 'stream-tree-root',
+      chatId: chat.id,
+      parentId: null,
+      siblingIndex: 0,
+      turnId: 'stream-tree-root',
+      turnIndex: 0,
+      createdAt: 2,
+      role: 'user',
+      origin: 'user',
+      content: [{ type: 'text', text: 'stream tree prompt' }],
+      nodeVersion: 0,
+      deleted: false,
+    }
+    const originalLeaf: Message = {
+      ...root,
+      id: 'stream-tree-original',
+      parentId: root.id,
+      turnId: 'stream-tree-original',
+      createdAt: 3,
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: 'stable answer before stream' }],
+    }
+    const streamingLeaf: Message = {
+      ...originalLeaf,
+      id: 'stream-tree-live',
+      siblingIndex: 1,
+      turnId: 'stream-tree-live',
+      createdAt: 4,
+      content: [{ type: 'output_text', text: '' }],
+    }
+    await putTestMessages([root, originalLeaf])
+    await getDb().chats.put({
+      ...chat,
+      titleStatus: 'manual',
+      lastUpdatedLeafId: originalLeaf.id,
+      lastBranchUpdatedAt: 3,
+      updatedAt: 3,
+    })
+    window.location.hash = `#/chat/${chat.id}`
+
+    const { container, findByText } = render(<App />)
+
+    expect(await findByText('stable answer before stream')).toBeInTheDocument()
+
+    await putTestMessages([streamingLeaf])
+    await getDb().chats.update(chat.id, {
+      lastUpdatedLeafId: streamingLeaf.id,
+      lastBranchUpdatedAt: 4,
+      updatedAt: 4,
+    })
+    act(() => {
+      useChatStore.getState().setCursor(chat.id, {
+        [cursorKeyOf(null)]: root.id,
+        [cursorKeyOf(root.id)]: streamingLeaf.id,
+      })
+      useStreamStore.getState().setActive({
+        streamId: 'stream-tree-handoff',
+        chatId: chat.id,
+        messageId: streamingLeaf.id,
+        startedAt: 4,
+        ownerClientId: 'test-client',
+      })
+      useStreamStore.getState().setLiveSnapshot({
+        streamId: 'stream-tree-handoff',
+        chatId: chat.id,
+        messageId: streamingLeaf.id,
+        content: [{ type: 'output_text', text: 'live answer in progress' }],
+        textLength: 23,
+        reasoningLength: 0,
+        updatedAt: 5,
+      })
+    })
+
+    const treeButton = container.querySelector(
+      '[data-role="chat-branch-tree"]',
+    ) as HTMLButtonElement
+    fireEvent.click(treeButton)
+    expect(treeButton).toHaveAttribute('aria-pressed', 'true')
+    fireEvent.click(treeButton)
+
+    expect(container.querySelector('[data-ui="message-list"]')?.textContent ?? '').not.toContain(
+      'stable answer before stream',
+    )
+    expect(await findByText('live answer in progress')).toBeInTheDocument()
+    const transcript = container.querySelector('[data-ui="message-list"]')
+    expect(transcript).toBeInTheDocument()
+    expect(transcript?.querySelector('[data-ui="message"]')).toBeInTheDocument()
+    expect(transcript).not.toHaveTextContent('stable answer before stream')
+  })
+
   it('renders the active chat without hydrating irrelevant chat or branch bodies', async () => {
     const active = await createChat({
       title: 'Active huge-safe',

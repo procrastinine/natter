@@ -819,7 +819,7 @@ function putReasoningDetail(
   incoming: ReasoningDetail,
   mode: 'delta' | 'snapshot' | 'cumulative' = 'snapshot',
 ): void {
-  if (mode !== 'delta' && isAnthropicReasoningSnapshot(incoming)) {
+  if (mode === 'snapshot' && isAnthropicReasoningSnapshot(incoming)) {
     const target = findAnthropicReasoningSnapshotTarget(acc, incoming)
     if (target !== undefined) {
       replaceAnthropicReasoningSnapshot(acc, target, incoming)

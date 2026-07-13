@@ -1470,8 +1470,8 @@ describe('sendText — chat-completions streaming', () => {
               choices: [
                 {
                   delta: {
-                    reasoning: 'Let me',
-                    reasoning_details: [{ type: 'reasoning.text', index: 0, text: 'Let me' }],
+                    reasoning: ' me',
+                    reasoning_details: [{ type: 'reasoning.text', index: 0, text: ' me' }],
                     content: 'answer',
                   },
                   finish_reason: 'stop',

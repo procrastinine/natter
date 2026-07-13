@@ -1,5 +1,12 @@
 import { expect, type Page, test } from './fixtures'
-import { buildSseBody, clearIndexedDb, mockChatCompletions, seedFirstRun } from './helpers'
+import {
+  buildSseBody,
+  clearIndexedDb,
+  createChatAndOpen,
+  mockChatCompletions,
+  seedFirstRun,
+  sendMessage,
+} from './helpers'
 
 interface BranchTreeStoredMessage {
   id: string
@@ -56,7 +63,7 @@ test('middle-click opens the newest descendant branch in a background tab', asyn
 
   await expect(page.locator('[data-ui="branch-tree-view"]')).toBeVisible()
   await expect.poll(() => page.evaluate(() => window.location.hash)).toContain('/message/A2')
-  await expect.poll(() => popup.evaluate(() => window.location.hash)).toContain('/message/B2')
+  await expect(popup).toHaveURL(/\/message\/B2/)
   await expect(popup.locator('[data-ui="message-list"]')).toContainText('branch B assistant')
   await expect(popup.locator('[data-ui="message-list"]')).not.toContainText('branch A assistant')
 })
@@ -70,8 +77,8 @@ test('tree view replaces the transcript, searches all branches, and changes the 
 
   await page.locator('[data-role="chat-branch-tree"]').click()
   await expect(page.locator('[data-ui="branch-tree-view"]')).toBeVisible()
-  await expect(page.locator('[data-ui="message-list"]')).toHaveCount(0)
-  await expect(page.locator('[data-ui="composer"]')).toHaveCount(0)
+  await expect(page.locator('[data-ui="message-list"]')).not.toBeVisible()
+  await expect(page.locator('[data-ui="composer"]')).not.toBeVisible()
   await expect(page.locator('[data-ui="branch-tree-node"]')).toHaveCount(5)
   await expect(page.locator('[data-ui="tree-density-toggle"]')).toBeVisible()
   await expect(page.locator('[data-ui="focus-mode-toggle"]')).toHaveCount(0)
@@ -240,9 +247,56 @@ test('tree view replaces the transcript, searches all branches, and changes the 
   await expect(page.locator('[data-ui="branch-tree-inspector"]')).toHaveCount(0)
   await expect.poll(() => page.evaluate(() => window.location.hash)).toContain('/message/A2')
   await page.locator('[data-role="chat-branch-tree"]').click()
-  await expect(page.locator('[data-ui="branch-tree-view"]')).toHaveCount(0)
+  await expect(page.locator('[data-ui="branch-tree-view"]')).not.toBeVisible()
   await expect(page.locator('[data-ui="message-list"]')).toContainText('branch A assistant')
   await expect(page.locator('[data-ui="message-list"]')).not.toContainText('branch B assistant')
+})
+
+test('switching views preserves the active branch and retained tree workspace state', async ({
+  page,
+}) => {
+  const chatId = await seedBranchTreeChat(page)
+  await page.goto(`/#/chat/${chatId}/message/B2`)
+  await expect(page.locator('[data-ui="message-list"]')).toContainText('branch B assistant')
+
+  const treeToggle = page.locator('[data-role="chat-branch-tree"]')
+  await treeToggle.click()
+  const tree = page.locator('[data-ui="branch-tree-view"]')
+  const search = page.getByRole('searchbox', { name: 'Search messages in this chat' })
+  const inspectedNode = page.locator('[data-ui="branch-tree-node"][data-message-id="A2"]')
+  const currentLeaf = page.locator('[data-ui="branch-tree-node"][data-message-id="B2"]')
+  const inspector = page.locator('[data-ui="branch-tree-inspector"]')
+
+  await search.fill('branch A')
+  await inspectedNode.click()
+  await expect(inspectedNode).toHaveAttribute('data-selected', 'true')
+  await expect(currentLeaf).toHaveAttribute('data-current-leaf', 'true')
+  await expect(inspector).toHaveAttribute('data-message-id', 'A2')
+  await expect.poll(() => page.evaluate(() => window.location.hash)).toContain('/message/B2')
+
+  await page.getByRole('separator', { name: 'Resize message details' }).focus()
+  await page.keyboard.press('ArrowLeft')
+  const inspectorWidth = (await inspector.boundingBox())?.width
+  if (!inspectorWidth) throw new Error('Inspector has no browser geometry')
+
+  await treeToggle.click()
+  await expect(tree).not.toBeVisible()
+  await expect(page.locator('[data-ui="message-list"]')).toBeVisible()
+  await expect(page.locator('[data-ui="message-list"]')).toContainText('branch B assistant')
+  await expect(page.locator('[data-ui="message-list"]')).not.toContainText('branch A assistant')
+  await expect.poll(() => page.evaluate(() => window.location.hash)).toContain('/message/B2')
+
+  await treeToggle.click()
+  await expect(tree).toBeVisible()
+  await expect(search).toHaveValue('branch A')
+  await expect(page.locator('[data-search-match="true"]')).toHaveCount(2)
+  await expect(inspectedNode).toHaveAttribute('data-selected', 'true')
+  await expect(currentLeaf).toHaveAttribute('data-current-leaf', 'true')
+  await expect(inspector).toHaveAttribute('data-message-id', 'A2')
+  await expect
+    .poll(async () => (await inspector.boundingBox())?.width ?? 0)
+    .toBeCloseTo(inspectorWidth, 0)
+  await expect.poll(() => page.evaluate(() => window.location.hash)).toContain('/message/B2')
 })
 
 test('tree inspector stays bounded across viewport sizes and drag panning preserves it', async ({
@@ -619,7 +673,7 @@ test('tree inspector exposes generation, fork, context, reasoning, and tool acti
 
   page.once('dialog', (dialog) => void dialog.accept('Tree action fork'))
   await page.getByRole('button', { name: 'Branch this chat from here' }).click()
-  await expect(page.locator('[data-ui="branch-tree-view"]')).toHaveCount(0)
+  await expect(page.locator('[data-ui="branch-tree-view"]')).not.toBeVisible()
   await expect(page.locator('[data-ui="message-list"]')).toContainText('continued from tree')
   await expect(page.locator('[data-ui="chat-title"]')).toContainText('Tree action fork')
 })
@@ -784,11 +838,11 @@ test('tree inspector keeps header controls live and guards body actions during a
     await expect(page.locator('[data-ui="message"][data-message-id="A2"]')).toBeVisible()
     await expect(page.getByRole('button', { name: 'Stop generating' })).toBeVisible()
     await page.locator('[data-role="chat-branch-tree"]').click()
-    await page.locator('[data-ui="branch-tree-node"][data-message-id="A2"]').click()
-    await page.locator('[data-ui="branch-tree-inspector"] [data-ui="reasoning-summary"]').click()
-    await page
-      .locator('[data-ui="branch-tree-inspector"] [data-ui="tool-evidence-summary"]')
-      .click()
+    await expect(
+      page.locator('[data-ui="branch-tree-node"][data-message-id="A2"]'),
+    ).toHaveAttribute('data-selected', 'true')
+    await expect(page.getByRole('button', { name: 'Hide this reasoning block' })).toBeDisabled()
+    await expect(page.getByRole('button', { name: 'Hide tool call' })).toBeDisabled()
   } finally {
     releaseResponse()
   }
@@ -857,12 +911,18 @@ test('switching to the tree during a stream does not stop or lose the generation
     )
     .then((handle) => handle.jsonValue())
   if (!streamTargetId) throw new Error('Active fake stream has no target message')
+  await expect(page.getByRole('button', { name: 'Stop generating' })).toBeVisible()
   await page.locator('[data-role="chat-branch-tree"]').click()
   await expect(page.locator('[data-ui="branch-tree-view"]')).toBeVisible()
-  await page.locator(`[data-ui="branch-tree-node"][data-message-id="${streamTargetId}"]`).click()
-  await expect(
-    page.locator(`[data-ui="branch-tree-node"][data-message-id="${streamTargetId}"]`),
-  ).toHaveAttribute('data-current-leaf', 'true')
+  const streamingNode = page.locator(
+    `[data-ui="branch-tree-node"][data-message-id="${streamTargetId}"]`,
+  )
+  await expect(streamingNode).toHaveAttribute('data-current-leaf', 'true')
+  await expect(streamingNode).toHaveAttribute('data-selected', 'true')
+  await expect(page.locator('[data-ui="branch-tree-inspector"]')).toHaveAttribute(
+    'data-message-id',
+    streamTargetId,
+  )
   await expect
     .poll(() =>
       page
@@ -871,9 +931,36 @@ test('switching to the tree during a stream does not stop or lose the generation
         .then((text) => text?.length ?? 0),
     )
     .toBeGreaterThan(0)
+  await expect(page.locator('[data-ui="branch-tree-inspector-stream-status"]')).toHaveText(
+    'Streaming response…',
+  )
+  await expect(page.locator('[data-ui="branch-tree-stop"]')).toBeVisible()
   await expect(page.getByRole('button', { name: 'Edit message' })).toBeDisabled()
   await expect(page.getByRole('button', { name: 'Delete message' })).toBeDisabled()
   await expect(page.locator('[data-connector-hit][data-stream-busy="true"]')).not.toHaveCount(0)
+
+  await page.locator('[data-role="chat-branch-tree"]').click()
+  await expect(
+    page.locator(`[data-ui="message"][data-message-id="${streamTargetId}"]`),
+  ).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Stop generating' })).toBeVisible()
+
+  await page.locator('[data-role="chat-branch-tree"]').click()
+  await expect(streamingNode).toHaveAttribute('data-selected', 'true')
+  await expect(page.locator('[data-ui="branch-tree-inspector"]')).toHaveAttribute(
+    'data-message-id',
+    streamTargetId,
+  )
+  await expect
+    .poll(() =>
+      page
+        .locator('[data-ui="branch-tree-inspector"] [data-ui="markdown"]')
+        .textContent()
+        .then((text) => text?.length ?? 0),
+    )
+    .toBeGreaterThan(0)
+  await expect(page.locator('[data-ui="branch-tree-stop"]')).toBeVisible()
+
   const chatId = await resultPromise
   await expect
     .poll(() =>
@@ -892,6 +979,106 @@ test('switching to the tree during a stream does not stop or lose the generation
   await expect(page.locator('[data-ui="message-list"]')).toBeVisible()
   const persisted = await readAssistantLengths(page, chatId)
   expect(persisted).toEqual({ text: 12_000, reasoning: 12_000 })
+})
+
+test('tree shows and follows a pending response before the first byte arrives', async ({
+  page,
+}) => {
+  let releaseResponse: () => void = () => undefined
+  const responseGate = new Promise<void>((resolve) => {
+    releaseResponse = resolve
+  })
+  let markRequestSeen: () => void = () => undefined
+  const requestSeen = new Promise<void>((resolve) => {
+    markRequestSeen = resolve
+  })
+  await page.route('**/api/v1/chat/completions', async (route) => {
+    markRequestSeen()
+    await responseGate
+    await route.fulfill({
+      contentType: 'text/event-stream',
+      body: buildSseBody([
+        {
+          id: 'tree-delayed-generation',
+          model: 'google/gemini-3.1-flash-lite-preview:free',
+          content: 'response released after tree waiting state',
+        },
+        { finish: 'stop' },
+      ]),
+    })
+  })
+
+  await createChatAndOpen(page)
+  await sendMessage(page, 'wait before replying')
+  await requestSeen
+  const streamTargetId = await page
+    .waitForFunction(
+      () =>
+        (
+          window as unknown as {
+            __debugFakeStream?: {
+              state(): { streamStore: { activeTargets: Array<{ messageId?: string }> } }
+            }
+          }
+        ).__debugFakeStream
+          ?.state()
+          .streamStore.activeTargets.find((target) => target.messageId)?.messageId ?? null,
+    )
+    .then((handle) => handle.jsonValue())
+  if (!streamTargetId) throw new Error('Pending response has no target message')
+  await expect(page.getByRole('button', { name: 'Stop generating' })).toBeVisible()
+
+  try {
+    await page.locator('[data-role="chat-branch-tree"]').click()
+    const pendingNode = page.locator(
+      `[data-ui="branch-tree-node"][data-message-id="${streamTargetId}"]`,
+    )
+    await expect(pendingNode).toHaveAttribute('data-current-leaf', 'true')
+    await expect(pendingNode).toHaveAttribute('data-selected', 'true')
+    await expect(page.locator('[data-ui="branch-tree-inspector"]')).toHaveAttribute(
+      'data-message-id',
+      streamTargetId,
+    )
+    await expect(page.locator('[data-ui="branch-tree-inspector-stream-status"]')).toHaveText(
+      'Waiting for response…',
+    )
+    await expect(page.locator('[data-ui="branch-tree-stop"]')).toBeVisible()
+
+    await page.locator('[data-role="chat-branch-tree"]').click()
+    await expect(
+      page.locator(`[data-ui="message"][data-message-id="${streamTargetId}"]`),
+    ).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Stop generating' })).toBeVisible()
+
+    await page.locator('[data-role="chat-branch-tree"]').click()
+    await expect(pendingNode).toHaveAttribute('data-selected', 'true')
+    await expect(page.locator('[data-ui="branch-tree-inspector"]')).toHaveAttribute(
+      'data-message-id',
+      streamTargetId,
+    )
+    await expect(page.locator('[data-ui="branch-tree-inspector-stream-status"]')).toHaveText(
+      'Waiting for response…',
+    )
+    await page.locator('[data-ui="branch-tree-stop"]').click()
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () =>
+            (
+              window as unknown as {
+                __debugFakeStream?: { state(): { streamStore: { activeCount: number } } }
+              }
+            ).__debugFakeStream?.state().streamStore.activeCount,
+        ),
+      )
+      .toBe(0)
+    await expect(page.locator('[data-ui="branch-tree-stop"]')).toHaveCount(0)
+    await expect(page.locator('[data-ui="branch-tree-inspector-stream-status"]')).toContainText(
+      'Cancelled — partial response kept above.',
+    )
+  } finally {
+    releaseResponse()
+  }
 })
 
 async function seedBranchTreeChat(page: Page): Promise<string> {

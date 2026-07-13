@@ -211,7 +211,6 @@ export async function* splitChatStream(
     ...(opts.forceInlineReasoning === true ? { autoDetect: false } : {}),
   })
   let transportTerminal: Extract<StreamLaneEvent, { lane: 'terminal' }> | undefined
-  const reasoningStates = new Map<number, ChatReasoningStreamState>()
   for await (const chunk of source) {
     if (chunk.type === 'integrity') {
       yield { lane: 'integrity', integrity: chunk.integrity }
@@ -229,7 +228,7 @@ export async function* splitChatStream(
       yield* splitBufferedResult(chunk.result, chunk.generationId, lifter)
       continue
     }
-    yield* splitDelta(chunk.chunk, chunk.generationId, lifter, reasoningStates)
+    yield* splitDelta(chunk.chunk, chunk.generationId, lifter)
   }
 
   // End-of-stream: flush any pending content buffered by the lifter.
@@ -247,7 +246,6 @@ function* splitDelta(
   chunk: ChatCompletionChunkWire,
   generationId: string | undefined,
   lifter: InlineReasoningLifter,
-  reasoningStates: Map<number, ChatReasoningStreamState>,
 ): Generator<StreamLaneEvent> {
   // Mid-stream error frame — §4.5: top-level `error` on a 200 response body.
   if (chunk.error) {
@@ -278,19 +276,8 @@ function* splitDelta(
   }
   if (metaDirty) yield meta
 
-  for (const [choiceOffset, choice] of (chunk.choices ?? []).entries()) {
-    const choiceIndex = choice.index ?? choiceOffset
-    let reasoningState = reasoningStates.get(choiceIndex)
-    if (!reasoningState) {
-      reasoningState = {}
-      reasoningStates.set(choiceIndex, reasoningState)
-    }
-    yield* splitChoiceDelta(
-      choice,
-      typeof chunk.id === 'string' ? chunk.id : undefined,
-      lifter,
-      reasoningState,
-    )
+  for (const choice of chunk.choices ?? []) {
+    yield* splitChoiceDelta(choice, typeof chunk.id === 'string' ? chunk.id : undefined, lifter)
   }
 
   if (chunk.usage) {
@@ -306,7 +293,6 @@ function* splitChoiceDelta(
   choice: ChatCompletionChoiceWire,
   chunkId: string | undefined,
   lifter: InlineReasoningLifter,
-  reasoningState: ChatReasoningStreamState,
 ): Generator<StreamLaneEvent> {
   const delta = choice.delta
   if (delta) {
@@ -346,19 +332,7 @@ function* splitChoiceDelta(
       }
       if (reasoningDetails !== undefined) {
         event.details = reasoningDetails
-        const prefixGrowingMirror =
-          mirror.kind === 'exact' &&
-          mirror.value !== undefined &&
-          reasoningState.lastMirroredStructuredValue !== undefined &&
-          mirror.value.length > reasoningState.lastMirroredStructuredValue.length &&
-          mirror.value.startsWith(reasoningState.lastMirroredStructuredValue)
-        event.detailsMode =
-          mirror.kind === 'cumulative' || prefixGrowingMirror ? 'cumulative' : 'delta'
-        if (mirror.kind !== 'none' && mirror.value !== undefined) {
-          reasoningState.lastMirroredStructuredValue = mirror.value
-        } else {
-          delete reasoningState.lastMirroredStructuredValue
-        }
+        event.detailsMode = mirror.kind === 'cumulative' ? 'cumulative' : 'delta'
       }
       if (chunkId !== undefined) event.chunkId = chunkId
       yield event
@@ -421,10 +395,6 @@ function* splitChoiceDelta(
       ...(chunkId !== undefined ? { chunkId } : {}),
     }
   }
-}
-
-interface ChatReasoningStreamState {
-  lastMirroredStructuredValue?: string
 }
 
 function toToolCallEvent(

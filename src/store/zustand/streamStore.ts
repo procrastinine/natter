@@ -49,7 +49,7 @@ interface StreamStoreState {
   abortStream: (streamId: string) => boolean
   abortChat: (chatId: ChatId) => number
   clearActive: (streamId: string) => void
-  clearLiveSnapshot: (messageId: MessageId) => void
+  clearLiveSnapshot: (messageId: MessageId, expectedStreamId?: string) => void
   reset: () => void
 }
 
@@ -111,9 +111,12 @@ export const useStreamStore = create<StreamStoreState>((set, get) => ({
       delete next[streamId]
       return { activeByStreamId: next }
     }),
-  clearLiveSnapshot: (messageId) =>
+  clearLiveSnapshot: (messageId, expectedStreamId) =>
     set((state) => {
-      if (!(messageId in state.liveByMessageId)) return state
+      const current = state.liveByMessageId[messageId]
+      if (!current || (expectedStreamId !== undefined && current.streamId !== expectedStreamId)) {
+        return state
+      }
       const next = { ...state.liveByMessageId }
       delete next[messageId]
       return { liveByMessageId: next }
@@ -121,7 +124,10 @@ export const useStreamStore = create<StreamStoreState>((set, get) => ({
   reset: () => set({ activeByStreamId: {}, liveByMessageId: {} }),
 }))
 
-export function clearLiveSnapshotIfPresent(messageId: MessageId): void {
+export function clearLiveSnapshotIfPresent(messageId: MessageId, expectedStreamId?: string): void {
   const state = useStreamStore.getState()
-  if (state.liveByMessageId[messageId]) state.clearLiveSnapshot(messageId)
+  const current = state.liveByMessageId[messageId]
+  if (current && (expectedStreamId === undefined || current.streamId === expectedStreamId)) {
+    state.clearLiveSnapshot(messageId, expectedStreamId)
+  }
 }

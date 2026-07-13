@@ -28,6 +28,7 @@ export function seedCursorAtMessage(
   messages: readonly Message[],
   targetId: MessageId,
   cursor: CursorMap,
+  options: { preserveDescendantPins?: boolean } = {},
 ): void {
   const byId = indexById(messages)
   let cur: Message | undefined = byId.get(targetId)
@@ -43,8 +44,13 @@ export function seedCursorAtMessage(
     if (bucket) bucket.push(m)
     else byParent.set(m.parentId, [m])
   }
-  for (const bucket of byParent.values()) {
-    bucket.sort((a, b) => a.siblingIndex - b.siblingIndex)
+  if (options.preserveDescendantPins === false) {
+    const stack = [targetId]
+    while (stack.length > 0) {
+      const parentId = stack.pop() as MessageId
+      delete cursor[cursorKeyOf(parentId)]
+      for (const child of byParent.get(parentId) ?? []) stack.push(child.id)
+    }
   }
   resolveLastUpdatedBranchBelow({ targetId, byParent, byId }, cursor)
 }

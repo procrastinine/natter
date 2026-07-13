@@ -293,7 +293,7 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
 
     const prepareLiveSnapshot = (publishedAt: number) => {
       if (useUiStore.getState().activeChatId !== input.chatId) {
-        clearLiveSnapshotIfPresent(activeTarget.id)
+        clearLiveSnapshotIfPresent(activeTarget.id, streamId)
         return undefined
       }
       const preparedCursor = useChatStore.getState().getCursor(input.chatId) ?? {}
@@ -303,7 +303,7 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
             preparedCursor[key] !== undefined && preparedCursor[key] !== selectedMessageId,
         )
       ) {
-        clearLiveSnapshotIfPresent(activeTarget.id)
+        clearLiveSnapshotIfPresent(activeTarget.id, streamId)
         return undefined
       }
       const snapshot = {
@@ -320,7 +320,7 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
       }
       return () => {
         if (useUiStore.getState().activeChatId !== input.chatId) {
-          clearLiveSnapshotIfPresent(activeTarget.id)
+          clearLiveSnapshotIfPresent(activeTarget.id, streamId)
           return
         }
         const currentCursor = useChatStore.getState().getCursor(input.chatId) ?? {}
@@ -330,7 +330,7 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
               currentCursor[key] !== undefined && currentCursor[key] !== selectedMessageId,
           )
         ) {
-          clearLiveSnapshotIfPresent(activeTarget.id)
+          clearLiveSnapshotIfPresent(activeTarget.id, streamId)
           return
         }
         useStreamStore.getState().setLiveSnapshot(snapshot)
@@ -433,7 +433,7 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
       cleanup: (attemptResult) => {
         if (attemptResult.journalCleanupPending) lifecycle.preserveLease()
         useStreamStore.getState().clearActive(streamId)
-        clearLiveSnapshotIfPresent(activeTarget.id)
+        clearLiveSnapshotIfPresent(activeTarget.id, streamId)
         postEvent({
           kind: 'stream-ended',
           chatId: input.chatId,
@@ -450,7 +450,7 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
   } finally {
     if (useStreamStore.getState().isActive(lifecycle.streamId)) {
       useStreamStore.getState().clearActive(lifecycle.streamId)
-      if (target) clearLiveSnapshotIfPresent(target.id)
+      if (target) clearLiveSnapshotIfPresent(target.id, lifecycle.streamId)
       postEvent({
         kind: 'stream-ended',
         chatId: input.chatId,

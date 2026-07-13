@@ -564,7 +564,7 @@ describe('splitChatStream', () => {
     })
   })
 
-  it('collapses prefix-growing scalar and structured mirrors into one cumulative path', async () => {
+  it('preserves prefix-growing scalar and structured mirrors as exact deltas', async () => {
     const pieces = ['Let', 'Let me', 'Let me think']
     const chunks: ChatStreamChunk[] = pieces.map((text) => ({
       type: 'delta',
@@ -582,14 +582,87 @@ describe('splitChatStream', () => {
     const events = await collect(splitChatStream(fromChunks(chunks)))
     expect(
       events.filter((event) => event.lane === 'reasoning').map((event) => event.detailsMode),
-    ).toEqual(['delta', 'cumulative', 'cumulative'])
+    ).toEqual(['delta', 'delta', 'delta'])
 
     const accumulator = createStreamAccumulator({ initialContent: [], now: 0 })
     for (const [index, event] of events.entries()) {
       applyStreamAccumulatorEvent(accumulator, event, index + 1)
     }
     expect(projectStreamAccumulatorFinal(accumulator).reasoningDetails?.[0]).toMatchObject({
-      text: 'Let me think',
+      text: pieces.join(''),
+    })
+  })
+
+  it('does not discard earlier Claude reasoning for a suffix-mirrored structured delta', async () => {
+    const chunks: ChatStreamChunk[] = [
+      {
+        type: 'delta',
+        chunk: {
+          choices: [
+            {
+              delta: {
+                reasoning: 'EARLY ',
+                reasoning_details: [
+                  {
+                    type: 'reasoning.text',
+                    index: 0,
+                    format: 'anthropic-claude-v1',
+                    text: 'EARLY ',
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      },
+      {
+        type: 'delta',
+        chunk: {
+          choices: [
+            {
+              delta: {
+                reasoning: 'tail',
+                reasoning_details: [
+                  {
+                    type: 'reasoning.text',
+                    index: 0,
+                    format: 'anthropic-claude-v1',
+                    text: 'LATER tail',
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      },
+      {
+        type: 'delta',
+        chunk: {
+          choices: [
+            {
+              delta: {
+                reasoning: ' END',
+                reasoning_details: [
+                  {
+                    type: 'reasoning.text',
+                    index: 0,
+                    format: 'anthropic-claude-v1',
+                    text: ' END',
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      },
+    ]
+    const accumulator = createStreamAccumulator({ initialContent: [], now: 0 })
+    for (const [index, event] of (await collect(splitChatStream(fromChunks(chunks)))).entries()) {
+      applyStreamAccumulatorEvent(accumulator, event, index + 1)
+    }
+
+    expect(projectStreamAccumulatorFinal(accumulator).reasoningDetails?.[0]).toMatchObject({
+      text: 'EARLY LATER tail END',
     })
   })
 
@@ -615,8 +688,15 @@ describe('splitChatStream', () => {
           choices: [
             {
               delta: {
-                reasoning: 'ab',
-                reasoning_details: [{ type: 'reasoning.text', index: 0, text: 'ab' }],
+                reasoning: 'b',
+                reasoning_details: [
+                  {
+                    type: 'reasoning.text',
+                    index: 0,
+                    format: 'anthropic-claude-v1',
+                    text: 'ab',
+                  },
+                ],
               },
             },
           ],
