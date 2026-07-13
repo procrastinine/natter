@@ -3,8 +3,7 @@
 // these can blow up on NaN / undefined / corrupt rows / pathological inputs.
 // This module funnels all of that into a handful of small helpers so the
 // counting core (tokens.ts / prompt-size.ts / context-cutoff.ts / cost.ts)
-// never has to think about it. See `plan/token-counting-audit.md` for the
-// full rationale and the audit findings each helper addresses.
+// never has to think about it.
 //
 // Discipline:
 //   - Non-string inputs always return 0 (not throw).

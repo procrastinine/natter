@@ -198,6 +198,16 @@ describe('text-completions prompt templates', () => {
     expect(result.wire).not.toHaveProperty('messages')
   })
 
+  it('preserves forward sampling keys from portable imports', () => {
+    const settings = cloneDefaultChatSettings()
+    Object.assign(settings.sampling, { future_sampler: 0.25 })
+
+    const result = toTextCompletions(settings, [], { template: builtInTemplate('raw') })
+
+    expect(result.wire.future_sampler).toBe(0.25)
+    expect(result.wire.undefined).toBeUndefined()
+  })
+
   it('uses classic max_tokens for text completions even when caps list chat-style max_completion_tokens', () => {
     const settings = cloneDefaultChatSettings()
     settings.model = 'meta-llama/llama-3.3-70b-instruct'

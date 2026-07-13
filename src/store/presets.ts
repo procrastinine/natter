@@ -1,10 +1,7 @@
-// ChatPreset CRUD + MRU selection. See `plan/02-data-model.md §2.6a` and
-// `plan/09-privacy.md §9.2.B`.
-//
 // A preset is a named ChatSettings bundle pinned to a ConnectionProfile. Many
 // presets can share one profile. Preset edits do NOT propagate to chats that
 // were already created from the preset — chats are their own snapshots. The
-// MRU preset (greatest non-archived `lastUsedAt`) seeds new chats per §9.2.1.
+// MRU preset (greatest non-archived `lastUsedAt`) seeds new chats.
 
 import { withProfileApiDefaults } from '../core/provider-defaults'
 import type {
@@ -15,9 +12,11 @@ import type {
   ProfileId,
 } from '../core/types'
 import { newId } from '../lib/ulid'
+import { runAuthoritativeTransaction } from './authoritative-write'
 import { postEvent } from './broadcast'
 import { getDb } from './db'
 import { ProfileMissingError } from './profiles'
+import { getWorkspaceRepository } from './workspace-repository'
 
 export class PresetMissingError extends Error {
   readonly presetId: PresetId
@@ -40,21 +39,36 @@ interface CreatePresetInput {
 
 export async function createPreset(input: CreatePresetInput): Promise<ChatPreset> {
   const db = getDb()
-  const profile = await db.profiles.get(input.connectionProfileId)
-  if (!profile) throw new ProfileMissingError(input.connectionProfileId)
   const now = input.now ?? Date.now()
-  const preset: ChatPreset = {
-    id: input.id ?? newId(),
-    name: input.name,
-    connectionProfileId: input.connectionProfileId,
-    // `settings.profileId` is kept in sync with `connectionProfileId` (§2.6a).
-    settings: normalizePresetSettings(input.settings, input.connectionProfileId, profile),
-    sortIndex: input.sortIndex ?? (await nextPresetSortIndex(db)),
-    createdAt: now,
-    updatedAt: now,
-  }
-  if (input.lastUsedAt !== undefined) preset.lastUsedAt = input.lastUsedAt
-  await db.presets.put(preset)
+  const presetId = input.id ?? newId()
+  const { value: preset } = await runAuthoritativeTransaction({
+    db,
+    lockNames: [`preset:${presetId}`, 'presets:order'],
+    tables: [db.presets, db.profiles, db.settings],
+    now,
+    write: async (tx) => {
+      const profile = await tx
+        .table<ConnectionProfile, ProfileId>('profiles')
+        .get(input.connectionProfileId)
+      if (!profile) throw new ProfileMissingError(input.connectionProfileId)
+      const rows =
+        input.sortIndex === undefined ? await tx.table<ChatPreset>('presets').toArray() : []
+      const row: ChatPreset = {
+        id: presetId,
+        name: input.name,
+        connectionProfileId: input.connectionProfileId,
+        settings: normalizePresetSettings(input.settings, input.connectionProfileId, profile),
+        sortIndex:
+          input.sortIndex ??
+          (rows.length === 0 ? 0 : Math.max(...rows.map((candidate) => candidate.sortIndex)) + 1),
+        createdAt: now,
+        updatedAt: now,
+      }
+      if (input.lastUsedAt !== undefined) row.lastUsedAt = input.lastUsedAt
+      await tx.table('presets').put(row)
+      return { value: row, changed: true }
+    },
+  })
   postEvent({ kind: 'preset-mutated', presetId: preset.id })
   return preset
 }
@@ -75,24 +89,35 @@ export async function updatePreset(
   opts: { now?: number } = {},
 ): Promise<ChatPreset> {
   const db = getDb()
-  const existing = await db.presets.get(presetId)
-  if (!existing) throw new PresetMissingError(presetId)
   const now = opts.now ?? Date.now()
-  const next: ChatPreset = {
-    ...existing,
-    ...patch,
-    id: existing.id,
-    createdAt: existing.createdAt,
-    updatedAt: now,
-  }
-  // Keep `settings.profileId` aligned with `connectionProfileId`.
-  const targetProfileId = patch.connectionProfileId ?? existing.connectionProfileId
-  if (patch.connectionProfileId !== undefined || patch.settings) {
-    const targetProfile = await db.profiles.get(targetProfileId)
-    if (!targetProfile) throw new ProfileMissingError(targetProfileId)
-    next.settings = normalizePresetSettings(next.settings, targetProfileId, targetProfile)
-  }
-  await db.presets.put(next)
+  const { value: next } = await runAuthoritativeTransaction({
+    db,
+    lockNames: [`preset:${presetId}`],
+    tables: [db.presets, db.profiles, db.settings],
+    now,
+    write: async (tx) => {
+      const table = tx.table<ChatPreset, PresetId>('presets')
+      const existing = await table.get(presetId)
+      if (!existing) throw new PresetMissingError(presetId)
+      const row: ChatPreset = {
+        ...existing,
+        ...patch,
+        id: existing.id,
+        createdAt: existing.createdAt,
+        updatedAt: now,
+      }
+      const targetProfileId = patch.connectionProfileId ?? existing.connectionProfileId
+      if (patch.connectionProfileId !== undefined || patch.settings) {
+        const targetProfile = await tx
+          .table<ConnectionProfile, ProfileId>('profiles')
+          .get(targetProfileId)
+        if (!targetProfile) throw new ProfileMissingError(targetProfileId)
+        row.settings = normalizePresetSettings(row.settings, targetProfileId, targetProfile)
+      }
+      await table.put(row)
+      return { value: row, changed: true }
+    },
+  })
   postEvent({ kind: 'preset-mutated', presetId })
   return next
 }
@@ -101,21 +126,35 @@ export async function duplicatePreset(
   sourceId: PresetId,
   opts: { name?: string; now?: number } = {},
 ): Promise<ChatPreset> {
-  const source = await getPreset(sourceId)
-  if (!source) throw new PresetMissingError(sourceId)
   const now = opts.now ?? Date.now()
-  const copy: ChatPreset = {
-    ...source,
-    id: newId(),
-    name: opts.name ?? `${source.name} (copy)`,
-    settings: { ...source.settings },
-    sortIndex: await nextPresetSortIndex(),
-    createdAt: now,
-    updatedAt: now,
-  }
-  delete copy.lastUsedAt
-  copy.archived = false
-  await getDb().presets.put(copy)
+  const copyId = newId()
+  const db = getDb()
+  const { value: copy } = await runAuthoritativeTransaction({
+    db,
+    lockNames: [`preset:${sourceId}`, `preset:${copyId}`, 'presets:order'],
+    tables: [db.presets, db.settings],
+    now,
+    write: async (tx) => {
+      const table = tx.table<ChatPreset, PresetId>('presets')
+      const source = await table.get(sourceId)
+      if (!source) throw new PresetMissingError(sourceId)
+      const rows = await table.toArray()
+      const next: ChatPreset = {
+        ...source,
+        id: copyId,
+        name: opts.name ?? `${source.name} (copy)`,
+        settings: { ...source.settings },
+        sortIndex:
+          rows.length === 0 ? 0 : Math.max(...rows.map((candidate) => candidate.sortIndex)) + 1,
+        createdAt: now,
+        updatedAt: now,
+        archived: false,
+      }
+      delete next.lastUsedAt
+      await table.put(next)
+      return { value: next, changed: true }
+    },
+  })
   postEvent({ kind: 'preset-mutated', presetId: copy.id })
   return copy
 }
@@ -126,25 +165,30 @@ export async function reorderPresets(
 ): Promise<void> {
   const db = getDb()
   const ids = Array.from(new Set(orderedIds))
-  const rows = await db.presets.bulkGet(ids)
   const now = opts.now ?? Date.now()
-  const updates: ChatPreset[] = []
-  for (const [index, id] of ids.entries()) {
-    const row = rows[index]
-    if (!row) throw new PresetMissingError(id)
-    if (row.sortIndex === index) continue
-    updates.push({ ...row, sortIndex: index, updatedAt: now })
-  }
+  const { value: updates } = await runAuthoritativeTransaction({
+    db,
+    lockNames: ['presets:order'],
+    tables: [db.presets, db.settings],
+    now,
+    write: async (tx) => {
+      const table = tx.table<ChatPreset, PresetId>('presets')
+      const rows = await table.bulkGet(ids)
+      const next: ChatPreset[] = []
+      for (const [index, id] of ids.entries()) {
+        const row = rows[index]
+        if (!row) throw new PresetMissingError(id)
+        if (row.sortIndex === index) continue
+        next.push({ ...row, sortIndex: index, updatedAt: now })
+      }
+      if (next.length > 0) await table.bulkPut(next)
+      return { value: next, changed: next.length > 0 }
+    },
+  })
   if (updates.length === 0) return
-  await db.presets.bulkPut(updates)
   for (const row of updates) {
     postEvent({ kind: 'preset-mutated', presetId: row.id })
   }
-}
-
-async function nextPresetSortIndex(db = getDb()): Promise<number> {
-  const rows = await db.presets.toArray()
-  return rows.length === 0 ? 0 : Math.max(...rows.map((row) => row.sortIndex)) + 1
 }
 
 function sortPresetsForPicker(rows: ChatPreset[]): ChatPreset[] {
@@ -175,31 +219,26 @@ export async function unarchivePreset(presetId: PresetId, now = Date.now()): Pro
 // Delete a preset. Chats that were created from this preset keep their
 // settings; their `presetId` breadcrumb is cleared. See §9.2.B.
 export async function deletePreset(presetId: PresetId, opts: { now?: number } = {}): Promise<void> {
-  const db = getDb()
-  const existing = await db.presets.get(presetId)
-  if (!existing) throw new PresetMissingError(presetId)
   const now = opts.now ?? Date.now()
-  const chats = await db.chats.where('presetId').equals(presetId).toArray()
-  for (const chat of chats) {
-    const { presetId: _, ...rest } = chat
-    await db.chats.put({ ...rest, updatedAt: now })
-    postEvent({
-      kind: 'chat-mutated',
-      chatId: chat.id,
-      metaVersion: chat.metaVersion,
-      summaryVersion: chat.summaryVersion,
-      affected: [{ kind: 'chat-meta', chatId: chat.id }],
-    })
-  }
-  await db.presets.delete(presetId)
-  postEvent({ kind: 'preset-deleted', presetId })
+  const result = await getWorkspaceRepository().deletePresetAndClearBreadcrumbs(presetId, now)
+  if (result.kind === 'missing') throw new PresetMissingError(presetId)
 }
 
 export async function bumpPresetLastUsedAt(presetId: PresetId, now = Date.now()): Promise<void> {
   const db = getDb()
-  const existing = await db.presets.get(presetId)
-  if (!existing) return
-  await db.presets.put({ ...existing, lastUsedAt: now })
+  await runAuthoritativeTransaction({
+    db,
+    lockNames: [`preset:${presetId}`],
+    tables: [db.presets, db.settings],
+    now,
+    write: async (tx) => {
+      const table = tx.table<ChatPreset, PresetId>('presets')
+      const existing = await table.get(presetId)
+      if (!existing) return { value: undefined, changed: false }
+      await table.put({ ...existing, lastUsedAt: now })
+      return { value: undefined, changed: true }
+    },
+  })
 }
 
 function pickDefaultPreset(rows: ChatPreset[]): ChatPreset | null {

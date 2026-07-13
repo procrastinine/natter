@@ -240,7 +240,7 @@ export class AttachmentLibrary {
   missingRefs(refIds: string[]): MessageAttachmentRef[] {
     return refIds.flatMap((refId) => {
       const ref = this.refs.get(refId)
-      if (!ref || ref.storageStateSnapshot !== 'missing') return []
+      if (ref?.storageStateSnapshot !== 'missing') return []
       return [{ ...ref }]
     })
   }

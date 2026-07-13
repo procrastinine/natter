@@ -1,7 +1,3 @@
-// Effective-capability resolver + stored-settings validator. See
-// `plan/07-discovery.md §7.2` (step 5) and `§7.6` for the non-OpenRouter
-// fallback.
-//
 // Inputs:
 // - For OpenRouter: `ModelEndpoint[]` from `/endpoints`, filtered by user's
 //   provider prefs (only / ignore). Privacy filtering happens elsewhere
@@ -125,7 +121,7 @@ function pricingRange(
 ): { min: number; max: number } | undefined {
   const nums: number[] = []
   for (const ep of endpoints) {
-    const raw = ep.pricing?.[key]
+    const raw = ep.pricing[key]
     if (raw === undefined) continue
     const n = Number(raw)
     if (Number.isFinite(n)) nums.push(n)

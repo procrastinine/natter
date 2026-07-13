@@ -1,5 +1,3 @@
-// Phase 11: buildHeaders gemini-native branch. See `plan/phase11-implementation.md §4.4`.
-//
 // Contract: `buildHeaders` DOES NOT infer Gemini-native auth from `kind`; the
 // transport adapter (api/gemini-native.ts) passes `authScheme: 'gemini-native'`
 // explicitly. This way the same Google profile can serve both transports:

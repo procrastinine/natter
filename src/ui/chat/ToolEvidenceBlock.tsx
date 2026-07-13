@@ -4,9 +4,14 @@ import type { Message } from '../../core/types'
 interface ToolEvidenceBlockProps {
   message: Message
   onToggleHidden?: (itemIndex: number) => void
+  toggleHiddenDisabled?: boolean
 }
 
-export function ToolEvidenceBlock({ message, onToggleHidden }: ToolEvidenceBlockProps) {
+export function ToolEvidenceBlock({
+  message,
+  onToggleHidden,
+  toggleHiddenDisabled = false,
+}: ToolEvidenceBlockProps) {
   const sections = toolEvidenceSectionsForMessage(message)
   if (sections.length === 0) return null
   return (
@@ -34,6 +39,7 @@ export function ToolEvidenceBlock({ message, onToggleHidden }: ToolEvidenceBlock
                   type="button"
                   data-ui="tool-evidence-hide"
                   data-pressed={section.hidden ? 'true' : undefined}
+                  disabled={toggleHiddenDisabled}
                   onClick={(event) => {
                     event.preventDefault()
                     event.stopPropagation()
@@ -41,9 +47,11 @@ export function ToolEvidenceBlock({ message, onToggleHidden }: ToolEvidenceBlock
                   }}
                   aria-label={section.hidden ? 'Unhide tool call' : 'Hide tool call'}
                   title={
-                    section.hidden
-                      ? 'Hidden — preserved on disk, not sent on next turn. Click to unhide.'
-                      : 'Hide this tool call or result (kept on disk, skipped on context replay).'
+                    toggleHiddenDisabled
+                      ? 'Wait for this generation to finish before changing tool visibility.'
+                      : section.hidden
+                        ? 'Hidden — preserved on disk, not sent on next turn. Click to unhide.'
+                        : 'Hide this tool call or result (kept on disk, skipped on context replay).'
                   }
                 >
                   {section.hidden ? <EyeOffIcon /> : <EyeIcon />}

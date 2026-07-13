@@ -159,7 +159,8 @@ function migrateLegacyReasoningSettings(reasoning: ChatSettings['reasoning']): {
   reasoning: ChatSettings['reasoning']
   changed: boolean
 } {
-  const legacy = reasoning as ChatSettings['reasoning'] & {
+  const legacy = reasoning as Omit<ChatSettings['reasoning'], 'include'> & {
+    include?: ChatSettings['reasoning']['include']
     carryForward?: LegacyReasoningCarryForward
   }
   if (legacy.carryForward === undefined) {

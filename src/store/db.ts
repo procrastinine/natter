@@ -1,16 +1,30 @@
-// Dexie schema + open/close. Schema kept in lockstep with `plan/03-storage.md §3.1`.
-//
 // The module exports a single default-name singleton for production. Tests that
 // need isolation use `createDbForTests(name)` to mint a uniquely-named instance
 // and close it when they're done.
 
 import Dexie, { type Table } from 'dexie'
+import { migrateAttachmentHeaderProjection } from '../backcompat/attachment-header-projection'
+import {
+  rebuildAttachmentReferenceEdges,
+  scrubMissingAttachmentByteReferences,
+} from '../backcompat/attachment-reference-edges'
 import {
   attachmentRefsBackfillMarker,
   migrateAttachmentRefRows,
-  normalizeLegacyAttachmentRefs,
+  migrateLegacyAttachmentStorage,
+  normalizeAttachmentRefOwners,
 } from '../backcompat/attachment-refs'
+import { BACKCOMPAT_BATCH_SIZE, forEachTableBatch } from '../backcompat/batched-table'
+import { migrateBrowserWriterLock } from '../backcompat/browser-writer-lock'
+import {
+  backfillChatPreviewProjection,
+  chatPreviewProjectionBackfillMarker,
+  migrateChatPreviewProjection,
+} from '../backcompat/chat-preview-projection'
 import { migrateCurrentChatSettingsSnapshot } from '../backcompat/chat-settings'
+import { migrateChatSidebarProjection } from '../backcompat/chat-sidebar-projection'
+import { migrateLegacyChildLists } from '../backcompat/child-lists'
+import { migrateGenerationAttemptOutcomes } from '../backcompat/generation-attempt-outcomes'
 import {
   globalSettingsBackfillMarker,
   migrateGlobalSettingsRows,
@@ -20,36 +34,37 @@ import {
   messageBodySplitBackfillMarker,
   migrateInlineMessageBodies,
 } from '../backcompat/message-body-split'
+import { migrateMessageHeaderProjections } from '../backcompat/message-header-projections'
 import {
-  migrateProviderApiModeProfile,
-  migrateProviderApiModeSettings,
-} from '../backcompat/provider-api-modes'
+  migrateLegacyPresetSortOrder,
+  PRESET_SORT_MIGRATION_INDEX,
+} from '../backcompat/preset-sort-order'
+import { migrateProviderApiModeTables } from '../backcompat/provider-api-modes'
 import {
   migrateProviderOutputItemRows,
-  migrateProviderOutputItemsFromGeneration,
+  migrateProviderOutputItemRowsInTables,
   providerOutputItemsBackfillMarker,
 } from '../backcompat/provider-output-items'
-import {
-  migrateProviderSettingsRow,
-  providerCacheKey,
-} from '../backcompat/provider-settings-migration'
+import { migrateProviderSettingsTables } from '../backcompat/provider-settings-migration'
 import {
   migrateProviderToolSettings,
   migrateProviderToolSettingsRows,
   providerToolSettingsBackfillMarker,
 } from '../backcompat/provider-tools'
+import { migrateStreamLeaseAttempts } from '../backcompat/stream-lease-attempts'
 import {
   canonicalizeTokenCalibrationRows,
   rebuildTokenCalibrationGlobalRows,
   tokenCalibrationCanonicalizeBackfillMarker,
   tokenCalibrationGlobalBackfillMarker,
 } from '../backcompat/token-calibration-global'
+import { migrateWorkspaceReplacementEpoch } from '../backcompat/workspace-meta'
 import { findLastUpdatedLeafId } from '../core/active-path'
 import { buildBranchMessages } from '../core/branch-flatten'
 import {
   DEFAULT_CONTINUE_SYSTEM_PROMPT,
   DEFAULT_CONTINUE_USER_PROMPT,
-} from '../core/global-settings'
+} from '../core/continue-prompts'
 import {
   normalizeRenderingPreferences,
   RENDERING_PREFERENCES_KEY,
@@ -59,6 +74,7 @@ import type {
   AttachmentArtifact,
   AttachmentBlob,
   AttachmentJob,
+  AttachmentReferenceEdge,
   Chat,
   ChatBranchCache,
   ChatFolder,
@@ -73,35 +89,41 @@ import type {
   PromptPreset,
 } from '../core/types'
 import { countMessagesWords } from '../core/word-count'
-import { hydrateMessages, type MessageBodyRow, type MessageHeaderRow } from './message-storage'
+import { configureBroadcastFallbackReader } from './broadcast'
+import { type BrowserLockRow, emptyBrowserWriterLockRow } from './browser-lock-record'
+import {
+  CHAT_SIDEBAR_PROJECTION_BACKFILL_KEY,
+  CHAT_SIDEBAR_PROJECTION_MANIFEST_KEY,
+  type ChatSidebarProjectionRow,
+  chatSidebarProjectionSettings,
+  isValidChatSidebarProjectionManifest,
+  putChatSidebarProjection,
+  rebuildChatSidebarProjection,
+} from './chat-sidebar-projection'
+import type {
+  CachedEndpointsRow,
+  CachedModelsRow,
+  CachedPrivacyPolicyRow,
+  CachedProvidersRow,
+  SettingsRow,
+} from './db-rows'
+import { configureLockDatabaseOpener } from './locks'
+import {
+  hydrateMessages,
+  type MessageBodyRow,
+  type MessageHeaderRow,
+  previewTextFromContent,
+} from './message-storage'
 import type { StreamChunkRow, StreamLeaseRow } from './repository'
+import { readBrowserWorkspaceMeta } from './workspace-meta'
 
-export interface CachedModelsRow {
-  profileId: string
-  queryKey: string
-  fetchedAt: number
-  payload: unknown
-}
-
-export interface CachedEndpointsRow {
-  profileId: string
-  modelId: string
-  fetchedAt: number
-  payload: unknown
-}
-
-export interface CachedPrivacyPolicyRow {
-  profileId: string
-  modelId: string
-  fetchedAt: number
-  payload: unknown
-}
-
-export interface CachedProvidersRow {
-  profileId: string
-  fetchedAt: number
-  payload: unknown
-}
+export type {
+  CachedEndpointsRow,
+  CachedModelsRow,
+  CachedPrivacyPolicyRow,
+  CachedProvidersRow,
+  SettingsRow,
+} from './db-rows'
 
 interface CachedGenerationRow {
   id: string
@@ -111,13 +133,9 @@ interface CachedGenerationRow {
   payload: unknown
 }
 
-export interface SettingsRow {
-  key: string
-  value: unknown
-}
-
 export class NatterDb extends Dexie {
   chats!: Table<Chat, string>
+  chatSidebarRows!: Table<ChatSidebarProjectionRow, string>
   messages!: Table<MessageHeaderRow, string>
   messageBodies!: Table<MessageBodyRow, string>
   childLists!: Table<ChildListState, string>
@@ -125,6 +143,10 @@ export class NatterDb extends Dexie {
   attachmentBlobs!: Table<AttachmentBlob, string>
   attachmentArtifacts!: Table<AttachmentArtifact, string>
   attachmentJobs!: Table<AttachmentJob, string>
+  attachmentRefEdges!: Table<
+    AttachmentReferenceEdge,
+    [AttachmentReferenceEdge['ownerKind'], string, string]
+  >
   profiles!: Table<ConnectionProfile, string>
   presets!: Table<ChatPreset, string>
   promptPresets!: Table<PromptPreset, string>
@@ -133,6 +155,7 @@ export class NatterDb extends Dexie {
   chatBranchCache!: Table<ChatBranchCache, string>
   keys!: Table<KeyRecord, string>
   settings!: Table<SettingsRow, string>
+  browserLocks!: Table<BrowserLockRow, string>
   streamLeases!: Table<StreamLeaseRow, string>
   streamChunks!: Table<StreamChunkRow, string>
   models!: Table<CachedModelsRow, [string, string]>
@@ -159,12 +182,15 @@ export function registerSchema(db: Dexie): void {
         attachmentRefsBackfillMarker(),
         messageBodySplitBackfillMarker(),
         organizationFieldsBackfillMarker(),
+        chatPreviewProjectionBackfillMarker(),
         globalSettingsBackfillMarker(),
         providerOutputItemsBackfillMarker(),
         providerToolSettingsBackfillMarker(),
         tokenCalibrationGlobalBackfillMarker(),
         tokenCalibrationCanonicalizeBackfillMarker(),
+        ...chatSidebarProjectionSettings(0),
       ])
+    void tx.table<BrowserLockRow>('browserLocks').put(emptyBrowserWriterLockRow())
   })
 
   db.version(1).stores({
@@ -229,28 +255,15 @@ export function registerSchema(db: Dexie): void {
         ;(row as Chat).summaryVersion = version
       })
 
-      const messages = tx.table<LegacyMessageV1>('messages')
+      const messages = tx.table<LegacyMessageV1, string>('messages')
       await messages.toCollection().modify((row) => {
         if (row.nodeVersion === undefined) {
           ;(row as Message).nodeVersion = 0
         }
       })
 
-      const childLists = tx.table<ChildListState>('childLists')
-      const messageRows = await messages.toArray()
-      const seen = new Set<string>()
-      for (const row of messageRows) {
-        const id = childListKey(row.chatId, row.parentId)
-        if (seen.has(id)) continue
-        seen.add(id)
-        await childLists.put({
-          id,
-          chatId: row.chatId,
-          parentId: row.parentId,
-          version: 0,
-          updatedAt: 0,
-        })
-      }
+      const childLists = tx.table<ChildListState, string>('childLists')
+      await migrateLegacyChildLists(messages, childLists)
     })
 
   db.version(3).stores({
@@ -300,46 +313,7 @@ export function registerSchema(db: Dexie): void {
       drafts: '&chatId, updatedAt',
     })
     .upgrade(async (tx) => {
-      const endpointsRows = await tx.table<CachedEndpointsRow>('endpoints').toArray()
-      const privacyRows = await tx.table<CachedPrivacyPolicyRow>('privacyPolicies').toArray()
-      const profiles = await tx.table<ConnectionProfile>('profiles').toArray()
-      const endpointsByKey = new Map<string, CachedEndpointsRow>()
-      const privacyByKey = new Map<string, CachedPrivacyPolicyRow>()
-      const profilesById = new Map(profiles.map((profile) => [profile.id, profile]))
-      for (const row of endpointsRows)
-        endpointsByKey.set(providerCacheKey(row.profileId, row.modelId), row)
-      for (const row of privacyRows)
-        privacyByKey.set(providerCacheKey(row.profileId, row.modelId), row)
-
-      await tx
-        .table<Chat>('chats')
-        .toCollection()
-        .modify((chat) => {
-          const result = migrateProviderSettingsRow(
-            chat.settings,
-            chat.settings.profileId,
-            chat.settings.model,
-            {
-              endpointsByKey,
-              privacyByKey,
-              profilesById,
-            },
-          )
-          if (result.changed) chat.settings = result.settings
-        })
-
-      await tx
-        .table<ChatPreset>('presets')
-        .toCollection()
-        .modify((preset) => {
-          const result = migrateProviderSettingsRow(
-            preset.settings,
-            preset.connectionProfileId,
-            preset.settings.model,
-            { endpointsByKey, privacyByKey, profilesById },
-          )
-          if (result.changed) preset.settings = result.settings
-        })
+      await migrateProviderSettingsTables(tx)
     })
 
   // v5: promptPresets table + move continue prompts from global settings onto
@@ -450,86 +424,7 @@ export function registerSchema(db: Dexie): void {
       drafts: '&chatId, updatedAt',
     })
     .upgrade(async (tx) => {
-      const now = Date.now()
-      const blobs = tx.table<AttachmentBlob>('attachmentBlobs')
-      const attachmentTable = tx.table<Record<string, unknown>>('attachments')
-      const attachmentRows = await attachmentTable.toArray()
-      for (const row of attachmentRows) {
-        const id = String(row.id)
-        const createdAt = numberOr(row.createdAt, now)
-        const updatedAt = numberOr(row.updatedAt, createdAt)
-        const blob = legacyBlob(row.blob)
-        const blobId = storageBlobId(row.storage) ?? (blob ? `${id}:original` : undefined)
-        const contentHash = typeof row.contentHash === 'string' ? row.contentHash : undefined
-        if (blob && blobId && contentHash && !(await blobs.get(blobId))) {
-          await blobs.put({
-            id: blobId,
-            attachmentId: id,
-            role: 'original',
-            mime: typeof row.mime === 'string' ? row.mime : 'application/octet-stream',
-            contentHash,
-            sizeBytes: typeof row.sizeBytes === 'number' ? row.sizeBytes : blob.size,
-            blob,
-            createdAt,
-          })
-        }
-
-        delete row.blob
-        delete row.thumbnailB64
-        row.kind = row.kind === 'file' ? 'other' : (row.kind ?? 'other')
-        row.origin = row.origin ?? 'import'
-        row.createdAt = createdAt
-        row.updatedAt = updatedAt
-        row.extension = row.extension ?? extensionFromFilename(row.filename)
-        row.sizeBytes = row.sizeBytes ?? blob?.size
-        row.artifacts = Array.isArray(row.artifacts) ? row.artifacts : []
-        row.processing = Array.isArray(row.processing) ? row.processing : []
-        row.storage =
-          row.storage ??
-          (blobId
-            ? { kind: 'local-blob', blobId }
-            : { kind: 'missing', reason: 'import-missing', missingSince: now })
-        row.refCount = 0
-        await attachmentTable.put(row)
-      }
-
-      const refCounts = new Map<string, number>()
-      await tx
-        .table<Record<string, unknown>>('messages')
-        .toCollection()
-        .modify((row) => {
-          const refs =
-            normalizeLegacyAttachmentRefs(row.attachmentRefs, {
-              messageId: String(row.id),
-              createdAt: numberOr(row.createdAt, now),
-            }) ?? []
-          row.attachmentRefs = refs
-          for (const ref of refs ?? []) {
-            if (ref.deletedAt !== undefined) continue
-            refCounts.set(ref.attachmentId, (refCounts.get(ref.attachmentId) ?? 0) + 1)
-          }
-        })
-      await tx
-        .table<Record<string, unknown>>('drafts')
-        .toCollection()
-        .modify((row) => {
-          const refs =
-            normalizeLegacyAttachmentRefs(row.attachmentRefs, {
-              draftChatId: String(row.chatId),
-              createdAt: numberOr(row.updatedAt, now),
-            }) ?? []
-          row.attachmentRefs = refs
-          for (const ref of refs ?? []) {
-            if (ref.deletedAt !== undefined) continue
-            refCounts.set(ref.attachmentId, (refCounts.get(ref.attachmentId) ?? 0) + 1)
-          }
-        })
-      await tx
-        .table<Attachment>('attachments')
-        .toCollection()
-        .modify((row) => {
-          row.refCount = refCounts.get(row.id) ?? 0
-        })
+      await migrateLegacyAttachmentStorage(tx)
     })
 
   // v7: Provider routing sort became an explicit OpenRouter preset field.
@@ -564,48 +459,7 @@ export function registerSchema(db: Dexie): void {
       drafts: '&chatId, updatedAt',
     })
     .upgrade(async (tx) => {
-      const [endpointsRows, privacyRows, profiles] = await Promise.all([
-        tx.table<CachedEndpointsRow>('endpoints').toArray(),
-        tx.table<CachedPrivacyPolicyRow>('privacyPolicies').toArray(),
-        tx.table<ConnectionProfile>('profiles').toArray(),
-      ])
-      const endpointsByKey = new Map<string, CachedEndpointsRow>()
-      const privacyByKey = new Map<string, CachedPrivacyPolicyRow>()
-      const profilesById = new Map(profiles.map((profile) => [profile.id, profile]))
-      for (const row of endpointsRows)
-        endpointsByKey.set(providerCacheKey(row.profileId, row.modelId), row)
-      for (const row of privacyRows)
-        privacyByKey.set(providerCacheKey(row.profileId, row.modelId), row)
-
-      await tx
-        .table<Chat>('chats')
-        .toCollection()
-        .modify((chat) => {
-          const result = migrateProviderSettingsRow(
-            chat.settings,
-            chat.settings.profileId,
-            chat.settings.model,
-            {
-              endpointsByKey,
-              privacyByKey,
-              profilesById,
-            },
-          )
-          if (result.changed) chat.settings = result.settings
-        })
-
-      await tx
-        .table<ChatPreset>('presets')
-        .toCollection()
-        .modify((preset) => {
-          const result = migrateProviderSettingsRow(
-            preset.settings,
-            preset.connectionProfileId,
-            preset.settings.model,
-            { endpointsByKey, privacyByKey, profilesById },
-          )
-          if (result.changed) preset.settings = result.settings
-        })
+      await migrateProviderSettingsTables(tx)
     })
 
   // v8: appendPrompt slot lands on ChatSettings as a fourth preset-pinnable
@@ -841,46 +695,7 @@ export function registerSchema(db: Dexie): void {
       drafts: '&chatId, updatedAt',
     })
     .upgrade(async (tx) => {
-      const endpointsRows = await tx.table<CachedEndpointsRow>('endpoints').toArray()
-      const privacyRows = await tx.table<CachedPrivacyPolicyRow>('privacyPolicies').toArray()
-      const profiles = await tx.table<ConnectionProfile>('profiles').toArray()
-      const endpointsByKey = new Map<string, CachedEndpointsRow>()
-      const privacyByKey = new Map<string, CachedPrivacyPolicyRow>()
-      const profilesById = new Map(profiles.map((profile) => [profile.id, profile]))
-      for (const row of endpointsRows)
-        endpointsByKey.set(providerCacheKey(row.profileId, row.modelId), row)
-      for (const row of privacyRows)
-        privacyByKey.set(providerCacheKey(row.profileId, row.modelId), row)
-
-      await tx
-        .table<Chat>('chats')
-        .toCollection()
-        .modify((chat) => {
-          const result = migrateProviderSettingsRow(
-            chat.settings,
-            chat.settings.profileId,
-            chat.settings.model,
-            {
-              endpointsByKey,
-              privacyByKey,
-              profilesById,
-            },
-          )
-          if (result.changed) chat.settings = result.settings
-        })
-
-      await tx
-        .table<ChatPreset>('presets')
-        .toCollection()
-        .modify((preset) => {
-          const result = migrateProviderSettingsRow(
-            preset.settings,
-            preset.connectionProfileId,
-            preset.settings.model,
-            { endpointsByKey, privacyByKey, profilesById },
-          )
-          if (result.changed) preset.settings = result.settings
-        })
+      await migrateProviderSettingsTables(tx)
     })
 
   // v14: move first-pass OpenRouter hosted-tool settings from the old shared
@@ -933,24 +748,10 @@ export function registerSchema(db: Dexie): void {
           if (result.changed) preset.settings = result.settings
         })
 
-      const headers = await tx.table<MessageHeaderRow>('messages').toArray()
-      const headersById = new Map(headers.map((header) => [header.id, header]))
-      await tx
-        .table<MessageBodyRow>('messageBodies')
-        .toCollection()
-        .modify((body) => {
-          const migrated = migrateProviderOutputItemsFromGeneration(
-            headersById.get(body.id)?.generation,
-            (body as { providerOutputItems?: unknown }).providerOutputItems,
-          )
-          if (migrated) {
-            ;(
-              body as MessageBodyRow & {
-                providerOutputItems: typeof migrated
-              }
-            ).providerOutputItems = migrated
-          }
-        })
+      await migrateProviderOutputItemRowsInTables(
+        tx.table<MessageHeaderRow, string>('messages'),
+        tx.table<MessageBodyRow, string>('messageBodies'),
+      )
     })
 
   // v15: ChatPreset.settings is the single full ChatSettings snapshot. Backfill
@@ -1129,45 +930,7 @@ export function registerSchema(db: Dexie): void {
       drafts: '&chatId, updatedAt',
     })
     .upgrade(async (tx) => {
-      const profileRows = await tx.table<ConnectionProfile>('profiles').toArray()
-      const profilesById = new Map(profileRows.map((profile) => [profile.id, profile]))
-
-      await tx
-        .table<Chat>('chats')
-        .toCollection()
-        .modify((chat) => {
-          const result = migrateProviderApiModeSettings(
-            chat.settings,
-            profilesById.get(chat.settings.profileId),
-          )
-          if (result.changed) chat.settings = result.settings
-        })
-
-      await tx
-        .table<ChatPreset>('presets')
-        .toCollection()
-        .modify((preset) => {
-          const profile = profilesById.get(preset.connectionProfileId)
-          const result = migrateProviderApiModeSettings(preset.settings, profile)
-          const profileChanged = result.settings.profileId !== preset.connectionProfileId
-          if (result.changed || profileChanged) {
-            preset.settings = { ...result.settings, profileId: preset.connectionProfileId }
-          }
-        })
-
-      await tx
-        .table<ConnectionProfile>('profiles')
-        .toCollection()
-        .modify((profile) => {
-          const result = migrateProviderApiModeProfile(profile)
-          if (!result.changed) return
-          const row = profile as ConnectionProfile & Record<string, unknown>
-          Object.assign(row, result.profile)
-          delete row.usesResponsesApiByDefault
-          delete row.geminiMode
-          delete row.responsesDefaults
-          delete row.geminiDefaults
-        })
+      await migrateProviderApiModeTables(tx)
     })
 
   // v19: ChatPreset picker order is a first-class row field. Backfill dense
@@ -1186,7 +949,7 @@ export function registerSchema(db: Dexie): void {
       attachmentJobs:
         'id, attachmentId, processorId, status, updatedAt, [attachmentId+processorId+inputHash]',
       profiles: 'id, name, kind, lastUsedAt, archived',
-      presets: 'id, name, connectionProfileId, sortIndex, lastUsedAt, archived',
+      presets: `id, name, connectionProfileId, sortIndex, lastUsedAt, archived, ${PRESET_SORT_MIGRATION_INDEX}`,
       promptPresets: 'id, kind, name, lastUsedAt',
       folders: 'id, name, sortIndex, lastUsedAt',
       tags: 'id, &nameLower, lastUsedAt',
@@ -1204,16 +967,7 @@ export function registerSchema(db: Dexie): void {
       drafts: '&chatId, updatedAt',
     })
     .upgrade(async (tx) => {
-      const table = tx.table<ChatPreset>('presets')
-      const rows = await table.toArray()
-      rows.sort((left, right) => {
-        const bySort =
-          numberOr(left.sortIndex, left.createdAt) - numberOr(right.sortIndex, right.createdAt)
-        if (bySort !== 0) return bySort
-        const byCreatedAt = left.createdAt - right.createdAt
-        return byCreatedAt !== 0 ? byCreatedAt : left.id.localeCompare(right.id)
-      })
-      await table.bulkPut(rows.map((row, sortIndex) => ({ ...row, sortIndex })))
+      await migrateLegacyPresetSortOrder(tx.table<ChatPreset, string>('presets'))
     })
 
   // v20: rendering-preferences gained a visible line-break option. Normalize
@@ -1258,10 +1012,71 @@ export function registerSchema(db: Dexie): void {
         await settings.put({ key: RENDERING_PREFERENCES_KEY, value: next })
       }
     })
+
+  // v22: generation/continuation attempts gained explicit terminal/integrity
+  // state, fallback writes gained one persisted fence row, and attachment
+  // owners gained a normalized live-edge projection and consistent missing-byte
+  // bundles, and stale chat previews gained a one-time repair. Compose them so
+  // this implementation block has one schema bump.
+  db.version(22)
+    .stores({
+      chats:
+        'id, updatedAt, createdAt, lastViewedAt, lastUpdatedLeafId, lastBranchUpdatedAt, wordCount, totalCostUsd, archived, pinned, presetId, folderId, *tags',
+      chatSidebarRows:
+        '&id, updatedAt, createdAt, lastViewedAt, lastUpdatedLeafId, lastBranchUpdatedAt, wordCount, totalCostUsd, archived, pinned, folderId, *tags',
+      messages:
+        'id, chatId, parentId, turnId, [chatId+parentId], [chatId+createdAt], [chatId+turnId], [chatId+deleted]',
+      messageBodies: '&id, chatId, updatedAt, nodeVersion',
+      childLists: 'id, [chatId+parentId], updatedAt',
+      attachments: 'id, contentHash, kind, mime, origin, refCount, createdAt, updatedAt, deletedAt',
+      attachmentBlobs: 'id, attachmentId, role, contentHash, createdAt',
+      attachmentArtifacts: 'artifactId, attachmentId, kind, processorId, createdAt',
+      attachmentJobs:
+        'id, attachmentId, processorId, status, updatedAt, [attachmentId+processorId+inputHash]',
+      profiles: 'id, name, kind, lastUsedAt, archived',
+      presets: 'id, name, connectionProfileId, sortIndex, lastUsedAt, archived',
+      promptPresets: 'id, kind, name, lastUsedAt',
+      folders: 'id, name, sortIndex, lastUsedAt',
+      tags: 'id, &nameLower, lastUsedAt',
+      chatBranchCache: '&chatId, branchLeafId, generatedAt',
+      keys: 'id, name',
+      settings: '&key',
+      browserLocks: '&name',
+      attachmentRefEdges:
+        '&[ownerKind+ownerId+refId], attachmentId, [attachmentId+ownerKind], [ownerKind+ownerId], chatId',
+      streamLeases: '&streamId, chatId, messageId, ownerClientId, heartbeatAt',
+      streamChunks: '&id, streamId, chatId, messageId, [streamId+seq], createdAt',
+      models: '&[profileId+queryKey], fetchedAt',
+      endpoints: '&[profileId+modelId], fetchedAt',
+      privacyPolicies: '&[profileId+modelId], fetchedAt',
+      providers: '&profileId, fetchedAt',
+      generations: 'id, chatId, gen_id',
+      presetResolutions: '&[profileId+presetSlug], fetchedAt',
+      drafts: '&chatId, updatedAt',
+    })
+    .upgrade(async (tx) => {
+      await migrateWorkspaceReplacementEpoch(tx)
+      await migrateStreamLeaseAttempts(tx)
+      await migrateGenerationAttemptOutcomes(tx)
+      await migrateBrowserWriterLock(tx)
+      await normalizeAttachmentRefOwners(tx)
+      await scrubMissingAttachmentByteReferences(tx)
+      await rebuildAttachmentReferenceEdges(tx)
+      await tx.table<SettingsRow>('settings').put(attachmentRefsBackfillMarker())
+      await migrateChatPreviewProjection(tx)
+      await migrateChatSidebarProjection(tx)
+    })
+
+  // v23: add bounded message-header text previews and move potentially large
+  // provider-hosted tool outputs into the cold message body.
+  db.version(23).upgrade(async (tx) => {
+    await migrateMessageHeaderProjections(tx)
+    await migrateAttachmentHeaderProjection(tx)
+  })
 }
 
 function organizationDefaultsPatch(
-  chat: Chat & Record<string, unknown>,
+  chat: Partial<Chat> & Record<string, unknown>,
   messageHeaders: readonly Pick<Message, 'origin'>[],
   computed: {
     lastUpdatedLeafId: string | null
@@ -1328,61 +1143,28 @@ function isFiniteNumber(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value)
 }
 
-function numberOr(value: unknown, fallback: number): number {
-  return typeof value === 'number' && Number.isFinite(value) ? value : fallback
-}
-
 function jsonValuesEqual(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right)
 }
 
-const PREVIEW_MAX_CHARS = 240
-
 async function computePreviewText(
-  db: NatterDb,
+  bodies: Table<MessageBodyRow, string>,
   rows: readonly MessageHeaderRow[],
 ): Promise<string> {
   let earliestHeader: MessageHeaderRow | undefined
   for (const header of rows) {
     if (header.deleted || header.role !== 'user') continue
-    if (!earliestHeader || header.createdAt < earliestHeader.createdAt) earliestHeader = header
+    if (
+      !earliestHeader ||
+      header.createdAt < earliestHeader.createdAt ||
+      (header.createdAt === earliestHeader.createdAt && header.id < earliestHeader.id)
+    ) {
+      earliestHeader = header
+    }
   }
   if (!earliestHeader) return ''
-  const body = await db.messageBodies.get(earliestHeader.id)
-  const parts: string[] = []
-  for (const item of body?.content ?? []) {
-    if (item.type === 'text' || item.type === 'output_text') parts.push(item.text)
-  }
-  const trimmed = parts.join('').replace(/\s+/g, ' ').trim()
-  return trimmed.length > PREVIEW_MAX_CHARS
-    ? `${trimmed.slice(0, PREVIEW_MAX_CHARS - 1)}…`
-    : trimmed
-}
-
-function extensionFromFilename(value: unknown): string | undefined {
-  if (typeof value !== 'string') return undefined
-  const filename = value.split(/[\\/]/).pop() ?? value
-  const dot = filename.lastIndexOf('.')
-  if (dot <= 0 || dot === filename.length - 1) return undefined
-  return filename.slice(dot + 1).toLowerCase()
-}
-
-function storageBlobId(value: unknown): string | undefined {
-  if (!value || typeof value !== 'object') return undefined
-  const storage = value as { kind?: unknown; blobId?: unknown }
-  return storage.kind === 'local-blob' && typeof storage.blobId === 'string'
-    ? storage.blobId
-    : undefined
-}
-
-function legacyBlob(value: unknown): Blob | undefined {
-  if (value instanceof Blob) return value
-  if (!value || typeof value !== 'object') return undefined
-  const candidate = value as { size?: unknown; arrayBuffer?: unknown; type?: unknown }
-  if (typeof candidate.size !== 'number' || typeof candidate.arrayBuffer !== 'function') {
-    return undefined
-  }
-  return value as Blob
+  const body = await bodies.get(earliestHeader.id)
+  return previewTextFromContent(body?.content ?? [])
 }
 
 export function childListKey(chatId: string, parentId: string | null): string {
@@ -1391,6 +1173,8 @@ export function childListKey(chatId: string, parentId: string | null): string {
 
 let singleton: NatterDb | null = null
 let organizationFieldsBackfillPromise: Promise<void> | null = null
+let chatPreviewProjectionBackfillPromise: Promise<void> | null = null
+let chatSidebarProjectionBackfillPromise: Promise<void> | null = null
 let messageBodySplitBackfillPromise: Promise<void> | null = null
 let globalSettingsBackfillPromise: Promise<void> | null = null
 let attachmentRefsBackfillPromise: Promise<void> | null = null
@@ -1411,6 +1195,8 @@ export function getDb(): NatterDb {
 
 function resetBackfillState(): void {
   organizationFieldsBackfillPromise = null
+  chatPreviewProjectionBackfillPromise = null
+  chatSidebarProjectionBackfillPromise = null
   messageBodySplitBackfillPromise = null
   globalSettingsBackfillPromise = null
   attachmentRefsBackfillPromise = null
@@ -1435,11 +1221,21 @@ export async function openDb(): Promise<NatterDb> {
     throw err
   })
   await messageBodySplitBackfillPromise
+  chatPreviewProjectionBackfillPromise ??= backfillChatPreviewProjection(db).catch((err) => {
+    chatPreviewProjectionBackfillPromise = null
+    throw err
+  })
+  await chatPreviewProjectionBackfillPromise
   organizationFieldsBackfillPromise ??= backfillOrganizationFields(db).catch((err) => {
     organizationFieldsBackfillPromise = null
     throw err
   })
   await organizationFieldsBackfillPromise
+  chatSidebarProjectionBackfillPromise ??= ensureChatSidebarProjection(db).catch((err) => {
+    chatSidebarProjectionBackfillPromise = null
+    throw err
+  })
+  await chatSidebarProjectionBackfillPromise
   globalSettingsBackfillPromise ??= migrateGlobalSettingsRows(db).catch((err) => {
     globalSettingsBackfillPromise = null
     throw err
@@ -1470,6 +1266,13 @@ export async function openDb(): Promise<NatterDb> {
   return db
 }
 
+configureLockDatabaseOpener(openDb)
+configureBroadcastFallbackReader(async () => {
+  const db = await openDb()
+  const { mutationCounter } = await readBrowserWorkspaceMeta(db)
+  return { db, mutationCounter }
+})
+
 export function closeDb(): void {
   if (singleton) {
     singleton.close()
@@ -1494,50 +1297,77 @@ export async function backfillOrganizationFields(db: NatterDb): Promise<void> {
   const marker = await db.settings.get(ORGANIZATION_FIELDS_BACKFILL_KEY)
   if (marker?.value === 1) return
 
-  const { chats, messageHeaders } = await db.transaction('r', db.chats, db.messages, async () => {
-    const chatRows = await db.chats.toArray()
-    const headers = await db.messages.toArray()
-    return { chats: chatRows, messageHeaders: headers }
-  })
-  const messagesByChat = new Map<string, MessageHeaderRow[]>()
-  for (const message of messageHeaders) {
-    const list = messagesByChat.get(message.chatId) ?? []
-    list.push(message)
-    messagesByChat.set(message.chatId, list)
-  }
-
-  const chatPatches: Array<{ chat: Chat; patch: Partial<Chat> }> = []
-  for (const chat of chats) {
-    const rows = messagesByChat.get(chat.id) ?? []
-    const nextLeafId = findLastUpdatedLeafId(rows as unknown as Message[])
-    const branchHeaders =
-      nextLeafId !== null
-        ? (buildBranchMessages(rows as unknown as Message[], nextLeafId) as MessageHeaderRow[])
-        : []
-    const messageBodies =
-      branchHeaders.length > 0
-        ? (await db.messageBodies.bulkGet(branchHeaders.map((message) => message.id))).filter(
-            (row): row is MessageBodyRow => row !== undefined,
+  await db.transaction(
+    'rw',
+    db.chats,
+    db.chatSidebarRows,
+    db.messages,
+    db.messageBodies,
+    db.settings,
+    async (tx) => {
+      await forEachTableBatch(db.chats, async (chats) => {
+        const patchedChats: Chat[] = []
+        for (const chat of chats) {
+          const rows = await db.messages.where('chatId').equals(chat.id).toArray()
+          const nextLeafId = findLastUpdatedLeafId(rows as unknown as Message[])
+          const branchHeaders =
+            nextLeafId !== null
+              ? (buildBranchMessages(
+                  rows as unknown as Message[],
+                  nextLeafId,
+                ) as unknown as MessageHeaderRow[])
+              : []
+          let wordCount = 0
+          for (let start = 0; start < branchHeaders.length; start += BACKCOMPAT_BATCH_SIZE) {
+            const headers = branchHeaders.slice(start, start + BACKCOMPAT_BATCH_SIZE)
+            const bodies = (
+              await db.messageBodies.bulkGet(headers.map((message) => message.id))
+            ).filter((row): row is MessageBodyRow => row !== undefined)
+            wordCount += countMessagesWords(hydrateMessages(headers, bodies))
+          }
+          const totalCostUsd = rows.reduce(
+            (total, message) => total + (message.deleted ? 0 : (message.generation?.cost ?? 0)),
+            0,
           )
-        : []
-    const branch = hydrateMessages(branchHeaders, messageBodies)
-    const totalCostUsd = rows.reduce(
-      (total, message) => total + (message.deleted ? 0 : (message.generation?.cost ?? 0)),
-      0,
-    )
-    const patch = organizationDefaultsPatch(chat as Chat & Record<string, unknown>, rows, {
-      lastUpdatedLeafId: nextLeafId,
-      previewText:
-        chat.previewText === undefined ? await computePreviewText(db, rows) : chat.previewText,
-      wordCount: countMessagesWords(branch),
-      totalCostUsd,
-    })
-    if (patch) chatPatches.push({ chat, patch })
-  }
+          const patch = organizationDefaultsPatch(
+            chat as Partial<Chat> & Record<string, unknown>,
+            rows,
+            {
+              lastUpdatedLeafId: nextLeafId,
+              previewText:
+                chat.previewText === undefined
+                  ? await computePreviewText(db.messageBodies, rows)
+                  : chat.previewText,
+              wordCount,
+              totalCostUsd,
+            },
+          )
+          if (patch) patchedChats.push({ ...chat, ...patch })
+        }
+        if (patchedChats.length > 0) {
+          await db.chats.bulkPut(patchedChats)
+          for (const chat of patchedChats) await putChatSidebarProjection(tx, chat)
+        }
+      })
+      await db.settings.put(organizationFieldsBackfillMarker())
+    },
+  )
+}
 
-  await db.transaction('rw', db.chats, db.settings, async () => {
-    const patchedChats = chatPatches.map(({ chat, patch }) => ({ ...chat, ...patch }))
-    if (patchedChats.length > 0) await db.chats.bulkPut(patchedChats)
-    await db.settings.put(organizationFieldsBackfillMarker())
-  })
+async function ensureChatSidebarProjection(db: NatterDb): Promise<void> {
+  const [marker, manifest, actualCount] = await db.transaction(
+    'r',
+    db.chatSidebarRows,
+    db.settings,
+    async () =>
+      Promise.all([
+        db.settings.get(CHAT_SIDEBAR_PROJECTION_BACKFILL_KEY),
+        db.settings.get(CHAT_SIDEBAR_PROJECTION_MANIFEST_KEY),
+        db.chatSidebarRows.count(),
+      ]),
+  )
+  if (marker?.value === 1 && isValidChatSidebarProjectionManifest(manifest?.value, actualCount)) {
+    return
+  }
+  await rebuildChatSidebarProjection(db)
 }

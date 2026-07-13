@@ -1,6 +1,3 @@
-// Prev / Next swipe anchors + editable variant-count + first/last
-// jumps. See `plan/10-ui.md §10.6` and `plan/08-branching.md §8.4.3`.
-//
 // Every arrow/label is an `<a>` anchor so middle-click / Cmd-click
 // falls through to the browser and opens the sibling in a new tab at
 // `#/chat/<id>/message/<siblingId>`. Plain left-click is intercepted
@@ -17,19 +14,25 @@ import {
   useState,
 } from 'react'
 import { chatHref } from '../../app/router'
-import { cursorKeyOf, groupByParent, indexById } from '../../core/active-path'
+import { cursorKeyOf } from '../../core/active-path'
 import { resolveLastUpdatedBranchBelow } from '../../core/branch-resolve'
 import { swipe } from '../../core/messages'
 import type { ChatId, CursorMap, Message } from '../../core/types'
 import { useChatStore } from '../../store/zustand/chatStore'
 
+export interface BranchNavigationContext {
+  messages: readonly Message[]
+  byParent: Map<string | null, Message[]>
+  byId: Map<string, Message>
+}
+
 interface BranchControlsProps {
   chatId: ChatId
   message: Message
-  messages: readonly Message[]
+  context: BranchNavigationContext
 }
 
-export function BranchControls({ chatId, message, messages }: BranchControlsProps) {
+export function BranchControls({ chatId, message, context }: BranchControlsProps) {
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState('')
   const inputRef = useRef<HTMLInputElement | null>(null)
@@ -47,7 +50,7 @@ export function BranchControls({ chatId, message, messages }: BranchControlsProp
     el.select()
   }, [editing])
 
-  const byParent = groupByParent(messages)
+  const { byId, byParent, messages } = context
   const siblings = (byParent.get(message.parentId) ?? []).filter((m) => !m.deleted)
   const sorted = [...siblings].sort((a, b) => a.siblingIndex - b.siblingIndex)
   const idx = sorted.findIndex((s) => s.id === message.id)
@@ -62,13 +65,13 @@ export function BranchControls({ chatId, message, messages }: BranchControlsProp
         {
           targetId,
           byParent,
-          byId: indexById(messages),
+          byId,
         },
         nextCursor,
       )
       useChatStore.getState().setCursor(chatId, nextCursor)
     },
-    [chatId, message.parentId, byParent, messages],
+    [byId, byParent, chatId, message.parentId],
   )
 
   if (siblings.length < 2) return null
@@ -99,7 +102,7 @@ export function BranchControls({ chatId, message, messages }: BranchControlsProp
         {
           targetId: chosenId,
           byParent,
-          byId: indexById(messages),
+          byId,
         },
         nextCursor,
       )

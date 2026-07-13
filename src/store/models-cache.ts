@@ -1,15 +1,14 @@
-// Cached `/models` and `/endpoints` results. See `plan/03-storage.md §3.12` and
-// `plan/07-discovery.md §7.4`.
-//
 // The cache key for `/models` is the normalized query signature so equivalent
 // filters share a row. Endpoints are keyed by `(profileId, modelId)`. Every
 // row carries `fetchedAt` for TTL checks; the caller decides the TTL since
 // different surfaces tolerate different staleness.
 
 import { modelsCacheKey } from '../core/cache-keys'
-import type { ModelsQuery, ProfileId } from '../core/types'
-import { postEvent } from './broadcast'
+import type { ConnectionProfile, ModelsQuery, ProfileId } from '../core/types'
+import { onEvent, postEvent } from './broadcast'
 import { type CachedEndpointsRow, type CachedModelsRow, getDb } from './db'
+import { withNamedLock } from './locks'
+import { readBrowserWorkspaceMeta, readBrowserWorkspaceMetaFromTransaction } from './workspace-meta'
 
 export const MODELS_TTL_MS = 60 * 60 * 1000
 export const ENDPOINTS_TTL_MS = 5 * 60 * 1000
@@ -76,29 +75,58 @@ export async function clearEndpointsCacheForProfile(profileId: ProfileId): Promi
 // dedup the browser fires two identical requests that both land in
 // `putCachedEndpoints`/`putCachedModels`. The Map makes concurrent
 // callers share one Promise. Single-tab only — it is not a substitute
-// for a Web Lock across tabs, but the Dexie live-query already serializes
-// visible writes cross-tab (both tabs' fetches land in the same cache
+// for a Web Lock across tabs (both tabs' fetches can land in the same cache
 // row; the losing tab's row is a harmless overwrite).
 const modelsInFlight = new Map<string, Promise<void>>()
 const endpointsInFlight = new Map<string, Promise<void>>()
+let workspaceEpoch = 0
+let unsubscribe: (() => void) | null = null
+
+function ensureWorkspaceListener(): void {
+  if (unsubscribe) return
+  unsubscribe = onEvent((event) => {
+    if (event.kind === 'workspace-replaced') {
+      workspaceEpoch += 1
+      modelsInFlight.clear()
+      endpointsInFlight.clear()
+    } else if (event.kind === 'workspace-invalidated') {
+      modelsInFlight.clear()
+      endpointsInFlight.clear()
+    }
+  })
+}
 
 export function dedupedModelsFetch(
   profileId: ProfileId,
   query: ModelsQuery,
   fetchPayload: () => Promise<unknown>,
 ): Promise<void> {
+  ensureWorkspaceListener()
   const key = `${profileId}\u0000${modelsCacheKey(query)}`
   const existing = modelsInFlight.get(key)
   if (existing) return existing
   const promise = (async () => {
-    try {
-      const payload = await fetchPayload()
-      await putCachedModels(profileId, query, payload)
-    } finally {
-      modelsInFlight.delete(key)
-    }
+    const epoch = workspaceEpoch
+    const replacementEpoch = await currentReplacementEpoch()
+    const profileFingerprint = await currentProfileFingerprint(profileId)
+    const payload = await fetchPayload()
+    if (epoch !== workspaceEpoch) return
+    const queryKey = modelsCacheKey(query)
+    const committed = await commitCacheIfWorkspaceUnchanged({
+      tableName: 'models',
+      lockName: `models-cache:${profileId}:${queryKey}`,
+      profileId,
+      profileFingerprint,
+      replacementEpoch,
+      row: { profileId, queryKey, fetchedAt: Date.now(), payload },
+    })
+    if (committed) postEvent({ kind: 'models-refreshed', profileId })
   })()
   modelsInFlight.set(key, promise)
+  const clear = () => {
+    if (modelsInFlight.get(key) === promise) modelsInFlight.delete(key)
+  }
+  void promise.then(clear, clear)
   return promise
 }
 
@@ -107,17 +135,76 @@ export function dedupedEndpointsFetch(
   modelId: string,
   fetchPayload: () => Promise<unknown>,
 ): Promise<void> {
+  ensureWorkspaceListener()
   const key = `${profileId}\u0000${modelId}`
   const existing = endpointsInFlight.get(key)
   if (existing) return existing
   const promise = (async () => {
-    try {
-      const payload = await fetchPayload()
-      await putCachedEndpoints(profileId, modelId, payload)
-    } finally {
-      endpointsInFlight.delete(key)
-    }
+    const epoch = workspaceEpoch
+    const replacementEpoch = await currentReplacementEpoch()
+    const profileFingerprint = await currentProfileFingerprint(profileId)
+    const payload = await fetchPayload()
+    if (epoch !== workspaceEpoch) return
+    await commitCacheIfWorkspaceUnchanged({
+      tableName: 'endpoints',
+      lockName: `endpoints-cache:${profileId}:${modelId}`,
+      profileId,
+      profileFingerprint,
+      replacementEpoch,
+      row: { profileId, modelId, fetchedAt: Date.now(), payload },
+    })
   })()
   endpointsInFlight.set(key, promise)
+  const clear = () => {
+    if (endpointsInFlight.get(key) === promise) endpointsInFlight.delete(key)
+  }
+  void promise.then(clear, clear)
   return promise
+}
+
+async function commitCacheIfWorkspaceUnchanged(input: {
+  tableName: 'models' | 'endpoints'
+  lockName: string
+  profileId: ProfileId
+  profileFingerprint: string | null
+  replacementEpoch: number
+  row: CachedModelsRow | CachedEndpointsRow
+}): Promise<boolean> {
+  return withNamedLock(input.lockName, async (grant) => {
+    const db = getDb()
+    return grant.runTransaction(
+      db,
+      [db.table(input.tableName), db.profiles, db.settings],
+      async (tx) => {
+        const meta = await readBrowserWorkspaceMetaFromTransaction(tx)
+        if (meta.replacementEpoch !== input.replacementEpoch) return false
+        const current = await tx
+          .table<ConnectionProfile, ProfileId>('profiles')
+          .get(input.profileId)
+        if (fingerprint(current) !== input.profileFingerprint) return false
+        await tx.table(input.tableName).put(input.row)
+        return true
+      },
+    )
+  })
+}
+
+async function currentReplacementEpoch(): Promise<number> {
+  return (await readBrowserWorkspaceMeta(getDb())).replacementEpoch
+}
+
+async function currentProfileFingerprint(profileId: ProfileId): Promise<string | null> {
+  return fingerprint(await getDb().profiles.get(profileId))
+}
+
+function fingerprint(value: unknown): string | null {
+  return value === undefined ? null : JSON.stringify(value)
+}
+
+export function __resetModelsInFlightForTests(): void {
+  modelsInFlight.clear()
+  endpointsInFlight.clear()
+  workspaceEpoch = 0
+  unsubscribe?.()
+  unsubscribe = null
 }

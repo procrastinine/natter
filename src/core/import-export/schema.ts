@@ -17,6 +17,11 @@ import type {
   ProfileId,
   PromptPreset,
 } from '../types'
+import {
+  assertPortableChatPresetRows,
+  assertPortableChatRows,
+  assertWorkspaceBackupRows,
+} from './row-validation'
 
 export const NATTER_EXPORT_SCHEMA_VERSION = 1
 
@@ -181,6 +186,7 @@ function assertChatPayload(value: unknown): asserts value is PortableChatPayload
   if (!Array.isArray(value.messages)) throw new Error('ImportChatMissingMessages')
   if (!Array.isArray(value.tags)) throw new Error('ImportChatMissingTags')
   if (!Array.isArray(value.attachments)) throw new Error('ImportChatMissingAttachments')
+  assertPortableChatRows(value)
 }
 
 function assertChatPresetPayload(value: unknown): asserts value is PortableChatPresetPayload {
@@ -188,6 +194,7 @@ function assertChatPresetPayload(value: unknown): asserts value is PortableChatP
   if (typeof value.sourcePresetId !== 'string') throw new Error('ImportPresetMissingSourceId')
   if (typeof value.name !== 'string') throw new Error('ImportPresetMissingName')
   if (!isRecord(value.settings)) throw new Error('ImportPresetMissingSettings')
+  assertPortableChatPresetRows(value)
 }
 
 function assertWorkspaceBackupPayload(value: unknown): asserts value is WorkspaceBackupPayload {
@@ -209,6 +216,7 @@ function assertWorkspaceBackupPayload(value: unknown): asserts value is Workspac
   ] as const) {
     if (!Array.isArray(value[key])) throw new Error(`ImportWorkspaceMissingTable:${key}`)
   }
+  assertWorkspaceBackupRows(value)
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

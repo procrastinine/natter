@@ -1,4 +1,8 @@
-import type { WorkspaceRepository } from '../store/repository'
+import {
+  chatMatchesBranchCacheWriteGuard,
+  readChatBranchCacheSource,
+  type WorkspaceRepository,
+} from '../store/repository'
 import { indexById } from './active-path'
 import type {
   Chat,
@@ -77,9 +81,7 @@ export function flattenBranchMessages(
   }
   for (const message of messages) {
     const phase = message.phase ? ` (${PHASE_LABEL[message.phase]})` : ''
-    blocks.push(
-      `${ROLE_LABEL[message.role] ?? message.role.toUpperCase()}${phase}:\n${messageRenderableText(message)}`,
-    )
+    blocks.push(`${ROLE_LABEL[message.role]}${phase}:\n${messageRenderableText(message)}`)
   }
   return `${blocks.join('\n\n')}\n`
 }
@@ -127,35 +129,49 @@ export async function exportLastUpdatedBranchAsTxt(
   repo: WorkspaceRepository,
   chatId: ChatId,
 ): Promise<ChatTextExport> {
-  const chat = await repo.getChat(chatId)
-  if (!chat) throw new Error(`ChatMissing:${chatId}`)
-  const cached = await repo.getChatBranchCache(chatId)
-  if (
-    cached &&
-    cached.branchLeafId === chat.lastUpdatedLeafId &&
-    cached.generatedAt >= chat.lastBranchUpdatedAt
-  ) {
+  for (;;) {
+    const { chat, expected } = await readChatBranchCacheSource(repo, chatId)
+    if (!chat) throw new Error(`ChatMissing:${chatId}`)
+    const cached = await repo.getChatBranchCache(chatId)
+    if ((await repo.getWorkspaceMeta()).replacementEpoch !== expected.replacementEpoch) continue
+    if (
+      cached &&
+      cached.branchLeafId === chat.lastUpdatedLeafId &&
+      cached.generatedAt >= chat.lastBranchUpdatedAt
+    ) {
+      return {
+        filename: exportFilename(chat),
+        content: textBodyWithTitle(chat, cached.textContent),
+      }
+    }
+
+    const branch = await repo.getBranchByLeaf(chatId, chat.lastUpdatedLeafId)
+    if (chat.lastUpdatedLeafId === null) {
+      if (cached) await repo.deleteChatBranchCache(chatId, expected)
+      const current = await readChatBranchCacheSource(repo, chatId)
+      if (!current.chat) throw new Error(`ChatMissing:${chatId}`)
+      if (
+        current.expected.replacementEpoch !== expected.replacementEpoch ||
+        !chatMatchesBranchCacheWriteGuard(current.chat, expected)
+      ) {
+        continue
+      }
+    } else {
+      const written = await repo.putChatBranchCache(
+        buildBranchCacheRow({
+          chatId,
+          branchLeafId: chat.lastUpdatedLeafId,
+          messages: branch,
+          generatedAt: Math.max(Date.now(), chat.lastBranchUpdatedAt),
+        }),
+        expected,
+      )
+      if (!written) continue
+    }
     return {
       filename: exportFilename(chat),
-      content: textBodyWithTitle(chat, cached.textContent),
+      content: flattenBranchMessages(branch, chat),
     }
-  }
-
-  const branch = await repo.getBranchByLeaf(chatId, chat.lastUpdatedLeafId)
-  if (chat.lastUpdatedLeafId === null) {
-    if (cached) await repo.deleteChatBranchCache(chatId)
-  } else {
-    await repo.putChatBranchCache(
-      buildBranchCacheRow({
-        chatId,
-        branchLeafId: chat.lastUpdatedLeafId,
-        messages: branch,
-      }),
-    )
-  }
-  return {
-    filename: exportFilename(chat),
-    content: flattenBranchMessages(branch, chat),
   }
 }
 

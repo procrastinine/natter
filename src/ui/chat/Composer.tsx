@@ -1,6 +1,7 @@
 import { type ReactNode, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import type { SendShortcut } from '../../core/global-settings'
 import type { MessageAttachmentRef } from '../../core/types'
+import { isPageHidingAbortError } from '../../lib/page-lifecycle'
 import { AttachmentDraftTray } from '../attachments/AttachmentDraftTray'
 import { AttachmentPicker } from '../attachments/AttachmentPicker'
 import { useAttachmentDrafts } from '../attachments/useAttachmentDrafts'
@@ -34,6 +35,7 @@ interface ComposerProps {
   // "Import at end" button handler (§10.7). Opens the import modal
   // pre-scoped to "end of active path." Rendered only when provided.
   onImportAtEnd?: () => void
+  onImportAtEndIntent?: () => void
   // Reply-to-trailing-user handler. When the active path ends with a
   // user message and the composer text is empty, pressing Send triggers
   // this instead of creating a new user message — it just fires an
@@ -209,6 +211,7 @@ export function Composer({
   streaming = false,
   onAbort,
   onImportAtEnd,
+  onImportAtEndIntent,
   onReplyToTrailingUser,
   trailingUserMessage,
   autoSize = false,
@@ -443,6 +446,7 @@ export function Composer({
         try {
           await onReplyToTrailingUser()
         } catch (err) {
+          if (isPageHidingAbortError(err)) return
           console.error('composer reply failed', err)
         } finally {
           setSubmitting(false)
@@ -471,6 +475,7 @@ export function Composer({
         ...(refsOut.length > 0 ? { attachmentRefs: refsOut } : {}),
       })
     } catch (err) {
+      if (isPageHidingAbortError(err)) return
       setComposerText((current) => (current.length === 0 ? out : current))
       if (refsOut.length > 0) restoreAttachments(refsOut, rowsOut)
       if (prefillOut.length > 0) setPrefillText(prefillOut)
@@ -702,6 +707,9 @@ export function Composer({
             <button
               type="button"
               data-ui="composer-import-at-end"
+              onPointerEnter={onImportAtEndIntent}
+              onPointerDown={onImportAtEndIntent}
+              onFocus={onImportAtEndIntent}
               onClick={onImportAtEnd}
               aria-label="Import messages at the end of the chat"
               title="Import at end (⇧⌘V)"

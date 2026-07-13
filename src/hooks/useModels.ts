@@ -1,8 +1,5 @@
-// Live `/models` query with Dexie-backed cache. See `plan/07-discovery.md
-// §7.4` and `§7.9`.
-//
 // Behavior:
-// - Reads the cached row via `useLiveQuery`; immediately returns what's on
+// - Reads the cached row reactively; immediately returns what's on
 //   disk so the UI never blocks on a network round-trip.
 // - On mount (or whenever the cache key changes), triggers a refresh if
 //   the row is stale (TTL 1h) or missing — stale-while-revalidate.
@@ -13,11 +10,11 @@
 //   table — bundled entries fill in capability fields the upstream list
 //   doesn't expose.
 
-import { useLiveQuery } from 'dexie-react-hooks'
 import { useEffect, useMemo, useState } from 'react'
 import { fetchModels, type ModelsQueryString } from '../api/models'
 import { type ModelListEntry, normalizeModelsResponse } from '../api/providers'
 import { listBundledEntries } from '../capabilities'
+import { modelsCacheKey } from '../core/cache-keys'
 import { canonicalCompatModelId, compatModelIdsMatch, structuralModelSlug } from '../core/model-ids'
 import type { ConnectionProfile, ModelsQuery, ProfileId } from '../core/types'
 import { resolveKeyIfPresent } from '../store/keys'
@@ -29,6 +26,8 @@ import {
   MODELS_TTL_MS,
 } from '../store/models-cache'
 import { getProfile } from '../store/profiles'
+import { primaryKeys } from '../store/reactive-dependencies'
+import { useRepositoryQuery } from '../store/reactive-query'
 
 interface UseModelsOptions {
   query?: ModelsQuery
@@ -65,19 +64,21 @@ export function useModels(
   // and loop the network (ERR_INSUFFICIENT_RESOURCES on failure paths).
   const queryKey = JSON.stringify(opts.query ?? {})
   const query = useMemo<ModelsQuery>(() => JSON.parse(queryKey) as ModelsQuery, [queryKey])
-  const cachedRow = useLiveQuery(
+  const cachedRow = useRepositoryQuery(
+    JSON.stringify(['models-cache', profileId, queryKey]),
     () => (profileId ? getCachedModels(profileId, query) : Promise.resolve(undefined)),
-    [profileId, queryKey],
     undefined,
+    primaryKeys('models', profileId ? [profileId, modelsCacheKey(query)] : undefined),
   )
   const [error, setError] = useState<string | null>(null)
   const [inFlight, setInFlight] = useState(false)
   const [refreshToken, setRefreshToken] = useState(0)
 
-  const profile = useLiveQuery(
+  const profile = useRepositoryQuery(
+    JSON.stringify(['profile', profileId]),
     () => (profileId ? getProfile(profileId) : Promise.resolve(undefined)),
-    [profileId],
     undefined,
+    primaryKeys('profiles', profileId),
   )
 
   useEffect(() => {
@@ -86,7 +87,8 @@ export function useModels(
     const fetchedAt = cachedRow?.fetchedAt
     const fresh = fetchedAt !== undefined && isFresh(fetchedAt, MODELS_TTL_MS)
     if (fresh && refreshToken === 0) return
-    let cancelled = false
+    const requestState = { cancelled: false }
+    const isCancelled = () => requestState.cancelled
     setInFlight(true)
     setError(null)
     void (async () => {
@@ -97,24 +99,24 @@ export function useModels(
         // the owning component unmounted.
         await dedupedModelsFetch(profile.id, query, () => loadModelsPayload(profile, query))
       } catch (err) {
-        if (cancelled) {
+        if (isCancelled()) {
           return
         }
         if (profile.kind === 'llama-server') {
           await clearCachedModels(profile.id, query)
-          if (cancelled) {
+          if (isCancelled()) {
             return
           }
         }
         setError(err instanceof Error ? err.message : 'refresh failed')
       } finally {
-        if (!cancelled) {
+        if (!isCancelled()) {
           setInFlight(false)
         }
       }
     })()
     return () => {
-      cancelled = true
+      requestState.cancelled = true
     }
   }, [enabled, profile, query, cachedRow?.fetchedAt, refreshToken])
 

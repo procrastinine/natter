@@ -1,5 +1,3 @@
-// Right-side settings pane for the current chat. See `plan/10-ui.md §10.9`.
-//
 // Tabs:
 // 1. "Model & Provider"  — inline model picker + (OpenRouter only) provider
 //                          picker shell
@@ -13,7 +11,6 @@
 // diverges the chat from its seed preset; the breadcrumb lets the user
 // write those edits back to the preset (update or save-as-new).
 
-import { useLiveQuery } from 'dexie-react-hooks'
 import {
   type ChangeEvent,
   type PointerEvent,
@@ -58,6 +55,14 @@ import {
   updatePreset,
 } from '../../store/presets'
 import { getProfile } from '../../store/profiles'
+import {
+  allTable,
+  chatMessageDependencies,
+  GLOBAL_PREFERENCES_DEPENDENCIES,
+  GLOBAL_TOKEN_CALIBRATION_DEPENDENCIES,
+  primaryKeys,
+} from '../../store/reactive-dependencies'
+import { useRepositoryQuery } from '../../store/reactive-query'
 import { loadActiveBranchHeaderSnapshot, loadSendContextForBranch } from '../../store/send-context'
 import { useChatStore } from '../../store/zustand/chatStore'
 import { useStreamStore } from '../../store/zustand/streamStore'
@@ -96,13 +101,12 @@ export function ChatModelPanel({
 }: ChatModelPanelProps) {
   const chat = chatSnapshot
 
-  const snapshotProfile =
-    chat && profileSnapshot?.id === chat.settings.profileId ? profileSnapshot : null
-  const liveProfile = useLiveQuery(
-    () =>
-      !snapshotProfile && chat ? getProfile(chat.settings.profileId) : Promise.resolve(undefined),
-    [chat?.settings.profileId, snapshotProfile?.id],
+  const snapshotProfile = profileSnapshot?.id === chat.settings.profileId ? profileSnapshot : null
+  const liveProfile = useRepositoryQuery(
+    JSON.stringify(['profile-fallback', chat.settings.profileId, snapshotProfile?.id]),
+    () => (!snapshotProfile ? getProfile(chat.settings.profileId) : Promise.resolve(undefined)),
     undefined,
+    primaryKeys('profiles', !snapshotProfile ? chat.settings.profileId : undefined),
   )
   const profileCacheRef = useRef(new Map<string, ConnectionProfile>())
   useEffect(() => {
@@ -112,7 +116,7 @@ export function ChatModelPanel({
   const profile =
     snapshotProfile ??
     liveProfile ??
-    (chat?.settings.profileId ? profileCacheRef.current.get(chat.settings.profileId) : undefined)
+    (chat.settings.profileId ? profileCacheRef.current.get(chat.settings.profileId) : undefined)
   const [llamaProps, setLlamaProps] = useState<LlamaServerProps | null>(null)
   useEffect(() => {
     if (profile?.kind !== 'llama-server') {
@@ -129,10 +133,11 @@ export function ChatModelPanel({
     }
   }, [profile?.kind, profile?.baseUrl])
 
-  const livePreset = useLiveQuery(
-    () => (chat?.presetId ? getPreset(chat.presetId) : Promise.resolve(undefined)),
-    [chat?.presetId],
+  const livePreset = useRepositoryQuery(
+    JSON.stringify(['preset', chat.presetId]),
+    () => (chat.presetId ? getPreset(chat.presetId) : Promise.resolve(undefined)),
     undefined,
+    primaryKeys('presets', chat.presetId),
   )
   const presetCacheRef = useRef(new Map<string, ChatPreset>())
   useEffect(() => {
@@ -140,12 +145,12 @@ export function ChatModelPanel({
     presetCacheRef.current.set(livePreset.id, livePreset)
   }, [livePreset])
   const preset =
-    livePreset ?? (chat?.presetId ? presetCacheRef.current.get(chat.presetId) : undefined)
+    livePreset ?? (chat.presetId ? presetCacheRef.current.get(chat.presetId) : undefined)
   const routing = usePrivacyRouting(chat)
   const { capability, descriptor, modelAvailable } = routing
   const endpointTokenizer = descriptor?.architecture?.tokenizer ?? null
   const [tab, setTab] = useState<Tab>('model')
-  const needsPromptEstimate = !!chat && tab === 'context'
+  const needsPromptEstimate = tab === 'context'
   const canEstimatePrompt =
     needsPromptEstimate &&
     !!capability &&
@@ -153,11 +158,20 @@ export function ChatModelPanel({
       capability.maxPromptTokens !== undefined ||
       capability.maxCompletionTokens !== undefined)
   const cursor = useChatStore((s) =>
-    chat && canEstimatePrompt ? (s.cursors[chat.id] ?? EMPTY_CURSOR) : EMPTY_CURSOR,
+    canEstimatePrompt ? (s.cursors[chat.id] ?? EMPTY_CURSOR) : EMPTY_CURSOR,
   )
-  const activeSendContext = useLiveQuery(
+  const activeSendContext = useRepositoryQuery(
+    JSON.stringify([
+      'active-send-context',
+      chat.id,
+      chat.metaVersion,
+      chat.summaryVersion,
+      canEstimatePrompt,
+      cursor,
+      capability,
+    ]),
     async () => {
-      if (!chat || !canEstimatePrompt) return null
+      if (!canEstimatePrompt) return null
       const branch = await loadActiveBranchHeaderSnapshot(chat.id, cursor)
       return loadSendContextForBranch({
         chat,
@@ -165,22 +179,31 @@ export function ChatModelPanel({
         capabilities: capability,
       })
     },
-    [chat, canEstimatePrompt, cursor, capability],
     null,
+    canEstimatePrompt
+      ? [
+          ...chatMessageDependencies(chat.id),
+          ...GLOBAL_PREFERENCES_DEPENDENCIES,
+          ...GLOBAL_TOKEN_CALIBRATION_DEPENDENCIES,
+          ...allTable('attachments', 'attachmentArtifacts'),
+        ]
+      : [],
   )
-  const prefs = useLiveQuery(
+  const prefs = useRepositoryQuery(
+    `global-preferences:context:${canEstimatePrompt ? 'enabled' : 'disabled'}`,
     () =>
       canEstimatePrompt ? readGlobalPreferences() : Promise.resolve(DEFAULT_GLOBAL_PREFERENCES),
-    [canEstimatePrompt],
     DEFAULT_GLOBAL_PREFERENCES,
+    canEstimatePrompt ? GLOBAL_PREFERENCES_DEPENDENCIES : [],
   )
-  const globalCalibration = useLiveQuery(
+  const globalCalibration = useRepositoryQuery(
+    `token-calibration-global:${canEstimatePrompt ? 'enabled' : 'disabled'}`,
     () => (canEstimatePrompt ? readTokenCalibrationGlobal() : Promise.resolve(null)),
-    [canEstimatePrompt],
     null,
+    canEstimatePrompt ? GLOBAL_TOKEN_CALIBRATION_DEPENDENCIES : [],
   )
   const streamActivityKey = useStreamStore((s) =>
-    chat && canEstimatePrompt
+    canEstimatePrompt
       ? Object.values(s.activeByStreamId)
           .filter((stream) => stream.chatId === chat.id)
           .map((stream) => (stream.messageId ? `m:${stream.messageId}` : `s:${stream.streamId}`))
@@ -192,18 +215,18 @@ export function ChatModelPanel({
     ? (activeSendContext?.pathMessages ?? EMPTY_MESSAGES)
     : EMPTY_MESSAGES
   const attachmentResolver = useAttachmentResolverForContext({
-    settings: chat?.settings,
+    settings: chat.settings,
     messages: activePathMessages,
     enabled: canEstimatePrompt,
   })
   const promptEstimateInput = useMemo<PromptSizeEstimateInput | null>(() => {
-    if (!chat || !canEstimatePrompt) return null
+    if (!canEstimatePrompt) return null
     return buildSettingsPromptSizeEstimateInput(
       chat.settings,
       activePathMessages,
       '',
       endpointTokenizer,
-      capability?.maxPromptTokens ?? capability?.contextLength ?? null,
+      capability.maxPromptTokens ?? capability.contextLength ?? null,
       attachmentResolver,
       {
         chatTokenCalibration: chat.tokenCalibration,
@@ -226,12 +249,12 @@ export function ChatModelPanel({
   ])
   const deferredPromptEstimateInput = useDeferredValue(promptEstimateInput)
   const promptEstimate = useStreamStablePromptEstimate(
-    chat?.id,
+    chat.id,
     deferredPromptEstimateInput,
     streamActivityKey,
   )
   const providerNeededTokens = useMemo(() => {
-    if (!chat || !promptEstimate) return null
+    if (!promptEstimate) return null
     const reserveRaw = chat.settings.maxCompletionTokens
     const reserve = reserveRaw === UNLIMITED_CONTEXT ? 0 : (reserveRaw ?? 0)
     return promptEstimate.total + reserve
@@ -438,7 +461,7 @@ interface PresetDragState {
 
 function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | undefined }) {
   const pushToast = useToastStore((s) => s.push)
-  const presets = useLiveQuery(() => listPresets(), [], [])
+  const presets = useRepositoryQuery('presets:all', () => listPresets(), [], allTable('presets'))
   const [dragState, setDragState] = useState<PresetDragState | null>(null)
   const dragStateRef = useRef<PresetDragState | null>(null)
   const presetItemRefs = useRef(new Map<PresetId, HTMLLIElement>())
@@ -572,7 +595,9 @@ function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | u
     (event: PointerEvent<HTMLButtonElement>, presetId: PresetId) => {
       if (event.button !== 0) return
       event.preventDefault()
-      event.currentTarget.setPointerCapture?.(event.pointerId)
+      const captureTarget: Partial<Pick<HTMLButtonElement, 'setPointerCapture'>> =
+        event.currentTarget
+      captureTarget.setPointerCapture?.(event.pointerId)
       const nextState: PresetDragState = {
         draggedId: presetId,
         orderedIds: visiblePresets.map((p) => p.id),
@@ -588,8 +613,7 @@ function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | u
   const updatePresetDragPosition = useCallback((event: PointerEvent<HTMLButtonElement>) => {
     const current = dragStateRef.current
     if (
-      !current ||
-      current.status !== 'dragging' ||
+      current?.status !== 'dragging' ||
       current.draggedId === null ||
       current.pointerId !== event.pointerId
     ) {
@@ -610,7 +634,7 @@ function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | u
 
   const commitPresetDrag = useCallback(async () => {
     const current = dragStateRef.current
-    if (!current || current.status !== 'dragging') return
+    if (current?.status !== 'dragging') return
     const liveIds = presets.map((p) => p.id)
     const liveIdSet = new Set(liveIds)
     const orderedIds = current.orderedIds.filter((id) => liveIdSet.has(id))
@@ -638,7 +662,9 @@ function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | u
       const current = dragStateRef.current
       event.preventDefault()
       if (current?.pointerId !== event.pointerId) return
-      event.currentTarget.releasePointerCapture?.(event.pointerId)
+      const captureTarget: Partial<Pick<HTMLButtonElement, 'releasePointerCapture'>> =
+        event.currentTarget
+      captureTarget.releasePointerCapture?.(event.pointerId)
       void commitPresetDrag()
     },
     [commitPresetDrag],

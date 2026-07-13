@@ -1,5 +1,3 @@
-// Phase 11 `chooseApi` matrix. See `plan/phase11-implementation.md §1`.
-
 import { describe, expect, it } from 'vitest'
 import {
   chooseApi,
@@ -270,6 +268,19 @@ describe('chooseApi matrix', () => {
         makeCaps({ reasoningPreservationFormat: 'openai-responses-v1' }),
       )
       expect(r.kind).toBe('responses')
+    })
+
+    it('does not upgrade from a tool-prefixed encrypted row', () => {
+      const assistant = assistantWithEncrypted('a1', 'openai-responses-v1')
+      const detail = assistant.reasoningDetails?.[0]
+      if (detail) detail.id = 'tool_call-1'
+      const r = chooseApi(
+        makeProfile(),
+        makeSettings('auto', true, 'anthropic/claude-haiku-4.5'),
+        [assistant],
+        makeCaps({ reasoningPreservationFormat: 'openai-responses-v1' }),
+      )
+      expect(r.kind).toBe('chat-completions')
     })
 
     it('does NOT upgrade when include.encrypted is false (non-OpenAI model to isolate step 6)', () => {

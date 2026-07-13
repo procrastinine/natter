@@ -1,6 +1,3 @@
-// Low-level tree mutators used by `src/core/messages.ts`. See
-// `plan/08-branching.md §8.4.2–§8.4.10` and §8.10 for invariants.
-//
 // These helpers run inside a repository mutation. They do not start
 // transactions of their own, do not broadcast, and do not write cursor state.
 // They return the data the caller needs to apply those side effects.
@@ -185,14 +182,16 @@ export async function cascadeSoftDelete(
       stack.push(kid.id)
     }
   }
+  const tombstoned: MessageId[] = []
   for (const id of toTombstone) {
     const row = await ctx.getMessage(id)
     if (!row) continue
     if (!row.deleted) {
       await ctx.putMessage({ ...row, deleted: true })
+      tombstoned.push(id)
     }
   }
-  return [...toTombstone]
+  return tombstoned
 }
 
 // Collect every message in the same turn chain as `headId`. The head (the

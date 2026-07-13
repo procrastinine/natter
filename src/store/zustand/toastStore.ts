@@ -25,6 +25,7 @@ interface Toast {
   durationMs: number
   // Monotonic createdAt — used for stable ordering and time-based dismiss.
   createdAt: number
+  actionState?: NoticeActionState<'undo'>
 }
 
 type BannerKind = 'chat-not-found' | 'mutation-conflict' | 'stale-edit' | 'stale-reasoning'
@@ -37,15 +38,28 @@ interface Banner {
   primary?: { label: string; action: () => void | Promise<void> }
   // Optional secondary action (e.g. "Dismiss", "Cancel").
   secondary?: { label: string; action: () => void | Promise<void> }
+  actionState?: NoticeActionState<'primary' | 'secondary'>
+}
+
+interface NoticeActionState<TKey extends string> {
+  key: TKey
+  pending: boolean
+  error?: string
 }
 
 interface ToastStoreState {
   toasts: Toast[]
   banners: Banner[]
-  push: (t: Omit<Toast, 'id' | 'createdAt' | 'durationMs'> & { durationMs?: number }) => string
+  push: (
+    t: Omit<Toast, 'id' | 'createdAt' | 'durationMs' | 'actionState'> & {
+      durationMs?: number
+    },
+  ) => string
   dismissToast: (id: string) => void
-  pushBanner: (b: Omit<Banner, 'id'>) => string
+  runToastAction: (id: string) => Promise<boolean>
+  pushBanner: (b: Omit<Banner, 'id' | 'actionState'>) => string
   dismissBanner: (id: string) => void
+  runBannerAction: (id: string, key: 'primary' | 'secondary') => Promise<boolean>
   clearBannersByKind: (kind: BannerKind) => void
   reset: () => void
 }
@@ -56,7 +70,9 @@ function nextId(prefix: string): string {
   return `${prefix}-${Date.now()}-${counter}`
 }
 
-export const useToastStore = create<ToastStoreState>((set) => ({
+const ACTION_FAILED_MESSAGE = 'Action failed. Try again.'
+
+export const useToastStore = create<ToastStoreState>((set, get) => ({
   toasts: [],
   banners: [],
   push: (t) => {
@@ -73,12 +89,67 @@ export const useToastStore = create<ToastStoreState>((set) => ({
     return id
   },
   dismissToast: (id) => set((state) => ({ toasts: state.toasts.filter((x) => x.id !== id) })),
+  runToastAction: async (id) => {
+    const toast = get().toasts.find((candidate) => candidate.id === id)
+    if (!toast?.undo || toast.actionState?.pending) return false
+    set((state) => ({
+      toasts: state.toasts.map((candidate) =>
+        candidate.id === id
+          ? { ...candidate, actionState: { key: 'undo', pending: true } }
+          : candidate,
+      ),
+    }))
+    try {
+      await toast.undo()
+    } catch {
+      set((state) => ({
+        toasts: state.toasts.map((candidate) =>
+          candidate.id === id
+            ? {
+                ...candidate,
+                actionState: { key: 'undo', pending: false, error: ACTION_FAILED_MESSAGE },
+              }
+            : candidate,
+        ),
+      }))
+      return false
+    }
+    set((state) => ({ toasts: state.toasts.filter((candidate) => candidate.id !== id) }))
+    return true
+  },
   pushBanner: (b) => {
     const id = nextId('banner')
     set((state) => ({ banners: [...state.banners, { ...b, id }] }))
     return id
   },
   dismissBanner: (id) => set((state) => ({ banners: state.banners.filter((x) => x.id !== id) })),
+  runBannerAction: async (id, key) => {
+    const banner = get().banners.find((candidate) => candidate.id === id)
+    const action = banner?.[key]?.action
+    if (!banner || !action || banner.actionState?.pending) return false
+    set((state) => ({
+      banners: state.banners.map((candidate) =>
+        candidate.id === id ? { ...candidate, actionState: { key, pending: true } } : candidate,
+      ),
+    }))
+    try {
+      await action()
+    } catch {
+      set((state) => ({
+        banners: state.banners.map((candidate) =>
+          candidate.id === id
+            ? {
+                ...candidate,
+                actionState: { key, pending: false, error: ACTION_FAILED_MESSAGE },
+              }
+            : candidate,
+        ),
+      }))
+      return false
+    }
+    set((state) => ({ banners: state.banners.filter((candidate) => candidate.id !== id) }))
+    return true
+  },
   clearBannersByKind: (kind) =>
     set((state) => ({ banners: state.banners.filter((x) => x.kind !== kind) })),
   reset: () => set({ toasts: [], banners: [] }),

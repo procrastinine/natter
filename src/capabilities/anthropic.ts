@@ -1,5 +1,3 @@
-// Hand-maintained Anthropic capability table. See `plan/07-discovery.md §7.6`.
-//
 // Parameter names follow Anthropic's Messages API (`stop_sequences`, not
 // `stop`; `max_tokens` required). Reasoning shows up as `thinking` on the
 // wire for 4.x models; the registry narrows `allowedEffort` / verbosity on

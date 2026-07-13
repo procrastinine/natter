@@ -3,7 +3,6 @@
  *             JSON/schema editors.
  * Owns: [data-ui='field'|'label'|'helper'|'validation'|'slider'|'segmented'|
  *              'schema-editor'|'json-editor'|'logit-bias-editor'].
- * See plan/10-ui.md §10.20.
  */
 
 [data-ui="field"] {

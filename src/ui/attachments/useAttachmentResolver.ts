@@ -1,4 +1,3 @@
-import { useLiveQuery } from 'dexie-react-hooks'
 import { useMemo } from 'react'
 import {
   attachmentContextIds,
@@ -6,7 +5,9 @@ import {
 } from '../../core/attachments/context'
 import type { AttachmentResolver } from '../../core/prompt-size'
 import type { Attachment, AttachmentRef, ChatSettings, Message } from '../../core/types'
-import { getBrowserRepository } from '../../store/browser-repo'
+import { attachmentMapDependencies } from '../../store/reactive-dependencies'
+import { useRepositoryQuery } from '../../store/reactive-query'
+import { getWorkspaceRepository } from '../../store/workspace-repository'
 
 const EMPTY_ATTACHMENT_MAP = new Map<string, Attachment>()
 
@@ -27,10 +28,11 @@ export function useAttachmentResolverForContext(input: {
     }).join('|')
   }, [input.enabled, input.settings, input.messages, input.draftAttachmentRefs])
 
-  const attachments = useLiveQuery(
+  const attachments = useRepositoryQuery(
+    JSON.stringify(['attachment-map', idsKey]),
     async () => {
       if (!idsKey) return EMPTY_ATTACHMENT_MAP
-      const repo = getBrowserRepository()
+      const repo = getWorkspaceRepository()
       const rows = await Promise.all(
         idsKey.split('|').map(async (id) => [id, await repo.getAttachment(id)] as const),
       )
@@ -40,8 +42,8 @@ export function useAttachmentResolverForContext(input: {
       }
       return map
     },
-    [idsKey],
     EMPTY_ATTACHMENT_MAP,
+    attachmentMapDependencies(idsKey ? idsKey.split('|') : []),
   )
 
   return useMemo(() => {

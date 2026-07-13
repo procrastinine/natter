@@ -1,7 +1,4 @@
-// Phase 11: `splitResponsesStream` — normalize `ResponsesEventWire` → lane
-// events. Fixture-driven using probe 5 + probe 6 captures.
-
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { type StreamLaneEvent, splitResponsesStream } from '../../src/api/stream-transforms'
@@ -10,6 +7,12 @@ import type {
   ResponsesResultWire,
   ResponsesStreamChunk,
 } from '../../src/api/types'
+import {
+  applyStreamAccumulatorEvent,
+  createStreamAccumulator,
+  projectStreamAccumulatorFinal,
+} from '../../src/core/stream-accumulator'
+import { responsesBufferedResult, responsesStreamSse } from '../helpers/protocol-fixtures'
 
 const PROBE5 = resolve(
   __dirname,
@@ -45,10 +48,9 @@ async function collect(source: AsyncIterable<StreamLaneEvent>): Promise<StreamLa
   return out
 }
 
-describe('splitResponsesStream — streaming fixture (probe 5)', () => {
+describe('splitResponsesStream — representative streaming fixture', () => {
   it('emits reasoning (summaryDelta) + text deltas + phase + finish in order', async () => {
-    const body = readFileSync(PROBE5, 'utf8')
-    const lanes = await collect(splitResponsesStream(asAsync(sseToChunks(body))))
+    const lanes = await collect(splitResponsesStream(asAsync(sseToChunks(responsesStreamSse))))
 
     // 1. First event should be meta with model + generationId.
     const firstMeta = lanes.find((l) => l.lane === 'meta')
@@ -112,9 +114,9 @@ describe('splitResponsesStream — streaming fixture (probe 5)', () => {
   })
 })
 
-describe('splitResponsesStream — buffered result (probe 6)', () => {
+describe('splitResponsesStream — representative buffered result', () => {
   it('synthesizes output-item + reasoning + text + phase + usage + finish from buffered JSON', async () => {
-    const buffered = JSON.parse(readFileSync(PROBE6, 'utf8')) as ResponsesResultWire
+    const buffered = responsesBufferedResult
     const chunks: ResponsesStreamChunk[] = [
       buffered.id
         ? { type: 'buffered_result', result: buffered, generationId: buffered.id }
@@ -163,6 +165,35 @@ describe('splitResponsesStream — buffered result (probe 6)', () => {
   })
 })
 
+if (existsSync(PROBE5)) {
+  describe('splitResponsesStream — full local stream capture', () => {
+    it('normalizes the complete capture without losing terminal state', async () => {
+      const lanes = await collect(
+        splitResponsesStream(asAsync(sseToChunks(readFileSync(PROBE5, 'utf8')))),
+      )
+      expect(lanes.some((lane) => lane.lane === 'reasoning')).toBe(true)
+      expect(lanes.some((lane) => lane.lane === 'text')).toBe(true)
+      expect(lanes.at(-1)?.lane).toBe('finish')
+    })
+  })
+}
+
+if (existsSync(PROBE6)) {
+  describe('splitResponsesStream — full local buffered capture', () => {
+    it('normalizes the complete capture without losing output items', async () => {
+      const buffered = JSON.parse(readFileSync(PROBE6, 'utf8')) as ResponsesResultWire
+      const chunk: ResponsesStreamChunk = buffered.id
+        ? { type: 'buffered_result', result: buffered, generationId: buffered.id }
+        : { type: 'buffered_result', result: buffered }
+      const lanes = await collect(splitResponsesStream(asAsync([chunk])))
+      expect(lanes.filter((lane) => lane.lane === 'output-item-added')).toHaveLength(
+        buffered.output?.length ?? 0,
+      )
+      expect(lanes.some((lane) => lane.lane === 'finish')).toBe(true)
+    })
+  })
+}
+
 describe('splitResponsesStream — encrypted_content overwrite contract', () => {
   it('emits replaceEncrypted:true on both output_item.added and output_item.done', async () => {
     // Synthetic minimal sequence: added → done (each with distinct encrypted_content).
@@ -198,6 +229,125 @@ describe('splitResponsesStream — encrypted_content overwrite contract', () => 
     expect(reasoning).toHaveLength(2)
     expect(reasoning[0]).toMatchObject({ encryptedDelta: 'partial', replaceEncrypted: true })
     expect(reasoning[1]).toMatchObject({ encryptedDelta: 'FINAL', replaceEncrypted: true })
+  })
+})
+
+describe('splitResponsesStream — function calls', () => {
+  it('merges output-item metadata, argument deltas, and authoritative completion', async () => {
+    const events: ResponsesStreamChunk[] = [
+      {
+        type: 'event',
+        event: {
+          type: 'response.output_item.added',
+          output_index: 4,
+          item: {
+            id: 'fc_item_1',
+            type: 'function_call',
+            call_id: 'call_1',
+            name: 'lookup',
+            arguments: '',
+          },
+        },
+      },
+      {
+        type: 'event',
+        event: {
+          type: 'response.function_call_arguments.delta',
+          output_index: 4,
+          item_id: 'fc_item_1',
+          delta: '{"query":',
+        },
+      },
+      {
+        type: 'event',
+        event: {
+          type: 'response.function_call_arguments.delta',
+          output_index: 4,
+          item_id: 'fc_item_1',
+          delta: '"natter"}',
+        },
+      },
+      {
+        type: 'event',
+        event: {
+          type: 'response.function_call_arguments.done',
+          output_index: 4,
+          item_id: 'fc_item_1',
+          arguments: '{"query":"natter"}',
+        },
+      },
+      {
+        type: 'event',
+        event: {
+          type: 'response.output_item.done',
+          output_index: 4,
+          item: {
+            id: 'fc_item_1',
+            type: 'function_call',
+            call_id: 'call_1',
+            name: 'lookup',
+            arguments: '{"query":"natter"}',
+          },
+        },
+      },
+    ]
+    const lanes = await collect(splitResponsesStream(asAsync(events)))
+    const toolCalls = lanes.filter(
+      (lane): lane is Extract<StreamLaneEvent, { lane: 'tool-call' }> => lane.lane === 'tool-call',
+    )
+    const accumulator = createStreamAccumulator({ initialContent: [], now: 0 })
+    for (const [index, lane] of toolCalls.entries()) {
+      applyStreamAccumulatorEvent(accumulator, lane, index + 1)
+    }
+
+    expect(toolCalls[0]).toMatchObject({
+      index: 4,
+      id: 'call_1',
+      type: 'function',
+      name: 'lookup',
+    })
+    expect(toolCalls.filter((lane) => lane.argumentsDelta !== undefined)).toHaveLength(2)
+    expect(toolCalls.filter((lane) => lane.argumentsSnapshot !== undefined)).toHaveLength(2)
+    expect(projectStreamAccumulatorFinal(accumulator).toolCalls).toEqual([
+      {
+        id: 'call_1',
+        type: 'function',
+        function: { name: 'lookup', arguments: '{"query":"natter"}' },
+      },
+    ])
+  })
+
+  it('normalizes buffered function_call items into canonical tool calls', async () => {
+    const result: ResponsesResultWire = {
+      id: 'resp_tools',
+      status: 'completed',
+      output: [
+        {
+          id: 'fc_item_2',
+          type: 'function_call',
+          call_id: 'call_2',
+          name: 'calculate',
+          arguments: '{"value":42}',
+        },
+      ],
+    }
+    const lanes = await collect(
+      splitResponsesStream(
+        asAsync([{ type: 'buffered_result', result, generationId: 'resp_tools' }]),
+      ),
+    )
+    const accumulator = createStreamAccumulator({ initialContent: [], now: 0 })
+    for (const [index, lane] of lanes.entries()) {
+      applyStreamAccumulatorEvent(accumulator, lane, index + 1)
+    }
+
+    expect(projectStreamAccumulatorFinal(accumulator).toolCalls).toEqual([
+      {
+        id: 'call_2',
+        type: 'function',
+        function: { name: 'calculate', arguments: '{"value":42}' },
+      },
+    ])
   })
 })
 

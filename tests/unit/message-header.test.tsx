@@ -1,5 +1,5 @@
-import { fireEvent, render } from '@testing-library/react'
-import { afterEach, describe, expect, it } from 'vitest'
+import { fireEvent, render, waitFor } from '@testing-library/react'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { effectiveCapabilityFromEndpoints } from '../../src/core/capabilities'
 import type { Message as MessageRow, ModelEndpoint } from '../../src/core/types'
 import { getStreamClientId } from '../../src/store/stream-leases'
@@ -160,7 +160,7 @@ describe('MessageInfo (revealed by ⓘ — full factual record)', () => {
     expect(container.textContent).toMatch(/encrypted 6/)
   })
 
-  it('dedupes mirrored reasoning text when counting fallback reasoning chars', () => {
+  it('counts overlap-looking reasoning rows independently', () => {
     const msg = makeAssistant({
       reasoningDetails: [
         { type: 'reasoning.text', index: 0, text: 'Let' },
@@ -172,12 +172,18 @@ describe('MessageInfo (revealed by ⓘ — full factual record)', () => {
     }
     const { container } = render(<MessageInfo message={msg} />)
     expect(container.textContent).toMatch(/Reasoning chars/)
-    expect(container.textContent).toMatch(/text 6/)
+    expect(container.textContent).toMatch(/text 9/)
   })
 
   it('renders persisted hosted-tool evidence in message info', () => {
     const msg = makeAssistant()
     if (!msg.generation) throw new Error('expected generation metadata')
+    const serializeOutput = vi.fn(() => ({
+      type: 'openrouter:web_fetch',
+      url: 'https://openrouter.ai/',
+      title: 'OpenRouter',
+      content: 'The Unified Interface For LLMs',
+    }))
     msg.generation.serverTools = [
       {
         type: 'openrouter:web_fetch',
@@ -185,20 +191,23 @@ describe('MessageInfo (revealed by ⓘ — full factual record)', () => {
         id: 'wf_1',
         status: 'completed',
         outputIndex: 0,
-        output: {
-          type: 'openrouter:web_fetch',
-          url: 'https://openrouter.ai/',
-          title: 'OpenRouter',
-          content: 'The Unified Interface For LLMs',
-        },
+        output: { toJSON: serializeOutput },
       },
     ]
     const { container } = render(<MessageInfo message={msg} />)
-    const text = container.textContent
-    expect(text).toMatch(/Tool calls/)
-    expect(text).toMatch(/web fetch/)
-    expect(text).toMatch(/wf_1/)
-    expect(text).toMatch(/The Unified Interface For LLMs/)
+    expect(container.textContent).toMatch(/Tool calls/)
+    expect(container.textContent).toMatch(/web fetch/)
+    expect(container.textContent).toMatch(/wf_1/)
+    expect(container.textContent).not.toMatch(/The Unified Interface For LLMs/)
+    expect(serializeOutput).not.toHaveBeenCalled()
+
+    const toolDetails = container.querySelector('details[data-ui="tool-call"]')
+    if (!(toolDetails instanceof HTMLDetailsElement)) throw new Error('tool details missing')
+    toolDetails.open = true
+    fireEvent(toolDetails, new Event('toggle'))
+
+    expect(serializeOutput).toHaveBeenCalledOnce()
+    expect(container.textContent).toMatch(/The Unified Interface For LLMs/)
   })
 })
 
@@ -224,8 +233,6 @@ describe('Message hidden-reasoning footer', () => {
         chatId={msg.chatId}
         message={msg}
         hasAnyReasoningDetails={false}
-        hasSiblingVariants={false}
-        cursor={{}}
         hasConnection={false}
         capability={currentCapability}
         onEditInPlace={async () => {}}
@@ -234,6 +241,85 @@ describe('Message hidden-reasoning footer', () => {
     expect(container.querySelector('[data-ui="message-hidden-reasoning"]')?.textContent).toMatch(
       /reasoned internally/i,
     )
+  })
+
+  it('hides one raw reasoning row without rewriting adjacent or tool rows', () => {
+    const reasoningDetails: NonNullable<MessageRow['reasoningDetails']> = [
+      {
+        type: 'reasoning.text',
+        id: 'block-a',
+        index: 0,
+        format: 'unknown',
+        text: 'abcd',
+      },
+      { type: 'reasoning.text', id: 'tool_call-1', index: 0, text: 'tool carrier' },
+      {
+        type: 'reasoning.text',
+        id: 'block-b',
+        index: 0,
+        format: 'anthropic-claude-v1',
+        text: 'abcdX',
+        signature: 'signature-b',
+      },
+    ]
+    const msg = makeAssistant({ reasoningDetails })
+    const onEditInPlace = vi.fn(async () => {})
+    const onToggleReasoningDetailHidden = vi.fn(async () => {})
+    const { container } = render(
+      <ChatMessage
+        chatId={msg.chatId}
+        message={msg}
+        hasAnyReasoningDetails
+        hasConnection={false}
+        onEditInPlace={onEditInPlace}
+        onToggleReasoningDetailHidden={onToggleReasoningDetailHidden}
+      />,
+    )
+
+    const hideButtons = container.querySelectorAll('[data-ui="reasoning-row-hide"]')
+    expect(hideButtons).toHaveLength(2)
+    fireEvent.click(hideButtons[1] as HTMLElement)
+
+    expect(onEditInPlace).not.toHaveBeenCalled()
+    expect(onToggleReasoningDetailHidden).toHaveBeenCalledWith(msg, 2)
+  })
+})
+
+describe('Message content refresh', () => {
+  it('rerenders static markdown when a persisted message version changes', async () => {
+    const first = makeAssistant({ content: [{ type: 'text', text: 'Body version one' }] })
+    const props = {
+      chatId: first.chatId,
+      hasAnyReasoningDetails: false,
+      hasSiblingVariants: false,
+      cursor: {},
+      hasConnection: false,
+      onEditInPlace: async () => {},
+    }
+    const { container, rerender } = render(<ChatMessage {...props} message={first} />)
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-ui="message-body"]')?.textContent).toContain(
+        'Body version one',
+      )
+    })
+
+    rerender(
+      <ChatMessage
+        {...props}
+        message={makeAssistant({
+          id: first.id,
+          nodeVersion: first.nodeVersion + 1,
+          content: [{ type: 'text', text: 'Body version two' }],
+        })}
+      />,
+    )
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-ui="message-body"]')?.textContent).toContain(
+        'Body version two',
+      )
+    })
   })
 })
 
@@ -245,8 +331,6 @@ describe('Message streaming info surface', () => {
         chatId={msg.chatId}
         message={msg}
         hasAnyReasoningDetails={false}
-        hasSiblingVariants={false}
-        cursor={{}}
         hasConnection={false}
         onEditInPlace={async () => {}}
       />,
@@ -274,7 +358,12 @@ describe('Message streaming info surface', () => {
       chatId: msg.chatId,
       messageId: msg.id,
       content: [{ type: 'output_text', text: 'live streamed words' }],
-      reasoningDetails: [{ type: 'reasoning.text', text: 'thinking live' }],
+      reasoningRows: [
+        {
+          detail: { type: 'reasoning.text', text: '' },
+          valueSections: ['thinking ', 'live'],
+        },
+      ],
       generation: {
         ...generation,
         provider: 'Live Provider',
@@ -294,8 +383,6 @@ describe('Message streaming info surface', () => {
         chatId={msg.chatId}
         message={msg}
         hasAnyReasoningDetails={false}
-        hasSiblingVariants={false}
-        cursor={{}}
         hasConnection={false}
         onEditInPlace={async () => {}}
       />,
@@ -329,8 +416,6 @@ describe('Message streaming info surface', () => {
         chatId={msg.chatId}
         message={msg}
         hasAnyReasoningDetails={false}
-        hasSiblingVariants={false}
-        cursor={{}}
         hasConnection={false}
         onEditInPlace={async () => {}}
       />,
@@ -339,6 +424,45 @@ describe('Message streaming info surface', () => {
     expect(container.querySelector('[data-ui="message-stream-remote"]')?.textContent).toMatch(
       /currently streaming in another tab/i,
     )
+  })
+
+  it('suppresses the original failure banner after an applied successful continuation', () => {
+    const msg = makeAssistant()
+    const generation = msg.generation
+    if (!generation) throw new Error('expected generation metadata')
+    msg.generation = {
+      ...generation,
+      status: 'interrupted',
+      abortReason: 'network',
+      error: {
+        category: 'network',
+        code: 'NETWORK',
+        message: 'original stream interrupted',
+      },
+    }
+    msg.continuationAttempts = [
+      {
+        streamId: 'successful-continuation',
+        strategy: 'prompt',
+        status: 'done',
+        startedAt: generation.finishedAt ?? generation.startedAt,
+        finishedAt: (generation.finishedAt ?? generation.startedAt) + 1,
+      },
+    ]
+
+    const { container, getByRole } = render(
+      <ChatMessage
+        chatId={msg.chatId}
+        message={msg}
+        hasAnyReasoningDetails={false}
+        hasConnection
+        onEditInPlace={async () => {}}
+        onContinue={async () => {}}
+      />,
+    )
+
+    expect(container.querySelector('[data-ui="message-error"]')).toBeNull()
+    expect(getByRole('button', { name: 'Continue from here' })).toBeTruthy()
   })
 })
 
@@ -396,7 +520,7 @@ describe('MessageInfo — Phase B calibration fields', () => {
 })
 
 describe('ReasoningBlock', () => {
-  it('dedupes mirrored Claude reasoning rows before rendering', () => {
+  it('renders overlap-looking persisted reasoning as distinct rows', () => {
     const { container } = render(
       <ReasoningBlock
         details={[
@@ -405,8 +529,9 @@ describe('ReasoningBlock', () => {
         ]}
       />,
     )
-    expect(container.querySelector('[data-reasoning-count="1"]')).toBeTruthy()
+    expect(container.querySelector('[data-reasoning-count="2"]')).toBeTruthy()
+    expect(container.querySelectorAll('[data-ui="reasoning-row"]')).toHaveLength(2)
+    expect(container.textContent).toMatch(/Let/)
     expect(container.textContent).toMatch(/Let me/)
-    expect(container.textContent).not.toMatch(/LetLet me/)
   })
 })

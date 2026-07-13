@@ -1,5 +1,5 @@
-// Phase 11: reasoning echo in `toChatCompletions` + standalone
-// `filterReasoningForInclude` helper. See `plan/phase11-implementation.md §2 / §4.5b`.
+// Reasoning echo in `toChatCompletions` and the standalone
+// `filterReasoningForInclude` helper.
 
 import { describe, expect, it } from 'vitest'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'

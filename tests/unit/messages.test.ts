@@ -4,9 +4,10 @@ import { groupByParent, indexById } from '../../src/core/active-path'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import {
   appendAsChild,
+  applyStructuralEffectsToCursor,
   branchExplicit,
-  continueAssistant,
   deletePair,
+  deleteSingleMessage,
   deleteTurn,
   deleteVariant,
   editMessageContent,
@@ -19,8 +20,11 @@ import {
 } from '../../src/core/messages'
 import { nextSiblingIndex, TreeChangedError } from '../../src/core/tree-ops'
 import type { Chat, ChatId, Message, MessageId, MessageRole } from '../../src/core/types'
+import { applyStructuralSnapshot } from '../../src/core/undo'
 import { newId } from '../../src/lib/ulid'
+import { buildAttachment, putAttachment } from '../../src/store/attachments'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
+import { getBrowserRepository } from '../../src/store/browser-repo'
 import {
   applyChatPreset,
   getMessage as getStoredMessage,
@@ -30,10 +34,16 @@ import {
 } from '../../src/store/chats'
 import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
 import { splitMessageForStorage } from '../../src/store/message-storage'
+import type { WorkspaceRepository } from '../../src/store/repository'
+import {
+  __resetWorkspaceRepositoryForTests,
+  __setWorkspaceRepositoryForTests,
+} from '../../src/store/workspace-repository'
 
 const DB_NAME = 'natter'
 
 async function resetAll() {
+  __resetWorkspaceRepositoryForTests()
   __resetDbForTests()
   __resetBroadcastForTests()
   await Dexie.delete(DB_NAME)
@@ -83,6 +93,7 @@ interface SeedMsg {
   createdAt?: number
   deleted?: boolean
   text?: string
+  attachmentRefs?: Message['attachmentRefs']
 }
 
 async function putMessage(chatId: ChatId, spec: SeedMsg = {}): Promise<Message> {
@@ -97,6 +108,7 @@ async function putMessage(chatId: ChatId, spec: SeedMsg = {}): Promise<Message> 
     role: spec.role ?? 'user',
     origin: 'user',
     content: [{ type: 'text', text: spec.text ?? 'x' }],
+    ...(spec.attachmentRefs ? { attachmentRefs: spec.attachmentRefs } : {}),
     nodeVersion: 0,
     deleted: spec.deleted ?? false,
   }
@@ -498,28 +510,6 @@ describe('editMessageContent', () => {
   })
 })
 
-describe('continueAssistant', () => {
-  it('creates an assistant child with origin=continued and advances cursor', async () => {
-    const chat = await seedChat()
-    const assistant = await putMessage(chat.id, {
-      id: 'A',
-      role: 'assistant',
-      parentId: null,
-      createdAt: 1,
-    })
-    const res = await continueAssistant({
-      chatId: chat.id,
-      messageId: assistant.id,
-      now: 2,
-    })
-    const row = await getStoredMessage(res.messageId)
-    expect(row?.parentId).toBe(assistant.id)
-    expect(row?.role).toBe('assistant')
-    expect(row?.origin).toBe('continued')
-    expect(res.effects.cursorUpdates[assistant.id]).toBe(res.messageId)
-  })
-})
-
 describe('branchExplicit', () => {
   it('clones allowed fields and clears generation-only fields', async () => {
     const chat = await seedChat()
@@ -634,6 +624,7 @@ describe('insertBetween', () => {
     expect(cAfter?.siblingIndex).toBe(0)
     expect(res.effects.cursorUpdates[p.id]).toBe(res.messageId)
     expect(res.effects.cursorUpdates[res.messageId]).toBe(c.id)
+    expect(res.effects.newMessageIds).toEqual([res.messageId])
   })
 
   it('assigns X siblingIndex above any pre-existing variants at the same slot', async () => {
@@ -989,6 +980,310 @@ describe('cascade delete', () => {
   })
 })
 
+describe('delete atomic pre-images', () => {
+  it('captures pair members and the selected splice child exactly', async () => {
+    const chat = await seedChat()
+    await putMessage(chat.id, { id: 'P', parentId: null, createdAt: 1 })
+    await putMessage(chat.id, {
+      id: 'U',
+      parentId: 'P',
+      siblingIndex: 0,
+      createdAt: 2,
+      role: 'user',
+      turnId: 'user-turn',
+    })
+    await putMessage(chat.id, {
+      id: 'A',
+      parentId: 'U',
+      siblingIndex: 0,
+      createdAt: 3,
+      role: 'assistant',
+      turnId: 'assistant-turn',
+    })
+    await putMessage(chat.id, {
+      id: 'K',
+      parentId: 'A',
+      siblingIndex: 0,
+      createdAt: 4,
+      role: 'user',
+      turnId: 'next-turn',
+    })
+
+    const result = await deletePair({
+      chatId: chat.id,
+      messageId: 'U',
+      cursor: { __root__: 'P', P: 'U', U: 'A', A: 'K' },
+    })
+
+    expect(new Set(result.preImage.previousRows.map((row) => row.id))).toEqual(
+      new Set(['U', 'A', 'K']),
+    )
+    expect(new Set(result.effects.tombstoned)).toEqual(new Set(['U', 'A']))
+    expect(result.effects.reparented).toEqual([
+      { id: 'K', previousParentId: 'A', newParentId: 'P' },
+    ])
+    expect(result.effects.cursorUpdates).toEqual({ P: 'K' })
+    expect(
+      applyStructuralEffectsToCursor({ __root__: 'P', P: 'U', U: 'A', A: 'K' }, result.effects),
+    ).toEqual({ __root__: 'P', P: 'K' })
+  })
+
+  it('captures every variant in a deleted turn and its promoted child', async () => {
+    const chat = await seedChat()
+    await putMessage(chat.id, { id: 'P', parentId: null, createdAt: 1 })
+    await putMessage(chat.id, {
+      id: 'V1',
+      parentId: 'P',
+      siblingIndex: 0,
+      createdAt: 2,
+      role: 'assistant',
+      turnId: 'variant-one',
+    })
+    await putMessage(chat.id, {
+      id: 'V1T',
+      parentId: 'V1',
+      siblingIndex: 0,
+      createdAt: 3,
+      role: 'tool',
+      turnId: 'variant-one',
+      turnIndex: 1,
+    })
+    await putMessage(chat.id, {
+      id: 'V2',
+      parentId: 'P',
+      siblingIndex: 1,
+      createdAt: 4,
+      role: 'assistant',
+      turnId: 'variant-two',
+    })
+    await putMessage(chat.id, {
+      id: 'K',
+      parentId: 'V1T',
+      siblingIndex: 0,
+      createdAt: 5,
+      role: 'user',
+      turnId: 'next-turn',
+    })
+
+    const result = await deleteTurn({
+      chatId: chat.id,
+      messageId: 'V1',
+      cursor: { __root__: 'P', P: 'V1', V1: 'V1T', V1T: 'K' },
+    })
+
+    expect(new Set(result.preImage.previousRows.map((row) => row.id))).toEqual(
+      new Set(['V1', 'V1T', 'V2', 'K']),
+    )
+    expect(new Set(result.effects.tombstoned)).toEqual(new Set(['V1', 'V1T', 'V2']))
+    expect(result.effects.reparented).toEqual([
+      { id: 'K', previousParentId: 'V1T', newParentId: 'P' },
+    ])
+    expect(result.effects.cursorUpdates).toEqual({ P: 'K' })
+  })
+
+  it('captures only rows actually changed by a cascading variant delete', async () => {
+    const chat = await seedChat()
+    await putMessage(chat.id, { id: 'P', parentId: null, createdAt: 1 })
+    await putMessage(chat.id, {
+      id: 'A',
+      parentId: 'P',
+      siblingIndex: 0,
+      createdAt: 2,
+      role: 'assistant',
+      turnId: 'variant-a',
+    })
+    await putMessage(chat.id, {
+      id: 'V',
+      parentId: 'P',
+      siblingIndex: 1,
+      createdAt: 3,
+      role: 'assistant',
+      turnId: 'variant-v',
+    })
+    await putMessage(chat.id, { id: 'K', parentId: 'A', createdAt: 4, turnId: 'child' })
+    await putMessage(chat.id, { id: 'G', parentId: 'K', createdAt: 5, turnId: 'grandchild' })
+    await putMessage(chat.id, {
+      id: 'OLD',
+      parentId: 'K',
+      siblingIndex: 1,
+      createdAt: 6,
+      deleted: true,
+    })
+
+    const result = await deleteVariant({
+      chatId: chat.id,
+      messageId: 'A',
+      cursor: { __root__: 'P', P: 'A', A: 'K', K: 'G' },
+      cascade: true,
+    })
+
+    expect(new Set(result.preImage.previousRows.map((row) => row.id))).toEqual(
+      new Set(['A', 'K', 'G']),
+    )
+    expect(new Set(result.effects.tombstoned)).toEqual(new Set(['A', 'K', 'G']))
+    expect(result.preImage.previousRows.some((row) => row.id === 'V')).toBe(false)
+    expect(result.preImage.previousRows.some((row) => row.id === 'OLD')).toBe(false)
+    expect(result.effects.reparented).toEqual([])
+  })
+
+  it('restores a single-delete splice, renumbered sibling, and attachment refs without touching descendants', async () => {
+    const chat = await seedChat()
+    await putMessage(chat.id, { id: 'P', parentId: null, createdAt: 0 })
+    await putMessage(chat.id, {
+      id: 'U',
+      parentId: 'P',
+      siblingIndex: 0,
+      createdAt: 1,
+      role: 'user',
+      text: 'untouched before delete',
+    })
+    await putMessage(chat.id, {
+      id: 'S',
+      parentId: 'P',
+      siblingIndex: 9,
+      createdAt: 2,
+      role: 'assistant',
+    })
+    await putMessage(chat.id, {
+      id: 'A',
+      parentId: 'P',
+      siblingIndex: 2,
+      createdAt: 3,
+      role: 'assistant',
+    })
+    await putMessage(chat.id, {
+      id: 'C',
+      parentId: 'A',
+      siblingIndex: 0,
+      createdAt: 4,
+      role: 'user',
+    })
+    await putMessage(chat.id, {
+      id: 'G',
+      parentId: 'C',
+      siblingIndex: 0,
+      createdAt: 5,
+      role: 'assistant',
+      text: 'before undo',
+    })
+    const attachment = await buildAttachment({
+      blob: new Blob(['delete undo']),
+      filename: 'delete-undo.txt',
+      mime: 'text/plain',
+      kind: 'plaintext',
+    })
+    await putAttachment(attachment)
+    await editMessageContent({
+      chatId: chat.id,
+      messageId: 'C',
+      content: [{ type: 'text', text: 'attached child' }],
+      attachmentRefs: [
+        {
+          refId: 'delete-undo-ref',
+          attachmentId: attachment.id,
+          includeInContext: true,
+          presentation: {},
+          createdAt: 6,
+          updatedAt: 6,
+        },
+      ],
+      now: 6,
+    })
+
+    const priorCursor = { __root__: 'P', P: 'A', A: 'C', C: 'G' }
+    const result = await deleteSingleMessage({
+      chatId: chat.id,
+      messageId: 'A',
+      cursor: priorCursor,
+    })
+
+    expect(new Set(result.preImage.previousRows.map((row) => row.id))).toEqual(
+      new Set(['S', 'A', 'C']),
+    )
+    expect(result.preImage.previousRows.some((row) => row.id === 'U')).toBe(false)
+    expect(result.preImage.previousRows.some((row) => row.id === 'G')).toBe(false)
+    expect(result.preImage.attachmentIds).toEqual([attachment.id])
+    expect((await getStoredMessage('U'))?.siblingIndex).toBe(0)
+    expect((await getStoredMessage('S'))?.siblingIndex).toBe(1)
+    expect((await getStoredMessage('A'))?.siblingIndex).toBe(2)
+    expect((await getStoredMessage('C'))?.parentId).toBe('P')
+    expect((await getStoredMessage('C'))?.siblingIndex).toBe(3)
+    expect((await getDb().attachments.get(attachment.id))?.refCount).toBe(1)
+    expect(applyStructuralEffectsToCursor(priorCursor, result.effects)).toEqual({
+      __root__: 'P',
+      P: 'C',
+      C: 'G',
+    })
+
+    await editMessageContent({
+      chatId: chat.id,
+      messageId: 'G',
+      content: [{ type: 'text', text: 'changed after delete' }],
+      now: 7,
+    })
+    await editMessageContent({
+      chatId: chat.id,
+      messageId: 'U',
+      content: [{ type: 'text', text: 'untouched after delete' }],
+      now: 8,
+    })
+    await applyStructuralSnapshot(result.preImage)
+
+    expect((await getStoredMessage('S'))?.siblingIndex).toBe(9)
+    expect((await getStoredMessage('A'))?.deleted).toBe(false)
+    expect((await getStoredMessage('A'))?.siblingIndex).toBe(2)
+    expect((await getStoredMessage('C'))?.parentId).toBe('A')
+    expect((await getStoredMessage('C'))?.siblingIndex).toBe(0)
+    expect((await getStoredMessage('G'))?.content).toEqual([
+      { type: 'text', text: 'changed after delete' },
+    ])
+    expect((await getStoredMessage('U'))?.content).toEqual([
+      { type: 'text', text: 'untouched after delete' },
+    ])
+    expect((await getDb().attachments.get(attachment.id))?.refCount).toBe(1)
+  })
+
+  it('rejects undo when another tab changes a captured row after deletion', async () => {
+    const chat = await seedChat()
+    await putMessage(chat.id, { id: 'A', parentId: null, createdAt: 1, role: 'assistant' })
+    await putMessage(chat.id, { id: 'C', parentId: 'A', createdAt: 2, role: 'user' })
+    const result = await deleteSingleMessage({
+      chatId: chat.id,
+      messageId: 'A',
+      cursor: { __root__: 'A', A: 'C' },
+    })
+    await editMessageContent({
+      chatId: chat.id,
+      messageId: 'C',
+      content: [{ type: 'text', text: 'changed in another tab' }],
+      now: 3,
+    })
+
+    await expect(applyStructuralSnapshot(result.preImage)).rejects.toBeInstanceOf(TreeChangedError)
+    expect((await getStoredMessage('A'))?.deleted).toBe(true)
+    expect((await getStoredMessage('C'))?.parentId).toBeNull()
+    expect((await getStoredMessage('C'))?.content).toEqual([
+      { type: 'text', text: 'changed in another tab' },
+    ])
+  })
+
+  it('allows only one of two concurrent deletes to commit', async () => {
+    const chat = await seedChat()
+    await putMessage(chat.id, { id: 'A', parentId: null, createdAt: 1, role: 'assistant' })
+
+    const outcomes = await Promise.allSettled([
+      deleteSingleMessage({ chatId: chat.id, messageId: 'A', cursor: { __root__: 'A' } }),
+      deleteSingleMessage({ chatId: chat.id, messageId: 'A', cursor: { __root__: 'A' } }),
+    ])
+
+    expect(outcomes.filter((outcome) => outcome.status === 'fulfilled')).toHaveLength(1)
+    const rejected = outcomes.find((outcome) => outcome.status === 'rejected')
+    expect(rejected?.status).toBe('rejected')
+    if (rejected?.status === 'rejected') expect(rejected.reason).toBeInstanceOf(TreeChangedError)
+    expect((await getStoredMessage('A'))?.deleted).toBe(true)
+  })
+})
+
 // -----------------------------------------------------------------------------
 
 describe('pasteImport', () => {
@@ -1032,6 +1327,325 @@ describe('pasteImport', () => {
     })
     const first = await getStoredMessage(res.newMessageIds[0] as MessageId)
     expect(first?.parentId).toBe('L')
+  })
+
+  it('inserts every imported row before the displaced child as one chain', async () => {
+    const chat = await seedChat()
+    await putMessage(chat.id, { id: 'P', parentId: null, createdAt: 1 })
+    await putMessage(chat.id, {
+      id: 'C',
+      parentId: 'P',
+      siblingIndex: 0,
+      createdAt: 2,
+      turnId: 'target-turn',
+    })
+    await putMessage(chat.id, {
+      id: 'V',
+      parentId: 'P',
+      siblingIndex: 2,
+      createdAt: 3,
+      turnId: 'other-turn',
+    })
+    await putMessage(chat.id, {
+      id: 'C2',
+      parentId: 'P',
+      siblingIndex: 1,
+      createdAt: 4,
+      turnId: 'target-turn',
+    })
+
+    const res = await pasteImport({
+      chatId: chat.id,
+      slot: { kind: 'before', messageId: 'C' },
+      cursor: { __root__: 'P', P: 'C' },
+      messages: [
+        { role: 'assistant', content: [{ type: 'text', text: 'X1' }] },
+        { role: 'user', content: [{ type: 'text', text: 'X2' }] },
+        { role: 'assistant', content: [{ type: 'text', text: 'X3' }] },
+      ],
+      now: 5,
+    })
+
+    const [x1Id, x2Id, x3Id] = res.newMessageIds as [MessageId, MessageId, MessageId]
+    expect((await getStoredMessage(x1Id))?.parentId).toBe('P')
+    expect((await getStoredMessage(x2Id))?.parentId).toBe(x1Id)
+    expect((await getStoredMessage(x3Id))?.parentId).toBe(x2Id)
+    expect((await getStoredMessage('C'))?.parentId).toBe(x3Id)
+    expect((await getStoredMessage('C'))?.siblingIndex).toBe(0)
+    expect((await getStoredMessage('C2'))?.parentId).toBe(x3Id)
+    expect((await getStoredMessage('C2'))?.siblingIndex).toBe(1)
+    expect((await getStoredMessage('V'))?.parentId).toBe('P')
+    expect(res.effects.newMessageIds).toEqual([x1Id, x2Id, x3Id])
+    expect(res.effects.reparented).toEqual([
+      { id: 'C', previousParentId: 'P', newParentId: x3Id },
+      { id: 'C2', previousParentId: 'P', newParentId: x3Id },
+    ])
+    expect(res.effects.cursorUpdates).toMatchObject({
+      P: x1Id,
+      [x1Id]: x2Id,
+      [x2Id]: x3Id,
+      [x3Id]: 'C',
+    })
+  })
+
+  it('inserts every imported row between a parent and its selected descendant as one chain', async () => {
+    const chat = await seedChat()
+    await putMessage(chat.id, { id: 'P', parentId: null, createdAt: 1 })
+    await putMessage(chat.id, { id: 'C', parentId: 'P', siblingIndex: 0, createdAt: 2 })
+    await putMessage(chat.id, { id: 'V', parentId: 'P', siblingIndex: 1, createdAt: 3 })
+
+    const res = await pasteImport({
+      chatId: chat.id,
+      slot: { kind: 'after', messageId: 'P' },
+      cursor: { __root__: 'P', P: 'C' },
+      messages: [
+        { role: 'assistant', content: [{ type: 'text', text: 'X1' }] },
+        { role: 'user', content: [{ type: 'text', text: 'X2' }] },
+      ],
+      now: 5,
+    })
+
+    const [x1Id, x2Id] = res.newMessageIds as [MessageId, MessageId]
+    expect((await getStoredMessage(x1Id))?.parentId).toBe('P')
+    expect((await getStoredMessage(x2Id))?.parentId).toBe(x1Id)
+    expect((await getStoredMessage('C'))?.parentId).toBe(x2Id)
+    expect((await getStoredMessage('V'))?.parentId).toBe('P')
+    expect(res.effects.newMessageIds).toEqual([x1Id, x2Id])
+    expect(res.effects.reparented).toEqual([{ id: 'C', previousParentId: 'P', newParentId: x2Id }])
+    expect(res.effects.cursorUpdates).toMatchObject({
+      P: x1Id,
+      [x1Id]: x2Id,
+      [x2Id]: 'C',
+    })
+  })
+
+  it('inserts one shared chain after a real parent and moves every live child under its tail', async () => {
+    const chat = await seedChat()
+    await putMessage(chat.id, { id: 'P', parentId: null, createdAt: 1 })
+    await putMessage(chat.id, {
+      id: 'V',
+      parentId: 'P',
+      siblingIndex: 0,
+      createdAt: 2,
+      turnId: 'variant-turn',
+    })
+    await putMessage(chat.id, {
+      id: 'C2',
+      parentId: 'P',
+      siblingIndex: 2,
+      createdAt: 3,
+      turnId: 'shared-turn',
+    })
+    await putMessage(chat.id, {
+      id: 'C1',
+      parentId: 'P',
+      siblingIndex: 3,
+      createdAt: 4,
+      turnId: 'shared-turn',
+    })
+    await putMessage(chat.id, {
+      id: 'T',
+      parentId: 'P',
+      siblingIndex: 9,
+      createdAt: 5,
+      deleted: true,
+    })
+    await putMessage(chat.id, {
+      id: 'G',
+      parentId: 'C1',
+      siblingIndex: 0,
+      createdAt: 6,
+      turnId: 'descendant-turn',
+    })
+    const attachment = await buildAttachment({
+      blob: new Blob(['shared attachment']),
+      filename: 'shared.txt',
+      mime: 'text/plain',
+      kind: 'plaintext',
+    })
+    await putAttachment(attachment)
+
+    const res = await pasteImport({
+      chatId: chat.id,
+      slot: { kind: 'after-all', parentId: 'P' },
+      cursor: { __root__: 'P', P: 'C2' },
+      messages: [
+        {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'X1' }],
+          attachmentRefs: [attachment.id],
+        },
+        { role: 'user', content: [{ type: 'text', text: 'X2' }] },
+        {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'X3' }],
+          attachmentRefs: [attachment.id],
+        },
+      ],
+      now: 10,
+    })
+
+    const [x1Id, x2Id, x3Id] = res.newMessageIds as [MessageId, MessageId, MessageId]
+    const x1 = await getStoredMessage(x1Id)
+    const x2 = await getStoredMessage(x2Id)
+    const x3 = await getStoredMessage(x3Id)
+    expect(x1?.parentId).toBe('P')
+    expect(x1?.siblingIndex).toBe(10)
+    expect(x2?.parentId).toBe(x1Id)
+    expect(x2?.siblingIndex).toBe(0)
+    expect(x3?.parentId).toBe(x2Id)
+    expect(x3?.siblingIndex).toBe(0)
+    expect(x1?.attachmentRefs?.map((ref) => ref.attachmentId)).toEqual([attachment.id])
+    expect(x3?.attachmentRefs?.map((ref) => ref.attachmentId)).toEqual([attachment.id])
+    expect((await getDb().attachments.get(attachment.id))?.refCount).toBe(2)
+
+    for (const [id, siblingIndex] of [
+      ['V', 0],
+      ['C2', 1],
+      ['C1', 2],
+    ] as const) {
+      const child = await getStoredMessage(id)
+      expect(child?.parentId).toBe(x3Id)
+      expect(child?.siblingIndex).toBe(siblingIndex)
+    }
+    expect((await getStoredMessage('C1'))?.turnId).toBe('shared-turn')
+    expect((await getStoredMessage('C2'))?.turnId).toBe('shared-turn')
+    expect((await getStoredMessage('G'))?.parentId).toBe('C1')
+    expect((await getStoredMessage('G'))?.turnId).toBe('descendant-turn')
+    expect((await getStoredMessage('T'))?.parentId).toBe('P')
+    expect((await getStoredMessage('T'))?.siblingIndex).toBe(9)
+
+    expect(res.effects.newMessageIds).toEqual([x1Id, x2Id, x3Id])
+    expect(new Set(res.effects.newMessageIds).size).toBe(3)
+    expect(res.effects.reparented).toEqual([
+      { id: 'V', previousParentId: 'P', newParentId: x3Id },
+      { id: 'C2', previousParentId: 'P', newParentId: x3Id },
+      { id: 'C1', previousParentId: 'P', newParentId: x3Id },
+    ])
+    expect(res.effects.cursorUpdates).toEqual({
+      P: x1Id,
+      [x1Id]: x2Id,
+      [x2Id]: x3Id,
+      [x3Id]: 'C2',
+    })
+  })
+
+  it('supports the virtual root and falls back to the canonical selected branch', async () => {
+    const chat = await seedChat()
+    await putMessage(chat.id, { id: 'R2', parentId: null, siblingIndex: 1, createdAt: 20 })
+    await putMessage(chat.id, { id: 'R1', parentId: null, siblingIndex: 5, createdAt: 1 })
+    await putMessage(chat.id, { id: 'R1L', parentId: 'R1', siblingIndex: 0, createdAt: 100 })
+    await putMessage(chat.id, {
+      id: 'RT',
+      parentId: null,
+      siblingIndex: 9,
+      createdAt: 200,
+      deleted: true,
+    })
+
+    const res = await pasteImport({
+      chatId: chat.id,
+      slot: { kind: 'after-all', parentId: null },
+      cursor: { __root__: 'missing' },
+      messages: [
+        { role: 'system', content: [{ type: 'text', text: 'X1' }] },
+        { role: 'user', content: [{ type: 'text', text: 'X2' }] },
+      ],
+      now: 300,
+    })
+
+    const [x1Id, x2Id] = res.newMessageIds as [MessageId, MessageId]
+    expect((await getStoredMessage(x1Id))?.parentId).toBeNull()
+    expect((await getStoredMessage(x1Id))?.siblingIndex).toBe(10)
+    expect((await getStoredMessage(x2Id))?.parentId).toBe(x1Id)
+    expect((await getStoredMessage('R2'))?.parentId).toBe(x2Id)
+    expect((await getStoredMessage('R2'))?.siblingIndex).toBe(0)
+    expect((await getStoredMessage('R1'))?.parentId).toBe(x2Id)
+    expect((await getStoredMessage('R1'))?.siblingIndex).toBe(1)
+    expect((await getStoredMessage('R1L'))?.parentId).toBe('R1')
+    expect((await getStoredMessage('RT'))?.parentId).toBeNull()
+    expect((await getStoredMessage('RT'))?.siblingIndex).toBe(9)
+    expect(res.effects.reparented).toEqual([
+      { id: 'R2', previousParentId: null, newParentId: x2Id },
+      { id: 'R1', previousParentId: null, newParentId: x2Id },
+    ])
+    expect(res.effects.cursorUpdates).toEqual({
+      __root__: x1Id,
+      [x1Id]: x2Id,
+      [x2Id]: 'R1',
+    })
+  })
+
+  it('appends the shared chain normally when the slot has no live children', async () => {
+    const chat = await seedChat()
+    await putMessage(chat.id, { id: 'P', parentId: null, createdAt: 1 })
+    await putMessage(chat.id, {
+      id: 'T',
+      parentId: 'P',
+      siblingIndex: 7,
+      createdAt: 2,
+      deleted: true,
+    })
+
+    const res = await pasteImport({
+      chatId: chat.id,
+      slot: { kind: 'after-all', parentId: 'P' },
+      cursor: { P: 'T' },
+      messages: [
+        { role: 'assistant', content: [{ type: 'text', text: 'X1' }] },
+        { role: 'user', content: [{ type: 'text', text: 'X2' }] },
+      ],
+      now: 5,
+    })
+
+    const [x1Id, x2Id] = res.newMessageIds as [MessageId, MessageId]
+    expect((await getStoredMessage(x1Id))?.parentId).toBe('P')
+    expect((await getStoredMessage(x1Id))?.siblingIndex).toBe(8)
+    expect((await getStoredMessage(x2Id))?.parentId).toBe(x1Id)
+    expect((await getStoredMessage('T'))?.parentId).toBe('P')
+    expect((await getStoredMessage('T'))?.siblingIndex).toBe(7)
+    expect(res.effects.newMessageIds).toEqual([x1Id, x2Id])
+    expect(res.effects.reparented).toEqual([])
+    expect(res.effects.cursorUpdates).toEqual({ P: x1Id, [x1Id]: x2Id })
+  })
+
+  it('rejects a stale shared-trunk snapshot before writing any imported row', async () => {
+    const chat = await seedChat()
+    await putMessage(chat.id, { id: 'P', parentId: null, createdAt: 1 })
+    await putMessage(chat.id, { id: 'C', parentId: 'P', siblingIndex: 0, createdAt: 2 })
+    const repo = getBrowserRepository()
+    let injected = false
+    __setWorkspaceRepositoryForTests({
+      listMessageHeaders: async (chatId) => {
+        const headers = await repo.listMessageHeaders(chatId)
+        if (!injected) {
+          injected = true
+          await putMessage(chat.id, {
+            id: 'LATE',
+            parentId: 'P',
+            siblingIndex: 1,
+            createdAt: 3,
+          })
+        }
+        return headers
+      },
+      runMutation: repo.runMutation.bind(repo),
+    } as WorkspaceRepository)
+
+    await expect(
+      pasteImport({
+        chatId: chat.id,
+        slot: { kind: 'after-all', parentId: 'P' },
+        cursor: { P: 'C' },
+        messages: [{ role: 'assistant', content: [{ type: 'text', text: 'X' }] }],
+        now: 5,
+      }),
+    ).rejects.toBeInstanceOf(TreeChangedError)
+
+    __resetWorkspaceRepositoryForTests()
+    const rows = await loadMessages(chat.id)
+    expect(rows.map((row) => row.id).sort()).toEqual(['C', 'LATE', 'P'])
+    expect(rows.some((row) => row.origin === 'imported')).toBe(false)
   })
 })
 

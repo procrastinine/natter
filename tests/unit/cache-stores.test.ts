@@ -1,5 +1,5 @@
 import Dexie from 'dexie'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { DEFAULT_CORS_PROXY_URL, DEV_CORS_PROXY_URL } from '../../src/core/cors-proxy'
 import {
   defaultCorsProxyUrlForRuntime,
@@ -247,6 +247,18 @@ describe('settings', () => {
     expect(prefs.sidebarRenderWindowLoadMode).toBe('manual')
   })
 
+  it('reads the global preference snapshot with one IndexedDB request', async () => {
+    const settings = getDb().settings
+    const get = vi.spyOn(settings, 'get')
+    const bulkGet = vi.spyOn(settings, 'bulkGet')
+
+    await readGlobalPreferences()
+
+    expect(bulkGet).toHaveBeenCalledOnce()
+    expect(bulkGet.mock.calls[0]?.[0]).toHaveLength(18)
+    expect(get).not.toHaveBeenCalled()
+  })
+
   it('marks run-once backcompat tasks complete on a fresh database', async () => {
     expect(await getSetting('backfill:attachment-refs-v1')).toBe(1)
     expect(await getSetting('backfill:message-body-split-v1')).toBe(1)
@@ -326,6 +338,9 @@ describe('settings', () => {
       expect.objectContaining({ refId: 'legacy:chat-old:0', attachmentId: 'att-old' }),
     ])
     expect((await migrated.attachments.get('att-old'))?.refCount).toBe(2)
+    expect(await migrated.attachmentRefEdges.where('attachmentId').equals('att-old').count()).toBe(
+      2,
+    )
     expect(await getSetting('backfill:attachment-refs-v1')).toBe(1)
   })
 

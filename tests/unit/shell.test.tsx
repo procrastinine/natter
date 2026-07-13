@@ -8,6 +8,7 @@ import { cursorKeyOf } from '../../src/core/active-path'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import type { Chat, Message } from '../../src/core/types'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
+import { rebuildChatSidebarProjection } from '../../src/store/chat-sidebar-projection'
 import { archiveChat, createChat, updateChatSettings } from '../../src/store/chats'
 import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
 import { createFolder } from '../../src/store/folders'
@@ -19,9 +20,15 @@ import { createPreset, getPreset } from '../../src/store/presets'
 import { createProfile } from '../../src/store/profiles'
 import { __resetSearchSessionRunnerForTests } from '../../src/store/search-session'
 import { setSetting } from '../../src/store/settings'
+import {
+  __resetStreamLeasesForTests,
+  __setStreamLockManagerForTests,
+  STREAM_LEASE_TTL_MS,
+} from '../../src/store/stream-leases'
 import { createTag } from '../../src/store/tags'
 import { useChatStore } from '../../src/store/zustand/chatStore'
 import { __resetSearchStoreForTests } from '../../src/store/zustand/searchStore'
+import { useStreamStore } from '../../src/store/zustand/streamStore'
 import { useUiStore } from '../../src/store/zustand/uiStore'
 import { readActiveSeedState } from '../../src/ui/header/ConnectionHeader'
 import { putTestMessageHeaderOnly, putTestMessages } from '../helpers/message-storage'
@@ -37,7 +44,9 @@ describe('shell smoke render', () => {
     __resetKeyCacheForTests()
     __resetSearchSessionRunnerForTests()
     __resetSearchStoreForTests()
+    __resetStreamLeasesForTests()
     useChatStore.getState().reset()
+    useStreamStore.getState().reset()
     useUiStore.getState().reset()
     __resetDbForTests()
     window.localStorage.clear()
@@ -167,6 +176,35 @@ describe('shell smoke render', () => {
     })
   })
 
+  it('retries a fresh no-Web-Locks orphan when its lease TTL expires', async () => {
+    __setStreamLockManagerForTests(null)
+    const chat = await createChat({ id: 'chat-orphan-retry', title: 'Orphan retry' })
+    const meta = await getDb().settings.get('workspace-meta')
+    const replacementEpoch = (meta?.value as { replacementEpoch?: number } | undefined)
+      ?.replacementEpoch
+    expect(replacementEpoch).toBeTypeOf('number')
+    await getDb().streamLeases.put({
+      streamId: 'fresh-message-less-orphan',
+      chatId: chat.id,
+      ownerClientId: 'closed-tab',
+      fenceToken: 'closed-tab-fence',
+      replacementEpoch: replacementEpoch as number,
+      startedAt: Date.now() - STREAM_LEASE_TTL_MS,
+      heartbeatAt: Date.now() - STREAM_LEASE_TTL_MS + 300,
+      attemptKind: 'generation',
+    })
+    window.location.hash = `#/chat/${chat.id}`
+
+    render(<App />)
+
+    await waitFor(
+      async () => {
+        expect(await getDb().streamLeases.get('fresh-message-less-orphan')).toBeUndefined()
+      },
+      { timeout: 2_000 },
+    )
+  })
+
   it('does not rewrite an existing chat model just because the chat route opens', async () => {
     const openAiKey = await createKey({ name: 'OpenAI', plaintextKey: 'sk-test' })
     const openAi = await createProfile({
@@ -210,6 +248,28 @@ describe('shell smoke render', () => {
       'data-chat-model-panel',
       'closed',
     )
+  })
+
+  it('opens chat settings synchronously without mounting an empty transcript', async () => {
+    const chat = await createChat({ settings: cloneDefaultChatSettings() })
+    window.location.hash = `#/chat/${chat.id}`
+    const { container } = render(<App />)
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-role="settings-cog"]')).toBeInTheDocument()
+    })
+    expect(container.querySelector('[data-ui="message-list"]')).not.toBeInTheDocument()
+    expect(container).not.toHaveTextContent('Loading conversation…')
+
+    fireEvent.click(container.querySelector('[data-role="settings-cog"]') as HTMLButtonElement)
+
+    expect(container.querySelector('[data-ui="chat-model-panel"]')).toBeInTheDocument()
+    expect(container.querySelector('[data-ui="app-shell"]')).toHaveAttribute(
+      'data-chat-model-panel',
+      'open',
+    )
+    expect(container).not.toHaveTextContent('Loading chat settings…')
+    expect(container.querySelector('[data-ui="message-list"]')).not.toBeInTheDocument()
   })
 
   it('renders configured connection access beside the active chat title', async () => {
@@ -391,6 +451,68 @@ describe('shell smoke render', () => {
     await waitFor(() => {
       expect(container.querySelector('[data-ui="focus-mode-toggle"]')).toBeInTheDocument()
     })
+  })
+
+  it('opens a header-only tree without mounting the transcript, composer, or message bodies', async () => {
+    const chat = await createChat({ title: 'Cold tree', settings: cloneDefaultChatSettings() })
+    const root: Message = {
+      id: 'cold-tree-root',
+      chatId: chat.id,
+      parentId: null,
+      siblingIndex: 0,
+      turnId: 'cold-tree-root',
+      turnIndex: 0,
+      createdAt: 1,
+      role: 'user',
+      origin: 'user',
+      content: [{ type: 'text', text: 'poison body must stay cold' }],
+      nodeVersion: 0,
+      deleted: false,
+    }
+    const child: Message = {
+      ...root,
+      id: 'cold-tree-child',
+      parentId: root.id,
+      turnId: 'cold-tree-child',
+      createdAt: 2,
+      role: 'assistant',
+      origin: 'generated',
+    }
+    await putTestMessageHeaderOnly(root)
+    await putTestMessageHeaderOnly(child)
+    await getDb().chats.put({ ...chat, lastUpdatedLeafId: child.id })
+    useUiStore.getState().setEditTreeMode(true)
+    useUiStore.getState().setTreeViewChatId(chat.id)
+    window.location.hash = `#/chat/${chat.id}`
+
+    const { container } = render(<App />)
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-ui="branch-tree-view"]')).toBeInTheDocument()
+      expect(container.querySelectorAll('[data-ui="branch-tree-node"]')).toHaveLength(2)
+    })
+    expect(container.querySelector('[data-ui="message-list"]')).not.toBeInTheDocument()
+    expect(container.querySelector('[data-ui="composer"]')).not.toBeInTheDocument()
+    expect(container.querySelector('[data-ui="focus-mode-toggle"]')).not.toBeInTheDocument()
+    expect(container.querySelector('[data-ui="tree-density-toggle"]')).toBeInTheDocument()
+    expect(
+      container.querySelector(
+        '[data-ui="branch-tree-canvas-pane"] [data-ui="tree-density-toggle"]',
+      ),
+    ).toBeInTheDocument()
+    expect(container.querySelector('[data-role="chat-branch-tree"]')).toHaveAttribute(
+      'aria-pressed',
+      'true',
+    )
+    expect(container.querySelector('[data-connector-hit]')).toBeInTheDocument()
+    const editTreeButton = container.querySelector(
+      '[data-role="chat-edit-tree"]',
+    ) as HTMLButtonElement
+    expect(editTreeButton).toBeDisabled()
+    expect(editTreeButton).toHaveAttribute('title', 'Return to conversation to edit the tree')
+    fireEvent.click(editTreeButton)
+    expect(container.querySelector('[data-ui="edit-tree-toolbar"]')).not.toBeInTheDocument()
+    await waitFor(() => expect(useUiStore.getState().editTreeMode).toBe(false))
   })
 
   it('renders the active chat without hydrating irrelevant chat or branch bodies', async () => {
@@ -600,6 +722,9 @@ describe('shell smoke render', () => {
     })
 
     expect(useChatStore.getState().getCursor(chat.id)?.[cursorKeyOf(root.id)]).toBe(localLeaf.id)
+    await waitFor(() => {
+      expect(window.location.hash).toBe(`#/chat/${chat.id}/message/${localLeaf.id}`)
+    })
 
     const { header, body } = splitMessageForStorage(localLeaf)
     const db = getDb()
@@ -753,6 +878,7 @@ describe('shell smoke render', () => {
       tags: [tag.id],
       updatedAt: 2,
     })
+    await rebuildChatSidebarProjection(getDb())
 
     const { container } = render(<App />)
     await waitFor(() => {
@@ -798,6 +924,7 @@ describe('shell smoke render', () => {
       tags: [tag.id],
       updatedAt: 2,
     })
+    await rebuildChatSidebarProjection(getDb())
 
     const { container } = render(<App />)
     await waitFor(() => {
@@ -853,6 +980,7 @@ describe('shell smoke render', () => {
       previewText: `preview ${index}`,
     }))
     await getDb().chats.bulkPut(chats)
+    await rebuildChatSidebarProjection(getDb())
     await setSetting('global:sidebar-render-window-size', 250)
 
     const { container } = render(<App />)
@@ -1026,6 +1154,7 @@ describe('shell smoke render', () => {
       previewText: 'durable search preview',
       updatedAt: 3,
     })
+    await rebuildChatSidebarProjection(getDb())
     const { container } = render(<App />)
     const input = container.querySelector('[data-ui="sidebar-search-input"]') as HTMLInputElement
 

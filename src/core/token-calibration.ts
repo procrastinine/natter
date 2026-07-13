@@ -1,6 +1,3 @@
-// Per-chat per-bucket chars-per-token calibration. See
-// `plan/token-counting-audit.md §Phase B` for the full design.
-//
 // Core insight: every successful send yields two (charCount, promptTokens)
 // pairs — one for the prompt, one for the completion. Running-summing these
 // per calibration bucket yields an empirically-calibrated ratio that adapts
@@ -480,7 +477,7 @@ export async function addAcceptedSampleToGlobal(
       return
     }
     const calibrationKey = tokenCalibrationKey(modelId)
-    await updateSetting<GlobalTokenCalibration>(GLOBAL_KEY, (stored) => {
+    await updateSetting<GlobalTokenCalibration>(GLOBAL_TOKEN_CALIBRATION_KEY, (stored) => {
       const global = normalizeGlobalPayload(stored)
       let globalSample = global.byModel[calibrationKey]
       if (!globalSample) {
@@ -503,7 +500,7 @@ export async function subtractSamplesFromTokenCalibrationGlobal(
   const removedByFamily = aggregateCalibrationSamples(samples)
   if (Object.keys(removedByFamily).length === 0) return
   try {
-    await updateSetting<GlobalTokenCalibration>(GLOBAL_KEY, (stored) => {
+    await updateSetting<GlobalTokenCalibration>(GLOBAL_TOKEN_CALIBRATION_KEY, (stored) => {
       const global = normalizeGlobalPayload(stored)
       let changed = false
       for (const [calibrationKey, removed] of Object.entries(removedByFamily)) {
@@ -543,14 +540,14 @@ export async function addSampleToChatAndGlobal(
 // Global-storage helpers (settings table, key `global:token-calibration`).
 // ---------------------------------------------------------------------------
 
-const GLOBAL_KEY = 'global:token-calibration'
+export const GLOBAL_TOKEN_CALIBRATION_KEY = 'global:token-calibration'
 
 function emptyGlobal(): GlobalTokenCalibration {
   return { version: 1, updatedAt: 0, byModel: {} }
 }
 
 export async function readTokenCalibrationGlobal(): Promise<GlobalTokenCalibration> {
-  const raw = await getSetting<unknown>(GLOBAL_KEY)
+  const raw = await getSetting<unknown>(GLOBAL_TOKEN_CALIBRATION_KEY)
   if (!raw || typeof raw !== 'object') return emptyGlobal()
   // Minimal validation — version check only; individual samples are
   // consumed through `ratioFromSample` which already guards against bad
@@ -568,7 +565,7 @@ export async function readTokenCalibrationGlobal(): Promise<GlobalTokenCalibrati
 }
 
 export async function writeTokenCalibrationGlobal(value: GlobalTokenCalibration): Promise<void> {
-  await updateSetting<GlobalTokenCalibration>(GLOBAL_KEY, () => ({
+  await updateSetting<GlobalTokenCalibration>(GLOBAL_TOKEN_CALIBRATION_KEY, () => ({
     ...value,
     byModel: normalizedCalibrationSamples(value.byModel) ?? {},
   }))
@@ -835,6 +832,7 @@ function reasoningDetailsChars(message: Message): number {
   if (!details || details.length === 0) return 0
   let total = 0
   for (const d of details) {
+    if (d.id?.startsWith('tool_')) continue
     if (d.type === 'reasoning.text') total += safeLen(d.text)
     else if (d.type === 'reasoning.summary') total += safeLen(d.summary)
     // reasoning.encrypted is opaque bytes — never contributes to char count.
@@ -859,37 +857,49 @@ interface SamplePair {
   tokens: number
 }
 
+export interface PromptCalibrationBasis {
+  chars: number
+  tokenOverhead: number
+}
+
+export function derivePromptCalibrationBasis(
+  input: Omit<DerivePromptSampleInput, 'usage' | 'modelId'>,
+): PromptCalibrationBasis | null {
+  if (
+    input.mediaTokens > 0 ||
+    input.sentPath.some((message) => hasNonTextContent(message.content))
+  ) {
+    return null
+  }
+
+  let chars = safeLen(input.systemPrompt)
+  let tokenOverhead = FRAMING_PER_MESSAGE[input.family] * input.sentPath.length
+  for (const message of input.sentPath) {
+    chars += messageTextChars(message.content)
+    if (input.reasoningEchoOpts) {
+      tokenOverhead += estimateReasoningEchoTokensForMessage(message, input.reasoningEchoOpts)
+      tokenOverhead += estimateToolCallContextTokensForMessage(message, input.reasoningEchoOpts)
+    }
+  }
+  return { chars, tokenOverhead }
+}
+
+export function derivePromptSampleFromBasis(
+  basis: PromptCalibrationBasis,
+  usage: ChatUsage,
+): SamplePair | null {
+  const promptTokens = safeServerTokens(usage.prompt_tokens)
+  if (promptTokens === undefined || promptTokens <= 0) return null
+  const tokens = promptTokens - basis.tokenOverhead
+  return tokens > 0 ? { chars: basis.chars, tokens } : null
+}
+
 // Build the prompt sample (chars sent vs prompt_tokens minus text-only
 // overhead). Returns `null` when inputs are insufficient to form a useful
 // sample, or when the sent path contains any non-text/file/image input.
 export function derivePromptSample(input: DerivePromptSampleInput): SamplePair | null {
-  if (input.mediaTokens > 0 || input.sentPath.some((m) => hasNonTextContent(m.content))) {
-    return null
-  }
-  const promptTokens = safeServerTokens(input.usage.prompt_tokens)
-  if (promptTokens === undefined || promptTokens <= 0) return null
-
-  let sentTextChars = safeLen(input.systemPrompt)
-  let reasoningEchoHeuristic = 0
-  let toolCallHeuristic = 0
-  for (const m of input.sentPath) {
-    sentTextChars += messageTextChars(m.content)
-    if (input.reasoningEchoOpts) {
-      reasoningEchoHeuristic += estimateReasoningEchoTokensForMessage(m, input.reasoningEchoOpts)
-      toolCallHeuristic += estimateToolCallContextTokensForMessage(m, input.reasoningEchoOpts)
-    }
-  }
-
-  // Per-family framing per message. For OpenAI chat-completions the server
-  // adds ~4 tokens of wrapper overhead per message; other families put
-  // wrapper at the request level.
-  const framingOverhead = FRAMING_PER_MESSAGE[input.family] * input.sentPath.length
-
-  const calibratedTextTokens =
-    promptTokens - reasoningEchoHeuristic - toolCallHeuristic - framingOverhead
-  if (calibratedTextTokens <= 0) return null
-
-  return { chars: sentTextChars, tokens: calibratedTextTokens }
+  const basis = derivePromptCalibrationBasis(input)
+  return basis ? derivePromptSampleFromBasis(basis, input.usage) : null
 }
 
 interface DeriveCompletionSampleInput {

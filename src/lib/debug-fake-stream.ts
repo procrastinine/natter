@@ -5,7 +5,7 @@ import { cloneDefaultChatSettings } from '../core/defaults'
 import type { ChatId, ConnectionProfile, MessageId } from '../core/types'
 import { type SendTextResult, sendFromMessage, sendText } from '../hooks/useChat'
 import { createChat } from '../store/chats'
-import { putCachedEndpoints } from '../store/models-cache'
+import { getCachedEndpoints, putCachedEndpoints } from '../store/models-cache'
 import { createProfile, getProfile } from '../store/profiles'
 import { useChatStore } from '../store/zustand/chatStore'
 import { useStreamStore } from '../store/zustand/streamStore'
@@ -51,6 +51,7 @@ interface DebugStoreSnapshot {
   }
   streamStore: {
     activeCount: number
+    activeTargets: Array<{ chatId: ChatId; messageId?: MessageId }>
     liveSnapshotCount: number
     liveTextLength: number
     liveReasoningLength: number
@@ -79,6 +80,7 @@ const streamStats = {
   maxLiveReasoningLength: 0,
 }
 let streamStatsInstalled = false
+let debugEnvironmentPromise: Promise<ConnectionProfile> | null = null
 
 declare global {
   interface Window {
@@ -151,6 +153,10 @@ function state(): DebugStoreSnapshot {
     },
     streamStore: {
       activeCount: Object.keys(streamState.activeByStreamId).length,
+      activeTargets: Object.values(streamState.activeByStreamId).map(({ chatId, messageId }) => ({
+        chatId,
+        ...(messageId ? { messageId } : {}),
+      })),
       liveSnapshotCount: liveSnapshots.length,
       liveTextLength: liveSnapshots.reduce((sum, snapshot) => sum + snapshot.textLength, 0),
       liveReasoningLength: liveSnapshots.reduce(
@@ -171,8 +177,7 @@ async function start(options: DebugFakeStreamOptions = {}): Promise<DebugFakeStr
   const chunkChars = Math.max(1, Math.floor(options.chunkChars ?? 128))
   const reasoningChunkChars = Math.max(1, Math.floor(options.reasoningChunkChars ?? chunkChars))
   const delayMs = Math.max(0, Math.floor(options.delayMs ?? 0))
-  const connection = await ensureDebugProfile()
-  await seedDebugEndpoint(connection.id)
+  const connection = await ensureDebugEnvironment()
   const chatId = options.chatId ?? (await createDebugChat(connection.id)).id
   if (options.openChat !== false) navigateToChat(chatId)
 
@@ -227,6 +232,20 @@ async function ensureDebugProfile(): Promise<ConnectionProfile> {
   })
 }
 
+async function ensureDebugEnvironment(): Promise<ConnectionProfile> {
+  if (debugEnvironmentPromise) return debugEnvironmentPromise
+  const setup = ensureDebugProfile().then(async (connection) => {
+    await seedDebugEndpoint(connection.id)
+    return connection
+  })
+  debugEnvironmentPromise = setup
+  try {
+    return await setup
+  } finally {
+    if (debugEnvironmentPromise === setup) debugEnvironmentPromise = null
+  }
+}
+
 async function createDebugChat(profileId: string) {
   const settings = cloneDefaultChatSettings()
   settings.profileId = profileId
@@ -241,6 +260,7 @@ async function createDebugChat(profileId: string) {
 }
 
 async function seedDebugEndpoint(profileId: string): Promise<void> {
+  if (await getCachedEndpoints(profileId, DEBUG_MODEL_ID)) return
   await putCachedEndpoints(profileId, DEBUG_MODEL_ID, {
     id: DEBUG_MODEL_ID,
     endpoints: [

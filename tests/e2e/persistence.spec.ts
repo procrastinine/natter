@@ -1,5 +1,4 @@
-import type { Page } from '@playwright/test'
-import { expect, test } from '@playwright/test'
+import { expect, type Page, test } from './fixtures'
 import {
   buildSseBody,
   clearIndexedDb,
@@ -9,6 +8,7 @@ import {
   readMessages,
   seedFirstRun,
   sendMessage,
+  waitForAssistantGenerationFinished,
 } from './helpers'
 
 async function getChatRow(page: Page, chatId: string): Promise<Record<string, unknown>> {
@@ -32,7 +32,6 @@ async function getChatRow(page: Page, chatId: string): Promise<Record<string, un
 }
 
 test.beforeEach(async ({ page }) => {
-  await page.goto('/')
   await clearIndexedDb(page)
   await seedFirstRun(page)
 })
@@ -50,6 +49,8 @@ test('reloading a chat preserves user + assistant messages and generation meta',
   await sendMessage(page, 'hello persist')
   const assistant = page.locator('[data-ui="message"][data-role="assistant"]').first()
   await expect(assistant.locator('[data-ui="message-body"]')).toHaveText('persisted text')
+  const chatId = await firstChatId(page)
+  await waitForAssistantGenerationFinished(page, chatId)
 
   await page.reload()
   // The URL is the source of truth — reload restores the active chat directly,
@@ -143,6 +144,7 @@ test('chat.totalCostUsd matches the sum of generation.cost across live rows', as
   await expect(page.locator('[data-ui="message"][data-role="assistant"]').nth(1)).toBeVisible()
 
   const chatId = await firstChatId(page)
+  await waitForAssistantGenerationFinished(page, chatId, 1)
   const messages = (await readMessages(page, chatId)) as Array<{
     deleted: boolean
     generation?: { cost?: number }
@@ -168,28 +170,10 @@ test('streaming assistant row commits generation.finishedAt on close', async ({ 
       .first()
       .locator('[data-ui="message-body"]'),
   ).toHaveText('bye')
-  const finishedAt = await page.evaluate(async () => {
-    const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const req = indexedDB.open('natter')
-      req.onsuccess = () => resolve(req.result)
-      req.onerror = () => reject(req.error)
-    })
-    try {
-      return await new Promise<number | undefined>((resolve, reject) => {
-        const tx = db.transaction('messages', 'readonly')
-        const req = tx.objectStore('messages').getAll()
-        req.onsuccess = () => {
-          const rows = (
-            req.result as Array<{ role: string; generation?: { finishedAt?: number } }>
-          ).filter((r) => r.role === 'assistant')
-          resolve(rows[0]?.generation?.finishedAt)
-        }
-        req.onerror = () => reject(req.error)
-      })
-    } finally {
-      db.close()
-    }
-  })
+  const chatId = await firstChatId(page)
+  await waitForAssistantGenerationFinished(page, chatId)
+  const assistant = (await readMessages(page, chatId)).find((row) => row.role === 'assistant')
+  const finishedAt = (assistant?.generation as { finishedAt?: number } | undefined)?.finishedAt
   expect(typeof finishedAt).toBe('number')
   expect(finishedAt).toBeGreaterThan(0)
 })

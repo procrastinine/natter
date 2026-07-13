@@ -28,11 +28,12 @@ import type {
   ContentItem,
   Message,
   MessageId,
-  ProviderOutputItem,
-  ReasoningDetail,
 } from '../core/types'
 import { getChat } from '../store/chats'
-import { resolveKeyIfPresent } from '../store/keys'
+import {
+  type ConnectionRuntimeKeyCandidate,
+  resolveConnectionRuntimeKeys,
+} from '../store/connection-runtime'
 import { bumpPresetLastUsedAt } from '../store/presets'
 import { bumpProfileLastUsedAt, getProfile } from '../store/profiles'
 import { getWorkspaceRepository } from '../store/workspace-repository'
@@ -49,6 +50,7 @@ export interface MessageOpsContext {
     chatId: ChatId
     connection: ConnectionProfile
     apiKey: string
+    apiKeyCandidates?: readonly ConnectionRuntimeKeyCandidate[]
     parentMessageId: MessageId
     prefillContent?: ContentItem[]
   }) => Promise<SendTextResult>
@@ -58,51 +60,62 @@ export async function editInPlace(
   chatId: ChatId,
   message: Message,
   newText: string,
-  reasoning?: ReasoningDetail[],
-  attachmentRefs?: AttachmentRef[],
-  providerOutputItems?: ProviderOutputItem[],
 ): Promise<void> {
   const nextContent = writeTextInto(message.content, newText)
   await editMessageContent({
     chatId,
     messageId: message.id,
     content: nextContent,
-    ...(attachmentRefs ? { attachmentRefs } : {}),
   })
-  // Reasoning edits bypass `editMessageContent` (that helper only
-  // touches content). A separate scoped mutation updates
-  // reasoningDetails directly — this preserves the "never mutate the
-  // generation factual record" rule for cost / usage / model while
-  // still letting advanced users curate the reasoning carrier.
-  if (reasoning !== undefined || providerOutputItems !== undefined) {
-    const repo = getWorkspaceRepository()
-    await repo.runMutation([{ kind: 'message', messageId: message.id }], async (ctx) => {
-      const current = await ctx.getMessage(message.id)
-      if (!current) return
-      const next: Message = { ...current }
-      if (reasoning !== undefined) {
-        if (reasoning.length === 0) {
-          delete next.reasoningDetails
-        } else {
-          next.reasoningDetails = reasoning
-        }
-      }
-      if (providerOutputItems !== undefined) {
-        if (providerOutputItems.length === 0) {
-          delete next.providerOutputItems
-        } else {
-          next.providerOutputItems = providerOutputItems
-        }
-      }
-      await ctx.putMessage(next)
-    })
-  }
 }
 
-async function resolveActiveConnection(
+export async function toggleReasoningDetailHidden(
   chatId: ChatId,
-): Promise<
-  | { ok: true; profile: ConnectionProfile; apiKey: string; presetId?: string }
+  messageId: MessageId,
+  detailIndex: number,
+): Promise<void> {
+  const repo = getWorkspaceRepository()
+  await repo.runMutation([{ kind: 'message', messageId }], async (ctx) => {
+    const current = await ctx.getMessage(messageId)
+    if (!current || current.chatId !== chatId) return
+    const details = current.reasoningDetails
+    const detail = details?.[detailIndex]
+    if (!details || !detail || detail.id?.startsWith('tool_')) return
+    const nextDetails = [...details]
+    nextDetails[detailIndex] = { ...detail, hidden: !detail.hidden }
+    await ctx.putMessage({ ...current, reasoningDetails: nextDetails })
+  })
+}
+
+export async function toggleProviderOutputItemHidden(
+  chatId: ChatId,
+  messageId: MessageId,
+  itemIndex: number,
+): Promise<void> {
+  const repo = getWorkspaceRepository()
+  await repo.runMutation([{ kind: 'message', messageId }], async (ctx) => {
+    const current = await ctx.getMessage(messageId)
+    if (!current || current.chatId !== chatId) return
+    const items = current.providerOutputItems
+    const item = items?.[itemIndex]
+    if (!items || !item) return
+    const nextItem = { ...item }
+    if (nextItem.hidden === true) delete nextItem.hidden
+    else nextItem.hidden = true
+    const nextItems = [...items]
+    nextItems[itemIndex] = nextItem
+    await ctx.putMessage({ ...current, providerOutputItems: nextItems })
+  })
+}
+
+async function resolveActiveConnection(chatId: ChatId): Promise<
+  | {
+      ok: true
+      profile: ConnectionProfile
+      apiKey: string
+      apiKeyCandidates: readonly ConnectionRuntimeKeyCandidate[]
+      presetId?: string
+    }
   | { ok: false; reason: string }
 > {
   const chat = await getChat(chatId)
@@ -112,14 +125,12 @@ async function resolveActiveConnection(
   const profile = await getProfile(chat.settings.profileId)
   if (!profile) return { ok: false, reason: 'profile-missing' }
   try {
-    const apiKey = (await resolveKeyIfPresent(profile.apiKeyRef)) ?? ''
-    if (profile.kind !== 'custom' && profile.kind !== 'llama-server' && !apiKey) {
-      return { ok: false, reason: 'missing-key' }
-    }
+    const apiKeyCandidates = await resolveConnectionRuntimeKeys(profile, { chatId })
     return {
       ok: true,
       profile,
-      apiKey,
+      apiKey: '',
+      apiKeyCandidates,
       ...(chat.presetId ? { presetId: chat.presetId } : {}),
     }
   } catch (err) {
@@ -159,6 +170,7 @@ export async function editAndResend(
     chatId: ctx.chatId,
     connection: conn.profile,
     apiKey: conn.apiKey,
+    apiKeyCandidates: conn.apiKeyCandidates,
     parentMessageId: inserted.messageId,
     ...(hasPrefill ? { prefillContent: options.prefillContent } : {}),
   })
@@ -185,6 +197,7 @@ export async function regenerateFromMessage(
     chatId: ctx.chatId,
     connection: conn.profile,
     apiKey: conn.apiKey,
+    apiKeyCandidates: conn.apiKeyCandidates,
     parentMessageId: assistantMessage.parentId,
   })
   await bumpProfileLastUsedAt(conn.profile.id)
@@ -227,6 +240,7 @@ export async function continueFromMessage(
     targetMessageId: assistantMessage.id,
     connection: conn.profile,
     apiKey: conn.apiKey,
+    apiKeyCandidates: conn.apiKeyCandidates,
   })
   await bumpProfileLastUsedAt(conn.profile.id)
   if (conn.presetId) await bumpPresetLastUsedAt(conn.presetId)

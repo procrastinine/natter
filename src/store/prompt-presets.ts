@@ -1,5 +1,3 @@
-// PromptPreset CRUD + pin-propagation. See `plan/02-data-model.md §2.6b`.
-//
 // A PromptPreset is a workspace-global, kind-scoped snapshot of a single
 // prompt text (system / continue-system / continue-user). The chat's
 // `{kind}Prompt` field is the canonical storage; `{kind}PromptPresetId` is
@@ -17,17 +15,94 @@
 //   - Delete preset -> clears pin on chats/ChatPresets; their last-propagated
 //     text is preserved.
 
-import type {
-  Chat,
-  ChatPreset,
-  ChatSettings,
-  PromptPreset,
-  PromptPresetId,
-  PromptPresetKind,
-} from '../core/types'
+import type { PromptPreset, PromptPresetId, PromptPresetKind } from '../core/types'
 import { newId } from '../lib/ulid'
+import { runAuthoritativeTransaction } from './authoritative-write'
 import { postEvent } from './broadcast'
 import { getDb } from './db'
+import { getWorkspaceRepository } from './workspace-repository'
+
+type PromptSettingSaveFlusher = () => Promise<void>
+
+const pendingPromptSettingSaves = new Map<string, Set<Promise<unknown>>>()
+const promptSettingSaveFlushers = new Map<string, Set<PromptSettingSaveFlusher>>()
+
+export function trackPendingPromptSettingSave<T>(chatId: string, save: Promise<T>): Promise<T> {
+  let saves = pendingPromptSettingSaves.get(chatId)
+  if (!saves) {
+    saves = new Set()
+    pendingPromptSettingSaves.set(chatId, saves)
+  }
+  const tracked = save.finally(() => {
+    const current = pendingPromptSettingSaves.get(chatId)
+    current?.delete(tracked)
+    if (current?.size === 0) pendingPromptSettingSaves.delete(chatId)
+  })
+  saves.add(tracked)
+  return tracked
+}
+
+export function registerPromptSettingSaveFlusher(
+  chatId: string,
+  flush: PromptSettingSaveFlusher,
+): () => void {
+  let flushers = promptSettingSaveFlushers.get(chatId)
+  if (!flushers) {
+    flushers = new Set()
+    promptSettingSaveFlushers.set(chatId, flushers)
+  }
+  flushers.add(flush)
+  return () => {
+    const current = promptSettingSaveFlushers.get(chatId)
+    current?.delete(flush)
+    if (current?.size === 0) promptSettingSaveFlushers.delete(chatId)
+  }
+}
+
+export async function flushPendingPromptSettingSaves(chatId: string): Promise<void> {
+  const flushers = promptSettingSaveFlushers.get(chatId)
+  const initial = [
+    ...(pendingPromptSettingSaves.get(chatId) ?? []),
+    ...[...(flushers ?? [])].map((flush) => flush()),
+  ]
+  if (initial.length > 0) {
+    const results = await Promise.allSettled(initial)
+    const failed = results.find(
+      (result): result is PromiseRejectedResult => result.status === 'rejected',
+    )
+    if (failed) throw failed.reason
+  }
+
+  for (;;) {
+    const pending = pendingPromptSettingSaves.get(chatId)
+    if (!pending?.size) return
+    const results = await Promise.allSettled([...pending])
+    const failed = results.find(
+      (result): result is PromiseRejectedResult => result.status === 'rejected',
+    )
+    if (failed) throw failed.reason
+  }
+}
+
+export function __promptSettingSaveRegistrySizeForTests(): {
+  pendingChats: number
+  pendingSaves: number
+  flusherChats: number
+  flushers: number
+} {
+  return {
+    pendingChats: pendingPromptSettingSaves.size,
+    pendingSaves: [...pendingPromptSettingSaves.values()].reduce(
+      (sum, saves) => sum + saves.size,
+      0,
+    ),
+    flusherChats: promptSettingSaveFlushers.size,
+    flushers: [...promptSettingSaveFlushers.values()].reduce(
+      (sum, flushers) => sum + flushers.size,
+      0,
+    ),
+  }
+}
 
 export class PromptPresetMissingError extends Error {
   readonly presetId: PromptPresetId
@@ -93,7 +168,17 @@ export async function createPromptPreset(input: CreatePromptPresetInput): Promis
     updatedAt: now,
   }
   if (input.lastUsedAt !== undefined) preset.lastUsedAt = input.lastUsedAt
-  await getDb().promptPresets.put(preset)
+  const db = getDb()
+  await runAuthoritativeTransaction({
+    db,
+    lockNames: [`prompt-preset:${preset.id}`],
+    tables: [db.promptPresets, db.settings],
+    now,
+    write: async (tx) => {
+      await tx.table('promptPresets').put(preset)
+      return { value: undefined, changed: true }
+    },
+  })
   postEvent({ kind: 'prompt-preset-mutated', promptPresetId: preset.id })
   return preset
 }
@@ -122,62 +207,17 @@ export async function updatePromptPreset(
   patch: UpdatePromptPresetPatch,
   opts: { now?: number } = {},
 ): Promise<PromptPreset> {
-  const db = getDb()
   const now = opts.now ?? Date.now()
-  const touchedChats: Chat[] = []
-  const touchedChatPresetIds: string[] = []
-  const result = await db.transaction('rw', db.promptPresets, db.chats, db.presets, async () => {
-    const existing = await db.promptPresets.get(presetId)
-    if (!existing) throw new PromptPresetMissingError(presetId)
-    const next: PromptPreset = {
-      ...existing,
-      ...patch,
-      id: existing.id,
-      kind: existing.kind,
-      createdAt: existing.createdAt,
-      updatedAt: now,
-    }
-    await db.promptPresets.put(next)
-    if (patch.text !== undefined && patch.text !== existing.text) {
-      const slot = SLOTS[existing.kind]
-      const chatHits: Chat[] = []
-      await db.chats.toCollection().each((chat) => {
-        if (chat.settings[slot.pinKey] === presetId) chatHits.push(chat)
-      })
-      for (const chat of chatHits) {
-        const nextSettings: ChatSettings = { ...chat.settings }
-        ;(nextSettings as unknown as Record<string, unknown>)[slot.textKey] = patch.text
-        const written: Chat = { ...chat, settings: nextSettings, updatedAt: now }
-        await db.chats.put(written)
-        touchedChats.push(written)
-      }
-      const presetHits: ChatPreset[] = []
-      await db.presets.toCollection().each((preset) => {
-        if (preset.settings[slot.pinKey] === presetId) presetHits.push(preset)
-      })
-      for (const preset of presetHits) {
-        const nextSettings: ChatSettings = { ...preset.settings }
-        ;(nextSettings as unknown as Record<string, unknown>)[slot.textKey] = patch.text
-        await db.presets.put({ ...preset, settings: nextSettings, updatedAt: now })
-        touchedChatPresetIds.push(preset.id)
-      }
-    }
-    return next
+  const existing = await getDb().promptPresets.get(presetId)
+  if (!existing) throw new PromptPresetMissingError(presetId)
+  const result = await getWorkspaceRepository().updatePromptPresetAndPropagate({
+    presetId,
+    patch,
+    slot: SLOTS[existing.kind],
+    now,
   })
-  postEvent({ kind: 'prompt-preset-mutated', promptPresetId: presetId })
-  for (const chat of touchedChats) {
-    postEvent({
-      kind: 'chat-mutated',
-      chatId: chat.id,
-      metaVersion: chat.metaVersion,
-      summaryVersion: chat.summaryVersion,
-      affected: [{ kind: 'chat-meta', chatId: chat.id }],
-    })
-  }
-  for (const id of touchedChatPresetIds) {
-    postEvent({ kind: 'preset-mutated', presetId: id })
-  }
-  return result
+  if (result.kind === 'missing') throw new PromptPresetMissingError(presetId)
+  return result.promptPreset
 }
 
 // Delete a preset. Clears any pins pointing at it on chats + ChatPresets;
@@ -186,50 +226,15 @@ export async function deletePromptPreset(
   presetId: PromptPresetId,
   opts: { now?: number } = {},
 ): Promise<void> {
-  const db = getDb()
   const now = opts.now ?? Date.now()
-  const touchedChats: Chat[] = []
-  const touchedChatPresetIds: string[] = []
-  await db.transaction('rw', db.promptPresets, db.chats, db.presets, async () => {
-    const existing = await db.promptPresets.get(presetId)
-    if (!existing) throw new PromptPresetMissingError(presetId)
-    const slot = SLOTS[existing.kind]
-    const chatHits: Chat[] = []
-    await db.chats.toCollection().each((chat) => {
-      if (chat.settings[slot.pinKey] === presetId) chatHits.push(chat)
-    })
-    for (const chat of chatHits) {
-      const nextSettings: ChatSettings = { ...chat.settings }
-      delete (nextSettings as Partial<ChatSettings>)[slot.pinKey]
-      const written: Chat = { ...chat, settings: nextSettings, updatedAt: now }
-      await db.chats.put(written)
-      touchedChats.push(written)
-    }
-    const presetHits: ChatPreset[] = []
-    await db.presets.toCollection().each((preset) => {
-      if (preset.settings[slot.pinKey] === presetId) presetHits.push(preset)
-    })
-    for (const preset of presetHits) {
-      const nextSettings: ChatSettings = { ...preset.settings }
-      delete (nextSettings as Partial<ChatSettings>)[slot.pinKey]
-      await db.presets.put({ ...preset, settings: nextSettings, updatedAt: now })
-      touchedChatPresetIds.push(preset.id)
-    }
-    await db.promptPresets.delete(presetId)
+  const existing = await getDb().promptPresets.get(presetId)
+  if (!existing) throw new PromptPresetMissingError(presetId)
+  const result = await getWorkspaceRepository().deletePromptPresetAndClearPins({
+    presetId,
+    slot: SLOTS[existing.kind],
+    now,
   })
-  postEvent({ kind: 'prompt-preset-deleted', promptPresetId: presetId })
-  for (const chat of touchedChats) {
-    postEvent({
-      kind: 'chat-mutated',
-      chatId: chat.id,
-      metaVersion: chat.metaVersion,
-      summaryVersion: chat.summaryVersion,
-      affected: [{ kind: 'chat-meta', chatId: chat.id }],
-    })
-  }
-  for (const id of touchedChatPresetIds) {
-    postEvent({ kind: 'preset-mutated', presetId: id })
-  }
+  if (result.kind === 'missing') throw new PromptPresetMissingError(presetId)
 }
 
 export async function bumpPromptPresetLastUsedAt(
@@ -237,7 +242,17 @@ export async function bumpPromptPresetLastUsedAt(
   now = Date.now(),
 ): Promise<void> {
   const db = getDb()
-  const existing = await db.promptPresets.get(presetId)
-  if (!existing) return
-  await db.promptPresets.put({ ...existing, lastUsedAt: now })
+  await runAuthoritativeTransaction({
+    db,
+    lockNames: [`prompt-preset:${presetId}`],
+    tables: [db.promptPresets, db.settings],
+    now,
+    write: async (tx) => {
+      const table = tx.table<PromptPreset, PromptPresetId>('promptPresets')
+      const existing = await table.get(presetId)
+      if (!existing) return { value: undefined, changed: false }
+      await table.put({ ...existing, lastUsedAt: now })
+      return { value: undefined, changed: true }
+    },
+  })
 }

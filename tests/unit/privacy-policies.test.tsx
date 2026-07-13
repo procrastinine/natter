@@ -1,4 +1,4 @@
-import { renderHook, waitFor } from '@testing-library/react'
+import { act, renderHook, waitFor } from '@testing-library/react'
 import Dexie from 'dexie'
 import { IDBFactory } from 'fake-indexeddb'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -44,6 +44,48 @@ afterEach(async () => {
 })
 
 describe('usePrivacyPolicies', () => {
+  it('negative-caches a fresh empty result while preserving explicit refresh', async () => {
+    const profile = await createProfile({
+      name: 'OpenRouter',
+      kind: 'openrouter',
+      baseUrl: 'https://openrouter.ai/api/v1',
+      apiKeyRef: newId(),
+    })
+    const modelId = 'deepseek/deepseek-v4-flash'
+    const fetchedAt = Date.now()
+    await putCachedPrivacyPolicy(profile.id, modelId, { policies: {}, fetchedAt }, fetchedAt)
+    fetchPrivacyScrapeMock.mockResolvedValueOnce({
+      modelId,
+      policies: {},
+      raw: {
+        policies: {
+          'deepinfra/fp4': {
+            training: false,
+            trainingOpenRouter: false,
+            retainsPrompts: false,
+            canPublish: false,
+            termsOfServiceURL: '',
+            privacyPolicyURL: '',
+          },
+        },
+        fetchedAt: Date.now(),
+      },
+      fetchedAt: Date.now(),
+    })
+
+    const { result } = renderHook(() => usePrivacyPolicies(profile.id, modelId))
+
+    await waitFor(() => expect(result.current.fetchedAt).toBe(fetchedAt))
+    expect(fetchPrivacyScrapeMock).not.toHaveBeenCalled()
+
+    act(() => result.current.refresh())
+
+    await waitFor(() => expect(fetchPrivacyScrapeMock).toHaveBeenCalledTimes(1))
+    await waitFor(() => {
+      expect(result.current.policies['deepinfra/fp4']?.retainsPrompts).toBe(false)
+    })
+  })
+
   it('automatically refreshes empty cached policy rows instead of requiring manual reload', async () => {
     const profile = await createProfile({
       name: 'OpenRouter',

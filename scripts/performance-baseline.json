@@ -1,0 +1,139 @@
+{
+  "schemaVersion": 1,
+  "deliveryBudgets": {
+    "recordedAt": "2026-07-13",
+    "topology": {
+      "rootFiles": [
+        "icons/natter-icon-192.png",
+        "icons/natter-icon-512.png",
+        "icons/natter-icon.svg",
+        "index.html",
+        "manifest.webmanifest"
+      ],
+      "assetExtensions": [".css", ".js", ".woff2"]
+    },
+    "maximums": {
+      "fileCount": 210,
+      "assetCount": 205,
+      "javascriptCount": 185,
+      "stylesheetCount": 3,
+      "fontCount": 20,
+      "totalBytes": 9500000,
+      "totalGzipBytes": 2450000
+    },
+    "largestJavascriptMaximums": {
+      "bytes": 1075000,
+      "gzipBytes": 325000
+    },
+    "coldStaticGraphMaximums": {
+      "fileCount": 12,
+      "javascriptCount": 11,
+      "stylesheetCount": 1,
+      "bytes": 1550000,
+      "gzipBytes": 400000
+    },
+    "namedAssets": {
+      "markdown-runtime": {
+        "prefix": "ToolEvidenceBlock",
+        "extension": ".js",
+        "maximums": {
+          "bytes": 1075000,
+          "gzipBytes": 325000
+        }
+      },
+      "markdown-styles": {
+        "prefix": "ToolEvidenceBlock",
+        "extension": ".css",
+        "maximums": {
+          "bytes": 30000,
+          "gzipBytes": 8700
+        }
+      },
+      "message-list": {
+        "prefix": "MessageList",
+        "extension": ".js",
+        "maximums": {
+          "bytes": 38000,
+          "gzipBytes": 12500
+        }
+      },
+      "branch-tree": {
+        "prefix": "BranchTreeView",
+        "extension": ".js",
+        "maximums": {
+          "bytes": 35000,
+          "gzipBytes": 11500
+        }
+      },
+      "branch-tree-inspector": {
+        "prefix": "BranchTreeInspector",
+        "extension": ".js",
+        "maximums": {
+          "bytes": 13000,
+          "gzipBytes": 4450
+        }
+      },
+      "branch-tree-preview": {
+        "prefix": "BranchTreePreview",
+        "extension": ".js",
+        "maximums": {
+          "bytes": 4000,
+          "gzipBytes": 1880
+        }
+      },
+      "branch-tree-inspector-search": {
+        "prefix": "BranchTreeInspectorSearch",
+        "extension": ".js",
+        "maximums": {
+          "bytes": 2200,
+          "gzipBytes": 1100
+        }
+      },
+      "global-settings": {
+        "prefix": "GlobalSettingsModal",
+        "extension": ".js",
+        "maximums": {
+          "bytes": 19000,
+          "gzipBytes": 5450
+        }
+      },
+      "storage-view": {
+        "prefix": "StorageView",
+        "extension": ".js",
+        "maximums": {
+          "bytes": 48000,
+          "gzipBytes": 13500
+        }
+      },
+      "import-modal": {
+        "prefix": "ImportModal",
+        "extension": ".js",
+        "maximums": {
+          "bytes": 4900,
+          "gzipBytes": 1950
+        }
+      }
+    },
+    "browserMeasurements": {
+      "preview": {
+        "resourceCount": 16,
+        "javascriptCount": 12,
+        "encodedBytes": 400000,
+        "decodedBytes": 1550000
+      },
+      "dev": {}
+    },
+    "coldForbiddenPathFragments": [
+      "BranchTreeInspector",
+      "BranchTreeInspectorSearch",
+      "BranchTreePreview",
+      "BranchTreeView",
+      "GlobalSettingsModal",
+      "ImportModal",
+      "MessageList",
+      "StorageView",
+      "ToolEvidenceBlock",
+      "debug-fake-stream"
+    ]
+  }
+}

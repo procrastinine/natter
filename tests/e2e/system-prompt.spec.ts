@@ -1,4 +1,4 @@
-import { expect, type Page, test } from '@playwright/test'
+import { expect, type Page, test } from './fixtures'
 import {
   buildSseBody,
   clearIndexedDb,
@@ -7,15 +7,15 @@ import {
   mockChatCompletions,
   seedFirstRun,
   sendMessage,
+  waitForAssistantGenerationFinished,
 } from './helpers'
 
-// System prompt editing (plan/14-details.md §14.35.5). Edits take effect on
-// NEXT send; the current in-flight request isn't rewritten. Bumps updatedAt +
+// System prompt edits take effect on the next send; the current in-flight
+// request isn't rewritten. A commit bumps updatedAt +
 // metaVersion but leaves branch state untouched; exactly one chat-mutated
 // broadcast on commit.
 
 test.beforeEach(async ({ page }) => {
-  await page.goto('/')
   await clearIndexedDb(page)
   await seedFirstRun(page)
 })
@@ -42,8 +42,6 @@ test('edited system prompt shows up in the NEXT /chat/completions body', async (
   await page.locator('[data-ui="settings-tab"][data-tab="prompts"]').click()
   const textarea = page.locator('[data-ui="system-prompt-textarea"]')
   await textarea.fill('You are a terse copy editor.')
-  // System prompt save is debounced; send the next message after the debounce.
-  await page.waitForTimeout(500)
   await page.locator('[data-role="settings-pane-close"]').click()
   await sendMessage(page, 'second')
   await expect.poll(() => bodies.length, { timeout: 5000 }).toBeGreaterThanOrEqual(2)
@@ -91,11 +89,12 @@ test('committing a system prompt bumps updatedAt + metaVersion and leaves branch
   await sendMessage(page, 'warm up')
   await expect(page.locator('[data-ui="message"][data-role="assistant"]').first()).toBeVisible()
   const chatId = await firstChatId(page)
+  await waitForAssistantGenerationFinished(page, chatId)
   const before = await readChat(page, chatId)
   await page.locator('[data-role="settings-cog"]').click()
   await page.locator('[data-ui="settings-tab"][data-tab="prompts"]').click()
   await page.locator('[data-ui="system-prompt-textarea"]').fill('System edit v1')
-  await page.waitForTimeout(500)
+  await expectChatSetting(page, chatId, 'systemPrompt', 'System edit v1')
   const after = await readChat(page, chatId)
   expect(Number(after.metaVersion)).toBeGreaterThanOrEqual(Number(before.metaVersion) + 1)
   expect(Number(after.updatedAt)).toBeGreaterThan(Number(before.updatedAt))
@@ -124,13 +123,21 @@ test('the one-off toast appears after the first edit and disappears on subsequen
   await expect(page.locator('[data-ui="settings-toast"]')).toContainText(
     /takes effect on the next send/i,
   )
-  // Second edit in the same session shouldn't re-show the toast.
+  await expect(page.locator('[data-ui="settings-toast"]')).toBeHidden({ timeout: 5000 })
+  const chatId = await firstChatId(page)
   await page.locator('[data-ui="system-prompt-textarea"]').fill('First system prompt — appended')
-  await page.waitForTimeout(500)
-  await expect(page.locator('[data-ui="settings-toast"]')).toBeHidden({
-    timeout: 5000,
-  })
+  await expectChatSetting(page, chatId, 'systemPrompt', 'First system prompt — appended')
+  await expect(page.locator('[data-ui="settings-toast"]')).toBeHidden()
 })
+
+async function expectChatSetting(page: Page, chatId: string, key: string, value: unknown) {
+  await expect
+    .poll(async () => {
+      const chat = await readChat(page, chatId)
+      return (chat.settings as Record<string, unknown>)[key]
+    })
+    .toBe(value)
+}
 
 async function readChat(page: Page, chatId: string): Promise<Record<string, unknown>> {
   return page.evaluate(async (id) => {

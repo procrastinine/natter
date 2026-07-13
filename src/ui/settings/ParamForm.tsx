@@ -1,6 +1,3 @@
-// Capability-gated generation-settings form. See `plan/10-ui.md §10.9
-// tab 1` and `plan/07-discovery.md §7.10`.
-//
 // Renders only controls whose wire-key is in the effective capability's
 // `supportedParameters`. For reasoning effort / verbosity the value set
 // is narrowed against the quirks registry, e.g. Claude 4.7 shows the
@@ -689,10 +686,7 @@ function OpenAiHostedToolConfig({ chat, toolId }: { chat: Chat; toolId: OpenAiSe
   if (toolId === 'shell') {
     return <span data-ui="helper">Runs in OpenAI's provider container with network disabled.</span>
   }
-  if (toolId === 'code-interpreter') {
-    return <span data-ui="helper">Runs provider-hosted Python without local file uploads.</span>
-  }
-  return null
+  return <span data-ui="helper">Runs provider-hosted Python without local file uploads.</span>
 }
 
 function GoogleHostedToolConfig({ chat, toolId }: { chat: Chat; toolId: GoogleServerToolId }) {
@@ -877,24 +871,21 @@ function AnthropicHostedToolConfig({
     )
   }
 
-  if (toolId === 'advisor') {
-    const advisor = config.advisor ?? { advisorModel: 'claude-opus-4-7' as const }
-    return (
-      <div data-ui="hosted-tool-config" data-tool="advisor">
-        <div data-ui="field-group" data-ui-field>
-          <span>Advisor model</span>
-          <select
-            aria-label="Anthropic advisor model"
-            value={advisor.advisorModel}
-            onChange={() => updateConfig({ advisor: { advisorModel: 'claude-opus-4-7' } })}
-          >
-            <option value="claude-opus-4-7">Claude Opus 4.7</option>
-          </select>
-        </div>
+  const advisor = config.advisor ?? { advisorModel: 'claude-opus-4-7' as const }
+  return (
+    <div data-ui="hosted-tool-config" data-tool="advisor">
+      <div data-ui="field-group" data-ui-field>
+        <span>Advisor model</span>
+        <select
+          aria-label="Anthropic advisor model"
+          value={advisor.advisorModel}
+          onChange={() => updateConfig({ advisor: { advisorModel: 'claude-opus-4-7' } })}
+        >
+          <option value="claude-opus-4-7">Claude Opus 4.7</option>
+        </select>
       </div>
-    )
-  }
-  return null
+    </div>
+  )
 }
 
 function anthropicAdvisorAvailable(modelId: string): boolean {
@@ -1036,9 +1027,7 @@ function ReasoningSection({ chat, capability }: { chat: Chat; capability: Effect
     <section data-ui="settings-section" data-ui-section="reasoning">
       <h3>Reasoning</h3>
       <div data-ui="field-group" data-ui-field>
-        <span>
-          Mode {modeInfo ? <InfoDisclosure title={modeInfo} /> : null}
-        </span>
+        <span>Mode {modeInfo ? <InfoDisclosure title={modeInfo} /> : null}</span>
         <div data-ui="segmented">
           {modes.map((m) => (
             <button
@@ -1095,16 +1084,26 @@ function ReasoningBudgetControl({
   const committedSliderValue = Math.min(max, Math.max(0, value ?? 0))
   const [draft, setDraft] = useState(value === undefined ? '' : String(value))
   const [sliderValue, setSliderValue] = useState(committedSliderValue)
+  const lastRequestedSliderValueRef = useRef(committedSliderValue)
 
   useEffect(() => {
     setDraft(value === undefined ? '' : String(value))
     setSliderValue(committedSliderValue)
+    lastRequestedSliderValueRef.current = committedSliderValue
   }, [value, committedSliderValue])
 
   const commitSliderDraft = useCallback(() => {
     const clamped = Math.min(max, Math.max(0, sliderValue))
-    if (clamped !== committedSliderValue) onCommit(clamped)
-  }, [max, sliderValue, committedSliderValue, onCommit])
+    if (clamped === lastRequestedSliderValueRef.current) return
+    lastRequestedSliderValueRef.current = clamped
+    onCommit(clamped)
+  }, [max, sliderValue, onCommit])
+  const unmountCommitRef = useRef(commitSliderDraft)
+  unmountCommitRef.current = commitSliderDraft
+
+  useEffect(() => {
+    return () => unmountCommitRef.current()
+  }, [])
 
   useEffect(() => {
     if (sliderValue === committedSliderValue) return
@@ -1122,7 +1121,10 @@ function ReasoningBudgetControl({
       return
     }
     const clamped = Math.min(max, Math.floor(n))
-    if (clamped !== committedSliderValue) onCommit(clamped)
+    if (clamped !== lastRequestedSliderValueRef.current) {
+      lastRequestedSliderValueRef.current = clamped
+      onCommit(clamped)
+    }
     setDraft(String(clamped))
     setSliderValue(clamped)
   }

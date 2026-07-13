@@ -4,7 +4,6 @@
  * Owns: [data-ui='settings-pane'|'settings-tab'|'settings-section'|'field-group'|
  *              'media-settings'|'rendering-settings'|'observability-panel'|
  *              'chat-org-settings'|'autotitle-settings'].
- * See plan/10-ui.md §10.20.
  */
 
 [data-ui="settings-pane"] {

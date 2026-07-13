@@ -38,6 +38,49 @@ describe('Composer', () => {
     await waitFor(() => expect(input).toHaveValue('keep this draft'))
   })
 
+  it('does not report or restore an aborted submit while the page is being replaced', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const { container } = render(
+      <Composer
+        onSubmit={async () => {
+          window.dispatchEvent(new Event('pagehide'))
+          throw new Dexie.AbortError('page replacement')
+        }}
+      />,
+    )
+    const input = screen.getByRole('textbox')
+    fireEvent.change(input, { target: { value: 'leaving page' } })
+    try {
+      fireEvent.submit(container.querySelector('[data-ui="composer"]') as HTMLFormElement)
+      await waitFor(() => expect(input).toHaveValue(''))
+      expect(consoleError).not.toHaveBeenCalled()
+    } finally {
+      window.dispatchEvent(new Event('pageshow'))
+    }
+  })
+
+  it('does not report an aborted trailing-user reply while the page is being replaced', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const onReplyToTrailingUser = vi.fn(async () => {
+      window.dispatchEvent(new Event('pagehide'))
+      throw new Dexie.AbortError('page replacement')
+    })
+    const { container } = render(
+      <Composer
+        trailingUserMessage
+        onReplyToTrailingUser={onReplyToTrailingUser}
+        onSubmit={() => {}}
+      />,
+    )
+    try {
+      fireEvent.submit(container.querySelector('[data-ui="composer"]') as HTMLFormElement)
+      await waitFor(() => expect(onReplyToTrailingUser).toHaveBeenCalledTimes(1))
+      expect(consoleError).not.toHaveBeenCalled()
+    } finally {
+      window.dispatchEvent(new Event('pageshow'))
+    }
+  })
+
   it('updates the live character count without prompt-budget callbacks', () => {
     render(<Composer onSubmit={() => {}} />)
     const input = screen.getByRole('textbox')
@@ -80,18 +123,18 @@ describe('Composer', () => {
     vi.spyOn(window, 'getComputedStyle').mockImplementation((element) => {
       const style = nativeGetComputedStyle(element)
       return new Proxy(style, {
-        get(target, property, receiver) {
+        get(target, property) {
           if (property === 'fontSize') return '15px'
           if (property === 'lineHeight') return '22.5px'
           if (property === 'paddingTop' || property === 'paddingBottom') return '12px'
           if (property === 'borderTopWidth' || property === 'borderBottomWidth') return '0px'
-          return Reflect.get(target, property, receiver)
+          return target[property as keyof CSSStyleDeclaration]
         },
       })
     })
     Object.defineProperty(HTMLTextAreaElement.prototype, 'scrollHeight', {
       configurable: true,
-      get() {
+      get(this: HTMLTextAreaElement) {
         return this.value.length === 0 ? 47 : 49
       },
     })

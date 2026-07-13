@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { Attachment, AttachmentKind } from '../../core/types'
-import { getBrowserRepository } from '../../store/browser-repo'
+import { getWorkspaceRepository } from '../../store/workspace-repository'
 import { CloseIcon, DatabaseIcon, SearchIcon } from '../icons/Icon'
 import { formatBytes, kindLabel, shortId, storageLabel } from './format'
 
@@ -24,6 +24,7 @@ const KIND_FILTERS: Array<AttachmentKind | 'all'> = [
   'plaintext',
   'other',
 ]
+const ATTACHMENT_SEARCH_DEBOUNCE_MS = 150
 
 export function AttachmentPicker({
   title = 'Stored attachments',
@@ -35,6 +36,7 @@ export function AttachmentPicker({
   const [kind, setKind] = useState<AttachmentKind | 'all'>('all')
   const [rows, setRows] = useState<Attachment[]>([])
   const [busyId, setBusyId] = useState<string | null>(null)
+  const lastStartedTextQueryRef = useRef<string | null>(null)
 
   const filters = useMemo(() => (kind === 'all' ? undefined : { kind }), [kind])
 
@@ -49,24 +51,41 @@ export function AttachmentPicker({
   }, [onClose])
 
   useEffect(() => {
-    let cancelled = false
-    void getBrowserRepository()
-      .searchAttachments({
-        query,
-        ...(filters ? { filters } : {}),
-        sort: 'created-desc',
-        limit: 80,
-      })
-      .then((page) => {
-        if (cancelled) return
-        setRows(
-          excludeAttachmentId
-            ? page.rows.filter((row) => row.id !== excludeAttachmentId)
-            : page.rows,
-        )
-      })
+    const controller = new AbortController()
+    const normalizedQuery = query.trim()
+    const delay =
+      normalizedQuery.length > 0 &&
+      lastStartedTextQueryRef.current !== null &&
+      lastStartedTextQueryRef.current !== normalizedQuery
+        ? ATTACHMENT_SEARCH_DEBOUNCE_MS
+        : 0
+    const timer = window.setTimeout(() => {
+      lastStartedTextQueryRef.current = normalizedQuery.length > 0 ? normalizedQuery : null
+      void getWorkspaceRepository()
+        .searchAttachments({
+          query,
+          ...(filters ? { filters } : {}),
+          sort: 'created-desc',
+          limit: 80,
+          signal: controller.signal,
+        })
+        .then((page) => {
+          if (controller.signal.aborted) return
+          setRows(
+            excludeAttachmentId
+              ? page.rows.filter((row) => row.id !== excludeAttachmentId)
+              : page.rows,
+          )
+        })
+        .catch((error: unknown) => {
+          if (!controller.signal.aborted && (error as { name?: string }).name !== 'AbortError') {
+            throw error
+          }
+        })
+    }, delay)
     return () => {
-      cancelled = true
+      window.clearTimeout(timer)
+      controller.abort()
     }
   }, [query, filters, excludeAttachmentId])
 

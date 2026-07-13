@@ -18,13 +18,15 @@
 // `replaceRoute` is silent per the HTML spec, so direction 2 never
 // triggers direction 1.
 
-import { useLiveQuery } from 'dexie-react-hooks'
 import { useEffect, useRef } from 'react'
 import { chatHref, parseRoute, replaceRoute } from '../app/router'
-import { activePath } from '../core/active-path'
+import { activePath, cursorKeyOf } from '../core/active-path'
 import { seedCursorAtMessage } from '../core/branch-resolve'
 import type { ChatId, Message } from '../core/types'
 import { loadMessageHeaders } from '../store/chats'
+import type { MessageHeaderRow } from '../store/message-storage'
+import { chatRowDependencies, indexKeys } from '../store/reactive-dependencies'
+import { useRepositoryQuery } from '../store/reactive-query'
 import { useChatStore } from '../store/zustand/chatStore'
 
 function cursorEqual(left: Record<string, string>, right: Record<string, string>): boolean {
@@ -33,12 +35,37 @@ function cursorEqual(left: Record<string, string>, right: Record<string, string>
   return leftEntries.every(([key, value]) => right[key] === value)
 }
 
-export function useBranchUrlSync(chatId: ChatId | null): void {
-  const messages = useLiveQuery(
+function pendingCursorLeaf(
+  rows: readonly Message[],
+  path: readonly Message[],
+  cursor: Readonly<Record<string, string>>,
+): string | undefined {
+  const loadedIds = new Set(rows.map((row) => row.id))
+  const parents: Array<string | null> = [null, ...path.map((row) => row.id)]
+  for (const parentId of parents) {
+    const selected = cursor[cursorKeyOf(parentId)]
+    if (selected === undefined || loadedIds.has(selected)) continue
+    const seen = new Set<string>()
+    let leaf = selected
+    while (!seen.has(leaf)) {
+      seen.add(leaf)
+      const child = cursor[cursorKeyOf(leaf)]
+      if (child === undefined || loadedIds.has(child)) return leaf
+      leaf = child
+    }
+    return leaf
+  }
+  return path.at(-1)?.id
+}
+
+export function useBranchUrlSync(chatId: ChatId | null): MessageHeaderRow[] {
+  const headers = useRepositoryQuery(
+    JSON.stringify(['message-headers', chatId]),
     () => (chatId ? loadMessageHeaders(chatId) : Promise.resolve([])),
-    [chatId],
     [],
-  ) as Message[]
+    [...chatRowDependencies(chatId), ...indexKeys('messages', 'chatId', chatId)],
+  )
+  const messages = headers as unknown as Message[]
   const messagesRef = useRef<Message[]>(messages)
   messagesRef.current = messages
 
@@ -56,15 +83,15 @@ export function useBranchUrlSync(chatId: ChatId | null): void {
     if (route.kind !== 'chat' || route.chatId !== chatId) return
     const cursor = useChatStore.getState().getCursor(chatId) ?? {}
     const path = activePath(rows, cursor)
-    const leaf = path.at(-1)
-    if (!leaf) return
-    const desired = chatHref(chatId, leaf.id)
+    const pendingLeaf = pendingCursorLeaf(rows, path, cursor)
+    if (!pendingLeaf) return
+    const desired = chatHref(chatId, pendingLeaf)
     if (window.location.hash === desired) return
     replaceRoute(desired)
     // Mark the URL just written as already-seeded so the hashchange
     // that might fire for some external reason (DevTools edits, etc.)
     // doesn't reseed and bounce back.
-    seededRef.current.add(`${chatId}:${leaf.id}`)
+    seededRef.current.add(`${chatId}:${pendingLeaf}`)
   }
 
   // ─── URL → cursor ────────────────────────────────────────────────
@@ -92,8 +119,8 @@ export function useBranchUrlSync(chatId: ChatId | null): void {
   // Bare chat routes start without a URL pin. Materialize the initially
   // rendered default branch into this tab's cursor once, so later cross-tab
   // siblings do not become this tab's default. This must stay out of the
-  // cursor→URL path: local sends advance the cursor before Dexie's live query
-  // necessarily exposes the new row.
+  // cursor→URL path: local sends advance the cursor before the repository
+  // query necessarily exposes the new row.
   const pinBareRouteDefault = useRef<(() => void) | null>(null)
   pinBareRouteDefault.current = () => {
     if (!chatId || typeof window === 'undefined') return
@@ -146,4 +173,6 @@ export function useBranchUrlSync(chatId: ChatId | null): void {
     window.addEventListener('hashchange', onHashChange)
     return () => window.removeEventListener('hashchange', onHashChange)
   }, [])
+
+  return headers
 }

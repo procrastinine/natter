@@ -5,20 +5,26 @@
 // so the next stale-read can re-fetch.
 
 import Dexie from 'dexie'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import type { ModelsQuery } from '../../src/core/types'
-import { __resetBroadcastForTests } from '../../src/store/broadcast'
-import { __resetDbForTests, openDb } from '../../src/store/db'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { ConnectionProfile, ModelsQuery } from '../../src/core/types'
+import { __resetBroadcastForTests, postEvent } from '../../src/store/broadcast'
+import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
 import {
+  __resetModelsInFlightForTests,
   dedupedEndpointsFetch,
   dedupedModelsFetch,
   getCachedEndpoints,
   getCachedModels,
 } from '../../src/store/models-cache'
+import {
+  markBrowserWorkspaceReplaced,
+  readBrowserWorkspaceMeta,
+} from '../../src/store/workspace-meta'
 
 const DB_NAME = 'natter'
 
 async function resetAll() {
+  __resetModelsInFlightForTests()
   __resetDbForTests()
   __resetBroadcastForTests()
   await Dexie.delete(DB_NAME)
@@ -49,6 +55,24 @@ function deferred<T>(): {
   return { promise, resolve, reject }
 }
 
+function profile(id: string, baseUrl = 'https://before.example/v1'): ConnectionProfile {
+  return {
+    id,
+    name: 'Profile',
+    kind: 'openrouter',
+    baseUrl,
+    apiKeyRef: 'key',
+    defaultHeaders: {},
+    appTitle: 'natter',
+    appUrl: '',
+    supportsEndpointsApi: true,
+    supportsGenerationApi: true,
+    supportsPrivacyScrape: true,
+    createdAt: 1,
+    updatedAt: 1,
+  }
+}
+
 describe('dedupedModelsFetch', () => {
   const profileId = 'prof-1'
   const query: ModelsQuery = { outputModalities: ['text'] }
@@ -63,7 +87,7 @@ describe('dedupedModelsFetch', () => {
 
     const a = dedupedModelsFetch(profileId, query, fetcher)
     const b = dedupedModelsFetch(profileId, query, fetcher)
-    expect(calls).toBe(1)
+    await vi.waitFor(() => expect(calls).toBe(1))
 
     gate.resolve({ payload: 'ok' })
     await Promise.all([a, b])
@@ -130,6 +154,66 @@ describe('dedupedModelsFetch', () => {
     ])
     expect(calls).toBe(2)
   })
+
+  it('does not commit a response fetched for a replaced connection profile', async () => {
+    await getDb().profiles.put(profile(profileId))
+    const gate = deferred<{ stale: true }>()
+    const fetcher = vi.fn(() => gate.promise)
+    const pending = dedupedModelsFetch(profileId, query, fetcher)
+    await vi.waitFor(() => expect(fetcher).toHaveBeenCalledOnce())
+
+    await getDb().profiles.put(profile(profileId, 'https://after.example/v1'))
+    gate.resolve({ stale: true })
+    await pending
+
+    expect(await getCachedModels(profileId, query)).toBeUndefined()
+  })
+
+  it('rejects a stale response after a byte-identical replacement without a broadcast', async () => {
+    await getDb().profiles.put(profile(profileId))
+    const gate = deferred<{ stale: true }>()
+    const fetcher = vi.fn(() => gate.promise)
+    const pending = dedupedModelsFetch(profileId, query, fetcher)
+    await vi.waitFor(() => expect(fetcher).toHaveBeenCalledOnce())
+
+    const db = getDb()
+    const before = await readBrowserWorkspaceMeta(db)
+    await db.transaction('rw', db.settings, async (tx) => {
+      await markBrowserWorkspaceReplaced(tx, Date.now(), before)
+    })
+    gate.resolve({ stale: true })
+    await pending
+
+    expect(await getCachedModels(profileId, query)).toBeUndefined()
+  })
+
+  it('starts a fresh fetch after fallback invalidation while the old epoch is in flight', async () => {
+    await getDb().profiles.put(profile(profileId))
+    const oldGate = deferred<{ stale: true }>()
+    const freshGate = deferred<{ fresh: true }>()
+    let calls = 0
+    const fetcher = () => {
+      calls += 1
+      return calls === 1 ? oldGate.promise : freshGate.promise
+    }
+    const stale = dedupedModelsFetch(profileId, query, fetcher)
+    await vi.waitFor(() => expect(calls).toBe(1))
+
+    const db = getDb()
+    const before = await readBrowserWorkspaceMeta(db)
+    await db.transaction('rw', db.settings, async (tx) => {
+      await markBrowserWorkspaceReplaced(tx, Date.now(), before)
+    })
+    postEvent({ kind: 'workspace-invalidated', mutationCounter: before.mutationCounter + 1 })
+    const fresh = dedupedModelsFetch(profileId, query, fetcher)
+    await vi.waitFor(() => expect(calls).toBe(2))
+    freshGate.resolve({ fresh: true })
+    await fresh
+    oldGate.resolve({ stale: true })
+    await stale
+
+    expect((await getCachedModels(profileId, query))?.payload).toEqual({ fresh: true })
+  })
 })
 
 describe('dedupedEndpointsFetch', () => {
@@ -146,7 +230,7 @@ describe('dedupedEndpointsFetch', () => {
 
     const a = dedupedEndpointsFetch(profileId, modelId, fetcher)
     const b = dedupedEndpointsFetch(profileId, modelId, fetcher)
-    expect(calls).toBe(1)
+    await vi.waitFor(() => expect(calls).toBe(1))
 
     gate.resolve({ payload: 'ok' })
     await Promise.all([a, b])

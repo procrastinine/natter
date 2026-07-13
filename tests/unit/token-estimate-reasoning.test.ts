@@ -282,12 +282,8 @@ describe('guards — reasoning echo robustness', () => {
   })
 })
 
-describe('dedup invariant — storage never holds scalar reasoning', () => {
-  it('normalizes partial-overlap reasoning.text details before counting', () => {
-    // Emulating a rehydrated legacy chat where the accumulator wrote both
-    // scalar-style "thinking about X" as detail[0].text AND appended
-    // " about X" as a second detail chunk. `normalizeReasoningDetails` in
-    // core/reasoning.ts collapses these on read.
+describe('reasoning row accounting', () => {
+  it('counts ambiguous reasoning.text rows without lossy read-time deduplication', () => {
     const path: Message[] = [
       assistant('a1', 'answer', [
         { type: 'reasoning.text', id: 'r', text: 'thinking about ' },
@@ -298,7 +294,6 @@ describe('dedup invariant — storage never holds scalar reasoning', () => {
       path,
       opts({ encrypted: false, summary: false, text: true }, 'unknown'),
     )
-    // Normalized: single "thinking about X" (16 chars) ≈ ceil(16 / 3.5) = 5.
-    expect(cost).toBe(5)
+    expect(cost).toBe(10)
   })
 })

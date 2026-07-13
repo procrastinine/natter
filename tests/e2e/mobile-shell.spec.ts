@@ -1,9 +1,8 @@
-import { expect, type Locator, type Page, test } from '@playwright/test'
+import { expect, type Locator, type Page, test } from './fixtures'
 import { clearIndexedDb } from './helpers'
 
 test.beforeEach(async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 740 })
-  await page.goto('/')
   await clearIndexedDb(page)
   await page.evaluate(() => {
     window.sessionStorage.clear()

@@ -1,6 +1,3 @@
-// Provider picker. See `plan/10-ui.md §10.5`, `plan/07-discovery.md §7.2`,
-// `plan/09-privacy.md §9.11`.
-//
 // Rows render in one of three states:
 //   - kept: survived the privacy filter and will receive traffic. Padlock
 //     tinted by tier (green/yellow/orange/red).
@@ -57,6 +54,16 @@ const SORT_OPTIONS: ReadonlyArray<{ value: SortBy; label: string }> = [
   { value: 'latency', label: 'Latency' },
 ]
 
+function persistedProviderSort(
+  value: ProviderPreferences['sort'],
+): ProviderPreferences['sort'] | null {
+  return value
+}
+
+function endpointBoundaryFields(endpoint: ModelEndpoint): Partial<ModelEndpoint> {
+  return endpoint
+}
+
 export function ProviderPicker({
   chat,
   routing,
@@ -65,11 +72,12 @@ export function ProviderPicker({
   const { endpoints, filter, loading, isFreeModel, scrapeApplicable, liveScrapeEnabled, refresh } =
     routing
   const prefs = chat.settings.providerPrefs ?? {}
+  const storedSort = persistedProviderSort(prefs.sort)
   const currentSort: SortBy =
-    typeof prefs.sort === 'string'
-      ? prefs.sort
-      : typeof prefs.sort === 'object' && prefs.sort !== null
-        ? prefs.sort.by
+    typeof storedSort === 'string'
+      ? storedSort
+      : typeof storedSort === 'object' && storedSort !== null
+        ? storedSort.by
         : DEFAULT_OPENROUTER_PROVIDER_SORT
   const manualOrdered = useMemo(() => orderEndpoints(endpoints, prefs), [endpoints, prefs])
   const displayOrdered = useMemo(
@@ -297,7 +305,8 @@ export function ProviderPicker({
       ) : (
         <ul data-ui="provider-picker-list">
           {rows.map((row) => {
-            const epCap = row.endpoint.max_prompt_tokens ?? row.endpoint.context_length
+            const endpointLimits = endpointBoundaryFields(row.endpoint)
+            const epCap = endpointLimits.max_prompt_tokens ?? endpointLimits.context_length
             const insufficient =
               neededTokens !== undefined && epCap !== undefined && epCap > 0 && neededTokens > epCap
             const ref = providerRoutingRef(row.endpoint)
@@ -663,6 +672,7 @@ function providerDetailsTooltip(row: PickerRow): string {
 
 function providerDetailRows(row: PickerRow): Array<[string, string]> {
   const { endpoint, policy, policySynthesized } = row
+  const boundaryEndpoint = endpointBoundaryFields(endpoint)
   const rows: Array<[string, string]> = []
   rows.push(['Provider', providerDisplayName(endpoint)])
   const routingRef = providerRoutingRef(endpoint)
@@ -701,7 +711,7 @@ function providerDetailRows(row: PickerRow): Array<[string, string]> {
   if (endpoint.supports_implicit_caching !== undefined) {
     rows.push(['Implicit caching', endpoint.supports_implicit_caching ? 'yes' : 'no'])
   }
-  const supported = endpoint.supported_parameters ?? []
+  const supported = boundaryEndpoint.supported_parameters ?? []
   if (supported.length > 0) rows.push(['Parameters', supported.join(', ')])
   if (policy && row.state !== 'no-filter') {
     rows.push(['Training', policy.training ? 'yes' : 'no'])

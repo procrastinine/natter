@@ -1,4 +1,5 @@
 import type { ConnectionProfile } from '../core/types'
+import { isSensitiveDiagnosticKey } from './diagnostic-redaction'
 
 const STORAGE_KEY = 'natter.debug.streams'
 const PLAN_STORAGE_KEY = 'natter.debug.request_plans'
@@ -79,10 +80,17 @@ export function streamDebugEnabled(profile?: Pick<ConnectionProfile, 'debugReque
   return profile?.debugRequests === true || globalDebugEnabled()
 }
 
+export function snapshotStreamDebugRequest(
+  profile: Pick<ConnectionProfile, 'debugRequests'>,
+  request: unknown,
+): unknown {
+  return streamDebugEnabled(profile) ? sanitize(request, 1) : null
+}
+
 function redactHeaders(headers: Record<string, string>): Record<string, string> {
   const out: Record<string, string> = {}
   for (const [k, v] of Object.entries(headers)) {
-    if (/^authorization$/i.test(k) || /^x-goog-api-key$/i.test(k)) {
+    if (isSensitiveDiagnosticKey(k)) {
       out[k] = '<redacted>'
     } else {
       out[k] = v
@@ -240,7 +248,7 @@ function sanitize(value: unknown, depth = 0): unknown {
   const entries = Object.entries(value as Record<string, unknown>)
   const out: Record<string, unknown> = {}
   for (const [key, entry] of entries.slice(0, MAX_OBJECT_KEYS)) {
-    out[key] = sanitize(entry, depth + 1)
+    out[key] = isSensitiveDiagnosticKey(key) ? '<redacted>' : sanitize(entry, depth + 1)
   }
   if (entries.length > MAX_OBJECT_KEYS) {
     out.__truncatedKeys = entries.length - MAX_OBJECT_KEYS

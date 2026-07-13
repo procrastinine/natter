@@ -6,7 +6,6 @@
 //
 // Patterns come from live probes against OpenAI and Gemini direct, plus the
 // generic "upstream 400 while reasoning_details were being sent" fallback.
-// See `plan/13-delivery.md §Phase 11.1 → Stale-reasoning rejection UI`.
 
 import type { ApiError } from '../api/errors'
 

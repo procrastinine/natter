@@ -1,8 +1,7 @@
-import { expect, test } from '@playwright/test'
-import { clearIndexedDb, seedFirstRun } from './helpers'
+import { expect, test } from './fixtures'
+import { clearIndexedDb, rebuildSidebarProjection, seedFirstRun } from './helpers'
 
 test.beforeEach(async ({ page }) => {
-  await page.goto('/')
   await clearIndexedDb(page)
   await seedFirstRun(page)
 })
@@ -126,6 +125,7 @@ test('oversized stream lane auto-compacts and the avatar cycles compact -> peek 
     },
     { activeChatId: chatId, hugeMessage: huge },
   )
+  await rebuildSidebarProjection(page)
   await page.goto(`/?overflow=${Date.now()}#/chat/${chatId}`)
   const assistant = page.locator('[data-ui="message"][data-role="assistant"]').first()
   const avatar = assistant.locator('[data-ui="profile-glyph-button"]').first()

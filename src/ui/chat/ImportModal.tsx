@@ -1,16 +1,12 @@
-// Paste-import modal. See `plan/08-branching.md §8.4.10` and
-// `plan/10-ui.md §10.6.2`. Plaintext-only in Phase 8.1 (no attachment
-// chips, no advanced JSON editor); those arrive with 12.1 / 13.1.
-//
 // Inserts a chain of user-typed messages under the requested slot:
 // - "at-end": append-as-child under the active-path leaf (composer button)
-// - "before" / "after" / "sibling" M: insert-between / insert-sibling
-//   per §8.4.9.
+// - "before" / "after" / "after-all" / "sibling": explicit tree insertion
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { type PasteImportSlot, pasteImport } from '../../core/messages'
 import type { ChatId, ContentItem, CursorMap, MessageRole } from '../../core/types'
 import { newId } from '../../lib/ulid'
+import { useChatStore } from '../../store/zustand/chatStore'
 import { CloseIcon, TrashIcon } from '../icons/Icon'
 
 interface ImportModalProps {
@@ -45,6 +41,10 @@ function slotLabel(slot: PasteImportSlot): string {
   switch (slot.kind) {
     case 'at-end':
       return 'end of active path'
+    case 'after-all':
+      return slot.parentId === null
+        ? 'before all current root messages'
+        : 'after this parent, before all of its children'
     case 'before':
       return 'before this message'
     case 'after':
@@ -116,7 +116,7 @@ export function ImportModal({
         }
         effectiveChatId = await materializeChat()
       }
-      await pasteImport({
+      const result = await pasteImport({
         chatId: effectiveChatId,
         slot,
         cursor,
@@ -124,6 +124,11 @@ export function ImportModal({
           role: r.role,
           content: [{ type: 'text', text: r.text } satisfies ContentItem],
         })),
+      })
+      const currentCursor = useChatStore.getState().getCursor(effectiveChatId) ?? {}
+      useChatStore.getState().setCursor(effectiveChatId, {
+        ...currentCursor,
+        ...result.effects.cursorUpdates,
       })
       onDone?.()
       onClose()

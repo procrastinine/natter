@@ -5,9 +5,14 @@
 
 import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { __resetBroadcastForTests } from '../../src/store/broadcast'
-import { __resetDbForTests, openDb } from '../../src/store/db'
-import { __resetLockTrackerForTests } from '../../src/store/locks'
+import type { ConnectionProfile } from '../../src/core/types'
+import { __resetBroadcastForTests, postEvent } from '../../src/store/broadcast'
+import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
+import {
+  __resetLockTrackerForTests,
+  __setLockBackendForTests,
+  type LockBackend,
+} from '../../src/store/locks'
 import { isFresh } from '../../src/store/models-cache'
 import {
   __resetPrivacyInFlightForTests,
@@ -16,6 +21,10 @@ import {
   getCachedPrivacyPolicy,
   PRIVACY_POLICY_TTL_MS,
 } from '../../src/store/privacy-cache'
+import {
+  markBrowserWorkspaceReplaced,
+  readBrowserWorkspaceMeta,
+} from '../../src/store/workspace-meta'
 
 const DB_NAME = 'natter'
 
@@ -48,6 +57,24 @@ function deferred<T>(): {
     reject = rej
   })
   return { promise, resolve, reject }
+}
+
+function profile(id: string, baseUrl = 'https://before.example/v1'): ConnectionProfile {
+  return {
+    id,
+    name: 'Profile',
+    kind: 'openrouter',
+    baseUrl,
+    apiKeyRef: 'key',
+    defaultHeaders: {},
+    appTitle: 'natter',
+    appUrl: '',
+    supportsEndpointsApi: true,
+    supportsGenerationApi: true,
+    supportsPrivacyScrape: true,
+    createdAt: 1,
+    updatedAt: 1,
+  }
 }
 
 describe('dedupedPrivacyFetch', () => {
@@ -111,26 +138,113 @@ describe('dedupedPrivacyFetch', () => {
     expect(calls).toBe(3)
   })
 
-  it('re-checks the cache inside the lock so a tab storm fetches once', async () => {
+  it('does not commit a scrape fetched for a replaced connection profile', async () => {
+    await getDb().profiles.put(profile(profileId))
+    const gate = deferred<{ stale: true }>()
+    const fetcher = vi.fn(() => gate.promise)
+    const pending = dedupedPrivacyFetch(profileId, modelId, fetcher)
+    await vi.waitFor(() => expect(fetcher).toHaveBeenCalledOnce())
+
+    await getDb().profiles.put(profile(profileId, 'https://after.example/v1'))
+    gate.resolve({ stale: true })
+    await pending
+
+    expect(await getCachedPrivacyPolicy(profileId, modelId)).toBeUndefined()
+  })
+
+  it('rejects a stale scrape and releases fallback dedup after replacement', async () => {
+    await getDb().profiles.put(profile(profileId))
+    const staleGate = deferred<{ stale: true }>()
+    const freshGate = deferred<{ fresh: true }>()
     let calls = 0
-    const gate = deferred<{ policies: Record<string, unknown>; fetchedAt: number }>()
+    const fetcher = () => {
+      calls += 1
+      return calls === 1 ? staleGate.promise : freshGate.promise
+    }
+    const stale = dedupedPrivacyFetch(profileId, modelId, fetcher)
+    await vi.waitFor(() => expect(calls).toBe(1))
+
+    const db = getDb()
+    const before = await readBrowserWorkspaceMeta(db)
+    await db.transaction('rw', db.settings, async (tx) => {
+      await markBrowserWorkspaceReplaced(tx, Date.now(), before)
+    })
+    postEvent({ kind: 'workspace-invalidated', mutationCounter: before.mutationCounter + 1 })
+    const fresh = dedupedPrivacyFetch(profileId, modelId, fetcher)
+    await vi.waitFor(() => expect(calls).toBe(2))
+    freshGate.resolve({ fresh: true })
+    await fresh
+    staleGate.resolve({ stale: true })
+    await stale
+
+    expect((await getCachedPrivacyPolicy(profileId, modelId))?.payload).toEqual({ fresh: true })
+  })
+
+  it('does not hold the workspace lock while fetching', async () => {
+    let lockHeld = false
+    let fetchObservedLock: boolean | undefined
+    let lockCalls = 0
+    const backend: LockBackend = {
+      kind: 'web-locks',
+      run: async (logicalNames, fn) => {
+        lockCalls += 1
+        lockHeld = true
+        try {
+          return await fn({
+            kind: 'web-locks',
+            logicalNames,
+            runTransaction: (db, _tables, transactionFn) =>
+              db.transaction(
+                'rw',
+                [db.table('privacyPolicies'), db.table('profiles'), db.table('settings')],
+                transactionFn,
+              ),
+          })
+        } finally {
+          lockHeld = false
+        }
+      },
+    }
+    __setLockBackendForTests(backend)
+
+    await dedupedPrivacyFetch(profileId, modelId, async () => {
+      fetchObservedLock = lockHeld
+      return { policies: {}, fetchedAt: Date.now() }
+    })
+
+    expect(fetchObservedLock).toBe(false)
+    expect(lockCalls).toBe(1)
+  })
+
+  it('keeps a fresh competing result instead of overwriting it after a tab race', async () => {
+    let calls = 0
+    const firstGate = deferred<{ policies: Record<string, unknown>; fetchedAt: number }>()
+    const secondGate = deferred<{ policies: Record<string, unknown>; fetchedAt: number }>()
     const fetcher = async () => {
       calls += 1
-      return gate.promise
+      return calls === 1 ? firstGate.promise : secondGate.promise
     }
 
     const first = dedupedPrivacyFetch(profileId, modelId, fetcher, skipFresh)
     await vi.waitFor(() => expect(calls).toBe(1))
 
     // Simulate another tab: it has no access to this module's in-memory
-    // single-flight map, but it does contend on the same Web Lock/fallback lock.
+    // single-flight map, but its commit uses the same Web Lock/fallback lock.
     __resetPrivacyInFlightForTests()
     const second = dedupedPrivacyFetch(profileId, modelId, fetcher, skipFresh)
+    await vi.waitFor(() => expect(calls).toBe(2))
 
-    gate.resolve({ policies: { Azure: { training: false } }, fetchedAt: Date.now() })
-    await Promise.all([first, second])
+    const winningPayload = {
+      policies: { OpenAI: { training: false } },
+      fetchedAt: Date.now(),
+    }
+    secondGate.resolve(winningPayload)
+    await second
+    firstGate.resolve({ policies: { Azure: { training: false } }, fetchedAt: Date.now() })
+    await first
 
-    expect(calls).toBe(1)
+    expect(calls).toBe(2)
+    expect((await getCachedPrivacyPolicy(profileId, modelId))?.payload).toEqual(winningPayload)
   })
 
   it('force refresh bypasses the under-lock cache re-check', async () => {

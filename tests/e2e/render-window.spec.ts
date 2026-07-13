@@ -1,8 +1,14 @@
-import { expect, type Locator, type Page, test } from '@playwright/test'
-import { buildSseBody, clearIndexedDb, seedFirstRun, seedLinearChat, sendMessage } from './helpers'
+import { expect, type Locator, type Page, test } from './fixtures'
+import {
+  buildSseBody,
+  clearIndexedDb,
+  rebuildSidebarProjection,
+  seedFirstRun,
+  seedLinearChat,
+  sendMessage,
+} from './helpers'
 
 test.beforeEach(async ({ page }) => {
-  await page.goto('/')
   await clearIndexedDb(page)
   await seedFirstRun(page)
 })
@@ -72,9 +78,11 @@ test('opening Appearance settings does not reapply the default chat width', asyn
     return w.__chatWidthMutations ?? []
   })
   expect(mutations).not.toContain('920px')
-  await expect.poll(() =>
-    page.evaluate(() => document.documentElement.style.getPropertyValue('--message-max-width')),
-  ).toBe('1280px')
+  await expect
+    .poll(() =>
+      page.evaluate(() => document.documentElement.style.getPropertyValue('--message-max-width')),
+    )
+    .toBe('1280px')
 })
 
 test('chat transcript mounts only the newest message window and loads older batches manually', async ({
@@ -146,7 +154,7 @@ test('send and regenerate keep the transcript mounted while the branch window re
   await expect(
     page.locator('[data-ui="message"]').last().locator('[data-ui="message-body"]'),
   ).toContainText('sent answer')
-  await expect(await stopMessageCountRecorder(page)).not.toContain(0)
+  expect(await stopMessageCountRecorder(page)).not.toContain(0)
 
   await startMessageCountRecorder(page)
   await page
@@ -157,11 +165,12 @@ test('send and regenerate keep the transcript mounted while the branch window re
   await expect(
     page.locator('[data-ui="message"]').last().locator('[data-ui="message-body"]'),
   ).toContainText('regenerated answer')
-  await expect(await stopMessageCountRecorder(page)).not.toContain(0)
+  expect(await stopMessageCountRecorder(page)).not.toContain(0)
 })
 
 test('switching message variants re-renders the selected branch window', async ({ page }) => {
   const chatId = await seedBranchedChat(page)
+  await rebuildSidebarProjection(page)
 
   await page.goto(`/#/chat/${chatId}/message/A2`)
   await page.reload()
@@ -190,6 +199,7 @@ test('sidebar mounts only the first row window and loads more rows manually', as
       'global:sidebar-render-window-load-mode': 'manual',
     },
   })
+  await rebuildSidebarProjection(page)
   await page.goto('/')
   await page.reload()
 
@@ -212,6 +222,7 @@ test('sidebar keeps scroll position when auto-load crosses virtualization thresh
       'global:sidebar-render-window-load-mode': 'auto',
     },
   })
+  await rebuildSidebarProjection(page)
   await page.goto('/')
   await page.reload()
 
@@ -229,6 +240,7 @@ test('sidebar keeps scroll position when auto-load crosses virtualization thresh
 
 test('virtualized sidebar bottom tracks mixed folder and tag row heights', async ({ page }) => {
   await seedMixedHeightSidebarRows(page)
+  await rebuildSidebarProjection(page)
   await page.goto('/')
   await page.reload()
 
@@ -258,6 +270,7 @@ test('sidebar keeps a loaded row anchored when folders toggle and tag rows grow'
   page,
 }) => {
   await seedSidebarScrollMutationFixture(page)
+  await rebuildSidebarProjection(page)
   await page.goto('/')
   await page.reload()
 
@@ -349,7 +362,7 @@ async function scrollSidebarToAutoLoadedVirtualRows(page: Page): Promise<void> {
 
 async function alignSidebarRowNearTop(row: Locator): Promise<void> {
   await row.evaluate((node) => {
-    const list = node.closest('[data-ui="chat-list"]') as HTMLElement | null
+    const list = node.closest('[data-ui="chat-list"]')
     if (!list) return
     const rowRect = node.getBoundingClientRect()
     const listRect = list.getBoundingClientRect()
@@ -362,13 +375,10 @@ async function scrollSidebarUntilText(page: Page, text: string): Promise<void> {
   const matchingRows = page.locator('[data-sidebar-row-key]').filter({ hasText: text })
   for (let attempt = 0; attempt < 30; attempt += 1) {
     if ((await matchingRows.count()) > 0) return
-    await list.evaluate(
-      (node, attemptIndex) => {
-        const maxScrollTop = Math.max(0, node.scrollHeight - node.clientHeight)
-        node.scrollTop = Math.min(maxScrollTop, attemptIndex * 520)
-      },
-      attempt,
-    )
+    await list.evaluate((node, attemptIndex) => {
+      const maxScrollTop = Math.max(0, node.scrollHeight - node.clientHeight)
+      node.scrollTop = Math.min(maxScrollTop, attemptIndex * 520)
+    }, attempt)
     await page.waitForTimeout(40)
   }
   throw new Error(`Could not render sidebar row containing ${text}`)
@@ -384,7 +394,7 @@ async function settleSidebarMeasurementsToBottom(list: Locator): Promise<void> {
         requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
       })
       if (target >= maxScrollTop) break
-      target += 180
+      target += Math.max(180, node.clientHeight * 0.75)
     }
     node.scrollTop = Math.max(0, node.scrollHeight - node.clientHeight)
     await new Promise<void>((resolve) => {
@@ -399,8 +409,8 @@ async function sidebarRowMetrics(row: Locator): Promise<{
   renderedCount: number
 }> {
   return row.evaluate((node) => {
-    const list = node.closest('[data-ui="chat-list"]') as HTMLElement | null
-    if (!list) throw new Error('Sidebar list not found')
+    const list = node.closest('[data-ui="chat-list"]')
+    if (!(list instanceof HTMLElement)) throw new Error('Sidebar list not found')
     const rowRect = node.getBoundingClientRect()
     const listRect = list.getBoundingClientRect()
     return {

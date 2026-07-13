@@ -21,6 +21,7 @@ import type {
   AttachmentMissingReason,
   AttachmentOrigin,
   AttachmentRef,
+  AttachmentReferenceEdge,
   AttachmentTokenEstimate,
   ChatId,
   ChatTitleStatus,
@@ -31,13 +32,10 @@ import type {
 } from '../core/types'
 import { newId } from '../lib/ulid'
 import {
-  attachmentIdOf,
-  attachmentIdsOf,
   attachmentRefsFromIds,
   createAttachmentRef,
   liveAttachmentRefs,
   normalizeAttachmentRefs,
-  uniqueAttachmentIdsOf,
 } from './attachment-refs'
 import { getBrowserRepository } from './browser-repo'
 import { openDb } from './db'
@@ -58,12 +56,14 @@ interface CreateAttachmentInput {
   sourceUrl?: string
 }
 
-interface AttachmentBundle {
+export interface PreparedAttachmentBundle {
   attachment: Attachment
   blobs: AttachmentBlob[]
   artifacts: AttachmentArtifact[]
   jobs: AttachmentJob[]
 }
+
+type AttachmentBundle = PreparedAttachmentBundle
 
 interface IngestAttachmentBytesInput {
   blob: Blob
@@ -226,6 +226,28 @@ export async function ingestAttachmentBytes(
   return bundle
 }
 
+export async function prepareAttachmentBytes(input: {
+  blob: Blob
+  filename: string
+  declaredMime?: string
+  origin?: AttachmentOrigin
+  sourceUrl?: string
+  id: AttachmentId
+  now?: number
+}): Promise<PreparedAttachmentBundle> {
+  const bytes = new Uint8Array(await input.blob.arrayBuffer())
+  const processed = await processAttachment({
+    id: input.id,
+    filename: input.filename,
+    bytes,
+    ...(input.declaredMime ? { declaredMime: input.declaredMime } : {}),
+    ...(input.origin ? { origin: input.origin } : {}),
+    ...(input.sourceUrl ? { sourceUrl: input.sourceUrl } : {}),
+    ...(input.now !== undefined ? { now: input.now } : {}),
+  })
+  return bundleFromProcessed(processed, input.blob)
+}
+
 export async function replaceAttachmentBytes(
   input: ReplaceAttachmentBytesInput,
 ): Promise<ReplaceAttachmentBytesResult> {
@@ -260,23 +282,7 @@ export async function replaceAttachmentBytes(
 export async function createRemoteAttachment(
   input: CreateRemoteAttachmentInput,
 ): Promise<Attachment> {
-  const now = input.now ?? Date.now()
-  const extension = fileExtension(input.filename)
-  const attachment: Attachment = {
-    id: input.id ?? newId(),
-    kind: canonicalKind(input.kind ?? 'other'),
-    mime: input.mime ?? 'application/octet-stream',
-    filename: input.filename,
-    ...(extension ? { extension } : {}),
-    origin: input.origin ?? 'user-remote-url',
-    sourceUrl: input.url,
-    createdAt: now,
-    updatedAt: now,
-    storage: { kind: 'remote-url', url: input.url },
-    artifacts: [],
-    processing: [],
-    refCount: 0,
-  }
+  const attachment = remoteAttachment(input)
   if (input.id !== undefined) {
     return (
       await putAttachmentBundleIfAbsent({
@@ -291,6 +297,37 @@ export async function createRemoteAttachment(
   return attachment
 }
 
+export function prepareRemoteAttachment(input: {
+  url: string
+  filename: string
+  mime?: string
+  kind?: AttachmentKind
+  origin?: AttachmentOrigin
+  id: AttachmentId
+  now?: number
+}): PreparedAttachmentBundle {
+  return { attachment: remoteAttachment(input), blobs: [], artifacts: [], jobs: [] }
+}
+
+export async function persistPreparedAttachmentBundle(
+  ctx: MutationContext,
+  bundle: PreparedAttachmentBundle,
+): Promise<Attachment> {
+  const existing = await ctx.getAttachment(bundle.attachment.id)
+  if (existing) {
+    const references = await ctx.countAttachmentReferences(existing.id)
+    if (
+      references.occurrences > 0 ||
+      preparedAttachmentMatchesExisting(existing, bundle.attachment)
+    ) {
+      return existing
+    }
+    await ctx.deleteAttachment(existing.id)
+  }
+  await writeAttachmentBundle(ctx, bundle)
+  return bundle.attachment
+}
+
 async function putAttachmentBundle(bundle: AttachmentBundle): Promise<void> {
   const repo = getBrowserRepository()
   await repo.runMutation(
@@ -303,17 +340,17 @@ async function putAttachmentBundle(bundle: AttachmentBundle): Promise<void> {
 
 async function putAttachmentBundleIfAbsent(bundle: AttachmentBundle): Promise<AttachmentBundle> {
   const repo = getBrowserRepository()
-  let wrote = false
+  const result = { wrote: false }
   await repo.runMutation(
     [{ kind: 'attachment', attachmentId: bundle.attachment.id }],
     async (ctx) => {
       const existing = await ctx.getAttachment(bundle.attachment.id)
       if (existing) return
       await writeAttachmentBundle(ctx, bundle)
-      wrote = true
+      result.wrote = true
     },
   )
-  if (wrote) return bundle
+  if (result.wrote) return bundle
   return (await getAttachmentBundle(bundle.attachment.id)) ?? bundle
 }
 
@@ -325,6 +362,44 @@ async function writeAttachmentBundle(
   for (const blob of bundle.blobs) await ctx.putAttachmentBlob(blob)
   for (const artifact of bundle.artifacts) await ctx.putAttachmentArtifact(artifact)
   for (const job of bundle.jobs) await ctx.putAttachmentJob(job)
+}
+
+function remoteAttachment(input: CreateRemoteAttachmentInput): Attachment {
+  const now = input.now ?? Date.now()
+  const extension = fileExtension(input.filename)
+  return {
+    id: input.id ?? newId(),
+    kind: canonicalKind(input.kind ?? 'other'),
+    mime: input.mime ?? 'application/octet-stream',
+    filename: input.filename,
+    ...(extension ? { extension } : {}),
+    origin: input.origin ?? 'user-remote-url',
+    sourceUrl: input.url,
+    createdAt: now,
+    updatedAt: now,
+    storage: { kind: 'remote-url', url: input.url },
+    artifacts: [],
+    processing: [],
+    refCount: 0,
+  }
+}
+
+function preparedAttachmentMatchesExisting(existing: Attachment, prepared: Attachment): boolean {
+  if (
+    existing.storage.kind === 'local-blob' &&
+    prepared.contentHash !== undefined &&
+    existing.contentHash === prepared.contentHash
+  ) {
+    return true
+  }
+  if (
+    existing.storage.kind !== 'missing' &&
+    prepared.sourceUrl !== undefined &&
+    existing.sourceUrl === prepared.sourceUrl
+  ) {
+    return true
+  }
+  return false
 }
 
 export async function getAttachmentBundle(
@@ -362,75 +437,17 @@ async function replaceAttachmentBundle(
   await repo.runMutation(
     [{ kind: 'attachment', attachmentId: previous.attachment.id }],
     async (ctx) => {
-      for (const blob of previous.blobs) await ctx.deleteAttachmentBlob(blob.id)
-      for (const artifact of previous.artifacts)
-        await ctx.deleteAttachmentArtifact(artifact.artifactId)
-      for (const job of previous.jobs) await ctx.deleteAttachmentJob(job.id)
-      await ctx.putAttachment(next.attachment)
+      const current = await ctx.getAttachment(previous.attachment.id)
+      if (!current) throw new Error(`AttachmentMissing:${previous.attachment.id}`)
+      await ctx.deleteAttachmentBlobs(previous.attachment.id)
+      await ctx.deleteAttachmentArtifacts(previous.attachment.id)
+      await ctx.deleteAttachmentJobs(previous.attachment.id)
+      await ctx.putAttachment({ ...next.attachment, createdAt: current.createdAt })
       for (const blob of next.blobs) await ctx.putAttachmentBlob(blob)
       for (const artifact of next.artifacts) await ctx.putAttachmentArtifact(artifact)
       for (const job of next.jobs) await ctx.putAttachmentJob(job)
     },
   )
-}
-
-export async function incRefs(
-  ctx: MutationContext,
-  refs: readonly AttachmentRef[] | undefined,
-): Promise<void> {
-  await updateAttachmentRefCounts(ctx, attachmentIdsOf(refs), 1)
-}
-
-export async function decRefs(
-  ctx: MutationContext,
-  refs: readonly AttachmentRef[] | undefined,
-): Promise<void> {
-  await updateAttachmentRefCounts(ctx, attachmentIdsOf(refs), -1)
-}
-
-export async function incAttachmentIds(
-  ctx: MutationContext,
-  ids: readonly AttachmentId[] | undefined,
-): Promise<void> {
-  await updateAttachmentRefCounts(ctx, ids ?? [], 1)
-}
-
-export async function decAttachmentIds(
-  ctx: MutationContext,
-  ids: readonly AttachmentId[] | undefined,
-): Promise<void> {
-  await updateAttachmentRefCounts(ctx, ids ?? [], -1)
-}
-
-async function updateAttachmentRefCounts(
-  ctx: MutationContext,
-  ids: readonly AttachmentId[],
-  delta: 1 | -1,
-): Promise<void> {
-  for (const id of ids) {
-    const row = await ctx.getAttachment(id)
-    if (!row) continue
-    const refCount = delta > 0 ? row.refCount + 1 : Math.max(0, row.refCount - 1)
-    await ctx.putAttachment({ ...row, refCount })
-  }
-}
-
-export function diffAttachmentRefs(
-  previous: readonly AttachmentRef[] | undefined,
-  next: readonly AttachmentRef[] | undefined,
-): { toInc: AttachmentId[]; toDec: AttachmentId[] } {
-  const prev = multiset(attachmentIdsOf(previous))
-  const curr = multiset(attachmentIdsOf(next))
-  const ids = new Set([...prev.keys(), ...curr.keys()])
-  const toInc: AttachmentId[] = []
-  const toDec: AttachmentId[] = []
-  for (const id of ids) {
-    const before = prev.get(id) ?? 0
-    const after = curr.get(id) ?? 0
-    for (let i = before; i < after; i += 1) toInc.push(id)
-    for (let i = after; i < before; i += 1) toDec.push(id)
-  }
-  return { toInc, toDec }
 }
 
 export async function addExistingAttachmentRef(
@@ -475,7 +492,6 @@ export async function addExistingAttachmentRef(
         updatedAt: now,
       })
     }
-    await incRefs(ctx, [ref])
   })
   return ref
 }
@@ -528,7 +544,6 @@ export async function detachAttachmentRef(
   const repo = getBrowserRepository()
   const now = input.now ?? Date.now()
   const target = await resolveRefTarget(input)
-  let removed: MessageAttachmentRef | undefined
   await repo.runMutation(scopesForTarget(target), async (ctx) => {
     if (target.kind === 'message') {
       const message = await mustGetMessage(ctx, target.message.id)
@@ -536,7 +551,7 @@ export async function detachAttachmentRef(
         messageId: message.id,
         createdAt: message.createdAt,
       })
-      removed = refs.find((ref) => ref.refId === input.refId)
+      const removed = refs.find((ref) => ref.refId === input.refId)
       if (!removed) return
       await ctx.putMessage(
         messageWithAttachmentRefs(
@@ -551,7 +566,7 @@ export async function detachAttachmentRef(
         draftChatId: draft.chatId,
         createdAt: draft.updatedAt,
       })
-      removed = refs.find((ref) => ref.refId === input.refId)
+      const removed = refs.find((ref) => ref.refId === input.refId)
       if (!removed) return
       await ctx.putDraft({
         ...draft,
@@ -559,15 +574,13 @@ export async function detachAttachmentRef(
         updatedAt: now,
       })
     }
-    await decRefs(ctx, removed ? [removed] : [])
   })
 }
 
 export async function relinkAttachmentRef(
   input: RelinkAttachmentRefInput,
 ): Promise<MessageAttachmentRef> {
-  const result = await batchRelinkAttachmentRefs({
-    oldAttachmentId: '',
+  const result = await mutateAttachmentReferenceTargets({
     newAttachmentId: input.newAttachmentId,
     refs: [input],
     ...(input.now !== undefined ? { now: input.now } : {}),
@@ -580,60 +593,177 @@ export async function relinkAttachmentRef(
 export async function batchRelinkAttachmentRefs(
   input: BatchRelinkAttachmentRefsInput,
 ): Promise<MessageAttachmentRef[]> {
+  return mutateAttachmentReferenceTargets(input)
+}
+
+async function mutateAttachmentReferenceTargets(
+  input: Omit<BatchRelinkAttachmentRefsInput, 'oldAttachmentId'> & {
+    oldAttachmentId?: AttachmentId
+    supersedeAttachmentId?: AttachmentId
+  },
+): Promise<MessageAttachmentRef[]> {
   const repo = getBrowserRepository()
   const now = input.now ?? Date.now()
   const targets = await Promise.all(input.refs.map(resolveRefTarget))
-  if (!(await repo.getAttachment(input.newAttachmentId))) {
-    throw new Error(`AttachmentMissing:${input.newAttachmentId}`)
-  }
-  const updated: MessageAttachmentRef[] = []
-  const oldIds: AttachmentId[] = []
   const scopes = dedupeScopes([
     ...targets.flatMap((target) => scopesForTarget(target)),
     { kind: 'attachment', attachmentId: input.newAttachmentId },
+    ...(input.oldAttachmentId
+      ? [{ kind: 'attachment' as const, attachmentId: input.oldAttachmentId }]
+      : []),
+    ...(input.supersedeAttachmentId
+      ? [{ kind: 'attachment' as const, attachmentId: input.supersedeAttachmentId }]
+      : []),
   ])
+  const updatedByIndex = new Map<number, MessageAttachmentRef>()
   await repo.runMutation(scopes, async (ctx) => {
-    for (let i = 0; i < targets.length; i += 1) {
-      const target = targets[i]
-      const spec = input.refs[i]
-      if (!target || !spec) continue
+    if (!(await ctx.getAttachment(input.newAttachmentId))) {
+      throw new Error(`AttachmentMissing:${input.newAttachmentId}`)
+    }
+
+    const grouped = new Map<
+      string,
+      {
+        target: (typeof targets)[number]
+        specs: Array<{ index: number; refId: string; expectedAttachmentId: AttachmentId }>
+      }
+    >()
+    for (let index = 0; index < targets.length; index += 1) {
+      const target = targets[index]
+      const spec = input.refs[index]
+      if (!target || !spec) throw new Error('AttachmentRelinkTargetMismatch')
+      const key =
+        target.kind === 'message' ? `message:${target.message.id}` : `draft:${target.draft.chatId}`
+      const group = grouped.get(key) ?? { target, specs: [] }
+      if (group.specs.some((candidate) => candidate.refId === spec.refId)) {
+        throw new Error(`DuplicateAttachmentRelinkSpec:${key}:${spec.refId}`)
+      }
+      group.specs.push({
+        index,
+        refId: spec.refId,
+        expectedAttachmentId:
+          input.oldAttachmentId ?? attachmentIdFromTargetSnapshot(target, spec.refId),
+      })
+      grouped.set(key, group)
+    }
+
+    const writes: Array<
+      | { kind: 'message'; message: Message; refs: MessageAttachmentRef[] }
+      | {
+          kind: 'draft'
+          draft: {
+            chatId: ChatId
+            text: string
+            attachmentRefs: AttachmentRef[]
+            updatedAt: number
+          }
+          refs: MessageAttachmentRef[]
+        }
+    > = []
+    for (const { target, specs } of grouped.values()) {
       if (target.kind === 'message') {
         const message = await mustGetMessage(ctx, target.message.id)
         const refs = normalizeAttachmentRefs(message.attachmentRefs, {
           messageId: message.id,
           createdAt: message.createdAt,
         })
-        const next = refs.map((ref) => {
-          if (ref.refId !== spec.refId) return ref
-          oldIds.push(ref.attachmentId)
-          const relinked = { ...ref, attachmentId: input.newAttachmentId, updatedAt: now }
-          updated.push(relinked)
-          return relinked
-        })
-        await ctx.putMessage(messageWithAttachmentRefs(message, next), {
-          touchChatSummary: false,
-          broadcast: true,
+        writes.push({
+          kind: 'message',
+          message,
+          refs: relinkOwnerRefs(refs, specs, input, now, updatedByIndex),
         })
       } else {
-        const draft = (await ctx.getDraft(target.draft.chatId)) ?? target.draft
+        const draft = await ctx.getDraft(target.draft.chatId)
+        if (!draft) throw new Error(`DraftMissing:${target.draft.chatId}`)
         const refs = normalizeAttachmentRefs(draft.attachmentRefs, {
           draftChatId: draft.chatId,
           createdAt: draft.updatedAt,
         })
-        const next = refs.map((ref) => {
-          if (ref.refId !== spec.refId) return ref
-          oldIds.push(ref.attachmentId)
-          const relinked = { ...ref, attachmentId: input.newAttachmentId, updatedAt: now }
-          updated.push(relinked)
-          return relinked
+        writes.push({
+          kind: 'draft',
+          draft,
+          refs: relinkOwnerRefs(refs, specs, input, now, updatedByIndex),
         })
-        await ctx.putDraft({ ...draft, attachmentRefs: next, updatedAt: now })
       }
     }
-    await decAttachmentIds(ctx, oldIds)
-    await incRefs(ctx, updated)
+
+    for (const write of writes) {
+      if (write.kind === 'message') {
+        await ctx.putMessage(messageWithAttachmentRefs(write.message, write.refs), {
+          touchChatSummary: false,
+          broadcast: true,
+        })
+      } else {
+        await ctx.putDraft({ ...write.draft, attachmentRefs: write.refs, updatedAt: now })
+      }
+    }
+
+    if (input.supersedeAttachmentId) {
+      const superseded = await ctx.getAttachment(input.supersedeAttachmentId)
+      if (!superseded) throw new Error(`AttachmentMissing:${input.supersedeAttachmentId}`)
+      await ctx.putAttachment({
+        ...superseded,
+        supersededByAttachmentId: input.newAttachmentId,
+        updatedAt: now,
+      })
+    }
   })
-  return updated
+  return input.refs.map((spec, index) => {
+    const updated = updatedByIndex.get(index)
+    if (!updated) throw new Error(`AttachmentRefMissing:${spec.refId}`)
+    return updated
+  })
+}
+
+function relinkOwnerRefs(
+  refs: readonly MessageAttachmentRef[],
+  specs: readonly { index: number; refId: string; expectedAttachmentId: AttachmentId }[],
+  input: { newAttachmentId: AttachmentId },
+  now: number,
+  updatedByIndex: Map<number, MessageAttachmentRef>,
+): MessageAttachmentRef[] {
+  const specByRefId = new Map(specs.map((spec) => [spec.refId, spec]))
+  const matched = new Set<string>()
+  const next = refs.map((ref) => {
+    const spec = specByRefId.get(ref.refId)
+    if (!spec) return ref
+    if (ref.deletedAt !== undefined) {
+      throw new Error(`AttachmentRefNotLive:${ref.refId}`)
+    }
+    if (ref.attachmentId !== spec.expectedAttachmentId) {
+      throw new Error(
+        `AttachmentRelinkStale:${ref.refId}:${spec.expectedAttachmentId}:${ref.attachmentId}`,
+      )
+    }
+    matched.add(ref.refId)
+    const relinked = { ...ref, attachmentId: input.newAttachmentId, updatedAt: now }
+    updatedByIndex.set(spec.index, relinked)
+    return relinked
+  })
+  for (const spec of specs) {
+    if (!matched.has(spec.refId)) throw new Error(`AttachmentRefMissing:${spec.refId}`)
+  }
+  return next
+}
+
+function attachmentIdFromTargetSnapshot(
+  target: Awaited<ReturnType<typeof resolveRefTarget>>,
+  refId: string,
+): AttachmentId {
+  const refs =
+    target.kind === 'message'
+      ? normalizeAttachmentRefs(target.message.attachmentRefs, {
+          messageId: target.message.id,
+          createdAt: target.message.createdAt,
+        })
+      : normalizeAttachmentRefs(target.draft.attachmentRefs, {
+          draftChatId: target.draft.chatId,
+          createdAt: target.draft.updatedAt,
+        })
+  const ref = refs.find((candidate) => candidate.refId === refId)
+  if (!ref) throw new Error(`AttachmentRefMissing:${refId}`)
+  if (ref.deletedAt !== undefined) throw new Error(`AttachmentRefNotLive:${refId}`)
+  return ref.attachmentId
 }
 
 export async function deleteReferencedAttachmentBytes(
@@ -642,56 +772,74 @@ export async function deleteReferencedAttachmentBytes(
   now = Date.now(),
 ): Promise<Attachment | undefined> {
   const repo = getBrowserRepository()
-  const blobs = (await repo.getAttachmentBundle(attachmentId))?.blobs ?? []
-  let updated: Attachment | undefined
-  await repo.runMutation([{ kind: 'attachment', attachmentId }], async (ctx) => {
-    const current = await ctx.getAttachment(attachmentId)
-    if (!current) return
-    for (const blob of blobs) await ctx.deleteAttachmentBlob(blob.id)
-    updated = markMissingRow(current, reason, now)
-    await ctx.putAttachment(updated)
-  })
-  return updated
+  for (;;) {
+    const snapshot = await repo.getAttachmentBundle(attachmentId)
+    if (!snapshot) return undefined
+    const result = { retry: false, updated: undefined as Attachment | undefined }
+    await repo.runMutation([{ kind: 'attachment', attachmentId }], async (ctx) => {
+      const current = await ctx.getAttachment(attachmentId)
+      if (!current) return
+      if (attachmentRevision(current) !== attachmentRevision(snapshot.attachment)) {
+        result.retry = true
+        return
+      }
+
+      const artifacts = snapshot.artifacts.filter((artifact) => artifact.kind !== 'blob')
+      const artifactIds = new Set(artifacts.map((artifact) => artifact.artifactId))
+      const processing = current.processing.flatMap((state) => {
+        const outputArtifactIds = state.outputArtifactIds.filter((id) => artifactIds.has(id))
+        return state.outputArtifactIds.length > 0 && outputArtifactIds.length === 0
+          ? []
+          : [{ ...state, outputArtifactIds }]
+      })
+
+      await ctx.deleteAttachmentBlobs(attachmentId)
+      for (const artifact of snapshot.artifacts) {
+        if (artifact.kind === 'blob') await ctx.deleteAttachmentArtifact(artifact.artifactId)
+      }
+      for (const job of snapshot.jobs) {
+        const outputArtifactIds = job.outputArtifactIds.filter((id) => artifactIds.has(id))
+        if (job.outputArtifactIds.length > 0 && outputArtifactIds.length === 0) {
+          await ctx.deleteAttachmentJob(job.id)
+        } else if (!sameStringArray(outputArtifactIds, job.outputArtifactIds)) {
+          await ctx.putAttachmentJob({ ...job, outputArtifactIds, updatedAt: now })
+        }
+      }
+
+      result.updated = markMissingRow(current, reason, now, artifacts, processing)
+      await ctx.putAttachment(result.updated)
+    })
+    if (!result.retry) return result.updated
+  }
 }
 
 export async function restoreMissingAttachment(
   input: RestoreMissingAttachmentInput,
 ): Promise<MessageAttachmentRef[]> {
-  const updated = await batchRelinkAttachmentRefs({
+  return mutateAttachmentReferenceTargets({
     oldAttachmentId: input.missingAttachmentId,
     newAttachmentId: input.replacementAttachmentId,
     refs: input.refs,
+    supersedeAttachmentId: input.missingAttachmentId,
     ...(input.now !== undefined ? { now: input.now } : {}),
   })
-  const repo = getBrowserRepository()
-  await repo.runMutation(
-    [
-      { kind: 'attachment', attachmentId: input.missingAttachmentId },
-      { kind: 'attachment', attachmentId: input.replacementAttachmentId },
-    ],
-    async (ctx) => {
-      const missing = await ctx.getAttachment(input.missingAttachmentId)
-      if (!missing) return
-      await ctx.putAttachment({
-        ...missing,
-        supersededByAttachmentId: input.replacementAttachmentId,
-        updatedAt: input.now ?? Date.now(),
-      })
-    },
-  )
-  return updated
 }
 
 export async function deleteUnreferencedAttachment(
   attachmentId: AttachmentId,
 ): Promise<{ deleted: boolean; refs: { messages: number; drafts: number } }> {
-  const refs = await countLiveRefs(attachmentId)
-  if (refs.messages + refs.drafts > 0) return { deleted: false, refs }
   const repo = getBrowserRepository()
+  let deleted = false
+  let refs = { messages: 0, drafts: 0 }
   await repo.runMutation([{ kind: 'attachment', attachmentId }], async (ctx) => {
+    const counts = await ctx.countAttachmentReferences(attachmentId)
+    refs = { messages: counts.messages, drafts: counts.drafts }
+    if (counts.occurrences > 0) return
+    if (!(await ctx.getAttachment(attachmentId))) return
     await ctx.deleteAttachment(attachmentId)
+    deleted = true
   })
-  return { deleted: true, refs }
+  return { deleted, refs }
 }
 
 export async function reapOrphanedAttachments(
@@ -718,40 +866,55 @@ export async function countLiveRefs(
   id: AttachmentId,
 ): Promise<{ messages: number; drafts: number }> {
   const db = await openDb()
-  let messages = 0
-  let drafts = 0
-  await db.messages.each((m) => {
-    if (liveAttachmentRefs(m.attachmentRefs).some((ref) => ref.attachmentId === id)) {
-      messages += 1
-    }
-  })
-  await db.drafts.each((d) => {
-    if (liveAttachmentRefs(d.attachmentRefs).some((ref) => ref.attachmentId === id)) {
-      drafts += 1
-    }
-  })
-  return { messages, drafts }
+  const edges = await db.attachmentRefEdges.where('attachmentId').equals(id).toArray()
+  return {
+    messages: new Set(
+      edges.filter((edge) => edge.ownerKind === 'message').map((edge) => edge.ownerId),
+    ).size,
+    drafts: new Set(edges.filter((edge) => edge.ownerKind === 'draft').map((edge) => edge.ownerId))
+      .size,
+  }
 }
 
 export async function listAttachmentReferences(
   id: AttachmentId,
 ): Promise<AttachmentReferenceRow[]> {
   const db = await openDb()
+  const edges = await listAttachmentReferenceEdges(id)
+  if (edges.length === 0) return []
+  const messageIds = [
+    ...new Set(edges.filter((edge) => edge.ownerKind === 'message').map((edge) => edge.ownerId)),
+  ]
+  const draftIds = [
+    ...new Set(edges.filter((edge) => edge.ownerKind === 'draft').map((edge) => edge.ownerId)),
+  ]
+  const chatIds = [...new Set(edges.map((edge) => edge.chatId))]
   const [chats, messages, drafts] = await Promise.all([
-    db.chats.toArray(),
-    db.messages.toArray(),
-    db.drafts.toArray(),
+    db.chats.bulkGet(chatIds),
+    db.messages.bulkGet(messageIds),
+    db.drafts.bulkGet(draftIds),
   ])
-  const chatById = new Map(chats.map((chat) => [chat.id, chat]))
+  const chatById = new Map(chats.flatMap((chat) => (chat ? [[chat.id, chat]] : [])))
+  const messageById = new Map(
+    messages.flatMap((message) => (message ? [[message.id, message]] : [])),
+  )
+  const draftById = new Map(drafts.flatMap((draft) => (draft ? [[draft.chatId, draft]] : [])))
   const rows: AttachmentReferenceRow[] = []
-  for (const message of messages) {
-    const refs = normalizeAttachmentRefs(message.attachmentRefs, {
-      messageId: message.id,
-      createdAt: message.createdAt,
-    }).filter((ref) => ref.attachmentId === id && !ref.deletedAt)
-    if (refs.length === 0) continue
-    const chat = chatById.get(message.chatId)
-    for (const ref of refs) {
+  for (const edge of edges) {
+    if (edge.ownerKind === 'message') {
+      const message = messageById.get(edge.ownerId)
+      if (!message) throw attachmentEdgeOwnerMissing(edge)
+      const ref = normalizeAttachmentRefs(message.attachmentRefs, {
+        messageId: message.id,
+        createdAt: message.createdAt,
+      }).find(
+        (candidate) =>
+          candidate.refId === edge.refId &&
+          candidate.attachmentId === edge.attachmentId &&
+          candidate.deletedAt === undefined,
+      )
+      if (!ref) throw attachmentEdgeRefMissing(edge)
+      const chat = chatById.get(message.chatId)
       rows.push({
         ownerKind: 'message',
         chatId: message.chatId,
@@ -762,16 +925,20 @@ export async function listAttachmentReferences(
         messageCreatedAt: message.createdAt,
         ref,
       })
-    }
-  }
-  for (const draft of drafts) {
-    const refs = normalizeAttachmentRefs(draft.attachmentRefs, {
-      draftChatId: draft.chatId,
-      createdAt: draft.updatedAt,
-    }).filter((ref) => ref.attachmentId === id && !ref.deletedAt)
-    if (refs.length === 0) continue
-    const chat = chatById.get(draft.chatId)
-    for (const ref of refs) {
+    } else {
+      const draft = draftById.get(edge.ownerId)
+      if (!draft) throw attachmentEdgeOwnerMissing(edge)
+      const ref = normalizeAttachmentRefs(draft.attachmentRefs, {
+        draftChatId: draft.chatId,
+        createdAt: draft.updatedAt,
+      }).find(
+        (candidate) =>
+          candidate.refId === edge.refId &&
+          candidate.attachmentId === edge.attachmentId &&
+          candidate.deletedAt === undefined,
+      )
+      if (!ref) throw attachmentEdgeRefMissing(edge)
+      const chat = chatById.get(draft.chatId)
       rows.push({
         ownerKind: 'draft',
         chatId: draft.chatId,
@@ -788,14 +955,33 @@ export async function listAttachmentReferences(
   return rows
 }
 
-export function attachmentScopes(refs: readonly AttachmentRef[] | undefined): MutationScope[] {
-  return uniqueAttachmentIdsOf(refs).map((attachmentId) => ({
-    kind: 'attachment',
-    attachmentId,
-  }))
+export async function listAttachmentReferenceEdges(
+  id: AttachmentId,
+): Promise<AttachmentReferenceEdge[]> {
+  const db = await openDb()
+  return db.attachmentRefEdges.where('attachmentId').equals(id).toArray()
 }
 
-export { attachmentIdOf, attachmentRefsFromIds }
+function attachmentEdgeOwnerMissing(edge: AttachmentReferenceEdge): Error {
+  return new Error(`AttachmentReferenceOwnerMissing:${edge.ownerKind}:${edge.ownerId}`)
+}
+
+function attachmentEdgeRefMissing(edge: AttachmentReferenceEdge): Error {
+  return new Error(
+    `AttachmentReferenceProjectionMismatch:${edge.ownerKind}:${edge.ownerId}:${edge.refId}`,
+  )
+}
+
+export function attachmentScopes(refs: readonly AttachmentRef[] | undefined): MutationScope[] {
+  return [...new Set(liveAttachmentRefs(refs).map((ref) => ref.attachmentId))].map(
+    (attachmentId) => ({
+      kind: 'attachment',
+      attachmentId,
+    }),
+  )
+}
+
+export { attachmentRefsFromIds }
 
 function metadataAndOptionalBlob(row: PendingAttachment): {
   metadata: Attachment
@@ -966,12 +1152,6 @@ function canonicalKind(kind: AttachmentKind): AttachmentKind {
   return kind === 'file' ? 'other' : kind
 }
 
-function multiset(ids: readonly AttachmentId[]): Map<AttachmentId, number> {
-  const counts = new Map<AttachmentId, number>()
-  for (const id of ids) counts.set(id, (counts.get(id) ?? 0) + 1)
-  return counts
-}
-
 function insertRef(
   refs: readonly MessageAttachmentRef[],
   ref: MessageAttachmentRef,
@@ -1065,10 +1245,16 @@ function markMissingRow(
   attachment: Attachment,
   reason: AttachmentMissingReason,
   now: number,
+  artifacts: AttachmentArtifact[],
+  processing: Attachment['processing'],
 ): Attachment {
   const lastKnownBlobId =
-    attachment.storage.kind === 'local-blob' ? attachment.storage.blobId : undefined
-  return {
+    attachment.storage.kind === 'local-blob'
+      ? attachment.storage.blobId
+      : attachment.storage.kind === 'missing'
+        ? attachment.storage.lastKnownBlobId
+        : undefined
+  const next: Attachment = {
     ...attachment,
     updatedAt: now,
     storage: {
@@ -1077,7 +1263,36 @@ function markMissingRow(
       missingSince: now,
       ...(lastKnownBlobId ? { lastKnownBlobId } : {}),
     },
+    artifacts,
+    processing,
   }
+  delete next.thumbnailBlobId
+  return next
+}
+
+function attachmentRevision(attachment: Attachment): string {
+  return JSON.stringify({
+    updatedAt: attachment.updatedAt,
+    refCount: attachment.refCount,
+    contentHash: attachment.contentHash,
+    storage: attachment.storage,
+    thumbnailBlobId: attachment.thumbnailBlobId,
+    artifacts: attachment.artifacts.map((artifact) => [
+      artifact.artifactId,
+      artifact.kind,
+      artifact.kind === 'blob' ? artifact.blobId : undefined,
+    ]),
+    processing: attachment.processing.map((state) => [
+      state.processorId,
+      state.inputHash,
+      state.status,
+      state.outputArtifactIds,
+    ]),
+  })
+}
+
+function sameStringArray(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index])
 }
 
 function displayChatTitle(chat: { title?: string; id: ChatId } | undefined): string {

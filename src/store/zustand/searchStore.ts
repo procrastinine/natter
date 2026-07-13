@@ -17,7 +17,7 @@ export interface SearchSession {
   scope: SearchScope
   filters: SearchFilters
   status: SearchStatus
-  results: SearchResult[]
+  results: SearchResultCollection
   candidateCount: number
   completedCount: number
   startedAt: number
@@ -27,6 +27,14 @@ export interface SearchSession {
   invalidatedChatIds: ChatId[]
   tailPassChatIds: ChatId[]
   deletedChatIds: ChatId[]
+  deletedChatIdSet: ReadonlySet<ChatId>
+}
+
+export interface SearchResultCollection {
+  readonly orderedIds: readonly ChatId[]
+  readonly byChatId: ReadonlyMap<ChatId, SearchResult>
+  readonly revision: number
+  readonly size: number
 }
 
 interface SearchStoreState {
@@ -45,6 +53,16 @@ interface SearchStoreState {
 }
 
 let unsubscribe: (() => void) | null = null
+const RESULT_INDEX = Symbol('resultIndex')
+const RESULT_VALUES = Symbol('resultValues')
+const EMPTY_ORDERED_RESULTS: readonly SearchResult[] = []
+
+interface MutableSearchResultCollection extends SearchResultCollection {
+  readonly orderedIds: ChatId[]
+  readonly byChatId: Map<ChatId, SearchResult>
+  readonly [RESULT_INDEX]: Map<ChatId, number>
+  readonly [RESULT_VALUES]: SearchResult[]
+}
 
 function nextQueryId(): string {
   return `search-${Date.now()}-${Math.random().toString(36).slice(2)}`
@@ -61,13 +79,14 @@ export const useSearchStore = create<SearchStoreState>((set) => ({
         scope: options.scope ?? 'last-updated-branch',
         filters,
         status: hasSearchWork(query, filters) ? 'debouncing' : 'idle',
-        results: [],
+        results: createResultCollection(),
         candidateCount: 0,
         completedCount: 0,
         startedAt: Date.now(),
         invalidatedChatIds: [],
         tailPassChatIds: [],
         deletedChatIds: [],
+        deletedChatIdSet: new Set(),
       },
     })
   },
@@ -97,8 +116,9 @@ export const useSearchStore = create<SearchStoreState>((set) => ({
   mergeResult: (result, completedCount, candidateCount) =>
     set((state) => {
       if (!state.session) return state
-      if (state.session.deletedChatIds.includes(result.chatId)) return state
-      const results = upsertResult(state.session.results, result)
+      const chatId = result.chatId
+      if (state.session.deletedChatIdSet.has(chatId)) return state
+      const results = upsertResult(state.session.results, chatId, result)
       return {
         session: {
           ...state.session,
@@ -114,8 +134,9 @@ export const useSearchStore = create<SearchStoreState>((set) => ({
         ? {
             session: {
               ...state.session,
-              results: results.filter(
-                (result) => !state.session?.deletedChatIds.includes(result.chatId),
+              results: createResultCollection(
+                results.filter((result) => !state.session?.deletedChatIdSet.has(result.chatId)),
+                state.session.results.revision + 1,
               ),
             },
           }
@@ -127,20 +148,23 @@ export const useSearchStore = create<SearchStoreState>((set) => ({
       return {
         session: {
           ...state.session,
-          results: state.session.results.filter((result) => result.chatId !== chatId),
+          results: removeResult(state.session.results, chatId),
         },
       }
     }),
   markChatDeleted: (chatId) =>
     set((state) => {
       if (!state.session) return state
+      const deletedChatIdSet = new Set(state.session.deletedChatIdSet)
+      deletedChatIdSet.add(chatId)
       return {
         session: {
           ...state.session,
-          results: state.session.results.filter((result) => result.chatId !== chatId),
+          results: removeResult(state.session.results, chatId),
           invalidatedChatIds: state.session.invalidatedChatIds.filter((id) => id !== chatId),
           tailPassChatIds: state.session.tailPassChatIds.filter((id) => id !== chatId),
           deletedChatIds: appendUnique(state.session.deletedChatIds, chatId),
+          deletedChatIdSet,
         },
       }
     }),
@@ -184,6 +208,10 @@ export const useSearchStore = create<SearchStoreState>((set) => ({
 export function startSearchStoreBroadcastListener(): void {
   if (unsubscribe) return
   unsubscribe = onEvent((event) => {
+    if (event.kind === 'workspace-invalidated' || event.kind === 'workspace-replaced') {
+      useSearchStore.getState().reset()
+      return
+    }
     if (event.kind === 'branch-cache-refreshed') {
       useSearchStore.getState().markChatInvalidated(event.chatId)
     }
@@ -214,12 +242,82 @@ export function __resetSearchStoreForTests(): void {
   unsubscribe = null
 }
 
-function upsertResult(results: readonly SearchResult[], result: SearchResult): SearchResult[] {
-  const next = [...results]
-  const index = next.findIndex((candidate) => candidate.chatId === result.chatId)
-  if (index >= 0) next[index] = result
-  else next.push(result)
-  return next
+export function orderedSearchResults(
+  results: SearchResultCollection | undefined,
+): readonly SearchResult[] {
+  return results ? mutableResults(results)[RESULT_VALUES] : EMPTY_ORDERED_RESULTS
+}
+
+function createResultCollection(
+  results: readonly SearchResult[] = [],
+  revision = 0,
+): SearchResultCollection {
+  const collection: MutableSearchResultCollection = {
+    orderedIds: [],
+    byChatId: new Map(),
+    revision,
+    size: 0,
+    [RESULT_INDEX]: new Map(),
+    [RESULT_VALUES]: [],
+  }
+  for (const result of results) {
+    const chatId = result.chatId
+    const index = collection[RESULT_INDEX].get(chatId)
+    if (index === undefined) {
+      collection[RESULT_INDEX].set(chatId, collection.orderedIds.length)
+      collection.orderedIds.push(chatId)
+      collection[RESULT_VALUES].push(result)
+    } else {
+      collection[RESULT_VALUES][index] = result
+    }
+    collection.byChatId.set(chatId, result)
+  }
+  return { ...collection, size: collection.byChatId.size }
+}
+
+function upsertResult(
+  results: SearchResultCollection,
+  chatId: ChatId,
+  result: SearchResult,
+): SearchResultCollection {
+  const mutable = mutableResults(results)
+  const index = mutable[RESULT_INDEX].get(chatId)
+  if (index !== undefined) {
+    mutable[RESULT_VALUES][index] = result
+  } else {
+    mutable[RESULT_INDEX].set(chatId, mutable.orderedIds.length)
+    mutable.orderedIds.push(chatId)
+    mutable[RESULT_VALUES].push(result)
+  }
+  mutable.byChatId.set(chatId, result)
+  return {
+    ...mutable,
+    revision: results.revision + 1,
+    size: mutable.byChatId.size,
+  }
+}
+
+function removeResult(results: SearchResultCollection, chatId: ChatId): SearchResultCollection {
+  const mutable = mutableResults(results)
+  const index = mutable[RESULT_INDEX].get(chatId)
+  if (index === undefined) return results
+  mutable.orderedIds.splice(index, 1)
+  mutable[RESULT_VALUES].splice(index, 1)
+  mutable.byChatId.delete(chatId)
+  mutable[RESULT_INDEX].delete(chatId)
+  for (let position = index; position < mutable.orderedIds.length; position += 1) {
+    const shiftedChatId = mutable.orderedIds[position]
+    if (shiftedChatId !== undefined) mutable[RESULT_INDEX].set(shiftedChatId, position)
+  }
+  return {
+    ...mutable,
+    revision: results.revision + 1,
+    size: mutable.byChatId.size,
+  }
+}
+
+function mutableResults(results: SearchResultCollection): MutableSearchResultCollection {
+  return results as MutableSearchResultCollection
 }
 
 function appendUnique<T>(values: readonly T[], value: T): T[] {

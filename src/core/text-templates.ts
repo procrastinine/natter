@@ -29,7 +29,7 @@ export interface SavedTextTemplate {
   updatedAt: number
 }
 
-const SAVED_TEXT_TEMPLATES_KEY = 'global:text-templates:v1'
+export const SAVED_TEXT_TEMPLATES_KEY = 'global:text-templates:v1'
 
 const EMPTY_LEGACY_TEXT_TEMPLATE: TextTemplateConfig = {
   userPrefix: '',
@@ -749,14 +749,14 @@ function collectIfBranches(
   end: number
 } | null {
   const first = tokens[start]
-  if (!first || first.kind !== 'stmt' || !first.value.startsWith('if ')) return null
+  if (first?.kind !== 'stmt' || !first.value.startsWith('if ')) return null
   const branches: Array<{ condition: string | null; start: number; end: number }> = []
   let condition: string | null = first.value.slice(3).trim()
   let branchStart = start + 1
   let depth = 0
   for (let index = start + 1; index < tokens.length; index += 1) {
     const token = tokens[index]
-    if (!token || token.kind !== 'stmt') continue
+    if (token?.kind !== 'stmt') continue
     if (token.value.startsWith('if ')) {
       depth += 1
     } else if (token.value === 'endif') {
@@ -787,7 +787,7 @@ function findMatchingStatement(
   let depth = 0
   for (let index = start + 1; index < tokens.length; index += 1) {
     const token = tokens[index]
-    if (!token || token.kind !== 'stmt') continue
+    if (token?.kind !== 'stmt') continue
     if (token.value.startsWith(opener)) {
       depth += 1
     } else if (token.value === closer) {

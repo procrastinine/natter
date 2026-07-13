@@ -1,5 +1,3 @@
-// Storage-quota probes. See `plan/03-storage.md §3.4`.
-
 export const QUOTA_WARN_RATIO = 0.8
 export const QUOTA_HARD_WARN_RATIO = 0.95
 
@@ -73,9 +71,7 @@ function storagePersistenceHelpBrowser(): PersistenceHelpBrowser {
   const brands = (navigator as { userAgentData?: { brands?: Array<{ brand: string }> } })
     .userAgentData?.brands
   if (
-    brands?.some(({ brand }) =>
-      /Chromium|Google Chrome|Microsoft Edge|Opera|Brave/i.test(brand),
-    )
+    brands?.some(({ brand }) => /Chromium|Google Chrome|Microsoft Edge|Opera|Brave/i.test(brand))
   ) {
     return 'chromium'
   }

@@ -1,5 +1,3 @@
-// Caching controls. See `plan/10-ui.md §10.10`.
-//
 // The panel shape depends on the current model + effective capability:
 //
 // - Anthropic-style models (cache_control in supportedParameters): mode

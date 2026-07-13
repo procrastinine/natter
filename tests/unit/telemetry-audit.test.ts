@@ -60,4 +60,87 @@ describe('tooling telemetry audit', () => {
 
     expect(viteConfig).not.toMatch(/openTelemetry/i)
   })
+
+  it('keeps malformed stream warnings on the bounded redaction path', () => {
+    const adapters = [
+      'src/api/anthropic-messages.ts',
+      'src/api/chat-completions.ts',
+      'src/api/gemini-native.ts',
+      'src/api/responses.ts',
+      'src/api/text-completions.ts',
+    ]
+
+    for (const adapter of adapters) {
+      const source = readText(adapter)
+      expect(source).toContain('malformedJsonFrameReport({')
+      expect(source).not.toMatch(/console\.warn\([\s\S]{0,200}data:\s*ev\.data/u)
+    }
+    expect(readText('src/api/sse.ts')).toContain('malformedStreamFrameDiagnostic(')
+  })
+
+  it('keeps the native compiler and tooling API on bounded aliases', () => {
+    const packageJson = readJson<{
+      scripts: Record<string, string>
+      devDependencies: Record<string, string>
+    }>('package.json')
+    const workspace = readText('pnpm-workspace.yaml')
+    const refresh = readText('scripts/deps-refresh.mjs')
+    const workflow = readText('.github/workflows/verify.yml')
+    const renovate = readJson<{
+      packageRules: Array<{
+        matchDepNames?: string[]
+        rangeStrategy?: string
+        allowedVersions?: string
+      }>
+    }>('renovate.json')
+    const rule = renovate.packageRules.find((candidate) =>
+      candidate.matchDepNames?.includes('@typescript/native'),
+    )
+
+    expect(packageJson.devDependencies['@typescript/native']).toMatch(/^npm:typescript@\^7\./u)
+    expect(packageJson.devDependencies.typescript).toMatch(/^npm:@typescript\/typescript6@\^6\./u)
+    expect(workspace).toContain("- '@typescript/native'")
+    expect(workspace).toContain('- typescript')
+    expect(packageJson.scripts['deps:peers']).toBe('pnpm peers check')
+    expect(refresh).toContain("await run(['peers', 'check'])")
+    expect(workflow).toContain('pnpm deps:peers')
+    expect(rule?.matchDepNames).toEqual(['@typescript/native', 'typescript'])
+    expect(rule?.rangeStrategy).toBe('in-range-only')
+    expect(rule?.allowedVersions).toBeUndefined()
+  })
+
+  it('keeps delivery ratchets in one shared baseline', () => {
+    const baseline = readJson<{
+      deliveryBudgets: {
+        maximums: Record<string, number>
+        coldStaticGraphMaximums: Record<string, number>
+        namedAssets: Record<string, unknown>
+        browserMeasurements: {
+          preview: Record<string, number>
+          dev: Record<string, number>
+        }
+        coldForbiddenPathFragments: string[]
+      }
+    }>('scripts/performance-baseline.json')
+
+    expect(baseline.deliveryBudgets.maximums.totalBytes).toBeGreaterThan(0)
+    expect(baseline.deliveryBudgets.coldStaticGraphMaximums.gzipBytes).toBeGreaterThan(0)
+    expect(Object.keys(baseline.deliveryBudgets.namedAssets)).toContain('branch-tree')
+    expect(Object.keys(baseline.deliveryBudgets.browserMeasurements)).toEqual(['preview', 'dev'])
+    expect(
+      Object.keys(baseline.deliveryBudgets.browserMeasurements.preview).length,
+    ).toBeGreaterThan(0)
+    expect(baseline.deliveryBudgets.browserMeasurements.dev).toEqual({})
+    expect(baseline.deliveryBudgets.coldForbiddenPathFragments.length).toBeGreaterThan(0)
+    for (const script of [
+      'scripts/verify-dist.mjs',
+      'scripts/report-performance-baseline.mjs',
+      'scripts/measure-delivery.mjs',
+    ]) {
+      expect(readText(script)).toContain('baseline.deliveryBudgets')
+    }
+    const browserMeasurement = readText('scripts/measure-delivery.mjs')
+    expect(browserMeasurement).toContain('coldForbiddenRequests')
+    expect(browserMeasurement).toContain('diagnostics')
+  })
 })

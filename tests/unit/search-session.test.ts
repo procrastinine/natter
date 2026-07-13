@@ -6,7 +6,11 @@ import {
   __resetSearchSessionRunnerForTests,
   requestSearchSession,
 } from '../../src/store/search-session'
-import { __resetSearchStoreForTests, useSearchStore } from '../../src/store/zustand/searchStore'
+import {
+  __resetSearchStoreForTests,
+  orderedSearchResults,
+  useSearchStore,
+} from '../../src/store/zustand/searchStore'
 
 afterEach(() => {
   __resetSearchSessionRunnerForTests()
@@ -65,6 +69,13 @@ function repo(input: {
   return {
     listChats: vi.fn(async () => [...chats.values()]),
     getChat: vi.fn(async (chatId: string) => chats.get(chatId)),
+    getWorkspaceMeta: vi.fn(async () => ({
+      workspaceId: 'test-workspace',
+      backendKind: 'unknown' as const,
+      lastMutationAt: 0,
+      mutationCounter: 0,
+      replacementEpoch: 0,
+    })),
     listFolders: vi.fn(async () => []),
     listTags: vi.fn(async () => []),
     getChatBranchCache: vi.fn(async (chatId: string) => caches.get(chatId)),
@@ -74,6 +85,7 @@ function repo(input: {
     }),
     deleteChatBranchCache: vi.fn(async (chatId: string) => caches.delete(chatId)),
     listMessages: vi.fn(async (chatId: string) => input.messages?.[chatId] ?? []),
+    getBranchByLeaf: vi.fn(async (chatId: string) => input.messages?.[chatId] ?? []),
   } as unknown as WorkspaceRepository
 }
 
@@ -110,7 +122,7 @@ describe('search session runner', () => {
       debounceMs: 0,
     })
 
-    await waitFor(() => useSearchStore.getState().session?.results.length === 1)
+    await waitFor(() => useSearchStore.getState().session?.results.size === 1)
     expect(useSearchStore.getState().session).toMatchObject({
       status: 'scanning',
       completedCount: 1,
@@ -120,9 +132,8 @@ describe('search session runner', () => {
     releaseMessages()
     await waitFor(() => useSearchStore.getState().session?.status === 'done')
     expect(
-      useSearchStore
-        .getState()
-        .session?.results.map((result) => result.chatId)
+      orderedSearchResults(useSearchStore.getState().session?.results)
+        .map((result) => result.chatId)
         .sort(),
     ).toEqual(['body', 'title'])
   })

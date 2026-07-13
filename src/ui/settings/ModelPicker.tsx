@@ -17,7 +17,6 @@
 // stay (pins are workspace-wide).
 
 import { useVirtualizer } from '@tanstack/react-virtual'
-import { useLiveQuery } from 'dexie-react-hooks'
 import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
 import type { ModelListEntry } from '../../api/providers'
 import {
@@ -28,6 +27,8 @@ import {
 } from '../../core/global-settings'
 import type { Chat, ConnectionKind } from '../../core/types'
 import { useModels } from '../../hooks/useModels'
+import { GLOBAL_PREFERENCES_DEPENDENCIES } from '../../store/reactive-dependencies'
+import { useRepositoryQuery } from '../../store/reactive-query'
 
 // Below this threshold, the picker collapses to a plain list. OpenRouter's ~350
 // models and OpenAI direct's ~20 bundled entries stay above it; a local
@@ -72,13 +73,14 @@ export function ModelPicker({ chat, profileKind, onPick, onPickForPreset }: Mode
   // Pinned + recent model ids come from global prefs (workspace-wide).
   // Live queries poll prefs; `writePinnedModels` / `writeRecentModels`
   // broadcast through IDB so other tabs see the update.
-  const prefs = useLiveQuery(
+  const prefs = useRepositoryQuery(
+    'global-model-preferences',
     async () => {
       const p = await readGlobalPreferences()
       return { pinned: p.pinnedModels, recent: p.recentModels }
     },
-    [],
     { pinned: [...DEFAULT_PINNED_MODELS], recent: [] as string[] },
+    GLOBAL_PREFERENCES_DEPENDENCIES,
   )
   const pinnedModels = prefs.pinned
   const pinnedSet = useMemo(() => new Set(pinnedModels), [pinnedModels])

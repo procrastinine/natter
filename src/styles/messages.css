@@ -15,7 +15,6 @@
  *              'inline-editor'|'message-edited'|'message-imported'|
  *              'message-error'|'message-crash'|'message-continue'|
  *              'fallback-chip'].
- * See plan/10-ui.md §10.6.
  */
 
 [data-ui="message-list"] {

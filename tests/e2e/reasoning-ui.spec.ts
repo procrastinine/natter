@@ -1,13 +1,12 @@
-import { expect, test } from '@playwright/test'
-import { clearIndexedDb, seedFirstRun } from './helpers'
+import { expect, test } from './fixtures'
+import { clearIndexedDb, rebuildSidebarProjection, seedFirstRun } from './helpers'
 
 test.beforeEach(async ({ page }) => {
-  await page.goto('/')
   await clearIndexedDb(page)
   await seedFirstRun(page)
 })
 
-test('mirrored Claude reasoning renders once in the UI and shows reasoning time in message info', async ({
+test('canonicalized Claude reasoning renders once in the UI and shows reasoning time in message info', async ({
   page,
 }) => {
   const chatId = 'reasoning-chat'
@@ -105,10 +104,7 @@ test('mirrored Claude reasoning renders once in the UI and shows reasoning time 
             role: 'assistant',
             origin: 'generated',
             content: [{ type: 'output_text', text: 'The ratio is Cauchy.' }],
-            reasoningDetails: [
-              { type: 'reasoning.text', index: 0, text: 'Let' },
-              { type: 'reasoning.text', index: 0, text: 'Let me' },
-            ],
+            reasoningDetails: [{ type: 'reasoning.text', index: 0, text: 'Let me' }],
             nodeVersion: 0,
             deleted: false,
             generation: {
@@ -133,6 +129,7 @@ test('mirrored Claude reasoning renders once in the UI and shows reasoning time 
       db.close()
     }
   }, chatId)
+  await rebuildSidebarProjection(page)
   await page.goto(`/#/chat/${chatId}`)
 
   const assistant = page.locator('[data-ui="message"][data-role="assistant"]').first()

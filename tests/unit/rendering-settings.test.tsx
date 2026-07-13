@@ -20,11 +20,14 @@ vi.mock('../../src/store/settings', () => {
   }
 })
 
-vi.mock('dexie-react-hooks', () => {
+vi.mock('../../src/store/reactive-query', () => {
   return {
-    useLiveQuery: <T,>(_query: () => Promise<T>, _deps: unknown[], initial: T): T | undefined => {
-      return initial
-    },
+    useRepositoryQuery: <T,>(_key: string, _query: () => Promise<T>, initial: T): T => initial,
+    useRepositoryQueryState: <T,>(_key: string, _query: () => Promise<T>, initial: T) => ({
+      status: 'ready',
+      value: initial,
+      error: null,
+    }),
   }
 })
 

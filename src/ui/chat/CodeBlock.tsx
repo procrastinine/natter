@@ -12,8 +12,8 @@ const HARD_SIZE_CAP_LINES = 10_000
 // Minimal standalone code-block component for content that doesn't come
 // through the Streamdown pipeline (e.g. programmatic content lanes or
 // stream-overflow disclosures). Streamdown-rendered code fences get their
-// chrome from the `@streamdown/code` plugin — this module is intentionally
-// independent so it can be rendered without any streaming context.
+// chrome from Streamdown — this module is intentionally independent so it
+// can be rendered without any streaming context.
 export function CodeBlock({ code, language, fileName }: CodeBlockProps) {
   const lineCount = useMemo(() => code.split('\n').length, [code])
   const overLimit = lineCount > HARD_SIZE_CAP_LINES

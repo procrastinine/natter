@@ -1,3 +1,4 @@
+import type { IndexableType, Table, Transaction } from 'dexie'
 import { readCachedPrivacyPayload } from '../api/privacy-scrape'
 import { normalizeEndpointsResponse } from '../api/providers'
 import { filterEndpointsByPrivacy, type PrivacyFilterResult } from '../core/privacy-filter'
@@ -10,6 +11,8 @@ import {
   resolveProviderRefsToRoutingRefs,
 } from '../core/provider-identity'
 import type {
+  Chat,
+  ChatPreset,
   ChatSettings,
   ConnectionProfile,
   DataPolicy,
@@ -17,7 +20,8 @@ import type {
   ProviderPreferences,
   SortBy,
 } from '../core/types'
-import type { CachedEndpointsRow, CachedPrivacyPolicyRow } from '../store/db'
+import type { CachedEndpointsRow, CachedPrivacyPolicyRow } from '../store/db-rows'
+import { forEachTableBatch } from './batched-table'
 import { migrateLegacyChatSettings } from './chat-settings'
 
 type LegacyPrivacyPrefs = ChatSettings['privacy'] & {
@@ -48,11 +52,82 @@ interface ProviderSettingsRowMigrationCaches {
   profilesById?: ReadonlyMap<string, ConnectionProfile>
 }
 
-export function providerCacheKey(profileId: string, modelId: string): string {
+function providerCacheKey(profileId: string, modelId: string): string {
   return `${profileId}\u0000${modelId}`
 }
 
-export function migrateProviderSettingsRow(
+export async function migrateProviderSettingsTables(tx: Transaction): Promise<void> {
+  const endpoints = tx.table<CachedEndpointsRow, [string, string]>('endpoints')
+  const privacyPolicies = tx.table<CachedPrivacyPolicyRow, [string, string]>('privacyPolicies')
+  const profiles = tx.table<ConnectionProfile, string>('profiles')
+  await migrateProviderSettingsTable(
+    tx.table<Chat, string>('chats'),
+    endpoints,
+    privacyPolicies,
+    profiles,
+    (chat) => chat.settings.profileId,
+  )
+  await migrateProviderSettingsTable(
+    tx.table<ChatPreset, string>('presets'),
+    endpoints,
+    privacyPolicies,
+    profiles,
+    (preset) => preset.connectionProfileId,
+  )
+}
+
+async function migrateProviderSettingsTable<
+  TRow extends { settings: ChatSettings },
+  TKey extends IndexableType,
+>(
+  table: Table<TRow, TKey>,
+  endpoints: Table<CachedEndpointsRow, [string, string]>,
+  privacyPolicies: Table<CachedPrivacyPolicyRow, [string, string]>,
+  profiles: Table<ConnectionProfile, string>,
+  profileIdFor: (row: TRow) => string,
+): Promise<void> {
+  await forEachTableBatch(table, async (rows) => {
+    const cacheKeys = new Map<string, [string, string]>()
+    const profileIds = new Set<string>()
+    for (const row of rows) {
+      const profileId = profileIdFor(row)
+      const modelId = row.settings.model
+      cacheKeys.set(providerCacheKey(profileId, modelId), [profileId, modelId])
+      profileIds.add(profileId)
+    }
+    const keys = [...cacheKeys.values()]
+    const [endpointRows, privacyRows, profileRows] = await Promise.all([
+      endpoints.bulkGet(keys),
+      privacyPolicies.bulkGet(keys),
+      profiles.bulkGet([...profileIds]),
+    ])
+    const endpointsByKey = new Map<string, CachedEndpointsRow>()
+    const privacyByKey = new Map<string, CachedPrivacyPolicyRow>()
+    const profilesById = new Map<string, ConnectionProfile>()
+    for (const row of endpointRows) {
+      if (row) endpointsByKey.set(providerCacheKey(row.profileId, row.modelId), row)
+    }
+    for (const row of privacyRows) {
+      if (row) privacyByKey.set(providerCacheKey(row.profileId, row.modelId), row)
+    }
+    for (const row of profileRows) {
+      if (row) profilesById.set(row.id, row)
+    }
+    const changed: TRow[] = []
+    for (const row of rows) {
+      const result = migrateProviderSettingsRow(
+        row.settings,
+        profileIdFor(row),
+        row.settings.model,
+        { endpointsByKey, privacyByKey, profilesById },
+      )
+      if (result.changed) changed.push({ ...row, settings: result.settings })
+    }
+    if (changed.length > 0) await table.bulkPut(changed)
+  })
+}
+
+function migrateProviderSettingsRow(
   settings: ChatSettings,
   profileId: string,
   modelId: string,

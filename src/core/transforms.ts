@@ -1,5 +1,3 @@
-// Internal → Chat Completions wire transform. See `plan/05-transforms-and-quirks.md §5.1`.
-//
 // Phase 7 scope: text-only chat (no tools, no attachments, no reasoning echo,
 // no cache control, no Responses API). We DO respect the contracts that will
 // stay unchanged as other features are bolted on later:
@@ -86,7 +84,7 @@ export interface ChatCompletionsTransformOptions {
   // Pre-computed privacy-filter output from `usePrivacyRouting`. When
   // provided, its auto-ignore / only / order / deny / zdr fragments are
   // merged with `settings.providerPrefs` before the wire `provider`
-  // block is built. See `plan/09-privacy.md §9.9`.
+  // block is built.
   privacy?: WireProviderPrivacy
   // OpenRouter-specific provider routing. This must be explicitly enabled by
   // the request planner so direct/custom OpenAI-compatible endpoints never see
@@ -100,7 +98,7 @@ export interface ChatCompletionsTransformOptions {
   // for OpenAI Responses). Determined by `caps.quirks.reasoningPreservationFormat`
   // on Phase-11-aware callers; when undefined, encrypted reasoning entries
   // are dropped on echo (plaintext / summary still flow per the include
-  // flags). See `plan/phase11-implementation.md §2`.
+  // flags).
   reasoningPreservationFormat?: ReasoningFormat
   attachmentPartsByMessageId?: ReadonlyMap<MessageId, readonly unknown[]>
   extraPlugins?: readonly unknown[]
@@ -127,7 +125,7 @@ const ENVELOPE_KEYS: ReadonlySet<string> = new Set([
 // representation in `ChatSettings.sampling` uses the wire names directly
 // (SamplingKey is already snake_case for stream/temperature/etc.) so the
 // remap is identity for this set.
-const SAMPLING_WIRE_KEY: Readonly<Record<SamplingKey, string>> = Object.freeze({
+const SAMPLING_WIRE_KEY: Readonly<Record<string, string | undefined>> = Object.freeze({
   temperature: 'temperature',
   top_p: 'top_p',
   top_k: 'top_k',
@@ -155,22 +153,21 @@ const SAMPLING_WIRE_KEY: Readonly<Record<SamplingKey, string>> = Object.freeze({
   dry_allowed_length: 'dry_allowed_length',
   dry_penalty_last_n: 'dry_penalty_last_n',
   n_keep: 'n_keep',
-})
+} satisfies Record<SamplingKey, string>)
 
-// Apply prefill-specific path rewrites before any wire serialization. See
-// `plan/prefill-research.md §P.8.5` (trailing-whitespace trim) and §P.8.6
-// (merge adjacent prefill+continuation assistant rows). Both are wire-only;
-// stored messages keep the user's content verbatim. Returns a new array
-// when changes apply, else the input array reference.
+// Apply prefill-specific path rewrites before wire serialization: trim trailing
+// whitespace and merge adjacent prefill/continuation assistant rows. Both are
+// wire-only; stored messages keep the user's content verbatim. Returns a new
+// array when changes apply, otherwise the input array reference.
 function applyPrefillWireRewrites(path: readonly Message[]): readonly Message[] {
   if (path.length === 0) return path
   let mutated: Message[] | null = null
   const dropped = new Set<number>()
   for (let i = 0; i < path.length; i += 1) {
     const current = path[i]
-    if (!current || current.role !== 'assistant' || current.origin !== 'prefill') continue
+    if (current?.role !== 'assistant' || current.origin !== 'prefill') continue
     const next = path[i + 1]
-    if (!next || next.role !== 'assistant' || next.origin === 'prefill') continue
+    if (next?.role !== 'assistant' || next.origin === 'prefill') continue
     // Adjacent `prefill → continuation` pair. Merge them into one wire
     // assistant turn on the wire; the upstream API requires strict role
     // alternation and two adjacent assistant messages would be rejected.
@@ -197,8 +194,8 @@ function applyPrefillWireRewrites(path: readonly Message[]): readonly Message[] 
 }
 
 function mergePrefillIntoContinuation(prefill: Message, continuation: Message): Message {
-  const prefillContent = prefill.content ?? []
-  const contContent = continuation.content ?? []
+  const prefillContent = prefill.content
+  const contContent = continuation.content
   const prefillPrefix = prefillContent
     .filter(
       (item): item is Extract<ContentItem, { type: 'text' | 'output_text' }> =>
@@ -237,7 +234,7 @@ function mergePrefillIntoContinuation(prefill: Message, continuation: Message): 
 
 function trimTrailingWhitespaceOnLastText(message: Message): Message {
   const items = message.content
-  if (!items || items.length === 0) return message
+  if (items.length === 0) return message
   for (let i = items.length - 1; i >= 0; i -= 1) {
     const item = items[i]
     if (!item) continue
@@ -331,7 +328,7 @@ export function buildChatMessages(
 // adds `reasoning_details` (echo per the include matrix), `tool_calls`
 // (on assistant messages), and `tool_call_id` (on tool messages). `phase`
 // is intentionally NOT echoed on chat-completions — the wire can't represent
-// it; it's a Responses-API field. See `plan/phase11-implementation.md §4.5b`.
+// it because it is a Responses-API field.
 function serializeChatMessage(
   message: Message,
   settings: ChatSettings,
@@ -507,8 +504,7 @@ export function toChatCompletions(
   }
 
   for (const [key, value] of Object.entries(settings.sampling)) {
-    if (value === undefined) continue
-    const wireKey = SAMPLING_WIRE_KEY[key as SamplingKey] ?? key
+    const wireKey = SAMPLING_WIRE_KEY[key] ?? key
     if (!gate(wireKey)) continue
     wire[wireKey] = value
   }
@@ -648,8 +644,7 @@ export function toTextCompletions(
   }
 
   for (const [key, value] of Object.entries(settings.sampling)) {
-    if (value === undefined) continue
-    const wireKey = SAMPLING_WIRE_KEY[key as SamplingKey] ?? key
+    const wireKey = SAMPLING_WIRE_KEY[key] ?? key
     if (!gate(wireKey)) continue
     wire[wireKey] = value
   }
@@ -752,8 +747,7 @@ function buildProviderBlock(
   if (settings.allowFallbacks === false) base.allow_fallbacks = false
   if (isFreeModel(settings.model)) {
     // Free-model exception. OpenRouter ignores these fields on `*:free`
-    // models; sending them is just noise. See plan/05 §5.4 and
-    // plan/09-privacy.md §9.9.
+    // models, so sending them is just noise.
     delete base.data_collection
     delete base.zdr
     delete base.only
@@ -809,8 +803,7 @@ function buildReasoning(settings: ChatSettings): Record<string, unknown> | undef
 }
 
 // ---------------------------------------------------------------------------
-// Phase 11: `toResponses` — the OpenAI Responses API transform.
-// See `plan/phase11-implementation.md §4.5`.
+// OpenAI Responses API transform.
 // ---------------------------------------------------------------------------
 
 export interface ResponsesTransformOptions {
@@ -909,7 +902,6 @@ export function toResponses(
 
   // Sampling (subject to gpt54SamplingGate below).
   for (const [key, value] of Object.entries(settings.sampling)) {
-    if (value === undefined) continue
     if (!gate(key)) continue
     wire[key] = value
   }
@@ -1555,8 +1547,7 @@ function anthropicImageSource(
 }
 
 // ---------------------------------------------------------------------------
-// Phase 11: `toGeminiNative` — the Google Gemini native generateContent transform.
-// See `plan/phase11-implementation.md §4.5`.
+// Google Gemini native generateContent transform.
 // ---------------------------------------------------------------------------
 
 export interface GeminiNativeTransformOptions {
@@ -1996,6 +1987,7 @@ function messageToGeminiContents(
       const encrypted = message.reasoningDetails.find(
         (d) =>
           d.type === 'reasoning.encrypted' &&
+          !d.id?.startsWith('tool_') &&
           (d.format === 'google-gemini-v1' || d.format === undefined),
       )
       if (encrypted && encrypted.type === 'reasoning.encrypted') {

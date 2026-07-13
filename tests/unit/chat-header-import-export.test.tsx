@@ -90,4 +90,62 @@ describe('ChatHeader import/export controls', () => {
       downloads.restore()
     }
   })
+
+  it('marks tree view active and disables tree editing until conversation view returns', async () => {
+    const chat = await createChat({ id: 'chat-tree-state', title: 'Tree state', now: 1000 })
+    const onToggleEditTree = vi.fn()
+    const onToggleTreeView = vi.fn()
+    const { container, rerender } = render(
+      <ChatHeader
+        chatId={chat.id}
+        settingsOpen={false}
+        onToggleSettings={() => undefined}
+        editTreeActive={false}
+        onToggleEditTree={onToggleEditTree}
+        treeViewActive
+        onToggleTreeView={onToggleTreeView}
+      />,
+    )
+
+    const treeButton = await screen.findByRole('button', { name: 'Return to conversation' })
+    const editButton = container.querySelector('[data-role="chat-edit-tree"]') as HTMLButtonElement
+    expect(treeButton).toHaveAttribute('aria-pressed', 'true')
+    expect(treeButton).toHaveAttribute('data-state', 'active')
+    expect(editButton).toBeDisabled()
+    expect(editButton).toHaveAttribute('aria-pressed', 'false')
+    expect(editButton).toHaveAttribute('title', 'Return to conversation to edit the tree')
+
+    fireEvent.click(editButton)
+    expect(onToggleEditTree).not.toHaveBeenCalled()
+
+    fireEvent.click(container.querySelector('[data-role="chat-controls-menu"]') as HTMLElement)
+    const mobileEditButton = container.querySelector(
+      '[data-role="mobile-chat-edit-tree"]',
+    ) as HTMLButtonElement
+    const mobileTreeButton = container.querySelector(
+      '[data-role="mobile-chat-branch-tree"]',
+    ) as HTMLButtonElement
+    expect(mobileEditButton).toBeDisabled()
+    expect(mobileTreeButton).toHaveAttribute('data-state', 'active')
+    fireEvent.click(mobileEditButton)
+    expect(onToggleEditTree).not.toHaveBeenCalled()
+
+    rerender(
+      <ChatHeader
+        chatId={chat.id}
+        settingsOpen={false}
+        onToggleSettings={() => undefined}
+        editTreeActive={false}
+        onToggleEditTree={onToggleEditTree}
+        treeViewActive={false}
+        onToggleTreeView={onToggleTreeView}
+      />,
+    )
+
+    expect(editButton).toBeEnabled()
+    expect(editButton).toHaveAttribute('aria-label', 'Enter edit tree mode')
+    expect(editButton).toHaveAttribute('title', 'Edit tree mode (⇧⌘E)')
+    fireEvent.click(editButton)
+    expect(onToggleEditTree).toHaveBeenCalledOnce()
+  })
 })

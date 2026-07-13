@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { ApiError } from '../../src/api/errors'
 import { parseSSE, type SSEEvent } from '../../src/api/sse'
 
 function responseFromChunks(chunks: Uint8Array[]): Response {
@@ -52,10 +53,15 @@ describe('parseSSE', () => {
     expect(events).toEqual([{ kind: 'data', data: 'final' }])
   })
 
-  it('terminates on [DONE] without emitting the sentinel', async () => {
+  it('emits explicit terminal evidence for [DONE] and stops before later frames', async () => {
     const r = responseFromChunks([enc('data: one\n\ndata: [DONE]\n\ndata: never\n\n')])
     const events = await collect(r)
-    expect(events).toEqual([{ kind: 'data', data: 'one' }])
+    expect(events).toEqual([{ kind: 'data', data: 'one' }, { kind: 'done' }])
+  })
+
+  it('emits terminal evidence for [DONE] without a trailing blank line', async () => {
+    const r = responseFromChunks([enc('data: [DONE]')])
+    expect(await collect(r)).toEqual([{ kind: 'done' }])
   })
 
   it('survives UTF-8 code points split across chunk boundaries', async () => {
@@ -72,6 +78,30 @@ describe('parseSSE', () => {
     expect(events).toEqual([{ kind: 'data', data: 'hi 😀' }])
   })
 
+  it('preserves mixed SSE semantics when every byte is a separate chunk', async () => {
+    const source =
+      'event: custom\r\ndata: first\r\ndata: second\n\n: still working\r\n\r\ndata: final'
+    const bytes = enc(source)
+    const chunks = Array.from(bytes, (byte) => Uint8Array.of(byte))
+
+    expect(await collect(responseFromChunks(chunks))).toEqual([
+      { kind: 'data', event: 'custom', data: 'first\nsecond' },
+      { kind: 'keepalive', comment: 'still working' },
+      { kind: 'data', data: 'final' },
+    ])
+  })
+
+  it('assembles a large unterminated line from fragments without changing its payload', async () => {
+    const payload = 'x'.repeat(100_000)
+    const source = `data: ${payload}`
+    const chunks: Uint8Array[] = []
+    for (let offset = 0; offset < source.length; offset += 31) {
+      chunks.push(enc(source.slice(offset, offset + 31)))
+    }
+
+    expect(await collect(responseFromChunks(chunks))).toEqual([{ kind: 'data', data: payload }])
+  })
+
   it('strips a single leading space after `data:` per the SSE spec', async () => {
     const r = responseFromChunks([enc('data:  two-leading-spaces\n\n')])
     const events = await collect(r)
@@ -85,13 +115,19 @@ describe('parseSSE', () => {
     expect(events).toEqual([{ kind: 'data', event: 'custom', data: 'payload' }])
   })
 
-  it('throws when the response has no body', async () => {
+  it('normalizes a missing response body as a protocol error', async () => {
     const response = new Response(null)
     await expect(async () => {
       for await (const _ of parseSSE(response)) {
         /* noop */
       }
-    }).rejects.toThrow(/no body/i)
+    }).rejects.toMatchObject({
+      kind: 'protocol',
+      code: 'PROTOCOL',
+      message: 'Provider response could not be decoded',
+      midStream: true,
+      retryable: false,
+    })
   })
 
   it('aborts an already-open stream when the caller signal fires mid-read', async () => {
@@ -114,12 +150,17 @@ describe('parseSSE', () => {
     expect(seen).toEqual([{ kind: 'data', data: 'one' }])
   })
 
-  it('maps a post-abort reader rejection back to AbortError', async () => {
+  it('maps a post-abort reader rejection to a typed abort', async () => {
     const controller = new AbortController()
     let cancelCalled = false
+    let markReadStarted: (() => void) | undefined
+    const readStarted = new Promise<void>((resolve) => {
+      markReadStarted = resolve
+    })
     const reader = {
       read: () =>
         new Promise<ReadableStreamReadResult<Uint8Array>>((_, reject) => {
+          markReadStarted?.()
           controller.signal.addEventListener('abort', () => reject(new TypeError('terminated')), {
             once: true,
           })
@@ -133,13 +174,74 @@ describe('parseSSE', () => {
         getReader: () => reader,
       },
     } as unknown as Response
-    await expect(async () => {
-      const iter = parseSSE(response, { signal: controller.signal })
-      controller.abort()
-      for await (const _ of iter) {
+    const iterator = parseSSE(response, { signal: controller.signal })
+    const next = iterator.next()
+    await readStarted
+    controller.abort()
+    await expect(next).rejects.toMatchObject({
+      kind: 'abort',
+      code: 'ABORTED',
+      message: 'Request aborted',
+      midStream: true,
+      retryable: false,
+    })
+    expect(cancelCalled).toBe(true)
+  })
+
+  it('normalizes reader failures as network errors without retaining the raw failure', async () => {
+    const response = {
+      body: {
+        getReader: () => ({
+          read: async () => {
+            throw new Error('reader-secret')
+          },
+          cancel: async () => {},
+        }),
+      },
+    } as unknown as Response
+
+    let thrown: unknown
+    try {
+      for await (const _ of parseSSE(response)) {
         /* noop */
       }
-    }).rejects.toThrow(/abort/i)
-    expect(cancelCalled).toBe(true)
+    } catch (error) {
+      thrown = error
+    }
+
+    expect(thrown).toBeInstanceOf(ApiError)
+    expect(thrown).toMatchObject({
+      kind: 'network',
+      code: 'NETWORK',
+      message: 'Network error',
+      midStream: true,
+      retryable: true,
+    })
+    expect(JSON.stringify(thrown)).not.toContain('reader-secret')
+  })
+
+  it('normalizes arbitrary abort reasons without retaining them', async () => {
+    const controller = new AbortController()
+    controller.abort(new Error('abort-reason-secret'))
+    const response = responseFromChunks([enc('data: never\n\n')])
+
+    let thrown: unknown
+    try {
+      for await (const _ of parseSSE(response, { signal: controller.signal })) {
+        /* noop */
+      }
+    } catch (error) {
+      thrown = error
+    }
+
+    expect(thrown).toBeInstanceOf(ApiError)
+    expect(thrown).toMatchObject({
+      kind: 'abort',
+      code: 'ABORTED',
+      message: 'Request aborted',
+      midStream: true,
+      retryable: false,
+    })
+    expect(JSON.stringify(thrown)).not.toContain('abort-reason-secret')
   })
 })

@@ -1,17 +1,17 @@
-// Cached scraped privacy data + `/providers` directory. See
-// `plan/03-storage.md §3.12` and `plan/09-privacy.md §9.6`.
-//
 // Scraped `data_policy` rows are keyed by `(profileId, modelId)` because the
 // scrape target is the per-model providers page; the providers directory is a
 // single cache row per profile.
 
-import type { ProfileId } from '../core/types'
-import { postEvent } from './broadcast'
+import type { ConnectionProfile, ProfileId } from '../core/types'
+import { onEvent, postEvent } from './broadcast'
 import { type CachedPrivacyPolicyRow, type CachedProvidersRow, getDb } from './db'
 import { withNamedLock } from './locks'
+import { readBrowserWorkspaceMeta, readBrowserWorkspaceMetaFromTransaction } from './workspace-meta'
+
+export type { CachedPrivacyPolicyRow } from './db'
 
 export const PRIVACY_POLICY_TTL_MS = 24 * 60 * 60 * 1000
-export const EMPTY_PRIVACY_POLICY_RETRY_MS = 2_000
+export const EMPTY_PRIVACY_POLICY_RETRY_MS = 5 * 60 * 1000
 
 export async function getCachedPrivacyPolicy(
   profileId: ProfileId,
@@ -58,9 +58,23 @@ export async function clearProvidersForProfile(profileId: ProfileId): Promise<vo
 // `dedupedEndpointsFetch` in `models-cache.ts`: two sibling components
 // (header badge + provider picker) opening at the same time would
 // otherwise fire two scrapes against the same (profile, model). The
-// Map shares one Promise inside a tab; the Web Lock inside the Promise
-// collapses cold-cache startup races across many tabs.
+// Map shares one Promise inside a tab. Cross-tab callers can fetch in
+// parallel, then the short commit lock preserves a freshly committed result.
 const privacyInFlight = new Map<string, Promise<void>>()
+let workspaceEpoch = 0
+let unsubscribe: (() => void) | null = null
+
+function ensureWorkspaceListener(): void {
+  if (unsubscribe) return
+  unsubscribe = onEvent((event) => {
+    if (event.kind === 'workspace-replaced') {
+      workspaceEpoch += 1
+      privacyInFlight.clear()
+    } else if (event.kind === 'workspace-invalidated') {
+      privacyInFlight.clear()
+    }
+  })
+}
 
 export interface DedupedPrivacyFetchOptions {
   force?: boolean
@@ -81,23 +95,53 @@ export function dedupedPrivacyFetch(
   fetchPayload: () => Promise<unknown>,
   opts: DedupedPrivacyFetchOptions = {},
 ): Promise<void> {
+  ensureWorkspaceListener()
   const key = privacyCacheKey(profileId, modelId)
   const existing = privacyInFlight.get(key)
   if (existing) return existing
   const promise = (async () => {
-    try {
-      await withNamedLock(privacyLockName(profileId, modelId), async () => {
-        if (!opts.force && opts.isCachedFresh?.(await getCachedPrivacyPolicy(profileId, modelId))) {
-          return
-        }
-        const payload = await fetchPayload()
-        await putCachedPrivacyPolicy(profileId, modelId, payload)
-      })
-    } finally {
-      privacyInFlight.delete(key)
+    const epoch = workspaceEpoch
+    const replacementEpoch = (await readBrowserWorkspaceMeta(getDb())).replacementEpoch
+    const profileFingerprint = fingerprint(await getDb().profiles.get(profileId))
+    if (!opts.force && opts.isCachedFresh?.(await getCachedPrivacyPolicy(profileId, modelId))) {
+      return
+    }
+    const payload = await fetchPayload()
+    if (epoch !== workspaceEpoch) return
+    const committed = await withNamedLock(privacyLockName(profileId, modelId), async (grant) => {
+      const db = getDb()
+      return grant.runTransaction(
+        db,
+        [db.privacyPolicies, db.profiles, db.settings],
+        async (tx) => {
+          const meta = await readBrowserWorkspaceMetaFromTransaction(tx)
+          if (meta.replacementEpoch !== replacementEpoch) return false
+          const currentProfile = await tx
+            .table<ConnectionProfile, ProfileId>('profiles')
+            .get(profileId)
+          if (fingerprint(currentProfile) !== profileFingerprint) return false
+          const table = tx.table<CachedPrivacyPolicyRow, [string, string]>('privacyPolicies')
+          const cached = await table.get([profileId, modelId])
+          if (!opts.force && opts.isCachedFresh?.(cached)) return false
+          await table.put({
+            profileId,
+            modelId,
+            fetchedAt: Date.now(),
+            payload,
+          })
+          return true
+        },
+      )
+    })
+    if (committed) {
+      postEvent({ kind: 'privacy-refreshed', profileId, modelId })
     }
   })()
   privacyInFlight.set(key, promise)
+  const clear = () => {
+    if (privacyInFlight.get(key) === promise) privacyInFlight.delete(key)
+  }
+  void promise.then(clear, clear)
   return promise
 }
 
@@ -105,4 +149,11 @@ export function dedupedPrivacyFetch(
 // its own dedup behavior without contamination from an earlier case.
 export function __resetPrivacyInFlightForTests(): void {
   privacyInFlight.clear()
+  workspaceEpoch = 0
+  unsubscribe?.()
+  unsubscribe = null
+}
+
+function fingerprint(value: unknown): string | null {
+  return value === undefined ? null : JSON.stringify(value)
 }

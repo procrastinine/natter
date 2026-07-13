@@ -8,11 +8,17 @@
 //     final part in the same response.
 //   - At low thinking the summary part may be skipped; only the signature part arrives.
 
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import type { GeminiStreamChunk, GenerateContentResponseWire } from '../../src/api/gemini-types'
 import { type StreamLaneEvent, splitGeminiStream } from '../../src/api/stream-transforms'
+import {
+  applyStreamAccumulatorEvent,
+  createStreamAccumulator,
+  projectStreamAccumulatorFinal,
+} from '../../src/core/stream-accumulator'
+import { geminiBufferedResult, geminiStreamSse } from '../helpers/protocol-fixtures'
 
 const PROBE8 = resolve(__dirname, '../../../plan/phase11-probes/08-gemini-native-stream.sse')
 const PROBE3 = resolve(__dirname, '../../../plan/phase11-probes/03-gemini-native.json')
@@ -43,10 +49,9 @@ function sseToChunks(body: string): GeminiStreamChunk[] {
   return out
 }
 
-describe('splitGeminiStream — probe 8 (native stream w/ thoughtSignature)', () => {
+describe('splitGeminiStream — representative native stream', () => {
   it('emits meta + text + one replaceEncrypted reasoning event + finish', async () => {
-    const body = readFileSync(PROBE8, 'utf8')
-    const lanes = await collect(splitGeminiStream(asAsync(sseToChunks(body))))
+    const lanes = await collect(splitGeminiStream(asAsync(sseToChunks(geminiStreamSse))))
 
     const firstMeta = lanes.find((l) => l.lane === 'meta')
     expect(firstMeta?.model).toBe('gemini-3.1-flash-lite-preview')
@@ -114,6 +119,32 @@ describe('splitGeminiStream — coalesces thought:true parts into one summary ro
       'Thought A',
       '\n\nThought B',
       '\n\nThought C',
+    ])
+  })
+  it('preserves two identical thinking sections', async () => {
+    const chunks: GeminiStreamChunk[] = [
+      {
+        type: 'chunk',
+        chunk: { candidates: [{ content: { parts: [{ text: 'ha', thought: true }] } }] },
+      },
+      {
+        type: 'chunk',
+        chunk: { candidates: [{ content: { parts: [{ text: 'ha', thought: true }] } }] },
+      },
+    ]
+    const accumulator = createStreamAccumulator({ initialContent: [], now: 0 })
+    for (const [index, event] of (await collect(splitGeminiStream(asAsync(chunks)))).entries()) {
+      applyStreamAccumulatorEvent(accumulator, event, index + 1)
+    }
+
+    expect(projectStreamAccumulatorFinal(accumulator).reasoningDetails).toEqual([
+      {
+        type: 'reasoning.summary',
+        id: 'summary#0',
+        index: 0,
+        format: 'google-gemini-v1',
+        summary: 'ha\n\nha',
+      },
     ])
   })
 })
@@ -220,8 +251,8 @@ describe('splitGeminiStream — finishReason mapping', () => {
 })
 
 describe('splitGeminiStream — buffered result', () => {
-  it('works on probe 3 buffered JSON', async () => {
-    const buffered = JSON.parse(readFileSync(PROBE3, 'utf8')) as GenerateContentResponseWire
+  it('works on a representative buffered JSON response', async () => {
+    const buffered = geminiBufferedResult
     const chunks: GeminiStreamChunk[] = [
       { type: 'buffered_result', result: buffered, generationId: 'gen-probe-3' },
     ]
@@ -231,6 +262,41 @@ describe('splitGeminiStream — buffered result', () => {
     expect(lanes.some((l) => l.lane === 'finish')).toBe(true)
   })
 })
+
+if (existsSync(PROBE8)) {
+  describe('splitGeminiStream — full local stream capture', () => {
+    it('normalizes the complete capture without losing its signature', async () => {
+      const lanes = await collect(
+        splitGeminiStream(asAsync(sseToChunks(readFileSync(PROBE8, 'utf8')))),
+      )
+      expect(lanes.some((lane) => lane.lane === 'text')).toBe(true)
+      expect(
+        lanes.some(
+          (lane) =>
+            lane.lane === 'reasoning' &&
+            lane.replaceEncrypted === true &&
+            Boolean(lane.encryptedDelta),
+        ),
+      ).toBe(true)
+      expect(lanes.some((lane) => lane.lane === 'finish')).toBe(true)
+    })
+  })
+}
+
+if (existsSync(PROBE3)) {
+  describe('splitGeminiStream — full local buffered capture', () => {
+    it('normalizes the complete captured response', async () => {
+      const buffered = JSON.parse(readFileSync(PROBE3, 'utf8')) as GenerateContentResponseWire
+      const lanes = await collect(
+        splitGeminiStream(
+          asAsync([{ type: 'buffered_result', result: buffered, generationId: 'local-capture' }]),
+        ),
+      )
+      expect(lanes.some((lane) => lane.lane === 'text')).toBe(true)
+      expect(lanes.some((lane) => lane.lane === 'finish')).toBe(true)
+    })
+  })
+}
 
 describe('splitGeminiStream — error payload', () => {
   it('emits an error lane event when the response body carries an `error`', async () => {
@@ -277,8 +343,15 @@ describe('splitGeminiStream — functionCall', () => {
     const toolCalls = lanes.filter(
       (l): l is Extract<StreamLaneEvent, { lane: 'tool-call' }> => l.lane === 'tool-call',
     )
-    expect(toolCalls).toHaveLength(1)
-    expect(toolCalls[0]?.name).toBe('search')
-    expect(toolCalls[0]?.argumentsDelta).toBe('{"query":"consecutive integers"}')
+    expect(toolCalls).toEqual([
+      {
+        lane: 'tool-call',
+        index: 0,
+        id: 'google-gemini:function-call:0',
+        type: 'function',
+        name: 'search',
+        argumentsSnapshot: '{"query":"consecutive integers"}',
+      },
+    ])
   })
 })

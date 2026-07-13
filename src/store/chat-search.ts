@@ -1,14 +1,10 @@
 import { buildBranchCacheRow, messageRenderableText } from '../core/branch-flatten'
 import {
-  firstPositiveMatch,
-  hasNegativeTextTerms,
-  hasPositiveTextTerms,
   parseSearchQuery,
   type SearchNameClause,
   type SearchQuery,
   type SearchQueryParseError,
   type SearchTextClause,
-  textMatchesClauses,
 } from '../core/search-query'
 import type {
   Chat,
@@ -22,7 +18,11 @@ import type {
   TagId,
 } from '../core/types'
 import { isChatBranchCacheFresh } from './branch-cache'
-import type { WorkspaceRepository } from './repository'
+import {
+  chatMatchesBranchCacheWriteGuard,
+  readChatBranchCacheSource,
+  type WorkspaceRepository,
+} from './repository'
 import { getWorkspaceRepository } from './workspace-repository'
 
 export type SearchScope = 'last-updated-branch' | 'all-branches'
@@ -133,6 +133,22 @@ interface SearchField {
   source: SearchResultSource
   text: string
   messageId?: MessageId
+  normalizedText?: string
+}
+
+interface NormalizedSearchField extends SearchField {
+  normalizedText: string
+}
+
+interface NormalizedSearchTextClause {
+  clause: SearchTextClause
+  needle: string
+}
+
+interface NormalizedSearchText {
+  clauses: NormalizedSearchTextClause[]
+  hasPositive: boolean
+  hasNegative: boolean
 }
 
 interface FieldMatch {
@@ -146,6 +162,7 @@ interface FieldMatch {
 interface ScanContext {
   queryId: string
   parsed: SearchQuery
+  normalizedText: NormalizedSearchText
   catalog: SearchCatalog
   filters: SearchFilters
   scope: SearchScope
@@ -228,6 +245,7 @@ export async function searchChats(input: SearchChatsInput): Promise<ChatSearchOu
   const context: ScanContext = {
     queryId: input.queryId,
     parsed: parseResult.query,
+    normalizedText: normalizeSearchText(parseResult.query.text),
     catalog,
     filters,
     scope,
@@ -284,7 +302,7 @@ export async function searchChats(input: SearchChatsInput): Promise<ChatSearchOu
   const concurrency = boundedConcurrency(input.concurrency)
   let nextIndex = 0
   async function scanNext(): Promise<void> {
-    while (true) {
+    for (;;) {
       throwIfAborted(input.signal)
       const index = nextIndex
       nextIndex += 1
@@ -357,9 +375,9 @@ function matchImmediateChat(chat: Chat, context: ScanContext): SearchResult | nu
     })
   }
 
-  if (hasNegativeTextTerms(context.parsed) && !context.filters.titleOnly) return null
+  if (context.normalizedText.hasNegative && !context.filters.titleOnly) return null
 
-  const metadataMatch = matchFields(metadataFields(chat, context), context.parsed)
+  const metadataMatch = matchFields(metadataFields(chat, context), context.normalizedText)
   if (!metadataMatch) return null
   return buildResult({ chat, match: metadataMatch, parsed: context.parsed })
 }
@@ -375,7 +393,7 @@ async function scanLastUpdatedBranchChat(
   if (cache?.textContent) {
     fields.push({ source: 'branch-cache', text: cache.textContent })
   }
-  const match = matchFields(fields, context.parsed)
+  const match = matchFields(fields, context.normalizedText)
   if (!match) return null
   const resultInput: Parameters<typeof buildResult>[0] = {
     chat,
@@ -392,12 +410,20 @@ async function scanAllBranchesChat(chat: Chat, context: ScanContext): Promise<Se
   throwIfAborted(context.signal)
   const corpus = buildAllBranchesCorpus(messages, context.signal)
   const fields = [...metadataFields(chat, context)]
-  if (corpus.text.length > 0) fields.push({ source: 'all-branches', text: corpus.text })
+  if (corpus.text.length > 0) {
+    fields.push({
+      source: 'all-branches',
+      text: corpus.text,
+      normalizedText: corpus.normalizedText,
+    })
+  }
 
-  const match = matchFields(fields, context.parsed)
+  const match = matchFields(fields, context.normalizedText)
   if (!match) return null
 
-  let messageId = latestMatchingMessageId(corpus.messages, context.parsed) ?? match.messageId
+  let messageId =
+    latestMatchingMessageId(corpus.messages, corpus.normalizedText, context.normalizedText) ??
+    match.messageId
   let branchLeafId: MessageId | null | undefined
   if (messageId && (await freshLastUpdatedBranchMatches(chat, context))) {
     messageId = undefined
@@ -480,11 +506,14 @@ function isClausesPass(chat: Chat, parsed: SearchQuery): boolean {
   return true
 }
 
-function matchFields(fields: readonly SearchField[], parsed: SearchQuery): FieldMatch | null {
-  const combined = fields.map((field) => field.text).join('\n')
-  if (!textMatchesClauses(combined, parsed.text)) return null
+function matchFields(
+  fields: readonly SearchField[],
+  normalizedSearch: NormalizedSearchText,
+): FieldMatch | null {
+  const normalizedFields = fields.map(normalizeSearchField)
+  if (!normalizedFieldsMatchClauses(normalizedFields, normalizedSearch.clauses)) return null
 
-  if (!hasPositiveTextTerms(parsed)) {
+  if (!normalizedSearch.hasPositive) {
     const fallback = fields.find((field) => field.text.trim().length > 0)
     if (!fallback) return { source: 'preview', text: '', matchIndex: null, matchLength: 0 }
     return {
@@ -497,8 +526,8 @@ function matchFields(fields: readonly SearchField[], parsed: SearchQuery): Field
   }
 
   let best: FieldMatch | null = null
-  for (const field of fields) {
-    const hit = firstPositiveMatch(field.text, parsed.text)
+  for (const field of normalizedFields) {
+    const hit = firstPositiveNormalizedMatch(field.normalizedText, normalizedSearch.clauses)
     if (!hit) continue
     if (!best || hit.index < (best.matchIndex ?? Number.POSITIVE_INFINITY)) {
       best = {
@@ -508,6 +537,100 @@ function matchFields(fields: readonly SearchField[], parsed: SearchQuery): Field
         matchLength: hit.length,
         ...(field.messageId ? { messageId: field.messageId } : {}),
       }
+    }
+  }
+  if (best) return best
+
+  const fallback = normalizedFields.find((field) => field.text.trim().length > 0)
+  if (!fallback) return { source: 'preview', text: '', matchIndex: null, matchLength: 0 }
+  return {
+    source: fallback.source,
+    text: fallback.text,
+    matchIndex: null,
+    matchLength: 0,
+    ...(fallback.messageId ? { messageId: fallback.messageId } : {}),
+  }
+}
+
+function normalizeSearchText(clauses: readonly SearchTextClause[]): NormalizedSearchText {
+  return {
+    clauses: clauses.map((clause) => ({
+      clause,
+      needle: clause.value.toLocaleLowerCase(),
+    })),
+    hasPositive: clauses.some((clause) => !clause.negated),
+    hasNegative: clauses.some((clause) => clause.negated),
+  }
+}
+
+function normalizeSearchField(field: SearchField): NormalizedSearchField {
+  return {
+    ...field,
+    normalizedText: field.normalizedText ?? field.text.toLocaleLowerCase(),
+  }
+}
+
+function normalizedFieldsMatchClauses(
+  fields: readonly NormalizedSearchField[],
+  clauses: readonly NormalizedSearchTextClause[],
+): boolean {
+  for (const { clause, needle } of clauses) {
+    const hit = normalizedFieldsInclude(fields, needle)
+    if (clause.negated ? hit : !hit) return false
+  }
+  return true
+}
+
+function normalizedFieldsInclude(
+  fields: readonly NormalizedSearchField[],
+  needle: string,
+): boolean {
+  if (needle.length === 0) return true
+  const retainedLength = needle.length - 1
+  let trailing = ''
+
+  const scanSegment = (segment: string): boolean => {
+    if (segment.includes(needle)) return true
+    if (retainedLength === 0) return false
+    const boundary = `${trailing}${segment.slice(0, retainedLength)}`
+    if (boundary.includes(needle)) return true
+    trailing =
+      segment.length >= retainedLength
+        ? segment.slice(-retainedLength)
+        : `${trailing}${segment}`.slice(-retainedLength)
+    return false
+  }
+
+  for (let index = 0; index < fields.length; index += 1) {
+    if (index > 0 && scanSegment('\n')) return true
+    const field = fields[index]
+    if (field && scanSegment(field.normalizedText)) return true
+  }
+  return false
+}
+
+function normalizedTextMatchesClauses(
+  normalizedText: string,
+  clauses: readonly NormalizedSearchTextClause[],
+): boolean {
+  for (const { clause, needle } of clauses) {
+    const hit = normalizedText.includes(needle)
+    if (clause.negated ? hit : !hit) return false
+  }
+  return true
+}
+
+function firstPositiveNormalizedMatch(
+  normalizedText: string,
+  clauses: readonly NormalizedSearchTextClause[],
+): { index: number; length: number } | null {
+  let best: { index: number; length: number } | null = null
+  for (const { clause, needle } of clauses) {
+    if (clause.negated) continue
+    const index = normalizedText.indexOf(needle)
+    if (index < 0) continue
+    if (!best || index < best.index) {
+      best = { index, length: clause.value.length }
     }
   }
   return best
@@ -643,33 +766,64 @@ async function readFreshBranchCache(
   chat: Chat,
   signal?: AbortSignal,
 ): Promise<ChatBranchCache | undefined> {
-  throwIfAborted(signal)
-  const current = await repo.getChat(chat.id)
-  if (!current) {
-    await repo.deleteChatBranchCache(chat.id)
-    return undefined
+  for (;;) {
+    throwIfAborted(signal)
+    const { chat: current, expected } = await readChatBranchCacheSource(repo, chat.id)
+    if (!current) {
+      await repo.deleteChatBranchCache(chat.id, expected)
+      const afterDelete = await readChatBranchCacheSource(repo, chat.id)
+      if (
+        afterDelete.expected.replacementEpoch !== expected.replacementEpoch ||
+        afterDelete.chat !== undefined
+      ) {
+        continue
+      }
+      return undefined
+    }
+    const existing = await repo.getChatBranchCache(chat.id)
+    if ((await repo.getWorkspaceMeta()).replacementEpoch !== expected.replacementEpoch) continue
+    if (existing && isChatBranchCacheFresh(current, existing)) return existing
+    if (current.lastUpdatedLeafId === null) {
+      if (existing) await repo.deleteChatBranchCache(chat.id, expected)
+      const afterDelete = await readChatBranchCacheSource(repo, chat.id)
+      if (
+        afterDelete.expected.replacementEpoch !== expected.replacementEpoch ||
+        !afterDelete.chat ||
+        !chatMatchesBranchCacheWriteGuard(afterDelete.chat, expected)
+      ) {
+        continue
+      }
+      return undefined
+    }
+    const messages = await repo.getBranchByLeaf(chat.id, current.lastUpdatedLeafId)
+    throwIfAborted(signal)
+    const written = await repo.putChatBranchCache(
+      buildBranchCacheRow({
+        chatId: chat.id,
+        branchLeafId: current.lastUpdatedLeafId,
+        messages,
+        generatedAt: Math.max(Date.now(), current.lastBranchUpdatedAt),
+      }),
+      expected,
+    )
+    if (written) return written
   }
-  const existing = await repo.getChatBranchCache(chat.id)
-  if (isChatBranchCacheFresh(current, existing)) return existing
-  if (current.lastUpdatedLeafId === null) {
-    if (existing) await repo.deleteChatBranchCache(chat.id)
-    return undefined
-  }
-  const messages = await repo.listMessages(chat.id)
-  throwIfAborted(signal)
-  return repo.putChatBranchCache(
-    buildBranchCacheRow({
-      chatId: chat.id,
-      branchLeafId: current.lastUpdatedLeafId,
-      messages,
-    }),
-  )
 }
 
 async function freshLastUpdatedBranchMatches(chat: Chat, context: ScanContext): Promise<boolean> {
-  const cache = await context.repo.getChatBranchCache(chat.id)
-  if (!isChatBranchCacheFresh(chat, cache)) return false
-  return textMatchesClauses(cache.textContent, context.parsed.text)
+  for (;;) {
+    const { chat: current, expected } = await readChatBranchCacheSource(context.repo, chat.id)
+    if (!current || current.lastUpdatedLeafId !== chat.lastUpdatedLeafId) return false
+    const cache = await context.repo.getChatBranchCache(chat.id)
+    if ((await context.repo.getWorkspaceMeta()).replacementEpoch !== expected.replacementEpoch) {
+      continue
+    }
+    if (!cache || !isChatBranchCacheFresh(current, cache)) return false
+    return normalizedTextMatchesClauses(
+      cache.textContent.toLocaleLowerCase(),
+      context.normalizedText.clauses,
+    )
+  }
 }
 
 function buildAllBranchesCorpus(
@@ -677,44 +831,126 @@ function buildAllBranchesCorpus(
   signal?: AbortSignal,
 ): {
   text: string
-  messages: Array<{ message: Message; text: string; start: number; end: number }>
+  normalizedText: string
+  messages: Array<{
+    message: Message
+    normalizedStart: number
+    normalizedEnd: number
+  }>
 } {
   const liveMessages = messages
     .filter((message) => !message.deleted)
     .sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id))
   const chunks: string[] = []
-  const indexed: Array<{ message: Message; text: string; start: number; end: number }> = []
-  let offset = 0
+  const indexed: Array<{
+    message: Message
+    text: string
+    normalizedStart: number
+    normalizedEnd: number
+  }> = []
 
   for (const message of liveMessages) {
     throwIfAborted(signal)
     const text = messageRenderableText(message)
     if (text.length === 0) continue
-    if (chunks.length > 0) {
-      chunks.push('\n\n')
-      offset += 2
-    }
-    const start = offset
+    if (chunks.length > 0) chunks.push('\n\n')
     chunks.push(text)
-    offset += text.length
-    indexed.push({ message, text, start, end: offset })
+    indexed.push({ message, text, normalizedStart: 0, normalizedEnd: 0 })
   }
 
-  return { text: chunks.join(''), messages: indexed }
+  const text = chunks.join('')
+  chunks.length = 0
+  const normalizedChunks: string[] = []
+  let normalizedOffset = 0
+  for (let index = 0; index < indexed.length; index += 1) {
+    const row = indexed[index]
+    if (!row) continue
+    if (index > 0) {
+      normalizedChunks.push('\n\n')
+      normalizedOffset += 2
+    }
+    const normalizedMessage = row.text.toLocaleLowerCase()
+    row.text = ''
+    row.normalizedStart = normalizedOffset
+    normalizedChunks.push(normalizedMessage)
+    normalizedOffset += normalizedMessage.length
+    row.normalizedEnd = normalizedOffset
+  }
+
+  return { text, normalizedText: normalizedChunks.join(''), messages: indexed }
 }
 
 function latestMatchingMessageId(
-  messages: readonly { message: Message; text: string }[],
-  parsed: SearchQuery,
+  messages: readonly {
+    message: Message
+    normalizedStart: number
+    normalizedEnd: number
+  }[],
+  normalizedCorpus: string,
+  normalizedSearch: NormalizedSearchText,
 ): MessageId | undefined {
   let fallback: Message | undefined
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const row = messages[index]
     if (!row) continue
-    if (textMatchesClauses(row.text, parsed.text)) return row.message.id
-    if (!fallback && firstPositiveMatch(row.text, parsed.text)) fallback = row.message
+    if (
+      normalizedRangeMatchesClauses(
+        normalizedCorpus,
+        row.normalizedStart,
+        row.normalizedEnd,
+        normalizedSearch.clauses,
+      )
+    ) {
+      return row.message.id
+    }
+    if (
+      !fallback &&
+      firstPositiveNormalizedMatchInRange(
+        normalizedCorpus,
+        row.normalizedStart,
+        row.normalizedEnd,
+        normalizedSearch.clauses,
+      )
+    ) {
+      fallback = row.message
+    }
   }
   return fallback?.id
+}
+
+function normalizedRangeMatchesClauses(
+  normalizedText: string,
+  start: number,
+  end: number,
+  clauses: readonly NormalizedSearchTextClause[],
+): boolean {
+  for (const { clause, needle } of clauses) {
+    const hit = normalizedRangeIncludes(normalizedText, start, end, needle)
+    if (clause.negated ? hit : !hit) return false
+  }
+  return true
+}
+
+function firstPositiveNormalizedMatchInRange(
+  normalizedText: string,
+  start: number,
+  end: number,
+  clauses: readonly NormalizedSearchTextClause[],
+): boolean {
+  for (const { clause, needle } of clauses) {
+    if (!clause.negated && normalizedRangeIncludes(normalizedText, start, end, needle)) return true
+  }
+  return false
+}
+
+function normalizedRangeIncludes(
+  normalizedText: string,
+  start: number,
+  end: number,
+  needle: string,
+): boolean {
+  const index = normalizedText.indexOf(needle, start)
+  return index >= start && index + needle.length <= end
 }
 
 function buildCatalog(folders: readonly ChatFolder[], tags: readonly ChatTag[]): SearchCatalog {
@@ -812,9 +1048,8 @@ function createSearchYieldController(): { maybeYield: () => Promise<void> } {
 }
 
 async function yieldToEventLoop(): Promise<void> {
-  const scheduler = (
-    globalThis as typeof globalThis & { scheduler?: { yield?: () => Promise<void> } }
-  ).scheduler
+  const scheduler = (globalThis as unknown as { scheduler?: { yield?: () => Promise<void> } })
+    .scheduler
   if (typeof scheduler?.yield === 'function') {
     await scheduler.yield()
     return
@@ -840,6 +1075,7 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
 
 function isAbortError(error: unknown): boolean {
   return (
-    error instanceof ChatSearchAbortedError || (error as { name?: string })?.name === 'AbortError'
+    error instanceof ChatSearchAbortedError ||
+    (typeof error === 'object' && error !== null && 'name' in error && error.name === 'AbortError')
   )
 }

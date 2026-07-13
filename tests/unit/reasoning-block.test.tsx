@@ -110,6 +110,28 @@ describe('ReasoningBlock', () => {
     expect(outer.getAttribute('data-streaming')).toBeNull()
   })
 
+  it('renders live reasoning sections contiguously without materializing one growing value', () => {
+    const details: ReasoningDetail[] = [
+      { type: 'reasoning.text', text: '', id: 'text#live', format: 'anthropic-claude-v1' },
+      { type: 'reasoning.encrypted', data: '', id: 'encrypted#live' },
+    ]
+    const { container } = render(
+      <ReasoningBlock
+        details={details}
+        liveRows={[
+          { detail: details[0] as ReasoningDetail, valueSections: ['one ', 'two ', 'three'] },
+          { detail: details[1] as ReasoningDetail, valueSections: ['A'.repeat(1024), 'B'] },
+        ]}
+        streaming
+      />,
+    )
+    openSummary(container)
+    expect(container.textContent).toContain('one two three')
+    expect(container.querySelector('[data-ui="reasoning-lock"]')?.getAttribute('title')).toMatch(
+      /1\.0 KB/,
+    )
+  })
+
   it('surfaces a lock badge + byte count when encrypted reasoning is present', () => {
     const bytes = 'A'.repeat(2048)
     const details: ReasoningDetail[] = [{ type: 'reasoning.encrypted', data: bytes, id: 'e-1' }]
@@ -130,6 +152,43 @@ describe('ReasoningBlock', () => {
     expect(sections).toHaveLength(3)
     const kinds = Array.from(sections).map((el) => el.getAttribute('data-reasoning-kind'))
     expect(kinds).toEqual(['summary', 'text', 'encrypted'])
+  })
+
+  it('can keep reasoning rows unmounted until the outer disclosure opens', () => {
+    const details: ReasoningDetail[] = [
+      { type: 'reasoning.summary', summary: 'cold summary', id: 's-1' },
+      { type: 'reasoning.text', text: 'cold details', id: 't-1' },
+    ]
+    const { container } = render(<ReasoningBlock details={details} deferContentUntilOpen />)
+    const outer = container.querySelector('details[data-ui="reasoning"]') as HTMLDetailsElement
+
+    expect(outer).toBeTruthy()
+    expect(outer.open).toBe(false)
+    expect(container.querySelector('[data-ui="reasoning-details"]')).toBeNull()
+    expect(container.querySelector('[data-ui="reasoning-row"]')).toBeNull()
+    expect(container.textContent).not.toContain('cold summary')
+    expect(container.textContent).not.toContain('cold details')
+
+    outer.open = true
+    fireEvent(outer, new Event('toggle'))
+
+    expect(container.querySelector('[data-ui="reasoning-details"]')).toBeTruthy()
+    expect(container.querySelectorAll('[data-ui="reasoning-row"]')).toHaveLength(2)
+    expect(container.textContent).toContain('cold summary')
+    expect(container.textContent).toContain('cold details')
+  })
+
+  it('keeps the existing eager row mounting behavior by default', () => {
+    const details: ReasoningDetail[] = [
+      { type: 'reasoning.text', text: 'eager details', id: 't-1' },
+    ]
+    const { container } = render(<ReasoningBlock details={details} />)
+
+    expect(container.querySelector('details[data-ui="reasoning"]')?.hasAttribute('open')).toBe(
+      false,
+    )
+    expect(container.querySelector('[data-ui="reasoning-row"]')).toBeTruthy()
+    expect(container.textContent).toContain('eager details')
   })
 
   it('renders a hide button per row when onToggleHidden is supplied and routes the click with the stored detail index', () => {

@@ -26,13 +26,25 @@ export function PromptsTab({ chat, prefillRecommendationEndpoints = [] }: Prompt
   const continuePrefill = prefillSupportedForModel && chat.settings.continuePrefill === true
   return (
     <div data-ui="prompts-form">
-      <SystemPromptEditor chat={chat} />
-      <AppendPromptEditor chat={chat} defaultCollapsed />
+      <SystemPromptEditor key={`${chat.id}:system`} chat={chat} />
+      <AppendPromptEditor key={`${chat.id}:append`} chat={chat} defaultCollapsed />
       {prefillSupportedForModel ? (
-        <PrefillSettingsSection chat={chat} endpoints={prefillRecommendationEndpoints} />
+        <PrefillSettingsSection
+          key={`${chat.id}:prefill`}
+          chat={chat}
+          endpoints={prefillRecommendationEndpoints}
+        />
       ) : null}
-      {continuePrefill ? null : <ContinueSystemPromptEditor chat={chat} defaultCollapsed />}
-      {continuePrefill ? null : <ContinueUserPromptEditor chat={chat} defaultCollapsed />}
+      {continuePrefill ? null : (
+        <ContinueSystemPromptEditor
+          key={`${chat.id}:continue-system`}
+          chat={chat}
+          defaultCollapsed
+        />
+      )}
+      {continuePrefill ? null : (
+        <ContinueUserPromptEditor key={`${chat.id}:continue-user`} chat={chat} defaultCollapsed />
+      )}
     </div>
   )
 }

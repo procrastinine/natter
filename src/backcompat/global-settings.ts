@@ -1,4 +1,5 @@
-import type { NatterDb, SettingsRow } from '../store/db'
+import type Dexie from 'dexie'
+import type { SettingsRow } from '../store/db-rows'
 
 const GLOBAL_SETTINGS_BACKFILL_KEY = 'backfill:global-settings-v1'
 
@@ -15,24 +16,24 @@ export function globalSettingsBackfillMarker(): SettingsRow {
   return { key: GLOBAL_SETTINGS_BACKFILL_KEY, value: 1 }
 }
 
-export async function migrateGlobalSettingsRows(db: NatterDb): Promise<void> {
-  const marker = await db.settings.get(GLOBAL_SETTINGS_BACKFILL_KEY)
+export async function migrateGlobalSettingsRows(db: Dexie): Promise<void> {
+  const settings = db.table<SettingsRow, string>('settings')
+  const marker = await settings.get(GLOBAL_SETTINGS_BACKFILL_KEY)
   if (marker?.value === 1) return
 
-  await db.transaction('rw', db.settings, async () => {
-    const legacy = await db.settings.get(LEGACY_AUTO_SCROLL_KEY)
-    const stream = await db.settings.get(AUTO_SCROLL_STREAM_KEY)
-    const sidebarSort = await db.settings.get(SIDEBAR_SORT_SETTING_KEY)
+  await db.transaction('rw', settings, async () => {
+    const legacy = await settings.get(LEGACY_AUTO_SCROLL_KEY)
+    const stream = await settings.get(AUTO_SCROLL_STREAM_KEY)
+    const sidebarSort = await settings.get(SIDEBAR_SORT_SETTING_KEY)
     if (typeof legacy?.value === 'boolean') {
-      if (!stream) await db.settings.put({ key: AUTO_SCROLL_STREAM_KEY, value: legacy.value })
-      await db.settings.delete(LEGACY_AUTO_SCROLL_KEY)
+      if (!stream) await settings.put({ key: AUTO_SCROLL_STREAM_KEY, value: legacy.value })
+      await settings.delete(LEGACY_AUTO_SCROLL_KEY)
     }
-    await db.settings.delete(RETIRED_AUTO_SCROLL_OPEN_KEY)
+    await settings.delete(RETIRED_AUTO_SCROLL_OPEN_KEY)
     if (typeof sidebarSort?.value === 'string') {
       const migratedSort = LEGACY_SIDEBAR_SORT_MODES[sidebarSort.value]
-      if (migratedSort)
-        await db.settings.put({ key: SIDEBAR_SORT_SETTING_KEY, value: migratedSort })
+      if (migratedSort) await settings.put({ key: SIDEBAR_SORT_SETTING_KEY, value: migratedSort })
     }
-    await db.settings.put(globalSettingsBackfillMarker())
+    await settings.put(globalSettingsBackfillMarker())
   })
 }

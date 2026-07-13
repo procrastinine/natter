@@ -1,10 +1,9 @@
 // Per-tab ephemeral chat state. Holds the active-path cursor map for each chat
 // the user has opened in this tab. Navigation-only mutations (swipes, search
-// clicks, deep-links) write here and NEVER touch IDB — see `plan/02-data-model.md
-// §2.1 comment` and `plan/08-branching.md §8.3`.
+// clicks, deep-links) write here and never touch IDB.
 //
 // A missing entry means "no cursor recorded for this chat in this tab" — the
-// active-path resolver falls back to the plan's highest-priority defaults.
+// active-path resolver falls back to its highest-priority defaults.
 
 import { create } from 'zustand'
 import type { ChatId, CursorMap, MessageId } from '../../core/types'

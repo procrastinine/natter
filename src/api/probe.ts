@@ -11,12 +11,12 @@
 // 3. Detect thinking support via `chat_template_caps` so the reasoning
 //    panel can be shown or hidden on llama-server chats.
 //
-// Per the CLAUDE.md URL-scoping note, `/props` lives at SERVER ROOT, not
-// under `/v1`. A llama-server connection profile's `baseUrl` typically
-// ends in `/v1` (OpenAI convention); `llamaServerRoot()` strips that.
+// `/props` lives at the server root, not under `/v1`. A llama-server connection
+// profile's `baseUrl` typically ends in `/v1`; `llamaServerRoot()` strips it.
 
 import type { ConnectionProfile } from '../core/types'
-import { fetchWithTimeout } from './client'
+import { fetchWithTimeout, readResponseJson } from './client'
+import { ApiError } from './errors'
 
 export interface LlamaServerProps {
   modelPath: string | null
@@ -125,7 +125,14 @@ export async function probeLlamaServer(
         elapsedMs: elapsed,
       }
     }
-    const body = (await response.json().catch(() => null)) as unknown
+    let body: unknown = null
+    try {
+      body = await readResponseJson<unknown>(response)
+    } catch (error) {
+      if (error instanceof ApiError && (error.kind === 'timeout' || error.kind === 'abort')) {
+        throw error
+      }
+    }
     const props = parseLlamaServerProps(body)
     if (!props) {
       return {
@@ -179,7 +186,7 @@ export async function applyServerTemplate(
   if (!response.ok) {
     throw new Error(`apply-template failed: ${response.status} ${response.statusText}`)
   }
-  const body = (await response.json()) as { prompt?: unknown }
+  const body = await readResponseJson<{ prompt?: unknown }>(response)
   const prompt = asString(body.prompt)
   if (prompt === null) {
     throw new Error('apply-template returned no prompt string')

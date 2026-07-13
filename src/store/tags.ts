@@ -4,7 +4,7 @@ import type { CreateTagInput, UpdateTagInput } from './repository'
 import { getWorkspaceRepository } from './workspace-repository'
 
 export async function listTags(): Promise<ChatTag[]> {
-  // Keep this read synchronous up to the Dexie table access so useLiveQuery can
+  // Keep this read synchronous up to the Dexie table access so reactive queries can
   // subscribe to tag writes. The UI still depends only on this store-layer
   // abstraction; daemon mode will replace the store implementation.
   try {

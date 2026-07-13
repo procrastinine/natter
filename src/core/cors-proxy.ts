@@ -6,8 +6,7 @@
 // `core/global-settings.ts` re-exports the dev default for browser callers
 // that already group their preference imports there.
 
-// CORS proxy used for the OpenRouter privacy scrape (see
-// `plan/09-privacy.md §9.4` and `plan/14-details.md §14.14`). Vite dev uses
+// CORS proxy used for the OpenRouter privacy scrape. Vite dev uses
 // `/_or_scrape`, the same-origin path its dev server rewrites to
 // `https://openrouter.ai`. Static builds default to no live scrape; users can
 // opt into a public or self-hosted bouncer in Settings. When
@@ -45,8 +44,7 @@ export function isCorsProxyDisabled(proxy: CorsProxyConfig): boolean {
 //
 // To add a bouncer: live-check it returns `openrouter.ai/{model}/providers`
 // HTML (200 + the page's `data_policy` / `provider_display_name` markers)
-// from a browser-style request, document it in `plan/cors-proxy.md`, and
-// add a row here.
+// from a browser-style request, then add a row here.
 interface KnownBouncer {
   host: string
   buildUrl: (modelId: string) => string

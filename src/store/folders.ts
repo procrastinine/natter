@@ -4,7 +4,7 @@ import type { CreateFolderInput, UpdateFolderInput } from './repository'
 import { getWorkspaceRepository } from './workspace-repository'
 
 export async function listFolders(): Promise<ChatFolder[]> {
-  // Keep this read synchronous up to the Dexie table access so useLiveQuery can
+  // Keep this read synchronous up to the Dexie table access so reactive queries can
   // subscribe to folder writes. The UI still depends only on this store-layer
   // abstraction; daemon mode will replace the store implementation.
   try {

@@ -276,10 +276,9 @@ export function EyeOffIcon({ size = 18, ariaLabel }: IconProps) {
   )
 }
 
-// Edit-tree — four connected nodes (parent + 3 children) for the
-// "Edit tree mode" toggle in the chat header. Distinct from the pencil
-// used by title-edit + per-message edit so the two modes don't blur.
-export function EditTreeIcon({ size = 18, ariaLabel }: IconProps) {
+// Branch tree — four connected nodes (parent + 3 children). This opens
+// the topology viewer; structural editing has a separate +/- glyph.
+export function BranchTreeIcon({ size = 18, ariaLabel }: IconProps) {
   return (
     <BaseSvg size={size} {...(ariaLabel ? { 'aria-label': ariaLabel } : {})}>
       <circle cx="12" cy="5" r="1.8" />
@@ -290,6 +289,41 @@ export function EditTreeIcon({ size = 18, ariaLabel }: IconProps) {
       <path d="M12 10H5v6" />
       <path d="M12 10v6" />
       <path d="M12 10h7v6" />
+    </BaseSvg>
+  )
+}
+
+export function StructureEditIcon({ size = 18, ariaLabel }: IconProps) {
+  return (
+    <BaseSvg size={size} {...(ariaLabel ? { 'aria-label': ariaLabel } : {})}>
+      <circle cx="6" cy="5" r="1.7" />
+      <circle cx="6" cy="18" r="1.7" />
+      <path d="M6 6.7v9.6" />
+      <path d="M13 7h8" />
+      <path d="M17 3v8" />
+      <path d="M13 18h8" />
+    </BaseSvg>
+  )
+}
+
+export function ExpandIcon({ size = 18, ariaLabel }: IconProps) {
+  return (
+    <BaseSvg size={size} {...(ariaLabel ? { 'aria-label': ariaLabel } : {})}>
+      <path d="M15 3h6v6" />
+      <path d="M9 21H3v-6" />
+      <path d="M21 3l-7 7" />
+      <path d="M3 21l7-7" />
+    </BaseSvg>
+  )
+}
+
+export function ContractIcon({ size = 18, ariaLabel }: IconProps) {
+  return (
+    <BaseSvg size={size} {...(ariaLabel ? { 'aria-label': ariaLabel } : {})}>
+      <path d="M3 9h6V3" />
+      <path d="M21 9h-6V3" />
+      <path d="M3 15h6v6" />
+      <path d="M21 15h-6v6" />
     </BaseSvg>
   )
 }
@@ -488,8 +522,7 @@ export function SendIcon({ size = 18, ariaLabel }: IconProps) {
   )
 }
 
-// Padlock — privacy surface. Closed/open variant picks the visual. See
-// `plan/09-privacy.md §9.11`.
+// Padlock — privacy surface. Closed/open variant picks the visual.
 export function LockIcon({ size = 18, ariaLabel }: IconProps) {
   return (
     <BaseSvg size={size} {...(ariaLabel ? { 'aria-label': ariaLabel } : {})}>

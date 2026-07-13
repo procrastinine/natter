@@ -1,6 +1,3 @@
-// Rough pre-send prompt-size estimate. See `plan/14-details.md §14.15` for
-// the tokenization ratio; `plan/10-ui.md §10.9` for the gauge this feeds.
-//
 // The model's tokenizer isn't available; the estimator approximates with a
 // family-keyed char/token ratio. The number is ONLY used for UI context
 // gauges and for the truncation preview; the authoritative token count comes
@@ -27,6 +24,9 @@ import {
   DRAFT_ATTACHMENT_CONTEXT_ID,
   resolveAttachmentContextRefs,
 } from './attachments/context'
+
+export { UNLIMITED_CONTEXT } from './context-budget'
+
 import { computeCutoffPlan } from './context-cutoff'
 import {
   type AttachmentResolver,
@@ -549,18 +549,6 @@ export function estimateSettingsPromptSize(
       preCutAttachmentIds,
     ),
   )
-}
-
-// Sentinel value for `customMaxContext` / `maxCompletionTokens` meaning
-// "no cap — rely on provider limits or OpenRouter middle-out compression."
-// The user types `-1` into the numeric input; the stored value stays as
-// -1 so preset/chat round-tripping preserves intent, but budget math
-// treats it as `Infinity`.
-export const UNLIMITED_CONTEXT = -1
-
-export function resolveContextCap(stored: number | undefined, providerCap: number): number {
-  if (stored === UNLIMITED_CONTEXT) return Number.POSITIVE_INFINITY
-  return stored ?? providerCap
 }
 
 export function tokenizerFromSettings(

@@ -2,7 +2,6 @@
  * shell.css — app frame, overlays, status bar, empty states, responsive shell.
  * Owns: [data-ui='app-shell'|'main-pane'|'settings-overlay'|'status-bar'|
  *              'empty-state'|'sample-prompts'|'focus-mode-toggle'].
- * See plan/10-ui.md §10.20.
  */
 
 /* Floating eye toggle — fixed at the bottom-right so it survives the
@@ -11,7 +10,8 @@
  * right-padding keeps it clear of the scroll region's scrollbar when
  * focus mode is active (the scrollbar hugs the viewport edge since
  * there's no more chat-title-bar chrome inset). */
-[data-ui="focus-mode-toggle"] {
+[data-ui="focus-mode-toggle"],
+[data-ui="tree-density-toggle"] {
   position: fixed;
   right: var(--space-6);
   bottom: var(--space-6);
@@ -39,14 +39,33 @@
  * composer's Send button which lives at the bottom-right of the main
  * pane — stacking two affordances in the same corner reads as
  * duplicate-y visually even when they're technically different buttons. */
-[data-ui="app-shell"][data-chat-model-panel="open"] [data-ui="focus-mode-toggle"] {
+[data-ui="app-shell"][data-chat-model-panel="open"] [data-ui="focus-mode-toggle"],
+[data-ui="app-shell"][data-chat-model-panel="open"]
+  [data-ui="tree-density-toggle"]:not([data-placement="canvas"]) {
   right: calc(var(--settings-pane-width) + var(--space-4));
 }
 
-[data-ui="focus-mode-toggle"]:hover {
+[data-ui="focus-mode-toggle"]:hover,
+[data-ui="tree-density-toggle"]:hover {
   opacity: 1;
   background: var(--color-bg-surface-2);
   color: var(--color-fg-primary);
+}
+
+[data-ui="tree-density-toggle"] {
+  opacity: 0.92;
+}
+
+[data-ui="tree-density-toggle"]:focus {
+  outline: none;
+}
+
+[data-ui="tree-density-toggle"]:focus-visible {
+  border-color: var(--color-border-focus);
+  box-shadow:
+    0 0 0 var(--focus-ring-width) var(--color-accent-subtle),
+    var(--shadow-sm);
+  opacity: 1;
 }
 
 [data-ui="focus-mode-toggle"]:disabled,
@@ -75,6 +94,24 @@
   color: var(--color-fg-primary);
 }
 
+[data-ui="surface-loading"] {
+  display: grid;
+  place-items: center;
+  min-height: 8rem;
+  color: var(--color-fg-muted);
+  font-size: var(--font-size-sm);
+}
+
+[data-ui="surface-loading"][data-placement="overlay"] {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-modal);
+  min-height: 0;
+  background: color-mix(in srgb, var(--color-bg-app) 72%, transparent);
+  backdrop-filter: var(--backdrop-blur-overlay);
+  -webkit-backdrop-filter: var(--backdrop-blur-overlay);
+}
+
 /* New shell layout: a simple two-column grid (sidebar + main), no separate
  * header row at the top of the shell. The connection header, chat title row,
  * scroll region and composer all stack inside main-pane. The chat-model panel
@@ -96,14 +133,14 @@
 }
 
 [data-ui="app-shell"][data-sidebar="expanded"]:has(
-    [data-ui="sidebar-org-toolbar"][data-search-expanded="true"]
-  ) {
+  [data-ui="sidebar-org-toolbar"][data-search-expanded="true"]
+) {
   grid-template-columns: var(--sidebar-search-width) 1fr;
 }
 
 [data-ui="app-shell"][data-sidebar="expanded"][data-chat-model-panel="open"]:has(
-    [data-ui="sidebar-org-toolbar"][data-search-expanded="true"]
-  ) {
+  [data-ui="sidebar-org-toolbar"][data-search-expanded="true"]
+) {
   grid-template-columns: var(--sidebar-search-width) 1fr var(--settings-pane-width);
 }
 
@@ -356,11 +393,11 @@
   }
 
   [data-ui="app-shell"][data-sidebar="expanded"]:has(
-      [data-ui="sidebar-org-toolbar"][data-search-expanded="true"]
-    ),
+    [data-ui="sidebar-org-toolbar"][data-search-expanded="true"]
+  ),
   [data-ui="app-shell"][data-sidebar="expanded"][data-chat-model-panel="open"]:has(
-      [data-ui="sidebar-org-toolbar"][data-search-expanded="true"]
-    ) {
+    [data-ui="sidebar-org-toolbar"][data-search-expanded="true"]
+  ) {
     grid-template-columns: 1fr;
   }
 

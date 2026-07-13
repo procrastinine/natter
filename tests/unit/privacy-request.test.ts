@@ -21,9 +21,14 @@ import {
 import type { Chat, ConnectionProfile } from '../../src/core/types'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import { __resetDbForTests, openDb } from '../../src/store/db'
-import { putCachedEndpoints } from '../../src/store/models-cache'
+import {
+  __resetModelsInFlightForTests,
+  dedupedEndpointsFetch,
+  putCachedEndpoints,
+} from '../../src/store/models-cache'
 import {
   __resetPrivacyInFlightForTests,
+  EMPTY_PRIVACY_POLICY_RETRY_MS,
   putCachedPrivacyPolicy,
 } from '../../src/store/privacy-cache'
 
@@ -45,6 +50,7 @@ const DB_NAME = 'natter'
 async function resetAll() {
   __resetDbForTests()
   __resetBroadcastForTests()
+  __resetModelsInFlightForTests()
   __resetPrivacyInFlightForTests()
   await Dexie.delete(DB_NAME)
 }
@@ -56,6 +62,7 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
+  vi.useRealTimers()
   await resetAll()
 })
 
@@ -245,6 +252,54 @@ describe('resolvePrivacyForSend', () => {
     ).rejects.toBeInstanceOf(PrivacyDiscoveryUnavailableError)
   })
 
+  it('applies the send deadline while a longer shared endpoint fetch remains in flight', async () => {
+    vi.useFakeTimers()
+    let resolveFetchStarted!: () => void
+    const fetchStarted = new Promise<void>((resolve) => {
+      resolveFetchStarted = resolve
+    })
+    void dedupedEndpointsFetch('prof-1', 'openai/gpt-5.4', () => {
+      resolveFetchStarted()
+      return new Promise<never>(() => {})
+    })
+    await fetchStarted
+    const pending = resolvePrivacyForSend({
+      chat: makeChat(),
+      profile: makeProfile(),
+      proxy: TEST_PROXY,
+    })
+    const rejected = expect(pending).rejects.toBeInstanceOf(PrivacyDiscoveryUnavailableError)
+    for (let index = 0; index < 10; index += 1) await Promise.resolve()
+
+    await vi.advanceTimersByTimeAsync(15_000)
+
+    await rejected
+  })
+
+  it('lets an aborted send stop waiting without cancelling shared endpoint discovery', async () => {
+    let resolveFetchStarted!: () => void
+    const fetchStarted = new Promise<void>((resolve) => {
+      resolveFetchStarted = resolve
+    })
+    void dedupedEndpointsFetch('prof-1', 'openai/gpt-5.4', () => {
+      resolveFetchStarted()
+      return new Promise<never>(() => {})
+    })
+    await fetchStarted
+    const controller = new AbortController()
+    const pending = resolvePrivacyForSend({
+      chat: makeChat(),
+      profile: makeProfile(),
+      proxy: TEST_PROXY,
+      signal: controller.signal,
+    })
+    const rejected = expect(pending).rejects.toBeInstanceOf(PrivacyDiscoveryUnavailableError)
+
+    controller.abort()
+
+    await rejected
+  })
+
   it('runs the filter and builds a wire block when both caches are warm', async () => {
     const chat = makeChat()
     const profile = makeProfile()
@@ -295,7 +350,7 @@ describe('resolvePrivacyForSend', () => {
     expect(r.wire?.zeroEligible).toBe(false)
   })
 
-  it('refetches empty privacy-cache rows before request-time routing', async () => {
+  it('reuses a recent empty privacy result and refetches it after the short retry TTL', async () => {
     const chat = makeChat({ model: 'deepseek/deepseek-v4-flash' })
     const profile = makeProfile()
     await putCachedEndpoints('prof-1', 'deepseek/deepseek-v4-flash', {
@@ -317,11 +372,12 @@ describe('resolvePrivacyForSend', () => {
         },
       ],
     })
+    const cachedAt = Date.now()
     await putCachedPrivacyPolicy(
       'prof-1',
       'deepseek/deepseek-v4-flash',
-      { policies: {}, fetchedAt: Date.now() },
-      Date.now(),
+      { policies: {}, fetchedAt: cachedAt },
+      cachedAt,
     )
     fetchPrivacyScrapeMock.mockResolvedValueOnce({
       modelId: 'deepseek/deepseek-v4-flash',
@@ -350,12 +406,22 @@ describe('resolvePrivacyForSend', () => {
       fetchedAt: Date.now(),
     })
 
-    const r = await resolvePrivacyForSend({ chat, profile, proxy: TEST_PROXY })
+    const cachedResult = await resolvePrivacyForSend({ chat, profile, proxy: TEST_PROXY })
+    expect(fetchPrivacyScrapeMock).not.toHaveBeenCalled()
+    expect(cachedResult.applicable).toBe(true)
+
+    await putCachedPrivacyPolicy(
+      'prof-1',
+      'deepseek/deepseek-v4-flash',
+      { policies: {}, fetchedAt: cachedAt - EMPTY_PRIVACY_POLICY_RETRY_MS - 1 },
+      cachedAt - EMPTY_PRIVACY_POLICY_RETRY_MS - 1,
+    )
+    const refreshedResult = await resolvePrivacyForSend({ chat, profile, proxy: TEST_PROXY })
 
     expect(fetchPrivacyScrapeMock).toHaveBeenCalledTimes(1)
-    expect(r.filter?.kept.map((k) => k.endpoint.provider_name)).toEqual(['DeepInfra'])
-    expect(r.wire?.ignore).toContain('deepseek')
-    expect(r.wire?.ignore).not.toContain('deepinfra/fp4')
+    expect(refreshedResult.filter?.kept.map((k) => k.endpoint.provider_name)).toEqual(['DeepInfra'])
+    expect(refreshedResult.wire?.ignore).toContain('deepseek')
+    expect(refreshedResult.wire?.ignore).not.toContain('deepinfra/fp4')
   })
 
   it('flags zeroEligible when every endpoint is a trainer', async () => {

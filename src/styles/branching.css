@@ -3,8 +3,809 @@
  * Owns: [data-ui='branch-controls'|'variant-ghost'|'edit-tree-toolbar'|
  *              'branch-node'|'inline-editor'|'import-modal'|'toast-tray'|
  *              'banner-tray'].
- * Wired out in Phase 8.1 per plan/08-branching.md.
  */
+
+/* Conversation tree workspace ------------------------------------------------ */
+
+[data-ui="branch-tree-view"] {
+  display: flex;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  flex-direction: column;
+  background: var(--color-bg-app);
+  color: var(--color-fg-primary);
+}
+
+[data-ui="branch-tree-toolbar"] {
+  display: flex;
+  flex: 0 0 auto;
+  min-height: 44px;
+  align-items: center;
+  gap: var(--space-3);
+  padding: 6px var(--space-4);
+  border-bottom: 1px solid var(--color-border-subtle);
+  background: var(--color-bg-surface-1);
+}
+
+[data-ui="branch-tree-search"] {
+  display: flex;
+  min-width: 0;
+  height: 32px;
+  flex: 1 1 auto;
+  align-items: center;
+  overflow: hidden;
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-surface-2);
+  box-shadow: inset 0 1px 1px var(--color-border-subtle);
+}
+
+[data-ui="branch-tree-search"]:focus-within {
+  border-color: var(--color-border-focus);
+  box-shadow: 0 0 0 2px var(--color-accent-subtle);
+}
+
+[data-ui="branch-tree-search-icon"] {
+  display: inline-flex;
+  flex: 0 0 auto;
+  padding-left: var(--space-3);
+  color: var(--color-fg-muted);
+  pointer-events: none;
+}
+
+[data-ui="branch-tree-search-input"] {
+  min-width: 80px;
+  flex: 1 1 auto;
+  align-self: stretch;
+  padding: 0 var(--space-3);
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--color-fg-primary);
+  font: inherit;
+  font-size: var(--font-size-sm);
+}
+
+[data-ui="branch-tree-search-input"]:focus,
+[data-ui="branch-tree-search-input"]:focus-visible {
+  outline: none;
+  box-shadow: none;
+}
+
+[data-ui="branch-tree-search-input"]::-webkit-search-cancel-button {
+  display: none;
+}
+
+[data-ui="branch-tree-search-clear"],
+[data-ui="branch-tree-search-nav"],
+[data-ui="branch-tree-action"] {
+  display: inline-flex;
+  width: 30px;
+  height: 30px;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--color-fg-secondary);
+  cursor: pointer;
+}
+
+[data-ui="branch-tree-search-clear"]:hover,
+[data-ui="branch-tree-search-nav"]:hover:not(:disabled),
+[data-ui="branch-tree-action"]:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-fg-primary);
+}
+
+[data-ui="branch-tree-search-nav"] {
+  border-left: 1px solid var(--color-border-subtle);
+}
+
+[data-ui="branch-tree-search-nav"]:disabled {
+  cursor: default;
+  opacity: var(--opacity-disabled);
+}
+
+[data-ui="branch-tree-search-status"] {
+  min-width: 62px;
+  padding: 0 var(--space-3);
+  color: var(--color-fg-muted);
+  font-size: var(--font-size-xs);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+
+[data-ui="branch-tree-search-status"][data-state="error"] {
+  color: var(--color-danger);
+}
+
+[data-ui="branch-tree-workspace"] {
+  --branch-tree-inspector-width: 38%;
+  --branch-tree-inspector-min-width: 300px;
+  --branch-tree-canvas-min-width: 260px;
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  flex: 1 1 auto;
+  grid-template-columns: minmax(0, 1fr);
+  overflow: hidden;
+}
+
+[data-ui="branch-tree-workspace"][data-inspector-open] {
+  grid-template-columns:
+    minmax(var(--branch-tree-canvas-min-width), 1fr) 1px
+    minmax(var(--branch-tree-inspector-min-width), var(--branch-tree-inspector-width));
+}
+
+[data-ui="branch-tree-workspace"][data-resizing] {
+  cursor: col-resize;
+  user-select: none;
+}
+
+[data-ui="branch-tree-canvas-pane"] {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+[data-ui="branch-tree-scroll"] {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  background-color: var(--color-bg-app);
+  background-image: radial-gradient(
+    circle,
+    color-mix(in srgb, var(--color-border-strong) 58%, transparent) 0.7px,
+    transparent 0.8px
+  );
+  background-size: 20px 20px;
+  width: 100%;
+  height: 100%;
+  cursor: grab;
+  touch-action: none;
+}
+
+[data-ui="branch-tree-scroll"][data-panning] {
+  cursor: grabbing;
+}
+
+[data-ui="tree-density-toggle"][data-placement="canvas"] {
+  position: absolute;
+  right: var(--space-5);
+  bottom: var(--space-5);
+  z-index: 5;
+  opacity: 0.92;
+}
+
+[data-ui="branch-tree-empty"] {
+  display: grid;
+  min-height: 100%;
+  place-items: center;
+  color: var(--color-fg-muted);
+  font-size: var(--font-size-sm);
+}
+
+[data-ui="branch-tree-plane"] {
+  display: block;
+  overflow: visible;
+}
+
+[data-ui="branch-tree-connector"] {
+  fill: none;
+  stroke: var(--color-border-strong);
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.5px;
+  pointer-events: none;
+}
+
+[data-ui="branch-tree-connector"][data-active] {
+  stroke: var(--color-accent);
+  stroke-width: 2.25px;
+}
+
+[data-ui="branch-tree-connector"][data-highlighted] {
+  stroke: var(--color-border-focus);
+  stroke-width: 3px;
+}
+
+[data-connector-hit] {
+  cursor: copy;
+  outline: none;
+}
+
+[data-connector-hit][aria-disabled="true"] {
+  cursor: not-allowed;
+}
+
+[data-ui="branch-tree-connector-hit-path"] {
+  fill: none;
+  stroke: rgba(15, 23, 42, 0.01);
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 18px;
+  pointer-events: stroke;
+}
+
+[data-ui="branch-tree-connector-add"],
+[data-ui="branch-tree-leaf-add"] {
+  color: var(--color-fg-muted);
+  pointer-events: none;
+}
+
+[data-connector-hit][aria-disabled="true"] [data-ui="branch-tree-connector-add"],
+[data-connector-hit][aria-disabled="true"] [data-ui="branch-tree-leaf-add"] {
+  opacity: var(--opacity-disabled);
+}
+
+[data-ui="branch-tree-connector-add"] circle,
+[data-ui="branch-tree-leaf-add"] circle {
+  fill: var(--color-bg-surface-1);
+  stroke: var(--color-border-strong);
+  stroke-width: 1.25px;
+  vector-effect: non-scaling-stroke;
+}
+
+[data-ui="branch-tree-connector-add"] path,
+[data-ui="branch-tree-leaf-add"] path {
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-width: 1.75px;
+  vector-effect: non-scaling-stroke;
+}
+
+[data-ui="branch-tree-connector-add"][data-highlighted],
+[data-ui="branch-tree-leaf-add"][data-highlighted] {
+  color: var(--color-accent);
+}
+
+[data-ui="branch-tree-connector-add"][data-highlighted] circle,
+[data-ui="branch-tree-leaf-add"][data-highlighted] circle {
+  fill: color-mix(in srgb, var(--color-accent) 9%, var(--color-bg-surface-1));
+  stroke: var(--color-accent);
+}
+
+[data-connector-hit]:focus-visible [data-ui="branch-tree-connector-add"] circle,
+[data-connector-hit]:focus-visible [data-ui="branch-tree-leaf-add"] circle {
+  fill: color-mix(in srgb, var(--color-accent) 9%, var(--color-bg-surface-1));
+  stroke: var(--color-border-focus);
+}
+
+[data-ui="branch-tree-node"] {
+  cursor: pointer;
+  outline: none;
+  text-decoration: none;
+}
+
+[data-ui="branch-tree-node-surface"] {
+  fill: var(--color-bg-surface-1);
+  stroke: var(--color-role-system);
+  stroke-width: 1.75px;
+  vector-effect: non-scaling-stroke;
+  transition:
+    fill var(--duration-fast) var(--ease-standard),
+    stroke-width var(--duration-fast) var(--ease-standard);
+}
+
+[data-ui="branch-tree-node"][data-role="user"] [data-ui="branch-tree-node-surface"] {
+  stroke: var(--color-role-user);
+}
+
+[data-ui="branch-tree-node"][data-role="assistant"] [data-ui="branch-tree-node-surface"] {
+  stroke: var(--color-role-assistant);
+}
+
+[data-ui="branch-tree-node"][data-role="tool"] [data-ui="branch-tree-node-surface"] {
+  stroke: var(--color-role-tool);
+}
+
+[data-ui="branch-tree-node"]:hover [data-ui="branch-tree-node-surface"],
+[data-ui="branch-tree-node"]:focus-visible [data-ui="branch-tree-node-surface"] {
+  fill: var(--color-bg-surface-2);
+  stroke-width: 2.25px;
+}
+
+[data-ui="branch-tree-node"][data-active-path] [data-ui="branch-tree-node-surface"] {
+  fill: color-mix(in srgb, var(--color-accent) 8%, var(--color-bg-surface-1));
+  stroke-width: 2px;
+}
+
+[data-ui="branch-tree-node"][data-hidden-from-context] [data-ui="branch-tree-node-surface"] {
+  fill: color-mix(in srgb, var(--color-fg-muted) 5%, var(--color-bg-surface-1));
+  stroke-dasharray: 4 3;
+  opacity: 0.62;
+}
+
+[data-ui="branch-tree-node-visibility"] {
+  color: var(--color-fg-secondary);
+  pointer-events: none;
+}
+
+[data-ui="branch-tree-node-visibility"] > circle {
+  fill: var(--color-bg-surface-1);
+  stroke: var(--color-border-strong);
+  stroke-width: 1px;
+  vector-effect: non-scaling-stroke;
+}
+
+[data-ui="branch-tree-node-visibility"] svg {
+  overflow: visible;
+}
+
+[data-ui="branch-tree-node-search-ring"],
+[data-ui="branch-tree-node-selection-ring"] {
+  fill: none;
+  opacity: 0;
+  pointer-events: none;
+  vector-effect: non-scaling-stroke;
+}
+
+[data-ui="branch-tree-node"][data-search-match] [data-ui="branch-tree-node-search-ring"] {
+  opacity: 1;
+  stroke: color-mix(in srgb, var(--color-warning) 72%, transparent);
+  stroke-width: 2px;
+}
+
+[data-ui="branch-tree-node"][data-current-match] [data-ui="branch-tree-node-search-ring"] {
+  opacity: 1;
+  stroke: var(--color-warning);
+  stroke-width: 3px;
+}
+
+[data-ui="branch-tree-node"][data-selected] [data-ui="branch-tree-node-selection-ring"] {
+  opacity: 1;
+  stroke: var(--color-fg-primary);
+  stroke-dasharray: 5 3;
+  stroke-width: 2.5px;
+}
+
+[data-ui="branch-tree-node"]:focus-visible [data-ui="branch-tree-node-selection-ring"] {
+  opacity: 1;
+  stroke: var(--color-border-focus);
+  stroke-dasharray: none;
+  stroke-width: 2.5px;
+}
+
+[data-ui="branch-tree-node-leaf-dot"] {
+  fill: var(--color-accent);
+  stroke: var(--color-bg-surface-1);
+  stroke-width: 2px;
+  opacity: 0;
+  pointer-events: none;
+  vector-effect: non-scaling-stroke;
+}
+
+[data-ui="branch-tree-node"][data-current-leaf] [data-ui="branch-tree-node-leaf-dot"] {
+  opacity: 1;
+}
+
+[data-ui="branch-tree-node-card-content"] {
+  pointer-events: none;
+}
+
+[data-ui="branch-tree-node-role"] {
+  fill: var(--color-fg-secondary);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-semibold);
+  letter-spacing: 0.035em;
+  text-transform: uppercase;
+}
+
+[data-ui="branch-tree-node-icon"],
+[data-ui="branch-tree-role-icon"] {
+  color: var(--color-role-system);
+  pointer-events: none;
+}
+
+[data-ui="branch-tree-node-icon"] svg {
+  stroke-width: 2.1px;
+}
+
+[data-ui="branch-tree-node-icon"][data-role="user"],
+[data-ui="branch-tree-role-icon"][data-role="user"] {
+  color: var(--color-role-user);
+}
+
+[data-ui="branch-tree-node-icon"][data-role="assistant"],
+[data-ui="branch-tree-role-icon"][data-role="assistant"] {
+  color: var(--color-role-assistant);
+}
+
+[data-ui="branch-tree-role-marker"] {
+  fill: var(--color-bg-surface-1);
+  stroke: var(--color-role-system);
+  stroke-width: 1.75px;
+  vector-effect: non-scaling-stroke;
+}
+
+[data-ui="branch-tree-role-marker"][data-role="tool"] {
+  stroke: var(--color-role-tool);
+}
+
+[data-ui="branch-tree-node-preview"] {
+  fill: var(--color-fg-secondary);
+  font-size: var(--font-size-sm);
+}
+
+[data-ui="branch-tree-preview"] {
+  pointer-events: none;
+}
+
+[data-ui="branch-tree-preview-surface"] {
+  fill: var(--color-bg-surface-1);
+  stroke: var(--color-border-default);
+  stroke-width: 1px;
+  vector-effect: non-scaling-stroke;
+}
+
+[data-ui="branch-tree-preview-role"] {
+  fill: var(--color-role-system);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-semibold);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+[data-ui="branch-tree-preview"][data-role="user"] [data-ui="branch-tree-preview-role"] {
+  fill: var(--color-role-user);
+}
+
+[data-ui="branch-tree-preview"][data-role="assistant"] [data-ui="branch-tree-preview-role"] {
+  fill: var(--color-role-assistant);
+}
+
+[data-ui="branch-tree-preview"][data-role="tool"] [data-ui="branch-tree-preview-role"] {
+  fill: var(--color-role-tool);
+}
+
+[data-ui="branch-tree-preview-text"] {
+  fill: var(--color-fg-primary);
+  font-size: var(--font-size-sm);
+}
+
+[data-ui="branch-tree-separator"] {
+  position: relative;
+  z-index: 6;
+  width: 11px;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  align-self: stretch;
+  justify-self: center;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+[data-ui="branch-tree-separator"]::after {
+  position: absolute;
+  inset: 0 5px;
+  background: transparent;
+  content: "";
+  transition: background var(--duration-fast) var(--ease-standard);
+}
+
+[data-ui="branch-tree-separator"]:hover::after,
+[data-ui="branch-tree-separator"]:focus-visible::after,
+[data-ui="branch-tree-workspace"][data-resizing] [data-ui="branch-tree-separator"]::after {
+  background: var(--color-border-focus);
+}
+
+[data-ui="branch-tree-separator"]:focus {
+  outline: none;
+}
+
+[data-ui="branch-tree-inspector-slot"] {
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--color-bg-surface-1);
+}
+
+[data-ui="branch-tree-inspector-status"] {
+  display: grid;
+  min-height: 100%;
+  place-items: center;
+  padding: var(--space-6);
+  color: var(--color-fg-muted);
+  font-size: var(--font-size-sm);
+}
+
+[data-ui="branch-tree-inspector-status"][data-state="error"] {
+  color: var(--color-danger);
+}
+
+[data-ui="branch-tree-inspector"] {
+  display: flex;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+  background: var(--color-bg-surface-1);
+}
+
+[data-ui="branch-tree-inspector-header"] {
+  display: grid;
+  flex: 0 0 auto;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: var(--space-3) var(--space-4);
+  padding: var(--space-5);
+  border-bottom: 1px solid var(--color-border-subtle);
+  background: var(--color-bg-surface-2);
+}
+
+[data-ui="branch-tree-inspector-heading"] {
+  display: grid;
+  min-width: 0;
+  flex: 1 1 auto;
+  gap: var(--space-1);
+}
+
+[data-ui="branch-tree-inspector-heading"] h2 {
+  margin: 0;
+  color: var(--color-fg-primary);
+  font-size: var(--font-size-md);
+  font-weight: var(--font-weight-semibold);
+}
+
+[data-ui="branch-tree-inspector-message-id"] {
+  overflow: hidden;
+  color: var(--color-fg-muted);
+  font-size: var(--font-size-xs);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+[data-ui="branch-tree-inspector-char-count"] {
+  color: var(--color-fg-muted);
+  font-size: var(--font-size-xs);
+  font-variant-numeric: tabular-nums;
+}
+
+[data-ui="branch-tree-inspector-actions"] {
+  display: flex;
+  min-width: 0;
+  grid-column: 1 / -1;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-start;
+  gap: var(--space-1);
+}
+
+[data-ui="branch-tree-inspector-activate"] {
+  min-height: 30px;
+  padding: 0 var(--space-4);
+  border: 1px solid var(--color-accent);
+  border-radius: var(--radius-md);
+  background: var(--color-accent);
+  color: var(--color-accent-contrast);
+  font: inherit;
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-medium);
+  cursor: pointer;
+}
+
+[data-ui="branch-tree-inspector-activate"]:hover {
+  border-color: var(--color-accent-hover);
+  background: var(--color-accent-hover);
+}
+
+[data-ui="branch-tree-inspector-action"],
+[data-ui="branch-tree-inspector-close"] {
+  display: inline-flex;
+  width: 30px;
+  height: 30px;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-surface-1);
+  color: var(--color-fg-muted);
+  cursor: pointer;
+}
+
+[data-ui="branch-tree-inspector-action"]:hover:not(:disabled),
+[data-ui="branch-tree-inspector-close"]:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-fg-primary);
+}
+
+[data-ui="branch-tree-inspector-action"]:focus-visible,
+[data-ui="branch-tree-inspector-close"]:focus-visible {
+  outline: var(--focus-ring-width) solid var(--color-accent);
+  outline-offset: 1px;
+}
+
+[data-ui="branch-tree-inspector-action"]:disabled {
+  cursor: not-allowed;
+  opacity: var(--opacity-disabled);
+}
+
+[data-ui="branch-tree-inspector-action"][data-action="delete"] {
+  color: var(--color-danger);
+}
+
+[data-ui="branch-tree-inspector-action"][data-action="delete"]:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--color-danger) 32%, var(--color-border-default));
+  background: var(--color-banner-danger-bg);
+  color: var(--color-danger);
+}
+
+[data-ui="branch-tree-inspector-scroll"] {
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding: var(--space-5) var(--space-6) var(--space-8);
+}
+
+[data-ui="branch-tree-inspector-content"],
+[data-ui="branch-tree-inspector-details"] {
+  min-width: 0;
+}
+
+[data-ui="branch-tree-inspector-content"] > h3,
+[data-ui="branch-tree-inspector-details"] > h3 {
+  margin: 0 0 var(--space-4);
+  color: var(--color-fg-muted);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-semibold);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+[data-ui="branch-tree-inspector-content"] [data-ui="message-body"] {
+  min-width: 0;
+  padding: 0;
+}
+
+[data-ui="branch-tree-inspector-content"] [data-ui="reasoning"] {
+  margin-bottom: var(--space-4);
+}
+
+[data-ui="branch-tree-inspector-edit-error"] {
+  margin-top: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid color-mix(in srgb, var(--color-danger) 36%, var(--color-border-default));
+  border-radius: var(--radius-sm);
+  background: var(--color-banner-danger-bg);
+  color: var(--color-danger);
+  font-size: var(--font-size-xs);
+}
+
+[data-ui="branch-tree-inspector-details"] {
+  margin-top: var(--space-8);
+  padding-top: var(--space-5);
+  border-top: 1px solid var(--color-border-subtle);
+}
+
+[data-ui="branch-tree-inspector-details"] [data-ui="message-info"] {
+  margin-top: 0;
+}
+
+[data-ui="branch-tree-inspector-details"] [data-ui="message-info"] dd {
+  word-break: normal;
+  overflow-wrap: anywhere;
+}
+
+[data-ui="branch-tree-inspector-overflow"] {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  margin-bottom: var(--space-5);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--color-info-border);
+  border-radius: var(--radius-md);
+  background: var(--color-info-tint-soft);
+  color: var(--color-fg-secondary);
+  font-size: var(--font-size-xs);
+}
+
+[data-ui="branch-tree-inspector-overflow-toggle"] {
+  flex: 0 0 auto;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-surface-1);
+  color: var(--color-fg-primary);
+  font: inherit;
+  font-size: var(--font-size-xs);
+  cursor: pointer;
+}
+
+[data-ui="branch-tree-inspector-search"] {
+  display: flex;
+  min-width: 0;
+  height: 30px;
+  align-items: center;
+  overflow: hidden;
+  margin-bottom: var(--space-4);
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-surface-2);
+}
+
+[data-ui="branch-tree-inspector-search-query"] {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  padding-inline: var(--space-3);
+  color: var(--color-fg-secondary);
+  font-size: var(--font-size-xs);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+[data-ui="branch-tree-inspector-search-status"] {
+  flex: 0 0 auto;
+  padding-inline: var(--space-2);
+  color: var(--color-fg-muted);
+  font-size: var(--font-size-xs);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+[data-ui="branch-tree-inspector-search-nav"] {
+  display: inline-flex;
+  width: 30px;
+  height: 30px;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 0;
+  border-left: 1px solid var(--color-border-subtle);
+  background: transparent;
+  color: var(--color-fg-secondary);
+  cursor: pointer;
+}
+
+[data-ui="branch-tree-inspector-search-nav"]:hover:not(:disabled) {
+  background: var(--color-bg-hover);
+  color: var(--color-fg-primary);
+}
+
+[data-ui="branch-tree-inspector-search-nav"]:disabled {
+  cursor: default;
+  opacity: var(--opacity-disabled);
+}
+
+[data-ui="branch-tree-inspector-search-overflow"] {
+  display: block;
+  margin-top: var(--space-1);
+  color: var(--color-warning);
+  font-weight: var(--font-weight-medium);
+}
+
+@media (max-width: 760px) {
+  [data-ui="branch-tree-toolbar"] {
+    padding-inline: var(--space-3);
+  }
+
+  [data-ui="branch-tree-search"] {
+    width: 100%;
+    min-width: 0;
+  }
+
+  [data-ui="branch-tree-inspector-actions"] {
+    width: 100%;
+  }
+}
 
 /* BranchControls sits in the shared action row (see Message.tsx) so
  * it aligns with the trailing icon buttons. No top margin here — the

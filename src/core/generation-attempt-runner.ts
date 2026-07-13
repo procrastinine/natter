@@ -1,0 +1,418 @@
+import { splitAssistantStream } from '../api/assistant-lanes'
+import type { AssistantStreamChunk } from '../api/assistant-stream'
+import { ApiError, normalizeError } from '../api/errors'
+import type { StreamLaneEvent } from '../api/stream-transforms'
+import { errorFromUnknown } from '../lib/error'
+import type { StreamChunkWriter } from '../store/stream-chunk-writer'
+import type { ApiRoute } from './api-choice'
+import {
+  applyStreamAccumulatorEvent,
+  markStreamAccumulatorPublished,
+  releaseStreamAccumulatorBuffers,
+  STREAM_LIVE_UPDATE_INTERVAL_MS,
+  type StreamAccumulator,
+  shouldPublishStreamAccumulatorLive,
+} from './stream-accumulator'
+import type { AbortReason } from './types'
+
+type GenerationAttemptOutcome = 'done' | 'error' | 'abort'
+
+export interface GenerationAttemptErrorPolicy {
+  thrownNetworkApiError: 'abort' | 'error'
+  unknownError: 'swallow' | 'rethrow-after-finalization'
+}
+
+export const SEND_GENERATION_ATTEMPT_ERROR_POLICY = {
+  thrownNetworkApiError: 'abort',
+  unknownError: 'swallow',
+} as const satisfies GenerationAttemptErrorPolicy
+
+export const CONTINUE_GENERATION_ATTEMPT_ERROR_POLICY = {
+  thrownNetworkApiError: 'error',
+  unknownError: 'rethrow-after-finalization',
+} as const satisfies GenerationAttemptErrorPolicy
+
+export interface GenerationAttemptResult {
+  outcome: GenerationAttemptOutcome
+  abortReason?: AbortReason
+  error?: ApiError
+  finishReason?: string
+  journalCleanupPending?: boolean
+}
+
+interface GenerationAttemptFinalizationContext extends GenerationAttemptResult {
+  accumulator: StreamAccumulator
+}
+
+export interface GenerationAttemptRunnerInput {
+  open: () => AsyncIterable<AssistantStreamChunk>
+  beforeDispatch?: () => Promise<void> | void
+  transportHint?: ApiRoute['transport']
+  accumulator: StreamAccumulator
+  journal: StreamChunkWriter
+  errorPolicy: GenerationAttemptErrorPolicy
+  now?: () => number
+  isAborted?: () => boolean
+  abortReason?: AbortReason | (() => AbortReason)
+  prepareLive?: (input: {
+    accumulator: StreamAccumulator
+    now: number
+  }) => (() => void | Promise<void>) | undefined
+  finalize: (input: GenerationAttemptFinalizationContext) => Promise<void>
+  cleanupJournal: () => Promise<unknown>
+  cleanup: (result: GenerationAttemptResult) => void | Promise<void>
+}
+
+export async function runGenerationAttempt(
+  input: GenerationAttemptRunnerInput,
+): Promise<GenerationAttemptResult> {
+  const now = input.now ?? Date.now
+  let outcome: GenerationAttemptOutcome = 'done'
+  let abortReason: AbortReason | undefined
+  let error: ApiError | undefined
+  let deferredError: unknown
+  let hasDeferredError = false
+  let sawTerminalEvidence = false
+  const attemptState = { beforeDispatchFailed: false, streamIterationFailed: false }
+  const livePublisher = createAttemptLivePublisher(input, now)
+
+  try {
+    let source: AsyncIterable<AssistantStreamChunk>
+    if (input.beforeDispatch) {
+      source = openAfterDispatchGuard(input.beforeDispatch, input.open, () => {
+        attemptState.beforeDispatchFailed = true
+      })
+    } else {
+      try {
+        source = input.open()
+      } catch (caught) {
+        attemptState.streamIterationFailed = true
+        throw caught
+      }
+    }
+    const iterator = splitAssistantStream(source, input.transportHint)[Symbol.asyncIterator]()
+    let iteratorClosed = false
+    let iterationError: unknown
+    let hasIterationError = false
+    try {
+      for (;;) {
+        let next: IteratorResult<StreamLaneEvent>
+        try {
+          next = await iterator.next()
+        } catch (caught) {
+          iteratorClosed = true
+          if (sawTerminalEvidence) break
+          attemptState.streamIterationFailed = true
+          throw caught
+        }
+        if (next.done) {
+          iteratorClosed = true
+          break
+        }
+        const event = next.value
+        const eventNow = now()
+        applyStreamAccumulatorEvent(input.accumulator, event, eventNow)
+        try {
+          input.journal.append(event, eventNow)
+        } catch (caught) {
+          throw normalizeError(caught, { midStream: true, cause: 'storage' })
+        }
+        if (event.lane === 'finish' || event.lane === 'terminal') sawTerminalEvidence = true
+        if (event.lane === 'error') {
+          outcome = 'error'
+          error = event.error
+          break
+        }
+        const publishNow = now()
+        try {
+          await livePublisher.afterEvent(publishNow)
+        } catch (caught) {
+          throw normalizeError(caught, { midStream: true, cause: 'internal' })
+        }
+        try {
+          input.journal.flush({ mode: 'scheduled', now: publishNow })
+          const backpressure = input.journal.backpressure()
+          if (backpressure) await backpressure
+        } catch (caught) {
+          throw normalizeError(caught, { midStream: true, cause: 'storage' })
+        }
+      }
+    } catch (caught) {
+      iterationError = caught
+      hasIterationError = true
+    } finally {
+      if (!iteratorClosed) {
+        iteratorClosed = true
+        try {
+          await iterator.return(undefined)
+        } catch (caught) {
+          if (!hasIterationError && outcome === 'done' && error === undefined) {
+            iterationError = caught
+            hasIterationError = true
+          }
+        }
+      }
+    }
+    if (hasIterationError) throw iterationError
+    try {
+      await livePublisher.flush()
+    } catch (caught) {
+      throw normalizeError(caught, { midStream: true, cause: 'internal' })
+    }
+    if (outcome === 'done' && !sawTerminalEvidence) {
+      outcome = 'error'
+      error = prematureStreamEndError()
+      const eventNow = now()
+      const event = { lane: 'error', error } as const
+      applyStreamAccumulatorEvent(input.accumulator, event, eventNow)
+      try {
+        input.journal.append(event, eventNow)
+      } catch (caught) {
+        throw normalizeError(caught, { midStream: true, cause: 'storage' })
+      }
+    }
+  } catch (caught) {
+    let recoveryFailure: ApiError | undefined
+    if (attemptState.beforeDispatchFailed) {
+      outcome = 'error'
+      error = normalizeError(caught, { midStream: false, cause: 'internal' })
+      deferredError = caught
+      hasDeferredError = true
+    } else if (input.isAborted?.()) {
+      outcome = 'abort'
+      abortReason = resolveAbortReason(input.abortReason)
+    } else if (caught instanceof ApiError) {
+      if (caught.kind === 'abort') {
+        outcome = 'abort'
+        abortReason = resolveAbortReason(input.abortReason)
+      } else if (caught.kind === 'network' && input.errorPolicy.thrownNetworkApiError === 'abort') {
+        outcome = 'abort'
+        abortReason = 'network'
+        recoveryFailure = caught
+      } else {
+        outcome = 'error'
+        error = caught
+        recoveryFailure = caught
+      }
+    } else {
+      outcome = 'error'
+      error = normalizeError(caught, { midStream: true, cause: 'protocol' })
+      recoveryFailure = error
+      if (input.errorPolicy.unknownError === 'rethrow-after-finalization') {
+        deferredError = error
+        hasDeferredError = true
+      }
+    }
+    if (attemptState.streamIterationFailed && recoveryFailure) {
+      try {
+        input.journal.append({ lane: 'error', error: recoveryFailure }, now())
+      } catch (journalError) {
+        outcome = 'error'
+        abortReason = undefined
+        error = normalizeError(journalError, { midStream: true, cause: 'storage' })
+      }
+    }
+  }
+
+  try {
+    await livePublisher.stop()
+  } catch (caught) {
+    if (!error) {
+      outcome = 'error'
+      error = normalizeError(caught, { midStream: true, cause: 'internal' })
+    }
+  }
+
+  let effectiveResult: GenerationAttemptResult = {
+    outcome,
+    ...(abortReason ? { abortReason } : {}),
+    ...(error ? { error } : {}),
+    ...(input.accumulator.finishReason ? { finishReason: input.accumulator.finishReason } : {}),
+  }
+  let primaryError: unknown
+  let hasPrimaryError = false
+  let journalSettleError: ApiError | undefined
+
+  try {
+    try {
+      await input.journal.settle()
+    } catch (caught) {
+      journalSettleError = normalizeError(caught, { midStream: true, cause: 'storage' })
+      effectiveResult = {
+        outcome: 'error',
+        error: journalSettleError,
+        ...(input.accumulator.finishReason ? { finishReason: input.accumulator.finishReason } : {}),
+      }
+    }
+
+    try {
+      await input.finalize({ ...effectiveResult, accumulator: input.accumulator })
+    } catch (caught) {
+      const canonicalError =
+        caught instanceof ApiError
+          ? caught
+          : normalizeError(caught, { midStream: true, cause: 'storage' })
+      effectiveResult = {
+        outcome: 'error',
+        error: journalSettleError ?? canonicalError,
+        ...(input.accumulator.finishReason ? { finishReason: input.accumulator.finishReason } : {}),
+      }
+      try {
+        await input.journal.flush({ mode: 'immediate' })
+      } catch (caught) {
+        void caught
+      }
+      throw journalSettleError ?? canonicalError
+    }
+
+    try {
+      await input.cleanupJournal()
+    } catch {
+      effectiveResult = { ...effectiveResult, journalCleanupPending: true }
+    }
+  } catch (caught) {
+    primaryError = caught
+    hasPrimaryError = true
+  }
+
+  let cleanupError: unknown
+  let hasCleanupError = false
+  try {
+    input.journal.release()
+  } catch (caught) {
+    cleanupError = normalizeError(caught, { midStream: true, cause: 'internal' })
+    hasCleanupError = true
+  }
+  releaseStreamAccumulatorBuffers(input.accumulator)
+  try {
+    await input.cleanup(effectiveResult)
+  } catch (caught) {
+    if (!hasCleanupError) {
+      cleanupError =
+        caught instanceof ApiError
+          ? caught
+          : normalizeError(caught, { midStream: true, cause: 'internal' })
+      hasCleanupError = true
+    }
+  }
+
+  if (hasPrimaryError) throw primaryError
+  if (hasDeferredError && effectiveResult.error?.kind !== 'storage') throw deferredError
+  if (hasCleanupError) throw cleanupError
+  return effectiveResult
+}
+
+function createAttemptLivePublisher(
+  input: Pick<GenerationAttemptRunnerInput, 'accumulator' | 'journal' | 'prepareLive'>,
+  now: () => number,
+): {
+  afterEvent: (publishNow: number) => Promise<void>
+  flush: () => Promise<void>
+  stop: () => Promise<void>
+} {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let tail = Promise.resolve()
+  let failure: Error | undefined
+  let stopped = false
+
+  const clearTimer = () => {
+    if (timer === undefined) return
+    clearTimeout(timer)
+    timer = undefined
+  }
+
+  const throwIfFailed = () => {
+    if (failure !== undefined) throw failure
+  }
+
+  const enqueue = (publishNow: number): Promise<void> => {
+    const task = tail.then(async () => {
+      if (stopped || !input.prepareLive || !input.accumulator.dirtySinceLastLivePublish) return
+      const revision = input.accumulator.liveMutationRevision
+      const apply = input.prepareLive({ accumulator: input.accumulator, now: publishNow })
+      if (!apply) {
+        markStreamAccumulatorPublished(input.accumulator, publishNow, revision)
+        return
+      }
+      await input.journal.flush({ mode: 'immediate' })
+      await apply()
+      markStreamAccumulatorPublished(input.accumulator, publishNow, revision)
+    })
+    const observed = task.catch((error) => {
+      const normalized = errorFromUnknown(error)
+      if (failure === undefined) failure = normalized
+      throw normalized
+    })
+    tail = observed.catch(() => {})
+    return observed
+  }
+
+  const schedule = (publishNow: number) => {
+    if (timer !== undefined || !input.prepareLive || stopped) return
+    const delay = Math.max(
+      0,
+      STREAM_LIVE_UPDATE_INTERVAL_MS - (publishNow - input.accumulator.lastLivePublishedAt),
+    )
+    timer = setTimeout(() => {
+      timer = undefined
+      void enqueue(now()).catch(() => {})
+    }, delay)
+  }
+
+  return {
+    async afterEvent(publishNow) {
+      throwIfFailed()
+      if (!input.prepareLive || !input.accumulator.dirtySinceLastLivePublish) return
+      if (shouldPublishStreamAccumulatorLive(input.accumulator, publishNow)) {
+        clearTimer()
+        await enqueue(publishNow)
+        return
+      }
+      schedule(publishNow)
+    },
+    async flush() {
+      clearTimer()
+      throwIfFailed()
+      if (input.prepareLive && input.accumulator.dirtySinceLastLivePublish) {
+        await enqueue(now())
+      }
+      await tail
+      throwIfFailed()
+    },
+    async stop() {
+      clearTimer()
+      stopped = true
+      await tail
+      throwIfFailed()
+    },
+  }
+}
+
+async function* openAfterDispatchGuard(
+  beforeDispatch: () => Promise<void> | void,
+  open: () => AsyncIterable<AssistantStreamChunk>,
+  onFailure: () => void,
+): AsyncGenerator<AssistantStreamChunk> {
+  try {
+    await beforeDispatch()
+  } catch (error) {
+    onFailure()
+    throw error
+  }
+  yield* open()
+}
+
+function resolveAbortReason(configured: GenerationAttemptRunnerInput['abortReason']): AbortReason {
+  if (typeof configured === 'function') return configured()
+  return configured ?? 'user'
+}
+
+function prematureStreamEndError(): ApiError {
+  return new ApiError({
+    kind: 'protocol',
+    code: 'STREAM_TRUNCATED',
+    message: 'Stream ended before a terminal event',
+    midStream: true,
+    retryable: true,
+  })
+}

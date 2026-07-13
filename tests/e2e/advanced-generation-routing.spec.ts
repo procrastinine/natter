@@ -1,4 +1,4 @@
-import { expect, type Page, test } from '@playwright/test'
+import { expect, type Page, test } from './fixtures'
 import {
   buildSseBody,
   clearIndexedDb,
@@ -6,6 +6,7 @@ import {
   firstChatId,
   readMessages,
   seedFirstRun,
+  waitForAssistantGenerationFinished,
 } from './helpers'
 
 const OR_CHAT_MODEL = 'qwen/qwen3-4b'
@@ -26,7 +27,6 @@ type PlanEntry = {
 }
 
 test.beforeEach(async ({ page }) => {
-  await page.goto('/')
   await clearIndexedDb(page)
   await page.evaluate(() =>
     (
@@ -392,12 +392,9 @@ test('GUI edit Save & Send reuses provider planning for the edited branch', asyn
   expect(JSON.stringify(second?.messages)).toContain('edited user prompt')
   expect(JSON.stringify(second?.messages)).not.toContain('original user prompt')
   expect(second?.provider).toMatchObject({ data_collection: 'deny' })
-  expect((second?.provider as { order?: string[] }).order?.slice(0, 3)).toEqual([
-    'Budget Clean',
-    'Alpha ZDR',
-    'Tiny Context',
-  ])
-  expect((second?.provider as { ignore?: string[] }).ignore).toEqual(
+  const secondProvider = second?.provider as { order?: string[]; ignore?: string[] } | undefined
+  expect(secondProvider?.order?.slice(0, 3)).toEqual(['Budget Clean', 'Alpha ZDR', 'Tiny Context'])
+  expect(secondProvider?.ignore).toEqual(
     expect.arrayContaining(['Fast Retain', 'Training Host', 'Tiny Context', 'UserID Host']),
   )
 
@@ -508,7 +505,9 @@ test('GUI duplicate provider display names stay independently selectable by slug
     disablePrivacyFilter: false,
   })
   await createChatAndOpen(page)
+  await openSettingsPanel(page)
   await seedLegacyProviderPrivacy(page, ['Anthropic'])
+  await page.reload()
   await openSettingsPanel(page)
 
   const anth2 = page
@@ -545,6 +544,7 @@ test('GUI duplicate provider display names stay independently selectable by slug
   await expect(page.locator('[data-ui="message"][data-role="assistant"]').first()).toContainText(
     'duplicate provider ok',
   )
+  await waitForAssistantGenerationFinished(page, await firstChatId(page))
 
   const provider = requests[0]?.body.provider as { ignore?: string[]; order?: string[] }
   expect(provider.ignore).toEqual(['anthropic/2'])

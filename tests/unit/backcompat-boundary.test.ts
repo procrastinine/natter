@@ -19,6 +19,13 @@ describe('backcompat boundary', () => {
     expect(offenders).toEqual([])
   })
 
+  it('keeps backcompat runners independent from the runtime DB module', () => {
+    const offenders = sourceFiles(join(SRC_ROOT, 'backcompat'))
+      .map((file) => relative(SRC_ROOT, file).split(sep).join('/'))
+      .filter((rel) => importsRuntimeDb(readFileSync(join(SRC_ROOT, rel), 'utf8')))
+    expect(offenders).toEqual([])
+  })
+
   it('does not keep removed schema branches in live source', () => {
     const forbidden = [
       'usePreferredOrdering',
@@ -50,6 +57,12 @@ function importsBackcompat(source: string): boolean {
   return (
     /from\s+['"][^'"]*backcompat\//.test(source) ||
     /import\s*\([^)]*['"][^'"]*backcompat\//.test(source)
+  )
+}
+
+function importsRuntimeDb(source: string): boolean {
+  return /from\s+['"][^'"]*store\/(?:db|workspace-repository|browser-(?:repo|import-export|domain-mutations))(?:\.ts)?['"]/.test(
+    source,
   )
 }
 

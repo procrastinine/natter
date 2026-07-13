@@ -1,7 +1,10 @@
 import type { ReasoningDetail, ReasoningFormat, ReasoningInclude, ReasoningSettings } from './types'
 
-// Phase 11: the three-checkbox `ReasoningInclude` policy. See
-// `plan/phase11-implementation.md §2`.
+type ReasoningSettingsInput = Omit<Partial<ReasoningSettings>, 'include'> & {
+  include?: Partial<ReasoningInclude> | null
+}
+
+// Three-checkbox `ReasoningInclude` policy.
 //
 // Default policy:
 //   - **`encrypted: true`** — round-trip the opaque carry-forward carrier for
@@ -32,7 +35,7 @@ export function defaultReasoningInclude(
 // before readers assume the nested fields exist. Return the input verbatim
 // when already well-formed so downstream memoization holds. Never mutates.
 export function normalizeReasoningSettings(
-  input: Partial<ReasoningSettings> | undefined,
+  input: ReasoningSettingsInput | undefined,
 ): ReasoningSettings {
   if (!input) {
     return {
@@ -45,7 +48,7 @@ export function normalizeReasoningSettings(
   const needsInclude =
     input.include === undefined ||
     input.include === null ||
-    typeof (input.include as Partial<ReasoningInclude>).encrypted !== 'boolean'
+    typeof input.include.encrypted !== 'boolean'
   const needsMode = input.mode === undefined
   const needsExclude = input.exclude === undefined
   if (!needsInclude && !needsMode && !needsExclude) {
@@ -91,10 +94,9 @@ interface FilterReasoningOptions {
 }
 
 // OpenAI direct emits `openai-responses-v1`; OpenRouter's `/responses` proxy
-// rewrites to `azure-openai-responses-v1` (confirmed by live probe 6 in
-// `plan/phase11-research.md`). Both are accepted on either target — treat as
-// interchangeable. xAI Grok uses `xai-responses-v1`, which is NOT accepted
-// by OpenAI / Azure (different upstream signing key); kept distinct.
+// rewrites it to `azure-openai-responses-v1`. Both are accepted on either
+// target. xAI Grok uses `xai-responses-v1`, which OpenAI and Azure reject due
+// to its different upstream signing key, so it stays distinct.
 const OPENAI_RESPONSES_FAMILY: ReadonlySet<ReasoningFormat> = new Set<ReasoningFormat>([
   'openai-responses-v1',
   'azure-openai-responses-v1',
@@ -138,21 +140,18 @@ export function filterReasoningForInclude(
       return true
     }
     if (d.type === 'reasoning.summary') return include.summary
-    if (d.type === 'reasoning.text') {
-      // Anthropic case: `reasoning.text` with a `.signature` IS the
-      // encrypted carrier. Gate by `include.encrypted` + format check.
-      if (typeof d.signature === 'string' && d.signature.length > 0) {
-        if (!include.encrypted) return false
-        if (!preservationFormat || preservationFormat === 'unknown') return false
-        if (d.format && !formatsCompatible(d.format, preservationFormat)) {
-          warnIncompatibleFormat(d.format, preservationFormat)
-          return false
-        }
-        return true
+    // Anthropic case: `reasoning.text` with a `.signature` IS the
+    // encrypted carrier. Gate by `include.encrypted` + format check.
+    if (typeof d.signature === 'string' && d.signature.length > 0) {
+      if (!include.encrypted) return false
+      if (!preservationFormat || preservationFormat === 'unknown') return false
+      if (d.format && !formatsCompatible(d.format, preservationFormat)) {
+        warnIncompatibleFormat(d.format, preservationFormat)
+        return false
       }
-      return include.text
+      return true
     }
-    return false
+    return include.text
   })
 }
 
@@ -175,8 +174,6 @@ function startsWithBlankLine(s: string | null | undefined): boolean {
   return typeof s === 'string' && /^\s*\n/.test(s)
 }
 
-const MAX_REASONING_OVERLAP_CHARS = 4096
-
 export function mergeReasoningText(
   existingRaw: string | null | undefined,
   incomingRaw: string | null | undefined,
@@ -187,16 +184,6 @@ export function mergeReasoningText(
   if (existing.length === 0) return incoming
   if (incoming === existing) return existing
   if (incoming.startsWith(existing)) return incoming
-  if (existing.startsWith(incoming) || existing.endsWith(incoming)) return existing
-  for (
-    let overlap = Math.min(existing.length, incoming.length, MAX_REASONING_OVERLAP_CHARS);
-    overlap > 0;
-    overlap -= 1
-  ) {
-    if (existing.slice(-overlap) === incoming.slice(0, overlap)) {
-      return existing + incoming.slice(overlap)
-    }
-  }
   return existing + incoming
 }
 
@@ -214,8 +201,8 @@ export function mergeReasoningDetail(
   }
   if (existing.type === 'reasoning.summary' && incoming.type === 'reasoning.summary') {
     // Incremental: Responses API sends `summary_text.delta` events that
-    // append to a single summary row. Overlap-dedup via `mergeReasoningText`
-    // so the merge is idempotent if the same chunk arrives twice.
+    // append to a single summary row. Exact repeats and explicit cumulative
+    // prefix growth are idempotent; other boundary overlaps append verbatim.
     //
     // Gemini-family summaries: each thinking section arrives as its own
     // entry (one per OpenRouter `reasoning_details[]` element OR one per
@@ -228,9 +215,9 @@ export function mergeReasoningDetail(
     let mergedSummary = mergeReasoningText(existing.summary, incoming.summary)
     if (
       isGeminiCoalesce &&
-      mergedSummary === `${existing.summary ?? ''}${incoming.summary ?? ''}` &&
-      (existing.summary?.length ?? 0) > 0 &&
-      (incoming.summary?.length ?? 0) > 0 &&
+      mergedSummary === `${existing.summary}${incoming.summary}` &&
+      existing.summary.length > 0 &&
+      incoming.summary.length > 0 &&
       !endsWithBlankLine(existing.summary) &&
       !startsWithBlankLine(incoming.summary)
     ) {
@@ -249,18 +236,11 @@ export function mergeReasoningDetail(
 }
 
 export function normalizeReasoningDetails(details: ReasoningDetail[]): ReasoningDetail[] {
-  const normalized: ReasoningDetail[] = []
-  for (const raw of details) {
-    if (raw.id?.startsWith('tool_')) continue
-    const detail = normalizeIncomingReasoningDetail(raw)
-    const target = findMergeTargetIndex(normalized, detail)
-    if (target >= 0) {
-      normalized[target] = mergeReasoningDetail(normalized[target], detail)
-      continue
-    }
-    normalized.push(detail)
-  }
-  return dropMirroredOpenAiSummaryText(normalized)
+  // Persisted rows are already stream-reduced. Keep their order, identity,
+  // metadata, and payload bytes; only apply provider-specific relabeling to
+  // each row independently. Ambiguous deduplication cannot be repaired after
+  // it guesses wrong, and this helper is also used by rendering and budgets.
+  return details.map(normalizeIncomingReasoningDetail)
 }
 
 // On-ingest relabel: OpenRouter returns Gemini 3 thought SUMMARIES tagged
@@ -297,13 +277,8 @@ export function findMergeTargetIndex(
   for (let index = details.length - 1; index >= 0; index -= 1) {
     const existing = details[index]
     if (!existing || existing.type !== incoming.type) continue
+    if ((existing.id || incoming.id) && existing.id !== incoming.id) continue
     if (shareIdentity(existing, incoming)) return index
-    if (incoming.type === 'reasoning.text' && existing.type === 'reasoning.text') {
-      const merged = mergeReasoningText(existing.text, incoming.text)
-      const appended = `${existing.text ?? ''}${incoming.text ?? ''}`
-      if (merged !== appended) return index
-      continue
-    }
     if (incoming.type === 'reasoning.summary' && existing.type === 'reasoning.summary') {
       // Two Gemini-family summaries belong to the same logical reasoning
       // row regardless of index: Gemini emits each thinking section as its
@@ -317,8 +292,7 @@ export function findMergeTargetIndex(
       }
       // Backcompat: some older streams persisted successive snapshots of the
       // SAME OpenAI/OpenRouter summary as separate rows without a stable id.
-      // Collapse obvious prefix/overlap growth when both rows sit on the same
-      // index.
+      // Collapse only strict prefix growth when both rows sit on the same index.
       if (
         existing.index !== undefined &&
         incoming.index !== undefined &&
@@ -345,7 +319,7 @@ export function findMergeTargetIndex(
 
 function shareIdentity(existing: ReasoningDetail, incoming: ReasoningDetail): boolean {
   if (existing.type !== incoming.type) return false
-  if (existing.id && incoming.id) return existing.id === incoming.id
+  if (existing.id || incoming.id) return existing.id === incoming.id
   // Summaries are content-addressed: each summary part is its own row.
   // Two summaries that happen to carry the same `index` (OpenRouter's
   // Gemini path reuses index=0 across all thought summaries) are NOT the
@@ -357,23 +331,4 @@ function shareIdentity(existing: ReasoningDetail, incoming: ReasoningDetail): bo
     incoming.index !== undefined &&
     existing.index === incoming.index
   )
-}
-
-function dropMirroredOpenAiSummaryText(details: ReasoningDetail[]): ReasoningDetail[] {
-  const openAiSummaries = details.filter(
-    (detail): detail is Extract<ReasoningDetail, { type: 'reasoning.summary' }> =>
-      detail.type === 'reasoning.summary' && isOpenAiResponsesFamilyFormat(detail.format),
-  )
-  if (openAiSummaries.length === 0) return details
-  return details.filter((detail) => {
-    if (detail.type !== 'reasoning.text') return true
-    if (typeof detail.signature === 'string' && detail.signature.length > 0) return true
-    return !openAiSummaries.some(
-      (summary) =>
-        summary.summary === detail.text &&
-        summary.index !== undefined &&
-        detail.index !== undefined &&
-        summary.index === detail.index,
-    )
-  })
 }

@@ -1,5 +1,4 @@
 // Inline `<think>`/`<thought>` tag lifter for chat-completions content streams.
-// See `plan/05-transforms-and-quirks.md §5.2` ("Inline <think>/<thought>").
 //
 // Some thinking models emit their chain-of-thought inline in `delta.content`
 // rather than via `reasoning_details[]`. DeepSeek-R1 / Qwen3 / Gemma-3 are
@@ -82,7 +81,7 @@ export function createInlineReasoningLifter(
     buffer += text
     const out: InlineReasoningEvent[] = []
 
-    while (true) {
+    for (;;) {
       if (mode === 'undecided') {
         const result = tryUndecided()
         if (result.wait) return out
@@ -118,28 +117,26 @@ export function createInlineReasoningLifter(
         }
         return out
       }
-      if (mode === 'reasoning') {
-        const closeTag = `</${activeTag}>`
-        const closeIdx = buffer.indexOf(closeTag)
-        if (closeIdx >= 0) {
-          if (closeIdx > 0) {
-            out.push({ kind: 'reasoning', text: buffer.slice(0, closeIdx) })
-          }
-          buffer = buffer.slice(closeIdx + closeTag.length)
-          mode = 'content'
-          activeTag = null
-          // Confirm: this model uses inline tags. Any subsequent open tag
-          // anywhere in the stream should also lift.
-          armedForMultiBlock = true
-          continue
+      const closeTag = `</${activeTag}>`
+      const closeIdx = buffer.indexOf(closeTag)
+      if (closeIdx >= 0) {
+        if (closeIdx > 0) {
+          out.push({ kind: 'reasoning', text: buffer.slice(0, closeIdx) })
         }
-        const safeLen = findSafeReasoningPrefixLen(buffer, closeTag)
-        if (safeLen > 0) {
-          out.push({ kind: 'reasoning', text: buffer.slice(0, safeLen) })
-          buffer = buffer.slice(safeLen)
-        }
-        return out
+        buffer = buffer.slice(closeIdx + closeTag.length)
+        mode = 'content'
+        activeTag = null
+        // Confirm: this model uses inline tags. Any subsequent open tag
+        // anywhere in the stream should also lift.
+        armedForMultiBlock = true
+        continue
       }
+      const safeLen = findSafeReasoningPrefixLen(buffer, closeTag)
+      if (safeLen > 0) {
+        out.push({ kind: 'reasoning', text: buffer.slice(0, safeLen) })
+        buffer = buffer.slice(safeLen)
+      }
+      return out
     }
   }
 

@@ -1,7 +1,6 @@
 import { fireEvent, render, waitFor } from '@testing-library/react'
 import 'fake-indexeddb/auto'
 import Dexie from 'dexie'
-import { useLiveQuery } from 'dexie-react-hooks'
 import { IDBFactory } from 'fake-indexeddb'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { effectiveCapabilityFromEndpoints } from '../../src/core/capabilities'
@@ -11,6 +10,9 @@ import type { Message, MessageAttachmentRef, ModelEndpoint } from '../../src/cor
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import { createChat, getChat, loadActiveBranchSnapshot } from '../../src/store/chats'
 import { __resetDbForTests, openDb } from '../../src/store/db'
+import { __resetLockTrackerForTests, withMutationLocks } from '../../src/store/locks'
+import { chatMessageDependencies, chatRowDependencies } from '../../src/store/reactive-dependencies'
+import { useRepositoryQuery } from '../../src/store/reactive-query'
 import { ContextPanel } from '../../src/ui/settings/ContextPanel'
 import { putTestMessages } from '../helpers/message-storage'
 
@@ -91,8 +93,18 @@ function LiveContextPanel({
   chatId: string
   capability: ReturnType<typeof effectiveCapabilityFromEndpoints>
 }) {
-  const chat = useLiveQuery(() => getChat(chatId), [chatId], undefined)
-  const branchSnapshot = useLiveQuery(() => loadActiveBranchSnapshot(chatId, {}), [chatId], null)
+  const chat = useRepositoryQuery(
+    JSON.stringify(['chat', chatId]),
+    () => getChat(chatId),
+    undefined,
+    chatRowDependencies(chatId),
+  )
+  const branchSnapshot = useRepositoryQuery(
+    JSON.stringify(['active-branch', chatId, {}]),
+    () => loadActiveBranchSnapshot(chatId, {}),
+    null,
+    chatMessageDependencies(chatId),
+  )
   const estimate: PromptSizeEstimate | null =
     chat && branchSnapshot
       ? estimateSettingsPromptSize(
@@ -116,6 +128,7 @@ function LiveContextPanel({
 
 async function resetAll() {
   __resetBroadcastForTests()
+  __resetLockTrackerForTests()
   __resetDbForTests()
   await Dexie.delete(DB_NAME)
 }
@@ -157,6 +170,32 @@ describe('ContextPanel slider persistence', () => {
     await waitFor(async () => {
       expect((await getChat(chat.id))?.settings.customMaxContext).toBe(4096)
     })
+  })
+
+  it('flushes a pending max-context slider value on unmount', async () => {
+    const settings = cloneDefaultChatSettings()
+    settings.model = 'openai/gpt-4o-mini'
+    const chat = await createChat({ settings })
+    const capability = effectiveCapabilityFromEndpoints(settings.model, [makeEndpoint()])
+    const estimate = estimateSettingsPromptSize(settings, [], '', null)
+    const { container, unmount } = render(
+      <ContextPanel
+        chat={chat}
+        capability={capability}
+        endpointTokenizer={null}
+        estimateOverride={estimate}
+      />,
+    )
+    const maxContext = container.querySelector<HTMLInputElement>('[data-ui="slider"]')
+    expect(maxContext).toBeTruthy()
+
+    fireEvent.change(maxContext as HTMLInputElement, { target: { value: '8192' } })
+    unmount()
+
+    await waitFor(async () => {
+      expect((await getChat(chat.id))?.settings.customMaxContext).toBe(8192)
+    })
+    await withMutationLocks([{ kind: 'chat-meta', chatId: chat.id }], () => {})
   })
 
   it('uses the same estimator when Files is switched Off', async () => {

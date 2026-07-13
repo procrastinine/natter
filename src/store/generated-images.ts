@@ -10,15 +10,18 @@ import { createAttachmentRef, normalizeAttachmentRefs } from './attachment-refs'
 import {
   attachmentScopes,
   createRemoteAttachment,
-  decRefs,
   deleteUnreferencedAttachment,
-  incRefs,
   ingestAttachmentBytes,
+  type PreparedAttachmentBundle,
+  persistPreparedAttachmentBundle,
+  prepareAttachmentBytes,
+  prepareRemoteAttachment,
   replaceAttachmentBytes,
 } from './attachments'
 import { getBrowserRepository } from './browser-repo'
 import { resolveKeyIfPresent } from './keys'
 import { getProfile } from './profiles'
+import type { MutationContext } from './repository'
 
 type OutputImageItem = Extract<ContentItem, { type: 'output_image' }>
 type OutputAudioItem = Extract<ContentItem, { type: 'audio_output' }>
@@ -58,6 +61,10 @@ interface GeneratedOutputMaterialization {
   changed: boolean
 }
 
+export interface PreparedGeneratedOutputMaterialization extends GeneratedOutputMaterialization {
+  attachmentBundles: PreparedAttachmentBundle[]
+}
+
 function generatedImageOutputAttachmentIds(content: readonly ContentItem[]): Set<string> {
   return generatedOutputAttachmentIds(content)
 }
@@ -77,6 +84,7 @@ async function materializeGeneratedImageOutputAttachments(input: {
   content: readonly ContentItem[]
   now?: number
   downloader?: GeneratedOutputDownloader
+  attachmentBundles?: PreparedAttachmentBundle[]
 }): Promise<GeneratedImageMaterialization> {
   const now = input.now ?? Date.now()
   const replacements: GeneratedImageReplacement[] = []
@@ -84,8 +92,7 @@ async function materializeGeneratedImageOutputAttachments(input: {
   for (let index = 0; index < input.content.length; index += 1) {
     const item = input.content[index]
     if (
-      !item ||
-      item.type !== 'output_image' ||
+      item?.type !== 'output_image' ||
       item.attachmentId ||
       typeof item.url !== 'string' ||
       item.url.length === 0
@@ -99,6 +106,7 @@ async function materializeGeneratedImageOutputAttachments(input: {
       index,
       now,
       ...(input.downloader ? { downloader: input.downloader } : {}),
+      ...(input.attachmentBundles ? { attachmentBundles: input.attachmentBundles } : {}),
     })
     if (!materialized) {
       content.push(structuredClone(item))
@@ -135,11 +143,46 @@ export async function materializeGeneratedOutputAttachments(input: {
   }
 }
 
+export async function prepareGeneratedOutputAttachments(input: {
+  messageId: MessageId
+  content: readonly ContentItem[]
+  now?: number
+  downloader?: GeneratedOutputDownloader
+}): Promise<PreparedGeneratedOutputMaterialization> {
+  const attachmentBundles: PreparedAttachmentBundle[] = []
+  const imageMaterialized = await materializeGeneratedImageOutputAttachments({
+    ...input,
+    attachmentBundles,
+  })
+  const mediaMaterialized = await materializeGeneratedAudioVideoOutputAttachments({
+    ...input,
+    content: imageMaterialized.content,
+    attachmentBundles,
+  })
+  return {
+    content: mediaMaterialized.content,
+    replacements: [...imageMaterialized.replacements, ...mediaMaterialized.replacements],
+    newRefs: [...imageMaterialized.newRefs, ...mediaMaterialized.newRefs],
+    changed: imageMaterialized.changed || mediaMaterialized.changed,
+    attachmentBundles,
+  }
+}
+
+export async function persistPreparedGeneratedOutputAttachments(
+  ctx: MutationContext,
+  prepared: Pick<PreparedGeneratedOutputMaterialization, 'attachmentBundles'>,
+): Promise<void> {
+  for (const bundle of prepared.attachmentBundles) {
+    await persistPreparedAttachmentBundle(ctx, bundle)
+  }
+}
+
 async function materializeGeneratedAudioVideoOutputAttachments(input: {
   messageId: MessageId
   content: readonly ContentItem[]
   now?: number
   downloader?: GeneratedOutputDownloader
+  attachmentBundles?: PreparedAttachmentBundle[]
 }): Promise<GeneratedOutputMaterialization> {
   const now = input.now ?? Date.now()
   const replacements: GeneratedOutputReplacement[] = []
@@ -164,6 +207,7 @@ async function materializeGeneratedAudioVideoOutputAttachments(input: {
             index,
             now,
             ...(input.downloader ? { downloader: input.downloader } : {}),
+            ...(input.attachmentBundles ? { attachmentBundles: input.attachmentBundles } : {}),
           })
         : await materializeOneGeneratedVideo({
             messageId: input.messageId,
@@ -171,6 +215,7 @@ async function materializeGeneratedAudioVideoOutputAttachments(input: {
             index,
             now,
             ...(input.downloader ? { downloader: input.downloader } : {}),
+            ...(input.attachmentBundles ? { attachmentBundles: input.attachmentBundles } : {}),
           })
     if (!materialized) {
       content.push(structuredClone(item))
@@ -234,7 +279,6 @@ export async function migrateGeneratedOutputAttachments(messageId: MessageId): P
         attachmentRefs: merged.refs,
       }
       delete next.cachedMediaTokens
-      await incRefs(ctx, merged.addedRefs)
       await ctx.putMessage(next, { touchChatSummary: false, broadcast: true })
     },
   )
@@ -325,7 +369,7 @@ async function sourceUrlForOutputVideo(item: OutputVideoItem): Promise<string | 
   if (!item.attachmentId) return null
   const bundle = await getBrowserRepository().getAttachmentBundle(item.attachmentId)
   const attachment = bundle?.attachment
-  if (!attachment || attachment.origin !== 'generated-output') return null
+  if (attachment?.origin !== 'generated-output') return null
   if (attachment.storage.kind === 'remote-url') return attachment.storage.url
   return attachment.sourceUrl ?? null
 }
@@ -355,7 +399,7 @@ async function localizeReferencedGeneratedOutputAttachments(
     seen.add(item.attachmentId)
     const bundle = await repo.getAttachmentBundle(item.attachmentId)
     const attachment = bundle?.attachment
-    if (!attachment || attachment.origin !== 'generated-output') continue
+    if (attachment?.origin !== 'generated-output') continue
     if (attachment.storage.kind !== 'remote-url') continue
     const kind =
       item.type === 'output_image' ? 'image' : item.type === 'audio_output' ? 'audio' : 'video'
@@ -430,7 +474,6 @@ export async function normalizeGeneratedImageOutputAttachmentRefs(
         attachmentRefs: currentPlan.kept,
       }
       delete next.cachedMediaTokens
-      await decRefs(ctx, currentPlan.removed)
       await ctx.putMessage(next, { touchChatSummary: false, broadcast: true })
     },
   )
@@ -463,6 +506,7 @@ async function materializeOneGeneratedImage(input: {
   index: number
   now: number
   downloader?: GeneratedOutputDownloader
+  attachmentBundles?: PreparedAttachmentBundle[]
 }): Promise<GeneratedImageReplacement | null> {
   const sourceUrl = input.item.url
   if (!sourceUrl) return null
@@ -473,6 +517,7 @@ async function materializeOneGeneratedImage(input: {
       filenameStem: `generated-${input.messageId}-${input.index + 1}`,
       now: input.now,
       ...(input.downloader ? { downloader: input.downloader } : {}),
+      ...(input.attachmentBundles ? { attachmentBundles: input.attachmentBundles } : {}),
     })
     const ref = createAttachmentRef(attachment.id, {
       messageId: input.messageId,
@@ -495,6 +540,7 @@ async function materializeOneGeneratedAudio(input: {
   index: number
   now: number
   downloader?: GeneratedOutputDownloader
+  attachmentBundles?: PreparedAttachmentBundle[]
 }): Promise<GeneratedOutputReplacement | null> {
   const sourceUrl = input.item.url
   if (!sourceUrl) return null
@@ -505,6 +551,7 @@ async function materializeOneGeneratedAudio(input: {
       filenameStem: `generated-${input.messageId}-audio-${input.index + 1}`,
       now: input.now,
       ...(input.downloader ? { downloader: input.downloader } : {}),
+      ...(input.attachmentBundles ? { attachmentBundles: input.attachmentBundles } : {}),
     })
     const ref = createAttachmentRef(attachment.id, {
       messageId: input.messageId,
@@ -529,6 +576,7 @@ async function materializeOneGeneratedVideo(input: {
   index: number
   now: number
   downloader?: GeneratedOutputDownloader
+  attachmentBundles?: PreparedAttachmentBundle[]
 }): Promise<GeneratedOutputReplacement | null> {
   const sourceUrl = input.item.url
   if (!sourceUrl) return null
@@ -539,6 +587,7 @@ async function materializeOneGeneratedVideo(input: {
       filenameStem: `generated-${input.messageId}-video-${input.index + 1}`,
       now: input.now,
       ...(input.downloader ? { downloader: input.downloader } : {}),
+      ...(input.attachmentBundles ? { attachmentBundles: input.attachmentBundles } : {}),
     })
     const ref = createAttachmentRef(attachment.id, {
       messageId: input.messageId,
@@ -561,19 +610,23 @@ async function createGeneratedImageAttachment(input: {
   filenameStem: string
   now: number
   downloader?: GeneratedOutputDownloader
+  attachmentBundles?: PreparedAttachmentBundle[]
 }): Promise<Attachment> {
   const parsed = parseImagePayload(input.sourceUrl)
   if (parsed) {
     const buffer = new ArrayBuffer(parsed.bytes.byteLength)
     new Uint8Array(buffer).set(parsed.bytes)
-    const bundle = await ingestAttachmentBytes({
-      blob: new Blob([buffer], { type: parsed.mime }),
-      filename: `${input.filenameStem}.${extensionForMime(parsed.mime)}`,
-      declaredMime: parsed.mime,
-      origin: 'generated-output',
-      id: input.id,
-      now: input.now,
-    })
+    const bundle = await ingestOrPrepareGeneratedAttachment(
+      {
+        blob: new Blob([buffer], { type: parsed.mime }),
+        filename: `${input.filenameStem}.${extensionForMime(parsed.mime)}`,
+        declaredMime: parsed.mime,
+        origin: 'generated-output',
+        id: input.id,
+        now: input.now,
+      },
+      input.attachmentBundles,
+    )
     return bundle.attachment
   }
   const remote = remoteImage(input.sourceUrl)
@@ -581,26 +634,32 @@ async function createGeneratedImageAttachment(input: {
   const downloaded = await downloadGeneratedBlob(input.sourceUrl, 'image', input.downloader)
   if (downloaded) {
     const mime = downloaded.type || remote.mime
-    const bundle = await ingestAttachmentBytes({
-      blob: downloaded,
-      filename: `${input.filenameStem}.${extensionForMime(mime)}`,
-      declaredMime: mime,
-      origin: 'generated-output',
-      sourceUrl: input.sourceUrl,
-      id: input.id,
-      now: input.now,
-    })
+    const bundle = await ingestOrPrepareGeneratedAttachment(
+      {
+        blob: downloaded,
+        filename: `${input.filenameStem}.${extensionForMime(mime)}`,
+        declaredMime: mime,
+        origin: 'generated-output',
+        sourceUrl: input.sourceUrl,
+        id: input.id,
+        now: input.now,
+      },
+      input.attachmentBundles,
+    )
     return bundle.attachment
   }
-  return createRemoteAttachment({
-    url: input.sourceUrl,
-    filename: `${input.filenameStem}.${remote.extension}`,
-    mime: remote.mime,
-    kind: 'image',
-    origin: 'generated-output',
-    id: input.id,
-    now: input.now,
-  })
+  return createOrPrepareGeneratedRemoteAttachment(
+    {
+      url: input.sourceUrl,
+      filename: `${input.filenameStem}.${remote.extension}`,
+      mime: remote.mime,
+      kind: 'image',
+      origin: 'generated-output',
+      id: input.id,
+      now: input.now,
+    },
+    input.attachmentBundles,
+  )
 }
 
 async function createGeneratedAudioAttachment(input: {
@@ -609,19 +668,23 @@ async function createGeneratedAudioAttachment(input: {
   filenameStem: string
   now: number
   downloader?: GeneratedOutputDownloader
+  attachmentBundles?: PreparedAttachmentBundle[]
 }): Promise<Attachment> {
   const parsed = parseMediaDataUrl(input.sourceUrl, 'audio/')
   if (parsed) {
     const buffer = new ArrayBuffer(parsed.bytes.byteLength)
     new Uint8Array(buffer).set(parsed.bytes)
-    const bundle = await ingestAttachmentBytes({
-      blob: new Blob([buffer], { type: parsed.mime }),
-      filename: `${input.filenameStem}.${extensionForMediaMime(parsed.mime)}`,
-      declaredMime: parsed.mime,
-      origin: 'generated-output',
-      id: input.id,
-      now: input.now,
-    })
+    const bundle = await ingestOrPrepareGeneratedAttachment(
+      {
+        blob: new Blob([buffer], { type: parsed.mime }),
+        filename: `${input.filenameStem}.${extensionForMediaMime(parsed.mime)}`,
+        declaredMime: parsed.mime,
+        origin: 'generated-output',
+        id: input.id,
+        now: input.now,
+      },
+      input.attachmentBundles,
+    )
     return bundle.attachment
   }
   const remote = remoteMedia(input.sourceUrl, 'audio')
@@ -629,26 +692,32 @@ async function createGeneratedAudioAttachment(input: {
   const downloaded = await downloadGeneratedBlob(input.sourceUrl, 'audio', input.downloader)
   if (downloaded) {
     const mime = downloaded.type || remote.mime
-    const bundle = await ingestAttachmentBytes({
-      blob: downloaded,
-      filename: `${input.filenameStem}.${extensionForMediaMime(mime)}`,
-      declaredMime: mime,
-      origin: 'generated-output',
-      sourceUrl: input.sourceUrl,
-      id: input.id,
-      now: input.now,
-    })
+    const bundle = await ingestOrPrepareGeneratedAttachment(
+      {
+        blob: downloaded,
+        filename: `${input.filenameStem}.${extensionForMediaMime(mime)}`,
+        declaredMime: mime,
+        origin: 'generated-output',
+        sourceUrl: input.sourceUrl,
+        id: input.id,
+        now: input.now,
+      },
+      input.attachmentBundles,
+    )
     return bundle.attachment
   }
-  return createRemoteAttachment({
-    url: input.sourceUrl,
-    filename: `${input.filenameStem}.${remote.extension}`,
-    mime: remote.mime,
-    kind: 'audio',
-    origin: 'generated-output',
-    id: input.id,
-    now: input.now,
-  })
+  return createOrPrepareGeneratedRemoteAttachment(
+    {
+      url: input.sourceUrl,
+      filename: `${input.filenameStem}.${remote.extension}`,
+      mime: remote.mime,
+      kind: 'audio',
+      origin: 'generated-output',
+      id: input.id,
+      now: input.now,
+    },
+    input.attachmentBundles,
+  )
 }
 
 async function createGeneratedVideoAttachment(input: {
@@ -657,19 +726,23 @@ async function createGeneratedVideoAttachment(input: {
   filenameStem: string
   now: number
   downloader?: GeneratedOutputDownloader
+  attachmentBundles?: PreparedAttachmentBundle[]
 }): Promise<Attachment> {
   const parsed = parseMediaDataUrl(input.sourceUrl, 'video/')
   if (parsed) {
     const buffer = new ArrayBuffer(parsed.bytes.byteLength)
     new Uint8Array(buffer).set(parsed.bytes)
-    const bundle = await ingestAttachmentBytes({
-      blob: new Blob([buffer], { type: parsed.mime }),
-      filename: `${input.filenameStem}.${extensionForMediaMime(parsed.mime)}`,
-      declaredMime: parsed.mime,
-      origin: 'generated-output',
-      id: input.id,
-      now: input.now,
-    })
+    const bundle = await ingestOrPrepareGeneratedAttachment(
+      {
+        blob: new Blob([buffer], { type: parsed.mime }),
+        filename: `${input.filenameStem}.${extensionForMediaMime(parsed.mime)}`,
+        declaredMime: parsed.mime,
+        origin: 'generated-output',
+        id: input.id,
+        now: input.now,
+      },
+      input.attachmentBundles,
+    )
     return bundle.attachment
   }
   const remote = remoteMedia(input.sourceUrl, 'video')
@@ -677,26 +750,52 @@ async function createGeneratedVideoAttachment(input: {
   const downloaded = await downloadGeneratedBlob(input.sourceUrl, 'video', input.downloader)
   if (downloaded) {
     const mime = downloaded.type || remote.mime
-    const bundle = await ingestAttachmentBytes({
-      blob: downloaded,
-      filename: `${input.filenameStem}.${extensionForMediaMime(mime)}`,
-      declaredMime: mime,
-      origin: 'generated-output',
-      sourceUrl: input.sourceUrl,
-      id: input.id,
-      now: input.now,
-    })
+    const bundle = await ingestOrPrepareGeneratedAttachment(
+      {
+        blob: downloaded,
+        filename: `${input.filenameStem}.${extensionForMediaMime(mime)}`,
+        declaredMime: mime,
+        origin: 'generated-output',
+        sourceUrl: input.sourceUrl,
+        id: input.id,
+        now: input.now,
+      },
+      input.attachmentBundles,
+    )
     return bundle.attachment
   }
-  return createRemoteAttachment({
-    url: input.sourceUrl,
-    filename: `${input.filenameStem}.${remote.extension}`,
-    mime: remote.mime,
-    kind: 'video',
-    origin: 'generated-output',
-    id: input.id,
-    now: input.now,
-  })
+  return createOrPrepareGeneratedRemoteAttachment(
+    {
+      url: input.sourceUrl,
+      filename: `${input.filenameStem}.${remote.extension}`,
+      mime: remote.mime,
+      kind: 'video',
+      origin: 'generated-output',
+      id: input.id,
+      now: input.now,
+    },
+    input.attachmentBundles,
+  )
+}
+
+async function ingestOrPrepareGeneratedAttachment(
+  input: Parameters<typeof prepareAttachmentBytes>[0],
+  attachmentBundles: PreparedAttachmentBundle[] | undefined,
+): Promise<PreparedAttachmentBundle> {
+  if (!attachmentBundles) return ingestAttachmentBytes(input)
+  const bundle = await prepareAttachmentBytes(input)
+  attachmentBundles.push(bundle)
+  return bundle
+}
+
+async function createOrPrepareGeneratedRemoteAttachment(
+  input: Parameters<typeof prepareRemoteAttachment>[0],
+  attachmentBundles: PreparedAttachmentBundle[] | undefined,
+): Promise<Attachment> {
+  if (!attachmentBundles) return createRemoteAttachment(input)
+  const bundle = prepareRemoteAttachment(input)
+  attachmentBundles.push(bundle)
+  return bundle.attachment
 }
 
 function generatedImageAttachmentId(messageId: MessageId, index: number): string {

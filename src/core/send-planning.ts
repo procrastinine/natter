@@ -4,7 +4,7 @@ import { resolveBundledCapability } from '../capabilities'
 import { logRequestPlanDebug } from '../lib/debug-streams'
 import { getCachedModels } from '../store/models-cache'
 import { getWorkspaceRepository } from '../store/workspace-repository'
-import { type ApiRoute, chooseApi } from './api-choice'
+import { type ApiRoute, apiUsedForRoute, chooseApi } from './api-choice'
 import {
   attachmentContextHasRefs,
   attachmentContextIds,
@@ -54,6 +54,7 @@ import type {
   ChatSettings,
   ConnectionProfile,
   ContentItem,
+  GenerationMeta,
   Message,
 } from './types'
 
@@ -195,12 +196,14 @@ export async function resolveRequestPrivacyPlan(
   return neededTokens !== undefined ? { neededTokens, privacy } : { privacy }
 }
 
+export type AssistantRequestTransform = Partial<ChatCompletionsTransformOptions>
+
 interface AssistantRequestPlanInput {
   chat: Chat
   connection: ConnectionProfile
   pathMessages: Message[]
   capabilities?: CapabilityDescriptor
-  transform?: Partial<ChatCompletionsTransformOptions>
+  transform?: AssistantRequestTransform
   signal?: AbortSignal
   settings?: ChatSettings
   stream?: boolean
@@ -212,6 +215,7 @@ export interface AssistantRequestPlan {
   settings: ChatSettings
   useTextProtocol: boolean
   route: ApiRoute | null
+  apiUsed: GenerationMeta['apiUsed']
   requestedModel: string
   geminiModelId?: string
   anthropicModelId?: string
@@ -591,7 +595,7 @@ function toOpenRouterVideoGeneration(
 function videoPromptFromPath(path: readonly Message[]): string {
   for (let i = path.length - 1; i >= 0; i -= 1) {
     const message = path[i]
-    if (!message || message.role !== 'user') continue
+    if (message?.role !== 'user') continue
     const text = contentText(message.content).trim()
     if (text.length > 0) return text
   }
@@ -806,6 +810,7 @@ async function buildAssistantRequestPlan(
     settings,
     useTextProtocol,
     route,
+    apiUsed: apiUsedForRoute(route, useTextProtocol),
     requestedModel,
     ...(geminiModelId ? { geminiModelId } : {}),
     ...(anthropicModelId ? { anthropicModelId } : {}),

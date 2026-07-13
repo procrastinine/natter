@@ -127,8 +127,6 @@ describe('Message active-stream overflow behavior', () => {
         chatId={message.chatId}
         message={message}
         hasAnyReasoningDetails={false}
-        hasSiblingVariants={false}
-        cursor={{}}
         hasConnection={false}
         longMessageDisplayMode="compact"
         onEditInPlace={async () => {}}

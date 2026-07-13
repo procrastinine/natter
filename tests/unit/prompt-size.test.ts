@@ -1,6 +1,4 @@
-// Context-estimation invariants. See `src/core/prompt-size.ts` for the
-// implementation and `plan/14-details.md §14.15` + `CLAUDE.md` "auto memory:
-// Screenshot-first on visual CSS bugs" (no bearing — this suite is pure).
+// Context-estimation invariants.
 //
 // The Composer's budget indicator and the Context-tab gauge both read from
 // `estimatePromptSize`, so every edge case here directly affects what the

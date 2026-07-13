@@ -1,4 +1,3 @@
-import { useLiveQuery } from 'dexie-react-hooks'
 import {
   type ChangeEvent,
   Fragment,
@@ -58,13 +57,13 @@ import {
   deleteUnreferencedAttachment,
   detachAttachmentRef,
   ingestAttachmentBytes,
+  listAttachmentReferenceEdges,
   listAttachmentReferences,
   relinkAttachmentRef,
   replaceAttachmentBytes,
   restoreMissingAttachment,
   setAttachmentRefVisibility,
 } from '../../store/attachments'
-import { getBrowserRepository } from '../../store/browser-repo'
 import {
   DEFAULT_SEARCH_FILTERS,
   hasActiveSearchFilters,
@@ -96,17 +95,35 @@ import {
   estimateQuota,
   isPersisted,
   type QuotaSnapshot,
-  requestPersist,
   requestNotificationPermissionForStoragePersistence,
+  requestPersist,
   storagePersistenceAvailable,
   storagePersistenceNotificationMayHelp,
 } from '../../store/quota'
+import {
+  allTable,
+  attachmentBundleDependencies,
+  GLOBAL_TOKEN_CALIBRATION_DEPENDENCIES,
+  indexKeys,
+  primaryKeys,
+  SIDEBAR_MODEL_DEPENDENCIES,
+  WORKSPACE_META_DEPENDENCIES,
+} from '../../store/reactive-dependencies'
+import { useRepositoryQuery } from '../../store/reactive-query'
 import type { AttachmentBundle } from '../../store/repository'
 import { abortSearchSession, requestSearchSession } from '../../store/search-session'
-import { readSidebarSortMode, writeSidebarSortMode } from '../../store/sidebar-preferences'
-import { getWorkspaceRepository } from '../../store/workspace-repository'
+import {
+  readSidebarSortMode,
+  SIDEBAR_SORT_SETTING_KEY,
+  writeSidebarSortMode,
+} from '../../store/sidebar-preferences'
 import { listTags } from '../../store/tags'
-import { startSearchStoreBroadcastListener, useSearchStore } from '../../store/zustand/searchStore'
+import { getWorkspaceRepository } from '../../store/workspace-repository'
+import {
+  orderedSearchResults,
+  startSearchStoreBroadcastListener,
+  useSearchStore,
+} from '../../store/zustand/searchStore'
 import { useToastStore } from '../../store/zustand/toastStore'
 import { AttachmentPicker } from '../attachments/AttachmentPicker'
 import { AttachmentPreview } from '../attachments/AttachmentPreview'
@@ -131,11 +148,11 @@ import {
   UploadIcon,
 } from '../icons/Icon'
 import {
+  forEachJsonOrZipFile,
   importExportErrorMessage,
   natterJsonFilename,
   natterZipFilename,
   readJsonFile,
-  readJsonOrZipFile,
   triggerJsonDownload,
   triggerJsonZipDownload,
 } from '../import-export/json-file'
@@ -182,7 +199,6 @@ interface StorageGlobalCalibrationModel {
   rows: Array<[string, TokenCalibrationSample]>
 }
 
-const EMPTY_SEARCH_RESULTS: SearchResult[] = []
 const EMPTY_STORAGE_CHAT_MODEL: StorageChatModel = {
   chats: [],
   folders: [],
@@ -199,17 +215,24 @@ const STORAGE_USAGE_DETAIL_LABELS: Record<string, string> = {
 }
 
 async function loadStorageChatModel(): Promise<StorageChatModel> {
-  const [rows, chats, folders, tags] = await Promise.all([
-    listChatSidebarRows(),
-    listChats(),
-    listFolders(),
-    listTags(),
-  ])
-  return {
-    chats: rows,
-    folders,
-    tags,
-    calibrations: new Map(chats.map((chat) => [chat.id, chat.tokenCalibration])),
+  try {
+    const [rows, chats, folders, tags] = await Promise.all([
+      listChatSidebarRows(),
+      listChats(),
+      listFolders(),
+      listTags(),
+    ])
+    return {
+      chats: rows,
+      folders,
+      tags,
+      calibrations: new Map(chats.map((chat) => [chat.id, chat.tokenCalibration])),
+    }
+  } catch (error) {
+    if (error instanceof Error && error.name === 'DatabaseClosedError') {
+      return EMPTY_STORAGE_CHAT_MODEL
+    }
+    throw error
   }
 }
 
@@ -291,13 +314,19 @@ export function StorageView({ route, onOpenSidebar }: StorageViewProps) {
 
 function StorageOverview() {
   const pushToast = useToastStore((s) => s.push)
-  const chats = useLiveQuery(() => listChats(), [], [])
-  const attachments = useLiveQuery(
+  const chats = useRepositoryQuery('chats:all', () => listChats(), [], allTable('chats'))
+  const attachments = useRepositoryQuery(
+    'manager-attachments:overview',
     () => listManagerAttachments({ query: '', filter: 'all' }),
     [],
-    [],
+    allTable('attachments', 'attachmentArtifacts'),
   )
-  const workspaceMeta = useLiveQuery(() => getWorkspaceRepository().getWorkspaceMeta(), [], null)
+  const workspaceMeta = useRepositoryQuery(
+    'workspace-meta',
+    () => getWorkspaceRepository().getWorkspaceMeta(),
+    null,
+    WORKSPACE_META_DEPENDENCIES,
+  )
   const [quota, setQuota] = useState<QuotaSnapshot | null>(null)
   const [persistence, setPersistence] = useState<
     'checking' | 'unsupported' | 'persistent' | 'best-effort'
@@ -458,7 +487,8 @@ function StorageOverview() {
       : workspaceMeta
         ? 'Daemon'
         : 'Checking'
-  const modeDetail = workspaceMeta?.backendKind === 'browser-idb' ? 'Browser workspace' : 'Workspace'
+  const modeDetail =
+    workspaceMeta?.backendKind === 'browser-idb' ? 'Browser workspace' : 'Workspace'
   return (
     <section data-ui="storage-overview">
       <div data-ui="storage-panel-row">
@@ -590,7 +620,12 @@ function StorageUsageDetails({ quota }: { quota: QuotaSnapshot | null }) {
 }
 
 function StorageGlobalCalibrationPanel() {
-  const model = useLiveQuery(loadStorageGlobalCalibrationModel, [], EMPTY_GLOBAL_CALIBRATION_MODEL)
+  const model = useRepositoryQuery(
+    'storage-global-calibration-model',
+    loadStorageGlobalCalibrationModel,
+    EMPTY_GLOBAL_CALIBRATION_MODEL,
+    GLOBAL_TOKEN_CALIBRATION_DEPENDENCIES,
+  )
   const [busy, setBusy] = useState<string | null>(null)
   const rows = model.rows
   const handleClearFamily = async (calibrationKey: string) => {
@@ -704,8 +739,18 @@ function StoragePanelMetric({
 
 function ChatsStorageSurface() {
   const pushToast = useToastStore((s) => s.push)
-  const model = useLiveQuery(loadStorageChatModel, [], EMPTY_STORAGE_CHAT_MODEL)
-  const persistedSortMode = useLiveQuery(readSidebarSortMode, [], DEFAULT_SIDEBAR_SORT_MODE)
+  const model = useRepositoryQuery(
+    'storage-chat-model',
+    loadStorageChatModel,
+    EMPTY_STORAGE_CHAT_MODEL,
+    [...SIDEBAR_MODEL_DEPENDENCIES, ...allTable('chats')],
+  )
+  const persistedSortMode = useRepositoryQuery(
+    'sidebar-sort-mode',
+    readSidebarSortMode,
+    DEFAULT_SIDEBAR_SORT_MODE,
+    primaryKeys('settings', SIDEBAR_SORT_SETTING_KEY),
+  )
   const [sortMode, setSortMode] = useState<SidebarSortMode>(DEFAULT_SIDEBAR_SORT_MODE)
   const [searchQuery, setSearchQuery] = useState('')
   const [searchTitleOnly, setSearchTitleOnly] = useState(false)
@@ -755,7 +800,7 @@ function ChatsStorageSurface() {
   const searchTextActive = searchQuery.trim().length > 0
   const searchHasFilters = hasActiveSearchFilters(searchFilters) || searchAllBranches
   const sortedSearchResults = useMemo(() => {
-    const results = searchSession?.results ?? EMPTY_SEARCH_RESULTS
+    const results = orderedSearchResults(searchSession?.results)
     const byChatId = new Map(results.map((result) => [result.chatId, result]))
     return sortChats(
       results.map((result) => projectChatSidebarRow(result.chat)),
@@ -970,12 +1015,14 @@ function ChatsStorageSurface() {
           pushToast({ level: 'success', text: 'Exported chat JSON.', durationMs: 2500 })
           return
         }
-        const entries = await Promise.all(
-          chats.map(async (chat) => ({
-            filename: natterJsonFilename('chat', displayChatTitle(chat), chat.id),
-            value: await exportChat(chat.id),
-          })),
-        )
+        const pendingEntries = chats.map((chat) => ({
+          chat,
+          filename: natterJsonFilename('chat', displayChatTitle(chat), chat.id),
+        }))
+        const entries = pendingEntries.map(({ chat, filename }) => ({
+          filename,
+          loadValue: () => exportChat(chat.id),
+        }))
         await triggerJsonZipDownload(natterZipFilename('chats'), entries)
         pushToast({
           level: 'success',
@@ -996,14 +1043,13 @@ function ChatsStorageSurface() {
       if (!file) return
       setBusyChatAction('import')
       try {
-        const values = await readJsonOrZipFile(file)
         let importedCount = 0
         let lastChatId = ''
-        for (const value of values) {
+        await forEachJsonOrZipFile(file, async (value) => {
           const result = await importChat(value)
           importedCount += 1
           lastChatId = result.chatId
-        }
+        })
         pushToast({
           level: 'success',
           text:
@@ -1695,7 +1741,7 @@ function chatPassesStorageFilters(chat: ChatSidebarRow, filters: SearchFilters):
 }
 
 function ArchiveManager() {
-  const chats = useLiveQuery(() => listChats(), [], [])
+  const chats = useRepositoryQuery('chats:all', () => listChats(), [], allTable('chats'))
   const [busy, setBusy] = useState<string | null>(null)
   const archived = chats
     .filter((chat) => chat.archived)
@@ -1809,21 +1855,54 @@ function AttachmentManager({
   const uploadRef = useRef<HTMLInputElement | null>(null)
   const replaceUploadRef = useRef<HTMLInputElement | null>(null)
   const selectedId = route.attachmentId
-  const rows = useLiveQuery(
+  const rows = useRepositoryQuery(
+    JSON.stringify(['manager-attachments', query, filter]),
     async () => listManagerAttachments({ query, filter, limit: 5000 }),
-    [query, filter],
     [],
+    allTable('attachments', 'attachmentArtifacts'),
   )
-  const selected = useLiveQuery(
+  const selected = useRepositoryQuery(
+    JSON.stringify(['attachment-bundle', selectedId ?? null]),
     async () =>
-      selectedId ? await getBrowserRepository().getAttachmentBundle(selectedId) : undefined,
-    [selectedId],
+      selectedId ? await getWorkspaceRepository().getAttachmentBundle(selectedId) : undefined,
     undefined,
+    attachmentBundleDependencies(selectedId),
   )
-  const references = useLiveQuery(
-    async () => (selectedId ? await listAttachmentReferences(selectedId) : []),
-    [selectedId],
+  const referenceEdges = useRepositoryQuery(
+    JSON.stringify(['attachment-reference-edges', selectedId ?? null]),
+    async () => (selectedId ? await listAttachmentReferenceEdges(selectedId) : []),
     [],
+    [
+      ...primaryKeys('attachments', selectedId),
+      ...indexKeys('attachmentRefEdges', 'attachmentId', selectedId),
+    ],
+  )
+  const referenceOwnerKey = JSON.stringify(
+    referenceEdges.map((edge) => [
+      edge.ownerKind,
+      edge.ownerId,
+      edge.chatId,
+      edge.refId,
+      edge.ordinal,
+    ]),
+  )
+  const references = useRepositoryQuery(
+    JSON.stringify(['attachment-references', selectedId ?? null, referenceOwnerKey]),
+    async () => (selectedId ? await listAttachmentReferences(selectedId) : []),
+    [],
+    [
+      ...primaryKeys(
+        'messages',
+        ...referenceEdges
+          .filter((edge) => edge.ownerKind === 'message')
+          .map((edge) => edge.ownerId),
+      ),
+      ...primaryKeys(
+        'drafts',
+        ...referenceEdges.filter((edge) => edge.ownerKind === 'draft').map((edge) => edge.ownerId),
+      ),
+      ...primaryKeys('chats', ...referenceEdges.map((edge) => edge.chatId)),
+    ],
   )
   const unknownSelected = Boolean(selectedId && selected === undefined)
   const displaySelected =
@@ -2244,7 +2323,7 @@ async function downloadAttachment(attachment: Attachment): Promise<void> {
     return
   }
 
-  const bundle = await getBrowserRepository().getAttachmentBundle(attachment.id)
+  const bundle = await getWorkspaceRepository().getAttachmentBundle(attachment.id)
   const blobRow = selectAttachmentDownloadBlob(attachment, bundle)
   if (!blobRow) throw new Error(`AttachmentBlobMissing:${attachment.id}`)
   const blob = await attachmentDownloadBlob(blobRow)
@@ -2328,7 +2407,7 @@ async function listManagerAttachments({
   const rows: Attachment[] = []
   let cursor: string | undefined
   do {
-    const page = await getBrowserRepository().searchAttachments({
+    const page = await getWorkspaceRepository().searchAttachments({
       query,
       ...(filters ? { filters } : {}),
       sort: 'size-desc',
@@ -2345,10 +2424,10 @@ async function listManagerAttachments({
   return limit === undefined ? rows : rows.slice(0, limit)
 }
 
-async function deleteAttachmentForStorage(attachment: Attachment): Promise<boolean> {
+export async function deleteAttachmentForStorage(attachment: Attachment): Promise<boolean> {
   if (attachment.refCount === 0) {
     const result = await deleteUnreferencedAttachment(attachment.id)
-    if (result.deleted) return true
+    return result.deleted
   }
   await deleteReferencedAttachmentBytes(attachment.id, 'deleted')
   return false

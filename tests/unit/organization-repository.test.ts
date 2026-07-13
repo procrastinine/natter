@@ -26,7 +26,7 @@ import {
   mergeTagInto,
   updateTag,
 } from '../../src/store/tags'
-import { putTestMessage } from '../helpers/message-storage'
+import { expectAttachmentReferenceInvariants } from '../helpers/attachment-reference-invariants'
 
 const DB_NAME = 'natter'
 
@@ -69,8 +69,7 @@ async function seedChat(overrides: Partial<Chat> = {}): Promise<Chat> {
     tags: [],
     ...overrides,
   }
-  await getDb().chats.put(chat)
-  return chat
+  return getBrowserRepository().createChat(chat)
 }
 
 async function seedMessage(chatId: string, overrides: Partial<Message> = {}): Promise<Message> {
@@ -89,7 +88,18 @@ async function seedMessage(chatId: string, overrides: Partial<Message> = {}): Pr
     deleted: false,
     ...overrides,
   }
-  await putTestMessage(message)
+  await getBrowserRepository().runMutation(
+    [
+      { kind: 'message', messageId: message.id },
+      { kind: 'children', chatId, parentId: message.parentId },
+      ...[...new Set((message.attachmentRefs ?? []).map((ref) => ref.attachmentId))].map(
+        (attachmentId) => ({ kind: 'attachment' as const, attachmentId }),
+      ),
+    ],
+    async (ctx) => {
+      await ctx.putMessage(message)
+    },
+  )
   return message
 }
 
@@ -310,19 +320,27 @@ describe('organization repository contract', () => {
   })
 
   it('permanently deletes archived chats and decrements attachment refs', async () => {
-    const attachment = await seedAttachment({ id: 'att-1', refCount: 2 })
+    const attachment = await seedAttachment({ id: 'att-1' })
     const archived = await seedChat({ id: 'archived', archived: true })
     const live = await seedChat({ id: 'live', archived: false })
     await seedMessage(archived.id, {
       id: 'archived-message',
       attachmentRefs: [attachmentRef(attachment.id)],
     })
-    await getDb().drafts.put({
-      chatId: archived.id,
-      text: '',
-      attachmentRefs: [attachmentRef(attachment.id)],
-      updatedAt: 100,
-    })
+    await getBrowserRepository().runMutation(
+      [
+        { kind: 'draft', chatId: archived.id },
+        { kind: 'attachment', attachmentId: attachment.id },
+      ],
+      async (ctx) => {
+        await ctx.putDraft({
+          chatId: archived.id,
+          text: '',
+          attachmentRefs: [attachmentRef(attachment.id)],
+          updatedAt: 100,
+        })
+      },
+    )
     await seedMessage(live.id, { id: 'live-message' })
 
     const deleted = await getBrowserRepository().deleteArchivedChat(archived.id)
@@ -333,6 +351,7 @@ describe('organization repository contract', () => {
     expect(await getDb().drafts.get(archived.id)).toBeUndefined()
     expect(await getDb().chats.get(live.id)).toBeDefined()
     expect((await getDb().attachments.get(attachment.id))?.refCount).toBe(0)
+    await expectAttachmentReferenceInvariants(getDb())
   })
 
   it('emptyArchivedChats deletes only archived chats', async () => {

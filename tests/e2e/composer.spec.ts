@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test'
+import { expect, test } from './fixtures'
 import {
   buildSseBody,
   clearIndexedDb,
@@ -8,7 +8,6 @@ import {
 } from './helpers'
 
 test.beforeEach(async ({ page }) => {
-  await page.goto('/')
   await clearIndexedDb(page)
   await seedFirstRun(page)
   await createChatAndOpen(page)
@@ -161,7 +160,7 @@ test('composer can be resized below its content and scrolls internally', async (
 test('composer input overscroll backing matches the input surface', async ({ page }) => {
   const metrics = await page.locator('[data-ui="composer-input"]').evaluate((el) => {
     const input = el as HTMLTextAreaElement
-    const shell = input.parentElement as HTMLElement | null
+    const shell = input.parentElement
     const inputStyle = getComputedStyle(input)
     const shellStyle = shell ? getComputedStyle(shell) : null
     return {

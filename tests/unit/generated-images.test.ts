@@ -3,7 +3,11 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import type { Chat, Message } from '../../src/core/types'
 import { newId } from '../../src/lib/ulid'
-import { ingestAttachmentBytes } from '../../src/store/attachments'
+import {
+  attachmentScopes,
+  deleteReferencedAttachmentBytes,
+  ingestAttachmentBytes,
+} from '../../src/store/attachments'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import {
   __resetBrowserRepositoryForTests,
@@ -14,8 +18,10 @@ import {
   materializeGeneratedOutputAttachments,
   migrateGeneratedImageOutputAttachments,
   normalizeGeneratedImageOutputAttachmentRefs,
+  persistPreparedGeneratedOutputAttachments,
+  prepareGeneratedOutputAttachments,
 } from '../../src/store/generated-images'
-import { putTestMessage } from '../helpers/message-storage'
+import { expectAttachmentReferenceInvariants } from '../helpers/attachment-reference-invariants'
 
 const DB_NAME = 'natter'
 const ONE_PIXEL_PNG =
@@ -61,7 +67,167 @@ async function seedChat(): Promise<Chat> {
   return chat
 }
 
+async function putMessage(message: Message): Promise<void> {
+  await getBrowserRepository().runMutation(
+    [
+      { kind: 'message', messageId: message.id },
+      { kind: 'children', chatId: message.chatId, parentId: message.parentId },
+      ...[...new Set((message.attachmentRefs ?? []).map((ref) => ref.attachmentId))].map(
+        (attachmentId) => ({ kind: 'attachment' as const, attachmentId }),
+      ),
+    ],
+    async (ctx) => {
+      await ctx.putMessage(message)
+    },
+  )
+}
+
 describe('generated image output storage migration', () => {
+  it('prepares generated output without writes and commits its attachment with the message', async () => {
+    const chat = await seedChat()
+    const message: Message = {
+      id: 'm-prepared',
+      chatId: chat.id,
+      parentId: null,
+      siblingIndex: 0,
+      turnId: newId(),
+      turnIndex: 0,
+      createdAt: 2,
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: '' }],
+      nodeVersion: 0,
+      deleted: false,
+    }
+    await putMessage(message)
+    const prepared = await prepareGeneratedOutputAttachments({
+      messageId: message.id,
+      content: [{ type: 'output_image', url: ONE_PIXEL_PNG }],
+      now: 10,
+    })
+
+    expect(prepared.attachmentBundles).toHaveLength(1)
+    expect(await getDb().attachments.count()).toBe(0)
+
+    const scopes = [
+      { kind: 'message' as const, messageId: message.id },
+      ...attachmentScopes(prepared.newRefs),
+    ]
+    await expect(
+      getBrowserRepository().runMutation(scopes, async (ctx) => {
+        await persistPreparedGeneratedOutputAttachments(ctx, prepared)
+        const current = await ctx.getMessage(message.id)
+        if (!current) throw new Error('MessageMissing')
+        await ctx.putMessage({
+          ...current,
+          content: prepared.content,
+          attachmentRefs: prepared.newRefs,
+        })
+        throw new Error('reject-canonical-finalize')
+      }),
+    ).rejects.toThrow('reject-canonical-finalize')
+    expect(await getDb().attachments.count()).toBe(0)
+    expect((await getBrowserRepository().getMessage(message.id))?.attachmentRefs).toHaveLength(0)
+
+    await getBrowserRepository().runMutation(scopes, async (ctx) => {
+      await persistPreparedGeneratedOutputAttachments(ctx, prepared)
+      const current = await ctx.getMessage(message.id)
+      if (!current) throw new Error('MessageMissing')
+      await ctx.putMessage({
+        ...current,
+        content: prepared.content,
+        attachmentRefs: prepared.newRefs,
+      })
+    })
+
+    const attachmentId = prepared.newRefs[0]?.attachmentId
+    expect(attachmentId).toBe('generated:m-prepared:1')
+    expect((await getBrowserRepository().getAttachment(attachmentId ?? ''))?.refCount).toBe(1)
+    await expectAttachmentReferenceInvariants(getDb())
+  })
+
+  it('preserves a referenced generated attachment whose bytes were manually deleted', async () => {
+    const chat = await seedChat()
+    const message: Message = {
+      id: 'm-manual-delete',
+      chatId: chat.id,
+      parentId: null,
+      siblingIndex: 0,
+      turnId: newId(),
+      turnIndex: 0,
+      createdAt: 2,
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: '' }],
+      nodeVersion: 0,
+      deleted: false,
+    }
+    await putMessage(message)
+    const prepared = await prepareGeneratedOutputAttachments({
+      messageId: message.id,
+      content: [{ type: 'output_image', url: ONE_PIXEL_PNG }],
+      now: 10,
+    })
+    const scopes = [
+      { kind: 'message' as const, messageId: message.id },
+      ...attachmentScopes(prepared.newRefs),
+    ]
+    await getBrowserRepository().runMutation(scopes, async (ctx) => {
+      await persistPreparedGeneratedOutputAttachments(ctx, prepared)
+      const current = await ctx.getMessage(message.id)
+      if (!current) throw new Error('MessageMissing')
+      await ctx.putMessage({
+        ...current,
+        content: prepared.content,
+        attachmentRefs: prepared.newRefs,
+      })
+    })
+    const attachmentId = prepared.newRefs[0]?.attachmentId
+    if (!attachmentId) throw new Error('AttachmentMissing')
+    await deleteReferencedAttachmentBytes(attachmentId, 'deleted', 20)
+
+    const retry = await prepareGeneratedOutputAttachments({
+      messageId: message.id,
+      content: [{ type: 'output_image', url: ONE_PIXEL_PNG }],
+      now: 30,
+    })
+    await getBrowserRepository().runMutation(scopes, async (ctx) => {
+      await persistPreparedGeneratedOutputAttachments(ctx, retry)
+    })
+
+    const bundle = await getBrowserRepository().getAttachmentBundle(attachmentId)
+    expect(bundle?.attachment.storage).toMatchObject({ kind: 'missing', reason: 'deleted' })
+    expect(bundle?.blobs).toHaveLength(0)
+    expect(bundle?.attachment.refCount).toBe(1)
+    await expectAttachmentReferenceInvariants(getDb())
+  })
+
+  it('replaces a conflicting unreferenced legacy generated-output row at commit', async () => {
+    const eager = await materializeGeneratedOutputAttachments({
+      messageId: 'm-orphan',
+      content: [{ type: 'output_image', url: 'https://old.example/generated.png' }],
+      now: 10,
+    })
+    const attachmentId = eager.newRefs[0]?.attachmentId
+    expect(attachmentId).toBe('generated:m-orphan:1')
+    expect((await getBrowserRepository().getAttachment(attachmentId ?? ''))?.refCount).toBe(0)
+
+    const prepared = await prepareGeneratedOutputAttachments({
+      messageId: 'm-orphan',
+      content: [{ type: 'output_image', url: 'https://new.example/generated.png' }],
+      now: 20,
+    })
+    await getBrowserRepository().runMutation(attachmentScopes(prepared.newRefs), async (ctx) => {
+      await persistPreparedGeneratedOutputAttachments(ctx, prepared)
+    })
+
+    expect(await getBrowserRepository().getAttachment(attachmentId ?? '')).toMatchObject({
+      sourceUrl: 'https://new.example/generated.png',
+      storage: { kind: 'remote-url', url: 'https://new.example/generated.png' },
+      refCount: 0,
+    })
+  })
+
   it('materializes raw generated audio data URLs into attachments', async () => {
     const materialized = await materializeGeneratedOutputAttachments({
       messageId: 'm-audio',
@@ -107,7 +273,7 @@ describe('generated image output storage migration', () => {
       nodeVersion: 0,
       deleted: false,
     }
-    await putTestMessage(message)
+    await putMessage(message)
 
     await migrateGeneratedImageOutputAttachments(message.id)
 
@@ -133,6 +299,7 @@ describe('generated image output storage migration', () => {
       refCount: 1,
     })
     expect(bundle?.blobs.some((blob) => blob.role === 'original')).toBe(true)
+    await expectAttachmentReferenceInvariants(getDb())
   })
 
   it('is idempotent when a legacy row is migrated twice at the same time', async () => {
@@ -151,7 +318,7 @@ describe('generated image output storage migration', () => {
       nodeVersion: 0,
       deleted: false,
     }
-    await putTestMessage(message)
+    await putMessage(message)
 
     await Promise.all([
       migrateGeneratedImageOutputAttachments(message.id),
@@ -169,6 +336,7 @@ describe('generated image output storage migration', () => {
     expect(generated).toHaveLength(1)
     expect(generated[0]?.id).toBe(attachmentId)
     expect(generated[0]?.refCount).toBe(1)
+    await expectAttachmentReferenceInvariants(getDb())
   })
 
   it('removes stale generated-output refs that are not the inline output image', async () => {
@@ -187,8 +355,6 @@ describe('generated image output storage migration', () => {
       declaredMime: 'image/png',
       origin: 'generated-output',
     })
-    await getDb().attachments.update(kept.attachment.id, { refCount: 1 })
-    await getDb().attachments.update(stale.attachment.id, { refCount: 1 })
     const message: Message = {
       id: newId(),
       chatId: chat.id,
@@ -221,7 +387,7 @@ describe('generated image output storage migration', () => {
       nodeVersion: 0,
       deleted: false,
     }
-    await putTestMessage(message)
+    await putMessage(message)
 
     await normalizeGeneratedImageOutputAttachmentRefs(message.id)
 
@@ -229,5 +395,6 @@ describe('generated image output storage migration', () => {
     expect(stored?.attachmentRefs).toHaveLength(1)
     expect(stored?.attachmentRefs?.[0]).toMatchObject({ attachmentId: kept.attachment.id })
     expect(await getBrowserRepository().getAttachment(stale.attachment.id)).toBeUndefined()
+    await expectAttachmentReferenceInvariants(getDb())
   })
 })

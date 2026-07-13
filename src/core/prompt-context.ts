@@ -32,7 +32,7 @@ function applyPrefillReasoningToPath(path: readonly Message[]): Message[] {
   const tailIndex = lastVisibleIndex(path)
   if (tailIndex < 0) return [...path]
   const tail = path[tailIndex]
-  if (!tail || tail.role !== 'assistant' || tail.origin !== 'prefill') return [...path]
+  if (tail?.role !== 'assistant' || tail.origin !== 'prefill') return [...path]
   const rewritten = withPrefillReasoningContext(tail)
   if (rewritten === tail) return [...path]
   return [...path.slice(0, tailIndex), rewritten, ...path.slice(tailIndex + 1)]

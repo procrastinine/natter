@@ -1,5 +1,3 @@
-// Privacy controls block. See `plan/09-privacy.md §9.9` + `plan/10-ui.md §10.5.1`.
-//
 // Renders inline inside the Providers section on the Model tab. Exposes the
 // axes the picker itself can't surface:
 //   - `paretoFilter` — turn off the tier-based auto-exclusion

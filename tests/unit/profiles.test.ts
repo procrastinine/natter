@@ -4,6 +4,7 @@ import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import type { Chat, KeyId, ProfileId } from '../../src/core/types'
 import { newId } from '../../src/lib/ulid'
 import { __resetBroadcastForTests, type BroadcastEvent, onEvent } from '../../src/store/broadcast'
+import { getBrowserRepository } from '../../src/store/browser-repo'
 import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
 import { __resetKeyCacheForTests, createKey, getKey } from '../../src/store/keys'
 import { putCachedEndpoints, putCachedModels } from '../../src/store/models-cache'
@@ -185,6 +186,54 @@ describe('updateProfile cache invalidation', () => {
     const db = getDb()
     expect(await db.models.count()).toBe(1)
   })
+
+  it('derives kind defaults from the locked current profile when baseUrl is omitted', async () => {
+    const keyId = await fakeKeyId()
+    const profile = await createProfile({
+      name: 'Custom endpoint',
+      kind: 'custom',
+      baseUrl: 'https://existing.example/v1',
+      apiKeyRef: keyId,
+    })
+
+    const updated = await updateProfile(profile.id, { kind: 'openrouter' })
+
+    expect(updated.baseUrl).toBe('https://existing.example/v1')
+    expect(updated.supportsEndpointsApi).toBe(true)
+    expect(updated.supportsGenerationApi).toBe(true)
+    expect(updated.supportsPrivacyScrape).toBe(true)
+  })
+
+  it('rolls back the profile and caches when invalidation fails', async () => {
+    const keyId = await fakeKeyId()
+    const profile = await createProfile({
+      name: 'P',
+      kind: 'openrouter',
+      baseUrl: 'https://old',
+      apiKeyRef: keyId,
+    })
+    await putCachedModels(profile.id, { supportedParameters: ['tools'] }, { m: 1 }, 100)
+    const beforeWorkspace = await getBrowserRepository().getWorkspaceMeta()
+    const seen: BroadcastEvent[] = []
+    const unsubscribe = onEvent((event) => seen.push(event))
+    const failDelete = () => {
+      throw new Error('injected cache failure')
+    }
+    getDb().models.hook.deleting.subscribe(failDelete)
+
+    await expect(updateProfile(profile.id, { baseUrl: 'https://new' })).rejects.toThrow(
+      'injected cache failure',
+    )
+
+    getDb().models.hook.deleting.unsubscribe(failDelete)
+    unsubscribe()
+    expect(await getProfile(profile.id)).toEqual(profile)
+    expect(await getDb().models.count()).toBe(1)
+    expect((await getBrowserRepository().getWorkspaceMeta()).mutationCounter).toBe(
+      beforeWorkspace.mutationCounter,
+    )
+    expect(seen).toEqual([])
+  })
 })
 
 describe('duplicateProfile', () => {
@@ -246,7 +295,10 @@ describe('deleteProfile blocking', () => {
       apiKeyRef: keyId,
     })
     const chat = await seedChatWithProfile(profile.id)
+    const seen: BroadcastEvent[] = []
+    const unsubscribe = onEvent((event) => seen.push(event))
     await deleteProfile(profile.id, { force: true })
+    unsubscribe()
     expect(await getProfile(profile.id)).toBeUndefined()
     // Chat is still present; its settings.profileId points at the missing
     // connection so send paths must surface the reconnect prompt.
@@ -254,6 +306,7 @@ describe('deleteProfile blocking', () => {
     expect(stored?.settings.profileId).toBe(profile.id)
     // Key got reaped (no remaining profile references it).
     expect(await getKey(keyId)).toBeUndefined()
+    expect(seen).toContainEqual({ kind: 'key-rotated', keyId })
   })
 
   it('reassigns dependents to another profile when reassignTo is provided', async () => {
@@ -278,14 +331,79 @@ describe('deleteProfile blocking', () => {
       settings,
     })
     const chat = await seedChatWithProfile(a.id)
+    const repo = getBrowserRepository()
+    const beforeWorkspace = await repo.getWorkspaceMeta()
+    const seen: BroadcastEvent[] = []
+    const unsubscribe = onEvent((event) => seen.push(event))
 
-    await deleteProfile(a.id, { reassignTo: b.id })
+    await deleteProfile(a.id, { reassignTo: b.id, now: 500 })
+    unsubscribe()
     const db = getDb()
     const nextPreset = await db.presets.get(preset.id)
     expect(nextPreset?.connectionProfileId).toBe(b.id)
     expect(nextPreset?.settings.profileId).toBe(b.id)
     const nextChat = await db.chats.get(chat.id)
     expect(nextChat?.settings.profileId).toBe(b.id)
+    expect(nextChat).toMatchObject({ metaVersion: 1, summaryVersion: 1, updatedAt: 500 })
+    expect((await repo.getWorkspaceMeta()).mutationCounter).toBe(
+      beforeWorkspace.mutationCounter + 1,
+    )
+    expect(
+      seen.find((event) => event.kind === 'chat-mutated' && event.chatId === chat.id),
+    ).toMatchObject({ metaVersion: 1, summaryVersion: 1 })
+  })
+
+  it('rolls back dependent rewrites, deletion, caches, key cleanup, and events on failure', async () => {
+    const keyId = await fakeKeyId()
+    const replacementKeyId = await fakeKeyId('replacement')
+    const source = await createProfile({
+      name: 'source',
+      kind: 'openrouter',
+      baseUrl: 'https://source',
+      apiKeyRef: keyId,
+    })
+    const replacement = await createProfile({
+      name: 'replacement',
+      kind: 'openrouter',
+      baseUrl: 'https://replacement',
+      apiKeyRef: replacementKeyId,
+    })
+    const settings = cloneDefaultChatSettings()
+    settings.profileId = source.id
+    const preset = await createPreset({
+      name: 'source preset',
+      connectionProfileId: source.id,
+      settings,
+    })
+    const first = await seedChatWithProfile(source.id)
+    const second = await seedChatWithProfile(source.id)
+    await putCachedModels(source.id, {}, { cached: true }, 1)
+    const repo = getBrowserRepository()
+    const beforeWorkspace = await repo.getWorkspaceMeta()
+    const beforeChats = await getDb().chats.bulkGet([first.id, second.id])
+    const beforePreset = await getDb().presets.get(preset.id)
+    const seen: BroadcastEvent[] = []
+    const unsubscribe = onEvent((event) => seen.push(event))
+    let updates = 0
+    const failSecondUpdate = () => {
+      updates += 1
+      if (updates === 2) throw new Error('injected profile cascade failure')
+    }
+    getDb().chats.hook.updating.subscribe(failSecondUpdate)
+
+    await expect(
+      deleteProfile(source.id, { reassignTo: replacement.id, now: 500 }),
+    ).rejects.toThrow('injected profile cascade failure')
+
+    getDb().chats.hook.updating.unsubscribe(failSecondUpdate)
+    unsubscribe()
+    expect(await getDb().chats.bulkGet([first.id, second.id])).toEqual(beforeChats)
+    expect(await getDb().presets.get(preset.id)).toEqual(beforePreset)
+    expect(await getProfile(source.id)).toEqual(source)
+    expect(await getKey(keyId)).toBeDefined()
+    expect(await getDb().models.where('profileId').equals(source.id).count()).toBe(1)
+    expect((await repo.getWorkspaceMeta()).mutationCounter).toBe(beforeWorkspace.mutationCounter)
+    expect(seen).toEqual([])
   })
 
   it('keeps the shared key when a sibling profile still references it', async () => {
@@ -304,6 +422,62 @@ describe('deleteProfile blocking', () => {
     })
     await deleteProfile(a.id)
     expect(await getKey(keyId)).toBeDefined()
+  })
+
+  it("keeps primary and fallback keys referenced through another profile's fallback and management slots", async () => {
+    const primaryId = await fakeKeyId('primary')
+    const fallbackId = await fakeKeyId('fallback')
+    const managementId = await fakeKeyId('management')
+    const source = await createProfile({
+      name: 'source',
+      kind: 'openrouter',
+      baseUrl: 'https://source',
+      apiKeyRef: primaryId,
+      apiKeyFallbackRefs: [fallbackId],
+      managementApiKeyRef: managementId,
+    })
+    const siblingKeyId = await fakeKeyId('sibling')
+    await createProfile({
+      name: 'sibling',
+      kind: 'openrouter',
+      baseUrl: 'https://sibling',
+      apiKeyRef: siblingKeyId,
+      apiKeyFallbackRefs: [primaryId],
+      managementApiKeyRef: fallbackId,
+    })
+
+    await deleteProfile(source.id)
+
+    expect(await getKey(primaryId)).toBeDefined()
+    expect(await getKey(fallbackId)).toBeDefined()
+    expect(await getKey(managementId)).toBeUndefined()
+    expect(await getKey(siblingKeyId)).toBeDefined()
+  })
+
+  it('keeps a management key referenced by another profile and reaps every unshared source key', async () => {
+    const primaryId = await fakeKeyId('primary')
+    const fallbackId = await fakeKeyId('fallback')
+    const managementId = await fakeKeyId('management')
+    const source = await createProfile({
+      name: 'source',
+      kind: 'openrouter',
+      baseUrl: 'https://source',
+      apiKeyRef: primaryId,
+      apiKeyFallbackRefs: [fallbackId],
+      managementApiKeyRef: managementId,
+    })
+    await createProfile({
+      name: 'sibling',
+      kind: 'openrouter',
+      baseUrl: 'https://sibling',
+      apiKeyRef: managementId,
+    })
+
+    await deleteProfile(source.id)
+
+    expect(await getKey(primaryId)).toBeUndefined()
+    expect(await getKey(fallbackId)).toBeUndefined()
+    expect(await getKey(managementId)).toBeDefined()
   })
 
   it('throws ProfileMissingError when deleting a ghost id', async () => {

@@ -4,7 +4,6 @@
  * separate top-of-shell header row; these elements live inside main-pane
  * (see shell.css).
  * Owns: [data-ui='chat-title*' | 'settings-cog' | 'abort' | 'connection-*'].
- * See plan/10-ui.md §10.3.
  */
 
 [data-ui="chat-title-bar"] {
@@ -147,6 +146,17 @@
   flex: 1 1 auto;
 }
 
+[data-ui="icon-button"][data-role="chat-branch-tree"][data-state="active"] {
+  background: var(--color-accent);
+  color: var(--color-accent-contrast);
+}
+
+[data-ui="icon-button"][data-role="chat-edit-tree"]:disabled,
+[data-ui="icon-button"][data-role="chat-edit-tree"][data-state="active"]:disabled {
+  background: transparent;
+  color: var(--color-fg-muted);
+}
+
 /* When the title editor is active, the trailing header-spacer would
  * otherwise compete with the input for available width — collapse it
  * so the editor truly fills the row. */
@@ -278,7 +288,7 @@
 }
 
 /* ─────────────────────────────────────────────────────────────────────────
- * Header privacy badge (see plan/09-privacy.md §9.11).
+ * Header privacy badge.
  * Lock icon tinted by tier; click opens a popover listing kept providers.
  * ────────────────────────────────────────────────────────────────────── */
 
@@ -889,9 +899,8 @@
   cursor: not-allowed;
 }
 
-/* API-routing controls — live below the ConnectionViewer/Editor block so
- * users can flip transport preferences without entering edit mode. See
- * plan/10-ui.md §10.17.5. */
+/* API-routing controls live below the ConnectionViewer/Editor block so users
+ * can flip transport preferences without entering edit mode. */
 [data-ui="connection-routing"] {
   margin-top: var(--space-3);
   padding: var(--space-2) 0;
@@ -1214,9 +1223,19 @@
     font-size: var(--font-size-sm);
   }
 
-  [data-ui="mobile-menu-action"]:hover {
+  [data-ui="mobile-menu-action"]:hover:not(:disabled) {
     background: var(--color-bg-hover);
     color: var(--color-fg-primary);
+  }
+
+  [data-ui="mobile-menu-action"][data-state="active"] {
+    background: var(--color-accent);
+    color: var(--color-accent-contrast);
+  }
+
+  [data-ui="mobile-menu-action"]:disabled {
+    cursor: not-allowed;
+    opacity: var(--opacity-disabled);
   }
 
   [data-ui="mobile-menu-action"] > span:last-child {

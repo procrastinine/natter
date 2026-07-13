@@ -1,22 +1,34 @@
-import type { ChatId, MessageId } from '../core/types'
+import { normalizeError } from '../api/errors'
+import type { ChatId, GenerationMeta, MessageId } from '../core/types'
 import { postEvent } from '../store/broadcast'
-import { getStreamClientId, startStreamLease, stopStreamLease } from '../store/stream-leases'
+import type { StreamWriteFence } from '../store/repository'
+import {
+  announceStreamEnded,
+  getStreamClientId,
+  startStreamLease,
+  stopStreamLease,
+} from '../store/stream-leases'
 import { useStreamStore } from '../store/zustand/streamStore'
 
 interface RequestLifecycle {
   streamId: string
   signal: AbortSignal
-  end: (outcome: 'done' | 'error' | 'abort') => void
+  abort: () => void
+  preserveLease: () => void
+  end: (outcome: 'done' | 'error' | 'abort') => Promise<void>
 }
 
-export function startRequestLifecycle(args: {
+export async function startRequestLifecycle(args: {
   chatId: ChatId
   streamId: string
+  attemptKind: 'generation' | 'continuation'
   userSignal?: AbortSignal
-}): RequestLifecycle {
+}): Promise<RequestLifecycle> {
   const controller = new AbortController()
   const abort = () => controller.abort()
+  let shouldPreserveLease = false
   let removeUserAbort: (() => void) | undefined
+  const startedAt = Date.now()
 
   if (args.userSignal?.aborted) {
     controller.abort(args.userSignal.reason)
@@ -26,11 +38,24 @@ export function startRequestLifecycle(args: {
     removeUserAbort = () => args.userSignal?.removeEventListener('abort', onAbort)
   }
 
+  try {
+    await startStreamLease({
+      streamId: args.streamId,
+      chatId: args.chatId,
+      startedAt,
+      attemptKind: args.attemptKind,
+    })
+  } catch (error) {
+    removeUserAbort?.()
+    await stopStreamLease(args.streamId)
+    throw normalizeError(error, { midStream: false, cause: 'storage' })
+  }
+
   useStreamStore.getState().setActive({
     streamId: args.streamId,
     chatId: args.chatId,
-    startedAt: Date.now(),
-    heartbeatAt: Date.now(),
+    startedAt,
+    heartbeatAt: startedAt,
     ownerClientId: getStreamClientId(),
     abort,
   })
@@ -44,13 +69,15 @@ export function startRequestLifecycle(args: {
   return {
     streamId: args.streamId,
     signal: controller.signal,
-    end(outcome) {
+    abort,
+    preserveLease() {
+      shouldPreserveLease = true
+    },
+    async end(outcome) {
       removeUserAbort?.()
-      stopStreamLease(args.streamId)
+      await stopStreamLease(args.streamId, { deleteRow: !shouldPreserveLease })
       if (!useStreamStore.getState().isActive(args.streamId)) return
-      useStreamStore.getState().clearActive(args.streamId)
-      postEvent({
-        kind: 'stream-ended',
+      announceStreamEnded({
         chatId: args.chatId,
         streamId: args.streamId,
         outcome,
@@ -59,13 +86,29 @@ export function startRequestLifecycle(args: {
   }
 }
 
-export function markLifecycleTarget(args: {
+export async function markLifecycleTarget(args: {
   chatId: ChatId
   streamId: string
   messageId: MessageId
   abort: () => void
-}): void {
+  attemptKind?: 'generation' | 'continuation'
+  continuationStrategy?: 'prompt' | 'prefill'
+  baseNodeVersion?: number
+  requestedModel?: string
+  apiUsed?: GenerationMeta['apiUsed']
+}): Promise<StreamWriteFence> {
   const startedAt = Date.now()
+  const fence = await startStreamLease({
+    streamId: args.streamId,
+    chatId: args.chatId,
+    messageId: args.messageId,
+    startedAt,
+    ...(args.attemptKind ? { attemptKind: args.attemptKind } : {}),
+    ...(args.continuationStrategy ? { continuationStrategy: args.continuationStrategy } : {}),
+    ...(args.baseNodeVersion !== undefined ? { baseNodeVersion: args.baseNodeVersion } : {}),
+    ...(args.requestedModel ? { requestedModel: args.requestedModel } : {}),
+    ...(args.apiUsed ? { apiUsed: args.apiUsed } : {}),
+  })
   useStreamStore.getState().setActive({
     streamId: args.streamId,
     chatId: args.chatId,
@@ -75,12 +118,6 @@ export function markLifecycleTarget(args: {
     ownerClientId: getStreamClientId(),
     abort: args.abort,
   })
-  startStreamLease({
-    streamId: args.streamId,
-    chatId: args.chatId,
-    messageId: args.messageId,
-    startedAt,
-  })
   postEvent({
     kind: 'stream-started',
     chatId: args.chatId,
@@ -88,4 +125,5 @@ export function markLifecycleTarget(args: {
     messageId: args.messageId,
     ownerClientId: getStreamClientId(),
   })
+  return fence
 }

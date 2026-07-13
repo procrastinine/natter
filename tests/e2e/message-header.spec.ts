@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test'
+import { expect, test } from './fixtures'
 import {
   buildSseBody,
   clearIndexedDb,
@@ -8,14 +8,12 @@ import {
   sendMessage,
 } from './helpers'
 
-// Phase-8 polish (CLAUDE.md "Main content must be quiet"): the message
-// header is now a quiet single-line `Role` label only. Model, timestamp,
+// The message header is a quiet single-line `Role` label. Model, timestamp,
 // token breakdown, cost, and other factual-record metadata moved into the
 // `[data-ui="message-info"]` disclosure that opens via the ⓘ Info button on
 // the always-visible action row beneath the message body.
 
 test.beforeEach(async ({ page }) => {
-  await page.goto('/')
   await clearIndexedDb(page)
   await seedFirstRun(page)
 })

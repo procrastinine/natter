@@ -1,5 +1,3 @@
-// Phase 11: `toResponses` transform tests. See `plan/phase11-implementation.md §4.5`.
-
 import { describe, expect, it } from 'vitest'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import { toResponses } from '../../src/core/transforms'

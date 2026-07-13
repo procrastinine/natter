@@ -10,6 +10,7 @@ import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import { createChat, getChat } from '../../src/store/chats'
 import { __resetDbForTests, openDb } from '../../src/store/db'
 import { exportChatPreset } from '../../src/store/import-export'
+import { __resetLockTrackerForTests, withMutationLocks } from '../../src/store/locks'
 import { createPreset, listPresets } from '../../src/store/presets'
 import { createProfile } from '../../src/store/profiles'
 import { ChatModelPanel } from '../../src/ui/settings/ChatModelPanel'
@@ -81,6 +82,7 @@ function makeProfile(overrides: Partial<ConnectionProfile> = {}): ConnectionProf
 
 async function resetAll() {
   __resetBroadcastForTests()
+  __resetLockTrackerForTests()
   __resetDbForTests()
   await Dexie.delete(DB_NAME)
 }
@@ -218,6 +220,32 @@ describe('ParamForm reasoning budget persistence', () => {
     await waitFor(async () => {
       expect((await getChat(chat.id))?.settings.reasoning.maxTokens).toBe(2048)
     })
+  })
+
+  it('flushes a pending reasoning-budget slider value on unmount', async () => {
+    const settings = cloneDefaultChatSettings()
+    settings.model = 'openai/gpt-5.4-nano'
+    settings.reasoning = { ...settings.reasoning, mode: 'budget', maxTokens: 64 }
+    const chat = await createChat({ settings })
+    const capability = effectiveCapabilityFromEndpoints(settings.model, [
+      makeEndpoint({
+        supported_parameters: ['reasoning', 'max_tokens'],
+        max_completion_tokens: 32000,
+      }),
+    ])
+    const { container, unmount } = render(<ParamForm chat={chat} capability={capability} />)
+    const slider = container.querySelector<HTMLInputElement>(
+      '[data-ui-section="reasoning"] [data-ui="slider"]',
+    )
+    expect(slider).toBeTruthy()
+
+    fireEvent.change(slider as HTMLInputElement, { target: { value: '4096' } })
+    unmount()
+
+    await waitFor(async () => {
+      expect((await getChat(chat.id))?.settings.reasoning.maxTokens).toBe(4096)
+    })
+    await withMutationLocks([{ kind: 'chat-meta', chatId: chat.id }], () => {})
   })
 })
 
@@ -489,7 +517,7 @@ describe('ChatModelPanel context tab', () => {
     const { container } = render(<ChatModelPanel chatSnapshot={chat} onClose={() => undefined} />)
     const presetNames = () =>
       Array.from(container.querySelectorAll<HTMLButtonElement>('[data-ui="preset-menu-load"]')).map(
-        (button) => (button.textContent ?? '').trim(),
+        (button) => button.textContent.trim(),
       )
 
     fireEvent.click(await screen.findByRole('button', { name: /Preset:/ }))

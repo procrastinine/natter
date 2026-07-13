@@ -1,6 +1,3 @@
-// Hand-maintained Google Gemini capability table. See
-// `plan/07-discovery.md §7.6`.
-//
 // Gemini uses `max_output_tokens` (not `max_tokens`), `stop_sequences`, and
 // has its own `thinking_config` shape for reasoning. Bundled params use the
 // abstract names; transforms map them to wire shape.

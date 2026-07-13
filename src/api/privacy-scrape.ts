@@ -1,6 +1,5 @@
 // Privacy scrape — fetch `openrouter.ai/{model}/providers`, extract per-
-// provider `data_policy` blocks, cache for 24h. See
-// `plan/09-privacy.md §9.4` and `plan/07-discovery.md §7.5`.
+// provider `data_policy` blocks, and cache them for 24h.
 //
 // The provider-privacy matrix isn't in the JSON API. It lives on the
 // per-model page OpenRouter ships to the browser; the relevant fields
@@ -25,8 +24,8 @@ import {
   matchKnownBouncer,
 } from '../core/cors-proxy'
 import type { DataPolicy } from '../core/types'
-import { fetchWithTimeout } from './client'
-import { normalizeError } from './errors'
+import { fetchWithTimeout, readResponseText } from './client'
+import { ApiError, normalizeError } from './errors'
 
 interface PrivacyScrapeContext {
   // Workspace-global CORS-proxy config. Required — `core/privacy-request.ts`
@@ -118,13 +117,20 @@ export async function fetchPrivacyScrape(
     : (u: string, i: RequestInit) => fetchWithTimeout(u, i, opts)
   const response = await impl(url, init)
   if (!response.ok) {
-    const text = await response.text().catch(() => '')
+    let text = ''
+    try {
+      text = await readResponseText(response)
+    } catch (error) {
+      if (error instanceof ApiError && (error.kind === 'timeout' || error.kind === 'abort')) {
+        throw error
+      }
+    }
     throw normalizeError(
       { error: { code: response.status, message: text || response.statusText } },
       { midStream: false, httpStatus: response.status },
     )
   }
-  const html = await response.text()
+  const html = await readResponseText(response)
   const policies = parsePrivacyPage(html)
   const fetchedAt = Date.now()
   return {
@@ -221,7 +227,6 @@ function scanProviderPairs(text: string, out: Record<string, DataPolicy>): void 
     /"(provider_display_name|provider_name|providerDisplayName|providerName)"\s*:\s*"([^"]+)"/g
   const markers: Array<{ pos: number; name: string }> = []
   for (const m of text.matchAll(markerRe)) {
-    if (m.index === undefined) continue
     markers.push({ pos: m.index + m[0].length, name: m[2] ?? '' })
   }
   for (let i = 0; i < markers.length; i += 1) {

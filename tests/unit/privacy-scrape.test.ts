@@ -1,10 +1,5 @@
-// Privacy-scrape parser. See `plan/09-privacy.md §9.4` and
-// `src/api/privacy-scrape.ts`.
-//
-// The live HTTP fetch isn't covered here (that's a live-curl probe per
-// CLAUDE.md "Live validation policy"). The HTML-parsing branch IS
-// covered: __NEXT_DATA__ JSON envelopes, loose JSON objects, and the
-// worst-case "nothing recognizable" fallback.
+// The live HTTP fetch is covered separately. This suite covers __NEXT_DATA__
+// JSON envelopes, loose JSON objects, and the unrecognized-page fallback.
 
 import { describe, expect, it } from 'vitest'
 import {

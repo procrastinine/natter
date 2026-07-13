@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test'
+import { expect, test } from './fixtures'
 import {
   buildSseBody,
   clearIndexedDb,
@@ -9,12 +9,21 @@ import {
   sendMessage,
 } from './helpers'
 
+test.use({
+  runtimeDiagnosticAllowances: [
+    {
+      category: 'page-error',
+      message:
+        '(?:Message debug crash|The above error occurred in the <MessageInner> component\\.)',
+    },
+  ],
+})
+
 // Phase 7 required spec: a deliberate React render crash inside a single
 // Message must NOT take down the rest of the chat. The crashed row should
 // show a replacement block; other messages + composer remain interactive.
 
 test.beforeEach(async ({ page }) => {
-  await page.goto('/')
   await clearIndexedDb(page)
   await seedFirstRun(page)
 })
@@ -31,7 +40,7 @@ test('a single crashed Message renders a replacement; peers remain interactive',
 
   const chatId = await firstChatId(page)
   // Toggle debugCrash=true on the first assistant row. The raw IDB write
-  // bypasses Dexie's live-query, so the page reloads to pick up the fresh
+  // bypasses the repository changefeed, so the page reloads to pick up the fresh
   // row and trigger the error boundary on re-render.
   await page.evaluate(async (id) => {
     const db = await new Promise<IDBDatabase>((resolve, reject) => {

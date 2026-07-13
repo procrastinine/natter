@@ -11,13 +11,14 @@ test-results
 .env.*
 !.env.example
 
-# Generated local attachment corpus for Phase 12 experiments.
+# Rich local fixture corpora. Committed tests use compact deterministic cases.
 tests/fixtures/attachments/
+tests/fixtures/privacy-scrape/
+tests/unit/plan-audit.test.ts
 
 # Local development probes. Keep these runnable on disk, but out of commits.
 scripts/dump-indexeddb-console.js
 scripts/probe-provider-server-tools.mjs
-scripts/profile-fake-stream.mjs
 
 # Local IndexedDB exports used for manual storage/debug replay.
 natter_export.json
@@ -32,5 +33,6 @@ natter-indexeddb-*.json
 !.vscode/extensions.json
 
 key.txt
+keys.json
 *.key
 secrets.json

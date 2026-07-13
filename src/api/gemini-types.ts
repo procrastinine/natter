@@ -1,9 +1,8 @@
-// Google Gemini native API — wire shapes. See `plan/phase11-implementation.md §4.1`
-// and `gemini_docs/`.
-//
 // Unlike the OpenAI family, the wire shape is camelCase end-to-end. Our
 // internal types stay camelCase, so the transform is nearly identity on
 // property names. Auth uses `x-goog-api-key`, NOT `Authorization: Bearer`.
+
+import type { StreamIntegrityChunk } from './stream-integrity'
 
 export interface GenerateContentRequestWire {
   contents: GeminiContent[]
@@ -124,6 +123,7 @@ export type GeminiStreamChunk =
       generationId?: string
     }
   | { type: 'keepalive'; comment: string }
+  | StreamIntegrityChunk
   | {
       type: 'buffered_result'
       result: GenerateContentResponseWire

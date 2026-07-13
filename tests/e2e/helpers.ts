@@ -1,11 +1,9 @@
-// Shared e2e helpers. See `plan/13-delivery.md §13.3.0 Track B`.
-//
 // Every spec that hits the send pipeline uses `mockChatCompletions` to stub
 // `/api/v1/chat/completions` to avoid burning live quota on deterministic
 // assertions. Live-API specs live in `*.live.spec.ts` and gate on
 // `process.env.RUN_LIVE === '1'`.
 
-import { expect, type Page } from '@playwright/test'
+import { expect, type Page } from './fixtures'
 
 export interface IndexedDbDump {
   dbName: string
@@ -28,7 +26,8 @@ const DEFAULT_E2E_MODEL = 'google/gemini-3.1-flash-lite-preview:free'
 export async function seedFirstRun(page: Page, opts: SeedOptions = {}): Promise<void> {
   const apiKey = opts.apiKey ?? 'sk-or-v1-test-00000000000000000000000000000000000000000000'
   const model = opts.model ?? DEFAULT_E2E_MODEL
-  await page.goto('/')
+  const currentUrl = new URL(page.url())
+  if (currentUrl.pathname !== '/' || currentUrl.hash) await page.goto('/')
   await page.locator('[data-ui="connection-add"]').click()
   const input = page.locator('[data-ui="connection-setup-key"]')
   await input.fill(apiKey)
@@ -137,8 +136,11 @@ export async function createChatAndSend(page: Page, text: string): Promise<void>
   const expectedRows = (await page.locator('[data-ui="chat-row"]').count()) + 1
   await createChatAndOpen(page)
   await sendMessage(page, text)
-  await page.locator('[data-ui="abort"]').waitFor({ state: 'detached' })
   await expect(page.locator('[data-ui="chat-row"]')).toHaveCount(expectedRows)
+  const chatId = await firstChatId(page)
+  expect(chatId).not.toBe('')
+  await waitForAssistantGenerationFinished(page, chatId)
+  await expect(page.locator('[data-ui="abort"]')).toHaveCount(0)
 }
 
 interface SseDelta {
@@ -227,7 +229,7 @@ export async function seedLinearChat(
     assistantContentType?: 'text' | 'output_text'
   },
 ): Promise<string> {
-  return page.evaluate(async (seed) => {
+  const chatId = await page.evaluate(async (seed) => {
     const db = await new Promise<IDBDatabase>((resolve, reject) => {
       const req = indexedDB.open('natter')
       req.onsuccess = () => resolve(req.result)
@@ -320,6 +322,23 @@ export async function seedLinearChat(
     }
     return chatId
   }, input)
+  await rebuildSidebarProjection(page)
+  return chatId
+}
+
+export async function rebuildSidebarProjection(page: Page): Promise<void> {
+  await page.evaluate(async () => {
+    const projectionPath = '/src/store/chat-sidebar-projection.ts'
+    const dbPath = '/src/store/db.ts'
+    const [projectionModule, dbModule] = (await Promise.all([
+      import(/* @vite-ignore */ projectionPath),
+      import(/* @vite-ignore */ dbPath),
+    ])) as unknown as [
+      { rebuildChatSidebarProjection(database: unknown): Promise<void> },
+      { getDb(): unknown },
+    ]
+    await projectionModule.rebuildChatSidebarProjection(dbModule.getDb())
+  })
 }
 
 // Read a chat's messages table via the page's IndexedDB. Returns the
@@ -369,6 +388,24 @@ export async function readMessages(
   }, chatId)
 }
 
+export async function waitForAssistantGenerationFinished(
+  page: Page,
+  chatId: string,
+  assistantIndex = 0,
+): Promise<void> {
+  await expect
+    .poll(async () => {
+      const assistants = (await readMessages(page, chatId)).filter(
+        (row) => row.role === 'assistant',
+      )
+      const generation = assistants[assistantIndex]?.generation
+      return generation && typeof generation === 'object'
+        ? typeof (generation as { finishedAt?: unknown }).finishedAt
+        : 'undefined'
+    })
+    .toBe('number')
+}
+
 export async function firstChatId(page: Page): Promise<string> {
   return page.evaluate(async () => {
     const db = await new Promise<IDBDatabase>((resolve, reject) => {
@@ -396,15 +433,26 @@ export async function firstChatId(page: Page): Promise<string> {
 }
 
 export async function clearIndexedDb(page: Page): Promise<void> {
+  const resetRoute = '**/__e2e-reset__'
+  await page.route(resetRoute, (route) =>
+    route.fulfill({ contentType: 'text/html', body: '<!doctype html><title>Reset</title>' }),
+  )
+  try {
+    await page.goto('/__e2e-reset__')
+  } finally {
+    await page.unroute(resetRoute)
+  }
   await page.evaluate(async () => {
     window.sessionStorage.removeItem('natter:active-seed')
     await new Promise<void>((resolve, reject) => {
       const req = indexedDB.deleteDatabase('natter')
       req.onsuccess = () => resolve()
       req.onerror = () => reject(req.error)
-      req.onblocked = () => resolve()
+      req.onblocked = () => reject(new Error('IndexedDBDeleteBlocked:natter'))
     })
   })
+  await page.goto('/')
+  await page.locator('#root > *').first().waitFor()
 }
 
 export async function importIndexedDbDump(page: Page, dump: IndexedDbDump): Promise<void> {

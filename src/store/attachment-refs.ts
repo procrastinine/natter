@@ -7,31 +7,18 @@ interface AttachmentRefOwner {
   createdAt?: number
 }
 
-export function attachmentIdOf(ref: AttachmentRef): AttachmentId {
-  return ref.attachmentId
-}
-
 export function liveAttachmentRefs(
   refs: readonly AttachmentRef[] | undefined,
 ): MessageAttachmentRef[] {
   return normalizeAttachmentRefs(refs).filter((ref) => ref.deletedAt === undefined)
 }
 
-export function attachmentIdsOf(refs: readonly AttachmentRef[] | undefined): AttachmentId[] {
-  if (!refs) return []
-  return refs.map(attachmentIdOf)
-}
-
-export function uniqueAttachmentIdsOf(refs: readonly AttachmentRef[] | undefined): AttachmentId[] {
-  return [...new Set(attachmentIdsOf(refs))]
-}
-
 export function normalizeAttachmentRefs(
   refs: readonly AttachmentRef[] | undefined,
-  owner: AttachmentRefOwner = {},
+  _owner: AttachmentRefOwner = {},
 ): MessageAttachmentRef[] {
   if (!refs) return []
-  return refs.map((ref, index) => normalizeAttachmentRef(ref, index, owner))
+  return refs.map((ref) => normalizeAttachmentRef(ref))
 }
 
 export function attachmentRefsFromIds(
@@ -69,21 +56,16 @@ export function createAttachmentRef(
   }
 }
 
-function normalizeAttachmentRef(
-  ref: AttachmentRef,
-  _index: number,
-  owner: AttachmentRefOwner,
-): MessageAttachmentRef {
-  const now = owner.createdAt ?? 0
+function normalizeAttachmentRef(ref: AttachmentRef): MessageAttachmentRef {
   return {
     refId: ref.refId,
     attachmentId: ref.attachmentId,
     includeInContext: ref.includeInContext !== false,
-    presentation: ref.presentation ?? {},
+    presentation: ref.presentation,
     ...(ref.tokenEstimate ? { tokenEstimate: ref.tokenEstimate } : {}),
     ...(ref.missingResolution ? { missingResolution: ref.missingResolution } : {}),
-    createdAt: ref.createdAt ?? now,
-    updatedAt: ref.updatedAt ?? now,
+    createdAt: ref.createdAt,
+    updatedAt: ref.updatedAt,
     ...(ref.deletedAt !== undefined ? { deletedAt: ref.deletedAt } : {}),
   }
 }

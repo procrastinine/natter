@@ -1,7 +1,6 @@
-// "Edit tree mode" toolbar. See `plan/10-ui.md §10.6.1`. Rendered beneath
-// the chat title bar while `useUiStore.editTreeMode` is on. Exposes the
-// cascade-delete checkbox and an Escape-able exit button so tree edits
-// stay discoverable.
+// Rendered beneath the chat title bar while `useUiStore.editTreeMode` is on.
+// Exposes the cascade-delete checkbox and an Escape-able exit button so tree
+// edits stay discoverable.
 
 import { useUiStore } from '../../store/zustand/uiStore'
 import { CloseIcon } from '../icons/Icon'

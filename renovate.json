@@ -1,6 +1,6 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["config:recommended"],
+  "extends": ["config:recommended", "helpers:pinGitHubActionDigests"],
   "timezone": "America/New_York",
   "dependencyDashboard": true,
   "minimumReleaseAge": "1 day",
@@ -15,6 +15,12 @@
     "schedule": ["before 5am on monday"]
   },
   "packageRules": [
+    {
+      "description": "Treat both TypeScript alias ranges as compatibility boundaries",
+      "matchDatasources": ["npm"],
+      "matchDepNames": ["@typescript/native", "typescript"],
+      "rangeStrategy": "in-range-only"
+    },
     {
       "matchDepTypes": ["packageManager"],
       "groupName": "package manager"

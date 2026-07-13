@@ -108,9 +108,10 @@ describe('ApiModeSection — two-button toggle', () => {
       <ApiModeSection chat={chat} capability={capability} profile={makeProfile('openrouter')} />,
     )
     fireEvent.click(screen.getByRole('button', { name: 'Text completions' }))
-    await new Promise((r) => setTimeout(r, 20))
-    const updated = await getChat(chat.id)
-    expect(updated?.settings.api).toBe('text')
+    await waitFor(async () => {
+      const updated = await getChat(chat.id)
+      expect(updated?.settings.api).toBe('text')
+    })
   })
 
   it('renders Gemini Native/OpenAI-compat as chat settings and persists compat mode', async () => {
@@ -163,9 +164,10 @@ describe('ApiModeSection — two-button toggle', () => {
       <ApiModeSection chat={chat} capability={capability} profile={makeProfile('openrouter')} />,
     )
     fireEvent.click(screen.getByRole('button', { name: 'Chat completions' }))
-    await new Promise((r) => setTimeout(r, 20))
-    const updated = await getChat(chat.id)
-    expect(updated?.settings.api).toBe('chat')
+    await waitFor(async () => {
+      const updated = await getChat(chat.id)
+      expect(updated?.settings.api).toBe('chat')
+    })
   })
 
   it('gates the Chat pin behind a confirm() dialog on phase-echo models', async () => {
@@ -187,13 +189,14 @@ describe('ApiModeSection — two-button toggle', () => {
         <ApiModeSection chat={chat} capability={capability} profile={makeProfile('openrouter')} />,
       )
       fireEvent.click(screen.getByRole('button', { name: 'Chat completions' }))
-      await new Promise((r) => setTimeout(r, 20))
+      await waitFor(async () => {
+        const updated = await getChat(chat.id)
+        expect(updated?.settings.api).toBe('chat')
+      })
     } finally {
       window.confirm = originalConfirm
     }
     expect(prompted).toBe(true)
-    const updated = await getChat(chat.id)
-    expect(updated?.settings.api).toBe('chat')
   })
 
   it('uses the active path when deciding the resolved route', async () => {

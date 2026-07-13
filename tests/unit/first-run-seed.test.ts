@@ -1,12 +1,9 @@
 import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import {
-  cloneDefaultChatSettings,
-  resolveDefaultModel,
-  runFirstRunSeed,
-} from '../../src/core/defaults'
+import { cloneDefaultChatSettings, resolveDefaultModel } from '../../src/core/defaults'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
+import { runFirstRunSeed } from '../../src/store/first-run-seed'
 import { __resetKeyCacheForTests, resolveKey } from '../../src/store/keys'
 import { listPresets } from '../../src/store/presets'
 import { listProfiles } from '../../src/store/profiles'

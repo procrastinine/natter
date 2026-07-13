@@ -1,5 +1,4 @@
 // Live `/endpoints` query for a single model on an OpenRouter connection.
-// See `plan/07-discovery.md §7.2–§7.3`.
 //
 // For non-OpenRouter connections (openai-compatible, anthropic, google,
 // custom), /endpoints doesn't exist. The caller should use
@@ -7,7 +6,6 @@
 // returns a synthetic single-endpoint descriptor in that case so callers
 // can share a code path.
 
-import { useLiveQuery } from 'dexie-react-hooks'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { fetchEndpoints } from '../api/models'
 import {
@@ -17,6 +15,7 @@ import {
   normalizeModelsResponse,
 } from '../api/providers'
 import { listBundledEntries, resolveBundledCapability } from '../capabilities'
+import { modelsCacheKey } from '../core/cache-keys'
 import type { EffectiveCapability } from '../core/capabilities'
 import {
   effectiveCapabilityFromDescriptor,
@@ -33,6 +32,8 @@ import {
   isFresh,
 } from '../store/models-cache'
 import { getProfile } from '../store/profiles'
+import { primaryKeys } from '../store/reactive-dependencies'
+import { useRepositoryQuery } from '../store/reactive-query'
 
 // `useModels` in ModelPicker uses this exact query; useEndpoints looks up
 // the already-cached row keyed off the same signature so a double
@@ -68,16 +69,18 @@ export function useEndpoints(
   modelId: string | null,
   opts: UseEndpointsOptions = {},
 ): UseEndpointsResult {
-  const cachedRow = useLiveQuery(
+  const cachedRow = useRepositoryQuery(
+    JSON.stringify(['endpoint-cache', profileId, modelId]),
     () =>
       profileId && modelId ? getCachedEndpoints(profileId, modelId) : Promise.resolve(undefined),
-    [profileId, modelId],
     undefined,
+    primaryKeys('endpoints', profileId && modelId ? [profileId, modelId] : undefined),
   )
-  const profile = useLiveQuery(
+  const profile = useRepositoryQuery(
+    JSON.stringify(['profile', profileId]),
     () => (profileId ? getProfile(profileId) : Promise.resolve(undefined)),
-    [profileId],
     undefined,
+    primaryKeys('profiles', profileId),
   )
   const [error, setError] = useState<string | null>(null)
   const [inFlight, setInFlight] = useState(false)
@@ -91,12 +94,12 @@ export function useEndpoints(
     !!profile && !!modelId && profile.kind === 'openrouter' && profile.supportsEndpointsApi
 
   useEffect(() => {
-    if (!enabled || !profile || !modelId) return
+    if (!enabled) return
     const fetchedAt = cachedRow?.fetchedAt
     const fresh = fetchedAt !== undefined && isFresh(fetchedAt, ENDPOINTS_TTL_MS)
     const forceRefresh = refreshToken !== handledRefreshTokenRef.current
     if (fresh && !forceRefresh) return
-    let cancelled = false
+    const requestState = { cancelled: false }
     if (forceRefresh) handledRefreshTokenRef.current = refreshToken
     setInFlight(true)
     setError(null)
@@ -111,18 +114,18 @@ export function useEndpoints(
           return fetchEndpoints({ profile, apiKey }, modelId)
         })
       } catch (err) {
-        if (cancelled) {
+        if (requestState.cancelled) {
           return
         }
         setError(err instanceof Error ? err.message : 'refresh failed')
       } finally {
-        if (!cancelled) {
+        if (!requestState.cancelled) {
           setInFlight(false)
         }
       }
     })()
     return () => {
-      cancelled = true
+      requestState.cancelled = true
     }
   }, [enabled, profile, modelId, cachedRow?.fetchedAt, refreshToken])
 
@@ -143,7 +146,8 @@ export function useEndpoints(
   // simply isn't served on this connection" (e.g., a chat started on
   // llama-server with gemma, now pointed at OR; OR returns 404 and an
   // actionable banner is needed, not a permanently-spinning Context tab).
-  const liveModelsRow = useLiveQuery(
+  const liveModelsRow = useRepositoryQuery(
+    JSON.stringify(['model-cache-capability', profileId, profile?.kind]),
     () =>
       profileId
         ? getCachedModels(
@@ -153,8 +157,20 @@ export function useEndpoints(
               : DIRECT_CAPABILITY_LOOKUP_QUERY,
           )
         : Promise.resolve(undefined),
-    [profileId, profile?.kind],
     undefined,
+    primaryKeys(
+      'models',
+      profileId
+        ? [
+            profileId,
+            modelsCacheKey(
+              profile?.kind === 'openrouter'
+                ? OPENROUTER_CAPABILITY_LOOKUP_QUERY
+                : DIRECT_CAPABILITY_LOOKUP_QUERY,
+            ),
+          ]
+        : undefined,
+    ),
   )
   const liveModelRows = useMemo<ModelListEntry[]>(() => {
     return liveModelsRow ? normalizeModelsResponse(liveModelsRow.payload) : []

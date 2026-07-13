@@ -3,7 +3,6 @@
 // moved to per-chat settings (see `PromptPresetEditor`) in the prompt-preset
 // refactor — they're no longer workspace-global.
 
-import { useLiveQuery } from 'dexie-react-hooks'
 import { useCallback } from 'react'
 import {
   DEFAULT_GLOBAL_PREFERENCES,
@@ -18,6 +17,8 @@ import {
   writeSendShortcut,
   writeTokenCalibrationMode,
 } from '../../core/global-settings'
+import { GLOBAL_PREFERENCES_DEPENDENCIES } from '../../store/reactive-dependencies'
+import { useRepositoryQuery } from '../../store/reactive-query'
 import { InfoDisclosure } from './InfoDisclosure'
 
 const SHORTCUT_OPTIONS: ReadonlyArray<{ value: SendShortcut; label: string }> = [
@@ -48,7 +49,12 @@ const CALIBRATION_MODE_OPTIONS: ReadonlyArray<{
 ]
 
 export function GeneralSettings() {
-  const prefs = useLiveQuery(readGlobalPreferences, [], DEFAULT_GLOBAL_PREFERENCES)
+  const prefs = useRepositoryQuery(
+    'global-preferences',
+    readGlobalPreferences,
+    DEFAULT_GLOBAL_PREFERENCES,
+    GLOBAL_PREFERENCES_DEPENDENCIES,
+  )
   const onShortcut = useCallback(async (value: SendShortcut) => {
     await writeSendShortcut(value)
   }, [])

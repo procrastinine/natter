@@ -1,7 +1,9 @@
+import type Dexie from 'dexie'
 import { tokenCalibrationKeyForStoredRecordKey } from '../core/model-ids'
 import type { Chat, GlobalTokenCalibration, TokenCalibrationSample } from '../core/types'
-import type { NatterDb, SettingsRow } from '../store/db'
+import type { SettingsRow } from '../store/db-rows'
 import type { MessageHeaderRow } from '../store/message-storage'
+import { forEachTableBatch } from './batched-table'
 
 const TOKEN_CALIBRATION_GLOBAL_BACKFILL_KEY = 'backfill:token-calibration-global-v1'
 const TOKEN_CALIBRATION_CANONICALIZE_BACKFILL_KEY = 'backfill:token-calibration-canonicalize-v1'
@@ -15,45 +17,54 @@ export function tokenCalibrationCanonicalizeBackfillMarker(): SettingsRow {
   return { key: TOKEN_CALIBRATION_CANONICALIZE_BACKFILL_KEY, value: 1 }
 }
 
-export async function rebuildTokenCalibrationGlobalRows(db: NatterDb): Promise<void> {
-  const marker = await db.settings.get(TOKEN_CALIBRATION_GLOBAL_BACKFILL_KEY)
+export async function rebuildTokenCalibrationGlobalRows(db: Dexie): Promise<void> {
+  const chats = db.table<Chat, string>('chats')
+  const settings = db.table<SettingsRow, string>('settings')
+  const marker = await settings.get(TOKEN_CALIBRATION_GLOBAL_BACKFILL_KEY)
   if (marker?.value === 1) return
 
-  await db.transaction('rw', db.chats, db.settings, async () => {
-    const chats = await db.chats.toArray()
-    const global = rebuildGlobalCalibration(chats)
-    await db.settings.put({ key: GLOBAL_TOKEN_CALIBRATION_KEY, value: global })
-    await db.settings.put(tokenCalibrationGlobalBackfillMarker())
+  await db.transaction('rw', chats, settings, async () => {
+    const global = emptyGlobalCalibration()
+    await forEachTableBatch(chats, (rows) => appendGlobalCalibration(global, rows))
+    await settings.put({ key: GLOBAL_TOKEN_CALIBRATION_KEY, value: global })
+    await settings.put(tokenCalibrationGlobalBackfillMarker())
   })
 }
 
-export async function canonicalizeTokenCalibrationRows(db: NatterDb): Promise<void> {
-  const marker = await db.settings.get(TOKEN_CALIBRATION_CANONICALIZE_BACKFILL_KEY)
+export async function canonicalizeTokenCalibrationRows(db: Dexie): Promise<void> {
+  const chats = db.table<Chat, string>('chats')
+  const messages = db.table<MessageHeaderRow, string>('messages')
+  const settings = db.table<SettingsRow, string>('settings')
+  const marker = await settings.get(TOKEN_CALIBRATION_CANONICALIZE_BACKFILL_KEY)
   if (marker?.value === 1) return
 
-  await db.transaction('rw', db.chats, db.messages, db.settings, async () => {
-    const chats = await db.chats.toArray()
-    const nextChats: Chat[] = []
-    for (const chat of chats) {
-      const result = canonicalizeTokenCalibrationSamples(chat.tokenCalibration)
-      if (!result.changed) continue
-      nextChats.push({ ...chat, tokenCalibration: result.samples ?? {} })
-    }
-    if (nextChats.length > 0) await db.chats.bulkPut(nextChats)
+  await db.transaction('rw', chats, messages, settings, async () => {
+    const global = emptyGlobalCalibration()
+    await forEachTableBatch(chats, async (rows) => {
+      const changed: Chat[] = []
+      const current: Chat[] = []
+      for (const chat of rows) {
+        const result = canonicalizeTokenCalibrationSamples(chat.tokenCalibration)
+        const next = result.changed ? { ...chat, tokenCalibration: result.samples ?? {} } : chat
+        current.push(next)
+        if (result.changed) changed.push(next)
+      }
+      appendGlobalCalibration(global, current)
+      if (changed.length > 0) await chats.bulkPut(changed)
+    })
 
-    await db.messages.toCollection().modify((message: MessageHeaderRow) => {
+    await messages.toCollection().modify((message) => {
       const key = message.originalCalibrationKey
       if (typeof key !== 'string' || key.length === 0) return
       const canonical = tokenCalibrationKeyForStoredRecordKey(key)
       if (canonical !== key) message.originalCalibrationKey = canonical
     })
 
-    const currentChats = nextChats.length > 0 ? await db.chats.toArray() : chats
-    await db.settings.put({
+    await settings.put({
       key: GLOBAL_TOKEN_CALIBRATION_KEY,
-      value: rebuildGlobalCalibration(currentChats),
+      value: global,
     })
-    await db.settings.put(tokenCalibrationCanonicalizeBackfillMarker())
+    await settings.put(tokenCalibrationCanonicalizeBackfillMarker())
   })
 }
 
@@ -86,17 +97,28 @@ export function canonicalizeTokenCalibrationSamples(
 export function rebuildGlobalCalibration(
   chats: readonly Pick<Chat, 'tokenCalibration'>[],
 ): GlobalTokenCalibration {
-  const byModel: Record<string, TokenCalibrationSample> = {}
-  let updatedAt = 0
+  const global = emptyGlobalCalibration()
+  appendGlobalCalibration(global, chats)
+  return global
+}
+
+function emptyGlobalCalibration(): GlobalTokenCalibration {
+  return { version: 1, updatedAt: 0, byModel: {} }
+}
+
+function appendGlobalCalibration(
+  global: GlobalTokenCalibration,
+  chats: readonly Pick<Chat, 'tokenCalibration'>[],
+): void {
   for (const chat of chats) {
     for (const [storedKey, rawSample] of Object.entries(chat.tokenCalibration ?? {})) {
       const sample = normalizeSample(rawSample)
       if (!sample) continue
       const calibrationKey = tokenCalibrationKeyForStoredRecordKey(storedKey)
-      let target = byModel[calibrationKey]
+      let target = global.byModel[calibrationKey]
       if (!target) {
         target = { totalTextChars: 0, totalTextTokens: 0, sampleCount: 0, updatedAt: 0 }
-        byModel[calibrationKey] = target
+        global.byModel[calibrationKey] = target
       }
       target.totalTextChars += sample.totalTextChars
       target.totalTextTokens += sample.totalTextTokens
@@ -106,10 +128,9 @@ export function rebuildGlobalCalibration(
         if (sample.lastRatio !== undefined) target.lastRatio = sample.lastRatio
         else delete target.lastRatio
       }
-      if (sample.updatedAt > updatedAt) updatedAt = sample.updatedAt
+      if (sample.updatedAt > global.updatedAt) global.updatedAt = sample.updatedAt
     }
   }
-  return { version: 1, updatedAt, byModel }
 }
 
 function mergeSample(target: TokenCalibrationSample, sample: TokenCalibrationSample): void {

@@ -1,8 +1,4 @@
-// Phase 11: `api/responses.ts` adapter tests. Drives the adapter with the
-// captured SSE probe fixture (probe 5) through a mocked fetch. See
-// `plan/phase11-implementation.md §4.2`.
-
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { openAssistantRequestStream } from '../../src/api/assistant-stream'
@@ -14,6 +10,7 @@ import type {
 } from '../../src/api/types'
 import type { AssistantRequestPlan } from '../../src/core/send-planning'
 import type { ConnectionProfile } from '../../src/core/types'
+import { responsesBufferedResult, responsesStreamSse } from '../helpers/protocol-fixtures'
 
 const PROBE5_PATH = resolve(
   __dirname,
@@ -77,11 +74,10 @@ describe('responses() streaming', () => {
     }).rejects.toThrow(/stream:true/)
   })
 
-  it('parses the probe 5 SSE fixture into typed events', async () => {
-    const body = readFileSync(PROBE5_PATH, 'utf8')
+  it('parses a representative SSE fixture into typed events', async () => {
     vi.stubGlobal(
       'fetch',
-      vi.fn(async () => sseResponse(body, { 'x-generation-id': 'gen-probe-5' })),
+      vi.fn(async () => sseResponse(responsesStreamSse, { 'x-generation-id': 'gen-fixture' })),
     )
 
     const events: ResponsesEventWire[] = []
@@ -128,14 +124,13 @@ describe('responses() streaming', () => {
     expect(reasoningItemDone?.item?.encrypted_content).toBeDefined()
     expect(reasoningItemDone?.item?.encrypted_content?.length).toBeGreaterThan(0)
 
-    expect(generationIds).toEqual(new Set(['gen-probe-5']))
+    expect(generationIds).toEqual(new Set(['gen-fixture']))
   })
 
   it('yields a buffered_result when the upstream answers JSON despite stream:true', async () => {
-    const buffered = JSON.parse(readFileSync(PROBE6_PATH, 'utf8')) as unknown as ResponsesResultWire
     vi.stubGlobal(
       'fetch',
-      vi.fn(async () => jsonResponse(buffered)),
+      vi.fn(async () => jsonResponse(responsesBufferedResult)),
     )
 
     const chunks: ResponsesStreamChunk[] = []
@@ -154,6 +149,46 @@ describe('responses() streaming', () => {
     expect(result.output?.[0]?.type).toBe('reasoning')
     expect(result.output?.[1]?.type).toBe('message')
   })
+
+  if (existsSync(PROBE5_PATH)) {
+    it('also parses the full local Responses stream capture', async () => {
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => sseResponse(readFileSync(PROBE5_PATH, 'utf8'))),
+      )
+      const types: string[] = []
+      for await (const chunk of responses(ctx(), {
+        model: 'gpt-5.4-nano',
+        input: 'x',
+        stream: true,
+      })) {
+        if (chunk.type === 'event') types.push(chunk.event.type)
+      }
+      expect(types[0]).toBe('response.created')
+      expect(types.at(-1)).toBe('response.completed')
+    })
+  }
+
+  if (existsSync(PROBE6_PATH)) {
+    it('also parses the full local buffered Responses capture', async () => {
+      const buffered = JSON.parse(readFileSync(PROBE6_PATH, 'utf8')) as ResponsesResultWire
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => jsonResponse(buffered)),
+      )
+      const chunks: ResponsesStreamChunk[] = []
+      for await (const chunk of responses(ctx(), {
+        model: 'openai/gpt-5.4-nano',
+        input: 'x',
+        stream: true,
+      })) {
+        chunks.push(chunk)
+      }
+      expect(chunks).toEqual([
+        expect.objectContaining({ type: 'buffered_result', result: buffered }),
+      ])
+    })
+  }
 
   it('constructs the URL as `<base>/responses`', async () => {
     const seenUrls: string[] = []

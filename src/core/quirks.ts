@@ -1,6 +1,4 @@
-// Per-model behavioral quirks that /endpoints cannot express. See
-// `plan/05-transforms-and-quirks.md` and `CLAUDE.md` "Per-model quirks
-// to honor."
+// Per-model behavioral quirks that /endpoints cannot express.
 //
 // /endpoints reports which top-level params exist for a model + provider.
 // What it CAN'T report:
@@ -22,7 +20,6 @@
 import { canonicalCompatModelId, canonicalModelSlug } from './model-ids'
 import type { EffortLevel, ReasoningFormat, VerbosityLevel } from './types'
 
-// Assistant-prefill classification. See `plan/prefill-research.md §P.8.1`.
 // `native`  — prefill works transparently (Claude < 4.6, Gemini).
 // `unsupported` — provider or model rejects prefill (Claude ≥ 4.6,
 //                 openai/gpt-oss-*, OpenAI GPT family).
@@ -84,8 +81,7 @@ interface QuirksEntry {
   // Claude 4.7+ uses adaptive-only reasoning: `reasoning` is in
   // supported_parameters but `effort` and `max_tokens` are ignored or rejected.
   adaptiveReasoningOnly?: boolean
-  // Anthropic cache floor: "cache_control" below this token count is
-  // not honored. One floor per variant per CLAUDE.md.
+  // Anthropic does not honor cache_control below this per-model token floor.
   cacheMinTokens?: number
   // `phase` field must be persisted verbatim across Responses-API turns
   // (GPT-5.4+ family; dropping phase causes early stopping).
@@ -674,8 +670,7 @@ export function emitsEncryptedReasoningFor(modelId: string): 'always' | 'tools-o
 }
 
 // ---------------------------------------------------------------------------
-// Prefill classification + reasoning-toggleable gate. See
-// `plan/prefill-research.md §P.7` and §P.8.1.
+// Prefill classification + reasoning-toggleable gate.
 // ---------------------------------------------------------------------------
 
 // Claude ≥ 4.6 dropped assistant-prefill on Anthropic direct AND via
@@ -814,7 +809,6 @@ function isKnownOpenWeightTextFamily(slug: string): boolean {
 // Strip sampling params that are gated behind `reasoning.effort === 'none'` on
 // GPT-5.3-codex / GPT-5.4+ family. Call this BEFORE dispatching. Mutates the request.
 //
-// Gate contract per `plan/phase11-implementation.md §4.6`:
 //   `gpt-5.5{,-pro}`, `gpt-5.4{,-pro,-mini,-nano}`, `gpt-5.3-codex` accept `temperature`,
 //   `top_p`, `logprobs`, `top_k` ONLY when `reasoning.effort === 'none'`.
 //   Any other effort value makes the API return HTTP 400.

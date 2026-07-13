@@ -64,9 +64,8 @@ export interface PdfMeta {
   pageCount?: number
   // Fallback: derive pageCount ≈ max(1, bytes / 75000).
   sizeBytes?: number
-  // Tier resolved at upload/extraction time (see
-  // `plan/15-non-text-in-context.md §15.12`). Drives which per-page cost
-  // table applies. When unset, assumes Tier 1 (native passthrough).
+  // Tier resolved at upload/extraction time. Drives which per-page cost table
+  // applies. When unset, assumes Tier 1 (native passthrough).
   tier?: 'native' | 'server-parser' | 'client-extract'
   // Tier 3 only: the extracted text that will flow through calibration
   // instead of a per-page heuristic. When present AND tier === 'client-extract',

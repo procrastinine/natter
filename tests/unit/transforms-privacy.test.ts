@@ -2,9 +2,6 @@
 //   - Free-model exception strips provider.{data_collection,zdr,only,ignore,order}
 //   - allowFallbacks:false surfaces as provider.allow_fallbacks:false
 //   - Pre-computed privacy wire fragments merge into the provider block
-//
-// See `plan/05-transforms-and-quirks.md` privacy-free-strip note and
-// `plan/09-privacy.md §9.9`.
 
 import { describe, expect, it } from 'vitest'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'

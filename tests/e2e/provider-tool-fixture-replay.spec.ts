@@ -1,5 +1,5 @@
-import { readFileSync } from 'node:fs'
-import { expect, type Page, test } from '@playwright/test'
+import { existsSync, readFileSync } from 'node:fs'
+import { expect, type Page, test } from './fixtures'
 import { clearIndexedDb, readMessages } from './helpers'
 
 const PROBE_DIR = new URL(
@@ -11,8 +11,186 @@ interface ProbeRecord {
   response?: { ok?: boolean; body?: Record<string, unknown> }
 }
 
+const COMPACT_PROBE_BODIES: Record<string, Record<string, unknown>> = {
+  'openai-web-search': {
+    id: 'resp_web',
+    status: 'completed',
+    output: [
+      {
+        id: 'web_1',
+        type: 'web_search_call',
+        status: 'completed',
+        action: {
+          type: 'search',
+          query: 'OpenAI API docs',
+          sources: [{ type: 'url', url: 'https://platform.openai.com/api/docs' }],
+        },
+      },
+      {
+        id: 'msg_web',
+        type: 'message',
+        role: 'assistant',
+        status: 'completed',
+        phase: 'final_answer',
+        content: [{ type: 'output_text', text: 'platform.openai.com' }],
+      },
+    ],
+  },
+  'openai-code-interpreter': {
+    id: 'resp_code',
+    status: 'completed',
+    output: [
+      {
+        id: 'code_1',
+        type: 'code_interpreter_call',
+        status: 'completed',
+        code: 'sum(i*i for i in range(6))',
+        outputs: [{ type: 'logs', logs: '55' }],
+      },
+      {
+        id: 'msg_code',
+        type: 'message',
+        role: 'assistant',
+        status: 'completed',
+        phase: 'final_answer',
+        content: [{ type: 'output_text', text: '55' }],
+      },
+    ],
+  },
+  'openai-shell': {
+    id: 'resp_shell',
+    status: 'completed',
+    output: [
+      {
+        id: 'shell_1',
+        type: 'shell_call',
+        status: 'completed',
+        call_id: 'call_shell',
+        action: { commands: ['printf natter-shape-probe.'] },
+      },
+      {
+        id: 'shell_output_1',
+        type: 'shell_call_output',
+        status: 'completed',
+        call_id: 'call_shell',
+        output: [
+          { outcome: { type: 'exit', exit_code: 0 }, stderr: '', stdout: 'natter-shape-probe.' },
+        ],
+      },
+      {
+        id: 'msg_shell',
+        type: 'message',
+        role: 'assistant',
+        status: 'completed',
+        phase: 'final_answer',
+        content: [{ type: 'output_text', text: 'natter-shape-probe.' }],
+      },
+    ],
+  },
+  'google-code-execution': {
+    responseId: 'gemini_code',
+    candidates: [
+      {
+        content: {
+          role: 'model',
+          parts: [
+            { executableCode: { language: 'PYTHON', code: 'print(55)' } },
+            { codeExecutionResult: { outcome: 'OUTCOME_OK', output: '55\n' } },
+            { text: '55' },
+          ],
+        },
+        finishReason: 'STOP',
+      },
+    ],
+  },
+  'anthropic-web-search': {
+    id: 'msg_web_search',
+    type: 'message',
+    role: 'assistant',
+    stop_reason: 'end_turn',
+    content: [
+      {
+        type: 'server_tool_use',
+        id: 'server_web',
+        name: 'web_search',
+        input: { query: 'OpenAI API docs' },
+      },
+      {
+        type: 'web_search_tool_result',
+        tool_use_id: 'server_web',
+        content: [
+          {
+            type: 'web_search_result',
+            title: 'OpenAI API documentation',
+            url: 'https://platform.openai.com/api/docs',
+          },
+        ],
+      },
+      { type: 'text', text: 'platform.openai.com' },
+    ],
+  },
+  'anthropic-web-fetch': {
+    id: 'msg_web_fetch',
+    type: 'message',
+    role: 'assistant',
+    stop_reason: 'end_turn',
+    content: [
+      {
+        type: 'server_tool_use',
+        id: 'server_fetch',
+        name: 'web_fetch',
+        input: { url: 'https://example.com' },
+      },
+      {
+        type: 'web_fetch_tool_result',
+        tool_use_id: 'server_fetch',
+        content: {
+          type: 'web_fetch_result',
+          url: 'https://example.com',
+          content: { type: 'document', title: 'Example Domain' },
+        },
+      },
+      { type: 'text', text: 'example.com' },
+    ],
+  },
+  'anthropic-code-execution': {
+    id: 'msg_code_execution',
+    type: 'message',
+    role: 'assistant',
+    stop_reason: 'end_turn',
+    content: [
+      {
+        type: 'server_tool_use',
+        id: 'server_code',
+        name: 'bash_code_execution',
+        input: { command: 'printf 55' },
+      },
+      {
+        type: 'bash_code_execution_tool_result',
+        tool_use_id: 'server_code',
+        content: { type: 'bash_code_execution_result', stdout: '55\n', stderr: '', return_code: 0 },
+      },
+      { type: 'text', text: '55' },
+    ],
+  },
+  'anthropic-advisor': {
+    id: 'msg_advisor',
+    type: 'message',
+    role: 'assistant',
+    stop_reason: 'end_turn',
+    content: [
+      { type: 'server_tool_use', id: 'server_advisor', name: 'advisor', input: {} },
+      {
+        type: 'advisor_tool_result',
+        tool_use_id: 'server_advisor',
+        content: { type: 'advisor_result', text: '2+2 equals 4' },
+      },
+      { type: 'text', text: '2+2 equals 4' },
+    ],
+  },
+}
+
 test.beforeEach(async ({ page }) => {
-  await page.goto('/')
   await clearIndexedDb(page)
   await page.evaluate(() => {
     window.sessionStorage.clear()
@@ -90,7 +268,7 @@ test('debug fake stream replays Anthropic Messages hosted-tool fixtures through 
   })
 })
 
-test('tool evidence supports per-item visibility and edit/create in the inline editor', async ({
+test('tool evidence supports per-item visibility while Edit remains content-only', async ({
   page,
 }) => {
   const result = await startProviderFixture(page, 'openai-shell')
@@ -115,45 +293,34 @@ test('tool evidence supports per-item visibility and edit/create in the inline e
     'data-hidden',
     'true',
   )
-  await assistant.locator('[data-action="edit"]').click()
-  await assistant.locator('[data-ui="inline-editor-tool-calls"] summary').click()
-  await assistant
-    .locator('[data-ui="inline-editor-tool-call-input"]')
-    .first()
-    .fill('{"type":"shell_call","commands":["echo edited-marker"]}')
-  await assistant.locator('[data-ui="inline-editor-tool-call-add-button"]').click()
-  await assistant.locator('[aria-label="Tool call type"]').last().fill('manual_tool_call')
-  await assistant
-    .locator('[data-ui="inline-editor-tool-call-input"]')
-    .last()
-    .fill('{"note":"created-marker"}')
-  await assistant.locator('[data-role="save"]').click()
-
-  await expect(evidence).toContainText('edited')
   rows = await readMessages(page, result.chatId)
   storedAssistant = rows.filter((row) => row.role === 'assistant').at(-1)
   expect(storedAssistant?.providerOutputItems?.[0]?.hidden).toBeUndefined()
-  expect(storedAssistant?.providerOutputItems?.[0]?.edited).toBe(true)
-  expect(JSON.stringify(storedAssistant?.providerOutputItems?.[0]?.item)).toContain('edited-marker')
-  expect(storedAssistant?.providerOutputItems?.at(-1)?.edited).toBe(true)
-  expect(JSON.stringify(storedAssistant?.providerOutputItems?.at(-1)?.item)).toContain(
-    'created-marker',
-  )
+  const providerOutputBeforeEdit = structuredClone(storedAssistant?.providerOutputItems)
+  await assistant.locator('[data-action="edit"]').click()
+  await expect(assistant.locator('[data-ui="inline-editor-tool-calls"]')).toHaveCount(0)
+  await assistant.locator('[data-ui="inline-editor-input"]').fill('content-only edit')
+  await assistant.locator('[data-role="save"]').click()
+
+  await expect(assistant.locator('[data-ui="message-body"]')).toContainText('content-only edit')
+  rows = await readMessages(page, result.chatId)
+  storedAssistant = rows.filter((row) => row.role === 'assistant').at(-1)
+  expect(storedAssistant?.providerOutputItems).toEqual(providerOutputBeforeEdit)
 })
 
 test('tool evidence keeps long stdout horizontally scrollable in narrow layouts', async ({
   page,
 }) => {
-  await startProviderFixture(page, 'openai-shell')
-  const assistant = page.locator('[data-ui="message"][data-role="assistant"]').last()
-  await assistant.locator('[data-action="edit"]').click()
-  await assistant.locator('[data-ui="inline-editor-tool-calls"] summary').click()
   const longStdout = `LONG_STDOUT_${'x'.repeat(180)}`
-  await assistant
-    .locator('[data-ui="inline-editor-tool-call-input"]')
-    .nth(1)
-    .fill(JSON.stringify({ type: 'shell_call_output', stdout: longStdout }))
-  await assistant.locator('[data-role="save"]').click()
+  const body = loadProbeBody('openai-shell')
+  const shellOutput = (body.output as Array<Record<string, unknown>>).find(
+    (item) => item.type === 'shell_call_output',
+  )
+  const outputRows = shellOutput?.output as Array<Record<string, unknown>> | undefined
+  if (!outputRows?.[0]) throw new Error('OpenAI shell fixture output missing')
+  outputRows[0].stdout = longStdout
+  await startProviderFixture(page, 'openai-shell', body)
+  const assistant = page.locator('[data-ui="message"][data-role="assistant"]').last()
 
   await page.setViewportSize({ width: 760, height: 840 })
   const evidence = assistant.locator('[data-ui="tool-evidence"]')
@@ -226,8 +393,11 @@ async function replayProviderFixture(
   for (const type of input.expectedToolTypes) expect(toolTypes).toContain(type)
 }
 
-async function startProviderFixture(page: Page, id: string): Promise<{ chatId: string }> {
-  const body = loadProbeBody(id)
+async function startProviderFixture(
+  page: Page,
+  id: string,
+  body = loadProbeBody(id),
+): Promise<{ chatId: string }> {
   return page.evaluate(
     async ({ body, id }) => {
       const api = (
@@ -261,8 +431,14 @@ function escapeRegExp(value: string): string {
 }
 
 function loadProbeBody(id: string): Record<string, unknown> {
-  const record = JSON.parse(readFileSync(new URL(`${id}.json`, PROBE_DIR), 'utf8')) as ProbeRecord
-  expect(record.response?.ok, `${id} live probe should have succeeded`).toBe(true)
-  expect(record.response?.body, `${id} live probe should have a JSON response body`).toBeDefined()
-  return record.response?.body ?? {}
+  const localPath = new URL(`${id}.json`, PROBE_DIR)
+  if (process.env.NATTER_COMPACT_FIXTURES !== '1' && existsSync(localPath)) {
+    const record = JSON.parse(readFileSync(localPath, 'utf8')) as ProbeRecord
+    expect(record.response?.ok, `${id} live probe should have succeeded`).toBe(true)
+    expect(record.response?.body, `${id} live probe should have a JSON response body`).toBeDefined()
+    return record.response?.body ?? {}
+  }
+  const compact = COMPACT_PROBE_BODIES[id]
+  if (!compact) throw new Error(`unknown compact provider fixture: ${id}`)
+  return structuredClone(compact)
 }

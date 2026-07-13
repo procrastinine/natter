@@ -1,15 +1,18 @@
 // Global (app-wide) preferences. Distinct from per-chat settings (which live
 // on `Chat.settings` / `ChatPreset.settings`) and from connection-profile
-// settings (creds + endpoint, on `ConnectionProfile`). See plan/02-data-model.md
-// §2.5 for the precedence picture.
+// settings (credentials and endpoint, on `ConnectionProfile`).
 //
 // Everything here is keyed under the `settings` IDB table via the existing
 // `getSetting/setSetting` helpers. Typed read/write wrappers are exposed so
 // call sites don't have to remember the key names.
 
-import { getSetting, setSetting } from '../store/settings'
+import { getSettings, setSetting } from '../store/settings'
 import { type CorsProxyConfig, DEFAULT_CORS_PROXY_URL, DEV_CORS_PROXY_URL } from './cors-proxy'
 
+export {
+  CONTINUE_SYSTEM_PROMPT_PLACEHOLDER,
+  resolveContinueSystemPromptTemplate,
+} from './continue-prompts'
 export { DEV_CORS_PROXY_URL }
 
 export type ThemePreference = 'system' | 'light' | 'dark' | 'high-contrast'
@@ -68,20 +71,6 @@ export type RenderWindowLoadMode = 'auto' | 'manual'
 // original system prompt is not appended automatically.
 // `continueUserPrompt` is appended as a synthetic trailing user turn when
 // non-empty; blank falls back to the legacy double-assistant shape.
-export const CONTINUE_SYSTEM_PROMPT_PLACEHOLDER = '[SYSTEM_PROMPT]'
-export const DEFAULT_CONTINUE_SYSTEM_PROMPT =
-  'Continue the chat from the last assistant message. The last assistant message is incomplete. Output only the continuation. Do not repeat prior content, do not add filler text, and do not restate the user question.\n\nThe original system prompt (for reference):\n```\n[SYSTEM_PROMPT]\n```'
-export const DEFAULT_CONTINUE_USER_PROMPT =
-  'Now please generate only the continuation of the last message, with zero filler text.'
-
-export function resolveContinueSystemPromptTemplate(
-  template: string,
-  originalSystemPrompt: string,
-): string {
-  if (template.trim().length === 0) return ''
-  return template.split(CONTINUE_SYSTEM_PROMPT_PLACEHOLDER).join(originalSystemPrompt)
-}
-
 interface GlobalPreferences {
   theme: ThemePreference
   sendShortcut: SendShortcut
@@ -181,6 +170,27 @@ const SIDEBAR_RENDER_WINDOW_LOAD_MODE_KEY = 'global:sidebar-render-window-load-m
 const CORS_PROXY_URL_KEY = 'global:cors-proxy-url'
 const CORS_PROXY_SECRET_KEY = 'global:cors-proxy-secret'
 
+export const GLOBAL_PREFERENCE_KEYS = [
+  THEME_KEY,
+  SEND_SHORTCUT_KEY,
+  USER_PIC_KEY,
+  ASSISTANT_PIC_KEY,
+  CHAT_MAX_WIDTH_KEY,
+  FONT_FAMILY_KEY,
+  BASE_FONT_SIZE_KEY,
+  AUTO_SCROLL_STREAM_KEY,
+  PINNED_MODELS_KEY,
+  RECENT_MODELS_KEY,
+  TOKEN_CALIBRATION_MODE_KEY,
+  LONG_MESSAGE_DISPLAY_MODE_KEY,
+  MESSAGE_RENDER_WINDOW_SIZE_KEY,
+  SIDEBAR_RENDER_WINDOW_SIZE_KEY,
+  MESSAGE_RENDER_WINDOW_LOAD_MODE_KEY,
+  SIDEBAR_RENDER_WINDOW_LOAD_MODE_KEY,
+  CORS_PROXY_URL_KEY,
+  CORS_PROXY_SECRET_KEY,
+] as const
+
 export const FONT_FAMILY_OPTIONS: ReadonlyArray<{
   value: FontFamilyChoice
   label: string
@@ -217,6 +227,14 @@ export const FONT_FAMILY_OPTIONS: ReadonlyArray<{
     stack: 'Georgia, "Times New Roman", Times, serif',
   },
 ]
+
+export function fontFamilyStack(value: FontFamilyChoice): string {
+  return (
+    FONT_FAMILY_OPTIONS.find((option) => option.value === value)?.stack ??
+    FONT_FAMILY_OPTIONS[0]?.stack ??
+    ''
+  )
+}
 
 export const BASE_FONT_SIZE_OPTIONS: readonly BaseFontSize[] = [13, 14, 15, 16, 17, 18]
 
@@ -306,45 +324,25 @@ function clampInt(value: number, min: number, max: number): number {
 }
 
 export async function readGlobalPreferences(): Promise<GlobalPreferences> {
-  const [
-    theme,
-    sendShortcut,
-    userPic,
-    asstPic,
-    chatMaxWidth,
-    fontFamily,
-    baseFontSize,
-    autoScrollStream,
-    pinned,
-    recent,
-    tokenCalibrationMode,
-    longMessageDisplayMode,
-    messageRenderWindowSize,
-    sidebarRenderWindowSize,
-    messageRenderWindowLoadMode,
-    sidebarRenderWindowLoadMode,
-    corsProxyUrl,
-    corsProxySecret,
-  ] = await Promise.all([
-    getSetting<ThemePreference>(THEME_KEY),
-    getSetting<SendShortcut>(SEND_SHORTCUT_KEY),
-    getSetting<ProfilePictureRef>(USER_PIC_KEY),
-    getSetting<ProfilePictureRef>(ASSISTANT_PIC_KEY),
-    getSetting<ChatMaxWidth>(CHAT_MAX_WIDTH_KEY),
-    getSetting<FontFamilyChoice>(FONT_FAMILY_KEY),
-    getSetting<BaseFontSize>(BASE_FONT_SIZE_KEY),
-    getSetting<boolean>(AUTO_SCROLL_STREAM_KEY),
-    getSetting<string[]>(PINNED_MODELS_KEY),
-    getSetting<string[]>(RECENT_MODELS_KEY),
-    getSetting<TokenCalibrationMode>(TOKEN_CALIBRATION_MODE_KEY),
-    getSetting<LongMessageDisplayMode>(LONG_MESSAGE_DISPLAY_MODE_KEY),
-    getSetting<number>(MESSAGE_RENDER_WINDOW_SIZE_KEY),
-    getSetting<number>(SIDEBAR_RENDER_WINDOW_SIZE_KEY),
-    getSetting<RenderWindowLoadMode>(MESSAGE_RENDER_WINDOW_LOAD_MODE_KEY),
-    getSetting<RenderWindowLoadMode>(SIDEBAR_RENDER_WINDOW_LOAD_MODE_KEY),
-    getSetting<string>(CORS_PROXY_URL_KEY),
-    getSetting<string>(CORS_PROXY_SECRET_KEY),
-  ])
+  const stored = await getSettings(GLOBAL_PREFERENCE_KEYS)
+  const theme = stored.get(THEME_KEY)
+  const sendShortcut = stored.get(SEND_SHORTCUT_KEY)
+  const userPic = stored.get(USER_PIC_KEY)
+  const asstPic = stored.get(ASSISTANT_PIC_KEY)
+  const chatMaxWidth = stored.get(CHAT_MAX_WIDTH_KEY)
+  const fontFamily = stored.get(FONT_FAMILY_KEY)
+  const baseFontSize = stored.get(BASE_FONT_SIZE_KEY)
+  const autoScrollStream = stored.get(AUTO_SCROLL_STREAM_KEY)
+  const pinned = stored.get(PINNED_MODELS_KEY)
+  const recent = stored.get(RECENT_MODELS_KEY)
+  const tokenCalibrationMode = stored.get(TOKEN_CALIBRATION_MODE_KEY)
+  const longMessageDisplayMode = stored.get(LONG_MESSAGE_DISPLAY_MODE_KEY)
+  const messageRenderWindowSize = stored.get(MESSAGE_RENDER_WINDOW_SIZE_KEY)
+  const sidebarRenderWindowSize = stored.get(SIDEBAR_RENDER_WINDOW_SIZE_KEY)
+  const messageRenderWindowLoadMode = stored.get(MESSAGE_RENDER_WINDOW_LOAD_MODE_KEY)
+  const sidebarRenderWindowLoadMode = stored.get(SIDEBAR_RENDER_WINDOW_LOAD_MODE_KEY)
+  const corsProxyUrl = stored.get(CORS_PROXY_URL_KEY)
+  const corsProxySecret = stored.get(CORS_PROXY_SECRET_KEY)
   return {
     theme: ALLOWED_THEMES.includes(theme as ThemePreference)
       ? (theme as ThemePreference)
@@ -490,9 +488,7 @@ export async function writeAutoScrollOnStream(value: boolean): Promise<void> {
 // preferred font isn't installed.
 export function applyFontFamilyToDocument(value: FontFamilyChoice): void {
   if (typeof document === 'undefined') return
-  const match = FONT_FAMILY_OPTIONS.find((f) => f.value === value)
-  const stack = match?.stack ?? FONT_FAMILY_OPTIONS[0]?.stack ?? ''
-  document.documentElement.style.setProperty('--font-sans', stack)
+  document.documentElement.style.setProperty('--font-sans', fontFamilyStack(value))
 }
 
 // Apply the base font-size pref — drives `--font-size-md` on :root.

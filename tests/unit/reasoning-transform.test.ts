@@ -1,5 +1,4 @@
-// Reasoning-mode serialization. See `plan/05-transforms-and-quirks.md §5.1`
-// step 5 and `src/core/transforms.ts::buildReasoning` for the rules.
+// Reasoning-mode serialization rules.
 //
 // Five modes:
 //   - default → no `reasoning` field on the wire (provider's native default)

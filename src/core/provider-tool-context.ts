@@ -514,7 +514,9 @@ function displayValue(value: unknown): string {
 }
 
 function compactJson(value: unknown): string {
-  return trimLong(JSON.stringify(redactNoisyFields(value), null, 2) ?? '')
+  const stringify: (value: unknown, replacer: null, space: number) => string | undefined =
+    JSON.stringify
+  return trimLong(stringify(redactNoisyFields(value), null, 2) ?? '')
 }
 
 function redactNoisyFields(value: unknown): unknown {

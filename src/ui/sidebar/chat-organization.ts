@@ -285,7 +285,7 @@ function startOfLocalDay(value: number): number {
 }
 
 function chatTitle(chat: ChatSidebarRow): string {
-  const title = chat.title?.trim()
+  const title = chat.title.trim()
   return title ? title : 'Untitled chat'
 }
 

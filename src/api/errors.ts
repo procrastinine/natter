@@ -1,12 +1,10 @@
-// Transport error taxonomy. See `plan/04-api-client.md §4.5`.
-//
 // `normalizeError` is the single choke point for all upstream failure modes.
 // Every error that leaves the transport layer is an `ApiError` — callers don't
 // need to branch on DOMException / TypeError / response shape themselves. The
 // `retryable` flag is a HINT for the UI's retry button; the actual retry policy
 // (GET backoff, key fallback chain) lives in `client.ts`.
 
-type ApiErrorKind =
+export type ApiErrorKind =
   | 'network'
   | 'timeout'
   | 'abort'
@@ -18,7 +16,10 @@ type ApiErrorKind =
   | 'provider_error'
   | 'no_provider_available'
   | 'validation'
-  | 'unknown'
+  | 'protocol'
+  | 'storage'
+  | 'integrity'
+  | 'internal'
 
 interface ApiErrorShape {
   kind: ApiErrorKind
@@ -50,7 +51,7 @@ export class ApiError extends Error implements ApiErrorShape {
   }
 }
 
-interface NormalizeCtx {
+export interface NormalizeCtx {
   midStream: boolean
   httpStatus?: number
   // When the request never reached a response, the caller indicates WHICH
@@ -58,7 +59,7 @@ interface NormalizeCtx {
   // 'timeout' + 'abort' distinguish the two AbortError sources that fetch
   // cannot tell apart on its own; without this, every aborted request would
   // wind up as `network` or `unknown`.
-  cause?: 'timeout' | 'abort' | 'network'
+  cause?: 'timeout' | 'abort' | 'network' | 'protocol' | 'storage' | 'integrity' | 'internal'
 }
 
 function classifyStatus(
@@ -80,7 +81,7 @@ function classifyStatus(
   if (status === 503) return { kind: 'no_provider_available', retryable: true }
   if (status >= 500 && status < 600) return { kind: 'provider_error', retryable: true }
   if (status >= 400 && status < 500) return { kind: 'bad_request', retryable: false }
-  return { kind: 'unknown', retryable: false }
+  return { kind: 'protocol', retryable: false }
 }
 
 interface ErrorLike {
@@ -119,6 +120,37 @@ export function normalizeError(input: unknown, ctx: NormalizeCtx): ApiError {
       retryable: true,
     })
   }
+  if (
+    ctx.cause === 'network' ||
+    ctx.cause === 'protocol' ||
+    ctx.cause === 'storage' ||
+    ctx.cause === 'integrity' ||
+    ctx.cause === 'internal'
+  ) {
+    const labels = {
+      network: { code: 'NETWORK', message: 'Network error', retryable: true },
+      protocol: {
+        code: 'PROTOCOL',
+        message: 'Provider response could not be decoded',
+        retryable: false,
+      },
+      storage: { code: 'STORAGE', message: 'Local persistence failed', retryable: true },
+      integrity: {
+        code: 'INTEGRITY',
+        message: 'Response integrity could not be verified',
+        retryable: false,
+      },
+      internal: { code: 'INTERNAL', message: 'Internal generation failure', retryable: false },
+    } as const
+    const selected = labels[ctx.cause]
+    return new ApiError({
+      kind: ctx.cause,
+      code: selected.code,
+      message: input instanceof Error && input.message ? input.message : selected.message,
+      midStream: ctx.midStream,
+      retryable: selected.retryable,
+    })
+  }
 
   if (ctx.httpStatus !== undefined) {
     const body = extractErrorBody(input)
@@ -154,14 +186,19 @@ export function normalizeError(input: unknown, ctx: NormalizeCtx): ApiError {
     }
   }
 
-  // No HTTP status, no user abort, no timeout: network or an opaque throw.
+  // No boundary hint means an internal failure. Network/protocol/storage
+  // boundaries must classify their own throws before they reach this point.
   const message =
-    input instanceof Error ? input.message : typeof input === 'string' ? input : 'Network error'
+    input instanceof Error
+      ? input.message
+      : typeof input === 'string'
+        ? input
+        : 'Internal generation failure'
   return new ApiError({
-    kind: ctx.cause === 'network' ? 'network' : 'unknown',
-    code: ctx.cause === 'network' ? 'NETWORK' : 'UNKNOWN',
+    kind: 'internal',
+    code: 'INTERNAL',
     message,
     midStream: ctx.midStream,
-    retryable: ctx.cause === 'network',
+    retryable: false,
   })
 }

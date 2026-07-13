@@ -1,10 +1,8 @@
-// ULID generation. See `plan/02-data-model.md §2.7`.
-//
 // `ulidx`'s monotonic factory is used so ULIDs generated within the same
 // millisecond still strictly increase (the random tail increments). The
 // module-local factory is shared across all callers in this tab so ordering is
-// consistent for in-process generation; cross-tab ordering is lexicographic via
-// the shared timestamp prefix (good enough, see §2.7 on the wall-clock caveat).
+// consistent for in-process generation. Cross-tab ordering is lexicographic via
+// the shared timestamp prefix and therefore remains subject to wall-clock skew.
 
 import { monotonicFactory, ulid as rawUlid, ULID_REGEX } from 'ulidx'
 

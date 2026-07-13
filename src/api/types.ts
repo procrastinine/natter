@@ -1,22 +1,12 @@
-// Wire + internal types for the transport layer. See `plan/04-api-client.md §4.1 and §4.3`.
-//
 // Wire types mirror the JSON shape on `api.openai.com`-style endpoints (snake_case).
 // Internal `ChatStreamChunk` is the tagged union yielded by `chatCompletions()` — it
 // lets one consumer handle three outcomes: a normal SSE delta, a keepalive comment
-// (used for hang detection per §6.11), and a synthetic `buffered_result` when the
+// used for hang detection, and a synthetic `buffered_result` when the
 // upstream answers with JSON despite `stream: true`.
 
-export interface CallOpts {
-  signal?: AbortSignal
-  overrideHeaders?: Record<string, string>
-  // GET-only retry policy. POSTs ignore this (see §4.10). API-key fallback is
-  // handled separately via `apiKeyFallbackRefs` on the profile.
-  retry?: { attempts: number; backoffMs: number }
-  // Time allowed to establish the HTTP response headers. Once the response head
-  // arrives, stream reads are not bounded by this — long generations are fine.
-  // Default 120_000 (2 minutes) per §4.2.
-  timeoutMs?: number
-}
+import type { StreamIntegrityChunk } from './stream-integrity'
+
+export type { CallOpts } from './call-opts'
 
 // ---------------------------------------------------------------------------
 // Chat completions — wire shapes
@@ -102,6 +92,8 @@ export interface ChatCompletionResultWire {
 export type ChatStreamChunk =
   | { type: 'delta'; chunk: ChatCompletionChunkWire; generationId?: string }
   | { type: 'keepalive'; comment: string }
+  | { type: 'transport_terminal'; evidence: 'done-sentinel' }
+  | StreamIntegrityChunk
   | {
       type: 'buffered_result'
       result: ChatCompletionResultWire
@@ -109,8 +101,7 @@ export type ChatStreamChunk =
     }
 
 // ---------------------------------------------------------------------------
-// Responses API — wire shapes (OpenAI direct + OpenRouter beta). See
-// `plan/phase11-implementation.md §4.1`.
+// Responses API — wire shapes (OpenAI direct + OpenRouter beta).
 // ---------------------------------------------------------------------------
 
 export interface ResponsesRequestWire {
@@ -158,7 +149,7 @@ export interface ResponsesInputItem {
   content?: unknown[]
   phase?: 'commentary' | 'final_answer' | null
   encrypted_content?: string
-  summary?: Array<{ type: 'summary_text'; text: string }>
+  summary?: unknown[]
   // function_call / function_call_output
   call_id?: string
   name?: string
@@ -373,6 +364,7 @@ export type ResponsesStreamChunk =
       generationId?: string
     }
   | { type: 'keepalive'; comment: string }
+  | StreamIntegrityChunk
   | {
       type: 'buffered_result'
       result: ResponsesResultWire

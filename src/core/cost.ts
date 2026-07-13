@@ -1,6 +1,3 @@
-// Cost + token extraction and aggregation. See `plan/02-data-model.md §2.1`
-// (`chat.totalCostUsd`) and `plan/13-delivery.md §13.2` (phase 2).
-//
 // Two wire shapes flow in:
 //
 //   Chat completions `usage`: `{prompt_tokens, completion_tokens, total_tokens,
@@ -92,9 +89,8 @@ export function normalizeResponsesUsage(usage: ResponsesUsage | null | undefined
   }
 }
 
-// Sum `generation.cost` across all non-deleted messages (all branches). Mirrors
-// the `chat.totalCostUsd` recompute rule in `plan/02-data-model.md §2.1` + §13.5.
-// Messages without a `generation.cost` field contribute 0.
+// Sum `generation.cost` across all non-deleted messages on every branch.
+// Messages without a generation cost contribute zero.
 export function aggregateChatCost(messages: readonly Message[]): number {
   let total = 0
   for (const m of messages) {

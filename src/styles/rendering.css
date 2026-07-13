@@ -3,7 +3,6 @@
  *                 blocked-image stub.
  * Owns: [data-ui='markdown'|'code-block'|'code-toolbar'|'math-block'|'media-block'|
  *              'annotations'|'citation-link'|'blocked-image'|'image-allowlist'].
- * See plan/10-ui.md §10.20, plan/11-rendering.md.
  */
 
 [data-ui="markdown"] {

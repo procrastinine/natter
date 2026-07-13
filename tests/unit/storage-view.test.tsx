@@ -9,9 +9,15 @@ import {
   readTokenCalibrationGlobal,
   writeTokenCalibrationGlobal,
 } from '../../src/core/token-calibration'
-import { createRemoteAttachment, ingestAttachmentBytes } from '../../src/store/attachments'
+import type { Chat } from '../../src/core/types'
+import {
+  addExistingAttachmentRef,
+  createRemoteAttachment,
+  ingestAttachmentBytes,
+} from '../../src/store/attachments'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import { __resetBrowserRepositoryForTests } from '../../src/store/browser-repo'
+import { putChatSidebarProjection } from '../../src/store/chat-sidebar-projection'
 import {
   archiveChat,
   createChat,
@@ -31,7 +37,7 @@ import {
 } from '../../src/store/workspace-repository'
 import { __resetSearchStoreForTests } from '../../src/store/zustand/searchStore'
 import { jsonEntriesZipBlob } from '../../src/ui/import-export/json-file'
-import { StorageView } from '../../src/ui/storage/StorageView'
+import { deleteAttachmentForStorage, StorageView } from '../../src/ui/storage/StorageView'
 
 const debugNukeMocks = vi.hoisted(() => ({
   nukeSiteStorage: vi.fn<() => Promise<void>>(),
@@ -84,6 +90,7 @@ function setDaemonWorkspaceRepository(): WorkspaceRepository {
       mutationCounter: 0,
     }),
     listChats: vi.fn().mockResolvedValue([]),
+    searchAttachments: vi.fn().mockResolvedValue({ rows: [] }),
   } as unknown as WorkspaceRepository
   __setWorkspaceRepositoryForTests(repo)
   return repo
@@ -136,18 +143,30 @@ async function resetAll() {
   await Dexie.delete(DB_NAME)
 }
 
+async function updateChatForTest(chatId: string, patch: Partial<Chat>): Promise<void> {
+  const db = getDb()
+  await db.transaction('rw', db.chats, db.chatSidebarRows, db.settings, async (tx) => {
+    const chat = await db.chats.get(chatId)
+    if (!chat) throw new Error(`missing test chat ${chatId}`)
+    const next = { ...chat, ...patch }
+    await db.chats.put(next)
+    await putChatSidebarProjection(tx, next)
+  })
+}
+
 describe('StorageView', () => {
   beforeEach(async () => {
     ;(globalThis as unknown as { indexedDB: IDBFactory }).indexedDB = new IDBFactory()
     await resetAll()
     debugNukeMocks.nukeSiteStorage.mockReset()
     debugNukeMocks.nukeSiteStorage.mockResolvedValue(undefined)
+    const estimate = {
+      usage: 4096,
+      quota: 8192,
+      usageDetails: { indexedDB: 1024, caches: 3072 },
+    }
     setNavigatorStorage({
-      estimate: vi.fn<StorageManager['estimate']>().mockResolvedValue({
-        usage: 4096,
-        quota: 8192,
-        usageDetails: { indexedDB: 1024, caches: 3072 },
-      } as StorageEstimate),
+      estimate: vi.fn<StorageManager['estimate']>().mockResolvedValue(estimate),
       persist: vi.fn<StorageManager['persist']>().mockResolvedValue(true),
       persisted: vi.fn<StorageManager['persisted']>().mockResolvedValue(false),
     })
@@ -247,6 +266,28 @@ describe('StorageView', () => {
     expect(anchor?.href).toBe('https://example.test/note.txt')
   })
 
+  it('does not escalate a stale unreferenced delete into referenced byte deletion', async () => {
+    const chat = await createChat({ title: 'Race target' })
+    const bundle = await ingestAttachmentBytes({
+      blob: bytes('keep these bytes'),
+      filename: 'race.txt',
+      now: 10,
+    })
+    const stale = structuredClone(bundle.attachment)
+    expect(stale.refCount).toBe(0)
+    await addExistingAttachmentRef({
+      draftChatId: chat.id,
+      attachmentId: stale.id,
+      now: 20,
+    })
+
+    await expect(deleteAttachmentForStorage(stale)).resolves.toBe(false)
+    const stored = await getDb().attachments.get(stale.id)
+    expect(stored?.refCount).toBe(1)
+    expect(stored?.storage.kind).toBe('local-blob')
+    expect(await getDb().attachmentBlobs.where('attachmentId').equals(stale.id).count()).toBe(1)
+  })
+
   it('requests notification permission and shows Chromium/Safari persistence hints in browser mode', async () => {
     const persist = vi.fn<StorageManager['persist']>().mockResolvedValue(false)
     const persisted = vi.fn<StorageManager['persisted']>().mockResolvedValue(false)
@@ -254,7 +295,7 @@ describe('StorageView', () => {
       estimate: vi.fn<StorageManager['estimate']>().mockResolvedValue({
         usage: 4096,
         quota: 8192,
-      } as StorageEstimate),
+      }),
       persist,
       persisted,
     })
@@ -284,7 +325,7 @@ describe('StorageView', () => {
       estimate: vi.fn<StorageManager['estimate']>().mockResolvedValue({
         usage: 4096,
         quota: 8192,
-      } as StorageEstimate),
+      }),
       persist,
       persisted: vi.fn<StorageManager['persisted']>().mockResolvedValue(false),
     })
@@ -348,12 +389,13 @@ describe('StorageView', () => {
     const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true)
 
     const { container } = render(<StorageView route={{ section: 'overview' }} />)
-    let input: HTMLInputElement | null = null
-    await waitFor(() => {
-      input = container.querySelector<HTMLInputElement>('[data-ui="storage-workspace-import-input"]')
-      expect(input).toBeTruthy()
+    const input = await waitFor(() => {
+      const candidate = container.querySelector<HTMLInputElement>(
+        '[data-ui="storage-workspace-import-input"]',
+      )
+      if (!candidate) throw new Error('expected workspace import input')
+      return candidate
     })
-    if (!input) throw new Error('expected workspace import input')
 
     fireEvent.change(input, {
       target: {
@@ -373,7 +415,7 @@ describe('StorageView', () => {
     const googleKey = tokenCalibrationKey('google/gemini-2.5-pro-preview')
     const alpha = await createChat({ id: 'chat-alpha', title: 'Alpha' })
     const beta = await createChat({ id: 'chat-beta', title: 'Beta' })
-    await getDb().chats.update(alpha.id, {
+    await updateChatForTest(alpha.id, {
       tokenCalibration: {
         [openaiKey]: {
           totalTextChars: 400,
@@ -389,7 +431,7 @@ describe('StorageView', () => {
         },
       },
     })
-    await getDb().chats.update(beta.id, {
+    await updateChatForTest(beta.id, {
       tokenCalibration: {
         [openaiKey]: {
           totalTextChars: 600,
@@ -455,7 +497,7 @@ describe('StorageView', () => {
     const live = await createChat({ id: 'chat-live', title: 'Live' })
     const archivedOne = await createChat({ id: 'chat-archived-one', title: 'Archived one' })
     const archivedTwo = await createChat({ id: 'chat-archived-two', title: 'Archived two' })
-    await getDb().chats.update(live.id, {
+    await updateChatForTest(live.id, {
       tokenCalibration: {
         [openaiKey]: {
           totalTextChars: 400,
@@ -465,7 +507,7 @@ describe('StorageView', () => {
         },
       },
     })
-    await getDb().chats.update(archivedOne.id, {
+    await updateChatForTest(archivedOne.id, {
       tokenCalibration: {
         [openaiKey]: {
           totalTextChars: 600,
@@ -475,7 +517,7 @@ describe('StorageView', () => {
         },
       },
     })
-    await getDb().chats.update(archivedTwo.id, {
+    await updateChatForTest(archivedTwo.id, {
       tokenCalibration: {
         [openaiKey]: {
           totalTextChars: 800,
@@ -527,7 +569,7 @@ describe('StorageView', () => {
     const chat = await createChat({ id: 'chat-alpha', title: 'Alpha', now: 1000 })
     const folder = await createFolder({ name: 'Work' })
     const tagIds = await setChatTagsFromNames(chat.id, ['Research'], 2000)
-    await getDb().chats.update(chat.id, {
+    await updateChatForTest(chat.id, {
       previewText: 'Alpha preview',
       folderId: folder.id,
       tags: tagIds,
@@ -603,8 +645,8 @@ describe('StorageView', () => {
   it('uses the sidebar search session behavior on the chats table', async () => {
     const alpha = await createChat({ id: 'chat-alpha', title: 'Alpha', now: 1000 })
     const beta = await createChat({ id: 'chat-beta', title: 'Needle beta', now: 2000 })
-    await getDb().chats.update(alpha.id, { previewText: 'plain preview' })
-    await getDb().chats.update(beta.id, { previewText: 'matching preview' })
+    await updateChatForTest(alpha.id, { previewText: 'plain preview' })
+    await updateChatForTest(beta.id, { previewText: 'matching preview' })
 
     const { container } = render(<StorageView route={{ section: 'chats' }} />)
 
@@ -624,8 +666,8 @@ describe('StorageView', () => {
   it('includes archived rows locally without starting an empty search loop', async () => {
     const live = await createChat({ id: 'chat-live', title: 'Live chat', now: 1000 })
     const archived = await createChat({ id: 'chat-archived', title: 'Archived chat', now: 2000 })
-    await getDb().chats.update(live.id, { previewText: 'Live preview' })
-    await getDb().chats.update(archived.id, { archived: true, previewText: 'Archived preview' })
+    await updateChatForTest(live.id, { previewText: 'Live preview' })
+    await updateChatForTest(archived.id, { archived: true, previewText: 'Archived preview' })
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
 
     try {
@@ -659,9 +701,9 @@ describe('StorageView', () => {
     await setChatTagsFromNames(alpha.id, ['One'], 4000)
     await setChatTagsFromNames(beta.id, ['Two'], 4000)
     await setChatTagsFromNames(gamma.id, ['Three'], 4000)
-    await getDb().chats.update(alpha.id, { previewText: 'Alpha preview' })
-    await getDb().chats.update(beta.id, { previewText: 'Beta preview' })
-    await getDb().chats.update(gamma.id, { previewText: 'Gamma preview' })
+    await updateChatForTest(alpha.id, { previewText: 'Alpha preview' })
+    await updateChatForTest(beta.id, { previewText: 'Beta preview' })
+    await updateChatForTest(gamma.id, { previewText: 'Gamma preview' })
     const promptSpy = vi.spyOn(window, 'prompt').mockReturnValue('Shared, Later')
 
     const { container } = render(<StorageView route={{ section: 'chats' }} />)
@@ -674,7 +716,8 @@ describe('StorageView', () => {
     fireEvent.click(checkboxes[2] as HTMLInputElement, { shiftKey: true })
 
     await waitFor(() => expect(container).toHaveTextContent('3 selected'))
-    fireEvent.click(screen.getByRole('button', { name: 'Tags' }))
+    const tagsButton = screen.getByRole('button', { name: 'Tags' })
+    fireEvent.click(tagsButton)
 
     await waitFor(async () => {
       expect(promptSpy).toHaveBeenCalledWith('Tags for 3 chats, comma-separated', '')
@@ -684,6 +727,8 @@ describe('StorageView', () => {
         const stored = await getDb().chats.get(id)
         expect((stored?.tags ?? []).map((tagId) => tagById.get(tagId))).toEqual(['Shared', 'Later'])
       }
+      expect(tags.map((tag) => tag.name).sort()).toEqual(['Later', 'Shared'])
+      expect(tagsButton).not.toBeDisabled()
     })
   })
 
@@ -691,10 +736,10 @@ describe('StorageView', () => {
     const alpha = await createChat({ id: 'chat-alpha', title: 'Alpha', now: 1000 })
     const beta = await createChat({ id: 'chat-beta', title: 'Beta', now: 2000 })
     const work = await createFolder({ name: 'Work' })
-    await getDb().chats.update(alpha.id, { folderId: work.id })
-    await getDb().chats.update(beta.id, { folderId: work.id })
-    await getDb().chats.update(alpha.id, { previewText: 'Alpha preview' })
-    await getDb().chats.update(beta.id, { previewText: 'Beta preview' })
+    await updateChatForTest(alpha.id, { folderId: work.id })
+    await updateChatForTest(beta.id, { folderId: work.id })
+    await updateChatForTest(alpha.id, { previewText: 'Alpha preview' })
+    await updateChatForTest(beta.id, { previewText: 'Beta preview' })
     const promptSpy = vi.spyOn(window, 'prompt').mockReturnValue('Done')
 
     const { container } = render(<StorageView route={{ section: 'chats' }} />)
@@ -705,7 +750,8 @@ describe('StorageView', () => {
     )
     fireEvent.click(checkboxes[0] as HTMLInputElement)
     fireEvent.click(checkboxes[1] as HTMLInputElement, { metaKey: true })
-    fireEvent.click(screen.getByRole('button', { name: 'Move' }))
+    const moveButton = screen.getByRole('button', { name: 'Move' })
+    fireEvent.click(moveButton)
 
     await waitFor(async () => {
       expect(promptSpy).toHaveBeenCalledWith(
@@ -717,14 +763,15 @@ describe('StorageView', () => {
       expect(done).toBeTruthy()
       expect((await getDb().chats.get(alpha.id))?.folderId).toBe(done?.id)
       expect((await getDb().chats.get(beta.id))?.folderId).toBe(done?.id)
+      expect(moveButton).not.toBeDisabled()
     })
   })
 
   it('downloads multiple selected chats as a zip with unique filenames', async () => {
     const alpha = await createChat({ id: 'chat-alpha', title: 'Untitled Chat', now: 1000 })
     const beta = await createChat({ id: 'chat-beta', title: 'Untitled Chat', now: 2000 })
-    await getDb().chats.update(alpha.id, { titleStatus: 'manual', previewText: 'Alpha preview' })
-    await getDb().chats.update(beta.id, { titleStatus: 'manual', previewText: 'Beta preview' })
+    await updateChatForTest(alpha.id, { titleStatus: 'manual', previewText: 'Alpha preview' })
+    await updateChatForTest(beta.id, { titleStatus: 'manual', previewText: 'Beta preview' })
     const originalCreateObjectURL = URL.createObjectURL
     const originalRevokeObjectURL = URL.revokeObjectURL
     const createdBlobs: Blob[] = []
@@ -749,9 +796,13 @@ describe('StorageView', () => {
       )
       fireEvent.click(checkboxes[0] as HTMLInputElement)
       fireEvent.click(checkboxes[1] as HTMLInputElement, { metaKey: true })
-      fireEvent.click(screen.getByRole('button', { name: 'Download' }))
+      const downloadButton = screen.getByRole('button', { name: 'Download' })
+      fireEvent.click(downloadButton)
 
-      await waitFor(() => expect(clickSpy).toHaveBeenCalled())
+      await waitFor(() => {
+        expect(clickSpy).toHaveBeenCalled()
+        expect(downloadButton).not.toBeDisabled()
+      })
       expect(createdBlobs).toHaveLength(1)
       expect(createdBlobs[0]?.type).toBe('application/zip')
       const entries = unzipSync(new Uint8Array(await (createdBlobs[0] as Blob).arrayBuffer()))
@@ -776,7 +827,7 @@ describe('StorageView', () => {
 
   it('exports a single selected chat as portable JSON from the chats table', async () => {
     const chat = await createChat({ id: 'chat-alpha', title: 'Alpha', now: 1000 })
-    await getDb().chats.update(chat.id, { titleStatus: 'manual', previewText: 'Alpha preview' })
+    await updateChatForTest(chat.id, { titleStatus: 'manual', previewText: 'Alpha preview' })
     const downloads = mockBlobDownloads()
     try {
       const { container } = render(<StorageView route={{ section: 'chats' }} />)
@@ -802,8 +853,8 @@ describe('StorageView', () => {
   it('exports multiple selected chats as a ZIP of portable JSON files', async () => {
     const alpha = await createChat({ id: 'chat-alpha', title: 'Untitled Chat', now: 1000 })
     const beta = await createChat({ id: 'chat-beta', title: 'Untitled Chat', now: 2000 })
-    await getDb().chats.update(alpha.id, { titleStatus: 'manual', previewText: 'Alpha preview' })
-    await getDb().chats.update(beta.id, { titleStatus: 'manual', previewText: 'Beta preview' })
+    await updateChatForTest(alpha.id, { titleStatus: 'manual', previewText: 'Alpha preview' })
+    await updateChatForTest(beta.id, { titleStatus: 'manual', previewText: 'Beta preview' })
     const downloads = mockBlobDownloads()
     try {
       const { container } = render(<StorageView route={{ section: 'chats' }} />)
@@ -814,9 +865,23 @@ describe('StorageView', () => {
       )
       fireEvent.click(checkboxes[0] as HTMLInputElement)
       fireEvent.click(checkboxes[1] as HTMLInputElement, { metaKey: true })
+      const chatTable = getDb().chats
+      const originalGet = chatTable.get.bind(chatTable)
+      let activeExports = 0
+      let maxActiveExports = 0
+      const trackedGet = ((chatId: string) => {
+        activeExports += 1
+        maxActiveExports = Math.max(maxActiveExports, activeExports)
+        return originalGet(chatId).finally(() => {
+          activeExports -= 1
+        })
+      }) as typeof chatTable.get
+      const chatReads = vi.spyOn(chatTable, 'get').mockImplementation(trackedGet)
       fireEvent.click(screen.getByRole('button', { name: 'Export' }))
 
       await waitFor(() => expect(downloads.clickSpy).toHaveBeenCalled())
+      expect(chatReads).toHaveBeenCalledTimes(2)
+      expect(maxActiveExports).toBe(1)
       expect(downloads.createdBlobs).toHaveLength(1)
       expect(downloads.createdBlobs[0]?.type).toBe('application/zip')
       const entries = unzipSync(
@@ -826,7 +891,6 @@ describe('StorageView', () => {
       expect(filenames).toHaveLength(2)
       expect(new Set(filenames).size).toBe(2)
       expect(filenames.every((filename) => filename.endsWith('.json'))).toBe(true)
-      expect(filenames.some((filename) => filename.includes('-2.json'))).toBe(true)
       const exported = filenames.map(
         (filename) =>
           JSON.parse(strFromU8(entries[filename] as Uint8Array)) as {

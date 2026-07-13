@@ -1,6 +1,3 @@
-// Branch-explicit clone helper. See `plan/13-delivery.md §13.2.2` (Branch-explicit rule)
-// and `plan/08-branching.md §8.4.6`.
-//
 // A "Branch from here" op creates a new sibling of a source message. The clone
 // copies a narrow set of user-authored fields and clears all generation-specific
 // state. The caller supplies the new ids + tree position; this function only

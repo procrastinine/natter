@@ -1,6 +1,11 @@
 import Dexie from 'dexie'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { __resetBroadcastForTests, type BroadcastEvent, onEvent } from '../../src/store/broadcast'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import {
+  __resetBroadcastForTests,
+  type BroadcastEvent,
+  onEvent,
+  postEvent,
+} from '../../src/store/broadcast'
 import { __resetDbForTests, openDb } from '../../src/store/db'
 import {
   __resetKeyCacheForTests,
@@ -10,11 +15,14 @@ import {
   getKey,
   getOrCreateInstallSecret,
   KeyMissingError,
+  markKeyUsed,
   obscurePreview,
   PassphraseRequiredError,
   resolveKey,
+  resolveKeyForDispatch,
   WrongPassphraseError,
 } from '../../src/store/keys'
+import { withNamedLock } from '../../src/store/locks'
 import { getSetting } from '../../src/store/settings'
 
 const DB_NAME = 'natter'
@@ -52,6 +60,69 @@ describe('install-secret', () => {
     expect(first).toBe(second)
     const stored = await getSetting<string>('install-secret')
     expect(stored).toBe(first)
+  })
+
+  it('atomically initializes concurrent encryptors and decrypts both after a reload', async () => {
+    let announceLockHeld: (() => void) | undefined
+    const lockHeld = new Promise<void>((resolve) => {
+      announceLockHeld = resolve
+    })
+    let releaseLock: (() => void) | undefined
+    const lockRelease = new Promise<void>((resolve) => {
+      releaseLock = resolve
+    })
+    const lockTask = withNamedLock('setting:install-secret', async () => {
+      announceLockHeld?.()
+      await lockRelease
+    })
+    await lockHeld
+
+    const originalGetRandomValues = crypto.getRandomValues.bind(crypto)
+    let candidateCount = 0
+    let announceCandidatesGenerated: (() => void) | undefined
+    const candidatesGenerated = new Promise<void>((resolve) => {
+      announceCandidatesGenerated = resolve
+    })
+    const randomSpy = vi.spyOn(crypto, 'getRandomValues').mockImplementation((array) => {
+      if (array instanceof Uint8Array && array.byteLength === 32) {
+        candidateCount += 1
+        array.fill(candidateCount)
+        if (candidateCount === 2) announceCandidatesGenerated?.()
+        return array
+      }
+      return originalGetRandomValues(array)
+    })
+
+    try {
+      const firstKey = createKey({
+        id: 'concurrent-install-key-1',
+        name: 'Concurrent one',
+        plaintextKey: 'sk-or-v1-concurrent-one',
+      })
+      const secondKey = createKey({
+        id: 'concurrent-install-key-2',
+        name: 'Concurrent two',
+        plaintextKey: 'sk-or-v1-concurrent-two',
+      })
+
+      await candidatesGenerated
+      releaseLock?.()
+      await lockTask
+      const [firstRecord, secondRecord] = await Promise.all([firstKey, secondKey])
+      expect(candidateCount).toBe(2)
+      const persistedSecret = await getSetting<string>('install-secret')
+      expect(persistedSecret).toBe(await getOrCreateInstallSecret())
+
+      __resetKeyCacheForTests()
+      __resetDbForTests()
+      await openDb()
+      await expect(resolveKeyForDispatch(firstRecord.id)).resolves.toBe('sk-or-v1-concurrent-one')
+      await expect(resolveKeyForDispatch(secondRecord.id)).resolves.toBe('sk-or-v1-concurrent-two')
+    } finally {
+      releaseLock?.()
+      await lockTask
+      randomSpy.mockRestore()
+    }
   })
 })
 
@@ -99,6 +170,22 @@ describe('createKey + resolveKey (passphrase mode)', () => {
     __resetKeyCacheForTests()
     await expect(resolveKey(record.id)).rejects.toBeInstanceOf(PassphraseRequiredError)
   })
+
+  it.each([
+    { kind: 'workspace-replaced' as const },
+    { kind: 'workspace-invalidated' as const, mutationCounter: 7 },
+  ])('drops derived wrapper keys on $kind', async (event) => {
+    const record = await createKey({
+      name: 'OpenRouter',
+      plaintextKey: 'sk-or-v1-secret',
+      passphrase: 'correct',
+    })
+    await expect(resolveKey(record.id, { passphrase: 'correct' })).resolves.toBe('sk-or-v1-secret')
+
+    postEvent(event)
+
+    await expect(resolveKey(record.id)).rejects.toBeInstanceOf(PassphraseRequiredError)
+  })
 })
 
 describe('createKey + resolveKey (install-secret mode)', () => {
@@ -120,6 +207,19 @@ describe('createKey + resolveKey (install-secret mode)', () => {
     __resetKeyCacheForTests()
     const plaintext = await resolveKey(record.id)
     expect(plaintext).toBe('sk-or-v1-persist')
+  })
+
+  it('can decrypt for dispatch without marking an unselected fallback used', async () => {
+    const record = await createKey({
+      name: 'Fallback',
+      plaintextKey: 'sk-or-v1-lazy-fallback',
+    })
+
+    await expect(resolveKeyForDispatch(record.id)).resolves.toBe('sk-or-v1-lazy-fallback')
+    expect((await getKey(record.id))?.lastUsedAt).toBeUndefined()
+
+    await markKeyUsed(record.id, 123)
+    expect((await getKey(record.id))?.lastUsedAt).toBe(123)
   })
 })
 

@@ -1,4 +1,4 @@
-import { expect, type Page, test } from '@playwright/test'
+import { expect, type Page, test } from './fixtures'
 import { buildSseBody, clearIndexedDb, createChatAndOpen, seedFirstRun } from './helpers'
 
 const OSS_MODEL = 'qwen/qwen3-4b'
@@ -20,7 +20,6 @@ type PlanEntry = {
 }
 
 test.beforeEach(async ({ page }) => {
-  await page.goto('/')
   await clearIndexedDb(page)
   await page.evaluate(() =>
     (

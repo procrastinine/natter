@@ -1,5 +1,4 @@
-// Per-chat per-model token calibration invariants. Source:
-// `src/core/token-calibration.ts` and `plan/token-counting-audit.md §Phase B`.
+// Per-chat per-model token calibration invariants.
 //
 // Test strategy:
 // - validateSample() is pure — covers ingest gates (physical bounds,
@@ -24,7 +23,9 @@ import {
   calibrationFieldsForEdit,
   charsPerToken,
   deriveCompletionSample,
+  derivePromptCalibrationBasis,
   derivePromptSample,
+  derivePromptSampleFromBasis,
   FRAMING_PER_MESSAGE,
   freshTokenEstimate,
   MIN_SAMPLE_CHARS,
@@ -598,6 +599,29 @@ describe('derivePromptSample', () => {
     expect(sample?.tokens).toBe(92)
   })
 
+  it('derives the same sample from a compact precomputed basis', () => {
+    const sentPath = [message('user', 'A'.repeat(10)), message('assistant', 'B'.repeat(10))]
+    const usage = { prompt_tokens: 100, completion_tokens: 0, total_tokens: 100 }
+    const basis = derivePromptCalibrationBasis({
+      sentPath,
+      systemPrompt: 'S'.repeat(10),
+      family: 'gpt',
+      mediaTokens: 0,
+    })
+
+    expect(basis).toEqual({ chars: 30, tokenOverhead: 8 })
+    expect(basis && derivePromptSampleFromBasis(basis, usage)).toEqual(
+      derivePromptSample({
+        sentPath,
+        systemPrompt: 'S'.repeat(10),
+        usage,
+        family: 'gpt',
+        modelId: 'openai/gpt-4o',
+        mediaTokens: 0,
+      }),
+    )
+  })
+
   it('does NOT subtract framing for Anthropic / Gemini', () => {
     const base = {
       sentPath: [message('user', 'A'.repeat(10))],
@@ -740,6 +764,22 @@ describe('deriveCompletionSample', () => {
     })
     expect(sample?.chars).toBe(60 + 230) // 6*10 + 23*10
     expect(sample?.tokens).toBe(80) // full completion_tokens
+  })
+
+  it('does not count tool-prefixed reasoning rows as inline completion text', () => {
+    const sample = deriveCompletionSample({
+      assistantMessage: assistant('answer', [
+        { type: 'reasoning.text', id: 'tool_call-1', text: 'tool signature'.repeat(100) },
+      ]),
+      usage: {
+        prompt_tokens: 0,
+        completion_tokens: 10,
+        total_tokens: 10,
+      },
+      family: 'deepseek',
+    })
+
+    expect(sample).toEqual({ chars: 6, tokens: 10 })
   })
 
   it('returns null when completion_tokens is 0', () => {

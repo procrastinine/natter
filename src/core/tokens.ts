@@ -1,5 +1,3 @@
-// Rough pre-send token estimation. See `plan/14-details.md §14.15`.
-//
 // Real tokenization needs the model's tokenizer binary and is out of scope for V1.
 // These char/token ratios are deliberately conservative (they over-report slightly)
 // so the UI context gauge is safer to under-fill. `usage.*_tokens` in the response
@@ -94,8 +92,7 @@ export interface PromptEstimateOptions {
 
 // Rough token cost of the reasoning fragments echoed on the NEXT turn for
 // a given list of assistant messages. Call AFTER filtering the path for
-// `hiddenFromContext` / `deleted`. Mirrors the contract in
-// `plan/phase11-implementation.md §3`:
+// `hiddenFromContext` / `deleted`:
 //
 //   - reasoning.text.text (+ small signature overhead when present) → char-heuristic
 //   - reasoning.summary.summary → char-heuristic
@@ -106,8 +103,8 @@ export interface PromptEstimateOptions {
 // The estimate NEVER double-counts: only `reasoningDetails[]` is iterated
 // (storage never carries the scalar `reasoning` field; it was suppressed
 // by the splitter's de-dup fix in commit 1390685).
-// `normalizeReasoningDetails` runs before estimating so any partial-overlap
-// artifacts in rehydrated-legacy rows collapse first.
+// `normalizeReasoningDetails` applies per-row provider relabeling without
+// guessing that overlap-looking persisted rows are duplicates.
 const SIGNATURE_TOKEN_GUARD = 16
 
 export function estimateReasoningEchoTokensForMessage(
@@ -121,8 +118,6 @@ export function estimateReasoningEchoTokensForMessage(
   // items of unexpected shape would otherwise crash the gauge. A
   // conservative 0 estimate is preferred over a UI-wide break.
   try {
-    // Deduplicate first: covers the "scalar + details both stored on
-    // legacy chats" edge case called out in the 1390685 fix.
     const normalized = normalizeReasoningDetails(message.reasoningDetails)
 
     // Apply the include matrix: if the user excluded reasoning entirely on
@@ -161,8 +156,8 @@ export function estimateReasoningEchoTokensForMessage(
           }
         }
       } else if (d.type === 'reasoning.summary') {
-        if (typeof d.summary === 'string') visibleCost += estimateTokens(d.summary, opts.family)
-      } else if (d.type === 'reasoning.encrypted') {
+        visibleCost += estimateTokens(d.summary, opts.family)
+      } else {
         // Cap raw byte-length contribution; a 10MB blob would otherwise
         // balloon to ~3.3M tokens and poison both the gauge and budget math.
         encryptedCharCost += clampTokens(Math.ceil(safeLen(d.data) / 3))

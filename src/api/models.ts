@@ -1,6 +1,3 @@
-// /models + /endpoints fetchers. See `plan/04-api-client.md §4.6` (for the
-// header/fetch pattern) and `plan/07-discovery.md §7.2–§7.4`.
-//
 // OpenRouter returns full capability data (supported_parameters, pricing,
 // caps, uptime/latency/throughput). Non-OpenRouter providers expose at most
 // a bare model list via `GET /v1/models`; capability data for those comes
@@ -12,7 +9,7 @@
 // in caching + reactivity.
 
 import type { ConnectionProfile } from '../core/types'
-import { buildHeaders, fetchWithTimeout } from './client'
+import { buildHeaders, fetchWithTimeout, readErrorResponseJson, readResponseJson } from './client'
 import { normalizeError } from './errors'
 
 interface DiscoveryContext {
@@ -75,15 +72,13 @@ async function fetchJson(
   const init: RequestInit = { method: 'GET', headers }
   const response = await fetchWithTimeout(url, init, opts)
   if (!response.ok) {
-    const body: unknown = await response.json().catch(() => ({
-      error: { code: response.status, message: response.statusText },
-    }))
+    const body = await readErrorResponseJson(response)
     throw normalizeError(body, {
       midStream: false,
       httpStatus: response.status,
     })
   }
-  return response.json() as Promise<unknown>
+  return readResponseJson<unknown>(response)
 }
 
 export async function fetchModels(

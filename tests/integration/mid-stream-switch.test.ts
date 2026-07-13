@@ -1,6 +1,3 @@
-// Phase 7 required test: mid-stream preset / connection / model switch.
-// Covers plan/06-streaming.md §6.11.1 + plan/09-privacy.md §9.2.1.
-//
 // The contract is that a mid-stream switch is a `chat-meta:{chatId}`
 // mutation — independent of the stream's `message:` scope — so the in-flight
 // stream continues to completion using the PRE-SWITCH settings snapshot.

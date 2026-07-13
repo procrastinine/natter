@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test'
+import { expect, test } from './fixtures'
 import {
   buildSseBody,
   clearIndexedDb,
@@ -11,7 +11,6 @@ import {
 } from './helpers'
 
 test.beforeEach(async ({ page }) => {
-  await page.goto('/')
   await clearIndexedDb(page)
   await seedFirstRun(page)
 })
@@ -119,51 +118,75 @@ test('mid-stream error frame surfaces ApiError and preserves partial text', asyn
   await expect(err).toContainText(/rate limited/)
 })
 
-test('HTTP 401 shows the unauthorized classifier string', async ({ page }) => {
-  await mockChatCompletions(page, {
-    status: 401,
-    json: { error: { code: 401, message: 'Invalid credentials' } },
+test.describe('HTTP error response diagnostics', () => {
+  test.use({
+    runtimeDiagnosticAllowances: [
+      {
+        category: 'console-other',
+        message:
+          '^Failed to load resource: the server responded with a status of (?:401 \\(Unauthorized\\)|402 \\(Payment Required\\)|503 \\(Service Unavailable\\))$',
+      },
+    ],
   })
-  await createChatAndOpen(page)
-  await sendMessage(page, 'hi')
-  const err = page.locator('[data-ui="message-error"][data-role="error"]').first()
-  await expect(err).toBeVisible()
-  await expect(err).toContainText(/Invalid credentials/)
-})
 
-test('HTTP 402 payment_required surfaces as error row', async ({ page }) => {
-  await mockChatCompletions(page, {
-    status: 402,
-    json: { error: { code: 402, message: 'insufficient credit' } },
+  test('HTTP 401 shows the unauthorized classifier string', async ({ page }) => {
+    await mockChatCompletions(page, {
+      status: 401,
+      json: { error: { code: 401, message: 'Invalid credentials' } },
+    })
+    await createChatAndOpen(page)
+    await sendMessage(page, 'hi')
+    const err = page.locator('[data-ui="message-error"][data-role="error"]').first()
+    await expect(err).toBeVisible()
+    await expect(err).toContainText(/Invalid credentials/)
   })
-  await createChatAndOpen(page)
-  await sendMessage(page, 'hi')
-  const err = page.locator('[data-ui="message-error"][data-role="error"]').first()
-  await expect(err).toBeVisible()
-  await expect(err).toContainText(/insufficient credit/)
-})
 
-test('HTTP 503 no_provider_available surfaces as error row', async ({ page }) => {
-  await mockChatCompletions(page, {
-    status: 503,
-    json: { error: { code: 503, message: 'no provider free' } },
+  test('HTTP 402 payment_required surfaces as error row', async ({ page }) => {
+    await mockChatCompletions(page, {
+      status: 402,
+      json: { error: { code: 402, message: 'insufficient credit' } },
+    })
+    await createChatAndOpen(page)
+    await sendMessage(page, 'hi')
+    const err = page.locator('[data-ui="message-error"][data-role="error"]').first()
+    await expect(err).toBeVisible()
+    await expect(err).toContainText(/insufficient credit/)
   })
-  await createChatAndOpen(page)
-  await sendMessage(page, 'hi')
-  const err = page.locator('[data-ui="message-error"][data-role="error"]').first()
-  await expect(err).toBeVisible()
-  await expect(err).toContainText(/no provider free/)
+
+  test('HTTP 503 no_provider_available surfaces as error row', async ({ page }) => {
+    await mockChatCompletions(page, {
+      status: 503,
+      json: { error: { code: 503, message: 'no provider free' } },
+    })
+    await createChatAndOpen(page)
+    await sendMessage(page, 'hi')
+    const err = page.locator('[data-ui="message-error"][data-role="error"]').first()
+    await expect(err).toBeVisible()
+    await expect(err).toContainText(/no provider free/)
+  })
 })
 
 test('network drop mid-stream persists partial text + abortReason=network + Continue affordance', async ({
   page,
 }) => {
-  // Abort the fetch before any chunk lands. Playwright `route.abort()` surfaces
-  // to the browser as a TypeError ("Failed to fetch"); the transport layer
-  // normalizes that into ApiError{kind:'network'}, which the send pipeline
-  // converts to abortReason='network' per Phase 7 plan.
-  await page.route('**/api/v1/chat/completions', async (route) => {
-    await route.abort('internetdisconnected')
+  await page.evaluate(() => {
+    const originalFetch = window.fetch.bind(window)
+    window.fetch = async (input, init) => {
+      const url =
+        typeof input === 'string' ? input : input instanceof Request ? input.url : String(input)
+      if (!url.includes('/api/v1/chat/completions')) return originalFetch(input, init)
+      return new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.error(new TypeError('Network connection dropped'))
+          },
+        }),
+        {
+          status: 200,
+          headers: { 'content-type': 'text/event-stream' },
+        },
+      )
+    }
   })
   await createChatAndOpen(page)
   await sendMessage(page, 'drop this')
@@ -183,23 +206,35 @@ test('network drop mid-stream persists partial text + abortReason=network + Cont
   expect(typeof assistantRow.generation.finishedAt).toBe('number')
 })
 
-test('malformed SSE JSON is skipped; surrounding stream commits cleanly', async ({ page }) => {
-  const body = [
-    'data: {"id":"g1","choices":[{"delta":{"content":"A"}}]}',
-    '',
-    'data: {malformed',
-    '',
-    'data: {"id":"g1","choices":[{"delta":{"content":"B"}}]}',
-    '',
-    'data: {"id":"g1","choices":[{"delta":{},"finish_reason":"stop"}]}',
-    '',
-    'data: [DONE]',
-    '',
-    '',
-  ].join('\n')
-  await mockChatCompletions(page, { body })
-  await createChatAndOpen(page)
-  await sendMessage(page, 'x')
-  const assistant = page.locator('[data-ui="message"][data-role="assistant"]').first()
-  await expect(assistant.locator('[data-ui="message-body"]')).toHaveText('AB')
+test.describe('malformed stream diagnostics', () => {
+  test.use({
+    runtimeDiagnosticAllowances: [
+      {
+        category: 'console-other',
+        message:
+          '^chatCompletions: malformed SSE chunk skipped (?:JSHandle@object|\\{eventType: message, characterCount: 10, fingerprint: fnv1a32:d7b44597, error: Object\\})$',
+      },
+    ],
+  })
+
+  test('malformed SSE JSON is skipped; surrounding stream commits cleanly', async ({ page }) => {
+    const body = [
+      'data: {"id":"g1","choices":[{"delta":{"content":"A"}}]}',
+      '',
+      'data: {malformed',
+      '',
+      'data: {"id":"g1","choices":[{"delta":{"content":"B"}}]}',
+      '',
+      'data: {"id":"g1","choices":[{"delta":{},"finish_reason":"stop"}]}',
+      '',
+      'data: [DONE]',
+      '',
+      '',
+    ].join('\n')
+    await mockChatCompletions(page, { body })
+    await createChatAndOpen(page)
+    await sendMessage(page, 'x')
+    const assistant = page.locator('[data-ui="message"][data-role="assistant"]').first()
+    await expect(assistant.locator('[data-ui="message-body"]')).toHaveText('AB')
+  })
 })

@@ -1,6 +1,8 @@
 // Anthropic Messages API wire shapes. The request/response bodies intentionally
 // keep Anthropic's snake_case field names; internal app models remain camelCase.
 
+import type { StreamIntegrityChunk } from './stream-integrity'
+
 export interface AnthropicMessagesRequestWire {
   model: string
   max_tokens: number
@@ -104,6 +106,7 @@ export type AnthropicStreamChunk =
       generationId?: string
     }
   | { type: 'keepalive'; comment: string }
+  | StreamIntegrityChunk
   | {
       type: 'buffered_result'
       result: AnthropicMessagesResultWire

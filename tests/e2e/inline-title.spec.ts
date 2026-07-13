@@ -1,4 +1,4 @@
-import { expect, type Page, test } from '@playwright/test'
+import { expect, type Page, test } from './fixtures'
 import {
   buildSseBody,
   clearIndexedDb,
@@ -8,13 +8,13 @@ import {
   mockChatCompletions,
   seedFirstRun,
   sendMessage,
+  waitForAssistantGenerationFinished,
 } from './helpers'
 
-// Inline chat-title editor (plan/10-ui.md §10.3). Pencil opens edit, Enter
-// commits via chat-meta: scope, Escape cancels, empty-after-trim is blocked.
+// Pencil opens edit, Enter commits via chat-meta scope, Escape cancels, and
+// an empty trimmed title is blocked.
 
 test.beforeEach(async ({ page }) => {
-  await page.goto('/')
   await clearIndexedDb(page)
   await seedFirstRun(page)
   // Default mock so createChatAndSend has a quick reply to land on.
@@ -124,6 +124,7 @@ test('title commit bumps updatedAt + metaVersion, leaves branch state untouched,
   await sendMessage(page, 'establish a branch')
   await expect(page.locator('[data-ui="message"][data-role="assistant"]').first()).toBeVisible()
   const chatId = await firstChatId(page)
+  await waitForAssistantGenerationFinished(page, chatId)
   const before = await readChat(page, chatId)
 
   await page.locator('[data-role="chat-title-edit"]').click()

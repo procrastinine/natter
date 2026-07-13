@@ -4,7 +4,6 @@ import {
   useVirtualizer,
   type VirtualItem,
 } from '@tanstack/react-virtual'
-import { useLiveQuery } from 'dexie-react-hooks'
 import {
   type ChangeEvent,
   type DragEvent,
@@ -27,6 +26,7 @@ import {
   sidebarSortOption,
 } from '../../core/sidebar-sort'
 import type { ChatFolder, ChatId, ChatSidebarRow, ChatTag, FolderId } from '../../core/types'
+import { isPageHidingAbortError } from '../../lib/page-lifecycle'
 import {
   DEFAULT_SEARCH_FILTERS,
   hasActiveSearchFilters,
@@ -42,15 +42,27 @@ import {
 } from '../../store/chats'
 import { createFolder, deleteFolder, listFolders, updateFolder } from '../../store/folders'
 import { exportChat, importChat } from '../../store/import-export'
+import {
+  GLOBAL_PREFERENCES_DEPENDENCIES,
+  primaryKeys,
+  SIDEBAR_MODEL_DEPENDENCIES,
+} from '../../store/reactive-dependencies'
+import { useRepositoryQuery, useRepositoryQueryState } from '../../store/reactive-query'
 import { abortSearchSession, requestSearchSession } from '../../store/search-session'
 import {
   readCollapsedSidebarFolderIds,
   readSidebarSortMode,
+  SIDEBAR_COLLAPSED_FOLDERS_SETTING_KEY,
+  SIDEBAR_SORT_SETTING_KEY,
   updateCollapsedSidebarFolderIds,
   writeSidebarSortMode,
 } from '../../store/sidebar-preferences'
 import { listTags } from '../../store/tags'
-import { startSearchStoreBroadcastListener, useSearchStore } from '../../store/zustand/searchStore'
+import {
+  orderedSearchResults,
+  startSearchStoreBroadcastListener,
+  useSearchStore,
+} from '../../store/zustand/searchStore'
 import { useToastStore } from '../../store/zustand/toastStore'
 import {
   ChevronIcon,
@@ -68,9 +80,9 @@ import {
   UploadIcon,
 } from '../icons/Icon'
 import {
+  forEachJsonOrZipFile,
   importExportErrorMessage,
   natterJsonFilename,
-  readJsonOrZipFile,
   triggerJsonDownload,
 } from '../import-export/json-file'
 import {
@@ -85,10 +97,10 @@ import {
 interface ChatListProps {
   activeChatId: ChatId | null
   collapsed?: boolean
+  onChatIntent?: () => void
 }
 
 const EMPTY_COLLAPSED_FOLDER_IDS: FolderId[] = []
-const EMPTY_SEARCH_RESULTS: SearchResult[] = []
 const SIDEBAR_VIRTUALIZE_THRESHOLD = 200
 const SIDEBAR_INITIAL_VIRTUAL_ROWS = 18
 
@@ -188,11 +200,11 @@ function restoreSidebarScrollAnchor(root: HTMLElement, anchor: SidebarScrollAnch
 }
 
 // Loads the chat-row list only — never touches the `messages` table.
-// `chat.previewText` is populated by `refreshChatPreview` on the write
-// path (see src/store/chat-preview-maintainer.ts), so the sidebar stays
+// `chat.previewText` is maintained in the authoritative message transaction,
+// so the sidebar stays
 // cheap even with thousands of chats. The daemon-mode equivalent will
 // implement the same read via the repository boundary; this module
-// doesn't couple to Dexie semantics beyond the live-query subscription.
+// doesn't couple its read path to Dexie semantics.
 async function loadSidebarModel(): Promise<{
   chats: ChatSidebarRow[]
   folders: ChatFolder[]
@@ -312,15 +324,41 @@ function estimateSidebarVirtualTotalSize(
   return rows.reduce((sum, row) => sum + estimateSidebarVirtualRowSize(row, collapsed), 0)
 }
 
-export const ChatList = memo(function ChatList({ activeChatId, collapsed }: ChatListProps) {
-  const model = useLiveQuery(loadSidebarModel, [], { chats: [], folders: [], tags: [] })
-  const loadedPrefs = useLiveQuery(readGlobalPreferences, [], undefined)
-  const prefs = loadedPrefs ?? DEFAULT_GLOBAL_PREFERENCES
-  const persistedSortMode = useLiveQuery(readSidebarSortMode, [], DEFAULT_SIDEBAR_SORT_MODE)
-  const persistedCollapsedFolderIds = useLiveQuery(
+export const ChatList = memo(function ChatList({
+  activeChatId,
+  collapsed,
+  onChatIntent,
+}: ChatListProps) {
+  const model = useRepositoryQuery(
+    'sidebar-model',
+    loadSidebarModel,
+    {
+      chats: [],
+      folders: [],
+      tags: [],
+    },
+    SIDEBAR_MODEL_DEPENDENCIES,
+  )
+  const preferencesQuery = useRepositoryQueryState(
+    'global-preferences',
+    readGlobalPreferences,
+    DEFAULT_GLOBAL_PREFERENCES,
+    GLOBAL_PREFERENCES_DEPENDENCIES,
+  )
+  if (preferencesQuery.status === 'error') throw preferencesQuery.error
+  const loadedPrefs = preferencesQuery.status === 'ready' ? preferencesQuery.value : undefined
+  const prefs = preferencesQuery.value
+  const persistedSortMode = useRepositoryQuery(
+    'sidebar-sort-mode',
+    readSidebarSortMode,
+    DEFAULT_SIDEBAR_SORT_MODE,
+    primaryKeys('settings', SIDEBAR_SORT_SETTING_KEY),
+  )
+  const persistedCollapsedFolderIds = useRepositoryQuery(
+    'sidebar-collapsed-folder-ids',
     readCollapsedSidebarFolderIds,
-    [],
     EMPTY_COLLAPSED_FOLDER_IDS,
+    primaryKeys('settings', SIDEBAR_COLLAPSED_FOLDERS_SETTING_KEY),
   )
   const [sortMode, setSortMode] = useState<SidebarSortMode>(DEFAULT_SIDEBAR_SORT_MODE)
   const [sortMenuOpen, setSortMenuOpen] = useState(false)
@@ -399,7 +437,7 @@ export const ChatList = memo(function ChatList({ activeChatId, collapsed }: Chat
   const searchActive = hasSearchWork(searchQuery, searchFilters)
   const searchControlsExpanded = searchExpanded || searchActive || searchHasFilters
   const sortedSearchResults = useMemo(() => {
-    const results = searchSession?.results ?? EMPTY_SEARCH_RESULTS
+    const results = orderedSearchResults(searchSession?.results)
     const byChatId = new Map(results.map((result) => [result.chatId, result]))
     return sortChats(
       results.map((result) => result.chat),
@@ -694,20 +732,19 @@ export const ChatList = memo(function ChatList({ activeChatId, collapsed }: Chat
       if (!file) return
       setImportingChat(true)
       try {
-        const values = await readJsonOrZipFile(file)
         let importedCount = 0
-        let lastChatId: ChatId | null = null
-        for (const value of values) {
+        const imported = { lastChatId: null as ChatId | null }
+        await forEachJsonOrZipFile(file, async (value) => {
           const result = await importChat(value)
           importedCount += 1
-          lastChatId = result.chatId
-        }
+          imported.lastChatId = result.chatId
+        })
         pushToast({
           level: 'success',
           text: importedCount === 1 ? 'Imported chat.' : `Imported ${importedCount} chats.`,
           durationMs: 2500,
         })
-        if (lastChatId) navigateToChat(lastChatId)
+        if (imported.lastChatId) navigateToChat(imported.lastChatId)
       } catch (error) {
         console.error('Failed to import chat JSON/ZIP', error)
         pushToast({ level: 'danger', text: importExportErrorMessage(error) })
@@ -726,6 +763,7 @@ export const ChatList = memo(function ChatList({ activeChatId, collapsed }: Chat
     setSortMode(mode)
     setSortMenuOpen(false)
     void writeSidebarSortMode(mode).catch((error: unknown) => {
+      if (isPageHidingAbortError(error)) return
       console.error('Failed to persist sidebar sort mode', error)
     })
   }, [])
@@ -871,6 +909,7 @@ export const ChatList = memo(function ChatList({ activeChatId, collapsed }: Chat
       void updateCollapsedSidebarFolderIds((current) =>
         current.filter((id) => id !== folderId),
       ).catch((error: unknown) => {
+        if (isPageHidingAbortError(error)) return
         console.error('Failed to persist sidebar folder state', error)
       })
       if (changed) markRecentMove(chatId, folderId)
@@ -892,6 +931,7 @@ export const ChatList = memo(function ChatList({ activeChatId, collapsed }: Chat
         else next.add(folderId)
         return [...next]
       }).catch((error: unknown) => {
+        if (isPageHidingAbortError(error)) return
         console.error('Failed to persist sidebar folder state', error)
       })
     },
@@ -902,7 +942,7 @@ export const ChatList = memo(function ChatList({ activeChatId, collapsed }: Chat
     searchResult?: SearchResult,
     options: VirtualRowOptions = {},
   ) => {
-    const displayTitle = chat.title?.trim().length ? chat.title : 'Untitled chat'
+    const displayTitle = chat.title.trim().length ? chat.title : 'Untitled chat'
     const preview = chat.previewText ?? ''
     const searchTargetId = searchResult?.messageId ?? searchResult?.branchLeafId ?? undefined
     const href = chatHref(chat.id, searchTargetId)
@@ -937,6 +977,9 @@ export const ChatList = memo(function ChatList({ activeChatId, collapsed }: Chat
           data-ui="chat-row-link"
           href={href}
           rel="noopener"
+          onPointerEnter={onChatIntent}
+          onPointerDown={onChatIntent}
+          onFocus={onChatIntent}
           onClick={makeAnchorClickHandler(href)}
         >
           <span data-ui="chat-row-head">

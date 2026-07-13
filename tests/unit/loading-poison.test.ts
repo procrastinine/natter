@@ -5,8 +5,10 @@ import {
   attachmentContextIds,
   attachmentContextPolicyForSettings,
 } from '../../src/core/attachments/context'
+import { buildBranchCacheRow } from '../../src/core/branch-flatten'
 import { applyContextCutoff } from '../../src/core/context-cutoff'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
+import { insertSibling, regenerateAssistant, sendUserMessage } from '../../src/core/messages'
 import { applyOutboundContextRewrites } from '../../src/core/prompt-context'
 import { tokenizerFromSettings } from '../../src/core/prompt-size'
 import type {
@@ -19,6 +21,8 @@ import type {
 } from '../../src/core/types'
 import { editInPlace } from '../../src/hooks/useMessageOps'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
+import { getBrowserRepository } from '../../src/store/browser-repo'
+import { searchChats } from '../../src/store/chat-search'
 import {
   createChat,
   listChatSidebarRows,
@@ -126,6 +130,49 @@ async function hydrateBranchMessages(
   )
 }
 
+async function seedChatProjection(
+  chatId: string,
+  messages: readonly Message[],
+  branchLeafId: string,
+  generatedAt = 10,
+): Promise<void> {
+  const cache = buildBranchCacheRow({ chatId, branchLeafId, messages, generatedAt })
+  await getDb().chats.update(chatId, {
+    lastUpdatedLeafId: branchLeafId,
+    lastBranchUpdatedAt: generatedAt,
+    wordCount: cache.wordCount,
+    totalCostUsd: messages.reduce(
+      (total, row) => total + (row.deleted ? 0 : (row.generation?.cost ?? 0)),
+      0,
+    ),
+    previewText: cache.previewText,
+  })
+  await getDb().chatBranchCache.put(cache)
+}
+
+function captureMessageBodyReads(): {
+  ids: string[]
+  textCharacters: () => number
+  stop: () => void
+} {
+  const ids: string[] = []
+  let textCharacters = 0
+  const reading = (body: ReturnType<typeof splitMessageForStorage>['body'] | undefined) => {
+    if (!body) return body
+    ids.push(body.id)
+    for (const item of body.content) {
+      if (item.type === 'text' || item.type === 'output_text') textCharacters += item.text.length
+    }
+    return body
+  }
+  getDb().messageBodies.hook('reading', reading)
+  return {
+    ids,
+    textCharacters: () => textCharacters,
+    stop: () => getDb().messageBodies.hook('reading').unsubscribe(reading),
+  }
+}
+
 async function cutoffIdsAfterPlanning(input: {
   messages: readonly Message[]
   settings: ChatSettings
@@ -164,27 +211,36 @@ describe('loading poison boundaries', () => {
       settings: cloneDefaultChatSettings(),
       now: 10,
     })
-    await getDb().chats.put({
-      ...chat,
-      titleStatus: 'manual',
-      previewText: 'short preview',
-      folderId: 'folder-1',
-      tags: ['tag-a'],
-      settings: { ...chat.settings, systemPrompt: 'large-setting-blob'.repeat(10_000) },
-      tokenCalibration: {
-        poison: {
-          totalTextChars: 1,
-          totalTextTokens: 1,
-          sampleCount: 1,
-          updatedAt: 1,
-        },
+    await getBrowserRepository().runMutation(
+      [{ kind: 'chat-meta', chatId: chat.id }],
+      async (ctx) => {
+        ctx.patchChatMeta(chat.id, {
+          titleStatus: 'manual',
+          previewText: 'short preview',
+          folderId: 'folder-1',
+          tags: ['tag-a'],
+          settings: { ...chat.settings, systemPrompt: 'large-setting-blob'.repeat(10_000) },
+          tokenCalibration: {
+            poison: {
+              totalTextChars: 1,
+              totalTextTokens: 1,
+              sampleCount: 1,
+              updatedAt: 1,
+            },
+          },
+          favoriteModels: ['favorite-poison/'.repeat(5_000)],
+          recentModels: ['recent-poison/'.repeat(5_000)],
+        })
       },
-      favoriteModels: ['favorite-poison/'.repeat(5_000)],
-      recentModels: ['recent-poison/'.repeat(5_000)],
-    })
+    )
     await putHeaderOnly(message(chat.id, 'sidebar-message-poison'))
 
     const db = getDb()
+    const chatsGet = vi.spyOn(db.chats, 'get')
+    const chatsWhere = vi.spyOn(db.chats, 'where')
+    const chatsOrderBy = vi.spyOn(db.chats, 'orderBy')
+    const chatsToArray = vi.spyOn(db.chats, 'toArray')
+    const chatsBulkGet = vi.spyOn(db.chats, 'bulkGet')
     const messagesWhere = vi.spyOn(db.messages, 'where')
     const messagesToArray = vi.spyOn(db.messages, 'toArray')
     const bodiesGet = vi.spyOn(db.messageBodies, 'get')
@@ -207,6 +263,11 @@ describe('loading poison boundaries', () => {
     expect('tokenCalibration' in (rows[0] as Record<string, unknown>)).toBe(false)
     expect('favoriteModels' in (rows[0] as Record<string, unknown>)).toBe(false)
     expect('recentModels' in (rows[0] as Record<string, unknown>)).toBe(false)
+    expect(chatsGet).not.toHaveBeenCalled()
+    expect(chatsWhere).not.toHaveBeenCalled()
+    expect(chatsOrderBy).not.toHaveBeenCalled()
+    expect(chatsToArray).not.toHaveBeenCalled()
+    expect(chatsBulkGet).not.toHaveBeenCalled()
     expect(messagesWhere).not.toHaveBeenCalled()
     expect(messagesToArray).not.toHaveBeenCalled()
     expect(bodiesGet).not.toHaveBeenCalled()
@@ -250,6 +311,422 @@ describe('loading poison boundaries', () => {
     expect(snapshot.branch.map((row) => row.id)).toEqual(['branch-root', 'branch-active'])
     expect(bulkGet).toHaveBeenCalledTimes(1)
     expect(bulkGet.mock.calls[0]?.[0]).toEqual(['branch-root', 'branch-active'])
+  })
+
+  it('rebuilds a stale search cache from only the last-updated branch bodies', async () => {
+    const chat = await createChat({
+      id: 'search-cache-body-safe',
+      title: 'Search body safe',
+      settings: cloneDefaultChatSettings(),
+      now: 1,
+    })
+    const root = message(chat.id, 'search-root', { createdAt: 1 })
+    const selectedLeaf = message(chat.id, 'search-selected', {
+      parentId: root.id,
+      createdAt: 3,
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: 'selected branch needle' }],
+    })
+    const poison = message(chat.id, 'search-off-branch-poison', {
+      parentId: root.id,
+      siblingIndex: 1,
+      createdAt: 2,
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: 'OFF_BRANCH_SEARCH_BODY_MUST_NOT_LOAD' }],
+    })
+    await putFullMessages([root, selectedLeaf])
+    await putHeaderOnly(poison)
+    await getDb().chats.update(chat.id, {
+      lastUpdatedLeafId: selectedLeaf.id,
+      lastBranchUpdatedAt: 10,
+    })
+
+    const bodyReads = captureMessageBodyReads()
+    const output = await searchChats({
+      queryId: 'search-cache-poison',
+      query: 'needle',
+      repo: getBrowserRepository(),
+      concurrency: 1,
+    })
+    bodyReads.stop()
+
+    expect(output.results).toMatchObject([
+      {
+        chatId: chat.id,
+        source: 'branch-cache',
+        branchLeafId: selectedLeaf.id,
+      },
+    ])
+    expect(bodyReads.ids).toEqual([root.id, selectedLeaf.id])
+    expect(bodyReads.ids).not.toContain(poison.id)
+    expect(
+      (await getDb().chatBranchCache.get(chat.id))?.messageTimestamps.map(({ id }) => id),
+    ).toEqual([root.id, selectedLeaf.id])
+  })
+
+  it('persists a normal user-plus-assistant append without reading existing branch bodies', async () => {
+    const chat = await createChat({
+      id: 'append-body-safe',
+      title: 'Append body safe',
+      settings: cloneDefaultChatSettings(),
+      now: 1,
+    })
+    const root = message(chat.id, 'append-root', { createdAt: 1 })
+    const current = message(chat.id, 'append-current', {
+      parentId: root.id,
+      createdAt: 3,
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: 'current answer' }],
+    })
+    const poison = message(chat.id, 'append-off-branch-poison', {
+      parentId: root.id,
+      siblingIndex: 1,
+      createdAt: 2,
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: 'THIS BODY MUST NOT BE READ' }],
+    })
+    await putFullMessages([root, current])
+    await putHeaderOnly(poison)
+    await seedChatProjection(chat.id, [root, current, poison], current.id)
+
+    const bodyReads = captureMessageBodyReads()
+    const sent = await sendUserMessage({
+      chatId: chat.id,
+      cursor: {},
+      content: [{ type: 'text', text: 'next question' }],
+      now: 100,
+      messageId: 'append-user',
+      turnId: 'append-turn',
+      skipCalibration: true,
+    })
+    const assistant: Message = message(chat.id, 'append-assistant', {
+      parentId: sent.messageId,
+      createdAt: 101,
+      role: 'assistant',
+      origin: 'generated',
+      content: [],
+    })
+    await getBrowserRepository().runMutation(
+      [
+        { kind: 'message', messageId: assistant.id },
+        { kind: 'children', chatId: chat.id, parentId: sent.messageId },
+      ],
+      async (ctx) => ctx.putMessage(assistant),
+    )
+    bodyReads.stop()
+
+    expect(bodyReads.ids).toEqual(['append-root'])
+    expect(bodyReads.textCharacters()).toBe('body:append-root'.length)
+    expect(await getDb().chatBranchCache.get(chat.id)).toBeUndefined()
+    const sentMessage = message(chat.id, sent.messageId, {
+      parentId: current.id,
+      createdAt: 100,
+      content: [{ type: 'text', text: 'next question' }],
+    })
+    expect((await getDb().chats.get(chat.id))?.wordCount).toBe(
+      buildBranchCacheRow({
+        chatId: chat.id,
+        branchLeafId: assistant.id,
+        messages: [root, current, sentMessage, assistant],
+      }).wordCount,
+    )
+  })
+
+  it('replaces a final placeholder while reading only that target body', async () => {
+    const chat = await createChat({
+      id: 'placeholder-body-safe',
+      title: 'Placeholder body safe',
+      settings: cloneDefaultChatSettings(),
+      now: 1,
+    })
+    const shared = message(chat.id, 'placeholder-shared-poison', {
+      createdAt: 1,
+      content: [{ type: 'text', text: 'shared prefix '.repeat(10_000) }],
+    })
+    const target = message(chat.id, 'placeholder-target', {
+      parentId: shared.id,
+      createdAt: 2,
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: 'streaming placeholder' }],
+    })
+    await putHeaderOnly(shared)
+    await putFullMessages([target])
+    await seedChatProjection(chat.id, [shared, target], target.id)
+
+    const bodyReads = captureMessageBodyReads()
+    await getBrowserRepository().runMutation(
+      [{ kind: 'message', messageId: target.id }],
+      async (ctx) => {
+        await ctx.patchMessageBody(
+          target.id,
+          { content: [{ type: 'output_text', text: 'final replacement body' }] },
+          { replaceBody: true },
+        )
+      },
+    )
+    bodyReads.stop()
+
+    expect(bodyReads.ids).toEqual([target.id])
+    expect(bodyReads.ids).not.toContain(shared.id)
+    expect(await getDb().chatBranchCache.get(chat.id)).toBeUndefined()
+    const finalTarget = {
+      ...target,
+      content: [{ type: 'output_text' as const, text: 'final replacement body' }],
+    }
+    expect((await getDb().chats.get(chat.id))?.wordCount).toBe(
+      buildBranchCacheRow({
+        chatId: chat.id,
+        branchLeafId: target.id,
+        messages: [shared, finalTarget],
+      }).wordCount,
+    )
+  })
+
+  it('continues the latest assistant while reading only that target body', async () => {
+    const chat = await createChat({
+      id: 'continue-body-safe',
+      title: 'Continue body safe',
+      settings: cloneDefaultChatSettings(),
+      now: 1,
+    })
+    const shared = message(chat.id, 'continue-shared-poison', {
+      createdAt: 1,
+      content: [{ type: 'text', text: 'shared prefix '.repeat(10_000) }],
+    })
+    const target = message(chat.id, 'continue-target', {
+      parentId: shared.id,
+      createdAt: 2,
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: 'existing '.repeat(10_000) }],
+    })
+    await putHeaderOnly(shared)
+    await putFullMessages([target])
+    await seedChatProjection(chat.id, [shared, target], target.id)
+
+    const bodyReads = captureMessageBodyReads()
+    await getBrowserRepository().runMutation(
+      [{ kind: 'message', messageId: target.id }],
+      async (ctx) => {
+        const current = await ctx.getMessage(target.id)
+        if (!current) throw new Error('missing continuation target')
+        await ctx.putMessage({
+          ...current,
+          content: [{ type: 'output_text', text: `${'existing '.repeat(10_000)}continued` }],
+        })
+      },
+    )
+    bodyReads.stop()
+
+    expect(bodyReads.ids.length).toBeGreaterThan(0)
+    expect(new Set(bodyReads.ids)).toEqual(new Set([target.id]))
+    expect(await getDb().chatBranchCache.get(chat.id)).toBeUndefined()
+  })
+
+  it('regenerates by reading only the divergent old leaf, never the shared prefix', async () => {
+    const chat = await createChat({
+      id: 'regenerate-body-safe',
+      title: 'Regenerate body safe',
+      settings: cloneDefaultChatSettings(),
+      now: 1,
+    })
+    const root = message(chat.id, 'regenerate-root', { createdAt: 1 })
+    const target = message(chat.id, 'regenerate-target', {
+      parentId: root.id,
+      createdAt: 3,
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: 'large old answer'.repeat(10_000) }],
+    })
+    const poison = message(chat.id, 'regenerate-off-branch-poison', {
+      parentId: root.id,
+      siblingIndex: 1,
+      createdAt: 2,
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: 'THIS BODY MUST NOT BE READ' }],
+    })
+    await putHeaderOnly(root)
+    await putFullMessages([target])
+    await putHeaderOnly(poison)
+    await seedChatProjection(chat.id, [root, target, poison], target.id)
+
+    const bodyReads = captureMessageBodyReads()
+    const regenerated = await regenerateAssistant({
+      chatId: chat.id,
+      messageId: target.id,
+      now: 100,
+    })
+    bodyReads.stop()
+
+    expect(bodyReads.ids).toEqual([target.id])
+    expect(bodyReads.ids).not.toContain(root.id)
+    expect(bodyReads.ids).not.toContain(poison.id)
+    expect((await getDb().chats.get(chat.id))?.lastUpdatedLeafId).toBe(regenerated.messageId)
+    expect((await getDb().chats.get(chat.id))?.wordCount).toBe(
+      buildBranchCacheRow({
+        chatId: chat.id,
+        branchLeafId: root.id,
+        messages: [root],
+      }).wordCount,
+    )
+    expect(await getDb().chatBranchCache.get(chat.id)).toBeUndefined()
+  })
+
+  it('creates an explicit sibling by reading only the divergent old leaf', async () => {
+    const chat = await createChat({
+      id: 'sibling-body-safe',
+      title: 'Sibling body safe',
+      settings: cloneDefaultChatSettings(),
+      now: 1,
+    })
+    const root = message(chat.id, 'sibling-root', { createdAt: 1 })
+    const target = message(chat.id, 'sibling-target', {
+      parentId: root.id,
+      createdAt: 3,
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: 'large old sibling'.repeat(10_000) }],
+    })
+    const poison = message(chat.id, 'sibling-off-branch-poison', {
+      parentId: root.id,
+      siblingIndex: 1,
+      createdAt: 2,
+      role: 'assistant',
+      origin: 'generated',
+    })
+    await putHeaderOnly(root)
+    await putFullMessages([target])
+    await putHeaderOnly(poison)
+    await seedChatProjection(chat.id, [root, target, poison], target.id)
+
+    const bodyReads = captureMessageBodyReads()
+    const sibling = await insertSibling({
+      chatId: chat.id,
+      targetId: target.id,
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: 'replacement sibling' }],
+      now: 100,
+    })
+    bodyReads.stop()
+
+    expect(bodyReads.ids).toEqual([target.id])
+    expect(bodyReads.ids).not.toContain(root.id)
+    expect(bodyReads.ids).not.toContain(poison.id)
+    expect((await getDb().chats.get(chat.id))?.lastUpdatedLeafId).toBe(sibling.messageId)
+    const inserted = message(chat.id, sibling.messageId, {
+      parentId: root.id,
+      createdAt: 100,
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: 'replacement sibling' }],
+    })
+    expect((await getDb().chats.get(chat.id))?.wordCount).toBe(
+      buildBranchCacheRow({
+        chatId: chat.id,
+        branchLeafId: inserted.id,
+        messages: [root, inserted],
+      }).wordCount,
+    )
+    expect(await getDb().chatBranchCache.get(chat.id)).toBeUndefined()
+  })
+
+  it('falls back to after-branch hydration when an old divergent body is missing', async () => {
+    const chat = await createChat({
+      id: 'missing-old-body-fallback',
+      title: 'Missing old body fallback',
+      settings: cloneDefaultChatSettings(),
+      now: 1,
+    })
+    const root = message(chat.id, 'fallback-root', {
+      createdAt: 1,
+      content: [{ type: 'text', text: 'shared root words' }],
+    })
+    const target = message(chat.id, 'fallback-missing-target', {
+      parentId: root.id,
+      createdAt: 2,
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: 'missing old body words' }],
+    })
+    await putFullMessages([root])
+    await putHeaderOnly(target)
+    await seedChatProjection(chat.id, [root, target], target.id)
+
+    const bodyReads = captureMessageBodyReads()
+    const sibling = await insertSibling({
+      chatId: chat.id,
+      targetId: target.id,
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: 'new fallback answer' }],
+      now: 100,
+    })
+    bodyReads.stop()
+
+    expect(bodyReads.ids).toEqual([root.id, sibling.messageId])
+    expect((await getDb().chats.get(chat.id))?.wordCount).toBe(6)
+    expect(await getDb().chatBranchCache.get(chat.id)).toBeUndefined()
+  })
+
+  it('appends over a multi-megabyte off-branch body corpus while reading zero existing body characters', async () => {
+    const chat = await createChat({
+      id: 'large-append-body-safe',
+      title: 'Large append body safe',
+      settings: cloneDefaultChatSettings(),
+      now: 1,
+    })
+    const root = message(chat.id, 'large-append-root', { createdAt: 1, role: 'system' })
+    const winner = message(chat.id, 'large-append-winner', {
+      parentId: root.id,
+      createdAt: 1_000,
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: 'winner' }],
+    })
+    const bodyCharsPerBranch = 64 * 1_024
+    const offBranches = Array.from({ length: 64 }, (_, index) =>
+      message(chat.id, `large-off-${String(index).padStart(2, '0')}`, {
+        parentId: root.id,
+        siblingIndex: index + 1,
+        createdAt: index + 2,
+        role: 'assistant',
+        origin: 'generated',
+        content: [{ type: 'output_text', text: 'x'.repeat(bodyCharsPerBranch) }],
+      }),
+    )
+    await putFullMessages([root, winner, ...offBranches])
+    await seedChatProjection(chat.id, [root, winner, ...offBranches], winner.id)
+    const beforeWordCount = (await getDb().chats.get(chat.id))?.wordCount
+
+    const bodyReads = captureMessageBodyReads()
+    const appended = message(chat.id, 'large-append-new', {
+      parentId: winner.id,
+      createdAt: 2_000,
+      role: 'assistant',
+      origin: 'generated',
+      content: [],
+    })
+    await getBrowserRepository().runMutation(
+      [
+        { kind: 'message', messageId: appended.id },
+        { kind: 'children', chatId: chat.id, parentId: winner.id },
+      ],
+      async (ctx) => ctx.putMessage(appended),
+    )
+    bodyReads.stop()
+
+    expect(offBranches.length * bodyCharsPerBranch).toBe(4_194_304)
+    expect(bodyReads.ids).toEqual([])
+    expect(bodyReads.textCharacters()).toBe(0)
+    expect((await getDb().chats.get(chat.id))?.wordCount).toBe(beforeWordCount)
+    expect(await getDb().chatBranchCache.get(chat.id)).toBeUndefined()
   })
 
   it('hydrates only the requested active-branch body window', async () => {
@@ -367,7 +844,18 @@ describe('loading poison boundaries', () => {
     const target = message(chat.id, 'edit-target', {
       parentId: root.id,
       createdAt: 1,
-      content: [{ type: 'text', text: 'before edit' }],
+      content: [
+        { type: 'text', text: 'before ' },
+        { type: 'output_text', text: 'edit' },
+      ],
+      reasoningDetails: [{ type: 'reasoning.summary', summary: 'preserved reasoning' }],
+      providerOutputItems: [
+        {
+          dialect: 'openai-responses',
+          type: 'reasoning',
+          item: { type: 'reasoning', id: 'reasoning-1', encrypted_content: 'sealed' },
+        },
+      ],
     })
     const later = message(chat.id, 'edit-later', {
       parentId: target.id,
@@ -381,10 +869,12 @@ describe('loading poison boundaries', () => {
     const bodiesBulkGet = vi.spyOn(getDb().messageBodies, 'bulkGet')
     const messagesWhere = vi.spyOn(getDb().messages, 'where')
 
-    await editInPlace(chat.id, target, 'after edit')
+    await editInPlace(chat.id, target, '  after edit  ')
 
     const body = await getDb().messageBodies.get(target.id)
-    expect(body?.content).toEqual([{ type: 'text', text: 'after edit' }])
+    expect(body?.content).toEqual([{ type: 'text', text: '  after edit  ' }])
+    expect(body?.reasoningDetails).toEqual(target.reasoningDetails)
+    expect(body?.providerOutputItems).toEqual(target.providerOutputItems)
     expect(bodiesBulkGet).not.toHaveBeenCalled()
     expect(messagesWhere).not.toHaveBeenCalled()
   })

@@ -3,7 +3,7 @@ import type { Attachment, AttachmentRef, MessageAttachmentRef } from '../../core
 import { newId } from '../../lib/ulid'
 import { createAttachmentRef, normalizeAttachmentRefs } from '../../store/attachment-refs'
 import { ingestAttachmentBytes } from '../../store/attachments'
-import { getBrowserRepository } from '../../store/browser-repo'
+import { getWorkspaceRepository } from '../../store/workspace-repository'
 
 export interface AttachmentUploadItem {
   id: string
@@ -28,7 +28,7 @@ export function useAttachmentDrafts(initialRefs?: readonly AttachmentRef[]) {
     const ids = [...new Set(attachmentRefs.map((ref) => ref.attachmentId))]
     if (ids.length === 0) return
     void Promise.all(
-      ids.map(async (id) => [id, await getBrowserRepository().getAttachment(id)] as const),
+      ids.map(async (id) => [id, await getWorkspaceRepository().getAttachment(id)] as const),
     )
       .then((rows) => {
         if (cancelled) return

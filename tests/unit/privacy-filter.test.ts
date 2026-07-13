@@ -1,6 +1,4 @@
-// Privacy filter. See `plan/09-privacy.md §9.6 / §9.9` and
-// `src/core/privacy-filter.ts`. The rules tested here are the load-bearing
-// ones called out in CLAUDE.md "Non-negotiable behaviors #2":
+// Load-bearing privacy-filter rules:
 //
 //   - Hard-deny (training OR trainingOpenRouter) BEFORE Pareto
 //   - Pareto dominance along 4 dimensions
@@ -107,8 +105,8 @@ describe('filterEndpointsByPrivacy — hard deny', () => {
 })
 
 describe('filterEndpointsByPrivacy — GPT-5.4 live fixture', () => {
-  // Per plan/09 §9.6: Azure clean dominates OpenAI's unknown-retention +
-  // requires-user-IDs policy, so the filter should keep only Azure.
+  // Azure clean dominates OpenAI's unknown-retention + requires-user-IDs
+  // policy, so the filter should keep only Azure.
   it('Azure survives, OpenAI auto-excluded for GPT-5.4', () => {
     const result = filterEndpointsByPrivacy({
       model: 'openai/gpt-5.4',

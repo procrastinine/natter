@@ -1,6 +1,3 @@
-// Lookup layer over the bundled capability tables. See
-// `plan/07-discovery.md §7.6`.
-//
 // `resolveBundledCapability` returns:
 // 1. the table row for this connection kind + model id, if present
 // 2. otherwise the permissive custom default — this covers "unknown model on

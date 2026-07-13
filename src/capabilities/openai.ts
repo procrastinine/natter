@@ -9,8 +9,8 @@ import type { BundledModelEntry, CapabilityTable } from './types'
 
 const TOOLS = ['tools', 'tool_choice', 'parallel_tool_calls'] as const
 
-// GPT-5.4 family — Responses-API-required, no temperature/top_p/top_k per
-// the 5.4 migration (see CLAUDE.md per-model quirks).
+// GPT-5.4 requires the Responses API and rejects temperature/top_p/top_k while
+// reasoning is enabled.
 const GPT_5_4_PARAMS = [
   'max_tokens',
   'max_completion_tokens',

@@ -107,6 +107,8 @@ describe('uiStore', () => {
     expect(state.sidebarCollapsed).toBe(false)
     expect(state.activeChatId).toBeNull()
     expect(state.composerFullscreen).toBe(false)
+    expect(state.treeViewChatId).toBeNull()
+    expect(state.treeExpanded).toBe(false)
   })
 
   it('setters update individual slices', () => {
@@ -121,6 +123,15 @@ describe('uiStore', () => {
     expect(state.sidebarCollapsed).toBe(true)
     expect(state.activeChatId).toBe('C1')
     expect(state.composerFullscreen).toBe(true)
+  })
+
+  it('keeps tree view and density ephemeral in this tab', () => {
+    const { setTreeExpanded, setTreeViewChatId } = useUiStore.getState()
+    setTreeViewChatId('C1')
+    setTreeExpanded(true)
+    expect(useUiStore.getState()).toMatchObject({ treeViewChatId: 'C1', treeExpanded: true })
+    useUiStore.getState().reset()
+    expect(useUiStore.getState()).toMatchObject({ treeViewChatId: null, treeExpanded: false })
   })
 })
 

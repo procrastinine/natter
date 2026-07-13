@@ -1,7 +1,6 @@
 /*
  * themes.css — theme-specific token assignments.
  * Owns: [data-theme='light'|'dark'|'high-contrast'].
- * See plan/10-ui.md §10.20, §10.21.
  *
  * `:root` / Phase-8 default is the light palette (defined in tokens.css); light
  * lives here too for symmetry when a tab carries an explicit `data-theme='light'`.

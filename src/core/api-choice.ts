@@ -1,5 +1,4 @@
-// Phase 11 API router. See `plan/phase11-implementation.md §1` for the
-// 10-step decision matrix. Callers:
+// API router. Callers:
 //   - the send-pipeline (picks transport + wire shape)
 //   - the UI (surfaces the resolved route in the API-mode hint)
 //
@@ -21,7 +20,14 @@
 import { hasEnabledHostedTools, isOpenAiDirectProfile } from './provider-hosted-tools'
 import { isTextCompletionsSelectableFor, responsesSupportFor } from './quirks'
 import { normalizeReasoningSettings } from './reasoning'
-import type { ApiVariant, ChatSettings, ConnectionProfile, Message, ReasoningFormat } from './types'
+import type {
+  ApiVariant,
+  ChatSettings,
+  ConnectionProfile,
+  GenerationMeta,
+  Message,
+  ReasoningFormat,
+} from './types'
 
 type ApiRouteKind =
   | 'chat-completions'
@@ -45,6 +51,18 @@ export interface ApiRoute {
   // Human-readable rationale tag — the UI uses this to label "Auto — chat
   // completions" vs "Auto — Responses (required by gpt-5.4)".
   reason: string
+}
+
+export function apiUsedForRoute(
+  route: ApiRoute | null | undefined,
+  useTextProtocol = false,
+): GenerationMeta['apiUsed'] {
+  if (useTextProtocol || route?.kind === 'text-completions') return 'completion'
+  if (route?.kind === 'responses') return 'responses'
+  if (route?.kind === 'gemini-generate') return 'gemini-native'
+  if (route?.kind === 'anthropic-messages') return 'anthropic-messages'
+  if (route?.kind === 'video-generation') return 'video-generation'
+  return 'chat'
 }
 
 // Minimal capability surface the router needs. Real callers pass
@@ -214,6 +232,7 @@ function hasPriorOpenAiEncryptedReasoning(path: readonly Message[]): boolean {
     if (!m.reasoningDetails) continue
     for (const d of m.reasoningDetails) {
       if (d.type !== 'reasoning.encrypted') continue
+      if (d.id?.startsWith('tool_')) continue
       // Accept any OpenAI-family carrier; the router only asks "should
       // the route stay on Responses to round-trip it?" — the transform
       // decides the exact `include:` list from `format`.

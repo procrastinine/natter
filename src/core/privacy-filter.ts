@@ -1,5 +1,3 @@
-// Privacy filter. See `plan/09-privacy.md §9.6 and §9.9`.
-//
 // Given the live `/endpoints` rows + scraped `data_policy` map for a model,
 // produce the final routing decision for a request:
 //
@@ -160,9 +158,8 @@ function resolveEndpointPolicy(
   return undefined
 }
 
-// Privacy-lock tier. See `plan/09-privacy.md §9.11`. Computed from the
-// kept endpoints' policies in the UI. `open` means "privacy filter doesn't
-// apply" (free model); `unavailable` means kept endpoints exist but no
+// Privacy-lock tier computed from the kept endpoints' policies. `open` means
+// the privacy filter does not apply (free model); `unavailable` means kept
 // data_policy survives through to describe them.
 export type PrivacyTier = 'green' | 'yellow' | 'orange' | 'red' | 'open' | 'unavailable'
 

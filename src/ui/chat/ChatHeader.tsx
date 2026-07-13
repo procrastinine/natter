@@ -1,22 +1,24 @@
-import { useLiveQuery } from 'dexie-react-hooks'
 import { type ReactNode, useCallback, useEffect, useRef, useState } from 'react'
 import { exportChatAsTxt, triggerBrowserDownload } from '../../core/chat-export'
 import { aggregateCalibrationSamples } from '../../core/token-calibration'
 import type { ChatId, CursorMap, TokenCalibrationSample } from '../../core/types'
 import { getChat, setChatTagsFromNames, setManualTitle } from '../../store/chats'
 import { exportChat } from '../../store/import-export'
+import { chatRowDependencies } from '../../store/reactive-dependencies'
+import { useRepositoryQuery } from '../../store/reactive-query'
 import { listTags } from '../../store/tags'
 import { useChatStore } from '../../store/zustand/chatStore'
 import { useToastStore } from '../../store/zustand/toastStore'
 import {
+  BranchTreeIcon,
   CloseIcon,
   CogIcon,
   DownloadIcon,
-  EditTreeIcon,
   FileIcon,
   InfoIcon,
   MenuIcon,
   PencilIcon,
+  StructureEditIcon,
   TagIcon,
 } from '../icons/Icon'
 import {
@@ -48,6 +50,9 @@ interface ChatHeaderProps {
   onToggleSettings: () => void
   editTreeActive?: boolean
   onToggleEditTree?: () => void
+  treeViewActive?: boolean
+  onTreeViewIntent?: () => void
+  onToggleTreeView?: () => void
   mobileConnectionControl?: ReactNode
 }
 
@@ -57,12 +62,16 @@ export function ChatHeader({
   onToggleSettings,
   editTreeActive,
   onToggleEditTree,
+  treeViewActive,
+  onTreeViewIntent,
+  onToggleTreeView,
   mobileConnectionControl,
 }: ChatHeaderProps) {
-  const chat = useLiveQuery(
+  const chat = useRepositoryQuery(
+    JSON.stringify(['chat', chatId]),
     () => (chatId ? getChat(chatId) : Promise.resolve(undefined)),
-    [chatId],
     undefined,
+    chatRowDependencies(chatId),
   )
   const cursor = useChatStore((s) => (chatId ? (s.cursors[chatId] ?? EMPTY_CURSOR) : EMPTY_CURSOR))
   const [editing, setEditing] = useState(false)
@@ -167,7 +176,18 @@ export function ChatHeader({
     }
   }, [mobileMenuOpen])
 
-  const displayTitle = chat?.title?.trim().length ? chat.title : 'Untitled chat'
+  const displayTitle = chat?.title.trim().length ? chat.title : 'Untitled chat'
+  const editTreeUnavailable = !!treeViewActive
+  const editTreeLabel = editTreeUnavailable
+    ? 'Return to conversation to edit the tree'
+    : editTreeActive
+      ? 'Exit edit tree mode'
+      : 'Enter edit tree mode'
+  const editTreeTitle = editTreeUnavailable
+    ? 'Return to conversation to edit the tree'
+    : editTreeActive
+      ? 'Exit edit tree mode (Esc)'
+      : 'Edit tree mode (⇧⌘E)'
 
   // When no chat is active there's no title to edit, no streaming to abort,
   // and no chat-model panel to toggle — render nothing.
@@ -227,18 +247,36 @@ export function ChatHeader({
         </div>
       )}
       <span data-ui="header-spacer" />
+      {onToggleTreeView ? (
+        <button
+          type="button"
+          data-ui="icon-button"
+          data-role="chat-branch-tree"
+          aria-label={treeViewActive ? 'Return to conversation' : 'View conversation tree'}
+          aria-pressed={!!treeViewActive}
+          title={treeViewActive ? 'Return to conversation' : 'View conversation tree'}
+          onPointerEnter={onTreeViewIntent}
+          onPointerDown={onTreeViewIntent}
+          onFocus={onTreeViewIntent}
+          onClick={onToggleTreeView}
+          data-state={treeViewActive ? 'active' : undefined}
+        >
+          <BranchTreeIcon size={18} />
+        </button>
+      ) : null}
       {onToggleEditTree ? (
         <button
           type="button"
           data-ui="icon-button"
           data-role="chat-edit-tree"
-          aria-label={editTreeActive ? 'Exit edit tree mode' : 'Enter edit tree mode'}
+          aria-label={editTreeLabel}
           aria-pressed={!!editTreeActive}
-          title={editTreeActive ? 'Exit edit tree mode (Esc)' : 'Edit tree mode (⇧⌘E)'}
+          title={editTreeTitle}
+          disabled={editTreeUnavailable}
           onClick={onToggleEditTree}
-          data-state={editTreeActive ? 'active' : undefined}
+          data-state={editTreeActive && !editTreeUnavailable ? 'active' : undefined}
         >
-          <EditTreeIcon size={18} />
+          <StructureEditIcon size={18} />
         </button>
       ) : null}
       <button
@@ -331,14 +369,39 @@ export function ChatHeader({
               <button
                 type="button"
                 data-ui="mobile-menu-action"
+                data-role="mobile-chat-edit-tree"
+                aria-label={editTreeLabel}
                 aria-pressed={!!editTreeActive}
+                title={editTreeTitle}
+                disabled={editTreeUnavailable}
+                data-state={editTreeActive && !editTreeUnavailable ? 'active' : undefined}
                 onClick={() => {
                   onToggleEditTree()
                   setMobileMenuOpen(false)
                 }}
               >
-                <EditTreeIcon size={16} />
+                <StructureEditIcon size={16} />
                 <span>{editTreeActive ? 'Exit edit tree' : 'Edit tree'}</span>
+              </button>
+            ) : null}
+            {onToggleTreeView ? (
+              <button
+                type="button"
+                data-ui="mobile-menu-action"
+                data-role="mobile-chat-branch-tree"
+                aria-pressed={!!treeViewActive}
+                title={treeViewActive ? 'Return to conversation' : 'View conversation tree'}
+                data-state={treeViewActive ? 'active' : undefined}
+                onPointerEnter={onTreeViewIntent}
+                onPointerDown={onTreeViewIntent}
+                onFocus={onTreeViewIntent}
+                onClick={() => {
+                  onToggleTreeView()
+                  setMobileMenuOpen(false)
+                }}
+              >
+                <BranchTreeIcon size={16} />
+                <span>{treeViewActive ? 'Return to conversation' : 'View conversation tree'}</span>
               </button>
             ) : null}
             <button

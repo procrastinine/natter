@@ -5,6 +5,8 @@ import { describe, expect, it } from 'vitest'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const THEME_CSS = resolve(__dirname, '../../src/app/theme.css')
+const MAIN_TSX = resolve(__dirname, '../../src/main.tsx')
+const MARKDOWN_VIEW = resolve(__dirname, '../../src/ui/chat/MarkdownView.tsx')
 
 function parseImports(source: string): string[] {
   const imports: string[] = []
@@ -74,5 +76,17 @@ describe('theme.css import order', () => {
     const expectedStyleFiles = EXPECTED_ORDER.filter((i) => i.startsWith('../styles/'))
     const actualStyleFiles = imports.filter((i) => i.startsWith('../styles/'))
     expect(new Set(actualStyleFiles)).toEqual(new Set(expectedStyleFiles))
+  })
+})
+
+describe('lazy Markdown styles', () => {
+  it('loads Streamdown and KaTeX styles with the lazy Markdown runtime', () => {
+    const main = readFileSync(MAIN_TSX, 'utf8')
+    const markdown = readFileSync(MARKDOWN_VIEW, 'utf8')
+
+    expect(main).not.toContain("'streamdown/styles.css'")
+    expect(main).not.toContain("'katex/dist/katex.css'")
+    expect(markdown).toContain("'streamdown/styles.css'")
+    expect(markdown).toContain("'katex/dist/katex.css'")
   })
 })

@@ -1,13 +1,15 @@
 import { createCjkPlugin } from '@streamdown/cjk'
-import { createCodePlugin } from '@streamdown/code'
 import { createMathPlugin } from '@streamdown/math'
-import { createMermaidPlugin } from '@streamdown/mermaid'
 import { type MutableRefObject, memo, useContext, useMemo, useRef } from 'react'
 import type { Components, StreamdownProps } from 'streamdown'
 import { defaultRemarkPlugins, Streamdown } from 'streamdown'
+import 'streamdown/styles.css'
+import 'katex/dist/katex.css'
 import { DEFAULT_IMAGE_ORIGINS, isImageOriginAllowed } from '../../core/image-allowlist'
 import type { ShikiThemeChoice } from '../settings/RenderingSettings'
 import { RenderingPreferencesContext } from '../settings/RenderingSettings'
+import { createLazyMermaidPlugin } from './lazy-mermaid-plugin'
+import { createShikiCodePlugin } from './shiki-code-plugin'
 
 interface MarkdownViewProps {
   content: string
@@ -36,8 +38,9 @@ interface MarkdownSegmentViewProps {
 }
 
 interface PrefixSegmentCache {
-  target: number
-  refs: readonly string[]
+  scanTarget: number
+  scanRefs: readonly string[]
+  cut: number
   content: string
 }
 
@@ -50,7 +53,7 @@ const cjkPlugin = createCjkPlugin()
 // `securityLevel: 'strict'` (Mermaid's default) keeps click handlers
 // sandboxed (LLM-generated content is rendered here), so any looser
 // setting would let a model open dialogs or navigate the page.
-const mermaidPlugin = createMermaidPlugin({
+const mermaidPlugin = createLazyMermaidPlugin({
   config: { securityLevel: 'strict' },
 })
 
@@ -87,9 +90,8 @@ export function MarkdownView({
   // `CodeHighlighterPlugin` interface but no built-in implementation —
   // without a plugin mounted under `plugins.code`, the highlighter call
   // returns null and code blocks render as raw monospace text. The
-  // `@streamdown/code` plugin (Shiki-backed) is used and rebuilt whenever
-  // the theme tuple changes so the Settings dropdown actually repaints
-  // existing blocks.
+  // The Shiki-backed plugin is rebuilt whenever the theme tuple changes so
+  // the Settings dropdown actually repaints existing blocks.
   const renderingPrefs = useContext(RenderingPreferencesContext)
   const shikiTheme = useMemo<[ShikiThemeChoice, ShikiThemeChoice]>(
     () => [renderingPrefs.shikiLight, renderingPrefs.shikiDark],
@@ -276,19 +278,39 @@ function segmentMarkdownSections(
     Math.floor((totalLength - 1) / STREAMING_MARKDOWN_SEGMENT_CHARS) *
     STREAMING_MARKDOWN_SEGMENT_CHARS
   const rawSplit = splitTextSegmentsAt(contentSegments, prefixTarget)
+  const cached = cacheRef.current
+  if (
+    cached &&
+    cached.scanTarget === prefixTarget &&
+    sameStringRefs(cached.scanRefs, rawSplit.prefixRefs)
+  ) {
+    const tailRefs =
+      cached.cut === prefixTarget
+        ? rawSplit.tailRefs
+        : splitTextSegmentsAt(contentSegments, cached.cut).tailRefs
+    return [
+      {
+        id: `0-${cached.cut}`,
+        content: cached.content,
+        streaming: false,
+      },
+      {
+        id: `${cached.cut}-live`,
+        content: tailRefs.join(''),
+        streaming: true,
+      },
+    ]
+  }
   const rawPrefixContent = rawSplit.prefixRefs.join('')
   const cut = findSegmentCut(rawPrefixContent, 0, prefixTarget)
   const { prefixRefs, tailRefs } =
     cut === prefixTarget ? rawSplit : splitTextSegmentsAt(contentSegments, cut)
-  const cached = cacheRef.current
-  const prefixContent =
-    cached && cached.target === cut && sameStringRefs(cached.refs, prefixRefs)
-      ? cached.content
-      : cut === prefixTarget
-        ? rawPrefixContent
-        : prefixRefs.join('')
-  if (cached?.content !== prefixContent) {
-    cacheRef.current = { target: cut, refs: prefixRefs, content: prefixContent }
+  const prefixContent = cut === prefixTarget ? rawPrefixContent : prefixRefs.join('')
+  cacheRef.current = {
+    scanTarget: prefixTarget,
+    scanRefs: rawSplit.prefixRefs,
+    cut,
+    content: prefixContent,
   }
   return [
     {
@@ -370,7 +392,7 @@ function hasOpenFence(content: string, start: number, end: number): boolean {
 function buildPlugins(themes: [ShikiThemeChoice, ShikiThemeChoice], singleDollarTextMath: boolean) {
   return {
     math: createMathPlugin({ singleDollarTextMath }),
-    code: createCodePlugin({ themes }),
+    code: createShikiCodePlugin({ themes }),
     cjk: cjkPlugin,
     mermaid: mermaidPlugin,
   }

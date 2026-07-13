@@ -7,8 +7,7 @@
  *
  * The accompanying `[data-ui="icon-button"]` mixin gives every icon-only
  * button a SQUARE hit area (no taller-than-wide pills on hover) plus a
- * consistent hover background and focus ring — see CLAUDE.md / icon-
- * alignment memory.
+ * consistent hover background and focus ring.
  */
 
 [data-icon] {

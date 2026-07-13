@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest'
 import type { AnthropicStreamChunk } from '../../src/api/anthropic-types'
 import { type StreamLaneEvent, splitAnthropicStream } from '../../src/api/stream-transforms'
+import {
+  applyStreamAccumulatorEvent,
+  createStreamAccumulator,
+  projectStreamAccumulatorFinal,
+} from '../../src/core/stream-accumulator'
 
 async function* asAsync<T>(items: Iterable<T>): AsyncIterable<T> {
   for (const item of items) yield item
@@ -73,6 +78,88 @@ describe('splitAnthropicStream', () => {
     ])
   })
 
+  it('preserves ordinary tool_use metadata, streamed JSON, and the authoritative snapshot', async () => {
+    const chunks: AnthropicStreamChunk[] = [
+      {
+        type: 'anthropic_event',
+        event: {
+          type: 'content_block_start',
+          index: 2,
+          content_block: { type: 'tool_use', id: 'toolu_1', name: 'lookup', input: {} },
+        },
+      },
+      {
+        type: 'anthropic_event',
+        event: {
+          type: 'content_block_delta',
+          index: 2,
+          delta: { type: 'input_json_delta', partial_json: '{"query":' },
+        },
+      },
+      {
+        type: 'anthropic_event',
+        event: {
+          type: 'content_block_delta',
+          index: 2,
+          delta: { type: 'input_json_delta', partial_json: '"natter"}' },
+        },
+      },
+      {
+        type: 'anthropic_event',
+        event: { type: 'content_block_stop', index: 2 },
+      },
+    ]
+    const lanes = await collect(splitAnthropicStream(asAsync(chunks)))
+    const toolCalls = lanes.filter(
+      (lane): lane is Extract<StreamLaneEvent, { lane: 'tool-call' }> => lane.lane === 'tool-call',
+    )
+    expect(toolCalls).toEqual([
+      {
+        lane: 'tool-call',
+        index: 2,
+        id: 'toolu_1',
+        type: 'function',
+        name: 'lookup',
+        outputIndex: 2,
+      },
+      {
+        lane: 'tool-call',
+        index: 2,
+        type: 'function',
+        argumentsDelta: '{"query":',
+        outputIndex: 2,
+      },
+      {
+        lane: 'tool-call',
+        index: 2,
+        type: 'function',
+        argumentsDelta: '"natter"}',
+        outputIndex: 2,
+      },
+      {
+        lane: 'tool-call',
+        index: 2,
+        id: 'toolu_1',
+        type: 'function',
+        name: 'lookup',
+        argumentsSnapshot: '{"query":"natter"}',
+        outputIndex: 2,
+      },
+    ])
+
+    const accumulator = createStreamAccumulator({ initialContent: [], now: 0 })
+    for (const [index, lane] of toolCalls.entries()) {
+      applyStreamAccumulatorEvent(accumulator, lane, index + 1)
+    }
+    expect(projectStreamAccumulatorFinal(accumulator).toolCalls).toEqual([
+      {
+        id: 'toolu_1',
+        type: 'function',
+        function: { name: 'lookup', arguments: '{"query":"natter"}' },
+      },
+    ])
+  })
+
   it('preserves Claude thinking details and server-tool output blocks', async () => {
     const chunks: AnthropicStreamChunk[] = [
       {
@@ -136,5 +223,81 @@ describe('splitAnthropicStream', () => {
       }),
     ])
     expect(lanes.some((lane) => lane.lane === 'text' && lane.text === 'final')).toBe(true)
+  })
+
+  it('streams 100k Claude thinking once and attaches signature metadata without replay', async () => {
+    const part = 'reasoning-'.repeat(10)
+    const partCount = 1_000
+    const chunks: AnthropicStreamChunk[] = [
+      {
+        type: 'anthropic_event',
+        event: {
+          type: 'content_block_start',
+          index: 0,
+          content_block: { type: 'thinking', thinking: '' },
+        },
+      },
+      ...Array.from({ length: partCount }, () => ({
+        type: 'anthropic_event' as const,
+        event: {
+          type: 'content_block_delta' as const,
+          index: 0,
+          delta: { type: 'thinking_delta', thinking: part },
+        },
+      })),
+      {
+        type: 'anthropic_event',
+        event: {
+          type: 'content_block_delta',
+          index: 0,
+          delta: { type: 'signature_delta', signature: 'signature-' },
+        },
+      },
+      {
+        type: 'anthropic_event',
+        event: {
+          type: 'content_block_delta',
+          index: 0,
+          delta: { type: 'signature_delta', signature: 'tail' },
+        },
+      },
+      {
+        type: 'anthropic_event',
+        event: { type: 'content_block_stop', index: 0 },
+      },
+    ]
+    const lanes = await collect(splitAnthropicStream(asAsync(chunks)))
+    const reasoning = lanes.filter(
+      (lane): lane is Extract<StreamLaneEvent, { lane: 'reasoning' }> => lane.lane === 'reasoning',
+    )
+    const emittedThinkingCharacters = reasoning.reduce(
+      (total, lane) => total + (lane.textDelta?.length ?? 0),
+      0,
+    )
+    expect(emittedThinkingCharacters).toBe(part.length * partCount)
+    expect(reasoning.at(-1)?.details).toEqual([
+      {
+        type: 'reasoning.text',
+        id: 'text#anthropic-reasoning-0',
+        index: 0,
+        format: 'anthropic-claude-v1',
+        signature: 'signature-tail',
+      },
+    ])
+
+    const accumulator = createStreamAccumulator({ initialContent: [], now: 0 })
+    for (const [index, lane] of reasoning.entries()) {
+      applyStreamAccumulatorEvent(accumulator, lane, index + 1)
+    }
+    expect(projectStreamAccumulatorFinal(accumulator).reasoningDetails).toEqual([
+      {
+        type: 'reasoning.text',
+        id: 'text#anthropic-reasoning-0',
+        index: 0,
+        format: 'anthropic-claude-v1',
+        text: part.repeat(partCount),
+        signature: 'signature-tail',
+      },
+    ])
   })
 })

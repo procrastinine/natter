@@ -2,7 +2,6 @@
  * modals.css — modal shells, drawers, confirm dialogs, onboarding and import flows.
  * Owns: [data-ui='modal'|'drawer'|'dialog'|'import-modal'|'confirm-dialog'|
  *              'overflow-modal'|'tool-consent-dialog'|'ocr-upsell-dialog'|'unsaved-dialog'].
- * See plan/10-ui.md §10.20.
  */
 
 [data-ui="modal"],

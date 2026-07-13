@@ -1,4 +1,3 @@
-import { strToU8, Zip, ZipDeflate } from 'fflate'
 import { getWorkspaceRepository } from '../store/workspace-repository'
 import { exportActiveBranchAsTxt, exportLastUpdatedBranchAsTxt } from './branch-flatten'
 import type { ChatId, CursorMap } from './types'
@@ -61,9 +60,10 @@ function uniqueZipFilename(filename: string, index: number, seen: Map<string, nu
   return `${candidate.slice(0, dot)}-${count + 1}${candidate.slice(dot)}`
 }
 
-function zipEntriesAsBlob(
+async function zipEntriesAsBlob(
   entries: readonly { filename: string; content: string }[],
 ): Promise<Blob> {
+  const { strToU8, Zip, ZipDeflate } = await import('fflate')
   return new Promise((resolve, reject) => {
     const chunks: Uint8Array[] = []
     const archive = new Zip((error, chunk, final) => {

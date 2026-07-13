@@ -1,4 +1,3 @@
-import { useLiveQuery } from 'dexie-react-hooks'
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import { runAssistantRequestOnce } from '../../api/assistant-stream'
 import { fetchModels } from '../../api/models'
@@ -31,6 +30,8 @@ import {
   listProfiles,
   updateProfile,
 } from '../../store/profiles'
+import { allTable } from '../../store/reactive-dependencies'
+import { useRepositoryQuery } from '../../store/reactive-query'
 import { ChevronIcon, CloseIcon, TrashIcon } from '../icons/Icon'
 
 interface HeaderState {
@@ -413,20 +414,50 @@ export function ConnectionHeader({
   variant = 'empty-action',
 }: ConnectionHeaderProps = {}) {
   const [activeId, setActiveId] = useState<ProfileId | null>(() => readActiveProfileId())
-  const liveState = useLiveQuery(
+  const [setupOpen, setSetupOpen] = useState(false)
+  const liveState = useRepositoryQuery(
+    JSON.stringify(['connection-header', activeId, activeChatProfileId]),
     () => loadHeaderState(activeId, activeChatProfileId),
-    [activeId, activeChatProfileId],
     undefined,
+    allTable('profiles', 'keys'),
   )
   const stateCacheRef = useRef<HeaderState>({ profile: null, profiles: [], hasKey: false })
+  const pendingSaveProfileIdRef = useRef<ProfileId | null>(null)
   useEffect(() => {
     if (liveState === undefined) return
+    const pendingProfileId = pendingSaveProfileIdRef.current
+    if (
+      pendingProfileId !== null &&
+      activeId === pendingProfileId &&
+      stateCacheRef.current.profile?.id === pendingProfileId &&
+      liveState.profile?.id !== pendingProfileId
+    ) {
+      return
+    }
+    if (setupOpen && stateCacheRef.current.profile === null && liveState.profile !== null) return
     stateCacheRef.current = liveState
-  }, [liveState])
-  const state = liveState ?? stateCacheRef.current
+  }, [activeId, liveState, setupOpen])
+  useEffect(() => {
+    const pendingProfileId = pendingSaveProfileIdRef.current
+    if (
+      pendingProfileId !== null &&
+      (activeId !== pendingProfileId || liveState?.profile?.id === pendingProfileId)
+    ) {
+      pendingSaveProfileIdRef.current = null
+    }
+  }, [activeId, liveState])
+  const pendingSaveProfileId = pendingSaveProfileIdRef.current
+  const cachedStateTargetsPendingSave =
+    pendingSaveProfileId !== null &&
+    activeId === pendingSaveProfileId &&
+    stateCacheRef.current.profile?.id === pendingSaveProfileId &&
+    liveState?.profile?.id !== pendingSaveProfileId
+  const state =
+    cachedStateTargetsPendingSave || (setupOpen && stateCacheRef.current.profile === null)
+      ? stateCacheRef.current
+      : (liveState ?? stateCacheRef.current)
   const [open, setOpen] = useState(false)
   const [editing, setEditing] = useState(false)
-  const [setupOpen, setSetupOpen] = useState(false)
   const [probeState, setProbeState] = useState<ProbeState>({ kind: 'idle' })
   const [deleteBusy, setDeleteBusy] = useState(false)
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false)
@@ -502,8 +533,6 @@ export function ConnectionHeader({
 
   const applySaveResult = useCallback(
     async (result: ConnectionSaveResult) => {
-      setEditing(false)
-      setSetupOpen(false)
       if (result.activate) {
         await activateProfile(result.profileId, { resetModel: result.resetModel })
         const targetChatId = activeChatId ?? chatIdFromHash()
@@ -528,11 +557,14 @@ export function ConnectionHeader({
             })
           }
         }
-        return
-      }
-      if (activeChatId && activeChatProfileId === result.profileId && result.resetModel) {
+      } else if (activeChatId && activeChatProfileId === result.profileId && result.resetModel) {
         await updateChatSettings(activeChatId, { model: '' })
       }
+      const savedState = await loadHeaderState(result.profileId, null)
+      pendingSaveProfileIdRef.current = result.profileId
+      stateCacheRef.current = savedState
+      setEditing(false)
+      setSetupOpen(false)
     },
     [activateProfile, activeChatId, activeChatProfileId],
   )
@@ -1091,7 +1123,7 @@ function ConnectionEditor({
   const saveAsNew = trimmedName !== originalName
   const lockedBaseUrl = KIND_LOCKED_BASE_URL[kind]
   const baseUrlIsLocked = lockedBaseUrl !== null
-  const effectiveBaseUrl = baseUrlIsLocked ? (lockedBaseUrl ?? '') : baseUrl
+  const effectiveBaseUrl = baseUrlIsLocked ? lockedBaseUrl : baseUrl
   const trimmedBaseUrl = effectiveBaseUrl.trim()
   const baseUrlValid = useMemo(() => isValidHttpUrl(trimmedBaseUrl), [trimmedBaseUrl])
   const requiresKey = kindRequiresKey(kind)
@@ -1424,7 +1456,7 @@ function ConnectionSetupModal({
   const trimmedKey = keyDraft.trim()
   const lockedBaseUrl = KIND_LOCKED_BASE_URL[kind]
   const baseUrlIsLocked = lockedBaseUrl !== null
-  const effectiveBaseUrl = baseUrlIsLocked ? (lockedBaseUrl ?? '') : baseUrl
+  const effectiveBaseUrl = baseUrlIsLocked ? lockedBaseUrl : baseUrl
   const trimmedBaseUrl = effectiveBaseUrl.trim()
   const baseUrlValid = useMemo(() => isValidHttpUrl(trimmedBaseUrl), [trimmedBaseUrl])
   const requiresKey = kindRequiresKey(kind)

@@ -4,6 +4,7 @@ import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import type { Chat, ChatSettings, PresetId, ProfileId } from '../../src/core/types'
 import { newId } from '../../src/lib/ulid'
 import { __resetBroadcastForTests, type BroadcastEvent, onEvent } from '../../src/store/broadcast'
+import { getBrowserRepository } from '../../src/store/browser-repo'
 import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
 import { __resetKeyCacheForTests, createKey } from '../../src/store/keys'
 import {
@@ -274,6 +275,73 @@ describe('deletePreset', () => {
     const row = await getDb().chats.get(chat.id)
     expect(row?.presetId).toBeUndefined()
     expect(row?.settings.profileId).toBe(profileId) // settings stay intact
+  })
+
+  it('commits all breadcrumb clears with one workspace version and accurate chat versions', async () => {
+    const profileId = await fakeProfileId()
+    const preset = await createPreset({
+      name: 'base',
+      connectionProfileId: profileId,
+      settings: settingsFor(profileId),
+    })
+    const first = await seedChatReferencingPreset(profileId, preset.id)
+    const second = await seedChatReferencingPreset(profileId, preset.id)
+    const repo = getBrowserRepository()
+    const beforeWorkspace = await repo.getWorkspaceMeta()
+    const seen: BroadcastEvent[] = []
+    const unsubscribe = onEvent((event) => seen.push(event))
+
+    await deletePreset(preset.id, { now: 500 })
+
+    unsubscribe()
+    const rows = await getDb().chats.bulkGet([first.id, second.id])
+    expect(rows).toMatchObject([
+      { id: first.id, metaVersion: 1, summaryVersion: 1, updatedAt: 500 },
+      { id: second.id, metaVersion: 1, summaryVersion: 1, updatedAt: 500 },
+    ])
+    expect(await getDb().presets.get(preset.id)).toBeUndefined()
+    expect((await repo.getWorkspaceMeta()).mutationCounter).toBe(
+      beforeWorkspace.mutationCounter + 1,
+    )
+    const chatEvents = seen.filter((event) => event.kind === 'chat-mutated')
+    expect(chatEvents).toHaveLength(2)
+    expect(chatEvents.every((event) => event.metaVersion === 1 && event.summaryVersion === 1)).toBe(
+      true,
+    )
+  })
+
+  it('rolls back every row, workspace version, and event when a middle write fails', async () => {
+    const profileId = await fakeProfileId()
+    const preset = await createPreset({
+      name: 'base',
+      connectionProfileId: profileId,
+      settings: settingsFor(profileId),
+    })
+    const first = await seedChatReferencingPreset(profileId, preset.id)
+    const second = await seedChatReferencingPreset(profileId, preset.id)
+    const repo = getBrowserRepository()
+    const beforeWorkspace = await repo.getWorkspaceMeta()
+    const beforeChats = await getDb().chats.bulkGet([first.id, second.id])
+    const beforePreset = await getDb().presets.get(preset.id)
+    const seen: BroadcastEvent[] = []
+    const unsubscribe = onEvent((event) => seen.push(event))
+    let updates = 0
+    const failSecondUpdate = () => {
+      updates += 1
+      if (updates === 2) throw new Error('injected breadcrumb failure')
+    }
+    getDb().chats.hook.updating.subscribe(failSecondUpdate)
+
+    await expect(deletePreset(preset.id, { now: 500 })).rejects.toThrow(
+      'injected breadcrumb failure',
+    )
+
+    getDb().chats.hook.updating.unsubscribe(failSecondUpdate)
+    unsubscribe()
+    expect(await getDb().chats.bulkGet([first.id, second.id])).toEqual(beforeChats)
+    expect(await getDb().presets.get(preset.id)).toEqual(beforePreset)
+    expect((await repo.getWorkspaceMeta()).mutationCounter).toBe(beforeWorkspace.mutationCounter)
+    expect(seen).toEqual([])
   })
 })
 

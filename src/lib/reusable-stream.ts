@@ -1,6 +1,6 @@
 // Multicasting primitive so multiple lane extractors (text, reasoning,
 // tool-calls, meta) can iterate the same upstream stream independently without
-// starving each other. See `plan/04-api-client.md §4.7`.
+// starving each other.
 //
 // The underlying generator is pumped once; chunks are buffered in memory and
 // each consumer reads at its own offset. When the source ends, consumers drain

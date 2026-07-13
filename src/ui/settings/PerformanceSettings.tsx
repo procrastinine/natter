@@ -1,4 +1,3 @@
-import { useLiveQuery } from 'dexie-react-hooks'
 import { useCallback } from 'react'
 import {
   DEFAULT_GLOBAL_PREFERENCES,
@@ -13,6 +12,8 @@ import {
   writeSidebarRenderWindowLoadMode,
   writeSidebarRenderWindowSize,
 } from '../../core/global-settings'
+import { GLOBAL_PREFERENCES_DEPENDENCIES } from '../../store/reactive-dependencies'
+import { useRepositoryQuery } from '../../store/reactive-query'
 import { InfoDisclosure } from './InfoDisclosure'
 
 const LOAD_MODE_OPTIONS: ReadonlyArray<{ value: RenderWindowLoadMode; label: string }> = [
@@ -21,7 +22,12 @@ const LOAD_MODE_OPTIONS: ReadonlyArray<{ value: RenderWindowLoadMode; label: str
 ]
 
 export function PerformanceSettings() {
-  const prefs = useLiveQuery(readGlobalPreferences, [], DEFAULT_GLOBAL_PREFERENCES)
+  const prefs = useRepositoryQuery(
+    'global-preferences',
+    readGlobalPreferences,
+    DEFAULT_GLOBAL_PREFERENCES,
+    GLOBAL_PREFERENCES_DEPENDENCIES,
+  )
 
   const onMessageRenderWindowSize = useCallback(async (value: number) => {
     await writeMessageRenderWindowSize(value)

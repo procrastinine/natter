@@ -1,15 +1,16 @@
-import { expect, test } from '@playwright/test'
+import { expect, test } from './fixtures'
 import {
   buildSseBody,
   clearIndexedDb,
   createChatAndOpen,
   createChatAndSend,
+  firstChatId,
   mockChatCompletions,
+  readMessages,
   seedFirstRun,
 } from './helpers'
 
 test.beforeEach(async ({ page }) => {
-  await page.goto('/')
   await clearIndexedDb(page)
   await seedFirstRun(page)
   await mockChatCompletions(page, {
@@ -65,8 +66,13 @@ test('clicking the brand returns to home (no chat selected)', async ({ page }) =
 
 test('reload preserves the active chat (URL is the source of truth)', async ({ page }) => {
   await createChatAndSend(page, 'persisted')
+  const chatId = await firstChatId(page)
+  const assistant = (await readMessages(page, chatId)).find(
+    (message) => message.role === 'assistant',
+  )
+  if (typeof assistant?.id !== 'string') throw new Error('Expected an assistant message')
   const hashBefore = await page.evaluate(() => window.location.hash)
-  expect(hashBefore).toMatch(/^#\/chat\//)
+  expect(hashBefore).toBe(`#/chat/${chatId}/message/${assistant.id}`)
   await page.reload()
   // Same hash, same row marked active.
   const hashAfter = await page.evaluate(() => window.location.hash)

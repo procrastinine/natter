@@ -1,5 +1,3 @@
-// Privacy policy helpers. See `plan/09-privacy.md §9.5–§9.6`.
-
 import { UNKNOWN_POLICY } from './defaults'
 import type { DataPolicy } from './types'
 

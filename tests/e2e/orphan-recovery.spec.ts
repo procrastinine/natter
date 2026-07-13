@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test'
+import { expect, test } from './fixtures'
 import { clearIndexedDb, seedFirstRun } from './helpers'
 
 // The orphan sweep (Shell.tsx → recoverOrphans on mount) rescues any message
@@ -7,7 +7,6 @@ import { clearIndexedDb, seedFirstRun } from './helpers'
 // the test synthesizes an orphan row directly in IDB and reloads.
 
 test.beforeEach(async ({ page }) => {
-  await page.goto('/')
   await clearIndexedDb(page)
   await seedFirstRun(page)
 })

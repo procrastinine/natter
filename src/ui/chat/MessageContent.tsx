@@ -1,10 +1,11 @@
-import { useLiveQuery } from 'dexie-react-hooks'
 import { useMemo } from 'react'
 import type { AttachmentBlob, AttachmentRef, ContentItem, MessageId } from '../../core/types'
 import { liveAttachmentRefs } from '../../store/attachment-refs'
 import { setAttachmentRefVisibility } from '../../store/attachments'
-import { getBrowserRepository } from '../../store/browser-repo'
+import { attachmentBundleDependencies } from '../../store/reactive-dependencies'
+import { useRepositoryQuery } from '../../store/reactive-query'
 import type { AttachmentBundle } from '../../store/repository'
+import { getWorkspaceRepository } from '../../store/workspace-repository'
 import { EyeIcon, EyeOffIcon } from '../icons/Icon'
 import { MarkdownView } from './MarkdownView'
 import type { MessageCollapseMode } from './MessageStreamOverflow'
@@ -27,10 +28,7 @@ const outputObjectUrlCache = new Map<
   string,
   { url: string; contentHash: string; sizeBytes: number }
 >()
-
-export function messageTextFromContent(content: ContentItem[]): string {
-  return messageTextSegmentsFromContent(content).join('')
-}
+const outputObjectUrlApi: Partial<Pick<typeof URL, 'createObjectURL' | 'revokeObjectURL'>> = URL
 
 export function messageTextSegmentsFromContent(content: readonly ContentItem[]): string[] {
   if (content.length === 1) {
@@ -268,13 +266,14 @@ function OutputImage({
   messageId?: MessageId | undefined
   attachmentRef?: ReturnType<typeof liveAttachmentRefs>[number] | undefined
 }) {
-  const bundle = useLiveQuery(
+  const bundle = useRepositoryQuery(
+    JSON.stringify(['attachment-bundle', image.attachmentId ?? null]),
     async () => {
       if (!image.attachmentId) return undefined
-      return getBrowserRepository().getAttachmentBundle(image.attachmentId)
+      return getWorkspaceRepository().getAttachmentBundle(image.attachmentId)
     },
-    [image.attachmentId],
     undefined,
+    attachmentBundleDependencies(image.attachmentId),
   )
   const blob = useMemo(() => selectOutputImageBlob(bundle), [bundle])
   const objectUrl = useMemo(() => objectUrlForOutputBlob(blob), [blob])
@@ -310,13 +309,14 @@ function OutputAudio({
   messageId?: MessageId | undefined
   attachmentRef?: ReturnType<typeof liveAttachmentRefs>[number] | undefined
 }) {
-  const bundle = useLiveQuery(
+  const bundle = useRepositoryQuery(
+    JSON.stringify(['attachment-bundle', audio.attachmentId ?? null]),
     async () => {
       if (!audio.attachmentId) return undefined
-      return getBrowserRepository().getAttachmentBundle(audio.attachmentId)
+      return getWorkspaceRepository().getAttachmentBundle(audio.attachmentId)
     },
-    [audio.attachmentId],
     undefined,
+    attachmentBundleDependencies(audio.attachmentId),
   )
   const blob = useMemo(() => selectOutputImageBlob(bundle), [bundle])
   const objectUrl = useMemo(() => objectUrlForOutputBlob(blob), [blob])
@@ -356,13 +356,14 @@ function OutputVideo({
   messageId?: MessageId | undefined
   attachmentRef?: ReturnType<typeof liveAttachmentRefs>[number] | undefined
 }) {
-  const bundle = useLiveQuery(
+  const bundle = useRepositoryQuery(
+    JSON.stringify(['attachment-bundle', video.attachmentId ?? null]),
     async () => {
       if (!video.attachmentId) return undefined
-      return getBrowserRepository().getAttachmentBundle(video.attachmentId)
+      return getWorkspaceRepository().getAttachmentBundle(video.attachmentId)
     },
-    [video.attachmentId],
     undefined,
+    attachmentBundleDependencies(video.attachmentId),
   )
   const blob = useMemo(() => selectOutputImageBlob(bundle), [bundle])
   const objectUrl = useMemo(() => objectUrlForOutputBlob(blob), [blob])
@@ -442,15 +443,19 @@ function selectOutputImageBlob(bundle: AttachmentBundle | undefined): Attachment
 }
 
 function objectUrlForOutputBlob(blob: AttachmentBlob | undefined): string | undefined {
-  if (!blob || !(blob.blob instanceof Blob) || typeof URL.createObjectURL !== 'function') {
+  if (
+    !blob ||
+    !(blob.blob instanceof Blob) ||
+    typeof outputObjectUrlApi.createObjectURL !== 'function'
+  ) {
     return undefined
   }
   const cached = outputObjectUrlCache.get(blob.id)
   if (cached && cached.contentHash === blob.contentHash && cached.sizeBytes === blob.sizeBytes) {
     return cached.url
   }
-  if (cached) URL.revokeObjectURL?.(cached.url)
-  const url = URL.createObjectURL(blob.blob)
+  if (cached) outputObjectUrlApi.revokeObjectURL?.(cached.url)
+  const url = outputObjectUrlApi.createObjectURL(blob.blob)
   outputObjectUrlCache.set(blob.id, {
     url,
     contentHash: blob.contentHash,
@@ -465,7 +470,7 @@ function trimOutputObjectUrlCache(): void {
     const oldestKey = outputObjectUrlCache.keys().next().value
     if (!oldestKey) return
     const oldest = outputObjectUrlCache.get(oldestKey)
-    if (oldest) URL.revokeObjectURL?.(oldest.url)
+    if (oldest) outputObjectUrlApi.revokeObjectURL?.(oldest.url)
     outputObjectUrlCache.delete(oldestKey)
   }
 }

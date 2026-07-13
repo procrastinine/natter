@@ -1,101 +1,125 @@
-// Live-fixture parser tests. These consume HTML pages captured via
-//   curl https://openrouter.ai/{model}/providers > tests/fixtures/privacy-scrape/<file>.html
-// on 2026-04-19 / 2026-04-24, and assert that `parsePrivacyPage` extracts the expected
-// provider → policy pairs. See `plan/09-privacy.md §9.4 / §9.6` for the
-// data_policy shape and the domination outcomes these fixtures witness.
-//
-// If OpenRouter re-skins the per-model page, refresh the fixtures with
-// fresh curls; the shape the parser expects is stable but the scaffold
-// around it changes occasionally.
-
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { parsePrivacyPage } from '../../src/api/privacy-scrape'
 
-function readFixture(name: string): string {
-  return readFileSync(join(__dirname, '..', 'fixtures', 'privacy-scrape', name), 'utf8')
+const LOCAL_FIXTURE_ROOT = join(__dirname, '..', 'fixtures', 'privacy-scrape')
+
+const compactPages = {
+  'gpt-5.4': privacyPage([
+    policy('Azure', { training: false, retains_prompts: false, can_publish: false }),
+    policy('OpenAI', {
+      training: false,
+      retains_prompts: true,
+      requires_user_ids: true,
+      can_publish: false,
+    }),
+  ]),
+  'claude-opus-4.7': privacyPage([
+    policy('Anthropic', {
+      training: false,
+      retains_prompts: true,
+      retention_days: 30,
+      requires_user_ids: true,
+      can_publish: false,
+    }),
+    policy('Amazon Bedrock', {
+      training: false,
+      retains_prompts: false,
+      can_publish: false,
+    }),
+    policy('Google Vertex', {
+      training: false,
+      retains_prompts: false,
+      requires_user_ids: true,
+      can_publish: false,
+    }),
+  ]),
+  'gemini-2.5-pro': privacyPage([
+    policy('Google AI Studio', {
+      training: false,
+      retains_prompts: true,
+      retention_days: 55,
+      can_publish: false,
+    }),
+    policy('Google Vertex (Global)', {
+      training: false,
+      retains_prompts: false,
+      can_publish: false,
+    }),
+  ]),
 }
 
-describe('parsePrivacyPage — GPT-5.4 live fixture', () => {
-  const html = readFixture('gpt-5.4.html')
-  const policies = parsePrivacyPage(html)
-
-  it('finds Azure (clean) and OpenAI (retained + user IDs)', () => {
-    expect(policies).toHaveProperty('Azure')
-    expect(policies).toHaveProperty('OpenAI')
-  })
-
-  it('Azure policy is clean (no retention, no user IDs)', () => {
-    const azure = policies.Azure
-    expect(azure?.training).toBe(false)
-    expect(azure?.retainsPrompts).toBe(false)
-    expect(azure?.requiresUserIDs).toBeUndefined()
-  })
-
-  it('OpenAI retains prompts with unknown period and requires user IDs', () => {
-    const openai = policies.OpenAI
-    expect(openai?.training).toBe(false)
-    expect(openai?.retainsPrompts).toBe(true)
-    expect(openai?.retentionDays).toBeUndefined() // "unknown" period
-    expect(openai?.requiresUserIDs).toBe(true)
-  })
+describe('parsePrivacyPage — compact provider-page fixtures', () => {
+  assertGptPolicies(compactPages['gpt-5.4'])
+  assertClaudePolicies(compactPages['claude-opus-4.7'])
+  assertGeminiPolicies(compactPages['gemini-2.5-pro'])
 })
 
-describe('parsePrivacyPage — Claude Opus 4.7 live fixture', () => {
-  const html = readFixture('claude-opus-4.7.html')
+const localFiles = {
+  'gpt-5.4': join(LOCAL_FIXTURE_ROOT, 'gpt-5.4.html'),
+  'claude-opus-4.7': join(LOCAL_FIXTURE_ROOT, 'claude-opus-4.7.html'),
+  'gemini-2.5-pro': join(LOCAL_FIXTURE_ROOT, 'gemini-2.5-pro.html'),
+}
+
+if (Object.values(localFiles).every((path) => existsSync(path))) {
+  describe('parsePrivacyPage — full local provider-page captures', () => {
+    assertGptPolicies(readFileSync(localFiles['gpt-5.4'], 'utf8'))
+    assertClaudePolicies(readFileSync(localFiles['claude-opus-4.7'], 'utf8'))
+    assertGeminiPolicies(readFileSync(localFiles['gemini-2.5-pro'], 'utf8'))
+  })
+}
+
+function assertGptPolicies(html: string): void {
   const policies = parsePrivacyPage(html)
-
-  it('finds Anthropic, Amazon Bedrock, and Google Vertex', () => {
-    expect(policies).toHaveProperty('Anthropic')
-    expect(policies).toHaveProperty('Amazon Bedrock')
-    expect(policies).toHaveProperty('Google Vertex')
+  it('finds clean Azure and retained OpenAI policies', () => {
+    expect(policies.Azure).toMatchObject({ training: false, retainsPrompts: false })
+    expect(policies.Azure?.requiresUserIDs).toBeUndefined()
+    expect(policies.OpenAI).toMatchObject({
+      training: false,
+      retainsPrompts: true,
+      requiresUserIDs: true,
+    })
+    expect(policies.OpenAI?.retentionDays).toBeUndefined()
   })
+}
 
-  it('Anthropic has 30d retention + user IDs', () => {
-    const a = policies.Anthropic
-    expect(a?.retainsPrompts).toBe(true)
-    expect(a?.retentionDays).toBe(30)
-    expect(a?.requiresUserIDs).toBe(true)
-  })
-
-  it('Amazon Bedrock is clean', () => {
-    const b = policies['Amazon Bedrock']
-    expect(b?.retainsPrompts).toBe(false)
-    expect(b?.requiresUserIDs).toBeUndefined()
-  })
-
-  it('Google Vertex is clean on retention but requires user IDs', () => {
-    const v = policies['Google Vertex']
-    expect(v?.retainsPrompts).toBe(false)
-    expect(v?.requiresUserIDs).toBe(true)
-  })
-})
-
-describe('parsePrivacyPage — Gemini 2.5 Pro live fixture', () => {
-  const html = readFixture('gemini-2.5-pro.html')
+function assertClaudePolicies(html: string): void {
   const policies = parsePrivacyPage(html)
-
-  it('finds Google AI Studio', () => {
-    expect(Object.keys(policies)).toContain('Google AI Studio')
+  it('finds Anthropic, Bedrock, and Vertex policies', () => {
+    expect(policies.Anthropic).toMatchObject({
+      retainsPrompts: true,
+      retentionDays: 30,
+      requiresUserIDs: true,
+    })
+    expect(policies['Amazon Bedrock']).toMatchObject({ retainsPrompts: false })
+    expect(policies['Amazon Bedrock']?.requiresUserIDs).toBeUndefined()
+    expect(policies['Google Vertex']).toMatchObject({
+      retainsPrompts: false,
+      requiresUserIDs: true,
+    })
   })
+}
 
-  // The page serializes Vertex as regional variants:
-  // "Google Vertex (Global)", "Google Vertex (US)", etc. The parser
-  // must emit those live names verbatim; the filter no longer replaces
-  // missing live rows with a hardcoded provider-policy table.
-  it('emits regional Vertex variants verbatim (names match the HTML)', () => {
-    const keys = Object.keys(policies)
-    const vertexKeys = keys.filter((k) => k.startsWith('Google Vertex'))
-    expect(vertexKeys.length).toBeGreaterThan(0)
-    // At least one of them is "(Global)" per the 2026-04-19 snapshot.
-    expect(vertexKeys).toContain('Google Vertex (Global)')
+function assertGeminiPolicies(html: string): void {
+  const policies = parsePrivacyPage(html)
+  it('keeps regional Vertex names and AI Studio retention', () => {
+    expect(Object.keys(policies)).toContain('Google Vertex (Global)')
+    expect(policies['Google AI Studio']).toMatchObject({
+      retainsPrompts: true,
+      retentionDays: 55,
+    })
+    expect(policies['Google AI Studio']?.requiresUserIDs).toBeUndefined()
   })
+}
 
-  it('AI Studio retains 55 days without user IDs', () => {
-    const ai = policies['Google AI Studio']
-    expect(ai?.retainsPrompts).toBe(true)
-    expect(ai?.retentionDays).toBe(55)
-    expect(ai?.requiresUserIDs).toBeUndefined()
-  })
-})
+function policy(
+  providerName: string,
+  dataPolicy: Record<string, unknown>,
+): Record<string, unknown> {
+  return { provider_name: providerName, data_policy: dataPolicy }
+}
+
+function privacyPage(rows: Record<string, unknown>[]): string {
+  return `<script>window.__PROVIDERS__=${JSON.stringify(rows)}</script>`
+}

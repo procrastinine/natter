@@ -1,5 +1,3 @@
-// Simple key-value settings bag. See `plan/03-storage.md §3.1` (`settings` table).
-//
 // Used for app-wide preferences that aren't worth a dedicated table: theme
 // preference, "don't show this again" dismissals, the onboarding state, etc.
 // Every write broadcasts `settings-mutated { key }` so other tabs can reload.
@@ -7,6 +5,7 @@
 import { postEvent } from './broadcast'
 import { getDb } from './db'
 import { withNamedLock } from './locks'
+import { bumpBrowserWorkspaceMeta } from './workspace-meta'
 
 function stableStringify(value: unknown): string {
   return JSON.stringify(value)
@@ -21,13 +20,34 @@ export async function getSetting<T>(key: string): Promise<T | undefined> {
   return row?.value as T | undefined
 }
 
+export function getSettings(keys: readonly string[]): Promise<ReadonlyMap<string, unknown>> {
+  return getDb()
+    .settings.bulkGet([...keys])
+    .then(
+      (rows) =>
+        new Map(rows.flatMap((row) => (row === undefined ? [] : [[row.key, row.value] as const]))),
+    )
+}
+
 export async function setSetting<T>(key: string, value: T): Promise<void> {
-  await getDb().settings.put({ key, value })
+  const db = getDb()
+  await withNamedLock(`setting:${key}`, (grant) =>
+    grant.runTransaction(db, [db.settings], async (tx) => {
+      await tx.table('settings').put({ key, value })
+      await bumpBrowserWorkspaceMeta(tx, Date.now())
+    }),
+  )
   postEvent({ kind: 'settings-mutated', key })
 }
 
 export async function deleteSetting(key: string): Promise<void> {
-  await getDb().settings.delete(key)
+  const db = getDb()
+  await withNamedLock(`setting:${key}`, (grant) =>
+    grant.runTransaction(db, [db.settings], async (tx) => {
+      await tx.table('settings').delete(key)
+      await bumpBrowserWorkspaceMeta(tx, Date.now())
+    }),
+  )
   postEvent({ kind: 'settings-mutated', key })
 }
 
@@ -35,24 +55,27 @@ export async function updateSetting<T>(
   key: string,
   updater: (current: T | undefined) => T | undefined | Promise<T | undefined>,
 ): Promise<T | undefined> {
-  return withNamedLock(`setting:${key}`, async () => {
+  return withNamedLock(`setting:${key}`, async (grant) => {
     const db = getDb()
-    let changed = false
-    const next = await db.transaction('rw', db.settings, async () => {
-      const current = (await db.settings.get(key))?.value as T | undefined
+    const result = { changed: false }
+    const next = await grant.runTransaction(db, [db.settings], async (tx) => {
+      const settings = tx.table<{ key: string; value: unknown }, string>('settings')
+      const current = (await settings.get(key))?.value as T | undefined
       const updated = await updater(current)
       if (updated === undefined) {
         if (current === undefined) return undefined
-        await db.settings.delete(key)
-        changed = true
+        await settings.delete(key)
+        result.changed = true
+        await bumpBrowserWorkspaceMeta(tx, Date.now())
         return undefined
       }
       if (current !== undefined && valuesEqual(current, updated)) return updated
-      await db.settings.put({ key, value: updated })
-      changed = true
+      await settings.put({ key, value: updated })
+      result.changed = true
+      await bumpBrowserWorkspaceMeta(tx, Date.now())
       return updated
     })
-    if (changed) postEvent({ kind: 'settings-mutated', key })
+    if (result.changed) postEvent({ kind: 'settings-mutated', key })
     return next
   })
 }

@@ -21,7 +21,7 @@
 // All values are pinned to the effective capability; `validateChatSettings`
 // re-clamps when the model changes.
 
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { EffectiveCapability } from '../../core/capabilities'
 import { type PromptSizeEstimate, UNLIMITED_CONTEXT } from '../../core/prompt-size'
 import type { Chat } from '../../core/types'
@@ -351,15 +351,28 @@ function NumberSlider({
   const committedSliderValue = isUnlimited ? max : Math.min(max, Math.max(min, value))
   const [draft, setDraft] = useState(isUnlimited ? '-1' : String(value))
   const [sliderValue, setSliderValue] = useState(committedSliderValue)
+  const lastRequestedValueRef = useRef(value)
+  const lastRequestedSliderValueRef = useRef(committedSliderValue)
   useEffect(() => {
     setDraft(isUnlimited ? '-1' : String(value))
     setSliderValue(committedSliderValue)
+    lastRequestedValueRef.current = value
+    lastRequestedSliderValueRef.current = committedSliderValue
   }, [isUnlimited, value, committedSliderValue])
 
   const commitSliderDraft = useCallback(() => {
     const clamped = Math.min(Math.max(sliderValue, min), max)
-    if (clamped !== committedSliderValue) onCommit(clamped)
-  }, [sliderValue, min, max, committedSliderValue, onCommit])
+    if (clamped === lastRequestedSliderValueRef.current) return
+    lastRequestedValueRef.current = clamped
+    lastRequestedSliderValueRef.current = clamped
+    onCommit(clamped)
+  }, [sliderValue, min, max, onCommit])
+  const unmountCommitRef = useRef(commitSliderDraft)
+  unmountCommitRef.current = commitSliderDraft
+
+  useEffect(() => {
+    return () => unmountCommitRef.current()
+  }, [])
 
   useEffect(() => {
     if (sliderValue === committedSliderValue) return
@@ -377,13 +390,21 @@ function NumberSlider({
       return
     }
     if (allowUnlimited && n <= UNLIMITED_CONTEXT) {
-      if (value !== UNLIMITED_CONTEXT) onCommit(UNLIMITED_CONTEXT)
+      if (lastRequestedValueRef.current !== UNLIMITED_CONTEXT) {
+        lastRequestedValueRef.current = UNLIMITED_CONTEXT
+        lastRequestedSliderValueRef.current = max
+        onCommit(UNLIMITED_CONTEXT)
+      }
       setDraft('-1')
       setSliderValue(max)
       return
     }
     const clamped = Math.min(Math.max(n, min), max)
-    if (clamped !== value) onCommit(clamped)
+    if (clamped !== lastRequestedValueRef.current) {
+      lastRequestedValueRef.current = clamped
+      lastRequestedSliderValueRef.current = clamped
+      onCommit(clamped)
+    }
     setDraft(String(clamped))
     setSliderValue(clamped)
   }

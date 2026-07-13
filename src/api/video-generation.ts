@@ -1,11 +1,19 @@
 import type { ConnectionProfile } from '../core/types'
-import { buildHeaders, fetchWithTimeout } from './client'
+import {
+  type ApiKeyDispatchContext,
+  buildHeaders,
+  fetchWithApiKeyFallback,
+  fetchWithTimeout,
+  hasExplicitAuthHeaderOverride,
+  readErrorResponseJson,
+} from './client'
+import { deferAdapterRequest } from './deferred-request'
 import { normalizeError } from './errors'
+import { decodeProviderJson } from './sse'
 import type { CallOpts, ChatCompletionUsageWire, ChatStreamChunk } from './types'
 
-interface VideoGenerationContext {
+interface VideoGenerationContext extends ApiKeyDispatchContext {
   profile: ConnectionProfile
-  apiKey: string
 }
 
 interface VideoGenerationRequestWire {
@@ -28,7 +36,24 @@ interface VideoGenerationJobWire {
   [extra: string]: unknown
 }
 
+interface VideoOutputMetadata {
+  model: string
+  prompt: string
+}
+
+interface VideoPollContext {
+  profile: ConnectionProfile
+  signal?: AbortSignal
+  timeoutMs?: number
+}
+
 const POLL_INTERVAL_MS = 10_000
+const VIDEO_FAILURE_MESSAGES: Readonly<Record<string, string>> = {
+  failed: 'Video generation failed.',
+  cancelled: 'Video generation was cancelled.',
+  canceled: 'Video generation was canceled.',
+  expired: 'Video generation expired.',
+}
 
 function videoGenerationUrl(profile: ConnectionProfile): string {
   const base = profile.baseUrl.replace(/\/+$/, '')
@@ -36,45 +61,60 @@ function videoGenerationUrl(profile: ConnectionProfile): string {
 }
 
 async function readJsonResponse(response: Response): Promise<unknown> {
-  return response.json().catch(() => ({
-    error: { code: response.status, message: response.statusText },
-  })) as Promise<unknown>
+  return readErrorResponseJson(response)
 }
 
-async function postVideoGeneration(
+function postVideoGeneration(
   ctx: VideoGenerationContext,
   req: VideoGenerationRequestWire,
   opts: CallOpts,
-): Promise<VideoGenerationJobWire> {
+): Promise<{ job: VideoGenerationJobWire; apiKey: string }> {
+  return postVideoGenerationSerialized(ctx, JSON.stringify(req), opts)
+}
+
+function postVideoGenerationSerialized(
+  ctx: VideoGenerationContext,
+  body: string,
+  opts: CallOpts,
+): Promise<{ job: VideoGenerationJobWire; apiKey: string }> {
   const url = videoGenerationUrl(ctx.profile)
-  const headers = buildHeaders(ctx.profile, ctx.apiKey, { method: 'POST' })
-  const response = await fetchWithTimeout(
-    url,
-    {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(req),
+  const authCtx = hasExplicitAuthHeaderOverride(ctx.profile, undefined, 'Authorization')
+    ? { apiKey: ctx.apiKey }
+    : ctx
+  const fetched = fetchWithApiKeyFallback(
+    authCtx,
+    (candidateApiKey) => {
+      const headers = buildHeaders(ctx.profile, candidateApiKey, { method: 'POST' })
+      return { url, init: { method: 'POST', headers, body } }
     },
     {
       ...(opts.signal ? { signal: opts.signal } : {}),
       ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
     },
   )
+  return finishVideoPost(fetched)
+}
+
+async function finishVideoPost(
+  fetched: ReturnType<typeof fetchWithApiKeyFallback>,
+): Promise<{ job: VideoGenerationJobWire; apiKey: string }> {
+  const { response, apiKey } = await fetched
   if (!response.ok) {
     throw normalizeError(await readJsonResponse(response), {
       midStream: false,
       httpStatus: response.status,
     })
   }
-  return (await response.json()) as VideoGenerationJobWire
+  return { job: await decodeProviderJson<VideoGenerationJobWire>(response), apiKey }
 }
 
 async function getVideoGeneration(
-  ctx: VideoGenerationContext,
+  ctx: VideoPollContext,
   pollingUrl: string,
+  apiKey: string,
   opts: CallOpts,
 ): Promise<VideoGenerationJobWire> {
-  const headers = buildHeaders(ctx.profile, ctx.apiKey, { method: 'GET' })
+  const headers = buildHeaders(ctx.profile, apiKey, { method: 'GET' })
   const response = await fetchWithTimeout(
     pollingUrl,
     { method: 'GET', headers },
@@ -89,55 +129,73 @@ async function getVideoGeneration(
       httpStatus: response.status,
     })
   }
-  return (await response.json()) as VideoGenerationJobWire
+  return decodeProviderJson<VideoGenerationJobWire>(response)
 }
 
-export async function* videoGeneration(
+export function videoGeneration(
   ctx: VideoGenerationContext,
   req: VideoGenerationRequestWire,
   opts: CallOpts = {},
-): AsyncGenerator<ChatStreamChunk> {
-  let job = await postVideoGeneration(ctx, req, opts)
+): AsyncGenerator<ChatStreamChunk, void, unknown> {
+  return deferAdapterRequest(req, (request) => {
+    const metadata: VideoOutputMetadata = { model: request.model, prompt: request.prompt }
+    const pollContext: VideoPollContext = {
+      profile: ctx.profile,
+      ...(opts.signal ? { signal: opts.signal } : {}),
+      ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
+    }
+    return consumeVideoGeneration(postVideoGeneration(ctx, request, opts), metadata, pollContext)
+  })
+}
+
+async function* consumeVideoGeneration(
+  postedRequest: Promise<{ job: VideoGenerationJobWire; apiKey: string }>,
+  metadata: VideoOutputMetadata,
+  pollContext: VideoPollContext,
+): AsyncGenerator<ChatStreamChunk, void, unknown> {
+  const posted = await postedRequest
+  let job = posted.job
   const pollingUrl = typeof job.polling_url === 'string' ? job.polling_url : undefined
   if (!pollingUrl) {
-    yield failedChunk(job, req.model, 'Video generation did not return a polling URL.')
+    yield failedChunk(job, metadata.model, 'Video generation did not return a polling URL.')
     return
   }
 
-  while (true) {
+  for (;;) {
     const status = typeof job.status === 'string' ? job.status : 'pending'
     yield { type: 'keepalive', comment: `video:${status}` }
     if (status === 'completed') {
-      yield completedChunk(job, req)
+      yield completedChunk(job, metadata)
       return
     }
-    if (status === 'failed') {
-      yield failedChunk(job, req.model, errorMessage(job.error) ?? 'Video generation failed.')
+    const failureMessage = VIDEO_FAILURE_MESSAGES[status]
+    if (failureMessage) {
+      yield failedChunk(job, metadata.model, errorMessage(job.error) ?? failureMessage)
       return
     }
-    await delay(POLL_INTERVAL_MS, opts.signal)
-    job = await getVideoGeneration(ctx, pollingUrl, opts)
+    await delay(POLL_INTERVAL_MS, pollContext.signal)
+    job = await getVideoGeneration(pollContext, pollingUrl, posted.apiKey, pollContext)
   }
 }
 
 function completedChunk(
   job: VideoGenerationJobWire,
-  req: VideoGenerationRequestWire,
+  request: VideoOutputMetadata,
 ): ChatStreamChunk {
   const urls = videoContentUrls(job)
   if (urls.length === 0) {
-    return failedChunk(job, req.model, 'Video generation completed without a content URL.')
+    return failedChunk(job, request.model, 'Video generation completed without a content URL.')
   }
   const generationId = job.generation_id ?? job.id
   return {
     type: 'delta',
     chunk: {
       ...(typeof generationId === 'string' ? { id: generationId } : {}),
-      model: req.model,
+      model: request.model,
       choices: [
         {
           index: 0,
-          delta: { videos: urls.map((url) => ({ url, prompt: req.prompt })) },
+          delta: { videos: urls.map((url) => ({ url, prompt: request.prompt })) },
           finish_reason: 'stop',
         },
       ],
@@ -220,13 +278,13 @@ function errorMessage(error: unknown): string | undefined {
 function delay(ms: number, signal: AbortSignal | undefined): Promise<void> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
-      reject(abortError(signal))
+      reject(normalizeError(undefined, { midStream: true, cause: 'abort' }))
       return
     }
     const timer = setTimeout(done, ms)
     const onAbort = () => {
       clearTimeout(timer)
-      reject(signal ? abortError(signal) : new DOMException('Aborted', 'AbortError'))
+      reject(normalizeError(undefined, { midStream: true, cause: 'abort' }))
     }
     function done() {
       signal?.removeEventListener('abort', onAbort)
@@ -234,8 +292,4 @@ function delay(ms: number, signal: AbortSignal | undefined): Promise<void> {
     }
     signal?.addEventListener('abort', onAbort, { once: true })
   })
-}
-
-function abortError(signal: AbortSignal): Error | DOMException {
-  return signal.reason instanceof Error ? signal.reason : new DOMException('Aborted', 'AbortError')
 }

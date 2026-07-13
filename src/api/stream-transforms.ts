@@ -1,10 +1,6 @@
-// Chat-completions lane splitters. See `plan/04-api-client.md §4.7` and
-// `plan/05-transforms-and-quirks.md §5.3`.
-//
 // A single stream produces multiple independent lanes. Rather than force every
 // caller to re-parse the tagged union, the splitter exposes lane-tagged events that the
-// send-pipeline accumulator folds into the message. Events match the lane
-// contract sketched in `plan/06-streaming.md §6.1a "StreamDelta"`:
+// send-pipeline accumulator folds into the message:
 //
 //   { lane: 'text'      | 'reasoning' | 'tool-call' | 'usage' | 'keepalive'
 //              | 'error' | 'meta'       | 'finish'
@@ -33,6 +29,7 @@ import type {
   GeminiStreamChunk,
   GenerateContentResponseWire,
 } from './gemini-types'
+import type { StreamIntegrityEvent } from './stream-integrity'
 import type {
   ChatCompletionChoiceWire,
   ChatCompletionChunkWire,
@@ -65,12 +62,13 @@ export type StreamLaneEvent =
       textDelta?: string
       summaryDelta?: string
       encryptedDelta?: string
+      format?: ReasoningFormat
       // When `replaceEncrypted` is true the accumulator overwrites the
       // stored encrypted field instead of appending. Emitted on
-      // `output_item.done` — the final encrypted_content is authoritative
-      // (see `plan/phase11-implementation.md §5`).
+      // `output_item.done` because the final encrypted_content is authoritative.
       replaceEncrypted?: boolean
       details?: unknown[]
+      detailsMode?: 'delta' | 'snapshot' | 'cumulative'
       chunkId?: string
       outputIndex?: number
       itemId?: string
@@ -87,8 +85,10 @@ export type StreamLaneEvent =
       lane: 'tool-call'
       index: number
       id?: string
+      type?: 'function'
       name?: string
       argumentsDelta?: string
+      argumentsSnapshot?: string
       chunkId?: string
       outputIndex?: number
     }
@@ -166,8 +166,10 @@ export type StreamLaneEvent =
       chunkId?: string
     }
   | { lane: 'finish'; finishReason: string; chunkId?: string }
+  | { lane: 'terminal'; evidence: 'done-sentinel' }
   | { lane: 'meta'; model?: string; provider?: string; generationId?: string }
   | { lane: 'keepalive'; comment: string }
+  | { lane: 'integrity'; integrity: StreamIntegrityEvent }
   | { lane: 'error'; error: ApiError }
   | {
       lane: 'buffered'
@@ -208,17 +210,26 @@ export async function* splitChatStream(
     ...(opts.inlineReasoningTags !== undefined ? { tags: opts.inlineReasoningTags } : {}),
     ...(opts.forceInlineReasoning === true ? { autoDetect: false } : {}),
   })
-
+  let transportTerminal: Extract<StreamLaneEvent, { lane: 'terminal' }> | undefined
+  const reasoningStates = new Map<number, ChatReasoningStreamState>()
   for await (const chunk of source) {
+    if (chunk.type === 'integrity') {
+      yield { lane: 'integrity', integrity: chunk.integrity }
+      continue
+    }
     if (chunk.type === 'keepalive') {
       yield { lane: 'keepalive', comment: chunk.comment }
+      continue
+    }
+    if (chunk.type === 'transport_terminal') {
+      transportTerminal = { lane: 'terminal', evidence: chunk.evidence }
       continue
     }
     if (chunk.type === 'buffered_result') {
       yield* splitBufferedResult(chunk.result, chunk.generationId, lifter)
       continue
     }
-    yield* splitDelta(chunk.chunk, chunk.generationId, lifter)
+    yield* splitDelta(chunk.chunk, chunk.generationId, lifter, reasoningStates)
   }
 
   // End-of-stream: flush any pending content buffered by the lifter.
@@ -229,12 +240,14 @@ export async function* splitChatStream(
       yield { lane: 'reasoning', textDelta: flushed.text }
     }
   }
+  if (transportTerminal) yield transportTerminal
 }
 
 function* splitDelta(
   chunk: ChatCompletionChunkWire,
   generationId: string | undefined,
   lifter: InlineReasoningLifter,
+  reasoningStates: Map<number, ChatReasoningStreamState>,
 ): Generator<StreamLaneEvent> {
   // Mid-stream error frame — §4.5: top-level `error` on a 200 response body.
   if (chunk.error) {
@@ -242,9 +255,7 @@ function* splitDelta(
       lane: 'error',
       error: normalizeError(chunk, {
         midStream: true,
-        ...(chunk.error.code !== undefined && typeof chunk.error.code === 'number'
-          ? { httpStatus: chunk.error.code }
-          : {}),
+        ...(typeof chunk.error.code === 'number' ? { httpStatus: chunk.error.code } : {}),
       }),
     }
     return
@@ -267,8 +278,19 @@ function* splitDelta(
   }
   if (metaDirty) yield meta
 
-  for (const choice of chunk.choices ?? []) {
-    yield* splitChoiceDelta(choice, typeof chunk.id === 'string' ? chunk.id : undefined, lifter)
+  for (const [choiceOffset, choice] of (chunk.choices ?? []).entries()) {
+    const choiceIndex = choice.index ?? choiceOffset
+    let reasoningState = reasoningStates.get(choiceIndex)
+    if (!reasoningState) {
+      reasoningState = {}
+      reasoningStates.set(choiceIndex, reasoningState)
+    }
+    yield* splitChoiceDelta(
+      choice,
+      typeof chunk.id === 'string' ? chunk.id : undefined,
+      lifter,
+      reasoningState,
+    )
   }
 
   if (chunk.usage) {
@@ -284,6 +306,7 @@ function* splitChoiceDelta(
   choice: ChatCompletionChoiceWire,
   chunkId: string | undefined,
   lifter: InlineReasoningLifter,
+  reasoningState: ChatReasoningStreamState,
 ): Generator<StreamLaneEvent> {
   const delta = choice.delta
   if (delta) {
@@ -313,13 +336,30 @@ function* splitChoiceDelta(
       : undefined
     if (reasoningText !== undefined || reasoningDetails !== undefined) {
       const event: StreamLaneEvent & { lane: 'reasoning' } = { lane: 'reasoning' }
-      if (
-        reasoningText !== undefined &&
-        !reasoningDetailsMirrorText(reasoningText, reasoningDetails)
-      ) {
+      const mirror =
+        reasoningText !== undefined
+          ? reasoningDetailsMirrorInfo(reasoningText, reasoningDetails)
+          : { kind: 'none' as const }
+      const detailsMirrorScalar = mirror.kind !== 'none'
+      if (reasoningText !== undefined && !detailsMirrorScalar) {
         event.textDelta = reasoningText
       }
-      if (reasoningDetails !== undefined) event.details = reasoningDetails
+      if (reasoningDetails !== undefined) {
+        event.details = reasoningDetails
+        const prefixGrowingMirror =
+          mirror.kind === 'exact' &&
+          mirror.value !== undefined &&
+          reasoningState.lastMirroredStructuredValue !== undefined &&
+          mirror.value.length > reasoningState.lastMirroredStructuredValue.length &&
+          mirror.value.startsWith(reasoningState.lastMirroredStructuredValue)
+        event.detailsMode =
+          mirror.kind === 'cumulative' || prefixGrowingMirror ? 'cumulative' : 'delta'
+        if (mirror.kind !== 'none' && mirror.value !== undefined) {
+          reasoningState.lastMirroredStructuredValue = mirror.value
+        } else {
+          delete reasoningState.lastMirroredStructuredValue
+        }
+      }
       if (chunkId !== undefined) event.chunkId = chunkId
       yield event
     }
@@ -383,25 +423,35 @@ function* splitChoiceDelta(
   }
 }
 
+interface ChatReasoningStreamState {
+  lastMirroredStructuredValue?: string
+}
+
 function toToolCallEvent(
   raw: unknown,
   chunkId: string | undefined,
+  fallbackIndex?: number,
+  snapshot = false,
 ): (StreamLaneEvent & { lane: 'tool-call' }) | null {
   if (!raw || typeof raw !== 'object') return null
   const value = raw as {
     index?: number
     id?: string
+    type?: string
     function?: { name?: string; arguments?: string }
   }
-  if (typeof value.index !== 'number') return null
+  const index = typeof value.index === 'number' ? value.index : fallbackIndex
+  if (index === undefined) return null
   const event: StreamLaneEvent & { lane: 'tool-call' } = {
     lane: 'tool-call',
-    index: value.index,
+    index,
   }
   if (typeof value.id === 'string') event.id = value.id
+  if (value.type === undefined || value.type === 'function') event.type = 'function'
   if (typeof value.function?.name === 'string') event.name = value.function.name
   if (typeof value.function?.arguments === 'string') {
-    event.argumentsDelta = value.function.arguments
+    if (snapshot) event.argumentsSnapshot = value.function.arguments
+    else event.argumentsDelta = value.function.arguments
   }
   if (chunkId !== undefined) event.chunkId = chunkId
   return event
@@ -417,9 +467,7 @@ function* splitBufferedResult(
       lane: 'error',
       error: normalizeError(result, {
         midStream: true,
-        ...(result.error.code !== undefined && typeof result.error.code === 'number'
-          ? { httpStatus: result.error.code }
-          : {}),
+        ...(typeof result.error.code === 'number' ? { httpStatus: result.error.code } : {}),
       }),
     }
     return
@@ -443,10 +491,8 @@ function* splitBufferedResult(
 
   yield { lane: 'buffered', result, ...(generationId !== undefined ? { generationId } : {}) }
 
-  // Synthesize one text event so downstream accumulators don't need a
-  // separate "buffered" code path for the text lane. Reasoning / tool-calls
-  // in the buffered shape are round-tripped via the raw `buffered` event
-  // payload so Phase-8+ consumers can parse the full message shape.
+  // Synthesize the same lanes as the streaming path so downstream consumers
+  // have one accumulation contract for buffered and incremental responses.
   const choice = result.choices?.[0]
   const messageText = typeof choice?.message?.content === 'string' ? choice.message.content : ''
   const reasoningText =
@@ -464,9 +510,18 @@ function* splitBufferedResult(
     ) {
       event.textDelta = reasoningText
     }
-    if (reasoningDetails !== undefined) event.details = reasoningDetails
+    if (reasoningDetails !== undefined) {
+      event.details = reasoningDetails
+      event.detailsMode = 'snapshot'
+    }
     if (typeof result.id === 'string') event.chunkId = result.id
     yield event
+  }
+  if (Array.isArray(choice?.message?.tool_calls)) {
+    for (const [index, raw] of choice.message.tool_calls.entries()) {
+      const event = toToolCallEvent(raw, result.id, index, true)
+      if (event) yield event
+    }
   }
   if (messageText.length > 0) {
     for (const ev of lifter.feed(messageText)) {
@@ -533,22 +588,33 @@ function reasoningDetailsMirrorText(
   reasoningText: string,
   details: unknown[] | undefined,
 ): boolean {
-  if (!details || details.length === 0) return false
+  return reasoningDetailsMirrorInfo(reasoningText, details).kind !== 'none'
+}
+
+function reasoningDetailsMirrorInfo(
+  reasoningText: string,
+  details: unknown[] | undefined,
+): { kind: 'none' | 'exact' | 'cumulative'; value?: string } {
+  if (!details || details.length === 0) return { kind: 'none' }
   let merged = ''
   let sawText = false
+  let anthropicTextOnly = true
   let mergedSummary = ''
   let sawOpenAiSummary = false
   for (const raw of details) {
     if (!raw || typeof raw !== 'object') continue
     const detail = raw as {
+      id?: unknown
       type?: unknown
       text?: unknown
       summary?: unknown
       format?: unknown
     }
+    if (typeof detail.id === 'string' && detail.id.startsWith('tool_')) continue
     if (detail.type === 'reasoning.text' && typeof detail.text === 'string') {
       merged += detail.text
       sawText = true
+      anthropicTextOnly &&= detail.format === 'anthropic-claude-v1'
       continue
     }
     if (
@@ -561,9 +627,17 @@ function reasoningDetailsMirrorText(
       sawOpenAiSummary = true
     }
   }
-  return (
-    (sawText && merged === reasoningText) || (sawOpenAiSummary && mergedSummary === reasoningText)
-  )
+  if (sawText && merged === reasoningText) return { kind: 'exact', value: merged }
+  if (sawText && anthropicTextOnly && merged.endsWith(reasoningText)) {
+    return { kind: 'cumulative', value: merged }
+  }
+  if (sawOpenAiSummary && mergedSummary === reasoningText) {
+    return { kind: 'exact', value: mergedSummary }
+  }
+  return {
+    kind: 'none',
+    ...(sawText ? { value: merged } : sawOpenAiSummary ? { value: mergedSummary } : {}),
+  }
 }
 
 function contentItemsFromChatImages(images: readonly unknown[]): ContentItem[] {
@@ -723,6 +797,10 @@ export async function* splitResponsesStream(
   let metaEmittedGenerationId: string | undefined
 
   for await (const chunk of source) {
+    if (chunk.type === 'integrity') {
+      yield { lane: 'integrity', integrity: chunk.integrity }
+      continue
+    }
     if (chunk.type === 'keepalive') {
       yield { lane: 'keepalive', comment: chunk.comment }
       continue
@@ -789,6 +867,8 @@ function* splitResponsesEvent(ev: ResponsesEventWire): Generator<StreamLaneEvent
     case 'response.output_item.added': {
       const e = ev as Extract<ResponsesEventWire, { type: 'response.output_item.added' }>
       yield { lane: 'output-item-added', outputIndex: e.output_index, item: e.item }
+      const functionCall = toolCallEventFromResponsesItem(e.item, e.output_index, false)
+      if (functionCall) yield functionCall
       // Auto-expand the reasoning lane when an encrypted reasoning item shows
       // up. We emit a reasoning event with the INITIAL encrypted_content so
       // UI shows a blob-sized hint immediately; `output_item.done` later
@@ -822,6 +902,8 @@ function* splitResponsesEvent(ev: ResponsesEventWire): Generator<StreamLaneEvent
     case 'response.output_item.done': {
       const e = ev as Extract<ResponsesEventWire, { type: 'response.output_item.done' }>
       yield { lane: 'output-item-done', outputIndex: e.output_index, item: e.item }
+      const functionCall = toolCallEventFromResponsesItem(e.item, e.output_index, true)
+      if (functionCall) yield functionCall
       // Reasoning item: emit the FINAL encrypted_content as a replacing
       // reasoning event so the accumulator overwrites the partial from
       // `added` (see §5 of phase11-implementation).
@@ -898,6 +980,7 @@ function* splitResponsesEvent(ev: ResponsesEventWire): Generator<StreamLaneEvent
       yield {
         lane: 'tool-call',
         index: e.output_index,
+        type: 'function',
         argumentsDelta: e.delta,
         outputIndex: e.output_index,
       }
@@ -987,9 +1070,8 @@ function* splitResponsesEvent(ev: ResponsesEventWire): Generator<StreamLaneEvent
 
     case 'response.failed': {
       const e = ev as Extract<ResponsesEventWire, { type: 'response.failed' }>
-      const errorPayload = (
-        e.response as { error?: { code?: unknown; message?: string } } | undefined
-      )?.error ?? { message: 'Responses API reported failure' }
+      const response = (e as { response?: ResponsesResultWire }).response
+      const errorPayload = response?.error ?? { message: 'Responses API reported failure' }
       yield {
         lane: 'error',
         error: normalizeError(
@@ -1000,22 +1082,23 @@ function* splitResponsesEvent(ev: ResponsesEventWire): Generator<StreamLaneEvent
           },
         ),
       }
-      if (e.response?.usage) {
-        yield { lane: 'usage', usage: normalizeResponsesUsage(e.response.usage) }
+      if (response?.usage) {
+        yield { lane: 'usage', usage: normalizeResponsesUsage(response.usage) }
       }
       return
     }
 
     case 'response.error':
     case 'error': {
-      const e = ev as { error: { code?: unknown; message?: string } }
+      const e = ev as { error?: { code?: unknown; message?: string } }
+      const errorPayload = e.error ?? { message: 'unknown Responses error' }
       yield {
         lane: 'error',
         error: normalizeError(
-          { error: e.error ?? { message: 'unknown Responses error' } },
+          { error: errorPayload },
           {
             midStream: true,
-            ...(typeof e.error?.code === 'number' ? { httpStatus: e.error.code } : {}),
+            ...(typeof errorPayload.code === 'number' ? { httpStatus: errorPayload.code } : {}),
           },
         ),
       }
@@ -1032,8 +1115,19 @@ function* splitResponsesEvent(ev: ResponsesEventWire): Generator<StreamLaneEvent
     case 'response.reasoning_summary_part.done':
     case 'response.reasoning_summary_text.done':
     case 'response.reasoning.done':
-    case 'response.function_call_arguments.done':
       return
+
+    case 'response.function_call_arguments.done': {
+      const e = ev as Extract<ResponsesEventWire, { type: 'response.function_call_arguments.done' }>
+      yield {
+        lane: 'tool-call',
+        index: e.output_index,
+        type: 'function',
+        argumentsSnapshot: e.arguments,
+        outputIndex: e.output_index,
+      }
+      return
+    }
 
     default:
       // Forward-compat: silently drop unknown event types so future OpenAI
@@ -1088,7 +1182,11 @@ function* splitBufferedResponsesResult(
       }
       if (Array.isArray(item.summary)) {
         for (const [summaryIndex, s] of item.summary.entries()) {
-          if (s && typeof s === 'object' && typeof (s as { text?: unknown }).text === 'string') {
+          if (
+            typeof s === 'object' &&
+            s !== null &&
+            typeof (s as { text?: unknown }).text === 'string'
+          ) {
             yield {
               lane: 'reasoning',
               summaryDelta: (s as { text: string }).text,
@@ -1123,6 +1221,8 @@ function* splitBufferedResponsesResult(
       }
     }
     yield { lane: 'output-item-done', outputIndex: idx, item }
+    const functionCall = toolCallEventFromResponsesItem(item, idx, true)
+    if (functionCall) yield functionCall
   }
 
   if (result.usage) yield { lane: 'usage', usage: normalizeResponsesUsage(result.usage) }
@@ -1133,6 +1233,26 @@ function* splitBufferedResponsesResult(
         ? (result.incomplete_details?.reason ?? 'length')
         : (result.status ?? 'stop')
   yield { lane: 'finish', finishReason }
+}
+
+function toolCallEventFromResponsesItem(
+  item: ResponsesInputItem,
+  outputIndex: number,
+  includeArguments: boolean,
+): (StreamLaneEvent & { lane: 'tool-call' }) | null {
+  if (item.type !== 'function_call') return null
+  const event: StreamLaneEvent & { lane: 'tool-call' } = {
+    lane: 'tool-call',
+    index: outputIndex,
+    type: 'function',
+    outputIndex,
+  }
+  if (typeof item.call_id === 'string') event.id = item.call_id
+  if (typeof item.name === 'string') event.name = item.name
+  if (includeArguments && typeof item.arguments === 'string') {
+    event.argumentsSnapshot = item.arguments
+  }
+  return event
 }
 
 function contentItemFromResponsesOutputItem(item: ResponsesInputItem): ContentItem | null {
@@ -1185,10 +1305,8 @@ function normalizeResponsesUsage(u: ResponsesUsageWire): ChatCompletionUsageWire
 interface AnthropicBlockState {
   index: number
   block: AnthropicContentBlock
-  thinking: string
-  text: string
-  signature: string
-  inputJson: string
+  signatureParts: string[]
+  inputJsonParts: string[]
   citations: unknown[]
 }
 
@@ -1201,6 +1319,10 @@ export async function* splitAnthropicStream(
   let metaEmittedModel: string | undefined
 
   for await (const chunk of source) {
+    if (chunk.type === 'integrity') {
+      yield { lane: 'integrity', integrity: chunk.integrity }
+      continue
+    }
     if (chunk.type === 'keepalive') {
       yield { lane: 'keepalive', comment: chunk.comment }
       continue
@@ -1217,7 +1339,7 @@ export async function* splitAnthropicStream(
     }
     switch (ev.type) {
       case 'message_start': {
-        const e = ev as Extract<AnthropicEventWire, { type: 'message_start' }>
+        const e = ev as { message?: AnthropicMessagesResultWire }
         const meta: StreamLaneEvent & { lane: 'meta' } = { lane: 'meta' }
         let dirty = false
         if (typeof e.message?.model === 'string' && e.message.model !== metaEmittedModel) {
@@ -1280,12 +1402,17 @@ export async function* splitAnthropicStream(
         break
 
       case 'error': {
-        const e = ev as Extract<AnthropicEventWire, { type: 'error' }>
+        const e = ev as {
+          error?: { type?: unknown; message?: unknown }
+        }
+        const code = typeof e.error?.type === 'string' ? e.error.type : undefined
+        const message =
+          typeof e.error?.message === 'string' ? e.error.message : 'Anthropic stream error'
         yield {
           lane: 'error',
           error: normalizeError(
             {
-              error: { code: e.error?.type, message: e.error?.message ?? 'Anthropic stream error' },
+              error: { code, message },
             },
             { midStream: true },
           ),
@@ -1306,22 +1433,23 @@ function createAnthropicBlockState(
   return {
     index,
     block: structuredClone(block),
-    thinking: typeof block.thinking === 'string' ? block.thinking : '',
-    text: typeof block.text === 'string' ? block.text : '',
-    signature: typeof block.signature === 'string' ? block.signature : '',
-    inputJson: '',
+    signatureParts: typeof block.signature === 'string' ? [block.signature] : [],
+    inputJsonParts: [],
     citations: Array.isArray(block.citations) ? structuredClone(block.citations) : [],
   }
 }
 
 function* emitAnthropicBlockStart(state: AnthropicBlockState): Generator<StreamLaneEvent> {
   const type = state.block.type
-  if (type === 'text' && state.text.length > 0) {
-    yield { lane: 'text', text: state.text, outputIndex: state.index, contentIndex: state.index }
-  } else if (type === 'thinking' && state.thinking.length > 0) {
+  const initialText = typeof state.block.text === 'string' ? state.block.text : ''
+  const initialThinking = typeof state.block.thinking === 'string' ? state.block.thinking : ''
+  if (type === 'text' && initialText.length > 0) {
+    yield { lane: 'text', text: initialText, outputIndex: state.index, contentIndex: state.index }
+  } else if (type === 'thinking' && initialThinking.length > 0) {
     yield {
       lane: 'reasoning',
-      textDelta: state.thinking,
+      textDelta: initialThinking,
+      format: 'anthropic-claude-v1',
       outputIndex: state.index,
       itemId: anthropicReasoningId(state),
     }
@@ -1329,10 +1457,21 @@ function* emitAnthropicBlockStart(state: AnthropicBlockState): Generator<StreamL
     yield {
       lane: 'reasoning',
       encryptedDelta: state.block.data,
+      format: 'anthropic-claude-v1',
       replaceEncrypted: true,
       outputIndex: state.index,
       itemId: anthropicReasoningId(state),
     }
+  } else if (type === 'tool_use') {
+    const event: StreamLaneEvent & { lane: 'tool-call' } = {
+      lane: 'tool-call',
+      index: state.index,
+      id: anthropicBlockId(state),
+      type: 'function',
+      outputIndex: state.index,
+    }
+    if (typeof state.block.name === 'string') event.name = state.block.name
+    yield event
   } else if (isAnthropicToolBlockType(type)) {
     const id = anthropicBlockId(state)
     if (type === 'server_tool_use') {
@@ -1353,26 +1492,32 @@ function* applyAnthropicBlockDelta(
 ): Generator<StreamLaneEvent> {
   const deltaType = delta.type
   if (deltaType === 'text_delta' && typeof delta.text === 'string') {
-    state.text += delta.text
     yield { lane: 'text', text: delta.text, outputIndex: state.index, contentIndex: state.index }
     return
   }
   if (deltaType === 'thinking_delta' && typeof delta.thinking === 'string') {
-    state.thinking += delta.thinking
     yield {
       lane: 'reasoning',
       textDelta: delta.thinking,
+      format: 'anthropic-claude-v1',
       outputIndex: state.index,
       itemId: anthropicReasoningId(state),
     }
     return
   }
   if (deltaType === 'signature_delta' && typeof delta.signature === 'string') {
-    state.signature += delta.signature
+    state.signatureParts.push(delta.signature)
     return
   }
   if (deltaType === 'input_json_delta' && typeof delta.partial_json === 'string') {
-    state.inputJson += delta.partial_json
+    state.inputJsonParts.push(delta.partial_json)
+    yield {
+      lane: 'tool-call',
+      index: state.index,
+      type: 'function',
+      argumentsDelta: delta.partial_json,
+      outputIndex: state.index,
+    }
     return
   }
   if (deltaType === 'citations_delta' && delta.citation !== undefined) {
@@ -1383,22 +1528,20 @@ function* applyAnthropicBlockDelta(
 function* emitAnthropicBlockDone(state: AnthropicBlockState): Generator<StreamLaneEvent> {
   const type = state.block.type
   if (type === 'thinking') {
-    if (state.thinking.length > 0 || state.signature.length > 0) {
-      yield {
-        lane: 'reasoning',
-        details: [
-          {
-            type: 'reasoning.text',
-            id: anthropicReasoningId(state),
-            index: state.index,
-            format: 'anthropic-claude-v1',
-            ...(state.thinking.length > 0 ? { text: state.thinking } : {}),
-            ...(state.signature.length > 0 ? { signature: state.signature } : {}),
-          },
-        ],
-        outputIndex: state.index,
-        itemId: anthropicReasoningId(state),
-      }
+    const signature = state.signatureParts.join('')
+    yield {
+      lane: 'reasoning',
+      details: [
+        {
+          type: 'reasoning.text',
+          id: `text#${anthropicReasoningId(state)}`,
+          index: state.index,
+          format: 'anthropic-claude-v1',
+          ...(signature.length > 0 ? { signature } : {}),
+        },
+      ],
+      outputIndex: state.index,
+      itemId: anthropicReasoningId(state),
     }
     return
   }
@@ -1417,6 +1560,21 @@ function* emitAnthropicBlockDone(state: AnthropicBlockState): Generator<StreamLa
       outputIndex: state.index,
       itemId: anthropicReasoningId(state),
     }
+    return
+  }
+  if (type === 'tool_use') {
+    const streamedArguments = state.inputJsonParts.join('')
+    const event: StreamLaneEvent & { lane: 'tool-call' } = {
+      lane: 'tool-call',
+      index: state.index,
+      id: anthropicBlockId(state),
+      type: 'function',
+      argumentsSnapshot:
+        streamedArguments.length > 0 ? streamedArguments : JSON.stringify(state.block.input ?? {}),
+      outputIndex: state.index,
+    }
+    if (typeof state.block.name === 'string') event.name = state.block.name
+    yield event
     return
   }
   if (!isAnthropicToolBlockType(type)) return
@@ -1477,11 +1635,12 @@ function* splitBufferedAnthropicResult(
 
 function finalizeAnthropicToolBlock(state: AnthropicBlockState): AnthropicContentBlock {
   const output = structuredClone(state.block)
-  if (state.inputJson.length > 0 && output.input === undefined) {
+  const inputJson = state.inputJsonParts.join('')
+  if (inputJson.length > 0 && output.input === undefined) {
     try {
-      output.input = JSON.parse(state.inputJson)
+      output.input = JSON.parse(inputJson)
     } catch {
-      output.input = state.inputJson
+      output.input = inputJson
     }
   }
   if (state.citations.length > 0 && output.citations === undefined) {
@@ -1580,9 +1739,13 @@ export async function* splitGeminiStream(
   // `mergeReasoningText`. Section count is tracked to prepend a `\n\n`
   // separator on non-first parts so the joined text has clean breaks
   // even on synthetic / probe inputs that don't already end with newlines.
-  const counter = { summary: 0 }
+  const counter = { summary: 0, toolCalls: 0 }
 
   for await (const chunk of source) {
+    if (chunk.type === 'integrity') {
+      yield { lane: 'integrity', integrity: chunk.integrity }
+      continue
+    }
     if (chunk.type === 'keepalive') {
       yield { lane: 'keepalive', comment: chunk.comment }
       continue
@@ -1630,7 +1793,7 @@ function metaFromGemini(
 // to lane events, plus usageMetadata + finishReason.
 function* splitGeminiResponse(
   resp: GenerateContentResponseWire,
-  counter: { summary: number },
+  counter: { summary: number; toolCalls: number },
 ): Generator<StreamLaneEvent> {
   if (resp.error) {
     yield {
@@ -1705,7 +1868,7 @@ function* splitGeminiProviderToolMetadata(
 
 function* splitGeminiPart(
   part: GeminiPart,
-  counter: { summary: number },
+  counter: { summary: number; toolCalls: number },
 ): Generator<StreamLaneEvent> {
   // `thoughtSignature` can attach to ANY part type. Emit a reasoning event
   // with replaceEncrypted:true so the accumulator overwrites (last-wins).
@@ -1715,6 +1878,7 @@ function* splitGeminiPart(
       lane: 'reasoning',
       encryptedDelta: sig,
       replaceEncrypted: true,
+      format: 'google-gemini-v1',
     }
   }
 
@@ -1729,6 +1893,7 @@ function* splitGeminiPart(
         lane: 'reasoning',
         summaryDelta: isFirst ? part.text : `\n\n${part.text}`,
         summaryIndex: 0,
+        format: 'google-gemini-v1',
       }
       counter.summary += 1
     } else {
@@ -1741,13 +1906,16 @@ function* splitGeminiPart(
     part as { functionCall?: { name: string; args?: Record<string, unknown>; id?: string } }
   ).functionCall
   if (fnCall) {
+    const index = counter.toolCalls
+    counter.toolCalls += 1
     const event: StreamLaneEvent & { lane: 'tool-call' } = {
       lane: 'tool-call',
-      index: 0,
+      index,
+      id: fnCall.id ?? `google-gemini:function-call:${index}`,
+      type: 'function',
       name: fnCall.name,
-      argumentsDelta: JSON.stringify(fnCall.args ?? {}),
+      argumentsSnapshot: JSON.stringify(fnCall.args ?? {}),
     }
-    if (fnCall.id !== undefined) event.id = fnCall.id
     yield event
     return
   }

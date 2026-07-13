@@ -1,4 +1,14 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import {
+  lazy,
+  memo,
+  Suspense,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
 import { navigateToChat } from '../../app/router'
 import { cursorKeyOf, groupByParent, indexById } from '../../core/active-path'
 import { resolveLastUpdatedBranchBelow } from '../../core/branch-resolve'
@@ -17,7 +27,6 @@ import type {
   MessageRole,
   Message as MessageRow,
   ModelEndpoint,
-  ReasoningDetail,
 } from '../../core/types'
 import { useChat } from '../../hooks/useChat'
 import {
@@ -26,16 +35,22 @@ import {
   editInPlace,
   type MessageOpsContext,
   regenerateFromMessage,
+  toggleProviderOutputItemHidden,
+  toggleReasoningDetailHidden,
 } from '../../hooks/useMessageOps'
 import { getChat, listChatSidebarRows } from '../../store/chats'
+import type { MessageHeaderRow } from '../../store/message-storage'
 import type { ActiveBranchWindowSnapshot } from '../../store/repository'
 import { useChatStore } from '../../store/zustand/chatStore'
-import { useStreamStore } from '../../store/zustand/streamStore'
 import { useToastStore } from '../../store/zustand/toastStore'
-import { ImportModal } from './ImportModal'
+import type { BranchNavigationContext } from './BranchControls'
 import { Message } from './Message'
 import type { InsertSlot } from './MessageActions'
 import { PrefillSettingsPrompt } from './PrefillSettingsPrompt'
+
+const ImportModal = lazy(() =>
+  import('./ImportModal').then((module) => ({ default: module.ImportModal })),
+)
 
 interface MessageListProps {
   chatId: ChatId
@@ -54,11 +69,22 @@ interface MessageListProps {
 // every render — that triggers React 19's infinite-rerender detection via
 // `useSyncExternalStore` (getSnapshot must return a stable value).
 const EMPTY_CURSOR: CursorMap = Object.freeze({})
+const EMPTY_ENDPOINTS: readonly ModelEndpoint[] = Object.freeze([])
+const EMPTY_MESSAGE_HEADERS: readonly MessageHeaderRow[] = Object.freeze([])
 
 interface InsertTarget {
   messageId: MessageId
   slot: InsertSlot
   defaultRole: MessageRole
+}
+
+type MessageListIndexOperation = 'path-index' | 'tree-index' | 'parent-index'
+let messageListIndexProbe: ((operation: MessageListIndexOperation) => void) | undefined
+
+export function __setMessageListIndexProbeForTests(
+  probe: ((operation: MessageListIndexOperation) => void) | undefined,
+): void {
+  messageListIndexProbe = probe
 }
 
 // Pick the conversational counterpart of a role. user↔assistant is the
@@ -78,7 +104,7 @@ export const MessageList = memo(function MessageList({
   chatSettings,
   hasConnection,
   capability,
-  prefillRecommendationEndpoints = [],
+  prefillRecommendationEndpoints = EMPTY_ENDPOINTS,
   longMessageDisplayMode = 'full',
   messageRenderWindowSize,
   messageRenderWindowLoadMode,
@@ -87,25 +113,26 @@ export const MessageList = memo(function MessageList({
 }: MessageListProps) {
   const cursor = useChatStore((state) => state.cursors[chatId] ?? EMPTY_CURSOR)
   const messages = useStableMessageRows(branchSnapshot?.branchWindow ?? [])
-  const treeMessages = useMemo(
-    () => (branchSnapshot?.allHeaders ?? []) as unknown as MessageRow[],
-    [branchSnapshot],
+  const treeMessages = useStableMessageRows(
+    (branchSnapshot?.allHeaders ?? []) as unknown as MessageRow[],
   )
-  const branchHeaders = useMemo(
-    () => (branchSnapshot?.branchHeaders ?? []) as unknown as MessageRow[],
-    [branchSnapshot],
-  )
-  const streamGenerationBusy = useStreamStore((state) => state.hasStreamForChat(chatId))
-  const [localGenerationBusy, setLocalGenerationBusy] = useState(false)
-  const localGenerationBusyRef = useRef(false)
-  const generationBusy = streamGenerationBusy || localGenerationBusy
+  const branchHeaders = branchSnapshot?.branchHeaders ?? EMPTY_MESSAGE_HEADERS
   // Tree indices are O(N) over the message set — memoize so swipes /
   // keyboard shortcuts (§10.6.1) don't rebuild them per keystroke. `byId`
-  // and `byParent` only change when the live-query refires with a new
+  // and `byParent` only change when the repository query refires with a new
   // message array; `path` additionally depends on the cursor.
-  const pathById = useMemo(() => indexById(messages), [messages])
-  const byId = useMemo(() => indexById(treeMessages), [treeMessages])
-  const byParent = useMemo(() => groupByParent(treeMessages), [treeMessages])
+  const pathById = useMemo(() => {
+    messageListIndexProbe?.('path-index')
+    return indexById(messages)
+  }, [messages])
+  const byId = useMemo(() => {
+    messageListIndexProbe?.('tree-index')
+    return indexById(treeMessages)
+  }, [treeMessages])
+  const byParent = useMemo(() => {
+    messageListIndexProbe?.('parent-index')
+    return groupByParent(treeMessages)
+  }, [treeMessages])
   const liveSiblingsByParent = useMemo(() => {
     const live = new Map<MessageId | null, MessageRow[]>()
     for (const [parentId, kids] of byParent) {
@@ -114,7 +141,10 @@ export const MessageList = memo(function MessageList({
     }
     return live
   }, [byParent])
-  const branchTreeKey = useMemo(() => branchSnapshot?.treeKey ?? '', [branchSnapshot])
+  const branchContext = useMemo<BranchNavigationContext>(
+    () => ({ messages: treeMessages, byId, byParent }),
+    [byId, byParent, treeMessages],
+  )
   const visiblePath = messages
   const hiddenOlderCount = branchSnapshot?.windowOffset ?? 0
   const branchLength = branchSnapshot?.branchLength ?? visiblePath.length
@@ -140,6 +170,17 @@ export const MessageList = memo(function MessageList({
   const prefillSupported = chatSettings.model
     ? prefillClassFor(chatSettings.model) !== 'unsupported'
     : false
+  const prefillSettingsPrompt = useMemo(
+    () =>
+      prefillSupported ? (
+        <PrefillSettingsPrompt
+          chatId={chatId}
+          settings={chatSettings}
+          endpoints={prefillRecommendationEndpoints}
+        />
+      ) : undefined,
+    [chatId, chatSettings, prefillRecommendationEndpoints, prefillSupported],
+  )
   // Track the focused message id via a ref; the DOM's `:focus-within` +
   // `data-message-id` tuple on each <article> identifies which message the
   // user is navigating. Keeps keyboard shortcuts tied to "the message just
@@ -153,14 +194,8 @@ export const MessageList = memo(function MessageList({
   }, [])
 
   const handleEditInPlace = useCallback(
-    async (
-      m: MessageRow,
-      text: string,
-      reasoning?: ReasoningDetail[],
-      attachmentRefs?: MessageAttachmentRef[],
-      providerOutputItems?: MessageRow['providerOutputItems'],
-    ) => {
-      await editInPlace(chatId, m, text, reasoning, attachmentRefs, providerOutputItems)
+    async (m: MessageRow, text: string) => {
+      await editInPlace(chatId, m, text)
       if (m.role === 'user') {
         setStaleHintFor((prev) => {
           if (prev.has(m.id)) return prev
@@ -172,6 +207,32 @@ export const MessageList = memo(function MessageList({
     },
     [chatId],
   )
+  const handleToggleReasoningHidden = useCallback(
+    async (m: MessageRow, detailIndex: number) => {
+      try {
+        await toggleReasoningDetailHidden(chatId, m.id, detailIndex)
+      } catch (error) {
+        pushToast({
+          level: 'danger',
+          text: `Reasoning visibility update failed: ${error instanceof Error ? error.message : 'unknown error'}`,
+        })
+      }
+    },
+    [chatId, pushToast],
+  )
+  const handleToggleToolHidden = useCallback(
+    async (m: MessageRow, itemIndex: number) => {
+      try {
+        await toggleProviderOutputItemHidden(chatId, m.id, itemIndex)
+      } catch (error) {
+        pushToast({
+          level: 'danger',
+          text: `Tool visibility update failed: ${error instanceof Error ? error.message : 'unknown error'}`,
+        })
+      }
+    },
+    [chatId, pushToast],
+  )
 
   const handleEditAndSend = useCallback(
     async (
@@ -179,10 +240,6 @@ export const MessageList = memo(function MessageList({
       text: string,
       opts?: { prefillText?: string; attachmentRefs?: MessageAttachmentRef[] },
     ) => {
-      if (localGenerationBusyRef.current || useStreamStore.getState().hasStreamForChat(chatId))
-        return
-      localGenerationBusyRef.current = true
-      setLocalGenerationBusy(true)
       try {
         const prefillText = opts?.prefillText ?? ''
         await editAndResend(opsCtx, m, text, {
@@ -196,20 +253,13 @@ export const MessageList = memo(function MessageList({
           level: 'danger',
           text: err instanceof Error ? `Send failed: ${err.message}` : 'Send failed.',
         })
-      } finally {
-        localGenerationBusyRef.current = false
-        setLocalGenerationBusy(false)
       }
     },
-    [chatId, opsCtx, pushToast],
+    [opsCtx, pushToast],
   )
 
   const handleRegenerate = useCallback(
     async (m: MessageRow) => {
-      if (localGenerationBusyRef.current || useStreamStore.getState().hasStreamForChat(chatId))
-        return
-      localGenerationBusyRef.current = true
-      setLocalGenerationBusy(true)
       try {
         await regenerateFromMessage(opsCtx, m)
       } catch (err) {
@@ -217,20 +267,13 @@ export const MessageList = memo(function MessageList({
           level: 'danger',
           text: err instanceof Error ? `Regenerate failed: ${err.message}` : 'Regenerate failed.',
         })
-      } finally {
-        localGenerationBusyRef.current = false
-        setLocalGenerationBusy(false)
       }
     },
-    [chatId, opsCtx, pushToast],
+    [opsCtx, pushToast],
   )
 
   const handleContinue = useCallback(
     async (m: MessageRow) => {
-      if (localGenerationBusyRef.current || useStreamStore.getState().hasStreamForChat(chatId))
-        return
-      localGenerationBusyRef.current = true
-      setLocalGenerationBusy(true)
       try {
         await continueFromMessage(opsCtx, m)
       } catch (err) {
@@ -238,12 +281,9 @@ export const MessageList = memo(function MessageList({
           level: 'danger',
           text: err instanceof Error ? `Continue failed: ${err.message}` : 'Continue failed.',
         })
-      } finally {
-        localGenerationBusyRef.current = false
-        setLocalGenerationBusy(false)
       }
     },
-    [chatId, opsCtx, pushToast],
+    [opsCtx, pushToast],
   )
 
   const handleForkChat = useCallback(
@@ -265,11 +305,12 @@ export const MessageList = memo(function MessageList({
       if (chosen === null) return
       const title = chosen.trim() || defaultTitle
       try {
+        const currentCursor = useChatStore.getState().getCursor(chatId) ?? EMPTY_CURSOR
         const result = await forkChatFromMessage({
           chatId,
           messageId: m.id,
           title,
-          cursor,
+          cursor: currentCursor,
         })
         pushToast({
           level: 'success',
@@ -283,7 +324,7 @@ export const MessageList = memo(function MessageList({
         })
       }
     },
-    [chatId, cursor, pushToast],
+    [chatId, pushToast],
   )
 
   // Smart role defaults per the user's "insert should be smart" rule:
@@ -353,8 +394,8 @@ export const MessageList = memo(function MessageList({
   }, [branchHeaders, hiddenOlderCount, visiblePath.length])
 
   const excludedIds = useMemo(() => {
-    return computeExcludedIds(branchHeaders, chatSettings, capability)
-  }, [branchHeaders, chatSettings, capability])
+    return computeExcludedIds(branchHeaders, pathById, chatSettings, capability)
+  }, [branchHeaders, pathById, chatSettings, capability])
   const effectiveRenderedMessageCount = visiblePath.length
   const loadOlderMessages = useCallback(() => {
     if (hiddenOlderCount <= 0) return
@@ -418,20 +459,18 @@ export const MessageList = memo(function MessageList({
         const fullIndex = hiddenOlderCount + idx
         const prev = branchHeaders[fullIndex - 1]
         const showStaleHint = m.role === 'assistant' && prev && staleHintFor.has(prev.id)
+        const hasSiblingVariants = (liveSiblingsByParent.get(m.parentId)?.length ?? 0) > 1
         return (
           <Message
             key={m.id}
             chatId={chatId}
             message={m}
-            {...((liveSiblingsByParent.get(m.parentId)?.length ?? 0) > 1
-              ? { branchMessages: treeMessages, branchTreeKey }
-              : {})}
-            hasAnyReasoningDetails={hasAnyReasoningDetails}
-            hasSiblingVariants={(liveSiblingsByParent.get(m.parentId)?.length ?? 0) > 1}
-            cursor={cursor}
+            {...(hasSiblingVariants ? { branchContext } : {})}
+            hasAnyReasoningDetails={m.generation?.error ? hasAnyReasoningDetails : false}
             hasConnection={hasConnection}
-            generationBusy={generationBusy}
             onEditInPlace={handleEditInPlace}
+            onToggleReasoningDetailHidden={handleToggleReasoningHidden}
+            onToggleProviderOutputItemHidden={handleToggleToolHidden}
             {...(m.role === 'user'
               ? {
                   onEditAndSend: handleEditAndSend,
@@ -439,13 +478,7 @@ export const MessageList = memo(function MessageList({
                     ? {
                         showPrefillButton: true,
                         defaultPrefill: chatSettings.defaultPrefill ?? '',
-                        prefillSettingsPrompt: (
-                          <PrefillSettingsPrompt
-                            chatId={chatId}
-                            settings={chatSettings}
-                            endpoints={prefillRecommendationEndpoints}
-                          />
-                        ),
+                        prefillSettingsPrompt,
                       }
                     : {}),
                 }
@@ -455,9 +488,8 @@ export const MessageList = memo(function MessageList({
                   onRegenerate: handleRegenerate,
                   // Continue is offered on EVERY assistant — completed,
                   // aborted, or errored — so the user can extend any
-                  // response. Reasoning from the parent is preserved:
-                  // `continueFromMessage` creates a new CHILD, it does
-                  // not mutate the parent's `reasoningDetails`.
+                  // response in place. Original generation and reasoning
+                  // metadata stay untouched.
                   onContinue: handleContinue,
                 }
               : {})}
@@ -472,17 +504,25 @@ export const MessageList = memo(function MessageList({
         )
       })}
       {insertTarget ? (
-        <ImportModal
-          chatId={chatId}
-          slot={{
-            kind: insertTarget.slot,
-            messageId: insertTarget.messageId,
-          }}
-          cursor={cursor}
-          defaultRole={insertTarget.defaultRole}
-          onClose={() => setInsertTarget(null)}
-          onDone={() => setInsertTarget(null)}
-        />
+        <Suspense
+          fallback={
+            <div data-ui="surface-loading" data-placement="overlay" role="status">
+              Loading import…
+            </div>
+          }
+        >
+          <ImportModal
+            chatId={chatId}
+            slot={{
+              kind: insertTarget.slot,
+              messageId: insertTarget.messageId,
+            }}
+            cursor={cursor}
+            defaultRole={insertTarget.defaultRole}
+            onClose={() => setInsertTarget(null)}
+            onDone={() => setInsertTarget(null)}
+          />
+        </Suspense>
       ) : null}
     </div>
   )
@@ -528,10 +568,9 @@ function useStableMessageRows(messages: readonly MessageRow[]): readonly Message
 // - The walk goes backward from the end, accumulating, until the budget
 //   overflows; everything untouched is "excluded".
 type ContextEstimateRow = Pick<
-  MessageRow,
+  MessageHeaderRow,
   | 'id'
   | 'hiddenFromContext'
-  | 'content'
   | 'originalCharCount'
   | 'charCountDelta'
   | 'cachedTokenEstimate'
@@ -540,6 +579,7 @@ type ContextEstimateRow = Pick<
 
 function computeExcludedIds(
   path: readonly ContextEstimateRow[],
+  hydratedById: ReadonlyMap<MessageId, MessageRow>,
   settings: ChatSettings,
   capability?: EffectiveCapability,
 ): Set<MessageId> {
@@ -564,7 +604,7 @@ function computeExcludedIds(
   const budget = modelCap !== undefined ? Math.max(0, modelCap - maxCompletion) : undefined
   const strategy = settings.contextStrategy
   const keepFirst = Math.max(0, (strategy.keepFirstPairs ?? 0) * 2)
-  const tokensFor = (m: ContextEstimateRow): number => {
+  const tokensFor = (m: ContextEstimateRow): number | undefined => {
     if (typeof m.cachedTokenEstimate === 'number' && Number.isFinite(m.cachedTokenEstimate)) {
       return Math.max(0, Math.ceil(m.cachedTokenEstimate))
     }
@@ -578,8 +618,12 @@ function computeExcludedIds(
           : 0
       return Math.ceil(Math.max(0, m.originalCharCount + delta) / 4)
     }
+    const hydrated = hydratedById.get(m.id)
+    // Cold headers intentionally omit bodies. Do not hydrate an unestimated
+    // legacy row or guess from its truncated preview just to draw a trim ring.
+    if (!hydrated) return undefined
     let chars = 0
-    for (const item of m.content ?? []) {
+    for (const item of hydrated.content) {
       if (item.type === 'text' || item.type === 'output_text') chars += item.text.length
     }
     return Math.ceil(chars / 4)
@@ -598,13 +642,16 @@ function computeExcludedIds(
   for (let i = 0; i < Math.min(keepFirst, eligible.length); i += 1) {
     const m = eligible[i]
     if (!m) continue
-    spent += tokensFor(m)
+    const cost = tokensFor(m)
+    if (cost === undefined) return out
+    spent += cost
     kept.add(m.id)
   }
   for (let i = eligible.length - 1; i >= keepFirst; i -= 1) {
     const m = eligible[i]
     if (!m) continue
     const cost = tokensFor(m)
+    if (cost === undefined) return out
     if (spent + cost > budget) break
     spent += cost
     kept.add(m.id)

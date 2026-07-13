@@ -4,7 +4,6 @@
  * Owns: [data-ui='reasoning'|'reasoning-summary'|'reasoning-details'|
  *              'reasoning-section'|'reasoning-badge'|'reasoning-error'|
  *              'reasoning-overflow'].
- * See plan/10-ui.md §10.20, plan/11-rendering.md §11.9.
  */
 
 /* Subtle info-tint — reasoning is a distinct lane from main prose, so a
@@ -178,9 +177,14 @@
   cursor: pointer;
 }
 
-[data-ui="tool-evidence-hide"]:hover {
+[data-ui="tool-evidence-hide"]:hover:not(:disabled) {
   color: var(--color-fg-primary);
   background: var(--color-bg-hover, rgba(127, 127, 127, 0.08));
+}
+
+[data-ui="tool-evidence-hide"]:disabled {
+  cursor: not-allowed;
+  opacity: var(--opacity-disabled);
 }
 
 [data-ui="tool-evidence-hide"][data-pressed="true"] {
@@ -292,9 +296,14 @@
     background-color var(--duration-fast) var(--ease-standard);
 }
 
-[data-ui="reasoning-row-hide"]:hover {
+[data-ui="reasoning-row-hide"]:hover:not(:disabled) {
   color: var(--color-fg-primary);
   background: var(--color-bg-hover, rgba(127, 127, 127, 0.08));
+}
+
+[data-ui="reasoning-row-hide"]:disabled {
+  cursor: not-allowed;
+  opacity: var(--opacity-disabled);
 }
 
 [data-ui="reasoning-row-hide"][data-pressed="true"] {

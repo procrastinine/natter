@@ -1,6 +1,3 @@
-// Google Gemini native API adapter. See `plan/phase11-implementation.md §4.4`
-// and `gemini_docs/guides/`.
-//
 // Dispatches to `{baseUrl}/models/{model}:streamGenerateContent?alt=sse`
 // for streaming, `:generateContent` for buffered. Uses `x-goog-api-key`
 // (NOT `Authorization: Bearer`).
@@ -14,19 +11,26 @@
 // and full multi-modal come in Phase 12.
 
 import type { ConnectionProfile } from '../core/types'
-import { buildHeaders, fetchWithTimeout } from './client'
+import { errorFromUnknown } from '../lib/error'
+import {
+  type ApiKeyDispatchContext,
+  buildHeaders,
+  fetchWithApiKeyFallback,
+  hasExplicitAuthHeaderOverride,
+  readErrorResponseJson,
+} from './client'
+import { deferAdapterRequest } from './deferred-request'
 import { normalizeError } from './errors'
 import type {
   GeminiStreamChunk,
   GenerateContentRequestWire,
   GenerateContentResponseWire,
 } from './gemini-types'
-import { parseSSE } from './sse'
+import { decodeProviderJson, malformedJsonFrameReport, parseSSE } from './sse'
 import type { CallOpts } from './types'
 
-export interface GeminiContext {
+export interface GeminiContext extends ApiKeyDispatchContext {
   profile: ConnectionProfile
-  apiKey: string
 }
 
 // "models/{model}" is the Gemini URL pattern. Model ids sometimes arrive
@@ -44,44 +48,72 @@ function geminiUrl(profile: ConnectionProfile, model: string, stream: boolean): 
   return `${base}/models/${modelId}${method}`
 }
 
-async function dispatch(
+function dispatch(
   ctx: GeminiContext,
   req: GenerateContentRequestWire,
   modelId: string,
   stream: boolean,
   opts: CallOpts,
 ): Promise<Response> {
+  return dispatchSerialized(ctx, JSON.stringify(req), modelId, stream, opts)
+}
+
+function dispatchSerialized(
+  ctx: GeminiContext,
+  body: string,
+  modelId: string,
+  stream: boolean,
+  opts: CallOpts,
+): Promise<Response> {
   const url = geminiUrl(ctx.profile, modelId, stream)
-  const headers = buildHeaders(ctx.profile, ctx.apiKey, {
-    method: 'POST',
-    authScheme: 'gemini-native',
-    ...(opts.overrideHeaders ? { overrideHeaders: opts.overrideHeaders } : {}),
-  })
-  const init: RequestInit = {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(req),
-  }
   const fetchOpts: { signal?: AbortSignal; timeoutMs?: number } = {}
   if (opts.signal) fetchOpts.signal = opts.signal
   if (opts.timeoutMs !== undefined) fetchOpts.timeoutMs = opts.timeoutMs
-  const response = await fetchWithTimeout(url, init, fetchOpts)
+  const authCtx = hasExplicitAuthHeaderOverride(ctx.profile, opts.overrideHeaders, 'x-goog-api-key')
+    ? { apiKey: ctx.apiKey }
+    : ctx
+  const fetched = fetchWithApiKeyFallback(
+    authCtx,
+    (apiKey) => {
+      const headers = buildHeaders(ctx.profile, apiKey, {
+        method: 'POST',
+        authScheme: 'gemini-native',
+        ...(opts.overrideHeaders ? { overrideHeaders: opts.overrideHeaders } : {}),
+      })
+      return { url, init: { method: 'POST', headers, body } }
+    },
+    fetchOpts,
+  )
+  return requireSuccessfulResponse(fetched)
+}
+
+async function requireSuccessfulResponse(
+  fetched: ReturnType<typeof fetchWithApiKeyFallback>,
+): Promise<Response> {
+  const { response } = await fetched
   if (!response.ok) {
-    const body: unknown = await response.json().catch(() => ({
-      error: { code: response.status, message: response.statusText },
-    }))
-    throw normalizeError(body, { midStream: false, httpStatus: response.status })
+    const errorBody = await readErrorResponseJson(response)
+    throw normalizeError(errorBody, { midStream: false, httpStatus: response.status })
   }
   return response
 }
 
-export async function* geminiStream(
+export function geminiStream(
   ctx: GeminiContext,
   req: GenerateContentRequestWire,
   modelId: string,
   opts: CallOpts = {},
-): AsyncGenerator<GeminiStreamChunk> {
-  const response = await dispatch(ctx, req, modelId, true, opts)
+): AsyncGenerator<GeminiStreamChunk, void, unknown> {
+  return deferAdapterRequest(req, (request) =>
+    consumeGeminiStream(dispatch(ctx, request, modelId, true, opts), opts.signal),
+  )
+}
+
+async function* consumeGeminiStream(
+  dispatched: Promise<Response>,
+  signal: AbortSignal | undefined,
+): AsyncGenerator<GeminiStreamChunk, void, unknown> {
+  const response = await dispatched
   const generationId = response.headers.get('x-request-id') ?? undefined
   const contentType = response.headers.get('content-type') ?? ''
 
@@ -89,14 +121,15 @@ export async function* geminiStream(
   // despite `?alt=sse`, yield a buffered_result chunk so downstream code
   // can unify the consumer path.
   if (!/text\/event-stream/i.test(contentType)) {
-    const result = (await response.json()) as GenerateContentResponseWire
+    const result = await decodeProviderJson<GenerateContentResponseWire>(response)
     yield generationId
       ? { type: 'buffered_result', result, generationId }
       : { type: 'buffered_result', result }
     return
   }
 
-  for await (const ev of parseSSE(response, opts.signal ? { signal: opts.signal } : {})) {
+  for await (const ev of parseSSE(response, signal ? { signal } : {})) {
+    if (ev.kind === 'done') continue
     if (ev.kind === 'keepalive') {
       yield { type: 'keepalive', comment: ev.comment }
       continue
@@ -107,20 +140,34 @@ export async function* geminiStream(
         ? { type: 'chunk', chunk: parsed, generationId }
         : { type: 'chunk', chunk: parsed }
     } catch (err) {
-      console.warn('geminiStream: malformed SSE chunk skipped', {
+      const report = malformedJsonFrameReport({
+        adapter: 'gemini-native',
+        eventType: ev.event,
         data: ev.data,
         error: err,
       })
+      console.warn('geminiStream: malformed SSE chunk skipped', report.diagnostic)
+      yield { type: 'integrity', integrity: report.integrity }
     }
   }
 }
 
-export async function geminiOnce(
+export function geminiOnce(
   ctx: GeminiContext,
   req: GenerateContentRequestWire,
   modelId: string,
   opts: CallOpts = {},
 ): Promise<GenerateContentResponseWire> {
-  const response = await dispatch(ctx, req, modelId, false, opts)
-  return (await response.json()) as GenerateContentResponseWire
+  try {
+    return consumeGeminiOnce(dispatch(ctx, req, modelId, false, opts))
+  } catch (error) {
+    return Promise.reject(errorFromUnknown(error))
+  }
+}
+
+async function consumeGeminiOnce(
+  dispatched: Promise<Response>,
+): Promise<GenerateContentResponseWire> {
+  const response = await dispatched
+  return decodeProviderJson<GenerateContentResponseWire>(response)
 }

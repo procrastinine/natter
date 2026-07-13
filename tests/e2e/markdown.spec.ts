@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test'
+import { expect, test } from './fixtures'
 import {
   buildSseBody,
   clearIndexedDb,
@@ -8,11 +8,10 @@ import {
   sendMessage,
 } from './helpers'
 
-// Markdown + code + lists + tables + blockquotes + image allowlist
-// round-trip in a live browser. Backs plan/13-delivery.md §13.3.0 Track B.
+// Markdown, code, lists, tables, blockquotes, and the image allowlist
+// round-trip in a live browser.
 
 test.beforeEach(async ({ page }) => {
-  await page.goto('/')
   await clearIndexedDb(page)
   await seedFirstRun(page)
 })
@@ -102,6 +101,7 @@ test('keeps currency ranges out of math rendering while preserving double-dollar
   const assistant = page.locator('[data-ui="message"][data-role="assistant"]').first()
   await expect(assistant).toContainText('$10 to $12')
   await expect(assistant.locator('.katex')).toHaveCount(1)
+  await expect(assistant.locator('.katex').first()).toHaveCSS('font-family', /KaTeX_Main/)
 })
 
 test('global rendering setting enables single-dollar math', async ({ page }) => {

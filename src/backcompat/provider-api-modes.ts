@@ -1,5 +1,7 @@
+import type { IndexableType, Table, Transaction } from 'dexie'
 import { defaultApiForProfile } from '../core/provider-defaults'
-import type { ApiVariant, ChatSettings, ConnectionProfile } from '../core/types'
+import type { ApiVariant, Chat, ChatPreset, ChatSettings, ConnectionProfile } from '../core/types'
+import { forEachTableBatch } from './batched-table'
 import { migrateCurrentChatSettingsSnapshot } from './chat-settings'
 
 type LegacyGeminiMode = 'native' | 'openai-compat'
@@ -21,7 +23,61 @@ interface ProviderApiModeMigrationResult {
   changed: boolean
 }
 
-export function migrateProviderApiModeSettings(
+export async function migrateProviderApiModeTables(tx: Transaction): Promise<void> {
+  const profiles = tx.table<ConnectionProfile, string>('profiles')
+  await migrateSettingsTable(
+    tx.table<Chat, string>('chats'),
+    profiles,
+    (chat) => chat.settings.profileId,
+    (chat, settings) => ({ ...chat, settings }),
+  )
+  await migrateSettingsTable(
+    tx.table<ChatPreset, string>('presets'),
+    profiles,
+    (preset) => preset.connectionProfileId,
+    (preset, settings) => ({
+      ...preset,
+      settings: { ...settings, profileId: preset.connectionProfileId },
+    }),
+  )
+  await forEachTableBatch(profiles, async (rows) => {
+    const changed: ConnectionProfile[] = []
+    for (const profile of rows) {
+      const result = migrateProviderApiModeProfile(profile)
+      if (result.changed) changed.push(result.profile)
+    }
+    if (changed.length > 0) await profiles.bulkPut(changed)
+  })
+}
+
+async function migrateSettingsTable<
+  TRow extends { settings: ChatSettings },
+  TKey extends IndexableType,
+>(
+  table: Table<TRow, TKey>,
+  profiles: Table<ConnectionProfile, string>,
+  profileIdFor: (row: TRow) => string,
+  withSettings: (row: TRow, settings: ChatSettings) => TRow,
+): Promise<void> {
+  await forEachTableBatch(table, async (rows) => {
+    const profileIds = [...new Set(rows.map(profileIdFor))]
+    const profileRows = await profiles.bulkGet(profileIds)
+    const profilesById = new Map<string, ConnectionProfile>()
+    for (const profile of profileRows) {
+      if (profile) profilesById.set(profile.id, profile)
+    }
+    const changed: TRow[] = []
+    for (const row of rows) {
+      const profileId = profileIdFor(row)
+      const result = migrateProviderApiModeSettings(row.settings, profilesById.get(profileId))
+      const profileChanged = result.settings.profileId !== profileId
+      if (result.changed || profileChanged) changed.push(withSettings(row, result.settings))
+    }
+    if (changed.length > 0) await table.bulkPut(changed)
+  })
+}
+
+function migrateProviderApiModeSettings(
   settings: ChatSettings,
   profile: ConnectionProfile | undefined,
 ): ProviderApiModeMigrationResult {
@@ -52,7 +108,7 @@ export function migrateProviderApiModeSettings(
   return changed ? { settings: next, changed: true } : { settings, changed: false }
 }
 
-export function migrateProviderApiModeProfile(profile: ConnectionProfile): {
+function migrateProviderApiModeProfile(profile: ConnectionProfile): {
   profile: ConnectionProfile
   changed: boolean
 } {

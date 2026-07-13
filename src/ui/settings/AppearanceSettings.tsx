@@ -2,7 +2,6 @@
 // themes. Collects everything that changes how the chat LOOKS — split
 // from General, which now houses only composer + continue behavior.
 
-import { useLiveQuery } from 'dexie-react-hooks'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   applyBaseFontSizeToDocument,
@@ -28,6 +27,8 @@ import {
   writeLongMessageDisplayMode,
   writeTheme,
 } from '../../core/global-settings'
+import { GLOBAL_PREFERENCES_DEPENDENCIES } from '../../store/reactive-dependencies'
+import { useRepositoryQueryState } from '../../store/reactive-query'
 import { InfoDisclosure } from './InfoDisclosure'
 import { RenderingSettings } from './RenderingSettings'
 
@@ -62,8 +63,15 @@ function chatMaxWidthLabel(value: ChatMaxWidth): string {
 }
 
 export function AppearanceSettings() {
-  const loadedPrefs = useLiveQuery(readGlobalPreferences, [], undefined)
-  const prefs = loadedPrefs ?? DEFAULT_GLOBAL_PREFERENCES
+  const preferencesQuery = useRepositoryQueryState(
+    'global-preferences',
+    readGlobalPreferences,
+    DEFAULT_GLOBAL_PREFERENCES,
+    GLOBAL_PREFERENCES_DEPENDENCIES,
+  )
+  if (preferencesQuery.status === 'error') throw preferencesQuery.error
+  const loadedPrefs = preferencesQuery.status === 'ready' ? preferencesQuery.value : undefined
+  const prefs = preferencesQuery.value
 
   const onTheme = useCallback(async (value: ThemePreference) => {
     applyThemeToDocument(value)

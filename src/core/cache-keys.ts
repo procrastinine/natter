@@ -1,5 +1,3 @@
-// Cache-key helpers. See `plan/07-discovery.md §7.4`.
-
 import type { ModelsQuery } from './types'
 
 // Stable key for the `/models` cache. Two queries with different
@@ -23,17 +21,15 @@ function normalizeList(input: readonly string[] | undefined): string[] {
 
 // Object-key-sorted JSON so `{a:1,b:2}` and `{b:2,a:1}` produce the same string.
 function stableStringify(value: unknown): string {
-  return (
-    JSON.stringify(value, (_key: string, v: unknown) => {
-      if (v && typeof v === 'object' && !Array.isArray(v)) {
-        const record = v as Record<string, unknown>
-        const sorted: Record<string, unknown> = {}
-        for (const k of Object.keys(record).sort()) {
-          sorted[k] = record[k]
-        }
-        return sorted
+  return JSON.stringify(value, (_key: string, v: unknown) => {
+    if (v && typeof v === 'object' && !Array.isArray(v)) {
+      const record = v as Record<string, unknown>
+      const sorted: Record<string, unknown> = {}
+      for (const k of Object.keys(record).sort()) {
+        sorted[k] = record[k]
       }
-      return v
-    }) ?? 'undefined'
-  )
+      return sorted
+    }
+    return v
+  })
 }

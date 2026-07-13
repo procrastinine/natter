@@ -16,16 +16,24 @@
 //     JSON body despite `stream:true`. The lane splitter turns this into a
 //     `buffered` lane event, same as chat.
 //
-// Phase 11 reads this adapter from two paths:
-//   1. The UI send pipeline, via the api-choice router.
-//   2. Live integration tests that reuse captured SSE fixtures from
-//      `plan/phase11-probes/`.
-
 import type { ConnectionProfile } from '../core/types'
-import { logStreamDebug, type StreamDebugTrace, startStreamDebug } from '../lib/debug-streams'
-import { buildHeaders, fetchWithTimeout } from './client'
+import {
+  logStreamDebug,
+  type StreamDebugTrace,
+  snapshotStreamDebugRequest,
+  startStreamDebug,
+} from '../lib/debug-streams'
+import { errorFromUnknown } from '../lib/error'
+import {
+  type ApiKeyDispatchContext,
+  buildHeaders,
+  fetchWithApiKeyFallback,
+  hasExplicitAuthHeaderOverride,
+  readErrorResponseJson,
+} from './client'
+import { deferAdapterRequest } from './deferred-request'
 import { normalizeError } from './errors'
-import { parseSSE } from './sse'
+import { decodeProviderJson, malformedJsonFrameReport, parseSSE } from './sse'
 import type {
   CallOpts,
   ResponsesEventWire,
@@ -34,9 +42,8 @@ import type {
   ResponsesStreamChunk,
 } from './types'
 
-export interface ResponsesContext {
+export interface ResponsesContext extends ApiKeyDispatchContext {
   profile: ConnectionProfile
-  apiKey: string
 }
 
 function responsesUrl(profile: ConnectionProfile): string {
@@ -44,37 +51,77 @@ function responsesUrl(profile: ConnectionProfile): string {
   return `${base}/responses`
 }
 
-async function dispatch(
+interface DispatchResult {
+  response: Response
+  debugTrace: StreamDebugTrace | null
+}
+
+function dispatch(
   ctx: ResponsesContext,
   req: ResponsesRequestWire,
   opts: CallOpts,
-): Promise<{ response: Response; debugTrace: StreamDebugTrace | null }> {
+): Promise<DispatchResult> {
+  return dispatchSerialized(
+    ctx,
+    JSON.stringify(req),
+    snapshotStreamDebugRequest(ctx.profile, req),
+    opts,
+  )
+}
+
+function dispatchSerialized(
+  ctx: ResponsesContext,
+  body: string,
+  debugRequest: unknown,
+  opts: CallOpts,
+): Promise<DispatchResult> {
   const url = responsesUrl(ctx.profile)
-  const headers = buildHeaders(ctx.profile, ctx.apiKey, {
-    method: 'POST',
-    ...(opts.overrideHeaders ? { overrideHeaders: opts.overrideHeaders } : {}),
-  })
-  const debugTrace = startStreamDebug({
-    adapter: 'responses',
-    profile: ctx.profile,
-    url,
-    request: req,
-    headers,
-  })
-  const init: RequestInit = {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(req),
-  }
+  let debugTrace: StreamDebugTrace | null = null
   const fetchOpts: { signal?: AbortSignal; timeoutMs?: number } = {}
   if (opts.signal) fetchOpts.signal = opts.signal
   if (opts.timeoutMs !== undefined) fetchOpts.timeoutMs = opts.timeoutMs
-  const response = await fetchWithTimeout(url, init, fetchOpts)
+  const authCtx = hasExplicitAuthHeaderOverride(ctx.profile, opts.overrideHeaders, 'Authorization')
+    ? { apiKey: ctx.apiKey }
+    : ctx
+  const fetched = fetchWithApiKeyFallback(
+    authCtx,
+    (apiKey) => {
+      const headers = buildHeaders(ctx.profile, apiKey, {
+        method: 'POST',
+        ...(opts.overrideHeaders ? { overrideHeaders: opts.overrideHeaders } : {}),
+      })
+      if (debugRequest !== null) {
+        debugTrace ??= startStreamDebug({
+          adapter: 'responses',
+          profile: ctx.profile,
+          url,
+          request: debugRequest,
+          headers,
+        })
+      }
+      return { url, init: { method: 'POST', headers, body } }
+    },
+    fetchOpts,
+  )
+  return finishDispatch(fetched, () => debugTrace)
+}
+
+async function finishDispatch(
+  fetched: ReturnType<typeof fetchWithApiKeyFallback>,
+  getDebugTrace: () => StreamDebugTrace | null,
+): Promise<DispatchResult> {
+  const { response } = await fetched
+  return { response, debugTrace: getDebugTrace() }
+}
+
+async function requireSuccessfulDispatch(
+  dispatched: Promise<DispatchResult>,
+): Promise<DispatchResult> {
+  const result = await dispatched
+  const { response, debugTrace } = result
   if (!response.ok) {
-    const body: unknown = await response.json().catch(() => ({
-      error: { code: response.status, message: response.statusText },
-    }))
-    throw normalizeError(body, {
+    const errorBody = await readErrorResponseJson(response)
+    throw normalizeError(errorBody, {
       midStream: false,
       httpStatus: response.status,
     })
@@ -84,25 +131,34 @@ async function dispatch(
     contentType: response.headers.get('content-type'),
     generationId: response.headers.get('x-generation-id') ?? undefined,
   })
-  return { response, debugTrace }
+  return result
 }
 
-export async function* responses(
+export function responses(
   ctx: ResponsesContext,
   req: ResponsesRequestWire,
   opts: CallOpts = {},
-): AsyncGenerator<ResponsesStreamChunk> {
-  if (req.stream !== true) {
-    throw new Error(
-      'responses: request body must have stream:true — use responsesOnce for non-streaming',
-    )
-  }
-  const { response, debugTrace } = await dispatch(ctx, req, opts)
+): AsyncGenerator<ResponsesStreamChunk, void, unknown> {
+  return deferAdapterRequest(req, (request) => {
+    if (request.stream !== true) {
+      throw new Error(
+        'responses: request body must have stream:true — use responsesOnce for non-streaming',
+      )
+    }
+    return consumeResponses(dispatch(ctx, request, opts), opts.signal)
+  })
+}
+
+async function* consumeResponses(
+  dispatched: Promise<DispatchResult>,
+  signal: AbortSignal | undefined,
+): AsyncGenerator<ResponsesStreamChunk, void, unknown> {
+  const { response, debugTrace } = await requireSuccessfulDispatch(dispatched)
   const generationId = response.headers.get('x-generation-id') ?? undefined
   const contentType = response.headers.get('content-type') ?? ''
 
   if (!/text\/event-stream/i.test(contentType)) {
-    const result = (await response.json()) as ResponsesResultWire
+    const result = await decodeProviderJson<ResponsesResultWire>(response)
     logStreamDebug(debugTrace, 'buffered_result', result)
     yield generationId
       ? { type: 'buffered_result', result, generationId }
@@ -110,7 +166,8 @@ export async function* responses(
     return
   }
 
-  for await (const ev of parseSSE(response, opts.signal ? { signal: opts.signal } : {})) {
+  for await (const ev of parseSSE(response, signal ? { signal } : {})) {
+    if (ev.kind === 'done') continue
     if (ev.kind === 'keepalive') {
       yield { type: 'keepalive', comment: ev.comment }
       continue
@@ -128,22 +185,36 @@ export async function* responses(
         ? { type: 'event', event: raw as ResponsesEventWire, generationId }
         : { type: 'event', event: raw as ResponsesEventWire }
     } catch (err) {
-      console.warn('responses: malformed SSE chunk skipped', {
+      const report = malformedJsonFrameReport({
+        adapter: 'responses',
+        eventType: ev.event,
         data: ev.data,
         error: err,
       })
+      console.warn('responses: malformed SSE chunk skipped', report.diagnostic)
+      yield { type: 'integrity', integrity: report.integrity }
     }
   }
 }
 
-export async function responsesOnce(
+export function responsesOnce(
   ctx: ResponsesContext,
   req: ResponsesRequestWire,
   opts: CallOpts = {},
 ): Promise<ResponsesResultWire> {
-  const body: ResponsesRequestWire = { ...req, stream: false }
-  const { response, debugTrace } = await dispatch(ctx, body, opts)
-  const result = (await response.json()) as ResponsesResultWire
+  try {
+    const body: ResponsesRequestWire = { ...req, stream: false }
+    return consumeResponsesOnce(dispatch(ctx, body, opts))
+  } catch (error) {
+    return Promise.reject(errorFromUnknown(error))
+  }
+}
+
+async function consumeResponsesOnce(
+  dispatched: Promise<DispatchResult>,
+): Promise<ResponsesResultWire> {
+  const { response, debugTrace } = await requireSuccessfulDispatch(dispatched)
+  const result = await decodeProviderJson<ResponsesResultWire>(response)
   logStreamDebug(debugTrace, 'once.result', result)
   return result
 }

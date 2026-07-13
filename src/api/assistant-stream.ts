@@ -1,8 +1,11 @@
 import type { AssistantRequestPlan } from '../core/send-planning'
 import type { ConnectionProfile } from '../core/types'
+import { errorFromUnknown } from '../lib/error'
 import { type AnthropicContext, anthropicOnce, anthropicStream } from './anthropic-messages'
 import type { AnthropicMessagesResultWire, AnthropicStreamChunk } from './anthropic-types'
 import { chatCompletions, chatCompletionsOnce } from './chat-completions'
+import type { ApiKeyCandidate } from './client'
+import { deferAdapterRequest } from './deferred-request'
 import { type GeminiContext, geminiOnce, geminiStream } from './gemini-native'
 import type { GeminiStreamChunk, GenerateContentResponseWire } from './gemini-types'
 import { responses, responsesOnce } from './responses'
@@ -27,20 +30,43 @@ type AssistantOnceResult =
   | GenerateContentResponseWire
   | AnthropicMessagesResultWire
 
+export type AssistantDispatchPlan = Pick<
+  AssistantRequestPlan,
+  'useTextProtocol' | 'route' | 'requestedModel' | 'geminiModelId' | 'wire'
+>
+
 interface AssistantDispatchInput {
   connection: ConnectionProfile
   apiKey: string
-  requestPlan: AssistantRequestPlan
+  apiKeyCandidates?: readonly ApiKeyCandidate[]
+  onKeyCandidateSelected?: (
+    candidate: ApiKeyCandidate,
+    candidateIndex: number,
+    apiKey: string,
+  ) => void | Promise<void>
+  requestPlan: AssistantDispatchPlan
   signal?: AbortSignal
 }
 
 export function openAssistantRequestStream(
   input: AssistantDispatchInput,
 ): AsyncIterable<AssistantStreamChunk> {
-  const { connection, apiKey, requestPlan, signal } = input
-  const ctx = { profile: connection, apiKey }
+  const { connection, apiKey, apiKeyCandidates, onKeyCandidateSelected, requestPlan, signal } =
+    input
+  const ctx = {
+    profile: connection,
+    apiKey,
+    ...(apiKeyCandidates ? { apiKeyCandidates } : {}),
+    ...(onKeyCandidateSelected ? { onKeyCandidateSelected } : {}),
+  }
   if (requestPlan.route?.transport === 'openai-responses' && requestPlan.wire.stream !== true) {
-    return bufferedAssistantRequest(input)
+    return deferAdapterRequest(requestPlan.wire, (wire) =>
+      bufferedAssistantRequest(
+        responsesOnce(ctx, wire as Parameters<typeof responsesOnce>[1], {
+          ...(signal ? { signal } : {}),
+        }),
+      ),
+    )
   }
   if (requestPlan.useTextProtocol) {
     return textCompletions(ctx, requestPlan.wire as Parameters<typeof textCompletions>[1], {
@@ -80,17 +106,31 @@ export function openAssistantRequestStream(
 }
 
 async function* bufferedAssistantRequest(
-  input: AssistantDispatchInput,
-): AsyncGenerator<AssistantStreamChunk> {
-  const result = await runAssistantRequestOnce(input)
-  yield { type: 'buffered_result', result } as AssistantStreamChunk
+  requested: Promise<AssistantOnceResult>,
+): AsyncGenerator<AssistantStreamChunk, void, unknown> {
+  const result = await requested
+  yield { type: 'buffered_result', result }
 }
 
-export async function runAssistantRequestOnce(
+export function runAssistantRequestOnce(
   input: AssistantDispatchInput,
 ): Promise<AssistantOnceResult> {
-  const { connection, apiKey, requestPlan, signal } = input
-  const ctx = { profile: connection, apiKey }
+  try {
+    return dispatchAssistantRequestOnce(input)
+  } catch (error) {
+    return Promise.reject(errorFromUnknown(error))
+  }
+}
+
+function dispatchAssistantRequestOnce(input: AssistantDispatchInput): Promise<AssistantOnceResult> {
+  const { connection, apiKey, apiKeyCandidates, onKeyCandidateSelected, requestPlan, signal } =
+    input
+  const ctx = {
+    profile: connection,
+    apiKey,
+    ...(apiKeyCandidates ? { apiKeyCandidates } : {}),
+    ...(onKeyCandidateSelected ? { onKeyCandidateSelected } : {}),
+  }
   if (requestPlan.useTextProtocol) {
     return textCompletionsOnce(ctx, requestPlan.wire as Parameters<typeof textCompletionsOnce>[1], {
       ...(signal ? { signal } : {}),

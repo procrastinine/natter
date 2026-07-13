@@ -1,18 +1,17 @@
-// Header privacy badge. See `plan/09-privacy.md §9.11`.
-//
 // Rendered in the chat title bar next to info/settings. Shows the
 // overall privacy tier for the currently active chat's model, derived
 // from the kept providers after the privacy filter runs. Click opens a
 // popover listing the kept providers and their policies. Hidden for
 // non-OpenRouter connections and for free models.
 
-import { useLiveQuery } from 'dexie-react-hooks'
 import { useEffect, useRef, useState } from 'react'
 import type { PrivacyTier } from '../../core/privacy-filter'
 import { providerDisplayLabel, providerEndpointKey } from '../../core/provider-identity'
 import type { Chat, ChatId } from '../../core/types'
 import { usePrivacyRouting } from '../../hooks/usePrivacyRouting'
 import { getChat } from '../../store/chats'
+import { chatRowDependencies } from '../../store/reactive-dependencies'
+import { useRepositoryQuery } from '../../store/reactive-query'
 import { CloseIcon, LockIcon, LockOpenIcon } from '../icons/Icon'
 import {
   buildPickerRows,
@@ -26,7 +25,12 @@ interface HeaderPrivacyBadgeProps {
 }
 
 export function HeaderPrivacyBadge({ chatId }: HeaderPrivacyBadgeProps) {
-  const chat = useLiveQuery(() => getChat(chatId), [chatId], undefined)
+  const chat = useRepositoryQuery(
+    JSON.stringify(['chat', chatId]),
+    () => getChat(chatId),
+    undefined,
+    chatRowDependencies(chatId),
+  )
   if (!chat) return null
   return <Inner chat={chat} />
 }

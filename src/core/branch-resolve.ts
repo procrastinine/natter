@@ -1,5 +1,3 @@
-// Canonical leaf-chooser. See `plan/08-branching.md §8.4.3.1`.
-//
 // Given a target message M and a mutable cursor, write cursor entries from
 // M downward so the active-path walk agrees with the "most-recently-updated
 // chain below M" choice. Swipe, search-click, and
@@ -11,7 +9,7 @@
 // can merge it into Zustand atomically after the IDB transaction (if any) has
 // committed.
 
-import { cursorKeyOf, indexById, pickDefaultChild } from './active-path'
+import { createDefaultChildPicker, cursorKeyOf, indexById } from './active-path'
 import type { CursorMap, Message, MessageId } from './types'
 
 interface ResolveBranchInput {
@@ -62,8 +60,9 @@ export function seedCursorAtMessage(
 // helper only handles `target → leaf` below.
 export function resolveLastUpdatedBranchBelow(input: ResolveBranchInput, cursor: CursorMap): void {
   const { byParent, byId } = input
-  let currentId: MessageId | null = input.targetId
-  while (currentId !== null) {
+  const pickDefaultChild = createDefaultChildPicker(byParent, byId)
+  let currentId: MessageId = input.targetId
+  for (;;) {
     const kids = (byParent.get(currentId) ?? []).filter((m) => !m.deleted)
     if (kids.length === 0) break
     const key = cursorKeyOf(currentId)
@@ -72,7 +71,7 @@ export function resolveLastUpdatedBranchBelow(input: ResolveBranchInput, cursor:
       currentId = pinnedId
       continue
     }
-    const chosen = pickDefaultChild(kids, byParent, byId)
+    const chosen = pickDefaultChild(kids)
     cursor[key] = chosen.id
     currentId = chosen.id
   }

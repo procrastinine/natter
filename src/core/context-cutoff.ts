@@ -39,12 +39,12 @@ import {
   DRAFT_ATTACHMENT_CONTEXT_ID,
   resolveAttachmentContextRefs,
 } from './attachments/context'
+import { resolveContextCap, UNLIMITED_CONTEXT } from './context-budget'
 import {
   type AttachmentResolver,
   mediaTokensForMessage,
   mediaTokensForRefs,
 } from './media-context-tokens'
-import { resolveContextCap, UNLIMITED_CONTEXT } from './prompt-size'
 import { readPathTextTokenEstimate } from './token-calibration'
 import { clampTokens } from './token-guards'
 import {

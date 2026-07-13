@@ -1,6 +1,3 @@
-// Send pipeline for basic text chat. See `plan/06-streaming.md §6.1` and
-// `plan/13-delivery.md §13.2.7`.
-//
 // Lifecycle (text-only Phase 7):
 //   1. Run a cached zero-eligible privacy preflight, then persist the user
 //      message (via messages.sendUserMessage) before full request planning so
@@ -9,7 +6,7 @@
 //      user) before the fetch opens.
 //   2. Compose the wire body from the active path via `send-planning`.
 //   3. Open the stream through the single assistant dispatcher. Feed chunks
-//      through `splitChatStream` into an
+//      through `splitAssistantStream` into an
 //      in-memory accumulator (text / reasoning / tool-calls / usage / meta).
 //   4. Append stream-lane deltas to the durable `streamChunks` recovery log
 //      while the visible owner tab renders from the in-memory accumulator.
@@ -24,52 +21,53 @@
 // callbacks; components call `sendText({chat, connection, ...})`.
 
 import { useCallback, useRef } from 'react'
-import type { AnthropicStreamChunk } from '../api/anthropic-types'
-import { type AssistantStreamChunk, openAssistantRequestStream } from '../api/assistant-stream'
-import { ApiError } from '../api/errors'
-import type { GeminiStreamChunk } from '../api/gemini-types'
+import {
+  type AssistantDispatchPlan,
+  type AssistantStreamChunk,
+  openAssistantRequestStream,
+} from '../api/assistant-stream'
+import { type ApiError, normalizeError } from '../api/errors'
 import { readCachedPrivacyPayload } from '../api/privacy-scrape'
 import { normalizeEndpointsResponse } from '../api/providers'
+import { chatHref, parseRoute, replaceRoute } from '../app/router'
+import { activePath, cursorKeyOf } from '../core/active-path'
+import { toPersistedAttemptFailure } from '../core/attempt-outcome'
 import {
-  type StreamLaneEvent,
-  splitAnthropicStream,
-  splitChatStream,
-  splitGeminiStream,
-  splitResponsesStream,
-} from '../api/stream-transforms'
-import type { ChatStreamChunk, ResponsesStreamChunk } from '../api/types'
-import { activePath, cursorKeyOf, groupByParent } from '../core/active-path'
+  runGenerationAttempt,
+  SEND_GENERATION_ATTEMPT_ERROR_POLICY,
+} from '../core/generation-attempt-runner'
 import { readGlobalPreferences } from '../core/global-settings'
-import { sendUserMessage } from '../core/messages'
+import { nextSiblingIndexFromChildren, sendUserMessage } from '../core/messages'
 import { tokenCalibrationKey } from '../core/model-ids'
 import { isFreeModel } from '../core/model-predicates'
 import { buildWireProviderPrivacy, filterEndpointsByPrivacy } from '../core/privacy-filter'
 import { hasEnabledHostedTools, isOpenAiDirectProfile } from '../core/provider-hosted-tools'
 import {
-  providerOutputItemFromGeminiPart,
-  providerOutputItemFromResponsesItem,
-} from '../core/provider-tool-context'
-import {
-  findMergeTargetIndex,
-  mergeReasoningDetail,
-  normalizeIncomingReasoningDetail,
-} from '../core/reasoning'
-import {
   type AssistantRequestPlan,
+  type AssistantRequestTransform,
   NoEligibleProvidersError,
   prepareAssistantRequestPlan,
 } from '../core/send-planning'
+import {
+  createStreamAccumulator,
+  projectStreamAccumulatorFinal,
+  projectStreamAccumulatorLive,
+  projectStreamGeneration,
+  replayStreamAccumulator,
+  type StreamAccumulator,
+  streamAccumulatorHasCompletionCalibrationBlockers,
+} from '../core/stream-accumulator'
 import {
   addAcceptedSampleToGlobal,
   addSampleToChat,
   calibrationFieldsForCreate,
   deriveCompletionSample,
-  derivePromptSample,
+  derivePromptCalibrationBasis,
+  derivePromptSampleFromBasis,
+  type PromptCalibrationBasis,
   readTokenCalibrationGlobal,
 } from '../core/token-calibration'
-import type { PromptEstimateOptions, TokenizerFamily } from '../core/tokens'
-import type { ChatCompletionsTransformOptions } from '../core/transforms'
-import { nextSiblingIndex } from '../core/tree-ops'
+import type { TokenizerFamily } from '../core/tokens'
 import type {
   AbortReason,
   AttachmentRef,
@@ -82,48 +80,58 @@ import type {
   ContentItem,
   FinishReason,
   GenerationMeta,
-  GenerationServerToolCall,
   Message,
   MessageId,
-  MessagePhase,
   ProviderOutputItem,
-  ReasoningDetail,
 } from '../core/types'
 import { logStreamDebug, streamDebugEnabled } from '../lib/debug-streams'
 import { newId } from '../lib/ulid'
-import { attachmentScopes, incRefs } from '../store/attachments'
+import { attachmentScopes } from '../store/attachments'
 import { postEvent } from '../store/broadcast'
-import { getBrowserRepository } from '../store/browser-repo'
-import { getChat, loadMessageHeaders } from '../store/chats'
+import { getChat } from '../store/chats'
+import type { ConnectionRuntimeKeyCandidate } from '../store/connection-runtime'
+import { recoverStaleContinuationAttempts } from '../store/continuation-recovery'
 import {
   type GeneratedOutputDownloader,
-  materializeGeneratedOutputAttachments,
   mergeGeneratedImageAttachmentRefs,
+  persistPreparedGeneratedOutputAttachments,
+  prepareGeneratedOutputAttachments,
 } from '../store/generated-images'
 import { ENDPOINTS_TTL_MS, getCachedEndpoints, isFresh } from '../store/models-cache'
 import { getCachedPrivacyPolicy } from '../store/privacy-cache'
-import type { MessageHeaderPatch, StreamChunkRow } from '../store/repository'
-import { loadActiveBranchHeaderSnapshot, loadSendContextForBranch } from '../store/send-context'
-import { isFreshStreamLease, STREAM_LEASE_TTL_MS } from '../store/stream-leases'
+import { flushPendingPromptSettingSaves } from '../store/prompt-presets'
+import type { MessageHeaderPatch, StreamLeaseRow, StreamWriteFence } from '../store/repository'
+import {
+  assertSendContextFresh,
+  assertSendContextVersion,
+  loadActiveBranchHeaderSnapshot,
+  loadChatHeaderSnapshot,
+  loadSendContextForBranch,
+} from '../store/send-context'
+import { createStreamChunkWriter } from '../store/stream-chunk-writer'
+import {
+  announceStreamEnded,
+  getStreamClientId,
+  isFreshStreamLease,
+  isRecoveryClaimedStreamLease,
+  STREAM_LEASE_TTL_MS,
+  streamOwnershipLocksSupported,
+  streamWriteFenceForLease,
+  withStreamRecoveryLocks,
+} from '../store/stream-leases'
+import { getWorkspaceRepository } from '../store/workspace-repository'
 import { useChatStore } from '../store/zustand/chatStore'
-import { useStreamStore } from '../store/zustand/streamStore'
+import { clearLiveSnapshotIfPresent, useStreamStore } from '../store/zustand/streamStore'
 import { useUiStore } from '../store/zustand/uiStore'
 import { markLifecycleTarget, startRequestLifecycle } from './requestLifecycle'
 
-const STREAM_LIVE_UPDATE_INTERVAL_MS = 125
-const STREAM_LIVE_TEXT_GROWTH_CHARS = 2048
-const STREAM_LIVE_TEXT_SECTION_CHARS = 20_000
-const STREAM_CHUNK_FLUSH_INTERVAL_MS = 150
-const STREAM_CHUNK_FLUSH_MAX_ROWS = 256
-const STREAM_CHUNK_FLUSH_MAX_TEXT_CHARS = 128 * 1024
+const retainedRequestPlansForTests = import.meta.env.DEV
+  ? new Set<AssistantRequestPlan>()
+  : undefined
+const ORPHAN_RECOVERY_RETRY_MS = 2_000
 
-function routeApiUsed(route: AssistantRequestPlan['route']): GenerationMeta['apiUsed'] {
-  if (route?.kind === 'responses') return 'responses'
-  if (route?.kind === 'gemini-generate') return 'gemini-native'
-  if (route?.kind === 'anthropic-messages') return 'anthropic-messages'
-  if (route?.kind === 'video-generation') return 'video-generation'
-  if (route?.kind === 'text-completions') return 'completion'
-  return 'chat'
+export function __retainedSendRequestPlanCountForTests(): number | undefined {
+  return retainedRequestPlansForTests?.size
 }
 
 function pendingPrefillMessage(input: {
@@ -198,149 +206,17 @@ async function throwIfCachedPrivacyPreflightZeroEligible(input: {
   if (wire.zeroEligible) throwWithZeroEligibleUi(chat.id, new NoEligibleProvidersError())
 }
 
-async function* laneStreamForRoute(
-  route: AssistantRequestPlan['route'],
-  source: AsyncIterable<OpenStreamChunk>,
-): AsyncGenerator<StreamLaneEvent> {
-  const iterator = source[Symbol.asyncIterator]()
-  const first = await iterator.next()
-  if (first.done) return
-  const replay = {
-    async *[Symbol.asyncIterator]() {
-      yield first.value
-      for await (const chunk of { [Symbol.asyncIterator]: () => iterator }) yield chunk
-    },
-  }
-
-  const transport = detectStreamTransport(first.value, route)
-  if (transport === 'openai-responses') {
-    yield* splitResponsesStream(replay as AsyncIterable<ResponsesStreamChunk>)
-    return
-  }
-  if (transport === 'gemini-native') {
-    yield* splitGeminiStream(replay as AsyncIterable<GeminiStreamChunk>)
-    return
-  }
-  if (transport === 'anthropic') {
-    yield* splitAnthropicStream(replay as AsyncIterable<AnthropicStreamChunk>)
-    return
-  }
-  yield* splitChatStream(replay as AsyncIterable<ChatStreamChunk>)
-}
-
-function detectStreamTransport(
-  chunk: OpenStreamChunk,
-  route: AssistantRequestPlan['route'],
-): NonNullable<AssistantRequestPlan['route']>['transport'] | 'openai-chat' {
-  if ((chunk as { type?: string }).type === 'event') return 'openai-responses'
-  if ((chunk as { type?: string }).type === 'chunk') return 'gemini-native'
-  if ((chunk as { type?: string }).type === 'anthropic_event') return 'anthropic'
-  if ((chunk as { type?: string }).type === 'delta') return 'openai-chat'
-  if ((chunk as { type?: string }).type === 'buffered_result') {
-    const result = (chunk as { result?: Record<string, unknown> }).result
-    if (result) {
-      if (Array.isArray((result as { content?: unknown[] }).content) && 'stop_reason' in result) {
-        return 'anthropic'
-      }
-      if (Array.isArray((result as { output?: unknown[] }).output) || 'status' in result) {
-        return 'openai-responses'
-      }
-      if (Array.isArray((result as { candidates?: unknown[] }).candidates)) {
-        return 'gemini-native'
-      }
-      if (Array.isArray((result as { choices?: unknown[] }).choices)) return 'openai-chat'
-    }
-  }
-  if (route?.transport === 'openai-responses') return 'openai-responses'
-  if (route?.transport === 'gemini-native') return 'gemini-native'
-  if (route?.transport === 'anthropic') return 'anthropic'
-  return 'openai-chat'
-}
-
-// Per-stream mutable state. Mirrors the §6.2 `ActiveStream` fields that apply
-// at the Phase 7 scope. Reasoning / tool-call reducers are in place so later
-// phases can extend without changing the lifecycle.
-interface ChatAccumulator {
-  initialContent: ContentItem[]
-  textSections: string[]
-  textLength: number
-  // Ordered list of reasoning details accumulated so far. Streaming deltas
-  // from Responses / Gemini-native lanes carry a stable synthetic id when
-  // possible, so incremental text/summary/encrypted fragments and buffered
-  // fallbacks all converge on the same row. Legacy chat-completions
-  // `reasoning_details[]` entries still go through `findMergeTargetIndex`.
-  reasoningList: ReasoningDetail[]
-  reasoningRowById: Map<string, number>
-  generationId?: string
-  model?: string
-  provider?: string
-  phase?: MessagePhase
-  finishReason?: string
-  usage?: ChatUsage
-  generatedContent: ContentItem[]
-  audioOutput?: {
-    chunks: string[]
-    transcript: string
-    format: 'wav' | 'mp3' | 'flac' | 'ogg' | 'm4a' | 'pcm16'
-  }
-  serverTools: GenerationServerToolCall[]
-  providerOutputItems: ProviderOutputItem[]
-  firstTextAt?: number
-  reasoningStartedAt?: number
-  reasoningFinishedAt?: number
-  dirtySinceLastLivePublish: boolean
-  lastLivePublishedAt: number
-  lastLivePublishedTextLen: number
-  lastLivePublishedReasoningLen: number
-  streamChunkBuffer: StreamChunkRow[]
-  nextStreamChunkSeq: number
-  pendingStreamChunkFlush?: Promise<void>
-  streamChunkFlushTimer?: ReturnType<typeof setTimeout>
-  lastStreamChunkFlushAt: number
-  bufferedStreamChunkTextLen: number
-  persistedStreamGenerationId?: string
-  persistedStreamModel?: string
-  persistedStreamProvider?: string
-  lastChunkReceivedAt: number
-  midStreamError?: ApiError
-  debugScope?: string
-}
-
-function createAccumulator(input: {
-  initialContent: ContentItem[]
-  now: number
-  debugScope?: string
-}): ChatAccumulator {
-  return {
-    initialContent: input.initialContent,
-    textSections: [],
-    textLength: 0,
-    reasoningList: [],
-    reasoningRowById: new Map(),
-    generatedContent: [],
-    serverTools: [],
-    providerOutputItems: [],
-    dirtySinceLastLivePublish: false,
-    lastLivePublishedAt: input.now,
-    lastLivePublishedTextLen: 0,
-    lastLivePublishedReasoningLen: 0,
-    streamChunkBuffer: [],
-    nextStreamChunkSeq: 0,
-    lastStreamChunkFlushAt: input.now,
-    bufferedStreamChunkTextLen: 0,
-    lastChunkReceivedAt: input.now,
-    ...(input.debugScope ? { debugScope: input.debugScope } : {}),
-  }
-}
+type ChatAccumulator = StreamAccumulator
 
 interface SendTextInput {
   chatId: ChatId
   connection: ConnectionProfile
   apiKey: string
+  apiKeyCandidates?: readonly ConnectionRuntimeKeyCandidate[]
   content: ContentItem[]
   attachmentRefs?: AttachmentRef[]
   capabilities?: CapabilityDescriptor
-  transform?: Partial<ChatCompletionsTransformOptions>
+  transform?: AssistantRequestTransform
   // Injection seam for integration tests that want to mock the stream
   // generator instead of `fetch`. The default opens a real chat-completions
   // call; tests pass a replacement iterable.
@@ -387,6 +263,13 @@ function devOnlyOpenStreamOverride(
   return openStream
 }
 
+function replaceActiveChatMessageRoute(chatId: ChatId, messageId: MessageId): void {
+  if (typeof window === 'undefined') return
+  const route = parseRoute(window.location.hash)
+  if (route.kind !== 'chat' || route.chatId !== chatId) return
+  replaceRoute(chatHref(chatId, messageId))
+}
+
 export interface SendTextResult {
   streamId: string
   userMessageId: MessageId
@@ -402,13 +285,15 @@ export interface SendTextResult {
 // id, invalid invariants) throw.
 export async function sendText(input: SendTextInput): Promise<SendTextResult> {
   const now = input.now ?? Date.now
-  const lifecycle = startRequestLifecycle({
+  const lifecycle = await startRequestLifecycle({
     chatId: input.chatId,
     streamId: newId(),
+    attemptKind: 'generation',
     ...(input.signal ? { userSignal: input.signal } : {}),
   })
   try {
-    const chat = await getChat(input.chatId)
+    await flushPendingPromptSettingSaves(input.chatId)
+    let chat: Chat | null | undefined = await getChat(input.chatId)
     if (!chat) throw new Error(`sendText: chat not found: ${input.chatId}`)
 
     const cursor = useChatStore.getState().getCursor(input.chatId) ?? {}
@@ -427,13 +312,24 @@ export async function sendText(input: SendTextInput): Promise<SendTextResult> {
       turnId: userTurnId,
       ...(skipTurnCalibration ? { skipCalibration: true } : {}),
     })
+    chat = null
     const cursorAfterUser = {
       ...cursor,
       ...userMsg.effects.cursorUpdates,
     }
-    useChatStore.getState().setCursor(input.chatId, cursorAfterUser)
+    if (Object.keys(cursorAfterUser).length > 0) {
+      useChatStore.getState().setCursor(input.chatId, cursorAfterUser)
+    }
 
-    const branchSnapshot = await loadActiveBranchHeaderSnapshot(input.chatId, cursorAfterUser)
+    let branchSnapshot: Awaited<ReturnType<typeof loadActiveBranchHeaderSnapshot>> | undefined =
+      await loadActiveBranchHeaderSnapshot(input.chatId, cursorAfterUser)
+    let planningChat: Chat | undefined = branchSnapshot.chat
+    const branchHeaders = branchSnapshot.branchHeaders
+    const expectedSummaryVersion = branchSnapshot.summaryVersion
+    const targetPathSelections = branchHeaders.map(
+      (header) => [cursorKeyOf(header.parentId), header.id] as const,
+    )
+    branchSnapshot = undefined
     const hasPrefill = (input.prefillContent?.length ?? 0) > 0
     const prefillMessageId = hasPrefill ? newId() : null
     const pendingPrefill = hasPrefill
@@ -447,18 +343,19 @@ export async function sendText(input: SendTextInput): Promise<SendTextResult> {
           turnId: userTurnId,
         })
       : null
-    const sendContext = await loadSendContextForBranch({
-      chat,
-      branchHeaders: branchSnapshot.branchHeaders,
-      ...(input.capabilities ? { capabilities: input.capabilities } : {}),
-      pendingMessages: pendingPrefill ? [pendingPrefill] : [],
-    })
-    const plannedPath = sendContext.pathMessages
+    let sendContext: Awaited<ReturnType<typeof loadSendContextForBranch>> | undefined =
+      await loadSendContextForBranch({
+        chat: planningChat,
+        branchHeaders,
+        ...(input.capabilities ? { capabilities: input.capabilities } : {}),
+        pendingMessages: pendingPrefill ? [pendingPrefill] : [],
+      })
+    let plannedPath = sendContext.pathMessages
     let requestPlan: AssistantRequestPlan
     try {
       requestPlan = (
         await prepareAssistantRequestPlan({
-          chat,
+          chat: planningChat,
           connection: input.connection,
           pathMessages: plannedPath,
           preCutAttachmentIds: sendContext.preCutAttachmentIds,
@@ -474,17 +371,28 @@ export async function sendText(input: SendTextInput): Promise<SendTextResult> {
     }
     if (lifecycle.signal.aborted) throw new DOMException('Request aborted.', 'AbortError')
 
-    return await openAssistantStreamUnder({
+    retainedRequestPlansForTests?.add(requestPlan)
+    const requested = openAssistantStreamUnder({
       ...input,
       signal: lifecycle.signal,
+      lifecycleAbort: lifecycle.abort,
+      lifecyclePreserveLease: lifecycle.preserveLease,
       streamId: lifecycle.streamId,
       parentMessageId: userMsg.messageId,
       userMessageId: userMsg.messageId,
+      expectedSummaryVersion,
+      targetPathSelections,
       ...(hasPrefill ? { initialAssistantContent: input.prefillContent ?? [] } : {}),
       requestPlan,
     })
+    retainedRequestPlansForTests?.delete(requestPlan)
+    requestPlan = undefined as never
+    plannedPath = []
+    sendContext = undefined
+    planningChat = undefined
+    return await requested
   } finally {
-    lifecycle.end(lifecycle.signal.aborted ? 'abort' : 'error')
+    await lifecycle.end(lifecycle.signal.aborted ? 'abort' : 'error')
   }
 }
 
@@ -493,15 +401,19 @@ export async function sendText(input: SendTextInput): Promise<SendTextResult> {
 // role:'user', origin:'user'); all that's left is to attach an assistant
 // placeholder under it and stream the reply. No user message is created.
 export async function sendFromMessage(input: SendFromMessageInput): Promise<SendTextResult> {
-  const lifecycle = startRequestLifecycle({
+  const lifecycle = await startRequestLifecycle({
     chatId: input.chatId,
     streamId: newId(),
+    attemptKind: 'generation',
     ...(input.signal ? { userSignal: input.signal } : {}),
   })
   try {
-    const chat = await getChat(input.chatId)
-    if (!chat) throw new Error(`sendText: chat not found: ${input.chatId}`)
-    const allHeaders = await loadMessageHeaders(input.chatId)
+    let headerSnapshot: Awaited<ReturnType<typeof loadChatHeaderSnapshot>> | undefined =
+      await loadChatHeaderSnapshot(input.chatId)
+    let chat: Chat | undefined = headerSnapshot.chat
+    const allHeaders = headerSnapshot.allHeaders
+    const expectedSummaryVersion = headerSnapshot.summaryVersion
+    headerSnapshot = undefined
     const byId = new Map(allHeaders.map((header) => [header.id, header]))
     const parent = byId.get(input.parentMessageId)
     if (!parent || parent.chatId !== input.chatId || parent.deleted) {
@@ -535,13 +447,14 @@ export async function sendFromMessage(input: SendFromMessageInput): Promise<Send
             turnId: parent.turnId,
           })
         : null
-    const sendContext = await loadSendContextForBranch({
-      chat,
-      branchHeaders: rawOutboundHeaders,
-      ...(input.capabilities ? { capabilities: input.capabilities } : {}),
-      pendingMessages: pendingPrefill ? [pendingPrefill] : [],
-    })
-    const plannedPath = sendContext.pathMessages
+    let sendContext: Awaited<ReturnType<typeof loadSendContextForBranch>> | undefined =
+      await loadSendContextForBranch({
+        chat,
+        branchHeaders: rawOutboundHeaders,
+        ...(input.capabilities ? { capabilities: input.capabilities } : {}),
+        pendingMessages: pendingPrefill ? [pendingPrefill] : [],
+      })
+    let plannedPath = sendContext.pathMessages
     let requestPlan: AssistantRequestPlan
     try {
       requestPlan = (
@@ -562,17 +475,30 @@ export async function sendFromMessage(input: SendFromMessageInput): Promise<Send
     }
     if (lifecycle.signal.aborted) throw new DOMException('Request aborted.', 'AbortError')
 
-    return await openAssistantStreamUnder({
+    retainedRequestPlansForTests?.add(requestPlan)
+    const requested = openAssistantStreamUnder({
       ...input,
       signal: lifecycle.signal,
+      lifecycleAbort: lifecycle.abort,
+      lifecyclePreserveLease: lifecycle.preserveLease,
       streamId: lifecycle.streamId,
       parentMessageId: input.parentMessageId,
       userMessageId: input.parentMessageId,
+      expectedSummaryVersion,
+      targetPathSelections: rawOutboundHeaders.map(
+        (header) => [cursorKeyOf(header.parentId), header.id] as const,
+      ),
       ...(hasPrefill ? { initialAssistantContent: input.prefillContent ?? [] } : {}),
       requestPlan,
     })
+    retainedRequestPlansForTests?.delete(requestPlan)
+    requestPlan = undefined as never
+    plannedPath = []
+    sendContext = undefined
+    chat = undefined
+    return await requested
   } finally {
-    lifecycle.end(lifecycle.signal.aborted ? 'abort' : 'error')
+    await lifecycle.end(lifecycle.signal.aborted ? 'abort' : 'error')
   }
 }
 
@@ -580,54 +506,55 @@ async function openAssistantStreamUnder(
   input: SendFromMessageInput & {
     userMessageId: MessageId
     requestPlan: AssistantRequestPlan
+    expectedSummaryVersion: number
+    targetPathSelections: ReadonlyArray<readonly [string, MessageId]>
     streamId?: string
     initialAssistantContent?: ContentItem[]
+    signal: AbortSignal
+    lifecycleAbort: () => void
+    lifecyclePreserveLease: () => void
   },
 ): Promise<SendTextResult> {
   const now = input.now ?? Date.now
-  const repo = getBrowserRepository()
-  const chat = await getChat(input.chatId)
-  if (!chat) throw new Error(`sendText: chat not found: ${input.chatId}`)
-
-  const parent = await repo.getMessage(input.parentMessageId)
-  if (!parent || parent.chatId !== input.chatId || parent.deleted) {
-    throw new Error(`sendText: parent ${input.parentMessageId} unavailable`)
-  }
-  const requestPlan = input.requestPlan
+  const repo = getWorkspaceRepository()
   const {
-    settings: requestSettings,
+    requestModel,
     useTextProtocol,
     route,
+    resolvedApiUsed,
     requestedModel,
     geminiModelId,
-    wire,
-    outboundPath,
     outboundTokenizer,
-    outboundReasoningOpts,
-    hasAttachmentContext,
-  } = requestPlan
-  const placeholderApiUsed: 'chat' | 'completion' = useTextProtocol ? 'completion' : 'chat'
-  const delivery =
-    route?.transport === 'openai-responses' && wire.stream !== true ? 'buffered' : 'streaming'
+    dispatchPlan,
+    delivery,
+    outboundRetention,
+  } = consumeAssistantRequestPlan(input)
   const initialAssistantContent = input.initialAssistantContent ?? []
   const initialStoredContent = assistantContentWithStreamPrefix(initialAssistantContent, '')
-  const hasNonTextOutbound = outboundPath.some((message) =>
-    message.content.some(isNonTextContentItem),
-  )
 
   const assistantId = newId()
-  await repo.runMutation(
+  const targetPathSelections = [
+    ...input.targetPathSelections,
+    [cursorKeyOf(input.parentMessageId), assistantId] as const,
+  ]
+  const placeholderMutation = await repo.runMutation(
     [
       { kind: 'message', messageId: assistantId },
       { kind: 'children', chatId: input.chatId, parentId: input.parentMessageId },
     ],
     async (ctx) => {
-      const siblings = await ctx.listChildren(input.chatId, input.parentMessageId)
+      const currentChat = await ctx.getChat(input.chatId)
+      assertSendContextVersion(currentChat, input.chatId, input.expectedSummaryVersion)
+      const currentParent = await ctx.getMessageHeader(input.parentMessageId)
+      if (!currentParent || currentParent.chatId !== input.chatId || currentParent.deleted) {
+        throw new Error(`sendText: parent ${input.parentMessageId} unavailable`)
+      }
+      const siblings = await ctx.listChildHeaders(input.chatId, input.parentMessageId)
       await ctx.putMessage({
         id: assistantId,
         chatId: input.chatId,
         parentId: input.parentMessageId,
-        siblingIndex: nextSiblingIndex(groupByParent(siblings), input.parentMessageId),
+        siblingIndex: nextSiblingIndexFromChildren(siblings),
         turnId: newId(),
         turnIndex: 0,
         createdAt: now(),
@@ -638,61 +565,72 @@ async function openAssistantStreamUnder(
         deleted: false,
         generation: {
           id: '',
-          model: chat.settings.model,
-          requestedModel: chat.settings.model,
-          apiUsed: placeholderApiUsed,
+          model: requestModel,
+          requestedModel,
+          apiUsed: resolvedApiUsed,
           delivery,
+          status: 'streaming',
+          integrity: 'clean',
           costSource: 'stream',
           startedAt: now(),
         },
       })
+      return { requiresCursorPin: siblings.length > 0 }
     },
   )
+  const committedVersions = placeholderMutation.chatVersions[input.chatId]
+  assertSendContextVersion(
+    committedVersions
+      ? { id: input.chatId, summaryVersion: committedVersions.summaryVersion }
+      : undefined,
+    input.chatId,
+    input.expectedSummaryVersion + 1,
+  )
 
-  useChatStore.getState().patchCursor(input.chatId, cursorKeyOf(input.parentMessageId), assistantId)
+  if (placeholderMutation.value.requiresCursorPin) {
+    useChatStore
+      .getState()
+      .patchCursor(input.chatId, cursorKeyOf(input.parentMessageId), assistantId)
+  }
+  replaceActiveChatMessageRoute(input.chatId, assistantId)
 
   const streamId = input.streamId ?? newId()
   const debugScope = `send:${streamId}`
-  const abortController = new AbortController()
-  const abortStream = () => abortController.abort()
-  const userSignal = input.signal
-  if (userSignal?.aborted) abortController.abort(userSignal.reason)
-  else
-    userSignal?.addEventListener('abort', () => abortController.abort(userSignal.reason), {
-      once: true,
+  let streamFence: Awaited<ReturnType<typeof markLifecycleTarget>>
+  try {
+    streamFence = await markLifecycleTarget({
+      chatId: input.chatId,
+      streamId,
+      messageId: assistantId,
+      abort: input.lifecycleAbort,
+      attemptKind: 'generation',
     })
+  } catch (error) {
+    const storageError = normalizeError(error, { midStream: false, cause: 'storage' })
+    await repo.runMutation([{ kind: 'message', messageId: assistantId }], async (ctx) => {
+      const current = await ctx.getMessageHeader(assistantId)
+      if (!current?.generation || current.generation.finishedAt !== undefined) return
+      await ctx.patchMessageBody(
+        assistantId,
+        {},
+        {
+          headerPatch: {
+            generation: {
+              ...current.generation,
+              status: 'error',
+              finishedAt: now(),
+              error: toPersistedAttemptFailure(storageError, 'storage'),
+            },
+          },
+        },
+      )
+    })
+    throw storageError
+  }
 
-  markLifecycleTarget({
-    chatId: input.chatId,
-    streamId,
-    messageId: assistantId,
-    abort: abortStream,
-  })
-
-  const accumulator = createAccumulator({
+  const accumulator = createStreamAccumulator({
     initialContent: initialAssistantContent,
     now: now(),
-    ...(streamDebugEnabled(input.connection) ? { debugScope } : {}),
-  })
-
-  const resolvedApiUsed: GenerationMeta['apiUsed'] = useTextProtocol
-    ? 'completion'
-    : routeApiUsed(route)
-
-  await repo.runMutation([{ kind: 'message', messageId: assistantId }], async (ctx) => {
-    const current = await ctx.getMessage(assistantId)
-    if (!current?.generation) return
-    await ctx.putMessage(
-      {
-        ...current,
-        generation: {
-          ...current.generation,
-          requestedModel,
-          apiUsed: resolvedApiUsed,
-        },
-      },
-      { touchChatSummary: false, broadcast: false },
-    )
   })
 
   if (streamDebugEnabled(input.connection)) {
@@ -705,10 +643,10 @@ async function openAssistantStreamUnder(
         kind: input.connection.kind,
         baseUrl: input.connection.baseUrl,
       },
-      chatSettingsModel: requestSettings.model,
+      chatSettingsModel: requestModel,
       useTextProtocol,
       route,
-      wireBody: wire,
+      wireBody: dispatchPlan.wire,
     })
   }
 
@@ -718,281 +656,120 @@ async function openAssistantStreamUnder(
       openAssistantRequestStream({
         connection: open.connection,
         apiKey: open.apiKey,
-        requestPlan,
+        ...(input.apiKeyCandidates ? { apiKeyCandidates: input.apiKeyCandidates } : {}),
+        onKeyCandidateSelected: (_candidate, _candidateIndex, apiKey) => {
+          selectedApiKey = apiKey
+        },
+        requestPlan: dispatchPlan,
         signal: open.signal,
       }))
 
-  let outcome: 'done' | 'error' | 'abort' = 'done'
-  let abortReason: AbortReason | undefined
-  let streamError: ApiError | undefined
-  let finalFinishReason: FinishReason | undefined
-
-  try {
-    const chunkIter = openStream({
-      connection: input.connection,
-      apiKey: input.apiKey,
-      wireBody: wire,
-      signal: abortController.signal,
-      ...(route ? { route } : {}),
-      ...(geminiModelId ? { geminiModelId } : {}),
-    })
-    for await (const event of laneStreamForRoute(route, chunkIter)) {
-      const eventNow = now()
-      accumulator.lastChunkReceivedAt = eventNow
-      applyEvent(accumulator, event, eventNow)
-      queueStreamChunk({
+  const journal = createStreamChunkWriter({
+    port: repo,
+    chatId: input.chatId,
+    streamId,
+    messageId: assistantId,
+    now: now(),
+    fence: streamFence,
+  })
+  let selectedApiKey = input.apiKey
+  let canonicalFinalized = false
+  const attempt = await runGenerationAttempt({
+    open: () => {
+      const source = openStream({
+        connection: input.connection,
+        apiKey: selectedApiKey,
+        wireBody: dispatchPlan.wire,
+        signal: input.signal,
+        ...(route ? { route } : {}),
+        ...(geminiModelId ? { geminiModelId } : {}),
+      })
+      dispatchPlan.wire = {}
+      return source
+    },
+    beforeDispatch: () => assertSendContextFresh(input.chatId, input.expectedSummaryVersion + 1),
+    ...(route?.transport !== undefined ? { transportHint: route.transport } : {}),
+    accumulator,
+    journal,
+    errorPolicy: SEND_GENERATION_ATTEMPT_ERROR_POLICY,
+    now,
+    isAborted: () => input.signal.aborted,
+    prepareLive: ({ accumulator: current, now: publishedAt }) =>
+      prepareLiveSnapshot({
+        chatId: input.chatId,
+        streamId,
+        messageId: assistantId,
+        targetPathSelections,
+        accumulator: current,
+        requestedModel,
+        apiUsed: resolvedApiUsed,
+        now: publishedAt,
+      }),
+    finalize: async (result) => {
+      const completionCalibrationBlocked =
+        streamAccumulatorHasCompletionCalibrationBlockers(accumulator)
+      const promptCalibrationBlocked =
+        outboundRetention.promptCalibrationBlocked || completionCalibrationBlocked
+      const promptCalibrationAllowed = !promptCalibrationBlocked
+      const completionCalibrationAllowed = !completionCalibrationBlocked
+      const calibrationInputs =
+        promptCalibrationAllowed || completionCalibrationAllowed
+          ? {
+              promptBasis: outboundRetention.promptBasis,
+              modelId: requestModel,
+              family: outboundTokenizer,
+              promptCalibrationAllowed,
+              completionCalibrationAllowed,
+            }
+          : undefined
+      await finalize({
         repo,
         chatId: input.chatId,
         streamId,
         messageId: assistantId,
+        streamFence,
+        connection: input.connection,
+        apiKey: selectedApiKey,
+        signal: input.signal,
         accumulator,
-        event,
-        now: eventNow,
+        requestedModel,
+        apiUsed: resolvedApiUsed,
+        outcome: result.outcome,
+        ...(result.abortReason ? { abortReason: result.abortReason } : {}),
+        ...(result.error ? { error: result.error } : {}),
+        now: now(),
+        ...(calibrationInputs ? { calibrationInputs } : {}),
+        ...(streamDebugEnabled(input.connection) ? { debugScope } : {}),
       })
-      if (event.lane === 'error') {
-        outcome = 'error'
-        streamError = event.error
-        break
-      }
-      const afterEventNow = now()
-      if (shouldPublishLive(accumulator, afterEventNow)) {
-        publishLiveSnapshot({
-          chatId: input.chatId,
-          streamId,
-          messageId: assistantId,
-          accumulator,
-          requestedModel,
-          apiUsed: resolvedApiUsed,
-          now: afterEventNow,
-        })
-      }
-      flushStreamChunksSoon(repo, accumulator, afterEventNow)
-    }
-  } catch (err) {
-    if (abortController.signal.aborted || userSignal?.aborted) {
-      outcome = 'abort'
-      abortReason = 'user'
-    } else if (err instanceof ApiError && err.kind === 'network') {
-      // Network drop: the fetch never reached completion. Treat as an abort
-      // with a 'network' reason so the UI can surface a Continue affordance
-      // (plan/13-delivery.md Phase 7 e2e row: network drop mid-stream).
-      outcome = 'abort'
-      abortReason = 'network'
-    } else {
-      outcome = 'error'
-      streamError = err instanceof ApiError ? err : undefined
-    }
-  } finally {
-    const commitFinalState = async () => {
-      let finalized = false
-      try {
-        await settlePendingStreamChunkFlush(accumulator)
-        await finalize({
-          repo,
-          chatId: input.chatId,
-          streamId,
-          messageId: assistantId,
-          connection: input.connection,
-          apiKey: input.apiKey,
-          accumulator,
-          requestedModel,
-          apiUsed: resolvedApiUsed,
-          outcome,
-          ...(abortReason ? { abortReason } : {}),
-          ...(streamError ? { error: streamError } : {}),
-          now: now(),
-          ...(() => {
-            const completionCalibrationBlocked =
-              accumulatorHasCompletionCalibrationBlockers(accumulator)
-            const promptCalibrationBlocked =
-              hasAttachmentContext ||
-              hasNonTextOutbound ||
-              requestHasTools(wire) ||
-              pathHasToolArtifacts(outboundPath) ||
-              completionCalibrationBlocked
-            const promptCalibrationAllowed = !promptCalibrationBlocked
-            const completionCalibrationAllowed = !completionCalibrationBlocked
-            return promptCalibrationAllowed || completionCalibrationAllowed
-              ? {
-                  calibrationInputs: {
-                    outboundPath,
-                    systemPrompt: requestSettings.systemPrompt,
-                    modelId: requestSettings.model,
-                    family: outboundTokenizer,
-                    promptCalibrationAllowed,
-                    completionCalibrationAllowed,
-                    ...(outboundReasoningOpts ? { reasoningOpts: outboundReasoningOpts } : {}),
-                  },
-                }
-              : {}
-          })(),
-        })
-        finalized = true
-        await repo.deleteStreamChunks(streamId).catch(() => {})
-      } catch (err) {
-        if (!finalized) await flushStreamChunks(repo, accumulator).catch(() => {})
-        throw err
-      }
-    }
-    try {
-      await commitFinalState()
-    } finally {
-      finalFinishReason = accumulator.finishReason as FinishReason | undefined
-      releaseAccumulatorBuffers(accumulator)
+      canonicalFinalized = true
+    },
+    cleanupJournal: () => repo.deleteStreamChunks(streamId, streamFence),
+    cleanup: (result) => {
+      if (result.journalCleanupPending) input.lifecyclePreserveLease()
       useStreamStore.getState().clearActive(streamId)
-      useStreamStore.getState().clearLiveSnapshot(assistantId)
+      clearLiveSnapshotIfPresent(assistantId)
       postEvent({
         kind: 'stream-ended',
         chatId: input.chatId,
         streamId,
         messageId: assistantId,
-        outcome,
+        outcome: result.outcome,
       })
-    }
-  }
+    },
+  }).catch((err) => {
+    if (!canonicalFinalized) input.lifecyclePreserveLease()
+    throw err
+  })
 
   const result: SendTextResult = {
     streamId,
     userMessageId: input.userMessageId,
     assistantMessageId: assistantId,
-    outcome,
+    outcome: attempt.outcome,
   }
-  if (finalFinishReason) {
-    result.finishReason = finalFinishReason
-  }
-  if (streamError) result.error = streamError
+  if (attempt.finishReason) result.finishReason = attempt.finishReason as FinishReason
+  if (attempt.error) result.error = attempt.error
   return result
-}
-
-function applyEvent(acc: ChatAccumulator, event: StreamLaneEvent, nowMs: number): void {
-  switch (event.lane) {
-    case 'text':
-      if (acc.firstTextAt === undefined) acc.firstTextAt = nowMs
-      appendStreamText(acc, event.text)
-      acc.dirtySinceLastLivePublish = true
-      return
-    case 'reasoning': {
-      // Phase-7 reasoning reducer preserves whatever structure the provider
-      // emitted. Responses / Gemini-native deltas carry stable synthetic ids
-      // when possible so repeated flushes, mirrored buffered fallbacks, and
-      // incremental deltas all hit the same row instead of each surface
-      // inventing its own merge rule.
-      if (acc.reasoningStartedAt === undefined) acc.reasoningStartedAt = nowMs
-      acc.reasoningFinishedAt = nowMs
-      const outputIndex = event.outputIndex ?? 0
-      if (Array.isArray(event.details)) {
-        for (const raw of event.details) {
-          if (!raw || typeof raw !== 'object') continue
-          const detail = normalizeIncomingReasoningDetail(
-            raw as ReasoningDetail & { index?: number },
-          )
-          if (detail.id?.startsWith('tool_')) continue
-          putReasoningDetail(acc, detail)
-          acc.dirtySinceLastLivePublish = true
-        }
-      }
-      if (event.textDelta !== undefined) {
-        const id = syntheticReasoningDetailId('reasoning.text', event)
-        putReasoningDetail(acc, {
-          type: 'reasoning.text',
-          ...(id ? { id } : {}),
-          index: outputIndex,
-          text: event.textDelta,
-        })
-        acc.dirtySinceLastLivePublish = true
-      }
-      if (event.summaryDelta !== undefined) {
-        const id = syntheticReasoningDetailId('reasoning.summary', event)
-        putReasoningDetail(acc, {
-          type: 'reasoning.summary',
-          ...(id ? { id } : {}),
-          index: outputIndex,
-          summary: event.summaryDelta,
-        })
-        acc.dirtySinceLastLivePublish = true
-      }
-      if (event.encryptedDelta !== undefined) {
-        const id = syntheticReasoningDetailId('reasoning.encrypted', event)
-        putReasoningDetail(acc, {
-          type: 'reasoning.encrypted',
-          ...(id ? { id } : {}),
-          index: outputIndex,
-          data: event.encryptedDelta,
-        })
-        acc.dirtySinceLastLivePublish = true
-      }
-      if (acc.debugScope) {
-        logStreamDebug(acc.debugScope, 'reasoning.apply', {
-          event,
-          reasoningList: acc.reasoningList,
-        })
-      }
-      return
-    }
-    case 'usage':
-      acc.usage = event.usage as ChatUsage
-      return
-    case 'finish':
-      acc.finishReason = event.finishReason
-      return
-    case 'meta':
-      if (event.generationId) acc.generationId = event.generationId
-      if (event.model) acc.model = event.model
-      if (event.provider) acc.provider = event.provider
-      return
-    case 'content-item':
-      acc.generatedContent.push(structuredClone(event.item))
-      acc.dirtySinceLastLivePublish = true
-      return
-    case 'audio-output':
-      if (!acc.audioOutput) {
-        acc.audioOutput = { chunks: [], transcript: '', format: event.format ?? 'pcm16' }
-      }
-      if (event.format) acc.audioOutput.format = event.format
-      if (event.dataDelta) acc.audioOutput.chunks.push(event.dataDelta)
-      if (event.transcriptDelta) acc.audioOutput.transcript += event.transcriptDelta
-      acc.dirtySinceLastLivePublish = true
-      return
-    case 'server-tool':
-      recordServerToolStatus(acc, event)
-      return
-    case 'server-tool-output':
-      upsertServerTool(acc.serverTools, {
-        type: event.itemType,
-        source: 'provider-output',
-        id: event.itemId,
-        ...(event.status ? { status: event.status } : {}),
-        outputIndex: event.outputIndex,
-        output: structuredClone(event.output),
-      })
-      recordProviderOutputItem(acc, event.itemType, event.output, event.outputIndex)
-      return
-    case 'output-item-added':
-      recordServerToolOutputItem(acc, event.item, event.outputIndex, 'stream-status')
-      return
-    case 'output-item-done':
-      recordServerToolOutputItem(acc, event.item, event.outputIndex, 'responses-output')
-      recordResponsesOutputItem(acc, event.item, event.outputIndex)
-      return
-    case 'phase':
-      if (event.phase === null) delete acc.phase
-      else acc.phase = event.phase
-      return
-    case 'error':
-      acc.midStreamError = event.error
-      return
-    case 'buffered':
-      // `splitChatStream` re-emits buffered payloads as text/finish/usage so
-      // the main reducer doesn't need a branch; the buffered event itself is
-      // informational only at Phase 7.
-      return
-    case 'keepalive':
-    case 'tool-call':
-      // Phase 7: keepalive feeds hang detection (not persisted) and
-      // tool-calls aren't supported yet. Both are accepted so later phases
-      // just add branches here.
-      return
-  }
 }
 
 const HOSTED_SERVER_TOOL_ITEM_TYPES = new Set<string>([
@@ -1027,6 +804,71 @@ function requestHasTools(wire: unknown): boolean {
   return Array.isArray(tools) && tools.length > 0
 }
 
+function consumeOutboundPath(requestPlan: AssistantRequestPlan): {
+  promptBasis: PromptCalibrationBasis | null
+  promptCalibrationBlocked: boolean
+} {
+  const outboundPath = requestPlan.outboundPath
+  const hasNonTextOutbound = outboundPath.some((message) =>
+    message.content.some(isNonTextContentItem),
+  )
+  const promptBasis = derivePromptCalibrationBasis({
+    sentPath: outboundPath,
+    systemPrompt: requestPlan.settings.systemPrompt,
+    family: requestPlan.outboundTokenizer,
+    mediaTokens: requestPlan.hasAttachmentContext ? 1 : 0,
+    reasoningEchoOpts: requestPlan.outboundReasoningOpts,
+  })
+  const promptCalibrationBlocked =
+    requestPlan.hasAttachmentContext ||
+    hasNonTextOutbound ||
+    requestHasTools(requestPlan.wire) ||
+    pathHasToolArtifacts(outboundPath)
+  requestPlan.outboundPath = []
+  return { promptBasis, promptCalibrationBlocked }
+}
+
+function consumeAssistantRequestPlan(input: { requestPlan: AssistantRequestPlan }): {
+  requestModel: string
+  useTextProtocol: boolean
+  route: AssistantRequestPlan['route']
+  resolvedApiUsed: AssistantRequestPlan['apiUsed']
+  requestedModel: string
+  geminiModelId: string | undefined
+  outboundTokenizer: TokenizerFamily
+  dispatchPlan: AssistantDispatchPlan
+  delivery: 'buffered' | 'streaming'
+  outboundRetention: ReturnType<typeof consumeOutboundPath>
+} {
+  const requestPlan = input.requestPlan
+  input.requestPlan = undefined as never
+  const dispatchPlan: AssistantDispatchPlan = {
+    useTextProtocol: requestPlan.useTextProtocol,
+    route: requestPlan.route,
+    requestedModel: requestPlan.requestedModel,
+    wire: requestPlan.wire,
+    ...(requestPlan.geminiModelId ? { geminiModelId: requestPlan.geminiModelId } : {}),
+  }
+  const delivery =
+    requestPlan.route?.transport === 'openai-responses' && dispatchPlan.wire.stream !== true
+      ? 'buffered'
+      : 'streaming'
+  const outboundRetention = consumeOutboundPath(requestPlan)
+  requestPlan.wire = {}
+  return {
+    requestModel: requestPlan.settings.model,
+    useTextProtocol: requestPlan.useTextProtocol,
+    route: requestPlan.route,
+    resolvedApiUsed: requestPlan.apiUsed,
+    requestedModel: requestPlan.requestedModel,
+    geminiModelId: requestPlan.geminiModelId,
+    outboundTokenizer: requestPlan.outboundTokenizer,
+    dispatchPlan,
+    delivery,
+    outboundRetention,
+  }
+}
+
 function settingsMayRequestTools(connection: ConnectionProfile, settings: ChatSettings): boolean {
   if (settings.enabledToolIds.length > 0) return true
   if (connection.kind === 'openrouter') return hasEnabledHostedTools(settings, 'openrouter')
@@ -1057,452 +899,57 @@ function pathHasToolArtifacts(path: readonly Message[]): boolean {
   return path.some(messageHasToolArtifacts)
 }
 
-function hasServerToolUsage(usage: ChatUsage | undefined): boolean {
-  if (!usage?.server_tool_use || typeof usage.server_tool_use !== 'object') return false
-  return Object.values(usage.server_tool_use).some(
-    (value) => typeof value === 'number' && Number.isFinite(value) && value > 0,
-  )
-}
-
-function accumulatorHasCompletionCalibrationBlockers(acc: ChatAccumulator): boolean {
-  return (
-    acc.finishReason === 'tool_calls' ||
-    acc.generatedContent.some(isNonTextContentItem) ||
-    hasAudioOutput(acc) ||
-    acc.serverTools.length > 0 ||
-    hasServerToolUsage(acc.usage) ||
-    acc.providerOutputItems.some(providerOutputItemHasToolArtifact)
-  )
-}
-
-function recordServerToolStatus(
-  acc: ChatAccumulator,
-  event: Extract<StreamLaneEvent, { lane: 'server-tool' }>,
-): void {
-  upsertServerTool(acc.serverTools, {
-    type: event.itemType,
-    source: 'stream-status',
-    id: event.itemId,
-    status: event.status,
-    outputIndex: event.outputIndex,
-    ...(event.partialImageB64 ? { output: { partialImageB64: event.partialImageB64 } } : {}),
-  })
-}
-
-function recordServerToolOutputItem(
-  acc: ChatAccumulator,
-  item: unknown,
-  outputIndex: number,
-  fallbackSource: GenerationServerToolCall['source'],
-): void {
-  if (!item || typeof item !== 'object') return
-  const record = item as { type?: unknown; id?: unknown; status?: unknown }
-  if (typeof record.type !== 'string' || !HOSTED_SERVER_TOOL_ITEM_TYPES.has(record.type)) return
-  upsertServerTool(acc.serverTools, {
-    type: record.type,
-    source: fallbackSource,
-    ...(typeof record.id === 'string' ? { id: record.id } : {}),
-    ...(typeof record.status === 'string' ? { status: record.status } : {}),
-    outputIndex,
-    output: structuredClone(item),
-  })
-}
-
-function recordResponsesOutputItem(acc: ChatAccumulator, item: unknown, outputIndex: number): void {
-  const providerItem = providerOutputItemFromResponsesItem(item, outputIndex)
-  if (!providerItem) return
-  upsertProviderOutputItem(acc.providerOutputItems, providerItem)
-}
-
-function recordProviderOutputItem(
-  acc: ChatAccumulator,
-  type: string,
-  output: unknown,
-  outputIndex: number,
-): void {
-  const providerItem = type.startsWith('google:')
-    ? providerOutputItemFromGeminiPart(type, output, outputIndex)
-    : type === 'server_tool_use' || type.endsWith('_tool_result')
-      ? providerOutputItemFromResponsesItem(output, outputIndex)
-      : null
-  if (!providerItem) return
-  upsertProviderOutputItem(acc.providerOutputItems, providerItem)
-}
-
-function serverToolRecordsFromUsage(usage: ChatUsage | undefined): GenerationServerToolCall[] {
-  const raw = usage?.server_tool_use
-  if (!raw || typeof raw !== 'object') return []
-  const records: GenerationServerToolCall[] = []
-  for (const [key, value] of Object.entries(raw)) {
-    if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) continue
-    records.push({
-      type: serverToolUsageKeyToType(key),
-      source: 'usage',
-      status: 'completed',
-      requestCount: value,
-      output: { [key]: value },
-    })
-  }
-  return records
-}
-
-function serverToolUsageKeyToType(key: string): string {
-  if (key === 'web_search_requests') return 'openrouter:web_search'
-  if (key === 'web_fetch_requests') return 'openrouter:web_fetch'
-  if (key === 'datetime_requests') return 'openrouter:datetime'
-  return key
-}
-
-function mergeServerToolRecords(
-  records: readonly GenerationServerToolCall[],
-): GenerationServerToolCall[] {
-  const merged: GenerationServerToolCall[] = []
-  for (const record of records) upsertServerTool(merged, record)
-  return merged
-}
-
-function upsertServerTool(
-  records: GenerationServerToolCall[],
-  incoming: GenerationServerToolCall,
-): void {
-  const key = serverToolRecordKey(incoming)
-  const index = records.findIndex((record) => serverToolRecordKey(record) === key)
-  if (index < 0) {
-    records.push(structuredClone(incoming))
-    return
-  }
-  const existing = records[index]
-  if (!existing) return
-  records[index] = {
-    ...existing,
-    ...structuredClone(incoming),
-    source:
-      incoming.source === 'responses-output' || existing.source !== 'responses-output'
-        ? incoming.source
-        : existing.source,
-  }
-}
-
-function upsertProviderOutputItem(
-  records: ProviderOutputItem[],
-  incoming: ProviderOutputItem,
-): void {
-  const key = providerOutputItemKey(incoming)
-  const index = records.findIndex((record) => providerOutputItemKey(record) === key)
-  if (index < 0) {
-    records.push(structuredClone(incoming))
-    return
-  }
-  records[index] = structuredClone(incoming)
-}
-
-function providerOutputItemKey(record: ProviderOutputItem): string {
-  const item = record.item as {
-    id?: unknown
-    call_id?: unknown
-    executableCode?: { id?: unknown }
-    codeExecutionResult?: { id?: unknown }
-  }
-  if (typeof item?.id === 'string') return `id:${item.id}`
-  if (typeof item?.call_id === 'string') return `call:${record.type}:${item.call_id}`
-  if (typeof item?.executableCode?.id === 'string') {
-    return `gemini-code:${item.executableCode.id}:exec`
-  }
-  if (typeof item?.codeExecutionResult?.id === 'string') {
-    return `gemini-code:${item.codeExecutionResult.id}:result`
-  }
-  if (record.outputIndex !== undefined) {
-    return `idx:${record.outputIndex}:${record.type}:${Object.keys(item ?? {}).join(',')}`
-  }
-  return `${record.dialect}:${record.type}:${JSON.stringify(record.item).slice(0, 128)}`
-}
-
-function serverToolRecordKey(record: GenerationServerToolCall): string {
-  if (record.id) return `id:${record.id}:${record.type}`
-  if (record.outputIndex !== undefined) return `idx:${record.outputIndex}:${record.type}`
-  return `usage:${record.type}`
-}
-
-function appendStreamText(acc: ChatAccumulator, text: string): void {
-  if (text.length === 0) return
-  appendTextToSections(acc.textSections, text)
-  acc.textLength += text.length
-}
-
-function appendTextToSections(sections: string[], text: string): void {
-  let offset = 0
-  while (offset < text.length) {
-    const lastIndex = sections.length - 1
-    const last = lastIndex >= 0 ? (sections[lastIndex] ?? '') : ''
-    const room = STREAM_LIVE_TEXT_SECTION_CHARS - last.length
-    if (room <= 0) {
-      sections.push('')
-      continue
-    }
-    const nextOffset = Math.min(text.length, offset + room)
-    const part = text.slice(offset, nextOffset)
-    if (lastIndex >= 0) sections[lastIndex] = `${last}${part}`
-    else sections.push(part)
-    offset = nextOffset
-  }
-}
-
-function streamTextSnapshot(acc: ChatAccumulator): string {
-  return acc.textSections.join('')
-}
-
-function releaseAccumulatorBuffers(acc: ChatAccumulator): void {
-  acc.initialContent = []
-  acc.textSections = []
-  acc.textLength = 0
-  acc.reasoningList = []
-  acc.reasoningRowById.clear()
-  acc.generatedContent = []
-  acc.serverTools = []
-  acc.providerOutputItems = []
-  acc.streamChunkBuffer = []
-  if (acc.streamChunkFlushTimer) {
-    clearTimeout(acc.streamChunkFlushTimer)
-    delete acc.streamChunkFlushTimer
-  }
-  delete acc.audioOutput
-}
-
-function shouldPublishLive(acc: ChatAccumulator, nowMs: number): boolean {
-  if (!acc.dirtySinceLastLivePublish) return false
-  if (nowMs - acc.lastLivePublishedAt >= STREAM_LIVE_UPDATE_INTERVAL_MS) return true
-  if (acc.textLength - acc.lastLivePublishedTextLen >= STREAM_LIVE_TEXT_GROWTH_CHARS) {
-    return true
-  }
-  const reasoningLen = reasoningTextLength(acc.reasoningList)
-  if (reasoningLen - acc.lastLivePublishedReasoningLen >= STREAM_LIVE_TEXT_GROWTH_CHARS) {
-    return true
-  }
-  return false
-}
-
-function reasoningTextLength(details: readonly ReasoningDetail[]): number {
-  let total = 0
-  for (const detail of details) {
-    if (detail.type === 'reasoning.text') total += detail.text?.length ?? 0
-    else if (detail.type === 'reasoning.summary') total += detail.summary?.length ?? 0
-    else if (detail.type === 'reasoning.encrypted') total += detail.data?.length ?? 0
-  }
-  return total
-}
-
-function publishLiveSnapshot(ctx: {
+function prepareLiveSnapshot(ctx: {
   chatId: ChatId
   streamId: string
   messageId: MessageId
+  targetPathSelections: ReadonlyArray<readonly [string, MessageId]>
   accumulator: ChatAccumulator
   requestedModel: string
   apiUsed: GenerationMeta['apiUsed']
   now: number
-}): void {
-  const { accumulator } = ctx
-  const reasoning = collectReasoning(accumulator)
-  const content = assistantContentWithStreamSections(
-    accumulator.initialContent,
-    accumulator.textSections,
-    streamPreviewGeneratedContent(accumulator.generatedContent),
-  )
-  useStreamStore.getState().setLiveSnapshot({
-    streamId: ctx.streamId,
-    chatId: ctx.chatId,
-    messageId: ctx.messageId,
-    content,
-    ...(reasoning.length > 0 ? { reasoningDetails: reasoning } : {}),
-    generation: updatedGeneration(undefined, accumulator, ctx.requestedModel, {
-      apiUsed: ctx.apiUsed,
-    }),
-    textLength: accumulator.textLength,
-    reasoningLength: reasoningTextLength(reasoning),
-    updatedAt: ctx.now,
-  })
-  accumulator.lastLivePublishedAt = ctx.now
-  accumulator.lastLivePublishedTextLen = accumulator.textLength
-  accumulator.lastLivePublishedReasoningLen = reasoningTextLength(reasoning)
-  accumulator.dirtySinceLastLivePublish = false
-}
-
-function queueStreamChunk(ctx: {
-  repo: ReturnType<typeof getBrowserRepository>
-  chatId: ChatId
-  streamId: string
-  messageId: MessageId
-  accumulator: ChatAccumulator
-  event: StreamLaneEvent
-  now: number
-}): void {
-  if (!shouldPersistStreamEvent(ctx.event)) return
-  const event = serializeStreamEvent(ctx.event, ctx.accumulator)
-  if (!event) return
-  ctx.accumulator.streamChunkBuffer.push({
-    id: `${ctx.streamId}:${ctx.accumulator.nextStreamChunkSeq}`,
-    streamId: ctx.streamId,
-    chatId: ctx.chatId,
-    messageId: ctx.messageId,
-    seq: ctx.accumulator.nextStreamChunkSeq,
-    createdAt: ctx.now,
-    event,
-  })
-  ctx.accumulator.nextStreamChunkSeq += 1
-  ctx.accumulator.bufferedStreamChunkTextLen += streamEventTextLength(event)
-}
-
-function shouldPersistStreamEvent(event: StreamLaneEvent): boolean {
-  switch (event.lane) {
-    case 'text':
-    case 'reasoning':
-    case 'usage':
-    case 'finish':
-    case 'meta':
-    case 'content-item':
-    case 'audio-output':
-    case 'server-tool':
-    case 'server-tool-output':
-    case 'output-item-added':
-    case 'output-item-done':
-    case 'error':
-      return true
-    case 'buffered':
-    case 'keepalive':
-    case 'phase':
-      return true
-    case 'tool-call':
-      return false
+}): (() => void) | undefined {
+  if (useUiStore.getState().activeChatId !== ctx.chatId) {
+    clearLiveSnapshotIfPresent(ctx.messageId)
+    return undefined
   }
-}
-
-function serializeStreamEvent(
-  event: StreamLaneEvent,
-  acc: ChatAccumulator,
-): StreamLaneEvent | null {
-  if (event.lane === 'meta') {
-    const meta: StreamLaneEvent & { lane: 'meta' } = { lane: 'meta' }
-    let dirty = false
-    if (event.generationId !== undefined && acc.persistedStreamGenerationId === undefined) {
-      meta.generationId = event.generationId
-      acc.persistedStreamGenerationId = event.generationId
-      dirty = true
-    }
-    if (event.model !== undefined && event.model !== acc.persistedStreamModel) {
-      meta.model = event.model
-      acc.persistedStreamModel = event.model
-      dirty = true
-    }
-    if (event.provider !== undefined && event.provider !== acc.persistedStreamProvider) {
-      meta.provider = event.provider
-      acc.persistedStreamProvider = event.provider
-      dirty = true
-    }
-    return dirty ? meta : null
-  }
-  if (event.lane === 'output-item-added' || event.lane === 'output-item-done') {
-    if (!isRecoverableOutputItem(event.item)) return null
-  }
-  if (event.lane === 'error') {
-    return {
-      lane: 'error',
-      error: {
-        ...event.error,
-        message: event.error.message,
-      },
-    }
-  }
-  return structuredClone(event)
-}
-
-function isRecoverableOutputItem(item: unknown): boolean {
-  if (!item || typeof item !== 'object') return false
-  const type = (item as { type?: unknown }).type
-  return typeof type === 'string' && HOSTED_SERVER_TOOL_ITEM_TYPES.has(type)
-}
-
-function streamEventTextLength(event: StreamLaneEvent): number {
-  if (event.lane === 'text') return event.text.length
-  if (event.lane === 'reasoning') {
-    return (
-      (event.textDelta?.length ?? 0) +
-      (event.summaryDelta?.length ?? 0) +
-      (event.encryptedDelta?.length ?? 0)
+  const preparedCursor = useChatStore.getState().getCursor(ctx.chatId) ?? {}
+  if (
+    ctx.targetPathSelections.some(
+      ([key, selectedMessageId]) =>
+        preparedCursor[key] !== undefined && preparedCursor[key] !== selectedMessageId,
     )
+  ) {
+    clearLiveSnapshotIfPresent(ctx.messageId)
+    return undefined
   }
-  if (event.lane === 'audio-output') {
-    return (event.dataDelta?.length ?? 0) + (event.transcriptDelta?.length ?? 0)
-  }
-  return 0
-}
-
-function flushStreamChunksSoon(
-  repo: ReturnType<typeof getBrowserRepository>,
-  acc: ChatAccumulator,
-  nowMs: number,
-): void {
-  if (acc.streamChunkBuffer.length === 0 || acc.pendingStreamChunkFlush) return
-  const dueIn = Math.max(0, STREAM_CHUNK_FLUSH_INTERVAL_MS - (nowMs - acc.lastStreamChunkFlushAt))
-  const dueNow =
-    acc.streamChunkBuffer.length >= STREAM_CHUNK_FLUSH_MAX_ROWS ||
-    acc.bufferedStreamChunkTextLen >= STREAM_CHUNK_FLUSH_MAX_TEXT_CHARS ||
-    dueIn === 0
-  if (!dueNow) {
-    if (!acc.streamChunkFlushTimer) {
-      acc.streamChunkFlushTimer = setTimeout(() => {
-        delete acc.streamChunkFlushTimer
-        void flushStreamChunks(repo, acc).catch(() => {})
-      }, dueIn)
+  const projection = projectStreamAccumulatorLive(ctx.accumulator, {
+    requestedModel: ctx.requestedModel,
+    apiUsed: ctx.apiUsed,
+    now: ctx.now,
+  })
+  return () => {
+    if (useUiStore.getState().activeChatId !== ctx.chatId) {
+      clearLiveSnapshotIfPresent(ctx.messageId)
+      return
     }
-    return
-  }
-  void flushStreamChunks(repo, acc).catch(() => {})
-}
-
-async function settlePendingStreamChunkFlush(acc: ChatAccumulator): Promise<void> {
-  if (acc.streamChunkFlushTimer) {
-    clearTimeout(acc.streamChunkFlushTimer)
-    delete acc.streamChunkFlushTimer
-  }
-  if (acc.pendingStreamChunkFlush) await acc.pendingStreamChunkFlush.catch(() => {})
-}
-
-async function flushStreamChunks(
-  repo: ReturnType<typeof getBrowserRepository>,
-  acc: ChatAccumulator,
-): Promise<void> {
-  if (acc.streamChunkFlushTimer) {
-    clearTimeout(acc.streamChunkFlushTimer)
-    delete acc.streamChunkFlushTimer
-  }
-  if (acc.pendingStreamChunkFlush) {
-    await acc.pendingStreamChunkFlush
-    return
-  }
-  if (acc.streamChunkBuffer.length === 0) return
-  const batch = acc.streamChunkBuffer
-  acc.streamChunkBuffer = []
-  acc.bufferedStreamChunkTextLen = 0
-  const flush: Promise<void> = repo
-    .appendStreamChunks(batch)
-    .catch((err) => {
-      acc.streamChunkBuffer = [...batch, ...acc.streamChunkBuffer]
-      acc.bufferedStreamChunkTextLen += batch.reduce(
-        (sum, row) => sum + streamEventTextLength(row.event as StreamLaneEvent),
-        0,
+    const cursor = useChatStore.getState().getCursor(ctx.chatId) ?? {}
+    if (
+      ctx.targetPathSelections.some(
+        ([key, selectedMessageId]) =>
+          cursor[key] !== undefined && cursor[key] !== selectedMessageId,
       )
-      throw err
+    ) {
+      clearLiveSnapshotIfPresent(ctx.messageId)
+      return
+    }
+    useStreamStore.getState().setLiveSnapshot({
+      streamId: ctx.streamId,
+      chatId: ctx.chatId,
+      messageId: ctx.messageId,
+      ...projection,
     })
-    .finally(() => {
-      if (acc.pendingStreamChunkFlush === flush) {
-        delete acc.pendingStreamChunkFlush
-        acc.lastStreamChunkFlushAt = acc.lastChunkReceivedAt
-        if (acc.streamChunkBuffer.length > 0) {
-          flushStreamChunksSoon(repo, acc, acc.lastStreamChunkFlushAt)
-        }
-      }
-    })
-  acc.pendingStreamChunkFlush = flush
-  await flush
+  }
 }
 
 function assistantContentWithStreamPrefix(
@@ -1528,128 +975,8 @@ function assistantContentWithStreamPrefix(
   ]
 }
 
-function assistantContentWithStreamSections(
-  initialContent: readonly ContentItem[],
-  streamedSections: readonly string[],
-  generatedContent: readonly ContentItem[] = [],
-): ContentItem[] {
-  const prefix = initialContent
-    .filter(
-      (item): item is Extract<ContentItem, { type: 'text' | 'output_text' }> =>
-        item.type === 'text' || item.type === 'output_text',
-    )
-    .map((item) => item.text)
-    .join('')
-  const nonText = initialContent.filter(
-    (item) => item.type !== 'text' && item.type !== 'output_text',
-  )
-  const textItems: ContentItem[] = []
-  if (prefix.length > 0) {
-    const first = streamedSections[0]
-    if (first !== undefined) {
-      textItems.push({ type: 'output_text', text: `${prefix}${first}` })
-      for (let i = 1; i < streamedSections.length; i += 1) {
-        const section = streamedSections[i]
-        if (section) textItems.push({ type: 'output_text', text: section })
-      }
-    } else {
-      textItems.push({ type: 'output_text', text: prefix })
-    }
-  } else {
-    for (const section of streamedSections) {
-      if (section.length > 0) textItems.push({ type: 'output_text', text: section })
-    }
-  }
-  if (textItems.length === 0) textItems.push({ type: 'output_text', text: '' })
-  return [...textItems, ...structuredClone(nonText), ...structuredClone(generatedContent)]
-}
-
-function streamPreviewGeneratedContent(generatedContent: readonly ContentItem[]): ContentItem[] {
-  return generatedContent.filter(
-    (item) => item.type !== 'audio_output' && item.type !== 'output_video',
-  )
-}
-
-function hasAudioOutput(acc: ChatAccumulator): boolean {
-  return Boolean(
-    acc.audioOutput && (acc.audioOutput.chunks.length > 0 || acc.audioOutput.transcript.length > 0),
-  )
-}
-
-function audioOutputContent(acc: ChatAccumulator): ContentItem[] {
-  if (!hasAudioOutput(acc) || !acc.audioOutput) return []
-  const format = acc.audioOutput.format
-  const joined = acc.audioOutput.chunks.join('')
-  const item: ContentItem = {
-    type: 'audio_output',
-    format,
-    ...(acc.audioOutput.transcript.length > 0 ? { transcript: acc.audioOutput.transcript } : {}),
-  }
-  if (joined.length > 0) {
-    item.url =
-      format === 'pcm16'
-        ? pcm16DataUrlToWav(joined, { sampleRate: 24_000, channels: 1 })
-        : `data:audio/${format};base64,${joined}`
-  }
-  return [item]
-}
-
-function pcm16DataUrlToWav(
-  base64Pcm: string,
-  opts: { sampleRate: number; channels: number },
-): string {
-  const pcm = decodeBase64Bytes(base64Pcm)
-  const header = wavHeader(pcm.byteLength, opts.sampleRate, opts.channels)
-  const bytes = new Uint8Array(header.byteLength + pcm.byteLength)
-  bytes.set(header, 0)
-  bytes.set(pcm, header.byteLength)
-  return `data:audio/wav;base64,${encodeBase64Bytes(bytes)}`
-}
-
-function decodeBase64Bytes(value: string): Uint8Array {
-  const normalized = value.replace(/\s+/gu, '').replace(/-/gu, '+').replace(/_/gu, '/')
-  const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, '=')
-  const binary = atob(padded)
-  const out = new Uint8Array(binary.length)
-  for (let i = 0; i < binary.length; i += 1) out[i] = binary.charCodeAt(i)
-  return out
-}
-
-function encodeBase64Bytes(bytes: Uint8Array): string {
-  let binary = ''
-  const chunkSize = 0x8000
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize))
-  }
-  return btoa(binary)
-}
-
-function wavHeader(dataBytes: number, sampleRate: number, channels: number): Uint8Array {
-  const bytesPerSample = 2
-  const header = new ArrayBuffer(44)
-  const view = new DataView(header)
-  writeAscii(view, 0, 'RIFF')
-  view.setUint32(4, 36 + dataBytes, true)
-  writeAscii(view, 8, 'WAVE')
-  writeAscii(view, 12, 'fmt ')
-  view.setUint32(16, 16, true)
-  view.setUint16(20, 1, true)
-  view.setUint16(22, channels, true)
-  view.setUint32(24, sampleRate, true)
-  view.setUint32(28, sampleRate * channels * bytesPerSample, true)
-  view.setUint16(32, channels * bytesPerSample, true)
-  view.setUint16(34, bytesPerSample * 8, true)
-  writeAscii(view, 36, 'data')
-  view.setUint32(40, dataBytes, true)
-  return new Uint8Array(header)
-}
-
-function writeAscii(view: DataView, offset: number, value: string): void {
-  for (let i = 0; i < value.length; i += 1) view.setUint8(offset + i, value.charCodeAt(i))
-}
-
 interface FlushContext {
-  repo: ReturnType<typeof getBrowserRepository>
+  repo: ReturnType<typeof getWorkspaceRepository>
   chatId: ChatId
   streamId: string
   messageId: MessageId
@@ -1659,36 +986,38 @@ interface FlushContext {
 }
 
 interface FinalizeContext extends FlushContext {
+  streamFence: StreamWriteFence
   connection: ConnectionProfile
   apiKey: string
+  signal: AbortSignal
   outcome: 'done' | 'error' | 'abort'
   abortReason?: AbortReason
   error?: ApiError
   now: number
+  debugScope?: string
   // Token-calibration inputs — present when the send can produce a
   // calibration sample on success. When omitted, calibration is skipped
   // (e.g., text-protocol / llama-server, where usage is not returned).
   calibrationInputs?: {
-    outboundPath: readonly Message[]
-    systemPrompt: string
+    promptBasis: PromptCalibrationBasis | null
     modelId: string
     family: TokenizerFamily
     promptCalibrationAllowed: boolean
     completionCalibrationAllowed: boolean
-    reasoningOpts?: PromptEstimateOptions
   }
 }
 
 function generatedOutputDownloader(input: {
   connection: ConnectionProfile
   apiKey: string
+  signal: AbortSignal
 }): GeneratedOutputDownloader {
   return async ({ url }) => {
     const headers: Record<string, string> = {}
     if (shouldAuthorizeGeneratedOutputUrl(url, input.connection)) {
       headers.Authorization = `Bearer ${input.apiKey}`
     }
-    const response = await fetch(url, { headers })
+    const response = await fetch(url, { headers, signal: input.signal })
     if (!response.ok) return null
     return response.blob()
   }
@@ -1722,15 +1051,14 @@ async function finalize(ctx: FinalizeContext): Promise<void> {
     error,
     now,
     calibrationInputs,
+    debugScope,
+    streamFence,
   } = ctx
 
-  const rawFinalContent = assistantContentWithStreamPrefix(
-    accumulator.initialContent,
-    streamTextSnapshot(accumulator),
-    [...accumulator.generatedContent, ...audioOutputContent(accumulator)],
-  )
+  const finalProjection = projectStreamAccumulatorFinal(accumulator)
+  const rawFinalContent = finalProjection.content
   const generatedImageAttachments = contentNeedsGeneratedOutputMaterialization(rawFinalContent)
-    ? await materializeGeneratedOutputAttachments({
+    ? await prepareGeneratedOutputAttachments({
         messageId,
         content: rawFinalContent,
         now,
@@ -1741,9 +1069,10 @@ async function finalize(ctx: FinalizeContext): Promise<void> {
         replacements: [],
         newRefs: [],
         changed: false,
+        attachmentBundles: [],
       }
   const finalContent = generatedImageAttachments.content
-  const reasoning = collectReasoning(accumulator)
+  const reasoning = finalProjection.reasoningDetails ?? []
 
   // Pre-compute calibration fields for the assistant row. On a successful
   // `done`, `originalCharCount` / `originalTokenEstimate` /
@@ -1756,7 +1085,7 @@ async function finalize(ctx: FinalizeContext): Promise<void> {
   let assistantCalibrationFields: ReturnType<typeof calibrationFieldsForCreate> | null = null
   const completionCalibrationBlocked =
     calibrationInputs !== undefined &&
-    (accumulatorHasCompletionCalibrationBlockers(accumulator) ||
+    (streamAccumulatorHasCompletionCalibrationBlockers(accumulator) ||
       finalContent.some(isNonTextContentItem))
   if (outcome === 'done' && calibrationInputs && !completionCalibrationBlocked) {
     try {
@@ -1777,27 +1106,31 @@ async function finalize(ctx: FinalizeContext): Promise<void> {
     }
   }
 
-  let persistedAssistant: Message | null = null
+  const persistedAssistant = { value: null as Message | null }
   await repo.runMutation(
     [{ kind: 'message', messageId }, ...attachmentScopes(generatedImageAttachments.newRefs)],
     async (inner) => {
       const current = await inner.getMessageHeader(messageId)
       if (!current) return
-      const generation = updatedGeneration(current.generation, accumulator, requestedModel, {
+      await persistPreparedGeneratedOutputAttachments(inner, generatedImageAttachments)
+      const generation = projectStreamGeneration(current.generation, accumulator, requestedModel, {
         apiUsed,
         finishedAt: now,
       })
+      generation.status =
+        outcome === 'abort' ? (abortReason === 'tab-close' ? 'interrupted' : 'abort') : outcome
+      generation.integrity = accumulator.integritySummary.count > 0 ? 'degraded' : 'clean'
+      if (accumulator.integritySummary.count > 0) {
+        generation.integritySummary = structuredClone(accumulator.integritySummary)
+      } else {
+        delete generation.integritySummary
+      }
       if (outcome === 'abort') {
         generation.abortReason = abortReason ?? 'user'
       }
       const finalError = error ?? accumulator.midStreamError
       if (finalError) {
-        generation.error = {
-          code: String(finalError.code),
-          message: finalError.message,
-          ...(finalError.httpStatus !== undefined ? { statusCode: finalError.httpStatus } : {}),
-          raw: finalError,
-        }
+        generation.error = toPersistedAttemptFailure(finalError, 'provider')
       }
       const headerPatch: MessageHeaderPatch = {
         generation,
@@ -1812,26 +1145,23 @@ async function finalize(ctx: FinalizeContext): Promise<void> {
         )
         headerPatch.attachmentRefs = merged.refs
         headerPatch.cachedMediaTokens = undefined
-        await incRefs(inner, merged.addedRefs)
       }
       await inner.patchMessageBody(
         messageId,
         {
           content: finalContent,
           reasoningDetails: reasoning.length > 0 ? reasoning : undefined,
-          phase: accumulator.phase,
-          providerOutputItems:
-            accumulator.providerOutputItems.length > 0
-              ? structuredClone(accumulator.providerOutputItems)
-              : undefined,
+          toolCalls: finalProjection.toolCalls,
+          phase: finalProjection.phase,
+          providerOutputItems: finalProjection.providerOutputItems,
         },
         {
           headerPatch,
           replaceBody: true,
         },
       )
-      if (accumulator.debugScope) {
-        logStreamDebug(accumulator.debugScope, 'message.finalize', {
+      if (debugScope) {
+        logStreamDebug(debugScope, 'message.finalize', {
           messageId,
           outcome,
           reasoningDetails: reasoning,
@@ -1839,17 +1169,21 @@ async function finalize(ctx: FinalizeContext): Promise<void> {
           generation,
         })
       }
-      persistedAssistant = {
+      persistedAssistant.value = {
         ...current,
         ...headerPatch,
         content: finalContent,
         ...(reasoning.length > 0 ? { reasoningDetails: reasoning } : {}),
-        ...(accumulator.phase !== undefined ? { phase: accumulator.phase } : {}),
-        ...(accumulator.providerOutputItems.length > 0
-          ? { providerOutputItems: structuredClone(accumulator.providerOutputItems) }
+        ...(finalProjection.toolCalls
+          ? { toolCalls: structuredClone(finalProjection.toolCalls) }
+          : {}),
+        ...(finalProjection.phase !== undefined ? { phase: finalProjection.phase } : {}),
+        ...(finalProjection.providerOutputItems
+          ? { providerOutputItems: structuredClone(finalProjection.providerOutputItems) }
           : {}),
       } as Message
     },
+    { streamFence: { streamId: ctx.streamId, fence: streamFence } },
   )
 
   // Token calibration happens AFTER the assistant message is persisted
@@ -1860,17 +1194,19 @@ async function finalize(ctx: FinalizeContext): Promise<void> {
     outcome === 'done' &&
     calibrationInputs &&
     !completionCalibrationBlocked &&
-    persistedAssistant !== null &&
+    persistedAssistant.value !== null &&
     accumulator.usage
   ) {
     try {
       await ingestCalibrationSample({
         repo,
         chatId,
-        assistantMessage: persistedAssistant,
+        assistantMessage: persistedAssistant.value,
         usage: accumulator.usage,
         calibrationInputs,
         now,
+        streamId: ctx.streamId,
+        streamFence,
       })
     } catch {
       // Non-fatal: calibration failure must not surface to the user.
@@ -1895,30 +1231,24 @@ function contentNeedsGeneratedOutputMaterialization(content: readonly ContentIte
 }
 
 async function ingestCalibrationSample(args: {
-  repo: ReturnType<typeof getBrowserRepository>
+  repo: ReturnType<typeof getWorkspaceRepository>
   chatId: ChatId
   assistantMessage: Message
   usage: ChatUsage
   calibrationInputs: NonNullable<FinalizeContext['calibrationInputs']>
   now: number
+  streamId: string
+  streamFence: StreamWriteFence
 }): Promise<void> {
-  const { repo, chatId, assistantMessage, usage, calibrationInputs, now } = args
+  const { repo, chatId, assistantMessage, usage, calibrationInputs, now, streamId, streamFence } =
+    args
   if (assistantMessage.generation?.tokenCalibration) return
 
   const calibrationKey = tokenCalibrationKey(calibrationInputs.modelId)
-  const promptSample = calibrationInputs.promptCalibrationAllowed
-    ? derivePromptSample({
-        sentPath: calibrationInputs.outboundPath,
-        systemPrompt: calibrationInputs.systemPrompt,
-        usage,
-        family: calibrationInputs.family,
-        modelId: calibrationInputs.modelId,
-        mediaTokens: 0,
-        ...(calibrationInputs.reasoningOpts
-          ? { reasoningEchoOpts: calibrationInputs.reasoningOpts }
-          : {}),
-      })
-    : null
+  const promptSample =
+    calibrationInputs.promptCalibrationAllowed && calibrationInputs.promptBasis
+      ? derivePromptSampleFromBasis(calibrationInputs.promptBasis, usage)
+      : null
   const completionSample =
     calibrationInputs.completionCalibrationAllowed &&
     !assistantMessage.content.some(isNonTextContentItem) &&
@@ -2011,6 +1341,7 @@ async function ingestCalibrationSample(args: {
         acceptedSamples.push(...localAcceptedSamples)
       }
     },
+    { streamFence: { streamId, fence: streamFence } },
   )
 
   // Step 2: roll up to global AFTER the chat mutation closes — separate
@@ -2020,235 +1351,288 @@ async function ingestCalibrationSample(args: {
   }
 }
 
-function collectReasoning(acc: ChatAccumulator): ReasoningDetail[] {
-  // Return in insertion order — the list already reflects the stream's
-  // natural lane ordering, and per-row merges kept identity through stable
-  // ids plus `findMergeTargetIndex` for legacy shapes.
-  return acc.reasoningList.slice()
-}
-
-function putReasoningDetail(acc: ChatAccumulator, incoming: ReasoningDetail): void {
-  if (incoming.id) {
-    const existing = acc.reasoningRowById.get(incoming.id)
-    if (existing !== undefined) {
-      acc.reasoningList[existing] = mergeReasoningDetail(acc.reasoningList[existing], incoming)
-      return
-    }
-  }
-  const target = findMergeTargetIndex(acc.reasoningList, incoming)
-  if (target >= 0) {
-    acc.reasoningList[target] = mergeReasoningDetail(acc.reasoningList[target], incoming)
-    if (incoming.id) acc.reasoningRowById.set(incoming.id, target)
-    return
-  }
-  acc.reasoningList.push(incoming)
-  if (incoming.id) acc.reasoningRowById.set(incoming.id, acc.reasoningList.length - 1)
-}
-
-function syntheticReasoningDetailId(
-  type: ReasoningDetail['type'],
-  event: Extract<StreamLaneEvent, { lane: 'reasoning' }>,
-): string | undefined {
-  if (type === 'reasoning.summary') {
-    if (event.itemId) return `summary#${event.itemId}#${event.summaryIndex ?? 0}`
-    if (event.summaryIndex !== undefined) {
-      return event.outputIndex !== undefined
-        ? `summary#${event.outputIndex}#${event.summaryIndex}`
-        : `summary#${event.summaryIndex}`
-    }
-    return event.outputIndex !== undefined ? `summary#${event.outputIndex}` : 'summary#default'
-  }
-  if (event.itemId) {
-    return type === 'reasoning.text' ? `text#${event.itemId}` : `encrypted#${event.itemId}`
-  }
-  if (event.outputIndex !== undefined) {
-    return type === 'reasoning.text'
-      ? `text#${event.outputIndex}`
-      : `encrypted#${event.outputIndex}`
-  }
-  if (type === 'reasoning.text') return 'text#default'
-  return 'encrypted#default'
-}
-
-function updatedGeneration(
-  existing: GenerationMeta | undefined,
-  acc: ChatAccumulator,
-  requestedModel: string,
-  opts: { apiUsed?: GenerationMeta['apiUsed']; finishedAt?: number },
-): GenerationMeta {
-  const base: GenerationMeta = existing
-    ? { ...existing }
-    : {
-        id: '',
-        model: requestedModel,
-        requestedModel,
-        apiUsed: 'chat',
-        delivery: 'streaming',
-        costSource: 'stream',
-        startedAt: Date.now(),
-      }
-  if (opts.apiUsed !== undefined) base.apiUsed = opts.apiUsed
-  if (acc.generationId) base.id = acc.generationId
-  if (acc.model) base.model = acc.model
-  if (acc.provider) base.provider = acc.provider
-  if (acc.usage) base.usage = acc.usage
-  if (acc.usage?.cost !== undefined) base.cost = acc.usage.cost
-  const serverTools = mergeServerToolRecords([
-    ...acc.serverTools,
-    ...(acc.serverTools.length === 0 ? serverToolRecordsFromUsage(acc.usage) : []),
-  ])
-  if (serverTools.length > 0) base.serverTools = serverTools
-  else delete base.serverTools
-  if (acc.firstTextAt !== undefined) base.firstTextAt = acc.firstTextAt
-  if (acc.reasoningStartedAt !== undefined) base.reasoningStartedAt = acc.reasoningStartedAt
-  if (acc.reasoningFinishedAt !== undefined) base.reasoningFinishedAt = acc.reasoningFinishedAt
-  if (acc.finishReason) base.finishReason = acc.finishReason as FinishReason
-  if (opts.finishedAt !== undefined) base.finishedAt = opts.finishedAt
-  return base
-}
-
-// Orphan sweep for interrupted streams. Called on app start from the shell
-// (Phase 7: fired manually from tests, wired up in Phase 8). Any message
+// Orphan sweep for interrupted streams. The active-chat shell runs it on open
+// and when lease expiry or ownership-release evidence arrives. Any message
 // whose `generation.startedAt` is set without a `finishedAt` is marked
 // `abortReason: 'tab-close'` so the UI can render the "Stream interrupted"
-// banner per `plan/03-storage.md §3.11.1`.
+// banner.
 export async function recoverOrphans(now = Date.now(), chatId?: ChatId): Promise<number> {
-  const repo = getBrowserRepository()
+  const repo = getWorkspaceRepository()
   const scopedChat = chatId !== undefined ? await repo.getChat(chatId) : undefined
   const chats = chatId !== undefined ? (scopedChat ? [scopedChat] : []) : await repo.listChats()
   const allLeases = await repo.listStreamLeases(chatId)
+  const ownershipLocksSupported = streamOwnershipLocksSupported()
   const leases = allLeases.filter((lease) => isFreshStreamLease(lease, now))
   const leasedMessageIds = new Set(
-    leases
-      .filter((lease) => isFreshStreamLease(lease, now) && lease.messageId !== undefined)
-      .map((lease) => lease.messageId as MessageId),
+    ownershipLocksSupported
+      ? []
+      : leases
+          .filter((lease) => lease.messageId !== undefined)
+          .filter((lease) => !isRecoveryClaimedStreamLease(lease))
+          .map((lease) => lease.messageId as MessageId),
   )
   let recovered = 0
+  for (const lease of allLeases) {
+    if (
+      lease.attemptKind !== 'generation' ||
+      (isFreshStreamLease(lease, now) &&
+        !ownershipLocksSupported &&
+        !isRecoveryClaimedStreamLease(lease)) ||
+      (lease.messageId && isLocallyOwnedTargetActive(lease.chatId, lease.messageId))
+    ) {
+      continue
+    }
+    const guarded = await withStreamRecoveryLocks([lease.streamId], async (ownershipVerified) => {
+      if (lease.messageId && isLocallyOwnedTargetActive(lease.chatId, lease.messageId)) {
+        return false
+      }
+      const currentLease = (await repo.listStreamLeases(lease.chatId)).find(
+        (candidate) => candidate.streamId === lease.streamId,
+      )
+      if (
+        !currentLease ||
+        (isFreshStreamLease(currentLease, now) &&
+          !ownershipVerified &&
+          !isRecoveryClaimedStreamLease(currentLease))
+      ) {
+        return false
+      }
+      const header = currentLease.messageId
+        ? await repo.getMessageHeader(currentLease.messageId)
+        : undefined
+      if (header?.generation && header.generation.finishedAt === undefined) return false
+      const claimedLease = await repo.claimStreamLeaseForRecovery(currentLease, now)
+      if (!claimedLease) return false
+      await repo.deleteStreamChunks(claimedLease.streamId)
+      await repo.deleteStreamLease(claimedLease.streamId)
+      announceStreamEnded({
+        chatId: claimedLease.chatId,
+        streamId: claimedLease.streamId,
+        ...(claimedLease.messageId ? { messageId: claimedLease.messageId } : {}),
+        outcome: 'abort',
+      })
+      return true
+    })
+    if (guarded.acquired && guarded.value) recovered += 1
+  }
+  recovered += await recoverStaleContinuationAttempts({
+    repo,
+    leases: allLeases,
+    now,
+    isTargetActive: isLocallyOwnedTargetActive,
+  })
   for (const chat of chats) {
     const headers = await repo.listMessageHeaders(chat.id)
+    const initialMessageLessGenerationLeases = allLeases.filter(
+      (lease) =>
+        lease.chatId === chat.id &&
+        lease.attemptKind === 'generation' &&
+        lease.messageId === undefined,
+    )
     for (const header of headers) {
       const gen = header.generation
       if (!gen || gen.finishedAt !== undefined || gen.abortReason !== undefined) continue
-      if (now - gen.startedAt < STREAM_LEASE_TTL_MS) continue
-      if (useStreamStore.getState().isTargetActive(chat.id, header.id)) continue
+      if (now - gen.startedAt < STREAM_LEASE_TTL_MS && !ownershipLocksSupported) continue
+      if (isLocallyOwnedTargetActive(chat.id, header.id)) continue
       if (leasedMessageIds.has(header.id)) continue
-      const chunks = await repo.listStreamChunksForMessage(header.id)
-      let wroteCanonical = false
-      await repo.runMutation([{ kind: 'message', messageId: header.id }], async (ctx) => {
-        const current = await ctx.getMessage(header.id)
-        if (!current?.generation || current.generation.finishedAt !== undefined) return
-        if (chunks.length === 0) {
-          await ctx.putMessage({
-            ...current,
-            generation: {
-              ...current.generation,
-              finishedAt: now,
-              abortReason: 'tab-close',
-            },
-          })
-          wroteCanonical = true
-          return
-        }
-        const recovered = replayStreamChunks(current, chunks, now)
-        const generation = updatedGeneration(
-          current.generation,
-          recovered.accumulator,
-          current.generation.requestedModel || current.generation.model,
-          { apiUsed: current.generation.apiUsed, finishedAt: now },
-        )
-        if (!recovered.finishedCleanly) generation.abortReason = 'tab-close'
-        if (recovered.accumulator.midStreamError) {
-          generation.error = {
-            code: String(recovered.accumulator.midStreamError.code),
-            message: recovered.accumulator.midStreamError.message,
-            ...(recovered.accumulator.midStreamError.httpStatus !== undefined
-              ? { statusCode: recovered.accumulator.midStreamError.httpStatus }
-              : {}),
-            raw: recovered.accumulator.midStreamError,
+      const initialChunks = await repo.listStreamChunksForMessage(header.id)
+      const initialMessageLeases = allLeases.filter((lease) => lease.messageId === header.id)
+      const observedTarget = useStreamStore.getState().getTargetActive(chat.id, header.id)
+      const guardedStreamIds = new Set([
+        ...initialChunks.map((chunk) => chunk.streamId),
+        ...initialMessageLeases.map((lease) => lease.streamId),
+        ...initialMessageLessGenerationLeases.map((lease) => lease.streamId),
+        ...(observedTarget ? [observedTarget.streamId] : []),
+      ])
+      const guarded = await withStreamRecoveryLocks(
+        [...guardedStreamIds],
+        async (ownershipVerified) => {
+          if (isLocallyOwnedTargetActive(chat.id, header.id)) return false
+          const currentChatLeases = await repo.listStreamLeases(chat.id)
+          const currentMessageLeases = currentChatLeases.filter(
+            (lease) => lease.messageId === header.id,
+          )
+          const currentMessageLessGenerationLeases = currentChatLeases.filter(
+            (lease) => lease.attemptKind === 'generation' && lease.messageId === undefined,
+          )
+          if (
+            currentMessageLessGenerationLeases.some(
+              (lease) =>
+                !guardedStreamIds.has(lease.streamId) ||
+                (isFreshStreamLease(lease, now) &&
+                  !ownershipVerified &&
+                  !isRecoveryClaimedStreamLease(lease)),
+            )
+          ) {
+            return false
           }
-        }
-        await ctx.patchMessageBody(
-          header.id,
-          {
-            content: recovered.content,
-            reasoningDetails: recovered.reasoning.length > 0 ? recovered.reasoning : undefined,
-            phase: recovered.accumulator.phase,
-          },
-          {
-            headerPatch: { generation },
-            replaceBody: true,
-          },
-        )
-        wroteCanonical = true
-      })
-      const streamIds = new Set(chunks.map((chunk) => chunk.streamId))
-      for (const streamId of streamIds) {
-        await repo.deleteStreamChunks(streamId)
-        await repo.deleteStreamLease(streamId)
-      }
-      for (const lease of allLeases) {
-        if (lease.messageId === header.id && !isFreshStreamLease(lease, now)) {
-          await repo.deleteStreamLease(lease.streamId)
-        }
-      }
-      if (wroteCanonical) recovered += 1
+          if (
+            currentMessageLeases.some(
+              (lease) =>
+                !guardedStreamIds.has(lease.streamId) ||
+                (isFreshStreamLease(lease, now) &&
+                  !ownershipVerified &&
+                  !isRecoveryClaimedStreamLease(lease)),
+            )
+          ) {
+            return false
+          }
+          const claimedLeases: StreamLeaseRow[] = []
+          for (const currentLease of currentMessageLeases) {
+            const claimed = await repo.claimStreamLeaseForRecovery(currentLease, now)
+            if (!claimed) return false
+            claimedLeases.push(claimed)
+          }
+          const primaryClaim = claimedLeases[0]
+          for (const claimed of claimedLeases.slice(1)) {
+            await repo.deleteStreamLease(claimed.streamId)
+          }
+          const chunks = await repo.listStreamChunksForMessage(header.id)
+          if (chunks.some((chunk) => !guardedStreamIds.has(chunk.streamId))) return false
+          let wroteCanonical = false
+          await repo.runMutation(
+            [{ kind: 'message', messageId: header.id }],
+            async (ctx) => {
+              const current = await ctx.getMessage(header.id)
+              if (!current?.generation || current.generation.finishedAt !== undefined) return
+              if (chunks.length === 0) {
+                await ctx.putMessage({
+                  ...current,
+                  generation: {
+                    ...current.generation,
+                    finishedAt: now,
+                    abortReason: 'tab-close',
+                    status: 'interrupted',
+                    integrity: current.generation.integrity ?? 'clean',
+                  },
+                })
+                wroteCanonical = true
+                return
+              }
+              const replayed = replayStreamAccumulator({
+                initialContent: current.content,
+                now,
+                entries: chunks,
+              })
+              const generation = projectStreamGeneration(
+                current.generation,
+                replayed.accumulator,
+                current.generation.requestedModel || current.generation.model,
+                { apiUsed: current.generation.apiUsed, finishedAt: now },
+              )
+              generation.integrity =
+                replayed.accumulator.integritySummary.count > 0 ? 'degraded' : 'clean'
+              if (replayed.accumulator.integritySummary.count > 0) {
+                generation.integritySummary = structuredClone(replayed.accumulator.integritySummary)
+              } else {
+                delete generation.integritySummary
+              }
+              generation.status = replayed.accumulator.midStreamError
+                ? 'error'
+                : replayed.finishedCleanly
+                  ? 'done'
+                  : 'interrupted'
+              if (!replayed.finishedCleanly && !replayed.accumulator.midStreamError) {
+                generation.abortReason = 'tab-close'
+              }
+              if (replayed.accumulator.midStreamError) {
+                generation.error = toPersistedAttemptFailure(
+                  replayed.accumulator.midStreamError,
+                  'provider',
+                )
+              }
+              await ctx.patchMessageBody(
+                header.id,
+                {
+                  content: replayed.final.content,
+                  reasoningDetails: replayed.final.reasoningDetails,
+                  toolCalls: replayed.final.toolCalls,
+                  phase: replayed.final.phase,
+                  providerOutputItems: replayed.final.providerOutputItems,
+                },
+                {
+                  headerPatch: { generation },
+                  replaceBody: true,
+                },
+              )
+              wroteCanonical = true
+            },
+            primaryClaim
+              ? {
+                  streamFence: {
+                    streamId: primaryClaim.streamId,
+                    fence: streamWriteFenceForLease(primaryClaim),
+                  },
+                }
+              : undefined,
+          )
+          for (const streamId of guardedStreamIds) {
+            await repo.deleteStreamChunks(streamId)
+            await repo.deleteStreamLease(streamId)
+            announceStreamEnded({
+              chatId: chat.id,
+              streamId,
+              messageId: header.id,
+              outcome: 'abort',
+            })
+          }
+          return wroteCanonical
+        },
+      )
+      if (guarded.acquired && guarded.value) recovered += 1
     }
   }
   return recovered
 }
 
-function replayStreamChunks(
-  message: Message,
-  chunks: readonly StreamChunkRow[],
-  now: number,
-): {
-  accumulator: ChatAccumulator
-  content: ContentItem[]
-  reasoning: ReasoningDetail[]
-  finishedCleanly: boolean
-} {
-  const accumulator = createAccumulator({
-    initialContent: structuredClone(message.content),
-    now,
-  })
-  let finishedCleanly = false
-  for (const chunk of chunks) {
-    const event = replayableStreamEvent(chunk.event)
-    if (!event) continue
-    applyEvent(accumulator, event, chunk.createdAt)
-    if (event.lane === 'finish') finishedCleanly = true
+export async function nextOrphanRecoveryAt(
+  chatId: ChatId,
+  now = Date.now(),
+): Promise<number | null> {
+  const repo = getWorkspaceRepository()
+  const leases = await repo.listStreamLeases(chatId)
+  let next = Number.POSITIVE_INFINITY
+  for (const lease of leases) {
+    if (lease.attemptKind !== 'generation' && lease.attemptKind !== 'continuation') continue
+    if (
+      useStreamStore.getState().getActive(lease.streamId)?.ownerClientId === getStreamClientId()
+    ) {
+      continue
+    }
+    const expiresAt = lease.heartbeatAt + STREAM_LEASE_TTL_MS + 1
+    next = Math.min(
+      next,
+      isRecoveryClaimedStreamLease(lease)
+        ? now + ORPHAN_RECOVERY_RETRY_MS
+        : expiresAt > now
+          ? expiresAt
+          : now + ORPHAN_RECOVERY_RETRY_MS,
+    )
   }
-  const content = assistantContentWithStreamPrefix(
-    accumulator.initialContent,
-    streamTextSnapshot(accumulator),
-    [...accumulator.generatedContent, ...audioOutputContent(accumulator)],
-  )
-  const reasoning = collectReasoning(accumulator)
-  return { accumulator, content, reasoning, finishedCleanly }
+  if (!streamOwnershipLocksSupported()) {
+    const headers = await repo.listMessageHeaders(chatId)
+    for (const header of headers) {
+      const generation = header.generation
+      if (
+        !generation ||
+        generation.finishedAt !== undefined ||
+        generation.abortReason !== undefined ||
+        isLocallyOwnedTargetActive(chatId, header.id)
+      ) {
+        continue
+      }
+      const eligibleAt = generation.startedAt + STREAM_LEASE_TTL_MS + 1
+      next = Math.min(next, eligibleAt > now ? eligibleAt : now + ORPHAN_RECOVERY_RETRY_MS)
+    }
+  }
+  return Number.isFinite(next) ? next : null
 }
 
-function replayableStreamEvent(event: unknown): StreamLaneEvent | null {
-  if (!event || typeof event !== 'object') return null
-  const lane = (event as { lane?: unknown }).lane
-  if (typeof lane !== 'string') return null
-  switch (lane) {
-    case 'text':
-    case 'reasoning':
-    case 'usage':
-    case 'finish':
-    case 'meta':
-    case 'content-item':
-    case 'audio-output':
-    case 'server-tool':
-    case 'server-tool-output':
-    case 'output-item-added':
-    case 'output-item-done':
-    case 'phase':
-    case 'error':
-      return event as StreamLaneEvent
-    default:
-      return null
-  }
+function isLocallyOwnedTargetActive(chatId: ChatId, messageId: MessageId): boolean {
+  return (
+    useStreamStore.getState().getTargetActive(chatId, messageId)?.ownerClientId ===
+    getStreamClientId()
+  )
 }
 
 interface UseChatApi {

@@ -1,19 +1,26 @@
 // Anthropic Messages API adapter.
 
 import type { ConnectionProfile } from '../core/types'
+import { errorFromUnknown } from '../lib/error'
 import type {
   AnthropicMessagesRequestWire,
   AnthropicMessagesResultWire,
   AnthropicStreamChunk,
 } from './anthropic-types'
-import { buildHeaders, fetchWithTimeout } from './client'
+import {
+  type ApiKeyDispatchContext,
+  buildHeaders,
+  fetchWithApiKeyFallback,
+  hasExplicitAuthHeaderOverride,
+  readErrorResponseJson,
+} from './client'
+import { deferAdapterRequest } from './deferred-request'
 import { normalizeError } from './errors'
-import { parseSSE } from './sse'
+import { decodeProviderJson, malformedJsonFrameReport, parseSSE } from './sse'
 import type { CallOpts } from './types'
 
-export interface AnthropicContext {
+export interface AnthropicContext extends ApiKeyDispatchContext {
   profile: ConnectionProfile
-  apiKey: string
 }
 
 function anthropicUrl(profile: ConnectionProfile): string {
@@ -33,60 +40,87 @@ function betaHeaderForRequest(req: AnthropicMessagesRequestWire): string | undef
   return betas.size > 0 ? [...betas].join(',') : undefined
 }
 
-async function dispatch(
+function dispatch(
   ctx: AnthropicContext,
   req: AnthropicMessagesRequestWire,
   stream: boolean,
   opts: CallOpts,
 ): Promise<Response> {
-  const headers = buildHeaders(ctx.profile, ctx.apiKey, {
-    method: 'POST',
-    authScheme: 'anthropic-native',
-    overrideHeaders: {
-      'anthropic-version': '2023-06-01',
-      ...(betaHeaderForRequest(req)
-        ? { 'anthropic-beta': betaHeaderForRequest(req) as string }
-        : {}),
-      ...(opts.overrideHeaders ?? {}),
-    },
-  })
   const body: AnthropicMessagesRequestWire = { ...req, stream }
-  const init: RequestInit = {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(body),
-  }
-  const response = await fetchWithTimeout(anthropicUrl(ctx.profile), init, {
-    ...(opts.signal ? { signal: opts.signal } : {}),
-    ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
-  })
+  return dispatchSerialized(ctx, JSON.stringify(body), betaHeaderForRequest(req), opts)
+}
+
+function dispatchSerialized(
+  ctx: AnthropicContext,
+  serializedBody: string,
+  betaHeader: string | undefined,
+  opts: CallOpts,
+): Promise<Response> {
+  const url = anthropicUrl(ctx.profile)
+  const authCtx = hasExplicitAuthHeaderOverride(ctx.profile, opts.overrideHeaders, 'x-api-key')
+    ? { apiKey: ctx.apiKey }
+    : ctx
+  const fetched = fetchWithApiKeyFallback(
+    authCtx,
+    (apiKey) => {
+      const headers = buildHeaders(ctx.profile, apiKey, {
+        method: 'POST',
+        authScheme: 'anthropic-native',
+        overrideHeaders: {
+          'anthropic-version': '2023-06-01',
+          ...(betaHeader ? { 'anthropic-beta': betaHeader } : {}),
+          ...(opts.overrideHeaders ?? {}),
+        },
+      })
+      return { url, init: { method: 'POST', headers, body: serializedBody } }
+    },
+    {
+      ...(opts.signal ? { signal: opts.signal } : {}),
+      ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
+    },
+  )
+  return requireSuccessfulResponse(fetched)
+}
+
+async function requireSuccessfulResponse(
+  fetched: ReturnType<typeof fetchWithApiKeyFallback>,
+): Promise<Response> {
+  const { response } = await fetched
   if (!response.ok) {
-    const body: unknown = await response.json().catch(() => ({
-      error: { type: String(response.status), message: response.statusText },
-    }))
-    throw normalizeError(body, { midStream: false, httpStatus: response.status })
+    const errorBody = await readErrorResponseJson(response)
+    throw normalizeError(errorBody, { midStream: false, httpStatus: response.status })
   }
   return response
 }
 
-export async function* anthropicStream(
+export function anthropicStream(
   ctx: AnthropicContext,
   req: AnthropicMessagesRequestWire,
   opts: CallOpts = {},
-): AsyncGenerator<AnthropicStreamChunk> {
-  const response = await dispatch(ctx, req, true, opts)
+): AsyncGenerator<AnthropicStreamChunk, void, unknown> {
+  return deferAdapterRequest(req, (request) =>
+    consumeAnthropicStream(dispatch(ctx, request, true, opts), opts.signal),
+  )
+}
+
+async function* consumeAnthropicStream(
+  dispatched: Promise<Response>,
+  signal: AbortSignal | undefined,
+): AsyncGenerator<AnthropicStreamChunk, void, unknown> {
+  const response = await dispatched
   const generationId = response.headers.get('anthropic-request-id') ?? undefined
   const contentType = response.headers.get('content-type') ?? ''
 
   if (!/text\/event-stream/i.test(contentType)) {
-    const result = (await response.json()) as AnthropicMessagesResultWire
+    const result = await decodeProviderJson<AnthropicMessagesResultWire>(response)
     yield generationId
       ? { type: 'buffered_result', result, generationId }
       : { type: 'buffered_result', result }
     return
   }
 
-  for await (const ev of parseSSE(response, opts.signal ? { signal: opts.signal } : {})) {
+  for await (const ev of parseSSE(response, signal ? { signal } : {})) {
+    if (ev.kind === 'done') continue
     if (ev.kind === 'keepalive') {
       yield { type: 'keepalive', comment: ev.comment }
       continue
@@ -102,19 +136,33 @@ export async function* anthropicStream(
         ? { type: 'anthropic_event', event: parsed, generationId }
         : { type: 'anthropic_event', event: parsed }
     } catch (err) {
-      console.warn('anthropicStream: malformed SSE chunk skipped', {
+      const report = malformedJsonFrameReport({
+        adapter: 'anthropic-messages',
+        eventType: ev.event,
         data: ev.data,
         error: err,
       })
+      console.warn('anthropicStream: malformed SSE chunk skipped', report.diagnostic)
+      yield { type: 'integrity', integrity: report.integrity }
     }
   }
 }
 
-export async function anthropicOnce(
+export function anthropicOnce(
   ctx: AnthropicContext,
   req: AnthropicMessagesRequestWire,
   opts: CallOpts = {},
 ): Promise<AnthropicMessagesResultWire> {
-  const response = await dispatch(ctx, req, false, opts)
-  return (await response.json()) as AnthropicMessagesResultWire
+  try {
+    return consumeAnthropicOnce(dispatch(ctx, req, false, opts))
+  } catch (error) {
+    return Promise.reject(errorFromUnknown(error))
+  }
+}
+
+async function consumeAnthropicOnce(
+  dispatched: Promise<Response>,
+): Promise<AnthropicMessagesResultWire> {
+  const response = await dispatched
+  return decodeProviderJson<AnthropicMessagesResultWire>(response)
 }

@@ -1,7 +1,6 @@
 /*
  * sidebar.css — sidebar layout, brand row, chat rows (full-width highlight,
  * two-line title + preview, hover delete), folder/tags/search slots, footer.
- * See plan/10-ui.md §10.20.
  */
 
 [data-ui="sidebar"] {

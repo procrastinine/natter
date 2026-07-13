@@ -115,41 +115,6 @@ export function parseSearchQuery(raw: string): SearchQueryParseResult {
   return { ok: true, query }
 }
 
-export function hasPositiveTextTerms(query: SearchQuery): boolean {
-  return query.text.some((clause) => !clause.negated)
-}
-
-export function hasNegativeTextTerms(query: SearchQuery): boolean {
-  return query.text.some((clause) => clause.negated)
-}
-
-export function textMatchesClauses(text: string, clauses: readonly SearchTextClause[]): boolean {
-  const lowered = text.toLocaleLowerCase()
-  for (const clause of clauses) {
-    const hit = lowered.includes(clause.value.toLocaleLowerCase())
-    if (clause.negated ? hit : !hit) return false
-  }
-  return true
-}
-
-export function firstPositiveMatch(
-  text: string,
-  clauses: readonly SearchTextClause[],
-): { index: number; length: number; value: string } | null {
-  const lowered = text.toLocaleLowerCase()
-  let best: { index: number; length: number; value: string } | null = null
-  for (const clause of clauses) {
-    if (clause.negated) continue
-    const value = clause.value
-    const index = lowered.indexOf(value.toLocaleLowerCase())
-    if (index < 0) continue
-    if (!best || index < best.index) {
-      best = { index, length: value.length, value }
-    }
-  }
-  return best
-}
-
 function tokenizeSearchQuery(
   raw: string,
 ): { ok: true; tokens: Token[] } | { ok: false; error: SearchQueryParseError } {

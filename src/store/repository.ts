@@ -1,3 +1,4 @@
+import type { ActivePathMeasurement } from '../core/active-path'
 import type {
   Attachment,
   AttachmentArtifact,
@@ -14,21 +15,109 @@ import type {
   ChatTag,
   ChatVersions,
   ChildListState,
+  ConnectionProfile,
+  ContinuationStrategy,
   CursorMap,
   DraftRow,
   FolderId,
+  GenerationMeta,
+  KeyId,
   Message,
   MessageId,
   MutationScope,
+  PresetId,
+  ProfileId,
+  PromptPreset,
+  PromptPresetId,
   TagId,
 } from '../core/types'
 import type { MessageBodyFields, MessageHeaderRow } from './message-storage'
+
+export class ChatMissingError extends Error {
+  readonly chatId: ChatId
+
+  constructor(chatId: ChatId) {
+    super(`ChatMissing:${chatId}`)
+    this.name = 'ChatMissingError'
+    this.chatId = chatId
+  }
+}
 
 export interface WorkspaceMeta {
   workspaceId: string
   backendKind: 'browser-idb' | 'daemon' | 'unknown'
   lastMutationAt: number
   mutationCounter: number
+  replacementEpoch: number
+}
+
+export interface StreamWriteFence {
+  ownerClientId: string
+  fenceToken: string
+  replacementEpoch: number
+}
+
+export const STREAM_LEASE_TTL_MS = 15_000
+
+export class StreamTargetBusyError extends Error {
+  readonly messageId: MessageId
+
+  constructor(messageId: MessageId) {
+    super(`StreamTargetBusy:${messageId}`)
+    this.name = 'StreamTargetBusyError'
+    this.messageId = messageId
+  }
+}
+
+export interface WorkspaceMutationOptions {
+  streamFence?: {
+    streamId: string
+    fence: StreamWriteFence
+  }
+}
+
+export interface ChatBranchCacheWriteGuard {
+  branchLeafId: MessageId | null
+  lastBranchUpdatedAt: number
+  summaryVersion: number
+  replacementEpoch: number
+  missingChat?: true
+}
+
+export function chatBranchCacheWriteGuard(
+  chat: Pick<Chat, 'lastUpdatedLeafId' | 'lastBranchUpdatedAt' | 'summaryVersion'>,
+  replacementEpoch: number,
+): ChatBranchCacheWriteGuard {
+  return {
+    branchLeafId: chat.lastUpdatedLeafId,
+    lastBranchUpdatedAt: chat.lastBranchUpdatedAt,
+    summaryVersion: chat.summaryVersion,
+    replacementEpoch,
+  }
+}
+
+export function missingChatBranchCacheWriteGuard(
+  replacementEpoch: number,
+): ChatBranchCacheWriteGuard {
+  return {
+    branchLeafId: null,
+    lastBranchUpdatedAt: 0,
+    summaryVersion: 0,
+    replacementEpoch,
+    missingChat: true,
+  }
+}
+
+export function chatMatchesBranchCacheWriteGuard(
+  chat: Pick<Chat, 'lastUpdatedLeafId' | 'lastBranchUpdatedAt' | 'summaryVersion'>,
+  expected: ChatBranchCacheWriteGuard,
+): boolean {
+  return (
+    expected.missingChat !== true &&
+    chat.lastUpdatedLeafId === expected.branchLeafId &&
+    chat.lastBranchUpdatedAt === expected.lastBranchUpdatedAt &&
+    chat.summaryVersion === expected.summaryVersion
+  )
 }
 
 export interface StreamLeaseRow {
@@ -36,8 +125,15 @@ export interface StreamLeaseRow {
   chatId: ChatId
   messageId?: MessageId
   ownerClientId: string
+  fenceToken?: string
+  replacementEpoch?: number
   startedAt: number
   heartbeatAt: number
+  attemptKind?: 'generation' | 'continuation'
+  continuationStrategy?: ContinuationStrategy
+  baseNodeVersion?: number
+  requestedModel?: string
+  apiUsed?: GenerationMeta['apiUsed']
 }
 
 export interface StreamChunkRow {
@@ -48,6 +144,8 @@ export interface StreamChunkRow {
   seq: number
   createdAt: number
   event: unknown
+  fenceToken?: string
+  replacementEpoch?: number
 }
 
 export interface ChatMutationSummary {
@@ -58,7 +156,7 @@ export interface ChatMutationSummary {
   attachmentId?: AttachmentId
 }
 
-interface AttachmentSearchFilters {
+export interface AttachmentSearchFilters {
   kind?: AttachmentKind
   mime?: string
   origin?: AttachmentOrigin
@@ -82,11 +180,26 @@ export interface AttachmentSearchQuery {
   sort?: AttachmentSearchSort
   limit?: number
   cursor?: string
+  signal?: AbortSignal
+  onMeasure?: (measurement: AttachmentSearchMeasurement) => void
 }
 
 export interface AttachmentSearchPage {
   rows: Attachment[]
   nextCursor?: string
+}
+
+export interface AttachmentSearchMeasurement {
+  selectedIndex: 'kind' | 'mime' | 'origin' | 'refCount' | 'createdAt' | 'updatedAt' | 'primary'
+  indexCounts: Partial<Record<'kind' | 'mime' | 'origin' | 'refCount', number>>
+  metadataRowsRead: number
+  metadataCandidates: number
+  embeddedArtifactRowsRead: number
+  artifactCandidateAttachments: number
+  artifactRowsRead: number
+  attachmentBlobRowsRead: 0
+  matchedRows: number
+  returnedRows: number
 }
 
 export interface AttachmentBundle {
@@ -145,6 +258,12 @@ export interface MutationContext {
   getAttachment(attachmentId: AttachmentId): Promise<Attachment | undefined>
   putAttachment(attachment: Attachment): Promise<void>
   deleteAttachment(attachmentId: AttachmentId): Promise<void>
+  countAttachmentReferences(
+    attachmentId: AttachmentId,
+  ): Promise<{ messages: number; drafts: number; occurrences: number }>
+  deleteAttachmentBlobs(attachmentId: AttachmentId): Promise<void>
+  deleteAttachmentArtifacts(attachmentId: AttachmentId): Promise<void>
+  deleteAttachmentJobs(attachmentId: AttachmentId): Promise<void>
   getAttachmentBlob(blobId: string): Promise<AttachmentBlob | undefined>
   putAttachmentBlob(blob: AttachmentBlob): Promise<void>
   deleteAttachmentBlob(blobId: string): Promise<void>
@@ -208,6 +327,95 @@ export interface DeleteArchivedChatsResult {
   deletedChatIds: ChatId[]
 }
 
+export interface ChatCascadeVersion extends ChatVersions {
+  chatId: ChatId
+}
+
+export type DeletePresetCascadeResult =
+  | { kind: 'missing' }
+  | { kind: 'deleted'; chats: ChatCascadeVersion[] }
+
+export interface UpdateProfileAtomicInput {
+  profileId: ProfileId
+  patch: Partial<Omit<ConnectionProfile, 'id' | 'createdAt'>>
+  now: number
+}
+
+export type UpdateProfileAtomicResult =
+  | { kind: 'missing' }
+  | { kind: 'updated'; profile: ConnectionProfile; cachesInvalidated: boolean }
+
+export interface DeleteProfileAtomicInput {
+  profileId: ProfileId
+  force?: boolean
+  reassignTo?: ProfileId
+  now: number
+}
+
+export type DeleteProfileAtomicResult =
+  | { kind: 'missing-profile'; profileId: ProfileId }
+  | { kind: 'missing-target'; profileId: ProfileId }
+  | { kind: 'in-use'; presetIds: PresetId[]; chatIds: ChatId[] }
+  | {
+      kind: 'deleted'
+      chats: ChatCascadeVersion[]
+      presetIds: PresetId[]
+      deletedKeyIds: KeyId[]
+    }
+
+export interface PromptPresetSlot {
+  textKey:
+    | 'systemPrompt'
+    | 'appendPrompt'
+    | 'continueSystemPrompt'
+    | 'continueUserPrompt'
+    | 'defaultPrefill'
+  pinKey:
+    | 'systemPromptPresetId'
+    | 'appendPromptPresetId'
+    | 'continueSystemPromptPresetId'
+    | 'continueUserPromptPresetId'
+    | 'defaultPrefillPresetId'
+}
+
+interface PromptPresetCascadeResultBase {
+  chats: ChatCascadeVersion[]
+  presetIds: PresetId[]
+}
+
+export interface UpdatePromptPresetAtomicInput {
+  presetId: PromptPresetId
+  patch: { name?: string; text?: string }
+  slot: PromptPresetSlot
+  now: number
+}
+
+export type UpdatePromptPresetAtomicResult =
+  | { kind: 'missing' }
+  | ({ kind: 'updated'; promptPreset: PromptPreset } & PromptPresetCascadeResultBase)
+
+export interface DeletePromptPresetAtomicInput {
+  presetId: PromptPresetId
+  slot: PromptPresetSlot
+  now: number
+}
+
+export type DeletePromptPresetAtomicResult =
+  | { kind: 'missing' }
+  | ({ kind: 'deleted' } & PromptPresetCascadeResultBase)
+
+export interface ForkChatFromMessageInput {
+  chatId: ChatId
+  messageId: MessageId
+  title: string
+  now?: number
+}
+
+export interface ForkChatFromMessageResult {
+  chatId: ChatId
+  messageCount: number
+}
+
 interface BranchSiblingGroup {
   parentId: MessageId | null
   siblings: MessageHeaderRow[]
@@ -226,6 +434,15 @@ export interface ActiveBranchBodyWindow {
   // Negative offsets anchor the window to the newest branch messages.
   offset: number
   limit: number
+  onMeasure?: (measurement: ActiveBranchWindowMeasurement) => void
+}
+
+interface ActiveBranchWindowMeasurement {
+  headerRowsRead: number
+  bodyRowsRead: number
+  siblingRowsRetained: number
+  treeKeyRows: number
+  activePath: ActivePathMeasurement
 }
 
 export interface ActiveBranchWindowSnapshot {
@@ -242,13 +459,44 @@ export interface ActiveBranchWindowSnapshot {
 
 export interface WorkspaceRepository {
   getWorkspaceMeta(): Promise<WorkspaceMeta>
+  forkChatFromMessage(input: ForkChatFromMessageInput): Promise<ForkChatFromMessageResult>
+  createChat(chat: Chat): Promise<Chat>
+  discardEmptyDraftChats(input: {
+    chatIds?: readonly ChatId[]
+    exceptChatId?: ChatId | null
+    now?: number
+  }): Promise<ChatId[]>
+  deletePresetAndClearBreadcrumbs(
+    presetId: PresetId,
+    now: number,
+  ): Promise<DeletePresetCascadeResult>
+  updateProfileAndInvalidateCaches(
+    input: UpdateProfileAtomicInput,
+  ): Promise<UpdateProfileAtomicResult>
+  deleteProfileAndReassign(input: DeleteProfileAtomicInput): Promise<DeleteProfileAtomicResult>
+  updatePromptPresetAndPropagate(
+    input: UpdatePromptPresetAtomicInput,
+  ): Promise<UpdatePromptPresetAtomicResult>
+  deletePromptPresetAndClearPins(
+    input: DeletePromptPresetAtomicInput,
+  ): Promise<DeletePromptPresetAtomicResult>
   upsertStreamLease(lease: StreamLeaseRow): Promise<StreamLeaseRow>
+  renewStreamLease(
+    lease: StreamLeaseRow,
+    options?: { targetChanged?: boolean },
+  ): Promise<StreamLeaseRow>
+  claimStreamLeaseForRecovery(
+    expected: StreamLeaseRow,
+    now: number,
+  ): Promise<StreamLeaseRow | undefined>
   deleteStreamLease(streamId: string): Promise<boolean>
+  deleteOwnedStreamLease(streamId: string, fence: StreamWriteFence): Promise<boolean>
   listStreamLeases(chatId?: ChatId): Promise<StreamLeaseRow[]>
   appendStreamChunks(chunks: readonly StreamChunkRow[]): Promise<void>
+  listStreamChunks(streamId: string): Promise<StreamChunkRow[]>
   listStreamChunksForMessage(messageId: MessageId): Promise<StreamChunkRow[]>
   listStreamChunksForChat(chatId: ChatId): Promise<StreamChunkRow[]>
-  deleteStreamChunks(streamId: string): Promise<number>
+  deleteStreamChunks(streamId: string, fence?: StreamWriteFence): Promise<number>
   listChats(): Promise<Chat[]>
   getChat(chatId: ChatId): Promise<Chat | undefined>
   deleteArchivedChat(chatId: ChatId): Promise<boolean>
@@ -264,9 +512,21 @@ export interface WorkspaceRepository {
   updateTag(tagId: TagId, patch: UpdateTagInput): Promise<ChatTag | undefined>
   deleteTag(tagId: TagId): Promise<DeleteTagResult>
   getChatBranchCache(chatId: ChatId): Promise<ChatBranchCache | undefined>
-  putChatBranchCache(cache: ChatBranchCache): Promise<ChatBranchCache>
-  deleteChatBranchCache(chatId: ChatId): Promise<boolean>
+  putChatBranchCache(
+    cache: ChatBranchCache,
+    expected: ChatBranchCacheWriteGuard,
+  ): Promise<ChatBranchCache | undefined>
+  deleteChatBranchCache(chatId: ChatId, expected?: ChatBranchCacheWriteGuard): Promise<boolean>
   getMessage(messageId: MessageId): Promise<Message | undefined>
+  getMessageTextPreview(
+    messageId: MessageId,
+    options?: { maxChars?: number },
+  ): Promise<string | undefined>
+  searchChatMessageText(
+    chatId: ChatId,
+    query: string,
+    options?: { signal?: AbortSignal },
+  ): Promise<MessageId[]>
   listMessages(chatId: ChatId): Promise<Message[]>
   getMessageHeader(messageId: MessageId): Promise<MessageHeaderRow | undefined>
   listMessageHeaders(chatId: ChatId): Promise<MessageHeaderRow[]>
@@ -286,5 +546,24 @@ export interface WorkspaceRepository {
   runMutation<T>(
     scopes: MutationScope[],
     fn: (ctx: MutationContext) => Promise<T> | T,
+    options?: WorkspaceMutationOptions,
   ): Promise<WorkspaceMutationResult<T>>
+}
+
+export async function readChatBranchCacheSource(
+  repo: Pick<WorkspaceRepository, 'getChat' | 'getWorkspaceMeta'>,
+  chatId: ChatId,
+): Promise<{ chat: Chat | undefined; expected: ChatBranchCacheWriteGuard }> {
+  for (;;) {
+    const before = await repo.getWorkspaceMeta()
+    const chat = await repo.getChat(chatId)
+    const after = await repo.getWorkspaceMeta()
+    if (before.replacementEpoch !== after.replacementEpoch) continue
+    return {
+      chat,
+      expected: chat
+        ? chatBranchCacheWriteGuard(chat, after.replacementEpoch)
+        : missingChatBranchCacheWriteGuard(after.replacementEpoch),
+    }
+  }
 }

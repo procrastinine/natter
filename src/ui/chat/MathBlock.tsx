@@ -6,9 +6,8 @@ interface MathBlockProps {
 }
 
 // Fallback math component used when the KaTeX plugin fails to parse a block
-// (per plan/11-rendering.md §11.7). Streamdown's math plugin renders successful
-// blocks itself; this component is only for the error path and for callers
-// that want to force the raw-source fallback.
+// Streamdown's math plugin renders successful blocks itself; this component is
+// only for the error path and for callers that force the raw-source fallback.
 export function MathBlock({ source, display }: MathBlockProps) {
   const reason = useMemo(() => diagnose(source), [source])
   if (!reason) {

@@ -3,8 +3,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { DEFAULT_GLOBAL_PREFERENCES } from '../../src/core/global-settings'
 import { AppearanceSettings } from '../../src/ui/settings/AppearanceSettings'
 
-const liveQueryState = vi.hoisted(() => ({
-  value: undefined as unknown,
+const liveQueryState = vi.hoisted<{ value: unknown }>(() => ({
+  value: undefined,
 }))
 
 vi.mock('../../src/store/settings', () => {
@@ -25,11 +25,13 @@ vi.mock('../../src/store/settings', () => {
   }
 })
 
-vi.mock('dexie-react-hooks', () => {
+vi.mock('../../src/store/reactive-query', () => {
   return {
-    useLiveQuery: <T,>(): T | undefined => {
-      return liveQueryState.value as T | undefined
-    },
+    useRepositoryQuery: <T,>(_key: string, _query: () => Promise<T>, initial: T): T => initial,
+    useRepositoryQueryState: <T,>(_key: string, _query: () => Promise<T>, initial: T) =>
+      liveQueryState.value === undefined
+        ? { status: 'loading', value: initial, error: null }
+        : { status: 'ready', value: liveQueryState.value as T, error: null },
   }
 })
 

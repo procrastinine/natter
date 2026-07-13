@@ -1,11 +1,6 @@
-// Per-message action row. See `plan/10-ui.md §10.6` + `§10.6.1` and
-// `plan/08-branching.md §8.4`. Always-visible, low-weight icon-only buttons
-// trail the message body; Edit-tree mode REVEALS a second row below the
-// default one that carries the structural ops (insert-before /
-// insert-after / insert-sibling / delete-variant / delete-turn). The
-// default icon row is preserved in edit-tree mode so users don't lose
-// copy / edit / regenerate / continue / fork / info / delete-pair while
-// restructuring.
+// Always-visible, low-weight icon-only buttons trail the message body.
+// Edit-tree mode reveals a second row for structural operations while
+// preserving the default action row.
 //
 // The user's rule for "modify user prompt":
 //   - Edit in place — never creates a sibling, never fires an API call.
@@ -20,8 +15,10 @@
 // content block for a textarea cleanly.
 
 import { useCallback, useEffect, useRef, useState } from 'react'
-import type { Message, MessageId } from '../../core/types'
-import { applyStructuralSnapshot, snapshotMessages } from '../../core/undo'
+import { hasAppliedSuccessfulContinuation } from '../../core/continuation-content'
+import { applyStructuralEffectsToCursor } from '../../core/messages'
+import type { Message } from '../../core/types'
+import { applyStructuralSnapshot } from '../../core/undo'
 import {
   deletePairOp,
   deleteSingleOp,
@@ -32,6 +29,7 @@ import {
 // runtime references shrink; leaving them here keeps the component's
 // public contract readable from a single file.
 import { toggleMessageHidden } from '../../store/chats'
+import { useChatStore } from '../../store/zustand/chatStore'
 import { useToastStore } from '../../store/zustand/toastStore'
 import { useUiStore } from '../../store/zustand/uiStore'
 import {
@@ -66,6 +64,7 @@ interface MessageActionsProps {
   // can't run right now.
   hasConnection: boolean
   generationBusy?: boolean
+  streamTargetBusy?: boolean
   disabledReason?: string
   // Structural ops.
   onRegenerate?: () => void | Promise<void>
@@ -79,22 +78,15 @@ interface MessageActionsProps {
   // of the plaintext content.
   onCopy?: () => void | Promise<void>
   // Chat-scoped deletion context. Passed through from the list because
-  // the delete helpers need the full message set + cursor to compute
-  // the pair / turn chain.
+  // the delete helpers need the active chat to compute the pair / turn chain.
   chatId: string
-  cursor: Record<string, MessageId>
   roleMismatch?: boolean
 }
 
-// Shared delete workflow: snapshot → execute → toast w/ undo. Used by
+// Shared delete workflow: execute with atomic pre-image → toast w/ undo. Used by
 // both the default row (pair/single via confirm dialog) and the edit-tree
 // structural row (variant/turn direct).
-function useRunDelete(
-  chatId: string,
-  message: Message,
-  cursor: Record<string, MessageId>,
-  roleMismatch: boolean | undefined,
-) {
+function useRunDelete(chatId: string, message: Message, roleMismatch: boolean | undefined) {
   const cascadeDelete = useUiStore((s) => s.cascadeDelete)
   const pushToast = useToastStore((s) => s.push)
   return useCallback(
@@ -113,12 +105,15 @@ function useRunDelete(
             : effectiveKind === 'variant'
               ? deleteVariantOp
               : deleteSingleOp
-      const snapshot = await snapshotMessages(chatId, [message.id])
+      const priorCursor = {
+        ...(useChatStore.getState().getCursor(chatId) ?? {}),
+      }
+      let result: Awaited<ReturnType<typeof op>>
       try {
-        await op({
+        result = await op({
           chatId,
           messageId: message.id,
-          cursor,
+          cursor: priorCursor,
           ...(cascadeDelete ? { cascade: true } : {}),
         })
       } catch (err) {
@@ -128,6 +123,10 @@ function useRunDelete(
         })
         return
       }
+      const latestCursor = useChatStore.getState().getCursor(chatId) ?? priorCursor
+      useChatStore
+        .getState()
+        .setCursor(chatId, applyStructuralEffectsToCursor(latestCursor, result.effects))
       pushToast({
         level: 'info',
         text:
@@ -139,16 +138,12 @@ function useRunDelete(
                 ? 'Deleted turn.'
                 : 'Deleted message.',
         undo: async () => {
-          await applyStructuralSnapshot({
-            chatId,
-            previousRows: snapshot,
-            newMessageIds: [],
-            attachmentIds: [],
-          })
+          await applyStructuralSnapshot(result.preImage)
+          useChatStore.getState().setCursor(chatId, priorCursor)
         },
       })
     },
-    [chatId, cursor, cascadeDelete, message.id, pushToast, roleMismatch],
+    [chatId, cascadeDelete, message.id, pushToast, roleMismatch],
   )
 }
 
@@ -161,21 +156,23 @@ export function MessageActions(props: MessageActionsProps) {
     onBeginEdit,
     hasConnection,
     generationBusy = false,
+    streamTargetBusy = false,
     disabledReason,
     onRegenerate,
     onContinue,
     onForkChat,
     onCopy,
     chatId,
-    cursor,
     roleMismatch,
   } = props
   const [copied, setCopied] = useState(false)
   const [confirmOpen, setConfirmOpen] = useState(false)
   const copyTimerRef = useRef<number | null>(null)
   const isAssistant = message.role === 'assistant'
-  const abortReason = message.generation?.abortReason
-  const runDelete = useRunDelete(chatId, message, cursor, roleMismatch)
+  const abortReason = hasAppliedSuccessfulContinuation(message)
+    ? undefined
+    : message.generation?.abortReason
+  const runDelete = useRunDelete(chatId, message, roleMismatch)
 
   const previewText =
     message.content
@@ -225,9 +222,13 @@ export function MessageActions(props: MessageActionsProps) {
 
   const disabledTitle = disabledReason ?? 'Add a connection to send messages.'
   const generationDisabled = !hasConnection || generationBusy
+  const continuationDisabled = generationDisabled || streamTargetBusy
   const generationDisabledTitle = !hasConnection
     ? disabledTitle
     : 'A request is already running for this chat.'
+  const continuationDisabledTitle = streamTargetBusy
+    ? "Can't continue while streaming."
+    : generationDisabledTitle
   const deleteLabel = 'Delete message'
   const deleteTooltip = 'Delete this message…'
 
@@ -262,9 +263,9 @@ export function MessageActions(props: MessageActionsProps) {
         data-action="edit"
         aria-pressed={isEditing}
         onClick={onBeginEdit}
-        disabled={isEditing}
+        disabled={isEditing || streamTargetBusy}
         aria-label="Edit message"
-        title="Edit (Enter)"
+        title={streamTargetBusy ? "Can't edit while streaming." : 'Edit (Enter)'}
       >
         <PencilIcon size={14} />
       </button>
@@ -291,14 +292,14 @@ export function MessageActions(props: MessageActionsProps) {
           data-role="message-action"
           data-action="continue"
           onClick={() => void onContinue()}
-          disabled={generationDisabled}
+          disabled={continuationDisabled}
           aria-label={abortReason ? 'Continue partial response' : 'Continue from here'}
           title={
-            !generationDisabled
+            !continuationDisabled
               ? abortReason
                 ? 'Continue this partial response'
                 : 'Continue this assistant message'
-              : generationDisabledTitle
+              : continuationDisabledTitle
           }
         >
           <SendIcon size={14} />
@@ -346,8 +347,9 @@ export function MessageActions(props: MessageActionsProps) {
         data-role="message-action"
         data-action="delete-pair"
         onClick={() => setConfirmOpen(true)}
+        disabled={streamTargetBusy}
         aria-label={deleteLabel}
-        title={deleteTooltip}
+        title={streamTargetBusy ? "Can't delete while streaming." : deleteTooltip}
       >
         <TrashIcon size={14} />
       </button>
@@ -383,9 +385,9 @@ export function MessageActions(props: MessageActionsProps) {
 interface MessageEditTreeActionsProps {
   message: Message
   chatId: string
-  cursor: Record<string, MessageId>
   onInsert?: (slot: InsertSlot) => void | Promise<void>
   roleMismatch?: boolean
+  streamTargetBusy?: boolean
 }
 
 // Structural-ops row for edit-tree mode. Rendered BELOW the default
@@ -396,11 +398,11 @@ interface MessageEditTreeActionsProps {
 export function MessageEditTreeActions({
   message,
   chatId,
-  cursor,
   onInsert,
   roleMismatch,
+  streamTargetBusy = false,
 }: MessageEditTreeActionsProps) {
-  const runDelete = useRunDelete(chatId, message, cursor, roleMismatch)
+  const runDelete = useRunDelete(chatId, message, roleMismatch)
   return (
     <div data-ui="message-edit-tree-row">
       <div data-ui="edit-tree-group" data-side="inserts">
@@ -412,6 +414,7 @@ export function MessageEditTreeActions({
               data-tone="success"
               data-action="insert-before"
               onClick={() => void onInsert('before')}
+              disabled={streamTargetBusy}
             >
               + Insert before
             </button>
@@ -421,6 +424,7 @@ export function MessageEditTreeActions({
               data-tone="success"
               data-action="insert-after"
               onClick={() => void onInsert('after')}
+              disabled={streamTargetBusy}
             >
               + Insert after
             </button>
@@ -430,6 +434,7 @@ export function MessageEditTreeActions({
               data-tone="success"
               data-action="insert-sibling"
               onClick={() => void onInsert('sibling')}
+              disabled={streamTargetBusy}
             >
               + Insert sibling
             </button>
@@ -443,6 +448,7 @@ export function MessageEditTreeActions({
           data-tone="danger"
           data-action="delete-variant"
           onClick={() => void runDelete('variant')}
+          disabled={streamTargetBusy}
         >
           Delete variant
         </button>
@@ -452,6 +458,7 @@ export function MessageEditTreeActions({
           data-tone="danger"
           data-action="delete-turn"
           onClick={() => void runDelete('turn')}
+          disabled={streamTargetBusy}
         >
           Delete turn
         </button>

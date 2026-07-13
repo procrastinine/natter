@@ -1,5 +1,3 @@
-// Centralized model-slug and endpoint predicates. See `plan/05-transforms-and-quirks.md §5.5.1`.
-//
 // Every feature that needs "is this a free model?" / "is this a preset slug?" /
 // "is this Anthropic routed through Bedrock/Vertex?" must import from here. The
 // regexes and provider-name tests are NOT duplicated anywhere else; drift between

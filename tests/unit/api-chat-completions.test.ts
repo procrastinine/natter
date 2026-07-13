@@ -95,7 +95,7 @@ describe('chatCompletions', () => {
     expect(first.result.id).toBe('gen-1')
   })
 
-  it('parses SSE chunks, skipping malformed JSON without killing the stream', async () => {
+  it('parses SSE chunks, reporting malformed JSON without killing the stream', async () => {
     const body = [
       'data: {"id":"gen-x","choices":[{"delta":{"content":"A"}}]}',
       '',
@@ -120,9 +120,20 @@ describe('chatCompletions', () => {
     })) {
       chunks.push(c)
     }
-    expect(chunks).toHaveLength(2)
+    expect(chunks).toHaveLength(4)
     expect(chunks[0]?.type).toBe('delta')
-    expect(chunks[1]?.type).toBe('delta')
+    expect(chunks[1]).toMatchObject({
+      type: 'integrity',
+      integrity: {
+        category: 'malformed-json-frame',
+        adapter: 'chat-completions',
+        eventType: 'message',
+        count: 1,
+        characterCount: 16,
+      },
+    })
+    expect(chunks[2]?.type).toBe('delta')
+    expect(chunks[3]).toEqual({ type: 'transport_terminal', evidence: 'done-sentinel' })
     if (chunks[0]?.type === 'delta') {
       expect(chunks[0].chunk.choices?.[0]?.delta?.content).toBe('A')
     }
@@ -153,6 +164,7 @@ describe('chatCompletions', () => {
     }
     expect(chunks[0]).toEqual({ type: 'keepalive', comment: 'OPENROUTER PROCESSING' })
     expect(chunks[1]?.type).toBe('delta')
+    expect(chunks[2]).toEqual({ type: 'transport_terminal', evidence: 'done-sentinel' })
   })
 
   it('backfills x-generation-id onto chunks that lack an id', async () => {
@@ -179,6 +191,7 @@ describe('chatCompletions', () => {
     if (first?.type !== 'delta') throw new Error('expected delta')
     expect(first.generationId).toBe('gen-42')
     expect(first.chunk.id).toBe('gen-42')
+    expect(chunks[1]).toEqual({ type: 'transport_terminal', evidence: 'done-sentinel' })
   })
 
   it('throws ApiError on HTTP 429 before the body can be consumed', async () => {

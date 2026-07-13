@@ -6,10 +6,13 @@ import {
   resolveRequestPrivacyPlan,
 } from '../../src/core/send-planning'
 import type { Chat, ConnectionProfile, Message, MessageAttachmentRef } from '../../src/core/types'
-import { ingestAttachmentBytes } from '../../src/store/attachments'
+import { deleteReferencedAttachmentBytes, ingestAttachmentBytes } from '../../src/store/attachments'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
-import { __resetBrowserRepositoryForTests } from '../../src/store/browser-repo'
-import { __resetDbForTests, openDb } from '../../src/store/db'
+import {
+  __resetBrowserRepositoryForTests,
+  getBrowserRepository,
+} from '../../src/store/browser-repo'
+import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
 import { putCachedEndpoints } from '../../src/store/models-cache'
 import {
   __resetPrivacyInFlightForTests,
@@ -969,6 +972,51 @@ describe('resolveRequestPrivacyPlan', () => {
     expect(String(requestPlan.wire.prompt)).not.toContain('cat.png')
   })
 
+  it('skips a referenced attachment whose bytes were explicitly deleted', async () => {
+    const profile = makeProfile()
+    const chat = makeChat({ model: 'openai/gpt-4o:free' })
+    await ingestAttachmentBytes({
+      blob: new Blob([new Uint8Array([1, 2, 3])], { type: 'image/png' }),
+      filename: 'deleted-cat.png',
+      declaredMime: 'image/png',
+      id: 'att-deleted-cat',
+    })
+    const message = {
+      ...makeMessage('look'),
+      attachmentRefs: [attachmentRef('att-deleted-cat')],
+    }
+    await getDb().chats.put(chat)
+    await getBrowserRepository().runMutation(
+      [
+        { kind: 'message', messageId: message.id },
+        { kind: 'children', chatId: chat.id, parentId: null },
+        { kind: 'attachment', attachmentId: 'att-deleted-cat' },
+      ],
+      async (ctx) => {
+        await ctx.putMessage(message)
+      },
+    )
+    await deleteReferencedAttachmentBytes('att-deleted-cat', 'deleted', 10)
+    const loaded = await getBrowserRepository().getMessage(message.id)
+    if (!loaded) throw new Error('expected referenced message to remain loadable')
+
+    const { requestPlan } = await prepareAssistantRequestPlan({
+      chat,
+      connection: profile,
+      pathMessages: [loaded],
+      draftText: '',
+      capabilities: {
+        supportedParameters: [],
+        streaming: 'supported',
+        architecture: { inputModalities: ['text', 'image'], outputModalities: ['text'] },
+      },
+    })
+
+    expect(requestPlan.hasAttachmentContext).toBe(true)
+    expect(JSON.stringify(requestPlan.wire)).not.toContain('deleted-cat.png')
+    expect(JSON.stringify(requestPlan.wire)).not.toContain('AQID')
+  })
+
   it('glues appendPrompt onto the last user message at wire time and leaves the stored row alone', async () => {
     const profile = makeOpenAiProfile()
     const chat = makeChat({
@@ -1154,6 +1202,38 @@ describe('resolveRequestPrivacyPlan', () => {
     expect(assistantWire?.content).toBe('<think>\nstill thinking')
     expect(String(assistantWire?.content)).not.toContain('</think>')
     expect(String(assistantWire?.content)).not.toContain('do not send me')
+  })
+
+  it('continue-prefill preserves overlap-looking rows and excludes tool signatures', async () => {
+    const profile = makeOpenAiProfile()
+    const chat = makeChat({ profileId: profile.id, model: 'gpt-4o', api: 'chat' })
+    const user = makeMessage('Continue the partial answer.')
+    const reasoningDetails: NonNullable<Message['reasoningDetails']> = [
+      { type: 'reasoning.text', id: 'block-a', index: 0, text: 'ends A' },
+      { type: 'reasoning.text', id: 'tool_call-1', index: 0, text: 'tool carrier' },
+      { type: 'reasoning.text', id: 'block-b', index: 0, text: 'A starts' },
+    ]
+    const prefillAssistant: Message = {
+      ...makeMessage('Partial answer'),
+      id: 'a1',
+      parentId: user.id,
+      role: 'assistant',
+      origin: 'prefill',
+      content: [{ type: 'output_text', text: 'Partial answer' }],
+      reasoningDetails,
+    }
+
+    const { requestPlan } = await prepareAssistantRequestPlan({
+      chat,
+      connection: profile,
+      pathMessages: [user, prefillAssistant],
+      draftText: '',
+    })
+
+    const wireMessages = requestPlan.wire.messages as Array<{ role: string; content: unknown }>
+    const assistantWire = wireMessages.find((message) => message.role === 'assistant')
+    expect(assistantWire?.content).toBe('<think>\nends A\n\nA starts\n</think>\n\nPartial answer')
+    expect(prefillAssistant.reasoningDetails).toEqual(reasoningDetails)
   })
 
   it('omits appendPrompt entirely when the slot is blank', async () => {

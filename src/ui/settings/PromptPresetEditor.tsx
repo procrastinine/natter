@@ -7,11 +7,6 @@
 // slot touches. Typing saves just the text and clears the pin ("save to this
 // chat only" is the default); the preset picker offers load / overwrite /
 // save-as-new / rename / delete.
-//
-// Pin semantics, storage layout: see `plan/02-data-model.md §2.6b` and
-// `src/store/prompt-presets.ts`. UI spec: `plan/10-ui.md §10.9`.
-
-import { useLiveQuery } from 'dexie-react-hooks'
 import type { ReactNode } from 'react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { estimateTokensByTokenizer } from '../../core/tokens'
@@ -22,8 +17,12 @@ import {
   createPromptPreset,
   deletePromptPreset,
   listPromptPresets,
+  registerPromptSettingSaveFlusher,
+  trackPendingPromptSettingSave,
   updatePromptPreset,
 } from '../../store/prompt-presets'
+import { allTable } from '../../store/reactive-dependencies'
+import { useRepositoryQuery } from '../../store/reactive-query'
 import { useToastStore } from '../../store/zustand/toastStore'
 import { InfoDisclosure } from './InfoDisclosure'
 
@@ -44,6 +43,7 @@ interface SlotState {
   toastVisible: boolean
   pickerOpen: boolean
   setPickerOpen: (v: boolean) => void
+  flushDraft: () => Promise<void>
   loadPreset: (id: string) => Promise<void>
   saveToExisting: (id: string, presetName: string) => Promise<void>
   saveAsNew: (promptTitle: string) => Promise<void>
@@ -63,39 +63,47 @@ function usePromptSlot(
   slot: Slot<PromptPresetKind>,
   opts: UsePromptSlotOpts,
 ): SlotState {
+  const { kind, textKey, pinKey } = slot
   const storedText = (chat.settings[slot.textKey] as string | undefined) ?? ''
   const pinnedId = chat.settings[slot.pinKey] as string | undefined
 
   const [draft, setDraft] = useState(storedText)
+  const draftRef = useRef(storedText)
   const lastPersistedRef = useRef(storedText)
-  const lastChatIdRef = useRef(chat.id)
+  const saveTailRef = useRef<Promise<void>>(Promise.resolve())
+  const lastScheduledRef = useRef<{
+    text: string
+    pinnedId: string | undefined
+    promise: Promise<boolean>
+  } | null>(null)
+  const scheduledSaveCountRef = useRef(0)
+  const mountedRef = useRef(true)
   const [estimateText, setEstimateText] = useState(storedText)
   const [pickerOpen, setPickerOpen] = useState(false)
   const [toastVisible, setToastVisible] = useState(false)
+  const toastTimerRef = useRef<number | null>(null)
 
-  const presets = useLiveQuery(
+  const presets = useRepositoryQuery(
+    JSON.stringify(['prompt-presets', slot.kind]),
     () => listPromptPresets(slot.kind),
-    [slot.kind],
     [] as PromptPreset[],
+    allTable('promptPresets'),
   )
   const pushToast = useToastStore((s) => s.push)
 
-  // Resync draft from storage on chat-switch OR when an external write
-  // (preset propagation, other tab) changed the stored value.
+  const setDraftValue = useCallback((value: string) => {
+    draftRef.current = value
+    setDraft(value)
+  }, [])
+
   useEffect(() => {
-    if (lastChatIdRef.current !== chat.id) {
-      lastChatIdRef.current = chat.id
-      lastPersistedRef.current = storedText
-      setDraft(storedText)
-      setEstimateText(storedText)
-      return
-    }
-    if (storedText !== lastPersistedRef.current) {
-      lastPersistedRef.current = storedText
-      setDraft(storedText)
-      setEstimateText(storedText)
-    }
-  }, [chat.id, storedText])
+    if (storedText === lastPersistedRef.current) return
+    if (draftRef.current !== lastPersistedRef.current) return
+    if (scheduledSaveCountRef.current > 0) return
+    lastPersistedRef.current = storedText
+    setDraftValue(storedText)
+    setEstimateText(storedText)
+  }, [setDraftValue, storedText])
 
   useEffect(() => {
     if (!opts.showTokens) return
@@ -103,26 +111,88 @@ function usePromptSlot(
     return () => window.clearTimeout(id)
   }, [draft, opts.showTokens])
 
-  // Debounced local save clears the pin: editing the text is the default
-  // "save to this chat only" action per the user spec.
-  useEffect(() => {
-    if (draft === lastPersistedRef.current) return
-    const id = window.setTimeout(async () => {
-      lastPersistedRef.current = draft
-      const saved = await updateChatSettings(chat.id, {
-        [slot.textKey]: draft,
-        [slot.pinKey]: undefined,
-      })
-      if (saved && opts.firstEditToastKey && typeof window !== 'undefined') {
-        if (!window.sessionStorage.getItem(opts.firstEditToastKey)) {
-          window.sessionStorage.setItem(opts.firstEditToastKey, '1')
-          setToastVisible(true)
-          window.setTimeout(() => setToastVisible(false), 4000)
-        }
+  const showFirstEditToast = useCallback(() => {
+    if (!opts.firstEditToastKey || typeof window === 'undefined') return
+    if (window.sessionStorage.getItem(opts.firstEditToastKey)) return
+    window.sessionStorage.setItem(opts.firstEditToastKey, '1')
+    if (!mountedRef.current) return
+    setToastVisible(true)
+    if (toastTimerRef.current !== null) window.clearTimeout(toastTimerRef.current)
+    toastTimerRef.current = window.setTimeout(() => {
+      toastTimerRef.current = null
+      if (mountedRef.current) setToastVisible(false)
+    }, 4000)
+  }, [opts.firstEditToastKey])
+
+  const enqueueChatSave = useCallback(
+    (text: string, targetPinnedId: string | undefined, localEdit: boolean): Promise<boolean> => {
+      const scheduled = lastScheduledRef.current
+      if (scheduled?.text === text && scheduled.pinnedId === targetPinnedId) {
+        return scheduled.promise
       }
+
+      scheduledSaveCountRef.current += 1
+      const operation = saveTailRef.current
+        .catch(() => undefined)
+        .then(async () => {
+          const saved = await updateChatSettings(chat.id, {
+            [textKey]: text,
+            [pinKey]: targetPinnedId,
+          })
+          lastPersistedRef.current = text
+          if (saved && localEdit) showFirstEditToast()
+          return saved
+        })
+      const tracked = trackPendingPromptSettingSave(chat.id, operation)
+      lastScheduledRef.current = { text, pinnedId: targetPinnedId, promise: tracked }
+      saveTailRef.current = tracked.then(
+        () => undefined,
+        () => undefined,
+      )
+      const settle = () => {
+        scheduledSaveCountRef.current -= 1
+        if (lastScheduledRef.current?.promise === tracked) lastScheduledRef.current = null
+      }
+      void tracked.then(settle, settle)
+      return tracked
+    },
+    [chat.id, pinKey, showFirstEditToast, textKey],
+  )
+
+  const flushDraft = useCallback(async () => {
+    const text = draftRef.current
+    const scheduled = lastScheduledRef.current
+    if (scheduled?.text === text && scheduled.pinnedId === undefined) {
+      await scheduled.promise
+      return
+    }
+    if (!scheduled && text === lastPersistedRef.current) return
+    await enqueueChatSave(text, undefined, true)
+  }, [enqueueChatSave])
+
+  const flushDraftRef = useRef(flushDraft)
+  flushDraftRef.current = flushDraft
+
+  useEffect(() => {
+    mountedRef.current = true
+    const unregister = registerPromptSettingSaveFlusher(chat.id, () => flushDraftRef.current())
+    return () => {
+      mountedRef.current = false
+      if (toastTimerRef.current !== null) window.clearTimeout(toastTimerRef.current)
+      void flushDraftRef
+        .current()
+        .catch(() => undefined)
+        .finally(unregister)
+    }
+  }, [chat.id])
+
+  useEffect(() => {
+    if (draft === lastPersistedRef.current && !lastScheduledRef.current) return
+    const id = window.setTimeout(() => {
+      void flushDraft().catch(() => undefined)
     }, SAVE_DEBOUNCE_MS)
     return () => window.clearTimeout(id)
-  }, [draft, chat.id, slot.textKey, slot.pinKey, opts.firstEditToastKey])
+  }, [draft, flushDraft])
 
   const pinnedPreset = useMemo(
     () => (pinnedId ? (presets.find((p) => p.id === pinnedId) ?? null) : null),
@@ -135,94 +205,108 @@ function usePromptSlot(
   )
 
   const flushDraftBeforeAction = useCallback(async () => {
-    if (draft === lastPersistedRef.current) return
-    lastPersistedRef.current = draft
-    await updateChatSettings(chat.id, {
-      [slot.textKey]: draft,
-      [slot.pinKey]: undefined,
-    })
-  }, [chat.id, draft, slot.pinKey, slot.textKey])
+    try {
+      await flushDraft()
+      return true
+    } catch {
+      return false
+    }
+  }, [flushDraft])
 
   const loadPreset = useCallback(
     async (targetId: string) => {
       const target = presets.find((p) => p.id === targetId)
       if (!target) return
-      lastPersistedRef.current = target.text
-      setDraft(target.text)
+      if (!(await flushDraftBeforeAction())) return
+      try {
+        await enqueueChatSave(target.text, target.id, false)
+      } catch {
+        return
+      }
+      setDraftValue(target.text)
       setEstimateText(target.text)
-      await updateChatSettings(chat.id, {
-        [slot.textKey]: target.text,
-        [slot.pinKey]: target.id,
-      })
       await bumpPromptPresetLastUsedAt(target.id)
       setPickerOpen(false)
     },
-    [chat.id, presets, slot.pinKey, slot.textKey],
+    [enqueueChatSave, flushDraftBeforeAction, presets, setDraftValue],
   )
 
   const saveToExisting = useCallback(
     async (targetId: string, presetName: string) => {
-      await flushDraftBeforeAction()
-      await updatePromptPreset(targetId, { text: draft })
-      await updateChatSettings(chat.id, {
-        [slot.pinKey]: targetId,
-      })
-      pushToast({
-        level: 'info',
-        text: `Saved to "${presetName}".`,
-        durationMs: 2500,
-      })
-      setPickerOpen(false)
+      if (!(await flushDraftBeforeAction())) return
+      try {
+        await updatePromptPreset(targetId, { text: draftRef.current })
+        await updateChatSettings(chat.id, { [pinKey]: targetId })
+        pushToast({
+          level: 'info',
+          text: `Saved to "${presetName}".`,
+          durationMs: 2500,
+        })
+        setPickerOpen(false)
+      } catch {
+        return
+      }
     },
-    [chat.id, draft, flushDraftBeforeAction, pushToast, slot.pinKey],
+    [chat.id, flushDraftBeforeAction, pinKey, pushToast],
   )
 
   const saveAsNew = useCallback(
     async (promptTitle: string) => {
-      await flushDraftBeforeAction()
+      if (!(await flushDraftBeforeAction())) return
       const name = window.prompt(`Name for new ${promptTitle.toLowerCase()} preset:`)
       if (!name?.trim()) return
-      const created = await createPromptPreset({
-        kind: slot.kind,
-        name: name.trim(),
-        text: draft,
-        lastUsedAt: Date.now(),
-      })
-      await updateChatSettings(chat.id, {
-        [slot.pinKey]: created.id,
-      })
-      pushToast({
-        level: 'info',
-        text: `Created preset "${created.name}".`,
-        durationMs: 2500,
-      })
-      setPickerOpen(false)
+      try {
+        const created = await createPromptPreset({
+          kind,
+          name: name.trim(),
+          text: draftRef.current,
+          lastUsedAt: Date.now(),
+        })
+        await updateChatSettings(chat.id, { [pinKey]: created.id })
+        pushToast({
+          level: 'info',
+          text: `Created preset "${created.name}".`,
+          durationMs: 2500,
+        })
+        setPickerOpen(false)
+      } catch {
+        return
+      }
     },
-    [chat.id, draft, flushDraftBeforeAction, pushToast, slot.kind, slot.pinKey],
+    [chat.id, flushDraftBeforeAction, kind, pinKey, pushToast],
   )
 
   const renamePreset = useCallback(async (targetId: string, currentName: string) => {
     const name = window.prompt('Rename preset:', currentName)
     if (!name?.trim() || name === currentName) return
-    await updatePromptPreset(targetId, { name: name.trim() })
+    try {
+      await updatePromptPreset(targetId, { name: name.trim() })
+    } catch {
+      return
+    }
   }, [])
 
   const deletePresetWithConfirm = useCallback(async (targetId: string, name: string) => {
     if (!window.confirm(`Delete preset "${name}"? Chats pinned to it keep their current text.`)) {
       return
     }
-    await deletePromptPreset(targetId)
+    try {
+      await deletePromptPreset(targetId)
+    } catch {
+      return
+    }
   }, [])
 
   return {
     draft,
-    setDraft,
+    setDraft: setDraftValue,
     pinnedPreset,
     presets,
     tokens,
     toastVisible,
     pickerOpen,
     setPickerOpen,
+    flushDraft,
     loadPreset,
     saveToExisting,
     saveAsNew,
@@ -306,6 +390,7 @@ export function SystemPromptEditor({
               data-ui="system-prompt-textarea"
               value={s.draft}
               onChange={(e) => s.setDraft(e.target.value)}
+              onBlur={() => void s.flushDraft().catch(() => undefined)}
               rows={8}
               spellCheck
             />
@@ -386,6 +471,7 @@ export function AppendPromptEditor({
             data-ui="append-prompt-textarea"
             value={s.draft}
             onChange={(e) => s.setDraft(e.target.value)}
+            onBlur={() => void s.flushDraft().catch(() => undefined)}
             rows={4}
             spellCheck
           />
@@ -469,6 +555,7 @@ export function PrefillPromptEditor({
               data-ui="default-prefill-textarea"
               value={s.draft}
               onChange={(e) => s.setDraft(e.target.value)}
+              onBlur={() => void s.flushDraft().catch(() => undefined)}
               placeholder='Default text seeded into the prefill box. Example: "Chapter 1: The"'
               rows={3}
               spellCheck
@@ -547,6 +634,7 @@ export function ContinueSystemPromptEditor({
             data-ui="continue-system-prompt-textarea"
             value={s.draft}
             onChange={(e) => s.setDraft(e.target.value)}
+            onBlur={() => void s.flushDraft().catch(() => undefined)}
             rows={4}
             spellCheck
           />
@@ -621,6 +709,7 @@ export function ContinueUserPromptEditor({
             data-ui="continue-user-prompt-textarea"
             value={s.draft}
             onChange={(e) => s.setDraft(e.target.value)}
+            onBlur={() => void s.flushDraft().catch(() => undefined)}
             rows={3}
             spellCheck
           />

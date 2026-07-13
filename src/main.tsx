@@ -1,20 +1,26 @@
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import { App } from './app/App'
-import { installDebugFakeStream } from './lib/debug-fake-stream'
-import { installDebugNuke } from './lib/debug-nuke'
-import { installDebugScroll } from './lib/debug-scroll'
-import { installDebugStreams } from './lib/debug-streams'
 import { openDb } from './store/db'
-import 'streamdown/styles.css'
-import 'katex/dist/katex.css'
 import './app/theme.css'
 
-if (import.meta.env.DEV) {
-  installDebugNuke()
-  installDebugStreams()
-  installDebugScroll()
-  installDebugFakeStream()
+const debugToolsRequested =
+  import.meta.env.DEV &&
+  (navigator.userAgent.endsWith(' NatterE2E') ||
+    import.meta.env.VITE_NATTER_DEBUG === '1' ||
+    new URLSearchParams(window.location.search).has('debug'))
+
+if (debugToolsRequested) {
+  const [fakeStream, nuke, scroll, streams] = await Promise.all([
+    import('./lib/debug-fake-stream'),
+    import('./lib/debug-nuke'),
+    import('./lib/debug-scroll'),
+    import('./lib/debug-streams'),
+  ])
+  fakeStream.installDebugFakeStream()
+  nuke.installDebugNuke()
+  scroll.installDebugScroll()
+  streams.installDebugStreams()
 }
 
 const container = document.getElementById('root')

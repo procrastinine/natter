@@ -1,7 +1,6 @@
 /*
  * utilities.css — visually-hidden, overflow, focus helpers, print overrides.
  * Owns: .sr-only, .focus-ring, .truncate, [data-ui='print-only'].
- * See plan/10-ui.md §10.20.
  */
 
 .sr-only,

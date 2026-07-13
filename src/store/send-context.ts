@@ -21,10 +21,17 @@ import type {
 } from '../core/types'
 import { getDb } from './db'
 import { hydrateMessages, type MessageBodyRow, type MessageHeaderRow } from './message-storage'
+import { flushPendingPromptSettingSaves } from './prompt-presets'
+import { getWorkspaceRepository } from './workspace-repository'
 
-interface ActiveBranchHeaderSnapshot {
+interface ChatHeaderSnapshot {
+  chat: Chat
+  summaryVersion: number
   chatId: string
   allHeaders: MessageHeaderRow[]
+}
+
+interface ActiveBranchHeaderSnapshot extends ChatHeaderSnapshot {
   branchHeaders: MessageHeaderRow[]
 }
 
@@ -61,15 +68,61 @@ interface SendContextBucket {
 
 const EMPTY_PENDING: readonly Message[] = Object.freeze([])
 
+export class StaleSendContextError extends Error {
+  readonly chatId: string
+  readonly expectedSummaryVersion: number
+  readonly actualSummaryVersion?: number
+
+  constructor(chatId: string, expectedSummaryVersion: number, actualSummaryVersion?: number) {
+    super(
+      actualSummaryVersion === undefined
+        ? `Send context is stale because chat ${chatId} is unavailable.`
+        : `Send context is stale for chat ${chatId}: expected summary version ${expectedSummaryVersion}, found ${actualSummaryVersion}.`,
+    )
+    this.name = 'StaleSendContextError'
+    this.chatId = chatId
+    this.expectedSummaryVersion = expectedSummaryVersion
+    if (actualSummaryVersion !== undefined) this.actualSummaryVersion = actualSummaryVersion
+  }
+}
+
+export function assertSendContextVersion(
+  chat: Pick<Chat, 'id' | 'summaryVersion'> | undefined,
+  chatId: string,
+  expectedSummaryVersion: number,
+): asserts chat is Pick<Chat, 'id' | 'summaryVersion'> {
+  if (!chat || chat.id !== chatId || chat.summaryVersion !== expectedSummaryVersion) {
+    throw new StaleSendContextError(chatId, expectedSummaryVersion, chat?.summaryVersion)
+  }
+}
+
+export async function assertSendContextFresh(
+  chatId: string,
+  expectedSummaryVersion: number,
+): Promise<void> {
+  const chat = await getDb().chats.get(chatId)
+  assertSendContextVersion(chat, chatId, expectedSummaryVersion)
+}
+
+export async function loadChatHeaderSnapshot(chatId: string): Promise<ChatHeaderSnapshot> {
+  await flushPendingPromptSettingSaves(chatId)
+  const db = getDb()
+  const [chat, allHeaders] = await db.transaction('r', db.chats, db.messages, async () =>
+    Promise.all([db.chats.get(chatId), db.messages.where('chatId').equals(chatId).toArray()]),
+  )
+  if (!chat) throw new Error(`ChatHeaderSnapshotMissing:${chatId}`)
+  return { chat, summaryVersion: chat.summaryVersion, chatId, allHeaders }
+}
+
 export async function loadActiveBranchHeaderSnapshot(
   chatId: string,
   cursor: Record<string, MessageId>,
 ): Promise<ActiveBranchHeaderSnapshot> {
-  const headers = await getDb().messages.where('chatId').equals(chatId).toArray()
-  const branchHeaders = activePath(headers as unknown as Message[], cursor).map(
+  const snapshot = await loadChatHeaderSnapshot(chatId)
+  const branchHeaders = activePath(snapshot.allHeaders as unknown as Message[], cursor).map(
     (message) => message as unknown as MessageHeaderRow,
   )
-  return { chatId, allHeaders: headers, branchHeaders }
+  return { ...snapshot, branchHeaders }
 }
 
 export async function loadSendContextForBranch(
@@ -346,7 +399,8 @@ function attachmentIdsFromRefs(
 }
 
 async function loadAttachmentResolver(ids: readonly AttachmentId[]): Promise<AttachmentResolver> {
-  const rows = await getDb().attachments.bulkGet([...ids])
+  const repository = getWorkspaceRepository()
+  const rows = await Promise.all(ids.map((id) => repository.getAttachment(id)))
   const byId = new Map<AttachmentId, Attachment>()
   for (const row of rows) {
     if (row) byId.set(row.id, row)

@@ -115,7 +115,7 @@ function applyManualPickerState(
 
   const ignoredByPicker =
     userTouchedPicker &&
-    endpointMatchesAnyProviderRef(row.endpoint, providerPrefs?.ignore, endpoints)
+    endpointMatchesAnyProviderRef(row.endpoint, providerPrefs.ignore, endpoints)
   if (ignoredByPicker) {
     return { ...row, state: 'auto-excluded', reasons: ['user-ignored'] }
   }

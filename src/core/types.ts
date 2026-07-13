@@ -1,5 +1,4 @@
 // Core domain types. Source of truth for the app; storage and wire shapes derive from here.
-// See `plan/02-data-model.md` for rationale and invariants.
 //
 // Conventions:
 // - snake_case on the wire, camelCase internally
@@ -119,8 +118,7 @@ type ReasoningSummary = 'off' | 'auto' | 'concise' | 'detailed'
  *    Gemini `thought: true` parts).
  *  - `text`: round-trip visible plaintext reasoning (Claude / DeepSeek / Qwen
  *    / Gemma).
- *  Each flag is independently gated by what the current route can actually
- *  round-trip (see `plan/phase11-implementation.md §2`). */
+ *  Each flag is independently gated by what the current route can round-trip. */
 export interface ReasoningInclude {
   encrypted: boolean
   summary: boolean
@@ -455,7 +453,7 @@ export interface ChatSettings {
   // preset still exists, the preset is the canonical source — edits to the
   // preset propagate to `systemPrompt` via `prompt-presets.ts`. Editing the
   // text locally clears the pin; deleting the preset clears the pin but
-  // preserves the last propagated text. See `plan/02-data-model.md §2.6b`.
+  // preserves the last propagated text.
   systemPromptPresetId?: PromptPresetId
   systemRole: 'system' | 'developer'
   // Silently appended to the LAST user message on the wire (regular send,
@@ -477,10 +475,10 @@ export interface ChatSettings {
   continueUserPromptPresetId?: PromptPresetId
   // Default prefill text seeded into the prefill box whenever the user opens
   // prefill on this chat (composer or Edit-and-Send, NOT Continue). Blank
-  // means "start empty". Prefill research §P.8: shown above the continue
-  // prompts in the generation tab. Optional pin back to a `PromptPreset`
+  // means "start empty". Shown above the continue prompts in the generation
+  // tab. Optional pin back to a `PromptPreset`
   // (`kind: 'prefill'`) follows the same propagation rules as the other
-  // prompt slots — see `plan/02-data-model.md §2.6b`.
+  // prompt slots.
   defaultPrefill?: string
   defaultPrefillPresetId?: PromptPresetId
   // Continue-in-place mode. When true, Continue sends the history with the
@@ -654,7 +652,7 @@ export interface Chat {
   // on navigation.
   temporary?: boolean
   // Denormalized sidebar preview: plaintext of the earliest live user
-  // message, trimmed to a generous single-line cap. Populated by `refreshChatPreview`
+  // message, trimmed to a generous single-line cap. Maintained atomically
   // whenever a user message is created, edited, or deleted. The sidebar
   // reads this directly off the chat row so listing N chats never has to
   // touch the `messages` table (critical once a workspace holds
@@ -842,12 +840,45 @@ export interface ChatUsage {
   cache_creation_input_tokens?: number
 }
 
-interface ApiError {
+export type AttemptFailureCategory =
+  | 'abort'
+  | 'network'
+  | 'protocol'
+  | 'provider'
+  | 'storage'
+  | 'integrity'
+  | 'internal'
+
+export interface PersistedAttemptFailure {
+  category: AttemptFailureCategory
   code: string
   message: string
   statusCode?: number
   provider?: string
-  raw?: unknown
+  retryable?: boolean
+  midStream?: boolean
+}
+
+export type AttemptIntegrityState = 'clean' | 'degraded' | 'failed'
+
+export interface AttemptIntegrityEntry {
+  category: 'malformed-json-frame'
+  adapter:
+    | 'chat-completions'
+    | 'responses'
+    | 'gemini-native'
+    | 'anthropic-messages'
+    | 'text-completions'
+  eventType: string
+  count: number
+  fingerprint: string
+  characterCount: number
+}
+
+export interface AttemptIntegritySummary {
+  count: number
+  characterCount: number
+  entries: AttemptIntegrityEntry[]
 }
 
 export interface GenerationServerToolCall {
@@ -900,6 +931,9 @@ export interface GenerationMeta {
     | 'completion'
     | 'video-generation'
   delivery: DeliveryMethod
+  status?: 'streaming' | 'done' | 'error' | 'abort' | 'interrupted'
+  integrity?: AttemptIntegrityState
+  integritySummary?: AttemptIntegritySummary
   usage?: ChatUsage
   cost?: number
   costSource: 'stream' | 'generation-endpoint' | 'estimated'
@@ -910,16 +944,51 @@ export interface GenerationMeta {
   finishedAt?: number
   finishReason?: FinishReason
   nativeFinishReason?: string
-  error?: ApiError
+  error?: PersistedAttemptFailure
   abortReason?: AbortReason
   serverTools?: GenerationServerToolCall[]
   tokenCalibration?: GenerationTokenCalibration
 }
 
+export type ContinuationStrategy = 'prompt' | 'prefill'
+
+export type ContinuationAttemptStrategy = ContinuationStrategy | 'unknown'
+
+export type ContinuationAttemptStatus = 'done' | 'error' | 'abort' | 'interrupted'
+
+export interface ContinuationAttempt {
+  streamId: string
+  strategy: ContinuationAttemptStrategy
+  status: ContinuationAttemptStatus
+  integrity?: AttemptIntegrityState
+  integritySummary?: AttemptIntegritySummary
+  requestedModel?: string
+  model?: string
+  apiUsed?: GenerationMeta['apiUsed']
+  provider?: string
+  generationId?: string
+  startedAt: number
+  firstTextAt?: number
+  reasoningStartedAt?: number
+  reasoningFinishedAt?: number
+  finishedAt: number
+  usage?: ChatUsage
+  cost?: number
+  costSource?: GenerationMeta['costSource']
+  finishReason?: FinishReason
+  nativeFinishReason?: string
+  error?: PersistedAttemptFailure
+  abortReason?: AbortReason
+  unappliedText?: string
+  reasoningDetails?: ReasoningDetail[]
+  toolCalls?: ToolCall[]
+  phase?: MessagePhase
+  providerOutputItems?: ProviderOutputItem[]
+}
+
 // Minimal echo envelope for a Responses API output item. The full variant list
 // lives in transforms; this shape stays open so callers can round-trip unknown
-// item types without losing data. See `plan/15-non-text-in-context.md` and
-// `plan/02-data-model.md §2.9` for the canonical set.
+// item types without losing data.
 export interface ResponsesOutputItem {
   type: string
   id?: string
@@ -945,6 +1014,7 @@ export interface Message {
   phase?: MessagePhase
   responsesEchoItem?: ResponsesOutputItem
   providerOutputItems?: ProviderOutputItem[]
+  continuationAttempts?: ContinuationAttempt[]
   attachmentRefs?: MessageAttachmentRef[]
   approval?: MessageApproval
   nodeVersion: number
@@ -952,9 +1022,9 @@ export interface Message {
   hiddenFromContext?: boolean
   deleted: boolean
 
-  // ---- Token-calibration fields (Phase B) ----
+  // ---- Token-calibration fields ----
   // All optional for backcompat; rehydrated old rows fall through to the
-  // fresh/cross-model path. See `plan/token-counting-audit.md` Phase B.
+  // fresh/cross-model path.
 
   // Character count at message creation (text content only, no media). For
   // assistant messages in the inline-`<think>` family, also includes the
@@ -1128,6 +1198,15 @@ export interface MessageAttachmentRef {
 
 export type AttachmentRef = MessageAttachmentRef
 
+export interface AttachmentReferenceEdge {
+  ownerKind: 'message' | 'draft'
+  ownerId: string
+  chatId: ChatId
+  refId: string
+  attachmentId: AttachmentId
+  ordinal: number
+}
+
 export interface Attachment {
   id: AttachmentId
   contentHash?: string
@@ -1222,7 +1301,7 @@ export type PromptPresetKind = 'system' | 'append' | 'continue-system' | 'contin
 
 // A named, workspace-global prompt snapshot. Unlike ChatPreset (per-profile
 // bundle of the full ChatSettings), PromptPresets are kind-scoped and hold
-// just a label + text. See `plan/02-data-model.md §2.6b`.
+// just a label + text.
 export interface PromptPreset {
   id: PromptPresetId
   kind: PromptPresetKind

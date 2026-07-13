@@ -6,7 +6,12 @@ import { cursorKeyOf } from '../../src/core/active-path'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import { tokenCalibrationKey } from '../../src/core/model-ids'
 import type { ChatSettings, ConnectionProfile, Message } from '../../src/core/types'
-import { recoverOrphans, sendText } from '../../src/hooks/useChat'
+import {
+  nextOrphanRecoveryAt,
+  recoverOrphans,
+  sendFromMessage,
+  sendText,
+} from '../../src/hooks/useChat'
 import { newId } from '../../src/lib/ulid'
 import { __resetBroadcastForTests, postEvent } from '../../src/store/broadcast'
 import {
@@ -14,17 +19,87 @@ import {
   getBrowserRepository,
 } from '../../src/store/browser-repo'
 import { createChat } from '../../src/store/chats'
-import { __resetDbForTests, openDb } from '../../src/store/db'
+import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
 import { putCachedEndpoints } from '../../src/store/models-cache'
 import {
   __resetStreamLeasesForTests,
+  __setStreamLockManagerForTests,
   getStreamClientId,
   installStreamLeaseListener,
+  onRemoteStreamOwnershipReleased,
+  streamWriteFenceForLease,
 } from '../../src/store/stream-leases'
 import { useChatStore } from '../../src/store/zustand/chatStore'
 import { useStreamStore } from '../../src/store/zustand/streamStore'
+import { useUiStore } from '../../src/store/zustand/uiStore'
 
 const DB_NAME = 'natter'
+
+function chunkFence(lease: { streamId: string; fenceToken?: string; replacementEpoch?: number }) {
+  if (typeof lease.fenceToken !== 'string' || lease.replacementEpoch === undefined) {
+    throw new Error(`expected fenced lease ${lease.streamId}`)
+  }
+  return { fenceToken: lease.fenceToken, replacementEpoch: lease.replacementEpoch }
+}
+
+class TestExclusiveLockManager {
+  private readonly held = new Set<string>()
+  private readonly queues = new Map<string, Array<() => void>>()
+
+  request<T>(
+    name: string,
+    optionsOrCallback: LockOptions | ((lock: Lock | null) => T | PromiseLike<T>),
+    maybeCallback?: (lock: Lock | null) => T | PromiseLike<T>,
+  ): Promise<T> {
+    const options = typeof optionsOrCallback === 'function' ? {} : optionsOrCallback
+    const callback =
+      typeof optionsOrCallback === 'function'
+        ? optionsOrCallback
+        : (maybeCallback as NonNullable<typeof maybeCallback>)
+    if (options.ifAvailable && this.held.has(name)) return Promise.resolve(callback(null))
+    return new Promise<T>((resolve, reject) => {
+      const acquire = () => {
+        if (this.held.has(name)) {
+          const queue = this.queues.get(name) ?? []
+          queue.push(acquire)
+          this.queues.set(name, queue)
+          return
+        }
+        this.held.add(name)
+        const release = () => {
+          this.held.delete(name)
+          this.queues.get(name)?.shift()?.()
+        }
+        void Promise.resolve(callback({ name, mode: options.mode ?? 'exclusive' })).then(
+          (value) => {
+            release()
+            resolve(value)
+          },
+          (error) => {
+            release()
+            reject(error)
+          },
+        )
+      }
+      acquire()
+    })
+  }
+
+  hold(name: string): () => void {
+    this.held.add(name)
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      this.held.delete(name)
+      this.queues.get(name)?.shift()?.()
+    }
+  }
+
+  queuedCount(name: string): number {
+    return this.queues.get(name)?.length ?? 0
+  }
+}
 
 function makeProfile(): ConnectionProfile {
   return {
@@ -112,6 +187,7 @@ async function reset() {
   __resetStreamLeasesForTests()
   useChatStore.getState().reset()
   useStreamStore.getState().reset()
+  useUiStore.getState().reset()
   await Dexie.delete(DB_NAME)
 }
 
@@ -133,6 +209,42 @@ afterEach(async () => {
 
 async function messagesFor(chatId: string): Promise<Message[]> {
   return getBrowserRepository().listMessages(chatId)
+}
+
+async function seedUnfinishedAssistant(chatId: string, startedAt = 100): Promise<string> {
+  const id = newId()
+  await getBrowserRepository().runMutation(
+    [
+      { kind: 'message', messageId: id },
+      { kind: 'children', chatId, parentId: null },
+    ],
+    async (ctx) => {
+      await ctx.putMessage({
+        id,
+        chatId,
+        parentId: null,
+        siblingIndex: 0,
+        turnId: newId(),
+        turnIndex: 0,
+        createdAt: 1,
+        role: 'assistant',
+        origin: 'generated',
+        content: [{ type: 'output_text', text: 'partial' }],
+        nodeVersion: 0,
+        deleted: false,
+        generation: {
+          id: '',
+          model: 'm',
+          requestedModel: 'm',
+          apiUsed: 'chat',
+          delivery: 'streaming',
+          costSource: 'stream',
+          startedAt,
+        },
+      })
+    },
+  )
+  return id
 }
 
 async function eventually(assertion: () => Promise<void> | void): Promise<void> {
@@ -370,7 +482,9 @@ describe('sendText — chat-completions streaming', () => {
     expect(assistant.parentId).toBe(user.id)
     expect(assistant.content).toEqual([{ type: 'output_text', text: '' }])
     expect(useStreamStore.getState().listByChat(chat.id)[0]?.messageId).toBe(assistant.id)
-    expect(useChatStore.getState().getCursor(chat.id)?.[cursorKeyOf(user.id)]).toBe(assistant.id)
+    expect(useChatStore.getState().getCursor(chat.id)).toBeUndefined()
+    const active = await getBrowserRepository().getActiveBranchSnapshot(chat.id, {})
+    expect(active.branch.map((message) => message.id)).toEqual([user.id, assistant.id])
 
     release()
     await expect(sendPromise).resolves.toMatchObject({ outcome: 'done' })
@@ -420,6 +534,149 @@ describe('sendText — chat-completions streaming', () => {
     expect(assistant.generation?.finishReason).toBe('stop')
     expect(assistant.generation?.finishedAt).toBe(1000)
     expect(assistant.generation?.abortReason).toBeUndefined()
+  })
+
+  it('persists streamed tool-call metadata and all argument chunks on the assistant row', async () => {
+    const chat = await createChat({ settings: chatSettings() })
+    const result = await sendText({
+      chatId: chat.id,
+      connection: makeProfile(),
+      apiKey: 'sk-test',
+      content: [{ type: 'text', text: 'look it up' }],
+      openStream: () =>
+        stream(
+          {
+            type: 'delta',
+            chunk: {
+              choices: [
+                {
+                  delta: {
+                    tool_calls: [
+                      {
+                        index: 0,
+                        id: 'call-streamed',
+                        type: 'function',
+                        function: { name: 'lookup', arguments: '{"query":' },
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
+          },
+          {
+            type: 'delta',
+            chunk: {
+              choices: [
+                {
+                  delta: {
+                    tool_calls: [{ index: 0, function: { arguments: '"natter"}' } }],
+                  },
+                  finish_reason: 'tool_calls',
+                },
+              ],
+            },
+          },
+        ),
+      now: () => 1_000,
+    })
+
+    const assistant = requireDefined(
+      await getBrowserRepository().getMessage(result.assistantMessageId),
+      'assistant message',
+    )
+    expect(assistant.toolCalls).toEqual([
+      {
+        id: 'call-streamed',
+        type: 'function',
+        function: { name: 'lookup', arguments: '{"query":"natter"}' },
+      },
+    ])
+  })
+
+  it('computes assistant sibling indices from headers including tombstones', async () => {
+    const chat = await createChat({ settings: chatSettings() })
+    const repo = getBrowserRepository()
+    const parent: Message = {
+      id: 'header-parent',
+      chatId: chat.id,
+      parentId: null,
+      siblingIndex: 0,
+      turnId: 'header-parent-turn',
+      turnIndex: 0,
+      createdAt: 1,
+      role: 'user',
+      origin: 'user',
+      content: [{ type: 'text', text: 'parent' }],
+      nodeVersion: 0,
+      deleted: false,
+    }
+    const liveSibling: Message = {
+      id: 'header-live-sibling',
+      chatId: chat.id,
+      parentId: parent.id,
+      siblingIndex: 2,
+      turnId: 'header-live-turn',
+      turnIndex: 0,
+      createdAt: 2,
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: 'live sibling body' }],
+      nodeVersion: 0,
+      deleted: false,
+    }
+    const tombstonedSibling: Message = {
+      ...liveSibling,
+      id: 'header-tombstoned-sibling',
+      siblingIndex: 7,
+      turnId: 'header-tombstoned-turn',
+      createdAt: 3,
+      content: [{ type: 'output_text', text: 'tombstoned sibling body' }],
+      deleted: true,
+    }
+    await repo.runMutation(
+      [
+        { kind: 'message', messageId: parent.id },
+        { kind: 'message', messageId: liveSibling.id },
+        { kind: 'message', messageId: tombstonedSibling.id },
+        { kind: 'children', chatId: chat.id, parentId: null },
+        { kind: 'children', chatId: chat.id, parentId: parent.id },
+      ],
+      async (ctx) => {
+        await ctx.putMessage(parent)
+        await ctx.putMessage(liveSibling)
+        await ctx.putMessage(tombstonedSibling)
+      },
+    )
+
+    const bodyReads = vi.spyOn(getDb().messageBodies, 'bulkGet')
+    const result = await sendFromMessage({
+      chatId: chat.id,
+      parentMessageId: parent.id,
+      connection: makeProfile(),
+      apiKey: 'sk-test',
+      openStream: () =>
+        stream({
+          type: 'delta',
+          chunk: {
+            id: 'gen-header-only-siblings',
+            choices: [{ delta: { content: 'new sibling' }, finish_reason: 'stop' }],
+          },
+        }),
+      now: () => 1000,
+    })
+
+    const siblingIds = new Set([liveSibling.id, tombstonedSibling.id])
+    expect(bodyReads).toHaveBeenCalled()
+    expect(
+      bodyReads.mock.calls.some(
+        ([ids]) => ids.length === siblingIds.size && ids.every((id) => siblingIds.has(String(id))),
+      ),
+    ).toBe(false)
+    bodyReads.mockRestore()
+
+    const assistant = await repo.getMessage(result.assistantMessageId)
+    expect(assistant?.siblingIndex).toBe(8)
   })
 
   it('streams 100k reasoning and 100k completion in small chunks without per-chunk body rewrites', async () => {
@@ -502,6 +759,7 @@ describe('sendText — chat-completions streaming', () => {
 
   it('publishes large live text as bounded sections and stores one final text item', async () => {
     const chat = await createChat({ settings: chatSettings() })
+    useUiStore.getState().setActiveChatId(chat.id)
     const first = 'a'.repeat(20_000)
     const second = 'b'.repeat(5_000)
     let clock = 1000
@@ -1028,6 +1286,7 @@ describe('sendText — chat-completions streaming', () => {
 
   it('continues streaming when this tab or another tab views a different branch', async () => {
     const chat = await createChat({ settings: chatSettings() })
+    useUiStore.getState().setActiveChatId(chat.id)
     const repo = getBrowserRepository()
     const root: Message = {
       id: 'root-user',
@@ -1087,9 +1346,17 @@ describe('sendText — chat-completions streaming', () => {
     const gate = new Promise<void>((resolve) => {
       release = resolve
     })
+    let releaseCompletion!: () => void
+    const completionGate = new Promise<void>((resolve) => {
+      releaseCompletion = resolve
+    })
     let markPaused!: () => void
     const paused = new Promise<void>((resolve) => {
       markPaused = resolve
+    })
+    let markOffBranchDeltaProcessed!: () => void
+    const offBranchDeltaProcessed = new Promise<void>((resolve) => {
+      markOffBranchDeltaProcessed = resolve
     })
     let tick = 0
     const sendPromise = sendText({
@@ -1108,7 +1375,15 @@ describe('sendText — chat-completions streaming', () => {
           yield {
             type: 'delta',
             chunk: {
-              choices: [{ delta: { content: 'answer' }, finish_reason: 'stop' }],
+              choices: [{ delta: { content: 'answer' } }],
+            },
+          }
+          markOffBranchDeltaProcessed()
+          await completionGate
+          yield {
+            type: 'delta',
+            chunk: {
+              choices: [{ delta: {}, finish_reason: 'stop' }],
               usage: { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 },
             },
           }
@@ -1120,6 +1395,8 @@ describe('sendText — chat-completions streaming', () => {
     })
     await paused
     expect(useStreamStore.getState().hasStreamForChat(chat.id)).toBe(true)
+    const liveMessageId = Object.keys(useStreamStore.getState().liveByMessageId)[0]
+    expect(liveMessageId).toBeDefined()
 
     const rightBranchCursor = {
       [cursorKeyOf(null)]: root.id,
@@ -1131,6 +1408,9 @@ describe('sendText — chat-completions streaming', () => {
     expect(useStreamStore.getState().hasStreamForChat(chat.id)).toBe(true)
 
     release()
+    await offBranchDeltaProcessed
+    expect(useStreamStore.getState().liveByMessageId[liveMessageId as string]).toBeUndefined()
+    releaseCompletion()
     const result = await sendPromise
     expect(result.outcome).toBe('done')
     const assistant = await repo.getMessage(result.assistantMessageId)
@@ -1158,6 +1438,7 @@ describe('sendText — chat-completions streaming', () => {
     })
     const after = Object.keys(useStreamStore.getState().activeByStreamId).length
     expect(after).toBe(before)
+    expect(await getBrowserRepository().listStreamLeases(chat.id)).toEqual([])
   })
 
   it('dedupes mirrored reasoning payloads and stores separate reasoning timing', async () => {
@@ -1370,7 +1651,7 @@ describe('sendText — chat-completions streaming', () => {
     )
   })
 
-  it('merges overlapped mirrored reasoning fragments instead of re-appending them', async () => {
+  it('uses cumulative structured reasoning instead of re-appending its scalar mirror', async () => {
     const chat = await createChat({ settings: chatSettings() })
     await sendText({
       chatId: chat.id,
@@ -1386,7 +1667,14 @@ describe('sendText — chat-completions streaming', () => {
                 {
                   delta: {
                     reasoning: 'A ratio',
-                    reasoning_details: [{ type: 'reasoning.text', index: 0, text: 'A ratio' }],
+                    reasoning_details: [
+                      {
+                        type: 'reasoning.text',
+                        index: 0,
+                        format: 'anthropic-claude-v1',
+                        text: 'A ratio',
+                      },
+                    ],
                   },
                 },
               ],
@@ -1398,7 +1686,15 @@ describe('sendText — chat-completions streaming', () => {
               choices: [
                 {
                   delta: {
-                    reasoning: ' ratio of Gaussians',
+                    reasoning: ' of Gaussians',
+                    reasoning_details: [
+                      {
+                        type: 'reasoning.text',
+                        index: 0,
+                        format: 'anthropic-claude-v1',
+                        text: 'A ratio of Gaussians',
+                      },
+                    ],
                   },
                   finish_reason: 'stop',
                 },
@@ -1411,9 +1707,55 @@ describe('sendText — chat-completions streaming', () => {
     expect(assistant?.reasoningDetails).toEqual([
       {
         type: 'reasoning.text',
-        id: 'text#default',
         index: 0,
+        format: 'anthropic-claude-v1',
         text: 'A ratio of Gaussians',
+      },
+    ])
+  })
+
+  it('keeps one Claude reasoning path when legacy deltas mirror cumulative signed details', async () => {
+    const chat = await createChat({ settings: chatSettings() })
+    await sendText({
+      chatId: chat.id,
+      connection: makeProfile(),
+      apiKey: 'sk-test',
+      content: [{ type: 'text', text: 'reason carefully' }],
+      openStream: () =>
+        stream(
+          ...['1 ', '2 ', '3 ', '4'].map((reasoning, index, parts) => ({
+            type: 'delta' as const,
+            chunk: {
+              choices: [
+                {
+                  delta: {
+                    reasoning,
+                    reasoning_details: [
+                      {
+                        type: 'reasoning.text',
+                        index: 0,
+                        format: 'anthropic-claude-v1',
+                        text: parts.slice(0, index + 1).join(''),
+                        signature: `sig-${index}`,
+                      },
+                    ],
+                  },
+                  ...(index === parts.length - 1 ? { finish_reason: 'stop' } : {}),
+                },
+              ],
+            },
+          })),
+        ),
+    })
+
+    const assistant = (await messagesFor(chat.id)).find((message) => message.role === 'assistant')
+    expect(assistant?.reasoningDetails).toEqual([
+      {
+        type: 'reasoning.text',
+        index: 0,
+        format: 'anthropic-claude-v1',
+        text: '1 2 3 4',
+        signature: 'sig-3',
       },
     ])
   })
@@ -1886,6 +2228,80 @@ describe('sendText — token calibration sample ingest', () => {
     expect(assistant?.originalCalibrationKey).toBeUndefined()
   })
 
+  it('lets an explicit abort cancel generated-output localization without losing the response', async () => {
+    const chat = await createChat({
+      settings: chatSettings({ model: 'black-forest-labs/flux.2-klein-4b', systemPrompt: '' }),
+    })
+    const imageUrl = 'https://cdn.example/generated.png'
+    const controller = new AbortController()
+    let markDownloadStarted!: () => void
+    const downloadStarted = new Promise<void>((resolve) => {
+      markDownloadStarted = resolve
+    })
+    const fetchMock = vi.fn((_url: string | URL | Request, init?: RequestInit) => {
+      markDownloadStarted()
+      expect(init?.signal).toBe(controller.signal)
+      return new Promise<Response>((_resolve, reject) => {
+        const rejectAbort = () => reject(new DOMException('aborted', 'AbortError'))
+        if (init?.signal?.aborted) {
+          rejectAbort()
+          return
+        }
+        init?.signal?.addEventListener('abort', rejectAbort, { once: true })
+      })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const sendPromise = sendText({
+      chatId: chat.id,
+      connection: makeProfile(),
+      apiKey: 'sk-test',
+      content: [{ type: 'text', text: 'draw it' }],
+      signal: controller.signal,
+      openStream: () =>
+        stream(
+          {
+            type: 'delta',
+            chunk: {
+              id: 'g',
+              choices: [
+                {
+                  delta: {
+                    role: 'assistant',
+                    content: '',
+                    images: [{ type: 'image_url', image_url: { url: imageUrl } }],
+                  },
+                },
+              ],
+            },
+          },
+          {
+            type: 'delta',
+            chunk: { choices: [{ delta: {}, finish_reason: 'stop' }] },
+          },
+        ),
+    })
+
+    await downloadStarted
+    controller.abort()
+    const result = await sendPromise
+    expect(result.outcome).toBe('done')
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+
+    const assistant = liveMessagesSortedByCreated(await messagesFor(chat.id)).find(
+      (message) => message.role === 'assistant',
+    )
+    expect(assistant?.generation?.status).toBe('done')
+    const output = assistant?.content.find((item) => item.type === 'output_image')
+    const attachmentId = output?.type === 'output_image' ? output.attachmentId : undefined
+    expect(attachmentId).toBeTruthy()
+    const bundle = attachmentId
+      ? await getBrowserRepository().getAttachmentBundle(attachmentId)
+      : undefined
+    expect(bundle?.attachment.storage).toEqual({ kind: 'remote-url', url: imageUrl })
+    expect(bundle?.blobs).toHaveLength(0)
+  })
+
   it('populates per-message calibration fields on user + assistant messages', async () => {
     const chat = await createChat({
       settings: chatSettings({ model: 'openai/gpt-4o', systemPrompt: '' }),
@@ -2248,6 +2664,283 @@ describe('recoverOrphans', () => {
     expect((await repo.getMessage(leasedId))?.generation?.abortReason).toBeUndefined()
   })
 
+  it('recovers a fresh persisted lease immediately when its Web Lock owner is gone', async () => {
+    const manager = new TestExclusiveLockManager()
+    __setStreamLockManagerForTests(manager)
+    installStreamLeaseListener()
+    const chat = await createChat({ settings: chatSettings() })
+    const repo = getBrowserRepository()
+    const messageId = await seedUnfinishedAssistant(chat.id)
+    const recoveryNow = Date.now()
+    await repo.upsertStreamLease({
+      streamId: 'fresh-dead-owner',
+      chatId: chat.id,
+      messageId,
+      ownerClientId: 'reloaded-tab',
+      startedAt: 100,
+      heartbeatAt: recoveryNow,
+      attemptKind: 'generation',
+    })
+    expect(useStreamStore.getState().isTargetActive(chat.id, messageId)).toBe(true)
+
+    expect(await recoverOrphans(recoveryNow)).toBe(1)
+    expect(await repo.listStreamLeases(chat.id)).toEqual([])
+    expect(await repo.getMessage(messageId)).toMatchObject({
+      generation: {
+        status: 'interrupted',
+        abortReason: 'tab-close',
+        finishedAt: recoveryNow,
+      },
+    })
+  })
+
+  it.each([
+    'generation',
+    'continuation',
+  ] as const)('recovers a fresh message-less %s admission immediately when its Web Lock owner is gone', async (attemptKind) => {
+    const manager = new TestExclusiveLockManager()
+    __setStreamLockManagerForTests(manager)
+    const chat = await createChat({ settings: chatSettings() })
+    const repo = getBrowserRepository()
+    await repo.upsertStreamLease({
+      streamId: `message-less-${attemptKind}`,
+      chatId: chat.id,
+      ownerClientId: 'closed-tab',
+      startedAt: 100,
+      heartbeatAt: 19_000,
+      attemptKind,
+    })
+
+    expect(await recoverOrphans(20_000)).toBe(1)
+    expect(await repo.listStreamLeases(chat.id)).toEqual([])
+  })
+
+  it.each([
+    'generation',
+    'continuation',
+  ] as const)('waits for the no-Web-Locks TTL before recovering a message-less %s admission', async (attemptKind) => {
+    __setStreamLockManagerForTests(null)
+    const chat = await createChat({ settings: chatSettings() })
+    const repo = getBrowserRepository()
+    await repo.upsertStreamLease({
+      streamId: `fallback-message-less-${attemptKind}`,
+      chatId: chat.id,
+      ownerClientId: 'closed-tab',
+      startedAt: 100,
+      heartbeatAt: 19_000,
+      attemptKind,
+    })
+
+    expect(await recoverOrphans(20_000)).toBe(0)
+    expect(await repo.listStreamLeases(chat.id)).toHaveLength(1)
+    expect(await nextOrphanRecoveryAt(chat.id, 20_000)).toBe(34_001)
+    expect(await recoverOrphans(34_001)).toBe(1)
+    expect(await repo.listStreamLeases(chat.id)).toEqual([])
+    expect(await nextOrphanRecoveryAt(chat.id, 34_001)).toBeNull()
+  })
+
+  it('schedules no-Web-Locks recovery for an unfinished header without a lease', async () => {
+    __setStreamLockManagerForTests(null)
+    const chat = await createChat({ settings: chatSettings() })
+    const messageId = await seedUnfinishedAssistant(chat.id, 19_000)
+
+    expect(await recoverOrphans(20_000, chat.id)).toBe(0)
+    expect(await nextOrphanRecoveryAt(chat.id, 20_000)).toBe(34_001)
+    expect(await recoverOrphans(34_001, chat.id)).toBe(1)
+    expect(await getBrowserRepository().getMessage(messageId)).toMatchObject({
+      generation: {
+        status: 'interrupted',
+        abortReason: 'tab-close',
+        finishedAt: 34_001,
+      },
+    })
+    expect(await nextOrphanRecoveryAt(chat.id, 34_001)).toBeNull()
+  })
+
+  it('does not recover a fresh lease until its Web Lock owner releases it', async () => {
+    const manager = new TestExclusiveLockManager()
+    __setStreamLockManagerForTests(manager)
+    const chat = await createChat({ settings: chatSettings() })
+    const repo = getBrowserRepository()
+    const messageId = await seedUnfinishedAssistant(chat.id)
+    await repo.upsertStreamLease({
+      streamId: 'fresh-live-owner',
+      chatId: chat.id,
+      messageId,
+      ownerClientId: 'other-tab',
+      startedAt: 100,
+      heartbeatAt: 19_000,
+      attemptKind: 'generation',
+    })
+    const release = manager.hold('stream-owner:fresh-live-owner')
+
+    expect(await recoverOrphans(20_000)).toBe(0)
+    expect((await repo.getMessage(messageId))?.generation?.finishedAt).toBeUndefined()
+
+    release()
+    expect(await recoverOrphans(20_001)).toBe(1)
+    expect((await repo.getMessage(messageId))?.generation?.abortReason).toBe('tab-close')
+  })
+
+  it('wakes recovery when a reloaded page releases fresh stream ownership', async () => {
+    const manager = new TestExclusiveLockManager()
+    __setStreamLockManagerForTests(manager)
+    const chat = await createChat({ settings: chatSettings() })
+    const repo = getBrowserRepository()
+    const messageId = await seedUnfinishedAssistant(chat.id)
+    await repo.upsertStreamLease({
+      streamId: 'reload-release',
+      chatId: chat.id,
+      messageId,
+      ownerClientId: 'old-page',
+      startedAt: 100,
+      heartbeatAt: 20_000,
+      attemptKind: 'generation',
+    })
+    const release = manager.hold('stream-owner:reload-release')
+    let resolveRecovery!: (count: number) => void
+    let rejectRecovery!: (error: unknown) => void
+    const recovered = new Promise<number>((resolve, reject) => {
+      resolveRecovery = resolve
+      rejectRecovery = reject
+    })
+    const stopObserving = onRemoteStreamOwnershipReleased(chat.id, () => {
+      void recoverOrphans(20_000, chat.id).then(resolveRecovery, rejectRecovery)
+    })
+
+    try {
+      await eventually(() => {
+        expect(manager.queuedCount('stream-owner:reload-release')).toBe(1)
+      })
+      expect(await recoverOrphans(20_000, chat.id)).toBe(0)
+      expect((await repo.getMessage(messageId))?.generation?.finishedAt).toBeUndefined()
+
+      release()
+      expect(await recovered).toBe(1)
+      expect(await repo.listStreamLeases(chat.id)).toEqual([])
+      expect(await repo.getMessage(messageId)).toMatchObject({
+        generation: {
+          status: 'interrupted',
+          abortReason: 'tab-close',
+          finishedAt: 20_000,
+        },
+      })
+    } finally {
+      release()
+      stopObserving()
+    }
+  })
+
+  it('does not recover a placeholder while its message-less generation owner is retargeting', async () => {
+    const manager = new TestExclusiveLockManager()
+    __setStreamLockManagerForTests(manager)
+    const chat = await createChat({ settings: chatSettings() })
+    const repo = getBrowserRepository()
+    const messageId = await seedUnfinishedAssistant(chat.id)
+    await repo.upsertStreamLease({
+      streamId: 'placeholder-retarget-window',
+      chatId: chat.id,
+      ownerClientId: 'live-tab',
+      startedAt: 100,
+      heartbeatAt: 20_000,
+      attemptKind: 'generation',
+    })
+    const release = manager.hold('stream-owner:placeholder-retarget-window')
+
+    try {
+      expect(await recoverOrphans(20_000, chat.id)).toBe(0)
+      expect((await repo.getMessage(messageId))?.generation?.finishedAt).toBeUndefined()
+    } finally {
+      release()
+    }
+  })
+
+  it('defers placeholder recovery when a message-less generation lease appears inside the lock', async () => {
+    const manager = new TestExclusiveLockManager()
+    __setStreamLockManagerForTests(manager)
+    const chat = await createChat({ settings: chatSettings() })
+    const repo = getBrowserRepository()
+    const messageId = await seedUnfinishedAssistant(chat.id)
+    const listStreamLeases = repo.listStreamLeases.bind(repo)
+    let listCalls = 0
+    const listSpy = vi.spyOn(repo, 'listStreamLeases').mockImplementation(async (scopeChatId) => {
+      listCalls += 1
+      if (listCalls === 2) {
+        await repo.upsertStreamLease({
+          streamId: 'late-placeholder-retarget',
+          chatId: chat.id,
+          ownerClientId: 'live-tab',
+          startedAt: 100,
+          heartbeatAt: 20_000,
+          attemptKind: 'generation',
+        })
+      }
+      return listStreamLeases(scopeChatId)
+    })
+
+    expect(await recoverOrphans(20_000, chat.id)).toBe(0)
+    expect(listCalls).toBeGreaterThanOrEqual(2)
+    expect((await repo.getMessage(messageId))?.generation?.finishedAt).toBeUndefined()
+    expect(await listStreamLeases(chat.id)).toHaveLength(1)
+    listSpy.mockRestore()
+  })
+
+  it('does not let a finalized generation lease block later target work', async () => {
+    const chat = await createChat({ settings: chatSettings() })
+    const repo = getBrowserRepository()
+    const messageId = await seedUnfinishedAssistant(chat.id)
+    await repo.runMutation([{ kind: 'message', messageId }], async (ctx) => {
+      const current = requireDefined(await ctx.getMessage(messageId), 'finished target')
+      await ctx.putMessage({
+        ...current,
+        generation: {
+          ...requireDefined(current.generation, 'generation'),
+          status: 'done',
+          finishedAt: 500,
+          finishReason: 'stop',
+        },
+      })
+    })
+    await repo.upsertStreamLease({
+      streamId: 'finished-generation-cleanup-pending',
+      chatId: chat.id,
+      messageId,
+      ownerClientId: 'completed-tab',
+      startedAt: 100,
+      heartbeatAt: 500,
+      attemptKind: 'generation',
+    })
+
+    const continuationLease = await repo.upsertStreamLease({
+      streamId: 'next-continuation',
+      chatId: chat.id,
+      messageId,
+      ownerClientId: 'current-tab',
+      startedAt: 600,
+      heartbeatAt: 600,
+      attemptKind: 'continuation',
+      continuationStrategy: 'prompt',
+    })
+    await expect(
+      repo.runMutation([{ kind: 'message', messageId }], async (ctx) => {
+        const current = requireDefined(await ctx.getMessage(messageId), 'busy target')
+        await ctx.putMessage({ ...current, editedAt: 700 })
+      }),
+    ).rejects.toThrow(`StreamTargetBusy:${messageId}`)
+
+    await repo.deleteOwnedStreamLease(
+      continuationLease.streamId,
+      streamWriteFenceForLease(continuationLease),
+    )
+    await expect(
+      repo.runMutation([{ kind: 'message', messageId }], async (ctx) => {
+        const current = requireDefined(await ctx.getMessage(messageId), 'editable target')
+        await ctx.putMessage({ ...current, editedAt: 800 })
+      }),
+    ).resolves.toBeDefined()
+    expect((await repo.getMessage(messageId))?.editedAt).toBe(800)
+  })
+
   it('does not compact chunks while a fresh owner lease exists', async () => {
     const chat = await createChat({ settings: chatSettings() })
     const repo = getBrowserRepository()
@@ -2283,6 +2976,15 @@ describe('recoverOrphans', () => {
         })
       },
     )
+    const activeLease = await repo.upsertStreamLease({
+      streamId: 'active-stream',
+      chatId: chat.id,
+      messageId: leasedId,
+      ownerClientId: 'other-tab',
+      startedAt: 100,
+      heartbeatAt: 19_000,
+    })
+    const activeFence = chunkFence(activeLease)
     await repo.appendStreamChunks([
       {
         id: 'active-stream:0',
@@ -2292,16 +2994,9 @@ describe('recoverOrphans', () => {
         seq: 0,
         createdAt: 200,
         event: { lane: 'text', text: 'owned elsewhere' },
+        ...activeFence,
       },
     ])
-    await repo.upsertStreamLease({
-      streamId: 'active-stream',
-      chatId: chat.id,
-      messageId: leasedId,
-      ownerClientId: 'other-tab',
-      startedAt: 100,
-      heartbeatAt: 19_000,
-    })
 
     expect(await recoverOrphans(20_000)).toBe(0)
     const after = await repo.getMessage(leasedId)
@@ -2345,6 +3040,15 @@ describe('recoverOrphans', () => {
         })
       },
     )
+    const staleLease = await repo.upsertStreamLease({
+      streamId: 'stale-stream',
+      chatId: chat.id,
+      messageId: orphanId,
+      ownerClientId: 'dead-tab',
+      startedAt: 100,
+      heartbeatAt: 1_000,
+    })
+    const staleFence = chunkFence(staleLease)
     await repo.appendStreamChunks([
       {
         id: 'stale-stream:0',
@@ -2354,6 +3058,7 @@ describe('recoverOrphans', () => {
         seq: 0,
         createdAt: 200,
         event: { lane: 'reasoning', textDelta: 'thinking', outputIndex: 0 },
+        ...staleFence,
       },
       {
         id: 'stale-stream:1',
@@ -2363,6 +3068,7 @@ describe('recoverOrphans', () => {
         seq: 1,
         createdAt: 300,
         event: { lane: 'text', text: 'hello ' },
+        ...staleFence,
       },
       {
         id: 'stale-stream:2',
@@ -2372,6 +3078,7 @@ describe('recoverOrphans', () => {
         seq: 2,
         createdAt: 400,
         event: { lane: 'text', text: 'world' },
+        ...staleFence,
       },
       {
         id: 'stale-stream:3',
@@ -2380,17 +3087,37 @@ describe('recoverOrphans', () => {
         messageId: orphanId,
         seq: 3,
         createdAt: 500,
+        event: {
+          lane: 'tool-call',
+          index: 0,
+          id: 'call-recovered',
+          type: 'function',
+          name: 'lookup',
+          argumentsDelta: '{"query":',
+        },
+        ...staleFence,
+      },
+      {
+        id: 'stale-stream:4',
+        streamId: 'stale-stream',
+        chatId: chat.id,
+        messageId: orphanId,
+        seq: 4,
+        createdAt: 600,
+        event: { lane: 'tool-call', index: 0, argumentsDelta: '"natter"}' },
+        ...staleFence,
+      },
+      {
+        id: 'stale-stream:5',
+        streamId: 'stale-stream',
+        chatId: chat.id,
+        messageId: orphanId,
+        seq: 5,
+        createdAt: 700,
         event: { lane: 'phase', phase: 'final_answer', outputIndex: 0 },
+        ...staleFence,
       },
     ])
-    await repo.upsertStreamLease({
-      streamId: 'stale-stream',
-      chatId: chat.id,
-      messageId: orphanId,
-      ownerClientId: 'dead-tab',
-      startedAt: 100,
-      heartbeatAt: 1_000,
-    })
 
     expect(await recoverOrphans(20_000)).toBe(1)
     const after = await repo.getMessage(orphanId)
@@ -2401,6 +3128,13 @@ describe('recoverOrphans', () => {
     })
     expect(after?.generation?.abortReason).toBe('tab-close')
     expect(after?.phase).toBe('final_answer')
+    expect(after?.toolCalls).toEqual([
+      {
+        id: 'call-recovered',
+        type: 'function',
+        function: { name: 'lookup', arguments: '{"query":"natter"}' },
+      },
+    ])
     expect(await repo.listStreamChunksForMessage(orphanId)).toEqual([])
     expect(await repo.listStreamLeases(chat.id)).toEqual([])
 

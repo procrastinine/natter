@@ -1,6 +1,6 @@
 # natter
 
-A browser-only chat UI for OpenAI-compatible LLM APIs. OpenRouter-first; also talks to OpenAI direct, Gemini native, Anthropic via the OpenAI-compat shim, generic OpenAI-compatible endpoints, and `llama-server`.
+A browser-only chat UI for LLM APIs. OpenRouter-first; also talks to OpenAI direct, Gemini native, Anthropic's native Messages API, generic OpenAI-compatible endpoints, and `llama-server`. Anthropic and Gemini can use an OpenAI-compatible shim only when a chat explicitly selects that route.
 
 The whole app is a static bundle, served from any file server or opened directly from `file://`. Keys, chats, attachments, and settings live in IndexedDB in the browser. Multiple tabs against the same workspace are coordinated via Web Locks and BroadcastChannel, so concurrent writes don't conflict.
 
@@ -11,6 +11,18 @@ The goal is an easy way to use a variety of models on OpenRouter while keeping t
 ## OpenRouter privacy
 
 Different providers behind the same OpenRouter model have different data-retention terms, and the JSON `/endpoints` API doesn't expose them; they have to be scraped from the per-model providers page. natter does that scrape (cached 24h) and uses the labels to filter and rank endpoints. Endpoints that are strictly less private than another option for the same model are removed entirely (Pareto-dominance, not just deprioritized). Models that allow training on prompts are blocked. Free models opt out, since otherwise nothing would be eligible. The provider picker also has manual pin/block controls and a preferred-order list, and the chat header shows the resulting tier.
+
+## Browser key-storage boundary
+
+API keys are encrypted before they are written to IndexedDB. By default, the wrapping secret is stored in the same browser database, which protects against casual at-rest inspection but not against script execution in the page origin. Passphrase-protected keys avoid persisting that wrapping secret, although a decrypted key still exists briefly in the active tab when used. Treat full-workspace exports as sensitive: the current full backup includes both encrypted key rows and the install secret.
+
+For hardened hosted deployments, start with a response-header policy like this and extend `connect-src` and `img-src` only for configured custom endpoints and image origins:
+
+```text
+Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; media-src 'self' data: blob: https:; connect-src 'self' https://openrouter.ai https://api.openai.com https://api.anthropic.com https://generativelanguage.googleapis.com; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'
+```
+
+This is a deployment template, not a runtime default: arbitrary compatible endpoints, user-approved image origins, workers, and `file://` use need environment-specific treatment.
 
 ## Model controls
 
@@ -28,15 +40,27 @@ Cache breakpoint controls cover Anthropic (TTL plus off/auto/manual), Gemini (ma
 
 ## Message tree, editing, prefill
 
-Any message can be edited in place, keeping the same id, with no new sibling and no API call. Any message can also be branched via regenerate, continue, or insert-sibling, or used as the fork point for a whole new chat. Messages can be inserted between existing ones, and the four delete variants cover single-message, message-pair, whole-turn, and just-this-variant cases. The assistant can be prefilled with arbitrary opening text before sending. A branch tree view (with search and jump-to-latest) makes navigating dense trees workable. Switching between branches moves a cursor; no rows are duplicated.
+Any message can be edited in place, keeping the same id, with no new sibling and no API call. Regenerate and insert-sibling create branch variants, while continuing an assistant response appends the returned text to that same stored row. Any message can also be used as the fork point for a whole new chat. Messages can be inserted between existing ones, and the four delete variants cover single-message, message-pair, whole-turn, and just-this-variant cases. The assistant can be prefilled with arbitrary opening text before sending. Branch arrows expose sibling variants directly; switching between them moves a cursor and never duplicates rows. The alternate branch-tree navigator adds in-chat search, connector insertion controls, compact/expanded layouts, and a resizable message inspector without materializing another graph.
 
 ## Browser-native navigation
 
-Every chat, branch, attachment, and storage view has its own URL. Reload restores the chat and the active branch. Sidebar entries, branch arrows, branch tree nodes, storage rows, and attachment chips are `<a>` anchors, so middle-click and Cmd-click work everywhere, including (deliberately) on the branch arrows, so a swipe-variant can be opened in a new tab.
+Every chat, branch, attachment, and storage view has its own URL. Reload restores the chat and the active branch. Sidebar entries, branch arrows, branch-tree nodes, storage rows, and attachment chips use real anchors where implemented, so browser-native middle-click and Cmd-click work, including on branch arrows and tree nodes.
 
 ## Other things
 
-Image, PDF, audio, and video attachments with per-modality token estimation. Folders, tags, and full-text search in the sidebar. Flatten-export of a chat to text. JSON-schema response format. Tool calling with manual execution, plus OpenRouter's server-side tools. Workspace-global prompt presets for system/continue-system/continue-user slots. 5-second undo window on structural ops. Focus mode.
+Image, PDF, audio, and video attachments with per-modality token estimation. Folders, tags, and full-text search in the sidebar. Flatten-export of a chat to text. JSON-schema response format. Provider-hosted tool configuration and persisted tool evidence. General client-side/manual tool execution remains planned. Workspace-global prompt presets for system/continue-system/continue-user slots. 5-second undo window on structural ops. Focus mode.
+
+## Shipped, partial, and planned
+
+| Status | Surface | Evidence |
+|---|---|---|
+| Shipped | Message-tree swipes, deep links, and in-place editing | `src/ui/chat/BranchControls.tsx`, `src/core/active-path.ts`, `src/core/messages.ts`, `tests/e2e/render-window.spec.ts`, `tests/unit/active-path.test.ts`, `tests/unit/messages.test.ts` |
+| Shipped | Native Anthropic Messages and Gemini transports | `src/core/api-choice.ts`, `src/api/anthropic-messages.ts`, `src/api/gemini-native.ts`, `tests/unit/api-choice.test.ts`, `tests/unit/api-anthropic-messages.test.ts`, `tests/unit/api-gemini-native.test.ts` |
+| Shipped | Explicit provider-hosted tools and returned tool evidence | `src/core/send-planning.ts`, `tests/e2e/provider-tool-fixture-replay.spec.ts` |
+| Partial | Auto-title status schema and persistence | `src/core/types.ts`, `src/store/chats.ts`, `src/store/db.ts`, `tests/unit/db-schema.test.ts`; background title generation is not complete |
+| Shipped | Alternate branch-tree navigator | `src/ui/chat/BranchTreeView.tsx`, `src/ui/chat/BranchTreeInspector.tsx`, `src/core/branch-tree-layout.ts`, `tests/e2e/branch-tree.spec.ts`, `tests/unit/branch-tree-view.test.tsx` |
+| Planned | Client-side/manual tool execution and approvals | No client-side executor or approval flow is shipped yet |
+| Planned | Daemon/SQLite workspace backend | No daemon workspace engine is shipped yet |
 
 ## Quickstart
 
@@ -44,6 +68,12 @@ Image, PDF, audio, and video attachments with per-modality token estimation. Fol
 pnpm install
 pnpm dev
 ```
+
+## Verification
+
+Run `pnpm check:ci` for the clean, non-writing Biome check. The broader source checks are `pnpm typecheck`, `pnpm lint:semantic`, `pnpm test:run`, and `pnpm build`. The build rejects unexpected distribution paths and regressions in total, gzip, cold-static-graph, largest-chunk, and named lazy-feature budgets. `pnpm perf:report` applies the same delivery ratchets and the zero-dependency-cycle gate; wall time and heap measurements remain informational.
+
+`pnpm dev` is the normal unbundled Vite/HMR environment, so its request count and decoded source are intentionally much larger than the minified application. Use `pnpm preview` when testing production-like delivery weight. With either server running, `pnpm perf:delivery dev <url>` or `pnpm perf:delivery preview <url>` records a fresh Chromium context. Preview enforces production request/byte budgets; dev reports request/byte/time/heap measurements without rewarding bundled modules or disabled development tooling. Both modes fail on runtime/network diagnostics or cold-loading a forbidden lazy feature. The frequently used per-chat settings pane stays in the eager graph; Markdown, tree, global settings, storage, and import chunks must stay out of a cold load. The shared ratchets live in `scripts/performance-baseline.json` so the build, report, and browser measurement do not drift.
 
 ## Scripts
 
@@ -55,15 +85,21 @@ pnpm dev
 | `pnpm test` | Vitest in watch mode |
 | `pnpm test:run` | Vitest single run |
 | `pnpm e2e` | Playwright end-to-end suite |
-| `pnpm typecheck` | `tsc -b --noEmit` across all projects |
+| `pnpm typecheck` | native TypeScript 7 `tsc -b --noEmit` across all projects |
 | `pnpm lint` | Biome lint |
-| `pnpm deps:refresh` | update dependencies with pnpm supply-chain guards, then print audit/outdated/build-script info |
+| `pnpm lint:semantic` | type-aware ESLint checks |
+| `pnpm check:ci` | non-writing Biome format/lint/import check used by CI |
+| `pnpm deps:refresh` | update dependencies with pnpm supply-chain guards, clear Vite's derived dependency cache, then print audit/outdated/build-script info |
 | `pnpm deps:refresh -- --check` | print the same dependency info without updating |
 | `pnpm deps:audit` | npm advisory audit at `moderate` and above |
+| `pnpm deps:peers` | verify installed peer-dependency compatibility |
 | `pnpm deps:outdated` | list dependency updates visible under the current pnpm policy |
+| `pnpm perf:stream [url] [regens] [text chars] [reasoning chars] [turns] [reloads]` | headless loopback fake-stream profiler; run the dev server separately |
+| `pnpm perf:delivery <dev\|preview> <url>` | fresh-browser delivery report; preview enforces request/byte budgets, while both modes reject diagnostics and forbidden cold-loads |
+| `pnpm perf:report` | machine-readable distribution, named lazy-chunk, duplication, and dependency-cycle report; enforces delivery budgets and fails on any current cycle |
 | `pnpm format` | Biome format (write) |
 | `pnpm check` | Biome lint + format + organize imports |
 
 ## Stack
 
-React 19 · Vite 8 · TypeScript 6 · Tailwind v4 · Dexie (IndexedDB) · Zustand · TanStack Query · TanStack Virtual · hand-rolled `fetch` + SSE · Biome · Vitest · Playwright
+Node 24+ · React 19 · Vite 8 · TypeScript 7 native compiler (TypeScript 6 compatibility API for semantic tooling) · Tailwind v4 · Dexie (IndexedDB) · Zustand · TanStack Virtual · hand-rolled `fetch` + SSE · Biome · Vitest · Playwright

@@ -1,12 +1,13 @@
-import type { Table, Transaction } from 'dexie'
-import { activePath, findLastUpdatedLeafId, indexById, isOnPathToLeaf } from '../core/active-path'
-import { buildBranchCacheRow, buildBranchMessages } from '../core/branch-flatten'
+import Dexie, { type Collection, type Table, type Transaction } from 'dexie'
+import { type ActivePathMeasurement, activePath, findLastUpdatedLeafId } from '../core/active-path'
+import { buildBranchCacheRow } from '../core/branch-flatten'
 import type {
   Attachment,
   AttachmentArtifact,
   AttachmentBlob,
   AttachmentId,
   AttachmentJob,
+  AttachmentReferenceEdge,
   Chat,
   ChatBranchCache,
   ChatFolder,
@@ -17,36 +18,75 @@ import type {
   DraftRow,
   FolderId,
   Message,
+  MessageAttachmentRef,
   MessageId,
   MutationScope,
+  PresetId,
   TagId,
 } from '../core/types'
 import { countMessagesWords } from '../core/word-count'
 import { newId } from '../lib/ulid'
-import { liveAttachmentRefs, normalizeAttachmentRefs } from './attachment-refs'
-import { postEvent } from './broadcast'
-import { childListKey, type NatterDb, openDb, type SettingsRow } from './db'
-import { withMutationLocks } from './locks'
 import {
+  attachmentReferenceCounts,
+  edgesForOwner,
+  replaceAttachmentReferenceOwner,
+  replaceAttachmentReferenceOwners,
+  requireNoAttachmentReferences,
+} from './attachment-reference-edges'
+import { liveAttachmentRefs, normalizeAttachmentRefs } from './attachment-refs'
+import {
+  type AttachmentHeaderRow,
+  attachmentHeaderFromStoredRow,
+  hydrateAttachment,
+  splitAttachmentForStorage,
+} from './attachment-storage'
+import { postEvent } from './broadcast'
+import {
+  createChatInBrowser,
+  deletePresetAndClearBreadcrumbsInBrowser,
+  deleteProfileAndReassignInBrowser,
+  deletePromptPresetAndClearPinsInBrowser,
+  discardEmptyDraftChatsInBrowser,
+  updateProfileAndInvalidateCachesInBrowser,
+  updatePromptPresetAndPropagateInBrowser,
+} from './browser-domain-mutations'
+import { deleteChatSidebarProjections, putChatSidebarProjection } from './chat-sidebar-projection'
+import { childListKey, type NatterDb, openDb } from './db'
+import { withMutationLocks, withNamedLock, withNamedLocks } from './locks'
+import {
+  contentIncludesCaseInsensitiveText,
   hydrateMessage,
   hydrateMessages,
   type MessageBodyRow,
   type MessageHeaderRow,
+  previewTextFromContent,
+  previewTextFromMessages,
+  previewTextFromStoredProjection,
   splitMessageForStorage,
+  syncMessageHeaderProjections,
 } from './message-storage'
 import type {
   ActiveBranchBodyWindow,
   ActiveBranchSnapshot,
   ActiveBranchWindowSnapshot,
   AttachmentBundle,
+  AttachmentSearchMeasurement,
   AttachmentSearchPage,
   AttachmentSearchQuery,
+  ChatBranchCacheWriteGuard,
   ChatMutationSummary,
   CreateFolderInput,
   CreateTagInput,
   DeleteArchivedChatsResult,
   DeleteFolderResult,
+  DeletePresetCascadeResult,
+  DeleteProfileAtomicInput,
+  DeleteProfileAtomicResult,
+  DeletePromptPresetAtomicInput,
+  DeletePromptPresetAtomicResult,
   DeleteTagResult,
+  ForkChatFromMessageInput,
+  ForkChatFromMessageResult,
   MessageBodyPatch,
   MessageHeaderPatch,
   MutationContext,
@@ -54,32 +94,37 @@ import type {
   PutMessageOptions,
   StreamChunkRow,
   StreamLeaseRow,
+  StreamWriteFence,
   UpdateFolderInput,
+  UpdateProfileAtomicInput,
+  UpdateProfileAtomicResult,
+  UpdatePromptPresetAtomicInput,
+  UpdatePromptPresetAtomicResult,
   UpdateTagInput,
   WorkspaceMeta,
+  WorkspaceMutationOptions,
   WorkspaceMutationResult,
   WorkspaceRepository,
 } from './repository'
+import {
+  ChatMissingError,
+  chatMatchesBranchCacheWriteGuard,
+  StreamTargetBusyError,
+} from './repository'
+import {
+  bumpBrowserWorkspaceMeta,
+  readBrowserWorkspaceMeta,
+  readBrowserWorkspaceMetaFromTransaction,
+} from './workspace-meta'
 
-const WORKSPACE_META_KEY = 'workspace-meta'
-const WORKSPACE_ID = 'browser-idb:natter'
-
-export class ChatMissingError extends Error {
-  readonly chatId: ChatId
-
-  constructor(chatId: ChatId) {
-    super(`ChatMissing:${chatId}`)
-    this.name = 'ChatMissingError'
-    this.chatId = chatId
-  }
-}
-
-type StoredWorkspaceMeta = WorkspaceMeta & { backendKind: 'browser-idb' }
+export { ChatMissingError } from './repository'
 
 interface ChatMutationState {
   beforeChat: Chat
-  beforeMessages?: Message[]
-  afterMessages?: Message[]
+  beforeHeaders?: MessageHeaderRow[]
+  afterHeaders?: MessageHeaderRow[]
+  headersBeforeWrites: Map<MessageId, MessageHeaderRow | undefined>
+  incrementalAppends: Message[]
   wordCountDeltas: Map<MessageId, number>
   totalCostDelta: number
   visibleMetaPatch: Partial<Chat>
@@ -88,6 +133,7 @@ interface ChatMutationState {
   visibleMetaDirty: boolean
   summaryVersionDirty: boolean
   messageSummaryDirty: boolean
+  previewDirty: boolean
   broadcast: boolean
   changedMessageIds: Set<MessageId>
   affected: Map<string, ChatMutationSummary>
@@ -97,36 +143,98 @@ type BrowserMutationTableName =
   | 'attachmentArtifacts'
   | 'attachmentBlobs'
   | 'attachmentJobs'
+  | 'attachmentRefEdges'
   | 'attachments'
   | 'chatBranchCache'
+  | 'chatSidebarRows'
   | 'chats'
   | 'childLists'
   | 'drafts'
   | 'messages'
   | 'messageBodies'
   | 'settings'
+  | 'streamLeases'
 
 const MUTATION_TABLE_ORDER: readonly BrowserMutationTableName[] = [
   'attachmentArtifacts',
   'attachmentBlobs',
   'attachmentJobs',
+  'attachmentRefEdges',
   'attachments',
   'chatBranchCache',
+  'chatSidebarRows',
   'chats',
   'childLists',
   'drafts',
   'messages',
   'messageBodies',
   'settings',
+  'streamLeases',
 ]
 
 function stableStringify(value: unknown): string {
   return JSON.stringify(value)
 }
 
+function streamOwnedMessageFieldsChanged(
+  existingHeader: MessageHeaderRow,
+  existingBody: MessageBodyRow,
+  nextHeader: MessageHeaderRow,
+  nextBody: MessageBodyRow,
+): boolean {
+  const comparableHeader = (header: MessageHeaderRow) => {
+    const { nodeVersion, hiddenFromContext, attachmentRefs, cachedMediaTokens, ...value } = header
+    void nodeVersion
+    void hiddenFromContext
+    void attachmentRefs
+    void cachedMediaTokens
+    return value
+  }
+  const comparableBody = (body: MessageBodyRow) => {
+    const { nodeVersion, updatedAt, ...value } = body
+    void nodeVersion
+    void updatedAt
+    return value
+  }
+  return (
+    stableStringify(comparableHeader(existingHeader)) !==
+      stableStringify(comparableHeader(nextHeader)) ||
+    stableStringify(comparableBody(existingBody)) !== stableStringify(comparableBody(nextBody))
+  )
+}
+
+async function assertStreamLeaseTargetAvailable(
+  tx: Transaction,
+  incoming: StreamLeaseRow,
+): Promise<void> {
+  if (!incoming.messageId) return
+  const competing = await tx
+    .table<StreamLeaseRow, string>('streamLeases')
+    .where('messageId')
+    .equals(incoming.messageId)
+    .toArray()
+  for (const lease of competing) {
+    if (lease.streamId === incoming.streamId) continue
+    if (await streamLeaseTargetFinalized(tx, lease)) continue
+    throw new StreamTargetBusyError(incoming.messageId)
+  }
+}
+
+async function streamLeaseTargetFinalized(
+  tx: Transaction,
+  lease: StreamLeaseRow,
+): Promise<boolean> {
+  if (!lease.messageId) return false
+  const header = await tx.table<MessageHeaderRow, MessageId>('messages').get(lease.messageId)
+  if (lease.attemptKind === 'generation') return header?.generation?.finishedAt !== undefined
+  if (lease.attemptKind !== 'continuation') return false
+  const body = await tx.table<MessageBodyRow, MessageId>('messageBodies').get(lease.messageId)
+  return body?.continuationAttempts?.some((attempt) => attempt.streamId === lease.streamId) === true
+}
+
 function isStreamLeaseRow(value: unknown): value is StreamLeaseRow {
   if (!value || typeof value !== 'object') return false
-  const row = value as Partial<StreamLeaseRow>
+  const row = value as Partial<Record<keyof StreamLeaseRow, unknown>>
   return (
     typeof row.streamId === 'string' &&
     typeof row.chatId === 'string' &&
@@ -135,8 +243,74 @@ function isStreamLeaseRow(value: unknown): value is StreamLeaseRow {
     typeof row.startedAt === 'number' &&
     Number.isFinite(row.startedAt) &&
     typeof row.heartbeatAt === 'number' &&
-    Number.isFinite(row.heartbeatAt)
+    Number.isFinite(row.heartbeatAt) &&
+    (row.attemptKind === undefined ||
+      row.attemptKind === 'generation' ||
+      row.attemptKind === 'continuation') &&
+    (row.continuationStrategy === undefined ||
+      row.continuationStrategy === 'prompt' ||
+      row.continuationStrategy === 'prefill') &&
+    (row.baseNodeVersion === undefined ||
+      (typeof row.baseNodeVersion === 'number' &&
+        Number.isSafeInteger(row.baseNodeVersion) &&
+        row.baseNodeVersion >= 0)) &&
+    (row.requestedModel === undefined || typeof row.requestedModel === 'string') &&
+    (row.apiUsed === undefined ||
+      row.apiUsed === 'chat' ||
+      row.apiUsed === 'responses' ||
+      row.apiUsed === 'gemini-native' ||
+      row.apiUsed === 'anthropic-messages' ||
+      row.apiUsed === 'completion' ||
+      row.apiUsed === 'video-generation')
   )
+}
+
+function requiredStreamFence(lease: StreamLeaseRow): StreamWriteFence {
+  if (
+    typeof lease.fenceToken !== 'string' ||
+    !Number.isSafeInteger(lease.replacementEpoch) ||
+    (lease.replacementEpoch ?? -1) < 0
+  ) {
+    throw new Error(`StreamFenceMissing:${lease.streamId}`)
+  }
+  return {
+    ownerClientId: lease.ownerClientId,
+    fenceToken: lease.fenceToken,
+    replacementEpoch: lease.replacementEpoch as number,
+  }
+}
+
+function requiredChunkFence(
+  chunk: StreamChunkRow,
+): Pick<StreamWriteFence, 'fenceToken' | 'replacementEpoch'> {
+  if (
+    typeof chunk.fenceToken !== 'string' ||
+    !Number.isSafeInteger(chunk.replacementEpoch) ||
+    (chunk.replacementEpoch ?? -1) < 0
+  ) {
+    throw new Error(`StreamFenceMissing:${chunk.streamId}`)
+  }
+  return {
+    fenceToken: chunk.fenceToken,
+    replacementEpoch: chunk.replacementEpoch as number,
+  }
+}
+
+function assertOwnedStreamFence(
+  lease: StreamLeaseRow | undefined,
+  fence: StreamWriteFence,
+  replacementEpoch: number,
+  streamId: string,
+): asserts lease is StreamLeaseRow {
+  if (
+    !lease ||
+    lease.ownerClientId !== fence.ownerClientId ||
+    lease.fenceToken !== fence.fenceToken ||
+    lease.replacementEpoch !== fence.replacementEpoch ||
+    replacementEpoch !== fence.replacementEpoch
+  ) {
+    throw new Error(`StreamFenceLost:${streamId}`)
+  }
 }
 
 function isStreamChunkRow(value: unknown): value is StreamChunkRow {
@@ -250,6 +424,10 @@ function applyMessageBodyPatch(body: MessageBodyRow, patch: MessageBodyPatch): M
     if (patch.providerOutputItems === undefined) delete next.providerOutputItems
     else next.providerOutputItems = structuredClone(patch.providerOutputItems)
   }
+  if ('continuationAttempts' in patch) {
+    if (patch.continuationAttempts === undefined) delete next.continuationAttempts
+    else next.continuationAttempts = structuredClone(patch.continuationAttempts)
+  }
   return next
 }
 
@@ -280,6 +458,9 @@ function replacementMessageBody(
   if (patch.providerOutputItems !== undefined) {
     body.providerOutputItems = structuredClone(patch.providerOutputItems)
   }
+  if (patch.continuationAttempts !== undefined) {
+    body.continuationAttempts = structuredClone(patch.continuationAttempts)
+  }
   return body
 }
 
@@ -295,6 +476,7 @@ const FORBIDDEN_MESSAGE_HEADER_PATCH_KEYS = new Set<keyof MessageHeaderRow>([
   'origin',
   'nodeVersion',
   'deleted',
+  'textPreview',
 ])
 
 function applyMessageHeaderPatch(
@@ -337,19 +519,16 @@ async function listMessagesInTransaction(tx: Transaction, chatId: ChatId): Promi
   return hydrateStoredMessages(headers, tx.table<MessageBodyRow, MessageId>('messageBodies'))
 }
 
-function groupHeadersByParent(
-  headers: readonly MessageHeaderRow[],
-): Map<MessageId | null, MessageHeaderRow[]> {
-  const buckets = new Map<MessageId | null, MessageHeaderRow[]>()
-  for (const header of headers) {
-    const bucket = buckets.get(header.parentId)
-    if (bucket) bucket.push(header)
-    else buckets.set(header.parentId, [header])
-  }
-  for (const bucket of buckets.values()) {
-    bucket.sort((a, b) => a.siblingIndex - b.siblingIndex)
-  }
-  return buckets
+async function chatPreviewInTransaction(tx: Transaction, chatId: ChatId): Promise<string> {
+  const header = await tx
+    .table<MessageHeaderRow, MessageId>('messages')
+    .where('[chatId+createdAt]')
+    .between([chatId, Dexie.minKey], [chatId, Dexie.maxKey])
+    .filter((row) => !row.deleted && row.role === 'user')
+    .first()
+  if (!header) return ''
+  const body = await tx.table<MessageBodyRow, MessageId>('messageBodies').get(header.id)
+  return previewTextFromContent(body?.content ?? [])
 }
 
 function branchHeadersByLeaf(
@@ -389,9 +568,18 @@ function siblingGroupsForBranch(
   headers: readonly MessageHeaderRow[],
   branchHeaders: readonly MessageHeaderRow[],
 ): ActiveBranchSnapshot['siblingGroups'] {
-  const byParent = groupHeadersByParent(headers)
   const parentIds = new Set<MessageId | null>([null])
   for (const header of branchHeaders) parentIds.add(header.parentId)
+  const byParent = new Map<MessageId | null, MessageHeaderRow[]>()
+  for (const header of headers) {
+    if (!parentIds.has(header.parentId)) continue
+    const bucket = byParent.get(header.parentId)
+    if (bucket) bucket.push(header)
+    else byParent.set(header.parentId, [header])
+  }
+  for (const bucket of byParent.values()) {
+    bucket.sort((left, right) => left.siblingIndex - right.siblingIndex)
+  }
   return [...parentIds].map((parentId) => ({
     parentId,
     siblings: (byParent.get(parentId) ?? []).map(cloneMessageHeader),
@@ -407,8 +595,15 @@ function cloneDraft(draft: DraftRow): DraftRow {
   return cloned
 }
 
-function replaceMessage(messages: Message[], nextMessage: Message): void {
-  const next = cloneMessage(nextMessage)
+async function hydrateStoredAttachment(
+  header: AttachmentHeaderRow,
+  artifacts: Table<AttachmentArtifact, string>,
+): Promise<Attachment> {
+  return hydrateAttachment(header, await artifacts.bulkGet(header.artifactIds))
+}
+
+function replaceMessageHeader(messages: MessageHeaderRow[], nextMessage: MessageHeaderRow): void {
+  const next = cloneMessageHeader(nextMessage)
   const index = messages.findIndex((message) => message.id === next.id)
   if (index === -1) {
     messages.push(next)
@@ -417,7 +612,7 @@ function replaceMessage(messages: Message[], nextMessage: Message): void {
   messages[index] = next
 }
 
-function removeMessage(messages: Message[], messageId: MessageId): void {
+function removeMessageHeader(messages: MessageHeaderRow[], messageId: MessageId): void {
   const index = messages.findIndex((message) => message.id === messageId)
   if (index === -1) return
   messages.splice(index, 1)
@@ -439,7 +634,12 @@ function recordMessageSummaryDeltas(
   state.totalCostDelta += messageCost(after) - messageCost(before)
 }
 
-function computeTotalCostUsd(messages: readonly Message[]): number {
+function recordNewMessageSummary(state: ChatMutationState, message: Message): void {
+  state.wordCountDeltas.set(message.id, countMessagesWords([message]))
+  state.totalCostDelta += messageCost(message)
+}
+
+function computeTotalCostUsd(messages: readonly Pick<Message, 'deleted' | 'generation'>[]): number {
   let total = 0
   for (const message of messages) {
     if (message.deleted) continue
@@ -477,7 +677,7 @@ function stripSummaryPatch(patch: Partial<Chat>): Partial<Chat> {
 }
 
 function attachmentSearchText(
-  attachment: Attachment,
+  attachment: AttachmentHeaderRow,
   artifacts: readonly AttachmentArtifact[],
 ): string {
   return [
@@ -506,45 +706,293 @@ function attachmentSearchText(
 
 function attachmentSorter(
   sort: AttachmentSearchQuery['sort'],
-): (left: Attachment, right: Attachment) => number {
-  if (sort === 'created-asc') return (left, right) => left.createdAt - right.createdAt
-  if (sort === 'updated-desc') return (left, right) => right.updatedAt - left.updatedAt
-  if (sort === 'size-desc') return (left, right) => (right.sizeBytes ?? 0) - (left.sizeBytes ?? 0)
-  if (sort === 'size-asc') return (left, right) => (left.sizeBytes ?? 0) - (right.sizeBytes ?? 0)
-  return (left, right) => right.createdAt - left.createdAt
+): (left: AttachmentHeaderRow, right: AttachmentHeaderRow) => number {
+  const resolvedSort = sort ?? 'created-desc'
+  return (left, right) =>
+    compareAttachmentSortTuples(
+      attachmentSortValue(left, resolvedSort),
+      left.id,
+      attachmentSortValue(right, resolvedSort),
+      right.id,
+      resolvedSort,
+    )
+}
+
+type AttachmentSearchSort = NonNullable<AttachmentSearchQuery['sort']>
+type AttachmentSearchIndex = AttachmentSearchMeasurement['selectedIndex']
+
+const ATTACHMENT_SEARCH_CURSOR_PREFIX = 'natter-attachment-search:v1:'
+const ATTACHMENT_SEARCH_CURSOR_FAMILY = 'natter-attachment-search:'
+const ATTACHMENT_ARTIFACT_ID_BATCH = 500
+const ATTACHMENT_SEARCH_ABORT_CHECK_INTERVAL = 256
+
+interface AttachmentCursorTuple {
+  sort: AttachmentSearchSort
+  value: number
+  id: AttachmentId
+}
+
+interface AttachmentIndexCandidate {
+  index: Exclude<AttachmentSearchIndex, 'createdAt' | 'updatedAt' | 'primary'>
+  collection: Collection<Attachment, AttachmentId>
+  count: number
+}
+
+async function loadAttachmentSearchMetadata(
+  table: Table<Attachment, AttachmentId>,
+  query: AttachmentSearchQuery,
+  sort: AttachmentSearchSort,
+  measurement: AttachmentSearchMeasurement,
+): Promise<AttachmentHeaderRow[]> {
+  const filters = query.filters
+  if (
+    filters?.minRefCount !== undefined &&
+    filters.maxRefCount !== undefined &&
+    filters.minRefCount > filters.maxRefCount
+  ) {
+    measurement.selectedIndex = 'refCount'
+    measurement.indexCounts.refCount = 0
+    return []
+  }
+  const candidates: Array<{
+    index: AttachmentIndexCandidate['index']
+    collection: Collection<Attachment, AttachmentId>
+  }> = []
+  if (filters?.kind) {
+    candidates.push({ index: 'kind', collection: table.where('kind').equals(filters.kind) })
+  }
+  if (filters?.mime) {
+    candidates.push({ index: 'mime', collection: table.where('mime').equals(filters.mime) })
+  }
+  if (filters?.origin) {
+    candidates.push({ index: 'origin', collection: table.where('origin').equals(filters.origin) })
+  }
+  if (filters?.minRefCount !== undefined || filters?.maxRefCount !== undefined) {
+    candidates.push({
+      index: 'refCount',
+      collection: table
+        .where('refCount')
+        .between(
+          filters.minRefCount ?? Dexie.minKey,
+          filters.maxRefCount ?? Dexie.maxKey,
+          true,
+          true,
+        ),
+    })
+  }
+
+  let selected: AttachmentIndexCandidate | undefined
+  if (candidates.length === 1) {
+    const candidate = candidates[0]
+    if (candidate) selected = { ...candidate, count: 0 }
+  } else {
+    for (const candidate of candidates) {
+      throwIfAttachmentSearchAborted(query.signal)
+      const count = await candidate.collection.count()
+      throwIfAttachmentSearchAborted(query.signal)
+      measurement.indexCounts[candidate.index] = count
+      if (!selected || count < selected.count) selected = { ...candidate, count }
+    }
+  }
+
+  let collection: Collection<Attachment, AttachmentId>
+  if (selected) {
+    measurement.selectedIndex = selected.index
+    collection = selected.collection
+  } else if (sort === 'created-asc' || sort === 'created-desc') {
+    measurement.selectedIndex = 'createdAt'
+    const ordered = table.orderBy('createdAt')
+    collection = sort === 'created-desc' ? ordered.reverse() : ordered
+  } else if (sort === 'updated-desc') {
+    measurement.selectedIndex = 'updatedAt'
+    collection = table.orderBy('updatedAt').reverse()
+  } else {
+    measurement.selectedIndex = 'primary'
+    collection = table.toCollection()
+  }
+
+  const rows = await collection.toArray()
+  throwIfAttachmentSearchAborted(query.signal)
+  measurement.metadataRowsRead = rows.length
+  return rows.map(attachmentHeaderFromStoredRow)
+}
+
+function attachmentMatchesFilters(
+  attachment: AttachmentHeaderRow,
+  query: AttachmentSearchQuery,
+): boolean {
+  const filters = query.filters
+  if (filters?.kind && attachment.kind !== filters.kind) return false
+  if (filters?.mime && attachment.mime !== filters.mime) return false
+  if (filters?.origin && attachment.origin !== filters.origin) return false
+  if (filters?.storageKind && attachment.storage.kind !== filters.storageKind) return false
+  if (filters?.minSizeBytes !== undefined && (attachment.sizeBytes ?? 0) < filters.minSizeBytes) {
+    return false
+  }
+  if (filters?.maxSizeBytes !== undefined && (attachment.sizeBytes ?? 0) > filters.maxSizeBytes) {
+    return false
+  }
+  if (filters?.minRefCount !== undefined && attachment.refCount < filters.minRefCount) return false
+  if (filters?.maxRefCount !== undefined && attachment.refCount > filters.maxRefCount) return false
+  return true
+}
+
+async function loadCandidateAttachmentArtifacts(
+  table: Table<AttachmentArtifact, string>,
+  attachmentIds: readonly AttachmentId[],
+  signal: AbortSignal | undefined,
+): Promise<AttachmentArtifact[]> {
+  const rows: AttachmentArtifact[] = []
+  for (let offset = 0; offset < attachmentIds.length; offset += ATTACHMENT_ARTIFACT_ID_BATCH) {
+    throwIfAttachmentSearchAborted(signal)
+    const batch = attachmentIds.slice(offset, offset + ATTACHMENT_ARTIFACT_ID_BATCH)
+    rows.push(...(await table.where('attachmentId').anyOf(batch).toArray()))
+    throwIfAttachmentSearchAborted(signal)
+  }
+  return rows
+}
+
+function encodeAttachmentCursor(
+  attachment: AttachmentHeaderRow,
+  sort: AttachmentSearchSort,
+): string {
+  const tuple: [AttachmentSearchSort, number, AttachmentId] = [
+    sort,
+    attachmentSortValue(attachment, sort),
+    attachment.id,
+  ]
+  return `${ATTACHMENT_SEARCH_CURSOR_PREFIX}${encodeURIComponent(JSON.stringify(tuple))}`
+}
+
+function decodeAttachmentCursor(cursor: string): AttachmentCursorTuple | { legacyId: string } {
+  if (!cursor.startsWith(ATTACHMENT_SEARCH_CURSOR_FAMILY)) return { legacyId: cursor }
+  if (!cursor.startsWith(ATTACHMENT_SEARCH_CURSOR_PREFIX)) {
+    throw new Error('AttachmentSearchCursorVersionUnsupported')
+  }
+  try {
+    const parsed = JSON.parse(
+      decodeURIComponent(cursor.slice(ATTACHMENT_SEARCH_CURSOR_PREFIX.length)),
+    ) as unknown
+    if (!Array.isArray(parsed) || parsed.length !== 3) throw new Error('shape')
+    const sort: unknown = parsed[0]
+    const value: unknown = parsed[1]
+    const id: unknown = parsed[2]
+    if (!isAttachmentSearchSort(sort) || typeof value !== 'number' || typeof id !== 'string') {
+      throw new Error('value')
+    }
+    return { sort, value, id }
+  } catch {
+    throw new Error('AttachmentSearchCursorInvalid')
+  }
+}
+
+function attachmentPageStart(
+  rows: readonly AttachmentHeaderRow[],
+  cursor: string | undefined,
+  sort: AttachmentSearchSort,
+): number {
+  if (cursor === undefined) return 0
+  const decoded = decodeAttachmentCursor(cursor)
+  if ('legacyId' in decoded || decoded.sort !== sort) {
+    const legacyId = 'legacyId' in decoded ? decoded.legacyId : decoded.id
+    return Math.max(0, rows.findIndex((row) => row.id === legacyId) + 1)
+  }
+  let low = 0
+  let high = rows.length
+  while (low < high) {
+    const middle = low + Math.floor((high - low) / 2)
+    const row = rows[middle]
+    if (
+      row &&
+      compareAttachmentSortTuples(
+        attachmentSortValue(row, sort),
+        row.id,
+        decoded.value,
+        decoded.id,
+        sort,
+      ) <= 0
+    ) {
+      low = middle + 1
+    } else {
+      high = middle
+    }
+  }
+  return low
+}
+
+function attachmentSortValue(attachment: AttachmentHeaderRow, sort: AttachmentSearchSort): number {
+  if (sort === 'updated-desc') return attachment.updatedAt
+  if (sort === 'size-desc' || sort === 'size-asc') return attachment.sizeBytes ?? 0
+  return attachment.createdAt
+}
+
+function compareAttachmentSortTuples(
+  leftValue: number,
+  leftId: AttachmentId,
+  rightValue: number,
+  rightId: AttachmentId,
+  sort: AttachmentSearchSort,
+): number {
+  if (leftValue !== rightValue) {
+    const ascending = sort === 'created-asc' || sort === 'size-asc'
+    return (leftValue < rightValue ? -1 : 1) * (ascending ? 1 : -1)
+  }
+  return leftId < rightId ? -1 : leftId > rightId ? 1 : 0
+}
+
+function isAttachmentSearchSort(value: unknown): value is AttachmentSearchSort {
+  return (
+    value === 'created-desc' ||
+    value === 'created-asc' ||
+    value === 'updated-desc' ||
+    value === 'size-desc' ||
+    value === 'size-asc'
+  )
+}
+
+function throwIfAttachmentSearchAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw new DOMException('Attachment search aborted', 'AbortError')
 }
 
 export function resolveMutationTableNames(
   scopes: readonly MutationScope[],
+  options?: WorkspaceMutationOptions,
 ): BrowserMutationTableName[] {
   const names = new Set<BrowserMutationTableName>(['settings'])
+  if (options?.streamFence) names.add('streamLeases')
   for (const scope of scopes) {
     switch (scope.kind) {
       case 'attachment':
         names.add('attachmentArtifacts')
         names.add('attachmentBlobs')
         names.add('attachmentJobs')
+        names.add('attachmentRefEdges')
         names.add('attachments')
         break
       case 'chat-meta':
+        names.add('chatSidebarRows')
         names.add('chats')
         break
       case 'children':
         names.add('chatBranchCache')
+        names.add('chatSidebarRows')
         names.add('chats')
         names.add('childLists')
         names.add('messages')
         names.add('messageBodies')
         break
       case 'draft':
+        names.add('chatSidebarRows')
         names.add('chats')
         names.add('drafts')
         break
       case 'message':
         names.add('chatBranchCache')
+        names.add('chatSidebarRows')
         names.add('chats')
         names.add('messages')
         names.add('messageBodies')
+        names.add('streamLeases')
         break
     }
   }
@@ -554,8 +1002,9 @@ export function resolveMutationTableNames(
 function resolveMutationTables(
   db: NatterDb,
   scopes: readonly MutationScope[],
+  options?: WorkspaceMutationOptions,
 ): Table<unknown, unknown>[] {
-  return resolveMutationTableNames(scopes).map((name) => {
+  return resolveMutationTableNames(scopes, options).map((name) => {
     switch (name) {
       case 'attachments':
         return db.attachments as Table<unknown, unknown>
@@ -565,10 +1014,14 @@ function resolveMutationTables(
         return db.attachmentBlobs as Table<unknown, unknown>
       case 'attachmentJobs':
         return db.attachmentJobs as Table<unknown, unknown>
+      case 'attachmentRefEdges':
+        return db.attachmentRefEdges as Table<unknown, unknown>
       case 'chats':
         return db.chats as Table<unknown, unknown>
       case 'chatBranchCache':
         return db.chatBranchCache as Table<unknown, unknown>
+      case 'chatSidebarRows':
+        return db.chatSidebarRows as Table<unknown, unknown>
       case 'childLists':
         return db.childLists as Table<unknown, unknown>
       case 'drafts':
@@ -579,6 +1032,8 @@ function resolveMutationTables(
         return db.messageBodies as Table<unknown, unknown>
       case 'settings':
         return db.settings as Table<unknown, unknown>
+      case 'streamLeases':
+        return db.streamLeases as Table<unknown, unknown>
     }
     const exhaustive: never = name
     void exhaustive
@@ -637,22 +1092,54 @@ async function loadChatOrThrow(table: Table<Chat, string>, chatId: ChatId): Prom
   return structuredClone(chat)
 }
 
+function findLastUpdatedLeafIdFromHeaders(headers: readonly MessageHeaderRow[]): MessageId | null {
+  const parentsWithLiveChildren = new Set<MessageId>()
+  for (const header of headers) {
+    if (!header.deleted && header.parentId !== null) parentsWithLiveChildren.add(header.parentId)
+  }
+  let best: MessageHeaderRow | undefined
+  for (const header of headers) {
+    if (header.deleted || parentsWithLiveChildren.has(header.id)) continue
+    if (
+      !best ||
+      header.createdAt > best.createdAt ||
+      (header.createdAt === best.createdAt && header.id > best.id)
+    ) {
+      best = header
+    }
+  }
+  return best?.id ?? null
+}
+
+function headerIsOnPathToLeaf(
+  messageId: MessageId,
+  leafId: MessageId,
+  byId: ReadonlyMap<MessageId, MessageHeaderRow>,
+): boolean {
+  let currentId: MessageId | null = leafId
+  while (currentId !== null) {
+    if (currentId === messageId) return true
+    currentId = byId.get(currentId)?.parentId ?? null
+  }
+  return false
+}
+
 function shouldBumpLastBranchUpdatedAt(
   beforeChat: Chat,
-  beforeMessages: readonly Message[],
-  afterMessages: readonly Message[],
+  beforeHeaders: readonly MessageHeaderRow[],
+  afterHeaders: readonly MessageHeaderRow[],
   changedMessageIds: ReadonlySet<MessageId>,
 ): boolean {
-  const nextLeafId = findLastUpdatedLeafId(afterMessages)
+  const nextLeafId = findLastUpdatedLeafIdFromHeaders(afterHeaders)
   if (nextLeafId !== beforeChat.lastUpdatedLeafId) return true
   if (nextLeafId === null) return false
   if (changedMessageIds.size === 0) return false
-  const beforeById = indexById(beforeMessages)
-  const afterById = indexById(afterMessages)
+  const beforeById = new Map(beforeHeaders.map((header) => [header.id, header]))
+  const afterById = new Map(afterHeaders.map((header) => [header.id, header]))
   for (const messageId of changedMessageIds) {
     if (
-      isOnPathToLeaf(messageId, nextLeafId, beforeById) ||
-      isOnPathToLeaf(messageId, nextLeafId, afterById)
+      headerIsOnPathToLeaf(messageId, nextLeafId, beforeById) ||
+      headerIsOnPathToLeaf(messageId, nextLeafId, afterById)
     ) {
       return true
     }
@@ -675,61 +1162,91 @@ function shouldBumpLastBranchUpdatedAtFromHeaders(
   return false
 }
 
-async function writeBranchCacheForSummary(
-  tx: Transaction,
-  chatId: ChatId,
-  branchLeafId: MessageId | null,
-  messages: readonly Message[],
-  now: number,
-): Promise<void> {
-  const table = tx.table<ChatBranchCache, ChatId>('chatBranchCache')
-  if (branchLeafId === null) {
-    await table.delete(chatId)
-    return
-  }
-  await table.put(
-    buildBranchCacheRow({
-      chatId,
-      branchLeafId,
-      messages,
-      generatedAt: now,
-    }),
-  )
+async function invalidateBranchCacheForSummary(tx: Transaction, chatId: ChatId): Promise<void> {
+  await tx.table<ChatBranchCache, ChatId>('chatBranchCache').delete(chatId)
 }
 
-async function maybeRefreshBranchCacheForHeaderSummary(input: {
+function countStoredBodyWords(body: MessageBodyRow): number {
+  return countMessagesWords([body as unknown as Message])
+}
+
+function branchPathIsComplete(
+  branch: readonly MessageHeaderRow[],
+  leafId: MessageId | null,
+): boolean {
+  if (leafId === null) return branch.length === 0
+  return branch.at(-1)?.id === leafId
+}
+
+async function hydrateBranchWordCount(
+  headers: readonly MessageHeaderRow[],
+  bodyTable: Table<MessageBodyRow, MessageId>,
+): Promise<number> {
+  return countMessagesWords(await hydrateStoredMessages(headers, bodyTable))
+}
+
+async function structuralBranchWordCount(input: {
   tx: Transaction
-  chatId: ChatId
-  branchLeafId: MessageId | null
-  branchHeaders: readonly MessageHeaderRow[]
-  beforeChat: Chat
-  now: number
-}): Promise<{ refreshed: boolean; cache?: ChatBranchCache }> {
-  const table = input.tx.table<ChatBranchCache, ChatId>('chatBranchCache')
-  const existing = await table.get(input.chatId)
-  if (!existing) return { refreshed: false }
-  if (input.branchLeafId === null) {
-    await table.delete(input.chatId)
-    return { refreshed: true }
-  }
+  state: ChatMutationState
+  beforeHeaders: readonly MessageHeaderRow[]
+  afterHeaders: readonly MessageHeaderRow[]
+  nextLeafId: MessageId | null
+}): Promise<number> {
+  const { state } = input
+  const bodyTable = input.tx.table<MessageBodyRow, MessageId>('messageBodies')
+  const oldBranch = branchHeadersByLeaf(input.beforeHeaders, state.beforeChat.lastUpdatedLeafId)
+  const newBranch = branchHeadersByLeaf(input.afterHeaders, input.nextLeafId)
+  const fallback = () => hydrateBranchWordCount(newBranch, bodyTable)
   if (
-    existing.branchLeafId !== input.branchLeafId ||
-    existing.generatedAt < input.beforeChat.lastBranchUpdatedAt
+    !branchPathIsComplete(oldBranch, state.beforeChat.lastUpdatedLeafId) ||
+    !branchPathIsComplete(newBranch, input.nextLeafId)
   ) {
-    return { refreshed: false }
+    return fallback()
   }
-  const branchMessages = await hydrateStoredMessages(
-    input.branchHeaders,
-    input.tx.table<MessageBodyRow, MessageId>('messageBodies'),
+
+  const oldIds = new Set(oldBranch.map((header) => header.id))
+  const newIds = new Set(newBranch.map((header) => header.id))
+  const beforeIds = new Set(input.beforeHeaders.map((header) => header.id))
+  let wordCount = state.beforeChat.wordCount
+
+  for (const messageId of state.changedMessageIds) {
+    if (!oldIds.has(messageId) || !newIds.has(messageId)) continue
+    const delta = state.wordCountDeltas.get(messageId)
+    if (delta === undefined) return fallback()
+    wordCount += delta
+  }
+
+  for (const header of oldBranch) {
+    if (newIds.has(header.id)) continue
+    const body = await bodyTable.get(header.id)
+    if (!body) return fallback()
+    const currentCount = countStoredBodyWords(body)
+    wordCount -= currentCount - (state.wordCountDeltas.get(header.id) ?? 0)
+  }
+
+  for (const header of newBranch) {
+    if (oldIds.has(header.id)) continue
+    const delta = state.wordCountDeltas.get(header.id)
+    if (!beforeIds.has(header.id) && delta !== undefined) {
+      wordCount += delta
+      continue
+    }
+    const body = await bodyTable.get(header.id)
+    if (!body) return fallback()
+    wordCount += countStoredBodyWords(body)
+  }
+
+  return Math.max(0, wordCount)
+}
+
+function messageOutranksLeaf(
+  message: Pick<Message, 'createdAt' | 'id'>,
+  leaf: Pick<MessageHeaderRow, 'createdAt' | 'id'>,
+): boolean {
+  return (
+    message.createdAt > leaf.createdAt ||
+    (message.createdAt === leaf.createdAt && message.id > leaf.id)
   )
-  const cache = buildBranchCacheRow({
-    chatId: input.chatId,
-    branchLeafId: input.branchLeafId,
-    messages: branchMessages,
-    generatedAt: input.now,
-  })
-  await table.put(cache)
-  return { refreshed: true, cache }
 }
 
 async function branchHeadersByLeafInTransaction(
@@ -751,39 +1268,13 @@ async function branchHeadersByLeafInTransaction(
   return branch
 }
 
-async function getWorkspaceMetaRow(): Promise<StoredWorkspaceMeta> {
+async function getWorkspaceMetaRow(): Promise<WorkspaceMeta> {
   const db = await openDb()
-  const stored = (await db.settings.get(WORKSPACE_META_KEY))?.value as
-    | StoredWorkspaceMeta
-    | undefined
-  return (
-    stored ?? {
-      workspaceId: WORKSPACE_ID,
-      backendKind: 'browser-idb',
-      lastMutationAt: 0,
-      mutationCounter: 0,
-    }
-  )
+  return readBrowserWorkspaceMeta(db)
 }
 
 async function bumpWorkspaceMeta(tx: Transaction, now: number): Promise<void> {
-  const settings = tx.table<SettingsRow, string>('settings')
-  const stored = (await settings.get(WORKSPACE_META_KEY))?.value as StoredWorkspaceMeta | undefined
-  const mutationMeta = stored ?? {
-    workspaceId: WORKSPACE_ID,
-    backendKind: 'browser-idb' as const,
-    lastMutationAt: 0,
-    mutationCounter: 0,
-  }
-  const nextWorkspaceMeta: StoredWorkspaceMeta = {
-    ...mutationMeta,
-    lastMutationAt: now,
-    mutationCounter: mutationMeta.mutationCounter + 1,
-  }
-  await settings.put({
-    key: WORKSPACE_META_KEY,
-    value: nextWorkspaceMeta,
-  })
+  await bumpBrowserWorkspaceMeta(tx, now)
 }
 
 function normalizeName(value: string, kind: 'Folder' | 'Tag'): string {
@@ -841,6 +1332,8 @@ interface ArchivedChatDeleteSnapshot {
   attachmentIds: AttachmentId[]
 }
 
+class ArchivedChatDeletePlanChangedError extends Error {}
+
 async function archivedDeleteSnapshots(
   db: NatterDb,
   chatIds: readonly ChatId[],
@@ -877,10 +1370,155 @@ function attachmentIdsFromDeletedChat(
   return ids
 }
 
-function countAttachmentIds(ids: readonly AttachmentId[]): Map<AttachmentId, number> {
-  const counts = new Map<AttachmentId, number>()
-  for (const id of ids) counts.set(id, (counts.get(id) ?? 0) + 1)
-  return counts
+function sameArchivedDeleteSnapshot(
+  snapshot: ArchivedChatDeleteSnapshot,
+  messages: readonly MessageHeaderRow[],
+  draft: DraftRow | undefined,
+): boolean {
+  return (
+    sameOrderedValues(
+      [...snapshot.messageIds].sort(),
+      messages.map((message) => message.id).sort(),
+    ) &&
+    sameOrderedValues(
+      [...snapshot.attachmentIds].sort(),
+      attachmentIdsFromDeletedChat(messages, draft).sort(),
+    )
+  )
+}
+
+interface ForkWritePlan {
+  sourceMessageIds: MessageId[]
+  sourceParentIds: Array<MessageId | null>
+  liveAttachmentIds: AttachmentId[]
+  destinationChatId: ChatId
+  destinationMessageIds: MessageId[]
+  destinationParentIds: Array<MessageId | null>
+  scopes: MutationScope[]
+}
+
+class ForkWritePlanChangedError extends Error {}
+
+async function forkAncestorHeaders(
+  table: Table<MessageHeaderRow, MessageId>,
+  chatId: ChatId,
+  targetId: MessageId,
+): Promise<MessageHeaderRow[]> {
+  const ancestors: MessageHeaderRow[] = []
+  const visited = new Set<MessageId>()
+  let currentId: MessageId | null = targetId
+  while (currentId !== null) {
+    if (visited.has(currentId)) throw new Error(`fork: cycle at message ${currentId}`)
+    visited.add(currentId)
+    const row: MessageHeaderRow | undefined = await table.get(currentId)
+    if (!row) {
+      if (currentId === targetId) throw new Error(`fork: message ${targetId} not found`)
+      break
+    }
+    if (row.chatId !== chatId) {
+      throw new Error(`fork: message ${row.id} does not belong to chat ${chatId}`)
+    }
+    ancestors.push(cloneMessageHeader(row))
+    currentId = row.parentId
+  }
+  ancestors.reverse()
+  return ancestors
+}
+
+function forkLiveAttachmentIds(rows: readonly Pick<Message, 'attachmentRefs'>[]): AttachmentId[] {
+  return rows.flatMap((row) =>
+    liveAttachmentRefs(row.attachmentRefs).map((ref) => ref.attachmentId),
+  )
+}
+
+function sameOrderedValues<T>(left: readonly T[], right: readonly T[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index])
+}
+
+function sameForkPlanSource(plan: ForkWritePlan, rows: readonly Message[]): boolean {
+  return (
+    sameOrderedValues(
+      plan.sourceMessageIds,
+      rows.map((row) => row.id),
+    ) &&
+    sameOrderedValues(
+      plan.sourceParentIds,
+      rows.map((row) => row.parentId),
+    ) &&
+    sameOrderedValues([...plan.liveAttachmentIds].sort(), forkLiveAttachmentIds(rows).sort())
+  )
+}
+
+async function planForkWrite(
+  db: NatterDb,
+  input: ForkChatFromMessageInput,
+  destinationChatId: ChatId,
+): Promise<ForkWritePlan> {
+  const headers = await db.transaction('r', [db.chats, db.messages], async (tx: Transaction) => {
+    if (!(await tx.table<Chat, ChatId>('chats').get(input.chatId))) {
+      throw new Error(`fork: source chat ${input.chatId} not found`)
+    }
+    return forkAncestorHeaders(
+      tx.table<MessageHeaderRow, MessageId>('messages'),
+      input.chatId,
+      input.messageId,
+    )
+  })
+  if (headers.length === 0) throw new Error('fork: no ancestors to copy')
+
+  const destinationMessageIds = headers.map(() => newId())
+  const destinationIdBySourceId = new Map(
+    headers.map((row, index) => [row.id, destinationMessageIds[index] as MessageId]),
+  )
+  const destinationParentIds = headers.map((row) =>
+    row.parentId ? (destinationIdBySourceId.get(row.parentId) ?? null) : null,
+  )
+  const scopes: MutationScope[] = [
+    { kind: 'chat-meta', chatId: input.chatId },
+    { kind: 'chat-meta', chatId: destinationChatId },
+  ]
+  for (const row of headers) scopes.push({ kind: 'message', messageId: row.id })
+  for (const messageId of destinationMessageIds) scopes.push({ kind: 'message', messageId })
+  for (const parentId of destinationParentIds) {
+    scopes.push({ kind: 'children', chatId: destinationChatId, parentId })
+  }
+  const liveAttachmentIds = forkLiveAttachmentIds(headers)
+  for (const attachmentId of new Set(liveAttachmentIds)) {
+    scopes.push({ kind: 'attachment', attachmentId })
+  }
+
+  return {
+    sourceMessageIds: headers.map((row) => row.id),
+    sourceParentIds: headers.map((row) => row.parentId),
+    liveAttachmentIds,
+    destinationChatId,
+    destinationMessageIds,
+    destinationParentIds,
+    scopes,
+  }
+}
+
+function cloneForkMessages(
+  ancestors: readonly Message[],
+  plan: ForkWritePlan,
+  now: number,
+): Message[] {
+  const destinationIdBySourceId = new Map(
+    ancestors.map((row, index) => [row.id, plan.destinationMessageIds[index] as MessageId]),
+  )
+  return ancestors.map((source, index) => {
+    const clone = structuredClone(source)
+    clone.id = plan.destinationMessageIds[index] as MessageId
+    clone.chatId = plan.destinationChatId
+    clone.parentId = source.parentId ? (destinationIdBySourceId.get(source.parentId) ?? null) : null
+    clone.siblingIndex = 0
+    clone.turnId = newId()
+    clone.turnIndex = 0
+    clone.createdAt = now - (ancestors.length - index)
+    if (clone.editedAt !== undefined) clone.editedAt = now
+    clone.nodeVersion = 0
+    return clone
+  })
 }
 
 class BrowserWorkspaceRepository implements WorkspaceRepository {
@@ -888,20 +1526,425 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     return getWorkspaceMetaRow()
   }
 
+  async forkChatFromMessage(input: ForkChatFromMessageInput): Promise<ForkChatFromMessageResult> {
+    const db = await openDb()
+    const destinationChatId = newId()
+    const now = input.now ?? Date.now()
+
+    for (;;) {
+      const plan = await planForkWrite(db, input, destinationChatId)
+      try {
+        const result = await withMutationLocks(plan.scopes, async (grant) =>
+          grant.runTransaction(
+            db,
+            [
+              db.attachments,
+              db.attachmentRefEdges,
+              db.chatBranchCache,
+              db.chatSidebarRows,
+              db.chats,
+              db.childLists,
+              db.messages,
+              db.messageBodies,
+              db.settings,
+            ],
+            async (tx: Transaction) => {
+              const chatTable = tx.table<Chat, ChatId>('chats')
+              const source = await chatTable.get(input.chatId)
+              if (!source) throw new Error(`fork: source chat ${input.chatId} not found`)
+              if (await chatTable.get(destinationChatId)) {
+                throw new Error(`fork: destination chat ${destinationChatId} already exists`)
+              }
+
+              const headers = await forkAncestorHeaders(
+                tx.table<MessageHeaderRow, MessageId>('messages'),
+                input.chatId,
+                input.messageId,
+              )
+              const ancestors = await hydrateStoredMessages(
+                headers,
+                tx.table<MessageBodyRow, MessageId>('messageBodies'),
+              )
+              if (!sameForkPlanSource(plan, ancestors)) throw new ForkWritePlanChangedError()
+
+              const messages = cloneForkMessages(ancestors, plan, now)
+              const lastUpdatedLeafId = findLastUpdatedLeafId(messages)
+              const branchCache =
+                lastUpdatedLeafId === null
+                  ? undefined
+                  : buildBranchCacheRow({
+                      chatId: destinationChatId,
+                      branchLeafId: lastUpdatedLeafId,
+                      messages,
+                      generatedAt: now,
+                    })
+              const chat: Chat = {
+                id: destinationChatId,
+                title: input.title,
+                titleStatus: 'manual',
+                createdAt: now,
+                updatedAt: now,
+                lastViewedAt: now,
+                wordCount: branchCache?.wordCount ?? 0,
+                totalCostUsd: computeTotalCostUsd(messages),
+                metaVersion: 0,
+                summaryVersion: 1,
+                settings: structuredClone(source.settings),
+                lastUpdatedLeafId,
+                lastBranchUpdatedAt: now,
+                archived: false,
+                pinned: false,
+                folderId: null,
+                tags: [],
+                previewText: previewTextFromMessages(messages),
+                ...(source.presetId ? { presetId: source.presetId } : {}),
+              }
+
+              await chatTable.put(chat)
+              await putChatSidebarProjection(tx, chat, true)
+              const headerTable = tx.table<MessageHeaderRow, MessageId>('messages')
+              const bodyTable = tx.table<MessageBodyRow, MessageId>('messageBodies')
+              const childListTable = tx.table<ChildListState, string>('childLists')
+              for (const message of messages) {
+                const { header, body } = splitMessageForStorage(message, { updatedAt: now })
+                await headerTable.put(header)
+                await bodyTable.put(body)
+                await childListTable.put({
+                  id: childListKey(destinationChatId, message.parentId),
+                  chatId: destinationChatId,
+                  parentId: message.parentId,
+                  version: 1,
+                  updatedAt: now,
+                })
+              }
+              if (branchCache) {
+                await tx.table<ChatBranchCache, ChatId>('chatBranchCache').put(branchCache)
+              }
+              await replaceAttachmentReferenceOwners(
+                tx,
+                messages.map((message) => ({
+                  ownerKind: 'message' as const,
+                  ownerId: message.id,
+                  chatId: message.chatId,
+                  refs: message.attachmentRefs,
+                })),
+              )
+              await bumpWorkspaceMeta(tx, now)
+              return { chatId: destinationChatId, messageCount: messages.length }
+            },
+          ),
+        )
+
+        postEvent({
+          kind: 'chat-mutated',
+          chatId: destinationChatId,
+          metaVersion: 0,
+          summaryVersion: 1,
+          affected: [
+            { kind: 'chat-meta', chatId: destinationChatId },
+            ...plan.destinationMessageIds.map((messageId) => ({
+              kind: 'message' as const,
+              chatId: destinationChatId,
+              messageId,
+            })),
+            ...plan.destinationParentIds.map((parentId) => ({
+              kind: 'children' as const,
+              chatId: destinationChatId,
+              parentId,
+            })),
+          ],
+        })
+        return result
+      } catch (error) {
+        if (error instanceof ForkWritePlanChangedError) continue
+        throw error
+      }
+    }
+  }
+
+  async createChat(chat: Chat): Promise<Chat> {
+    const result = await withMutationLocks(
+      [{ kind: 'chat-meta', chatId: chat.id }],
+      async (grant) => createChatInBrowser(await openDb(), grant, chat, bumpWorkspaceMeta),
+    )
+    postEvent({
+      kind: 'chat-mutated',
+      chatId: result.id,
+      metaVersion: result.metaVersion,
+      summaryVersion: result.summaryVersion,
+      affected: [{ kind: 'chat-meta', chatId: result.id }],
+    })
+    return result
+  }
+
+  async discardEmptyDraftChats(input: {
+    chatIds?: readonly ChatId[]
+    exceptChatId?: ChatId | null
+    now?: number
+  }): Promise<ChatId[]> {
+    const deleted = await withNamedLock('db:global', async (grant) =>
+      discardEmptyDraftChatsInBrowser(
+        await openDb(),
+        grant,
+        input,
+        input.now ?? Date.now(),
+        bumpWorkspaceMeta,
+      ),
+    )
+    for (const chatId of deleted) postEvent({ kind: 'chat-deleted', chatId })
+    return deleted
+  }
+
+  async deletePresetAndClearBreadcrumbs(
+    presetId: PresetId,
+    now: number,
+  ): Promise<DeletePresetCascadeResult> {
+    const result = await withNamedLock(`preset:${presetId}`, async (grant) =>
+      deletePresetAndClearBreadcrumbsInBrowser(
+        await openDb(),
+        grant,
+        presetId,
+        now,
+        bumpWorkspaceMeta,
+      ),
+    )
+    if (result.kind === 'missing') return result
+    for (const chat of result.chats) {
+      postEvent({
+        kind: 'chat-mutated',
+        chatId: chat.chatId,
+        metaVersion: chat.metaVersion,
+        summaryVersion: chat.summaryVersion,
+        affected: [{ kind: 'chat-meta', chatId: chat.chatId }],
+      })
+    }
+    postEvent({ kind: 'preset-deleted', presetId })
+    return result
+  }
+
+  async updateProfileAndInvalidateCaches(
+    input: UpdateProfileAtomicInput,
+  ): Promise<UpdateProfileAtomicResult> {
+    const result = await withNamedLock(`profile:${input.profileId}`, async (grant) =>
+      updateProfileAndInvalidateCachesInBrowser(await openDb(), grant, input, bumpWorkspaceMeta),
+    )
+    if (result.kind === 'missing') return result
+    if (result.cachesInvalidated) {
+      postEvent({ kind: 'models-refreshed', profileId: input.profileId })
+    }
+    postEvent({ kind: 'profile-mutated', profileId: input.profileId })
+    return result
+  }
+
+  async deleteProfileAndReassign(
+    input: DeleteProfileAtomicInput,
+  ): Promise<DeleteProfileAtomicResult> {
+    const lockIds = [
+      ...new Set(
+        [input.profileId, input.reassignTo].filter((id): id is string => id !== undefined),
+      ),
+    ].sort()
+    const result = await withNamedLocks(
+      lockIds.map((profileId) => `profile:${profileId}`),
+      async (grant) =>
+        deleteProfileAndReassignInBrowser(await openDb(), grant, input, bumpWorkspaceMeta),
+    )
+    if (result.kind !== 'deleted') return result
+    for (const presetId of result.presetIds) {
+      postEvent({ kind: 'preset-mutated', presetId })
+    }
+    for (const chat of result.chats) {
+      postEvent({
+        kind: 'chat-mutated',
+        chatId: chat.chatId,
+        metaVersion: chat.metaVersion,
+        summaryVersion: chat.summaryVersion,
+        affected: [{ kind: 'chat-meta', chatId: chat.chatId }],
+      })
+    }
+    for (const keyId of result.deletedKeyIds) {
+      postEvent({ kind: 'key-rotated', keyId })
+    }
+    postEvent({ kind: 'profile-deleted', profileId: input.profileId })
+    return result
+  }
+
+  async updatePromptPresetAndPropagate(
+    input: UpdatePromptPresetAtomicInput,
+  ): Promise<UpdatePromptPresetAtomicResult> {
+    const result = await withNamedLock(`prompt-preset:${input.presetId}`, async (grant) =>
+      updatePromptPresetAndPropagateInBrowser(await openDb(), grant, input, bumpWorkspaceMeta),
+    )
+    if (result.kind === 'missing') return result
+    postEvent({ kind: 'prompt-preset-mutated', promptPresetId: input.presetId })
+    for (const chat of result.chats) {
+      postEvent({
+        kind: 'chat-mutated',
+        chatId: chat.chatId,
+        metaVersion: chat.metaVersion,
+        summaryVersion: chat.summaryVersion,
+        affected: [{ kind: 'chat-meta', chatId: chat.chatId }],
+      })
+    }
+    for (const presetId of result.presetIds) {
+      postEvent({ kind: 'preset-mutated', presetId })
+    }
+    return result
+  }
+
+  async deletePromptPresetAndClearPins(
+    input: DeletePromptPresetAtomicInput,
+  ): Promise<DeletePromptPresetAtomicResult> {
+    const result = await withNamedLock(`prompt-preset:${input.presetId}`, async (grant) =>
+      deletePromptPresetAndClearPinsInBrowser(await openDb(), grant, input, bumpWorkspaceMeta),
+    )
+    if (result.kind === 'missing') return result
+    postEvent({ kind: 'prompt-preset-deleted', promptPresetId: input.presetId })
+    for (const chat of result.chats) {
+      postEvent({
+        kind: 'chat-mutated',
+        chatId: chat.chatId,
+        metaVersion: chat.metaVersion,
+        summaryVersion: chat.summaryVersion,
+        affected: [{ kind: 'chat-meta', chatId: chat.chatId }],
+      })
+    }
+    for (const presetId of result.presetIds) {
+      postEvent({ kind: 'preset-mutated', presetId })
+    }
+    return result
+  }
+
   async upsertStreamLease(lease: StreamLeaseRow): Promise<StreamLeaseRow> {
     const db = await openDb()
-    const row: StreamLeaseRow = { ...lease }
-    await db.streamLeases.put(row)
+    const row = await withNamedLock(`stream-journal:${lease.streamId}`, (grant) =>
+      grant.runTransaction(
+        db,
+        lease.messageId
+          ? [db.streamLeases, db.settings, db.messages, db.messageBodies]
+          : [db.streamLeases, db.settings],
+        async (tx) => {
+          const table = tx.table<StreamLeaseRow, string>('streamLeases')
+          const existing = await table.get(lease.streamId)
+          const meta = await readBrowserWorkspaceMetaFromTransaction(tx)
+          const fenceToken = lease.fenceToken ?? newId()
+          if (
+            existing &&
+            (existing.ownerClientId !== lease.ownerClientId || existing.fenceToken !== fenceToken)
+          ) {
+            throw new Error(`StreamLeaseAlreadyOwned:${lease.streamId}`)
+          }
+          const admitted: StreamLeaseRow = {
+            ...lease,
+            fenceToken,
+            replacementEpoch: meta.replacementEpoch,
+          }
+          await assertStreamLeaseTargetAvailable(tx, admitted)
+          await table.put(admitted)
+          return admitted
+        },
+      ),
+    )
     postEvent({ kind: 'stream-heartbeat', lease: row })
     return row
   }
 
+  async renewStreamLease(
+    lease: StreamLeaseRow,
+    options: { targetChanged?: boolean } = {},
+  ): Promise<StreamLeaseRow> {
+    const fence = requiredStreamFence(lease)
+    const db = await openDb()
+    const checkTarget = options.targetChanged !== false
+    const row = await withNamedLock(`stream-journal:${lease.streamId}`, (grant) =>
+      grant.runTransaction(
+        db,
+        checkTarget && lease.messageId
+          ? [db.streamLeases, db.settings, db.messages, db.messageBodies]
+          : [db.streamLeases, db.settings],
+        async (tx) => {
+          const meta = await readBrowserWorkspaceMetaFromTransaction(tx)
+          const table = tx.table<StreamLeaseRow, string>('streamLeases')
+          const existing = await table.get(lease.streamId)
+          assertOwnedStreamFence(existing, fence, meta.replacementEpoch, lease.streamId)
+          const renewed: StreamLeaseRow = {
+            ...lease,
+            startedAt: existing.startedAt,
+            fenceToken: fence.fenceToken,
+            replacementEpoch: fence.replacementEpoch,
+          }
+          if (renewed.messageId !== existing.messageId) {
+            if (!checkTarget) throw new Error(`StreamLeaseTargetChanged:${lease.streamId}`)
+            await assertStreamLeaseTargetAvailable(tx, renewed)
+          }
+          await table.put(renewed)
+          return renewed
+        },
+      ),
+    )
+    postEvent({ kind: 'stream-heartbeat', lease: row })
+    return row
+  }
+
+  async claimStreamLeaseForRecovery(
+    expected: StreamLeaseRow,
+    now: number,
+  ): Promise<StreamLeaseRow | undefined> {
+    const expectedFence = requiredStreamFence(expected)
+    const db = await openDb()
+    return withNamedLock(`stream-journal:${expected.streamId}`, (grant) =>
+      grant.runTransaction(db, [db.streamLeases, db.settings], async (tx) => {
+        const meta = await readBrowserWorkspaceMetaFromTransaction(tx)
+        const table = tx.table<StreamLeaseRow, string>('streamLeases')
+        const existing = await table.get(expected.streamId)
+        if (
+          !existing ||
+          existing.ownerClientId !== expectedFence.ownerClientId ||
+          existing.fenceToken !== expectedFence.fenceToken ||
+          existing.replacementEpoch !== expectedFence.replacementEpoch ||
+          existing.heartbeatAt !== expected.heartbeatAt ||
+          meta.replacementEpoch !== expectedFence.replacementEpoch
+        ) {
+          return undefined
+        }
+        const claimed: StreamLeaseRow = {
+          ...existing,
+          ownerClientId: `recovery:${newId()}`,
+          fenceToken: newId(),
+          heartbeatAt: now,
+        }
+        await table.put(claimed)
+        return claimed
+      }),
+    )
+  }
+
   async deleteStreamLease(streamId: string): Promise<boolean> {
     const db = await openDb()
-    const existing = await db.streamLeases.get(streamId)
-    if (!existing) return false
-    await db.streamLeases.delete(streamId)
-    return true
+    return withNamedLock(`stream-journal:${streamId}`, (grant) =>
+      grant.runTransaction(db, [db.streamLeases], async (tx) => {
+        const table = tx.table<StreamLeaseRow, string>('streamLeases')
+        const existing = await table.get(streamId)
+        if (!existing) return false
+        await table.delete(streamId)
+        return true
+      }),
+    )
+  }
+
+  async deleteOwnedStreamLease(streamId: string, fence: StreamWriteFence): Promise<boolean> {
+    const db = await openDb()
+    return withNamedLock(`stream-journal:${streamId}`, (grant) =>
+      grant.runTransaction(db, [db.streamLeases, db.settings], async (tx) => {
+        const meta = await readBrowserWorkspaceMetaFromTransaction(tx)
+        const table = tx.table<StreamLeaseRow, string>('streamLeases')
+        const existing = await table.get(streamId)
+        if (!existing) return false
+        assertOwnedStreamFence(existing, fence, meta.replacementEpoch, streamId)
+        await table.delete(streamId)
+        return true
+      }),
+    )
   }
 
   async listStreamLeases(chatId?: ChatId): Promise<StreamLeaseRow[]> {
@@ -916,7 +1959,58 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
   async appendStreamChunks(chunks: readonly StreamChunkRow[]): Promise<void> {
     if (chunks.length === 0) return
     const db = await openDb()
-    await db.streamChunks.bulkPut(chunks.map((chunk) => structuredClone(chunk)))
+    const streamIds = [...new Set(chunks.map((chunk) => chunk.streamId))]
+    await withNamedLocks(
+      streamIds.map((streamId) => `stream-journal:${streamId}`),
+      (grant) =>
+        grant.runTransaction(db, [db.streamChunks, db.streamLeases, db.settings], async (tx) => {
+          const meta = await readBrowserWorkspaceMetaFromTransaction(tx)
+          const leases = tx.table<StreamLeaseRow, string>('streamLeases')
+          const leaseRows = await leases.bulkGet(streamIds)
+          const byStreamId = new Map(
+            leaseRows.flatMap((lease) => (lease ? [[lease.streamId, lease] as const] : [])),
+          )
+          const latestCreatedAtByStreamId = new Map<string, number>()
+          for (const chunk of chunks) {
+            const fence = requiredChunkFence(chunk)
+            const lease = byStreamId.get(chunk.streamId)
+            if (
+              !lease ||
+              lease.fenceToken !== fence.fenceToken ||
+              lease.replacementEpoch !== fence.replacementEpoch ||
+              meta.replacementEpoch !== fence.replacementEpoch
+            ) {
+              throw new Error(`StreamFenceLost:${chunk.streamId}`)
+            }
+            latestCreatedAtByStreamId.set(
+              chunk.streamId,
+              Math.max(
+                latestCreatedAtByStreamId.get(chunk.streamId) ?? chunk.createdAt,
+                chunk.createdAt,
+              ),
+            )
+          }
+          const advancedLeases: StreamLeaseRow[] = []
+          for (const [streamId, latestCreatedAt] of latestCreatedAtByStreamId) {
+            const lease = byStreamId.get(streamId) as StreamLeaseRow
+            if (latestCreatedAt <= lease.heartbeatAt) continue
+            advancedLeases.push({ ...lease, heartbeatAt: latestCreatedAt })
+          }
+          if (advancedLeases.length > 0) await leases.bulkPut(advancedLeases)
+          await tx
+            .table<StreamChunkRow, string>('streamChunks')
+            .bulkPut(chunks.map((chunk) => structuredClone(chunk)))
+        }),
+    )
+  }
+
+  async listStreamChunks(streamId: string): Promise<StreamChunkRow[]> {
+    const db = await openDb()
+    const rows = await db.streamChunks
+      .where('[streamId+seq]')
+      .between([streamId, Dexie.minKey], [streamId, Dexie.maxKey])
+      .toArray()
+    return rows.filter(isStreamChunkRow).map((chunk) => structuredClone(chunk))
   }
 
   async listStreamChunksForMessage(messageId: MessageId): Promise<StreamChunkRow[]> {
@@ -939,10 +2033,26 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
       .map((chunk) => structuredClone(chunk))
   }
 
-  async deleteStreamChunks(streamId: string): Promise<number> {
+  async deleteStreamChunks(streamId: string, fence?: StreamWriteFence): Promise<number> {
     const db = await openDb()
-    const deleted = await db.streamChunks.where('streamId').equals(streamId).delete()
-    return deleted
+    return withNamedLock(`stream-journal:${streamId}`, (grant) =>
+      grant.runTransaction(
+        db,
+        fence ? [db.streamChunks, db.streamLeases, db.settings] : [db.streamChunks],
+        async (tx) => {
+          if (fence) {
+            const meta = await readBrowserWorkspaceMetaFromTransaction(tx)
+            const lease = await tx.table<StreamLeaseRow, string>('streamLeases').get(streamId)
+            assertOwnedStreamFence(lease, fence, meta.replacementEpoch, streamId)
+          }
+          return tx
+            .table<StreamChunkRow, string>('streamChunks')
+            .where('streamId')
+            .equals(streamId)
+            .delete()
+        },
+      ),
+    )
   }
 
   async listChats(): Promise<Chat[]> {
@@ -971,92 +2081,120 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
   ): Promise<DeleteArchivedChatsResult> {
     if (chatIds.length === 0) return { deletedChatIds: [] }
     const db = await openDb()
-    const snapshots = await archivedDeleteSnapshots(db, chatIds)
-    if (snapshots.length === 0) return { deletedChatIds: [] }
-    const scopes: MutationScope[] = []
-    const attachmentScopeIds = new Set<AttachmentId>()
-    for (const snapshot of snapshots) {
-      scopes.push({ kind: 'chat-meta', chatId: snapshot.chatId })
-      scopes.push({ kind: 'draft', chatId: snapshot.chatId })
-      for (const messageId of snapshot.messageIds) scopes.push({ kind: 'message', messageId })
-      for (const attachmentId of snapshot.attachmentIds) {
-        if (attachmentScopeIds.has(attachmentId)) continue
-        attachmentScopeIds.add(attachmentId)
-        scopes.push({ kind: 'attachment', attachmentId })
+    for (;;) {
+      const snapshots = await archivedDeleteSnapshots(db, chatIds)
+      if (snapshots.length === 0) return { deletedChatIds: [] }
+      const scopes: MutationScope[] = []
+      const attachmentScopeIds = new Set<AttachmentId>()
+      for (const snapshot of snapshots) {
+        scopes.push({ kind: 'chat-meta', chatId: snapshot.chatId })
+        scopes.push({ kind: 'draft', chatId: snapshot.chatId })
+        for (const messageId of snapshot.messageIds) {
+          scopes.push({ kind: 'message', messageId })
+        }
+        for (const attachmentId of snapshot.attachmentIds) {
+          if (attachmentScopeIds.has(attachmentId)) continue
+          attachmentScopeIds.add(attachmentId)
+          scopes.push({ kind: 'attachment', attachmentId })
+        }
       }
-    }
 
-    const deletedChatIds: ChatId[] = []
-    const now = Date.now()
-    await withMutationLocks(scopes, async () =>
-      db.transaction(
-        'rw',
-        [
-          db.attachmentArtifacts,
-          db.attachmentBlobs,
-          db.attachmentJobs,
-          db.attachments,
-          db.chatBranchCache,
-          db.chats,
-          db.childLists,
-          db.drafts,
-          db.messages,
-          db.messageBodies,
-          db.streamLeases,
-          db.streamChunks,
-          db.settings,
-        ],
-        async (tx: Transaction) => {
-          const chats = tx.table<Chat, ChatId>('chats')
-          const messages = tx.table<MessageHeaderRow, MessageId>('messages')
-          const drafts = tx.table<DraftRow, ChatId>('drafts')
-          const attachments = tx.table<Attachment, AttachmentId>('attachments')
-          for (const { chatId } of snapshots) {
-            const chat = await chats.get(chatId)
-            if (!chat?.archived) continue
-            const messageRows = await messages.where('chatId').equals(chatId).toArray()
-            const draft = await drafts.get(chatId)
-            const refCounts = countAttachmentIds(attachmentIdsFromDeletedChat(messageRows, draft))
-            for (const [attachmentId, count] of refCounts) {
-              const row = await attachments.get(attachmentId)
-              if (!row) continue
-              await attachments.put({ ...row, refCount: Math.max(0, row.refCount - count) })
-            }
-            await messages.where('chatId').equals(chatId).delete()
-            await tx
-              .table<MessageBodyRow, MessageId>('messageBodies')
-              .where('chatId')
-              .equals(chatId)
-              .delete()
-            await drafts.delete(chatId)
-            await tx.table<ChatBranchCache, ChatId>('chatBranchCache').delete(chatId)
-            await tx
-              .table<ChildListState, string>('childLists')
-              .filter((row) => row.chatId === chatId)
-              .delete()
-            await tx
-              .table<StreamLeaseRow, string>('streamLeases')
-              .where('chatId')
-              .equals(chatId)
-              .delete()
-            await tx
-              .table<StreamChunkRow, string>('streamChunks')
-              .where('chatId')
-              .equals(chatId)
-              .delete()
-            await chats.delete(chatId)
-            deletedChatIds.push(chatId)
-          }
-          if (deletedChatIds.length > 0) await bumpWorkspaceMeta(tx, now)
-        },
-      ),
-    )
+      const deletedChatIds: ChatId[] = []
+      const now = Date.now()
+      try {
+        await withMutationLocks(scopes, async (grant) =>
+          grant.runTransaction(
+            db,
+            [
+              db.attachmentArtifacts,
+              db.attachmentBlobs,
+              db.attachmentJobs,
+              db.attachmentRefEdges,
+              db.attachments,
+              db.chatBranchCache,
+              db.chatSidebarRows,
+              db.chats,
+              db.childLists,
+              db.drafts,
+              db.messages,
+              db.messageBodies,
+              db.streamLeases,
+              db.streamChunks,
+              db.settings,
+            ],
+            async (tx: Transaction) => {
+              const chats = tx.table<Chat, ChatId>('chats')
+              const messages = tx.table<MessageHeaderRow, MessageId>('messages')
+              const drafts = tx.table<DraftRow, ChatId>('drafts')
+              for (const snapshot of snapshots) {
+                const chat = await chats.get(snapshot.chatId)
+                if (!chat?.archived) continue
+                const messageRows = await messages.where('chatId').equals(snapshot.chatId).toArray()
+                const draft = await drafts.get(snapshot.chatId)
+                if (!sameArchivedDeleteSnapshot(snapshot, messageRows, draft)) {
+                  throw new ArchivedChatDeletePlanChangedError()
+                }
+                await replaceAttachmentReferenceOwners(tx, [
+                  ...messageRows.map((message) => ({
+                    ownerKind: 'message' as const,
+                    ownerId: message.id,
+                    chatId: message.chatId,
+                    refs: [],
+                  })),
+                  ...(draft
+                    ? [
+                        {
+                          ownerKind: 'draft' as const,
+                          ownerId: draft.chatId,
+                          chatId: draft.chatId,
+                          refs: [],
+                        },
+                      ]
+                    : []),
+                ])
+                await messages.where('chatId').equals(snapshot.chatId).delete()
+                await tx
+                  .table<MessageBodyRow, MessageId>('messageBodies')
+                  .where('chatId')
+                  .equals(snapshot.chatId)
+                  .delete()
+                await drafts.delete(snapshot.chatId)
+                await tx.table<ChatBranchCache, ChatId>('chatBranchCache').delete(snapshot.chatId)
+                await tx
+                  .table<ChildListState, string>('childLists')
+                  .filter((row) => row.chatId === snapshot.chatId)
+                  .delete()
+                await tx
+                  .table<StreamLeaseRow, string>('streamLeases')
+                  .where('chatId')
+                  .equals(snapshot.chatId)
+                  .delete()
+                await tx
+                  .table<StreamChunkRow, string>('streamChunks')
+                  .where('chatId')
+                  .equals(snapshot.chatId)
+                  .delete()
+                await chats.delete(snapshot.chatId)
+                deletedChatIds.push(snapshot.chatId)
+              }
+              if (deletedChatIds.length > 0) {
+                await deleteChatSidebarProjections(tx, deletedChatIds)
+                await bumpWorkspaceMeta(tx, now)
+              }
+            },
+          ),
+        )
+      } catch (error) {
+        if (error instanceof ArchivedChatDeletePlanChangedError) continue
+        throw error
+      }
 
-    for (const chatId of deletedChatIds) {
-      postEvent({ kind: 'chat-deleted', chatId })
-      postEvent({ kind: 'branch-cache-refreshed', chatId })
+      for (const chatId of deletedChatIds) {
+        postEvent({ kind: 'chat-deleted', chatId })
+        postEvent({ kind: 'branch-cache-refreshed', chatId })
+      }
+      return { deletedChatIds }
     }
-    return { deletedChatIds }
   }
 
   async listFolders(): Promise<ChatFolder[]> {
@@ -1081,10 +2219,12 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     }
     if (input.color) folder.color = input.color
 
-    await db.transaction('rw', [db.folders, db.settings], async (tx: Transaction) => {
-      await tx.table<ChatFolder, FolderId>('folders').put(folder)
-      await bumpWorkspaceMeta(tx, now)
-    })
+    await withNamedLock(`folder:${folder.id}`, (grant) =>
+      grant.runTransaction(db, [db.folders, db.settings], async (tx: Transaction) => {
+        await tx.table<ChatFolder, FolderId>('folders').put(folder)
+        await bumpWorkspaceMeta(tx, now)
+      }),
+    )
     postEvent({ kind: 'folder-mutated', folderId: folder.id })
     return folder
   }
@@ -1096,25 +2236,27 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     const db = await openDb()
     const now = patch.now ?? Date.now()
     let next: ChatFolder | undefined
-    let changed = false
-    await db.transaction('rw', [db.folders, db.settings], async (tx: Transaction) => {
-      const table = tx.table<ChatFolder, FolderId>('folders')
-      const current = await table.get(folderId)
-      if (!current) return
-      next = { ...current }
-      if (patch.name !== undefined) next.name = normalizeName(patch.name, 'Folder')
-      if (patch.color !== undefined) patchOptionalString(next, 'color', patch.color)
-      if (patch.sortIndex !== undefined) next.sortIndex = patch.sortIndex
-      if (patch.lastUsedAt !== undefined) {
-        patchOptionalNumber(next, 'lastUsedAt', patch.lastUsedAt)
-      }
-      if (stableStringify(current) === stableStringify(next)) return
-      next.updatedAt = now
-      changed = true
-      await table.put(next)
-      await bumpWorkspaceMeta(tx, now)
-    })
-    if (changed) postEvent({ kind: 'folder-mutated', folderId })
+    const result = { changed: false }
+    await withNamedLock(`folder:${folderId}`, (grant) =>
+      grant.runTransaction(db, [db.folders, db.settings], async (tx: Transaction) => {
+        const table = tx.table<ChatFolder, FolderId>('folders')
+        const current = await table.get(folderId)
+        if (!current) return
+        next = { ...current }
+        if (patch.name !== undefined) next.name = normalizeName(patch.name, 'Folder')
+        if (patch.color !== undefined) patchOptionalString(next, 'color', patch.color)
+        if (patch.sortIndex !== undefined) next.sortIndex = patch.sortIndex
+        if (patch.lastUsedAt !== undefined) {
+          patchOptionalNumber(next, 'lastUsedAt', patch.lastUsedAt)
+        }
+        if (stableStringify(current) === stableStringify(next)) return
+        next.updatedAt = now
+        result.changed = true
+        await table.put(next)
+        await bumpWorkspaceMeta(tx, now)
+      }),
+    )
+    if (result.changed) postEvent({ kind: 'folder-mutated', folderId })
     return next
   }
 
@@ -1122,29 +2264,36 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     const db = await openDb()
     const now = Date.now()
     const changedChats: Chat[] = []
-    let deleted = false
-    await db.transaction('rw', [db.folders, db.chats, db.settings], async (tx: Transaction) => {
-      const folders = tx.table<ChatFolder, FolderId>('folders')
-      if (!(await folders.get(folderId))) return
-      await folders.delete(folderId)
-      deleted = true
+    const result = { deleted: false }
+    await withNamedLock(`folder:${folderId}`, (grant) =>
+      grant.runTransaction(
+        db,
+        [db.folders, db.chatSidebarRows, db.chats, db.settings],
+        async (tx: Transaction) => {
+          const folders = tx.table<ChatFolder, FolderId>('folders')
+          if (!(await folders.get(folderId))) return
+          await folders.delete(folderId)
+          result.deleted = true
 
-      const chats = tx.table<Chat, ChatId>('chats')
-      const rows = await chats.where('folderId').equals(folderId).toArray()
-      for (const row of rows) {
-        const next: Chat = {
-          ...row,
-          folderId: null,
-          updatedAt: now,
-          metaVersion: row.metaVersion + 1,
-          summaryVersion: row.summaryVersion + 1,
-        }
-        await chats.put(next)
-        changedChats.push(next)
-      }
-      await bumpWorkspaceMeta(tx, now)
-    })
-    if (deleted) {
+          const chats = tx.table<Chat, ChatId>('chats')
+          const rows = await chats.where('folderId').equals(folderId).toArray()
+          for (const row of rows) {
+            const next: Chat = {
+              ...row,
+              folderId: null,
+              updatedAt: now,
+              metaVersion: row.metaVersion + 1,
+              summaryVersion: row.summaryVersion + 1,
+            }
+            await chats.put(next)
+            await putChatSidebarProjection(tx, next)
+            changedChats.push(next)
+          }
+          await bumpWorkspaceMeta(tx, now)
+        },
+      ),
+    )
+    if (result.deleted) {
       postEvent({ kind: 'folder-deleted', folderId })
       for (const chat of changedChats) {
         postEvent({
@@ -1156,7 +2305,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
         })
       }
     }
-    return { deleted, affectedChatIds: changedChats.map((chat) => chat.id) }
+    return { deleted: result.deleted, affectedChatIds: changedChats.map((chat) => chat.id) }
   }
 
   async listTags(): Promise<ChatTag[]> {
@@ -1182,10 +2331,12 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     }
     if (input.color) tag.color = input.color
 
-    await db.transaction('rw', [db.tags, db.settings], async (tx: Transaction) => {
-      await tx.table<ChatTag, TagId>('tags').put(tag)
-      await bumpWorkspaceMeta(tx, now)
-    })
+    await withNamedLock(`tag:${tag.id}`, (grant) =>
+      grant.runTransaction(db, [db.tags, db.settings], async (tx: Transaction) => {
+        await tx.table<ChatTag, TagId>('tags').put(tag)
+        await bumpWorkspaceMeta(tx, now)
+      }),
+    )
     postEvent({ kind: 'tag-mutated', tagId: tag.id })
     return tag
   }
@@ -1194,27 +2345,29 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     const db = await openDb()
     const now = patch.now ?? Date.now()
     let next: ChatTag | undefined
-    let changed = false
-    await db.transaction('rw', [db.tags, db.settings], async (tx: Transaction) => {
-      const table = tx.table<ChatTag, TagId>('tags')
-      const current = await table.get(tagId)
-      if (!current) return
-      next = { ...current }
-      if (patch.name !== undefined) {
-        next.name = normalizeName(patch.name, 'Tag')
-        next.nameLower = tagNameLower(next.name)
-      }
-      if (patch.color !== undefined) patchOptionalString(next, 'color', patch.color)
-      if (patch.lastUsedAt !== undefined) {
-        patchOptionalNumber(next, 'lastUsedAt', patch.lastUsedAt)
-      }
-      if (stableStringify(current) === stableStringify(next)) return
-      next.updatedAt = now
-      changed = true
-      await table.put(next)
-      await bumpWorkspaceMeta(tx, now)
-    })
-    if (changed) postEvent({ kind: 'tag-mutated', tagId })
+    const result = { changed: false }
+    await withNamedLock(`tag:${tagId}`, (grant) =>
+      grant.runTransaction(db, [db.tags, db.settings], async (tx: Transaction) => {
+        const table = tx.table<ChatTag, TagId>('tags')
+        const current = await table.get(tagId)
+        if (!current) return
+        next = { ...current }
+        if (patch.name !== undefined) {
+          next.name = normalizeName(patch.name, 'Tag')
+          next.nameLower = tagNameLower(next.name)
+        }
+        if (patch.color !== undefined) patchOptionalString(next, 'color', patch.color)
+        if (patch.lastUsedAt !== undefined) {
+          patchOptionalNumber(next, 'lastUsedAt', patch.lastUsedAt)
+        }
+        if (stableStringify(current) === stableStringify(next)) return
+        next.updatedAt = now
+        result.changed = true
+        await table.put(next)
+        await bumpWorkspaceMeta(tx, now)
+      }),
+    )
+    if (result.changed) postEvent({ kind: 'tag-mutated', tagId })
     return next
   }
 
@@ -1222,29 +2375,36 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     const db = await openDb()
     const now = Date.now()
     const changedChats: Chat[] = []
-    let deleted = false
-    await db.transaction('rw', [db.tags, db.chats, db.settings], async (tx: Transaction) => {
-      const tags = tx.table<ChatTag, TagId>('tags')
-      if (!(await tags.get(tagId))) return
-      await tags.delete(tagId)
-      deleted = true
+    const result = { deleted: false }
+    await withNamedLock(`tag:${tagId}`, (grant) =>
+      grant.runTransaction(
+        db,
+        [db.tags, db.chatSidebarRows, db.chats, db.settings],
+        async (tx: Transaction) => {
+          const tags = tx.table<ChatTag, TagId>('tags')
+          if (!(await tags.get(tagId))) return
+          await tags.delete(tagId)
+          result.deleted = true
 
-      const chats = tx.table<Chat, ChatId>('chats')
-      const rows = await chats.where('tags').equals(tagId).toArray()
-      for (const row of rows) {
-        const nextTags = row.tags.filter((id) => id !== tagId)
-        if (nextTags.length === row.tags.length) continue
-        const next: Chat = {
-          ...row,
-          tags: nextTags,
-          metaVersion: row.metaVersion + 1,
-        }
-        await chats.put(next)
-        changedChats.push(next)
-      }
-      await bumpWorkspaceMeta(tx, now)
-    })
-    if (deleted) {
+          const chats = tx.table<Chat, ChatId>('chats')
+          const rows = await chats.where('tags').equals(tagId).toArray()
+          for (const row of rows) {
+            const nextTags = row.tags.filter((id) => id !== tagId)
+            if (nextTags.length === row.tags.length) continue
+            const next: Chat = {
+              ...row,
+              tags: nextTags,
+              metaVersion: row.metaVersion + 1,
+            }
+            await chats.put(next)
+            await putChatSidebarProjection(tx, next)
+            changedChats.push(next)
+          }
+          await bumpWorkspaceMeta(tx, now)
+        },
+      ),
+    )
+    if (result.deleted) {
       postEvent({ kind: 'tag-deleted', tagId })
       for (const chat of changedChats) {
         postEvent({
@@ -1256,7 +2416,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
         })
       }
     }
-    return { deleted, affectedChatIds: changedChats.map((chat) => chat.id) }
+    return { deleted: result.deleted, affectedChatIds: changedChats.map((chat) => chat.id) }
   }
 
   async getChatBranchCache(chatId: ChatId): Promise<ChatBranchCache | undefined> {
@@ -1264,30 +2424,80 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     return db.chatBranchCache.get(chatId)
   }
 
-  async putChatBranchCache(cache: ChatBranchCache): Promise<ChatBranchCache> {
+  async putChatBranchCache(
+    cache: ChatBranchCache,
+    expected: ChatBranchCacheWriteGuard,
+  ): Promise<ChatBranchCache | undefined> {
+    if (expected.missingChat) throw new Error(`BranchCacheGuardMissingChat:${cache.chatId}`)
+    if (cache.branchLeafId !== expected.branchLeafId) {
+      throw new Error(`BranchCacheGuardLeafMismatch:${cache.chatId}`)
+    }
     const db = await openDb()
     const now = Date.now()
-    await db.transaction('rw', [db.chatBranchCache, db.settings], async (tx: Transaction) => {
-      await tx.table<ChatBranchCache, ChatId>('chatBranchCache').put(cache)
-      await bumpWorkspaceMeta(tx, now)
-    })
-    postEvent({ kind: 'branch-cache-refreshed', chatId: cache.chatId })
-    return cache
+    const guardedCache =
+      cache.generatedAt < expected.lastBranchUpdatedAt
+        ? { ...cache, generatedAt: expected.lastBranchUpdatedAt }
+        : cache
+    let written: ChatBranchCache | undefined
+    await withNamedLock(`branch-cache:${cache.chatId}`, (grant) =>
+      grant.runTransaction(
+        db,
+        [db.chatBranchCache, db.chats, db.settings],
+        async (tx: Transaction) => {
+          const [chat, meta] = await Promise.all([
+            tx.table<Chat, ChatId>('chats').get(cache.chatId),
+            readBrowserWorkspaceMetaFromTransaction(tx),
+          ])
+          if (
+            meta.replacementEpoch !== expected.replacementEpoch ||
+            !chat ||
+            !chatMatchesBranchCacheWriteGuard(chat, expected)
+          ) {
+            return
+          }
+          await tx.table<ChatBranchCache, ChatId>('chatBranchCache').put(guardedCache)
+          written = guardedCache
+          await bumpWorkspaceMeta(tx, now)
+        },
+      ),
+    )
+    if (written) postEvent({ kind: 'branch-cache-refreshed', chatId: cache.chatId })
+    return written
   }
 
-  async deleteChatBranchCache(chatId: ChatId): Promise<boolean> {
+  async deleteChatBranchCache(
+    chatId: ChatId,
+    expected?: ChatBranchCacheWriteGuard,
+  ): Promise<boolean> {
     const db = await openDb()
     const now = Date.now()
-    let deleted = false
-    await db.transaction('rw', [db.chatBranchCache, db.settings], async (tx: Transaction) => {
-      const table = tx.table<ChatBranchCache, ChatId>('chatBranchCache')
-      if (!(await table.get(chatId))) return
-      await table.delete(chatId)
-      deleted = true
-      await bumpWorkspaceMeta(tx, now)
-    })
-    if (deleted) postEvent({ kind: 'branch-cache-refreshed', chatId })
-    return deleted
+    const result = { deleted: false }
+    await withNamedLock(`branch-cache:${chatId}`, (grant) =>
+      grant.runTransaction(
+        db,
+        expected ? [db.chatBranchCache, db.chats, db.settings] : [db.chatBranchCache, db.settings],
+        async (tx: Transaction) => {
+          if (expected) {
+            const [chat, meta] = await Promise.all([
+              tx.table<Chat, ChatId>('chats').get(chatId),
+              readBrowserWorkspaceMetaFromTransaction(tx),
+            ])
+            if (meta.replacementEpoch !== expected.replacementEpoch) return
+            if (
+              expected.missingChat
+                ? chat !== undefined
+                : !chat || !chatMatchesBranchCacheWriteGuard(chat, expected)
+            )
+              return
+          }
+          const table = tx.table<ChatBranchCache, ChatId>('chatBranchCache')
+          result.deleted = (await table.where(':id').equals(chatId).delete()) > 0
+          if (result.deleted) await bumpWorkspaceMeta(tx, now)
+        },
+      ),
+    )
+    if (result.deleted) postEvent({ kind: 'branch-cache-refreshed', chatId })
+    return result.deleted
   }
 
   async getMessage(messageId: MessageId): Promise<Message | undefined> {
@@ -1299,6 +2509,51 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
         ])
         return header && body ? hydrateStoredMessage(header, body) : undefined
       })
+    })
+  }
+
+  async getMessageTextPreview(
+    messageId: MessageId,
+    options: { maxChars?: number } = {},
+  ): Promise<string | undefined> {
+    const db = await openDb()
+    const maxChars = Math.min(4_096, Math.max(1, Math.floor(options.maxChars ?? 240)))
+    return db.transaction('r', db.messages, db.messageBodies, async () => {
+      const [header, bodyKey] = await Promise.all([
+        db.messages.get(messageId),
+        db.messageBodies.where(':id').equals(messageId).firstKey(),
+      ])
+      if (!header || bodyKey === undefined) return undefined
+      return previewTextFromStoredProjection(header.textPreview, maxChars)
+    })
+  }
+
+  async searchChatMessageText(
+    chatId: ChatId,
+    query: string,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<MessageId[]> {
+    if (query.length === 0) return []
+    if (options.signal?.aborted) throw new DOMException('Search aborted', 'AbortError')
+    const db = await openDb()
+    return db.transaction('r', db.messages, db.messageBodies, async () => {
+      const liveIds = new Set(
+        (await db.messages.where('chatId').equals(chatId).toArray())
+          .filter((header) => !header.deleted)
+          .map((header) => header.id),
+      )
+      const matches: MessageId[] = []
+      await db.messageBodies
+        .where('chatId')
+        .equals(chatId)
+        .each((body) => {
+          if (options.signal?.aborted) throw new DOMException('Search aborted', 'AbortError')
+          if (!liveIds.has(body.id)) return
+          if (contentIncludesCaseInsensitiveText(body.content, query, options.signal)) {
+            matches.push(body.id)
+          }
+        })
+      return matches
     })
   }
 
@@ -1359,14 +2614,34 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     const db = await openDb()
     return db.transaction('r', db.messages, db.messageBodies, async () => {
       const headers = await db.messages.where('chatId').equals(chatId).toArray()
-      const branchHeaders = activePath(headers as unknown as Message[], cursor).map(
-        (message) => message as unknown as MessageHeaderRow,
-      )
+      let activePathMeasurement: ActivePathMeasurement | undefined
+      const branchHeaders = activePath(
+        headers as unknown as Message[],
+        cursor,
+        window.onMeasure
+          ? (measurement) => {
+              activePathMeasurement = measurement
+            }
+          : undefined,
+      ).map((message) => message as unknown as MessageHeaderRow)
       const range = branchWindowRange(branchHeaders.length, window)
       const windowHeaders = branchHeaders.slice(range.start, range.end)
       const bodies = (
         await db.messageBodies.bulkGet(windowHeaders.map((header) => header.id))
       ).filter((row): row is MessageBodyRow => row !== undefined)
+      const siblingGroups = siblingGroupsForBranch(headers, branchHeaders)
+      if (window.onMeasure && activePathMeasurement) {
+        window.onMeasure({
+          headerRowsRead: headers.length,
+          bodyRowsRead: bodies.length,
+          siblingRowsRetained: siblingGroups.reduce(
+            (total, group) => total + group.siblings.length,
+            0,
+          ),
+          treeKeyRows: headers.length,
+          activePath: activePathMeasurement,
+        })
+      }
       return {
         chatId,
         allHeaders: headers.map(cloneMessageHeader),
@@ -1375,7 +2650,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
         windowOffset: range.start,
         windowLimit: range.limit,
         branchLength: branchHeaders.length,
-        siblingGroups: siblingGroupsForBranch(headers, branchHeaders),
+        siblingGroups,
         treeKey: messageHeaderTreeKey(headers),
       }
     })
@@ -1391,18 +2666,24 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
   }
 
   async getAttachment(attachmentId: AttachmentId): Promise<Attachment | undefined> {
-    return openDb().then((db) => db.attachments.get(attachmentId))
+    return openDb().then(async (db) => {
+      const header = await db.attachments.get(attachmentId)
+      return header
+        ? hydrateStoredAttachment(attachmentHeaderFromStoredRow(header), db.attachmentArtifacts)
+        : undefined
+    })
   }
 
   async getAttachmentBundle(attachmentId: AttachmentId): Promise<AttachmentBundle | undefined> {
     return openDb().then(async (db) => {
-      const attachment = await db.attachments.get(attachmentId)
-      if (!attachment) return undefined
+      const header = await db.attachments.get(attachmentId)
+      if (!header) return undefined
       const [blobs, artifacts, jobs] = await Promise.all([
         db.attachmentBlobs.where('attachmentId').equals(attachmentId).toArray(),
         db.attachmentArtifacts.where('attachmentId').equals(attachmentId).toArray(),
         db.attachmentJobs.where('attachmentId').equals(attachmentId).toArray(),
       ])
+      const attachment = hydrateAttachment(attachmentHeaderFromStoredRow(header), artifacts)
       return { attachment, blobs, artifacts, jobs }
     })
   }
@@ -1413,54 +2694,114 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
 
   async searchAttachments(query: AttachmentSearchQuery = {}): Promise<AttachmentSearchPage> {
     const db = await openDb()
+    throwIfAttachmentSearchAborted(query.signal)
     const limit = query.limit ?? 100
-    const rows = await db.attachments.toArray()
-    const artifacts = await db.attachmentArtifacts.toArray()
+    const sort = query.sort ?? 'created-desc'
+    const measurement: AttachmentSearchMeasurement = {
+      selectedIndex: 'primary',
+      indexCounts: {},
+      metadataRowsRead: 0,
+      metadataCandidates: 0,
+      embeddedArtifactRowsRead: 0,
+      artifactCandidateAttachments: 0,
+      artifactRowsRead: 0,
+      attachmentBlobRowsRead: 0,
+      matchedRows: 0,
+      returnedRows: 0,
+    }
+    const rows = await loadAttachmentSearchMetadata(db.attachments, query, sort, measurement)
+    throwIfAttachmentSearchAborted(query.signal)
+    const terms = query.query?.trim().toLowerCase().split(/\s+/).filter(Boolean) ?? []
+    const metadataCandidates: AttachmentHeaderRow[] = []
+    for (const [index, attachment] of rows.entries()) {
+      if (index % ATTACHMENT_SEARCH_ABORT_CHECK_INTERVAL === 0) {
+        throwIfAttachmentSearchAborted(query.signal)
+      }
+      if (attachmentMatchesFilters(attachment, query)) metadataCandidates.push(attachment)
+    }
+    measurement.metadataCandidates = metadataCandidates.length
+    const metadataTextByAttachment = new Map<AttachmentId, string>()
+    const artifactCandidateIds: AttachmentId[] = []
+    if (terms.length > 0) {
+      for (const [index, attachment] of metadataCandidates.entries()) {
+        if (index % ATTACHMENT_SEARCH_ABORT_CHECK_INTERVAL === 0) {
+          throwIfAttachmentSearchAborted(query.signal)
+        }
+        const metadataText = attachmentSearchText(attachment, [])
+        metadataTextByAttachment.set(attachment.id, metadataText)
+        if (!terms.every((term) => metadataText.includes(term))) {
+          artifactCandidateIds.push(attachment.id)
+        }
+      }
+    }
+    measurement.artifactCandidateAttachments = artifactCandidateIds.length
+    const artifacts =
+      terms.length === 0
+        ? []
+        : await loadCandidateAttachmentArtifacts(
+            db.attachmentArtifacts,
+            artifactCandidateIds,
+            query.signal,
+          )
+    measurement.artifactRowsRead = artifacts.length
     const artifactsByAttachment = new Map<AttachmentId, AttachmentArtifact[]>()
-    for (const artifact of artifacts) {
+    for (const [index, artifact] of artifacts.entries()) {
+      if (index % ATTACHMENT_SEARCH_ABORT_CHECK_INTERVAL === 0) {
+        throwIfAttachmentSearchAborted(query.signal)
+      }
       const list = artifactsByAttachment.get(artifact.attachmentId) ?? []
       list.push(artifact)
       artifactsByAttachment.set(artifact.attachmentId, list)
     }
-    const terms = query.query?.trim().toLowerCase().split(/\s+/).filter(Boolean) ?? []
-    const filtered = rows.filter((attachment) => {
-      const filters = query.filters
-      if (filters?.kind && attachment.kind !== filters.kind) return false
-      if (filters?.mime && attachment.mime !== filters.mime) return false
-      if (filters?.origin && attachment.origin !== filters.origin) return false
-      if (filters?.storageKind && attachment.storage.kind !== filters.storageKind) return false
-      if (
-        filters?.minSizeBytes !== undefined &&
-        (attachment.sizeBytes ?? 0) < filters.minSizeBytes
-      ) {
-        return false
+    const filtered: AttachmentHeaderRow[] = []
+    for (const [index, attachment] of metadataCandidates.entries()) {
+      if (index % ATTACHMENT_SEARCH_ABORT_CHECK_INTERVAL === 0) {
+        throwIfAttachmentSearchAborted(query.signal)
       }
-      if (
-        filters?.maxSizeBytes !== undefined &&
-        (attachment.sizeBytes ?? 0) > filters.maxSizeBytes
-      ) {
-        return false
+      if (terms.length === 0) {
+        filtered.push(attachment)
+        continue
       }
-      if (filters?.minRefCount !== undefined && attachment.refCount < filters.minRefCount) {
-        return false
+      const metadataText = metadataTextByAttachment.get(attachment.id) ?? ''
+      if (terms.every((term) => metadataText.includes(term))) {
+        filtered.push(attachment)
+        continue
       }
-      if (filters?.maxRefCount !== undefined && attachment.refCount > filters.maxRefCount) {
-        return false
-      }
-      if (terms.length === 0) return true
       const haystack = attachmentSearchText(
         attachment,
         artifactsByAttachment.get(attachment.id) ?? [],
       )
-      return terms.every((term) => haystack.includes(term))
-    })
-    filtered.sort(attachmentSorter(query.sort ?? 'created-desc'))
-    const start =
-      query.cursor === undefined
-        ? 0
-        : Math.max(0, filtered.findIndex((row) => row.id === query.cursor) + 1)
-    const page = filtered.slice(start, start + limit)
-    const nextCursor = filtered.length > start + limit ? page.at(-1)?.id : undefined
+      if (terms.every((term) => haystack.includes(term))) filtered.push(attachment)
+    }
+    filtered.sort(attachmentSorter(sort))
+    throwIfAttachmentSearchAborted(query.signal)
+    measurement.matchedRows = filtered.length
+    const start = attachmentPageStart(filtered, query.cursor, sort)
+    const pageHeaders = filtered.slice(start, start + limit)
+    const last = pageHeaders.at(-1)
+    const nextCursor =
+      last && filtered.length > start + limit ? encodeAttachmentCursor(last, sort) : undefined
+    const artifactsById = new Map(artifacts.map((artifact) => [artifact.artifactId, artifact]))
+    const missingArtifactIds = pageHeaders
+      .flatMap((header) => header.artifactIds)
+      .filter((artifactId) => !artifactsById.has(artifactId))
+    if (missingArtifactIds.length > 0) {
+      const pageArtifacts = await db.attachmentArtifacts.bulkGet(missingArtifactIds)
+      for (const artifact of pageArtifacts) {
+        if (artifact) artifactsById.set(artifact.artifactId, artifact)
+      }
+      measurement.artifactRowsRead += pageArtifacts.filter(
+        (artifact): artifact is AttachmentArtifact => artifact !== undefined,
+      ).length
+    }
+    const page = pageHeaders.map((header) =>
+      hydrateAttachment(
+        header,
+        header.artifactIds.map((artifactId) => artifactsById.get(artifactId)),
+      ),
+    )
+    measurement.returnedRows = page.length
+    query.onMeasure?.({ ...measurement, indexCounts: { ...measurement.indexCounts } })
     return nextCursor ? { rows: page, nextCursor } : { rows: page }
   }
 
@@ -1474,6 +2815,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
   async runMutation<T>(
     scopes: MutationScope[],
     fn: (ctx: MutationContext) => Promise<T> | T,
+    options?: WorkspaceMutationOptions,
   ): Promise<WorkspaceMutationResult<T>> {
     const db = await openDb()
     const now = Date.now()
@@ -1483,651 +2825,941 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
       affected: ChatMutationSummary[]
     }> = []
     const pendingBranchCacheEvents = new Set<ChatId>()
-    const mutationTables = resolveMutationTables(db, scopes)
+    const mutationTables = resolveMutationTables(db, scopes, options)
 
-    const result: WorkspaceMutationResult<T> = await withMutationLocks(scopes, async () =>
-      db.transaction<WorkspaceMutationResult<T>>('rw', mutationTables, async (tx: Transaction) => {
-        const { assertScope } = createScopeChecker(scopes)
-        const chatStates = new Map<ChatId, ChatMutationState>()
-        const affectedMessageIds = new Set<MessageId>()
-        let wroteWorkspaceState = false
-
-        const ensureChatState = async (chatId: ChatId): Promise<ChatMutationState> => {
-          const existing = chatStates.get(chatId)
-          if (existing) return existing
-          const beforeChat = await loadChatOrThrow(tx.table<Chat, ChatId>('chats'), chatId)
-          const state: ChatMutationState = {
-            beforeChat,
-            wordCountDeltas: new Map<MessageId, number>(),
-            totalCostDelta: 0,
-            visibleMetaPatch: {},
-            hiddenMetaPatch: {},
-            summaryPatch: {},
-            visibleMetaDirty: false,
-            summaryVersionDirty: false,
-            messageSummaryDirty: false,
-            broadcast: false,
-            changedMessageIds: new Set<MessageId>(),
-            affected: new Map<string, ChatMutationSummary>(),
-          }
-          chatStates.set(chatId, state)
-          return state
-        }
-
-        const ensureMessageSnapshots = async (
-          state: ChatMutationState,
-        ): Promise<{ beforeMessages: Message[]; afterMessages: Message[] }> => {
-          if (state.beforeMessages && state.afterMessages) {
-            return {
-              beforeMessages: state.beforeMessages,
-              afterMessages: state.afterMessages,
-            }
-          }
-          const snapshot = await listMessagesInTransaction(tx, state.beforeChat.id)
-          state.beforeMessages = snapshot.map(cloneMessage)
-          state.afterMessages = snapshot.map(cloneMessage)
-          return {
-            beforeMessages: state.beforeMessages,
-            afterMessages: state.afterMessages,
-          }
-        }
-
-        for (const scope of scopes) {
-          if (scope.kind === 'chat-meta' || scope.kind === 'children' || scope.kind === 'draft') {
-            await ensureChatState(scope.chatId)
-          }
-        }
-
-        const requireChatState = (chatId: ChatId): ChatMutationState => {
-          const state = chatStates.get(chatId)
-          if (!state) {
-            throw new Error(`ChatStateUnavailable:${chatId}`)
-          }
-          return state
-        }
-
-        const bumpChildList = async (
-          chatId: ChatId,
-          parentId: MessageId | null,
-          bumpNow = now,
-        ): Promise<ChildListState> => {
-          assertScope({ kind: 'children', chatId, parentId })
-          const table = tx.table<ChildListState, string>('childLists')
-          const id = childListKey(chatId, parentId)
-          const existing = await table.get(id)
-          const next: ChildListState = existing
-            ? { ...existing, version: existing.version + 1, updatedAt: bumpNow }
-            : { id, chatId, parentId, version: 1, updatedAt: bumpNow }
-          await table.put(next)
-          wroteWorkspaceState = true
-          const state = await ensureChatState(chatId)
-          state.broadcast = true
-          upsertAffected(state, { kind: 'children', chatId, parentId })
-          return next
-        }
-
-        const ctx: MutationContext = {
-          getChat: async (chatId) => {
-            const state = chatStates.get(chatId)
-            if (!state) return tx.table<Chat, ChatId>('chats').get(chatId)
-            return {
-              ...state.beforeChat,
-              ...state.hiddenMetaPatch,
-              ...state.visibleMetaPatch,
-              ...state.summaryPatch,
-            }
-          },
-
-          patchChatMeta: (chatId, patch, options = {}) => {
-            const {
-              touchVisibleState = true,
-              touchSummary = touchVisibleState,
-              broadcast = touchVisibleState || touchSummary,
-            } = options
-            assertScope({ kind: 'chat-meta', chatId })
-            const state = requireChatState(chatId)
-            const current = {
-              ...state.beforeChat,
-              ...state.hiddenMetaPatch,
-              ...state.visibleMetaPatch,
-              ...state.summaryPatch,
-            }
-            if (touchVisibleState) {
-              const applied = changedPatch(current, stripMetaPatch(patch))
-              if (!applied) return
-              state.visibleMetaPatch = {
-                ...state.visibleMetaPatch,
-                ...applied,
-              }
-              state.visibleMetaDirty = true
-              state.summaryVersionDirty ||= touchSummary
-            } else {
-              const applied = changedPatch(current, stripMetaPatch(patch))
-              if (!applied) return
-              state.hiddenMetaPatch = {
-                ...state.hiddenMetaPatch,
-                ...applied,
-              }
-            }
-            state.broadcast ||= broadcast
-            upsertAffected(state, { kind: 'chat-meta', chatId })
-          },
-
-          patchChatSummary: (chatId, patch) => {
-            const state = requireChatState(chatId)
-            const current = {
-              ...state.beforeChat,
-              ...state.hiddenMetaPatch,
-              ...state.visibleMetaPatch,
-              ...state.summaryPatch,
-            }
-            const applied = changedPatch(current, stripSummaryPatch(patch))
-            if (!applied) return
-            state.summaryPatch = {
-              ...state.summaryPatch,
-              ...applied,
-            }
-            state.summaryVersionDirty = true
-            state.broadcast = true
-            upsertAffected(state, { kind: 'chat-meta', chatId })
-          },
-
-          getMessage: async (messageId) => {
-            const [header, body] = await Promise.all([
-              tx.table<MessageHeaderRow, MessageId>('messages').get(messageId),
-              tx.table<MessageBodyRow, MessageId>('messageBodies').get(messageId),
+    const result: WorkspaceMutationResult<T> = await withMutationLocks(scopes, async (grant) =>
+      grant.runTransaction<WorkspaceMutationResult<T>>(
+        db,
+        mutationTables,
+        async (tx: Transaction) => {
+          let ownedStreamLease: StreamLeaseRow | undefined
+          if (options?.streamFence) {
+            const { streamId, fence } = options.streamFence
+            const [meta, lease] = await Promise.all([
+              readBrowserWorkspaceMetaFromTransaction(tx),
+              tx.table<StreamLeaseRow, string>('streamLeases').get(streamId),
             ])
-            return header && body ? hydrateStoredMessage(header, body) : undefined
-          },
+            assertOwnedStreamFence(lease, fence, meta.replacementEpoch, streamId)
+            ownedStreamLease = lease
+          }
+          const { assertScope } = createScopeChecker(scopes)
+          const chatStates = new Map<ChatId, ChatMutationState>()
+          const affectedMessageIds = new Set<MessageId>()
+          let wroteWorkspaceState = false
+          const targetLeasesByMessage = new Map<MessageId, StreamLeaseRow[]>()
 
-          getMessageHeader: async (messageId) => {
-            const header = await tx.table<MessageHeaderRow, MessageId>('messages').get(messageId)
-            return header ? cloneMessageHeader(header) : undefined
-          },
+          const assertStreamTargetWriteAllowed = async (messageId: MessageId): Promise<void> => {
+            let targetLeases = targetLeasesByMessage.get(messageId)
+            if (!targetLeases) {
+              const candidates = await tx
+                .table<StreamLeaseRow, string>('streamLeases')
+                .where('messageId')
+                .equals(messageId)
+                .toArray()
+              targetLeases = []
+              for (const lease of candidates) {
+                if (!(await streamLeaseTargetFinalized(tx, lease))) targetLeases.push(lease)
+              }
+              targetLeasesByMessage.set(messageId, targetLeases)
+            }
+            if (targetLeases.length === 0) return
+            if (
+              ownedStreamLease?.messageId === messageId &&
+              targetLeases.every((lease) => lease.streamId === ownedStreamLease.streamId)
+            ) {
+              return
+            }
+            throw new StreamTargetBusyError(messageId)
+          }
 
-          listMessages: async (chatId) => listMessagesInTransaction(tx, chatId),
+          const syncAttachmentReferenceOwner = async (input: {
+            ownerKind: AttachmentReferenceEdge['ownerKind']
+            ownerId: string
+            chatId: ChatId
+            previousRefs: readonly MessageAttachmentRef[] | undefined
+            nextRefs: readonly MessageAttachmentRef[] | undefined
+          }): Promise<void> => {
+            const previousEdges = edgesForOwner({
+              ownerKind: input.ownerKind,
+              ownerId: input.ownerId,
+              chatId: input.chatId,
+              refs: input.previousRefs,
+            })
+            const nextOwner = {
+              ownerKind: input.ownerKind,
+              ownerId: input.ownerId,
+              chatId: input.chatId,
+              refs: input.nextRefs,
+            }
+            const nextEdges = edgesForOwner(nextOwner)
+            if (stableStringify(previousEdges) === stableStringify(nextEdges)) return
+            if (!scopes.some((scope) => scope.kind === 'attachment')) {
+              throw new Error(
+                `UndeclaredAttachmentReferenceScope:${input.ownerKind}:${input.ownerId}`,
+              )
+            }
+            await replaceAttachmentReferenceOwner(tx, nextOwner, (attachmentId) =>
+              assertScope({ kind: 'attachment', attachmentId }),
+            )
+          }
 
-          listMessageHeaders: async (chatId) =>
-            (
+          const ensureChatState = async (chatId: ChatId): Promise<ChatMutationState> => {
+            const existing = chatStates.get(chatId)
+            if (existing) return existing
+            const beforeChat = await loadChatOrThrow(tx.table<Chat, ChatId>('chats'), chatId)
+            const state: ChatMutationState = {
+              beforeChat,
+              headersBeforeWrites: new Map<MessageId, MessageHeaderRow | undefined>(),
+              incrementalAppends: [],
+              wordCountDeltas: new Map<MessageId, number>(),
+              totalCostDelta: 0,
+              visibleMetaPatch: {},
+              hiddenMetaPatch: {},
+              summaryPatch: {},
+              visibleMetaDirty: false,
+              summaryVersionDirty: false,
+              messageSummaryDirty: false,
+              previewDirty: false,
+              broadcast: false,
+              changedMessageIds: new Set<MessageId>(),
+              affected: new Map<string, ChatMutationSummary>(),
+            }
+            chatStates.set(chatId, state)
+            return state
+          }
+
+          const ensureMessageHeaderSnapshots = async (
+            state: ChatMutationState,
+          ): Promise<{
+            beforeHeaders: MessageHeaderRow[]
+            afterHeaders: MessageHeaderRow[]
+          }> => {
+            if (state.beforeHeaders && state.afterHeaders) {
+              return {
+                beforeHeaders: state.beforeHeaders,
+                afterHeaders: state.afterHeaders,
+              }
+            }
+            const currentHeaders = (
               await tx
                 .table<MessageHeaderRow, MessageId>('messages')
                 .where('chatId')
-                .equals(chatId)
+                .equals(state.beforeChat.id)
                 .toArray()
-            ).map(cloneMessageHeader),
+            ).map(cloneMessageHeader)
+            const beforeHeaders = currentHeaders.map(cloneMessageHeader)
+            for (const [messageId, before] of state.headersBeforeWrites) {
+              if (before) replaceMessageHeader(beforeHeaders, before)
+              else removeMessageHeader(beforeHeaders, messageId)
+            }
+            state.beforeHeaders = beforeHeaders
+            state.afterHeaders = currentHeaders
+            return {
+              beforeHeaders: state.beforeHeaders,
+              afterHeaders: state.afterHeaders,
+            }
+          }
 
-          listChildHeaders: async (chatId, parentId) => {
-            return (
-              await listChildHeaderRows(
+          const recordHeaderBeforeWrite = (
+            state: ChatMutationState | undefined,
+            messageId: MessageId,
+            header: MessageHeaderRow | undefined,
+          ): void => {
+            if (!state || state.headersBeforeWrites.has(messageId)) return
+            state.headersBeforeWrites.set(
+              messageId,
+              header ? cloneMessageHeader(header) : undefined,
+            )
+          }
+
+          for (const scope of scopes) {
+            if (scope.kind === 'chat-meta' || scope.kind === 'children' || scope.kind === 'draft') {
+              await ensureChatState(scope.chatId)
+            }
+          }
+
+          const requireChatState = (chatId: ChatId): ChatMutationState => {
+            const state = chatStates.get(chatId)
+            if (!state) {
+              throw new Error(`ChatStateUnavailable:${chatId}`)
+            }
+            return state
+          }
+
+          const bumpChildList = async (
+            chatId: ChatId,
+            parentId: MessageId | null,
+            bumpNow = now,
+          ): Promise<ChildListState> => {
+            assertScope({ kind: 'children', chatId, parentId })
+            const table = tx.table<ChildListState, string>('childLists')
+            const id = childListKey(chatId, parentId)
+            const existing = await table.get(id)
+            const next: ChildListState = existing
+              ? { ...existing, version: existing.version + 1, updatedAt: bumpNow }
+              : { id, chatId, parentId, version: 1, updatedAt: bumpNow }
+            await table.put(next)
+            wroteWorkspaceState = true
+            const state = await ensureChatState(chatId)
+            state.broadcast = true
+            upsertAffected(state, { kind: 'children', chatId, parentId })
+            return next
+          }
+
+          const ctx: MutationContext = {
+            getChat: async (chatId) => {
+              const state = chatStates.get(chatId)
+              if (!state) return tx.table<Chat, ChatId>('chats').get(chatId)
+              return {
+                ...state.beforeChat,
+                ...state.hiddenMetaPatch,
+                ...state.visibleMetaPatch,
+                ...state.summaryPatch,
+              }
+            },
+
+            patchChatMeta: (chatId, patch, options = {}) => {
+              const {
+                touchVisibleState = true,
+                touchSummary = touchVisibleState,
+                broadcast = touchVisibleState || touchSummary,
+              } = options
+              assertScope({ kind: 'chat-meta', chatId })
+              const state = requireChatState(chatId)
+              const current = {
+                ...state.beforeChat,
+                ...state.hiddenMetaPatch,
+                ...state.visibleMetaPatch,
+                ...state.summaryPatch,
+              }
+              if (touchVisibleState) {
+                const applied = changedPatch(current, stripMetaPatch(patch))
+                if (!applied) return
+                state.visibleMetaPatch = {
+                  ...state.visibleMetaPatch,
+                  ...applied,
+                }
+                state.visibleMetaDirty = true
+                state.summaryVersionDirty ||= touchSummary
+              } else {
+                const applied = changedPatch(current, stripMetaPatch(patch))
+                if (!applied) return
+                state.hiddenMetaPatch = {
+                  ...state.hiddenMetaPatch,
+                  ...applied,
+                }
+              }
+              state.broadcast ||= broadcast
+              upsertAffected(state, { kind: 'chat-meta', chatId })
+            },
+
+            patchChatSummary: (chatId, patch) => {
+              const state = requireChatState(chatId)
+              const current = {
+                ...state.beforeChat,
+                ...state.hiddenMetaPatch,
+                ...state.visibleMetaPatch,
+                ...state.summaryPatch,
+              }
+              const applied = changedPatch(current, stripSummaryPatch(patch))
+              if (!applied) return
+              state.summaryPatch = {
+                ...state.summaryPatch,
+                ...applied,
+              }
+              state.summaryVersionDirty = true
+              state.broadcast = true
+              upsertAffected(state, { kind: 'chat-meta', chatId })
+            },
+
+            getMessage: async (messageId) => {
+              const [header, body] = await Promise.all([
+                tx.table<MessageHeaderRow, MessageId>('messages').get(messageId),
+                tx.table<MessageBodyRow, MessageId>('messageBodies').get(messageId),
+              ])
+              return header && body ? hydrateStoredMessage(header, body) : undefined
+            },
+
+            getMessageHeader: async (messageId) => {
+              const header = await tx.table<MessageHeaderRow, MessageId>('messages').get(messageId)
+              return header ? cloneMessageHeader(header) : undefined
+            },
+
+            listMessages: async (chatId) => listMessagesInTransaction(tx, chatId),
+
+            listMessageHeaders: async (chatId) =>
+              (
+                await tx
+                  .table<MessageHeaderRow, MessageId>('messages')
+                  .where('chatId')
+                  .equals(chatId)
+                  .toArray()
+              ).map(cloneMessageHeader),
+
+            listChildHeaders: async (chatId, parentId) => {
+              return (
+                await listChildHeaderRows(
+                  tx.table<MessageHeaderRow, MessageId>('messages'),
+                  chatId,
+                  parentId,
+                )
+              ).map(cloneMessageHeader)
+            },
+
+            listChildren: async (chatId, parentId) => {
+              const headers = await listChildHeaderRows(
                 tx.table<MessageHeaderRow, MessageId>('messages'),
                 chatId,
                 parentId,
               )
-            ).map(cloneMessageHeader)
-          },
+              return hydrateStoredMessages(
+                headers,
+                tx.table<MessageBodyRow, MessageId>('messageBodies'),
+              )
+            },
 
-          listChildren: async (chatId, parentId) => {
-            const headers = await listChildHeaderRows(
-              tx.table<MessageHeaderRow, MessageId>('messages'),
-              chatId,
-              parentId,
-            )
-            return hydrateStoredMessages(
-              headers,
-              tx.table<MessageBodyRow, MessageId>('messageBodies'),
-            )
-          },
+            putMessage: async (message, options: PutMessageOptions = {}) => {
+              const { touchChatSummary = true, broadcast = touchChatSummary } = options
+              const headerTable = tx.table<MessageHeaderRow, MessageId>('messages')
+              const bodyTable = tx.table<MessageBodyRow, MessageId>('messageBodies')
+              const existing = await headerTable.get(message.id)
+              const existingBody = existing ? await bodyTable.get(message.id) : undefined
+              const chatId = existing?.chatId ?? message.chatId
+              const needsChatState = touchChatSummary || broadcast
+              const state = needsChatState ? await ensureChatState(chatId) : undefined
+              const clone = cloneMessage(message)
 
-          putMessage: async (message, options: PutMessageOptions = {}) => {
-            const { touchChatSummary = true, broadcast = touchChatSummary } = options
-            const headerTable = tx.table<MessageHeaderRow, MessageId>('messages')
-            const bodyTable = tx.table<MessageBodyRow, MessageId>('messageBodies')
-            const existing = await headerTable.get(message.id)
-            const existingBody = existing ? await bodyTable.get(message.id) : undefined
-            const chatId = existing?.chatId ?? message.chatId
-            const needsChatState = touchChatSummary || broadcast
-            const state = needsChatState ? await ensureChatState(chatId) : undefined
-            const clone = cloneMessage(message)
-
-            assertScope({ kind: 'message', messageId: clone.id })
-            if (existing) {
-              if (existing.chatId !== clone.chatId) {
-                throw new Error(`CrossChatMessageMove:${clone.id}`)
-              }
-              const moved =
-                existing.parentId !== clone.parentId || existing.siblingIndex !== clone.siblingIndex
-              const deletionChanged = existing.deleted !== clone.deleted
-              const leafOrderingChanged = existing.createdAt !== clone.createdAt
-              if (!touchChatSummary && (moved || deletionChanged || leafOrderingChanged)) {
-                throw new Error(`DeferredMessageWriteRequiresStableTree:${clone.id}`)
-              }
-              if (moved || deletionChanged) {
-                assertScope({ kind: 'children', chatId, parentId: existing.parentId })
+              assertScope({ kind: 'message', messageId: clone.id })
+              if (existing) {
+                if (existing.chatId !== clone.chatId) {
+                  throw new Error(`CrossChatMessageMove:${clone.id}`)
+                }
+                const moved =
+                  existing.parentId !== clone.parentId ||
+                  existing.siblingIndex !== clone.siblingIndex
+                const deletionChanged = existing.deleted !== clone.deleted
+                const leafOrderingChanged = existing.createdAt !== clone.createdAt
+                if (!touchChatSummary && (moved || deletionChanged || leafOrderingChanged)) {
+                  throw new Error(`DeferredMessageWriteRequiresStableTree:${clone.id}`)
+                }
+                if (moved || deletionChanged) {
+                  assertScope({ kind: 'children', chatId, parentId: existing.parentId })
+                  assertScope({ kind: 'children', chatId, parentId: clone.parentId })
+                }
+                if (!existingBody) throw new Error(`MessageBodyMissing:${clone.id}`)
+                const comparable = { ...clone, nodeVersion: existing.nodeVersion }
+                const comparableSplit = splitMessageForStorage(comparable, {
+                  updatedAt: existingBody.updatedAt,
+                })
+                const changed =
+                  stableStringify(existing) !== stableStringify(comparableSplit.header) ||
+                  stableStringify(existingBody) !== stableStringify(comparableSplit.body)
+                if (!changed) return
+                if (
+                  streamOwnedMessageFieldsChanged(
+                    existing,
+                    existingBody,
+                    comparableSplit.header,
+                    comparableSplit.body,
+                  )
+                ) {
+                  await assertStreamTargetWriteAllowed(clone.id)
+                }
+                if (
+                  (existing.role === 'user' || clone.role === 'user') &&
+                  (existing.role !== clone.role ||
+                    deletionChanged ||
+                    existing.createdAt !== clone.createdAt ||
+                    stableStringify(existingBody.content) !== stableStringify(clone.content))
+                ) {
+                  const previewState = state ?? (await ensureChatState(chatId))
+                  previewState.previewDirty = true
+                }
+                if (touchChatSummary && (moved || deletionChanged || leafOrderingChanged)) {
+                  await ensureMessageHeaderSnapshots(state as ChatMutationState)
+                }
+                if (touchChatSummary) {
+                  recordMessageSummaryDeltas(
+                    state,
+                    clone.id,
+                    hydrateStoredMessage(existing, existingBody),
+                    clone,
+                  )
+                }
+                recordHeaderBeforeWrite(state, clone.id, existing)
+                clone.nodeVersion = existing.nodeVersion + 1
+                const { header, body } = splitMessageForStorage(clone, { updatedAt: now })
+                await syncAttachmentReferenceOwner({
+                  ownerKind: 'message',
+                  ownerId: clone.id,
+                  chatId: clone.chatId,
+                  previousRefs: existing.attachmentRefs,
+                  nextRefs: clone.attachmentRefs,
+                })
+                await headerTable.put(header)
+                await bodyTable.put(body)
+                wroteWorkspaceState = true
+                if (state?.afterHeaders) {
+                  replaceMessageHeader(state.afterHeaders, header)
+                }
+                if (moved || deletionChanged) {
+                  await bumpChildList(chatId, existing.parentId)
+                  if (existing.parentId !== clone.parentId) {
+                    await bumpChildList(chatId, clone.parentId)
+                  }
+                }
+              } else {
+                if (!touchChatSummary) {
+                  throw new Error(`DeferredMessageWriteRequiresExistingRow:${clone.id}`)
+                }
+                const summaryState = state as ChatMutationState
+                const expectedLeafId =
+                  summaryState.incrementalAppends.at(-1)?.id ??
+                  summaryState.beforeChat.lastUpdatedLeafId
+                let incrementalAppend =
+                  !summaryState.afterHeaders && !clone.deleted && clone.parentId === expectedLeafId
+                if (incrementalAppend && expectedLeafId !== null) {
+                  const expectedLeaf = await headerTable.get(expectedLeafId)
+                  incrementalAppend =
+                    expectedLeaf !== undefined &&
+                    !expectedLeaf.deleted &&
+                    messageOutranksLeaf(clone, expectedLeaf)
+                }
+                if (!incrementalAppend) {
+                  await ensureMessageHeaderSnapshots(summaryState)
+                }
                 assertScope({ kind: 'children', chatId, parentId: clone.parentId })
+                const { header, body } = splitMessageForStorage(clone, { updatedAt: now })
+                recordHeaderBeforeWrite(summaryState, clone.id, undefined)
+                await syncAttachmentReferenceOwner({
+                  ownerKind: 'message',
+                  ownerId: clone.id,
+                  chatId: clone.chatId,
+                  previousRefs: undefined,
+                  nextRefs: clone.attachmentRefs,
+                })
+                await headerTable.put(header)
+                await bodyTable.put(body)
+                wroteWorkspaceState = true
+                if (clone.role === 'user') summaryState.previewDirty = true
+                recordNewMessageSummary(summaryState, clone)
+                if (summaryState.afterHeaders) {
+                  replaceMessageHeader(summaryState.afterHeaders, header)
+                } else if (incrementalAppend) {
+                  summaryState.incrementalAppends.push(clone)
+                }
+                await bumpChildList(chatId, clone.parentId)
               }
-              if (!existingBody) throw new Error(`MessageBodyMissing:${clone.id}`)
-              const comparable = { ...clone, nodeVersion: existing.nodeVersion }
-              const comparableSplit = splitMessageForStorage(comparable, {
-                updatedAt: existingBody.updatedAt,
-              })
-              const changed =
-                stableStringify(existing) !== stableStringify(comparableSplit.header) ||
-                stableStringify(existingBody) !== stableStringify(comparableSplit.body)
-              if (!changed) return
-              if (touchChatSummary && (moved || deletionChanged || leafOrderingChanged)) {
-                await ensureMessageSnapshots(state as ChatMutationState)
+
+              if (touchChatSummary && state) {
+                state.summaryVersionDirty = true
+                state.messageSummaryDirty = true
+                state.changedMessageIds.add(clone.id)
               }
-              if (touchChatSummary && !moved && !deletionChanged && !leafOrderingChanged) {
-                recordMessageSummaryDeltas(
-                  state,
-                  clone.id,
-                  hydrateStoredMessage(existing, existingBody),
-                  clone,
-                )
+              if (broadcast && state) {
+                state.broadcast = true
+                upsertAffected(state, { kind: 'message', chatId, messageId: clone.id })
               }
-              clone.nodeVersion = existing.nodeVersion + 1
-              const { header, body } = splitMessageForStorage(clone, { updatedAt: now })
-              await headerTable.put(header)
-              await bodyTable.put(body)
-              wroteWorkspaceState = true
-              if (state?.afterMessages) {
-                replaceMessage(state.afterMessages, clone)
+              affectedMessageIds.add(clone.id)
+            },
+
+            patchMessageBody: async (messageId, patch, options: PatchMessageBodyOptions = {}) => {
+              const {
+                touchChatSummary = true,
+                broadcast = touchChatSummary,
+                headerPatch,
+                replaceBody = false,
+              } = options
+              assertScope({ kind: 'message', messageId })
+              const headerTable = tx.table<MessageHeaderRow, MessageId>('messages')
+              const bodyTable = tx.table<MessageBodyRow, MessageId>('messageBodies')
+              const existing = await headerTable.get(messageId)
+              if (!existing) return
+              const state =
+                touchChatSummary || broadcast ? await ensureChatState(existing.chatId) : undefined
+              const nextHeader = applyMessageHeaderPatch(existing, headerPatch)
+              const generationReplaced =
+                headerPatch !== undefined && Object.hasOwn(headerPatch, 'generation')
+              const preserveColdServerToolOutputs =
+                replaceBody &&
+                !generationReplaced &&
+                (existing.generation?.serverTools?.length ?? 0) > 0
+              const existingBody =
+                replaceBody && !touchChatSummary && !preserveColdServerToolOutputs
+                  ? undefined
+                  : await bodyTable.get(messageId)
+              if (!replaceBody && !existingBody) throw new Error(`MessageBodyMissing:${messageId}`)
+              if (replaceBody && touchChatSummary && !existingBody) {
+                throw new Error(`MessageBodyMissing:${messageId}`)
               }
-              if (moved || deletionChanged) {
-                await bumpChildList(chatId, existing.parentId)
-                if (existing.parentId !== clone.parentId) {
-                  await bumpChildList(chatId, clone.parentId)
+              let nextBody: MessageBodyRow
+              if (!replaceBody) {
+                const patchedBody = applyMessageBodyPatch(existingBody as MessageBodyRow, patch)
+                nextHeader.nodeVersion = existing.nodeVersion
+                patchedBody.nodeVersion = (existingBody as MessageBodyRow).nodeVersion
+                patchedBody.updatedAt = (existingBody as MessageBodyRow).updatedAt
+                syncMessageHeaderProjections(nextHeader, patchedBody, {
+                  replaceGenerationServerToolOutputs: generationReplaced,
+                })
+                const changed =
+                  stableStringify(existing) !== stableStringify(nextHeader) ||
+                  stableStringify(existingBody) !== stableStringify(patchedBody)
+                if (!changed) return
+                nextHeader.nodeVersion = existing.nodeVersion + 1
+                nextBody = {
+                  ...patchedBody,
+                  nodeVersion: nextHeader.nodeVersion,
+                  updatedAt: now,
+                }
+                if (touchChatSummary) {
+                  recordMessageSummaryDeltas(
+                    state,
+                    messageId,
+                    hydrateStoredMessage(existing, existingBody as MessageBodyRow),
+                    hydrateStoredMessage(nextHeader, nextBody),
+                  )
+                }
+              } else {
+                await assertStreamTargetWriteAllowed(messageId)
+                nextHeader.nodeVersion = existing.nodeVersion + 1
+                nextBody = replacementMessageBody(nextHeader, patch, {
+                  nodeVersion: nextHeader.nodeVersion,
+                  updatedAt: now,
+                })
+                if (preserveColdServerToolOutputs && existingBody?.generationServerToolOutputs) {
+                  nextBody.generationServerToolOutputs = structuredClone(
+                    existingBody.generationServerToolOutputs,
+                  )
+                }
+                syncMessageHeaderProjections(nextHeader, nextBody, {
+                  replaceGenerationServerToolOutputs: generationReplaced,
+                })
+                if (touchChatSummary) {
+                  recordMessageSummaryDeltas(
+                    state,
+                    messageId,
+                    hydrateStoredMessage(existing, existingBody as MessageBodyRow),
+                    hydrateStoredMessage(nextHeader, nextBody),
+                  )
                 }
               }
-            } else {
-              if (!touchChatSummary) {
-                throw new Error(`DeferredMessageWriteRequiresExistingRow:${clone.id}`)
+              if (
+                !replaceBody &&
+                streamOwnedMessageFieldsChanged(
+                  existing,
+                  existingBody as MessageBodyRow,
+                  nextHeader,
+                  nextBody,
+                )
+              ) {
+                await assertStreamTargetWriteAllowed(messageId)
               }
-              await ensureMessageSnapshots(state as ChatMutationState)
-              assertScope({ kind: 'children', chatId, parentId: clone.parentId })
-              if (clone.nodeVersion === undefined) clone.nodeVersion = 0
-              const { header, body } = splitMessageForStorage(clone, { updatedAt: now })
-              await headerTable.put(header)
-              await bodyTable.put(body)
+              if (
+                headerPatch !== undefined &&
+                Object.hasOwn(headerPatch, 'attachmentRefs') &&
+                stableStringify(existing.attachmentRefs ?? []) !==
+                  stableStringify(nextHeader.attachmentRefs ?? [])
+              ) {
+                await syncAttachmentReferenceOwner({
+                  ownerKind: 'message',
+                  ownerId: nextHeader.id,
+                  chatId: nextHeader.chatId,
+                  previousRefs: existing.attachmentRefs,
+                  nextRefs: nextHeader.attachmentRefs,
+                })
+              }
+              recordHeaderBeforeWrite(state, messageId, existing)
+              await headerTable.put(nextHeader)
+              await bodyTable.put(nextBody)
               wroteWorkspaceState = true
-              if (state?.afterMessages) {
-                replaceMessage(state.afterMessages, clone)
+              if (existing.role === 'user' && Object.hasOwn(patch, 'content')) {
+                const previewState = state ?? (await ensureChatState(existing.chatId))
+                previewState.previewDirty = true
               }
-              await bumpChildList(chatId, clone.parentId)
-            }
-
-            if (touchChatSummary && state) {
-              state.summaryVersionDirty = true
-              state.messageSummaryDirty = true
-              state.changedMessageIds.add(clone.id)
-            }
-            if (broadcast && state) {
-              state.broadcast = true
-              upsertAffected(state, { kind: 'message', chatId, messageId: clone.id })
-            }
-            affectedMessageIds.add(clone.id)
-          },
-
-          patchMessageBody: async (messageId, patch, options: PatchMessageBodyOptions = {}) => {
-            const {
-              touchChatSummary = true,
-              broadcast = touchChatSummary,
-              headerPatch,
-              replaceBody = false,
-            } = options
-            assertScope({ kind: 'message', messageId })
-            const headerTable = tx.table<MessageHeaderRow, MessageId>('messages')
-            const bodyTable = tx.table<MessageBodyRow, MessageId>('messageBodies')
-            const existing = await headerTable.get(messageId)
-            if (!existing) return
-            const state =
-              touchChatSummary || broadcast ? await ensureChatState(existing.chatId) : undefined
-            const nextHeader = applyMessageHeaderPatch(existing, headerPatch)
-            const existingBody =
-              replaceBody && !touchChatSummary ? undefined : await bodyTable.get(messageId)
-            if (!replaceBody && !existingBody) throw new Error(`MessageBodyMissing:${messageId}`)
-            if (replaceBody && touchChatSummary && !existingBody) {
-              throw new Error(`MessageBodyMissing:${messageId}`)
-            }
-            let nextBody: MessageBodyRow
-            if (!replaceBody) {
-              const patchedBody = applyMessageBodyPatch(existingBody as MessageBodyRow, patch)
-              nextHeader.nodeVersion = existing.nodeVersion
-              patchedBody.nodeVersion = (existingBody as MessageBodyRow).nodeVersion
-              patchedBody.updatedAt = (existingBody as MessageBodyRow).updatedAt
-              const changed =
-                stableStringify(existing) !== stableStringify(nextHeader) ||
-                stableStringify(existingBody) !== stableStringify(patchedBody)
-              if (!changed) return
-              nextHeader.nodeVersion = existing.nodeVersion + 1
-              nextBody = {
-                ...patchedBody,
-                nodeVersion: nextHeader.nodeVersion,
-                updatedAt: now,
+              if (state?.afterHeaders) {
+                replaceMessageHeader(state.afterHeaders, nextHeader)
               }
-              if (touchChatSummary) {
-                recordMessageSummaryDeltas(
-                  state,
+              if (touchChatSummary && state) {
+                state.summaryVersionDirty = true
+                state.messageSummaryDirty = true
+                state.changedMessageIds.add(messageId)
+              }
+              if (broadcast && state) {
+                state.broadcast = true
+                upsertAffected(state, {
+                  kind: 'message',
+                  chatId: existing.chatId,
                   messageId,
-                  hydrateStoredMessage(existing, existingBody as MessageBodyRow),
-                  hydrateStoredMessage(nextHeader, nextBody),
-                )
+                })
               }
-            } else {
-              nextHeader.nodeVersion = existing.nodeVersion + 1
-              nextBody = replacementMessageBody(nextHeader, patch, {
-                nodeVersion: nextHeader.nodeVersion,
-                updatedAt: now,
+              affectedMessageIds.add(messageId)
+            },
+
+            deleteMessage: async (messageId) => {
+              assertScope({ kind: 'message', messageId })
+              const table = tx.table<MessageHeaderRow, MessageId>('messages')
+              const existing = await table.get(messageId)
+              if (!existing) return
+              await assertStreamTargetWriteAllowed(messageId)
+              const state = await ensureChatState(existing.chatId)
+              await ensureMessageHeaderSnapshots(state)
+              assertScope({
+                kind: 'children',
+                chatId: existing.chatId,
+                parentId: existing.parentId,
               })
-              if (touchChatSummary) {
-                recordMessageSummaryDeltas(
-                  state,
-                  messageId,
-                  hydrateStoredMessage(existing, existingBody as MessageBodyRow),
-                  hydrateStoredMessage(nextHeader, nextBody),
-                )
-              }
-            }
-            await headerTable.put(nextHeader)
-            await bodyTable.put(nextBody)
-            wroteWorkspaceState = true
-            if (state?.afterMessages) {
-              replaceMessage(state.afterMessages, hydrateStoredMessage(nextHeader, nextBody))
-            }
-            if (touchChatSummary && state) {
+              await syncAttachmentReferenceOwner({
+                ownerKind: 'message',
+                ownerId: existing.id,
+                chatId: existing.chatId,
+                previousRefs: existing.attachmentRefs,
+                nextRefs: [],
+              })
+              recordHeaderBeforeWrite(state, messageId, existing)
+              await table.delete(messageId)
+              await tx.table<MessageBodyRow, MessageId>('messageBodies').delete(messageId)
+              wroteWorkspaceState = true
+              if (existing.role === 'user') state.previewDirty = true
+              removeMessageHeader(state.afterHeaders ?? [], messageId)
+              await bumpChildList(existing.chatId, existing.parentId)
               state.summaryVersionDirty = true
               state.messageSummaryDirty = true
-              state.changedMessageIds.add(messageId)
-            }
-            if (broadcast && state) {
               state.broadcast = true
+              state.changedMessageIds.add(messageId)
+              affectedMessageIds.add(messageId)
               upsertAffected(state, {
                 kind: 'message',
                 chatId: existing.chatId,
                 messageId,
               })
-            }
-            affectedMessageIds.add(messageId)
-          },
+            },
 
-          deleteMessage: async (messageId) => {
-            assertScope({ kind: 'message', messageId })
-            const table = tx.table<MessageHeaderRow, MessageId>('messages')
-            const existing = await table.get(messageId)
-            if (!existing) return
-            const state = await ensureChatState(existing.chatId)
-            await ensureMessageSnapshots(state)
-            assertScope({ kind: 'children', chatId: existing.chatId, parentId: existing.parentId })
-            await table.delete(messageId)
-            await tx.table<MessageBodyRow, MessageId>('messageBodies').delete(messageId)
-            wroteWorkspaceState = true
-            removeMessage(state.afterMessages ?? [], messageId)
-            await bumpChildList(existing.chatId, existing.parentId)
-            state.summaryVersionDirty = true
-            state.messageSummaryDirty = true
-            state.broadcast = true
-            state.changedMessageIds.add(messageId)
-            affectedMessageIds.add(messageId)
-            upsertAffected(state, {
-              kind: 'message',
-              chatId: existing.chatId,
-              messageId,
-            })
-          },
-
-          getChildList: async (chatId, parentId) => {
-            const row = await tx
-              .table<ChildListState, string>('childLists')
-              .get(childListKey(chatId, parentId))
-            return (
-              row ?? {
-                id: childListKey(chatId, parentId),
-                chatId,
-                parentId,
-                version: 0,
-                updatedAt: 0,
-              }
-            )
-          },
-
-          bumpChildList,
-
-          getAttachment: async (attachmentId) =>
-            tx.table<Attachment, AttachmentId>('attachments').get(attachmentId),
-
-          putAttachment: async (attachment) => {
-            assertScope({ kind: 'attachment', attachmentId: attachment.id })
-            await tx.table<Attachment, AttachmentId>('attachments').put(attachment)
-            wroteWorkspaceState = true
-          },
-
-          deleteAttachment: async (attachmentId) => {
-            assertScope({ kind: 'attachment', attachmentId })
-            const table = tx.table<Attachment, AttachmentId>('attachments')
-            const existing = await table.get(attachmentId)
-            if (!existing) return
-            await tx
-              .table<AttachmentBlob, string>('attachmentBlobs')
-              .where('attachmentId')
-              .equals(attachmentId)
-              .delete()
-            await tx
-              .table<AttachmentArtifact, string>('attachmentArtifacts')
-              .where('attachmentId')
-              .equals(attachmentId)
-              .delete()
-            await tx
-              .table<AttachmentJob, string>('attachmentJobs')
-              .where('attachmentId')
-              .equals(attachmentId)
-              .delete()
-            await table.delete(attachmentId)
-            wroteWorkspaceState = true
-          },
-
-          getAttachmentBlob: async (blobId) =>
-            tx.table<AttachmentBlob, string>('attachmentBlobs').get(blobId),
-
-          putAttachmentBlob: async (blob) => {
-            assertScope({ kind: 'attachment', attachmentId: blob.attachmentId })
-            await tx.table<AttachmentBlob, string>('attachmentBlobs').put(blob)
-            wroteWorkspaceState = true
-          },
-
-          deleteAttachmentBlob: async (blobId) => {
-            const table = tx.table<AttachmentBlob, string>('attachmentBlobs')
-            const existing = await table.get(blobId)
-            if (!existing) return
-            assertScope({ kind: 'attachment', attachmentId: existing.attachmentId })
-            await table.delete(blobId)
-            wroteWorkspaceState = true
-          },
-
-          putAttachmentArtifact: async (artifact) => {
-            assertScope({ kind: 'attachment', attachmentId: artifact.attachmentId })
-            await tx.table<AttachmentArtifact, string>('attachmentArtifacts').put(artifact)
-            wroteWorkspaceState = true
-          },
-
-          deleteAttachmentArtifact: async (artifactId) => {
-            const table = tx.table<AttachmentArtifact, string>('attachmentArtifacts')
-            const existing = await table.get(artifactId)
-            if (!existing) return
-            assertScope({ kind: 'attachment', attachmentId: existing.attachmentId })
-            await table.delete(artifactId)
-            wroteWorkspaceState = true
-          },
-
-          putAttachmentJob: async (job) => {
-            assertScope({ kind: 'attachment', attachmentId: job.attachmentId })
-            await tx.table<AttachmentJob, string>('attachmentJobs').put(job)
-            wroteWorkspaceState = true
-          },
-
-          deleteAttachmentJob: async (jobId) => {
-            const table = tx.table<AttachmentJob, string>('attachmentJobs')
-            const existing = await table.get(jobId)
-            if (!existing) return
-            assertScope({ kind: 'attachment', attachmentId: existing.attachmentId })
-            await table.delete(jobId)
-            wroteWorkspaceState = true
-          },
-
-          getDraft: async (chatId) => {
-            const row = await tx.table<DraftRow, ChatId>('drafts').get(chatId)
-            return row ? cloneDraft(row) : undefined
-          },
-
-          putDraft: async (draft) => {
-            assertScope({ kind: 'draft', chatId: draft.chatId })
-            const state = await ensureChatState(draft.chatId)
-            const table = tx.table<DraftRow, ChatId>('drafts')
-            const existing = await table.get(draft.chatId)
-            const normalized = cloneDraft(draft)
-            if (existing && stableStringify(cloneDraft(existing)) === stableStringify(normalized))
-              return
-            await table.put(normalized)
-            wroteWorkspaceState = true
-            state.broadcast = true
-            upsertAffected(state, { kind: 'draft', chatId: draft.chatId })
-          },
-
-          deleteDraft: async (chatId) => {
-            assertScope({ kind: 'draft', chatId })
-            const state = await ensureChatState(chatId)
-            const table = tx.table<DraftRow, ChatId>('drafts')
-            const existing = await table.get(chatId)
-            if (!existing) return
-            await table.delete(chatId)
-            wroteWorkspaceState = true
-            state.broadcast = true
-            upsertAffected(state, { kind: 'draft', chatId })
-          },
-        }
-
-        const value = await fn(ctx)
-
-        const chatVersions: Record<ChatId, ChatVersions> = {}
-        const affectedChatIds: ChatId[] = []
-        const chatTable = tx.table<Chat, ChatId>('chats')
-
-        for (const [chatId, state] of chatStates) {
-          const current = await chatTable.get(chatId)
-          if (!current) throw new ChatMissingError(chatId)
-          const next: Chat = {
-            ...current,
-            ...state.hiddenMetaPatch,
-            ...state.visibleMetaPatch,
-          }
-
-          if (state.visibleMetaDirty) {
-            next.metaVersion = current.metaVersion + 1
-          }
-
-          if (state.summaryVersionDirty) {
-            next.updatedAt = now
-            next.summaryVersion = current.summaryVersion + 1
-          }
-
-          if (state.messageSummaryDirty) {
-            if (state.afterMessages) {
-              const afterMessages = state.afterMessages
-              const nextLeafId = findLastUpdatedLeafId(afterMessages)
-              next.lastUpdatedLeafId = nextLeafId
-              next.wordCount = countMessagesWords(buildBranchMessages(afterMessages, nextLeafId))
-              next.totalCostUsd = computeTotalCostUsd(afterMessages)
-              const beforeMessages = state.beforeMessages ?? []
-              const lastBranchUpdatedAtChanged = shouldBumpLastBranchUpdatedAt(
-                state.beforeChat,
-                beforeMessages,
-                afterMessages,
-                state.changedMessageIds,
-              )
-              if (lastBranchUpdatedAtChanged) {
-                next.lastBranchUpdatedAt = now
-              }
-              if (nextLeafId !== state.beforeChat.lastUpdatedLeafId || lastBranchUpdatedAtChanged) {
-                await writeBranchCacheForSummary(tx, chatId, nextLeafId, afterMessages, now)
-                wroteWorkspaceState = true
-                pendingBranchCacheEvents.add(chatId)
-              }
-            } else {
-              const nextLeafId = state.beforeChat.lastUpdatedLeafId
-              const branchHeaders = await branchHeadersByLeafInTransaction(tx, chatId, nextLeafId)
-              next.lastUpdatedLeafId = nextLeafId
-              let wordCountDelta = 0
-              const branchIds = new Set(branchHeaders.map((header) => header.id))
-              for (const [messageId, delta] of state.wordCountDeltas) {
-                if (branchIds.has(messageId)) wordCountDelta += delta
-              }
-              next.wordCount = Math.max(0, current.wordCount + wordCountDelta)
-              next.totalCostUsd = Math.max(0, current.totalCostUsd + state.totalCostDelta)
-              const lastBranchUpdatedAtChanged = shouldBumpLastBranchUpdatedAtFromHeaders(
-                state.beforeChat,
-                nextLeafId,
-                branchHeaders,
-                state.changedMessageIds,
-              )
-              if (lastBranchUpdatedAtChanged) {
-                next.lastBranchUpdatedAt = now
-              }
-              if (nextLeafId !== state.beforeChat.lastUpdatedLeafId || lastBranchUpdatedAtChanged) {
-                const refreshResult = await maybeRefreshBranchCacheForHeaderSummary({
-                  tx,
+            getChildList: async (chatId, parentId) => {
+              const row = await tx
+                .table<ChildListState, string>('childLists')
+                .get(childListKey(chatId, parentId))
+              return (
+                row ?? {
+                  id: childListKey(chatId, parentId),
                   chatId,
-                  branchLeafId: nextLeafId,
-                  branchHeaders,
-                  beforeChat: state.beforeChat,
-                  now,
-                })
-                if (refreshResult.cache) {
-                  next.wordCount = refreshResult.cache.wordCount
+                  parentId,
+                  version: 0,
+                  updatedAt: 0,
                 }
-                if (refreshResult.refreshed) {
+              )
+            },
+
+            bumpChildList,
+
+            getAttachment: async (attachmentId) => {
+              const header = await tx
+                .table<AttachmentHeaderRow, AttachmentId>('attachments')
+                .get(attachmentId)
+              return header
+                ? hydrateStoredAttachment(
+                    header,
+                    tx.table<AttachmentArtifact, string>('attachmentArtifacts'),
+                  )
+                : undefined
+            },
+
+            putAttachment: async (attachment) => {
+              assertScope({ kind: 'attachment', attachmentId: attachment.id })
+              const refCount = await tx
+                .table<AttachmentReferenceEdge>('attachmentRefEdges')
+                .where('attachmentId')
+                .equals(attachment.id)
+                .count()
+              await tx
+                .table<AttachmentHeaderRow, AttachmentId>('attachments')
+                .put(splitAttachmentForStorage({ ...attachment, refCount }))
+              wroteWorkspaceState = true
+            },
+
+            deleteAttachment: async (attachmentId) => {
+              assertScope({ kind: 'attachment', attachmentId })
+              const table = tx.table<AttachmentHeaderRow, AttachmentId>('attachments')
+              const existing = await table.get(attachmentId)
+              if (!existing) return
+              if (!(await requireNoAttachmentReferences(tx, attachmentId))) {
+                throw new Error(`AttachmentStillReferenced:${attachmentId}`)
+              }
+              await tx
+                .table<AttachmentBlob, string>('attachmentBlobs')
+                .where('attachmentId')
+                .equals(attachmentId)
+                .delete()
+              await tx
+                .table<AttachmentArtifact, string>('attachmentArtifacts')
+                .where('attachmentId')
+                .equals(attachmentId)
+                .delete()
+              await tx
+                .table<AttachmentJob, string>('attachmentJobs')
+                .where('attachmentId')
+                .equals(attachmentId)
+                .delete()
+              await table.delete(attachmentId)
+              wroteWorkspaceState = true
+            },
+
+            countAttachmentReferences: async (attachmentId) =>
+              attachmentReferenceCounts(tx, attachmentId),
+
+            deleteAttachmentBlobs: async (attachmentId) => {
+              assertScope({ kind: 'attachment', attachmentId })
+              await tx
+                .table<AttachmentBlob, string>('attachmentBlobs')
+                .where('attachmentId')
+                .equals(attachmentId)
+                .delete()
+              wroteWorkspaceState = true
+            },
+
+            deleteAttachmentArtifacts: async (attachmentId) => {
+              assertScope({ kind: 'attachment', attachmentId })
+              await tx
+                .table<AttachmentArtifact, string>('attachmentArtifacts')
+                .where('attachmentId')
+                .equals(attachmentId)
+                .delete()
+              wroteWorkspaceState = true
+            },
+
+            deleteAttachmentJobs: async (attachmentId) => {
+              assertScope({ kind: 'attachment', attachmentId })
+              await tx
+                .table<AttachmentJob, string>('attachmentJobs')
+                .where('attachmentId')
+                .equals(attachmentId)
+                .delete()
+              wroteWorkspaceState = true
+            },
+
+            getAttachmentBlob: async (blobId) =>
+              tx.table<AttachmentBlob, string>('attachmentBlobs').get(blobId),
+
+            putAttachmentBlob: async (blob) => {
+              assertScope({ kind: 'attachment', attachmentId: blob.attachmentId })
+              await tx.table<AttachmentBlob, string>('attachmentBlobs').put(blob)
+              wroteWorkspaceState = true
+            },
+
+            deleteAttachmentBlob: async (blobId) => {
+              const table = tx.table<AttachmentBlob, string>('attachmentBlobs')
+              const existing = await table.get(blobId)
+              if (!existing) return
+              assertScope({ kind: 'attachment', attachmentId: existing.attachmentId })
+              await table.delete(blobId)
+              wroteWorkspaceState = true
+            },
+
+            putAttachmentArtifact: async (artifact) => {
+              assertScope({ kind: 'attachment', attachmentId: artifact.attachmentId })
+              await tx.table<AttachmentArtifact, string>('attachmentArtifacts').put(artifact)
+              wroteWorkspaceState = true
+            },
+
+            deleteAttachmentArtifact: async (artifactId) => {
+              const table = tx.table<AttachmentArtifact, string>('attachmentArtifacts')
+              const existing = await table.get(artifactId)
+              if (!existing) return
+              assertScope({ kind: 'attachment', attachmentId: existing.attachmentId })
+              await table.delete(artifactId)
+              wroteWorkspaceState = true
+            },
+
+            putAttachmentJob: async (job) => {
+              assertScope({ kind: 'attachment', attachmentId: job.attachmentId })
+              await tx.table<AttachmentJob, string>('attachmentJobs').put(job)
+              wroteWorkspaceState = true
+            },
+
+            deleteAttachmentJob: async (jobId) => {
+              const table = tx.table<AttachmentJob, string>('attachmentJobs')
+              const existing = await table.get(jobId)
+              if (!existing) return
+              assertScope({ kind: 'attachment', attachmentId: existing.attachmentId })
+              await table.delete(jobId)
+              wroteWorkspaceState = true
+            },
+
+            getDraft: async (chatId) => {
+              const row = await tx.table<DraftRow, ChatId>('drafts').get(chatId)
+              return row ? cloneDraft(row) : undefined
+            },
+
+            putDraft: async (draft) => {
+              assertScope({ kind: 'draft', chatId: draft.chatId })
+              const state = await ensureChatState(draft.chatId)
+              const table = tx.table<DraftRow, ChatId>('drafts')
+              const existing = await table.get(draft.chatId)
+              const normalized = cloneDraft(draft)
+              if (existing && stableStringify(cloneDraft(existing)) === stableStringify(normalized))
+                return
+              if (
+                stableStringify(existing?.attachmentRefs ?? []) !==
+                stableStringify(normalized.attachmentRefs)
+              ) {
+                await syncAttachmentReferenceOwner({
+                  ownerKind: 'draft',
+                  ownerId: normalized.chatId,
+                  chatId: normalized.chatId,
+                  previousRefs: existing?.attachmentRefs,
+                  nextRefs: normalized.attachmentRefs,
+                })
+              }
+              await table.put(normalized)
+              wroteWorkspaceState = true
+              state.broadcast = true
+              upsertAffected(state, { kind: 'draft', chatId: draft.chatId })
+            },
+
+            deleteDraft: async (chatId) => {
+              assertScope({ kind: 'draft', chatId })
+              const state = await ensureChatState(chatId)
+              const table = tx.table<DraftRow, ChatId>('drafts')
+              const existing = await table.get(chatId)
+              if (!existing) return
+              await syncAttachmentReferenceOwner({
+                ownerKind: 'draft',
+                ownerId: chatId,
+                chatId,
+                previousRefs: existing.attachmentRefs,
+                nextRefs: [],
+              })
+              await table.delete(chatId)
+              wroteWorkspaceState = true
+              state.broadcast = true
+              upsertAffected(state, { kind: 'draft', chatId })
+            },
+          }
+
+          const value = await fn(ctx)
+
+          const chatVersions: Record<ChatId, ChatVersions> = {}
+          const affectedChatIds: ChatId[] = []
+          const chatTable = tx.table<Chat, ChatId>('chats')
+
+          for (const [chatId, state] of chatStates) {
+            const current = await chatTable.get(chatId)
+            if (!current) throw new ChatMissingError(chatId)
+            const next: Chat = {
+              ...current,
+              ...state.hiddenMetaPatch,
+              ...state.visibleMetaPatch,
+            }
+
+            if (state.visibleMetaDirty) {
+              next.metaVersion = current.metaVersion + 1
+            }
+
+            if (state.summaryVersionDirty) {
+              next.updatedAt = now
+              next.summaryVersion = current.summaryVersion + 1
+            }
+
+            if (state.messageSummaryDirty) {
+              if (state.afterHeaders) {
+                const afterHeaders = state.afterHeaders
+                const nextLeafId = findLastUpdatedLeafIdFromHeaders(afterHeaders)
+                next.lastUpdatedLeafId = nextLeafId
+                next.wordCount = await structuralBranchWordCount({
+                  tx,
+                  state,
+                  beforeHeaders: state.beforeHeaders ?? [],
+                  afterHeaders,
+                  nextLeafId,
+                })
+                next.totalCostUsd = computeTotalCostUsd(afterHeaders)
+                const lastBranchUpdatedAtChanged = shouldBumpLastBranchUpdatedAt(
+                  state.beforeChat,
+                  state.beforeHeaders ?? [],
+                  afterHeaders,
+                  state.changedMessageIds,
+                )
+                if (lastBranchUpdatedAtChanged) next.lastBranchUpdatedAt = now
+                if (
+                  nextLeafId !== state.beforeChat.lastUpdatedLeafId ||
+                  lastBranchUpdatedAtChanged
+                ) {
+                  await invalidateBranchCacheForSummary(tx, chatId)
+                  wroteWorkspaceState = true
+                  pendingBranchCacheEvents.add(chatId)
+                }
+              } else {
+                const nextLeafId =
+                  state.incrementalAppends.at(-1)?.id ?? state.beforeChat.lastUpdatedLeafId
+                const branchHeaders = await branchHeadersByLeafInTransaction(tx, chatId, nextLeafId)
+                next.lastUpdatedLeafId = nextLeafId
+                let wordCountDelta = 0
+                const branchIds = new Set(branchHeaders.map((header) => header.id))
+                for (const [messageId, delta] of state.wordCountDeltas) {
+                  if (branchIds.has(messageId)) wordCountDelta += delta
+                }
+                next.wordCount = Math.max(0, current.wordCount + wordCountDelta)
+                next.totalCostUsd = Math.max(0, current.totalCostUsd + state.totalCostDelta)
+                const lastBranchUpdatedAtChanged = shouldBumpLastBranchUpdatedAtFromHeaders(
+                  state.beforeChat,
+                  nextLeafId,
+                  branchHeaders,
+                  state.changedMessageIds,
+                )
+                if (lastBranchUpdatedAtChanged) next.lastBranchUpdatedAt = now
+                if (
+                  nextLeafId !== state.beforeChat.lastUpdatedLeafId ||
+                  lastBranchUpdatedAtChanged
+                ) {
+                  await invalidateBranchCacheForSummary(tx, chatId)
                   wroteWorkspaceState = true
                   pendingBranchCacheEvents.add(chatId)
                 }
               }
             }
+
+            if (state.previewDirty) {
+              next.previewText = await chatPreviewInTransaction(tx, chatId)
+            }
+
+            const summaryPatch = stripSummaryPatch(state.summaryPatch)
+            const patched: Chat = { ...next, ...summaryPatch }
+
+            const changed = stableStringify(current) !== stableStringify(patched)
+            if (changed) {
+              await chatTable.put(patched)
+              await putChatSidebarProjection(tx, patched)
+              wroteWorkspaceState = true
+              affectedChatIds.push(chatId)
+            }
+            chatVersions[chatId] = {
+              metaVersion: patched.metaVersion,
+              summaryVersion: patched.summaryVersion,
+            }
           }
 
-          const summaryPatch = stripSummaryPatch(state.summaryPatch)
-          const patched: Chat = { ...next, ...summaryPatch }
-
-          const changed = stableStringify(current) !== stableStringify(patched)
-          if (changed) {
-            await chatTable.put(patched)
-            wroteWorkspaceState = true
-            affectedChatIds.push(chatId)
+          if (wroteWorkspaceState) {
+            await bumpWorkspaceMeta(tx, now)
           }
-          chatVersions[chatId] = {
-            metaVersion: patched.metaVersion,
-            summaryVersion: patched.summaryVersion,
+
+          for (const [chatId, state] of chatStates) {
+            if (!state.broadcast) continue
+            const versions = chatVersions[chatId]
+            if (!versions) continue
+            pendingEvents.push({
+              chatId,
+              versions,
+              affected: [...state.affected.values()],
+            })
           }
-        }
 
-        if (wroteWorkspaceState) {
-          await bumpWorkspaceMeta(tx, now)
-        }
-
-        for (const [chatId, state] of chatStates) {
-          if (!state.broadcast) continue
-          const versions = chatVersions[chatId]
-          if (!versions) continue
-          pendingEvents.push({
-            chatId,
-            versions,
-            affected: [...state.affected.values()],
-          })
-        }
-
-        return {
-          value,
-          affectedChatIds,
-          affectedMessageIds: [...affectedMessageIds],
-          chatVersions,
-        }
-      }),
+          return {
+            value,
+            affectedChatIds,
+            affectedMessageIds: [...affectedMessageIds],
+            chatVersions,
+          }
+        },
+      ),
     )
 
     for (const event of pendingEvents) {

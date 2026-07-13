@@ -1,6 +1,8 @@
+import type { Collection, Table } from 'dexie'
 import { findLastUpdatedLeafId } from '../core/active-path'
 import { sha256Hex as sha256BytesHex } from '../core/attachments/process'
 import { buildBranchCacheRow } from '../core/branch-flatten'
+import { WorkspaceReplacementInProgressError } from '../core/import-export/errors'
 import {
   flattenChatSettingsForPortableExport,
   stripPromptPresetPins,
@@ -21,6 +23,10 @@ import {
   type WorkspaceBackupEnvelope,
   type WorkspaceBackupPayload,
 } from '../core/import-export/schema'
+import {
+  validatePortableChatGraph,
+  validateWorkspaceBackupGraph,
+} from '../core/import-export/workspace-validation'
 import { readSavedTextTemplates } from '../core/text-templates'
 import type {
   Attachment,
@@ -45,7 +51,20 @@ import type {
   TagId,
 } from '../core/types'
 import { newId } from '../lib/ulid'
+import { replaceAttachmentReferenceOwners } from './attachment-reference-edges'
+import {
+  type AttachmentHeaderRow,
+  attachmentHeaderFromStoredRow,
+  hydrateAttachment,
+  splitAttachmentForStorage,
+} from './attachment-storage'
 import { postEvent } from './broadcast'
+import {
+  chatSidebarProjectionRow,
+  chatSidebarProjectionSettings,
+  isChatSidebarProjectionSettingKey,
+  putChatSidebarProjection,
+} from './chat-sidebar-projection'
 import { childListKey, type NatterDb, openDb } from './db'
 import type {
   ImportChatOptions,
@@ -55,16 +74,68 @@ import type {
   RestoreWorkspaceBackupOptions,
   RestoreWorkspaceBackupResult,
   WorkspaceImportExportBackend,
-} from './import-export'
-import { hydrateMessages, type MessageBodyRow, splitMessageForStorage } from './message-storage'
+} from './import-export-contract'
+import { withNamedLock } from './locks'
+import {
+  hydrateMessages,
+  type MessageBodyRow,
+  type MessageHeaderRow,
+  previewTextFromMessages,
+  previewTextsByChat,
+  splitMessageForStorage,
+} from './message-storage'
 import { PresetMissingError } from './presets'
+import type { StreamLeaseRow } from './repository'
+import { isFreshStreamLease, STREAM_LEASE_TTL_MS } from './stream-leases'
+import {
+  bumpBrowserWorkspaceMeta,
+  markBrowserWorkspaceReplaced,
+  readBrowserWorkspaceMetaFromTransaction,
+} from './workspace-meta'
+import { useStreamStore } from './zustand/streamStore'
 
-const WORKSPACE_META_KEY = 'workspace-meta'
 const WORKSPACE_ID = 'browser-idb:natter'
+const IMPORT_EXPORT_PAGE_SIZE = 128
+
+interface ImportExportMaterializationMetrics {
+  tableReadBatches: number
+  tableReadRows: number
+  maxTableReadBatchRows: number
+  tableWriteBatches: number
+  tableWriteRows: number
+  maxTableWriteBatchRows: number
+  messageBodyReadBatches: number
+  maxMessageBodyReadBatchRows: number
+  attachmentBlobReadBytes: number
+  maxAttachmentBlobReadBytes: number
+  attachmentBlobDecodeBytes: number
+  maxAttachmentBlobDecodeBytes: number
+}
+
+let materializationMetrics = emptyMaterializationMetrics()
+
+export function __resetImportExportMaterializationMetricsForTests(): void {
+  materializationMetrics = emptyMaterializationMetrics()
+}
+
+export function __importExportMaterializationMetricsForTests(): Readonly<ImportExportMaterializationMetrics> {
+  return { ...materializationMetrics }
+}
 
 interface StoredAttachmentBundle {
   attachment: Attachment
   blobs: AttachmentBlob[]
+  artifacts: AttachmentArtifact[]
+  jobs: AttachmentJob[]
+}
+
+interface ValidatedPortableAttachmentBlob extends PortableAttachmentBlob {
+  blobType: string
+}
+
+interface ValidatedAttachmentBundle {
+  attachment: Attachment
+  blobs: ValidatedPortableAttachmentBlob[]
   artifacts: AttachmentArtifact[]
   jobs: AttachmentJob[]
 }
@@ -78,7 +149,7 @@ interface ImportedAttachmentBundle {
   sourceAttachmentId: AttachmentId
   targetAttachmentId: AttachmentId
   reused: boolean
-  bundle?: StoredAttachmentBundle
+  bundle?: ValidatedAttachmentBundle
 }
 
 class BrowserImportExportBackend implements WorkspaceImportExportBackend {
@@ -103,11 +174,12 @@ class BrowserImportExportBackend implements WorkspaceImportExportBackend {
       async () => {
         const chat = await db.chats.get(chatId)
         if (!chat) throw new Error(`ChatMissing:${chatId}`)
-        const headers = await db.messages.where('chatId').equals(chatId).toArray()
-        const bodies = (await db.messageBodies.bulkGet(headers.map((row) => row.id))).filter(
-          (row): row is MessageBodyRow => row !== undefined,
+        const messages = sortMessages(
+          await hydrateStoredMessagesInPages(
+            db,
+            await db.messages.where('chatId').equals(chatId).primaryKeys(),
+          ),
         )
-        const messages = sortMessages(hydrateMessages(headers, bodies))
         const folder = chat.folderId ? await db.folders.get(chat.folderId) : undefined
         const tags = chat.tags.length > 0 ? await db.tags.bulkGet(chat.tags) : []
         const profile = await db.profiles.get(chat.settings.profileId)
@@ -148,7 +220,7 @@ class BrowserImportExportBackend implements WorkspaceImportExportBackend {
     const db = await openDb()
     const now = options.now ?? Date.now()
     const payload = envelope.payload
-    validatePortableMessages(payload.messages)
+    validatePortableChatGraph(payload)
     const resolvedProfile = await resolveProfileId(
       db,
       payload.chat.settings,
@@ -193,97 +265,84 @@ class BrowserImportExportBackend implements WorkspaceImportExportBackend {
     let tagIds: TagId[] = []
     const createdFolderIds: FolderId[] = []
     const createdTagIds: TagId[] = []
-    const splitMessages = messages.map((message) => splitMessageForStorage(message))
     const childLists = childListsForMessages(chatId, messages, now)
     const createdAttachmentIds: AttachmentId[] = []
     const reusedAttachmentIds: AttachmentId[] = []
 
-    await db.transaction(
-      'rw',
-      [
-        db.attachmentArtifacts,
-        db.attachmentBlobs,
-        db.attachmentJobs,
-        db.attachments,
-        db.chatBranchCache,
-        db.chats,
-        db.childLists,
-        db.folders,
-        db.messageBodies,
-        db.messages,
-        db.settings,
-        db.tags,
-      ],
-      async () => {
-        const folderResult = await ensurePortableFolder(db, payload.folder, now)
-        folderId = folderResult.folderId
-        if (folderResult.created && folderResult.folderId) {
-          createdFolderIds.push(folderResult.folderId)
-        }
+    await withNamedLock(`workspace:import-chat:${chatId}`, (grant) =>
+      grant.runTransaction(
+        db,
+        [
+          db.attachmentArtifacts,
+          db.attachmentBlobs,
+          db.attachmentJobs,
+          db.attachmentRefEdges,
+          db.attachments,
+          db.chatBranchCache,
+          db.chatSidebarRows,
+          db.chats,
+          db.childLists,
+          db.folders,
+          db.messageBodies,
+          db.messages,
+          db.settings,
+          db.tags,
+        ],
+        async (tx) => {
+          const folderResult = await ensurePortableFolder(db, payload.folder, now)
+          folderId = folderResult.folderId
+          if (folderResult.created && folderResult.folderId) {
+            createdFolderIds.push(folderResult.folderId)
+          }
 
-        const tagResult = await ensurePortableTags(db, payload.tags, now)
-        tagIds = tagResult.tagIds
-        createdTagIds.push(...tagResult.createdTagIds)
+          const tagResult = await ensurePortableTags(db, payload.tags, now)
+          tagIds = tagResult.tagIds
+          createdTagIds.push(...tagResult.createdTagIds)
 
-        for (const imported of attachmentRows) {
-          const refCount = liveRefCounts.get(imported.targetAttachmentId) ?? 0
-          if (imported.reused) {
-            const existing = await db.attachments.get(imported.targetAttachmentId)
-            if (existing && refCount > 0) {
-              await db.attachments.put({ ...existing, refCount: existing.refCount + refCount })
+          for (const imported of attachmentRows) {
+            if (imported.reused) {
+              reusedAttachmentIds.push(imported.targetAttachmentId)
+              continue
             }
-            reusedAttachmentIds.push(imported.targetAttachmentId)
-            continue
+            if (!imported.bundle) continue
+            await storeValidatedAttachmentBundle(db, imported.bundle)
+            createdAttachmentIds.push(imported.targetAttachmentId)
           }
-          if (!imported.bundle) continue
-          const attachment: Attachment = {
-            ...imported.bundle.attachment,
-            refCount,
-          }
-          await db.attachments.put(attachment)
-          if (imported.bundle.blobs.length > 0)
-            await db.attachmentBlobs.bulkPut(imported.bundle.blobs)
-          if (imported.bundle.artifacts.length > 0) {
-            await db.attachmentArtifacts.bulkPut(imported.bundle.artifacts)
-          }
-          if (imported.bundle.jobs.length > 0) await db.attachmentJobs.bulkPut(imported.bundle.jobs)
-          createdAttachmentIds.push(imported.targetAttachmentId)
-        }
 
-        const chat: Chat = {
-          id: chatId,
-          title: payload.chat.title,
-          titleStatus: 'untitled',
-          createdAt: now,
-          updatedAt: now,
-          lastViewedAt: now,
-          wordCount: branchCache.wordCount,
-          totalCostUsd,
-          metaVersion: 0,
-          summaryVersion: 0,
-          settings,
-          lastUpdatedLeafId: branchLeafId,
-          lastBranchUpdatedAt: now,
-          archived: false,
-          pinned: false,
-          folderId: folderId ?? null,
-          tags: tagIds,
-          ...(payload.chat.color ? { color: payload.chat.color } : {}),
-          ...(payload.chat.favoriteModels
-            ? { favoriteModels: [...payload.chat.favoriteModels] }
-            : {}),
-          ...(payload.chat.recentModels ? { recentModels: [...payload.chat.recentModels] } : {}),
-          previewText: branchCache.previewText,
-        }
-        await db.chats.put(chat)
-        if (splitMessages.length > 0) {
-          await db.messages.bulkPut(splitMessages.map((row) => row.header))
-          await db.messageBodies.bulkPut(splitMessages.map((row) => row.body))
-        }
-        if (childLists.length > 0) await db.childLists.bulkPut(childLists)
-        await db.chatBranchCache.put(branchCache)
-        await touchWorkspaceMeta(db, now)
-      },
+          const chat: Chat = {
+            id: chatId,
+            title: payload.chat.title,
+            titleStatus: 'untitled',
+            createdAt: now,
+            updatedAt: now,
+            lastViewedAt: now,
+            wordCount: branchCache.wordCount,
+            totalCostUsd,
+            metaVersion: 0,
+            summaryVersion: 0,
+            settings,
+            lastUpdatedLeafId: branchLeafId,
+            lastBranchUpdatedAt: now,
+            archived: false,
+            pinned: false,
+            folderId: folderId ?? null,
+            tags: tagIds,
+            ...(payload.chat.color ? { color: payload.chat.color } : {}),
+            ...(payload.chat.favoriteModels
+              ? { favoriteModels: [...payload.chat.favoriteModels] }
+              : {}),
+            ...(payload.chat.recentModels ? { recentModels: [...payload.chat.recentModels] } : {}),
+            previewText: previewTextFromMessages(messages),
+          }
+          await db.chats.put(chat)
+          await putChatSidebarProjection(tx, chat, true)
+          await storeMessagesInPages(db, messages)
+          await replaceMessageAttachmentReferenceOwnersInPages(tx, messages)
+          if (childLists.length > 0) await db.childLists.bulkPut(childLists)
+          await db.chatBranchCache.put(branchCache)
+          await bumpBrowserWorkspaceMeta(tx, now)
+        },
+      ),
     )
 
     for (const id of createdFolderIds) postEvent({ kind: 'folder-mutated', folderId: id })
@@ -361,10 +420,12 @@ class BrowserImportExportBackend implements WorkspaceImportExportBackend {
       updatedAt: now,
       archived: false,
     }
-    await db.transaction('rw', [db.presets, db.settings], async () => {
-      await db.presets.put(preset)
-      await touchWorkspaceMeta(db, now)
-    })
+    await withNamedLock(`preset:${presetId}`, (grant) =>
+      grant.runTransaction(db, [db.presets, db.settings], async (tx) => {
+        await tx.table('presets').put(preset)
+        await bumpBrowserWorkspaceMeta(tx, now)
+      }),
+    )
     postEvent({ kind: 'preset-mutated', presetId })
     return {
       presetId,
@@ -376,36 +437,33 @@ class BrowserImportExportBackend implements WorkspaceImportExportBackend {
   async exportWorkspaceBackup(): Promise<WorkspaceBackupEnvelope> {
     const db = await openDb()
     const snapshot = await db.transaction('r', db.tables, async () => {
-      const headers = await db.messages.toArray()
-      const bodies = (await db.messageBodies.bulkGet(headers.map((row) => row.id))).filter(
-        (row): row is MessageBodyRow => row !== undefined,
-      )
       return {
-        chats: await db.chats.toArray(),
-        messages: sortMessages(hydrateMessages(headers, bodies)),
-        childLists: await db.childLists.toArray(),
-        chatBranchCache: await db.chatBranchCache.toArray(),
-        attachmentBundles: await storedAttachmentBundles(
-          db,
-          (await db.attachments.toArray()).map((row) => row.id),
+        chats: await readTableInPages(db.chats),
+        messages: sortMessages(await hydrateAllStoredMessagesInPages(db)),
+        childLists: await readTableInPages(db.childLists),
+        chatBranchCache: await readTableInPages(db.chatBranchCache),
+        attachmentBundles: await storedAllAttachmentBundlesInPages(db),
+        profiles: await readTableInPages(db.profiles),
+        presets: await readTableInPages(db.presets),
+        promptPresets: await readTableInPages(db.promptPresets),
+        folders: await readTableInPages(db.folders),
+        tags: await readTableInPages(db.tags),
+        drafts: await readTableInPages(db.drafts),
+        keys: await readTableInPages(db.keys),
+        settings: (await readTableInPages(db.settings)).filter(
+          (row) => !isChatSidebarProjectionSettingKey(row.key),
         ),
-        profiles: await db.profiles.toArray(),
-        presets: await db.presets.toArray(),
-        promptPresets: await db.promptPresets.toArray(),
-        folders: await db.folders.toArray(),
-        tags: await db.tags.toArray(),
-        drafts: await db.drafts.toArray(),
-        keys: await db.keys.toArray(),
-        settings: await db.settings.toArray(),
       }
     })
+
+    const attachments = await consumePortableAttachmentBundles(snapshot.attachmentBundles)
 
     return envelope(db, 'workspace-backup', {
       chats: snapshot.chats,
       messages: snapshot.messages,
       childLists: snapshot.childLists,
       chatBranchCache: snapshot.chatBranchCache,
-      attachments: await portableAttachmentBundles(snapshot.attachmentBundles),
+      attachments,
       profiles: snapshot.profiles,
       presets: snapshot.presets,
       promptPresets: snapshot.promptPresets,
@@ -423,44 +481,85 @@ class BrowserImportExportBackend implements WorkspaceImportExportBackend {
   ): Promise<RestoreWorkspaceBackupResult> {
     const db = await openDb()
     const now = options.now ?? Date.now()
-    validatePortableMessages(envelope.payload.messages)
-    const attachmentBundles = await Promise.all(
-      envelope.payload.attachments.map((bundle) => storedBundleFromPortable(bundle)),
-    )
-    const splitMessages = envelope.payload.messages.map((message) =>
-      splitMessageForStorage(message),
-    )
-    await db.transaction('rw', db.tables, async () => {
-      for (const table of db.tables) await table.clear()
-      if (envelope.payload.folders.length > 0) await db.folders.bulkPut(envelope.payload.folders)
-      if (envelope.payload.tags.length > 0) await db.tags.bulkPut(envelope.payload.tags)
-      if (envelope.payload.profiles.length > 0) await db.profiles.bulkPut(envelope.payload.profiles)
-      if (envelope.payload.presets.length > 0) await db.presets.bulkPut(envelope.payload.presets)
-      if (envelope.payload.promptPresets.length > 0) {
-        await db.promptPresets.bulkPut(envelope.payload.promptPresets)
+    validateWorkspaceBackupGraph(envelope.payload)
+    const validatedBlobTypes = await validatePortableAttachmentBundles(envelope.payload.attachments)
+    const previewTextByChatId = previewTextsByChat(envelope.payload.messages)
+    const workspaceTables = db.tables.filter((table) => table.name !== 'browserLocks')
+    await withNamedLock('db:global', async (grant) => {
+      const runtimeStreamIds = await replacementRuntimeStreamIds()
+      if (runtimeStreamIds.length > 0) {
+        throw new WorkspaceReplacementInProgressError(runtimeStreamIds)
       }
-      if (envelope.payload.keys.length > 0) await db.keys.bulkPut(envelope.payload.keys)
-      if (envelope.payload.settings.length > 0) await db.settings.bulkPut(envelope.payload.settings)
-      if (envelope.payload.chats.length > 0) await db.chats.bulkPut(envelope.payload.chats)
-      if (splitMessages.length > 0) {
-        await db.messages.bulkPut(splitMessages.map((row) => row.header))
-        await db.messageBodies.bulkPut(splitMessages.map((row) => row.body))
-      }
-      if (envelope.payload.childLists.length > 0) {
-        await db.childLists.bulkPut(envelope.payload.childLists)
-      }
-      if (envelope.payload.chatBranchCache.length > 0) {
-        await db.chatBranchCache.bulkPut(envelope.payload.chatBranchCache)
-      }
-      for (const bundle of attachmentBundles) {
-        await db.attachments.put(bundle.attachment)
-        if (bundle.blobs.length > 0) await db.attachmentBlobs.bulkPut(bundle.blobs)
-        if (bundle.artifacts.length > 0) await db.attachmentArtifacts.bulkPut(bundle.artifacts)
-        if (bundle.jobs.length > 0) await db.attachmentJobs.bulkPut(bundle.jobs)
-      }
-      await touchWorkspaceMeta(db, now)
+      await grant.runTransaction(db, workspaceTables, async (tx) => {
+        const beforeRestoreMeta = await readBrowserWorkspaceMetaFromTransaction(tx)
+        const activeStreamIds = new Set<string>()
+        const leases = await tx.table<StreamLeaseRow, string>('streamLeases').toArray()
+        for (const lease of leases) {
+          if (isFreshStreamLease(lease)) activeStreamIds.add(lease.streamId)
+        }
+        await tx.table<MessageHeaderRow, string>('messages').each((message) => {
+          if (
+            message.generation?.status === 'streaming' &&
+            Date.now() - message.generation.startedAt <= STREAM_LEASE_TTL_MS
+          ) {
+            activeStreamIds.add(`streaming-message:${message.id}`)
+          }
+        })
+        for (const streamId of Object.keys(useStreamStore.getState().activeByStreamId)) {
+          activeStreamIds.add(streamId)
+        }
+        if (activeStreamIds.size > 0) {
+          throw new WorkspaceReplacementInProgressError(activeStreamIds)
+        }
+        for (const table of workspaceTables) await tx.table(table.name).clear()
+        await bulkPutInPages(db.folders, envelope.payload.folders)
+        await bulkPutInPages(db.tags, envelope.payload.tags)
+        await bulkPutInPages(db.profiles, envelope.payload.profiles)
+        await bulkPutInPages(db.presets, envelope.payload.presets)
+        await bulkPutInPages(db.promptPresets, envelope.payload.promptPresets)
+        await bulkPutInPages(db.keys, envelope.payload.keys)
+        for (const page of pages(envelope.payload.settings)) {
+          const authoritative = page.filter((row) => !isChatSidebarProjectionSettingKey(row.key))
+          if (authoritative.length > 0) {
+            await db.settings.bulkPut(authoritative)
+            recordTableWrite(authoritative.length)
+          }
+        }
+        for (const page of pages(envelope.payload.chats)) {
+          const restored = page.map((chat) => ({
+            ...chat,
+            previewText: previewTextByChatId.get(chat.id) ?? '',
+          }))
+          await db.chats.bulkPut(restored)
+          await db.chatSidebarRows.bulkPut(restored.map(chatSidebarProjectionRow))
+          recordTableWrite(restored.length)
+          recordTableWrite(restored.length)
+        }
+        await db.settings.bulkPut(chatSidebarProjectionSettings(envelope.payload.chats.length))
+        recordTableWrite(2)
+        for (const bundle of envelope.payload.attachments) {
+          await storePortableAttachmentBundle(db, bundle, validatedBlobTypes)
+        }
+        await storeMessagesInPages(db, envelope.payload.messages)
+        await bulkPutInPages(db.drafts, envelope.payload.drafts)
+        await replaceMessageAttachmentReferenceOwnersInPages(tx, envelope.payload.messages)
+        for (const page of pages(envelope.payload.drafts)) {
+          await replaceAttachmentReferenceOwners(
+            tx,
+            page.map((draft) => ({
+              ownerKind: 'draft' as const,
+              ownerId: draft.chatId,
+              chatId: draft.chatId,
+              refs: draft.attachmentRefs,
+            })),
+          )
+        }
+        await bulkPutInPages(db.childLists, envelope.payload.childLists)
+        await bulkPutInPages(db.chatBranchCache, envelope.payload.chatBranchCache)
+        await markBrowserWorkspaceReplaced(tx, now, beforeRestoreMeta)
+      })
+      postEvent({ kind: 'workspace-replaced' })
     })
-    postEvent({ kind: 'workspace-replaced' })
     return {
       chatCount: envelope.payload.chats.length,
       messageCount: envelope.payload.messages.length,
@@ -471,6 +570,45 @@ class BrowserImportExportBackend implements WorkspaceImportExportBackend {
       keyCount: envelope.payload.keys.length,
     }
   }
+}
+
+async function replacementRuntimeStreamIds(): Promise<string[]> {
+  const ids = new Set<string>()
+  addRuntimeStreamIds(ids)
+  const manager = lockQueryManager()
+  if (!manager) return [...ids]
+  try {
+    const snapshot = await manager.query()
+    for (const lock of [...(snapshot.held ?? []), ...(snapshot.pending ?? [])]) {
+      if (lock.name?.startsWith('stream-owner:')) ids.add(lock.name.slice('stream-owner:'.length))
+    }
+  } catch {
+    ids.add('stream-owner-state-unknown')
+  }
+  addRuntimeStreamIds(ids)
+  return [...ids]
+}
+
+function addRuntimeStreamIds(ids: Set<string>): void {
+  for (const streamId of Object.keys(useStreamStore.getState().activeByStreamId)) ids.add(streamId)
+}
+
+function lockQueryManager():
+  | {
+      query: () => Promise<{ held?: Array<{ name?: string }>; pending?: Array<{ name?: string }> }>
+    }
+  | undefined {
+  if (typeof navigator === 'undefined') return undefined
+  const locks = (navigator as unknown as { locks?: LockManager }).locks as
+    | (LockManager & {
+        query?: () => Promise<{
+          held?: Array<{ name?: string }>
+          pending?: Array<{ name?: string }>
+        }>
+      })
+    | undefined
+  const query = locks?.query
+  return typeof query === 'function' ? { query: () => query.call(locks) } : undefined
 }
 
 let singleton: WorkspaceImportExportBackend | null = null
@@ -666,14 +804,39 @@ async function storedAttachmentBundles(
 ): Promise<StoredAttachmentBundle[]> {
   const bundles: StoredAttachmentBundle[] = []
   for (const id of [...new Set(ids)]) {
-    const attachment = await db.attachments.get(id)
-    if (!attachment) continue
+    const header = await db.attachments.get(id)
+    if (!header) continue
+    const artifacts = await readCollectionInPages(
+      db.attachmentArtifacts.where('attachmentId').equals(id),
+    )
     bundles.push({
-      attachment,
-      blobs: await db.attachmentBlobs.where('attachmentId').equals(id).toArray(),
-      artifacts: await db.attachmentArtifacts.where('attachmentId').equals(id).toArray(),
-      jobs: await db.attachmentJobs.where('attachmentId').equals(id).toArray(),
+      attachment: hydrateAttachment(attachmentHeaderFromStoredRow(header), artifacts),
+      blobs: await readCollectionInPages(db.attachmentBlobs.where('attachmentId').equals(id)),
+      artifacts,
+      jobs: await readCollectionInPages(db.attachmentJobs.where('attachmentId').equals(id)),
     })
+  }
+  return bundles
+}
+
+async function storedAllAttachmentBundlesInPages(db: NatterDb): Promise<StoredAttachmentBundle[]> {
+  const bundles: StoredAttachmentBundle[] = []
+  for await (const attachments of tablePages(db.attachments)) {
+    for (const header of attachments) {
+      const artifacts = await readCollectionInPages(
+        db.attachmentArtifacts.where('attachmentId').equals(header.id),
+      )
+      bundles.push({
+        attachment: hydrateAttachment(attachmentHeaderFromStoredRow(header), artifacts),
+        blobs: await readCollectionInPages(
+          db.attachmentBlobs.where('attachmentId').equals(header.id),
+        ),
+        artifacts,
+        jobs: await readCollectionInPages(
+          db.attachmentJobs.where('attachmentId').equals(header.id),
+        ),
+      })
+    }
   }
   return bundles
 }
@@ -681,17 +844,203 @@ async function storedAttachmentBundles(
 async function portableAttachmentBundles(
   bundles: readonly StoredAttachmentBundle[],
 ): Promise<PortableAttachmentBundle[]> {
-  return Promise.all(
-    bundles.map(async (bundle) => ({
+  const portable: PortableAttachmentBundle[] = []
+  for (const bundle of bundles) {
+    const blobs: PortableAttachmentBlob[] = []
+    for (const blob of bundle.blobs) blobs.push(await portableBlob(blob))
+    portable.push({
       attachment: structuredClone(bundle.attachment),
-      blobs: await Promise.all(bundle.blobs.map(portableBlob)),
+      blobs,
       artifacts: structuredClone(bundle.artifacts),
       jobs: structuredClone(bundle.jobs),
-    })),
+    })
+  }
+  return portable
+}
+
+async function consumePortableAttachmentBundles(
+  bundles: StoredAttachmentBundle[],
+): Promise<PortableAttachmentBundle[]> {
+  const portable: PortableAttachmentBundle[] = []
+  for (const bundle of bundles) {
+    const blobs: PortableAttachmentBlob[] = []
+    for (const blob of bundle.blobs) blobs.push(await portableBlob(blob))
+    portable.push({
+      attachment: bundle.attachment,
+      blobs,
+      artifacts: bundle.artifacts,
+      jobs: bundle.jobs,
+    })
+    bundle.blobs.length = 0
+  }
+  return portable
+}
+
+async function hydrateStoredMessagesInPages(
+  db: NatterDb,
+  messageIds: readonly string[],
+): Promise<Message[]> {
+  const messages: Message[] = []
+  for (const ids of pages(messageIds)) {
+    const headers = (await db.messages.bulkGet(ids)).filter(
+      (row): row is MessageHeaderRow => row !== undefined,
+    )
+    const bodies = (await db.messageBodies.bulkGet(headers.map((row) => row.id))).filter(
+      (row): row is MessageBodyRow => row !== undefined,
+    )
+    recordMessageBodyRead(headers.length)
+    recordTableRead(headers.length)
+    recordTableRead(bodies.length)
+    messages.push(...hydrateMessages(headers, bodies))
+  }
+  return messages
+}
+
+async function hydrateAllStoredMessagesInPages(db: NatterDb): Promise<Message[]> {
+  const messages: Message[] = []
+  for await (const headers of tablePages(db.messages)) {
+    const bodies = (await db.messageBodies.bulkGet(headers.map((row) => row.id))).filter(
+      (row): row is MessageBodyRow => row !== undefined,
+    )
+    recordMessageBodyRead(headers.length)
+    recordTableRead(bodies.length)
+    messages.push(...hydrateMessages(headers, bodies))
+  }
+  return messages
+}
+
+async function storeMessagesInPages(db: NatterDb, messages: readonly Message[]): Promise<void> {
+  for (const page of pages(messages)) {
+    const split = page.map((message) => splitMessageForStorage(message))
+    await db.messages.bulkPut(split.map((row) => row.header))
+    await db.messageBodies.bulkPut(split.map((row) => row.body))
+    recordTableWrite(split.length)
+    recordTableWrite(split.length)
+  }
+}
+
+async function replaceMessageAttachmentReferenceOwnersInPages(
+  tx: Parameters<typeof replaceAttachmentReferenceOwners>[0],
+  messages: readonly Message[],
+): Promise<void> {
+  for (const page of pages(messages)) {
+    await replaceAttachmentReferenceOwners(
+      tx,
+      page.map((message) => ({
+        ownerKind: 'message' as const,
+        ownerId: message.id,
+        chatId: message.chatId,
+        refs: message.attachmentRefs,
+      })),
+    )
+  }
+}
+
+function* pages<T>(rows: readonly T[]): Generator<T[]> {
+  for (let index = 0; index < rows.length; index += IMPORT_EXPORT_PAGE_SIZE) {
+    yield rows.slice(index, index + IMPORT_EXPORT_PAGE_SIZE)
+  }
+}
+
+async function readTableInPages<T>(table: Table<T, string>): Promise<T[]> {
+  const rows: T[] = []
+  for await (const page of tablePages(table)) rows.push(...page)
+  return rows
+}
+
+async function* tablePages<T>(table: Table<T, string>): AsyncGenerator<T[]> {
+  let after: string | undefined
+  for (;;) {
+    const page: T[] = []
+    let lastPrimaryKey: string | undefined
+    const collection = after === undefined ? table.orderBy(':id') : table.where(':id').above(after)
+    await collection.limit(IMPORT_EXPORT_PAGE_SIZE).each((row, cursor) => {
+      if (typeof cursor.primaryKey !== 'string') {
+        throw new Error(`ImportExportPrimaryKeyInvalid:${table.name}`)
+      }
+      page.push(row)
+      lastPrimaryKey = cursor.primaryKey
+    })
+    if (page.length === 0) return
+    recordTableRead(page.length)
+    yield page
+    if (page.length < IMPORT_EXPORT_PAGE_SIZE) return
+    if (lastPrimaryKey === undefined) throw new Error(`ImportExportPrimaryKeyMissing:${table.name}`)
+    after = lastPrimaryKey
+  }
+}
+
+async function readCollectionInPages<T>(collection: Collection<T, string>): Promise<T[]> {
+  const rows: T[] = []
+  let batchRows = 0
+  await collection.clone().each((row) => {
+    rows.push(row)
+    batchRows += 1
+    if (batchRows !== IMPORT_EXPORT_PAGE_SIZE) return
+    recordTableRead(batchRows)
+    batchRows = 0
+  })
+  if (batchRows > 0) recordTableRead(batchRows)
+  return rows
+}
+
+async function bulkPutInPages<T>(table: Table<T, string>, rows: readonly T[]): Promise<void> {
+  for (const page of pages(rows)) {
+    await table.bulkPut(page)
+    recordTableWrite(page.length)
+  }
+}
+
+function emptyMaterializationMetrics(): ImportExportMaterializationMetrics {
+  return {
+    tableReadBatches: 0,
+    tableReadRows: 0,
+    maxTableReadBatchRows: 0,
+    tableWriteBatches: 0,
+    tableWriteRows: 0,
+    maxTableWriteBatchRows: 0,
+    messageBodyReadBatches: 0,
+    maxMessageBodyReadBatchRows: 0,
+    attachmentBlobReadBytes: 0,
+    maxAttachmentBlobReadBytes: 0,
+    attachmentBlobDecodeBytes: 0,
+    maxAttachmentBlobDecodeBytes: 0,
+  }
+}
+
+function recordTableRead(rows: number): void {
+  materializationMetrics.tableReadBatches += 1
+  materializationMetrics.tableReadRows += rows
+  materializationMetrics.maxTableReadBatchRows = Math.max(
+    materializationMetrics.maxTableReadBatchRows,
+    rows,
+  )
+}
+
+function recordTableWrite(rows: number): void {
+  materializationMetrics.tableWriteBatches += 1
+  materializationMetrics.tableWriteRows += rows
+  materializationMetrics.maxTableWriteBatchRows = Math.max(
+    materializationMetrics.maxTableWriteBatchRows,
+    rows,
+  )
+}
+
+function recordMessageBodyRead(rows: number): void {
+  materializationMetrics.messageBodyReadBatches += 1
+  materializationMetrics.maxMessageBodyReadBatchRows = Math.max(
+    materializationMetrics.maxMessageBodyReadBatchRows,
+    rows,
   )
 }
 
 async function portableBlob(blob: AttachmentBlob): Promise<PortableAttachmentBlob> {
+  const bytes = await blobBytes(blob.blob)
+  materializationMetrics.attachmentBlobReadBytes += bytes.byteLength
+  materializationMetrics.maxAttachmentBlobReadBytes = Math.max(
+    materializationMetrics.maxAttachmentBlobReadBytes,
+    bytes.byteLength,
+  )
   return {
     id: blob.id,
     attachmentId: blob.attachmentId,
@@ -699,7 +1048,7 @@ async function portableBlob(blob: AttachmentBlob): Promise<PortableAttachmentBlo
     mime: blob.mime,
     contentHash: blob.contentHash,
     sizeBytes: blob.sizeBytes,
-    dataBase64: bytesToBase64(await blobBytes(blob.blob)),
+    dataBase64: bytesToBase64(bytes),
     createdAt: blob.createdAt,
   }
 }
@@ -719,7 +1068,7 @@ async function prepareImportedAttachments(
       })
       continue
     }
-    const stored = await storedBundleFromPortableWithNewIds(bundle)
+    const stored = await validatedAttachmentBundleFromPortableWithNewIds(bundle)
     prepared.push({
       sourceAttachmentId: bundle.attachment.id,
       targetAttachmentId: stored.attachment.id,
@@ -747,47 +1096,65 @@ async function findExistingAttachment(
     .first()
 }
 
-async function storedBundleFromPortable(
+async function validatePortableAttachmentBundles(
+  bundles: readonly PortableAttachmentBundle[],
+): Promise<ReadonlyMap<PortableAttachmentBlob, string>> {
+  const blobTypes = new Map<PortableAttachmentBlob, string>()
+  for (const bundle of bundles) {
+    for (const blob of bundle.blobs) {
+      blobTypes.set(blob, await validatePortableBlob(blob))
+    }
+    verifyPortableBundleIntegrity(bundle.attachment, bundle.blobs)
+  }
+  return blobTypes
+}
+
+async function validatedAttachmentBundleFromPortableWithNewIds(
   bundle: PortableAttachmentBundle,
-): Promise<StoredAttachmentBundle> {
-  return {
+): Promise<ValidatedAttachmentBundle> {
+  const source = {
     attachment: structuredClone(bundle.attachment),
-    blobs: await Promise.all(bundle.blobs.map(storedBlob)),
+    blobs: bundle.blobs.map((blob) => ({ ...blob })),
     artifacts: structuredClone(bundle.artifacts),
     jobs: structuredClone(bundle.jobs),
   }
-}
-
-async function storedBundleFromPortableWithNewIds(
-  bundle: PortableAttachmentBundle,
-): Promise<StoredAttachmentBundle> {
   const targetAttachmentId = newId()
   const blobIdMap = new Map<string, string>()
   const artifactIdMap = new Map<string, string>()
-  const blobs = await Promise.all(
-    bundle.blobs.map(async (blob) => {
+  const blobs = await validatePortableBlobs(
+    source.blobs.map((blob) => {
       const targetBlobId = newId()
       blobIdMap.set(blob.id, targetBlobId)
-      return storedBlob({ ...blob, id: targetBlobId, attachmentId: targetAttachmentId })
+      return { ...blob, id: targetBlobId, attachmentId: targetAttachmentId }
     }),
   )
-  for (const artifact of bundle.artifacts) artifactIdMap.set(artifact.artifactId, newId())
+  for (const artifact of source.artifacts) artifactIdMap.set(artifact.artifactId, newId())
 
   const attachment: Attachment = rewriteAttachmentForImport(
-    bundle.attachment,
+    source.attachment,
     targetAttachmentId,
     blobIdMap,
     artifactIdMap,
   )
-  const artifacts = bundle.artifacts.map((artifact) =>
+  const artifacts = source.artifacts.map((artifact) =>
     rewriteArtifactForImport(artifact, targetAttachmentId, blobIdMap, artifactIdMap),
   )
-  const jobs = bundle.jobs.map((job) => rewriteJobForImport(job, targetAttachmentId, artifactIdMap))
+  const jobs = source.jobs.map((job) => rewriteJobForImport(job, targetAttachmentId, artifactIdMap))
   verifyPortableBundleIntegrity(attachment, blobs)
   return { attachment, blobs, artifacts, jobs }
 }
 
-async function storedBlob(blob: PortableAttachmentBlob): Promise<AttachmentBlob> {
+async function validatePortableBlobs(
+  blobs: readonly PortableAttachmentBlob[],
+): Promise<ValidatedPortableAttachmentBlob[]> {
+  const validated: ValidatedPortableAttachmentBlob[] = []
+  for (const blob of blobs) {
+    validated.push({ ...blob, blobType: await validatePortableBlob(blob) })
+  }
+  return validated
+}
+
+async function validatePortableBlob(blob: PortableAttachmentBlob): Promise<string> {
   const bytes = base64ToBytes(blob.dataBase64)
   const computedHash = await sha256BytesHex(bytes)
   if (computedHash !== blob.contentHash) {
@@ -796,6 +1163,15 @@ async function storedBlob(blob: PortableAttachmentBlob): Promise<AttachmentBlob>
   if (bytes.byteLength !== blob.sizeBytes) {
     throw new Error(`ImportAttachmentBlobSizeMismatch:${blob.id}`)
   }
+  return (await makeBlob(new Uint8Array(0), blob.mime)).type
+}
+
+function materializeValidatedBlob(blob: ValidatedPortableAttachmentBlob): AttachmentBlob {
+  return materializePortableBlob(blob, blob.blobType)
+}
+
+function materializePortableBlob(blob: PortableAttachmentBlob, blobType: string): AttachmentBlob {
+  const bytes = base64ToBytes(blob.dataBase64)
   return {
     id: blob.id,
     attachmentId: blob.attachmentId,
@@ -803,14 +1179,49 @@ async function storedBlob(blob: PortableAttachmentBlob): Promise<AttachmentBlob>
     mime: blob.mime,
     contentHash: blob.contentHash,
     sizeBytes: blob.sizeBytes,
-    blob: await makeBlob(bytes, blob.mime),
+    blob: makeStoredBlob(bytes, blobType),
     createdAt: blob.createdAt,
   }
 }
 
+async function storeValidatedAttachmentBundle(
+  db: NatterDb,
+  bundle: ValidatedAttachmentBundle,
+): Promise<void> {
+  await db
+    .table<AttachmentHeaderRow, string>('attachments')
+    .put(splitAttachmentForStorage({ ...bundle.attachment, refCount: 0 }))
+  recordTableWrite(1)
+  for (const blob of bundle.blobs) {
+    await db.attachmentBlobs.put(materializeValidatedBlob(blob))
+    recordTableWrite(1)
+  }
+  await bulkPutInPages(db.attachmentArtifacts, bundle.artifacts)
+  await bulkPutInPages(db.attachmentJobs, bundle.jobs)
+}
+
+async function storePortableAttachmentBundle(
+  db: NatterDb,
+  bundle: PortableAttachmentBundle,
+  blobTypes: ReadonlyMap<PortableAttachmentBlob, string>,
+): Promise<void> {
+  await db
+    .table<AttachmentHeaderRow, string>('attachments')
+    .put(splitAttachmentForStorage({ ...bundle.attachment, refCount: 0 }))
+  recordTableWrite(1)
+  for (const blob of bundle.blobs) {
+    const blobType = blobTypes.get(blob)
+    if (blobType === undefined) throw new Error(`ImportAttachmentBlobValidationMissing:${blob.id}`)
+    await db.attachmentBlobs.put(materializePortableBlob(blob, blobType))
+    recordTableWrite(1)
+  }
+  await bulkPutInPages(db.attachmentArtifacts, bundle.artifacts)
+  await bulkPutInPages(db.attachmentJobs, bundle.jobs)
+}
+
 function verifyPortableBundleIntegrity(
   attachment: Attachment,
-  blobs: readonly AttachmentBlob[],
+  blobs: readonly Pick<AttachmentBlob, 'contentHash' | 'id' | 'role'>[],
 ): void {
   if (!attachment.contentHash) return
   const originalBlobId =
@@ -1018,24 +1429,6 @@ function childListsForMessages(
   }))
 }
 
-function validatePortableMessages(messages: readonly Message[]): void {
-  const ids = new Set(messages.map((message) => message.id))
-  if (ids.size !== messages.length) throw new Error('ImportMessageDuplicateId')
-  for (const message of messages) {
-    if (message.parentId !== null && !ids.has(message.parentId)) {
-      throw new Error(`ImportParentMissing:${message.id}`)
-    }
-    const seen = new Set<MessageId>([message.id])
-    let parentId = message.parentId
-    while (parentId !== null) {
-      if (seen.has(parentId)) throw new Error(`ImportParentCycle:${message.id}`)
-      seen.add(parentId)
-      const parent = messages.find((row) => row.id === parentId)
-      parentId = parent?.parentId ?? null
-    }
-  }
-}
-
 function sortMessages(messages: Message[]): Message[] {
   return messages.sort((left, right) => {
     if (left.createdAt !== right.createdAt) return left.createdAt - right.createdAt
@@ -1043,19 +1436,6 @@ function sortMessages(messages: Message[]): Message[] {
     if (left.siblingIndex !== right.siblingIndex) return left.siblingIndex - right.siblingIndex
     return left.id.localeCompare(right.id)
   })
-}
-
-async function touchWorkspaceMeta(db: NatterDb, now: number): Promise<void> {
-  const stored = (await db.settings.get(WORKSPACE_META_KEY))?.value as
-    | { workspaceId?: string; lastMutationAt?: number; mutationCounter?: number }
-    | undefined
-  const next = {
-    workspaceId: stored?.workspaceId ?? WORKSPACE_ID,
-    backendKind: 'browser-idb' as const,
-    lastMutationAt: now,
-    mutationCounter: (stored?.mutationCounter ?? 0) + 1,
-  }
-  await db.settings.put({ key: WORKSPACE_META_KEY, value: next })
 }
 
 function bytesToBase64(bytes: Uint8Array): string {
@@ -1071,6 +1451,11 @@ function base64ToBytes(value: string): Uint8Array {
   const binary = atob(value)
   const bytes = new Uint8Array(binary.length)
   for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i)
+  materializationMetrics.attachmentBlobDecodeBytes += bytes.byteLength
+  materializationMetrics.maxAttachmentBlobDecodeBytes = Math.max(
+    materializationMetrics.maxAttachmentBlobDecodeBytes,
+    bytes.byteLength,
+  )
   return bytes
 }
 
@@ -1103,6 +1488,12 @@ async function makeBlob(bytes: Uint8Array, mime: string): Promise<Blob> {
     const init: ResponseInit = mime ? { headers: { 'content-type': mime } } : {}
     return new Response(blobBuffer, init).blob()
   }
+  return new Blob([blobBuffer], { type: mime })
+}
+
+function makeStoredBlob(bytes: Uint8Array, mime: string): Blob {
+  const blobBuffer = new ArrayBuffer(bytes.byteLength)
+  new Uint8Array(blobBuffer).set(bytes)
   return new Blob([blobBuffer], { type: mime })
 }
 

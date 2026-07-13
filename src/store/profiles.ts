@@ -1,17 +1,15 @@
-// ConnectionProfile CRUD + lifecycle. See `plan/02-data-model.md §2.6` and
-// `plan/09-privacy.md §9.2.A`.
-//
 // Profiles describe an endpoint + creds bundle ("OpenRouter", "OpenAI direct",
 // "Local llama.cpp"). Many ChatPresets can share one profile. Deletion is
 // blocked while non-archived presets or chats reference it; a force path moves
 // dependents into a "connection missing" state on explicit user request.
 
-import type { ConnectionKind, ConnectionProfile, KeyId, ProfileId } from '../core/types'
+import { connectionKindDefaults } from '../core/connection-defaults'
+import type { ConnectionKind, ConnectionProfile, KeyId, PresetId, ProfileId } from '../core/types'
 import { newId } from '../lib/ulid'
+import { runAuthoritativeTransaction } from './authoritative-write'
 import { postEvent } from './broadcast'
 import { getDb } from './db'
-import { clearEndpointsCacheForProfile, clearModelsCacheForProfile } from './models-cache'
-import { clearPrivacyPoliciesForProfile, clearProvidersForProfile } from './privacy-cache'
+import { getWorkspaceRepository } from './workspace-repository'
 
 export class ProfileMissingError extends Error {
   readonly profileId: ProfileId
@@ -24,9 +22,9 @@ export class ProfileMissingError extends Error {
 
 export class ProfileInUseError extends Error {
   readonly profileId: ProfileId
-  readonly presetIds: ProfileId[]
+  readonly presetIds: PresetId[]
   readonly chatIds: string[]
-  constructor(profileId: ProfileId, presetIds: ProfileId[], chatIds: string[]) {
+  constructor(profileId: ProfileId, presetIds: PresetId[], chatIds: string[]) {
     super(`ProfileInUse:${profileId}:presets=${presetIds.length}:chats=${chatIds.length}`)
     this.name = 'ProfileInUseError'
     this.profileId = profileId
@@ -58,43 +56,9 @@ interface CreateProfileInput {
 // Kind-specific defaults for connection capabilities. OpenRouter gets the full
 // feature set; everything else is conservative. Provider transport modes live
 // on ChatSettings, not on the connection profile.
-function kindDefaults(
-  kind: ConnectionKind,
-  _baseUrl: string,
-): {
-  supportsEndpointsApi: boolean
-  supportsGenerationApi: boolean
-  supportsPrivacyScrape: boolean
-} {
-  switch (kind) {
-    case 'openrouter':
-      return {
-        supportsEndpointsApi: true,
-        supportsGenerationApi: true,
-        supportsPrivacyScrape: true,
-      }
-    case 'openai-compatible': {
-      return {
-        supportsEndpointsApi: false,
-        supportsGenerationApi: false,
-        supportsPrivacyScrape: false,
-      }
-    }
-    case 'anthropic':
-    case 'google':
-    case 'llama-server':
-    case 'custom':
-      return {
-        supportsEndpointsApi: false,
-        supportsGenerationApi: false,
-        supportsPrivacyScrape: false,
-      }
-  }
-}
-
 export async function createProfile(input: CreateProfileInput): Promise<ConnectionProfile> {
   const now = input.now ?? Date.now()
-  const defaults = kindDefaults(input.kind, input.baseUrl)
+  const defaults = connectionKindDefaults(input.kind, input.baseUrl)
   const profile: ConnectionProfile = {
     id: input.id ?? newId(),
     name: input.name,
@@ -118,7 +82,17 @@ export async function createProfile(input: CreateProfileInput): Promise<Connecti
   }
   if (input.appCategories?.length) profile.appCategories = [...input.appCategories]
   if (input.debugRequests !== undefined) profile.debugRequests = input.debugRequests
-  await getDb().profiles.put(profile)
+  const db = getDb()
+  await runAuthoritativeTransaction({
+    db,
+    lockNames: [`profile:${profile.id}`],
+    tables: [db.profiles, db.settings],
+    now,
+    write: async (tx) => {
+      await tx.table('profiles').put(profile)
+      return { value: undefined, changed: true }
+    },
+  })
   postEvent({ kind: 'profile-mutated', profileId: profile.id })
   return profile
 }
@@ -158,70 +132,44 @@ export async function updateProfile(
   patch: Partial<Omit<ConnectionProfile, 'id' | 'createdAt'>>,
   opts: { now?: number } = {},
 ): Promise<ConnectionProfile> {
-  const db = getDb()
-  const existing = await db.profiles.get(profileId)
-  if (!existing) throw new ProfileMissingError(profileId)
   const now = opts.now ?? Date.now()
-  const baseUrlChanged = patch.baseUrl !== undefined && patch.baseUrl !== existing.baseUrl
-  const kindChanged = patch.kind !== undefined && patch.kind !== existing.kind
-  const kindOverrides: Partial<ConnectionProfile> = {}
-  if (kindChanged) {
-    const effectiveBaseUrl = patch.baseUrl ?? existing.baseUrl
-    const defaults = kindDefaults(patch.kind as ConnectionKind, effectiveBaseUrl)
-    if (patch.supportsEndpointsApi === undefined) {
-      kindOverrides.supportsEndpointsApi = defaults.supportsEndpointsApi
-    }
-    if (patch.supportsGenerationApi === undefined) {
-      kindOverrides.supportsGenerationApi = defaults.supportsGenerationApi
-    }
-    if (patch.supportsPrivacyScrape === undefined) {
-      kindOverrides.supportsPrivacyScrape = defaults.supportsPrivacyScrape
-    }
-  }
-  const next: ConnectionProfile = {
-    ...existing,
-    ...patch,
-    ...kindOverrides,
-    id: existing.id,
-    createdAt: existing.createdAt,
-    updatedAt: now,
-  }
-  await db.profiles.put(next)
-  if (baseUrlChanged || kindChanged) {
-    await invalidateCachesForProfile(profileId)
-  }
-  postEvent({ kind: 'profile-mutated', profileId })
-  return next
-}
-
-async function invalidateCachesForProfile(profileId: ProfileId): Promise<void> {
-  const db = getDb()
-  await Promise.all([
-    clearModelsCacheForProfile(profileId),
-    clearEndpointsCacheForProfile(profileId),
-    clearPrivacyPoliciesForProfile(profileId),
-    clearProvidersForProfile(profileId),
-    db.presetResolutions.where('profileId').equals(profileId).delete(),
-  ])
+  const result = await getWorkspaceRepository().updateProfileAndInvalidateCaches({
+    profileId,
+    patch,
+    now,
+  })
+  if (result.kind === 'missing') throw new ProfileMissingError(profileId)
+  return result.profile
 }
 
 export async function duplicateProfile(
   sourceId: ProfileId,
   opts: { name?: string; now?: number } = {},
 ): Promise<ConnectionProfile> {
-  const source = await getProfile(sourceId)
-  if (!source) throw new ProfileMissingError(sourceId)
   const now = opts.now ?? Date.now()
-  const copy: ConnectionProfile = {
-    ...source,
-    id: newId(),
-    name: opts.name ?? `${source.name} (copy)`,
-    createdAt: now,
-    updatedAt: now,
-  }
-  delete copy.lastUsedAt
-  copy.archived = false
-  await getDb().profiles.put(copy)
+  const copyId = newId()
+  const db = getDb()
+  const { value: copy } = await runAuthoritativeTransaction({
+    db,
+    lockNames: [`profile:${sourceId}`, `profile:${copyId}`],
+    tables: [db.profiles, db.settings],
+    now,
+    write: async (tx) => {
+      const source = await tx.table<ConnectionProfile, ProfileId>('profiles').get(sourceId)
+      if (!source) throw new ProfileMissingError(sourceId)
+      const next: ConnectionProfile = {
+        ...source,
+        id: copyId,
+        name: opts.name ?? `${source.name} (copy)`,
+        createdAt: now,
+        updatedAt: now,
+        archived: false,
+      }
+      delete next.lastUsedAt
+      await tx.table('profiles').put(next)
+      return { value: next, changed: true }
+    },
+  })
   postEvent({ kind: 'profile-mutated', profileId: copy.id })
   return copy
 }
@@ -236,9 +184,19 @@ export async function unarchiveProfile(profileId: ProfileId, now = Date.now()): 
 
 export async function bumpProfileLastUsedAt(profileId: ProfileId, now = Date.now()): Promise<void> {
   const db = getDb()
-  const existing = await db.profiles.get(profileId)
-  if (!existing) return
-  await db.profiles.put({ ...existing, lastUsedAt: now })
+  await runAuthoritativeTransaction({
+    db,
+    lockNames: [`profile:${profileId}`],
+    tables: [db.profiles, db.settings],
+    now,
+    write: async (tx) => {
+      const table = tx.table<ConnectionProfile, ProfileId>('profiles')
+      const existing = await table.get(profileId)
+      if (!existing) return { value: undefined, changed: false }
+      await table.put({ ...existing, lastUsedAt: now })
+      return { value: undefined, changed: true }
+    },
+  })
 }
 
 // Returns the non-archived presets and non-archived chats that reference this
@@ -246,7 +204,7 @@ export async function bumpProfileLastUsedAt(profileId: ProfileId, now = Date.now
 // "Move N presets and M chats to a replacement."
 export async function profileDependents(
   profileId: ProfileId,
-): Promise<{ presetIds: ProfileId[]; chatIds: string[] }> {
+): Promise<{ presetIds: PresetId[]; chatIds: string[] }> {
   const db = getDb()
   const presets = await db.presets.where('connectionProfileId').equals(profileId).toArray()
   const chats = await db.chats.toArray()
@@ -275,55 +233,17 @@ export async function deleteProfile(
   profileId: ProfileId,
   opts: DeleteProfileOptions = {},
 ): Promise<void> {
-  const db = getDb()
-  const existing = await db.profiles.get(profileId)
-  if (!existing) throw new ProfileMissingError(profileId)
-  const deps = await profileDependents(profileId)
-  if (opts.reassignTo !== undefined) {
-    const target = await db.profiles.get(opts.reassignTo)
-    if (!target) throw new ProfileMissingError(opts.reassignTo)
-    const now = opts.now ?? Date.now()
-    await reassignDependents(profileId, opts.reassignTo, now)
-  } else if (!opts.force) {
-    if (deps.presetIds.length > 0 || deps.chatIds.length > 0) {
-      throw new ProfileInUseError(profileId, deps.presetIds, deps.chatIds)
-    }
+  const result = await getWorkspaceRepository().deleteProfileAndReassign({
+    profileId,
+    ...(opts.force === undefined ? {} : { force: opts.force }),
+    ...(opts.reassignTo === undefined ? {} : { reassignTo: opts.reassignTo }),
+    now: opts.now ?? Date.now(),
+  })
+  if (result.kind === 'missing-profile' || result.kind === 'missing-target') {
+    throw new ProfileMissingError(result.profileId)
   }
-  await db.profiles.delete(profileId)
-  await invalidateCachesForProfile(profileId)
-  // Drop the primary KeyRecord iff no other profile still references it.
-  const otherRefs = await db.profiles.filter((p) => p.apiKeyRef === existing.apiKeyRef).count()
-  if (otherRefs === 0) await db.keys.delete(existing.apiKeyRef)
-  postEvent({ kind: 'profile-deleted', profileId })
-}
-
-async function reassignDependents(from: ProfileId, to: ProfileId, now: number): Promise<void> {
-  const db = getDb()
-  const presets = await db.presets.where('connectionProfileId').equals(from).toArray()
-  for (const preset of presets) {
-    await db.presets.put({
-      ...preset,
-      connectionProfileId: to,
-      settings: { ...preset.settings, profileId: to },
-      updatedAt: now,
-    })
-    postEvent({ kind: 'preset-mutated', presetId: preset.id })
-  }
-  const chats = await db.chats.toArray()
-  for (const chat of chats) {
-    if (chat.settings.profileId !== from) continue
-    await db.chats.put({
-      ...chat,
-      settings: { ...chat.settings, profileId: to },
-      updatedAt: now,
-    })
-    postEvent({
-      kind: 'chat-mutated',
-      chatId: chat.id,
-      metaVersion: chat.metaVersion,
-      summaryVersion: chat.summaryVersion,
-      affected: [{ kind: 'chat-meta', chatId: chat.id }],
-    })
+  if (result.kind === 'in-use') {
+    throw new ProfileInUseError(profileId, result.presetIds, result.chatIds)
   }
 }
 

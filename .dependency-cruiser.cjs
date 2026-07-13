@@ -8,15 +8,25 @@ module.exports = {
     },
     {
       name: 'no-circular',
-      severity: 'warn',
+      severity: 'error',
       from: {},
       to: { circular: true },
     },
     {
-      name: 'ui-must-not-import-db-directly',
+      name: 'presentation-must-use-workspace-boundary',
       severity: 'error',
-      from: { path: '^src/ui/' },
-      to: { path: '^src/store/db\\.ts$' },
+      from: { path: '^src/(ui|hooks)/' },
+      to: {
+        path: '^src/store/(browser-(repo|import-export|domain-mutations|lock-record)|db)\\.ts$',
+      },
+    },
+    {
+      name: 'backcompat-must-not-import-runtime-db',
+      severity: 'error',
+      from: { path: '^src/backcompat/' },
+      to: {
+        path: '^src/store/(browser-(repo|import-export|domain-mutations)|db|workspace-repository)\\.ts$',
+      },
     },
     {
       name: 'core-must-not-import-ui',

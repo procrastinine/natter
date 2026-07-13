@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import 'fake-indexeddb/auto'
 import Dexie from 'dexie'
 import { IDBFactory } from 'fake-indexeddb'
@@ -10,6 +10,7 @@ import { __resetKeyCacheForTests, createKey, getKey } from '../../src/store/keys
 import { listPresets } from '../../src/store/presets'
 import * as profileStore from '../../src/store/profiles'
 import { createProfile, getProfile, listProfiles } from '../../src/store/profiles'
+import { __setRepositoryMutationSubscriberForTests } from '../../src/store/reactive-query'
 import {
   ConnectionHeader,
   readActiveProfileId,
@@ -72,6 +73,7 @@ afterEach(async () => {
   // those are still resolving makes vitest flag a `DatabaseClosedError`
   // unhandled rejection. Cleanup first cancels the subscriptions.
   cleanup()
+  __setRepositoryMutationSubscriberForTests(undefined)
   vi.restoreAllMocks()
   await new Promise((resolve) => setTimeout(resolve, 10))
   await resetAll()
@@ -89,6 +91,7 @@ describe('ConnectionHeader', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
     await waitFor(async () => {
       expect(await listProfiles()).toHaveLength(1)
+      expect(await listPresets()).toHaveLength(1)
     })
     await waitFor(() => {
       expect(screen.queryByRole('dialog', { name: 'Add connection' })).not.toBeInTheDocument()
@@ -243,9 +246,7 @@ describe('ConnectionHeader', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Edit' }))
     fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'OpenRouter copy' } })
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
-    await waitFor(() => {
-      expect(screen.getByText('OpenRouter copy')).toBeTruthy()
-    })
+    await screen.findByRole('button', { name: connectionButtonMatcher('OpenRouter copy') })
     const profiles = await listProfiles()
     const copy = profiles.find((row) => row.name === 'OpenRouter copy')
     expect(profiles).toHaveLength(2)
@@ -267,6 +268,46 @@ describe('ConnectionHeader', () => {
     expect(readActiveProfileId()).toBe(b.id)
     rerender(<ConnectionHeader variant="title-icon" activeChatProfileId={null} />)
     await screen.findByRole('button', { name: connectionButtonMatcher('OpenRouter B') })
+  })
+
+  it('does not keep a cached profile visible after a later live deletion', async () => {
+    const profile = await seedProfile()
+    writeActiveProfileId(profile.id)
+    render(<ConnectionHeader variant="title-icon" />)
+    await screen.findByRole('button', { name: connectionButtonMatcher('OpenRouter') })
+
+    await profileStore.deleteProfile(profile.id, { force: true })
+
+    await waitFor(() => {
+      expect(
+        screen.queryByRole('button', { name: connectionButtonMatcher('OpenRouter') }),
+      ).toBeNull()
+    })
+  })
+
+  it('keeps a saved profile through rerenders until its live query catches up', async () => {
+    const pendingPublications: Array<() => void> = []
+    __setRepositoryMutationSubscriberForTests(undefined, 'natter', undefined, (task) =>
+      pendingPublications.push(task),
+    )
+    const view = render(<ConnectionHeader />)
+    await waitFor(() => {
+      expect(pendingPublications.length).toBeGreaterThan(0)
+    })
+    act(() => {
+      for (const publish of pendingPublications.splice(0)) publish()
+    })
+    fireEvent.click(await screen.findByText('Add connection'))
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Local llama' } })
+    fireEvent.change(screen.getByLabelText('Provider'), { target: { value: 'llama-server' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog', { name: 'Add connection' })).not.toBeInTheDocument()
+    })
+
+    view.rerender(<ConnectionHeader variant="mobile-menu" />)
+
+    expect(screen.getByRole('region', { name: 'Connection: Local llama' })).toBeTruthy()
   })
 
   it('keeps the previous header state visible while the next profile load is still resolving', async () => {

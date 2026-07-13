@@ -1,4 +1,3 @@
-import { useLiveQuery } from 'dexie-react-hooks'
 import { type ReactNode, useEffect, useMemo, useState } from 'react'
 import type { LlamaServerProps } from '../../api/probe'
 import { textCompletionsNeedsReasoningOffFor } from '../../core/quirks'
@@ -9,6 +8,7 @@ import {
   EMPTY_TEXT_TEMPLATE,
   editableTextTemplateConfig,
   readSavedTextTemplates,
+  SAVED_TEXT_TEMPLATES_KEY,
   type SavedTextTemplate,
   TEXT_TEMPLATES,
   templateSourceForConfig,
@@ -16,6 +16,8 @@ import {
 } from '../../core/text-templates'
 import type { Chat, TextTemplateConfig, TextTemplateId } from '../../core/types'
 import { updateChatSettings } from '../../store/chats'
+import { primaryKeys } from '../../store/reactive-dependencies'
+import { useRepositoryQuery } from '../../store/reactive-query'
 import { InfoDisclosure } from './InfoDisclosure'
 
 interface TextTemplateSectionProps {
@@ -33,7 +35,12 @@ export function TextTemplateSection({
   heading = 'Text completions template',
   requestStopControl = null,
 }: TextTemplateSectionProps) {
-  const saved = useLiveQuery(() => readSavedTextTemplates(), [], [] as SavedTextTemplate[]) ?? []
+  const saved = useRepositoryQuery(
+    'saved-text-templates',
+    () => readSavedTextTemplates(),
+    [] as SavedTextTemplate[],
+    primaryKeys('settings', SAVED_TEXT_TEMPLATES_KEY),
+  )
   const allowServerDefault = mode === 'llama-server'
   const selectedRaw = chat.settings.textTemplate ?? 'chatml'
   const selected = !allowServerDefault && selectedRaw === 'default' ? 'chatml' : selectedRaw

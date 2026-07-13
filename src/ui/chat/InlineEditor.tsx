@@ -53,6 +53,8 @@ interface InlineEditorProps {
   initialReasoning?: ReasoningDetail[]
   initialProviderOutputItems?: ProviderOutputItem[]
   initialAttachmentRefs?: readonly AttachmentRef[] | undefined
+  attachmentsEnabled?: boolean
+  saveContentOnly?: boolean
   // Prefill toggle for Save & Send. Only applied to user messages
   // (assistants don't have a "send" path). Hidden when the model doesn't
   // support prefill. Empty / whitespace-only prefill text is treated as
@@ -77,9 +79,11 @@ export function writeTextInto(prev: readonly ContentItem[], nextText: string): C
   let replaced = false
   const out: ContentItem[] = []
   for (const item of prev) {
-    if (!replaced && (item.type === 'text' || item.type === 'output_text')) {
-      out.push({ ...item, text: nextText })
-      replaced = true
+    if (item.type === 'text' || item.type === 'output_text') {
+      if (!replaced) {
+        out.push({ ...item, text: nextText })
+        replaced = true
+      }
       continue
     }
     out.push(item)
@@ -164,7 +168,7 @@ function toEditable(list: ReasoningDetail[]): EditableReasoning[] {
       index: detail.index ?? i,
       hidden,
       original: detail,
-      bytes: new Blob([detail.data ?? '']).size,
+      bytes: new Blob([detail.data]).size,
     }
   })
 }
@@ -299,6 +303,8 @@ export function InlineEditor({
   initialReasoning,
   initialProviderOutputItems,
   initialAttachmentRefs,
+  attachmentsEnabled = true,
+  saveContentOnly = false,
   showPrefillButton,
   defaultPrefill,
   prefillSettingsPrompt,
@@ -313,7 +319,7 @@ export function InlineEditor({
   const [toolCalls, setToolCalls] = useState<EditableToolCall[]>(() =>
     toEditableToolCalls(initialProviderOutputItems ?? []),
   )
-  const attachments = useAttachmentDrafts(initialAttachmentRefs)
+  const attachments = useAttachmentDrafts(attachmentsEnabled ? initialAttachmentRefs : undefined)
   const {
     initialAttachmentRefs: startingAttachmentRefs,
     attachmentRefs,
@@ -368,7 +374,6 @@ export function InlineEditor({
       // Messages may legitimately be empty (placeholder turn, deliberate
       // blank). The only place empty is blocked is the composer prompt
       // input, where "send empty" has no well-defined meaning.
-      const trimmed = text.trim()
       if (busy || uploadingAttachments) return
       setBusy(true)
       try {
@@ -376,7 +381,7 @@ export function InlineEditor({
         const nextToolCalls = initialProviderOutputItems
           ? fromEditableToolCalls(toolCalls)
           : undefined
-        await action(trimmed, nextReasoning, attachmentRefs, nextToolCalls)
+        await action(text, nextReasoning, attachmentRefs, nextToolCalls)
       } finally {
         setBusy(false)
       }
@@ -408,6 +413,7 @@ export function InlineEditor({
   // the user may want to re-send even when the text is unchanged.
   const isUnchanged = useCallback(() => {
     if (text !== initial) return false
+    if (saveContentOnly) return true
     if (JSON.stringify(startingAttachmentRefs) !== JSON.stringify(attachmentRefs)) return false
     if (!initialReasoning) return true
     const nextReasoning = fromEditable(reasoning)
@@ -418,6 +424,7 @@ export function InlineEditor({
   }, [
     text,
     initial,
+    saveContentOnly,
     initialReasoning,
     reasoning,
     startingAttachmentRefs,
@@ -622,7 +629,7 @@ export function InlineEditor({
           </button>
         </details>
       ) : null}
-      {attachmentRefs.length > 0 || uploads.length > 0 ? (
+      {attachmentsEnabled && (attachmentRefs.length > 0 || uploads.length > 0) ? (
         <AttachmentDraftTray
           refs={attachmentRefs}
           attachments={attachmentRows}
@@ -635,45 +642,49 @@ export function InlineEditor({
         />
       ) : null}
       <div data-ui="inline-editor-actions" ref={actionsRef}>
-        <input
-          data-ui="attachment-hidden-input"
-          type="file"
-          multiple
-          onChange={(event) => {
-            const files = Array.from(event.currentTarget.files ?? [])
-            event.currentTarget.value = ''
-            if (files.length === 0) return
-            void ingestFiles(files)
-          }}
-        />
-        <button
-          type="button"
-          data-ui="inline-editor-button"
-          data-role="attach"
-          onClick={() =>
-            (
-              actionsRef.current?.querySelector(
-                '[data-ui="attachment-hidden-input"]',
-              ) as HTMLInputElement | null
-            )?.click()
-          }
-          disabled={busy || uploadingAttachments}
-          aria-label="Upload attachment"
-          title="Upload attachment"
-        >
-          <PaperclipIcon size={14} />
-        </button>
-        <button
-          type="button"
-          data-ui="inline-editor-button"
-          data-role="attach-existing"
-          onClick={() => setPickerOpen(true)}
-          disabled={busy}
-          aria-label="Use existing stored attachment"
-          title="Use existing stored attachment"
-        >
-          <DatabaseIcon size={14} />
-        </button>
+        {attachmentsEnabled ? (
+          <>
+            <input
+              data-ui="attachment-hidden-input"
+              type="file"
+              multiple
+              onChange={(event) => {
+                const files = Array.from(event.currentTarget.files ?? [])
+                event.currentTarget.value = ''
+                if (files.length === 0) return
+                void ingestFiles(files)
+              }}
+            />
+            <button
+              type="button"
+              data-ui="inline-editor-button"
+              data-role="attach"
+              onClick={() =>
+                (
+                  actionsRef.current?.querySelector(
+                    '[data-ui="attachment-hidden-input"]',
+                  ) as HTMLInputElement | null
+                )?.click()
+              }
+              disabled={busy || uploadingAttachments}
+              aria-label="Upload attachment"
+              title="Upload attachment"
+            >
+              <PaperclipIcon size={14} />
+            </button>
+            <button
+              type="button"
+              data-ui="inline-editor-button"
+              data-role="attach-existing"
+              onClick={() => setPickerOpen(true)}
+              disabled={busy}
+              aria-label="Use existing stored attachment"
+              title="Use existing stored attachment"
+            >
+              <DatabaseIcon size={14} />
+            </button>
+          </>
+        ) : null}
         <button
           type="button"
           data-ui="inline-editor-button"
@@ -732,7 +743,7 @@ export function InlineEditor({
           </button>
         ) : null}
       </div>
-      {pickerOpen ? (
+      {attachmentsEnabled && pickerOpen ? (
         <AttachmentPicker
           title="Use stored attachment"
           onClose={() => setPickerOpen(false)}

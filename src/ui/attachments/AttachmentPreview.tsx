@@ -1,8 +1,9 @@
-import { useLiveQuery } from 'dexie-react-hooks'
 import { useEffect, useMemo, useState } from 'react'
 import type { Attachment, AttachmentBlob } from '../../core/types'
-import { getBrowserRepository } from '../../store/browser-repo'
+import { attachmentBundleDependencies } from '../../store/reactive-dependencies'
+import { useRepositoryQuery } from '../../store/reactive-query'
 import type { AttachmentBundle } from '../../store/repository'
+import { getWorkspaceRepository } from '../../store/workspace-repository'
 import { FileIcon } from '../icons/Icon'
 
 type AttachmentPreviewVariant = 'chip' | 'card' | 'panel'
@@ -17,13 +18,14 @@ export function AttachmentPreview({
   variant?: AttachmentPreviewVariant
 }) {
   const needsBundle = Boolean(attachment && !bundle && canPreviewFromBundle(attachment))
-  const liveBundle = useLiveQuery(
+  const liveBundle = useRepositoryQuery(
+    JSON.stringify(['attachment-bundle', needsBundle ? attachment?.id : null]),
     async () => {
       if (!attachment || !needsBundle) return undefined
-      return getBrowserRepository().getAttachmentBundle(attachment.id)
+      return getWorkspaceRepository().getAttachmentBundle(attachment.id)
     },
-    [attachment?.id, needsBundle],
     undefined,
+    attachmentBundleDependencies(needsBundle ? attachment?.id : null),
   )
   const resolvedBundle = bundle ?? liveBundle
   const blob = useMemo(
@@ -37,13 +39,14 @@ export function AttachmentPreview({
       setObjectUrl(undefined)
       return
     }
-    if (!(blob.blob instanceof Blob) || typeof URL.createObjectURL !== 'function') {
+    const objectUrlApi: Partial<Pick<typeof URL, 'createObjectURL' | 'revokeObjectURL'>> = URL
+    if (!(blob.blob instanceof Blob) || typeof objectUrlApi.createObjectURL !== 'function') {
       setObjectUrl(undefined)
       return
     }
-    const url = URL.createObjectURL(blob.blob)
+    const url = objectUrlApi.createObjectURL(blob.blob)
     setObjectUrl(url)
-    return () => URL.revokeObjectURL?.(url)
+    return () => objectUrlApi.revokeObjectURL?.(url)
   }, [blob])
 
   const src = objectUrl ?? remotePreviewUrl(attachment)

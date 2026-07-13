@@ -61,6 +61,16 @@ describe('toChatCompletions', () => {
     expect(wire.reasoning).toEqual({ enabled: false })
   })
 
+  it('preserves forward sampling keys from portable imports', () => {
+    const imported = settings()
+    Object.assign(imported.sampling, { future_sampler: 0.25 })
+
+    const { wire } = toChatCompletions(imported, [])
+
+    expect(wire.future_sampler).toBe(0.25)
+    expect(wire.undefined).toBeUndefined()
+  })
+
   it('appends prepared attachment parts to the owning message content', () => {
     const path = [textMessage({ id: 'u1', role: 'user', text: 'describe this' })]
     const { wire } = toChatCompletions(settings(), path, {

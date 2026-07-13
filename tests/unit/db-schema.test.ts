@@ -1,11 +1,30 @@
 import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import {
+  AttachmentReferenceEdgeMigrationError,
+  rebuildAttachmentReferenceEdges,
+} from '../../src/backcompat/attachment-reference-edges'
+import { forEachTableBatch } from '../../src/backcompat/batched-table'
 import { assertNoInlineMessageBodies } from '../../src/backcompat/message-body-split'
 import { migrateProviderOutputItemRows } from '../../src/backcompat/provider-output-items'
 import { canonicalizeTokenCalibrationRows } from '../../src/backcompat/token-calibration-global'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import { tokenCalibrationKey } from '../../src/core/model-ids'
-import type { Chat, GlobalTokenCalibration, Message } from '../../src/core/types'
+import type {
+  Attachment,
+  AttachmentArtifact,
+  AttachmentReferenceEdge,
+  Chat,
+  GlobalTokenCalibration,
+  Message,
+  MessageAttachmentRef,
+} from '../../src/core/types'
+import {
+  attachmentHeaderFromStoredRow,
+  hydrateAttachment,
+} from '../../src/store/attachment-storage'
+import { BROWSER_WRITER_LOCK_NAME, type BrowserLockRow } from '../../src/store/browser-lock-record'
+import { putChatSidebarProjection } from '../../src/store/chat-sidebar-projection'
 import type { NatterDb } from '../../src/store/db'
 import {
   __resetDbForTests,
@@ -14,7 +33,8 @@ import {
   openDb,
   registerSchema,
 } from '../../src/store/db'
-import { splitMessageForStorage } from '../../src/store/message-storage'
+import { hydrateMessage, splitMessageForStorage } from '../../src/store/message-storage'
+import type { StreamLeaseRow } from '../../src/store/repository'
 
 // Unique DB name per test so migrations start from a clean slate. Pre-existing
 // data is deleted at the top of each test so repeated runs don't pick up stale
@@ -36,14 +56,18 @@ describe('Dexie schema', () => {
   it('opens on a fresh IndexedDB with all declared tables', async () => {
     const db = await openDb()
     expect(db.isOpen()).toBe(true)
+    expect(db.verno).toBe(23)
     const names = db.tables.map((t) => t.name).sort()
     expect(names).toEqual(
       [
         'attachmentArtifacts',
         'attachmentBlobs',
         'attachmentJobs',
+        'attachmentRefEdges',
         'attachments',
+        'browserLocks',
         'chatBranchCache',
+        'chatSidebarRows',
         'chats',
         'childLists',
         'drafts',
@@ -66,6 +90,293 @@ describe('Dexie schema', () => {
         'tags',
       ].sort(),
     )
+    expect(db.attachmentRefEdges.schema.primKey.src).toBe('[ownerKind+ownerId+refId]')
+    expect(db.attachmentRefEdges.schema.indexes.map((index) => index.src)).toEqual([
+      'attachmentId',
+      '[attachmentId+ownerKind]',
+      '[ownerKind+ownerId]',
+      'chatId',
+    ])
+    expect(db.streamLeases.schema.indexes.map((index) => index.src)).toContain('messageId')
+    expect(await db.attachmentRefEdges.count()).toBe(0)
+    expect(await db.chatSidebarRows.count()).toBe(0)
+    expect((await db.settings.get('backfill:attachment-refs-v1'))?.value).toBe(1)
+    expect((await db.settings.get('backfill:chat-preview-projection-v1'))?.value).toBe(1)
+    expect((await db.settings.get('backfill:chat-sidebar-projection-v1'))?.value).toBe(1)
+    expect((await db.settings.get('projection:chat-sidebar-v1'))?.value).toEqual({
+      projectionVersion: 1,
+      expectedCount: 0,
+    })
+    expect(await db.browserLocks.get(BROWSER_WRITER_LOCK_NAME)).toEqual({
+      name: BROWSER_WRITER_LOCK_NAME,
+      ownerClientId: null,
+      leaseId: null,
+      fencingToken: 0,
+      acquiredAt: 0,
+      heartbeatAt: 0,
+      expiresAt: 0,
+    })
+  })
+
+  it('runs the composed v23 message and attachment projection migration exactly once', async () => {
+    const name = `natter-test-projections-v23-${Math.random().toString(36).slice(2)}`
+    await Dexie.delete(name)
+    const legacy = new Dexie(name)
+    legacy.version(22).stores({
+      messages:
+        'id, chatId, parentId, turnId, [chatId+parentId], [chatId+createdAt], [chatId+turnId], [chatId+deleted]',
+      messageBodies: '&id, chatId, updatedAt, nodeVersion',
+      attachments: 'id, contentHash, kind, mime, origin, refCount, createdAt, updatedAt, deletedAt',
+      attachmentArtifacts: 'artifactId, attachmentId, kind, processorId, createdAt',
+    })
+    await legacy.open()
+    const message: Message = {
+      id: 'projection-message',
+      chatId: 'projection-chat',
+      parentId: null,
+      siblingIndex: 0,
+      turnId: 'projection-turn',
+      turnIndex: 0,
+      createdAt: 1,
+      role: 'assistant',
+      origin: 'generated',
+      generation: {
+        id: 'projection-generation',
+        model: 'model',
+        requestedModel: 'model',
+        apiUsed: 'responses',
+        delivery: 'streaming',
+        costSource: 'stream',
+        startedAt: 1,
+        serverTools: [
+          {
+            type: 'web_search_call',
+            source: 'responses-output',
+            output: { text: 'large tool output' },
+          },
+        ],
+      },
+      content: [{ type: 'output_text', text: `  ${'preview '.repeat(1_000)}  ` }],
+      nodeVersion: 0,
+      deleted: false,
+    }
+    const split = splitMessageForStorage(message)
+    const legacyHeader = structuredClone(split.header) as Record<string, unknown>
+    delete legacyHeader.textPreview
+    legacyHeader.generation = structuredClone(message.generation)
+    const legacyBody = structuredClone(split.body)
+    delete legacyBody.generationServerToolOutputs
+    await legacy.table('messages').put(legacyHeader)
+    await legacy.table('messageBodies').put(legacyBody)
+
+    const artifact: AttachmentArtifact = {
+      kind: 'text',
+      artifactId: 'projection-artifact',
+      attachmentId: 'projection-attachment',
+      processorId: 'text-v1',
+      text: 'x'.repeat(100_000),
+      charCount: 100_000,
+      createdAt: 1,
+    }
+    const attachment: Attachment = {
+      id: 'projection-attachment',
+      kind: 'document',
+      mime: 'text/plain',
+      filename: 'projection.txt',
+      origin: 'import',
+      createdAt: 1,
+      updatedAt: 1,
+      storage: { kind: 'missing', reason: 'import-missing', missingSince: 1 },
+      artifacts: [artifact],
+      processing: [],
+      refCount: 0,
+    }
+    await legacy.table('attachments').put(attachment)
+    legacy.close()
+
+    const migrated = createDbForTests(name)
+    await migrated.open()
+    expect(migrated.verno).toBe(23)
+    const [header, body, storedAttachment, storedArtifact] = await Promise.all([
+      migrated.messages.get(message.id),
+      migrated.messageBodies.get(message.id),
+      migrated.attachments.get(attachment.id),
+      migrated.attachmentArtifacts.get(artifact.artifactId),
+    ])
+    expect(header?.textPreview).toHaveLength(4_096)
+    expect(header?.generation?.serverTools?.[0]).not.toHaveProperty('output')
+    expect(body?.generationServerToolOutputs).toEqual([
+      { index: 0, output: { text: 'large tool output' } },
+    ])
+    expect(header && body ? hydrateMessage(header, body) : undefined).toEqual(message)
+    expect(storedAttachment).not.toHaveProperty('artifacts')
+    expect(storedAttachment).toHaveProperty('artifactIds', [artifact.artifactId])
+    expect(storedArtifact).toEqual(artifact)
+    expect(
+      storedAttachment
+        ? hydrateAttachment(attachmentHeaderFromStoredRow(storedAttachment), [storedArtifact])
+        : undefined,
+    ).toEqual(attachment)
+    migrated.close()
+
+    const reopened = createDbForTests(name)
+    await reopened.open()
+    expect(reopened.verno).toBe(23)
+    expect(
+      (await reopened.messageBodies.get(message.id))?.generationServerToolOutputs,
+    ).toHaveLength(1)
+    expect(await reopened.attachmentArtifacts.count()).toBe(1)
+    await reopened.delete()
+  })
+
+  it('cursor-pages large tables in deterministic bounded batches', async () => {
+    const name = `natter-test-backcompat-batches-${Math.random().toString(36).slice(2)}`
+    await Dexie.delete(name)
+    const db = new Dexie(name)
+    db.version(1).stores({ rows: '&id' })
+    await db.open()
+    const table = db.table<{ id: string; visited: boolean }, string>('rows')
+    await table.bulkPut(
+      Array.from({ length: 1001 }, (_, index) => ({
+        id: `row-${index.toString().padStart(4, '0')}`,
+        visited: false,
+      })),
+    )
+    const visited: string[] = []
+    const observedBatchSizes: number[] = []
+    const stats = await db.transaction('rw', table, async () =>
+      forEachTableBatch(
+        table,
+        async (rows) => {
+          observedBatchSizes.push(rows.length)
+          visited.push(...rows.map((row) => row.id))
+          await table.bulkPut(rows.map((row) => ({ ...row, visited: true })))
+        },
+        64,
+      ),
+    )
+
+    expect(stats).toEqual({ rowCount: 1001, batchCount: 16, maxBatchSize: 64 })
+    expect(Math.max(...observedBatchSizes)).toBe(64)
+    expect(visited).toEqual(
+      Array.from({ length: 1001 }, (_, index) => `row-${index.toString().padStart(4, '0')}`),
+    )
+    expect(await table.filter((row) => !row.visited).count()).toBe(0)
+    await db.delete()
+  })
+
+  it('adds the browser-writer fence once on v21 to v22 and never resets its token', async () => {
+    const name = `natter-test-browser-lock-v22-${Math.random().toString(36).slice(2)}`
+    await Dexie.delete(name)
+    const legacy = new Dexie(name)
+    legacy.version(21).stores({
+      settings: '&key',
+      messages: 'id, chatId',
+      messageBodies: '&id, chatId',
+      streamChunks: '&id, streamId, chatId, messageId, [streamId+seq], createdAt',
+    })
+    await legacy.open()
+    legacy.close()
+
+    const migrated = createDbForTests(name)
+    await migrated.open()
+    expect(migrated.verno).toBe(23)
+    const seeded = await migrated.browserLocks.get(BROWSER_WRITER_LOCK_NAME)
+    expect(seeded?.fencingToken).toBe(0)
+    await migrated.browserLocks.put({
+      ...(seeded as BrowserLockRow),
+      ownerClientId: null,
+      leaseId: null,
+      fencingToken: 41,
+      expiresAt: 0,
+    })
+    migrated.close()
+
+    const reopened = createDbForTests(name)
+    await reopened.open()
+    expect((await reopened.browserLocks.get(BROWSER_WRITER_LOCK_NAME))?.fencingToken).toBe(41)
+    await reopened.delete()
+  })
+
+  it('repairs stale previews in the composed v21 to v22 migration', async () => {
+    const name = `natter-test-preview-v22-${Math.random().toString(36).slice(2)}`
+    await Dexie.delete(name)
+    const legacy = new Dexie(name)
+    legacy.version(21).stores({
+      chats:
+        'id, updatedAt, createdAt, lastViewedAt, lastUpdatedLeafId, lastBranchUpdatedAt, wordCount, totalCostUsd, archived, pinned, presetId, folderId, *tags',
+      messages:
+        'id, chatId, parentId, turnId, [chatId+parentId], [chatId+createdAt], [chatId+turnId], [chatId+deleted]',
+      messageBodies: '&id, chatId, updatedAt, nodeVersion',
+      settings: '&key',
+      streamChunks: '&id, streamId, chatId, messageId, [streamId+seq], createdAt',
+    })
+    await legacy.open()
+    const chat: Chat = {
+      id: 'preview-v22-chat',
+      title: 'Preview migration',
+      titleStatus: 'manual',
+      createdAt: 1,
+      updatedAt: 1,
+      lastViewedAt: 1,
+      wordCount: 2,
+      totalCostUsd: 0,
+      metaVersion: 0,
+      summaryVersion: 0,
+      settings: cloneDefaultChatSettings(),
+      lastUpdatedLeafId: 'preview-v22-message',
+      lastBranchUpdatedAt: 1,
+      archived: false,
+      pinned: false,
+      folderId: null,
+      tags: [],
+      previewText: 'stale',
+    }
+    const message: Message = {
+      id: 'preview-v22-message',
+      chatId: chat.id,
+      parentId: null,
+      siblingIndex: 0,
+      turnId: 'preview-v22-turn',
+      turnIndex: 0,
+      createdAt: 1,
+      role: 'user',
+      origin: 'user',
+      content: [{ type: 'text', text: ' migrated preview ' }],
+      nodeVersion: 0,
+      deleted: false,
+    }
+    const split = splitMessageForStorage(message)
+    await legacy.table<Chat>('chats').put(chat)
+    await legacy.table('messages').put(split.header)
+    await legacy.table('messageBodies').put(split.body)
+    legacy.close()
+
+    const migrated = createDbForTests(name)
+    await migrated.open()
+    expect((await migrated.chats.get(chat.id))?.previewText).toBe('migrated preview')
+    expect(await migrated.chatSidebarRows.get(chat.id)).toEqual(
+      expect.objectContaining({
+        id: chat.id,
+        title: chat.title,
+        previewText: 'migrated preview',
+        projectionVersion: 1,
+      }),
+    )
+    expect((await migrated.settings.get('backfill:chat-preview-projection-v1'))?.value).toBe(1)
+    expect((await migrated.settings.get('backfill:chat-sidebar-projection-v1'))?.value).toBe(1)
+    expect((await migrated.settings.get('projection:chat-sidebar-v1'))?.value).toEqual({
+      projectionVersion: 1,
+      expectedCount: 1,
+    })
+    migrated.close()
+
+    const reopened = createDbForTests(name)
+    await reopened.open()
+    expect(await reopened.chatSidebarRows.get(chat.id)).toEqual(
+      expect.objectContaining({ id: chat.id, previewText: 'migrated preview' }),
+    )
+    await reopened.delete()
   })
 
   it('is idempotent across repeated open calls', async () => {
@@ -73,6 +384,68 @@ describe('Dexie schema', () => {
     const b = await openDb()
     expect(a).toBe(b)
     expect(a.isOpen()).toBe(true)
+  })
+
+  it('repairs stale chat previews once and marks the repair complete', async () => {
+    let db = await openDb()
+    const chat: Chat = {
+      id: 'preview-backfill-chat',
+      title: 'Preview backfill',
+      titleStatus: 'manual',
+      createdAt: 1,
+      updatedAt: 1,
+      lastViewedAt: 1,
+      wordCount: 0,
+      totalCostUsd: 0,
+      metaVersion: 0,
+      summaryVersion: 0,
+      settings: cloneDefaultChatSettings(),
+      lastUpdatedLeafId: 'preview-backfill-message',
+      lastBranchUpdatedAt: 1,
+      archived: false,
+      pinned: false,
+      folderId: null,
+      tags: [],
+      previewText: 'stale',
+    }
+    const message: Message = {
+      id: 'preview-backfill-message',
+      chatId: chat.id,
+      parentId: null,
+      siblingIndex: 0,
+      turnId: 'preview-backfill-turn',
+      turnIndex: 0,
+      createdAt: 1,
+      role: 'user',
+      origin: 'user',
+      content: [{ type: 'text', text: ' repaired\n preview ' }],
+      nodeVersion: 0,
+      deleted: false,
+    }
+    const split = splitMessageForStorage(message)
+    await db.transaction('rw', db.chats, db.chatSidebarRows, db.settings, async (tx) => {
+      await db.chats.put(chat)
+      await putChatSidebarProjection(tx, chat, true)
+    })
+    await db.messages.put(split.header)
+    await db.messageBodies.put(split.body)
+    await db.settings.delete('backfill:chat-preview-projection-v1')
+    expect((await db.settings.get('projection:chat-sidebar-v1'))?.value).toEqual({
+      projectionVersion: 1,
+      expectedCount: 1,
+    })
+    expect((await db.chatSidebarRows.get(chat.id))?.previewText).toBe('stale')
+
+    __resetDbForTests()
+    db = await openDb()
+    expect((await db.chats.get(chat.id))?.previewText).toBe('repaired preview')
+    expect((await db.chatSidebarRows.get(chat.id))?.previewText).toBe('repaired preview')
+    expect((await db.settings.get('backfill:chat-preview-projection-v1'))?.value).toBe(1)
+
+    await db.chats.update(chat.id, { previewText: 'marker prevents repeat scans' })
+    __resetDbForTests()
+    db = await openDb()
+    expect((await db.chats.get(chat.id))?.previewText).toBe('marker prevents repeat scans')
   })
 
   it('reopens a previously-written DB and reads existing rows', async () => {
@@ -195,7 +568,371 @@ function registerLegacyChatSettingsV14(db: Dexie): void {
   })
 }
 
+function registerLegacyStreamLeasesV20(db: Dexie): void {
+  db.version(20).stores({
+    settings: '&key',
+    messages:
+      'id, chatId, parentId, turnId, [chatId+parentId], [chatId+createdAt], [chatId+turnId], [chatId+deleted]',
+    messageBodies: '&id, chatId, updatedAt, nodeVersion',
+    streamLeases: '&streamId, chatId, ownerClientId, heartbeatAt',
+    streamChunks: '&id, streamId, chatId, messageId, [streamId+seq], createdAt',
+  })
+}
+
+function registerLegacyAttemptOutcomesV21(db: Dexie): void {
+  db.version(21).stores({
+    settings: '&key',
+    messages:
+      'id, chatId, parentId, turnId, [chatId+parentId], [chatId+createdAt], [chatId+turnId], [chatId+deleted]',
+    messageBodies: '&id, chatId, updatedAt, nodeVersion',
+    streamChunks: '&id, streamId, chatId, messageId, [streamId+seq], createdAt',
+  })
+}
+
+function registerLegacyAttachmentReferenceEdgesV21(db: Dexie): void {
+  db.version(21).stores({
+    attachments: 'id, refCount',
+    attachmentBlobs: 'id, attachmentId',
+    attachmentArtifacts: 'artifactId, attachmentId',
+    attachmentJobs: 'id, attachmentId',
+    messages: 'id, chatId',
+    drafts: '&chatId',
+    messageBodies: '&id, chatId, updatedAt, nodeVersion',
+    streamChunks: '&id, streamId, chatId, messageId, [streamId+seq], createdAt',
+  })
+}
+
+function canonicalAttachmentRef(
+  refId: string,
+  attachmentId: string,
+  patch: Partial<MessageAttachmentRef> = {},
+): MessageAttachmentRef {
+  return {
+    refId,
+    attachmentId,
+    includeInContext: true,
+    presentation: {},
+    createdAt: 1,
+    updatedAt: 1,
+    ...patch,
+  }
+}
+
+function findAttachmentReferenceEdgeMigrationError(
+  input: unknown,
+): AttachmentReferenceEdgeMigrationError | undefined {
+  let current = input
+  const seen = new Set<unknown>()
+  while (current && typeof current === 'object' && !seen.has(current)) {
+    if (current instanceof AttachmentReferenceEdgeMigrationError) return current
+    seen.add(current)
+    const record = current as { inner?: unknown; cause?: unknown }
+    current = record.inner ?? record.cause
+  }
+  return undefined
+}
+
 describe('Dexie migrations', () => {
+  it('rebuilds normalized attachment edges and exact refcounts once in v22', async () => {
+    const name = `natter-test-attachment-edges-v22-${Math.random().toString(36).slice(2)}`
+    await Dexie.delete(name)
+
+    const messageRefs = [
+      canonicalAttachmentRef('message-a-1', 'attachment-a', { includeInContext: false }),
+      canonicalAttachmentRef('message-b-deleted', 'attachment-b', { deletedAt: 10 }),
+      canonicalAttachmentRef('message-a-2', 'attachment-a'),
+    ]
+    const draftRefs = [
+      canonicalAttachmentRef('draft-b', 'attachment-b'),
+      canonicalAttachmentRef('draft-missing-deleted', 'attachment-missing', { deletedAt: 11 }),
+    ]
+
+    const legacy = new Dexie(name)
+    registerLegacyAttachmentReferenceEdgesV21(legacy)
+    await legacy.open()
+    await legacy.table<Record<string, unknown>>('attachments').bulkPut([
+      { id: 'attachment-a', refCount: 91 },
+      { id: 'attachment-b', refCount: 92 },
+      { id: 'attachment-unreferenced', refCount: 93 },
+    ])
+    await legacy.table<Record<string, unknown>>('messages').put({
+      id: 'message-1',
+      chatId: 'chat-1',
+      deleted: true,
+      attachmentRefs: structuredClone(messageRefs),
+    })
+    await legacy.table<Record<string, unknown>>('messages').put({
+      id: 'message-legacy-strings',
+      chatId: 'chat-1',
+      createdAt: 12,
+      attachmentRefs: ['attachment-b'],
+    })
+    await legacy.table<Record<string, unknown>>('drafts').put({
+      chatId: 'chat-1',
+      attachmentRefs: structuredClone(draftRefs),
+    })
+    legacy.close()
+
+    const migrated = createDbForTests(name)
+    await migrated.open()
+    expect(migrated.verno).toBe(23)
+    expect(await migrated.attachmentRefEdges.toArray()).toEqual(
+      expect.arrayContaining<AttachmentReferenceEdge>([
+        {
+          ownerKind: 'message',
+          ownerId: 'message-1',
+          chatId: 'chat-1',
+          refId: 'message-a-1',
+          attachmentId: 'attachment-a',
+          ordinal: 0,
+        },
+        {
+          ownerKind: 'message',
+          ownerId: 'message-1',
+          chatId: 'chat-1',
+          refId: 'message-a-2',
+          attachmentId: 'attachment-a',
+          ordinal: 2,
+        },
+        {
+          ownerKind: 'draft',
+          ownerId: 'chat-1',
+          chatId: 'chat-1',
+          refId: 'draft-b',
+          attachmentId: 'attachment-b',
+          ordinal: 0,
+        },
+        {
+          ownerKind: 'message',
+          ownerId: 'message-legacy-strings',
+          chatId: 'chat-1',
+          refId: 'legacy:message-legacy-strings:0',
+          attachmentId: 'attachment-b',
+          ordinal: 0,
+        },
+      ]),
+    )
+    expect(await migrated.attachmentRefEdges.count()).toBe(4)
+    expect((await migrated.attachments.get('attachment-a'))?.refCount).toBe(2)
+    expect((await migrated.attachments.get('attachment-b'))?.refCount).toBe(2)
+    expect((await migrated.attachments.get('attachment-unreferenced'))?.refCount).toBe(0)
+    expect((await migrated.messages.get('message-1'))?.attachmentRefs).toEqual(messageRefs)
+    expect((await migrated.messages.get('message-legacy-strings'))?.attachmentRefs).toEqual([
+      expect.objectContaining({
+        refId: 'legacy:message-legacy-strings:0',
+        attachmentId: 'attachment-b',
+      }),
+    ])
+    expect((await migrated.drafts.get('chat-1'))?.attachmentRefs).toEqual(draftRefs)
+    expect((await migrated.settings.get('backfill:attachment-refs-v1'))?.value).toBe(1)
+
+    const expectedEdges = await migrated.attachmentRefEdges.toArray()
+    await migrated.transaction(
+      'rw',
+      [migrated.attachmentRefEdges, migrated.attachments, migrated.messages, migrated.drafts],
+      async (tx) => {
+        await rebuildAttachmentReferenceEdges(tx)
+        await rebuildAttachmentReferenceEdges(tx)
+      },
+    )
+    expect(await migrated.attachmentRefEdges.toArray()).toEqual(expectedEdges)
+    await migrated.attachments.update('attachment-a', { refCount: 19 })
+    migrated.close()
+
+    const reopened = createDbForTests(name)
+    await reopened.open()
+    expect(await reopened.attachmentRefEdges.toArray()).toEqual(expectedEdges)
+    expect((await reopened.attachments.get('attachment-a'))?.refCount).toBe(19)
+    await reopened.delete()
+  })
+
+  it('scrubs stale byte-derived pointers from missing attachments once in v22', async () => {
+    const name = `natter-test-missing-attachment-v22-${Math.random().toString(36).slice(2)}`
+    await Dexie.delete(name)
+    const textArtifact = {
+      kind: 'text',
+      artifactId: 'artifact-text',
+      attachmentId: 'attachment-missing',
+      processorId: 'extract-v1',
+      text: 'retained text',
+      charCount: 13,
+      createdAt: 1,
+    }
+    const blobArtifact = {
+      kind: 'blob',
+      artifactId: 'artifact-thumbnail',
+      attachmentId: 'attachment-missing',
+      processorId: 'thumbnail-v1',
+      blobId: 'blob-thumbnail',
+      createdAt: 1,
+    }
+    const legacy = new Dexie(name)
+    registerLegacyAttachmentReferenceEdgesV21(legacy)
+    await legacy.open()
+    await legacy.table('attachments').put({
+      id: 'attachment-missing',
+      kind: 'plaintext',
+      mime: 'text/plain',
+      filename: 'missing.txt',
+      origin: 'user-upload',
+      createdAt: 1,
+      updatedAt: 2,
+      storage: {
+        kind: 'missing',
+        reason: 'deleted',
+        missingSince: 2,
+        lastKnownBlobId: 'blob-original',
+      },
+      thumbnailBlobId: 'blob-thumbnail',
+      artifacts: [textArtifact, blobArtifact],
+      processing: [
+        {
+          processorId: 'mixed-v1',
+          inputHash: 'hash',
+          status: 'succeeded',
+          outputArtifactIds: ['artifact-text', 'artifact-thumbnail'],
+        },
+        {
+          processorId: 'thumbnail-v1',
+          inputHash: 'hash',
+          status: 'succeeded',
+          outputArtifactIds: ['artifact-thumbnail'],
+        },
+      ],
+      refCount: 0,
+    })
+    await legacy.table('attachmentBlobs').bulkPut([
+      { id: 'blob-original', attachmentId: 'attachment-missing' },
+      { id: 'blob-thumbnail', attachmentId: 'attachment-missing' },
+    ])
+    await legacy.table('attachmentArtifacts').bulkPut([textArtifact, blobArtifact])
+    await legacy.table('attachmentJobs').bulkPut([
+      {
+        id: 'arbitrary-mixed-job',
+        attachmentId: 'attachment-missing',
+        processorId: 'mixed-v1',
+        inputHash: 'hash',
+        status: 'succeeded',
+        outputArtifactIds: ['artifact-text', 'artifact-thumbnail'],
+        updatedAt: 2,
+      },
+      {
+        id: 'arbitrary-thumbnail-job',
+        attachmentId: 'attachment-missing',
+        processorId: 'thumbnail-v1',
+        inputHash: 'hash',
+        status: 'succeeded',
+        outputArtifactIds: ['artifact-thumbnail'],
+        updatedAt: 2,
+      },
+    ])
+    legacy.close()
+
+    const migrated = createDbForTests(name)
+    await migrated.open()
+    const attachment = await migrated.attachments.get('attachment-missing')
+    expect(attachment?.thumbnailBlobId).toBeUndefined()
+    expect(attachment).not.toHaveProperty('artifacts')
+    expect(attachment).toHaveProperty('artifactIds', [textArtifact.artifactId])
+    expect(attachment?.processing).toEqual([
+      expect.objectContaining({ processorId: 'mixed-v1', outputArtifactIds: ['artifact-text'] }),
+    ])
+    expect(await migrated.attachmentBlobs.count()).toBe(0)
+    expect(await migrated.attachmentArtifacts.toArray()).toEqual([textArtifact])
+    expect(await migrated.attachmentJobs.toArray()).toEqual([
+      expect.objectContaining({ id: 'arbitrary-mixed-job', outputArtifactIds: ['artifact-text'] }),
+    ])
+
+    await migrated.attachments.update('attachment-missing', {
+      thumbnailBlobId: 'post-migration-sentinel',
+    })
+    migrated.close()
+    const reopened = createDbForTests(name)
+    await reopened.open()
+    expect((await reopened.attachments.get('attachment-missing'))?.thumbnailBlobId).toBe(
+      'post-migration-sentinel',
+    )
+    await reopened.delete()
+  })
+
+  it.each([
+    {
+      label: 'duplicate ref IDs',
+      expectedCode: 'duplicate-ref-id' as const,
+      refs: [
+        canonicalAttachmentRef('duplicate', 'attachment-a'),
+        canonicalAttachmentRef('duplicate', 'attachment-a', { deletedAt: 9 }),
+      ],
+    },
+    {
+      label: 'a missing target for a live ref',
+      expectedCode: 'missing-attachment' as const,
+      refs: [canonicalAttachmentRef('missing', 'attachment-missing')],
+    },
+  ])('rejects $label and rolls the entire v22 upgrade back', async ({ expectedCode, refs }) => {
+    const name = `natter-test-attachment-edges-poison-${Math.random().toString(36).slice(2)}`
+    await Dexie.delete(name)
+    const legacy = new Dexie(name)
+    registerLegacyAttachmentReferenceEdgesV21(legacy)
+    await legacy.open()
+    await legacy.table<Record<string, unknown>>('attachments').put({
+      id: 'attachment-a',
+      refCount: 77,
+    })
+    await legacy.table<Record<string, unknown>>('messages').put({
+      id: 'message-poison',
+      chatId: 'chat-poison',
+      attachmentRefs: structuredClone(refs),
+    })
+    legacy.close()
+
+    const attempted = createDbForTests(name)
+    let failure: unknown
+    try {
+      await attempted.open()
+    } catch (error) {
+      failure = error
+    }
+    expect(findAttachmentReferenceEdgeMigrationError(failure)).toMatchObject({
+      code: expectedCode,
+      ownerKind: 'message',
+      ownerId: 'message-poison',
+    })
+    attempted.close()
+
+    const inspection = new Dexie(name)
+    registerLegacyAttachmentReferenceEdgesV21(inspection)
+    await inspection.open()
+    expect(inspection.verno).toBe(21)
+    expect(
+      (await inspection.table<Record<string, unknown>>('attachments').get('attachment-a'))
+        ?.refCount,
+    ).toBe(77)
+    expect(inspection.tables.some((table) => table.name === 'attachmentRefEdges')).toBe(false)
+    expect(
+      (await inspection.table<Record<string, unknown>>('messages').get('message-poison'))
+        ?.attachmentRefs,
+    ).toEqual(refs)
+    if (expectedCode === 'duplicate-ref-id') {
+      await inspection.table<Record<string, unknown>>('messages').update('message-poison', {
+        attachmentRefs: [structuredClone(refs[0])],
+      })
+    } else {
+      await inspection.table<Record<string, unknown>>('attachments').put({
+        id: 'attachment-missing',
+        refCount: 0,
+      })
+    }
+    inspection.close()
+
+    const retried = createDbForTests(name)
+    await retried.open()
+    expect(retried.verno).toBe(23)
+    expect(await retried.attachmentRefEdges.count()).toBe(1)
+    expect((await retried.settings.get('backfill:attachment-refs-v1'))?.value).toBe(1)
+    await retried.delete()
+  })
+
   it('opens a fresh DB at the highest declared version without replaying upgrade callbacks', async () => {
     // Dexie's contract: on a truly fresh IDB, it creates the union of all
     // declared tables at the latest version and skips upgrade() callbacks —
@@ -291,6 +1028,518 @@ describe('Dexie migrations', () => {
     await up.delete()
   })
 
+  it('classifies and fences legacy stream leases in the single v20 to v22 upgrade', async () => {
+    const name = `natter-test-stream-lease-v21-${Math.random().toString(36).slice(2)}`
+    await Dexie.delete(name)
+
+    const legacy = new Dexie(name)
+    registerLegacyStreamLeasesV20(legacy)
+    await legacy.open()
+    await legacy.table<Record<string, unknown>>('messages').bulkPut([
+      {
+        id: 'message-generating',
+        chatId: 'chat-1',
+        nodeVersion: 4,
+        generation: { startedAt: 1 },
+      },
+      {
+        id: 'message-complete',
+        chatId: 'chat-1',
+        nodeVersion: 7,
+        generation: { startedAt: 1, finishedAt: 2 },
+      },
+      {
+        id: 'message-without-generation',
+        chatId: 'chat-1',
+        nodeVersion: 9,
+      },
+    ])
+    const legacyLeases: StreamLeaseRow[] = [
+      {
+        streamId: 'original-stream',
+        chatId: 'chat-1',
+        messageId: 'message-generating',
+        ownerClientId: 'tab-1',
+        startedAt: 1,
+        heartbeatAt: 2,
+      },
+      {
+        streamId: 'continue-stream',
+        chatId: 'chat-1',
+        messageId: 'message-complete',
+        ownerClientId: 'tab-1',
+        startedAt: 3,
+        heartbeatAt: 4,
+      },
+      {
+        streamId: 'continue-without-generation',
+        chatId: 'chat-1',
+        messageId: 'message-without-generation',
+        ownerClientId: 'tab-1',
+        startedAt: 5,
+        heartbeatAt: 6,
+      },
+      {
+        streamId: 'continue-without-header',
+        chatId: 'chat-1',
+        messageId: 'missing-message',
+        ownerClientId: 'tab-1',
+        startedAt: 7,
+        heartbeatAt: 8,
+      },
+      {
+        streamId: 'already-classified',
+        chatId: 'chat-1',
+        messageId: 'message-complete',
+        ownerClientId: 'tab-2',
+        startedAt: 9,
+        heartbeatAt: 10,
+        attemptKind: 'generation',
+        requestedModel: 'model-a',
+        apiUsed: 'responses',
+      },
+    ]
+    await legacy.table<StreamLeaseRow>('streamLeases').bulkPut(legacyLeases)
+    legacy.close()
+
+    const migrated = createDbForTests(name)
+    await migrated.open()
+    expect(migrated.verno).toBe(23)
+    expect(await migrated.streamLeases.get('original-stream')).toEqual({
+      ...legacyLeases[0],
+      attemptKind: 'generation',
+      fenceToken: 'legacy:original-stream',
+      replacementEpoch: 0,
+    })
+    expect(await migrated.streamLeases.get('continue-stream')).toEqual({
+      ...legacyLeases[1],
+      attemptKind: 'continuation',
+      baseNodeVersion: 7,
+      fenceToken: 'legacy:continue-stream',
+      replacementEpoch: 0,
+    })
+    expect(await migrated.streamLeases.get('continue-without-generation')).toEqual({
+      ...legacyLeases[2],
+      attemptKind: 'continuation',
+      baseNodeVersion: 9,
+      fenceToken: 'legacy:continue-without-generation',
+      replacementEpoch: 0,
+    })
+    expect(await migrated.streamLeases.get('continue-without-header')).toEqual({
+      ...legacyLeases[3],
+      attemptKind: 'continuation',
+      fenceToken: 'legacy:continue-without-header',
+      replacementEpoch: 0,
+    })
+    expect(await migrated.streamLeases.get('already-classified')).toEqual({
+      ...legacyLeases[4],
+      fenceToken: 'legacy:already-classified',
+      replacementEpoch: 0,
+    })
+    expect(await migrated.streamLeases.get('continue-stream')).not.toHaveProperty('requestedModel')
+    expect(await migrated.streamLeases.get('continue-stream')).not.toHaveProperty('apiUsed')
+    expect(await migrated.streamLeases.get('continue-stream')).not.toHaveProperty(
+      'continuationStrategy',
+    )
+    await migrated.delete()
+  })
+
+  it('does not rerun the lease classifier or fence migration after v22 is current', async () => {
+    const name = `natter-test-stream-lease-v21-idempotent-${Math.random().toString(36).slice(2)}`
+    await Dexie.delete(name)
+
+    const legacy = new Dexie(name)
+    registerLegacyStreamLeasesV20(legacy)
+    await legacy.open()
+    await legacy.table<Record<string, unknown>>('messages').put({
+      id: 'message-complete',
+      chatId: 'chat-1',
+      nodeVersion: 7,
+      generation: { startedAt: 1, finishedAt: 2 },
+    })
+    await legacy.table<StreamLeaseRow>('streamLeases').put({
+      streamId: 'continue-stream',
+      chatId: 'chat-1',
+      messageId: 'message-complete',
+      ownerClientId: 'tab-1',
+      startedAt: 3,
+      heartbeatAt: 4,
+    })
+    legacy.close()
+
+    const migrated = createDbForTests(name)
+    await migrated.open()
+    const classified = await migrated.streamLeases.get('continue-stream')
+    expect(classified).toMatchObject({ attemptKind: 'continuation', baseNodeVersion: 7 })
+    if (!classified) throw new Error('expected migrated stream lease')
+    const manuallyChanged: StreamLeaseRow = { ...classified, attemptKind: 'generation' }
+    delete manuallyChanged.baseNodeVersion
+    await migrated.streamLeases.put(manuallyChanged)
+    migrated.close()
+
+    const reopened = createDbForTests(name)
+    await reopened.open()
+    expect(await reopened.streamLeases.get('continue-stream')).toEqual(manuallyChanged)
+    await reopened.delete()
+  })
+
+  it.each([
+    20, 21,
+  ])('adds the workspace replacement epoch once when upgrading v%i to v22', async (legacyVersion) => {
+    const name = `natter-test-workspace-meta-v${legacyVersion}-v22-${Math.random()
+      .toString(36)
+      .slice(2)}`
+    await Dexie.delete(name)
+
+    const legacy = new Dexie(name)
+    if (legacyVersion === 20) registerLegacyStreamLeasesV20(legacy)
+    else registerLegacyAttemptOutcomesV21(legacy)
+    await legacy.open()
+    const legacyValue = {
+      workspaceId: 'browser-idb:natter',
+      backendKind: 'browser-idb',
+      lastMutationAt: 123,
+      mutationCounter: 17,
+    }
+    await legacy.table('settings').put({ key: 'workspace-meta', value: legacyValue })
+    legacy.close()
+
+    const migrated = createDbForTests(name)
+    await migrated.open()
+    expect((await migrated.settings.get('workspace-meta'))?.value).toEqual({
+      ...legacyValue,
+      replacementEpoch: 0,
+    })
+    await migrated.settings.put({
+      key: 'workspace-meta',
+      value: { ...legacyValue, replacementEpoch: 9 },
+    })
+    migrated.close()
+
+    const reopened = createDbForTests(name)
+    await reopened.open()
+    expect((await reopened.settings.get('workspace-meta'))?.value).toEqual({
+      ...legacyValue,
+      replacementEpoch: 9,
+    })
+    await reopened.delete()
+  })
+
+  it('migrates v21 attempt outcomes once and strips raw failure payloads in v22', async () => {
+    const name = `natter-test-attempt-outcomes-v22-${Math.random().toString(36).slice(2)}`
+    await Dexie.delete(name)
+
+    const legacy = new Dexie(name)
+    registerLegacyAttemptOutcomesV21(legacy)
+    await legacy.open()
+    await legacy.table<Record<string, unknown>>('messages').bulkPut([
+      {
+        id: 'streaming',
+        chatId: 'chat-1',
+        generation: { startedAt: 1 },
+      },
+      {
+        id: 'failed',
+        chatId: 'chat-1',
+        generation: {
+          startedAt: 1,
+          finishedAt: 2,
+          error: {
+            code: 'NETWORK',
+            message: 'connection lost',
+            raw: { kind: 'network', metadata: { authorization: 'raw-secret' } },
+          },
+        },
+      },
+      {
+        id: 'interrupted',
+        chatId: 'chat-1',
+        generation: { startedAt: 1, finishedAt: 2, abortReason: 'tab-close' },
+      },
+      {
+        id: 'done',
+        chatId: 'chat-1',
+        generation: { startedAt: 1, finishedAt: 2 },
+      },
+    ])
+    await legacy.table<Record<string, unknown>>('messageBodies').put({
+      id: 'failed',
+      chatId: 'chat-1',
+      nodeVersion: 0,
+      updatedAt: 2,
+      content: [],
+      continuationAttempts: [
+        {
+          streamId: 'continue-1',
+          strategy: 'prompt',
+          status: 'error',
+          startedAt: 1,
+          finishedAt: 2,
+          error: {
+            code: 502,
+            message: 'Bearer sk-private-value',
+            raw: { kind: 'provider_error', metadata: { prompt: 'raw-secret' } },
+          },
+        },
+      ],
+    })
+    await legacy.table<Record<string, unknown>>('streamChunks').put({
+      id: 'stream-1:0',
+      streamId: 'stream-1',
+      chatId: 'chat-1',
+      messageId: 'failed',
+      seq: 0,
+      createdAt: 2,
+      event: {
+        lane: 'error',
+        error: {
+          kind: 'provider_error',
+          code: 502,
+          message: 'provider failed',
+          midStream: true,
+          retryable: true,
+          metadata: { output: 'raw-secret' },
+        },
+      },
+    })
+    legacy.close()
+
+    const migrated = createDbForTests(name)
+    await migrated.open()
+    expect(migrated.verno).toBe(23)
+    expect((await migrated.messages.get('streaming'))?.generation).toMatchObject({
+      status: 'streaming',
+      integrity: 'clean',
+    })
+    expect((await migrated.messages.get('failed'))?.generation).toMatchObject({
+      status: 'error',
+      integrity: 'clean',
+      error: {
+        category: 'network',
+        code: 'NETWORK',
+        message: 'connection lost',
+      },
+    })
+    expect((await migrated.messages.get('interrupted'))?.generation).toMatchObject({
+      status: 'interrupted',
+      integrity: 'clean',
+    })
+    expect((await migrated.messages.get('done'))?.generation).toMatchObject({
+      status: 'done',
+      integrity: 'clean',
+    })
+    const body = await migrated.messageBodies.get('failed')
+    expect(body?.continuationAttempts?.[0]).toMatchObject({
+      status: 'error',
+      integrity: 'clean',
+      error: {
+        category: 'provider',
+        code: '502',
+        message: 'Bearer <redacted>',
+      },
+    })
+    const chunk = await migrated.streamChunks.get('stream-1:0')
+    expect(chunk?.event).toEqual({
+      lane: 'error',
+      error: {
+        kind: 'provider_error',
+        code: '502',
+        message: 'provider failed',
+        midStream: true,
+        retryable: true,
+      },
+    })
+    expect(
+      JSON.stringify({ failed: await migrated.messages.get('failed'), body, chunk }),
+    ).not.toContain('raw-secret')
+
+    await migrated.messages.update('done', { 'generation.integrity': 'failed' } as never)
+    migrated.close()
+    const reopened = createDbForTests(name)
+    await reopened.open()
+    expect((await reopened.messages.get('done'))?.generation?.integrity).toBe('failed')
+    await reopened.delete()
+  })
+
+  it('moves released-v20 header continuation attempts into message bodies exactly once', async () => {
+    const name = `natter-test-v20-continuation-attempt-body-split-${Math.random()
+      .toString(36)
+      .slice(2)}`
+    await Dexie.delete(name)
+
+    const legacy = new Dexie(name)
+    registerLegacyStreamLeasesV20(legacy)
+    await legacy.open()
+    await legacy.table<Record<string, unknown>>('messages').put({
+      id: 'continued-message',
+      chatId: 'chat-1',
+      nodeVersion: 4,
+      continuationAttempts: [
+        {
+          streamId: 'shared-stream',
+          strategy: 'prompt',
+          status: 'error',
+          requestedModel: 'header-requested-model',
+          provider: 'header-provider',
+          startedAt: 1,
+          finishedAt: 2,
+          error: {
+            code: 'NETWORK',
+            message: 'Bearer sk-header-private',
+            raw: { kind: 'network', metadata: { prompt: 'raw-header-secret' } },
+          },
+        },
+        {
+          streamId: 'header-only-stream',
+          strategy: 'prompt',
+          status: 'error',
+          startedAt: 3,
+          finishedAt: 4,
+          error: {
+            code: 502,
+            message: 'Bearer sk-header-only-private',
+            raw: { kind: 'provider_error', metadata: { output: 'raw-header-only-secret' } },
+          },
+        },
+      ],
+    })
+    await legacy.table<Record<string, unknown>>('messageBodies').put({
+      id: 'continued-message',
+      chatId: 'chat-1',
+      nodeVersion: 4,
+      updatedAt: 5,
+      content: [],
+      continuationAttempts: [
+        {
+          streamId: 'shared-stream',
+          strategy: 'prefill',
+          status: 'error',
+          model: 'body-model',
+          startedAt: 10,
+          finishedAt: 20,
+        },
+        {
+          streamId: 'body-only-stream',
+          strategy: 'prompt',
+          status: 'done',
+          startedAt: 30,
+          finishedAt: 40,
+        },
+      ],
+    })
+    legacy.close()
+
+    const migrated = createDbForTests(name)
+    await migrated.open()
+    expect(migrated.verno).toBe(23)
+    const migratedHeader = (await migrated.messages.get('continued-message')) as unknown as Record<
+      string,
+      unknown
+    >
+    expect(migratedHeader).not.toHaveProperty('continuationAttempts')
+    const migratedBody = await migrated.messageBodies.get('continued-message')
+    expect(migratedBody?.continuationAttempts?.map((attempt) => attempt.streamId)).toEqual([
+      'shared-stream',
+      'body-only-stream',
+      'header-only-stream',
+    ])
+    expect(migratedBody?.continuationAttempts?.[0]).toMatchObject({
+      streamId: 'shared-stream',
+      strategy: 'prefill',
+      status: 'error',
+      integrity: 'clean',
+      requestedModel: 'header-requested-model',
+      model: 'body-model',
+      provider: 'header-provider',
+      startedAt: 10,
+      finishedAt: 20,
+      error: {
+        category: 'network',
+        code: 'NETWORK',
+        message: 'Bearer <redacted>',
+      },
+    })
+    expect(migratedBody?.continuationAttempts?.[1]).toMatchObject({
+      streamId: 'body-only-stream',
+      integrity: 'clean',
+    })
+    expect(migratedBody?.continuationAttempts?.[2]).toMatchObject({
+      streamId: 'header-only-stream',
+      integrity: 'clean',
+      error: {
+        category: 'provider',
+        code: '502',
+        message: 'Bearer <redacted>',
+      },
+    })
+    expect(JSON.stringify(migratedBody)).not.toContain('raw-header')
+
+    const manuallyEditedAttempts = [
+      {
+        ...(migratedBody?.continuationAttempts?.[0] ?? {
+          streamId: 'shared-stream',
+          strategy: 'prefill' as const,
+          status: 'error' as const,
+          startedAt: 10,
+          finishedAt: 20,
+        }),
+        model: 'manual-model',
+      },
+    ]
+    await migrated.messageBodies.update('continued-message', {
+      continuationAttempts: manuallyEditedAttempts,
+    })
+    const manuallyRestoredHeaderAttempts = [
+      {
+        streamId: 'manual-header-stream',
+        strategy: 'prompt',
+        status: 'done',
+        startedAt: 50,
+        finishedAt: 60,
+      },
+    ]
+    await migrated.messages.update('continued-message', {
+      continuationAttempts: manuallyRestoredHeaderAttempts,
+    } as never)
+    migrated.close()
+
+    const reopened = createDbForTests(name)
+    await reopened.open()
+    expect((await reopened.messageBodies.get('continued-message'))?.continuationAttempts).toEqual(
+      manuallyEditedAttempts,
+    )
+    expect(
+      (await reopened.messages.get('continued-message')) as unknown as Record<string, unknown>,
+    ).toHaveProperty('continuationAttempts', manuallyRestoredHeaderAttempts)
+    await reopened.delete()
+  })
+
+  it('populates a fresh v22 database without requiring a legacy lease pass', async () => {
+    const name = `natter-test-stream-lease-v21-fresh-${Math.random().toString(36).slice(2)}`
+    const db = await freshDb(name)
+    await db.open()
+
+    expect(db.verno).toBe(23)
+    expect(await db.streamLeases.count()).toBe(0)
+    expect((await db.settings.get('backfill:message-body-split-v1'))?.value).toBe(1)
+    const lease: StreamLeaseRow = {
+      streamId: 'continue-stream',
+      chatId: 'chat-1',
+      messageId: 'message-1',
+      ownerClientId: 'tab-1',
+      startedAt: 1,
+      heartbeatAt: 2,
+      attemptKind: 'continuation',
+      continuationStrategy: 'prefill',
+      baseNodeVersion: 3,
+      requestedModel: 'model-a',
+      apiUsed: 'responses',
+    }
+    await db.streamLeases.put(lease)
+    expect(await db.streamLeases.get(lease.streamId)).toEqual(lease)
+    await db.delete()
+  })
+
   it('deletes the retired open-scroll preference during schema upgrade', async () => {
     const name = `natter-test-open-scroll-mig-${Math.random().toString(36).slice(2)}`
     await Dexie.delete(name)
@@ -325,7 +1574,7 @@ describe('Dexie migrations', () => {
 
     const migrated = createDbForTests(name)
     await migrated.open()
-    expect(migrated.verno).toBe(20)
+    expect(migrated.verno).toBe(23)
     expect((await migrated.settings.get('global:message-render-window-size'))?.value).toBe(33)
     expect((await migrated.settings.get('global:sidebar-render-window-size'))?.value).toBe(50)
     expect((await migrated.settings.get('global:message-render-window-load-mode'))?.value).toBe(
@@ -705,7 +1954,7 @@ describe('Dexie migrations', () => {
 
     const migrated = createDbForTests(name)
     await migrated.open()
-    expect(migrated.verno).toBe(20)
+    expect(migrated.verno).toBe(23)
     const chat = await migrated.chats.get('chat-settings-snapshot')
     const preset = await migrated.presets.get('preset-settings-snapshot')
     for (const settings of [chat?.settings, preset?.settings]) {
@@ -851,7 +2100,7 @@ describe('Dexie migrations', () => {
 
     const migrated = createDbForTests(name)
     await migrated.open()
-    expect(migrated.verno).toBe(20)
+    expect(migrated.verno).toBe(23)
     const openaiChat = await migrated.chats.get('chat-openai')
     const googleChat = await migrated.chats.get('chat-google')
     const anthropicChat = await migrated.chats.get('chat-anthropic')
@@ -909,7 +2158,7 @@ describe('Dexie migrations', () => {
 
     const migrated = createDbForTests(name)
     await migrated.open()
-    expect(migrated.verno).toBe(20)
+    expect(migrated.verno).toBe(23)
     const rows = (await migrated.presets.toArray()).sort(
       (left, right) => left.sortIndex - right.sortIndex,
     )
@@ -917,6 +2166,14 @@ describe('Dexie migrations', () => {
       ['preset-first', 0],
       ['preset-second', 1],
     ])
+    expect(
+      rows.every(
+        (row) => !('migrationV19SortValue' in (row as unknown as Record<string, unknown>)),
+      ),
+    ).toBe(true)
+    expect(migrated.presets.schema.indexes.map((index) => index.src)).not.toContain(
+      '[migrationV19SortValue+createdAt+id]',
+    )
     await migrated.delete()
   })
 
@@ -939,7 +2196,7 @@ describe('Dexie migrations', () => {
 
     const migrated = createDbForTests(name)
     await migrated.open()
-    expect(migrated.verno).toBe(20)
+    expect(migrated.verno).toBe(23)
     expect((await migrated.settings.get('rendering-preferences'))?.value).toEqual({
       shikiLight: 'tokyo-night',
       shikiDark: 'dracula',
@@ -1146,7 +2403,7 @@ describe('Dexie migrations', () => {
           updatedAt: 20,
         },
       },
-    } as Chat)
+    })
     const message = {
       id: 'm1',
       chatId: 'chat-calib',
@@ -1333,10 +2590,10 @@ describe('Dexie migrations', () => {
       contentHash: 'hash-old',
       kind: 'other',
       origin: 'import',
-      artifacts: [],
       processing: [],
       refCount: 2,
     })
+    expect(attachment).toHaveProperty('artifactIds', [])
     expect(Object.hasOwn(attachment ?? {}, 'blob')).toBe(false)
 
     // Real browser IndexedDB preserves Blob values; fake-indexeddb's older

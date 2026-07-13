@@ -1,24 +1,34 @@
-// Chat-completions adapter. See `plan/04-api-client.md §4.6`.
-//
 // Two entry points:
 //
 // - `chatCompletions()` is the streaming path. It yields `ChatStreamChunk`s —
 //   one per SSE data event, plus `keepalive` for `: ...` comments, plus a
 //   synthetic `buffered_result` when the upstream answers with JSON despite
-//   `stream: true` (§4.6). Malformed JSON in a data line is skipped and
+//   `stream: true`. Malformed JSON in a data line is skipped and
 //   logged, not fatal — streams should be resilient to single-chunk corruption.
 // - `chatCompletionsOnce()` is the non-streaming path. It forces `stream: false`
 //   and returns a single `ChatCompletionResultWire`.
 //
-// Headers are bound at dispatch time (§4.2 in-flight stability): if the
-// profile or key changes in another tab while a stream is in flight, the
-// already-sent headers are not mutated.
+// Headers are bound at dispatch time: changing the profile or key in another
+// tab cannot mutate a request already in flight.
 
 import type { ConnectionProfile } from '../core/types'
-import { logStreamDebug, type StreamDebugTrace, startStreamDebug } from '../lib/debug-streams'
-import { buildHeaders, fetchWithTimeout } from './client'
+import {
+  logStreamDebug,
+  type StreamDebugTrace,
+  snapshotStreamDebugRequest,
+  startStreamDebug,
+} from '../lib/debug-streams'
+import { errorFromUnknown } from '../lib/error'
+import {
+  type ApiKeyDispatchContext,
+  buildHeaders,
+  fetchWithApiKeyFallback,
+  hasExplicitAuthHeaderOverride,
+  readErrorResponseJson,
+} from './client'
+import { deferAdapterRequest } from './deferred-request'
 import { normalizeError } from './errors'
-import { parseSSE } from './sse'
+import { decodeProviderJson, malformedJsonFrameReport, parseSSE } from './sse'
 import type {
   CallOpts,
   ChatCompletionRequestWire,
@@ -26,9 +36,8 @@ import type {
   ChatStreamChunk,
 } from './types'
 
-export interface ChatCompletionsContext {
+export interface ChatCompletionsContext extends ApiKeyDispatchContext {
   profile: ConnectionProfile
-  apiKey: string
 }
 
 function chatCompletionsUrl(profile: ConnectionProfile): string {
@@ -44,37 +53,77 @@ function normalizedBaseUrl(profile: ConnectionProfile): string {
   return base
 }
 
-async function dispatch(
+interface DispatchResult {
+  response: Response
+  debugTrace: StreamDebugTrace | null
+}
+
+function dispatch(
   ctx: ChatCompletionsContext,
   req: ChatCompletionRequestWire,
   opts: CallOpts,
-): Promise<{ response: Response; debugTrace: StreamDebugTrace | null }> {
+): Promise<DispatchResult> {
+  return dispatchSerialized(
+    ctx,
+    JSON.stringify(req),
+    snapshotStreamDebugRequest(ctx.profile, req),
+    opts,
+  )
+}
+
+function dispatchSerialized(
+  ctx: ChatCompletionsContext,
+  body: string,
+  debugRequest: unknown,
+  opts: CallOpts,
+): Promise<DispatchResult> {
   const url = chatCompletionsUrl(ctx.profile)
-  const headers = buildHeaders(ctx.profile, ctx.apiKey, {
-    method: 'POST',
-    ...(opts.overrideHeaders ? { overrideHeaders: opts.overrideHeaders } : {}),
-  })
-  const debugTrace = startStreamDebug({
-    adapter: 'chat-completions',
-    profile: ctx.profile,
-    url,
-    request: req,
-    headers,
-  })
-  const init: RequestInit = {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(req),
-  }
+  let debugTrace: StreamDebugTrace | null = null
   const fetchOpts: { signal?: AbortSignal; timeoutMs?: number } = {}
   if (opts.signal) fetchOpts.signal = opts.signal
   if (opts.timeoutMs !== undefined) fetchOpts.timeoutMs = opts.timeoutMs
-  const response = await fetchWithTimeout(url, init, fetchOpts)
+  const authCtx = hasExplicitAuthHeaderOverride(ctx.profile, opts.overrideHeaders, 'Authorization')
+    ? { apiKey: ctx.apiKey }
+    : ctx
+  const fetched = fetchWithApiKeyFallback(
+    authCtx,
+    (apiKey) => {
+      const headers = buildHeaders(ctx.profile, apiKey, {
+        method: 'POST',
+        ...(opts.overrideHeaders ? { overrideHeaders: opts.overrideHeaders } : {}),
+      })
+      if (debugRequest !== null) {
+        debugTrace ??= startStreamDebug({
+          adapter: 'chat-completions',
+          profile: ctx.profile,
+          url,
+          request: debugRequest,
+          headers,
+        })
+      }
+      return { url, init: { method: 'POST', headers, body } }
+    },
+    fetchOpts,
+  )
+  return finishDispatch(fetched, () => debugTrace)
+}
+
+async function finishDispatch(
+  fetched: ReturnType<typeof fetchWithApiKeyFallback>,
+  getDebugTrace: () => StreamDebugTrace | null,
+): Promise<DispatchResult> {
+  const { response } = await fetched
+  return { response, debugTrace: getDebugTrace() }
+}
+
+async function requireSuccessfulDispatch(
+  dispatched: Promise<DispatchResult>,
+): Promise<DispatchResult> {
+  const result = await dispatched
+  const { response, debugTrace } = result
   if (!response.ok) {
-    const body: unknown = await response.json().catch(() => ({
-      error: { code: response.status, message: response.statusText },
-    }))
-    throw normalizeError(body, {
+    const errorBody = await readErrorResponseJson(response)
+    throw normalizeError(errorBody, {
       midStream: false,
       httpStatus: response.status,
     })
@@ -84,20 +133,29 @@ async function dispatch(
     contentType: response.headers.get('content-type'),
     generationId: response.headers.get('x-generation-id') ?? undefined,
   })
-  return { response, debugTrace }
+  return result
 }
 
-export async function* chatCompletions(
+export function chatCompletions(
   ctx: ChatCompletionsContext,
   req: ChatCompletionRequestWire,
   opts: CallOpts = {},
-): AsyncGenerator<ChatStreamChunk> {
-  if (req.stream !== true) {
-    throw new Error(
-      'chatCompletions: request body must have stream:true — use chatCompletionsOnce for non-streaming',
-    )
-  }
-  const { response, debugTrace } = await dispatch(ctx, req, opts)
+): AsyncGenerator<ChatStreamChunk, void, unknown> {
+  return deferAdapterRequest(req, (request) => {
+    if (request.stream !== true) {
+      throw new Error(
+        'chatCompletions: request body must have stream:true — use chatCompletionsOnce for non-streaming',
+      )
+    }
+    return consumeChatCompletions(dispatch(ctx, request, opts), opts.signal)
+  })
+}
+
+async function* consumeChatCompletions(
+  dispatched: Promise<DispatchResult>,
+  signal: AbortSignal | undefined,
+): AsyncGenerator<ChatStreamChunk, void, unknown> {
+  const { response, debugTrace } = await requireSuccessfulDispatch(dispatched)
   const generationId = response.headers.get('x-generation-id') ?? undefined
   const contentType = response.headers.get('content-type') ?? ''
 
@@ -105,7 +163,7 @@ export async function* chatCompletions(
   // JSON even though SSE was requested. Normalize into a single terminal
   // chunk so the rest of the app can keep one consumer shape.
   if (!/text\/event-stream/i.test(contentType)) {
-    const result = (await response.json()) as ChatCompletionResultWire
+    const result = await decodeProviderJson<ChatCompletionResultWire>(response)
     logStreamDebug(debugTrace, 'buffered_result', result)
     const chunk: ChatStreamChunk = generationId
       ? { type: 'buffered_result', result, generationId }
@@ -114,7 +172,11 @@ export async function* chatCompletions(
     return
   }
 
-  for await (const ev of parseSSE(response, opts.signal ? { signal: opts.signal } : {})) {
+  for await (const ev of parseSSE(response, signal ? { signal } : {})) {
+    if (ev.kind === 'done') {
+      yield { type: 'transport_terminal', evidence: 'done-sentinel' }
+      continue
+    }
     if (ev.kind === 'keepalive') {
       yield { type: 'keepalive', comment: ev.comment }
       continue
@@ -131,22 +193,36 @@ export async function* chatCompletions(
     } catch (err) {
       // Malformed SSE JSON — skip and log. Streams survive single-chunk
       // corruption; one bad frame is not a reason to abort the whole turn.
-      console.warn('chatCompletions: malformed SSE chunk skipped', {
+      const report = malformedJsonFrameReport({
+        adapter: 'chat-completions',
+        eventType: ev.event,
         data: ev.data,
         error: err,
       })
+      console.warn('chatCompletions: malformed SSE chunk skipped', report.diagnostic)
+      yield { type: 'integrity', integrity: report.integrity }
     }
   }
 }
 
-export async function chatCompletionsOnce(
+export function chatCompletionsOnce(
   ctx: ChatCompletionsContext,
   req: ChatCompletionRequestWire,
   opts: CallOpts = {},
 ): Promise<ChatCompletionResultWire> {
-  const body: ChatCompletionRequestWire = { ...req, stream: false }
-  const { response, debugTrace } = await dispatch(ctx, body, opts)
-  const result = (await response.json()) as ChatCompletionResultWire
+  try {
+    const body: ChatCompletionRequestWire = { ...req, stream: false }
+    return consumeChatCompletionsOnce(dispatch(ctx, body, opts))
+  } catch (error) {
+    return Promise.reject(errorFromUnknown(error))
+  }
+}
+
+async function consumeChatCompletionsOnce(
+  dispatched: Promise<DispatchResult>,
+): Promise<ChatCompletionResultWire> {
+  const { response, debugTrace } = await requireSuccessfulDispatch(dispatched)
+  const result = await decodeProviderJson<ChatCompletionResultWire>(response)
   logStreamDebug(debugTrace, 'once.result', result)
   return result
 }

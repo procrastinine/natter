@@ -1,5 +1,3 @@
-// Phase 11: `toGeminiNative` transform tests. See `plan/phase11-implementation.md §4.5`.
-//
 // Verified against `gemini_docs/` and live probes (Gemini 3.1 confirms
 // `thought: true` summary parts AND a final-part `thoughtSignature` can
 // coexist in the same response).
@@ -342,6 +340,37 @@ describe('toGeminiNative — reasoning echo (thoughtSignature on LAST part)', ()
     }
     expect(lastPart.thoughtSignature).toBe('SIG_BLOB')
     expect(lastPart.text).toBe('The answer is 42.')
+  })
+
+  it('ignores tool-prefixed encrypted rows when selecting thoughtSignature', () => {
+    const details: ReasoningDetail[] = [
+      {
+        type: 'reasoning.encrypted',
+        id: 'tool_call-1',
+        data: 'TOOL_SIGNATURE',
+        format: 'google-gemini-v1',
+      },
+      {
+        type: 'reasoning.encrypted',
+        id: 'gemini-reasoning',
+        data: 'GEMINI_SIGNATURE',
+        format: 'google-gemini-v1',
+      },
+    ]
+    const path: Message[] = [
+      user('u1', 'q'),
+      assistant('a1', 'answer', { reasoningDetails: details }),
+      user('u2', 'follow'),
+    ]
+
+    const { wire } = toGeminiNative(settings(), path)
+
+    const modelTurn = required(wire.contents[1], 'model turn')
+    const lastPart = required(modelTurn.parts[modelTurn.parts.length - 1], 'last model part') as {
+      thoughtSignature?: string
+    }
+    expect(lastPart.thoughtSignature).toBe('GEMINI_SIGNATURE')
+    expect(path[1]?.reasoningDetails).toEqual(details)
   })
 
   it('drops signature when include.encrypted is false', () => {

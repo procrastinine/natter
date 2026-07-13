@@ -1,28 +1,11 @@
 // Default values for the core domain. Frozen to guard against accidental mutation
 // via shared references, since every new chat / preset copies from these.
-//
-// See `plan/02-data-model.md §2.5` (settings precedence) and `plan/13-delivery.md §13.2.1`
-// for the fields Phase 0 requires.
-
-import { createKey } from '../store/keys'
-import { createPreset } from '../store/presets'
-import { createProfile } from '../store/profiles'
-import { DEFAULT_CONTINUE_SYSTEM_PROMPT, DEFAULT_CONTINUE_USER_PROMPT } from './global-settings'
-import { withProfileApiDefaults } from './provider-defaults'
-import type {
-  ChatPreset,
-  ChatSettings,
-  ConnectionProfile,
-  DataPolicy,
-  KeyRecord,
-  PrivacyPrefs,
-} from './types'
+import { DEFAULT_CONTINUE_SYSTEM_PROMPT, DEFAULT_CONTINUE_USER_PROMPT } from './continue-prompts'
+import type { ChatSettings, DataPolicy, PrivacyPrefs } from './types'
 
 // First-run seed: ordered candidate model list consumed by `resolveDefaultModel`
-// when creating the seed ChatPreset for a new ConnectionProfile. See
-// `plan/14-details.md §14.35.8`. The actual fetch + resolution lives in Phase 5;
-// this constant is the pure-data default that Phase 2 pins so no other
-// subsystem has to hardcode the list.
+// when creating the seed ChatPreset for a new ConnectionProfile. This
+// pure-data default keeps the list out of fetch and resolution code.
 export const SEED_DEFAULT_MODEL_CANDIDATES: readonly string[] = Object.freeze([
   'anthropic/claude-opus-4.7',
   'openai/gpt-5.4',
@@ -38,7 +21,6 @@ export const DEFAULT_PRIVACY_PREFS: Readonly<PrivacyPrefs> = Object.freeze({
 })
 
 // Worst-case synthetic policy used when scraping returned no policy for an endpoint.
-// See `plan/09-privacy.md §9.6`.
 export const UNKNOWN_POLICY: Readonly<DataPolicy> = Object.freeze({
   training: true,
   trainingOpenRouter: true,
@@ -161,63 +143,4 @@ export function resolveDefaultModel(
     if (m.supportedParameters?.includes('tools') && freshEnough(m)) return m.id
   }
   return availableModels[0]?.id ?? SEED_DEFAULT_MODEL_CANDIDATES[0] ?? ''
-}
-
-// First-run seed per `plan/09-privacy.md §9.1`:
-//   1. Create ONE KeyRecord wrapping the pasted API key.
-//   2. Create ONE ConnectionProfile pointing at that key.
-//   3. Create ONE ChatPreset pointing at that profile with DEFAULT_CHAT_SETTINGS.
-// `resolveDefaultModel` is expected to run before calling this so the preset
-// starts with a concrete model; callers that haven't loaded /models yet can
-// pass an explicit `model` and defer resolution.
-interface FirstRunSeedInput {
-  apiKey: string
-  keyName?: string
-  passphrase?: string
-  passphraseHint?: string
-  profileName?: string
-  profileBaseUrl?: string
-  profileKind?: ConnectionProfile['kind']
-  appTitle?: string
-  appUrl?: string
-  presetName?: string
-  model?: string
-  now?: number
-}
-
-interface FirstRunSeedResult {
-  key: KeyRecord
-  profile: ConnectionProfile
-  preset: ChatPreset
-}
-
-export async function runFirstRunSeed(input: FirstRunSeedInput): Promise<FirstRunSeedResult> {
-  const now = input.now ?? Date.now()
-  const key = await createKey({
-    name: input.keyName ?? 'OpenRouter',
-    plaintextKey: input.apiKey,
-    ...(input.passphrase !== undefined ? { passphrase: input.passphrase } : {}),
-    ...(input.passphraseHint !== undefined ? { passphraseHint: input.passphraseHint } : {}),
-    now,
-  })
-  const profile = await createProfile({
-    name: input.profileName ?? 'OpenRouter',
-    kind: input.profileKind ?? 'openrouter',
-    baseUrl: input.profileBaseUrl ?? 'https://openrouter.ai/api/v1',
-    apiKeyRef: key.id,
-    appTitle: input.appTitle ?? 'llm-api-frontend',
-    appUrl: input.appUrl ?? '',
-    now,
-  })
-  const settings = cloneDefaultChatSettings()
-  settings.profileId = profile.id
-  settings.model = input.model ?? ''
-  const preset = await createPreset({
-    name: input.presetName ?? `${profile.name} default`,
-    connectionProfileId: profile.id,
-    settings: withProfileApiDefaults(settings, profile),
-    lastUsedAt: now,
-    now,
-  })
-  return { key, profile, preset }
 }

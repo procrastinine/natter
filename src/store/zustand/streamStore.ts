@@ -1,17 +1,12 @@
-// Per-tab ephemeral state for active streams. See `plan/03-storage.md §3.10` and
-// `plan/06-streaming.md §6.2`.
-//
 // Streams are keyed by `streamId`, not `chatId`, so one chat can host multiple
 // concurrent same-tab streams as long as they target different output rows.
 
 import { create } from 'zustand'
 import type {
-  ChatId,
-  ContentItem,
-  GenerationMeta,
-  MessageId,
-  ReasoningDetail,
-} from '../../core/types'
+  StreamAccumulatorLiveReasoningRow,
+  StreamAccumulatorLiveToolCallRow,
+} from '../../core/stream-accumulator'
+import type { ChatId, ContentItem, GenerationMeta, MessageId } from '../../core/types'
 
 interface ActiveStream {
   streamId: string
@@ -28,7 +23,8 @@ interface LiveStreamSnapshot {
   chatId: ChatId
   messageId: MessageId
   content: ContentItem[]
-  reasoningDetails?: ReasoningDetail[]
+  reasoningRows?: StreamAccumulatorLiveReasoningRow[]
+  toolCallRows?: StreamAccumulatorLiveToolCallRow[]
   generation?: GenerationMeta
   textLength: number
   reasoningLength: number
@@ -124,3 +120,8 @@ export const useStreamStore = create<StreamStoreState>((set, get) => ({
     }),
   reset: () => set({ activeByStreamId: {}, liveByMessageId: {} }),
 }))
+
+export function clearLiveSnapshotIfPresent(messageId: MessageId): void {
+  const state = useStreamStore.getState()
+  if (state.liveByMessageId[messageId]) state.clearLiveSnapshot(messageId)
+}

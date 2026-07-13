@@ -7,8 +7,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
 const TOKENS_PATH = resolve(__dirname, '../../src/styles/tokens.css')
 const THEMES_PATH = resolve(__dirname, '../../src/styles/themes.css')
 
-// Full required set per plan/10-ui.md §10.21 (color, typography, spacing,
-// motion, effects). Missing any of these is a Phase-8 contract failure.
+// Full required set for color, typography, spacing, motion, and effects.
 const REQUIRED_TOKENS = [
   '--color-bg-app',
   '--color-bg-surface-1',

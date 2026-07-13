@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import { normalizeReasoningDetails } from '../../core/reasoning'
 import {
   messageTextCharCount,
@@ -28,7 +29,9 @@ interface MessageInfoProps {
 export function MessageInfo({ message, staleReplyHint }: MessageInfoProps) {
   const gen = message.generation
   const usage = gen?.usage
-  const normalizedReasoning = normalizeReasoningDetails(message.reasoningDetails ?? [])
+  const normalizedReasoning = normalizeReasoningDetails(message.reasoningDetails ?? []).filter(
+    (detail) => !detail.id?.startsWith('tool_'),
+  )
   const start = gen?.startedAt
   const end = gen?.finishedAt
   const elapsedSec =
@@ -184,12 +187,24 @@ function ServerToolCalls({ tools }: { tools: readonly GenerationServerToolCall[]
   return (
     <div data-ui="message-tool-calls">
       {tools.map((tool, index) => (
-        <details key={`${tool.type}:${tool.id ?? tool.outputIndex ?? index}`} data-ui="tool-call">
-          <summary>{serverToolSummary(tool)}</summary>
-          <pre>{formatServerToolOutput(tool)}</pre>
-        </details>
+        <ServerToolCall key={`${tool.type}:${tool.id ?? tool.outputIndex ?? index}`} tool={tool} />
       ))}
     </div>
+  )
+}
+
+function ServerToolCall({ tool }: { tool: GenerationServerToolCall }) {
+  const [open, setOpen] = useState(false)
+  return (
+    <details
+      data-ui="tool-call"
+      onToggle={(event) => {
+        setOpen(event.currentTarget.open)
+      }}
+    >
+      <summary>{serverToolSummary(tool)}</summary>
+      {open ? <pre>{formatServerToolOutput(tool)}</pre> : null}
+    </details>
   )
 }
 
@@ -248,8 +263,8 @@ function summarizeReasoningChars(details: ReasoningDetail[]): {
   let encrypted = 0
   for (const detail of normalizeReasoningDetails(details)) {
     if (detail.type === 'reasoning.text') text += detail.text?.length ?? 0
-    else if (detail.type === 'reasoning.summary') summary += detail.summary?.length ?? 0
-    else if (detail.type === 'reasoning.encrypted') encrypted += detail.data?.length ?? 0
+    else if (detail.type === 'reasoning.summary') summary += detail.summary.length
+    else encrypted += detail.data.length
   }
   return { text, summary, encrypted, total: text + summary + encrypted }
 }

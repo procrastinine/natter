@@ -1,5 +1,3 @@
-// Image origin allowlist for MarkdownView. See plan/11-rendering.md §11.5.
-//
 // The default list covers origins that LLM responses commonly reference and
 // that are trusted not to ship tracking pixels. User-added origins are
 // persisted under `settings['image-allowlist']` and appended at render time.

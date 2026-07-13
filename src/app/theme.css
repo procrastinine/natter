@@ -1,7 +1,7 @@
 /*
  * theme.css — style entrypoint.
  *
- * Imports the shared style files in the order declared in plan/10-ui.md §10.20:
+ * Imports the shared style files in dependency order:
  *   1. tokens.css
  *   2. themes.css
  *   3. motion.css

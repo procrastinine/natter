@@ -1,12 +1,10 @@
-// Phase 11: `api/gemini-native.ts` adapter tests. See
-// `plan/phase11-implementation.md §4.4`.
-
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { type GeminiContext, geminiOnce, geminiStream } from '../../src/api/gemini-native'
 import type { GeminiStreamChunk, GenerateContentResponseWire } from '../../src/api/gemini-types'
 import type { ConnectionProfile } from '../../src/core/types'
+import { geminiBufferedResult, geminiStreamSse } from '../helpers/protocol-fixtures'
 
 const PROBE8 = resolve(__dirname, '../../../plan/phase11-probes/08-gemini-native-stream.sse')
 const PROBE3 = resolve(__dirname, '../../../plan/phase11-probes/03-gemini-native.json')
@@ -114,12 +112,11 @@ describe('geminiStream — URL & headers', () => {
   })
 })
 
-describe('geminiStream — probe 8 round-trip', () => {
-  it('parses the captured SSE into typed chunks with a final thoughtSignature', async () => {
-    const body = readFileSync(PROBE8, 'utf8')
+describe('geminiStream — representative round-trip', () => {
+  it('parses SSE into typed chunks with a final thoughtSignature', async () => {
     vi.stubGlobal(
       'fetch',
-      vi.fn(async () => sseResponse(body)),
+      vi.fn(async () => sseResponse(geminiStreamSse)),
     )
 
     const chunks: GeminiStreamChunk[] = []
@@ -146,15 +143,14 @@ describe('geminiStream — probe 8 round-trip', () => {
   })
 })
 
-describe('geminiOnce — probe 3 buffered', () => {
+describe('geminiOnce — representative buffered response', () => {
   it('returns the full GenerateContentResponseWire body', async () => {
-    const buffered = JSON.parse(readFileSync(PROBE3, 'utf8')) as GenerateContentResponseWire
     vi.stubGlobal(
       'fetch',
-      vi.fn(async () => jsonResponse(buffered)),
+      vi.fn(async () => jsonResponse(geminiBufferedResult)),
     )
     const result = await geminiOnce(ctx(), { contents: [] }, 'gemini-3.1-flash-lite-preview')
-    expect(result).toEqual(buffered)
+    expect(result).toEqual(geminiBufferedResult)
   })
 
   it('surfaces pre-response 4xx errors normalized to ApiError', async () => {
@@ -178,3 +174,42 @@ describe('geminiOnce — probe 3 buffered', () => {
     ).rejects.toThrow(/thought_signature/i)
   })
 })
+
+if (existsSync(PROBE8)) {
+  describe('geminiStream — full local stream capture', () => {
+    it('parses the complete capture with its final thought signature', async () => {
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => sseResponse(readFileSync(PROBE8, 'utf8'))),
+      )
+      const chunks: GeminiStreamChunk[] = []
+      for await (const chunk of geminiStream(
+        ctx(),
+        { contents: [{ role: 'user', parts: [{ text: 'x' }] }] },
+        'gemini-3.1-flash-lite-preview',
+      )) {
+        chunks.push(chunk)
+      }
+      const final = chunks.at(-1)
+      expect(final?.type).toBe('chunk')
+      if (final?.type !== 'chunk') throw new Error('expected final Gemini chunk')
+      const part = final.chunk.candidates?.[0]?.content.parts.at(-1)
+      expect(part && 'thoughtSignature' in part ? part.thoughtSignature : undefined).toBeDefined()
+    })
+  })
+}
+
+if (existsSync(PROBE3)) {
+  describe('geminiOnce — full local buffered capture', () => {
+    it('returns the complete captured response', async () => {
+      const buffered = JSON.parse(readFileSync(PROBE3, 'utf8')) as GenerateContentResponseWire
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => jsonResponse(buffered)),
+      )
+      await expect(
+        geminiOnce(ctx(), { contents: [] }, 'gemini-3.1-flash-lite-preview'),
+      ).resolves.toEqual(buffered)
+    })
+  })
+}

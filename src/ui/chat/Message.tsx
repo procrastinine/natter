@@ -9,16 +9,16 @@ import {
   useState,
 } from 'react'
 import type { EffectiveCapability } from '../../core/capabilities'
+import { hasAppliedSuccessfulContinuation } from '../../core/continuation-content'
 import type { LongMessageDisplayMode } from '../../core/global-settings'
 import { quirksFor } from '../../core/quirks'
 import { normalizeReasoningDetails } from '../../core/reasoning'
 import { detectStaleReasoning, staleReasoningBannerText } from '../../core/stale-reasoning'
+import type { StreamAccumulatorLiveReasoningRow } from '../../core/stream-accumulator'
 import type {
   ChatId,
-  CursorMap,
   MessageAttachmentRef,
   Message as MessageRow,
-  ProviderOutputItem,
   ReasoningDetail,
 } from '../../core/types'
 import { dismissAbortReason, updateChatSettings } from '../../store/chats'
@@ -32,14 +32,10 @@ import { useStreamStore } from '../../store/zustand/streamStore'
 import { useToastStore } from '../../store/zustand/toastStore'
 import { useUiStore } from '../../store/zustand/uiStore'
 import { AttachmentRefChips } from '../attachments/AttachmentRefChips'
-import { BranchControls } from './BranchControls'
+import { BranchControls, type BranchNavigationContext } from './BranchControls'
 import { InlineEditor, plaintextOf } from './InlineEditor'
 import { type InsertSlot, MessageActions, MessageEditTreeActions } from './MessageActions'
-import {
-  MessageContent,
-  messageTextFromContent,
-  messageTextSegmentsFromContent,
-} from './MessageContent'
+import { MessageContent, messageTextSegmentsFromContent } from './MessageContent'
 import { MessageHeader } from './MessageHeader'
 import { MessageInfo } from './MessageInfo'
 import {
@@ -54,11 +50,8 @@ import { ToolEvidenceBlock } from './ToolEvidenceBlock'
 interface MessageProps {
   chatId: ChatId
   message: MessageRow
-  branchMessages?: readonly MessageRow[]
-  branchTreeKey?: string
+  branchContext?: BranchNavigationContext
   hasAnyReasoningDetails: boolean
-  hasSiblingVariants: boolean
-  cursor: CursorMap
   streaming?: boolean
   hasConnection: boolean
   generationBusy?: boolean
@@ -78,13 +71,9 @@ interface MessageProps {
   excludedFromContext?: boolean
   // Structural op handlers. Threaded from the list so `<Message>` can stay
   // presentational except for its own edit-swap state.
-  onEditInPlace: (
-    message: MessageRow,
-    text: string,
-    reasoning?: ReasoningDetail[],
-    attachmentRefs?: MessageAttachmentRef[],
-    providerOutputItems?: ProviderOutputItem[],
-  ) => Promise<void>
+  onEditInPlace: (message: MessageRow, text: string) => Promise<void>
+  onToggleReasoningDetailHidden?: (message: MessageRow, detailIndex: number) => Promise<void>
+  onToggleProviderOutputItemHidden?: (message: MessageRow, itemIndex: number) => Promise<void>
   onEditAndSend?: (
     message: MessageRow,
     text: string,
@@ -103,6 +92,14 @@ interface MessageProps {
   longMessageDisplayMode?: LongMessageDisplayMode
 }
 
+let messageRenderProbe: ((messageId: string) => void) | undefined
+
+export function __setMessageRenderProbeForTests(
+  probe: ((messageId: string) => void) | undefined,
+): void {
+  messageRenderProbe = probe
+}
+
 // Memoized — the markdown render path (Streamdown + Shiki + KaTeX) is
 // expensive, and parents (Shell) re-render on any global-prefs change.
 // Without memo, every theme/sendShortcut/chatMaxWidth change cascades a
@@ -118,10 +115,8 @@ export const Message = memo(
   },
   (prev, next) =>
     prev.message === next.message &&
-    prev.branchTreeKey === next.branchTreeKey &&
+    prev.branchContext === next.branchContext &&
     prev.hasAnyReasoningDetails === next.hasAnyReasoningDetails &&
-    prev.hasSiblingVariants === next.hasSiblingVariants &&
-    prev.cursor === next.cursor &&
     prev.streaming === next.streaming &&
     prev.hasConnection === next.hasConnection &&
     prev.generationBusy === next.generationBusy &&
@@ -130,6 +125,8 @@ export const Message = memo(
     prev.staleReplyHint === next.staleReplyHint &&
     prev.excludedFromContext === next.excludedFromContext &&
     prev.onEditInPlace === next.onEditInPlace &&
+    prev.onToggleReasoningDetailHidden === next.onToggleReasoningDetailHidden &&
+    prev.onToggleProviderOutputItemHidden === next.onToggleProviderOutputItemHidden &&
     prev.onEditAndSend === next.onEditAndSend &&
     prev.onRegenerate === next.onRegenerate &&
     prev.onContinue === next.onContinue &&
@@ -144,11 +141,8 @@ export const Message = memo(
 function MessageInner({
   chatId,
   message,
-  branchMessages,
-  branchTreeKey,
+  branchContext,
   hasAnyReasoningDetails,
-  hasSiblingVariants,
-  cursor,
   streaming,
   hasConnection,
   generationBusy = false,
@@ -157,6 +151,8 @@ function MessageInner({
   staleReplyHint,
   excludedFromContext,
   onEditInPlace,
+  onToggleReasoningDetailHidden,
+  onToggleProviderOutputItemHidden,
   onEditAndSend,
   onRegenerate,
   onContinue,
@@ -167,7 +163,7 @@ function MessageInner({
   prefillSettingsPrompt,
   longMessageDisplayMode = 'full',
 }: MessageProps) {
-  void branchTreeKey
+  messageRenderProbe?.(message.id)
   const debug = (message as unknown as { debugCrash?: boolean }).debugCrash
   if (debug) {
     throw new Error('Message debug crash')
@@ -190,28 +186,32 @@ function MessageInner({
   const remoteStreaming =
     activeStream !== undefined && activeStream.ownerClientId !== getStreamClientId()
   const renderedContent = liveSnapshot?.content ?? message.content
-  const renderedReasoningDetails = liveSnapshot?.reasoningDetails ?? message.reasoningDetails
+  const liveReasoningRows = liveSnapshot?.reasoningRows
   const renderedGeneration = mergeLiveGeneration(message.generation, liveSnapshot?.generation)
+  const infoReasoningDetails = useMemo(
+    () =>
+      showInfo && liveReasoningRows
+        ? materializeLiveReasoningRows(liveReasoningRows)
+        : message.reasoningDetails,
+    [liveReasoningRows, message.reasoningDetails, showInfo],
+  )
   const infoMessage = useMemo(() => {
     if (!showInfo || !liveSnapshot) return message
     return {
       ...message,
       content: renderedContent,
-      ...(renderedReasoningDetails ? { reasoningDetails: renderedReasoningDetails } : {}),
+      ...(infoReasoningDetails ? { reasoningDetails: infoReasoningDetails } : {}),
       ...(renderedGeneration ? { generation: renderedGeneration } : {}),
     }
-  }, [
-    showInfo,
-    liveSnapshot,
-    message,
-    renderedContent,
-    renderedReasoningDetails,
-    renderedGeneration,
-  ])
+  }, [showInfo, liveSnapshot, message, renderedContent, infoReasoningDetails, renderedGeneration])
   const reasoning = useMemo(
-    () => normalizeReasoningDetails(renderedReasoningDetails ?? []),
-    [renderedReasoningDetails],
+    () =>
+      liveReasoningRows
+        ? liveReasoningRows.map((row) => row.detail)
+        : normalizeReasoningDetails(message.reasoningDetails ?? []),
+    [liveReasoningRows, message.reasoningDetails],
   )
+  const hasDisplayReasoning = reasoning.some((detail) => !detail.id?.startsWith('tool_'))
   const textSegments = useMemo(
     () => messageTextSegmentsFromContent(renderedContent),
     [renderedContent],
@@ -250,8 +250,9 @@ function MessageInner({
     }
   }, [isStreaming, renderedContent, message.id])
   const gen = renderedGeneration
-  const error = gen?.error
-  const abortReason = gen?.abortReason
+  const suppressOriginalFailure = hasAppliedSuccessfulContinuation(message)
+  const error = suppressOriginalFailure ? undefined : gen?.error
+  const abortReason = suppressOriginalFailure ? undefined : gen?.abortReason
   const messageModelQuirks = useMemo(
     () => quirksFor(gen?.model ?? gen?.requestedModel ?? ''),
     [gen?.model, gen?.requestedModel],
@@ -264,7 +265,7 @@ function MessageInner({
   const showHiddenReasoningFooter =
     message.role === 'assistant' &&
     !editing &&
-    reasoning.length === 0 &&
+    !hasDisplayReasoning &&
     (messageModelQuirks.hiddenReasoningOnChatApi === true ||
       capability?.quirks.hiddenReasoningOnChatApi === true) &&
     apiUsed === 'chat'
@@ -276,9 +277,8 @@ function MessageInner({
 
   // Stale-reasoning detection. When a fresh assistant error matches the
   // "preserved reasoning got rejected" pattern, push a banner with actions
-  // to retry without carry-forward and to copy the error. The banner is the
-  // canonical surface (see plan/13 §Phase 11.1); the inline error row still
-  // shows the raw message so the user has context either way.
+  // to retry without carry-forward and to copy the error. The inline error row
+  // still shows the raw message so the user has context either way.
   const pushBanner = useToastStore((s) => s.pushBanner)
   const clearBannersByKind = useToastStore((s) => s.clearBannersByKind)
   const dismissBanner = useToastStore((s) => s.dismissBanner)
@@ -315,8 +315,10 @@ function MessageInner({
       null,
       2,
     )
-    if (typeof navigator !== 'undefined' && navigator.clipboard) {
-      void navigator.clipboard.writeText(payload)
+    const browserNavigator: Partial<Navigator> | undefined =
+      typeof navigator === 'undefined' ? undefined : navigator
+    if (browserNavigator?.clipboard) {
+      void browserNavigator.clipboard.writeText(payload)
     }
   }, [error, message.id])
   useEffect(() => {
@@ -366,50 +368,27 @@ function MessageInner({
   }, [collapseProfile.defaultMode, collapseProfile.modes])
 
   const handleSave = useCallback(
-    async (
-      text: string,
-      reasoning?: ReasoningDetail[],
-      attachmentRefs?: MessageAttachmentRef[],
-      providerOutputItems?: ProviderOutputItem[],
-    ) => {
-      await onEditInPlace(message, text, reasoning, attachmentRefs, providerOutputItems)
+    async (text: string) => {
+      await onEditInPlace(message, text)
       setEditing(false)
     },
     [message, onEditInPlace],
   )
-  // Per-block hide toggle. `reasoning` is the normalized view, so indices
-  // here map 1:1 to the stored list for clean data (post-Phase-11 fix);
-  // legacy duplicates get cleaned up as a side effect of the first toggle.
+  // The display normalizer is deliberately one-row-in/one-row-out. Apply the
+  // eye toggle to that same raw row and leave every other carrier untouched.
   const handleToggleReasoningHidden = useCallback(
     (detailIndex: number) => {
-      if (detailIndex < 0 || detailIndex >= reasoning.length) return
-      const next = reasoning.map((d, i) => (i === detailIndex ? { ...d, hidden: !d.hidden } : d))
-      void onEditInPlace(message, messageTextFromContent(renderedContent), next)
+      if (liveReasoningRows || !onToggleReasoningDetailHidden) return
+      void onToggleReasoningDetailHidden(message, detailIndex)
     },
-    [message, reasoning, renderedContent, onEditInPlace],
+    [liveReasoningRows, message, onToggleReasoningDetailHidden],
   )
   const handleToggleToolHidden = useCallback(
     (itemIndex: number) => {
-      const items = structuredClone(message.providerOutputItems ?? [])
-      if (itemIndex < 0 || itemIndex >= items.length) return
-      const item = items[itemIndex]
-      if (!item) return
-      if (item.hidden === true) {
-        const next = { ...item }
-        delete next.hidden
-        items[itemIndex] = next
-      } else {
-        items[itemIndex] = { ...item, hidden: true }
-      }
-      void onEditInPlace(
-        message,
-        messageTextFromContent(renderedContent),
-        undefined,
-        undefined,
-        items,
-      )
+      if (!onToggleProviderOutputItemHidden) return
+      void onToggleProviderOutputItemHidden(message, itemIndex)
     },
-    [message, renderedContent, onEditInPlace],
+    [message, onToggleProviderOutputItemHidden],
   )
   const handleSaveAndSend = useCallback(
     async (
@@ -457,7 +436,7 @@ function MessageInner({
       data-message-id={message.id}
       data-editing={editing ? 'true' : 'false'}
       data-has-error={error ? 'true' : 'false'}
-      data-has-reasoning={reasoning.length > 0 ? 'true' : 'false'}
+      data-has-reasoning={hasDisplayReasoning ? 'true' : 'false'}
       data-collapse-mode={collapseMode}
     >
       <button
@@ -483,18 +462,27 @@ function MessageInner({
       </button>
       <div data-ui="message-body-column">
         <MessageHeader message={message} />
-        {collapseMode === 'full' && reasoning.length > 0 && !editing ? (
+        {collapseMode === 'full' && hasDisplayReasoning && !editing ? (
           <ReasoningBlock
             details={reasoning}
+            detailsNormalized
+            {...(liveReasoningRows ? { liveRows: liveReasoningRows } : {})}
             streaming={isStreaming}
             hasContent={hasContent}
-            {...(message.role === 'assistant'
+            toggleHiddenDisabled={isStreaming}
+            {...(message.role === 'assistant' && onToggleReasoningDetailHidden
               ? { onToggleHidden: handleToggleReasoningHidden }
               : {})}
           />
         ) : null}
         {collapseMode === 'full' && !editing ? (
-          <ToolEvidenceBlock message={infoMessage} onToggleHidden={handleToggleToolHidden} />
+          <ToolEvidenceBlock
+            message={infoMessage}
+            toggleHiddenDisabled={isStreaming}
+            {...(onToggleProviderOutputItemHidden
+              ? { onToggleHidden: handleToggleToolHidden }
+              : {})}
+          />
         ) : null}
         {collapseMode === 'full' && showHiddenReasoningFooter ? (
           <div data-ui="message-hidden-reasoning" role="status">
@@ -519,9 +507,11 @@ function MessageInner({
             initial={plaintextOf(message.content)}
             onSave={handleSave}
             onCancel={() => setEditing(false)}
-            initialAttachmentRefs={message.attachmentRefs}
+            saveContentOnly
+            attachmentsEnabled={message.role === 'user' && onEditAndSend !== undefined}
             {...(message.role === 'user' && onEditAndSend
               ? {
+                  initialAttachmentRefs: message.attachmentRefs,
                   onSaveAndSend: handleSaveAndSend,
                   saveAndSendDisabled: !hasConnection || generationBusy,
                   ...(showPrefillButton
@@ -538,16 +528,11 @@ function MessageInner({
                       : {}),
                 }
               : {})}
-            {...(message.role === 'assistant'
-              ? {
-                  initialReasoning: message.reasoningDetails ?? [],
-                  initialProviderOutputItems: message.providerOutputItems ?? [],
-                }
-              : {})}
             ariaLabel={`Edit ${message.role} message`}
           />
         ) : (
           <MessageContent
+            key={`${message.id}:${message.nodeVersion}`}
             content={renderedContent}
             text={text}
             textSegments={isStreaming ? textSegments : undefined}
@@ -610,14 +595,13 @@ function MessageInner({
         ) : null}
         {null}
         <div data-ui="message-action-row">
-          {hasSiblingVariants && branchMessages ? (
-            <BranchControls chatId={chatId} message={message} messages={branchMessages} />
+          {branchContext ? (
+            <BranchControls chatId={chatId} message={message} context={branchContext} />
           ) : (
             <span data-ui="message-action-row-spacer" />
           )}
           <MessageActions
             chatId={chatId}
-            cursor={cursor}
             message={message}
             showInfo={showInfo}
             onToggleInfo={() => setShowInfo((v) => !v)}
@@ -625,6 +609,7 @@ function MessageInner({
             onBeginEdit={() => setEditing(true)}
             hasConnection={hasConnection}
             generationBusy={generationBusy}
+            streamTargetBusy={isStreaming}
             {...(roleMismatch ? { roleMismatch: true } : {})}
             {...(onRegenerate ? { onRegenerate: handleRegenerate } : {})}
             {...(onContinue ? { onContinue: handleContinue } : {})}
@@ -634,8 +619,8 @@ function MessageInner({
         {editTreeMode ? (
           <MessageEditTreeActions
             chatId={chatId}
-            cursor={cursor}
             message={message}
+            streamTargetBusy={isStreaming}
             {...(onInsert ? { onInsert: handleInsert } : {})}
             {...(roleMismatch ? { roleMismatch: true } : {})}
           />
@@ -649,6 +634,18 @@ function MessageInner({
       </div>
     </article>
   )
+}
+
+function materializeLiveReasoningRows(
+  rows: readonly StreamAccumulatorLiveReasoningRow[],
+): ReasoningDetail[] {
+  return rows.map(({ detail, valueSections }) => {
+    if (!valueSections) return detail
+    const value = valueSections.join('')
+    if (detail.type === 'reasoning.text') return { ...detail, text: value }
+    if (detail.type === 'reasoning.summary') return { ...detail, summary: value }
+    return { ...detail, data: value }
+  })
 }
 
 function mergeLiveGeneration(

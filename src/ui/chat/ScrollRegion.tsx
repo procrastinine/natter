@@ -9,6 +9,7 @@ import {
   useState,
 } from 'react'
 import { logScrollDebug } from '../../lib/debug-scroll'
+import { scheduleReactPublication } from '../../lib/react-publication'
 
 export type ScrollState = 'follow' | 'pinned'
 
@@ -46,10 +47,48 @@ export interface ScrollRegionHandle {
 
 const DEFAULT_THRESHOLD_PX = 48
 const USER_SCROLL_INTENT_MS = 750
-const PROGRAMMATIC_SCROLL_GRACE_MS = 250
-const SMOOTH_PROGRAMMATIC_SCROLL_GRACE_MS = 1200
+const PROGRAMMATIC_SCROLL_TOLERANCE_PX = 4
 const SETTLE_REQUIRED_STABLE_FRAMES = 2
 const SETTLE_MAX_FRAME_CHECKS = 8
+
+interface InstantScrollIntent {
+  sequence: number
+  top: number
+}
+
+interface SmoothScrollIntent {
+  target: number
+  last: number
+  direction: -1 | 1
+}
+
+function consumeInstantScrollIntent(intents: InstantScrollIntent[], top: number): boolean {
+  for (let index = intents.length - 1; index >= 0; index -= 1) {
+    const intent = intents[index]
+    if (intent && Math.abs(intent.top - top) <= PROGRAMMATIC_SCROLL_TOLERANCE_PX) {
+      intents.splice(0, index + 1)
+      return true
+    }
+  }
+  return false
+}
+
+function advanceSmoothScrollIntent(
+  intent: SmoothScrollIntent,
+  top: number,
+): { programmatic: boolean; next: SmoothScrollIntent | null } {
+  const withinTarget =
+    intent.direction > 0
+      ? top >= intent.last - PROGRAMMATIC_SCROLL_TOLERANCE_PX &&
+        top <= intent.target + PROGRAMMATIC_SCROLL_TOLERANCE_PX
+      : top <= intent.last + PROGRAMMATIC_SCROLL_TOLERANCE_PX &&
+        top >= intent.target - PROGRAMMATIC_SCROLL_TOLERANCE_PX
+  if (!withinTarget) return { programmatic: false, next: null }
+  if (Math.abs(top - intent.target) <= PROGRAMMATIC_SCROLL_TOLERANCE_PX) {
+    return { programmatic: true, next: null }
+  }
+  return { programmatic: true, next: { ...intent, last: top } }
+}
 
 type PositionSource = 'layout' | 'observer' | 'resize' | 'scroll'
 type ScrollDebugEvent =
@@ -59,7 +98,6 @@ type ScrollDebugEvent =
   | 'follow.settle.tick'
   | 'follow.schedule'
   | 'follow.scheduled-scroll'
-  | 'follow.resize-scroll'
   | 'position'
   | 'open.wait'
   | 'open.bottom'
@@ -121,20 +159,29 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
   // at its leaf. Overflow measurement below flips to `pinned` when needed.
   const [state, setState] = useState<ScrollState>('follow')
   const stateRef = useRef<ScrollState>(state)
+  const pendingStateRef = useRef<ScrollState | null>(null)
+  const statePublicationScheduledRef = useRef(false)
+  const mountedRef = useRef(true)
   stateRef.current = state
   const followIntentRef = useRef(true)
   const didOpenRef = useRef(false)
   const resetKeyRef = useRef(resetKey)
   const followFrameRef = useRef<number | null>(null)
+  const observerFrameRef = useRef<number | null>(null)
+  const observerSignalsRef = useRef({ resize: false, mutation: false })
   const settleCheckFrameRef = useRef<number | null>(null)
   const settleFollowPendingRef = useRef(false)
   const settleLastHeightRef = useRef<number | null>(null)
   const settleStableFramesRef = useRef(0)
   const settleFrameChecksRef = useRef(0)
   const userScrollIntentUntilRef = useRef(0)
-  const programmaticScrollUntilRef = useRef(0)
-  const programmaticScrollTargetRef = useRef<number | null>(null)
-  const programmaticSmoothScrollRef = useRef(false)
+  const lastNativeScrollTopRef = useRef<number | null>(null)
+  const instantScrollIntentsRef = useRef<InstantScrollIntent[]>([])
+  const instantScrollSequenceRef = useRef(0)
+  const instantScrollRevisionRef = useRef(0)
+  const instantScrollCleanupFrameRef = useRef<number | null>(null)
+  const streamTailLayoutScrollAllowanceRef = useRef(false)
+  const smoothScrollIntentRef = useRef<SmoothScrollIntent | null>(null)
   const thresholdRef = useRef(pinThresholdPx ?? DEFAULT_THRESHOLD_PX)
   const autoScrollOnStreamRef = useRef(autoScrollOnStream)
   const streamActiveRef = useRef(streamActive)
@@ -156,7 +203,9 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
         streamActive: streamActiveRef.current,
         autoScrollOnStream: autoScrollOnStreamRef.current,
         userScrollIntentMsRemaining: Math.max(0, userScrollIntentUntilRef.current - timestamp),
-        programmaticScrollMsRemaining: Math.max(0, programmaticScrollUntilRef.current - timestamp),
+        instantScrollIntents: instantScrollIntentsRef.current.length,
+        streamTailLayoutScrollAllowance: streamTailLayoutScrollAllowanceRef.current,
+        smoothScrollIntent: smoothScrollIntentRef.current,
         settlePending: settleFollowPendingRef.current,
         metrics: container
           ? {
@@ -177,14 +226,73 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
     onStateChange?.(state)
   }, [state, onStateChange])
 
+  useLayoutEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+      pendingStateRef.current = null
+    }
+  }, [])
+
   const setScrollStateNow = useCallback(
     (next: ScrollState, reason = 'unknown') => {
       const previous = stateRef.current
       stateRef.current = next
       if (previous !== next) debugScroll('state', { from: previous, to: next, reason })
-      setState((prev) => (prev === next ? prev : next))
+      pendingStateRef.current = next
+      if (statePublicationScheduledRef.current) return
+      statePublicationScheduledRef.current = true
+      scheduleReactPublication(() => {
+        statePublicationScheduledRef.current = false
+        const pending = pendingStateRef.current
+        pendingStateRef.current = null
+        if (!mountedRef.current || pending === null) return
+        setState((current) => (current === pending ? current : pending))
+      })
     },
     [debugScroll],
+  )
+
+  const clearInstantScrollIntents = useCallback(() => {
+    instantScrollIntentsRef.current = []
+    instantScrollRevisionRef.current += 1
+    if (instantScrollCleanupFrameRef.current !== null) {
+      cancelAnimationFrame(instantScrollCleanupFrameRef.current)
+      instantScrollCleanupFrameRef.current = null
+    }
+  }, [])
+
+  const clearProgrammaticScrollIntents = useCallback(() => {
+    clearInstantScrollIntents()
+    streamTailLayoutScrollAllowanceRef.current = false
+    smoothScrollIntentRef.current = null
+  }, [clearInstantScrollIntents])
+
+  const scheduleInstantScrollIntentCleanup: () => void = useCallback(() => {
+    if (instantScrollCleanupFrameRef.current !== null) return
+    const scheduledRevision = instantScrollRevisionRef.current
+    instantScrollCleanupFrameRef.current = requestAnimationFrame(() => {
+      instantScrollCleanupFrameRef.current = null
+      if (
+        scheduledRevision !== instantScrollRevisionRef.current &&
+        instantScrollIntentsRef.current.length > 0
+      ) {
+        scheduleInstantScrollIntentCleanup()
+        return
+      }
+      instantScrollIntentsRef.current = []
+    })
+  }, [])
+
+  const recordInstantScrollIntent = useCallback(
+    (top: number) => {
+      const sequence = instantScrollSequenceRef.current + 1
+      instantScrollSequenceRef.current = sequence
+      instantScrollIntentsRef.current.push({ sequence, top })
+      instantScrollRevisionRef.current += 1
+      scheduleInstantScrollIntentCleanup()
+    },
+    [scheduleInstantScrollIntentCleanup],
   )
 
   const scrollToBottomNow = useCallback(
@@ -193,26 +301,36 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       if (!container) return
       const smooth = opts?.smooth ?? false
       const top = bottomScrollTop(container)
-      programmaticScrollUntilRef.current =
-        nowMs() + (smooth ? SMOOTH_PROGRAMMATIC_SCROLL_GRACE_MS : PROGRAMMATIC_SCROLL_GRACE_MS)
-      programmaticScrollTargetRef.current = top
-      programmaticSmoothScrollRef.current = smooth
       debugScroll('scroll.to-bottom', {
         reason: opts?.reason ?? 'unknown',
         smooth,
         targetTop: top,
       })
-      if (typeof container.scrollTo === 'function') {
+      if (smooth && Math.abs(container.scrollTop - top) > PROGRAMMATIC_SCROLL_TOLERANCE_PX) {
+        clearInstantScrollIntents()
+        smoothScrollIntentRef.current = {
+          target: top,
+          last: container.scrollTop,
+          direction: top > container.scrollTop ? 1 : -1,
+        }
         container.scrollTo({
           top,
-          behavior: smooth ? 'smooth' : 'auto',
+          behavior: 'smooth',
         })
+      } else if (!smooth) {
+        smoothScrollIntentRef.current = null
+        const before = container.scrollTop
+        container.scrollTop = top
+        const actual = container.scrollTop
+        lastNativeScrollTopRef.current = actual
+        if (Math.abs(actual - before) > 0.5) recordInstantScrollIntent(actual)
+      } else {
+        smoothScrollIntentRef.current = null
       }
-      if (!smooth) container.scrollTop = top
       followIntentRef.current = true
       setScrollStateNow('follow', opts?.reason ?? 'scroll.to-bottom')
     },
-    [debugScroll, setScrollStateNow],
+    [clearInstantScrollIntents, debugScroll, recordInstantScrollIntent, setScrollStateNow],
   )
 
   const shouldFollowContentGrowth = useCallback(() => {
@@ -221,10 +339,9 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
     return settleFollowPendingRef.current || stateRef.current === 'follow'
   }, [])
 
-  const settleActive = useCallback(() => settleFollowPendingRef.current, [])
-
   const clearFollowSettle = useCallback(() => {
     settleFollowPendingRef.current = false
+    streamTailLayoutScrollAllowanceRef.current = false
     settleLastHeightRef.current = null
     settleStableFramesRef.current = 0
     settleFrameChecksRef.current = 0
@@ -297,8 +414,32 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
     (source: PositionSource) => {
       const container = containerRef.current
       if (!container) return
+      const previousNativeScrollTop = lastNativeScrollTopRef.current
       const next = scrollStateFromPosition(container, thresholdRef.current)
-      debugScroll('position', { source, next })
+      const stationaryNativeScroll =
+        source === 'scroll' &&
+        previousNativeScrollTop !== null &&
+        Math.abs(previousNativeScrollTop - container.scrollTop) <= 0.5
+      if (source === 'scroll') lastNativeScrollTopRef.current = container.scrollTop
+      debugScroll('position', { source, next, stationaryNativeScroll })
+      let programmaticScroll = false
+      if (source === 'scroll') {
+        const instantMatched = consumeInstantScrollIntent(
+          instantScrollIntentsRef.current,
+          container.scrollTop,
+        )
+        if (instantMatched) {
+          instantScrollRevisionRef.current += 1
+          programmaticScroll = true
+        } else if (smoothScrollIntentRef.current) {
+          const smooth = advanceSmoothScrollIntent(
+            smoothScrollIntentRef.current,
+            container.scrollTop,
+          )
+          smoothScrollIntentRef.current = smooth.next
+          programmaticScroll = smooth.programmatic
+        }
+      }
       if (next === 'follow') {
         followIntentRef.current = true
         setScrollStateNow('follow', source)
@@ -306,22 +447,27 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       }
       const timestamp = nowMs()
       const userScrollIntentActive = timestamp <= userScrollIntentUntilRef.current
-      const programmaticScrollActive = timestamp <= programmaticScrollUntilRef.current
-      const programmaticTarget = programmaticScrollTargetRef.current
-      const programmaticInstantScroll =
-        programmaticScrollActive &&
-        !programmaticSmoothScrollRef.current &&
-        programmaticTarget !== null &&
-        Math.abs(container.scrollTop - programmaticTarget) <= 4
-      const programmaticSmoothScroll =
-        programmaticScrollActive && programmaticSmoothScrollRef.current
-      const nativeScrollIntent =
-        source === 'scroll' && !programmaticInstantScroll && !programmaticSmoothScroll
-      if (nativeScrollIntent) {
+      const streamTailLayoutScroll =
+        source === 'scroll' &&
+        !programmaticScroll &&
+        streamTailLayoutScrollAllowanceRef.current &&
+        streamActiveRef.current &&
+        settleFollowPendingRef.current &&
+        previousNativeScrollTop !== null &&
+        container.scrollTop < previousNativeScrollTop - PROGRAMMATIC_SCROLL_TOLERANCE_PX &&
+        !userScrollIntentActive
+      if (streamTailLayoutScroll) streamTailLayoutScrollAllowanceRef.current = false
+      if (
+        programmaticScroll ||
+        streamTailLayoutScroll ||
+        (stationaryNativeScroll && !userScrollIntentActive)
+      ) {
+        if (shouldFollowContentGrowth() && !userScrollIntentActive) scheduleFollowScroll()
+        return
+      }
+      if (source === 'scroll') {
         followIntentRef.current = false
-        programmaticScrollUntilRef.current = 0
-        programmaticScrollTargetRef.current = null
-        programmaticSmoothScrollRef.current = false
+        clearProgrammaticScrollIntents()
         clearFollowSettle()
         debugScroll('user-follow-cancel', { event: 'native-scroll' })
         setScrollStateNow('pinned', source)
@@ -336,6 +482,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
     },
     [
       clearFollowSettle,
+      clearProgrammaticScrollIntents,
       debugScroll,
       scheduleFollowScroll,
       setScrollStateNow,
@@ -370,6 +517,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       resetKeyRef.current = resetKey
       didOpenRef.current = false
       followIntentRef.current = true
+      clearProgrammaticScrollIntents()
       clearFollowSettle()
     }
     if (completeOpenScrollIfReady()) return
@@ -403,69 +551,59 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
   }, [pinThresholdPx, completeOpenScrollIfReady, debugScroll, updateFromScrollPosition])
 
   // Live stream snapshots rerender individual Message rows through Zustand;
-  // the ScrollRegion parent does not necessarily rerender per token. Observing
-  // content height is the durable signal that the bottom moved.
+  // the ScrollRegion parent does not necessarily rerender per token. Resize
+  // and mutation signals cover different browser/layout paths, but both feed
+  // one reconciliation per animation frame.
   useEffect(() => {
-    if (typeof ResizeObserver === 'undefined') return
     const content = contentRef.current
     if (!content) return
-    const observer = new ResizeObserver(() => {
-      debugScroll('resize')
-      if (completeOpenScrollIfReady()) return
-      if (shouldFollowContentGrowth()) {
-        if (settleActive()) {
-          debugScroll('follow.resize-scroll')
-          scrollToBottomNow({ smooth: false, reason: 'resize-follow' })
-        } else {
+    const scheduleReconciliation = (source: 'resize' | 'mutation') => {
+      observerSignalsRef.current[source] = true
+      if (observerFrameRef.current !== null) return
+      observerFrameRef.current = requestAnimationFrame(() => {
+        observerFrameRef.current = null
+        const signals = observerSignalsRef.current
+        observerSignalsRef.current = { resize: false, mutation: false }
+        if (signals.resize) debugScroll('resize')
+        if (signals.mutation) debugScroll('mutation')
+        if (completeOpenScrollIfReady()) return
+        if (shouldFollowContentGrowth()) {
           scheduleFollowScroll()
+          return
         }
-        return
-      }
-      updateFromScrollPosition('resize')
-    })
-    observer.observe(content)
-    return () => observer.disconnect()
-  }, [
-    completeOpenScrollIfReady,
-    debugScroll,
-    scheduleFollowScroll,
-    shouldFollowContentGrowth,
-    scrollToBottomNow,
-    settleActive,
-    updateFromScrollPosition,
-  ])
+        updateFromScrollPosition('resize')
+      })
+    }
 
-  useEffect(() => {
-    if (typeof MutationObserver === 'undefined') return
-    const content = contentRef.current
-    if (!content) return
-    const observer = new MutationObserver(() => {
-      debugScroll('mutation')
-      if (completeOpenScrollIfReady()) return
-      if (shouldFollowContentGrowth()) {
-        if (settleActive()) {
-          debugScroll('follow.resize-scroll', { source: 'mutation' })
-          scrollToBottomNow({ smooth: false, reason: 'mutation-follow' })
-        } else {
-          scheduleFollowScroll()
-        }
-        return
-      }
-      updateFromScrollPosition('resize')
-    })
-    observer.observe(content, {
+    const resizeObserver =
+      typeof ResizeObserver === 'undefined'
+        ? undefined
+        : new ResizeObserver(() => scheduleReconciliation('resize'))
+    resizeObserver?.observe(content)
+    const mutationObserver =
+      typeof MutationObserver === 'undefined'
+        ? undefined
+        : new MutationObserver(() => scheduleReconciliation('mutation'))
+    mutationObserver?.observe(content, {
       childList: true,
       characterData: true,
       subtree: true,
     })
-    return () => observer.disconnect()
+
+    return () => {
+      resizeObserver?.disconnect()
+      mutationObserver?.disconnect()
+      observerSignalsRef.current = { resize: false, mutation: false }
+      if (observerFrameRef.current !== null) {
+        cancelAnimationFrame(observerFrameRef.current)
+        observerFrameRef.current = null
+      }
+    }
   }, [
     completeOpenScrollIfReady,
     debugScroll,
     scheduleFollowScroll,
     shouldFollowContentGrowth,
-    scrollToBottomNow,
-    settleActive,
     updateFromScrollPosition,
   ])
 
@@ -474,9 +612,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
     if (!container) return
     const markUserScrollIntent = (event: 'wheel' | 'touchmove') => {
       userScrollIntentUntilRef.current = nowMs() + USER_SCROLL_INTENT_MS
-      programmaticScrollUntilRef.current = 0
-      programmaticScrollTargetRef.current = null
-      programmaticSmoothScrollRef.current = false
+      clearProgrammaticScrollIntents()
       if (followIntentRef.current) {
         followIntentRef.current = false
         clearFollowSettle()
@@ -488,17 +624,22 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       debugScroll('native-scroll')
       updateFromScrollPosition('scroll')
     }
+    const onScrollEnd = () => {
+      smoothScrollIntentRef.current = null
+    }
     const onWheel = () => markUserScrollIntent('wheel')
     const onTouchMove = () => markUserScrollIntent('touchmove')
     container.addEventListener('wheel', onWheel, { passive: true })
     container.addEventListener('touchmove', onTouchMove, { passive: true })
     container.addEventListener('scroll', onScroll, { passive: true })
+    container.addEventListener('scrollend', onScrollEnd, { passive: true })
     return () => {
       container.removeEventListener('wheel', onWheel)
       container.removeEventListener('touchmove', onTouchMove)
       container.removeEventListener('scroll', onScroll)
+      container.removeEventListener('scrollend', onScrollEnd)
     }
-  }, [clearFollowSettle, debugScroll, updateFromScrollPosition])
+  }, [clearFollowSettle, clearProgrammaticScrollIntents, debugScroll, updateFromScrollPosition])
 
   useLayoutEffect(() => {
     if (!autoScrollOnStream || !streamActive || !followIntentRef.current) return
@@ -513,6 +654,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
     if (!autoScrollOnStream || !streamActive || !followIntentRef.current) return
     scrollToBottomNow({ smooth: false, reason: 'stream-tail' })
     startFollowSettle('stream-tail')
+    streamTailLayoutScrollAllowanceRef.current = true
   }, [
     autoScrollOnStream,
     debugScroll,
@@ -526,6 +668,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
     const wasActive = previousStreamActiveRef.current
     previousStreamActiveRef.current = streamActive
     if (streamActive || !wasActive) return
+    streamTailLayoutScrollAllowanceRef.current = false
     if (!autoScrollOnStream) return
     if (!followIntentRef.current) return
     debugScroll('stream-settle-start')
@@ -565,9 +708,10 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
   useEffect(() => {
     return () => {
       if (followFrameRef.current !== null) cancelAnimationFrame(followFrameRef.current)
+      clearProgrammaticScrollIntents()
       clearFollowSettle()
     }
-  }, [clearFollowSettle])
+  }, [clearFollowSettle, clearProgrammaticScrollIntents])
 
   return (
     <div ref={containerRef} data-ui="scroll-region" data-scroll-state={state}>

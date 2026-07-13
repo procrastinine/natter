@@ -1,4 +1,3 @@
-import { useLiveQuery } from 'dexie-react-hooks'
 import { createContext, type ReactNode, useCallback, useEffect, useState } from 'react'
 import {
   DEFAULT_RENDERING_PREFS,
@@ -8,6 +7,8 @@ import {
   SHIKI_THEME_CHOICES,
   type ShikiThemeChoice,
 } from '../../core/rendering-preferences'
+import { primaryKeys } from '../../store/reactive-dependencies'
+import { useRepositoryQuery } from '../../store/reactive-query'
 import { getSetting, setSetting } from '../../store/settings'
 import { InfoDisclosure } from './InfoDisclosure'
 
@@ -45,10 +46,15 @@ async function writeRenderingPreferences(next: Partial<RenderingPreferences>): P
 }
 
 function useRenderingPreferences(): RenderingPreferences {
-  const storedPrefs = useLiveQuery(readRenderingPreferences, [], DEFAULT_RENDERING_PREFS)
-  const [prefs, setPrefs] = useState<RenderingPreferences>(storedPrefs ?? DEFAULT_RENDERING_PREFS)
+  const storedPrefs = useRepositoryQuery(
+    'rendering-preferences',
+    readRenderingPreferences,
+    DEFAULT_RENDERING_PREFS,
+    primaryKeys('settings', RENDERING_PREFERENCES_KEY),
+  )
+  const [prefs, setPrefs] = useState<RenderingPreferences>(storedPrefs)
   useEffect(() => {
-    const next = storedPrefs ?? DEFAULT_RENDERING_PREFS
+    const next = storedPrefs
     latestRenderingPreferences = next
     setPrefs(next)
   }, [storedPrefs])

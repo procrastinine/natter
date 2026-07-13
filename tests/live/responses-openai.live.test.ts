@@ -79,7 +79,7 @@ describe.skipIf(!LIVE)('live — OpenAI direct Responses (gpt-5.4-nano)', () => 
     expect(typeof reasoning?.encrypted_content).toBe('string')
     expect(reasoning?.summary).toBeDefined()
     expect(Array.isArray(reasoning?.summary)).toBe(true)
-    expect((reasoning?.summary as unknown[]).length).toBeGreaterThan(0)
+    expect(reasoning?.summary?.length ?? 0).toBeGreaterThan(0)
     expect(message?.phase).toBe('final_answer')
   }, 90_000)
 

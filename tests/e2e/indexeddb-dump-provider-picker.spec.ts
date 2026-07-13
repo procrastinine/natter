@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs'
-import { expect, type Page, test } from '@playwright/test'
+import { expect, type Page, test } from './fixtures'
 import { type IndexedDbDump, importIndexedDbDump } from './helpers'
 
 const dumpPath = process.env.NATTER_IDB_DUMP

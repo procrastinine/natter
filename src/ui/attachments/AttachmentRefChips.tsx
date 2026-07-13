@@ -1,4 +1,3 @@
-import { useLiveQuery } from 'dexie-react-hooks'
 import { useState } from 'react'
 import { attachmentHref, makeAnchorClickHandler } from '../../app/router'
 import type { AttachmentRef, ChatId, MessageId } from '../../core/types'
@@ -8,7 +7,9 @@ import {
   relinkAttachmentRef,
   setAttachmentRefVisibility,
 } from '../../store/attachments'
-import { getBrowserRepository } from '../../store/browser-repo'
+import { attachmentMapDependencies } from '../../store/reactive-dependencies'
+import { useRepositoryQuery } from '../../store/reactive-query'
+import { getWorkspaceRepository } from '../../store/workspace-repository'
 import { DatabaseIcon, EyeIcon, EyeOffIcon, TrashIcon } from '../icons/Icon'
 import { AttachmentPicker } from './AttachmentPicker'
 import { AttachmentPreview } from './AttachmentPreview'
@@ -29,18 +30,19 @@ export function AttachmentRefChips({
 }: AttachmentRefChipsProps) {
   const liveRefs = liveAttachmentRefs(refs)
   const attachmentIds = liveRefs.map((ref) => ref.attachmentId).join('|')
-  const attachments = useLiveQuery(
+  const attachments = useRepositoryQuery(
+    JSON.stringify(['attachment-map', attachmentIds]),
     async () => {
-      const repo = getBrowserRepository()
+      const repo = getWorkspaceRepository()
       const entries = await Promise.all(
         liveRefs.map(
           async (ref) => [ref.attachmentId, await repo.getAttachment(ref.attachmentId)] as const,
         ),
       )
-      return new Map(entries)
+      return new Map(entries.flatMap(([id, row]) => (row ? [[id, row] as const] : [])))
     },
-    [attachmentIds],
     undefined,
+    attachmentMapDependencies(liveRefs.map((ref) => ref.attachmentId)),
   )
   const [replaceRefId, setReplaceRefId] = useState<string | null>(null)
   if (liveRefs.length === 0) return null

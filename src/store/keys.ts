@@ -1,5 +1,3 @@
-// Key vault. See `plan/02-data-model.md §2.6` and `plan/09-privacy.md §9.3`.
-//
 // Keys are AES-GCM-256 encrypted with a PBKDF2-derived wrapper key. Two modes:
 //
 // - **Passphrase**: the wrapper key comes from PBKDF2(passphrase, salt, 200k, SHA-256).
@@ -8,19 +6,18 @@
 // - **Install secret**: the wrapper key comes from PBKDF2(installSecret, salt, ...).
 //   The install secret is a random 32-byte value stored in the `settings` table
 //   under `install-secret`. This gives encryption-at-rest without a passphrase,
-//   but an attacker with IDB read access can decrypt. Trade-off documented in
-//   §9.3.1.
+//   but an attacker with IDB read access can decrypt.
 //
 // `resolveKey(keyId)` decrypts a stored KeyRecord and hands back plaintext for a
 // single use (never written back to storage). Wrong-passphrase attempts throw
-// `WrongPassphraseError` — they MUST NOT fall through to an unauthenticated
-// request (§13.2.5 test).
+// `WrongPassphraseError` and must not fall through to an unauthenticated request.
 
 import type { KeyId, KeyRecord } from '../core/types'
 import { newId } from '../lib/ulid'
+import { runAuthoritativeTransaction } from './authoritative-write'
 import { onEvent, postEvent } from './broadcast'
 import { getDb } from './db'
-import { getSetting, setSetting } from './settings'
+import { getSetting, updateSetting } from './settings'
 
 const INSTALL_SECRET_SETTING_KEY = 'install-secret'
 const KDF_ITERATIONS = 200_000
@@ -37,6 +34,9 @@ function ensureBroadcastHook(): void {
   broadcastHookAttached = true
   onEvent((event) => {
     if (event.kind === 'key-rotated') derivedKeyCache.delete(event.keyId)
+    if (event.kind === 'workspace-invalidated' || event.kind === 'workspace-replaced') {
+      derivedKeyCache.clear()
+    }
   })
 }
 
@@ -92,8 +92,12 @@ export async function getOrCreateInstallSecret(): Promise<string> {
   const existing = await getSetting<string>(INSTALL_SECRET_SETTING_KEY)
   if (existing) return existing
   const fresh = bytesToBase64(randomBytes(32))
-  await setSetting(INSTALL_SECRET_SETTING_KEY, fresh)
-  return fresh
+  const winning = await updateSetting<string>(
+    INSTALL_SECRET_SETTING_KEY,
+    (current) => current || fresh,
+  )
+  if (!winning) throw new Error('InstallSecretInitializationFailed')
+  return winning
 }
 
 async function deriveWrapperKey(passphraseOrSecret: string, salt: Uint8Array): Promise<CryptoKey> {
@@ -170,8 +174,18 @@ export async function createKey(input: CreateKeyInput): Promise<KeyRecord> {
   if (input.passphrase !== undefined) {
     record.passphraseHint = input.passphraseHint ?? ''
   }
+  const db = getDb()
+  await runAuthoritativeTransaction({
+    db,
+    lockNames: [`key:${record.id}`],
+    tables: [db.keys, db.settings],
+    now,
+    write: async (tx) => {
+      await tx.table('keys').put(record)
+      return { value: undefined, changed: true }
+    },
+  })
   derivedKeyCache.set(record.id, wrapperKey)
-  await getDb().keys.put(record)
   return record
 }
 
@@ -188,14 +202,26 @@ interface ResolveKeyOptions {
 // prompt is needed. For passphrase keys, `opts.passphrase` is required on the
 // FIRST decrypt per tab; subsequent calls reuse the in-memory derived wrapper.
 export async function resolveKey(keyId: KeyId, opts: ResolveKeyOptions = {}): Promise<string> {
+  const plaintext = await resolveKeyForDispatch(keyId, opts)
+  await markKeyUsed(keyId)
+  return plaintext
+}
+
+export async function resolveKeyForDispatch(
+  keyId: KeyId,
+  opts: ResolveKeyOptions = {},
+): Promise<string> {
   ensureBroadcastHook()
   const record = await getKey(keyId)
   if (!record) throw new KeyMissingError(keyId)
   const wrapperKey = await resolveWrapperKey(record, opts)
   const plaintextBuffer = await decryptWith(record, wrapperKey, keyId)
   derivedKeyCache.set(keyId, wrapperKey)
-  await touchLastUsedAt(keyId)
   return new TextDecoder().decode(plaintextBuffer)
+}
+
+export async function markKeyUsed(keyId: KeyId, now = Date.now()): Promise<void> {
+  await touchLastUsedAt(keyId, now)
 }
 
 export async function resolveKeyIfPresent(
@@ -237,9 +263,19 @@ async function decryptWith(
 
 async function touchLastUsedAt(keyId: KeyId, now = Date.now()): Promise<void> {
   const db = getDb()
-  const row = await db.keys.get(keyId)
-  if (!row) return
-  await db.keys.put({ ...row, lastUsedAt: now })
+  await runAuthoritativeTransaction({
+    db,
+    lockNames: [`key:${keyId}`],
+    tables: [db.keys, db.settings],
+    now,
+    write: async (tx) => {
+      const table = tx.table<KeyRecord, KeyId>('keys')
+      const row = await table.get(keyId)
+      if (!row) return { value: undefined, changed: false }
+      await table.put({ ...row, lastUsedAt: now })
+      return { value: undefined, changed: true }
+    },
+  })
 }
 
 interface ChangePassphraseInput {
@@ -270,18 +306,39 @@ export async function changePassphrase(input: ChangePassphraseInput): Promise<Ke
     wrapperKey,
     new TextEncoder().encode(plaintext),
   )
-  const next: KeyRecord = {
-    ...existing,
-    ciphertext: bytesToBase64(new Uint8Array(ciphertextBuffer)),
-    iv: bytesToBase64(iv),
-    salt: bytesToBase64(salt),
-  }
-  if (input.newPassphrase !== undefined) {
-    next.passphraseHint = input.newPassphraseHint ?? existing.passphraseHint ?? ''
-  } else {
-    delete next.passphraseHint
-  }
-  await getDb().keys.put(next)
+  const db = getDb()
+  const now = input.now ?? Date.now()
+  const { value: next } = await runAuthoritativeTransaction({
+    db,
+    lockNames: [`key:${input.keyId}`],
+    tables: [db.keys, db.settings],
+    now,
+    write: async (tx) => {
+      const table = tx.table<KeyRecord, KeyId>('keys')
+      const current = await table.get(input.keyId)
+      if (!current) throw new KeyMissingError(input.keyId)
+      if (
+        current.ciphertext !== existing.ciphertext ||
+        current.iv !== existing.iv ||
+        current.salt !== existing.salt
+      ) {
+        throw new Error(`KeyChanged:${input.keyId}`)
+      }
+      const row: KeyRecord = {
+        ...current,
+        ciphertext: bytesToBase64(new Uint8Array(ciphertextBuffer)),
+        iv: bytesToBase64(iv),
+        salt: bytesToBase64(salt),
+      }
+      if (input.newPassphrase !== undefined) {
+        row.passphraseHint = input.newPassphraseHint ?? current.passphraseHint ?? ''
+      } else {
+        delete row.passphraseHint
+      }
+      await table.put(row)
+      return { value: row, changed: true }
+    },
+  })
   derivedKeyCache.set(input.keyId, wrapperKey)
   postEvent({ kind: 'key-rotated', keyId: input.keyId })
   return next
@@ -292,8 +349,21 @@ export async function changePassphrase(input: ChangePassphraseInput): Promise<Ke
 // use (the next `resolveKey` call will throw `KeyMissingError`). See §9.3.5.
 export async function deleteKey(keyId: KeyId): Promise<void> {
   ensureBroadcastHook()
+  const db = getDb()
+  await runAuthoritativeTransaction({
+    db,
+    lockNames: [`key:${keyId}`],
+    tables: [db.keys, db.settings],
+    now: Date.now(),
+    write: async (tx) => {
+      const table = tx.table<KeyRecord, KeyId>('keys')
+      const existing = await table.get(keyId)
+      if (!existing) return { value: undefined, changed: false }
+      await table.delete(keyId)
+      return { value: undefined, changed: true }
+    },
+  })
   derivedKeyCache.delete(keyId)
-  await getDb().keys.delete(keyId)
   postEvent({ kind: 'key-rotated', keyId })
 }
 

@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { groupByParent, indexById, ROOT_CURSOR_KEY } from '../../src/core/active-path'
-import { resolveLastUpdatedBranchBelow } from '../../src/core/branch-resolve'
+import {
+  groupByParent,
+  indexById,
+  ROOT_CURSOR_KEY,
+  resolveActiveLeafId,
+} from '../../src/core/active-path'
+import { resolveLastUpdatedBranchBelow, seedCursorAtMessage } from '../../src/core/branch-resolve'
 import type { CursorMap, Message } from '../../src/core/types'
 
 function mkMessage(over: Partial<Message> & Pick<Message, 'id'>): Message {
@@ -20,6 +25,26 @@ function mkMessage(over: Partial<Message> & Pick<Message, 'id'>): Message {
 }
 
 const M = (n: number) => `M-${n.toString().padStart(4, '0')}`
+
+describe('seedCursorAtMessage', () => {
+  it('lands on the newest leaf that contains the pinned interior node', () => {
+    const msgs: Message[] = [
+      mkMessage({ id: M(1), parentId: null, siblingIndex: 0, createdAt: 1 }),
+      mkMessage({ id: M(2), parentId: M(1), siblingIndex: 0, createdAt: 2 }),
+      mkMessage({ id: M(3), parentId: M(1), siblingIndex: 1, createdAt: 100 }),
+      mkMessage({ id: M(4), parentId: M(2), siblingIndex: 0, createdAt: 5 }),
+      mkMessage({ id: M(5), parentId: M(2), siblingIndex: 1, createdAt: 9 }),
+    ]
+    const cursor: CursorMap = {}
+
+    seedCursorAtMessage(msgs, M(2), cursor)
+
+    expect(cursor[ROOT_CURSOR_KEY]).toBe(M(1))
+    expect(cursor[M(1)]).toBe(M(2))
+    expect(cursor[M(2)]).toBe(M(5))
+    expect(resolveActiveLeafId(msgs, cursor)).toBe(M(5))
+  })
+})
 
 describe('resolveLastUpdatedBranchBelow', () => {
   it('writes cursor entries for each fork below the target along the max-createdAt chain', () => {

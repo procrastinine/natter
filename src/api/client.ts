@@ -1,15 +1,26 @@
 // Fetch wrapper — header merge, timeout, abort, GET retry, key-fallback chain.
-// See `plan/04-api-client.md §4.2, §4.9, §4.10, §4.10.1`.
 //
 // This file is environment-neutral (no `window`, no IDB, no DOM). Both the
 // in-tab engine and the daemon engine build import it directly.
 
 import type { ConnectionProfile } from '../core/types'
+import type { CallOpts } from './call-opts'
 import { ApiError, normalizeError } from './errors'
-import type { CallOpts } from './types'
 
 const DEFAULT_TIMEOUT_MS = 120_000
 const DEFAULT_RETRY_CAP_MS = 5_000
+
+interface ResponseBodyContract {
+  readonly deadline: number | undefined
+  readonly signal: AbortSignal | undefined
+}
+
+const responseBodyContracts = new WeakMap<Response, ResponseBodyContract>()
+
+function monotonicNow(): number {
+  const performance = (globalThis as { performance?: Performance }).performance
+  return performance?.now() ?? Date.now()
+}
 
 type TargetAddressSpace = 'local' | 'loopback'
 type LocalNetworkRequestInit = RequestInit & { targetAddressSpace?: TargetAddressSpace }
@@ -67,14 +78,35 @@ export function buildHeaders(
   }
   if (opts.method === 'POST') headers['Content-Type'] = 'application/json'
   for (const [k, v] of Object.entries(profile.defaultHeaders)) {
-    headers[k] = v
+    setHeader(headers, k, v)
   }
   if (opts.overrideHeaders) {
     for (const [k, v] of Object.entries(opts.overrideHeaders)) {
-      headers[k] = v
+      setHeader(headers, k, v)
     }
   }
   return headers
+}
+
+function setHeader(headers: Record<string, string>, name: string, value: string): void {
+  const normalizedName = name.toLowerCase()
+  for (const existing of Object.keys(headers)) {
+    if (existing !== name && existing.toLowerCase() === normalizedName) delete headers[existing]
+  }
+  headers[name] = value
+}
+
+export function hasExplicitAuthHeaderOverride(
+  profile: ConnectionProfile,
+  overrideHeaders: Record<string, string> | undefined,
+  authHeaderName: 'Authorization' | 'x-goog-api-key' | 'x-api-key',
+): boolean {
+  const normalizedName = authHeaderName.toLowerCase()
+  return [profile.defaultHeaders, overrideHeaders].some(
+    (headers) =>
+      headers !== undefined &&
+      Object.keys(headers).some((name) => name.toLowerCase() === normalizedName),
+  )
 }
 
 function parseIpv4(hostname: string): [number, number, number, number] | null {
@@ -165,11 +197,17 @@ export async function fetchWithTimeout(
   opts: { signal?: AbortSignal; timeoutMs?: number } = {},
 ): Promise<Response> {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS
+  const deadline = timeoutMs > 0 ? monotonicNow() + timeoutMs : undefined
   const timeoutCtl = new AbortController()
   const timer = timeoutMs > 0 ? setTimeout(() => timeoutCtl.abort(), timeoutMs) : undefined
   const link = linkSignals([opts.signal, timeoutCtl.signal])
   try {
-    return await fetch(url, annotateLocalNetworkFetch(url, { ...init, signal: link.signal }))
+    const response = await fetch(
+      url,
+      annotateLocalNetworkFetch(url, { ...init, signal: link.signal }),
+    )
+    responseBodyContracts.set(response, { deadline, signal: opts.signal })
+    return response
   } catch (e) {
     if (timeoutCtl.signal.aborted && !opts.signal?.aborted) {
       throw normalizeError(e, { midStream: false, cause: 'timeout' })
@@ -184,12 +222,133 @@ export async function fetchWithTimeout(
   }
 }
 
+function bufferedBodyFailure(cause: 'timeout' | 'abort' | 'network' | 'protocol'): ApiError {
+  return normalizeError(undefined, { midStream: false, cause })
+}
+
+export function releaseResponseBodyTimeout(response: Response): void {
+  responseBodyContracts.delete(response)
+}
+
+export async function readResponseText(response: Response): Promise<string> {
+  const contract = responseBodyContracts.get(response)
+  responseBodyContracts.delete(response)
+
+  let body: ReadableStream<Uint8Array> | null
+  try {
+    body = response.body
+  } catch {
+    throw bufferedBodyFailure('protocol')
+  }
+  if (!body) throw bufferedBodyFailure('protocol')
+
+  let reader: ReadableStreamDefaultReader<Uint8Array>
+  try {
+    reader = body.getReader()
+  } catch {
+    throw bufferedBodyFailure('protocol')
+  }
+
+  const signal = contract?.signal
+  let interruptedBy: 'timeout' | 'abort' | undefined
+  let rejectInterrupted: ((error: ApiError) => void) | undefined
+  const interrupted = new Promise<never>((_, reject) => {
+    rejectInterrupted = reject
+  })
+  const interrupt = (cause: 'timeout' | 'abort') => {
+    if (interruptedBy !== undefined) return
+    interruptedBy = cause
+    try {
+      void reader.cancel().catch(() => {})
+    } catch {
+      // The typed timeout/abort remains authoritative even if cancellation fails.
+    }
+    rejectInterrupted?.(bufferedBodyFailure(cause))
+  }
+  const onAbort = () => interrupt('abort')
+  let timer: ReturnType<typeof setTimeout> | undefined
+
+  if (signal?.aborted) {
+    interrupt('abort')
+  } else {
+    signal?.addEventListener('abort', onAbort, { once: true })
+    if (contract?.deadline !== undefined) {
+      const remainingMs = contract.deadline - monotonicNow()
+      if (remainingMs <= 0) interrupt('timeout')
+      else timer = setTimeout(() => interrupt(signal?.aborted ? 'abort' : 'timeout'), remainingMs)
+    }
+  }
+
+  const decoder = new TextDecoder()
+  const parts: string[] = []
+  try {
+    for (;;) {
+      let result: ReadableStreamReadResult<Uint8Array>
+      try {
+        result = await Promise.race([reader.read(), interrupted])
+      } catch (error) {
+        if (error instanceof ApiError) throw error
+        if (signal?.aborted) throw bufferedBodyFailure('abort')
+        if (interruptedBy === 'timeout') throw bufferedBodyFailure('timeout')
+        throw bufferedBodyFailure('network')
+      }
+      if (signal?.aborted) throw bufferedBodyFailure('abort')
+      if (interruptedBy === 'timeout') throw bufferedBodyFailure('timeout')
+      if (result.done) break
+      parts.push(decoder.decode(result.value, { stream: true }))
+    }
+    parts.push(decoder.decode())
+    return parts.join('')
+  } finally {
+    if (timer) clearTimeout(timer)
+    signal?.removeEventListener('abort', onAbort)
+    try {
+      reader.releaseLock()
+    } catch {
+      // A failed/canceled reader may still be settling; cancellation above released the body.
+    }
+  }
+}
+
+export async function readResponseJson<T>(response: Response): Promise<T> {
+  const text = await readResponseText(response)
+  try {
+    return JSON.parse(text) as T
+  } catch {
+    throw bufferedBodyFailure('protocol')
+  }
+}
+
+export async function readErrorResponseJson(response: Response): Promise<unknown> {
+  try {
+    return await readResponseJson<unknown>(response)
+  } catch (error) {
+    if (error instanceof ApiError && (error.kind === 'timeout' || error.kind === 'abort')) {
+      throw error
+    }
+    return { error: { code: response.status, message: response.statusText } }
+  }
+}
+
 function isRetryableStatus(status: number): boolean {
   return status === 408 || status === 429 || status === 502 || status === 503
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms))
+function abortableDelay(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  if (signal?.aborted) return Promise.reject(bufferedBodyFailure('abort'))
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(done, ms)
+    const onAbort = () => {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', onAbort)
+      reject(bufferedBodyFailure('abort'))
+    }
+    function done() {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
 }
 
 export function computeBackoffMs(
@@ -223,15 +382,24 @@ export async function fetchWithRetry(
       if (res.ok || !isRetryableStatus(res.status)) return res
       lastError = undefined
       if (i === attempts - 1) return res
+      cancelUnusedResponseBody(res)
     } catch (e) {
       if (!(e instanceof ApiError) || !e.retryable) throw e
       lastError = e
       if (i === attempts - 1) throw e
     }
-    await sleep(computeBackoffMs(i, baseBackoff))
+    await abortableDelay(computeBackoffMs(i, baseBackoff), opts.signal)
   }
   if (lastError) throw lastError
   throw new Error('fetchWithRetry: unreachable')
+}
+
+function cancelUnusedResponseBody(response: Response): void {
+  try {
+    void response.body?.cancel().catch(() => {})
+  } catch {
+    // Retry behavior must not depend on whether a runtime can cancel an unused body.
+  }
 }
 
 // True when the response says "this key itself is the problem" — 401, 403,
@@ -240,44 +408,158 @@ export async function fetchWithRetry(
 export function isKeyFallbackTrigger(response: Response): boolean {
   if (response.status === 401 || response.status === 403) return true
   if (response.status === 429) {
-    return response.headers.get('x-ratelimit-limit') === '0'
+    const rawLimit = response.headers.get('x-ratelimit-limit')
+    if (rawLimit === null || rawLimit.trim().length === 0) return false
+    const limit = Number(rawLimit)
+    return Number.isFinite(limit) && limit === 0
   }
   return false
 }
 
-interface KeyFallbackResult {
+interface KeyFallbackResult<Candidate> {
   response: Response
-  keyIndex: number
+  candidate: Candidate
+  candidateIndex: number
 }
 
-// Tries each key in `keys` in order. Rotates on 401/403/qualifying 429;
-// returns on first non-rotation status (success or otherwise). If all keys
-// trigger rotation, returns the LAST response so the caller can surface
-// whatever error the last attempt produced (§4.10.1 step 3).
-export async function fetchWithKeyFallback(
-  keys: string[],
-  build: (key: string) => { url: string; init: RequestInit },
-  opts: { signal?: AbortSignal; timeoutMs?: number } = {},
-): Promise<KeyFallbackResult> {
-  if (keys.length === 0) {
-    throw new Error('fetchWithKeyFallback: at least one key is required')
+interface KeyFallbackRequest {
+  url: string
+  init: RequestInit
+}
+
+export interface ApiKeyCandidate {
+  readonly resolve: () => string | Promise<string>
+  readonly markUsed?: () => void | Promise<void>
+}
+
+export interface ApiKeyDispatchContext {
+  readonly apiKey: string
+  readonly apiKeyCandidates?: readonly ApiKeyCandidate[]
+  readonly onKeyCandidateSelected?: (
+    candidate: ApiKeyCandidate,
+    candidateIndex: number,
+    apiKey: string,
+  ) => void | Promise<void>
+}
+
+interface ApiKeyFallbackResult {
+  response: Response
+  candidate: ApiKeyCandidate
+  candidateIndex: number
+  apiKey: string
+}
+
+interface RequestBuilderState {
+  pending: boolean
+}
+
+const requestBuilderStates = import.meta.env.DEV
+  ? new WeakMap<object, RequestBuilderState>()
+  : undefined
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) {
+    throw normalizeError(signal.reason, { midStream: false, cause: 'abort' })
   }
-  let last: Response | undefined
-  let lastIndex = 0
-  for (let i = 0; i < keys.length; i += 1) {
-    const key = keys[i]
-    if (key === undefined) continue
-    const { url, init } = build(key)
+}
+
+// Tries each opaque candidate in order. The caller rebuilds authentication
+// headers per candidate while reusing the same request body. Rotation is only
+// allowed before response-body consumption; the selected candidate is returned
+// ephemerally and is never inspected or logged here.
+export async function fetchWithKeyFallback<Candidate>(
+  candidates: readonly Candidate[],
+  build: (
+    candidate: Candidate,
+    candidateIndex: number,
+  ) => KeyFallbackRequest | Promise<KeyFallbackRequest>,
+  opts: { signal?: AbortSignal; timeoutMs?: number } = {},
+): Promise<KeyFallbackResult<Candidate>> {
+  if (candidates.length === 0) {
+    throw new Error('fetchWithKeyFallback: at least one candidate is required')
+  }
+  for (let i = 0; i < candidates.length; i += 1) {
+    throwIfAborted(opts.signal)
+    const candidate = candidates[i] as Candidate
+    const { url, init } = await build(candidate, i)
+    throwIfAborted(opts.signal)
     const res = await fetchWithTimeout(url, init, opts)
-    last = res
-    lastIndex = i
-    if (res.ok) return { response: res, keyIndex: i }
-    if (!isKeyFallbackTrigger(res)) return { response: res, keyIndex: i }
-    // Non-last rotate trigger: drain the body to free the socket before
+    const result = { response: res, candidate, candidateIndex: i }
+    if (res.ok || res.bodyUsed || !isKeyFallbackTrigger(res)) return result
+    if (i === candidates.length - 1) return result
+    // Non-last rotate trigger: cancel the body to free the socket before
     // the next attempt. A response returned to the caller stays unread.
-    if (i < keys.length - 1) {
-      await res.body?.cancel().catch(() => {})
+    try {
+      await res.body?.cancel()
+    } catch {
+      return result
     }
   }
-  return { response: last as Response, keyIndex: lastIndex }
+  throw new Error('fetchWithKeyFallback: unreachable')
+}
+
+type ApiKeyRequestBuilder = (
+  apiKey: string,
+  candidate: ApiKeyCandidate,
+  candidateIndex: number,
+) => KeyFallbackRequest | Promise<KeyFallbackRequest>
+
+export function fetchWithApiKeyFallback(
+  ctx: ApiKeyDispatchContext,
+  build: ApiKeyRequestBuilder,
+  opts: { signal?: AbortSignal; timeoutMs?: number } = {},
+): Promise<ApiKeyFallbackResult> {
+  const state: RequestBuilderState | undefined = requestBuilderStates
+    ? { pending: true }
+    : undefined
+  const requested = fetchWithApiKeyFallbackImpl(ctx, build, opts, state)
+  if (state) requestBuilderStates?.set(requested, state)
+  return requested
+}
+
+async function fetchWithApiKeyFallbackImpl(
+  ctx: ApiKeyDispatchContext,
+  buildRequest: ApiKeyRequestBuilder | undefined,
+  opts: { signal?: AbortSignal; timeoutMs?: number },
+  state: RequestBuilderState | undefined,
+): Promise<ApiKeyFallbackResult> {
+  const legacyCandidate: ApiKeyCandidate = { resolve: () => ctx.apiKey }
+  const candidates =
+    ctx.apiKeyCandidates && ctx.apiKeyCandidates.length > 0
+      ? ctx.apiKeyCandidates
+      : [legacyCandidate]
+  const resolvedKeys = new Map<number, string>()
+  let result: KeyFallbackResult<ApiKeyCandidate>
+  try {
+    result = await fetchWithKeyFallback(
+      candidates,
+      async (candidate, candidateIndex) => {
+        const apiKey = await candidate.resolve()
+        resolvedKeys.set(candidateIndex, apiKey)
+        return (buildRequest as ApiKeyRequestBuilder)(apiKey, candidate, candidateIndex)
+      },
+      opts,
+    )
+  } finally {
+    buildRequest = undefined
+    if (state) state.pending = false
+  }
+  const apiKey = resolvedKeys.get(result.candidateIndex)
+  if (apiKey === undefined) {
+    throw new Error('fetchWithApiKeyFallback: selected candidate was not resolved')
+  }
+  if (result.response.ok) {
+    await ctx.onKeyCandidateSelected?.(result.candidate, result.candidateIndex, apiKey)
+    try {
+      const marked = result.candidate.markUsed?.()
+      void Promise.resolve(marked).catch(() => {})
+    } catch {
+      // Key-use metadata is best-effort and must not discard a provider response.
+    }
+  }
+  return { ...result, apiKey }
+}
+
+export function __apiKeyRequestBuilderPendingForTests(request: object): boolean | undefined {
+  return requestBuilderStates?.get(request)?.pending
 }

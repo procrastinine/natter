@@ -14,9 +14,11 @@
 // also get a null so the free-model-strip logic in the transform does
 // not need to also be aware of the filter.
 
+import { normalizeError } from '../api/errors'
 import { fetchEndpoints } from '../api/models'
 import { fetchPrivacyScrape, readCachedPrivacyPayload } from '../api/privacy-scrape'
 import { type EndpointsDescriptor, normalizeEndpointsResponse } from '../api/providers'
+import { errorFromUnknown } from '../lib/error'
 import { resolveKeyIfPresent } from '../store/keys'
 import {
   dedupedEndpointsFetch,
@@ -26,6 +28,7 @@ import {
 } from '../store/models-cache'
 import {
   dedupedPrivacyFetch,
+  EMPTY_PRIVACY_POLICY_RETRY_MS,
   getCachedPrivacyPolicy,
   PRIVACY_POLICY_TTL_MS,
 } from '../store/privacy-cache'
@@ -47,8 +50,9 @@ function usableCachedPrivacyPolicyRow(
 ): boolean {
   if (!row) return false
   const payload = readCachedPrivacyPayload(row.payload)
-  const hasPolicies = payload ? Object.keys(payload.policies).length > 0 : false
-  return hasPolicies && isFresh(row.fetchedAt, PRIVACY_POLICY_TTL_MS)
+  if (!payload) return false
+  const hasPolicies = Object.keys(payload.policies).length > 0
+  return isFresh(row.fetchedAt, hasPolicies ? PRIVACY_POLICY_TTL_MS : EMPTY_PRIVACY_POLICY_RETRY_MS)
 }
 
 export class PrivacyDiscoveryUnavailableError extends Error {
@@ -160,10 +164,9 @@ export async function resolvePrivacyForSend(
       // filter exclusions stay intact. The UI still shows the provider as
       // "checked" because the settings row is unchanged; the grey badge
       // plus this transient ignore are what keep the send honest.
-      const base: { ignore?: string[] } = wire ?? { ignore: [] }
-      const next = new Set<string>(base.ignore ?? [])
+      const next = new Set<string>(wire.ignore ?? [])
       for (const name of insufficient) next.add(name)
-      const merged: WireProviderPrivacy = { ...(wire ?? {}), ignore: [...next] }
+      const merged: WireProviderPrivacy = { ...wire, ignore: [...next] }
       return {
         wire: merged,
         filter,
@@ -184,13 +187,16 @@ async function ensureEndpointsRow(
   const cached = await getCachedEndpoints(profile.id, modelId)
   if (cached && isFresh(cached.fetchedAt, ENDPOINTS_TTL_MS)) return cached
   try {
-    await dedupedEndpointsFetch(profile.id, modelId, async () => {
-      const apiKey = (await resolveKeyIfPresent(profile.apiKeyRef)) ?? ''
-      return fetchEndpoints({ profile, apiKey }, modelId, {
-        ...(signal ? { signal } : {}),
-        timeoutMs: SEND_DISCOVERY_TIMEOUT_MS,
-      })
-    })
+    await awaitSendDiscovery(
+      dedupedEndpointsFetch(profile.id, modelId, async () => {
+        const apiKey = (await resolveKeyIfPresent(profile.apiKeyRef)) ?? ''
+        return fetchEndpoints({ profile, apiKey }, modelId, {
+          ...(signal ? { signal } : {}),
+          timeoutMs: SEND_DISCOVERY_TIMEOUT_MS,
+        })
+      }),
+      signal,
+    )
   } catch (err) {
     if (cached) return cached
     throw new PrivacyDiscoveryUnavailableError(
@@ -225,25 +231,29 @@ async function ensurePrivacyPolicies(input: {
     return { policies: cachedPolicies, offlineFallback: false }
   }
 
-  if (cached && hasCachedPolicies && isFresh(cached.fetchedAt, PRIVACY_POLICY_TTL_MS)) {
+  const cachedTtl = hasCachedPolicies ? PRIVACY_POLICY_TTL_MS : EMPTY_PRIVACY_POLICY_RETRY_MS
+  if (cached && cachedPayload && isFresh(cached.fetchedAt, cachedTtl)) {
     return { policies: cachedPolicies, offlineFallback: false }
   }
 
   try {
-    await dedupedPrivacyFetch(
-      profile.id,
-      modelId,
-      async () => {
-        const result = await fetchPrivacyScrape({ proxy }, modelId, {
-          ...(signal ? { signal } : {}),
-          timeoutMs: SEND_DISCOVERY_TIMEOUT_MS,
-        })
-        if (Object.keys(result.raw.policies).length === 0 && hasCachedPolicies && cached) {
-          return cached.payload
-        }
-        return result.raw
-      },
-      { isCachedFresh: usableCachedPrivacyPolicyRow },
+    await awaitSendDiscovery(
+      dedupedPrivacyFetch(
+        profile.id,
+        modelId,
+        async () => {
+          const result = await fetchPrivacyScrape({ proxy }, modelId, {
+            ...(signal ? { signal } : {}),
+            timeoutMs: SEND_DISCOVERY_TIMEOUT_MS,
+          })
+          if (Object.keys(result.raw.policies).length === 0 && hasCachedPolicies && cached) {
+            return cached.payload
+          }
+          return result.raw
+        },
+        { isCachedFresh: usableCachedPrivacyPolicyRow },
+      ),
+      signal,
     )
   } catch {
     if (hasCachedPolicies) return { policies: cachedPolicies, offlineFallback: false }
@@ -253,4 +263,31 @@ async function ensurePrivacyPolicies(input: {
   const refreshed = await getCachedPrivacyPolicy(profile.id, modelId)
   const refreshedPayload = refreshed ? readCachedPrivacyPayload(refreshed.payload) : null
   return { policies: refreshedPayload?.policies ?? {}, offlineFallback: false }
+}
+
+function awaitSendDiscovery(promise: Promise<void>, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) {
+    return Promise.reject(normalizeError(signal.reason, { midStream: false, cause: 'abort' }))
+  }
+  return new Promise((resolve, reject) => {
+    let settled = false
+    const finish = (callback: () => void) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', onAbort)
+      callback()
+    }
+    const onAbort = () => {
+      finish(() => reject(normalizeError(signal?.reason, { midStream: false, cause: 'abort' })))
+    }
+    const timer = setTimeout(() => {
+      finish(() => reject(new Error('SendDiscoveryTimeout')))
+    }, SEND_DISCOVERY_TIMEOUT_MS)
+    signal?.addEventListener('abort', onAbort, { once: true })
+    void promise.then(
+      () => finish(resolve),
+      (error) => finish(() => reject(errorFromUnknown(error))),
+    )
+  })
 }

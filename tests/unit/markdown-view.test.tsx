@@ -1,5 +1,5 @@
 import { render } from '@testing-library/react'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { MarkdownView, STREAMING_MARKDOWN_SEGMENT_CHARS } from '../../src/ui/chat/MarkdownView'
 import {
   DEFAULT_RENDERING_PREFS,
@@ -80,6 +80,37 @@ describe('MarkdownView', () => {
       STREAMING_MARKDOWN_SEGMENT_CHARS - 98,
     )
     expect(segments[1]?.getAttribute('data-mode')).toBe('streaming')
+  })
+
+  it('does not rescan an unchanged frozen prefix when the live tail advances', () => {
+    const prefix = `${'a'.repeat(STREAMING_MARKDOWN_SEGMENT_CHARS - 100)}\n\n${'b'.repeat(98)}`
+    const nativeLastIndexOf = String.prototype.lastIndexOf
+    let prefixScans = 0
+    const lastIndexOf = vi.spyOn(String.prototype, 'lastIndexOf').mockImplementation(function (
+      this: string,
+      searchString: string,
+      position?: number,
+    ) {
+      if (String(this) === prefix && (searchString === '\n\n' || searchString === '\n')) {
+        prefixScans += 1
+      }
+      return nativeLastIndexOf.call(this, searchString, position)
+    })
+
+    try {
+      const { rerender } = render(
+        <MarkdownView content="" contentSegments={[prefix, 'tail']} streaming />,
+      )
+      expect(prefixScans).toBeGreaterThan(0)
+      const scansAfterInitialRender = prefixScans
+
+      rerender(
+        <MarkdownView content="" contentSegments={[prefix, 'tail', '-advanced']} streaming />,
+      )
+      expect(prefixScans).toBe(scansAfterInitialRender)
+    } finally {
+      lastIndexOf.mockRestore()
+    }
   })
 
   it('returns oversized stream content to Markdown after the stream completes', () => {

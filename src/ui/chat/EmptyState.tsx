@@ -1,5 +1,6 @@
-import { useLiveQuery } from 'dexie-react-hooks'
 import { useCallback } from 'react'
+import { primaryKeys } from '../../store/reactive-dependencies'
+import { useRepositoryQuery } from '../../store/reactive-query'
 import { getSetting, setSetting } from '../../store/settings'
 
 const DISMISS_KEY = 'sample-prompts:dismissed'
@@ -38,10 +39,11 @@ interface EmptyStateProps {
 }
 
 export function EmptyState({ onPick }: EmptyStateProps) {
-  const dismissed = useLiveQuery(
+  const dismissed = useRepositoryQuery(
+    `setting:${DISMISS_KEY}`,
     () => getSetting<boolean>(DISMISS_KEY).then((v) => v === true),
-    [],
     false,
+    primaryKeys('settings', DISMISS_KEY),
   )
   const onDismiss = useCallback(async () => {
     await setSetting(DISMISS_KEY, true)

@@ -1,10 +1,8 @@
-import { expect, test } from '@playwright/test'
+import { expect, test } from './fixtures'
 import { clearIndexedDb } from './helpers'
 
 test.beforeEach(async ({ page }) => {
-  await page.goto('/')
   await clearIndexedDb(page)
-  await page.goto('/')
 })
 
 test('app boots without a connection — empty state visible, only Add connection CTA remains', async ({

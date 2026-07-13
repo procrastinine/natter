@@ -1,5 +1,6 @@
+import type Dexie from 'dexie'
 import type { Chat, ChatPreset, ChatProviderToolSettings, ChatSettings } from '../core/types'
-import type { NatterDb, SettingsRow } from '../store/db'
+import type { SettingsRow } from '../store/db-rows'
 
 const PROVIDER_TOOL_SETTINGS_BACKFILL_KEY = 'backfill:provider-tool-settings-v2'
 
@@ -7,20 +8,23 @@ export function providerToolSettingsBackfillMarker(): SettingsRow {
   return { key: PROVIDER_TOOL_SETTINGS_BACKFILL_KEY, value: 1 }
 }
 
-export async function migrateProviderToolSettingsRows(db: NatterDb): Promise<void> {
-  const marker = await db.settings.get(PROVIDER_TOOL_SETTINGS_BACKFILL_KEY)
+export async function migrateProviderToolSettingsRows(db: Dexie): Promise<void> {
+  const chats = db.table<Chat, string>('chats')
+  const presets = db.table<ChatPreset, string>('presets')
+  const settings = db.table<SettingsRow, string>('settings')
+  const marker = await settings.get(PROVIDER_TOOL_SETTINGS_BACKFILL_KEY)
   if (marker?.value === 1) return
 
-  await db.transaction('rw', db.chats, db.presets, db.settings, async () => {
-    await db.chats.toCollection().modify((chat: Chat) => {
+  await db.transaction('rw', chats, presets, settings, async () => {
+    await chats.toCollection().modify((chat) => {
       const result = migrateProviderToolSettings(chat.settings)
       if (result.changed) chat.settings = result.settings
     })
-    await db.presets.toCollection().modify((preset: ChatPreset) => {
+    await presets.toCollection().modify((preset) => {
       const result = migrateProviderToolSettings(preset.settings)
       if (result.changed) preset.settings = result.settings
     })
-    await db.settings.put(providerToolSettingsBackfillMarker())
+    await settings.put(providerToolSettingsBackfillMarker())
   })
 }
 

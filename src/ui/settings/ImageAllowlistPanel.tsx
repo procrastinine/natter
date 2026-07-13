@@ -1,6 +1,7 @@
-import { useLiveQuery } from 'dexie-react-hooks'
 import { useCallback, useState } from 'react'
 import { DEFAULT_IMAGE_ORIGINS } from '../../core/image-allowlist'
+import { primaryKeys } from '../../store/reactive-dependencies'
+import { useRepositoryQuery } from '../../store/reactive-query'
 import { getSetting, setSetting } from '../../store/settings'
 import { TrashIcon } from '../icons/Icon'
 import { InfoDisclosure } from './InfoDisclosure'
@@ -38,7 +39,12 @@ export function normalizeOrigin(input: string): string | null {
 }
 
 export function ImageAllowlistPanel() {
-  const allowlist = useLiveQuery(readImageAllowlist, [], [])
+  const allowlist = useRepositoryQuery(
+    'image-allowlist',
+    readImageAllowlist,
+    [],
+    primaryKeys('settings', STORAGE_KEY),
+  )
   const [draft, setDraft] = useState('')
   const [error, setError] = useState<string | null>(null)
 

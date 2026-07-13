@@ -1,12 +1,14 @@
+import type Dexie from 'dexie'
 import type { Transaction } from 'dexie'
 import type { Message } from '../core/types'
-import type { NatterDb, SettingsRow } from '../store/db'
+import type { SettingsRow } from '../store/db-rows'
 import {
   MESSAGE_BODY_KEYS,
   type MessageBodyRow,
   type MessageHeaderRow,
   splitMessageForStorage,
 } from '../store/message-storage'
+import { forEachTableBatch } from './batched-table'
 
 const MESSAGE_BODY_SPLIT_BACKFILL_KEY = 'backfill:message-body-split-v1'
 
@@ -20,38 +22,41 @@ export async function migrateInlineMessageBodies(tx: Transaction): Promise<void>
   const messages = tx.table<LegacyInlineMessageRow, string>('messages')
   const bodies = tx.table<MessageBodyRow, string>('messageBodies')
   const settings = tx.table<SettingsRow, string>('settings')
-  const rows = await messages.toArray()
-  for (const row of rows) {
-    await splitAndStoreLegacyMessage(messages, bodies, row)
-  }
+  await forEachTableBatch(messages, async (rows) => {
+    for (const row of rows) await splitAndStoreLegacyMessage(messages, bodies, row)
+  })
   await settings.put(messageBodySplitBackfillMarker())
 }
 
-export async function backfillMissingMessageBodies(db: NatterDb): Promise<void> {
-  const marker = await db.settings.get(MESSAGE_BODY_SPLIT_BACKFILL_KEY)
+export async function backfillMissingMessageBodies(db: Dexie): Promise<void> {
+  const messages = db.table<LegacyInlineMessageRow, string>('messages')
+  const messageBodies = db.table<MessageBodyRow, string>('messageBodies')
+  const settings = db.table<SettingsRow, string>('settings')
+  const marker = await settings.get(MESSAGE_BODY_SPLIT_BACKFILL_KEY)
   if (marker?.value === 1) return
 
-  await db.transaction('rw', db.messages, db.messageBodies, db.settings, async () => {
-    const rows = (await db.messages.toArray()) as unknown as LegacyInlineMessageRow[]
-    for (const row of rows) {
-      const existingBody = await db.messageBodies.get(String(row.id))
-      if (existingBody) {
-        if (hasInlineBodyFields(row)) {
-          await db.messages.put(stripInlineBodyFields(row))
+  await db.transaction('rw', messages, messageBodies, settings, async () => {
+    await forEachTableBatch(messages, async (rows) => {
+      for (const row of rows) {
+        const existingBody = await messageBodies.get(String(row.id))
+        if (existingBody) {
+          if (hasInlineBodyFields(row)) await messages.put(stripInlineBodyFields(row))
+          continue
         }
-        continue
+        if (!hasInlineBodyFields(row)) throw new Error(`MessageBodyMissing:${String(row.id)}`)
+        await splitAndStoreLegacyMessage(messages, messageBodies, row)
       }
-      if (!hasInlineBodyFields(row)) throw new Error(`MessageBodyMissing:${String(row.id)}`)
-      await splitAndStoreLegacyMessage(db.messages, db.messageBodies, row)
-    }
-    await db.settings.put(messageBodySplitBackfillMarker())
+    })
+    await settings.put(messageBodySplitBackfillMarker())
   })
 }
 
-export async function assertNoInlineMessageBodies(db: NatterDb): Promise<void> {
-  const rows = (await db.messages.toArray()) as unknown as LegacyInlineMessageRow[]
-  const bad = rows.find((row) => hasInlineBodyFields(row))
-  if (bad) throw new Error(`InlineMessageBodyStillPresent:${String(bad.id)}`)
+export async function assertNoInlineMessageBodies(db: Dexie): Promise<void> {
+  const messages = db.table<LegacyInlineMessageRow, string>('messages')
+  await forEachTableBatch(messages, (rows) => {
+    const bad = rows.find((row) => hasInlineBodyFields(row))
+    if (bad) throw new Error(`InlineMessageBodyStillPresent:${String(bad.id)}`)
+  })
 }
 
 function hasInlineBodyFields(row: LegacyInlineMessageRow): boolean {

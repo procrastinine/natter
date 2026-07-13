@@ -4,7 +4,6 @@
  * Owns: [data-ui='composer'|'composer-input-shell'|'composer-input'|
  *              'attachment-chip'|'attachment-menu'|'token-counter'|
  *              'composer-actions'|'image-output-settings'|'video-cost-notice'].
- * See plan/10-ui.md §10.7.
  */
 
 [data-ui="composer"] {

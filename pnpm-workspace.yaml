@@ -5,5 +5,7 @@ minimumReleaseAge: 1440
 trustPolicy: no-downgrade
 blockExoticSubdeps: true
 strictDepBuilds: true
-allowBuilds:
-  "@swc/core": false
+updateConfig:
+  ignoreDependencies:
+    - '@typescript/native'
+    - typescript

@@ -17,9 +17,8 @@
 //   #/storage/backups             → legacy alias for the storage overview
 //
 // The hash form is intentional: it works on static hosts without server config
-// and matches plan/01-architecture.md. Cursor pins persist in per-tab Zustand
-// per plan/02-data-model.md §2.1 / §2.1.2 — the URL only carries the *target*
-// pin for opens; subsequent in-tab swipes update Zustand without touching URL.
+// configuration. The URL only carries the target pin for opens; subsequent
+// in-tab swipes update the per-tab Zustand cursor without touching the URL.
 
 import { type MouseEvent, useSyncExternalStore } from 'react'
 import type { AttachmentId, ChatId, MessageId } from '../core/types'

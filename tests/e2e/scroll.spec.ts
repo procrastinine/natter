@@ -1,15 +1,17 @@
-import { expect, type Locator, type Page, test } from '@playwright/test'
+import { expect, type Locator, type Page, test } from './fixtures'
 import {
   buildSseBody,
   clearIndexedDb,
   createChatAndOpen,
+  firstChatId,
   mockChatCompletions,
   seedFirstRun,
   seedLinearChat,
   sendMessage,
+  waitForAssistantGenerationFinished,
 } from './helpers'
 
-// Scroll-follow vs pinned-scroll (plan/13-delivery.md §13.3.0 Phase 8).
+// Scroll-follow versus pinned-scroll behavior.
 
 function chunkFrame(content: string, finish?: string): string {
   return buildSseBody([{ id: 'scroll-stream', content, ...(finish ? { finish } : {}) }], {
@@ -60,7 +62,6 @@ async function scrollDistanceFromBottom(region: Locator): Promise<number> {
 }
 
 test.beforeEach(async ({ page }) => {
-  await page.goto('/')
   await clearIndexedDb(page)
   await seedFirstRun(page)
 })
@@ -218,6 +219,8 @@ test('browser find-style native scroll can move upward from the open bottom stat
       .first()
       .locator('[data-ui="message-body"]'),
   ).toContainText('browser-find-line 179')
+  const chatId = await firstChatId(page)
+  await waitForAssistantGenerationFinished(page, chatId)
   const region = page.locator('[data-ui="scroll-region"]')
   await expect
     .poll(() => scrollDistanceFromBottom(region), { timeout: 5000 })
@@ -225,14 +228,19 @@ test('browser find-style native scroll can move upward from the open bottom stat
 
   // Headless Chromium's `window.find()` does not reliably scroll nested
   // containers; this exercises the same non-wheel native scroll path.
-  await page
-    .locator('[data-ui="message-body"] p', { hasText: /^browser-find-line 5$/ })
-    .scrollIntoViewIfNeeded()
+  const browserFindMovement = await page.evaluate(() => {
+    const region = document.querySelector<HTMLElement>('[data-ui="scroll-region"]')
+    const target = Array.from(
+      document.querySelectorAll<HTMLElement>('[data-ui="message-body"] p'),
+    ).find((node) => node.textContent.trim() === 'browser-find-line 5')
+    if (!region || !target) throw new Error('Browser-find target or scroll region missing')
+    const before = region.scrollTop
+    target.scrollIntoView({ block: 'nearest' })
+    return { before, after: region.scrollTop }
+  })
+  expect(browserFindMovement.before - browserFindMovement.after).toBeGreaterThan(200)
   await expect(region).toHaveAttribute('data-scroll-state', 'pinned', { timeout: 3000 })
-  await expect
-    .poll(() => scrollDistanceFromBottom(region), { timeout: 3000 })
-    .toBeGreaterThan(200)
-
+  await expect.poll(() => scrollDistanceFromBottom(region), { timeout: 3000 }).toBeGreaterThan(200)
   await page.evaluate(() => {
     const content = document.querySelector('[data-ui="scroll-content"]')
     const sentinel = document.querySelector('[data-ui="scroll-sentinel"]')
@@ -245,9 +253,7 @@ test('browser find-style native scroll can move upward from the open bottom stat
   })
   await page.waitForTimeout(400)
   await expect(region).toHaveAttribute('data-scroll-state', 'pinned', { timeout: 3000 })
-  await expect
-    .poll(() => scrollDistanceFromBottom(region), { timeout: 3000 })
-    .toBeGreaterThan(200)
+  await expect.poll(() => scrollDistanceFromBottom(region), { timeout: 3000 }).toBeGreaterThan(200)
 })
 
 test('incremental streams keep following content growth that renders below the ScrollRegion parent', async ({

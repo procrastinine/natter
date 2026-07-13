@@ -1,5 +1,4 @@
 // Ephemeral UI state. Per-tab only — not persisted to IDB and not broadcast.
-// See `plan/03-storage.md §3.9`.
 //
 // Persistent UI preferences (theme choice, sidebar collapsed state, composer
 // fullscreen) live in the `settings` IDB table and hydrate into this store on
@@ -24,10 +23,16 @@ interface UiStoreState {
   sidebarCollapsed: boolean
   activeChatId: ChatId | null
   composerFullscreen: boolean
-  // Edit-tree mode toggle per §10.6.1. Applies globally across open chats
+  // Edit-tree mode applies globally across open chats
   // because the user's mental model is "editing the structure of the
   // current conversation"; switching chats re-uses the same mode.
   editTreeMode: boolean
+  // Alternate per-chat topology view. The id keeps switching to another
+  // chat from unexpectedly carrying tree mode with it; returning to the
+  // same chat in this tab restores the view until another tree is opened.
+  treeViewChatId: ChatId | null
+  // Tree density is a per-tab viewing preference, never chat data.
+  treeExpanded: boolean
   // Cascade-delete checkbox state inside Edit-tree toolbar. UI-local; resets
   // whenever the mode toggles off per §10.6.1.
   cascadeDelete: boolean
@@ -57,6 +62,8 @@ interface UiStoreState {
   setActiveChatId: (chatId: ChatId | null) => void
   setComposerFullscreen: (fullscreen: boolean) => void
   setEditTreeMode: (on: boolean) => void
+  setTreeViewChatId: (chatId: ChatId | null) => void
+  setTreeExpanded: (expanded: boolean) => void
   setCascadeDelete: (on: boolean) => void
   setFocusMode: (on: boolean) => void
   setDraftChat: (value: DraftChatSettings | null) => void
@@ -73,6 +80,8 @@ const INITIAL: Pick<
   | 'activeChatId'
   | 'composerFullscreen'
   | 'editTreeMode'
+  | 'treeViewChatId'
+  | 'treeExpanded'
   | 'cascadeDelete'
   | 'focusMode'
   | 'draftChat'
@@ -84,6 +93,8 @@ const INITIAL: Pick<
   activeChatId: null,
   composerFullscreen: false,
   editTreeMode: false,
+  treeViewChatId: null,
+  treeExpanded: false,
   cascadeDelete: false,
   focusMode: false,
   draftChat: null,
@@ -103,6 +114,8 @@ export const useUiStore = create<UiStoreState>((set) => ({
       // Exiting edit-tree mode always clears cascade (§10.6.1 "resets when the mode is toggled off").
       cascadeDelete: on ? state.cascadeDelete : false,
     })),
+  setTreeViewChatId: (treeViewChatId) => set({ treeViewChatId }),
+  setTreeExpanded: (treeExpanded) => set({ treeExpanded }),
   setCascadeDelete: (on) => set({ cascadeDelete: on }),
   setFocusMode: (on) => set({ focusMode: on }),
   setDraftChat: (value) => set({ draftChat: value }),
@@ -119,9 +132,7 @@ export const useUiStore = create<UiStoreState>((set) => ({
   setZeroEligibleChatId: (zeroEligibleChatId) => set({ zeroEligibleChatId }),
   dismissBanner: (entry) =>
     set((state) => {
-      if (
-        state.dismissedBanners.some((d) => d.kind === entry.kind && d.profileId === entry.profileId)
-      ) {
+      if (state.dismissedBanners.some((d) => d.profileId === entry.profileId)) {
         return state
       }
       return { dismissedBanners: [...state.dismissedBanners, entry] }

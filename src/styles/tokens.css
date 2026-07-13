@@ -1,8 +1,6 @@
 /*
  * tokens.css — shared design tokens.
  * Owns: :root, [data-theme], [data-density].
- * Source: plan/10-ui.md §10.21.
- *
  * All token names here are required by the Phase-8 contract test in
  * tests/unit/tokens-css.test.ts. Themes may change values, not names.
  */

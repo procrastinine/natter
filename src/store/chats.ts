@@ -1,11 +1,8 @@
-// Chat-level persistence helpers. See `plan/02-data-model.md §2.1` and
-// `plan/03-storage.md §3.1`.
-//
 // These helpers own chat-row CRUD and the read-side APIs that sit above the
 // repository boundary. Visible chat-row writes go through `WorkspaceRepository`
 // so browser mode already matches the future daemon contract.
 
-import { activePath } from '../core/active-path'
+import { type ActivePathMeasurement, activePath } from '../core/active-path'
 import { cloneDefaultChatSettings } from '../core/defaults'
 import { tokenCalibrationKeyForStoredRecordKey } from '../core/model-ids'
 import { normalizeReasoningSettings } from '../core/reasoning'
@@ -21,7 +18,6 @@ import type {
   ChatSettings,
   ChatSidebarRow,
   ChatTag,
-  DraftRow,
   FolderId,
   Message,
   MessageId,
@@ -30,8 +26,17 @@ import type {
   TokenCalibrationSample,
 } from '../core/types'
 import { newId } from '../lib/ulid'
-import { postEvent } from './broadcast'
-import { getDb, openDb } from './db'
+import {
+  CHAT_SIDEBAR_PROJECTION_BACKFILL_KEY,
+  CHAT_SIDEBAR_PROJECTION_MANIFEST_KEY,
+  type ChatSidebarProjectionRow,
+  isValidChatSidebarProjectionManifest,
+  isValidChatSidebarProjectionRow,
+  projectChatSidebarRow,
+  publicChatSidebarRow,
+  rebuildChatSidebarProjection,
+} from './chat-sidebar-projection'
+import { getDb } from './db'
 import {
   hydrateMessage,
   hydrateMessages,
@@ -43,6 +48,7 @@ import type {
   ActiveBranchSnapshot,
   ActiveBranchWindowSnapshot,
 } from './repository'
+import { ChatMissingError } from './repository'
 import { getWorkspaceRepository } from './workspace-repository'
 
 type OptionalKeys<T> = {
@@ -82,7 +88,6 @@ interface CreateChatInput {
 // left empty — the caller's first `sendUserMessage` produces the root user
 // message. Returns the full Chat for the caller to hold in Zustand.
 export async function createChat(input: CreateChatInput = {}): Promise<Chat> {
-  const db = await openDb()
   const now = input.now ?? Date.now()
   const settings = normalizeChatSettings(input.settings ?? cloneDefaultChatSettings())
   const chat: Chat = {
@@ -103,24 +108,17 @@ export async function createChat(input: CreateChatInput = {}): Promise<Chat> {
     pinned: false,
     folderId: null,
     tags: [],
+    previewText: '',
   }
   if (input.presetId !== undefined) chat.presetId = input.presetId
   if (input.temporary === true) chat.temporary = true
-  await db.chats.put(chat)
-  postEvent({
-    kind: 'chat-mutated',
-    chatId: chat.id,
-    metaVersion: 0,
-    summaryVersion: 0,
-    affected: [{ kind: 'chat-meta', chatId: chat.id }],
-  })
-  return chat
+  return getWorkspaceRepository().createChat(chat)
 }
 
 // The store/ layer is the abstraction boundary — UI code goes through
 // these functions rather than touching Dexie directly. Reads still call
 // `getDb()` inline here (not through the repo's async `openDb().then(...)`
-// wrapper) because `useLiveQuery` relies on Dexie's synchronous table-
+// wrapper) because reactive queries rely on Dexie's synchronous table-
 // access tracking to know when to re-run; inserting an await would lose
 // that subscription and the UI would stop updating as messages arrive.
 // Writes already route through `getWorkspaceRepository().runMutation(...)`.
@@ -144,74 +142,64 @@ export async function listChats(): Promise<Chat[]> {
   }
 }
 
-export function projectChatSidebarRow(chat: Chat): ChatSidebarRow {
-  return {
-    id: chat.id,
-    title: chat.title,
-    titleStatus: chat.titleStatus,
-    createdAt: chat.createdAt,
-    updatedAt: chat.updatedAt,
-    lastViewedAt: chat.lastViewedAt,
-    wordCount: chat.wordCount,
-    totalCostUsd: chat.totalCostUsd,
-    lastUpdatedLeafId: chat.lastUpdatedLeafId,
-    lastBranchUpdatedAt: chat.lastBranchUpdatedAt,
-    archived: chat.archived,
-    pinned: chat.pinned,
-    folderId: chat.folderId,
-    tags: [...chat.tags],
-    ...(chat.previewText !== undefined ? { previewText: chat.previewText } : {}),
-  }
-}
+export { projectChatSidebarRow }
+
+let chatSidebarProjectionRepair: Promise<void> | null = null
 
 export async function listChatSidebarRows(
   options: ChatSidebarListOptions = {},
 ): Promise<ChatSidebarRow[]> {
   try {
     const db = getDb()
-    const orderBy = options.orderBy
-    let rows: Chat[]
-    if (orderBy) {
-      let collection = db.chats.orderBy(orderBy)
-      if (options.direction !== 'asc') collection = collection.reverse()
-      if (options.offset && options.offset > 0) collection = collection.offset(options.offset)
-      if (options.limit !== undefined) collection = collection.limit(options.limit)
-      rows = await collection.toArray()
-    } else {
-      rows = await db.chats.toArray()
-      const offset = options.offset ?? 0
-      if (offset > 0 || options.limit !== undefined) {
-        rows = rows.slice(offset, options.limit === undefined ? undefined : offset + options.limit)
-      }
+    let result = await readChatSidebarProjection(db, options)
+    if (!result.valid) {
+      chatSidebarProjectionRepair ??= rebuildChatSidebarProjection(db).finally(() => {
+        chatSidebarProjectionRepair = null
+      })
+      await chatSidebarProjectionRepair
+      result = await readChatSidebarProjection(db, options)
     }
-    return rows.map(projectChatSidebarRow)
+    if (!result.valid) throw new Error('ChatSidebarProjectionIntegrityError')
+    return result.rows.map(publicChatSidebarRow)
   } catch (error) {
     if (isDatabaseClosedError(error)) return []
     throw error
   }
 }
 
-function isEmptyDraftRow(draft: DraftRow | undefined): boolean {
-  if (!draft) return true
-  if (draft.text.trim().length > 0) return false
-  if (draft.attachmentRefs.length > 0) return false
-  return true
-}
-
-function isEmptyMaterializedDraftChat(chat: Chat): boolean {
-  const hasCalibration = Object.keys(chat.tokenCalibration ?? {}).length > 0
-  const legacyHiddenDraft =
-    chat.presetId === undefined &&
-    chat.title.trim().length === 0 &&
-    chat.titleStatus === 'untitled' &&
-    (chat.previewText === undefined || chat.previewText === '')
-  return (
-    (chat.temporary === true || legacyHiddenDraft) &&
-    chat.lastUpdatedLeafId === null &&
-    chat.wordCount === 0 &&
-    chat.totalCostUsd === 0 &&
-    !hasCalibration
-  )
+async function readChatSidebarProjection(
+  db: ReturnType<typeof getDb>,
+  options: ChatSidebarListOptions,
+): Promise<{ valid: boolean; rows: ChatSidebarProjectionRow[] }> {
+  return db.transaction('r', db.chatSidebarRows, db.settings, async () => {
+    const [marker, manifest, actualCount] = await Promise.all([
+      db.settings.get(CHAT_SIDEBAR_PROJECTION_BACKFILL_KEY),
+      db.settings.get(CHAT_SIDEBAR_PROJECTION_MANIFEST_KEY),
+      db.chatSidebarRows.count(),
+    ])
+    const orderBy = options.orderBy
+    let rows: ChatSidebarProjectionRow[]
+    if (orderBy) {
+      let collection = db.chatSidebarRows.orderBy(orderBy)
+      if (options.direction !== 'asc') collection = collection.reverse()
+      if (options.offset && options.offset > 0) collection = collection.offset(options.offset)
+      if (options.limit !== undefined) collection = collection.limit(options.limit)
+      rows = await collection.toArray()
+    } else {
+      rows = await db.chatSidebarRows.toArray()
+      const offset = options.offset ?? 0
+      if (offset > 0 || options.limit !== undefined) {
+        rows = rows.slice(offset, options.limit === undefined ? undefined : offset + options.limit)
+      }
+    }
+    return {
+      valid:
+        marker?.value === 1 &&
+        isValidChatSidebarProjectionManifest(manifest?.value, actualCount) &&
+        rows.every(isValidChatSidebarProjectionRow),
+      rows,
+    }
+  })
 }
 
 export async function discardEmptyDraftChat(chatId: ChatId): Promise<boolean> {
@@ -226,60 +214,24 @@ export async function discardEmptyDraftChats({
   chatIds?: readonly ChatId[] | undefined
   exceptChatId?: ChatId | null | undefined
 } = {}): Promise<ChatId[]> {
-  const db = getDb()
-  const candidates =
-    chatIds === undefined
-      ? await db.chats.toArray()
-      : (await db.chats.bulkGet([...new Set(chatIds)])).filter((chat): chat is Chat =>
-          Boolean(chat),
-        )
-  const rows = candidates.filter(
-    (chat) => chat.id !== exceptChatId && isEmptyMaterializedDraftChat(chat),
-  )
-  if (rows.length === 0) return []
-  const deleted: ChatId[] = []
-  await db.transaction(
-    'rw',
-    [
-      db.chatBranchCache,
-      db.chats,
-      db.childLists,
-      db.drafts,
-      db.messageBodies,
-      db.messages,
-      db.streamChunks,
-      db.streamLeases,
-    ],
-    async () => {
-      for (const chat of rows) {
-        const [latest, draft] = await Promise.all([
-          db.messages.where('chatId').equals(chat.id).first(),
-          db.drafts.get(chat.id),
-        ])
-        if (latest || !isEmptyDraftRow(draft)) continue
-        await db.messages.where('chatId').equals(chat.id).delete()
-        await db.messageBodies.where('chatId').equals(chat.id).delete()
-        await db.drafts.delete(chat.id)
-        await db.chatBranchCache.delete(chat.id)
-        await db.childLists.filter((row) => row.chatId === chat.id).delete()
-        await db.streamChunks.where('chatId').equals(chat.id).delete()
-        await db.streamLeases.where('chatId').equals(chat.id).delete()
-        await db.chats.delete(chat.id)
-        deleted.push(chat.id)
-      }
-    },
-  )
-  for (const chatId of deleted) postEvent({ kind: 'chat-deleted', chatId })
-  return deleted
+  return getWorkspaceRepository().discardEmptyDraftChats({
+    ...(chatIds === undefined ? {} : { chatIds }),
+    exceptChatId,
+  })
 }
 
 export async function markChatPermanent(chatId: ChatId): Promise<void> {
   const repo = getWorkspaceRepository()
-  await repo.runMutation([{ kind: 'chat-meta', chatId }], async (ctx) => {
-    const chat = await ctx.getChat(chatId)
-    if (!chat?.temporary) return
-    ctx.patchChatMeta(chatId, { temporary: false })
-  })
+  try {
+    await repo.runMutation([{ kind: 'chat-meta', chatId }], async (ctx) => {
+      const chat = await ctx.getChat(chatId)
+      if (!chat?.temporary) return
+      ctx.patchChatMeta(chatId, { temporary: false })
+    })
+  } catch (error) {
+    if (error instanceof ChatMissingError && error.chatId === chatId) return
+    throw error
+  }
 }
 
 // Load every message row for a chat, including tombstones. Callers filter
@@ -383,14 +335,34 @@ export async function loadActiveBranchWindowSnapshot(
     const db = getDb()
     return await db.transaction('r', db.messages, db.messageBodies, async () => {
       const headers = await db.messages.where('chatId').equals(chatId).toArray()
-      const branchHeaders = activePath(headers as unknown as Message[], cursor).map(
-        (message) => message as unknown as MessageHeaderRow,
-      )
+      let activePathMeasurement: ActivePathMeasurement | undefined
+      const branchHeaders = activePath(
+        headers as unknown as Message[],
+        cursor,
+        window.onMeasure
+          ? (measurement) => {
+              activePathMeasurement = measurement
+            }
+          : undefined,
+      ).map((message) => message as unknown as MessageHeaderRow)
       const range = branchWindowRange(branchHeaders.length, window)
       const windowHeaders = branchHeaders.slice(range.start, range.end)
       const bodies = (
         await db.messageBodies.bulkGet(windowHeaders.map((header) => header.id))
       ).filter((row): row is MessageBodyRow => row !== undefined)
+      const siblingGroups = siblingGroupsForBranch(headers, branchHeaders)
+      if (window.onMeasure && activePathMeasurement) {
+        window.onMeasure({
+          headerRowsRead: headers.length,
+          bodyRowsRead: bodies.length,
+          siblingRowsRetained: siblingGroups.reduce(
+            (total, group) => total + group.siblings.length,
+            0,
+          ),
+          treeKeyRows: headers.length,
+          activePath: activePathMeasurement,
+        })
+      }
       return {
         chatId,
         allHeaders: headers,
@@ -399,7 +371,7 @@ export async function loadActiveBranchWindowSnapshot(
         windowOffset: range.start,
         windowLimit: range.limit,
         branchLength: branchHeaders.length,
-        siblingGroups: siblingGroupsForBranch(headers, branchHeaders),
+        siblingGroups,
         treeKey: messageHeaderTreeKey(headers),
       }
     })
@@ -421,26 +393,22 @@ export async function loadActiveBranchWindowSnapshot(
   }
 }
 
-function groupHeadersByParent(
-  headers: readonly MessageHeaderRow[],
-): Map<MessageId | null, MessageHeaderRow[]> {
-  const buckets = new Map<MessageId | null, MessageHeaderRow[]>()
-  for (const header of headers) {
-    const bucket = buckets.get(header.parentId)
-    if (bucket) bucket.push(header)
-    else buckets.set(header.parentId, [header])
-  }
-  for (const bucket of buckets.values()) bucket.sort((a, b) => a.siblingIndex - b.siblingIndex)
-  return buckets
-}
-
 function siblingGroupsForBranch(
   headers: readonly MessageHeaderRow[],
   branchHeaders: readonly MessageHeaderRow[],
 ): ActiveBranchSnapshot['siblingGroups'] {
-  const byParent = groupHeadersByParent(headers)
   const parentIds = new Set<MessageId | null>([null])
   for (const header of branchHeaders) parentIds.add(header.parentId)
+  const byParent = new Map<MessageId | null, MessageHeaderRow[]>()
+  for (const header of headers) {
+    if (!parentIds.has(header.parentId)) continue
+    const bucket = byParent.get(header.parentId)
+    if (bucket) bucket.push(header)
+    else byParent.set(header.parentId, [header])
+  }
+  for (const bucket of byParent.values()) {
+    bucket.sort((left, right) => left.siblingIndex - right.siblingIndex)
+  }
   return [...parentIds].map((parentId) => ({
     parentId,
     siblings: byParent.get(parentId) ?? [],
@@ -516,18 +484,18 @@ export async function moveChatToFolder(
   now = Date.now(),
 ): Promise<boolean> {
   const repo = getWorkspaceRepository()
-  let changed = false
+  const result = { changed: false }
   await repo.runMutation([{ kind: 'chat-meta', chatId }], async (ctx) => {
     const chat = await ctx.getChat(chatId)
     if (!chat) return
     if ((chat.folderId ?? null) === folderId) return
-    changed = true
+    result.changed = true
     ctx.patchChatMeta(chatId, { folderId, updatedAt: now })
   })
-  if (changed && folderId) {
+  if (result.changed && folderId) {
     await repo.updateFolder(folderId, { lastUsedAt: now, now })
   }
-  return changed
+  return result.changed
 }
 
 export async function moveChatsToFolder(
@@ -538,22 +506,22 @@ export async function moveChatsToFolder(
   const uniqueChatIds = [...new Set(chatIds)]
   if (uniqueChatIds.length === 0) return false
   const repo = getWorkspaceRepository()
-  let changed = false
+  const result = { changed: false }
   await repo.runMutation(
     uniqueChatIds.map((chatId) => ({ kind: 'chat-meta' as const, chatId })),
     async (ctx) => {
       for (const chatId of uniqueChatIds) {
         const chat = await ctx.getChat(chatId)
         if (!chat || (chat.folderId ?? null) === folderId) continue
-        changed = true
+        result.changed = true
         ctx.patchChatMeta(chatId, { folderId, updatedAt: now })
       }
     },
   )
-  if (changed && folderId) {
+  if (result.changed && folderId) {
     await repo.updateFolder(folderId, { lastUsedAt: now, now })
   }
-  return changed
+  return result.changed
 }
 
 async function setChatTags(
@@ -563,18 +531,18 @@ async function setChatTags(
 ): Promise<boolean> {
   const uniqueTagIds = [...new Set(tagIds)]
   const repo = getWorkspaceRepository()
-  let changed = false
+  const result = { changed: false }
   await repo.runMutation([{ kind: 'chat-meta', chatId }], async (ctx) => {
     const chat = await ctx.getChat(chatId)
     if (!chat) return
     if (sameStringList(chat.tags, uniqueTagIds)) return
-    changed = true
+    result.changed = true
     ctx.patchChatMeta(chatId, { tags: uniqueTagIds }, { touchSummary: false })
   })
-  if (changed) {
+  if (result.changed) {
     await Promise.all(uniqueTagIds.map((tagId) => repo.updateTag(tagId, { lastUsedAt: now, now })))
   }
-  return changed
+  return result.changed
 }
 
 export async function setChatTagsFromNames(
@@ -599,19 +567,19 @@ export async function setChatsTagsFromNames(
   const tagIds = await resolveChatTagIds(repo, names, now)
   const uniqueTagIds = [...new Set(tagIds)]
   if (uniqueChatIds.length > 0) {
-    let changed = false
+    const result = { changed: false }
     await repo.runMutation(
       uniqueChatIds.map((chatId) => ({ kind: 'chat-meta' as const, chatId })),
       async (ctx) => {
         for (const chatId of uniqueChatIds) {
           const chat = await ctx.getChat(chatId)
           if (!chat || sameStringList(chat.tags, uniqueTagIds)) continue
-          changed = true
+          result.changed = true
           ctx.patchChatMeta(chatId, { tags: uniqueTagIds }, { touchSummary: false })
         }
       },
     )
-    if (changed) {
+    if (result.changed) {
       await Promise.all(
         uniqueTagIds.map((tagId) => repo.updateTag(tagId, { lastUsedAt: now, now })),
       )
@@ -650,7 +618,7 @@ export async function clearChatTokenCalibration(
   now = Date.now(),
 ): Promise<boolean> {
   const repo = getWorkspaceRepository()
-  let changed = false
+  const result = { changed: false }
   const removedSamples: Record<string, TokenCalibrationSample> = {}
   await repo.runMutation([{ kind: 'chat-meta', chatId }], async (ctx) => {
     const chat = await ctx.getChat(chatId)
@@ -659,7 +627,7 @@ export async function clearChatTokenCalibration(
     const entries = Object.entries(current)
     if (!calibrationKey) {
       if (entries.length === 0) return
-      changed = true
+      result.changed = true
       Object.assign(removedSamples, current)
       ctx.patchChatMeta(
         chatId,
@@ -672,23 +640,23 @@ export async function clearChatTokenCalibration(
     const next: Record<string, TokenCalibrationSample> = {}
     for (const [storedKey, sample] of entries) {
       if (tokenCalibrationKeyForStoredRecordKey(storedKey) === calibrationKey) {
-        changed = true
+        result.changed = true
         removedSamples[storedKey] = sample
         continue
       }
       next[storedKey] = sample
     }
-    if (!changed) return
+    if (!result.changed) return
     ctx.patchChatMeta(
       chatId,
       { tokenCalibration: aggregateCalibrationSamples(next) },
       { touchVisibleState: false, broadcast: true },
     )
   })
-  if (changed) {
+  if (result.changed) {
     await subtractSamplesFromTokenCalibrationGlobal(removedSamples, now)
   }
-  return changed
+  return result.changed
 }
 
 export async function clearTokenCalibrationFamilyEverywhere(
@@ -792,9 +760,8 @@ function accumulateCalibrationSamples(
   }
 }
 
-// Record a chat-open event per §2.1.2 rule 1. Bumps `lastViewedAt` only and is
-// explicitly non-visible: it does not advance summary/meta versions or emit a
-// chat-mutated event.
+// A chat-open event bumps `lastViewedAt` only. It is explicitly non-visible: it
+// does not advance summary/meta versions or emit a chat-mutated event.
 export async function touchLastViewed(chatId: ChatId, now = Date.now()): Promise<void> {
   const repo = getWorkspaceRepository()
   await repo.runMutation([{ kind: 'chat-meta', chatId }], async (ctx) => {
@@ -806,8 +773,7 @@ export async function touchLastViewed(chatId: ChatId, now = Date.now()): Promise
 
 // Manual title edit. Sets `titleStatus = 'manual'` and overwrites `title` with
 // the trimmed value. Callers must pre-validate that the trimmed title is
-// non-empty — the helper defensively short-circuits if it is anyway. See
-// plan/02-data-model.md §2.1.1 and plan/10-ui.md §10.3 inline title editor.
+// non-empty; the helper defensively short-circuits if it is anyway.
 export async function setManualTitle(
   chatId: ChatId,
   title: string,
@@ -836,7 +802,7 @@ export async function setManualTitle(
 // Partial `ChatSettings` patch through the chat-meta scope. Used by the
 // settings pane (system prompt edit, rendering pref tweaks, etc.). Returns
 // true if anything actually changed. Concurrency is LWW on the chat-meta row,
-// consistent with other settings edits. See plan/14-details.md §14.35.5.
+// consistent with other settings edits.
 // Link / unlink the breadcrumb preset reference on a chat. Used when the
 // user loads a preset into an existing chat or saves the chat's current
 // settings as a new preset.
@@ -858,8 +824,8 @@ export async function toggleMessageHidden(messageId: MessageId): Promise<void> {
 
 // Clears `generation.abortReason` and any recorded error on a message,
 // removing the "Stream interrupted" banner. Keeps all other generation
-// metadata intact (usage, model, reasoning details). Used for the dismiss
-// button on the abort banner and auto-cleared after a successful continue.
+// metadata intact (usage, model, reasoning details). Used for the explicit
+// dismiss button on the abort banner.
 export async function dismissAbortReason(messageId: MessageId): Promise<void> {
   const repo = getWorkspaceRepository()
   await repo.runMutation([{ kind: 'message', messageId }], async (ctx) => {
@@ -1047,49 +1013,4 @@ async function pruneUnusedTags(repo: {
     for (const tagId of chat.tags) used.add(tagId)
   }
   await Promise.all(tags.filter((tag) => !used.has(tag.id)).map((tag) => repo.deleteTag(tag.id)))
-}
-
-// Sidebar preview length cap. Kept here (not in ChatList) because the
-// write path owns the canonical truncation — readers just render what the
-// chat row carries, no length math in the UI.
-const PREVIEW_MAX_CHARS = 240
-
-// Recomputes `chat.previewText` from the earliest live user message and
-// writes it back if it changed. Idempotent — safe to over-call. Uses the
-// chat-meta scope so it plays nicely with concurrent sends/edits through
-// the repository boundary. `touchVisibleState: false` because this is a
-// derived cache, not a user-visible edit: it must not bump
-// `updatedAt` / `metaVersion` / `summaryVersion` (otherwise the sidebar
-// would reorder on every sidebar refresh, and meta-version-gated caches
-// would thrash).
-export async function refreshChatPreview(chatId: ChatId): Promise<void> {
-  const headers = await loadMessageHeaders(chatId)
-  let earliestHeader: MessageHeaderRow | undefined
-  for (const header of headers) {
-    if (header.deleted || header.role !== 'user') continue
-    if (!earliestHeader || header.createdAt < earliestHeader.createdAt) earliestHeader = header
-  }
-  const earliest = earliestHeader ? await getMessage(earliestHeader.id) : undefined
-  let plain = ''
-  if (earliest) {
-    const parts: string[] = []
-    for (const p of earliest.content) {
-      if (p.type === 'text' || p.type === 'output_text') parts.push(p.text)
-    }
-    plain = parts.join('')
-  }
-  const trimmed = plain.replace(/\s+/g, ' ').trim()
-  const preview =
-    trimmed.length > PREVIEW_MAX_CHARS ? `${trimmed.slice(0, PREVIEW_MAX_CHARS - 1)}…` : trimmed
-  const repo = getWorkspaceRepository()
-  await repo.runMutation([{ kind: 'chat-meta', chatId }], async (ctx) => {
-    const chat = await ctx.getChat(chatId)
-    if (!chat) return
-    if (chat.previewText === preview) return
-    ctx.patchChatMeta(
-      chatId,
-      { previewText: preview },
-      { touchVisibleState: false, broadcast: false },
-    )
-  })
 }
