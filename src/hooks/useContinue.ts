@@ -51,6 +51,7 @@ import { postEvent } from '../store/broadcast'
 import type { ConnectionRuntimeKeyCandidate } from '../store/connection-runtime'
 import {
   assertSendContextFresh,
+  createSendContextGuard,
   loadChatHeaderSnapshot,
   loadSendContextForBranch,
 } from '../store/send-context'
@@ -122,7 +123,6 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
       await loadChatHeaderSnapshot(input.chatId)
     let chat: Chat | undefined = headerSnapshot.chat
     const allHeaders = headerSnapshot.allHeaders
-    const summaryVersion = headerSnapshot.summaryVersion
     headerSnapshot = undefined
     const byId = new Map(allHeaders.map((header) => [header.id, header]))
     const targetHeader = byId.get(input.targetMessageId)
@@ -157,6 +157,7 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
     // happen to share siblingIndex 0 are excluded.
     const targetIdx = path.findIndex((m) => m.id === activeTarget.id)
     const upstream = targetIdx >= 0 ? path.slice(0, targetIdx + 1) : path
+    const sendContextGuard = createSendContextGuard(chat, upstream)
 
     // Build the wire body as if sending a request that ends with
     // the target assistant. Continue has two independent per-chat prompt slots
@@ -338,7 +339,7 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
       }
     }
 
-    await assertSendContextFresh(input.chatId, summaryVersion)
+    await assertSendContextFresh(sendContextGuard)
     const streamFence = await markLifecycleTarget({
       chatId: input.chatId,
       streamId,
@@ -372,7 +373,7 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
         dispatchPlan.wire = {}
         return source
       },
-      beforeDispatch: () => assertSendContextFresh(input.chatId, summaryVersion),
+      beforeDispatch: () => assertSendContextFresh(sendContextGuard),
       ...(route?.transport ? { transportHint: route.transport } : {}),
       accumulator,
       journal,

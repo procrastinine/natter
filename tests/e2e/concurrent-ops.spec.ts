@@ -1,4 +1,4 @@
-import { expect, test } from './fixtures'
+import { expect, type Page, test } from './fixtures'
 import {
   buildSseBody,
   clearIndexedDb,
@@ -8,6 +8,8 @@ import {
   readMessages,
   seedFirstRun,
   sendMessage,
+  startMessageCountRecorder,
+  stopMessageCountRecorder,
 } from './helpers'
 
 // Phase 7 scope of the §6.11.1 concurrent-ops-during-stream matrix.
@@ -84,49 +86,27 @@ test('two tabs cannot turn simultaneous composer sends into an implicit branch',
   page,
 }) => {
   await page.goto('/?debug')
-  const initial = await page.evaluate(async () => {
-    const api = (
-      window as typeof window & {
-        __debugFakeStream?: {
-          start(options: Record<string, unknown>): Promise<{ chatId: string }>
-        }
-      }
-    ).__debugFakeStream
-    if (!api) throw new Error('debug fake stream API unavailable')
-    return api.start({
-      openChat: false,
-      prompt: 'baseline',
-      targetChars: 8,
-      reasoningChars: 0,
-      chunkChars: 8,
-    })
+  const initial = await startDebugStream(page, {
+    openChat: false,
+    prompt: 'baseline',
+    targetChars: 8,
+    reasoningChars: 0,
+    chunkChars: 8,
   })
   const second = await page.context().newPage()
   await second.goto(`/?debug#/chat/${initial.chatId}`)
 
   const start = (target: typeof page, prompt: string) =>
-    target.evaluate(
-      async ({ chatId, prompt: submittedPrompt }) => {
-        const api = (
-          window as typeof window & {
-            __debugFakeStream?: {
-              start(options: Record<string, unknown>): Promise<unknown>
-            }
-          }
-        ).__debugFakeStream
-        if (!api) throw new Error('debug fake stream API unavailable')
-        return api.start({
-          chatId,
-          openChat: false,
-          prompt: submittedPrompt,
-          targetChars: 256,
-          reasoningChars: 0,
-          chunkChars: 8,
-          delayMs: 50,
-        })
-      },
-      { chatId: initial.chatId, prompt },
-    )
+    startDebugStream(target, {
+      chatId: initial.chatId,
+      expectedLeafId: initial.assistantMessageId,
+      openChat: false,
+      prompt,
+      targetChars: 256,
+      reasoningChars: 0,
+      chunkChars: 8,
+      delayMs: 50,
+    })
   const settled = await Promise.allSettled([
     start(page, 'same-chat A'),
     start(second, 'same-chat B'),
@@ -137,7 +117,7 @@ test('two tabs cannot turn simultaneous composer sends into an implicit branch',
     (result): result is PromiseRejectedResult => result.status === 'rejected',
   )
   expect(rejected).toHaveLength(1)
-  expect(String(rejected[0]?.reason)).toContain('StreamChatBusy')
+  expect(String(rejected[0]?.reason)).toContain('ExpectedLeafChanged')
 
   const rows = (await readMessages(page, initial.chatId)).filter((row) => row.deleted !== true)
   expect(rows).toHaveLength(4)
@@ -160,6 +140,100 @@ test('two tabs cannot turn simultaneous composer sends into an implicit branch',
   }
   expect(roles).toEqual(['user', 'assistant', 'user', 'assistant'])
   await second.close()
+})
+
+test('a remote extension then newer sibling keeps each tab on its own branch without flashing', async ({
+  context,
+  page,
+}) => {
+  await page.goto('/?debug')
+  const initial = await startDebugStream(page, {
+    openChat: false,
+    prompt: 'tab-local baseline',
+    targetChars: 16,
+    reasoningChars: 0,
+    chunkChars: 16,
+  })
+
+  const first = await context.newPage()
+  await page.close()
+  const second = await context.newPage()
+  try {
+    await first.goto(`/?debug#/chat/${initial.chatId}`)
+    await expect(
+      first.locator(`[data-ui="message"][data-message-id="${initial.assistantMessageId}"]`),
+    ).toBeVisible()
+    await expect
+      .poll(() => first.evaluate(() => window.location.hash))
+      .toBe(`#/chat/${initial.chatId}/message/${initial.assistantMessageId}`)
+
+    await second.goto(`/?debug#/chat/${initial.chatId}/message/${initial.assistantMessageId}`)
+    await expect(
+      second.locator(`[data-ui="message"][data-message-id="${initial.assistantMessageId}"]`),
+    ).toBeVisible()
+
+    const extension = await startDebugStream(second, {
+      chatId: initial.chatId,
+      openChat: false,
+      prompt: 'shared linear extension',
+      targetChars: 24,
+      reasoningChars: 0,
+      chunkChars: 24,
+    })
+    await expect(
+      first.locator(`[data-ui="message"][data-message-id="${extension.assistantMessageId}"]`),
+    ).toBeVisible()
+    await expect
+      .poll(() => first.evaluate(() => window.location.hash))
+      .toBe(`#/chat/${initial.chatId}/message/${extension.assistantMessageId}`)
+    await expect
+      .poll(() => readCursorSelection(first, initial.chatId, extension.userMessageId))
+      .toBe(extension.assistantMessageId)
+
+    await startMessageCountRecorder(first)
+    const newerSibling = await startDebugStream(second, {
+      chatId: initial.chatId,
+      parentMessageId: extension.userMessageId,
+      openChat: false,
+      targetChars: 32,
+      reasoningChars: 0,
+      chunkChars: 32,
+    })
+
+    const firstAccepted = first.locator(
+      `[data-ui="message"][data-message-id="${extension.assistantMessageId}"]`,
+    )
+    const secondAccepted = second.locator(
+      `[data-ui="message"][data-message-id="${newerSibling.assistantMessageId}"]`,
+    )
+    await expect(firstAccepted.locator('[data-ui="branch-count"]')).toHaveText('1 / 2')
+    await expect(secondAccepted.locator('[data-ui="branch-count"]')).toHaveText('2 / 2')
+    await expect(
+      first.locator(`[data-ui="message"][data-message-id="${newerSibling.assistantMessageId}"]`),
+    ).toHaveCount(0)
+    await expect
+      .poll(() => first.evaluate(() => window.location.hash))
+      .toBe(`#/chat/${initial.chatId}/message/${extension.assistantMessageId}`)
+    await expect
+      .poll(() => second.evaluate(() => window.location.hash))
+      .toBe(`#/chat/${initial.chatId}/message/${newerSibling.assistantMessageId}`)
+    await expect
+      .poll(() => readCursorSelection(first, initial.chatId, extension.userMessageId))
+      .toBe(extension.assistantMessageId)
+    await expect
+      .poll(() => readCursorSelection(second, initial.chatId, extension.userMessageId))
+      .toBe(newerSibling.assistantMessageId)
+    expect(await stopMessageCountRecorder(first)).toEqual({
+      anchorRemoved: false,
+      listRemoved: false,
+      listReplaced: false,
+      loadingSeen: false,
+      messageCountsIncludeZero: false,
+      recyclingSeen: false,
+    })
+  } finally {
+    await Promise.allSettled([first.close(), second.close()])
+  }
 })
 
 test('bumping lastViewedAt on the active chat from tab B leaves the stream intact', async ({
@@ -254,3 +328,52 @@ test('renaming the chat while streaming does not abort the stream', async ({ pag
       .locator('[data-ui="message-body"]'),
   ).toHaveText('renamed-ok', { timeout: 5000 })
 })
+
+interface DebugStreamResult {
+  chatId: string
+  userMessageId: string
+  assistantMessageId: string
+}
+
+async function startDebugStream(
+  page: Page,
+  options: Record<string, unknown>,
+): Promise<DebugStreamResult> {
+  await page.waitForFunction(
+    () =>
+      typeof (window as typeof window & { __debugFakeStream?: unknown }).__debugFakeStream ===
+      'object',
+  )
+  return page.evaluate(async (input) => {
+    const api = (
+      window as typeof window & {
+        __debugFakeStream?: {
+          start(options: Record<string, unknown>): Promise<DebugStreamResult>
+        }
+      }
+    ).__debugFakeStream
+    if (!api) throw new Error('debug fake stream API unavailable')
+    return api.start(input)
+  }, options)
+}
+
+async function readCursorSelection(
+  page: Page,
+  chatId: string,
+  parentId: string,
+): Promise<string | null> {
+  return page.evaluate(
+    async ({ activeChatId, activeParentId }) => {
+      const storePath = '/src/store/zustand/chatStore.ts'
+      const module = (await import(/* @vite-ignore */ storePath)) as {
+        useChatStore: {
+          getState(): {
+            getCursor(id: string): Record<string, string> | undefined
+          }
+        }
+      }
+      return module.useChatStore.getState().getCursor(activeChatId)?.[activeParentId] ?? null
+    },
+    { activeChatId: chatId, activeParentId: parentId },
+  )
+}

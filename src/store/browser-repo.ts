@@ -95,6 +95,7 @@ import type {
   MutationContext,
   PatchMessageBodyOptions,
   PutMessageOptions,
+  SendContextRevisionSnapshot,
   StreamChunkRow,
   StreamLeaseRow,
   StreamWriteFence,
@@ -113,7 +114,6 @@ import {
   ChatMissingError,
   chatMatchesBranchCacheWriteGuard,
   ExpectedLeafChangedError,
-  StreamChatBusyError,
   StreamTargetBusyError,
 } from './repository'
 import {
@@ -225,23 +225,6 @@ async function assertStreamLeaseTargetAvailable(
   }
 }
 
-async function assertStreamLeaseChatAdmissionAvailable(
-  tx: Transaction,
-  incoming: StreamLeaseRow,
-): Promise<void> {
-  const competing = await tx
-    .table<StreamLeaseRow, string>('streamLeases')
-    .where('chatId')
-    .equals(incoming.chatId)
-    .toArray()
-  for (const lease of competing) {
-    if (lease.streamId === incoming.streamId) continue
-    if (incoming.exclusiveChat !== true && lease.exclusiveChat !== true) continue
-    if (await streamLeaseTargetFinalized(tx, lease)) continue
-    throw new StreamChatBusyError(incoming.chatId, lease.streamId)
-  }
-}
-
 async function streamLeaseTargetFinalized(
   tx: Transaction,
   lease: StreamLeaseRow,
@@ -277,7 +260,6 @@ function isStreamLeaseRow(value: unknown): value is StreamLeaseRow {
         Number.isSafeInteger(row.baseNodeVersion) &&
         row.baseNodeVersion >= 0)) &&
     (row.requestedModel === undefined || typeof row.requestedModel === 'string') &&
-    (row.exclusiveChat === undefined || row.exclusiveChat === true) &&
     (row.apiUsed === undefined ||
       row.apiUsed === 'chat' ||
       row.apiUsed === 'responses' ||
@@ -1905,40 +1887,36 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
 
   async upsertStreamLease(lease: StreamLeaseRow): Promise<StreamLeaseRow> {
     const db = await openDb()
-    const row = await withNamedLocks(
-      [`stream-chat:${lease.chatId}`, `stream-journal:${lease.streamId}`],
-      (grant) =>
-        grant.runTransaction(
-          db,
-          [db.streamLeases, db.settings, db.messages, db.messageBodies],
-          async (tx) => {
-            const table = tx.table<StreamLeaseRow, string>('streamLeases')
-            const existing = await table.get(lease.streamId)
-            const meta = await readBrowserWorkspaceMetaFromTransaction(tx)
-            const fenceToken = lease.fenceToken ?? newId()
-            if (existing && existing.chatId !== lease.chatId) {
-              throw new Error(`StreamLeaseChatMismatch:${lease.streamId}`)
-            }
-            if (
-              existing &&
-              (existing.ownerClientId !== lease.ownerClientId || existing.fenceToken !== fenceToken)
-            ) {
-              throw new Error(`StreamLeaseAlreadyOwned:${lease.streamId}`)
-            }
-            const admitted: StreamLeaseRow = {
-              ...lease,
-              fenceToken,
-              replacementEpoch: meta.replacementEpoch,
-              ...(existing?.exclusiveChat === true || lease.exclusiveChat === true
-                ? { exclusiveChat: true as const }
-                : {}),
-            }
-            await assertStreamLeaseChatAdmissionAvailable(tx, admitted)
-            await assertStreamLeaseTargetAvailable(tx, admitted)
-            await table.put(admitted)
-            return admitted
-          },
-        ),
+    const row = await withNamedLock(`stream-journal:${lease.streamId}`, (grant) =>
+      grant.runTransaction(
+        db,
+        lease.messageId
+          ? [db.streamLeases, db.settings, db.messages, db.messageBodies]
+          : [db.streamLeases, db.settings],
+        async (tx) => {
+          const table = tx.table<StreamLeaseRow, string>('streamLeases')
+          const existing = await table.get(lease.streamId)
+          const meta = await readBrowserWorkspaceMetaFromTransaction(tx)
+          const fenceToken = lease.fenceToken ?? newId()
+          if (existing && existing.chatId !== lease.chatId) {
+            throw new Error(`StreamLeaseChatMismatch:${lease.streamId}`)
+          }
+          if (
+            existing &&
+            (existing.ownerClientId !== lease.ownerClientId || existing.fenceToken !== fenceToken)
+          ) {
+            throw new Error(`StreamLeaseAlreadyOwned:${lease.streamId}`)
+          }
+          const admitted: StreamLeaseRow = {
+            ...lease,
+            fenceToken,
+            replacementEpoch: meta.replacementEpoch,
+          }
+          await assertStreamLeaseTargetAvailable(tx, admitted)
+          await table.put(admitted)
+          return admitted
+        },
+      ),
     )
     postEvent({ kind: 'stream-heartbeat', lease: row })
     return row
@@ -1970,7 +1948,6 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
             startedAt: existing.startedAt,
             fenceToken: fence.fenceToken,
             replacementEpoch: fence.replacementEpoch,
-            ...(existing.exclusiveChat === true ? { exclusiveChat: true as const } : {}),
           }
           if (renewed.messageId !== existing.messageId) {
             if (!checkTarget) throw new Error(`StreamLeaseTargetChanged:${lease.streamId}`)
@@ -2671,6 +2648,23 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     return header ? cloneMessageHeader(header) : undefined
   }
 
+  async getSendContextRevisionSnapshot(
+    chatId: ChatId,
+    messageIds: readonly MessageId[],
+  ): Promise<SendContextRevisionSnapshot> {
+    const db = await openDb()
+    return db.transaction('r', db.chats, db.messages, async () => {
+      const [chat, headers] = await Promise.all([
+        db.chats.get(chatId),
+        db.messages.bulkGet([...messageIds]),
+      ])
+      return {
+        chat,
+        headers: headers.map((header) => (header ? cloneMessageHeader(header) : undefined)),
+      }
+    })
+  }
+
   async listMessageHeaders(chatId: ChatId): Promise<MessageHeaderRow[]> {
     const db = await openDb()
     return (await db.messages.where('chatId').equals(chatId).toArray()).map(cloneMessageHeader)
@@ -2768,7 +2762,6 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
       if (!chat) throw new ChatMissingError(chatId)
       return {
         chat,
-        summaryVersion: chat.summaryVersion,
         chatId,
         allHeaders: headers.map(cloneMessageHeader),
         branchHeaders: branchHeadersByLeaf(headers, leafId).map(cloneMessageHeader),

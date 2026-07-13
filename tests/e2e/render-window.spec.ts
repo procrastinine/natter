@@ -6,6 +6,8 @@ import {
   seedFirstRun,
   seedLinearChat,
   sendMessage,
+  startMessageCountRecorder,
+  stopMessageCountRecorder,
 } from './helpers'
 
 test.beforeEach(async ({ page }) => {
@@ -487,103 +489,6 @@ async function sidebarRowMetrics(row: Locator): Promise<{
       top: rowRect.top - listRect.top,
       scrollTop: list.scrollTop,
       renderedCount: Number(list.dataset.renderedCount ?? 0),
-    }
-  })
-}
-
-async function startMessageCountRecorder(page: Page): Promise<void> {
-  await page.evaluate(() => {
-    const win = window as Window & {
-      __messageCountSamples?: {
-        anchor: Element
-        anchorRemoved: boolean
-        content: Element
-        list: Element
-        listRemoved: boolean
-        listReplaced: boolean
-        loadingSeen: boolean
-        messageCounts: number[]
-        recyclingSeen: boolean
-      }
-      __stopMessageCountSamples?: () => void
-    }
-    win.__stopMessageCountSamples?.()
-    const content = document.querySelector('[data-ui="scroll-content"]')
-    const list = content?.querySelector('[data-ui="message-list"]')
-    if (!content || !list) throw new Error('Mounted transcript not found')
-    const messages = list.querySelectorAll('[data-ui="message"]')
-    const state = {
-      anchor: messages.item(Math.max(0, messages.length - 2)),
-      anchorRemoved: false,
-      content,
-      list,
-      listRemoved: false,
-      listReplaced: false,
-      loadingSeen: false,
-      messageCounts: [] as number[],
-      recyclingSeen: false,
-    }
-    const sample = () => {
-      const currentList = state.content.querySelector('[data-ui="message-list"]')
-      state.messageCounts.push(currentList?.querySelectorAll('[data-ui="message"]').length ?? 0)
-      state.listRemoved ||= !state.list.isConnected
-      state.listReplaced ||= currentList !== state.list
-      state.anchorRemoved ||= !state.anchor.isConnected
-      state.loadingSeen ||= state.content.querySelector('[data-ui="surface-loading"]') !== null
-      state.recyclingSeen ||=
-        state.content.querySelector('[data-ui="message-list-recycling"]') !== null
-    }
-    const observer = new MutationObserver(sample)
-    observer.observe(content, { childList: true, subtree: true })
-    sample()
-    win.__messageCountSamples = state
-    win.__stopMessageCountSamples = () => observer.disconnect()
-  })
-}
-
-async function stopMessageCountRecorder(page: Page): Promise<{
-  anchorRemoved: boolean
-  listRemoved: boolean
-  listReplaced: boolean
-  loadingSeen: boolean
-  messageCountsIncludeZero: boolean
-  recyclingSeen: boolean
-}> {
-  return page.evaluate(() => {
-    const win = window as Window & {
-      __messageCountSamples?: {
-        anchor: Element
-        anchorRemoved: boolean
-        content: Element
-        list: Element
-        listRemoved: boolean
-        listReplaced: boolean
-        loadingSeen: boolean
-        messageCounts: number[]
-        recyclingSeen: boolean
-      }
-      __stopMessageCountSamples?: () => void
-    }
-    const state = win.__messageCountSamples
-    if (!state) throw new Error('Transcript continuity recorder not started')
-    const currentList = state.content.querySelector('[data-ui="message-list"]')
-    state.messageCounts.push(currentList?.querySelectorAll('[data-ui="message"]').length ?? 0)
-    state.listRemoved ||= !state.list.isConnected
-    state.listReplaced ||= currentList !== state.list
-    state.anchorRemoved ||= !state.anchor.isConnected
-    state.loadingSeen ||= state.content.querySelector('[data-ui="surface-loading"]') !== null
-    state.recyclingSeen ||=
-      state.content.querySelector('[data-ui="message-list-recycling"]') !== null
-    win.__stopMessageCountSamples?.()
-    delete win.__messageCountSamples
-    delete win.__stopMessageCountSamples
-    return {
-      anchorRemoved: state.anchorRemoved,
-      listRemoved: state.listRemoved,
-      listReplaced: state.listReplaced,
-      loadingSeen: state.loadingSeen,
-      messageCountsIncludeZero: state.messageCounts.includes(0),
-      recyclingSeen: state.recyclingSeen,
     }
   })
 }

@@ -22,11 +22,11 @@ import type {
 import { getDb } from './db'
 import { hydrateMessages, type MessageBodyRow, type MessageHeaderRow } from './message-storage'
 import { flushPendingPromptSettingSaves } from './prompt-presets'
+import type { MutationContext } from './repository'
 import { getWorkspaceRepository } from './workspace-repository'
 
 interface ChatHeaderSnapshot {
   chat: Chat
-  summaryVersion: number
   chatId: string
   allHeaders: MessageHeaderRow[]
 }
@@ -68,40 +68,170 @@ interface SendContextBucket {
 
 const EMPTY_PENDING: readonly Message[] = Object.freeze([])
 
+export interface SendContextMessageRevision {
+  id: MessageId
+  chatId: string
+  parentId: MessageId | null
+  nodeVersion: number
+  deleted: boolean
+}
+
+export interface SendContextGuard {
+  chatId: string
+  settings: ChatSettings
+  messageRevisions: SendContextMessageRevision[]
+}
+
+export type StaleSendContextReason =
+  | 'chat-missing'
+  | 'settings-changed'
+  | 'message-missing'
+  | 'message-changed'
+
 export class StaleSendContextError extends Error {
   readonly chatId: string
-  readonly expectedSummaryVersion: number
-  readonly actualSummaryVersion?: number
+  readonly reason: StaleSendContextReason
+  readonly messageId?: MessageId
 
-  constructor(chatId: string, expectedSummaryVersion: number, actualSummaryVersion?: number) {
-    super(
-      actualSummaryVersion === undefined
-        ? `Send context is stale because chat ${chatId} is unavailable.`
-        : `Send context is stale for chat ${chatId}: expected summary version ${expectedSummaryVersion}, found ${actualSummaryVersion}.`,
-    )
+  constructor(chatId: string, reason: StaleSendContextReason, messageId?: MessageId) {
+    super(staleSendContextMessage(chatId, reason, messageId))
     this.name = 'StaleSendContextError'
     this.chatId = chatId
-    this.expectedSummaryVersion = expectedSummaryVersion
-    if (actualSummaryVersion !== undefined) this.actualSummaryVersion = actualSummaryVersion
+    this.reason = reason
+    if (messageId !== undefined) this.messageId = messageId
   }
 }
 
-export function assertSendContextVersion(
-  chat: Pick<Chat, 'id' | 'summaryVersion'> | undefined,
+function staleSendContextMessage(
   chatId: string,
-  expectedSummaryVersion: number,
-): asserts chat is Pick<Chat, 'id' | 'summaryVersion'> {
-  if (!chat || chat.id !== chatId || chat.summaryVersion !== expectedSummaryVersion) {
-    throw new StaleSendContextError(chatId, expectedSummaryVersion, chat?.summaryVersion)
+  reason: StaleSendContextReason,
+  messageId?: MessageId,
+): string {
+  if (reason === 'chat-missing')
+    return `Send context is stale because chat ${chatId} is unavailable.`
+  if (reason === 'settings-changed') {
+    return `Send context is stale because chat ${chatId} settings changed while the request was being prepared.`
+  }
+  if (reason === 'message-missing') {
+    return `Send context is stale because message ${messageId ?? 'unknown'} is unavailable.`
+  }
+  return `Send context is stale because message ${messageId ?? 'unknown'} changed while the request was being prepared.`
+}
+
+export function createSendContextGuard(
+  chat: Pick<Chat, 'id' | 'settings'>,
+  headers: readonly MessageHeaderRow[],
+): SendContextGuard {
+  return {
+    chatId: chat.id,
+    settings: structuredClone(chat.settings),
+    messageRevisions: headers.map(messageRevision),
   }
 }
 
-export async function assertSendContextFresh(
-  chatId: string,
-  expectedSummaryVersion: number,
+export function appendSendContextGuardMessage(
+  guard: SendContextGuard,
+  message: Pick<MessageHeaderRow, 'id' | 'chatId' | 'parentId' | 'nodeVersion' | 'deleted'>,
+): SendContextGuard {
+  return {
+    ...guard,
+    messageRevisions: [...guard.messageRevisions, messageRevision(message)],
+  }
+}
+
+export function assertSendContextGuard(
+  chat: Pick<Chat, 'id' | 'settings'> | undefined,
+  headers: readonly (MessageHeaderRow | undefined)[],
+  guard: SendContextGuard,
+): void {
+  if (!chat || chat.id !== guard.chatId) {
+    throw new StaleSendContextError(guard.chatId, 'chat-missing')
+  }
+  if (!sendContextValuesEqual(chat.settings, guard.settings)) {
+    throw new StaleSendContextError(guard.chatId, 'settings-changed')
+  }
+  for (let index = 0; index < guard.messageRevisions.length; index += 1) {
+    const expected = guard.messageRevisions[index] as SendContextMessageRevision
+    const actual = headers[index]
+    if (!actual) {
+      throw new StaleSendContextError(guard.chatId, 'message-missing', expected.id)
+    }
+    if (!messageRevisionMatches(actual, expected)) {
+      throw new StaleSendContextError(guard.chatId, 'message-changed', expected.id)
+    }
+  }
+}
+
+export async function assertSendContextGuardInMutation(
+  ctx: MutationContext,
+  guard: SendContextGuard,
 ): Promise<void> {
-  const chat = await getDb().chats.get(chatId)
-  assertSendContextVersion(chat, chatId, expectedSummaryVersion)
+  const [chat, headers] = await Promise.all([
+    ctx.getChat(guard.chatId),
+    Promise.all(guard.messageRevisions.map((revision) => ctx.getMessageHeader(revision.id))),
+  ])
+  assertSendContextGuard(chat, headers, guard)
+}
+
+export async function assertSendContextFresh(guard: SendContextGuard): Promise<void> {
+  const snapshot = await getWorkspaceRepository().getSendContextRevisionSnapshot(
+    guard.chatId,
+    guard.messageRevisions.map((revision) => revision.id),
+  )
+  assertSendContextGuard(snapshot.chat, snapshot.headers, guard)
+}
+
+function messageRevision(
+  message: Pick<MessageHeaderRow, 'id' | 'chatId' | 'parentId' | 'nodeVersion' | 'deleted'>,
+): SendContextMessageRevision {
+  return {
+    id: message.id,
+    chatId: message.chatId,
+    parentId: message.parentId,
+    nodeVersion: message.nodeVersion,
+    deleted: message.deleted,
+  }
+}
+
+function messageRevisionMatches(
+  actual: Pick<MessageHeaderRow, 'id' | 'chatId' | 'parentId' | 'nodeVersion' | 'deleted'>,
+  expected: SendContextMessageRevision,
+): boolean {
+  return (
+    actual.id === expected.id &&
+    actual.chatId === expected.chatId &&
+    actual.parentId === expected.parentId &&
+    actual.nodeVersion === expected.nodeVersion &&
+    actual.deleted === expected.deleted
+  )
+}
+
+function sendContextValuesEqual(left: unknown, right: unknown): boolean {
+  if (Object.is(left, right)) return true
+  if (left === null || right === null || typeof left !== 'object' || typeof right !== 'object') {
+    return false
+  }
+  if (Array.isArray(left) || Array.isArray(right)) {
+    if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return false
+    for (let index = 0; index < left.length; index += 1) {
+      if (!sendContextValuesEqual(left[index], right[index])) return false
+    }
+    return true
+  }
+  const leftRecord = left as Record<string, unknown>
+  const rightRecord = right as Record<string, unknown>
+  const leftKeys = Object.keys(leftRecord)
+  const rightKeys = Object.keys(rightRecord)
+  if (leftKeys.length !== rightKeys.length) return false
+  for (const key of leftKeys) {
+    if (
+      !Object.hasOwn(rightRecord, key) ||
+      !sendContextValuesEqual(leftRecord[key], rightRecord[key])
+    ) {
+      return false
+    }
+  }
+  return true
 }
 
 export async function loadChatHeaderSnapshot(chatId: string): Promise<ChatHeaderSnapshot> {
@@ -111,7 +241,7 @@ export async function loadChatHeaderSnapshot(chatId: string): Promise<ChatHeader
     Promise.all([db.chats.get(chatId), db.messages.where('chatId').equals(chatId).toArray()]),
   )
   if (!chat) throw new Error(`ChatHeaderSnapshotMissing:${chatId}`)
-  return { chat, summaryVersion: chat.summaryVersion, chatId, allHeaders }
+  return { chat, chatId, allHeaders }
 }
 
 export async function loadActiveBranchHeaderSnapshot(

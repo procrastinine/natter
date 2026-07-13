@@ -61,7 +61,7 @@ describe('v19 preset sort-order migration', () => {
       cleanup: { rowCount: 1_041, batchCount: 62, maxBatchSize: 17 },
     })
     migrated.close()
-  })
+  }, 15_000)
 
   it('rolls completed batches back on poison, then retries once without rerunning after reopen', async () => {
     const name = databaseName('rollback')

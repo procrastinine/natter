@@ -107,12 +107,15 @@ import {
   type StreamWriteFence,
 } from '../store/repository'
 import {
+  appendSendContextGuardMessage,
   assertSendContextFresh,
-  assertSendContextVersion,
+  assertSendContextGuardInMutation,
+  createSendContextGuard,
   loadActiveBranchHeaderSnapshot,
   loadBranchHeaderSnapshotByLeaf,
   loadChatHeaderSnapshot,
   loadSendContextForBranch,
+  type SendContextGuard,
 } from '../store/send-context'
 import { createStreamChunkWriter } from '../store/stream-chunk-writer'
 import {
@@ -303,7 +306,6 @@ export async function sendText(input: SendTextInput): Promise<SendTextResult> {
     chatId: input.chatId,
     streamId: newId(),
     attemptKind: 'generation',
-    exclusiveChat: true,
     ...(input.signal ? { userSignal: input.signal } : {}),
   })
   try {
@@ -338,7 +340,7 @@ export async function sendText(input: SendTextInput): Promise<SendTextResult> {
     if (branchHeaders.at(-1)?.id !== userMsg.messageId) {
       throw new ExpectedLeafChangedError(input.chatId, userMsg.messageId, 'missing')
     }
-    const expectedSummaryVersion = branchSnapshot.summaryVersion
+    const sendContextGuard = createSendContextGuard(planningChat, branchHeaders)
     const targetPathSelections = branchHeaders.map(
       (header) => [cursorKeyOf(header.parentId), header.id] as const,
     )
@@ -394,7 +396,7 @@ export async function sendText(input: SendTextInput): Promise<SendTextResult> {
       parentMessageId: userMsg.messageId,
       userMessageId: userMsg.messageId,
       requireEmptyParent: true,
-      expectedSummaryVersion,
+      sendContextGuard,
       targetPathSelections,
       ...(hasPrefill ? { initialAssistantContent: input.prefillContent ?? [] } : {}),
       requestPlan,
@@ -426,7 +428,6 @@ export async function sendFromMessage(input: SendFromMessageInput): Promise<Send
       await loadChatHeaderSnapshot(input.chatId)
     let chat: Chat | undefined = headerSnapshot.chat
     const allHeaders = headerSnapshot.allHeaders
-    const expectedSummaryVersion = headerSnapshot.summaryVersion
     headerSnapshot = undefined
     const byId = new Map(allHeaders.map((header) => [header.id, header]))
     const parent = byId.get(input.parentMessageId)
@@ -446,6 +447,7 @@ export async function sendFromMessage(input: SendFromMessageInput): Promise<Send
     const parentIdx = branchHeaders.findIndex((m) => m.id === parent.id)
     const rawOutboundHeaders =
       parentIdx >= 0 ? branchHeaders.slice(0, parentIdx + 1) : branchHeaders
+    const sendContextGuard = createSendContextGuard(chat, rawOutboundHeaders)
     const hasPrefill = (input.prefillContent?.length ?? 0) > 0
     const prefillMessageId = hasPrefill ? newId() : null
     const createdAt = (input.now ?? Date.now)()
@@ -498,7 +500,7 @@ export async function sendFromMessage(input: SendFromMessageInput): Promise<Send
       streamId: lifecycle.streamId,
       parentMessageId: input.parentMessageId,
       userMessageId: input.parentMessageId,
-      expectedSummaryVersion,
+      sendContextGuard,
       targetPathSelections: rawOutboundHeaders.map(
         (header) => [cursorKeyOf(header.parentId), header.id] as const,
       ),
@@ -520,7 +522,7 @@ async function openAssistantStreamUnder(
   input: SendFromMessageInput & {
     userMessageId: MessageId
     requestPlan: AssistantRequestPlan
-    expectedSummaryVersion: number
+    sendContextGuard: SendContextGuard
     targetPathSelections: ReadonlyArray<readonly [string, MessageId]>
     streamId?: string
     initialAssistantContent?: ContentItem[]
@@ -554,12 +556,16 @@ async function openAssistantStreamUnder(
   ]
   const placeholderMutation = await repo.runMutation(
     [
+      { kind: 'chat-meta', chatId: input.chatId },
+      ...input.sendContextGuard.messageRevisions.map((revision) => ({
+        kind: 'message' as const,
+        messageId: revision.id,
+      })),
       { kind: 'message', messageId: assistantId },
       { kind: 'children', chatId: input.chatId, parentId: input.parentMessageId },
     ],
     async (ctx) => {
-      const currentChat = await ctx.getChat(input.chatId)
-      assertSendContextVersion(currentChat, input.chatId, input.expectedSummaryVersion)
+      await assertSendContextGuardInMutation(ctx, input.sendContextGuard)
       const currentParent = await ctx.getMessageHeader(input.parentMessageId)
       if (!currentParent || currentParent.chatId !== input.chatId || currentParent.deleted) {
         throw new Error(`sendText: parent ${input.parentMessageId} unavailable`)
@@ -604,14 +610,13 @@ async function openAssistantStreamUnder(
       return { requiresCursorPin: siblings.length > 0 }
     },
   )
-  const committedVersions = placeholderMutation.chatVersions[input.chatId]
-  assertSendContextVersion(
-    committedVersions
-      ? { id: input.chatId, summaryVersion: committedVersions.summaryVersion }
-      : undefined,
-    input.chatId,
-    input.expectedSummaryVersion + 1,
-  )
+  const dispatchGuard = appendSendContextGuardMessage(input.sendContextGuard, {
+    id: assistantId,
+    chatId: input.chatId,
+    parentId: input.parentMessageId,
+    nodeVersion: 0,
+    deleted: false,
+  })
 
   if (placeholderMutation.value.requiresCursorPin) {
     useChatStore
@@ -713,7 +718,7 @@ async function openAssistantStreamUnder(
       dispatchPlan.wire = {}
       return source
     },
-    beforeDispatch: () => assertSendContextFresh(input.chatId, input.expectedSummaryVersion + 1),
+    beforeDispatch: () => assertSendContextFresh(dispatchGuard),
     ...(route?.transport !== undefined ? { transportHint: route.transport } : {}),
     accumulator,
     journal,

@@ -1,7 +1,7 @@
 import { normalizeError } from '../api/errors'
 import type { ChatId, GenerationMeta, MessageId } from '../core/types'
 import { postEvent } from '../store/broadcast'
-import { StreamChatBusyError, type StreamWriteFence } from '../store/repository'
+import type { StreamWriteFence } from '../store/repository'
 import {
   announceStreamEnded,
   getStreamClientId,
@@ -23,7 +23,6 @@ export async function startRequestLifecycle(args: {
   chatId: ChatId
   streamId: string
   attemptKind: 'generation' | 'continuation'
-  exclusiveChat?: true
   userSignal?: AbortSignal
 }): Promise<RequestLifecycle> {
   const controller = new AbortController()
@@ -46,12 +45,10 @@ export async function startRequestLifecycle(args: {
       chatId: args.chatId,
       startedAt,
       attemptKind: args.attemptKind,
-      ...(args.exclusiveChat === true ? { exclusiveChat: true as const } : {}),
     })
   } catch (error) {
     removeUserAbort?.()
     await stopStreamLease(args.streamId)
-    if (error instanceof StreamChatBusyError) throw error
     throw normalizeError(error, { midStream: false, cause: 'storage' })
   }
 

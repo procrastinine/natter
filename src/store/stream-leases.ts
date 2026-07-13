@@ -197,7 +197,6 @@ export async function startStreamLease(input: {
   baseNodeVersion?: number
   requestedModel?: string
   apiUsed?: StreamLeaseRow['apiUsed']
-  exclusiveChat?: true
 }): Promise<StreamWriteFence> {
   const existing = activeLeaseWriters.get(input.streamId)
   if (existing) {
@@ -681,7 +680,6 @@ function enqueueLeaseWrite(writer: ActiveLeaseWriter): Promise<void> {
       ...(input.baseNodeVersion !== undefined ? { baseNodeVersion: input.baseNodeVersion } : {}),
       ...(input.requestedModel ? { requestedModel: input.requestedModel } : {}),
       ...(input.apiUsed ? { apiUsed: input.apiUsed } : {}),
-      ...(input.exclusiveChat === true ? { exclusiveChat: true as const } : {}),
     }
     const currentFence = writer.lease ? streamWriteFenceForLease(writer.lease) : undefined
     const targetChanged = writer.lease?.messageId !== lease.messageId

@@ -11,9 +11,18 @@ import {
   __resetBrowserRepositoryForTests,
   getBrowserRepository,
 } from '../../src/store/browser-repo'
-import { createChat, touchLastViewed, updateChatSettings } from '../../src/store/chats'
+import {
+  createChat,
+  setManualTitle,
+  touchLastViewed,
+  updateChatSettings,
+} from '../../src/store/chats'
 import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
-import { assertSendContextFresh, StaleSendContextError } from '../../src/store/send-context'
+import {
+  assertSendContextFresh,
+  createSendContextGuard,
+  StaleSendContextError,
+} from '../../src/store/send-context'
 import { __resetStreamLeasesForTests } from '../../src/store/stream-leases'
 import { useChatStore } from '../../src/store/zustand/chatStore'
 import { useStreamStore } from '../../src/store/zustand/streamStore'
@@ -184,7 +193,7 @@ async function seedAssistantBranch(): Promise<{
 }
 
 describe('send-context freshness', () => {
-  it('rejects a same-chat insert during delayed send planning before creating a placeholder', async () => {
+  it('allows an off-path sibling during delayed send planning', async () => {
     const chat = await createChat({ settings: settings() })
     await clearEndpointCache()
     const discovery = delayEndpointDiscovery()
@@ -209,7 +218,44 @@ describe('send-context freshness', () => {
     })
     discovery.release()
 
-    await expect(send).rejects.toBeInstanceOf(StaleSendContextError)
+    await expect(send).resolves.toMatchObject({ outcome: 'done' })
+    expect(openStream).toHaveBeenCalledTimes(1)
+    const assistant = (await getBrowserRepository().listMessages(chat.id)).find(
+      (message) => message.role === 'assistant',
+    )
+    expect(assistant?.parentId).toBe(user.id)
+  })
+
+  it('rejects an on-path edit during delayed send planning before creating a placeholder', async () => {
+    const chat = await createChat({ settings: settings() })
+    await clearEndpointCache()
+    const discovery = delayEndpointDiscovery()
+    const openStream = vi.fn(() => completedStream())
+    const send = sendText({
+      chatId: chat.id,
+      connection: profile(),
+      apiKey: 'sk-test',
+      content: [{ type: 'text', text: 'before edit' }],
+      openStream,
+    })
+
+    await discovery.started
+    const user = (await getBrowserRepository().listMessages(chat.id)).find(
+      (message) => message.role === 'user',
+    )
+    if (!user) throw new Error('sent user missing')
+    await editMessageContent({
+      chatId: chat.id,
+      messageId: user.id,
+      content: [{ type: 'text', text: 'after edit' }],
+    })
+    discovery.release()
+
+    await expect(send).rejects.toMatchObject({
+      name: 'StaleSendContextError',
+      reason: 'message-changed',
+      messageId: user.id,
+    })
     expect(openStream).not.toHaveBeenCalled()
     expect(
       (await getBrowserRepository().listMessages(chat.id)).filter((m) => m.role === 'assistant'),
@@ -317,7 +363,7 @@ describe('send-context freshness', () => {
     })
   })
 
-  it('does not invalidate for another chat or a hidden last-viewed update', async () => {
+  it('does not invalidate for another chat or unrelated same-chat metadata', async () => {
     const chat = await createChat({ settings: settings() })
     const unrelated = await createChat({ settings: settings() })
     await clearEndpointCache()
@@ -334,6 +380,7 @@ describe('send-context freshness', () => {
     await discovery.started
     await updateChatSettings(unrelated.id, { sampling: { temperature: 0.5 } })
     await touchLastViewed(chat.id, Date.now() + 10_000)
+    await setManualTitle(chat.id, 'renamed while planning')
     discovery.release()
 
     await expect(send).resolves.toMatchObject({ outcome: 'done' })
@@ -377,12 +424,12 @@ describe('send-context freshness', () => {
     ).toBeUndefined()
   })
 
-  it('checks the final summary version without reading message bodies', async () => {
+  it('checks settings and branch revisions without reading message bodies', async () => {
     const chat = await createChat({ settings: settings() })
     const bodyGet = vi.spyOn(getDb().messageBodies, 'get')
     const bodyBulkGet = vi.spyOn(getDb().messageBodies, 'bulkGet')
 
-    await expect(assertSendContextFresh(chat.id, chat.summaryVersion)).resolves.toBeUndefined()
+    await expect(assertSendContextFresh(createSendContextGuard(chat, []))).resolves.toBeUndefined()
 
     expect(bodyGet).not.toHaveBeenCalled()
     expect(bodyBulkGet).not.toHaveBeenCalled()

@@ -88,6 +88,17 @@ export async function expectWorkspaceRepositoryCoreContract(
   expect(await repository.getMessageHeader(root.id)).toEqual(
     expect.objectContaining({ id: root.id, textPreview: 'body contract-root' }),
   )
+  const revisionSnapshot = await repository.getSendContextRevisionSnapshot(chat.id, [
+    newer.id,
+    'contract-missing',
+    root.id,
+  ])
+  expect(revisionSnapshot.chat?.settings).toEqual(chat.settings)
+  expect(revisionSnapshot.headers.map((header) => header?.id)).toEqual([
+    newer.id,
+    undefined,
+    root.id,
+  ])
 
   const defaultSnapshot = await repository.getActiveBranchSnapshot(chat.id, {})
   expect(defaultSnapshot.branch.map((message) => message.id)).toEqual([root.id, newer.id])

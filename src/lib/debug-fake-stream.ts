@@ -19,6 +19,7 @@ const LOREM =
 interface DebugFakeStreamOptions {
   chatId?: ChatId
   parentMessageId?: MessageId
+  expectedLeafId?: MessageId | null
   targetChars?: number
   reasoningChars?: number
   chunkChars?: number
@@ -204,6 +205,7 @@ async function start(options: DebugFakeStreamOptions = {}): Promise<DebugFakeStr
       })
     : await sendText({
         chatId,
+        ...(options.expectedLeafId !== undefined ? { expectedLeafId: options.expectedLeafId } : {}),
         connection,
         apiKey: 'debug-fake-key',
         content: [

@@ -388,6 +388,96 @@ export async function readMessages(
   }, chatId)
 }
 
+interface TranscriptContinuityState {
+  anchor: Element
+  anchorRemoved: boolean
+  content: Element
+  list: Element
+  listRemoved: boolean
+  listReplaced: boolean
+  loadingSeen: boolean
+  messageCounts: number[]
+  recyclingSeen: boolean
+}
+
+interface TranscriptContinuityWindow extends Window {
+  __messageCountSamples?: TranscriptContinuityState
+  __stopMessageCountSamples?: () => void
+}
+
+export interface TranscriptContinuityResult {
+  anchorRemoved: boolean
+  listRemoved: boolean
+  listReplaced: boolean
+  loadingSeen: boolean
+  messageCountsIncludeZero: boolean
+  recyclingSeen: boolean
+}
+
+export async function startMessageCountRecorder(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const win = window as TranscriptContinuityWindow
+    win.__stopMessageCountSamples?.()
+    const content = document.querySelector('[data-ui="scroll-content"]')
+    const list = content?.querySelector('[data-ui="message-list"]')
+    if (!content || !list) throw new Error('Mounted transcript not found')
+    const messages = list.querySelectorAll('[data-ui="message"]')
+    const state: TranscriptContinuityState = {
+      anchor: messages.item(Math.max(0, messages.length - 2)),
+      anchorRemoved: false,
+      content,
+      list,
+      listRemoved: false,
+      listReplaced: false,
+      loadingSeen: false,
+      messageCounts: [],
+      recyclingSeen: false,
+    }
+    const sample = () => {
+      const currentList = state.content.querySelector('[data-ui="message-list"]')
+      state.messageCounts.push(currentList?.querySelectorAll('[data-ui="message"]').length ?? 0)
+      state.listRemoved ||= !state.list.isConnected
+      state.listReplaced ||= currentList !== state.list
+      state.anchorRemoved ||= !state.anchor.isConnected
+      state.loadingSeen ||= state.content.querySelector('[data-ui="surface-loading"]') !== null
+      state.recyclingSeen ||=
+        state.content.querySelector('[data-ui="message-list-recycling"]') !== null
+    }
+    const observer = new MutationObserver(sample)
+    observer.observe(content, { childList: true, subtree: true })
+    sample()
+    win.__messageCountSamples = state
+    win.__stopMessageCountSamples = () => observer.disconnect()
+  })
+}
+
+export async function stopMessageCountRecorder(page: Page): Promise<TranscriptContinuityResult> {
+  return page.evaluate(() => {
+    const win = window as TranscriptContinuityWindow
+    const state = win.__messageCountSamples
+    if (!state) throw new Error('Transcript continuity recorder not started')
+    const currentList = state.content.querySelector('[data-ui="message-list"]')
+    state.messageCounts.push(currentList?.querySelectorAll('[data-ui="message"]').length ?? 0)
+    state.listRemoved ||= !state.list.isConnected
+    state.listReplaced ||= currentList !== state.list
+    state.anchorRemoved ||= !state.anchor.isConnected
+    state.loadingSeen ||= state.content.querySelector('[data-ui="surface-loading"]') !== null
+    state.recyclingSeen ||=
+      state.content.querySelector('[data-ui="message-list-recycling"]') !== null
+    win.__stopMessageCountSamples?.()
+    delete win.__messageCountSamples
+    delete win.__stopMessageCountSamples
+    return {
+      anchorRemoved: state.anchorRemoved,
+      listRemoved: state.listRemoved,
+      listReplaced: state.listReplaced,
+      loadingSeen: state.loadingSeen,
+      messageCountsIncludeZero: state.messageCounts.includes(0),
+      recyclingSeen: state.recyclingSeen,
+    }
+  })
+}
+
 export async function waitForAssistantGenerationFinished(
   page: Page,
   chatId: string,

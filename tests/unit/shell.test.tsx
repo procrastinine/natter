@@ -870,7 +870,7 @@ describe('shell smoke render', () => {
     })
     window.location.hash = `#/chat/${chat.id}`
 
-    const { findByText, queryByText } = render(<App />)
+    const { container, findByText, queryByText } = render(<App />)
 
     expect(await findByText('original branch answer')).toBeInTheDocument()
     await waitFor(() => {
@@ -888,10 +888,131 @@ describe('shell smoke render', () => {
     })
 
     await waitFor(() => {
+      expect(container.querySelector('[data-ui="branch-count"]')).toHaveTextContent('1 / 2')
       expect(window.location.hash).toBe(`#/chat/${chat.id}/message/${originalLeaf.id}`)
       expect(queryByText('original branch answer')).toBeInTheDocument()
       expect(queryByText('newer sibling answer')).not.toBeInTheDocument()
     })
+  })
+
+  it('pins a remotely extended path before a newer sibling can replace it', async () => {
+    const chat = await createChat({
+      title: 'Sticky Extension',
+      settings: cloneDefaultChatSettings(),
+      now: 1,
+    })
+    const root: Message = {
+      id: 'sticky-root',
+      chatId: chat.id,
+      parentId: null,
+      siblingIndex: 0,
+      turnId: 'sticky-root',
+      turnIndex: 0,
+      createdAt: 2,
+      role: 'user',
+      origin: 'user',
+      content: [{ type: 'text', text: 'sticky prompt' }],
+      nodeVersion: 0,
+      deleted: false,
+    }
+    const initialLeaf: Message = {
+      ...root,
+      id: 'sticky-initial-leaf',
+      parentId: root.id,
+      turnId: 'sticky-initial-leaf',
+      createdAt: 3,
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: 'initial sticky answer' }],
+    }
+    const remoteUser: Message = {
+      ...root,
+      id: 'sticky-remote-user',
+      parentId: initialLeaf.id,
+      turnId: 'sticky-remote-turn',
+      createdAt: 4,
+      content: [{ type: 'text', text: 'remote linear extension' }],
+    }
+    const acceptedLeaf: Message = {
+      ...initialLeaf,
+      id: 'sticky-accepted-leaf',
+      parentId: remoteUser.id,
+      turnId: 'sticky-remote-turn',
+      createdAt: 5,
+      content: [{ type: 'output_text', text: 'accepted remote answer' }],
+    }
+    const newerSibling: Message = {
+      ...acceptedLeaf,
+      id: 'sticky-newer-sibling',
+      siblingIndex: 1,
+      turnId: 'sticky-newer-sibling',
+      createdAt: 6,
+      content: [{ type: 'output_text', text: 'newer remote sibling' }],
+    }
+    await putTestMessages([root, initialLeaf])
+    await getDb().chats.put({
+      ...chat,
+      titleStatus: 'manual',
+      previewText: 'sticky prompt',
+      lastUpdatedLeafId: initialLeaf.id,
+      lastBranchUpdatedAt: 3,
+      updatedAt: 3,
+    })
+    window.location.hash = `#/chat/${chat.id}`
+
+    const { container, findByText, queryByText } = render(<App />)
+
+    expect(await findByText('initial sticky answer')).toBeInTheDocument()
+    await waitFor(() => {
+      expect(window.location.hash).toBe(`#/chat/${chat.id}/message/${initialLeaf.id}`)
+    })
+    const originalList = container.querySelector('[data-ui="message-list"]')
+    expect(originalList).toBeInTheDocument()
+
+    await putTestMessages([remoteUser, acceptedLeaf])
+    await getDb().chats.put({
+      ...chat,
+      titleStatus: 'manual',
+      previewText: 'remote linear extension',
+      lastUpdatedLeafId: acceptedLeaf.id,
+      lastBranchUpdatedAt: 5,
+      updatedAt: 5,
+    })
+
+    expect(await findByText('accepted remote answer')).toBeInTheDocument()
+    await waitFor(() => {
+      expect(window.location.hash).toBe(`#/chat/${chat.id}/message/${acceptedLeaf.id}`)
+      expect(useChatStore.getState().getCursor(chat.id)?.[cursorKeyOf(initialLeaf.id)]).toBe(
+        remoteUser.id,
+      )
+      expect(useChatStore.getState().getCursor(chat.id)?.[cursorKeyOf(remoteUser.id)]).toBe(
+        acceptedLeaf.id,
+      )
+    })
+    expect(container.querySelector('[data-ui="message-list"]')).toBe(originalList)
+
+    await putTestMessages([newerSibling])
+    await getDb().chats.put({
+      ...chat,
+      titleStatus: 'manual',
+      previewText: 'newer remote sibling',
+      lastUpdatedLeafId: newerSibling.id,
+      lastBranchUpdatedAt: 6,
+      updatedAt: 6,
+    })
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-ui="branch-count"]')).toHaveTextContent('1 / 2')
+      expect(window.location.hash).toBe(`#/chat/${chat.id}/message/${acceptedLeaf.id}`)
+      expect(queryByText('accepted remote answer')).toBeInTheDocument()
+      expect(queryByText('newer remote sibling')).not.toBeInTheDocument()
+    })
+    expect(useChatStore.getState().getCursor(chat.id)?.[cursorKeyOf(remoteUser.id)]).toBe(
+      acceptedLeaf.id,
+    )
+    expect(container.querySelector('[data-ui="message-list"]')).toBe(originalList)
+    expect(container.querySelector('[data-ui="surface-loading"]')).not.toBeInTheDocument()
+    expect(container).not.toHaveTextContent('Loading conversation…')
   })
 
   it('does not overwrite a local cursor advance before the new leaf is observable', async () => {

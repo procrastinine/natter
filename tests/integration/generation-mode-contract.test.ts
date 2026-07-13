@@ -22,7 +22,6 @@ import { createChat } from '../../src/store/chats'
 import { __resetDbForTests, openDb } from '../../src/store/db'
 import { putCachedEndpoints } from '../../src/store/models-cache'
 import { __resetPrivacyInFlightForTests } from '../../src/store/privacy-cache'
-import { StreamChatBusyError } from '../../src/store/repository'
 import { __resetStreamLeasesForTests } from '../../src/store/stream-leases'
 import { useChatStore } from '../../src/store/zustand/chatStore'
 import { useStreamStore } from '../../src/store/zustand/streamStore'
@@ -387,7 +386,120 @@ describe('generation mode contract', () => {
     ])
   })
 
-  it('admits only one simultaneous composer send before either user row can branch', async () => {
+  it('prepares and streams two existing branches concurrently without cross-branch invalidation', async () => {
+    const chat = await createChat({ settings: settings() })
+    const root = message(chat.id, 'parallel-root', 'user', 'root question')
+    const left = message(chat.id, 'parallel-left', 'assistant', 'left answer', {
+      parentId: root.id,
+      siblingIndex: 0,
+      createdAt: 2,
+    })
+    const right = message(chat.id, 'parallel-right', 'assistant', 'right answer', {
+      parentId: root.id,
+      siblingIndex: 1,
+      createdAt: 3,
+    })
+    await putMessages([root, left, right])
+
+    const repo = getBrowserRepository()
+    const readSnapshot = repo.getBranchHeaderSnapshotByLeaf.bind(repo)
+    let releaseSnapshots!: () => void
+    const snapshotGate = new Promise<void>((resolve) => {
+      releaseSnapshots = resolve
+    })
+    let markBothSnapshots!: () => void
+    const bothSnapshots = new Promise<void>((resolve) => {
+      markBothSnapshots = resolve
+    })
+    let snapshotCount = 0
+    vi.spyOn(repo, 'getBranchHeaderSnapshotByLeaf').mockImplementation(async (chatId, leafId) => {
+      const snapshot = await readSnapshot(chatId, leafId)
+      snapshotCount += 1
+      if (snapshotCount === 2) markBothSnapshots()
+      await snapshotGate
+      return snapshot
+    })
+
+    let releaseStreams!: () => void
+    const streamGate = new Promise<void>((resolve) => {
+      releaseStreams = resolve
+    })
+    let markBothOpened!: () => void
+    const bothOpened = new Promise<void>((resolve) => {
+      markBothOpened = resolve
+    })
+    const opens: Record<string, unknown>[] = []
+    const openStream = (open: { wireBody: Record<string, unknown> }) => {
+      opens.push(structuredClone(open.wireBody))
+      if (opens.length === 2) markBothOpened()
+      return (async function* () {
+        await streamGate
+        yield {
+          type: 'delta' as const,
+          chunk: {
+            id: 'parallel-generation',
+            model: 'attempt-model',
+            choices: [{ delta: { content: 'parallel answer' }, finish_reason: 'stop' as const }],
+          },
+        }
+      })()
+    }
+
+    const leftSend = sendText({
+      chatId: chat.id,
+      expectedLeafId: left.id,
+      connection: profile(),
+      apiKey: 'sk-test',
+      content: [{ type: 'text', text: 'left followup' }],
+      openStream,
+    })
+    const rightSend = sendText({
+      chatId: chat.id,
+      expectedLeafId: right.id,
+      connection: profile(),
+      apiKey: 'sk-test',
+      content: [{ type: 'text', text: 'right followup' }],
+      openStream,
+    })
+
+    await bothSnapshots
+    const preparedRows = await repo.listMessages(chat.id)
+    expect(preparedRows.filter((row) => row.role === 'user')).toHaveLength(3)
+    expect((await repo.listStreamLeases(chat.id)).every((lease) => !lease.messageId)).toBe(true)
+    expect(await repo.listStreamLeases(chat.id)).toHaveLength(2)
+    releaseSnapshots()
+
+    await bothOpened
+    const targetedLeases = await repo.listStreamLeases(chat.id)
+    expect(targetedLeases).toHaveLength(2)
+    expect(new Set(targetedLeases.map((lease) => lease.messageId)).size).toBe(2)
+    expect(
+      opens
+        .map((wire) => (wire.messages as Array<{ content: string }>).map((entry) => entry.content))
+        .sort((a, b) => a.at(-1)?.localeCompare(b.at(-1) ?? '') ?? 0),
+    ).toEqual([
+      ['root question', 'left answer', 'left followup'],
+      ['root question', 'right answer', 'right followup'],
+    ])
+
+    releaseStreams()
+    const [leftResult, rightResult] = await Promise.all([leftSend, rightSend])
+    expect(leftResult.outcome).toBe('done')
+    expect(rightResult.outcome).toBe('done')
+    const rows = await repo.listMessages(chat.id)
+    expect(rows.find((row) => row.id === leftResult.userMessageId)?.parentId).toBe(left.id)
+    expect(rows.find((row) => row.id === leftResult.assistantMessageId)?.parentId).toBe(
+      leftResult.userMessageId,
+    )
+    expect(rows.find((row) => row.id === rightResult.userMessageId)?.parentId).toBe(right.id)
+    expect(rows.find((row) => row.id === rightResult.assistantMessageId)?.parentId).toBe(
+      rightResult.userMessageId,
+    )
+    expect(await repo.listStreamLeases(chat.id)).toEqual([])
+    expect(useStreamStore.getState().listByChat(chat.id)).toEqual([])
+  })
+
+  it('allows exactly one simultaneous same-leaf composer append', async () => {
     const chat = await createChat({ settings: settings() })
     let releaseStream!: () => void
     const streamGate = new Promise<void>((resolve) => {
@@ -442,8 +554,15 @@ describe('generation mode contract', () => {
     await opened
     const loser = await Promise.race([first, second])
     expect(loser.status).toBe('rejected')
-    if (loser.status !== 'rejected') throw new Error('expected one send admission rejection')
-    expect(loser.reason).toBeInstanceOf(StreamChatBusyError)
+    if (loser.status !== 'rejected') throw new Error('expected one expected-leaf rejection')
+    expect(loser.reason).toMatchObject({
+      name: 'ExpectedLeafChangedError',
+      reason: 'root-not-empty',
+    })
+    const rowsWhileStreaming = await getBrowserRepository().listMessages(chat.id)
+    const winningUser = rowsWhileStreaming.find((row) => row.role === 'user')
+    expect(loser.reason).toMatchObject({ blockingChildId: winningUser?.id })
+    expect(await getBrowserRepository().listStreamLeases(chat.id)).toHaveLength(1)
     releaseStream()
     const settled = await Promise.all([first, second])
 
@@ -457,6 +576,8 @@ describe('generation mode contract', () => {
     expect(user?.parentId).toBeNull()
     expect(assistant?.parentId).toBe(user?.id)
     expect(rows.filter((row) => row.parentId === null)).toHaveLength(1)
+    expect(await getBrowserRepository().listStreamLeases(chat.id)).toEqual([])
+    expect(useStreamStore.getState().listByChat(chat.id)).toEqual([])
   })
 
   it('sendFromMessage adds only the assistant-fork cursor pin required by regenerate', async () => {

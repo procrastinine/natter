@@ -7,7 +7,6 @@ import {
 } from '../../src/store/browser-repo'
 import { __resetDbForTests, getDb } from '../../src/store/db'
 import type { StreamChunkRow, StreamLeaseRow } from '../../src/store/repository'
-import { StreamChatBusyError } from '../../src/store/repository'
 
 const DB_NAME = 'natter'
 
@@ -235,89 +234,75 @@ describe('browser stream repository', () => {
     expect(distinct.messageId).toBe('message-2')
   })
 
-  it('admits an exclusive composer stream atomically across a chat', async () => {
+  it('allows exactly one of two concurrent leases for the same target', async () => {
     const repo = getBrowserRepository()
-    const exclusive = await repo.upsertStreamLease({
-      streamId: 'exclusive-send',
-      chatId: 'chat-1',
-      ownerClientId: 'tab-a',
-      startedAt: 1,
-      heartbeatAt: 1,
-      exclusiveChat: true,
-    })
-    const { exclusiveChat: ignoredExclusiveChat, ...leaseWithoutAdmission } = exclusive
-    void ignoredExclusiveChat
-    const bound = await repo.renewStreamLease(
-      { ...leaseWithoutAdmission, messageId: 'message-1', heartbeatAt: 2 },
-      { targetChanged: true },
+    const settled = await Promise.allSettled([
+      repo.upsertStreamLease({
+        streamId: 'target-race-a',
+        chatId: 'chat-1',
+        messageId: 'shared-message',
+        ownerClientId: 'tab-a',
+        startedAt: 1,
+        heartbeatAt: 1,
+      }),
+      repo.upsertStreamLease({
+        streamId: 'target-race-b',
+        chatId: 'chat-1',
+        messageId: 'shared-message',
+        ownerClientId: 'tab-b',
+        startedAt: 1,
+        heartbeatAt: 1,
+      }),
+    ])
+
+    expect(settled.filter((result) => result.status === 'fulfilled')).toHaveLength(1)
+    const rejected = settled.filter(
+      (result): result is PromiseRejectedResult => result.status === 'rejected',
     )
-    expect(bound.exclusiveChat).toBe(true)
-
-    await expect(
-      repo.upsertStreamLease({
-        streamId: 'competing-send',
-        chatId: 'chat-1',
-        ownerClientId: 'tab-b',
-        startedAt: 2,
-        heartbeatAt: 2,
-        exclusiveChat: true,
-      }),
-    ).rejects.toBeInstanceOf(StreamChatBusyError)
-    await expect(
-      repo.upsertStreamLease({
-        streamId: 'competing-target',
-        chatId: 'chat-1',
-        messageId: 'message-2',
-        ownerClientId: 'tab-b',
-        startedAt: 2,
-        heartbeatAt: 2,
-      }),
-    ).rejects.toBeInstanceOf(StreamChatBusyError)
-    await expect(
-      repo.upsertStreamLease({
-        streamId: 'other-chat',
-        chatId: 'chat-2',
-        ownerClientId: 'tab-b',
-        startedAt: 2,
-        heartbeatAt: 2,
-        exclusiveChat: true,
-      }),
-    ).resolves.toMatchObject({ chatId: 'chat-2' })
-
-    await repo.deleteOwnedStreamLease(bound.streamId, leaseFence(bound))
-    await expect(
-      repo.upsertStreamLease({
-        streamId: 'after-release',
-        chatId: 'chat-1',
-        ownerClientId: 'tab-b',
-        startedAt: 3,
-        heartbeatAt: 3,
-        exclusiveChat: true,
-      }),
-    ).resolves.toMatchObject({ chatId: 'chat-1' })
+    expect(rejected).toHaveLength(1)
+    expect(rejected[0]?.reason).toMatchObject({
+      name: 'StreamTargetBusyError',
+      messageId: 'shared-message',
+    })
   })
 
-  it('does not let an exclusive composer stream overtake an existing target stream', async () => {
+  it('admits independent message-less lifecycles in one chat while keeping targets exclusive', async () => {
     const repo = getBrowserRepository()
-    await repo.upsertStreamLease({
-      streamId: 'existing-target',
+    const first = await repo.upsertStreamLease({
+      streamId: 'first-send',
       chatId: 'chat-1',
-      messageId: 'message-1',
       ownerClientId: 'tab-a',
       startedAt: 1,
       heartbeatAt: 1,
     })
+    const second = await repo.upsertStreamLease({
+      streamId: 'second-send',
+      chatId: 'chat-1',
+      ownerClientId: 'tab-b',
+      startedAt: 2,
+      heartbeatAt: 2,
+    })
 
+    await repo.renewStreamLease(
+      { ...first, messageId: 'message-1', heartbeatAt: 3 },
+      { targetChanged: true },
+    )
+    await expect(
+      repo.renewStreamLease(
+        { ...second, messageId: 'message-2', heartbeatAt: 3 },
+        { targetChanged: true },
+      ),
+    ).resolves.toMatchObject({ messageId: 'message-2' })
     await expect(
       repo.upsertStreamLease({
-        streamId: 'exclusive-send',
+        streamId: 'duplicate-target',
         chatId: 'chat-1',
-        ownerClientId: 'tab-b',
-        startedAt: 2,
-        heartbeatAt: 2,
-        exclusiveChat: true,
+        messageId: 'message-1',
+        ownerClientId: 'tab-c',
+        startedAt: 4,
+        heartbeatAt: 4,
       }),
-    ).rejects.toBeInstanceOf(StreamChatBusyError)
+    ).rejects.toThrow('StreamTargetBusy:message-1')
   })
 
   it('checks a stream fence inside the authoritative mutation transaction', async () => {

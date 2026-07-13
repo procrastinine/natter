@@ -18,7 +18,7 @@
 // `replaceRoute` is silent per the HTML spec, so direction 2 never
 // triggers direction 1.
 
-import { useEffect, useRef } from 'react'
+import { useEffect, useLayoutEffect, useRef } from 'react'
 import { chatHref, parseRoute, replaceRoute } from '../app/router'
 import { activePath, cursorKeyOf } from '../core/active-path'
 import { seedCursorAtMessage } from '../core/branch-resolve'
@@ -105,9 +105,9 @@ export function useBranchUrlSync(chatId: ChatId | null): MessageHeaderRow[] {
     if (!route.pinnedMessageId) return
     const key = `${chatId}:${route.pinnedMessageId}`
     if (seededRef.current.has(key)) return
-    seededRef.current.add(key)
     const target = rows.find((m) => m.id === route.pinnedMessageId)
     if (!target || target.deleted) return
+    seededRef.current.add(key)
     const cursor = useChatStore.getState().getCursor(chatId) ?? {}
     const draft = { ...cursor }
     seedCursorAtMessage(rows, route.pinnedMessageId, draft)
@@ -116,34 +116,43 @@ export function useBranchUrlSync(chatId: ChatId | null): MessageHeaderRow[] {
     }
   }
 
-  // Bare chat routes start without a URL pin. Materialize the initially
-  // rendered default branch into this tab's cursor once, so later cross-tab
-  // siblings do not become this tab's default. This must stay out of the
-  // cursor→URL path: local sends advance the cursor before the repository
-  // query necessarily exposes the new row.
-  const pinBareRouteDefault = useRef<(() => void) | null>(null)
-  pinBareRouteDefault.current = () => {
+  // Materialize every path edge this tab has accepted from an authoritative
+  // header snapshot. A later remote sibling then cannot replace an observed
+  // linear extension. Missing selections are preserved and stop the walk:
+  // they can be local send/regenerate pins whose rows are not observable yet.
+  const pinObservedPath = useRef<(() => void) | null>(null)
+  pinObservedPath.current = () => {
     if (!chatId || typeof window === 'undefined') return
     const rows = messagesRef.current
     if (rows.length === 0) return
     const route = parseRoute(window.location.hash)
-    if (route.kind !== 'chat' || route.chatId !== chatId || route.pinnedMessageId) return
+    if (route.kind !== 'chat' || route.chatId !== chatId) return
     const cursor = useChatStore.getState().getCursor(chatId) ?? {}
-    if (Object.keys(cursor).length > 0) return
-    const leaf = activePath(rows, cursor).at(-1)
-    if (!leaf) return
+    const path = activePath(rows, cursor)
+    const byId = new Map(rows.map((row) => [row.id, row]))
     const draft = { ...cursor }
-    seedCursorAtMessage(rows, leaf.id, draft)
+    for (const child of path) {
+      const key = cursorKeyOf(child.parentId)
+      const selectedId = draft[key]
+      if (selectedId === child.id) continue
+      if (selectedId !== undefined) {
+        const selected = byId.get(selectedId)
+        if (!selected) break
+        if (!selected.deleted && selected.parentId === child.parentId) break
+      }
+      draft[key] = child.id
+    }
     if (!cursorEqual(cursor, draft)) {
       useChatStore.getState().setCursor(chatId, draft)
     }
   }
 
-  // On mount / chatId change / messages load: seed then write.
+  // Header publications pin before paint so a remote sibling cannot flash and
+  // then be corrected. Cursor-only changes do not trigger this path.
   // biome-ignore lint/correctness/useExhaustiveDependencies: chatId/messages changes intentionally trigger the ref-backed URL sync.
-  useEffect(() => {
+  useLayoutEffect(() => {
     seedCursorFromUrl.current?.()
-    pinBareRouteDefault.current?.()
+    pinObservedPath.current?.()
     writeUrlFromCursor.current?.()
   }, [chatId, messages])
 
@@ -167,7 +176,7 @@ export function useBranchUrlSync(chatId: ChatId | null): MessageHeaderRow[] {
   useEffect(() => {
     const onHashChange = () => {
       seedCursorFromUrl.current?.()
-      pinBareRouteDefault.current?.()
+      pinObservedPath.current?.()
       writeUrlFromCursor.current?.()
     }
     window.addEventListener('hashchange', onHashChange)

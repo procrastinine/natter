@@ -69,18 +69,6 @@ export class StreamTargetBusyError extends Error {
   }
 }
 
-export class StreamChatBusyError extends Error {
-  readonly chatId: ChatId
-  readonly blockingStreamId: string
-
-  constructor(chatId: ChatId, blockingStreamId: string) {
-    super(`StreamChatBusy:${chatId}:${blockingStreamId}`)
-    this.name = 'StreamChatBusyError'
-    this.chatId = chatId
-    this.blockingStreamId = blockingStreamId
-  }
-}
-
 export type ExpectedLeafChangedReason =
   | 'missing'
   | 'deleted'
@@ -176,7 +164,6 @@ export interface StreamLeaseRow {
   baseNodeVersion?: number
   requestedModel?: string
   apiUsed?: GenerationMeta['apiUsed']
-  exclusiveChat?: true
 }
 
 export interface AppendMessageToExpectedLeafInput {
@@ -192,10 +179,14 @@ export interface AppendMessageToExpectedLeafResult {
 
 export interface BranchHeaderSnapshot {
   chat: Chat
-  summaryVersion: number
   chatId: ChatId
   allHeaders: MessageHeaderRow[]
   branchHeaders: MessageHeaderRow[]
+}
+
+export interface SendContextRevisionSnapshot {
+  chat: Chat | undefined
+  headers: Array<MessageHeaderRow | undefined>
 }
 
 export interface StreamChunkRow {
@@ -594,6 +585,12 @@ export interface WorkspaceRepository {
   ): Promise<MessageId[]>
   listMessages(chatId: ChatId): Promise<Message[]>
   getMessageHeader(messageId: MessageId): Promise<MessageHeaderRow | undefined>
+  // One coherent settings+header read. Header slots preserve messageIds order;
+  // this path must never hydrate message bodies.
+  getSendContextRevisionSnapshot(
+    chatId: ChatId,
+    messageIds: readonly MessageId[],
+  ): Promise<SendContextRevisionSnapshot>
   listMessageHeaders(chatId: ChatId): Promise<MessageHeaderRow[]>
   listChildHeaders(chatId: ChatId, parentId: MessageId | null): Promise<MessageHeaderRow[]>
   getActiveBranchSnapshot(chatId: ChatId, cursor: CursorMap): Promise<ActiveBranchSnapshot>
