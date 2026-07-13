@@ -18,6 +18,7 @@ import type { Chat, TextTemplateConfig, TextTemplateId } from '../../core/types'
 import { updateChatSettings } from '../../store/chats'
 import { primaryKeys } from '../../store/reactive-dependencies'
 import { useRepositoryQuery } from '../../store/reactive-query'
+import { Button } from '../primitives/Button'
 import { InfoDisclosure } from './InfoDisclosure'
 
 interface TextTemplateSectionProps {
@@ -142,18 +143,18 @@ export function TextTemplateSection({
         </div>
       ) : null}
       <div data-ui="inline-actions">
-        <button type="button" data-ui="secondary-button" onClick={() => void createBlank()}>
+        <Button type="button" data-ui="secondary-button" onClick={() => void createBlank()}>
           New template
-        </button>
+        </Button>
         {selectedConfig ? (
-          <button type="button" data-ui="secondary-button" onClick={() => void saveAsNew()}>
+          <Button type="button" data-ui="secondary-button" onClick={() => void saveAsNew()}>
             Save as new
-          </button>
+          </Button>
         ) : null}
         {selectedSaved ? (
-          <button type="button" data-ui="secondary-button" onClick={() => void deleteCurrent()}>
+          <Button type="button" data-ui="secondary-button" onClick={() => void deleteCurrent()}>
             Delete saved
-          </button>
+          </Button>
         ) : null}
       </div>
       {selectedSaved ? (

@@ -8,10 +8,11 @@
 //   - `banners[]`: non-auto-dismiss inline banners (chat-not-found,
 //     mutation-conflict). The caller decides when to dismiss.
 //
-// Shape is intentionally small: no "tone" beyond `level` because the
-// renderers read the banner role directly.
+// Shape is intentionally small: no "tone" beyond `level`. A separate,
+// always-mounted live region announces notice events; the visual cards do not.
 
 import { create } from 'zustand'
+import { useAnnouncementStore } from './announcementStore'
 
 type ToastLevel = 'info' | 'success' | 'warning' | 'danger'
 
@@ -86,6 +87,11 @@ export const useToastStore = create<ToastStoreState>((set, get) => ({
       createdAt: Date.now(),
     }
     set((state) => ({ toasts: [...state.toasts, toast] }))
+    useAnnouncementStore.getState().announce({
+      text: toast.text,
+      priority: toast.level === 'danger' ? 'assertive' : 'polite',
+      eventKey: toast.id,
+    })
     return id
   },
   dismissToast: (id) => set((state) => ({ toasts: state.toasts.filter((x) => x.id !== id) })),
@@ -112,14 +118,20 @@ export const useToastStore = create<ToastStoreState>((set, get) => ({
             : candidate,
         ),
       }))
+      useAnnouncementStore.getState().announce({
+        text: ACTION_FAILED_MESSAGE,
+        priority: 'assertive',
+      })
       return false
     }
     set((state) => ({ toasts: state.toasts.filter((candidate) => candidate.id !== id) }))
+    useAnnouncementStore.getState().announce({ text: 'Delete undone.' })
     return true
   },
   pushBanner: (b) => {
     const id = nextId('banner')
     set((state) => ({ banners: [...state.banners, { ...b, id }] }))
+    useAnnouncementStore.getState().announce({ text: b.text, eventKey: id })
     return id
   },
   dismissBanner: (id) => set((state) => ({ banners: state.banners.filter((x) => x.id !== id) })),
@@ -145,6 +157,10 @@ export const useToastStore = create<ToastStoreState>((set, get) => ({
             : candidate,
         ),
       }))
+      useAnnouncementStore.getState().announce({
+        text: ACTION_FAILED_MESSAGE,
+        priority: 'assertive',
+      })
       return false
     }
     set((state) => ({ banners: state.banners.filter((candidate) => candidate.id !== id) }))
@@ -152,5 +168,8 @@ export const useToastStore = create<ToastStoreState>((set, get) => ({
   },
   clearBannersByKind: (kind) =>
     set((state) => ({ banners: state.banners.filter((x) => x.kind !== kind) })),
-  reset: () => set({ toasts: [], banners: [] }),
+  reset: () => {
+    useAnnouncementStore.getState().reset()
+    set({ toasts: [], banners: [] })
+  },
 }))

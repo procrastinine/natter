@@ -12,6 +12,7 @@ import {
 } from '../../src/store/workspace-repository'
 import {
   expectWorkspaceRepositoryCoreContract,
+  expectWorkspaceRepositoryExpectedLeafAppendContract,
   expectWorkspaceRepositoryRollbackContract,
 } from '../helpers/workspace-repository-contract'
 
@@ -36,6 +37,10 @@ describe('browser WorkspaceRepository contract', () => {
 
   it('rolls failed mutation callbacks back atomically', async () => {
     await expectWorkspaceRepositoryRollbackContract(getBrowserRepository())
+  })
+
+  it('atomically admits one append to an expected live leaf', async () => {
+    await expectWorkspaceRepositoryExpectedLeafAppendContract(getBrowserRepository())
   })
 
   it('keeps default singleton selection and explicit test override exact', () => {

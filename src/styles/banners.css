@@ -21,22 +21,46 @@
   margin-bottom: var(--banner-stack-gap);
 }
 
-[data-tone="info"] {
+:is(
+  [data-ui="banner"],
+  [data-ui="notice-banner"],
+  [data-ui="warning-banner"],
+  [data-ui="blocking-banner"],
+  [data-ui="tip-callout"]
+)[data-tone="info"] {
   background: var(--color-banner-info-bg);
   border-left: 3px solid var(--color-info);
 }
 
-[data-tone="success"] {
+:is(
+  [data-ui="banner"],
+  [data-ui="notice-banner"],
+  [data-ui="warning-banner"],
+  [data-ui="blocking-banner"],
+  [data-ui="tip-callout"]
+)[data-tone="success"] {
   background: var(--color-banner-success-bg);
   border-left: 3px solid var(--color-success);
 }
 
-[data-tone="warning"] {
+:is(
+  [data-ui="banner"],
+  [data-ui="notice-banner"],
+  [data-ui="warning-banner"],
+  [data-ui="blocking-banner"],
+  [data-ui="tip-callout"]
+)[data-tone="warning"] {
   background: var(--color-banner-warning-bg);
   border-left: 3px solid var(--color-warning);
 }
 
-[data-tone="danger"] {
+:is(
+  [data-ui="banner"],
+  [data-ui="notice-banner"],
+  [data-ui="warning-banner"],
+  [data-ui="blocking-banner"],
+  [data-ui="tip-callout"]
+)[data-tone="danger"] {
   background: var(--color-banner-danger-bg);
   border-left: 3px solid var(--color-danger);
 }

@@ -6,6 +6,7 @@ import { AttachmentDraftTray } from '../attachments/AttachmentDraftTray'
 import { AttachmentPicker } from '../attachments/AttachmentPicker'
 import { useAttachmentDrafts } from '../attachments/useAttachmentDrafts'
 import { DatabaseIcon, InsertIcon, PaperclipIcon, PrefillIcon, StopIcon } from '../icons/Icon'
+import { Button } from '../primitives/Button'
 
 interface ComposerProps {
   // Disables the textarea entirely.
@@ -646,13 +647,14 @@ export function Composer({
           />
         ) : null}
         <div data-ui="composer-actions">
-          <span data-ui="token-counter" aria-live="polite">
+          <span data-ui="token-counter">
             {text.trim().length + (prefillOpen ? prefillText.length : 0)} chars
           </span>
           {showPrefillButton ? (
-            <button
-              type="button"
+            <Button
               data-ui="composer-prefill-toggle"
+              appearance="strip"
+              geometry="flush"
               data-active={prefillOpen ? 'true' : undefined}
               onClick={() => void togglePrefill()}
               aria-label={prefillOpen ? 'Close prefill' : 'Open assistant prefill'}
@@ -665,7 +667,7 @@ export function Composer({
             >
               <PrefillIcon size={14} />
               <span>Prefill</span>
-            </button>
+            </Button>
           ) : null}
           <input
             ref={fileInputRef}
@@ -681,19 +683,21 @@ export function Composer({
               void ingestFiles(files)
             }}
           />
-          <button
-            type="button"
+          <Button
             data-ui="composer-attach"
+            appearance="strip"
+            geometry="flush"
             onClick={() => fileInputRef.current?.click()}
             aria-label="Upload attachments"
             title={attachmentsDisabled ? attachmentsDisabledReason : 'Upload attachments'}
             disabled={attachmentControlsDisabled}
           >
             <PaperclipIcon size={14} />
-          </button>
-          <button
-            type="button"
+          </Button>
+          <Button
             data-ui="composer-attach-existing"
+            appearance="strip"
+            geometry="flush"
             onClick={() => setPickerOpen(true)}
             aria-label="Use existing stored attachment"
             title={
@@ -702,11 +706,12 @@ export function Composer({
             disabled={attachmentControlsDisabled}
           >
             <DatabaseIcon size={14} />
-          </button>
+          </Button>
           {onImportAtEnd ? (
-            <button
-              type="button"
+            <Button
               data-ui="composer-import-at-end"
+              appearance="strip"
+              geometry="flush"
               onPointerEnter={onImportAtEndIntent}
               onPointerDown={onImportAtEndIntent}
               onFocus={onImportAtEndIntent}
@@ -716,23 +721,28 @@ export function Composer({
             >
               <InsertIcon size={14} />
               <span>Import</span>
-            </button>
+            </Button>
           ) : null}
           {streaming && onAbort ? (
-            <button
-              type="button"
+            <Button
               data-ui="abort"
+              tone="danger"
+              appearance="solid"
+              geometry="flush"
               onClick={onAbort}
               title="Stop generating (⌘.)"
               aria-label="Stop generating"
             >
               <StopIcon size={14} />
               <span>Stop</span>
-            </button>
+            </Button>
           ) : (
-            <button
+            <Button
               type="submit"
               data-ui="send"
+              tone="accent"
+              appearance="solid"
+              geometry="flush"
               data-mode={emptyWithTrailingUser ? 'reply' : 'send'}
               disabled={
                 sendBlocked || (text.trim() === '' && !hasAttachments && !emptyWithTrailingUser)
@@ -746,7 +756,7 @@ export function Composer({
               }
             >
               {sendButtonLabel}
-            </button>
+            </Button>
           )}
         </div>
       </div>

@@ -621,7 +621,7 @@ async function executeDeleteMutation(
 
 interface SendUserMessageInput {
   chatId: ChatId
-  cursor: CursorMap
+  expectedLeafId: MessageId | null
   content: ContentItem[]
   attachmentRefs?: AttachmentRef[]
   origin?: MessageOrigin
@@ -636,11 +636,9 @@ export async function sendUserMessage(
   input: SendUserMessageInput,
 ): Promise<{ effects: StructuralEffects; versions: ChatVersions; messageId: MessageId }> {
   const repo = getWorkspaceRepository()
-  const { chatId, cursor, content, attachmentRefs, now = Date.now() } = input
+  const { chatId, expectedLeafId, content, attachmentRefs, now = Date.now() } = input
   const role = input.role ?? 'user'
   const origin = input.origin ?? 'user'
-  const headers = await repo.listMessageHeaders(chatId)
-  const parentId = resolveActiveLeafId(headers, cursor)
   const messageId = input.messageId ?? newId()
   const turnId = input.turnId ?? newId()
   // Pre-fetch chat + global calibration outside the mutation. Both are
@@ -667,41 +665,26 @@ export async function sendUserMessage(
           prefs.tokenCalibrationMode,
         )
       : null
-  const result = await repo.runMutation(
-    dedupeScopes([
-      messageScope(messageId),
-      childrenScope(chatId, parentId),
-      ...attachmentScopes(attachmentRefs),
-    ]),
-    async (ctx) => {
-      const effects = emptyEffects()
-      const siblings = await ctx.listChildHeaders(chatId, parentId)
-      const row: Message = withAttachmentRefs(
-        {
-          id: messageId,
-          chatId,
-          parentId,
-          siblingIndex: nextSiblingIndexFromChildren(siblings),
-          turnId,
-          turnIndex: 0,
-          createdAt: now,
-          role,
-          origin,
-          content: structuredClone(content),
-          nodeVersion: 0,
-          deleted: false,
-          ...(calibrationFields ?? {}),
-        },
-        attachmentRefs,
-        now,
-      )
-      await ctx.putMessage(row)
-      effects.newMessageIds.push(messageId)
-      if (siblings.length > 0) effects.cursorUpdates[cursorKeyOf(parentId)] = messageId
-      return { effects, messageId }
+  const row = withAttachmentRefs(
+    {
+      id: messageId,
+      chatId,
+      turnId,
+      turnIndex: 0,
+      createdAt: now,
+      role,
+      origin,
+      content: structuredClone(content),
+      ...(calibrationFields ?? {}),
     },
+    attachmentRefs,
+    now,
   )
-  return { effects: result.value.effects, versions: versionsFor(result, chatId), messageId }
+  const result = await repo.appendMessageToExpectedLeaf({ expectedLeafId, message: row })
+  const effects = emptyEffects()
+  effects.newMessageIds.push(messageId)
+  if (result.hadExistingSiblings) effects.cursorUpdates[cursorKeyOf(expectedLeafId)] = messageId
+  return { effects, versions: result.versions, messageId }
 }
 
 interface RegenerateInput {

@@ -15,6 +15,7 @@ import type { EffectiveCapability } from '../../core/capabilities'
 import { cacheMinTokensFor } from '../../core/quirks'
 import type { AnthropicCacheSettings, Chat, ConnectionKind } from '../../core/types'
 import { updateChatSettings } from '../../store/chats'
+import { Button } from '../primitives/Button'
 import { InfoDisclosure } from './InfoDisclosure'
 
 interface CachingPanelProps {
@@ -93,7 +94,7 @@ export function CachingPanel({ chat, capability, connectionKind }: CachingPanelP
           const mode = m === 'off' ? 'off' : family === 'anthropic' ? 'automatic' : 'manual'
           const pressed = m === 'off' ? cache.mode === 'off' : cache.mode !== 'off'
           return (
-            <button
+            <Button
               key={m}
               type="button"
               data-ui="segmented-option"
@@ -101,7 +102,7 @@ export function CachingPanel({ chat, capability, connectionKind }: CachingPanelP
               onClick={() => setCache({ mode })}
             >
               {m}
-            </button>
+            </Button>
           )
         })}
       </div>
@@ -113,7 +114,7 @@ export function CachingPanel({ chat, capability, connectionKind }: CachingPanelP
           </span>
           <div data-ui="segmented">
             {(['5m', '1h'] as const).map((ttl) => (
-              <button
+              <Button
                 key={ttl}
                 type="button"
                 data-ui="segmented-option"
@@ -121,7 +122,7 @@ export function CachingPanel({ chat, capability, connectionKind }: CachingPanelP
                 onClick={() => setCache({ ttl })}
               >
                 {ttl}
-              </button>
+              </Button>
             ))}
           </div>
         </div>

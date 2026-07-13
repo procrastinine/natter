@@ -30,6 +30,7 @@ import type { Chat, ModelEndpoint, ProviderPreferences, SortBy } from '../../cor
 import type { UsePrivacyRoutingResult } from '../../hooks/usePrivacyRouting'
 import { updateChatSettings } from '../../store/chats'
 import { LockIcon } from '../icons/Icon'
+import { Button, IconButton } from '../primitives/Button'
 import { InfoDisclosure } from './InfoDisclosure'
 import { PrivacySection } from './PrivacySection'
 import {
@@ -244,7 +245,7 @@ export function ProviderPicker({
     <div data-ui="settings-section" data-ui-section="provider-picker">
       <header data-ui="provider-picker-header">
         <h3>Providers</h3>
-        <button
+        <IconButton
           type="button"
           data-ui="icon-button"
           onClick={() => refresh()}
@@ -253,7 +254,7 @@ export function ProviderPicker({
           aria-busy={loading}
         >
           <ReloadIcon />
-        </button>
+        </IconButton>
       </header>
       <div data-ui="provider-picker-controls">
         <label data-ui="provider-picker-strict">
@@ -347,7 +348,7 @@ export function ProviderPicker({
       ) : null}
       <PrivacySection chat={chat} />
       <footer data-ui="provider-picker-footer">
-        <button
+        <Button
           type="button"
           data-ui="field-inline-action"
           onClick={() => setAllProviders(true)}
@@ -356,8 +357,8 @@ export function ProviderPicker({
           title={rows.length === 0 ? 'No providers to select' : 'Select all providers'}
         >
           Select all
-        </button>
-        <button
+        </Button>
+        <Button
           type="button"
           data-ui="field-inline-action"
           onClick={() => setAllProviders(false)}
@@ -366,8 +367,8 @@ export function ProviderPicker({
           title={rows.length === 0 ? 'No providers to deselect' : 'Deselect all providers'}
         >
           Deselect all
-        </button>
-        <button
+        </Button>
+        <Button
           type="button"
           data-ui="field-inline-action"
           onClick={() =>
@@ -384,8 +385,8 @@ export function ProviderPicker({
           }
         >
           Deselect low quant
-        </button>
-        <button
+        </Button>
+        <Button
           type="button"
           data-ui="field-inline-action"
           onClick={() =>
@@ -402,7 +403,7 @@ export function ProviderPicker({
           }
         >
           Deselect unknown quant
-        </button>
+        </Button>
         {/*
           Always shown so users can "reset to default" at any time,
           even from a state the picker wouldn't normally flag as
@@ -411,7 +412,7 @@ export function ProviderPicker({
           which is cheap and eliminates the "where's the reset?"
           question the user hit when the flag was gated on hasOverrides.
         */}
-        <button
+        <Button
           type="button"
           data-ui="field-inline-action"
           onClick={resetPrefs}
@@ -420,7 +421,7 @@ export function ProviderPicker({
           title={hasOverrides ? 'Reset to default' : 'No overrides to reset'}
         >
           Reset to default
-        </button>
+        </Button>
       </footer>
     </div>
   )
@@ -585,7 +586,7 @@ function ProviderRow({
           </span>
         </label>
         <div data-ui="provider-picker-row-actions">
-          <button
+          <IconButton
             type="button"
             data-ui="icon-button"
             data-compact
@@ -594,8 +595,8 @@ function ProviderRow({
             title="Move up"
           >
             ↑
-          </button>
-          <button
+          </IconButton>
+          <IconButton
             type="button"
             data-ui="icon-button"
             data-compact
@@ -604,8 +605,8 @@ function ProviderRow({
             title="Move down"
           >
             ↓
-          </button>
-          <button
+          </IconButton>
+          <IconButton
             type="button"
             data-ui="icon-button"
             data-compact
@@ -615,7 +616,7 @@ function ProviderRow({
             onClick={() => setExpanded((v) => !v)}
           >
             <InfoGlyph />
-          </button>
+          </IconButton>
         </div>
       </div>
       <div data-ui="provider-picker-row-stats">

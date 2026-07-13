@@ -102,7 +102,7 @@ describe('browser repository mutation executor', () => {
 
     await sendUserMessage({
       chatId: chat.id,
-      cursor: {},
+      expectedLeafId: null,
       content: [{ type: 'text', text: '  First\n prompt  ' }],
       messageId: 'preview-u1',
       now: 200,
@@ -111,7 +111,7 @@ describe('browser repository mutation executor', () => {
 
     await sendUserMessage({
       chatId: chat.id,
-      cursor: {},
+      expectedLeafId: 'preview-u1',
       content: [{ type: 'text', text: 'Second prompt' }],
       messageId: 'preview-u2',
       now: 201,

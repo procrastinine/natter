@@ -4,6 +4,7 @@ import { primaryKeys } from '../../store/reactive-dependencies'
 import { useRepositoryQuery } from '../../store/reactive-query'
 import { getSetting, setSetting } from '../../store/settings'
 import { TrashIcon } from '../icons/Icon'
+import { Button, IconButton } from '../primitives/Button'
 import { InfoDisclosure } from './InfoDisclosure'
 
 const STORAGE_KEY = 'image-allowlist'
@@ -93,9 +94,9 @@ export function ImageAllowlistPanel() {
             }
           }}
         />
-        <button type="button" data-ui="image-allowlist-add-button" onClick={() => void onAdd()}>
+        <Button type="button" data-ui="image-allowlist-add-button" onClick={() => void onAdd()}>
           Add
-        </button>
+        </Button>
       </div>
       {error ? (
         <span data-ui="helper" data-validation="invalid" role="alert">
@@ -134,7 +135,7 @@ export function ImageAllowlistPanel() {
               </td>
               <td data-ui="image-allowlist-source">custom</td>
               <td data-ui="image-allowlist-action-cell">
-                <button
+                <IconButton
                   type="button"
                   data-ui="icon-button"
                   data-size="sm"
@@ -145,7 +146,7 @@ export function ImageAllowlistPanel() {
                   onClick={() => void onRemove(origin)}
                 >
                   <TrashIcon size={14} />
-                </button>
+                </IconButton>
               </td>
             </tr>
           ))}

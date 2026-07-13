@@ -151,7 +151,7 @@ async function seedAssistantBranch(): Promise<{
   const chat = await createChat({ settings: settings() })
   const sent = await sendUserMessage({
     chatId: chat.id,
-    cursor: {},
+    expectedLeafId: null,
     content: [{ type: 'text', text: 'question' }],
     now: 1,
     messageId: 'freshness-user',
@@ -220,7 +220,7 @@ describe('send-context freshness', () => {
     const chat = await createChat({ settings: settings() })
     const sent = await sendUserMessage({
       chatId: chat.id,
-      cursor: {},
+      expectedLeafId: null,
       content: [{ type: 'text', text: 'before edit' }],
     })
     await clearEndpointCache()

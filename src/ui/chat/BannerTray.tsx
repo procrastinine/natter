@@ -3,6 +3,7 @@
 // context.
 
 import { useToastStore } from '../../store/zustand/toastStore'
+import { Button } from '../primitives/Button'
 
 export function BannerTray() {
   const banners = useToastStore((s) => s.banners)
@@ -21,17 +22,14 @@ export function BannerTray() {
             data-tone={b.kind === 'mutation-conflict' ? 'warning' : 'info'}
             data-state={pending ? 'pending' : b.actionState?.error ? 'error' : 'idle'}
             aria-busy={pending}
-            role="status"
           >
             <span data-ui="banner-text">{b.text}</span>
             {b.actionState?.error ? (
-              <span data-ui="banner-action-error" role="alert">
-                {b.actionState.error}
-              </span>
+              <span data-ui="banner-action-error">{b.actionState.error}</span>
             ) : null}
             <span data-ui="banner-spacer" />
             {b.primary ? (
-              <button
+              <Button
                 type="button"
                 data-ui="banner-primary"
                 aria-disabled={pending}
@@ -45,10 +43,10 @@ export function BannerTray() {
                 }}
               >
                 {pending && b.actionState?.key === 'primary' ? 'Working…' : b.primary.label}
-              </button>
+              </Button>
             ) : null}
             {b.secondary ? (
-              <button
+              <Button
                 type="button"
                 data-ui="banner-secondary"
                 aria-disabled={pending}
@@ -62,9 +60,9 @@ export function BannerTray() {
                 }}
               >
                 {pending && b.actionState?.key === 'secondary' ? 'Working…' : b.secondary.label}
-              </button>
+              </Button>
             ) : null}
-            <button
+            <Button
               type="button"
               data-ui="banner-dismiss"
               aria-label="Dismiss banner"
@@ -78,7 +76,7 @@ export function BannerTray() {
               }}
             >
               ×
-            </button>
+            </Button>
           </div>
         )
       })}

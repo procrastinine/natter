@@ -48,8 +48,18 @@
   color: var(--color-fg-primary);
 }
 
-[data-ui="connection-provider-button"][data-kind="openrouter"] {
-  color: #94a3b8;
+[data-icon="openrouter"],
+[data-icon="llama-server"] {
+  opacity: 0.5;
+}
+
+[data-icon="openrouter"] {
+  color: #7624f4;
+}
+
+[data-theme="dark"] [data-icon="openrouter"],
+[data-theme="high-contrast"] [data-icon="openrouter"] {
+  color: #c8ff00;
 }
 
 [data-ui="connection-provider-button"][data-kind="openai-compatible"] {
@@ -74,6 +84,12 @@
 
 [data-ui="connection-provider-button"][data-kind="custom"] {
   color: #64748b;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) [data-icon="openrouter"] {
+    color: #c8ff00;
+  }
 }
 
 [data-ui="chat-title-label"] {
@@ -291,6 +307,10 @@
  * Header privacy badge.
  * Lock icon tinted by tier; click opens a popover listing kept providers.
  * ────────────────────────────────────────────────────────────────────── */
+
+[data-ui="desktop-header-privacy"]:empty {
+  display: none;
+}
 
 [data-ui="header-privacy-badge"] {
   position: relative;
@@ -524,17 +544,9 @@
 }
 
 [data-ui="connection-add"] {
-  background: var(--color-accent);
-  color: var(--color-accent-contrast);
-  border: none;
   border-radius: var(--radius-sm);
   padding: var(--space-1) var(--space-3);
   font-size: var(--font-size-sm);
-  cursor: pointer;
-}
-
-[data-ui="connection-add"]:hover {
-  background: var(--color-accent-hover);
 }
 
 /* Profile switcher row sits above the viewer / editor inside the detail
@@ -689,17 +701,9 @@
 }
 
 [data-ui="connection-edit-save"] {
-  background: var(--color-accent);
-  color: var(--color-accent-contrast);
-  border: none;
   border-radius: var(--radius-sm);
   padding: var(--space-2) var(--space-4);
   font-size: var(--font-size-sm);
-  cursor: pointer;
-}
-
-[data-ui="connection-edit-save"]:hover:not(:disabled) {
-  background: var(--color-accent-hover);
 }
 
 [data-ui="connection-edit"]:disabled,
@@ -821,32 +825,7 @@
  * Connection setup modal (first-run / "Add connection" CTA)
  * ────────────────────────────────────────────────────────────────────── */
 
-[data-ui="connection-setup-overlay"] {
-  position: fixed;
-  inset: 0;
-  z-index: var(--z-overlay);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
-[data-ui="connection-setup-scrim"] {
-  position: absolute;
-  inset: 0;
-  border: 0;
-  padding: 0;
-  background: var(--color-backdrop-scrim);
-  backdrop-filter: var(--backdrop-blur-overlay);
-  cursor: default;
-}
-
 [data-ui="connection-setup-modal"] {
-  position: relative;
-  z-index: 1;
-  background: var(--color-bg-surface-1);
-  border: 1px solid var(--color-border-default);
-  border-radius: var(--radius-md);
-  box-shadow: var(--shadow-overlay);
   width: var(--modal-width-md);
   max-width: calc(100vw - var(--space-8));
   display: flex;
@@ -886,12 +865,8 @@
 }
 
 [data-ui="connection-setup-submit"] {
-  background: var(--color-accent);
-  color: var(--color-accent-contrast);
-  border: none;
   border-radius: var(--radius-sm);
   padding: var(--space-2) var(--space-5);
-  cursor: pointer;
 }
 
 [data-ui="connection-setup-submit"]:disabled {

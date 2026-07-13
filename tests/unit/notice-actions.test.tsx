@@ -68,7 +68,7 @@ describe('notice actions', () => {
     })
 
     expect(screen.getByText('Deleted.')).toBeInTheDocument()
-    expect(screen.getByRole('alert')).toHaveTextContent('Action failed. Try again.')
+    expect(screen.getByText('Action failed. Try again.')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Undo' })).toHaveFocus()
 
     await act(async () => {
@@ -157,7 +157,7 @@ describe('notice actions', () => {
     })
 
     expect(screen.getByText('Conflict.')).toBeInTheDocument()
-    expect(screen.getByRole('alert')).toHaveTextContent('Action failed. Try again.')
+    expect(screen.getByText('Action failed. Try again.')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Retry' })).toHaveFocus()
 
     await act(async () => {

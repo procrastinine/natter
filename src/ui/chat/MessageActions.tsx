@@ -44,6 +44,7 @@ import {
   SendIcon,
   TrashIcon,
 } from '../icons/Icon'
+import { Button, IconButton } from '../primitives/Button'
 import { ConfirmDeleteDialog } from './ConfirmDeleteDialog'
 
 export type InsertSlot = 'before' | 'after' | 'sibling'
@@ -243,7 +244,7 @@ export function MessageActions(props: MessageActionsProps) {
           adjacency
         </span>
       ) : null}
-      <button
+      <IconButton
         type="button"
         data-ui="icon-button"
         data-size="sm"
@@ -254,8 +255,8 @@ export function MessageActions(props: MessageActionsProps) {
         title={copied ? 'Copied' : 'Copy'}
       >
         {copied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
-      </button>
-      <button
+      </IconButton>
+      <IconButton
         type="button"
         data-ui="icon-button"
         data-size="sm"
@@ -268,9 +269,9 @@ export function MessageActions(props: MessageActionsProps) {
         title={streamTargetBusy ? "Can't edit while streaming." : 'Edit (Enter)'}
       >
         <PencilIcon size={14} />
-      </button>
+      </IconButton>
       {isAssistant && onRegenerate ? (
-        <button
+        <IconButton
           type="button"
           data-ui="icon-button"
           data-size="sm"
@@ -282,10 +283,10 @@ export function MessageActions(props: MessageActionsProps) {
           title={!generationDisabled ? 'Regenerate (⇧⌘R)' : generationDisabledTitle}
         >
           <ReloadIcon size={14} />
-        </button>
+        </IconButton>
       ) : null}
       {isAssistant && onContinue ? (
-        <button
+        <IconButton
           type="button"
           data-ui="icon-button"
           data-size="sm"
@@ -303,10 +304,10 @@ export function MessageActions(props: MessageActionsProps) {
           }
         >
           <SendIcon size={14} />
-        </button>
+        </IconButton>
       ) : null}
       {onForkChat ? (
-        <button
+        <IconButton
           type="button"
           data-ui="icon-button"
           data-size="sm"
@@ -317,9 +318,9 @@ export function MessageActions(props: MessageActionsProps) {
           title="Branch this chat from here — opens in a new chat"
         >
           <BranchIcon size={14} />
-        </button>
+        </IconButton>
       ) : null}
-      <button
+      <IconButton
         type="button"
         data-ui="icon-button"
         data-size="sm"
@@ -339,8 +340,8 @@ export function MessageActions(props: MessageActionsProps) {
         }
       >
         {message.hiddenFromContext ? <EyeOffIcon size={14} /> : <EyeIcon size={14} />}
-      </button>
-      <button
+      </IconButton>
+      <IconButton
         type="button"
         data-ui="icon-button"
         data-size="sm"
@@ -352,8 +353,8 @@ export function MessageActions(props: MessageActionsProps) {
         title={streamTargetBusy ? "Can't delete while streaming." : deleteTooltip}
       >
         <TrashIcon size={14} />
-      </button>
-      <button
+      </IconButton>
+      <IconButton
         type="button"
         data-ui="icon-button"
         data-size="sm"
@@ -365,7 +366,7 @@ export function MessageActions(props: MessageActionsProps) {
         onClick={onToggleInfo}
       >
         <InfoIcon size={14} />
-      </button>
+      </IconButton>
       {confirmOpen ? (
         <ConfirmDeleteDialog
           previewText={previewText}
@@ -408,60 +409,65 @@ export function MessageEditTreeActions({
       <div data-ui="edit-tree-group" data-side="inserts">
         {onInsert ? (
           <>
-            <button
-              type="button"
+            <Button
               data-ui="edit-tree-action"
-              data-tone="success"
+              tone="success"
+              appearance="soft"
+              size="xs"
               data-action="insert-before"
               onClick={() => void onInsert('before')}
               disabled={streamTargetBusy}
             >
               + Insert before
-            </button>
-            <button
-              type="button"
+            </Button>
+            <Button
               data-ui="edit-tree-action"
-              data-tone="success"
+              tone="success"
+              appearance="soft"
+              size="xs"
               data-action="insert-after"
               onClick={() => void onInsert('after')}
               disabled={streamTargetBusy}
             >
               + Insert after
-            </button>
-            <button
-              type="button"
+            </Button>
+            <Button
               data-ui="edit-tree-action"
-              data-tone="success"
+              tone="success"
+              appearance="soft"
+              size="xs"
               data-action="insert-sibling"
               onClick={() => void onInsert('sibling')}
               disabled={streamTargetBusy}
             >
               + Insert sibling
-            </button>
+            </Button>
           </>
         ) : null}
       </div>
       <div data-ui="edit-tree-group" data-side="deletes">
-        <button
-          type="button"
+        <Button
           data-ui="edit-tree-action"
-          data-tone="danger"
+          tone="danger"
+          appearance="soft"
+          size="xs"
           data-action="delete-variant"
           onClick={() => void runDelete('variant')}
           disabled={streamTargetBusy}
         >
           Delete variant
-        </button>
-        <button
-          type="button"
+        </Button>
+        <Button
           data-ui="edit-tree-action"
-          data-tone="danger"
+          tone="danger"
+          appearance="soft"
+          size="xs"
           data-action="delete-turn"
           onClick={() => void runDelete('turn')}
           disabled={streamTargetBusy}
         >
           Delete turn
-        </button>
+        </Button>
       </div>
     </div>
   )

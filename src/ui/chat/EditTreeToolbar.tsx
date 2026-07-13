@@ -4,6 +4,7 @@
 
 import { useUiStore } from '../../store/zustand/uiStore'
 import { CloseIcon } from '../icons/Icon'
+import { IconButton } from '../primitives/Button'
 
 export function EditTreeToolbar() {
   const editTreeMode = useUiStore((s) => s.editTreeMode)
@@ -23,7 +24,7 @@ export function EditTreeToolbar() {
         Also delete descendants
       </label>
       <span data-ui="edit-tree-spacer" />
-      <button
+      <IconButton
         type="button"
         data-ui="icon-button"
         data-role="edit-tree-exit"
@@ -32,7 +33,7 @@ export function EditTreeToolbar() {
         onClick={() => setEditTreeMode(false)}
       >
         <CloseIcon size={14} />
-      </button>
+      </IconButton>
     </div>
   )
 }

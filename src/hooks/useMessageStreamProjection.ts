@@ -113,7 +113,7 @@ export function __resetMessageStreamProjectionForTests(): void {
   sharedCommittedByTarget.clear()
 }
 
-export function useMessageStreamProjection(chatId: ChatId, messageId: MessageId, enabled = true) {
+function useMessageStreamProjection(chatId: ChatId, messageId: MessageId, enabled = true) {
   const activeStream = useStreamStore((state) =>
     enabled ? state.getTargetActive(chatId, messageId) : undefined,
   )

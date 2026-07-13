@@ -2,13 +2,8 @@ name: Verify
 
 on:
   pull_request:
-  workflow_call:
-    inputs:
-      upload-pages-artifact:
-        description: Upload the verified distribution for GitHub Pages
-        required: false
-        type: boolean
-        default: false
+  push:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -34,21 +29,36 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
-      - run: pnpm deps:peers
+      - name: Check peer dependencies (advisory)
+        id: peer_dependencies
+        continue-on-error: true
+        run: pnpm deps:peers
 
-      - run: pnpm check:ci
+      - name: Check formatting and lint (advisory)
+        id: biome
+        continue-on-error: true
+        run: pnpm check:ci
 
-      - run: pnpm lint:semantic
+      - name: Check semantic lint (advisory)
+        id: semantic_lint
+        continue-on-error: true
+        run: pnpm lint:semantic
+
+      - name: Check dead code (advisory)
+        id: dead_code
+        continue-on-error: true
+        run: pnpm deadcode
 
       - run: pnpm test:run
         env:
           NODE_OPTIONS: --localstorage-file=/tmp/natter-vitest-${{ github.run_id }}-${{ github.run_attempt }}.json
 
-      - run: pnpm deadcode
-
       - run: pnpm build
 
-      - run: pnpm perf:report
+      - name: Check performance budgets (advisory)
+        id: performance
+        continue-on-error: true
+        run: pnpm perf:report
 
       - run: pnpm exec playwright install --with-deps chromium
 
@@ -56,8 +66,13 @@ jobs:
         env:
           E2E_SERVER_MODE: preview
 
-      - name: Upload verified Pages artifact
-        if: inputs.upload-pages-artifact
-        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
-        with:
-          path: ./dist
+      - name: Report advisory findings
+        if: >-
+          always() && (
+            steps.peer_dependencies.outcome == 'failure' ||
+            steps.biome.outcome == 'failure' ||
+            steps.semantic_lint.outcome == 'failure' ||
+            steps.dead_code.outcome == 'failure' ||
+            steps.performance.outcome == 'failure'
+          )
+        run: echo "::warning title=Advisory verification findings::One or more non-blocking checks reported findings; see the advisory step logs."

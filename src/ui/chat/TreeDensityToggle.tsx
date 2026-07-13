@@ -1,5 +1,6 @@
 import { useUiStore } from '../../store/zustand/uiStore'
 import { ContractIcon, ExpandIcon } from '../icons/Icon'
+import { Button } from '../primitives/Button'
 
 export function TreeDensityToggle({
   placement = 'floating',
@@ -9,7 +10,7 @@ export function TreeDensityToggle({
   const expanded = useUiStore((state) => state.treeExpanded)
   const setExpanded = useUiStore((state) => state.setTreeExpanded)
   return (
-    <button
+    <Button
       type="button"
       data-ui="tree-density-toggle"
       data-placement={placement}
@@ -20,6 +21,6 @@ export function TreeDensityToggle({
       onClick={() => setExpanded(!expanded)}
     >
       {expanded ? <ContractIcon size={18} /> : <ExpandIcon size={18} />}
-    </button>
+    </Button>
   )
 }

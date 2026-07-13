@@ -24,6 +24,7 @@ import {
 import { allTable } from '../../store/reactive-dependencies'
 import { useRepositoryQuery } from '../../store/reactive-query'
 import { useToastStore } from '../../store/zustand/toastStore'
+import { Button, IconButton } from '../primitives/Button'
 import { InfoDisclosure } from './InfoDisclosure'
 
 const SAVE_DEBOUNCE_MS = 300
@@ -346,7 +347,7 @@ export function SystemPromptEditor({
     >
       <div data-ui="prompt-slot-header">
         <div data-ui="prompt-slot-title-group">
-          <button
+          <Button
             type="button"
             data-ui="prompt-slot-toggle"
             aria-expanded={expanded}
@@ -354,7 +355,7 @@ export function SystemPromptEditor({
           >
             <ChevronIcon expanded={expanded} />
             <h3>System prompt</h3>
-          </button>
+          </Button>
           <InfoDisclosure title="System prompt">
             Sent ahead of every turn as the chat's system message. Empty = no system message.
           </InfoDisclosure>
@@ -433,7 +434,7 @@ export function AppendPromptEditor({
     >
       <div data-ui="prompt-slot-header">
         <div data-ui="prompt-slot-title-group">
-          <button
+          <Button
             type="button"
             data-ui="prompt-slot-toggle"
             aria-expanded={expanded}
@@ -441,7 +442,7 @@ export function AppendPromptEditor({
           >
             <ChevronIcon expanded={expanded} />
             <h3>Append prompt</h3>
-          </button>
+          </Button>
           <InfoDisclosure title="Append prompt">
             Glued onto the last user message at send time and stripped from history. Leading
             whitespace is preserved.
@@ -515,7 +516,7 @@ export function PrefillPromptEditor({
     >
       <div data-ui="prompt-slot-header">
         <div data-ui="prompt-slot-title-group">
-          <button
+          <Button
             type="button"
             data-ui="prompt-slot-toggle"
             aria-expanded={expanded}
@@ -523,7 +524,7 @@ export function PrefillPromptEditor({
           >
             <ChevronIcon expanded={expanded} />
             <h3>Prefill</h3>
-          </button>
+          </Button>
           <InfoDisclosure title="Prefill">
             Seeds the prefill box when prefill opens on this chat. The Continue-prefill toggle below
             sends the existing assistant message as a real prefill turn during Continue, instead of
@@ -596,7 +597,7 @@ export function ContinueSystemPromptEditor({
     >
       <div data-ui="prompt-slot-header">
         <div data-ui="prompt-slot-title-group">
-          <button
+          <Button
             type="button"
             data-ui="prompt-slot-toggle"
             aria-expanded={expanded}
@@ -604,7 +605,7 @@ export function ContinueSystemPromptEditor({
           >
             <ChevronIcon expanded={expanded} />
             <h3>Continue system prompt</h3>
-          </button>
+          </Button>
           <InfoDisclosure title="Continue system prompt">
             Used by Continue-in-place. [SYSTEM_PROMPT] expands to this chat's system prompt; blank
             sends none.
@@ -671,7 +672,7 @@ export function ContinueUserPromptEditor({
     >
       <div data-ui="prompt-slot-header">
         <div data-ui="prompt-slot-title-group">
-          <button
+          <Button
             type="button"
             data-ui="prompt-slot-toggle"
             aria-expanded={expanded}
@@ -679,7 +680,7 @@ export function ContinueUserPromptEditor({
           >
             <ChevronIcon expanded={expanded} />
             <h3>Continue user prompt</h3>
-          </button>
+          </Button>
           <InfoDisclosure title="Continue user prompt">
             Synthetic trailing user message appended during Continue-in-place. Blank falls back to
             the legacy double-assistant shape.
@@ -748,7 +749,7 @@ function PromptPresetPicker({
 }: PickerProps) {
   return (
     <div data-ui="prompt-preset-picker">
-      <button
+      <Button
         type="button"
         data-ui="prompt-preset-picker-button"
         aria-expanded={open}
@@ -760,7 +761,7 @@ function PromptPresetPicker({
         <span data-ui="prompt-preset-picker-chevron" aria-hidden="true">
           ▾
         </span>
-      </button>
+      </Button>
       {open ? (
         <div data-ui="prompt-preset-picker-menu" role="menu">
           {presets.length === 0 ? (
@@ -771,32 +772,32 @@ function PromptPresetPicker({
                 const isCurrent = pinnedPreset?.id === p.id
                 return (
                   <li key={p.id} data-current={isCurrent ? 'true' : undefined}>
-                    <button
+                    <Button
                       type="button"
                       data-ui="preset-menu-load"
                       onClick={() => onLoad(p.id)}
                       title={isCurrent ? 'Already loaded' : 'Load preset'}
                     >
                       {isCurrent ? '●' : '○'} {p.name}
-                    </button>
+                    </Button>
                     <div data-ui="preset-menu-actions">
-                      <button
+                      <Button
                         type="button"
                         data-ui="field-inline-action"
                         onClick={() => onSaveToExisting(p.id, p.name)}
                         title={`Overwrite "${p.name}" with the current text`}
                       >
                         save
-                      </button>
-                      <button
+                      </Button>
+                      <Button
                         type="button"
                         data-ui="field-inline-action"
                         onClick={() => onRename(p.id, p.name)}
                         title="Rename"
                       >
                         rename
-                      </button>
-                      <button
+                      </Button>
+                      <IconButton
                         type="button"
                         data-ui="icon-button"
                         data-compact
@@ -806,7 +807,7 @@ function PromptPresetPicker({
                         aria-label="Delete preset"
                       >
                         <TrashIcon />
-                      </button>
+                      </IconButton>
                     </div>
                   </li>
                 )
@@ -814,10 +815,10 @@ function PromptPresetPicker({
             </ul>
           )}
           <div data-ui="preset-menu-footer">
-            <button type="button" data-ui="field-inline-action" onClick={() => onSaveAsNew()}>
+            <Button type="button" data-ui="field-inline-action" onClick={() => onSaveAsNew()}>
               + Save as new…
-            </button>
-            <button
+            </Button>
+            <IconButton
               type="button"
               data-ui="icon-button"
               data-compact
@@ -826,7 +827,7 @@ function PromptPresetPicker({
               title="Close"
             >
               <CloseGlyph />
-            </button>
+            </IconButton>
           </div>
         </div>
       ) : null}

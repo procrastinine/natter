@@ -55,6 +55,28 @@ afterEach(() => {
   __setMessageListIndexProbeForTests(undefined)
 })
 
+describe('message-list accessibility', () => {
+  it('exposes new transcript entries through an additions-only log', () => {
+    const fixture = branchFixture(2)
+    const view = render(
+      <MessageList
+        chatId="chat-performance"
+        chatSettings={cloneDefaultChatSettings()}
+        hasConnection
+        messageRenderWindowSize={100}
+        messageRenderWindowLoadMode="manual"
+        branchSnapshot={fixture.first}
+        onLoadOlderMessages={() => {}}
+      />,
+    )
+
+    const log = view.getByRole('log')
+    expect(log).toHaveAttribute('data-ui', 'message-list')
+    expect(log).toHaveAttribute('aria-live', 'polite')
+    expect(log).toHaveAttribute('aria-relevant', 'additions')
+  })
+})
+
 describe('message-list render budgets', () => {
   it('uses hydrated window bodies for context rings while branch headers stay cold', () => {
     const fixture = branchFixture(3)

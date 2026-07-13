@@ -1,4 +1,5 @@
 import { useCallback, useMemo, useState } from 'react'
+import { Button } from '../primitives/Button'
 
 interface CodeBlockProps {
   code: string
@@ -46,19 +47,19 @@ export function CodeBlock({ code, language, fileName }: CodeBlockProps) {
         <div data-ui="code-toolbar">
           <span data-ui="code-toolbar-language">{language ?? 'text'}</span>
           <div data-ui="code-toolbar-actions">
-            <button
+            <Button
               type="button"
               data-ui="code-toolbar-highlight-anyway"
               onClick={() => setShowLarge(true)}
             >
               Highlight anyway
-            </button>
-            <button type="button" data-ui="code-toolbar-copy" onClick={() => void onCopy()}>
+            </Button>
+            <Button type="button" data-ui="code-toolbar-copy" onClick={() => void onCopy()}>
               Copy
-            </button>
-            <button type="button" data-ui="code-toolbar-download" onClick={onDownload}>
+            </Button>
+            <Button type="button" data-ui="code-toolbar-download" onClick={onDownload}>
               Download
-            </button>
+            </Button>
           </div>
         </div>
         <pre data-ui="code-block-body">
@@ -75,12 +76,12 @@ export function CodeBlock({ code, language, fileName }: CodeBlockProps) {
       <div data-ui="code-toolbar">
         <span data-ui="code-toolbar-language">{language ?? 'text'}</span>
         <div data-ui="code-toolbar-actions">
-          <button type="button" data-ui="code-toolbar-copy" onClick={() => void onCopy()}>
+          <Button type="button" data-ui="code-toolbar-copy" onClick={() => void onCopy()}>
             Copy
-          </button>
-          <button type="button" data-ui="code-toolbar-download" onClick={onDownload}>
+          </Button>
+          <Button type="button" data-ui="code-toolbar-download" onClick={onDownload}>
             Download
-          </button>
+          </Button>
         </div>
       </div>
       <pre data-ui="code-block-body" data-line-numbers={withNumbers ? 'on' : 'off'}>

@@ -35,6 +35,8 @@ import {
   SearchIcon,
   StopIcon,
 } from '../icons/Icon'
+import { Button } from '../primitives/Button'
+import { SvgAction } from '../primitives/SvgAction'
 import { TreeDensityToggle } from './TreeDensityToggle'
 
 const COMPACT_LAYOUT = {
@@ -1549,7 +1551,7 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
             }}
           />
           {query.length > 0 ? (
-            <button
+            <Button
               type="button"
               aria-label="Clear tree search"
               data-ui="branch-tree-search-clear"
@@ -1560,7 +1562,7 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
               }}
             >
               <CloseIcon size={13} />
-            </button>
+            </Button>
           ) : null}
           <output
             aria-live="polite"
@@ -1577,7 +1579,7 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
                     : '0 / 0'
                   : ''}
           </output>
-          <button
+          <Button
             type="button"
             aria-label="Previous matching message"
             data-ui="branch-tree-search-nav"
@@ -1585,8 +1587,8 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
             onClick={() => goToMatch(-1)}
           >
             <ChevronIcon size={15} rotate={180} />
-          </button>
-          <button
+          </Button>
+          <Button
             type="button"
             aria-label="Next matching message"
             data-ui="branch-tree-search-nav"
@@ -1594,10 +1596,10 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
             onClick={() => goToMatch(1)}
           >
             <ChevronIcon size={15} />
-          </button>
+          </Button>
         </search>
         {chatStreams.length > 0 && onAbort ? (
-          <button
+          <Button
             type="button"
             data-ui="branch-tree-stop"
             aria-label="Stop generating"
@@ -1606,7 +1608,7 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
           >
             <StopIcon size={14} />
             <span>Stop</span>
-          </button>
+          </Button>
         ) : null}
       </div>
 
@@ -1684,13 +1686,10 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
                     ? visibleConnectors.shared.map((connector) => {
                         const streamBusy = streamBusyParentIds.has(connector.parentId)
                         return (
-                          // biome-ignore lint/a11y/useSemanticElements: SVG has no native button element; this group exposes the visible marker as one keyboard-operable target.
-                          <g
+                          <SvgAction
                             key={`${connector.key}:hit-group`}
-                            role="button"
-                            tabIndex={streamBusy ? -1 : 0}
-                            aria-disabled={streamBusy || undefined}
-                            aria-label="Insert after this parent before all of its children"
+                            label="Insert after this parent before all of its children"
+                            disabled={streamBusy}
                             data-connector-hit="shared-trunk"
                             data-parent-id={connector.parentId}
                             data-stream-busy={streamBusy || undefined}
@@ -1702,14 +1701,7 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
                               if (!streamBusy) setHoveredConnectorKey(connector.key)
                             }}
                             onBlur={() => setHoveredConnectorKey(null)}
-                            onClick={() => {
-                              if (!streamBusy) {
-                                runAction(() => onInsertAtSharedTrunk(connector.parentId))
-                              }
-                            }}
-                            onKeyDown={(event) => {
-                              if (streamBusy || (event.key !== 'Enter' && event.key !== ' ')) return
-                              event.preventDefault()
+                            onActivate={() => {
                               runAction(() => onInsertAtSharedTrunk(connector.parentId))
                             }}
                           >
@@ -1719,12 +1711,13 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
                               </title>
                             ) : null}
                             <path d={connector.path} data-ui="branch-tree-connector-hit-path" />
-                            <ConnectorAddMarker
+                            <BranchTreeAddMarker
+                              ui="branch-tree-connector-add"
                               x={connector.insertX}
                               y={connector.insertY}
                               highlighted={hoveredConnectorKey === connector.key}
                             />
-                          </g>
+                          </SvgAction>
                         )
                       })
                     : null}
@@ -1732,13 +1725,10 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
                     ? visibleConnectors.children.map((connector) => {
                         const streamBusy = busyMessageIds.has(connector.childId)
                         return (
-                          // biome-ignore lint/a11y/useSemanticElements: SVG has no native button element; this group exposes the visible marker as one keyboard-operable target.
-                          <g
+                          <SvgAction
                             key={`${connector.key}:hit-group`}
-                            role="button"
-                            tabIndex={streamBusy ? -1 : 0}
-                            aria-disabled={streamBusy || undefined}
-                            aria-label="Insert before this child only"
+                            label="Insert before this child only"
+                            disabled={streamBusy}
                             data-connector-hit="child-leg"
                             data-parent-id={connector.parentId}
                             data-child-id={connector.childId}
@@ -1751,13 +1741,7 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
                               if (!streamBusy) setHoveredConnectorKey(connector.key)
                             }}
                             onBlur={() => setHoveredConnectorKey(null)}
-                            onClick={() => {
-                              if (!streamBusy)
-                                runAction(() => onInsertAtChildLeg(connector.childId))
-                            }}
-                            onKeyDown={(event) => {
-                              if (streamBusy || (event.key !== 'Enter' && event.key !== ' ')) return
-                              event.preventDefault()
+                            onActivate={() => {
                               runAction(() => onInsertAtChildLeg(connector.childId))
                             }}
                           >
@@ -1765,12 +1749,13 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
                               <title>Wait for this generation to finish before inserting</title>
                             ) : null}
                             <path d={connector.path} data-ui="branch-tree-connector-hit-path" />
-                            <ConnectorAddMarker
+                            <BranchTreeAddMarker
+                              ui="branch-tree-connector-add"
                               x={connector.insertX}
                               y={connector.insertY}
                               highlighted={hoveredConnectorKey === connector.key}
                             />
-                          </g>
+                          </SvgAction>
                         )
                       })
                     : null}
@@ -1784,13 +1769,10 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
                         const markerY = startY + 28
                         const path = `M ${x} ${startY} V ${markerY}`
                         return (
-                          // biome-ignore lint/a11y/useSemanticElements: SVG has no native button element; this group exposes the leaf append marker as one keyboard-operable target.
-                          <g
+                          <SvgAction
                             key={markerKey}
-                            role="button"
-                            tabIndex={streamBusy ? -1 : 0}
-                            aria-disabled={streamBusy || undefined}
-                            aria-label="Add message after this leaf"
+                            label="Add message after this leaf"
+                            disabled={streamBusy}
                             data-connector-hit="leaf-append"
                             data-parent-id={node.id}
                             data-stream-busy={streamBusy || undefined}
@@ -1802,12 +1784,7 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
                               if (!streamBusy) setHoveredConnectorKey(markerKey)
                             }}
                             onBlur={() => setHoveredConnectorKey(null)}
-                            onClick={() => {
-                              if (!streamBusy) runAction(() => onInsertAfterLeaf(node.id))
-                            }}
-                            onKeyDown={(event) => {
-                              if (streamBusy || (event.key !== 'Enter' && event.key !== ' ')) return
-                              event.preventDefault()
+                            onActivate={() => {
                               runAction(() => onInsertAfterLeaf(node.id))
                             }}
                           >
@@ -1824,12 +1801,13 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
                               data-highlighted={hoveredConnectorKey === markerKey || undefined}
                             />
                             <path d={path} data-ui="branch-tree-connector-hit-path" />
-                            <LeafAddMarker
+                            <BranchTreeAddMarker
+                              ui="branch-tree-leaf-add"
                               x={x}
                               y={markerY}
                               highlighted={hoveredConnectorKey === markerKey}
                             />
-                          </g>
+                          </SvgAction>
                         )
                       })
                     : null}
@@ -2034,26 +2012,19 @@ if (import.meta.env.MODE === 'test') {
   BranchTreeView.__setComputationProbeForTests = setBranchTreeComputationProbeForTests
 }
 
-function ConnectorAddMarker({ x, y, highlighted }: { x: number; y: number; highlighted: boolean }) {
+function BranchTreeAddMarker({
+  ui,
+  x,
+  y,
+  highlighted,
+}: {
+  ui: 'branch-tree-connector-add' | 'branch-tree-leaf-add'
+  x: number
+  y: number
+  highlighted: boolean
+}) {
   return (
-    <g
-      data-ui="branch-tree-connector-add"
-      data-highlighted={highlighted || undefined}
-      transform={`translate(${x} ${y})`}
-    >
-      <circle r={8} />
-      <path d="M -3.25 0 H 3.25 M 0 -3.25 V 3.25" />
-    </g>
-  )
-}
-
-function LeafAddMarker({ x, y, highlighted }: { x: number; y: number; highlighted: boolean }) {
-  return (
-    <g
-      data-ui="branch-tree-leaf-add"
-      data-highlighted={highlighted || undefined}
-      transform={`translate(${x} ${y})`}
-    >
+    <g data-ui={ui} data-highlighted={highlighted || undefined} transform={`translate(${x} ${y})`}>
       <circle r={8} />
       <path d="M -3.25 0 H 3.25 M 0 -3.25 V 3.25" />
     </g>

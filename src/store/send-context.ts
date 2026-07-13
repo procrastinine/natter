@@ -125,6 +125,14 @@ export async function loadActiveBranchHeaderSnapshot(
   return { ...snapshot, branchHeaders }
 }
 
+export async function loadBranchHeaderSnapshotByLeaf(
+  chatId: string,
+  leafId: MessageId | null,
+): Promise<ActiveBranchHeaderSnapshot> {
+  await flushPendingPromptSettingSaves(chatId)
+  return getWorkspaceRepository().getBranchHeaderSnapshotByLeaf(chatId, leafId)
+}
+
 export async function loadSendContextForBranch(
   input: SendContextInput,
 ): Promise<SendContextSnapshot> {

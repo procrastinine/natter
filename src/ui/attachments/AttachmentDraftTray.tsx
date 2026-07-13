@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { attachmentHref, makeAnchorClickHandler } from '../../app/router'
 import type { Attachment, MessageAttachmentRef } from '../../core/types'
 import { CloseIcon, DatabaseIcon, EyeIcon, EyeOffIcon, TrashIcon, UploadIcon } from '../icons/Icon'
+import { IconButton } from '../primitives/Button'
 import { AttachmentPicker } from './AttachmentPicker'
 import { AttachmentPreview } from './AttachmentPreview'
 import { formatBytes, kindLabel, shortId, storageLabel } from './format'
@@ -50,7 +51,7 @@ export function AttachmentDraftTray({
           </span>
           {upload.state === 'failed' ? (
             <span data-ui="attachment-file-actions">
-              <button
+              <IconButton
                 type="button"
                 data-ui="icon-button"
                 data-size="xs"
@@ -59,7 +60,7 @@ export function AttachmentDraftTray({
                 title="Dismiss failed upload"
               >
                 <CloseIcon size={13} />
-              </button>
+              </IconButton>
             </span>
           ) : null}
         </span>
@@ -94,7 +95,7 @@ export function AttachmentDraftTray({
               </span>
             </a>
             <span data-ui="attachment-file-actions">
-              <button
+              <IconButton
                 type="button"
                 data-ui="icon-button"
                 data-size="xs"
@@ -112,8 +113,8 @@ export function AttachmentDraftTray({
                 disabled={disabled}
               >
                 {ref.includeInContext ? <EyeIcon size={13} /> : <EyeOffIcon size={13} />}
-              </button>
-              <button
+              </IconButton>
+              <IconButton
                 type="button"
                 data-ui="icon-button"
                 data-size="xs"
@@ -123,8 +124,8 @@ export function AttachmentDraftTray({
                 disabled={disabled}
               >
                 <DatabaseIcon size={13} />
-              </button>
-              <button
+              </IconButton>
+              <IconButton
                 type="button"
                 data-ui="icon-button"
                 data-size="xs"
@@ -134,7 +135,7 @@ export function AttachmentDraftTray({
                 disabled={disabled}
               >
                 <TrashIcon size={13} />
-              </button>
+              </IconButton>
             </span>
           </span>
         )

@@ -8,8 +8,8 @@
 // is responsible for wiring that case — the dialog just reflects the
 // `pairDisabled` prop.
 
-import { useCallback, useEffect, useRef, useState } from 'react'
-import { CloseIcon } from '../icons/Icon'
+import { useCallback, useState } from 'react'
+import { ConfirmDialog } from '../primitives/ConfirmDialog'
 
 interface ConfirmDeleteDialogProps {
   previewText: string
@@ -31,22 +31,6 @@ export function ConfirmDeleteDialog({
 }: ConfirmDeleteDialogProps) {
   const [deletePair, setDeletePair] = useState<boolean>(pairDisabled ? false : pairDefault)
   const [busy, setBusy] = useState(false)
-  const confirmBtnRef = useRef<HTMLButtonElement | null>(null)
-
-  useEffect(() => {
-    confirmBtnRef.current?.focus()
-  }, [])
-
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.preventDefault()
-        onCancel()
-      }
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [onCancel])
 
   const commit = useCallback(async () => {
     if (busy) return
@@ -59,72 +43,29 @@ export function ConfirmDeleteDialog({
   }, [busy, deletePair, onConfirm])
 
   return (
-    <div data-ui="confirm-delete-overlay">
-      <button
-        type="button"
-        data-ui="confirm-delete-scrim"
-        aria-label="Cancel delete"
-        tabIndex={-1}
-        onClick={onCancel}
-      />
-      <div
-        data-ui="confirm-delete"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="confirm-delete-title"
-      >
-        <div data-ui="confirm-delete-header">
-          <h2 id="confirm-delete-title">Delete message?</h2>
-          <button
-            type="button"
-            data-ui="icon-button"
-            data-size="sm"
-            data-role="confirm-delete-close"
-            aria-label="Cancel delete"
-            onClick={onCancel}
-          >
-            <CloseIcon size={14} />
-          </button>
-        </div>
-        <blockquote data-ui="confirm-delete-preview">{previewText}</blockquote>
-        <label data-ui="confirm-delete-pair">
-          <input
-            type="checkbox"
-            checked={deletePair}
-            disabled={pairDisabled}
-            onChange={(e) => setDeletePair(e.target.checked)}
-          />
-          <span>Also delete the paired user/assistant message</span>
-          {pairDisabled ? (
-            <span data-ui="confirm-delete-hint">
-              Disabled — this message has an adjacency warning, so pair-delete would remove a
-              healthy neighbor.
-            </span>
-          ) : null}
-        </label>
-        <div data-ui="confirm-delete-actions">
-          <button
-            type="button"
-            data-ui="confirm-delete-button"
-            data-role="cancel"
-            onClick={onCancel}
-            disabled={busy}
-          >
-            Cancel
-          </button>
-          <button
-            ref={confirmBtnRef}
-            type="button"
-            data-ui="confirm-delete-button"
-            data-role="confirm"
-            data-tone="danger"
-            onClick={() => void commit()}
-            disabled={busy}
-          >
-            Delete
-          </button>
-        </div>
-      </div>
-    </div>
+    <ConfirmDialog
+      title="Delete message?"
+      confirmLabel="Delete"
+      busy={busy}
+      onCancel={onCancel}
+      onConfirm={commit}
+    >
+      <blockquote data-ui="confirm-delete-preview">{previewText}</blockquote>
+      <label data-ui="confirm-delete-pair">
+        <input
+          type="checkbox"
+          checked={deletePair}
+          disabled={pairDisabled}
+          onChange={(e) => setDeletePair(e.target.checked)}
+        />
+        <span>Also delete the paired user/assistant message</span>
+        {pairDisabled ? (
+          <span data-ui="confirm-delete-hint">
+            Disabled — this message has an adjacency warning, so pair-delete would remove a healthy
+            neighbor.
+          </span>
+        ) : null}
+      </label>
+    </ConfirmDialog>
   )
 }

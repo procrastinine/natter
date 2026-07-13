@@ -1,5 +1,6 @@
 import { toolEvidenceSectionsForMessage } from '../../core/provider-tool-context'
 import type { Message } from '../../core/types'
+import { Button } from '../primitives/Button'
 
 interface ToolEvidenceBlockProps {
   message: Message
@@ -35,7 +36,7 @@ export function ToolEvidenceBlock({
               {section.hidden ? <span data-ui="tool-evidence-status">hidden</span> : null}
               {section.badge ? <span data-ui="tool-evidence-status">{section.badge}</span> : null}
               {onToggleHidden ? (
-                <button
+                <Button
                   type="button"
                   data-ui="tool-evidence-hide"
                   data-pressed={section.hidden ? 'true' : undefined}
@@ -55,7 +56,7 @@ export function ToolEvidenceBlock({
                   }
                 >
                   {section.hidden ? <EyeOffIcon /> : <EyeIcon />}
-                </button>
+                </Button>
               ) : null}
             </summary>
             <div data-ui="tool-evidence-section-body">

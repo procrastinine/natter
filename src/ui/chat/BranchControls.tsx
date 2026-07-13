@@ -5,20 +5,15 @@
 // the variant-count label swaps it for an input so the user can jump
 // to an arbitrary sibling number.
 
-import {
-  type KeyboardEvent,
-  type MouseEvent,
-  useCallback,
-  useEffect,
-  useRef,
-  useState,
-} from 'react'
+import { type KeyboardEvent, type MouseEvent, useEffect, useRef, useState } from 'react'
 import { chatHref } from '../../app/router'
 import { cursorKeyOf } from '../../core/active-path'
 import { resolveLastUpdatedBranchBelow } from '../../core/branch-resolve'
 import { swipe } from '../../core/messages'
 import type { ChatId, CursorMap, Message } from '../../core/types'
+import { announceVariantPosition } from '../../store/zustand/announcementStore'
 import { useChatStore } from '../../store/zustand/chatStore'
+import { Button } from '../primitives/Button'
 
 export interface BranchNavigationContext {
   messages: readonly Message[]
@@ -54,25 +49,24 @@ export function BranchControls({ chatId, message, context }: BranchControlsProps
   const siblings = (byParent.get(message.parentId) ?? []).filter((m) => !m.deleted)
   const sorted = [...siblings].sort((a, b) => a.siblingIndex - b.siblingIndex)
   const idx = sorted.findIndex((s) => s.id === message.id)
-  const jumpTo = useCallback(
-    (targetId: string) => {
-      const cursor = useChatStore.getState().getCursor(chatId) ?? {}
-      const nextCursor: CursorMap = {
-        ...cursor,
-        [cursorKeyOf(message.parentId)]: targetId,
-      }
-      resolveLastUpdatedBranchBelow(
-        {
-          targetId,
-          byParent,
-          byId,
-        },
-        nextCursor,
-      )
-      useChatStore.getState().setCursor(chatId, nextCursor)
-    },
-    [byId, byParent, chatId, message.parentId],
-  )
+  const jumpTo = (targetId: string) => {
+    const cursor = useChatStore.getState().getCursor(chatId) ?? {}
+    const nextCursor: CursorMap = {
+      ...cursor,
+      [cursorKeyOf(message.parentId)]: targetId,
+    }
+    resolveLastUpdatedBranchBelow(
+      {
+        targetId,
+        byParent,
+        byId,
+      },
+      nextCursor,
+    )
+    useChatStore.getState().setCursor(chatId, nextCursor)
+    const targetIndex = sorted.findIndex((candidate) => candidate.id === targetId)
+    if (targetIndex >= 0) announceVariantPosition(targetIndex, sorted.length)
+  }
 
   if (siblings.length < 2) return null
   if (idx < 0) return null
@@ -108,6 +102,10 @@ export function BranchControls({ chatId, message, context }: BranchControlsProps
       )
     }
     useChatStore.getState().setCursor(chatId, nextCursor)
+    if (chosenId) {
+      const targetIndex = sorted.findIndex((candidate) => candidate.id === chosenId)
+      if (targetIndex >= 0) announceVariantPosition(targetIndex, sorted.length)
+    }
   }
 
   const handleAnchorStep = (direction: -1 | 1) => (e: MouseEvent<HTMLAnchorElement>) => {
@@ -183,15 +181,16 @@ export function BranchControls({ chatId, message, context }: BranchControlsProps
   return (
     <div data-ui="branch-controls">
       {atStart ? (
-        <span
+        <Button
           data-ui="branch-arrow"
           data-role="first"
-          data-state="disabled"
-          aria-disabled="true"
+          appearance="ghost"
+          disabled
+          aria-label="First variant unavailable"
           title="Already at first variant"
         >
           «
-        </span>
+        </Button>
       ) : (
         <a
           data-ui="branch-arrow"
@@ -206,15 +205,16 @@ export function BranchControls({ chatId, message, context }: BranchControlsProps
         </a>
       )}
       {atStart || !prev ? (
-        <span
+        <Button
           data-ui="branch-arrow"
           data-role="prev"
-          data-state="disabled"
-          aria-disabled="true"
+          appearance="ghost"
+          disabled
+          aria-label="Previous variant unavailable"
           title="Already at first variant"
         >
           ‹
-        </span>
+        </Button>
       ) : (
         <a
           data-ui="branch-arrow"
@@ -271,15 +271,16 @@ export function BranchControls({ chatId, message, context }: BranchControlsProps
         </a>
       )}
       {atEnd || !next ? (
-        <span
+        <Button
           data-ui="branch-arrow"
           data-role="next"
-          data-state="disabled"
-          aria-disabled="true"
+          appearance="ghost"
+          disabled
+          aria-label="Next variant unavailable"
           title="Already at last variant"
         >
           ›
-        </span>
+        </Button>
       ) : (
         <a
           data-ui="branch-arrow"
@@ -294,15 +295,16 @@ export function BranchControls({ chatId, message, context }: BranchControlsProps
         </a>
       )}
       {atEnd ? (
-        <span
+        <Button
           data-ui="branch-arrow"
           data-role="last"
-          data-state="disabled"
-          aria-disabled="true"
+          appearance="ghost"
+          disabled
+          aria-label="Last variant unavailable"
           title="Already at last variant"
         >
           »
-        </span>
+        </Button>
       ) : (
         <a
           data-ui="branch-arrow"

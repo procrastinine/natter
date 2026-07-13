@@ -69,6 +69,48 @@ export class StreamTargetBusyError extends Error {
   }
 }
 
+export class StreamChatBusyError extends Error {
+  readonly chatId: ChatId
+  readonly blockingStreamId: string
+
+  constructor(chatId: ChatId, blockingStreamId: string) {
+    super(`StreamChatBusy:${chatId}:${blockingStreamId}`)
+    this.name = 'StreamChatBusyError'
+    this.chatId = chatId
+    this.blockingStreamId = blockingStreamId
+  }
+}
+
+export type ExpectedLeafChangedReason =
+  | 'missing'
+  | 'deleted'
+  | 'wrong-chat'
+  | 'has-live-child'
+  | 'root-not-empty'
+
+export class ExpectedLeafChangedError extends Error {
+  readonly chatId: ChatId
+  readonly expectedLeafId: MessageId | null
+  readonly reason: ExpectedLeafChangedReason
+  readonly blockingChildId?: MessageId
+
+  constructor(
+    chatId: ChatId,
+    expectedLeafId: MessageId | null,
+    reason: ExpectedLeafChangedReason,
+    blockingChildId?: MessageId,
+  ) {
+    super(
+      `ExpectedLeafChanged:${chatId}:${expectedLeafId ?? '__root__'}:${reason}${blockingChildId ? `:${blockingChildId}` : ''}`,
+    )
+    this.name = 'ExpectedLeafChangedError'
+    this.chatId = chatId
+    this.expectedLeafId = expectedLeafId
+    this.reason = reason
+    if (blockingChildId !== undefined) this.blockingChildId = blockingChildId
+  }
+}
+
 export interface WorkspaceMutationOptions {
   streamFence?: {
     streamId: string
@@ -134,6 +176,26 @@ export interface StreamLeaseRow {
   baseNodeVersion?: number
   requestedModel?: string
   apiUsed?: GenerationMeta['apiUsed']
+  exclusiveChat?: true
+}
+
+export interface AppendMessageToExpectedLeafInput {
+  expectedLeafId: MessageId | null
+  message: Omit<Message, 'parentId' | 'siblingIndex' | 'nodeVersion' | 'deleted'>
+}
+
+export interface AppendMessageToExpectedLeafResult {
+  message: Message
+  versions: ChatVersions
+  hadExistingSiblings: boolean
+}
+
+export interface BranchHeaderSnapshot {
+  chat: Chat
+  summaryVersion: number
+  chatId: ChatId
+  allHeaders: MessageHeaderRow[]
+  branchHeaders: MessageHeaderRow[]
 }
 
 export interface StreamChunkRow {
@@ -459,6 +521,9 @@ export interface ActiveBranchWindowSnapshot {
 
 export interface WorkspaceRepository {
   getWorkspaceMeta(): Promise<WorkspaceMeta>
+  appendMessageToExpectedLeaf(
+    input: AppendMessageToExpectedLeafInput,
+  ): Promise<AppendMessageToExpectedLeafResult>
   forkChatFromMessage(input: ForkChatFromMessageInput): Promise<ForkChatFromMessageResult>
   createChat(chat: Chat): Promise<Chat>
   discardEmptyDraftChats(input: {
@@ -537,6 +602,10 @@ export interface WorkspaceRepository {
     cursor: CursorMap,
     window: ActiveBranchBodyWindow,
   ): Promise<ActiveBranchWindowSnapshot>
+  getBranchHeaderSnapshotByLeaf(
+    chatId: ChatId,
+    leafId: MessageId | null,
+  ): Promise<BranchHeaderSnapshot>
   getBranchByLeaf(chatId: ChatId, leafId: MessageId | null): Promise<Message[]>
   getAttachment(attachmentId: AttachmentId): Promise<Attachment | undefined>
   getAttachmentBundle(attachmentId: AttachmentId): Promise<AttachmentBundle | undefined>

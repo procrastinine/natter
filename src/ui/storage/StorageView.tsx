@@ -156,6 +156,7 @@ import {
   triggerJsonDownload,
   triggerJsonZipDownload,
 } from '../import-export/json-file'
+import { Button, IconButton } from '../primitives/Button'
 import { isEmptySidebarDraft, sortChats } from '../sidebar/chat-organization'
 
 interface StorageViewProps {
@@ -250,7 +251,7 @@ export function StorageView({ route, onOpenSidebar }: StorageViewProps) {
   return (
     <main data-ui="storage-view">
       <header data-ui="storage-header">
-        <button
+        <IconButton
           type="button"
           data-ui="icon-button"
           data-role="mobile-sidebar-toggle"
@@ -258,7 +259,7 @@ export function StorageView({ route, onOpenSidebar }: StorageViewProps) {
           onClick={onOpenSidebar}
         >
           <SidebarIcon size={17} />
-        </button>
+        </IconButton>
         <span data-ui="storage-title">
           <DatabaseIcon size={18} />
           Storage
@@ -501,7 +502,7 @@ function StorageOverview() {
                 detail={persistenceDetail}
               />
               {persistence !== 'unsupported' ? (
-                <button
+                <Button
                   type="button"
                   data-ui="storage-action"
                   onClick={() => void handleRequestPersistence()}
@@ -514,7 +515,7 @@ function StorageOverview() {
                     : persistenceRequestResult === 'denied'
                       ? 'Request again'
                       : 'Request persistence'}
-                </button>
+                </Button>
               ) : null}
               {showPersistenceHelp ? (
                 <span data-ui="storage-persistence-help">
@@ -524,7 +525,7 @@ function StorageOverview() {
                 </span>
               ) : null}
               <span data-ui="storage-workspace-actions">
-                <button
+                <Button
                   type="button"
                   data-ui="storage-action"
                   onClick={() => void handleExportWorkspace()}
@@ -533,8 +534,8 @@ function StorageOverview() {
                 >
                   <DownloadIcon size={14} />
                   {workspaceTransferBusy === 'export' ? 'Exporting' : 'Export all'}
-                </button>
-                <button
+                </Button>
+                <Button
                   type="button"
                   data-ui="storage-action"
                   onClick={() => workspaceImportInputRef.current?.click()}
@@ -543,18 +544,18 @@ function StorageOverview() {
                 >
                   <UploadIcon size={14} />
                   {workspaceTransferBusy === 'import' ? 'Importing' : 'Import all'}
-                </button>
-                <button
+                </Button>
+                <Button
                   type="button"
                   data-ui="storage-action"
-                  data-tone="danger"
+                  tone="danger"
                   onClick={() => void handleClearWorkspace()}
                   disabled={workspaceTransferBusy !== null}
                   title="Clear all local Natter data and reload"
                 >
                   <TrashIcon size={14} />
                   {workspaceTransferBusy === 'clear' ? 'Clearing' : 'Clear all'}
-                </button>
+                </Button>
               </span>
               <input
                 ref={workspaceImportInputRef}
@@ -663,7 +664,7 @@ function StorageGlobalCalibrationPanel() {
               <span data-ui="storage-global-calibration-samples">
                 {formatInteger(sample.sampleCount)} samples
               </span>
-              <button
+              <Button
                 type="button"
                 data-ui="storage-action"
                 aria-label={`Clear calibration for ${key}`}
@@ -671,19 +672,19 @@ function StorageGlobalCalibrationPanel() {
                 onClick={() => void handleClearFamily(key)}
               >
                 Clear
-              </button>
+              </Button>
             </div>
           ))}
         </div>
       )}
-      <button
+      <Button
         type="button"
         data-ui="storage-action"
         disabled={busy !== null || rows.length === 0}
         onClick={() => void handleClearAll()}
       >
         Clear all calibration globally
-      </button>
+      </Button>
     </StoragePanel>
   )
 }
@@ -1169,7 +1170,7 @@ function ChatsStorageSurface() {
             </span>
           ) : null}
           {searchTextActive || searchHasFilters ? (
-            <button
+            <IconButton
               type="button"
               data-ui="storage-chat-search-clear"
               aria-label="Clear search"
@@ -1177,7 +1178,7 @@ function ChatsStorageSurface() {
               onClick={handleClearSearch}
             >
               <CloseIcon size={13} />
-            </button>
+            </IconButton>
           ) : null}
         </label>
         <label data-ui="storage-chat-sort">
@@ -1194,10 +1195,11 @@ function ChatsStorageSurface() {
             ))}
           </select>
         </label>
-        <button
+        <IconButton
           type="button"
           data-ui="icon-button"
           data-size="lg"
+          size="lg"
           data-role="chat-import"
           disabled={Boolean(busyChatAction)}
           onClick={() => chatImportInputRef.current?.click()}
@@ -1205,7 +1207,7 @@ function ChatsStorageSurface() {
           title="Import chat JSON or ZIP"
         >
           <UploadIcon size={16} />
-        </button>
+        </IconButton>
         <input
           ref={chatImportInputRef}
           data-ui="storage-chat-import-input"
@@ -1253,7 +1255,7 @@ function ChatsStorageSurface() {
           </span>
           <div data-ui="storage-chat-chip-row">
             {model.folders.map((folder) => (
-              <button
+              <Button
                 key={folder.id}
                 type="button"
                 data-filter-state={filterState(folder.id, includeFolderIds, excludeFolderIds)}
@@ -1261,7 +1263,7 @@ function ChatsStorageSurface() {
                 onClick={() => toggleFolderFilter(folder.id)}
               >
                 {folder.name}
-              </button>
+              </Button>
             ))}
           </div>
         </section>
@@ -1274,7 +1276,7 @@ function ChatsStorageSurface() {
           </span>
           <div data-ui="storage-chat-chip-row">
             {model.tags.map((tag) => (
-              <button
+              <Button
                 key={tag.id}
                 type="button"
                 data-filter-state={filterState(tag.id, includeTagIds, excludeTagIds)}
@@ -1282,7 +1284,7 @@ function ChatsStorageSurface() {
                 onClick={() => toggleTagFilter(tag.id)}
               >
                 {tag.name}
-              </button>
+              </Button>
             ))}
           </div>
         </section>
@@ -1297,7 +1299,7 @@ function ChatsStorageSurface() {
             {selectedArchivedCount > 0 ? ` (${selectedArchivedCount} archived)` : ''}
           </span>
           <span data-ui="storage-chat-selection-actions">
-            <button
+            <Button
               type="button"
               data-ui="storage-chat-bulk-download"
               disabled={Boolean(busyChatAction)}
@@ -1305,8 +1307,8 @@ function ChatsStorageSurface() {
             >
               <DownloadIcon size={14} />
               Download
-            </button>
-            <button
+            </Button>
+            <Button
               type="button"
               data-ui="storage-chat-bulk-export"
               disabled={Boolean(busyChatAction)}
@@ -1319,8 +1321,8 @@ function ChatsStorageSurface() {
             >
               <FileIcon size={14} />
               Export
-            </button>
-            <button
+            </Button>
+            <Button
               type="button"
               data-ui="storage-chat-bulk-move"
               disabled={Boolean(busyChatAction)}
@@ -1328,8 +1330,8 @@ function ChatsStorageSurface() {
             >
               <FolderIcon size={14} />
               Move
-            </button>
-            <button
+            </Button>
+            <Button
               type="button"
               data-ui="storage-chat-bulk-tags"
               disabled={Boolean(busyChatAction)}
@@ -1337,9 +1339,9 @@ function ChatsStorageSurface() {
             >
               <TagIcon size={14} />
               Tags
-            </button>
+            </Button>
             {selectedArchivedCount > 0 ? (
-              <button
+              <Button
                 type="button"
                 data-ui="storage-chat-bulk-unarchive"
                 disabled={Boolean(busyChatAction)}
@@ -1347,10 +1349,10 @@ function ChatsStorageSurface() {
               >
                 <UnarchiveIcon size={14} />
                 Unarchive
-              </button>
+              </Button>
             ) : null}
             {selectedLiveCount > 0 ? (
-              <button
+              <Button
                 type="button"
                 data-ui="storage-chat-bulk-archive"
                 disabled={Boolean(busyChatAction)}
@@ -1366,21 +1368,21 @@ function ChatsStorageSurface() {
               >
                 <ArchiveIcon size={14} />
                 Archive
-              </button>
+              </Button>
             ) : null}
-            <button
+            <Button
               type="button"
               data-ui="storage-chat-bulk-delete"
-              data-tone="danger"
+              tone="danger"
               disabled={Boolean(busyChatAction)}
               onClick={() => void handleDeleteSelection()}
             >
               <TrashIcon size={14} />
               Delete
-            </button>
-            <button type="button" disabled={Boolean(busyChatAction)} onClick={clearSelection}>
+            </Button>
+            <Button type="button" disabled={Boolean(busyChatAction)} onClick={clearSelection}>
               Clear
-            </button>
+            </Button>
           </span>
         </div>
       ) : null}
@@ -1503,7 +1505,7 @@ function ChatsStorageSurface() {
                       <td>{folderLabel(chat.folderId, folderById)}</td>
                       <td data-ui="storage-chat-tags-cell">{tagLabels(chat.tags, tagById)}</td>
                       <td>
-                        <button
+                        <Button
                           type="button"
                           data-ui="storage-chat-calibration-button"
                           aria-expanded={calibrationOpen}
@@ -1515,7 +1517,7 @@ function ChatsStorageSurface() {
                         >
                           {calibrationLabel(calibrationRows)}
                           <ChevronIcon size={12} rotate={calibrationOpen ? 90 : 0} />
-                        </button>
+                        </Button>
                       </td>
                     </tr>
                     {calibrationOpen ? (
@@ -1524,7 +1526,7 @@ function ChatsStorageSurface() {
                           <div data-ui="storage-chat-calibration-detail">
                             <div data-ui="storage-chat-calibration-detail-header">
                               <strong>{title}</strong>
-                              <button
+                              <Button
                                 type="button"
                                 data-ui="storage-action"
                                 disabled={
@@ -1534,7 +1536,7 @@ function ChatsStorageSurface() {
                               >
                                 <TrashIcon size={13} />
                                 Clear all calibration
-                              </button>
+                              </Button>
                             </div>
                             {calibrationRows.length === 0 ? (
                               <span data-ui="helper">No chat calibration.</span>
@@ -1546,14 +1548,14 @@ function ChatsStorageSurface() {
                                     <span>{formatCalibrationRatio(sample)}</span>
                                     <span>{formatInteger(sample.sampleCount)} samples</span>
                                     <span>{formatDate(sample.updatedAt)}</span>
-                                    <button
+                                    <Button
                                       type="button"
                                       data-ui="storage-action"
                                       disabled={busyCalibration === `${chat.id}:${key}`}
                                       onClick={() => void handleClearCalibration(chat.id, key)}
                                     >
                                       Clear
-                                    </button>
+                                    </Button>
                                   </div>
                                 ))}
                               </div>
@@ -1591,7 +1593,7 @@ function StorageSortableHeader({
       scope="col"
       aria-sort={active ? (direction === 'asc' ? 'ascending' : 'descending') : 'none'}
     >
-      <button
+      <Button
         type="button"
         data-ui="storage-chat-sort-header"
         data-active={active ? 'true' : undefined}
@@ -1599,7 +1601,7 @@ function StorageSortableHeader({
       >
         <span>{label}</span>
         <ChevronIcon size={12} rotate={active && direction === 'asc' ? 270 : 90} />
-      </button>
+      </Button>
     </th>
   )
 }
@@ -1779,17 +1781,17 @@ function ArchiveManager() {
     <section data-ui="archive-manager">
       <div data-ui="archive-toolbar">
         <span data-ui="archive-count">{archived.length}</span>
-        <button
+        <IconButton
           type="button"
           data-ui="storage-action"
-          data-tone="danger"
+          tone="danger"
           aria-label="Empty trash"
           title="Empty trash"
           disabled={archived.length === 0 || busy !== null}
           onClick={() => void handleEmpty()}
         >
           <TrashIcon size={14} />
-        </button>
+        </IconButton>
       </div>
       {archived.length === 0 ? (
         <p data-ui="helper">No archived chats.</p>
@@ -1808,7 +1810,7 @@ function ArchiveManager() {
                   <span data-ui="archive-row-meta">{formatDate(chat.updatedAt)}</span>
                 </a>
                 <span data-ui="archive-row-actions">
-                  <button
+                  <IconButton
                     type="button"
                     data-ui="archive-restore-button"
                     aria-label={`Restore ${title}`}
@@ -1817,8 +1819,8 @@ function ArchiveManager() {
                     onClick={() => void handleRestore(chat)}
                   >
                     <UnarchiveIcon size={14} />
-                  </button>
-                  <button
+                  </IconButton>
+                  <Button
                     type="button"
                     aria-label={`Permanently delete ${title}`}
                     title="Delete permanently"
@@ -1826,7 +1828,7 @@ function ArchiveManager() {
                     onClick={() => void handleDelete(chat)}
                   >
                     <TrashIcon size={14} />
-                  </button>
+                  </Button>
                 </span>
               </li>
             )
@@ -1929,7 +1931,7 @@ function AttachmentManager({
         <div data-ui="attachment-filter-row">
           <fieldset data-ui="attachment-filter-strip" aria-label="Attachment filters">
             {FILTERS.map((value) => (
-              <button
+              <Button
                 key={value}
                 type="button"
                 data-ui="attachment-filter"
@@ -1937,13 +1939,13 @@ function AttachmentManager({
                 onClick={() => setFilter(value)}
               >
                 {filterLabel(value)}
-              </button>
+              </Button>
             ))}
           </fieldset>
-          <button
+          <Button
             type="button"
             data-ui="storage-action"
-            data-tone="danger"
+            tone="danger"
             disabled={bulkDeleting || rows.length === 0}
             onClick={() => {
               void (async () => {
@@ -1964,7 +1966,7 @@ function AttachmentManager({
           >
             <TrashIcon size={14} />
             {bulkDeleting ? 'Deleting…' : `Delete all${rows.length > 0 ? ` (${rows.length})` : ''}`}
-          </button>
+          </Button>
         </div>
       </div>
       {unknownSelected ? (
@@ -2116,16 +2118,17 @@ function AttachmentTable({
                 <td>{attachment.refCount}</td>
                 <td>{formatDate(attachment.createdAt)}</td>
                 <td data-ui="attachment-table-actions">
-                  <button
+                  <IconButton
                     type="button"
                     data-ui="icon-button"
                     data-size="xs"
+                    size="xs"
                     aria-label={`Delete ${attachment.filename}`}
                     title="Delete"
                     onClick={() => void onDelete(attachment)}
                   >
                     <TrashIcon size={13} />
-                  </button>
+                  </IconButton>
                 </td>
               </tr>
             )
@@ -2207,7 +2210,7 @@ function AttachmentDetails({
       </dl>
       <div data-ui="attachment-lifecycle-actions">
         {canDownload ? (
-          <button
+          <Button
             type="button"
             data-ui="storage-action"
             disabled={downloadBusy}
@@ -2216,27 +2219,27 @@ function AttachmentDetails({
           >
             <DownloadIcon size={14} />
             {downloadBusy ? 'Downloading...' : 'Download'}
-          </button>
+          </Button>
         ) : null}
-        <button type="button" data-ui="storage-action" onClick={onReplaceUpload}>
+        <Button type="button" data-ui="storage-action" onClick={onReplaceUpload}>
           <UploadIcon size={14} />
           Replace
-        </button>
+        </Button>
         {attachment.storage.kind === 'missing' ? (
-          <button type="button" data-ui="storage-action" onClick={onRestoreUpload}>
+          <Button type="button" data-ui="storage-action" onClick={onRestoreUpload}>
             <UploadIcon size={14} />
             Restore
-          </button>
+          </Button>
         ) : null}
-        <button
+        <Button
           type="button"
           data-ui="storage-action"
-          data-tone="danger"
+          tone="danger"
           onClick={() => void onDelete(attachment)}
         >
           <TrashIcon size={14} />
           Delete
-        </button>
+        </Button>
       </div>
       <section data-ui="attachment-reference-section">
         <h3>References</h3>
@@ -2255,10 +2258,11 @@ function AttachmentDetails({
                   </span>
                 </div>
                 <div data-ui="attachment-reference-actions">
-                  <button
+                  <IconButton
                     type="button"
                     data-ui="icon-button"
                     data-size="xs"
+                    size="xs"
                     aria-pressed={row.ref.includeInContext}
                     aria-label={
                       row.ref.includeInContext ? 'Hide from context' : 'Include in context'
@@ -2276,27 +2280,29 @@ function AttachmentDetails({
                     }
                   >
                     {row.ref.includeInContext ? <EyeIcon size={13} /> : <EyeOffIcon size={13} />}
-                  </button>
-                  <button
+                  </IconButton>
+                  <IconButton
                     type="button"
                     data-ui="icon-button"
                     data-size="xs"
+                    size="xs"
                     aria-label="Relink reference"
                     title="Relink this exact reference to another stored attachment"
                     onClick={() => onReplaceRef(row)}
                   >
                     <DatabaseIcon size={13} />
-                  </button>
-                  <button
+                  </IconButton>
+                  <IconButton
                     type="button"
                     data-ui="icon-button"
                     data-size="xs"
+                    size="xs"
                     aria-label="Detach reference"
                     title="Detach this exact reference"
                     onClick={() => void detachAttachmentRef(referenceTarget(row))}
                   >
                     <CloseIcon size={13} />
-                  </button>
+                  </IconButton>
                 </div>
               </li>
             ))}

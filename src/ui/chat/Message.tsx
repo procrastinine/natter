@@ -32,6 +32,7 @@ import { getStreamClientId } from '../../store/stream-leases'
 import { useToastStore } from '../../store/zustand/toastStore'
 import { useUiStore } from '../../store/zustand/uiStore'
 import { AttachmentRefChips } from '../attachments/AttachmentRefChips'
+import { Button } from '../primitives/Button'
 import { BranchControls, type BranchNavigationContext } from './BranchControls'
 import { InlineEditor, plaintextOf } from './InlineEditor'
 import { type InsertSlot, MessageActions, MessageEditTreeActions } from './MessageActions'
@@ -436,8 +437,9 @@ function MessageInner({
       data-has-error={error ? 'true' : 'false'}
       data-has-reasoning={hasDisplayReasoning ? 'true' : 'false'}
       data-collapse-mode={collapseMode}
+      aria-busy={isStreaming || undefined}
     >
-      <button
+      <Button
         type="button"
         data-ui="profile-glyph-button"
         data-collapse-mode={collapseMode}
@@ -457,7 +459,7 @@ function MessageInner({
           decorative
           {...(excludedFromContext ? { excluded: true } : {})}
         />
-      </button>
+      </Button>
       <div data-ui="message-body-column">
         <MessageHeader message={message} />
         {collapseMode === 'full' && hasDisplayReasoning && !editing ? (
@@ -489,14 +491,14 @@ function MessageInner({
               returned in this API mode.
             </span>
             {canSwitchToResponses ? (
-              <button
+              <Button
                 type="button"
                 data-ui="message-hidden-reasoning-action"
                 onClick={() => void handleSwitchToResponses()}
                 title="Switch this chat to the Responses API and regenerate"
               >
                 Switch to Responses API
-              </button>
+              </Button>
             ) : null}
           </div>
         ) : null}
@@ -546,7 +548,7 @@ function MessageInner({
         {error ? (
           <div data-ui="message-error" data-role="error">
             <strong>Error{error.statusCode ? ` ${error.statusCode}` : ''}:</strong> {error.message}
-            <button
+            <Button
               type="button"
               data-ui="message-error-dismiss"
               onClick={() => void dismissAbortReason(message.id)}
@@ -554,7 +556,7 @@ function MessageInner({
               title="Dismiss"
             >
               ×
-            </button>
+            </Button>
           </div>
         ) : null}
         {abortReason && !error ? (
@@ -565,7 +567,7 @@ function MessageInner({
                 : `Stream interrupted (${abortReason}).`}
             </span>
             {onContinue ? (
-              <button
+              <Button
                 type="button"
                 data-ui="message-continue"
                 onClick={handleContinue}
@@ -573,9 +575,9 @@ function MessageInner({
                 title={!hasConnection ? 'Add a connection to continue.' : 'Continue this response'}
               >
                 Continue
-              </button>
+              </Button>
             ) : null}
-            <button
+            <Button
               type="button"
               data-ui="message-error-dismiss"
               onClick={() => void dismissAbortReason(message.id)}
@@ -583,7 +585,7 @@ function MessageInner({
               title="Dismiss"
             >
               ×
-            </button>
+            </Button>
           </div>
         ) : null}
         {remoteStreaming ? (

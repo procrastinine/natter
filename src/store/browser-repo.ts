@@ -69,10 +69,13 @@ import type {
   ActiveBranchBodyWindow,
   ActiveBranchSnapshot,
   ActiveBranchWindowSnapshot,
+  AppendMessageToExpectedLeafInput,
+  AppendMessageToExpectedLeafResult,
   AttachmentBundle,
   AttachmentSearchMeasurement,
   AttachmentSearchPage,
   AttachmentSearchQuery,
+  BranchHeaderSnapshot,
   ChatBranchCacheWriteGuard,
   ChatMutationSummary,
   CreateFolderInput,
@@ -109,6 +112,8 @@ import type {
 import {
   ChatMissingError,
   chatMatchesBranchCacheWriteGuard,
+  ExpectedLeafChangedError,
+  StreamChatBusyError,
   StreamTargetBusyError,
 } from './repository'
 import {
@@ -220,6 +225,23 @@ async function assertStreamLeaseTargetAvailable(
   }
 }
 
+async function assertStreamLeaseChatAdmissionAvailable(
+  tx: Transaction,
+  incoming: StreamLeaseRow,
+): Promise<void> {
+  const competing = await tx
+    .table<StreamLeaseRow, string>('streamLeases')
+    .where('chatId')
+    .equals(incoming.chatId)
+    .toArray()
+  for (const lease of competing) {
+    if (lease.streamId === incoming.streamId) continue
+    if (incoming.exclusiveChat !== true && lease.exclusiveChat !== true) continue
+    if (await streamLeaseTargetFinalized(tx, lease)) continue
+    throw new StreamChatBusyError(incoming.chatId, lease.streamId)
+  }
+}
+
 async function streamLeaseTargetFinalized(
   tx: Transaction,
   lease: StreamLeaseRow,
@@ -255,6 +277,7 @@ function isStreamLeaseRow(value: unknown): value is StreamLeaseRow {
         Number.isSafeInteger(row.baseNodeVersion) &&
         row.baseNodeVersion >= 0)) &&
     (row.requestedModel === undefined || typeof row.requestedModel === 'string') &&
+    (row.exclusiveChat === undefined || row.exclusiveChat === true) &&
     (row.apiUsed === undefined ||
       row.apiUsed === 'chat' ||
       row.apiUsed === 'responses' ||
@@ -392,6 +415,12 @@ async function listChildHeaderRows(
     .where('[chatId+parentId]')
     .equals([chatId, parentId] as never)
     .toArray()
+}
+
+function nextSiblingIndex(headers: readonly Pick<MessageHeaderRow, 'siblingIndex'>[]): number {
+  let highest = -1
+  for (const header of headers) highest = Math.max(highest, header.siblingIndex)
+  return highest + 1
 }
 
 function applyMessageBodyPatch(body: MessageBodyRow, patch: MessageBodyPatch): MessageBodyRow {
@@ -1526,6 +1555,65 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     return getWorkspaceMetaRow()
   }
 
+  async appendMessageToExpectedLeaf(
+    input: AppendMessageToExpectedLeafInput,
+  ): Promise<AppendMessageToExpectedLeafResult> {
+    const { expectedLeafId, message } = input
+    const attachmentIds = [
+      ...new Set((message.attachmentRefs ?? []).map((ref) => ref.attachmentId)),
+    ]
+    const result = await this.runMutation(
+      [
+        { kind: 'message', messageId: message.id },
+        ...(expectedLeafId ? [{ kind: 'message' as const, messageId: expectedLeafId }] : []),
+        { kind: 'children', chatId: message.chatId, parentId: expectedLeafId },
+        ...attachmentIds.map((attachmentId) => ({
+          kind: 'attachment' as const,
+          attachmentId,
+        })),
+      ],
+      async (ctx) => {
+        if (await ctx.getMessageHeader(message.id)) {
+          throw new Error(`AppendMessageIdAlreadyExists:${message.id}`)
+        }
+        if (expectedLeafId !== null) {
+          const expected = await ctx.getMessageHeader(expectedLeafId)
+          if (!expected) {
+            throw new ExpectedLeafChangedError(message.chatId, expectedLeafId, 'missing')
+          }
+          if (expected.chatId !== message.chatId) {
+            throw new ExpectedLeafChangedError(message.chatId, expectedLeafId, 'wrong-chat')
+          }
+          if (expected.deleted) {
+            throw new ExpectedLeafChangedError(message.chatId, expectedLeafId, 'deleted')
+          }
+        }
+        const siblings = await ctx.listChildHeaders(message.chatId, expectedLeafId)
+        const blockingChild = siblings.find((header) => !header.deleted)
+        if (blockingChild) {
+          throw new ExpectedLeafChangedError(
+            message.chatId,
+            expectedLeafId,
+            expectedLeafId === null ? 'root-not-empty' : 'has-live-child',
+            blockingChild.id,
+          )
+        }
+        const appended: Message = {
+          ...structuredClone(message),
+          parentId: expectedLeafId,
+          siblingIndex: nextSiblingIndex(siblings),
+          nodeVersion: 0,
+          deleted: false,
+        }
+        await ctx.putMessage(appended)
+        return { message: appended, hadExistingSiblings: siblings.length > 0 }
+      },
+    )
+    const versions = result.chatVersions[message.chatId]
+    if (!versions) throw new Error(`AppendMessageVersionsMissing:${message.chatId}`)
+    return { ...result.value, versions }
+  }
+
   async forkChatFromMessage(input: ForkChatFromMessageInput): Promise<ForkChatFromMessageResult> {
     const db = await openDb()
     const destinationChatId = newId()
@@ -1817,33 +1905,40 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
 
   async upsertStreamLease(lease: StreamLeaseRow): Promise<StreamLeaseRow> {
     const db = await openDb()
-    const row = await withNamedLock(`stream-journal:${lease.streamId}`, (grant) =>
-      grant.runTransaction(
-        db,
-        lease.messageId
-          ? [db.streamLeases, db.settings, db.messages, db.messageBodies]
-          : [db.streamLeases, db.settings],
-        async (tx) => {
-          const table = tx.table<StreamLeaseRow, string>('streamLeases')
-          const existing = await table.get(lease.streamId)
-          const meta = await readBrowserWorkspaceMetaFromTransaction(tx)
-          const fenceToken = lease.fenceToken ?? newId()
-          if (
-            existing &&
-            (existing.ownerClientId !== lease.ownerClientId || existing.fenceToken !== fenceToken)
-          ) {
-            throw new Error(`StreamLeaseAlreadyOwned:${lease.streamId}`)
-          }
-          const admitted: StreamLeaseRow = {
-            ...lease,
-            fenceToken,
-            replacementEpoch: meta.replacementEpoch,
-          }
-          await assertStreamLeaseTargetAvailable(tx, admitted)
-          await table.put(admitted)
-          return admitted
-        },
-      ),
+    const row = await withNamedLocks(
+      [`stream-chat:${lease.chatId}`, `stream-journal:${lease.streamId}`],
+      (grant) =>
+        grant.runTransaction(
+          db,
+          [db.streamLeases, db.settings, db.messages, db.messageBodies],
+          async (tx) => {
+            const table = tx.table<StreamLeaseRow, string>('streamLeases')
+            const existing = await table.get(lease.streamId)
+            const meta = await readBrowserWorkspaceMetaFromTransaction(tx)
+            const fenceToken = lease.fenceToken ?? newId()
+            if (existing && existing.chatId !== lease.chatId) {
+              throw new Error(`StreamLeaseChatMismatch:${lease.streamId}`)
+            }
+            if (
+              existing &&
+              (existing.ownerClientId !== lease.ownerClientId || existing.fenceToken !== fenceToken)
+            ) {
+              throw new Error(`StreamLeaseAlreadyOwned:${lease.streamId}`)
+            }
+            const admitted: StreamLeaseRow = {
+              ...lease,
+              fenceToken,
+              replacementEpoch: meta.replacementEpoch,
+              ...(existing?.exclusiveChat === true || lease.exclusiveChat === true
+                ? { exclusiveChat: true as const }
+                : {}),
+            }
+            await assertStreamLeaseChatAdmissionAvailable(tx, admitted)
+            await assertStreamLeaseTargetAvailable(tx, admitted)
+            await table.put(admitted)
+            return admitted
+          },
+        ),
     )
     postEvent({ kind: 'stream-heartbeat', lease: row })
     return row
@@ -1867,11 +1962,15 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
           const table = tx.table<StreamLeaseRow, string>('streamLeases')
           const existing = await table.get(lease.streamId)
           assertOwnedStreamFence(existing, fence, meta.replacementEpoch, lease.streamId)
+          if (existing.chatId !== lease.chatId) {
+            throw new Error(`StreamLeaseChatMismatch:${lease.streamId}`)
+          }
           const renewed: StreamLeaseRow = {
             ...lease,
             startedAt: existing.startedAt,
             fenceToken: fence.fenceToken,
             replacementEpoch: fence.replacementEpoch,
+            ...(existing.exclusiveChat === true ? { exclusiveChat: true as const } : {}),
           }
           if (renewed.messageId !== existing.messageId) {
             if (!checkTarget) throw new Error(`StreamLeaseTargetChanged:${lease.streamId}`)
@@ -2652,6 +2751,27 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
         branchLength: branchHeaders.length,
         siblingGroups,
         treeKey: messageHeaderTreeKey(headers),
+      }
+    })
+  }
+
+  async getBranchHeaderSnapshotByLeaf(
+    chatId: ChatId,
+    leafId: MessageId | null,
+  ): Promise<BranchHeaderSnapshot> {
+    const db = await openDb()
+    return db.transaction('r', db.chats, db.messages, async () => {
+      const [chat, headers] = await Promise.all([
+        db.chats.get(chatId),
+        db.messages.where('chatId').equals(chatId).toArray(),
+      ])
+      if (!chat) throw new ChatMissingError(chatId)
+      return {
+        chat,
+        summaryVersion: chat.summaryVersion,
+        chatId,
+        allHeaders: headers.map(cloneMessageHeader),
+        branchHeaders: branchHeadersByLeaf(headers, leafId).map(cloneMessageHeader),
       }
     })
   }

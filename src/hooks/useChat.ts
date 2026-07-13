@@ -100,11 +100,17 @@ import {
 import { ENDPOINTS_TTL_MS, getCachedEndpoints, isFresh } from '../store/models-cache'
 import { getCachedPrivacyPolicy } from '../store/privacy-cache'
 import { flushPendingPromptSettingSaves } from '../store/prompt-presets'
-import type { MessageHeaderPatch, StreamLeaseRow, StreamWriteFence } from '../store/repository'
+import {
+  ExpectedLeafChangedError,
+  type MessageHeaderPatch,
+  type StreamLeaseRow,
+  type StreamWriteFence,
+} from '../store/repository'
 import {
   assertSendContextFresh,
   assertSendContextVersion,
   loadActiveBranchHeaderSnapshot,
+  loadBranchHeaderSnapshotByLeaf,
   loadChatHeaderSnapshot,
   loadSendContextForBranch,
 } from '../store/send-context'
@@ -120,6 +126,7 @@ import {
   withStreamRecoveryLocks,
 } from '../store/stream-leases'
 import { getWorkspaceRepository } from '../store/workspace-repository'
+import { announceGenerationOutcome } from '../store/zustand/announcementStore'
 import { useChatStore } from '../store/zustand/chatStore'
 import { clearLiveSnapshotIfPresent, useStreamStore } from '../store/zustand/streamStore'
 import { useUiStore } from '../store/zustand/uiStore'
@@ -210,6 +217,7 @@ type ChatAccumulator = StreamAccumulator
 
 interface SendTextInput {
   chatId: ChatId
+  expectedLeafId?: MessageId | null
   connection: ConnectionProfile
   apiKey: string
   apiKeyCandidates?: readonly ConnectionRuntimeKeyCandidate[]
@@ -285,10 +293,17 @@ export interface SendTextResult {
 // id, invalid invariants) throw.
 export async function sendText(input: SendTextInput): Promise<SendTextResult> {
   const now = input.now ?? Date.now
+  const cursorAtSubmit = useChatStore.getState().getCursor(input.chatId) ?? {}
+  const expectedLeafId =
+    input.expectedLeafId !== undefined
+      ? input.expectedLeafId
+      : ((await loadActiveBranchHeaderSnapshot(input.chatId, cursorAtSubmit)).branchHeaders.at(-1)
+          ?.id ?? null)
   const lifecycle = await startRequestLifecycle({
     chatId: input.chatId,
     streamId: newId(),
     attemptKind: 'generation',
+    exclusiveChat: true,
     ...(input.signal ? { userSignal: input.signal } : {}),
   })
   try {
@@ -296,7 +311,6 @@ export async function sendText(input: SendTextInput): Promise<SendTextResult> {
     let chat: Chat | null | undefined = await getChat(input.chatId)
     if (!chat) throw new Error(`sendText: chat not found: ${input.chatId}`)
 
-    const cursor = useChatStore.getState().getCursor(input.chatId) ?? {}
     const createdAt = now()
     const userMessageId = newId()
     const userTurnId = newId()
@@ -304,7 +318,7 @@ export async function sendText(input: SendTextInput): Promise<SendTextResult> {
     await throwIfCachedPrivacyPreflightZeroEligible({ chat, connection: input.connection })
     const userMsg = await sendUserMessage({
       chatId: input.chatId,
-      cursor,
+      expectedLeafId,
       content: input.content,
       ...(input.attachmentRefs ? { attachmentRefs: input.attachmentRefs } : {}),
       now: createdAt,
@@ -313,18 +327,17 @@ export async function sendText(input: SendTextInput): Promise<SendTextResult> {
       ...(skipTurnCalibration ? { skipCalibration: true } : {}),
     })
     chat = null
-    const cursorAfterUser = {
-      ...cursor,
-      ...userMsg.effects.cursorUpdates,
-    }
-    if (Object.keys(cursorAfterUser).length > 0) {
-      useChatStore.getState().setCursor(input.chatId, cursorAfterUser)
+    for (const [parentKey, childId] of Object.entries(userMsg.effects.cursorUpdates)) {
+      useChatStore.getState().patchCursor(input.chatId, parentKey, childId)
     }
 
-    let branchSnapshot: Awaited<ReturnType<typeof loadActiveBranchHeaderSnapshot>> | undefined =
-      await loadActiveBranchHeaderSnapshot(input.chatId, cursorAfterUser)
+    let branchSnapshot: Awaited<ReturnType<typeof loadBranchHeaderSnapshotByLeaf>> | undefined =
+      await loadBranchHeaderSnapshotByLeaf(input.chatId, userMsg.messageId)
     let planningChat: Chat | undefined = branchSnapshot.chat
     const branchHeaders = branchSnapshot.branchHeaders
+    if (branchHeaders.at(-1)?.id !== userMsg.messageId) {
+      throw new ExpectedLeafChangedError(input.chatId, userMsg.messageId, 'missing')
+    }
     const expectedSummaryVersion = branchSnapshot.summaryVersion
     const targetPathSelections = branchHeaders.map(
       (header) => [cursorKeyOf(header.parentId), header.id] as const,
@@ -380,6 +393,7 @@ export async function sendText(input: SendTextInput): Promise<SendTextResult> {
       streamId: lifecycle.streamId,
       parentMessageId: userMsg.messageId,
       userMessageId: userMsg.messageId,
+      requireEmptyParent: true,
       expectedSummaryVersion,
       targetPathSelections,
       ...(hasPrefill ? { initialAssistantContent: input.prefillContent ?? [] } : {}),
@@ -513,6 +527,7 @@ async function openAssistantStreamUnder(
     signal: AbortSignal
     lifecycleAbort: () => void
     lifecyclePreserveLease: () => void
+    requireEmptyParent?: boolean
   },
 ): Promise<SendTextResult> {
   const now = input.now ?? Date.now
@@ -550,6 +565,17 @@ async function openAssistantStreamUnder(
         throw new Error(`sendText: parent ${input.parentMessageId} unavailable`)
       }
       const siblings = await ctx.listChildHeaders(input.chatId, input.parentMessageId)
+      const blockingChild = input.requireEmptyParent
+        ? siblings.find((header) => !header.deleted)
+        : undefined
+      if (blockingChild) {
+        throw new ExpectedLeafChangedError(
+          input.chatId,
+          input.parentMessageId,
+          'has-live-child',
+          blockingChild.id,
+        )
+      }
       await ctx.putMessage({
         id: assistantId,
         chatId: input.chatId,
@@ -746,6 +772,7 @@ async function openAssistantStreamUnder(
     cleanupJournal: () => repo.deleteStreamChunks(streamId, streamFence),
     cleanup: (result) => {
       if (result.journalCleanupPending) input.lifecyclePreserveLease()
+      announceGenerationOutcome(streamId, result.outcome)
       useStreamStore.getState().clearActive(streamId)
       clearLiveSnapshotIfPresent(assistantId, streamId)
       postEvent({

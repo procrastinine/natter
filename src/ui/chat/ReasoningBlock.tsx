@@ -22,6 +22,7 @@ import { memo, useEffect, useMemo, useRef, useState } from 'react'
 import { normalizeReasoningDetails } from '../../core/reasoning'
 import type { StreamAccumulatorLiveReasoningRow } from '../../core/stream-accumulator'
 import type { ReasoningDetail } from '../../core/types'
+import { Button } from '../primitives/Button'
 
 interface ReasoningBlockProps {
   details: ReasoningDetail[]
@@ -263,7 +264,7 @@ function ReasoningRow({
         {children}
       </p>
       {onToggleHidden ? (
-        <button
+        <Button
           type="button"
           data-ui="reasoning-row-hide"
           data-pressed={hidden ? 'true' : undefined}
@@ -279,7 +280,7 @@ function ReasoningRow({
           }
         >
           {hidden ? <EyeOffIcon /> : <EyeIcon />}
-        </button>
+        </Button>
       ) : null}
     </div>
   )

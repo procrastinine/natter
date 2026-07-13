@@ -7,13 +7,14 @@
 
 import { useUiStore } from '../../store/zustand/uiStore'
 import { EyeIcon, EyeOffIcon } from '../icons/Icon'
+import { Button } from '../primitives/Button'
 
 export function FocusModeToggle({ disabled = false }: { disabled?: boolean }) {
   const focusMode = useUiStore((s) => s.focusMode)
   const setFocusMode = useUiStore((s) => s.setFocusMode)
   const active = !disabled && focusMode
   return (
-    <button
+    <Button
       type="button"
       data-ui="focus-mode-toggle"
       data-state={disabled ? 'disabled' : active ? 'active' : 'idle'}
@@ -38,6 +39,6 @@ export function FocusModeToggle({ disabled = false }: { disabled?: boolean }) {
       }}
     >
       {active ? <EyeOffIcon size={18} /> : <EyeIcon size={18} />}
-    </button>
+    </Button>
   )
 }

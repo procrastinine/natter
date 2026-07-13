@@ -137,7 +137,7 @@ describe('sendUserMessage', () => {
     const chat = await seedChat()
     const res = await sendUserMessage({
       chatId: chat.id,
-      cursor: {},
+      expectedLeafId: null,
       content: [{ type: 'text', text: 'hi' }],
       now: 200,
     })
@@ -156,10 +156,10 @@ describe('sendUserMessage', () => {
   it('appends under the active-path leaf and bumps siblingIndex above existing siblings', async () => {
     const chat = await seedChat()
     const root = await putMessage(chat.id, { id: 'R', text: 'root', createdAt: 1 })
-    await putMessage(chat.id, { parentId: 'R', siblingIndex: 0, createdAt: 2 })
+    const leaf = await putMessage(chat.id, { parentId: 'R', siblingIndex: 0, createdAt: 2 })
     const res = await sendUserMessage({
       chatId: chat.id,
-      cursor: {},
+      expectedLeafId: leaf.id,
       content: [{ type: 'text', text: 'new' }],
       now: 300,
     })

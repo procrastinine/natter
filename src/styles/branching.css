@@ -898,8 +898,8 @@
   font-size: 15px;
 }
 
-/* Disabled arrows at the extreme ends — rendered as <span> (no href)
- * so middle-click / Cmd-click don't open a new tab to a no-op URL. */
+/* Disabled arrows at the extreme ends have no href, so middle-click /
+ * Cmd-click cannot open a no-op URL. */
 [data-ui="branch-arrow"][data-state="disabled"] {
   color: var(--color-fg-disabled, var(--color-border-default));
   cursor: default;
@@ -1113,11 +1113,6 @@
   padding-inline: 0;
 }
 
-[data-ui="inline-editor-button"][data-role="save"] {
-  background: var(--color-bg-surface-2);
-  color: var(--color-fg-primary);
-}
-
 [data-ui="inline-editor-button"][data-role="prefill"] {
   color: var(--color-fg-muted);
   display: inline-flex;
@@ -1158,20 +1153,6 @@
 
 [data-ui="inline-editor-prefill"]::placeholder {
   color: var(--color-fg-muted);
-}
-
-[data-ui="inline-editor-button"][data-role="save"]:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--color-accent) 14%, var(--color-bg-surface-2));
-  color: var(--color-fg-primary);
-}
-
-[data-ui="inline-editor-button"][data-role="save-send"] {
-  background: var(--color-accent);
-  color: var(--color-accent-contrast);
-}
-
-[data-ui="inline-editor-button"][data-role="save-send"]:hover:not(:disabled) {
-  background: var(--color-accent-hover);
 }
 
 [data-ui="inline-editor-button"]:disabled {
@@ -1323,32 +1304,10 @@
 
 /* Import modal — plaintext-only in 8.1. */
 [data-ui="import-modal-overlay"] {
-  position: fixed;
-  inset: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: var(--z-overlay);
   padding: var(--space-5);
 }
 
-[data-ui="import-modal-scrim"],
-[data-ui="confirm-delete-scrim"] {
-  position: absolute;
-  inset: 0;
-  border: 0;
-  padding: 0;
-  background: var(--color-backdrop-scrim);
-  cursor: default;
-}
-
 [data-ui="import-modal"] {
-  position: relative;
-  z-index: 1;
-  background: var(--color-bg-surface-1);
-  border: 1px solid var(--color-border-default);
-  border-radius: var(--radius-md);
-  box-shadow: var(--shadow-overlay);
   width: min(640px, calc(100vw - var(--space-8)));
   max-height: 85vh;
   overflow: auto;
@@ -1447,16 +1406,6 @@
   flex: 1 1 auto;
 }
 
-[data-ui="import-modal-submit"] {
-  background: var(--color-accent);
-  color: var(--color-accent-contrast);
-  border-color: var(--color-accent);
-}
-
-[data-ui="import-modal-submit"]:hover:not(:disabled) {
-  background: var(--color-accent-hover);
-}
-
 [data-ui="import-modal-error"] {
   margin: 0;
   color: var(--color-danger);
@@ -1478,53 +1427,8 @@
  * background) so they look like buttons, not quiet text; hover deepens
  * the tint and the border so the click affordance is obvious. */
 [data-ui="edit-tree-action"] {
-  font: inherit;
-  font-size: var(--font-size-xs);
   font-weight: var(--font-weight-medium);
-  padding: var(--space-1) var(--space-3);
-  border: 1px solid var(--color-border-default);
-  border-radius: var(--radius-sm);
-  background: var(--color-bg-surface-2);
-  color: var(--color-fg-primary);
-  cursor: pointer;
   white-space: nowrap;
-  transition:
-    background var(--duration-fast) var(--ease-standard),
-    border-color var(--duration-fast) var(--ease-standard),
-    color var(--duration-fast) var(--ease-standard);
-}
-
-[data-ui="edit-tree-action"]:hover:not(:disabled) {
-  background: var(--color-bg-hover);
-  border-color: var(--color-border-default);
-}
-
-[data-ui="edit-tree-action"]:active:not(:disabled) {
-  background: var(--color-bg-active);
-}
-
-[data-ui="edit-tree-action"][data-tone="success"] {
-  color: var(--color-success);
-  background: var(--color-banner-success-bg);
-  border-color: color-mix(in srgb, var(--color-success) 35%, var(--color-border-subtle));
-}
-
-[data-ui="edit-tree-action"][data-tone="success"]:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--color-success) 22%, var(--color-bg-surface-1));
-  border-color: var(--color-success);
-  color: color-mix(in srgb, var(--color-success) 80%, #000);
-}
-
-[data-ui="edit-tree-action"][data-tone="danger"] {
-  color: var(--color-danger);
-  background: var(--color-banner-danger-bg);
-  border-color: color-mix(in srgb, var(--color-danger) 35%, var(--color-border-subtle));
-}
-
-[data-ui="edit-tree-action"][data-tone="danger"]:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--color-danger) 22%, var(--color-bg-surface-1));
-  border-color: var(--color-danger);
-  color: color-mix(in srgb, var(--color-danger) 80%, #000);
 }
 
 /* Tree-edit structural row — sits BELOW the message-action-row so the
@@ -1558,25 +1462,14 @@
  * a pair checkbox, and Cancel / Delete buttons. The Delete button is
  * danger-tinted. */
 [data-ui="confirm-delete-overlay"] {
-  position: fixed;
-  inset: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: var(--z-overlay);
   padding: var(--space-5);
 }
 
 [data-ui="confirm-delete"] {
-  position: relative;
-  z-index: 1;
-  background: var(--color-bg-surface-1);
   /* No outer border — the shadow is enough to lift the dialog off the
    * scrim, and the 1-px stroke was distracting from the red Delete
    * button in the action bar. */
   border: none;
-  border-radius: var(--radius-md);
-  box-shadow: var(--shadow-overlay);
   width: min(460px, calc(100vw - var(--space-8)));
   display: flex;
   flex-direction: column;
@@ -1673,15 +1566,6 @@
   color: var(--color-fg-muted);
 }
 
-[data-ui="confirm-delete-button"][data-tone="danger"] {
-  background: var(--color-danger);
-  color: var(--color-fg-inverse);
-}
-
-[data-ui="confirm-delete-button"][data-tone="danger"]:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--color-danger) 85%, #000);
-}
-
 /* Chat-title-bar Edit-tree toggle — when active, fill the button with
  * the accent color so the user can tell the mode is on at a glance. */
 [data-ui="icon-button"][data-role="chat-edit-tree"][data-state="active"] {
@@ -1697,48 +1581,28 @@
 [data-ui="composer-import-at-end"],
 [data-ui="composer-attach"],
 [data-ui="composer-attach-existing"] {
-  background: var(--color-bg-surface-2);
   border: none;
   border-left: 1px solid var(--color-border-subtle);
-  color: var(--color-fg-muted);
   padding: 0 var(--space-4);
   font-size: var(--font-size-sm);
-  cursor: pointer;
   align-self: stretch;
-  border-radius: 0;
   display: inline-flex;
   align-items: center;
   gap: var(--space-2);
-}
-
-[data-ui="composer-import-at-end"]:hover:not(:disabled),
-[data-ui="composer-attach"]:hover:not(:disabled),
-[data-ui="composer-attach-existing"]:hover:not(:disabled) {
-  background: var(--color-bg-hover);
-  color: var(--color-fg-primary);
 }
 
 /* Prefill toggle — same shape as import-at-end so the action row reads as a
  * uniform strip. Pressed state lights the button so the user knows the
  * prefill textarea is open. */
 [data-ui="composer-prefill-toggle"] {
-  background: var(--color-bg-surface-2);
   border: none;
   border-left: 1px solid var(--color-border-subtle);
-  color: var(--color-fg-muted);
   padding: 0 var(--space-4);
   font-size: var(--font-size-sm);
-  cursor: pointer;
   align-self: stretch;
-  border-radius: 0;
   display: inline-flex;
   align-items: center;
   gap: var(--space-2);
-}
-
-[data-ui="composer-prefill-toggle"]:hover:not(:disabled) {
-  background: var(--color-bg-hover);
-  color: var(--color-fg-primary);
 }
 
 [data-ui="composer-prefill-toggle"][data-active="true"] {

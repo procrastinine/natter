@@ -22,6 +22,7 @@ import { createChat } from '../../src/store/chats'
 import { __resetDbForTests, openDb } from '../../src/store/db'
 import { putCachedEndpoints } from '../../src/store/models-cache'
 import { __resetPrivacyInFlightForTests } from '../../src/store/privacy-cache'
+import { StreamChatBusyError } from '../../src/store/repository'
 import { __resetStreamLeasesForTests } from '../../src/store/stream-leases'
 import { useChatStore } from '../../src/store/zustand/chatStore'
 import { useStreamStore } from '../../src/store/zustand/streamStore'
@@ -384,6 +385,78 @@ describe('generation mode contract', () => {
       second.userMessageId,
       second.assistantMessageId,
     ])
+  })
+
+  it('admits only one simultaneous composer send before either user row can branch', async () => {
+    const chat = await createChat({ settings: settings() })
+    let releaseStream!: () => void
+    const streamGate = new Promise<void>((resolve) => {
+      releaseStream = resolve
+    })
+    let markOpened!: () => void
+    const opened = new Promise<void>((resolve) => {
+      markOpened = resolve
+    })
+    const opens: string[] = []
+    const openStream = (open: { wireBody: Record<string, unknown> }) => {
+      opens.push(JSON.stringify(open.wireBody))
+      markOpened()
+      return (async function* () {
+        await streamGate
+        yield {
+          type: 'delta' as const,
+          chunk: {
+            id: 'exclusive-generation',
+            model: 'attempt-model',
+            choices: [{ delta: { content: 'answer' }, finish_reason: 'stop' as const }],
+          },
+        }
+      })()
+    }
+    const tagged = (promise: ReturnType<typeof sendText>) =>
+      promise.then(
+        (value) => ({ status: 'fulfilled' as const, value }),
+        (reason: unknown) => ({ status: 'rejected' as const, reason }),
+      )
+    const first = tagged(
+      sendText({
+        chatId: chat.id,
+        expectedLeafId: null,
+        connection: profile(),
+        apiKey: 'sk-test',
+        content: [{ type: 'text', text: 'concurrent A' }],
+        openStream,
+      }),
+    )
+    const second = tagged(
+      sendText({
+        chatId: chat.id,
+        expectedLeafId: null,
+        connection: profile(),
+        apiKey: 'sk-test',
+        content: [{ type: 'text', text: 'concurrent B' }],
+        openStream,
+      }),
+    )
+
+    await opened
+    const loser = await Promise.race([first, second])
+    expect(loser.status).toBe('rejected')
+    if (loser.status !== 'rejected') throw new Error('expected one send admission rejection')
+    expect(loser.reason).toBeInstanceOf(StreamChatBusyError)
+    releaseStream()
+    const settled = await Promise.all([first, second])
+
+    expect(settled.filter((result) => result.status === 'fulfilled')).toHaveLength(1)
+    expect(settled.filter((result) => result.status === 'rejected')).toHaveLength(1)
+    expect(opens).toHaveLength(1)
+    const rows = await getBrowserRepository().listMessages(chat.id)
+    expect(rows).toHaveLength(2)
+    const user = rows.find((row) => row.role === 'user')
+    const assistant = rows.find((row) => row.role === 'assistant')
+    expect(user?.parentId).toBeNull()
+    expect(assistant?.parentId).toBe(user?.id)
+    expect(rows.filter((row) => row.parentId === null)).toHaveLength(1)
   })
 
   it('sendFromMessage adds only the assistant-fork cursor pin required by regenerate', async () => {

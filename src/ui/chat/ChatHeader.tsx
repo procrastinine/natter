@@ -26,6 +26,7 @@ import {
   natterJsonFilename,
   triggerJsonDownload,
 } from '../import-export/json-file'
+import { Button, IconButton } from '../primitives/Button'
 import { HeaderPrivacyBadge } from './HeaderPrivacyBadge'
 
 function formatCalibrationRatio(sample: TokenCalibrationSample): string {
@@ -219,7 +220,7 @@ export function ChatHeader({
         />
       ) : (
         <div data-ui="chat-title" data-title-status={chat.titleStatus}>
-          <button
+          <Button
             type="button"
             ref={titleLabelRef}
             data-ui="chat-title-label"
@@ -232,8 +233,8 @@ export function ChatHeader({
             onDoubleClick={beginEdit}
           >
             {displayTitle}
-          </button>
-          <button
+          </Button>
+          <IconButton
             type="button"
             data-ui="icon-button"
             data-size="sm"
@@ -243,12 +244,12 @@ export function ChatHeader({
             onClick={beginEdit}
           >
             <PencilIcon size={14} />
-          </button>
+          </IconButton>
         </div>
       )}
       <span data-ui="header-spacer" />
       {onToggleTreeView ? (
-        <button
+        <IconButton
           type="button"
           data-ui="icon-button"
           data-role="chat-branch-tree"
@@ -262,10 +263,10 @@ export function ChatHeader({
           data-state={treeViewActive ? 'active' : undefined}
         >
           <BranchTreeIcon size={18} />
-        </button>
+        </IconButton>
       ) : null}
       {onToggleEditTree ? (
-        <button
+        <IconButton
           type="button"
           data-ui="icon-button"
           data-role="chat-edit-tree"
@@ -277,9 +278,9 @@ export function ChatHeader({
           data-state={editTreeActive && !editTreeUnavailable ? 'active' : undefined}
         >
           <StructureEditIcon size={18} />
-        </button>
+        </IconButton>
       ) : null}
-      <button
+      <IconButton
         type="button"
         data-ui="icon-button"
         data-role="chat-tags"
@@ -288,11 +289,11 @@ export function ChatHeader({
         onClick={() => void handleEditTags()}
       >
         <TagIcon size={18} />
-      </button>
+      </IconButton>
       <span data-ui="desktop-header-privacy">
         <HeaderPrivacyBadge chatId={chat.id} />
       </span>
-      <button
+      <IconButton
         type="button"
         data-ui="icon-button"
         data-role="chat-download"
@@ -301,8 +302,8 @@ export function ChatHeader({
         onClick={() => void handleDownload()}
       >
         <DownloadIcon size={18} />
-      </button>
-      <button
+      </IconButton>
+      <IconButton
         type="button"
         data-ui="icon-button"
         data-role="chat-export"
@@ -311,8 +312,8 @@ export function ChatHeader({
         onClick={() => void handleExportJson()}
       >
         <FileIcon size={18} />
-      </button>
-      <button
+      </IconButton>
+      <IconButton
         type="button"
         data-ui="icon-button"
         data-role="chat-info"
@@ -322,8 +323,8 @@ export function ChatHeader({
         onClick={() => setShowInfo((v) => !v)}
       >
         <InfoIcon size={18} />
-      </button>
-      <button
+      </IconButton>
+      <IconButton
         type="button"
         data-ui="icon-button"
         data-role="settings-cog"
@@ -333,9 +334,9 @@ export function ChatHeader({
         onClick={onToggleSettings}
       >
         <CogIcon size={20} />
-      </button>
+      </IconButton>
       <div data-ui="chat-controls-menu-root" ref={mobileMenuRef}>
-        <button
+        <IconButton
           type="button"
           data-ui="icon-button"
           data-role="chat-controls-menu"
@@ -346,7 +347,7 @@ export function ChatHeader({
           onClick={() => setMobileMenuOpen((open) => !open)}
         >
           <MenuIcon size={20} />
-        </button>
+        </IconButton>
         {mobileMenuOpen ? (
           <div data-ui="chat-controls-menu" role="dialog" aria-label="Chat controls">
             {mobileConnectionControl ? (
@@ -354,7 +355,7 @@ export function ChatHeader({
                 <div data-ui="chat-controls-menu-connection">{mobileConnectionControl}</div>
               </section>
             ) : null}
-            <button
+            <Button
               type="button"
               data-ui="mobile-menu-action"
               onClick={() => {
@@ -364,9 +365,9 @@ export function ChatHeader({
             >
               <PencilIcon size={16} />
               <span>Rename chat</span>
-            </button>
+            </Button>
             {onToggleEditTree ? (
-              <button
+              <Button
                 type="button"
                 data-ui="mobile-menu-action"
                 data-role="mobile-chat-edit-tree"
@@ -382,10 +383,10 @@ export function ChatHeader({
               >
                 <StructureEditIcon size={16} />
                 <span>{editTreeActive ? 'Exit edit tree' : 'Edit tree'}</span>
-              </button>
+              </Button>
             ) : null}
             {onToggleTreeView ? (
-              <button
+              <Button
                 type="button"
                 data-ui="mobile-menu-action"
                 data-role="mobile-chat-branch-tree"
@@ -402,9 +403,9 @@ export function ChatHeader({
               >
                 <BranchTreeIcon size={16} />
                 <span>{treeViewActive ? 'Return to conversation' : 'View conversation tree'}</span>
-              </button>
+              </Button>
             ) : null}
-            <button
+            <Button
               type="button"
               data-ui="mobile-menu-action"
               onClick={() => {
@@ -414,14 +415,14 @@ export function ChatHeader({
             >
               <TagIcon size={16} />
               <span>Tags</span>
-            </button>
+            </Button>
             <div data-ui="mobile-menu-action" data-kind="privacy">
               <span data-ui="mobile-menu-action-icon">
                 <HeaderPrivacyBadge chatId={chat.id} />
               </span>
               <span>Privacy</span>
             </div>
-            <button
+            <Button
               type="button"
               data-ui="mobile-menu-action"
               onClick={() => {
@@ -431,8 +432,8 @@ export function ChatHeader({
             >
               <DownloadIcon size={16} />
               <span>Download .txt</span>
-            </button>
-            <button
+            </Button>
+            <Button
               type="button"
               data-ui="mobile-menu-action"
               onClick={() => {
@@ -442,8 +443,8 @@ export function ChatHeader({
             >
               <FileIcon size={16} />
               <span>Export JSON</span>
-            </button>
-            <button
+            </Button>
+            <Button
               type="button"
               data-ui="mobile-menu-action"
               onClick={() => {
@@ -453,7 +454,7 @@ export function ChatHeader({
             >
               <InfoIcon size={16} />
               <span>Chat info</span>
-            </button>
+            </Button>
           </div>
         ) : null}
       </div>
@@ -461,7 +462,7 @@ export function ChatHeader({
         <div data-ui="chat-info-popover" role="dialog" aria-label="Chat info">
           <div data-ui="chat-info-popover-header">
             <span>Chat info</span>
-            <button
+            <IconButton
               type="button"
               data-ui="icon-button"
               data-size="sm"
@@ -469,7 +470,7 @@ export function ChatHeader({
               onClick={() => setShowInfo(false)}
             >
               <CloseIcon size={14} />
-            </button>
+            </IconButton>
           </div>
           <dl data-ui="chat-info-popover-fields">
             <div>

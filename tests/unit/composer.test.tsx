@@ -81,13 +81,15 @@ describe('Composer', () => {
     }
   })
 
-  it('updates the live character count without prompt-budget callbacks', () => {
+  it('updates the visible character count without announcing every keystroke', () => {
     render(<Composer onSubmit={() => {}} />)
     const input = screen.getByRole('textbox')
 
     fireEvent.change(input, { target: { value: 'count this draft' } })
 
-    expect(screen.getByText('16 chars')).toBeInTheDocument()
+    const counter = screen.getByText('16 chars')
+    expect(counter).toBeInTheDocument()
+    expect(counter).not.toHaveAttribute('aria-live')
   })
 
   it('does not show an empty autosized textarea scrollbar', () => {

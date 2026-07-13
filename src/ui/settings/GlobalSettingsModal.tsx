@@ -1,5 +1,7 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { CloseIcon } from '../icons/Icon'
+import { Button, IconButton } from '../primitives/Button'
+import { Dialog } from '../primitives/Dialog'
 import { AppearanceSettings } from './AppearanceSettings'
 import { GeneralSettings } from './GeneralSettings'
 import { ImageAllowlistPanel } from './ImageAllowlistPanel'
@@ -28,67 +30,52 @@ interface GlobalSettingsModalProps {
 
 export function GlobalSettingsModal({ open, onClose }: GlobalSettingsModalProps) {
   const [tab, setTab] = useState<GlobalSettingsTab>('general')
-  useEffect(() => {
-    if (!open) return
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.preventDefault()
-        onClose()
-      }
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [open, onClose])
   if (!open) return null
   return (
-    <div
-      data-ui="global-settings-overlay"
-      role="dialog"
-      aria-modal="true"
-      aria-label="Global settings"
+    <Dialog
+      onClose={onClose}
+      overlayUi="global-settings-overlay"
+      scrimUi="global-settings-scrim"
+      surfaceUi="global-settings-modal"
+      surfaceAs="section"
+      ariaLabel="Global settings"
+      scrimLabel="Close global settings"
+      backdrop="blurred"
+      surfaceProps={{ 'data-ui-modal': 'global-settings' }}
     >
-      <button
-        type="button"
-        data-ui="global-settings-scrim"
-        onClick={onClose}
-        tabIndex={-1}
-        aria-label="Close global settings"
-      />
-      <section data-ui="global-settings-modal" data-ui-modal="global-settings">
-        <header data-ui="global-settings-header">
-          <h2>Settings</h2>
-          <button
+      <header data-ui="global-settings-header">
+        <h2>Settings</h2>
+        <IconButton
+          type="button"
+          data-ui="icon-button"
+          data-role="global-settings-close"
+          onClick={onClose}
+          aria-label="Close settings"
+        >
+          <CloseIcon size={16} />
+        </IconButton>
+      </header>
+      <div role="tablist" data-ui="settings-tabs">
+        {GLOBAL_SETTINGS_TABS.map((value) => (
+          <Button
+            key={value}
             type="button"
-            data-ui="icon-button"
-            data-role="global-settings-close"
-            onClick={onClose}
-            aria-label="Close settings"
+            role="tab"
+            data-ui="settings-tab"
+            data-tab={value}
+            aria-selected={tab === value}
+            onClick={() => setTab(value)}
           >
-            <CloseIcon size={16} />
-          </button>
-        </header>
-        <div role="tablist" data-ui="settings-tabs">
-          {GLOBAL_SETTINGS_TABS.map((value) => (
-            <button
-              key={value}
-              type="button"
-              role="tab"
-              data-ui="settings-tab"
-              data-tab={value}
-              aria-selected={tab === value}
-              onClick={() => setTab(value)}
-            >
-              {TAB_LABELS[value]}
-            </button>
-          ))}
-        </div>
-        <div role="tabpanel" data-ui="settings-panel" data-active-tab={tab}>
-          {tab === 'general' ? <GeneralSettings /> : null}
-          {tab === 'appearance' ? <AppearanceSettings /> : null}
-          {tab === 'performance' ? <PerformanceSettings /> : null}
-          {tab === 'images' ? <ImageAllowlistPanel /> : null}
-        </div>
-      </section>
-    </div>
+            {TAB_LABELS[value]}
+          </Button>
+        ))}
+      </div>
+      <div role="tabpanel" data-ui="settings-panel" data-active-tab={tab}>
+        {tab === 'general' ? <GeneralSettings /> : null}
+        {tab === 'appearance' ? <AppearanceSettings /> : null}
+        {tab === 'performance' ? <PerformanceSettings /> : null}
+        {tab === 'images' ? <ImageAllowlistPanel /> : null}
+      </div>
+    </Dialog>
   )
 }

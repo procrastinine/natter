@@ -17,7 +17,7 @@ body {
   background: var(--color-selection);
 }
 
-button {
+[data-control="button"] {
   font: inherit;
   color: inherit;
   background: var(--color-bg-surface-2);
@@ -30,28 +30,200 @@ button {
     border-color var(--duration-fast) var(--ease-standard);
 }
 
-/* Wrapped in :where() so this default-button hover sits at (0,1,0)
- * specificity. Any colored button (accent send, danger abort/stop,
- * accent connection-add, …) sets its own background and a matching
- * :hover at (0,2,0) or higher, and wins without needing to mirror an
- * artificially high baseline. Without :where(), every colored button
- * had to re-assert its hover background or get stomped to the surface
- * tint and read white-ish on hover. */
-:where(button:not([data-ui$="-scrim"]):not(:disabled)):hover {
+/* The low-specificity fallback keeps legacy-wrapped buttons stable while
+ * explicit appearances own their semantic hover and active treatments. */
+:where([data-control="button"]:not(:disabled)):hover {
   background: var(--color-bg-hover);
 }
 
-:where(button:not([data-ui$="-scrim"]):not(:disabled)):active {
+:where([data-control="button"]:not(:disabled)):active {
   background: var(--color-bg-active);
 }
 
-button:disabled,
-button[data-state="disabled"] {
+[data-control="button"]:disabled,
+[data-control="button"][data-state="disabled"] {
   opacity: var(--opacity-disabled);
   cursor: not-allowed;
 }
 
-button:focus-visible,
+[data-control="button"][data-button-tone="accent"] {
+  --button-tone-color: var(--color-accent);
+  --button-tone-hover: var(--color-accent-hover);
+  --button-tone-active: var(--color-accent-active);
+  --button-tone-soft: var(--color-accent-subtle);
+  --button-tone-contrast: var(--color-accent-contrast);
+}
+
+[data-control="button"][data-button-tone="success"] {
+  --button-tone-color: var(--color-success);
+  --button-tone-hover: color-mix(in srgb, var(--color-success) 80%, #000);
+  --button-tone-active: color-mix(in srgb, var(--color-success) 76%, #000);
+  --button-tone-soft: var(--color-banner-success-bg);
+  --button-tone-contrast: var(--color-fg-inverse);
+}
+
+[data-control="button"][data-button-tone="warning"] {
+  --button-tone-color: var(--color-warning);
+  --button-tone-hover: color-mix(in srgb, var(--color-warning) 80%, #000);
+  --button-tone-active: color-mix(in srgb, var(--color-warning) 76%, #000);
+  --button-tone-soft: var(--color-banner-warning-bg);
+  --button-tone-contrast: var(--color-fg-inverse);
+}
+
+[data-control="button"][data-button-tone="danger"] {
+  --button-tone-color: var(--color-danger);
+  --button-tone-hover: color-mix(in srgb, var(--color-danger) 80%, #000);
+  --button-tone-active: color-mix(in srgb, var(--color-danger) 75%, #000);
+  --button-tone-soft: var(--color-banner-danger-bg);
+  --button-tone-contrast: var(--color-fg-inverse);
+}
+
+[data-control="button"][data-button-appearance="surface"] {
+  background: var(--color-bg-surface-2);
+  border-color: var(--color-border-default);
+  color: var(--color-fg-primary);
+}
+
+[data-control="button"][data-button-appearance="strip"] {
+  background: var(--color-bg-surface-2);
+  border-color: transparent;
+  color: var(--color-fg-muted);
+}
+
+[data-control="button"][data-button-appearance="surface"]:hover:not(:disabled),
+[data-control="button"][data-button-appearance="plain"]:hover:not(:disabled),
+[data-control="button"][data-button-appearance="ghost"]:hover:not(:disabled),
+[data-control="button"][data-button-appearance="strip"]:hover:not(:disabled),
+[data-control="button"][data-button-appearance="outline"]:hover:not(:disabled) {
+  background: var(--color-bg-hover);
+  color: var(--color-fg-primary);
+}
+
+[data-control="button"][data-button-appearance="surface"]:active:not(:disabled),
+[data-control="button"][data-button-appearance="plain"]:active:not(:disabled),
+[data-control="button"][data-button-appearance="ghost"]:active:not(:disabled),
+[data-control="button"][data-button-appearance="strip"]:active:not(:disabled),
+[data-control="button"][data-button-appearance="outline"]:active:not(:disabled) {
+  background: var(--color-bg-active);
+}
+
+[data-control="button"][data-button-appearance="solid"] {
+  background: var(--button-tone-color, var(--color-fg-primary));
+  border-color: var(--button-tone-color, var(--color-fg-primary));
+  color: var(--button-tone-contrast, var(--color-fg-inverse));
+}
+
+[data-control="button"][data-button-appearance="solid"]:hover:not(:disabled) {
+  background: var(--button-tone-hover, var(--color-fg-secondary));
+  border-color: var(--button-tone-hover, var(--color-fg-secondary));
+  color: var(--button-tone-contrast, var(--color-fg-inverse));
+}
+
+[data-control="button"][data-button-appearance="solid"]:active:not(:disabled) {
+  background: var(--button-tone-active, var(--color-fg-primary));
+  border-color: var(--button-tone-active, var(--color-fg-primary));
+}
+
+[data-control="button"][data-button-appearance="soft"] {
+  background: var(--button-tone-soft, var(--color-bg-surface-2));
+  border-color: color-mix(
+    in srgb,
+    var(--button-tone-color, var(--color-border-default)) 35%,
+    var(--color-border-subtle)
+  );
+  color: var(--button-tone-color, var(--color-fg-primary));
+}
+
+[data-control="button"][data-button-appearance="soft"]:hover:not(:disabled) {
+  background: color-mix(
+    in srgb,
+    var(--button-tone-color, var(--color-fg-primary)) 22%,
+    var(--color-bg-surface-1)
+  );
+  border-color: var(--button-tone-color, var(--color-border-default));
+  color: var(--button-tone-hover, var(--color-fg-primary));
+}
+
+[data-control="button"][data-button-appearance="outline"] {
+  background: transparent;
+  border-color: var(--button-tone-color, var(--color-border-default));
+  color: var(--button-tone-color, var(--color-fg-primary));
+}
+
+[data-control="button"][data-button-appearance="ghost"] {
+  appearance: none;
+  background: transparent;
+  border-color: transparent;
+}
+
+[data-control="button"][data-button-appearance="plain"] {
+  background: var(--color-bg-surface-1);
+  border-color: transparent;
+}
+
+[data-control="button"][data-button-size="xs"] {
+  padding: var(--space-1) var(--space-3);
+  font-size: var(--font-size-xs);
+}
+
+[data-control="button"][data-button-size="sm"] {
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--font-size-sm);
+}
+
+[data-control="button"][data-button-size="md"] {
+  padding: var(--space-2) var(--space-4);
+}
+
+[data-control="button"][data-button-size="lg"] {
+  padding: var(--space-3) var(--space-5);
+}
+
+[data-control="button"][data-button-size^="icon-"] {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  flex: 0 0 auto;
+}
+
+[data-control="button"][data-button-size="icon-xs"] {
+  width: 20px;
+  height: 20px;
+}
+
+[data-control="button"][data-button-size="icon-sm"] {
+  width: 22px;
+  height: 22px;
+}
+
+[data-control="button"][data-button-size="icon-md"] {
+  width: 28px;
+  height: 28px;
+}
+
+[data-control="button"][data-button-size="icon-lg"] {
+  width: 32px;
+  height: 32px;
+}
+
+[data-control="button"][data-button-geometry="flush"] {
+  border-radius: 0;
+}
+
+[data-control="button"][data-button-geometry="joined-start"] {
+  border-radius: var(--radius-sm) 0 0 var(--radius-sm);
+}
+
+[data-control="button"][data-button-geometry="joined-center"] {
+  border-radius: 0;
+}
+
+[data-control="button"][data-button-geometry="joined-end"] {
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+}
+
+[data-control="button"]:focus-visible,
 input:focus-visible,
 textarea:focus-visible,
 [tabindex]:focus-visible {

@@ -71,7 +71,9 @@ pnpm dev
 
 ## Verification
 
-Run `pnpm check:ci` for the clean, non-writing Biome check. The broader source checks are `pnpm typecheck`, `pnpm lint:semantic`, `pnpm test:run`, and `pnpm build`. The build rejects unexpected distribution paths and regressions in total, gzip, cold-static-graph, largest-chunk, and named lazy-feature budgets. `pnpm perf:report` applies the same delivery ratchets and the zero-dependency-cycle gate; wall time and heap measurements remain informational.
+Run `pnpm check:ci` for the clean, non-writing Biome check. The broader source checks are `pnpm typecheck`, `pnpm lint:semantic`, `pnpm test:run`, and `pnpm build`. The checked build rejects unexpected distribution paths and regressions in total, gzip, cold-static-graph, largest-chunk, and named lazy-feature budgets. `pnpm perf:report` applies the same delivery ratchets and the zero-dependency-cycle gate; wall time and heap measurements remain informational.
+
+GitHub Pages publication is intentionally independent from the quality workflow. Only dependency installation, `pnpm build:pages`, artifact validation/upload, and the Pages deployment itself can block publication. Verification still runs on pull requests and `main`; peer, formatting/lint, dead-code, and performance findings are advisory, while correctness failures remain visible without holding the published site stale.
 
 `pnpm dev` is the normal unbundled Vite/HMR environment, so its request count and decoded source are intentionally much larger than the minified application. Use `pnpm preview` when testing production-like delivery weight. With either server running, `pnpm perf:delivery dev <url>` or `pnpm perf:delivery preview <url>` records a fresh Chromium context. Preview enforces production request/byte budgets; dev reports request/byte/time/heap measurements without rewarding bundled modules or disabled development tooling. Both modes fail on runtime/network diagnostics or cold-loading a forbidden lazy feature. The frequently used per-chat settings pane stays in the eager graph; Markdown, tree, global settings, storage, and import chunks must stay out of a cold load. The shared ratchets live in `scripts/performance-baseline.json` so the build, report, and browser measurement do not drift.
 
@@ -80,7 +82,8 @@ Run `pnpm check:ci` for the clean, non-writing Biome check. The broader source c
 | script | purpose |
 |---|---|
 | `pnpm dev` | Vite dev server |
-| `pnpm build` | production static bundle in `dist/` |
+| `pnpm build` | checked production bundle in `dist/` with type and distribution-policy gates |
+| `pnpm build:pages` | artifact-only production bundle used by GitHub Pages |
 | `pnpm preview` | serve the built bundle locally |
 | `pnpm test` | Vitest in watch mode |
 | `pnpm test:run` | Vitest single run |

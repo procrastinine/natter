@@ -109,6 +109,16 @@ describe('tooling telemetry audit', () => {
     expect(rule?.allowedVersions).toBeUndefined()
   })
 
+  it('keeps Pages publication independent from the quality workflow', () => {
+    const packageJson = readJson<{ scripts: Record<string, string> }>('package.json')
+    const deploy = readText('.github/workflows/deploy.yml')
+
+    expect(packageJson.scripts['build:pages']).toBe('vite build')
+    expect(deploy).not.toContain('uses: ./.github/workflows/verify.yml')
+    expect(deploy).toContain('needs: build_pages')
+    expect(deploy).toContain('run: pnpm build:pages')
+  })
+
   it('keeps delivery ratchets in one shared baseline', () => {
     const baseline = readJson<{
       deliveryBudgets: {

@@ -11,6 +11,7 @@ import { attachmentMapDependencies } from '../../store/reactive-dependencies'
 import { useRepositoryQuery } from '../../store/reactive-query'
 import { getWorkspaceRepository } from '../../store/workspace-repository'
 import { DatabaseIcon, EyeIcon, EyeOffIcon, TrashIcon } from '../icons/Icon'
+import { IconButton } from '../primitives/Button'
 import { AttachmentPicker } from './AttachmentPicker'
 import { AttachmentPreview } from './AttachmentPreview'
 import { formatBytes, kindLabel, shortId, storageLabel } from './format'
@@ -85,7 +86,7 @@ export function AttachmentRefChips({
             {missing ? <span data-ui="attachment-chip-state">missing</span> : null}
             {editable ? (
               <span data-ui="attachment-chip-actions">
-                <button
+                <IconButton
                   type="button"
                   data-ui="icon-button"
                   data-size="xs"
@@ -110,8 +111,8 @@ export function AttachmentRefChips({
                   disabled={!messageId && !draftChatId}
                 >
                   {ref.includeInContext ? <EyeIcon size={13} /> : <EyeOffIcon size={13} />}
-                </button>
-                <button
+                </IconButton>
+                <IconButton
                   type="button"
                   data-ui="icon-button"
                   data-size="xs"
@@ -121,8 +122,8 @@ export function AttachmentRefChips({
                   disabled={!messageId && !draftChatId}
                 >
                   <DatabaseIcon size={13} />
-                </button>
-                <button
+                </IconButton>
+                <IconButton
                   type="button"
                   data-ui="icon-button"
                   data-size="xs"
@@ -137,7 +138,7 @@ export function AttachmentRefChips({
                   disabled={!messageId && !draftChatId}
                 >
                   <TrashIcon size={13} />
-                </button>
+                </IconButton>
               </span>
             ) : null}
           </span>

@@ -23,6 +23,11 @@
   color: var(--color-fg-muted);
 }
 
+[data-ui="helper"][data-tone="danger"],
+[data-ui="status-text"][data-tone="danger"] {
+  color: var(--color-danger);
+}
+
 [data-validation="invalid"] input,
 [data-validation="invalid"] textarea {
   border-color: var(--color-danger);

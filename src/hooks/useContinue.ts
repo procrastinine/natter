@@ -56,6 +56,7 @@ import {
 } from '../store/send-context'
 import { createStreamChunkWriter } from '../store/stream-chunk-writer'
 import { getWorkspaceRepository } from '../store/workspace-repository'
+import { announceGenerationOutcome } from '../store/zustand/announcementStore'
 import { useChatStore } from '../store/zustand/chatStore'
 import { clearLiveSnapshotIfPresent, useStreamStore } from '../store/zustand/streamStore'
 import { useUiStore } from '../store/zustand/uiStore'
@@ -432,6 +433,7 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
       cleanupJournal: () => repo.deleteStreamChunks(streamId, streamFence),
       cleanup: (attemptResult) => {
         if (attemptResult.journalCleanupPending) lifecycle.preserveLease()
+        announceGenerationOutcome(streamId, attemptResult.outcome)
         useStreamStore.getState().clearActive(streamId)
         clearLiveSnapshotIfPresent(activeTarget.id, streamId)
         postEvent({

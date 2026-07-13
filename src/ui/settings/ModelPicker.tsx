@@ -29,6 +29,7 @@ import type { Chat, ConnectionKind } from '../../core/types'
 import { useModels } from '../../hooks/useModels'
 import { GLOBAL_PREFERENCES_DEPENDENCIES } from '../../store/reactive-dependencies'
 import { useRepositoryQuery } from '../../store/reactive-query'
+import { Button, IconButton } from '../primitives/Button'
 
 // Below this threshold, the picker collapses to a plain list. OpenRouter's ~350
 // models and OpenAI direct's ~20 bundled entries stay above it; a local
@@ -220,7 +221,7 @@ export function ModelPicker({ chat, profileKind, onPick, onPickForPreset }: Mode
           placeholder={compact ? 'Filter…' : 'Search models…'}
           aria-label="Search models"
         />
-        <button
+        <IconButton
           type="button"
           data-ui="icon-button"
           onClick={() => refresh()}
@@ -229,13 +230,13 @@ export function ModelPicker({ chat, profileKind, onPick, onPickForPreset }: Mode
           aria-busy={loading}
         >
           <ReloadIcon />
-        </button>
+        </IconButton>
       </div>
       {compact ? null : (
         <div data-ui="model-picker-tabs">
           <div data-ui="model-picker-tablist" role="tablist">
             {(['recent', 'all'] as const).map((t) => (
-              <button
+              <Button
                 key={t}
                 type="button"
                 role="tab"
@@ -244,17 +245,17 @@ export function ModelPicker({ chat, profileKind, onPick, onPickForPreset }: Mode
                 onClick={() => setTab(t)}
               >
                 {t === 'recent' ? 'Recent' : 'All'}
-              </button>
+              </Button>
             ))}
           </div>
           {tab === 'recent' && recents.length > 0 ? (
-            <button
+            <Button
               type="button"
               data-ui="picker-tab-action"
               onClick={() => void clearRecentHistory()}
             >
               Clear history
-            </button>
+            </Button>
           ) : null}
         </div>
       )}
@@ -286,17 +287,17 @@ export function ModelPicker({ chat, profileKind, onPick, onPickForPreset }: Mode
                     el.style.setProperty('--row-y', `${virtualRow.start}px`)
                   }}
                 >
-                  <button
+                  <Button
                     type="button"
                     data-ui="picker-row-pick"
                     onClick={(e) => handlePick(row.id, e.shiftKey)}
                     title={row.name ?? row.id}
                   >
                     <ModelRow row={row} />
-                  </button>
+                  </Button>
                   {isPinned ? (
                     <div data-ui="picker-row-pin-actions">
-                      <button
+                      <IconButton
                         type="button"
                         data-ui="icon-button"
                         data-compact
@@ -305,8 +306,8 @@ export function ModelPicker({ chat, profileKind, onPick, onPickForPreset }: Mode
                         onClick={() => void movePin(row.id, -1)}
                       >
                         ↑
-                      </button>
-                      <button
+                      </IconButton>
+                      <IconButton
                         type="button"
                         data-ui="icon-button"
                         data-compact
@@ -315,10 +316,10 @@ export function ModelPicker({ chat, profileKind, onPick, onPickForPreset }: Mode
                         onClick={() => void movePin(row.id, 1)}
                       >
                         ↓
-                      </button>
+                      </IconButton>
                     </div>
                   ) : null}
-                  <button
+                  <IconButton
                     type="button"
                     data-ui="icon-button"
                     data-compact
@@ -329,7 +330,7 @@ export function ModelPicker({ chat, profileKind, onPick, onPickForPreset }: Mode
                     onClick={() => void togglePin(row.id)}
                   >
                     <StarIcon filled={isPinned} />
-                  </button>
+                  </IconButton>
                 </div>
               )
             })}

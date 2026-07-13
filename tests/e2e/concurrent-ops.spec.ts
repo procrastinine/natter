@@ -5,6 +5,7 @@ import {
   createChatAndOpen,
   firstChatId,
   mockChatCompletions,
+  readMessages,
   seedFirstRun,
   sendMessage,
 } from './helpers'
@@ -76,6 +77,88 @@ test('two tabs streaming different chats run in parallel without aborting each o
     }
   })
   expect(chatCount).toBeGreaterThanOrEqual(2)
+  await second.close()
+})
+
+test('two tabs cannot turn simultaneous composer sends into an implicit branch', async ({
+  page,
+}) => {
+  await page.goto('/?debug')
+  const initial = await page.evaluate(async () => {
+    const api = (
+      window as typeof window & {
+        __debugFakeStream?: {
+          start(options: Record<string, unknown>): Promise<{ chatId: string }>
+        }
+      }
+    ).__debugFakeStream
+    if (!api) throw new Error('debug fake stream API unavailable')
+    return api.start({
+      openChat: false,
+      prompt: 'baseline',
+      targetChars: 8,
+      reasoningChars: 0,
+      chunkChars: 8,
+    })
+  })
+  const second = await page.context().newPage()
+  await second.goto(`/?debug#/chat/${initial.chatId}`)
+
+  const start = (target: typeof page, prompt: string) =>
+    target.evaluate(
+      async ({ chatId, prompt: submittedPrompt }) => {
+        const api = (
+          window as typeof window & {
+            __debugFakeStream?: {
+              start(options: Record<string, unknown>): Promise<unknown>
+            }
+          }
+        ).__debugFakeStream
+        if (!api) throw new Error('debug fake stream API unavailable')
+        return api.start({
+          chatId,
+          openChat: false,
+          prompt: submittedPrompt,
+          targetChars: 256,
+          reasoningChars: 0,
+          chunkChars: 8,
+          delayMs: 50,
+        })
+      },
+      { chatId: initial.chatId, prompt },
+    )
+  const settled = await Promise.allSettled([
+    start(page, 'same-chat A'),
+    start(second, 'same-chat B'),
+  ])
+
+  expect(settled.filter((result) => result.status === 'fulfilled')).toHaveLength(1)
+  const rejected = settled.filter(
+    (result): result is PromiseRejectedResult => result.status === 'rejected',
+  )
+  expect(rejected).toHaveLength(1)
+  expect(String(rejected[0]?.reason)).toContain('StreamChatBusy')
+
+  const rows = (await readMessages(page, initial.chatId)).filter((row) => row.deleted !== true)
+  expect(rows).toHaveLength(4)
+  const roots = rows.filter((row) => row.parentId === null)
+  expect(roots).toHaveLength(1)
+  const childrenByParent = new Map<string, Array<Record<string, unknown>>>()
+  for (const row of rows) {
+    if (typeof row.parentId !== 'string') continue
+    const bucket = childrenByParent.get(row.parentId) ?? []
+    bucket.push(row)
+    childrenByParent.set(row.parentId, bucket)
+  }
+  expect([...childrenByParent.values()].every((children) => children.length === 1)).toBe(true)
+
+  const roles: unknown[] = []
+  let current = roots[0]
+  while (current) {
+    roles.push(current.role)
+    current = childrenByParent.get(String(current.id))?.[0]
+  }
+  expect(roles).toEqual(['user', 'assistant', 'user', 'assistant'])
   await second.close()
 })
 

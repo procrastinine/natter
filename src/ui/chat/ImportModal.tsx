@@ -6,8 +6,11 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { type PasteImportSlot, pasteImport } from '../../core/messages'
 import type { ChatId, ContentItem, CursorMap, MessageRole } from '../../core/types'
 import { newId } from '../../lib/ulid'
+import { useAnnouncementStore } from '../../store/zustand/announcementStore'
 import { useChatStore } from '../../store/zustand/chatStore'
 import { CloseIcon, TrashIcon } from '../icons/Icon'
+import { Button, IconButton } from '../primitives/Button'
+import { Dialog } from '../primitives/Dialog'
 
 interface ImportModalProps {
   // Existing chat to import into. Pass `null` together with
@@ -130,6 +133,9 @@ export function ImportModal({
         ...currentCursor,
         ...result.effects.cursorUpdates,
       })
+      useAnnouncementStore.getState().announce({
+        text: `Imported ${cleaned.length} ${cleaned.length === 1 ? 'message' : 'messages'} (${slotLabel(slot)}).`,
+      })
       onDone?.()
       onClose()
     } catch (err) {
@@ -142,119 +148,118 @@ export function ImportModal({
   const roleOptions = useMemo(() => ROLE_OPTIONS, [])
 
   return (
-    <div data-ui="import-modal-overlay">
-      <button
-        type="button"
-        data-ui="import-modal-scrim"
-        aria-label="Close import modal"
-        tabIndex={-1}
-        onClick={onClose}
-      />
-      <div data-ui="import-modal" role="dialog" aria-modal="true" aria-label="Import messages">
-        <div data-ui="import-modal-header">
-          <h2>Import messages</h2>
-          <button
-            type="button"
-            data-ui="icon-button"
-            data-size="sm"
-            data-role="import-modal-close"
-            aria-label="Close import modal"
-            onClick={onClose}
-          >
-            <CloseIcon size={14} />
-          </button>
-        </div>
-        {chatId ? (
-          <p data-ui="import-modal-slot">
-            Inserting at: <strong>{slotLabel(slot)}</strong>
-          </p>
-        ) : null}
-        <div data-ui="import-modal-rows">
-          {rows.map((row, i) => (
-            <div key={row.id} data-ui="import-modal-row" data-role={row.role}>
-              <div data-ui="import-modal-row-head">
-                <label>
-                  Role
-                  <select
-                    data-ui="import-modal-role"
-                    value={row.role}
-                    disabled={isSiblingSlot && i === 0}
-                    onChange={(e) =>
-                      setRows((prev) =>
-                        prev.map((r, idx) =>
-                          idx === i ? { ...r, role: e.target.value as MessageRole } : r,
-                        ),
-                      )
-                    }
-                  >
-                    {roleOptions.map((r) => (
-                      <option key={r} value={r}>
-                        {r}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                {rows.length > 1 ? (
-                  <button
-                    type="button"
-                    data-ui="import-modal-remove"
-                    data-tone="danger"
-                    onClick={() => removeRow(i)}
-                    aria-label="Remove this message"
-                    title="Remove this message"
-                  >
-                    <TrashIcon size={14} />
-                  </button>
-                ) : null}
-              </div>
-              <textarea
-                data-ui="import-modal-text"
-                value={row.text}
-                onChange={(e) =>
-                  setRows((prev) =>
-                    prev.map((r, idx) => (idx === i ? { ...r, text: e.target.value } : r)),
-                  )
-                }
-                placeholder="Paste or type the message text…"
-                rows={4}
-                aria-label={`Message ${i + 1}`}
-              />
-            </div>
-          ))}
-        </div>
-        <div data-ui="import-modal-footer">
-          <button
-            type="button"
-            data-ui="import-modal-add-row"
-            onClick={addRow}
-            disabled={isSiblingSlot}
-            title={
-              isSiblingSlot
-                ? 'Sibling import creates one variant; use insert-after to chain.'
-                : 'Stack another message onto this import. Rows commit as a parent→child chain in the order shown — useful for pasting a back-and-forth from another app.'
-            }
-          >
-            + Add another message to this chain
-          </button>
-          <span data-ui="import-modal-spacer" />
-          <button type="button" data-ui="import-modal-cancel" onClick={onClose} disabled={busy}>
-            Cancel
-          </button>
-          <button
-            type="button"
-            data-ui="import-modal-submit"
-            onClick={() => void commit()}
-            disabled={busy}
-          >
-            Import
-          </button>
-        </div>
-        {error ? (
-          <p data-ui="import-modal-error" role="alert">
-            {error}
-          </p>
-        ) : null}
+    <Dialog
+      overlayUi="import-modal-overlay"
+      scrimUi="import-modal-scrim"
+      surfaceUi="import-modal"
+      ariaLabel="Import messages"
+      scrimLabel="Close import modal"
+      onClose={onClose}
+      surfaceProps={{ 'aria-busy': busy || undefined }}
+    >
+      <div data-ui="import-modal-header">
+        <h2>Import messages</h2>
+        <IconButton
+          type="button"
+          data-ui="icon-button"
+          data-size="sm"
+          data-role="import-modal-close"
+          aria-label="Close import modal"
+          onClick={onClose}
+        >
+          <CloseIcon size={14} />
+        </IconButton>
       </div>
-    </div>
+      {chatId ? (
+        <p data-ui="import-modal-slot">
+          Inserting at: <strong>{slotLabel(slot)}</strong>
+        </p>
+      ) : null}
+      <div data-ui="import-modal-rows">
+        {rows.map((row, i) => (
+          <div key={row.id} data-ui="import-modal-row" data-role={row.role}>
+            <div data-ui="import-modal-row-head">
+              <label>
+                Role
+                <select
+                  data-ui="import-modal-role"
+                  value={row.role}
+                  disabled={isSiblingSlot && i === 0}
+                  onChange={(e) =>
+                    setRows((prev) =>
+                      prev.map((r, idx) =>
+                        idx === i ? { ...r, role: e.target.value as MessageRole } : r,
+                      ),
+                    )
+                  }
+                >
+                  {roleOptions.map((r) => (
+                    <option key={r} value={r}>
+                      {r}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              {rows.length > 1 ? (
+                <Button
+                  data-ui="import-modal-remove"
+                  tone="danger"
+                  onClick={() => removeRow(i)}
+                  aria-label="Remove this message"
+                  title="Remove this message"
+                >
+                  <TrashIcon size={14} />
+                </Button>
+              ) : null}
+            </div>
+            <textarea
+              data-ui="import-modal-text"
+              value={row.text}
+              onChange={(e) =>
+                setRows((prev) =>
+                  prev.map((r, idx) => (idx === i ? { ...r, text: e.target.value } : r)),
+                )
+              }
+              placeholder="Paste or type the message text…"
+              rows={4}
+              aria-label={`Message ${i + 1}`}
+            />
+          </div>
+        ))}
+      </div>
+      <div data-ui="import-modal-footer">
+        <Button
+          data-ui="import-modal-add-row"
+          onClick={addRow}
+          disabled={isSiblingSlot}
+          title={
+            isSiblingSlot
+              ? 'Sibling import creates one variant; use insert-after to chain.'
+              : 'Stack another message onto this import. Rows commit as a parent→child chain in the order shown — useful for pasting a back-and-forth from another app.'
+          }
+        >
+          + Add another message to this chain
+        </Button>
+        <span data-ui="import-modal-spacer" />
+        <Button data-ui="import-modal-cancel" onClick={onClose} disabled={busy}>
+          Cancel
+        </Button>
+        <Button
+          data-ui="import-modal-submit"
+          tone="accent"
+          appearance="solid"
+          busy={busy}
+          busyLabel="Importing…"
+          onClick={() => void commit()}
+        >
+          Import
+        </Button>
+      </div>
+      {error ? (
+        <p data-ui="import-modal-error" role="alert">
+          {error}
+        </p>
+      ) : null}
+    </Dialog>
   )
 }

@@ -2,6 +2,7 @@ import { useCallback } from 'react'
 import { primaryKeys } from '../../store/reactive-dependencies'
 import { useRepositoryQuery } from '../../store/reactive-query'
 import { getSetting, setSetting } from '../../store/settings'
+import { Button } from '../primitives/Button'
 
 const DISMISS_KEY = 'sample-prompts:dismissed'
 
@@ -60,14 +61,14 @@ export function EmptyState({ onPick }: EmptyStateProps) {
         </p>
       </div>
       {dismissed ? (
-        <button type="button" data-ui="sample-prompts-restore" onClick={() => void onRestore()}>
+        <Button type="button" data-ui="sample-prompts-restore" onClick={() => void onRestore()}>
           Show sample prompts
-        </button>
+        </Button>
       ) : (
         <>
           <div data-ui="sample-prompts">
             {SAMPLE_PROMPTS.map((prompt) => (
-              <button
+              <Button
                 type="button"
                 data-ui="sample-prompt"
                 key={prompt.title}
@@ -75,12 +76,12 @@ export function EmptyState({ onPick }: EmptyStateProps) {
               >
                 <strong>{prompt.title}</strong>
                 <span>{prompt.preview}</span>
-              </button>
+              </Button>
             ))}
           </div>
-          <button type="button" data-ui="sample-prompts-dismiss" onClick={() => void onDismiss()}>
+          <Button type="button" data-ui="sample-prompts-dismiss" onClick={() => void onDismiss()}>
             Dismiss sample prompts
-          </button>
+          </Button>
         </>
       )}
     </div>

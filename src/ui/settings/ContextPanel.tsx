@@ -26,6 +26,7 @@ import type { EffectiveCapability } from '../../core/capabilities'
 import { type PromptSizeEstimate, UNLIMITED_CONTEXT } from '../../core/prompt-size'
 import type { Chat } from '../../core/types'
 import { updateChatSettings } from '../../store/chats'
+import { Button } from '../primitives/Button'
 import { InfoDisclosure } from './InfoDisclosure'
 
 interface ContextPanelProps {
@@ -161,7 +162,12 @@ export function ContextPanel({
             {Number.isFinite(effectivePromptBudget) ? effectivePromptBudget.toLocaleString() : '∞'}{' '}
             tokens
           </span>
-          {overBudget ? <span data-tone="danger"> · over budget</span> : null}
+          {overBudget ? (
+            <span data-ui="status-text" data-tone="danger">
+              {' '}
+              · over budget
+            </span>
+          ) : null}
         </div>
       </div>
       <div data-ui="context-gauge-breakdown-compact">
@@ -288,7 +294,7 @@ export function ContextPanel({
               ['drop-all', 'Off'],
             ] as const
           ).map(([value, label]) => (
-            <button
+            <Button
               key={value}
               type="button"
               data-ui="segmented-option"
@@ -300,7 +306,7 @@ export function ContextPanel({
               }
             >
               {label}
-            </button>
+            </Button>
           ))}
         </fieldset>
         {chat.settings.mediaContextStrategy === 'echo-last-N' ? (

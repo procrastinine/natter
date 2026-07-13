@@ -75,6 +75,7 @@ import {
   readJsonFile,
   triggerJsonDownload,
 } from '../import-export/json-file'
+import { Button, IconButton } from '../primitives/Button'
 import { CachingPanel } from './CachingPanel'
 import { ContextPanel } from './ContextPanel'
 import { InfoDisclosure } from './InfoDisclosure'
@@ -338,7 +339,7 @@ export function ChatModelPanel({
             ['generation', 'Generation'],
           ] as const
         ).map(([value, label]) => (
-          <button
+          <Button
             key={value}
             type="button"
             role="tab"
@@ -348,7 +349,7 @@ export function ChatModelPanel({
             onClick={() => setTab(value)}
           >
             {label}
-          </button>
+          </Button>
         ))}
       </div>
       <div role="tabpanel" data-ui="settings-panel" data-active-tab={tab}>
@@ -436,7 +437,7 @@ function PanelHeader({ title, onClose }: { title: string; onClose: () => void })
   return (
     <header data-ui="settings-pane-header">
       <span data-ui="settings-pane-title">{title}</span>
-      <button
+      <IconButton
         type="button"
         data-ui="icon-button"
         data-role="settings-pane-close"
@@ -444,7 +445,7 @@ function PanelHeader({ title, onClose }: { title: string; onClose: () => void })
         aria-label="Close settings pane"
       >
         <CloseIcon size={16} />
-      </button>
+      </IconButton>
     </header>
   )
 }
@@ -672,7 +673,7 @@ function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | u
 
   return (
     <div data-ui="preset-breadcrumb">
-      <button
+      <Button
         type="button"
         data-ui="preset-breadcrumb-button"
         aria-expanded={pickerOpen}
@@ -685,7 +686,7 @@ function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | u
         <span data-ui="preset-breadcrumb-chevron" aria-hidden="true">
           ▾
         </span>
-      </button>
+      </Button>
       {pickerOpen ? (
         <div data-ui="preset-breadcrumb-menu" role="menu">
           {presets.length === 0 ? (
@@ -712,7 +713,7 @@ function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | u
                         : undefined
                     }
                   >
-                    <button
+                    <IconButton
                       type="button"
                       data-ui="preset-drag-handle"
                       aria-label={`Drag preset "${p.name}" to reorder`}
@@ -724,17 +725,17 @@ function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | u
                       onPointerCancel={endPresetDrag}
                     >
                       <GripVerticalIcon size={14} />
-                    </button>
-                    <button
+                    </IconButton>
+                    <Button
                       type="button"
                       data-ui="preset-menu-load"
                       onClick={() => void loadPreset(p.id)}
                       title={isCurrent ? 'Already loaded' : 'Load preset'}
                     >
                       {p.name}
-                    </button>
+                    </Button>
                     <div data-ui="preset-menu-actions">
-                      <button
+                      <Button
                         type="button"
                         data-ui="field-inline-action"
                         onClick={() => void saveToExisting(p.id)}
@@ -745,16 +746,16 @@ function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | u
                         }
                       >
                         save
-                      </button>
-                      <button
+                      </Button>
+                      <Button
                         type="button"
                         data-ui="field-inline-action"
                         onClick={() => void renamePreset(p.id, p.name)}
                         title="Rename"
                       >
                         rename
-                      </button>
-                      <button
+                      </Button>
+                      <IconButton
                         type="button"
                         data-ui="icon-button"
                         data-compact
@@ -764,8 +765,8 @@ function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | u
                         aria-label="Delete preset"
                       >
                         <TrashIcon />
-                      </button>
-                      <button
+                      </IconButton>
+                      <IconButton
                         type="button"
                         data-ui="icon-button"
                         data-compact
@@ -776,7 +777,7 @@ function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | u
                         aria-label={`Export preset "${p.name}" JSON`}
                       >
                         <DownloadIcon size={13} />
-                      </button>
+                      </IconButton>
                     </div>
                   </li>
                 )
@@ -785,9 +786,9 @@ function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | u
           )}
           <div data-ui="preset-menu-footer">
             <span data-ui="preset-menu-footer-primary">
-              <button type="button" data-ui="field-inline-action" onClick={() => void saveAsNew()}>
+              <Button type="button" data-ui="field-inline-action" onClick={() => void saveAsNew()}>
                 + Save as new…
-              </button>
+              </Button>
               <input
                 ref={importInputRef}
                 data-ui="preset-import-input"
@@ -796,7 +797,7 @@ function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | u
                 hidden
                 onChange={(event) => void importPresetJson(event)}
               />
-              <button
+              <IconButton
                 type="button"
                 data-ui="icon-button"
                 data-compact
@@ -806,9 +807,9 @@ function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | u
                 title="Import preset JSON"
               >
                 <UploadIcon size={13} />
-              </button>
+              </IconButton>
             </span>
-            <button
+            <IconButton
               type="button"
               data-ui="icon-button"
               data-compact
@@ -817,7 +818,7 @@ function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | u
               title="Close"
             >
               <CloseGlyph />
-            </button>
+            </IconButton>
           </div>
         </div>
       ) : null}

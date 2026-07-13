@@ -80,6 +80,21 @@ afterEach(async () => {
 })
 
 describe('ConnectionHeader', () => {
+  it('renders the current OpenRouter v2 glyph', async () => {
+    const profile = await seedProfile()
+    writeActiveProfileId(profile.id)
+    render(<ConnectionHeader variant="title-icon" />)
+
+    const button = await screen.findByRole('button', {
+      name: connectionButtonMatcher('OpenRouter'),
+    })
+    const icon = button.querySelector('svg[data-icon="openrouter"]')
+    const path = icon?.querySelector('path')
+
+    expect(icon).toHaveAttribute('viewBox', '0 0 401.4 293.7')
+    expect(path?.getAttribute('d')).toMatch(/^M303\.9475,17\.19926/u)
+  })
+
   it('creates a first connection from the full setup dialog with any provider + name', async () => {
     render(<ConnectionHeader />)
     fireEvent.click(screen.getByText('Add connection'))
@@ -103,6 +118,24 @@ describe('ConnectionHeader', () => {
     expect(profiles[0]?.kind).toBe('llama-server')
     expect(profiles[0]?.name).toBe('Local llama')
     expect(presets).toHaveLength(1)
+  })
+
+  it('keeps the connection popover open while its portalled setup dialog is used', async () => {
+    const profile = await seedProfile()
+    writeActiveProfileId(profile.id)
+    render(<ConnectionHeader variant="title-icon" />)
+    await openConnectionPopover('OpenRouter')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Add new connection profile' }))
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Google' } })
+    fireEvent.change(screen.getByLabelText('Provider'), { target: { value: 'google' } })
+    const save = screen.getByRole('button', { name: 'Save' })
+    fireEvent.pointerDown(save)
+    expect(screen.getByRole('region', { name: 'Connection: OpenRouter' })).toBeInTheDocument()
+    fireEvent.click(save)
+
+    const region = await screen.findByRole('region', { name: 'Connection: Google' })
+    expect(region.querySelector('[data-ui="connection-name"]')).toHaveTextContent('Google')
   })
 
   it('shows Edit, Test, and Delete in viewer mode and tests non-llama connections', async () => {

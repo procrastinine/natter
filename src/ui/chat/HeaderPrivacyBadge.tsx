@@ -13,6 +13,7 @@ import { getChat } from '../../store/chats'
 import { chatRowDependencies } from '../../store/reactive-dependencies'
 import { useRepositoryQuery } from '../../store/reactive-query'
 import { CloseIcon, LockIcon, LockOpenIcon } from '../icons/Icon'
+import { IconButton } from '../primitives/Button'
 import {
   buildPickerRows,
   type PickerRow,
@@ -68,7 +69,7 @@ function Inner({ chat }: { chat: Chat }) {
   // user understands privacy routing doesn't apply here.
   if (isFreeModel) {
     return (
-      <button
+      <IconButton
         type="button"
         data-ui="icon-button"
         data-ui-surface="header-privacy-badge"
@@ -78,7 +79,7 @@ function Inner({ chat }: { chat: Chat }) {
         disabled
       >
         <LockOpenIcon size={18} />
-      </button>
+      </IconButton>
     )
   }
 
@@ -102,7 +103,7 @@ function Inner({ chat }: { chat: Chat }) {
 
   return (
     <div data-ui="header-privacy-badge">
-      <button
+      <IconButton
         ref={btnRef}
         type="button"
         data-ui="icon-button"
@@ -113,7 +114,7 @@ function Inner({ chat }: { chat: Chat }) {
         onClick={() => setOpen((v) => !v)}
       >
         <LockIcon size={18} />
-      </button>
+      </IconButton>
       {open ? (
         <div
           ref={popRef}
@@ -123,7 +124,7 @@ function Inner({ chat }: { chat: Chat }) {
         >
           <div data-ui="header-privacy-popover-header">
             <span>Privacy</span>
-            <button
+            <IconButton
               type="button"
               data-ui="icon-button"
               data-size="sm"
@@ -131,7 +132,7 @@ function Inner({ chat }: { chat: Chat }) {
               onClick={() => setOpen(false)}
             >
               <CloseIcon size={14} />
-            </button>
+            </IconButton>
           </div>
           <div data-ui="header-privacy-popover-body">
             {rows.length === 0 ? (

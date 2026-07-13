@@ -4,6 +4,7 @@
 
 import { useEffect } from 'react'
 import { useToastStore } from '../../store/zustand/toastStore'
+import { Button } from '../primitives/Button'
 
 export function ToastTray() {
   const toasts = useToastStore((s) => s.toasts)
@@ -24,7 +25,7 @@ export function ToastTray() {
 
   if (toasts.length === 0) return null
   return (
-    <div data-ui="toast-tray" aria-live="polite" aria-atomic="false">
+    <section data-ui="toast-tray" aria-label="Notifications">
       {toasts.map((t) => {
         const pending = t.actionState?.pending === true
         return (
@@ -34,16 +35,13 @@ export function ToastTray() {
             data-tone={t.level}
             data-state={pending ? 'pending' : t.actionState?.error ? 'error' : 'idle'}
             aria-busy={pending}
-            role={t.level === 'danger' ? 'alert' : 'status'}
           >
             <span data-ui="toast-text">{t.text}</span>
             {t.actionState?.error ? (
-              <span data-ui="toast-action-error" role="alert">
-                {t.actionState.error}
-              </span>
+              <span data-ui="toast-action-error">{t.actionState.error}</span>
             ) : null}
             {t.undo ? (
-              <button
+              <Button
                 type="button"
                 data-ui="toast-undo"
                 data-pending={pending || undefined}
@@ -57,9 +55,9 @@ export function ToastTray() {
                 }}
               >
                 {pending ? 'Undoing…' : 'Undo'}
-              </button>
+              </Button>
             ) : null}
-            <button
+            <Button
               type="button"
               data-ui="toast-dismiss"
               aria-label="Dismiss notification"
@@ -73,10 +71,10 @@ export function ToastTray() {
               }}
             >
               ×
-            </button>
+            </Button>
           </div>
         )
       })}
-    </div>
+    </section>
   )
 }

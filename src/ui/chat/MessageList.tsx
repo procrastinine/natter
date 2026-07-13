@@ -41,8 +41,10 @@ import {
 import { getChat, listChatSidebarRows } from '../../store/chats'
 import type { MessageHeaderRow } from '../../store/message-storage'
 import type { ActiveBranchWindowSnapshot } from '../../store/repository'
+import { announceVariantPosition } from '../../store/zustand/announcementStore'
 import { useChatStore } from '../../store/zustand/chatStore'
 import { useToastStore } from '../../store/zustand/toastStore'
+import { Button } from '../primitives/Button'
 import type { BranchNavigationContext } from './BranchControls'
 import { Message } from './Message'
 import type { InsertSlot } from './MessageActions'
@@ -369,6 +371,13 @@ export const MessageList = memo(function MessageList({
           resolveLastUpdatedBranchBelow({ targetId: chosenId, byParent, byId }, next)
         }
         useChatStore.getState().setCursor(chatId, next)
+        if (chosenId) {
+          const siblings = (byParent.get(focused.parentId) ?? [])
+            .filter((candidate) => !candidate.deleted)
+            .sort((a, b) => a.siblingIndex - b.siblingIndex)
+          const targetIndex = siblings.findIndex((candidate) => candidate.id === chosenId)
+          if (targetIndex >= 0) announceVariantPosition(targetIndex, siblings.length)
+        }
         return
       }
       if (e.key === 'R' && e.shiftKey && (e.metaKey || e.ctrlKey) && focused.role === 'assistant') {
@@ -441,7 +450,9 @@ export const MessageList = memo(function MessageList({
   return (
     <div
       data-ui="message-list"
+      role="log"
       aria-live="polite"
+      aria-relevant="additions"
       ref={listRef}
       data-render-window-size={messageRenderWindowSize}
       data-rendered-count={effectiveRenderedMessageCount}
@@ -449,9 +460,9 @@ export const MessageList = memo(function MessageList({
     >
       {hiddenOlderCount > 0 ? (
         <div ref={loadOlderRef} data-ui="message-window-load">
-          <button type="button" data-ui="load-more-messages" onClick={loadOlderMessages}>
+          <Button type="button" data-ui="load-more-messages" onClick={loadOlderMessages}>
             Load more
-          </button>
+          </Button>
           <span>{hiddenOlderCount} older</span>
         </div>
       ) : null}

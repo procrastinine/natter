@@ -324,6 +324,24 @@ describe('Message content refresh', () => {
 })
 
 describe('Message streaming info surface', () => {
+  it('marks the streaming message busy until its stream ends', () => {
+    const msg = makeAssistant()
+    const props = {
+      chatId: msg.chatId,
+      message: msg,
+      hasAnyReasoningDetails: false,
+      hasConnection: false,
+      onEditInPlace: async () => {},
+    }
+    const view = render(<ChatMessage {...props} streaming />)
+
+    expect(view.container.querySelector('[data-ui="message"]')).toHaveAttribute('aria-busy', 'true')
+
+    view.rerender(<ChatMessage {...props} streaming={false} />)
+
+    expect(view.container.querySelector('[data-ui="message"]')).not.toHaveAttribute('aria-busy')
+  })
+
   it('keeps MessageInfo unmounted until the info action is clicked', () => {
     const msg = makeAssistant()
     const { container } = render(

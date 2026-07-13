@@ -16,6 +16,7 @@ import {
   SendIcon,
   TrashIcon,
 } from '../icons/Icon'
+import { Button } from '../primitives/Button'
 import type { BranchTreeInspectorSearchTools as InspectorSearchTools } from './BranchTreeInspectorSearch'
 import { InlineEditor, plaintextOf } from './InlineEditor'
 import { MessageContent, messageTextSegmentsFromContent } from './MessageContent'
@@ -430,7 +431,7 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
             {totalChars.toLocaleString()} text characters
           </span>
         </div>
-        <button
+        <Button
           type="button"
           data-ui="branch-tree-inspector-close"
           aria-label="Close message inspector"
@@ -438,10 +439,10 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
           onClick={onClose}
         >
           <CloseIcon size={16} />
-        </button>
+        </Button>
         <div data-ui="branch-tree-inspector-actions">
           {onActivate ? (
-            <button
+            <Button
               type="button"
               data-ui="branch-tree-inspector-activate"
               data-tone="accent"
@@ -449,9 +450,9 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
               onClick={onActivate}
             >
               Open branch
-            </button>
+            </Button>
           ) : null}
-          <button
+          <Button
             type="button"
             data-ui="branch-tree-inspector-action"
             data-action="copy"
@@ -460,9 +461,9 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
             onClick={() => void copyMessage()}
           >
             <CopyIcon size={15} />
-          </button>
+          </Button>
           {onEdit ? (
-            <button
+            <Button
               type="button"
               data-ui="branch-tree-inspector-action"
               data-action="edit"
@@ -476,10 +477,10 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
               }}
             >
               <PencilIcon size={15} />
-            </button>
+            </Button>
           ) : null}
           {message.role === 'assistant' && onRegenerate ? (
-            <button
+            <Button
               type="button"
               data-ui="branch-tree-inspector-action"
               data-action="regenerate"
@@ -495,10 +496,10 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
               onClick={() => void onRegenerate()}
             >
               <ReloadIcon size={15} />
-            </button>
+            </Button>
           ) : null}
           {message.role === 'assistant' && onContinue ? (
-            <button
+            <Button
               type="button"
               data-ui="branch-tree-inspector-action"
               data-action="continue"
@@ -516,10 +517,10 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
               onClick={() => void onContinue()}
             >
               <SendIcon size={15} />
-            </button>
+            </Button>
           ) : null}
           {onForkChat ? (
-            <button
+            <Button
               type="button"
               data-ui="branch-tree-inspector-action"
               data-action="fork-chat"
@@ -528,10 +529,10 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
               onClick={() => void onForkChat()}
             >
               <BranchIcon size={15} />
-            </button>
+            </Button>
           ) : null}
           {onToggleContextVisibility ? (
-            <button
+            <Button
               type="button"
               data-ui="branch-tree-inspector-action"
               data-action="toggle-visible"
@@ -549,10 +550,10 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
               onClick={() => void onToggleContextVisibility()}
             >
               {message.hiddenFromContext ? <EyeOffIcon size={15} /> : <EyeIcon size={15} />}
-            </button>
+            </Button>
           ) : null}
           {onDelete ? (
-            <button
+            <Button
               type="button"
               data-ui="branch-tree-inspector-action"
               data-action="delete"
@@ -563,9 +564,9 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
               onClick={() => void onDelete()}
             >
               <TrashIcon size={15} />
-            </button>
+            </Button>
           ) : null}
-          <button
+          <Button
             type="button"
             data-ui="branch-tree-inspector-action"
             data-action="info"
@@ -575,7 +576,7 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
             onClick={() => setShowInfo((visible) => !visible)}
           >
             <InfoIcon size={15} />
-          </button>
+          </Button>
         </div>
       </header>
 
@@ -607,7 +608,7 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
                   {occurrenceCount.toLocaleString()}
                   {searchHighlightLimited ? '+' : ''}
                 </output>
-                <button
+                <Button
                   type="button"
                   aria-label="Previous occurrence in message"
                   data-ui="branch-tree-inspector-search-nav"
@@ -615,8 +616,8 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
                   onClick={() => goToOccurrence(-1)}
                 >
                   <ChevronIcon size={14} rotate={180} />
-                </button>
-                <button
+                </Button>
+                <Button
                   type="button"
                   aria-label="Next occurrence in message"
                   data-ui="branch-tree-inspector-search-nav"
@@ -624,7 +625,7 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
                   onClick={() => goToOccurrence(1)}
                 >
                   <ChevronIcon size={14} />
-                </button>
+                </Button>
               </div>
               {streamTargetBusy ? (
                 <span data-ui="branch-tree-inspector-search-overflow">
@@ -662,13 +663,13 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
                   </span>
                 ) : null}
               </span>
-              <button
+              <Button
                 type="button"
                 data-ui="branch-tree-inspector-overflow-toggle"
                 onClick={() => setFullMessageId(showingFull ? null : message.id)}
               >
                 {showingFull ? 'Show bounded preview' : 'Show full message'}
-              </button>
+              </Button>
             </div>
           ) : null}
           {editing ? (

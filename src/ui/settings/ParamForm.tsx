@@ -37,6 +37,7 @@ import type {
 } from '../../core/types'
 import { updateChatSettings } from '../../store/chats'
 import { PrefillSettingsPrompt } from '../chat/PrefillSettingsPrompt'
+import { Button } from '../primitives/Button'
 import { InfoDisclosure } from './InfoDisclosure'
 import { PrefillPromptEditor } from './PromptPresetEditor'
 import { TextTemplateSection } from './TextTemplateSection'
@@ -615,7 +616,7 @@ function OpenAiHostedToolConfig({ chat, toolId }: { chat: Chat; toolId: OpenAiSe
           <span>Search context</span>
           <div data-ui="segmented">
             {(['low', 'medium', 'high'] as const).map((value) => (
-              <button
+              <Button
                 key={value}
                 type="button"
                 data-ui="segmented-option"
@@ -623,7 +624,7 @@ function OpenAiHostedToolConfig({ chat, toolId }: { chat: Chat; toolId: OpenAiSe
                 onClick={() => updateConfig({ 'web-search': { ...web, searchContextSize: value } })}
               >
                 {value}
-              </button>
+              </Button>
             ))}
           </div>
         </div>
@@ -1030,7 +1031,7 @@ function ReasoningSection({ chat, capability }: { chat: Chat; capability: Effect
         <span>Mode {modeInfo ? <InfoDisclosure title={modeInfo} /> : null}</span>
         <div data-ui="segmented">
           {modes.map((m) => (
-            <button
+            <Button
               key={m}
               type="button"
               data-ui="segmented-option"
@@ -1038,7 +1039,7 @@ function ReasoningSection({ chat, capability }: { chat: Chat; capability: Effect
               onClick={() => updateReasoning({ mode: m })}
             >
               {m}
-            </button>
+            </Button>
           ))}
         </div>
       </div>
@@ -1047,7 +1048,7 @@ function ReasoningSection({ chat, capability }: { chat: Chat; capability: Effect
           <span>Effort</span>
           <div data-ui="segmented">
             {effortChoices.map((e) => (
-              <button
+              <Button
                 key={e}
                 type="button"
                 data-ui="segmented-option"
@@ -1055,7 +1056,7 @@ function ReasoningSection({ chat, capability }: { chat: Chat; capability: Effect
                 onClick={() => updateReasoning({ effort: e })}
               >
                 {e}
-              </button>
+              </Button>
             ))}
           </div>
         </div>
@@ -1207,7 +1208,7 @@ function ReasoningSummaryControl({
       <span>Summary output</span>
       <div data-ui="segmented">
         {SUMMARY_VALUES.map((v) => (
-          <button
+          <Button
             key={v}
             type="button"
             data-ui="segmented-option"
@@ -1219,7 +1220,7 @@ function ReasoningSummaryControl({
             }
           >
             {v}
-          </button>
+          </Button>
         ))}
       </div>
     </div>
@@ -1365,22 +1366,22 @@ export function ApiModeSection({
             <InfoDisclosure title="Native Gemini preserves thought signatures and uses generateContent with x-goog-api-key. OpenAI-compat uses Gemini's chat-completions shim." />
           </span>
           <div data-ui="segmented">
-            <button
+            <Button
               type="button"
               data-ui="segmented-option"
               aria-pressed={resolvedKind === 'gemini-native'}
               onClick={() => void updateChatSettings(chat.id, { api: 'gemini-native' })}
             >
               Native
-            </button>
-            <button
+            </Button>
+            <Button
               type="button"
               data-ui="segmented-option"
               aria-pressed={resolvedKind === 'chat'}
               onClick={() => void updateChatSettings(chat.id, { api: 'chat' })}
             >
               OpenAI-compat
-            </button>
+            </Button>
           </div>
         </div>
       </section>
@@ -1396,22 +1397,22 @@ export function ApiModeSection({
             <InfoDisclosure title="Messages uses Anthropic's native API with x-api-key. OpenAI-compat uses the chat-completions shim." />
           </span>
           <div data-ui="segmented">
-            <button
+            <Button
               type="button"
               data-ui="segmented-option"
               aria-pressed={resolvedKind === 'anthropic-messages'}
               onClick={() => void updateChatSettings(chat.id, { api: 'anthropic-messages' })}
             >
               Messages
-            </button>
-            <button
+            </Button>
+            <Button
               type="button"
               data-ui="segmented-option"
               aria-pressed={resolvedKind === 'chat'}
               onClick={() => void updateChatSettings(chat.id, { api: 'chat' })}
             >
               OpenAI-compat
-            </button>
+            </Button>
           </div>
         </div>
       </section>
@@ -1451,33 +1452,33 @@ export function ApiModeSection({
           <InfoDisclosure title="Responses preserves encrypted reasoning and `phase` metadata across turns. Text completions sends a single rendered prompt to /completions and is intended for OpenRouter-routed open-weight models." />
         </span>
         <div data-ui="segmented">
-          <button
+          <Button
             type="button"
             data-ui="segmented-option"
             aria-pressed={resolvedKind === 'chat'}
             onClick={() => pinTo('chat')}
           >
             Chat completions
-          </button>
+          </Button>
           {canResponses ? (
-            <button
+            <Button
               type="button"
               data-ui="segmented-option"
               aria-pressed={resolvedKind === 'responses'}
               onClick={() => pinTo('responses')}
             >
               Responses
-            </button>
+            </Button>
           ) : null}
           {canText ? (
-            <button
+            <Button
               type="button"
               data-ui="segmented-option"
               aria-pressed={resolvedKind === 'text'}
               onClick={() => pinTo('text')}
             >
               Text completions
-            </button>
+            </Button>
           ) : null}
         </div>
       </div>
@@ -1496,7 +1497,7 @@ function VerbositySection({ chat, capability }: { chat: Chat; capability: Effect
       <h3>Verbosity</h3>
       <div data-ui="segmented">
         {options.map((v) => (
-          <button
+          <Button
             key={v}
             type="button"
             data-ui="segmented-option"
@@ -1509,7 +1510,7 @@ function VerbositySection({ chat, capability }: { chat: Chat; capability: Effect
             }
           >
             {v}
-          </button>
+          </Button>
         ))}
       </div>
     </section>
@@ -1538,13 +1539,13 @@ function StopInlineRow({ chat, capability }: { chat: Chat; capability: Effective
         {entries.map((entry) => (
           <span key={entry.key} data-ui="chip">
             <code>{entry.value}</code>
-            <button
+            <Button
               type="button"
               aria-label={`Remove ${entry.value}`}
               onClick={() => setValues(values.filter((_, idx) => idx !== entry.index))}
             >
               ×
-            </button>
+            </Button>
           </span>
         ))}
         <input
@@ -1682,20 +1683,20 @@ function LogitBiasSection({ chat, capability }: { chat: Chat; capability: Effect
   }
   return (
     <section data-ui="settings-section" data-ui-section="logit-bias">
-      <button
+      <Button
         type="button"
         data-ui="settings-advanced-toggle"
         onClick={() => setOpen((v) => !v)}
         aria-expanded={open}
       >
         {open ? '▾' : '▸'} Logit bias (advanced)
-      </button>
+      </Button>
       {open ? (
         <div data-ui="field-group">
           <div data-ui="logit-bias-toolbar">
-            <button type="button" data-ui="logit-bias-btn" onClick={() => fileRef.current?.click()}>
+            <Button type="button" data-ui="logit-bias-btn" onClick={() => fileRef.current?.click()}>
               Upload
-            </button>
+            </Button>
             <input
               ref={fileRef}
               type="file"
@@ -1708,7 +1709,7 @@ function LogitBiasSection({ chat, capability }: { chat: Chat; capability: Effect
               }}
             />
             {draft ? (
-              <button
+              <Button
                 type="button"
                 data-ui="logit-bias-btn"
                 onClick={() => {
@@ -1718,7 +1719,7 @@ function LogitBiasSection({ chat, capability }: { chat: Chat; capability: Effect
                 }}
               >
                 Clear
-              </button>
+              </Button>
             ) : null}
           </div>
           <textarea

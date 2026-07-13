@@ -25,10 +25,12 @@ import type {
   ProviderOutputItem,
   ReasoningDetail,
 } from '../../core/types'
+import { useAnnouncementStore } from '../../store/zustand/announcementStore'
 import { AttachmentDraftTray } from '../attachments/AttachmentDraftTray'
 import { AttachmentPicker } from '../attachments/AttachmentPicker'
 import { useAttachmentDrafts } from '../attachments/useAttachmentDrafts'
 import { DatabaseIcon, PaperclipIcon, PrefillIcon } from '../icons/Icon'
+import { Button, IconButton } from '../primitives/Button'
 
 interface InlineEditorProps {
   initial: string
@@ -437,7 +439,18 @@ export function InlineEditor({
       onCancel()
       return
     }
-    return run(onSave)
+    return run(async (...args) => {
+      try {
+        await onSave(...args)
+        useAnnouncementStore.getState().announce({ text: 'Message saved.' })
+      } catch (error) {
+        useAnnouncementStore.getState().announce({
+          text: 'Edit failed.',
+          priority: 'assertive',
+        })
+        throw error
+      }
+    })
   }, [isUnchanged, onCancel, run, onSave])
   const commitSaveAndSend = useCallback(() => {
     if (!onSaveAndSend || saveAndSendDisabled) return
@@ -520,7 +533,7 @@ export function InlineEditor({
   }
 
   return (
-    <div data-ui="inline-editor">
+    <div data-ui="inline-editor" aria-busy={busy || undefined}>
       <textarea
         ref={textareaRef}
         data-ui="inline-editor-input"
@@ -619,14 +632,14 @@ export function InlineEditor({
               />
             ))}
           </div>
-          <button
+          <Button
             type="button"
             data-ui="inline-editor-tool-call-add-button"
             onClick={addToolCallRow}
             disabled={busy}
           >
             + Add tool call
-          </button>
+          </Button>
         </details>
       ) : null}
       {attachmentsEnabled && (attachmentRefs.length > 0 || uploads.length > 0) ? (
@@ -655,10 +668,10 @@ export function InlineEditor({
                 void ingestFiles(files)
               }}
             />
-            <button
-              type="button"
+            <Button
               data-ui="inline-editor-button"
               data-role="attach"
+              geometry="flush"
               onClick={() =>
                 (
                   actionsRef.current?.querySelector(
@@ -671,35 +684,35 @@ export function InlineEditor({
               title="Upload attachment"
             >
               <PaperclipIcon size={14} />
-            </button>
-            <button
-              type="button"
+            </Button>
+            <Button
               data-ui="inline-editor-button"
               data-role="attach-existing"
+              geometry="flush"
               onClick={() => setPickerOpen(true)}
               disabled={busy}
               aria-label="Use existing stored attachment"
               title="Use existing stored attachment"
             >
               <DatabaseIcon size={14} />
-            </button>
+            </Button>
           </>
         ) : null}
-        <button
-          type="button"
+        <Button
           data-ui="inline-editor-button"
           data-role="cancel"
+          geometry="flush"
           onClick={onCancel}
           disabled={busy}
           title="Cancel (Esc)"
         >
           Cancel
-        </button>
+        </Button>
         {onSaveAndSend && showPrefillButton ? (
-          <button
-            type="button"
+          <Button
             data-ui="inline-editor-button"
             data-role="prefill"
+            geometry="flush"
             data-active={prefillOpen ? 'true' : undefined}
             onClick={() => void togglePrefill()}
             disabled={busy}
@@ -712,23 +725,26 @@ export function InlineEditor({
           >
             <PrefillIcon size={14} />
             <span>Prefill</span>
-          </button>
+          </Button>
         ) : null}
-        <button
-          type="button"
+        <Button
           data-ui="inline-editor-button"
           data-role="save"
+          appearance="surface"
+          geometry="flush"
           onClick={() => void commitSave()}
           disabled={busy || uploadingAttachments}
           title={uploadingAttachments ? 'Uploading attachments' : 'Save in place (⌘⏎)'}
         >
           Save
-        </button>
+        </Button>
         {onSaveAndSend ? (
-          <button
-            type="button"
+          <Button
             data-ui="inline-editor-button"
             data-role="save-send"
+            tone="accent"
+            appearance="solid"
+            geometry="flush"
             onClick={() => void commitSaveAndSend()}
             disabled={busy || uploadingAttachments || saveAndSendDisabled}
             title={
@@ -740,7 +756,7 @@ export function InlineEditor({
             }
           >
             Save &amp; Send
-          </button>
+          </Button>
         ) : null}
       </div>
       {attachmentsEnabled && pickerOpen ? (
@@ -787,7 +803,7 @@ function ReasoningEditorRow({
       <div data-ui="inline-editor-reasoning-row-header">
         <span data-ui="inline-editor-reasoning-label">{label}</span>
         <div data-ui="inline-editor-reasoning-row-actions">
-          <button
+          <IconButton
             type="button"
             data-ui="icon-button"
             data-compact
@@ -802,19 +818,19 @@ function ReasoningEditorRow({
             }
           >
             {row.hidden ? <EyeOffIcon /> : <EyeIcon />}
-          </button>
-          <button
+          </IconButton>
+          <IconButton
             type="button"
             data-ui="icon-button"
             data-compact
-            data-tone="danger"
+            tone="danger"
             onClick={onDelete}
             disabled={busy}
             aria-label="Delete reasoning entry"
             title="Delete this reasoning entry"
           >
             <TrashSmallIcon />
-          </button>
+          </IconButton>
         </div>
       </div>
       {row.kind === 'encrypted' ? (
@@ -865,7 +881,7 @@ function ToolCallEditorRow({
           {row.type || 'Tool call'} · {row.dialect}
         </span>
         <div data-ui="inline-editor-reasoning-row-actions">
-          <button
+          <IconButton
             type="button"
             data-ui="icon-button"
             data-compact
@@ -880,19 +896,19 @@ function ToolCallEditorRow({
             }
           >
             {row.hidden ? <EyeOffIcon /> : <EyeIcon />}
-          </button>
-          <button
+          </IconButton>
+          <IconButton
             type="button"
             data-ui="icon-button"
             data-compact
-            data-tone="danger"
+            tone="danger"
             onClick={onDelete}
             disabled={busy}
             aria-label="Delete tool call"
             title="Delete this tool call"
           >
             <TrashSmallIcon />
-          </button>
+          </IconButton>
         </div>
       </div>
       <div data-ui="inline-editor-tool-call-meta">
@@ -963,14 +979,14 @@ function AddReasoningEntry({
         <option value="text">Reasoning text</option>
         <option value="summary">Summary</option>
       </select>
-      <button
+      <Button
         type="button"
         data-ui="inline-editor-reasoning-add-button"
         onClick={() => onAdd(kind)}
         disabled={busy}
       >
         + Add reasoning entry
-      </button>
+      </Button>
     </div>
   )
 }

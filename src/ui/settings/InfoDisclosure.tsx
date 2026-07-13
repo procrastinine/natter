@@ -1,4 +1,5 @@
 import { type ReactNode, useEffect, useId, useLayoutEffect, useRef, useState } from 'react'
+import { Button } from '../primitives/Button'
 
 export function InfoDisclosure({
   title,
@@ -68,7 +69,7 @@ export function InfoDisclosure({
 
   return (
     <span data-ui="info-disclosure" data-align={align} ref={rootRef}>
-      <button
+      <Button
         type="button"
         data-ui="info-hint"
         aria-label="More info"
@@ -86,7 +87,7 @@ export function InfoDisclosure({
           <circle cx="8" cy="4.5" r="0.9" fill="currentColor" />
           <path d="M8 6.8v5" stroke="currentColor" strokeWidth="1.25" strokeLinecap="round" />
         </svg>
-      </button>
+      </Button>
       {/* The popup lives inside whatever ancestor wraps the trigger, often a
           `<label>` or `<h3>`. Without these handlers, clicking text in the
           popup (or starting a text-selection drag) bubbles up and either

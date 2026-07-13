@@ -33,6 +33,9 @@ import {
 import { allTable } from '../../store/reactive-dependencies'
 import { useRepositoryQuery } from '../../store/reactive-query'
 import { ChevronIcon, CloseIcon, TrashIcon } from '../icons/Icon'
+import { Button, IconButton } from '../primitives/Button'
+import { ConfirmDialog } from '../primitives/ConfirmDialog'
+import { Dialog } from '../primitives/Dialog'
 
 interface HeaderState {
   profile: ConnectionProfile | null
@@ -482,6 +485,12 @@ export function ConnectionHeader({
   useEffect(() => {
     if (variant !== 'title-icon' || !open) return
     const onPointerDown = (event: PointerEvent) => {
+      if (
+        event.target instanceof Element &&
+        event.target.closest('[data-control="dialog-overlay"]')
+      ) {
+        return
+      }
       const root = titleEntryRef.current
       if (!root || root.contains(event.target as Node)) return
       setOpen(false)
@@ -612,9 +621,14 @@ export function ConnectionHeader({
     if (variant === 'title-icon') return null
     return (
       <div data-ui="connection-empty-action" data-variant={variant}>
-        <button type="button" data-ui="connection-add" onClick={() => setSetupOpen(true)}>
+        <Button
+          data-ui="connection-add"
+          tone="accent"
+          appearance="solid"
+          onClick={() => setSetupOpen(true)}
+        >
           Add connection
-        </button>
+        </Button>
         {setupOpen ? (
           <ConnectionSetupModal
             hasExistingConnections={false}
@@ -664,7 +678,7 @@ export function ConnectionHeader({
         {connectionSummary}
       </div>
     ) : (
-      <button
+      <Button
         type="button"
         data-ui="connection-row"
         aria-expanded={open}
@@ -675,7 +689,7 @@ export function ConnectionHeader({
           <ChevronIcon size={14} rotate={open ? 90 : 0} />
         </span>
         {connectionSummary}
-      </button>
+      </Button>
     )
   const connectionDetail = detailOpen ? (
     <div data-ui="connection-detail" id={detailId}>
@@ -746,7 +760,7 @@ export function ConnectionHeader({
   if (variant !== 'title-icon') return null
   return (
     <div data-ui="connection-title-entry" ref={titleEntryRef}>
-      <button
+      <Button
         type="button"
         data-ui="connection-provider-button"
         data-kind={profile.kind}
@@ -757,7 +771,7 @@ export function ConnectionHeader({
         onClick={() => setOpen((v) => !v)}
       >
         <ConnectionKindIcon kind={profile.kind} size={18} />
-      </button>
+      </Button>
       {open ? (
         <section
           data-ui="connection-header"
@@ -781,15 +795,15 @@ function ConnectionKindIcon({ kind, size }: { kind: ConnectionKind; size: number
   if (kind === 'openrouter') {
     return (
       <svg
-        viewBox="0 0 24 24"
+        viewBox="0 0 401.4 293.7"
         width={size}
         height={size}
         fill="currentColor"
         aria-hidden="true"
         focusable="false"
-        data-icon=""
+        data-icon="openrouter"
       >
-        <path d="M16.778 1.844v1.919q-.569-.026-1.138-.032-.708-.008-1.415.037c-1.93.126-4.023.728-6.149 2.237-2.911 2.066-2.731 1.95-4.14 2.75-.396.223-1.342.574-2.185.798-.841.225-1.753.333-1.751.333v4.229s.768.108 1.61.333c.842.224 1.789.575 2.185.799 1.41.798 1.228.683 4.14 2.75 2.126 1.509 4.22 2.11 6.148 2.236.88.058 1.716.041 2.555.005v1.918l7.222-4.168-7.222-4.17v2.176c-.86.038-1.611.065-2.278.021-1.364-.09-2.417-.357-3.979-1.465-2.244-1.593-2.866-2.027-3.68-2.508.889-.518 1.449-.906 3.822-2.59 1.56-1.109 2.614-1.377 3.978-1.466.667-.044 1.418-.017 2.278.02v2.176L24 6.014Z" />
+        <path d="M303.9475,17.19926c42.79734,0,77.48933,34.69327,77.48933,77.48933s-34.69199,77.48933-77.48933,77.48933l76.86166,76.86244c9.76367,9.76313,2.84903,26.45667-10.95697,26.45667h-220.88335c-71.32686,0-129.14889-57.82202-129.14889-129.14889S77.64197,17.19926,148.96884,17.19926h154.97866ZM148.96884,68.85881c-42.79607,0-77.48933,34.69327-77.48933,77.48933s34.69327,77.48933,77.48933,77.48933,77.48933-34.69327,77.48933-77.48933-34.69327-77.48933-77.48933-77.48933Z" />
       </svg>
     )
   }
@@ -863,7 +877,7 @@ function ConnectionKindIcon({ kind, size }: { kind: ConnectionKind; size: number
         height={size}
         aria-hidden="true"
         focusable="false"
-        data-icon=""
+        data-icon="llama-server"
       >
         <rect width="250" height="250" rx="8.6857" ry="8.7008" fill="#1b1f20" />
         <g transform="translate(-995.51066,-129.70875)" fill="#ff8236">
@@ -921,7 +935,7 @@ function ProfileSwitcher({ profiles, activeId, onSwitch, onCreateNew }: ProfileS
           </option>
         ))}
       </select>
-      <button
+      <Button
         type="button"
         data-ui="connection-new"
         onClick={onCreateNew}
@@ -929,7 +943,7 @@ function ProfileSwitcher({ profiles, activeId, onSwitch, onCreateNew }: ProfileS
         title="Add a new connection profile"
       >
         +
-      </button>
+      </Button>
     </div>
   )
 }
@@ -945,72 +959,20 @@ function ConnectionDeleteDialog({
   onCancel: () => void
   onConfirm: () => void | Promise<void>
 }) {
-  useEffect(() => {
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        event.preventDefault()
-        onCancel()
-      }
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [onCancel])
-
   return (
-    <div data-ui="confirm-delete-overlay">
-      <button
-        type="button"
-        data-ui="confirm-delete-scrim"
-        aria-label="Cancel connection delete"
-        tabIndex={-1}
-        onClick={onCancel}
-      />
-      <div
-        data-ui="confirm-delete"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="delete-connection-title"
-      >
-        <div data-ui="confirm-delete-header">
-          <h2 id="delete-connection-title">Delete connection?</h2>
-          <button
-            type="button"
-            data-ui="icon-button"
-            data-size="sm"
-            data-role="confirm-delete-close"
-            aria-label="Cancel delete"
-            onClick={onCancel}
-            disabled={busy}
-          >
-            <CloseIcon size={14} />
-          </button>
-        </div>
-        <blockquote data-ui="confirm-delete-preview">
-          Delete <strong>{profileName}</strong>? This cannot be undone.
-        </blockquote>
-        <div data-ui="confirm-delete-actions">
-          <button
-            type="button"
-            data-ui="confirm-delete-button"
-            data-role="cancel"
-            onClick={onCancel}
-            disabled={busy}
-          >
-            Cancel
-          </button>
-          <button
-            type="button"
-            data-ui="confirm-delete-button"
-            data-role="confirm"
-            data-tone="danger"
-            onClick={() => void onConfirm()}
-            disabled={busy}
-          >
-            {busy ? 'Deleting…' : 'Delete'}
-          </button>
-        </div>
-      </div>
-    </div>
+    <ConfirmDialog
+      title="Delete connection?"
+      confirmLabel="Delete"
+      busyLabel="Deleting…"
+      busy={busy}
+      onCancel={onCancel}
+      onConfirm={onConfirm}
+      closeLabel="Cancel connection delete"
+    >
+      <blockquote data-ui="confirm-delete-preview">
+        Delete <strong>{profileName}</strong>? This cannot be undone.
+      </blockquote>
+    </ConfirmDialog>
   )
 }
 
@@ -1066,15 +1028,15 @@ function ConnectionViewer({
       </dl>
       <div data-ui="connection-actions">
         <div data-ui="connection-actions-leading">
-          <button type="button" data-ui="connection-edit" onClick={onEdit}>
+          <Button type="button" data-ui="connection-edit" onClick={onEdit}>
             Edit
-          </button>
-          <button type="button" data-ui="connection-test" onClick={() => void onTest()}>
+          </Button>
+          <Button type="button" data-ui="connection-test" onClick={() => void onTest()}>
             {probeState.kind === 'running' ? 'Testing…' : 'Test'}
-          </button>
+          </Button>
         </div>
         <div data-ui="connection-actions-trailing">
-          <button
+          <Button
             type="button"
             data-ui="connection-delete"
             data-role="connection-delete"
@@ -1084,7 +1046,7 @@ function ConnectionViewer({
             title="Delete connection"
           >
             <TrashIcon size={13} />
-          </button>
+          </Button>
         </div>
       </div>
       <ConnectionProbeMessage state={probeState} />
@@ -1280,17 +1242,17 @@ function ConnectionEditor({
       />
       <div data-ui="connection-actions">
         <div data-ui="connection-actions-leading">
-          <button
+          <Button
             type="button"
             data-ui="connection-test"
             onClick={() => void runProbe()}
             disabled={busy || !baseUrlValid}
           >
             {probeState.kind === 'running' ? 'Testing…' : 'Test'}
-          </button>
+          </Button>
         </div>
         <div data-ui="connection-actions-trailing">
-          <button
+          <Button
             type="button"
             data-ui="connection-delete"
             data-role="connection-delete"
@@ -1300,13 +1262,21 @@ function ConnectionEditor({
             title="Delete connection"
           >
             <TrashIcon size={13} />
-          </button>
-          <button type="button" data-ui="connection-edit-cancel" onClick={onCancel} disabled={busy}>
+          </Button>
+          <Button type="button" data-ui="connection-edit-cancel" onClick={onCancel} disabled={busy}>
             Cancel
-          </button>
-          <button type="submit" data-ui="connection-edit-save" disabled={!canSave}>
-            {busy ? 'Saving…' : 'Save'}
-          </button>
+          </Button>
+          <Button
+            type="submit"
+            data-ui="connection-edit-save"
+            tone="accent"
+            appearance="solid"
+            busy={busy}
+            busyLabel="Saving…"
+            disabled={!canSave}
+          >
+            Save
+          </Button>
         </div>
       </div>
       <ConnectionProbeMessage state={probeState} />
@@ -1475,17 +1445,6 @@ function ConnectionSetupModal({
       : 'Custom and local endpoints can save without a key.'
 
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.preventDefault()
-        onClose()
-      }
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [onClose])
-
-  useEffect(() => {
     setProbeState({ kind: 'idle' })
   }, [])
 
@@ -1557,91 +1516,88 @@ function ConnectionSetupModal({
   }, [canSave, hasExistingConnections, kind, onSaved, trimmedBaseUrl, trimmedKey, trimmedName])
 
   return (
-    <div
-      data-ui="connection-setup-overlay"
-      role="dialog"
-      aria-modal="true"
-      aria-label="Add connection"
-    >
-      <button
-        type="button"
-        data-ui="connection-setup-scrim"
-        onClick={onClose}
-        tabIndex={-1}
-        aria-label="Close add-connection dialog"
-      />
-      <form
-        data-ui="connection-setup-modal"
-        onSubmit={(e) => {
-          e.preventDefault()
+    <Dialog
+      overlayUi="connection-setup-overlay"
+      scrimUi="connection-setup-scrim"
+      surfaceUi="connection-setup-modal"
+      surfaceAs="form"
+      ariaLabel="Add connection"
+      scrimLabel="Close add-connection dialog"
+      backdrop="blurred"
+      onClose={onClose}
+      surfaceProps={{
+        'aria-busy': busy || undefined,
+        onSubmit: (event) => {
+          event.preventDefault()
           void submit()
-        }}
-      >
-        <header>
-          <h2>Add connection</h2>
-          <button
-            type="button"
-            data-ui="icon-button"
-            data-role="connection-setup-close"
-            onClick={onClose}
-            aria-label="Close"
-          >
-            <CloseIcon size={16} />
-          </button>
-        </header>
-        <div data-ui="settings-section">
-          <ConnectionFormFields
-            prefix="connection-setup"
-            name={name}
-            kind={kind}
-            baseUrl={effectiveBaseUrl}
-            baseUrlValid={baseUrlValid}
-            trimmedBaseUrl={trimmedBaseUrl}
-            keyDraft={keyDraft}
-            keyPlaceholder={keyPlaceholder}
-            keyHelper={keyHelper}
-            requiresKey={requiresKey}
-            onNameChange={(value) => {
-              setName(value)
-              setNameTouched(true)
-            }}
-            onKindChange={onKindChange}
-            onBaseUrlChange={setBaseUrl}
-            onKeyChange={setKeyDraft}
-          />
-          <div data-ui="connection-actions">
-            <div data-ui="connection-actions-leading">
-              <button
-                type="button"
-                data-ui="connection-test"
-                onClick={() => void runProbe()}
-                disabled={busy || !baseUrlValid}
-              >
-                {probeState.kind === 'running' ? 'Testing…' : 'Test'}
-              </button>
-            </div>
-            <div data-ui="connection-actions-trailing">
-              <button
-                type="button"
-                data-ui="connection-edit-cancel"
-                onClick={onClose}
-                disabled={busy}
-              >
-                Cancel
-              </button>
-              <button type="submit" data-ui="connection-setup-submit" disabled={!canSave}>
-                {busy ? 'Saving…' : 'Save'}
-              </button>
-            </div>
+        },
+      }}
+    >
+      <header>
+        <h2>Add connection</h2>
+        <IconButton
+          data-ui="icon-button"
+          data-role="connection-setup-close"
+          onClick={onClose}
+          aria-label="Close"
+        >
+          <CloseIcon size={16} />
+        </IconButton>
+      </header>
+      <div data-ui="settings-section">
+        <ConnectionFormFields
+          prefix="connection-setup"
+          name={name}
+          kind={kind}
+          baseUrl={effectiveBaseUrl}
+          baseUrlValid={baseUrlValid}
+          trimmedBaseUrl={trimmedBaseUrl}
+          keyDraft={keyDraft}
+          keyPlaceholder={keyPlaceholder}
+          keyHelper={keyHelper}
+          requiresKey={requiresKey}
+          onNameChange={(value) => {
+            setName(value)
+            setNameTouched(true)
+          }}
+          onKindChange={onKindChange}
+          onBaseUrlChange={setBaseUrl}
+          onKeyChange={setKeyDraft}
+        />
+        <div data-ui="connection-actions">
+          <div data-ui="connection-actions-leading">
+            <Button
+              data-ui="connection-test"
+              onClick={() => void runProbe()}
+              disabled={busy || !baseUrlValid}
+            >
+              {probeState.kind === 'running' ? 'Testing…' : 'Test'}
+            </Button>
           </div>
-          <ConnectionProbeMessage state={probeState} />
-          {error ? (
-            <span data-ui="helper" data-validation="invalid" role="alert">
-              {error}
-            </span>
-          ) : null}
+          <div data-ui="connection-actions-trailing">
+            <Button data-ui="connection-edit-cancel" onClick={onClose} disabled={busy}>
+              Cancel
+            </Button>
+            <Button
+              type="submit"
+              data-ui="connection-setup-submit"
+              tone="accent"
+              appearance="solid"
+              busy={busy}
+              busyLabel="Saving…"
+              disabled={!canSave}
+            >
+              Save
+            </Button>
+          </div>
         </div>
-      </form>
-    </div>
+        <ConnectionProbeMessage state={probeState} />
+        {error ? (
+          <span data-ui="helper" data-validation="invalid" role="alert">
+            {error}
+          </span>
+        ) : null}
+      </div>
+    </Dialog>
   )
 }

@@ -1053,13 +1053,6 @@
 }
 
 [data-ui="attachment-picker-backdrop"] {
-  position: fixed;
-  inset: 0;
-  z-index: 50;
-  background: color-mix(in srgb, var(--color-bg-overlay) 40%, transparent);
-  display: flex;
-  align-items: center;
-  justify-content: center;
   padding: var(--space-5);
 }
 
@@ -1068,9 +1061,6 @@
   max-height: min(720px, 90vh);
   display: flex;
   flex-direction: column;
-  border: 1px solid var(--color-border-default);
-  border-radius: var(--radius-md);
-  background: var(--color-bg-surface-1);
   box-shadow: var(--shadow-lg);
   overflow: hidden;
 }

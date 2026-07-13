@@ -89,6 +89,7 @@ import {
   requestAbortForChat,
 } from '../store/stream-leases'
 import { getWorkspaceRepository } from '../store/workspace-repository'
+import { announceEditTreeMode, announceTreeBranchOpened } from '../store/zustand/announcementStore'
 import { useChatStore } from '../store/zustand/chatStore'
 import { useStreamStore } from '../store/zustand/streamStore'
 import { useToastStore } from '../store/zustand/toastStore'
@@ -116,6 +117,8 @@ import {
   NewChatIcon,
   SidebarIcon,
 } from '../ui/icons/Icon'
+import { Button, IconButton } from '../ui/primitives/Button'
+import { LiveRegions } from '../ui/primitives/LiveRegions'
 import { ChatModelPanel } from '../ui/settings/ChatModelPanel'
 import { ChatList } from '../ui/sidebar/ChatList'
 import {
@@ -958,6 +961,7 @@ export function Shell() {
         const prefillText = opts?.prefillText ?? ''
         const result = await send({
           chatId: activeChatId,
+          expectedLeafId: activeBranchTailId,
           connection: profile,
           apiKey: '',
           apiKeyCandidates,
@@ -979,7 +983,7 @@ export function Shell() {
       if (chat.presetId) await bumpPresetLastUsedAt(chat.presetId)
       await bumpRecentModel(chat.settings.model)
     },
-    [activeChatId, failSend, send],
+    [activeBranchTailId, activeChatId, failSend, send],
   )
 
   const handleNewChatSubmit = useCallback(
@@ -999,8 +1003,9 @@ export function Shell() {
       if (!profile) {
         return failSend('send: connection profile missing', { profileId: settings.profileId })
       }
+      let apiKeyCandidates: Awaited<ReturnType<typeof resolveConnectionRuntimeKeys>>
       try {
-        await resolveConnectionRuntimeKeys(profile)
+        apiKeyCandidates = await resolveConnectionRuntimeKeys(profile)
       } catch (err) {
         return failSend('send: resolveKey failed', err)
       }
@@ -1016,10 +1021,10 @@ export function Shell() {
       })
       navigateToChat(chat.id)
       try {
-        const apiKeyCandidates = await resolveConnectionRuntimeKeys(profile, { chatId: chat.id })
         const prefillText = opts?.prefillText ?? ''
         const result = await send({
           chatId: chat.id,
+          expectedLeafId: null,
           connection: profile,
           apiKey: '',
           apiKeyCandidates,
@@ -1066,7 +1071,9 @@ export function Shell() {
       // app-wide.
       if (e.key === 'E' && e.shiftKey && (e.metaKey || e.ctrlKey) && !isTyping && !treeViewActive) {
         e.preventDefault()
-        setEditTreeMode(!useUiStore.getState().editTreeMode)
+        const nextEditTreeMode = !useUiStore.getState().editTreeMode
+        setEditTreeMode(nextEditTreeMode)
+        announceEditTreeMode(nextEditTreeMode)
       }
       // Import-at-end modal shortcut (§10.14). Only meaningful on an active
       // chat; the keystroke is swallowed either way so DevTools bindings
@@ -1079,6 +1086,7 @@ export function Shell() {
         if (useUiStore.getState().editTreeMode) {
           e.preventDefault()
           setEditTreeMode(false)
+          announceEditTreeMode(false)
         }
       }
     }
@@ -1138,6 +1146,7 @@ export function Shell() {
         preserveDescendantPins: false,
       })
       useChatStore.getState().setCursor(activeChatId, next)
+      announceTreeBranchOpened(header.role)
     },
     [activeChatId, activeTreeHeaders, treeHeaderById],
   )
@@ -1415,6 +1424,7 @@ export function Shell() {
       data-mobile-sidebar={mobileSidebarOpen ? 'open' : 'closed'}
       data-focus-mode={effectiveFocusMode ? 'on' : 'off'}
     >
+      <LiveRegions />
       <aside
         data-ui="sidebar"
         data-collapsed={effectiveSidebarCollapsed}
@@ -1426,7 +1436,7 @@ export function Shell() {
           <a data-ui="brand" href={homeHref()} onClick={makeAnchorClickHandler(homeHref())}>
             natter
           </a>
-          <button
+          <IconButton
             type="button"
             data-ui="icon-button"
             data-role="sidebar-toggle"
@@ -1453,7 +1463,7 @@ export function Shell() {
             }}
           >
             <ChevronIcon size={16} rotate={effectiveSidebarCollapsed ? 0 : 180} />
-          </button>
+          </IconButton>
           <a
             data-ui="icon-button"
             data-role="new-chat"
@@ -1472,7 +1482,7 @@ export function Shell() {
           onChatIntent={preloadMessageList}
         />
         <div data-ui="sidebar-footer">
-          <button
+          <Button
             type="button"
             data-ui="open-global-settings"
             aria-label="Open settings"
@@ -1484,7 +1494,7 @@ export function Shell() {
           >
             <CogIcon size={18} />
             <span>Settings</span>
-          </button>
+          </Button>
           <a
             href={storageHref()}
             data-ui="open-storage"
@@ -1534,7 +1544,7 @@ export function Shell() {
             {activeChatId ? (
               <>
                 <div data-ui="chat-title-bar">
-                  <button
+                  <IconButton
                     type="button"
                     data-ui="icon-button"
                     data-role="mobile-sidebar-toggle"
@@ -1544,7 +1554,7 @@ export function Shell() {
                     onClick={() => setMobileSidebarOpen(true)}
                   >
                     <SidebarIcon size={20} />
-                  </button>
+                  </IconButton>
                   <ConnectionHeader
                     variant="title-icon"
                     activeChatId={activeChatId}
@@ -1555,7 +1565,11 @@ export function Shell() {
                     settingsOpen={chatModelOpen}
                     onToggleSettings={() => setChatModelOpen((v) => !v)}
                     editTreeActive={editTreeMode}
-                    onToggleEditTree={() => setEditTreeMode(!editTreeMode)}
+                    onToggleEditTree={() => {
+                      const nextEditTreeMode = !editTreeMode
+                      setEditTreeMode(nextEditTreeMode)
+                      announceEditTreeMode(nextEditTreeMode)
+                    }}
                     treeViewActive={treeViewActive}
                     onTreeViewIntent={preloadBranchTreeView}
                     onToggleTreeView={() => {
@@ -1789,13 +1803,13 @@ export function Shell() {
                           : {})}
                         floatingAccessory={
                           scrollState === 'pinned' ? (
-                            <button
+                            <Button
                               type="button"
                               data-ui="jump-to-latest"
                               onClick={() => scrollRef.current?.scrollToBottom({ smooth: true })}
                             >
                               ↓ Jump to latest
-                            </button>
+                            </Button>
                           ) : null
                         }
                       />
@@ -1808,7 +1822,7 @@ export function Shell() {
                 {/* The new-chat surface stays IDB-cold until send/import/settings
                  * needs a row. */}
                 <div data-ui="chat-title-bar">
-                  <button
+                  <IconButton
                     type="button"
                     data-ui="icon-button"
                     data-role="mobile-sidebar-toggle"
@@ -1818,13 +1832,13 @@ export function Shell() {
                     onClick={() => setMobileSidebarOpen(true)}
                   >
                     <SidebarIcon size={20} />
-                  </button>
+                  </IconButton>
                   <ConnectionHeader variant="title-icon" />
                   <span data-ui="chat-title" data-title-status="untitled">
                     <span data-ui="chat-title-label">New chat</span>
                   </span>
                   <span data-ui="header-spacer" />
-                  <button
+                  <IconButton
                     type="button"
                     data-ui="icon-button"
                     data-role="settings-cog"
@@ -1833,7 +1847,7 @@ export function Shell() {
                     onClick={() => void openSettingsForNewChat()}
                   >
                     <CogIcon size={20} />
-                  </button>
+                  </IconButton>
                   <MobileNewChatControls connectionControl={newChatMobileConnectionControl} />
                 </div>
                 <EmptyState onPick={(text) => setComposerSeed(text)} />
@@ -1858,7 +1872,7 @@ export function Shell() {
             ) : (
               <>
                 <div data-ui="chat-title-bar" data-mobile-home="true">
-                  <button
+                  <IconButton
                     type="button"
                     data-ui="icon-button"
                     data-role="mobile-sidebar-toggle"
@@ -1868,12 +1882,12 @@ export function Shell() {
                     onClick={() => setMobileSidebarOpen(true)}
                   >
                     <SidebarIcon size={20} />
-                  </button>
+                  </IconButton>
                   <span data-ui="chat-title" data-title-status="manual">
                     <span data-ui="chat-title-label">natter</span>
                   </span>
                   <span data-ui="header-spacer" />
-                  <button
+                  <IconButton
                     type="button"
                     data-ui="icon-button"
                     data-role="settings-cog"
@@ -1882,7 +1896,7 @@ export function Shell() {
                     onClick={() => void openSettingsForNewChat()}
                   >
                     <CogIcon size={20} />
-                  </button>
+                  </IconButton>
                   <MobileNewChatControls connectionControl={newChatMobileConnectionControl} />
                 </div>
                 <EmptyState onPick={(text) => setComposerSeed(text)} />
@@ -1892,7 +1906,7 @@ export function Shell() {
         )}
       </main>
       {mobilePanelOpen ? (
-        <button
+        <Button
           type="button"
           data-ui="mobile-panel-scrim"
           aria-label="Close mobile side panel"
@@ -1998,7 +2012,7 @@ function MobileNewChatControls({ connectionControl }: { connectionControl: React
 
   return (
     <div data-ui="chat-controls-menu-root" ref={rootRef}>
-      <button
+      <IconButton
         type="button"
         data-ui="icon-button"
         data-role="chat-controls-menu"
@@ -2009,7 +2023,7 @@ function MobileNewChatControls({ connectionControl }: { connectionControl: React
         onClick={() => setOpen((value) => !value)}
       >
         <MenuIcon size={20} />
-      </button>
+      </IconButton>
       {open ? (
         <div data-ui="chat-controls-menu" role="dialog" aria-label="Chat controls">
           {connectionControl ? (

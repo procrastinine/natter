@@ -7,6 +7,7 @@ import { useRepositoryQuery } from '../../store/reactive-query'
 import type { AttachmentBundle } from '../../store/repository'
 import { getWorkspaceRepository } from '../../store/workspace-repository'
 import { EyeIcon, EyeOffIcon } from '../icons/Icon'
+import { Button } from '../primitives/Button'
 import { MarkdownView } from './MarkdownView'
 import type { MessageCollapseMode } from './MessageStreamOverflow'
 
@@ -407,7 +408,7 @@ function OutputMediaContextToggle({
   noun: 'image' | 'audio' | 'video'
 }) {
   return (
-    <button
+    <Button
       type="button"
       data-ui="message-output-image-context-toggle"
       aria-pressed={attachmentRef.includeInContext}
@@ -430,7 +431,7 @@ function OutputMediaContextToggle({
       }
     >
       {attachmentRef.includeInContext ? <EyeIcon size={14} /> : <EyeOffIcon size={14} />}
-    </button>
+    </Button>
   )
 }
 

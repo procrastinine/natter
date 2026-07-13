@@ -396,13 +396,22 @@ describe('loading poison boundaries', () => {
     const bodyReads = captureMessageBodyReads()
     const sent = await sendUserMessage({
       chatId: chat.id,
-      cursor: {},
+      expectedLeafId: current.id,
       content: [{ type: 'text', text: 'next question' }],
       now: 100,
       messageId: 'append-user',
       turnId: 'append-turn',
       skipCalibration: true,
     })
+    const planned = await getBrowserRepository().getBranchHeaderSnapshotByLeaf(
+      chat.id,
+      sent.messageId,
+    )
+    expect(planned.branchHeaders.map((header) => header.id)).toEqual([
+      root.id,
+      current.id,
+      sent.messageId,
+    ])
     const assistant: Message = message(chat.id, 'append-assistant', {
       parentId: sent.messageId,
       createdAt: 101,

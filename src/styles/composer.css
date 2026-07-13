@@ -392,12 +392,10 @@
   font-weight: var(--font-weight-medium);
 }
 
-/* Send button fills the entire bottom-right corner of the card: full
- * height of the action row, only the bottom-right corner radiused to
- * match the card. No padding-margin around it. Pressing Enter (or the
- * configured send shortcut) submits, so the button is mostly visual
- * confirmation that the action exists. */
-button[data-ui="send"] {
+/* Send stays flush inside the card. Its own top corners remain square;
+ * composer-body's overflow clip supplies the rounded outer bottom-right
+ * corner. This joined geometry is deliberate. */
+[data-control="button"][data-ui="send"] {
   /* Slight inner shade on top so the send button reads the same way
    * every other affordance does (they all have shading; a flat accent
    * felt out of place). Gradient is very subtle — a 6% darken on the
@@ -423,7 +421,7 @@ button[data-ui="send"] {
   box-shadow: inset 0 1px 0 color-mix(in srgb, var(--color-accent-contrast) 20%, transparent);
 }
 
-button[data-ui="send"]:hover:not(:disabled) {
+[data-control="button"][data-ui="send"]:hover:not(:disabled) {
   background: linear-gradient(
     to bottom,
     color-mix(in srgb, var(--color-accent) 84%, #000) 0%,
@@ -432,7 +430,7 @@ button[data-ui="send"]:hover:not(:disabled) {
   color: var(--color-accent-contrast);
 }
 
-button[data-ui="send"]:active:not(:disabled) {
+[data-control="button"][data-ui="send"]:active:not(:disabled) {
   background: linear-gradient(
     to bottom,
     color-mix(in srgb, var(--color-accent) 76%, #000) 0%,
@@ -441,19 +439,15 @@ button[data-ui="send"]:active:not(:disabled) {
   color: var(--color-accent-contrast);
 }
 
-button[data-ui="send"]:disabled {
+[data-control="button"][data-ui="send"]:disabled {
   opacity: var(--opacity-disabled);
   cursor: not-allowed;
 }
 
-/* While a stream is in flight the same slot shows a Stop affordance.
- * The Stop button keeps `data-ui="abort"` (so existing e2e tests still
- * find it) but overrides the header's pill styling inside the composer
- * so it fills the Send slot: full action-row height, square bottom-right
- * corner, danger tint, icon + label. */
+/* While a stream is in flight the same joined slot shows Stop. It keeps
+ * `data-ui="abort"` for behavior/test identity while the shared button
+ * contract owns its danger treatment. */
 [data-ui="composer-actions"] > [data-ui="abort"] {
-  background: var(--color-danger);
-  color: var(--color-fg-inverse);
   border: none;
   border-radius: 0;
   padding: 0 var(--space-5);
@@ -466,8 +460,4 @@ button[data-ui="send"]:disabled {
   align-items: center;
   justify-content: center;
   gap: var(--space-2);
-}
-
-[data-ui="composer-actions"] > [data-ui="abort"]:hover {
-  background: color-mix(in srgb, var(--color-danger) 85%, #000);
 }

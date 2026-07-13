@@ -1,13 +1,14 @@
 import { normalizeError } from '../api/errors'
 import type { ChatId, GenerationMeta, MessageId } from '../core/types'
 import { postEvent } from '../store/broadcast'
-import type { StreamWriteFence } from '../store/repository'
+import { StreamChatBusyError, type StreamWriteFence } from '../store/repository'
 import {
   announceStreamEnded,
   getStreamClientId,
   startStreamLease,
   stopStreamLease,
 } from '../store/stream-leases'
+import { useAnnouncementStore } from '../store/zustand/announcementStore'
 import { useStreamStore } from '../store/zustand/streamStore'
 
 interface RequestLifecycle {
@@ -22,6 +23,7 @@ export async function startRequestLifecycle(args: {
   chatId: ChatId
   streamId: string
   attemptKind: 'generation' | 'continuation'
+  exclusiveChat?: true
   userSignal?: AbortSignal
 }): Promise<RequestLifecycle> {
   const controller = new AbortController()
@@ -44,10 +46,12 @@ export async function startRequestLifecycle(args: {
       chatId: args.chatId,
       startedAt,
       attemptKind: args.attemptKind,
+      ...(args.exclusiveChat === true ? { exclusiveChat: true as const } : {}),
     })
   } catch (error) {
     removeUserAbort?.()
     await stopStreamLease(args.streamId)
+    if (error instanceof StreamChatBusyError) throw error
     throw normalizeError(error, { midStream: false, cause: 'storage' })
   }
 
@@ -124,6 +128,10 @@ export async function markLifecycleTarget(args: {
     streamId: args.streamId,
     messageId: args.messageId,
     ownerClientId: getStreamClientId(),
+  })
+  useAnnouncementStore.getState().announce({
+    text: 'Assistant is responding.',
+    eventKey: `stream-start:${args.streamId}`,
   })
   return fence
 }

@@ -85,6 +85,7 @@ import {
   natterJsonFilename,
   triggerJsonDownload,
 } from '../import-export/json-file'
+import { Button, IconButton } from '../primitives/Button'
 import {
   buildCreatedAtGroups,
   buildSidebarEntries,
@@ -1013,7 +1014,7 @@ export const ChatList = memo(function ChatList({
             </a>
             <span data-ui="chat-row-tag-list">
               {visibleTags.slice(0, 3).map((tag) => (
-                <button
+                <Button
                   key={tag.id}
                   type="button"
                   data-ui="chat-row-tag"
@@ -1024,7 +1025,7 @@ export const ChatList = memo(function ChatList({
                   }}
                 >
                   {tag.name}
-                </button>
+                </Button>
               ))}
               {visibleTags.length > 3 ? (
                 <span
@@ -1039,7 +1040,7 @@ export const ChatList = memo(function ChatList({
         ) : null}
         {collapsed ? null : (
           <span data-ui="chat-row-actions">
-            <button
+            <IconButton
               ref={(node) => {
                 if (node) rowMenuButtonRefs.current.set(chat.id, node)
                 else rowMenuButtonRefs.current.delete(chat.id)
@@ -1057,7 +1058,7 @@ export const ChatList = memo(function ChatList({
               }}
             >
               <MoreVerticalIcon size={15} />
-            </button>
+            </IconButton>
             {openActionChatId === chat.id ? (
               <div
                 data-ui="chat-row-menu"
@@ -1071,7 +1072,7 @@ export const ChatList = memo(function ChatList({
                   if (event.key === 'Escape') setOpenActionChatId(null)
                 }}
               >
-                <button
+                <Button
                   type="button"
                   role="menuitem"
                   data-ui="chat-row-folder"
@@ -1083,8 +1084,8 @@ export const ChatList = memo(function ChatList({
                 >
                   <FolderIcon size={14} />
                   <span>Move</span>
-                </button>
-                <button
+                </Button>
+                <Button
                   type="button"
                   role="menuitem"
                   data-ui="chat-row-tags-button"
@@ -1096,8 +1097,8 @@ export const ChatList = memo(function ChatList({
                 >
                   <TagIcon size={14} />
                   <span>Tags</span>
-                </button>
-                <button
+                </Button>
+                <Button
                   type="button"
                   role="menuitem"
                   data-ui="chat-row-download"
@@ -1108,8 +1109,8 @@ export const ChatList = memo(function ChatList({
                 >
                   <DownloadIcon size={14} />
                   <span>Download</span>
-                </button>
-                <button
+                </Button>
+                <Button
                   type="button"
                   role="menuitem"
                   data-ui="chat-row-export"
@@ -1120,12 +1121,12 @@ export const ChatList = memo(function ChatList({
                 >
                   <FileIcon size={14} />
                   <span>Export</span>
-                </button>
-                <button
+                </Button>
+                <Button
                   type="button"
                   role="menuitem"
                   data-ui="chat-row-delete"
-                  data-tone="danger"
+                  tone="danger"
                   onClick={() => {
                     setOpenActionChatId(null)
                     void handleDelete(chat)
@@ -1133,7 +1134,7 @@ export const ChatList = memo(function ChatList({
                 >
                   <TrashIcon size={14} />
                   <span>Trash</span>
-                </button>
+                </Button>
               </div>
             ) : null}
           </span>
@@ -1171,7 +1172,7 @@ export const ChatList = memo(function ChatList({
         }}
         onDrop={(event) => void handleDropOnFolder(event, row.folder.id)}
       >
-        <button
+        <Button
           type="button"
           data-ui="folder-main"
           title={row.folder.name}
@@ -1182,24 +1183,24 @@ export const ChatList = memo(function ChatList({
           <FolderIcon size={14} />
           <span>{row.folder.name}</span>
           <span data-ui="folder-count">{row.chats.length}</span>
-        </button>
+        </Button>
         <span data-ui="folder-actions">
-          <button
+          <Button
             type="button"
             aria-label={`Rename folder ${row.folder.name}`}
             title="Rename folder"
             onClick={() => void handleRenameFolder(row.folder)}
           >
             <PencilIcon size={13} />
-          </button>
-          <button
+          </Button>
+          <Button
             type="button"
             aria-label={`Delete folder ${row.folder.name}`}
             title="Delete folder"
             onClick={() => beginDeleteFolder(row.folder)}
           >
             <TrashIcon size={13} />
-          </button>
+          </Button>
         </span>
       </fieldset>
     )
@@ -1209,13 +1210,13 @@ export const ChatList = memo(function ChatList({
     if (hiddenSidebarRowCount <= 0) return null
     return (
       <li ref={sidebarWindowLoadRef} data-ui="sidebar-window-load">
-        <button
+        <Button
           type="button"
           data-ui="load-more-sidebar"
           onClick={(event) => loadMoreSidebarRows(event.currentTarget)}
         >
           Load more
-        </button>
+        </Button>
         <span>{hiddenSidebarRowCount} more</span>
       </li>
     )
@@ -1393,7 +1394,7 @@ export const ChatList = memo(function ChatList({
           </span>
         ) : null}
         {searchActive ? (
-          <button
+          <IconButton
             type="button"
             data-ui="sidebar-search-clear"
             aria-label="Clear search"
@@ -1401,7 +1402,7 @@ export const ChatList = memo(function ChatList({
             onClick={handleClearSearch}
           >
             <CloseIcon size={13} />
-          </button>
+          </IconButton>
         ) : null}
       </label>
     )
@@ -1445,7 +1446,7 @@ export const ChatList = memo(function ChatList({
               data-ui="sidebar-search-filter-group"
               data-open={searchFoldersOpen ? 'true' : undefined}
             >
-              <button
+              <Button
                 type="button"
                 data-ui="sidebar-search-filter-heading"
                 aria-expanded={searchFoldersOpen}
@@ -1455,11 +1456,11 @@ export const ChatList = memo(function ChatList({
                 <FolderIcon size={12} />
                 <span>Folders</span>
                 <span data-ui="sidebar-search-filter-count">{model.folders.length}</span>
-              </button>
+              </Button>
               {searchFoldersOpen ? (
                 <div data-ui="sidebar-search-chip-row">
                   {model.folders.map((folder) => (
-                    <button
+                    <Button
                       key={folder.id}
                       type="button"
                       data-filter-state={filterState(folder.id, includeFolderIds, excludeFolderIds)}
@@ -1472,7 +1473,7 @@ export const ChatList = memo(function ChatList({
                       onClick={() => toggleFolderFilter(folder.id)}
                     >
                       {folder.name}
-                    </button>
+                    </Button>
                   ))}
                 </div>
               ) : null}
@@ -1483,7 +1484,7 @@ export const ChatList = memo(function ChatList({
               data-ui="sidebar-search-filter-group"
               data-open={searchTagsOpen ? 'true' : undefined}
             >
-              <button
+              <Button
                 type="button"
                 data-ui="sidebar-search-filter-heading"
                 aria-expanded={searchTagsOpen}
@@ -1493,11 +1494,11 @@ export const ChatList = memo(function ChatList({
                 <TagIcon size={12} />
                 <span>Tags</span>
                 <span data-ui="sidebar-search-filter-count">{model.tags.length}</span>
-              </button>
+              </Button>
               {searchTagsOpen ? (
                 <div data-ui="sidebar-search-chip-row">
                   {model.tags.map((tag) => (
-                    <button
+                    <Button
                       key={tag.id}
                       type="button"
                       data-filter-state={filterState(tag.id, includeTagIds, excludeTagIds)}
@@ -1505,7 +1506,7 @@ export const ChatList = memo(function ChatList({
                       onClick={() => toggleTagFilter(tag.id)}
                     >
                       {tag.name}
-                    </button>
+                    </Button>
                   ))}
                 </div>
               ) : null}
@@ -1562,7 +1563,7 @@ export const ChatList = memo(function ChatList({
         }}
       >
         {renderSearchControls()}
-        <button
+        <Button
           type="button"
           aria-label="New folder"
           title="New folder"
@@ -1570,8 +1571,8 @@ export const ChatList = memo(function ChatList({
         >
           <FolderIcon size={14} />
           <PlusIcon size={10} strokeWidth={2.4} />
-        </button>
-        <button
+        </Button>
+        <IconButton
           type="button"
           data-ui="sidebar-import-chat"
           aria-label="Import chat JSON or ZIP"
@@ -1580,7 +1581,7 @@ export const ChatList = memo(function ChatList({
           onClick={() => chatImportInputRef.current?.click()}
         >
           <UploadIcon size={15} />
-        </button>
+        </IconButton>
         <input
           ref={chatImportInputRef}
           data-ui="sidebar-chat-import-input"
@@ -1590,7 +1591,7 @@ export const ChatList = memo(function ChatList({
           onChange={(event) => void handleImportChatFile(event)}
         />
         <div data-ui="sidebar-sort" ref={sortMenuRef}>
-          <button
+          <IconButton
             type="button"
             data-ui="sidebar-sort-button"
             aria-label={`Sort: ${activeSortOption.label}`}
@@ -1600,11 +1601,11 @@ export const ChatList = memo(function ChatList({
             onClick={() => setSortMenuOpen((open) => !open)}
           >
             <SortIcon size={15} />
-          </button>
+          </IconButton>
           {sortMenuOpen ? (
             <div data-ui="sidebar-sort-menu" role="menu" aria-label="Sort chats">
               {SIDEBAR_SORT_OPTIONS.map((option) => (
-                <button
+                <Button
                   key={option.mode}
                   type="button"
                   role="menuitemradio"
@@ -1613,7 +1614,7 @@ export const ChatList = memo(function ChatList({
                   onClick={() => handleSelectSortMode(option.mode)}
                 >
                   <span>{option.label}</span>
-                </button>
+                </Button>
               ))}
             </div>
           ) : null}
@@ -1633,7 +1634,7 @@ export const ChatList = memo(function ChatList({
             <span>Delete chats in folder</span>
           </label>
           <div data-ui="folder-delete-actions">
-            <button
+            <Button
               type="button"
               onClick={() => {
                 setFolderDeleteTarget(null)
@@ -1641,10 +1642,10 @@ export const ChatList = memo(function ChatList({
               }}
             >
               Cancel
-            </button>
-            <button type="button" data-tone="danger" onClick={() => void commitDeleteFolder()}>
+            </Button>
+            <Button type="button" tone="danger" onClick={() => void commitDeleteFolder()}>
               Delete
-            </button>
+            </Button>
           </div>
         </div>
       ) : null}

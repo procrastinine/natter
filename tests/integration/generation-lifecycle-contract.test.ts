@@ -18,6 +18,7 @@ import {
   __flushStreamLeaseWritesForTests,
   __resetStreamLeasesForTests,
 } from '../../src/store/stream-leases'
+import { useAnnouncementStore } from '../../src/store/zustand/announcementStore'
 import { useChatStore } from '../../src/store/zustand/chatStore'
 import { useStreamStore } from '../../src/store/zustand/streamStore'
 import { useUiStore } from '../../src/store/zustand/uiStore'
@@ -71,6 +72,7 @@ async function reset(): Promise<void> {
   __resetBroadcastForTests()
   __resetStreamLeasesForTests()
   useChatStore.getState().reset()
+  useAnnouncementStore.getState().reset()
   useStreamStore.getState().reset()
   useUiStore.getState().reset()
   await Dexie.delete(DB_NAME)
@@ -360,6 +362,18 @@ describe('generation lifecycle contract', () => {
           })
           sawLiveSnapshot = true
           sawDurableChunk = true
+          expect(useAnnouncementStore.getState().polite.map((event) => event.text)).toEqual([
+            'Assistant is responding.',
+          ])
+          expect(useAnnouncementStore.getState().assertive).toEqual([])
+          yield {
+            type: 'delta' as const,
+            chunk: { choices: [{ delta: { content: ' after the durable flush' } }] },
+          }
+          expect(useAnnouncementStore.getState().polite.map((event) => event.text)).toEqual([
+            'Assistant is responding.',
+          ])
+          expect(useAnnouncementStore.getState().assertive).toEqual([])
           yield completionChunk()
           void open.signal
         },
@@ -387,6 +401,10 @@ describe('generation lifecycle contract', () => {
       expect(sawLease).toBe(true)
       expect(sawDurableChunk).toBe(true)
       expect(sawLiveSnapshot).toBe(true)
+      expect(useAnnouncementStore.getState().polite.map((event) => event.text)).toEqual([
+        'Assistant is responding.',
+      ])
+      expect(useAnnouncementStore.getState().assertive).toEqual([])
       await expectSettled(endedStreamId, result.assistantMessageId)
       expect(await getDb().streamChunks.where('streamId').equals(endedStreamId).count()).toBe(0)
     } finally {
@@ -538,6 +556,10 @@ describe('generation lifecycle contract', () => {
       expect(sawLease).toBe(true)
       expect(sawLiveSnapshot).toBe(true)
       expect(sawDurableChunk).toBe(true)
+      expect(useAnnouncementStore.getState().polite.map((event) => event.text)).toEqual([
+        'Assistant is responding.',
+      ])
+      expect(useAnnouncementStore.getState().assertive).toEqual([])
       await expectSettled(endedStreamId, target.id)
       expect(await getDb().streamChunks.where('streamId').equals(endedStreamId).count()).toBe(0)
       const stored = expectDefined(
@@ -718,6 +740,12 @@ describe('generation lifecycle contract', () => {
       'user',
     )
     expect(await getDb().streamChunks.where('streamId').equals(sendStreamId).count()).toBe(0)
+    expect(
+      useAnnouncementStore
+        .getState()
+        .polite.filter((event) => event.text === 'Generation stopped. Partial response kept.'),
+    ).toHaveLength(1)
+    expect(useAnnouncementStore.getState().assertive).toEqual([])
     sendCapture.stop()
 
     const continueChat = await createChat({ settings: settings() })
@@ -764,6 +792,12 @@ describe('generation lifecycle contract', () => {
         .equals(continueStreamId as string)
         .count(),
     ).toBe(0)
+    expect(
+      useAnnouncementStore
+        .getState()
+        .polite.filter((event) => event.text === 'Generation stopped. Partial response kept.'),
+    ).toHaveLength(2)
+    expect(useAnnouncementStore.getState().assertive).toEqual([])
     continueCapture.stop()
   })
 
@@ -776,6 +810,7 @@ describe('generation lifecycle contract', () => {
       retryable: false,
     })
 
+    let expectedErrorAnnouncements = 0
     for (const [label, error] of [
       ['api', apiError],
       ['unknown', new Error('injected unknown send error')],
@@ -806,6 +841,14 @@ describe('generation lifecycle contract', () => {
         outcome: 'error',
       })
       await expectSettled(streamId, result.assistantMessageId)
+      expectedErrorAnnouncements += 1
+      expect(
+        useAnnouncementStore
+          .getState()
+          .assertive.filter(
+            (event) => event.text === 'Response failed. Partial response kept if available.',
+          ),
+      ).toHaveLength(expectedErrorAnnouncements)
       expect(await getDb().streamChunks.where('streamId').equals(streamId).count()).toBe(0)
       capture.stop()
     }
@@ -830,6 +873,14 @@ describe('generation lifecycle contract', () => {
       outcome: 'error',
     })
     await expectSettled(apiStreamId, apiTarget.id)
+    expectedErrorAnnouncements += 1
+    expect(
+      useAnnouncementStore
+        .getState()
+        .assertive.filter(
+          (event) => event.text === 'Response failed. Partial response kept if available.',
+        ),
+    ).toHaveLength(expectedErrorAnnouncements)
     apiCapture.stop()
 
     const unknownChat = await createChat({ settings: settings() })
@@ -858,6 +909,14 @@ describe('generation lifecycle contract', () => {
       outcome: 'error',
     })
     await expectSettled(unknownStreamId, unknownTarget.id)
+    expectedErrorAnnouncements += 1
+    expect(
+      useAnnouncementStore
+        .getState()
+        .assertive.filter(
+          (event) => event.text === 'Response failed. Partial response kept if available.',
+        ),
+    ).toHaveLength(expectedErrorAnnouncements)
     unknownCapture.stop()
   })
 

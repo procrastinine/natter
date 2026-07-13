@@ -8,6 +8,7 @@
 
 import type { Chat, ChatSettings, ConnectionProfile } from '../../core/types'
 import { updateChatSettings } from '../../store/chats'
+import { Button } from '../primitives/Button'
 
 interface LlamaServerSectionProps {
   chat: Chat
@@ -48,7 +49,7 @@ export function LlamaServerSection({ chat }: LlamaServerSectionProps) {
           Wire protocol
         </span>
         <div data-ui="segmented">
-          <button
+          <Button
             type="button"
             aria-pressed={protocol === 'chat'}
             data-ui="segmented-option"
@@ -56,8 +57,8 @@ export function LlamaServerSection({ chat }: LlamaServerSectionProps) {
             onClick={() => setProtocol('chat')}
           >
             Chat completion
-          </button>
-          <button
+          </Button>
+          <Button
             type="button"
             aria-pressed={protocol === 'text'}
             data-ui="segmented-option"
@@ -65,7 +66,7 @@ export function LlamaServerSection({ chat }: LlamaServerSectionProps) {
             onClick={() => setProtocol('text')}
           >
             Text completion
-          </button>
+          </Button>
         </div>
         <span data-ui="helper">
           {protocol === 'chat'

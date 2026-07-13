@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react'
 import { prefillSettingsRecommendation } from '../../core/prefill-settings'
 import type { ChatId, ChatSettings, ModelEndpoint } from '../../core/types'
 import { updateChatSettings } from '../../store/chats'
+import { Button } from '../primitives/Button'
 
 export function PrefillSettingsPrompt({
   chatId,
@@ -29,7 +30,7 @@ export function PrefillSettingsPrompt({
     <div data-ui="prefill-settings-prompt" role="status">
       <span>For best prefill results: {label}.</span>
       <div data-ui="prefill-settings-actions">
-        <button
+        <Button
           type="button"
           data-ui="field-inline-action"
           onClick={() => {
@@ -38,10 +39,10 @@ export function PrefillSettingsPrompt({
           }}
         >
           Apply
-        </button>
-        <button type="button" data-ui="field-inline-action" onClick={() => setDismissed(true)}>
+        </Button>
+        <Button type="button" data-ui="field-inline-action" onClick={() => setDismissed(true)}>
           Dismiss
-        </button>
+        </Button>
       </div>
     </div>
   )

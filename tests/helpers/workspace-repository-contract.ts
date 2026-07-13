@@ -1,7 +1,7 @@
 import { expect } from 'vitest'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import type { Chat, CursorMap, Message } from '../../src/core/types'
-import type { WorkspaceRepository } from '../../src/store/repository'
+import { ExpectedLeafChangedError, type WorkspaceRepository } from '../../src/store/repository'
 
 function contractChat(id: string): Chat {
   return {
@@ -121,4 +121,61 @@ export async function expectWorkspaceRepositoryRollbackContract(
   ).rejects.toThrow('contract rollback')
   expect(await repository.getMessage(message.id)).toBeUndefined()
   expect((await repository.getWorkspaceMeta()).mutationCounter).toBe(before.mutationCounter)
+}
+
+export async function expectWorkspaceRepositoryExpectedLeafAppendContract(
+  repository: WorkspaceRepository,
+): Promise<void> {
+  const chat = await repository.createChat(contractChat('expected-leaf-chat'))
+  const rootTemplate = contractMessage(chat.id, 'expected-leaf-root', null, 0, 1)
+  const { parentId, siblingIndex, nodeVersion, deleted, ...root } = rootTemplate
+  void parentId
+  void siblingIndex
+  void nodeVersion
+  void deleted
+  await repository.appendMessageToExpectedLeaf({ expectedLeafId: null, message: root })
+
+  const candidate = (id: string, createdAt: number) => {
+    const template = contractMessage(chat.id, id, root.id, 0, createdAt)
+    const {
+      parentId: ignoredParent,
+      siblingIndex: ignoredSiblingIndex,
+      nodeVersion: ignoredNodeVersion,
+      deleted: ignoredDeleted,
+      ...message
+    } = template
+    void ignoredParent
+    void ignoredSiblingIndex
+    void ignoredNodeVersion
+    void ignoredDeleted
+    return repository.appendMessageToExpectedLeaf({ expectedLeafId: root.id, message })
+  }
+
+  const before = await repository.getWorkspaceMeta()
+  const settled = await Promise.allSettled([
+    candidate('expected-leaf-a', 2),
+    candidate('expected-leaf-b', 3),
+  ])
+  const fulfilled = settled.filter(
+    (result): result is PromiseFulfilledResult<Awaited<ReturnType<typeof candidate>>> =>
+      result.status === 'fulfilled',
+  )
+  const rejected = settled.filter(
+    (result): result is PromiseRejectedResult => result.status === 'rejected',
+  )
+  expect(fulfilled).toHaveLength(1)
+  expect(rejected).toHaveLength(1)
+  expect(rejected[0]?.reason).toBeInstanceOf(ExpectedLeafChangedError)
+
+  const winnerId = fulfilled[0]?.value.message.id
+  const loserId = winnerId === 'expected-leaf-a' ? 'expected-leaf-b' : 'expected-leaf-a'
+  expect(await repository.getMessage(loserId)).toBeUndefined()
+  const children = await repository.listChildHeaders(chat.id, root.id)
+  expect(children.filter((row) => !row.deleted).map((row) => row.id)).toEqual([winnerId])
+  expect(new Set(children.map((row) => row.siblingIndex)).size).toBe(children.length)
+  expect((await repository.getChat(chat.id))?.lastUpdatedLeafId).toBe(winnerId)
+  expect((await repository.getWorkspaceMeta()).mutationCounter).toBe(before.mutationCounter + 1)
+
+  await expect(candidate('expected-leaf-stale', 4)).rejects.toBeInstanceOf(ExpectedLeafChangedError)
+  expect(await repository.getMessage('expected-leaf-stale')).toBeUndefined()
 }

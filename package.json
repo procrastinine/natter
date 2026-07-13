@@ -11,6 +11,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build && node scripts/verify-dist.mjs",
+    "build:pages": "vite build",
     "preview": "vite preview",
     "test": "vitest",
     "test:run": "vitest run",

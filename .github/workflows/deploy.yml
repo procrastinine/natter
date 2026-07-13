@@ -12,15 +12,35 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  verify:
+  build_pages:
+    name: Build Pages artifact
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
-    uses: ./.github/workflows/verify.yml
-    with:
-      upload-pages-artifact: true
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm build:pages
+
+      - name: Validate Pages artifact
+        run: test -s dist/index.html
+
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
+        with:
+          path: ./dist
 
   deploy:
-    needs: verify
+    needs: build_pages
     runs-on: ubuntu-latest
     environment:
       name: github-pages
