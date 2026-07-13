@@ -183,8 +183,6 @@ const MODEL_AUTOSELECT_QUERY = {
   outputModalities: ['text', 'image', 'audio', 'file', 'video'],
 } as const
 const DIRECT_MODEL_AUTOSELECT_QUERY = {} as const
-const POST_STREAM_TRANSCRIPT_RECYCLE_CHARS = 100_000
-const POST_STREAM_TRANSCRIPT_RECYCLE_DELAY_MS = 250
 const TRANSCRIPT_RECYCLE_REMOUNT_DELAY_MS = 50
 const RECYCLE_TRANSCRIPT_EVENT = 'natter:recycle-transcript'
 const ORPHAN_RECOVERY_FAILURE_RETRY_MS = 2_000
@@ -298,17 +296,6 @@ export function Shell() {
   const streamingOnActiveChat = useStreamStore((s) =>
     activeChatId ? s.hasStreamForChat(activeChatId) : false,
   )
-  const activeStreamLivePayloadChars = useStreamStore((s) => {
-    if (!activeChatId) return 0
-    if (useUiStore.getState().treeViewChatId === activeChatId) return 0
-    let max = 0
-    for (const messageId in s.liveByMessageId) {
-      const snapshot = s.liveByMessageId[messageId]
-      if (!snapshot || snapshot.chatId !== activeChatId) continue
-      max = Math.max(max, snapshot.textLength + snapshot.reasoningLength)
-    }
-    return max
-  })
   const profileCount = useRepositoryQuery(
     'profile-count:include-archived',
     () => countProfiles({ includeArchived: true }),
@@ -333,9 +320,6 @@ export function Shell() {
   const [retainedAlternateViewsChatId, setRetainedAlternateViewsChatId] = useState<ChatId | null>(
     null,
   )
-  const streamPeakPayloadCharsRef = useRef(0)
-  const streamWasActiveRef = useRef(false)
-  const transcriptRecycleTimerRef = useRef<number | null>(null)
   const transcriptRemountTimerRef = useRef<number | null>(null)
   const editTreeMode = useUiStore((s) => s.editTreeMode)
   const setEditTreeMode = useUiStore((s) => s.setEditTreeMode)
@@ -486,69 +470,17 @@ export function Shell() {
   }, [activeBranchWindowResult, activeChatId])
   useEffect(() => {
     void activeChatId
-    streamPeakPayloadCharsRef.current = 0
-    streamWasActiveRef.current = false
-    if (transcriptRecycleTimerRef.current !== null) {
-      window.clearTimeout(transcriptRecycleTimerRef.current)
-      transcriptRecycleTimerRef.current = null
-    }
     setTranscriptMounted(true)
     setTranscriptPlaceholderHeight(0)
   }, [activeChatId])
   useEffect(() => {
     return () => {
-      if (transcriptRecycleTimerRef.current !== null) {
-        window.clearTimeout(transcriptRecycleTimerRef.current)
-        transcriptRecycleTimerRef.current = null
-      }
       if (transcriptRemountTimerRef.current !== null) {
         window.clearTimeout(transcriptRemountTimerRef.current)
         transcriptRemountTimerRef.current = null
       }
     }
   }, [])
-  useEffect(() => {
-    if (treeViewActive) {
-      streamPeakPayloadCharsRef.current = 0
-      streamWasActiveRef.current = false
-      if (transcriptRecycleTimerRef.current !== null) {
-        window.clearTimeout(transcriptRecycleTimerRef.current)
-        transcriptRecycleTimerRef.current = null
-      }
-      return
-    }
-    if (!activeChatId) return
-    streamPeakPayloadCharsRef.current = Math.max(
-      streamPeakPayloadCharsRef.current,
-      activeStreamLivePayloadChars,
-    )
-    if (streamingOnActiveChat) {
-      if (transcriptRecycleTimerRef.current !== null) {
-        window.clearTimeout(transcriptRecycleTimerRef.current)
-        transcriptRecycleTimerRef.current = null
-      }
-      streamWasActiveRef.current = true
-      return
-    }
-    if (!streamWasActiveRef.current) return
-    streamWasActiveRef.current = false
-    const peak = streamPeakPayloadCharsRef.current
-    streamPeakPayloadCharsRef.current = 0
-    if (peak < POST_STREAM_TRANSCRIPT_RECYCLE_CHARS) return
-    if (transcriptRecycleTimerRef.current !== null) {
-      window.clearTimeout(transcriptRecycleTimerRef.current)
-    }
-    transcriptRecycleTimerRef.current = window.setTimeout(() => {
-      transcriptRecycleTimerRef.current = null
-      recycleTranscriptRenderTree()
-    }, POST_STREAM_TRANSCRIPT_RECYCLE_DELAY_MS)
-  }, [
-    activeChatId,
-    activeStreamLivePayloadChars,
-    recycleTranscriptRenderTree,
-    streamingOnActiveChat,
-    treeViewActive,
-  ])
   const exactActiveBranchSnapshot =
     activeBranchSnapshotOverride?.key === activeBranchWindowQueryKey
       ? activeBranchSnapshotOverride.snapshot
@@ -560,11 +492,11 @@ export function Shell() {
   const lastActiveBranchSnapshot = activeChatId
     ? lastBranchSnapshotByChatRef.current.get(activeChatId)
     : undefined
-  const matchingLastActiveBranchSnapshot =
-    lastActiveBranchSnapshot?.cursorKey === activeCursorCacheKey
-      ? lastActiveBranchSnapshot.snapshot
+  const retainedActiveBranchSnapshot =
+    !treeViewActive || lastActiveBranchSnapshot?.cursorKey === activeCursorCacheKey
+      ? (lastActiveBranchSnapshot?.snapshot ?? null)
       : null
-  const resolvedActiveBranchSnapshot = exactActiveBranchSnapshot ?? matchingLastActiveBranchSnapshot
+  const resolvedActiveBranchSnapshot = exactActiveBranchSnapshot ?? retainedActiveBranchSnapshot
   const activeBranchLength = resolvedActiveBranchSnapshot?.branchLength ?? 0
   const activeBranchTailId = resolvedActiveBranchSnapshot?.branchHeaders.at(-1)?.id ?? null
   const messageBodyWindowResetKey = activeCursorCacheKey ?? '__none__'

@@ -944,12 +944,14 @@ describe('shell smoke render', () => {
     })
     window.location.hash = `#/chat/${chat.id}`
 
-    const { findByText, queryByText } = render(<App />)
+    const { container, findByText, queryByText } = render(<App />)
 
     expect(await findByText('old local answer')).toBeInTheDocument()
     await waitFor(() => {
       expect(window.location.hash).toBe(`#/chat/${chat.id}/message/${originalLeaf.id}`)
     })
+    const originalList = container.querySelector('[data-ui="message-list"]')
+    expect(originalList).toBeInTheDocument()
 
     act(() => {
       useChatStore.getState().setCursor(chat.id, {
@@ -959,6 +961,9 @@ describe('shell smoke render', () => {
     })
 
     expect(useChatStore.getState().getCursor(chat.id)?.[cursorKeyOf(root.id)]).toBe(localLeaf.id)
+    expect(container.querySelector('[data-ui="message-list"]')).toBe(originalList)
+    expect(container.querySelector('[data-ui="surface-loading"]')).not.toBeInTheDocument()
+    expect(container).not.toHaveTextContent('Loading conversation…')
     await waitFor(() => {
       expect(window.location.hash).toBe(`#/chat/${chat.id}/message/${localLeaf.id}`)
     })
@@ -982,6 +987,7 @@ describe('shell smoke render', () => {
       expect(window.location.hash).toBe(`#/chat/${chat.id}/message/${localLeaf.id}`)
       expect(queryByText('new local answer')).toBeInTheDocument()
     })
+    expect(container.querySelector('[data-ui="message-list"]')).toBe(originalList)
   })
 
   it('auto-closes the chat settings panel on storage routes', async () => {

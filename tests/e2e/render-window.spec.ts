@@ -154,7 +154,14 @@ test('send and regenerate keep the transcript mounted while the branch window re
   await expect(
     page.locator('[data-ui="message"]').last().locator('[data-ui="message-body"]'),
   ).toContainText('sent answer')
-  expect(await stopMessageCountRecorder(page)).not.toContain(0)
+  expect(await stopMessageCountRecorder(page)).toEqual({
+    anchorRemoved: false,
+    listRemoved: false,
+    listReplaced: false,
+    loadingSeen: false,
+    messageCountsIncludeZero: false,
+    recyclingSeen: false,
+  })
 
   await startMessageCountRecorder(page)
   await page
@@ -165,7 +172,70 @@ test('send and regenerate keep the transcript mounted while the branch window re
   await expect(
     page.locator('[data-ui="message"]').last().locator('[data-ui="message-body"]'),
   ).toContainText('regenerated answer')
-  expect(await stopMessageCountRecorder(page)).not.toContain(0)
+  expect(await stopMessageCountRecorder(page)).toEqual({
+    anchorRemoved: false,
+    listRemoved: false,
+    listReplaced: false,
+    loadingSeen: false,
+    messageCountsIncludeZero: false,
+    recyclingSeen: false,
+  })
+})
+
+test('large streamed turns do not recycle the transcript after completion', async ({ page }) => {
+  await page.waitForFunction(() =>
+    Boolean((window as unknown as { __debugFakeStream?: unknown }).__debugFakeStream),
+  )
+  const chatId = await page.evaluate(async () => {
+    const api = (
+      window as unknown as {
+        __debugFakeStream?: {
+          start(options: Record<string, unknown>): Promise<{ chatId: string }>
+        }
+      }
+    ).__debugFakeStream
+    if (!api) throw new Error('__debugFakeStream is not installed')
+    const result = await api.start({
+      targetChars: 32,
+      reasoningChars: 0,
+      chunkChars: 32,
+      delayMs: 0,
+      openChat: true,
+    })
+    return result.chatId
+  })
+  await expect(page.locator('[data-ui="message"]')).toHaveCount(2)
+
+  await startMessageCountRecorder(page)
+  await page.evaluate(async (activeChatId) => {
+    const api = (
+      window as unknown as {
+        __debugFakeStream?: {
+          start(options: Record<string, unknown>): Promise<unknown>
+        }
+      }
+    ).__debugFakeStream
+    if (!api) throw new Error('__debugFakeStream is not installed')
+    await api.start({
+      chatId: activeChatId,
+      prompt: 'large turn',
+      targetChars: 100_100,
+      reasoningChars: 0,
+      chunkChars: 25_000,
+      delayMs: 10,
+      openChat: false,
+    })
+  }, chatId)
+  await page.waitForTimeout(600)
+
+  expect(await stopMessageCountRecorder(page)).toEqual({
+    anchorRemoved: false,
+    listRemoved: false,
+    listReplaced: false,
+    loadingSeen: false,
+    messageCountsIncludeZero: false,
+    recyclingSeen: false,
+  })
 })
 
 test('switching message variants re-renders the selected branch window', async ({ page }) => {
@@ -424,32 +494,97 @@ async function sidebarRowMetrics(row: Locator): Promise<{
 async function startMessageCountRecorder(page: Page): Promise<void> {
   await page.evaluate(() => {
     const win = window as Window & {
-      __messageCountSamples?: number[]
+      __messageCountSamples?: {
+        anchor: Element
+        anchorRemoved: boolean
+        content: Element
+        list: Element
+        listRemoved: boolean
+        listReplaced: boolean
+        loadingSeen: boolean
+        messageCounts: number[]
+        recyclingSeen: boolean
+      }
       __stopMessageCountSamples?: () => void
     }
     win.__stopMessageCountSamples?.()
-    const samples: number[] = []
-    const sample = () => samples.push(document.querySelectorAll('[data-ui="message"]').length)
-    const root = document.querySelector('[data-ui="message-list"]')
-    const observer = root ? new MutationObserver(sample) : null
-    observer?.observe(root as Node, { childList: true, subtree: true })
+    const content = document.querySelector('[data-ui="scroll-content"]')
+    const list = content?.querySelector('[data-ui="message-list"]')
+    if (!content || !list) throw new Error('Mounted transcript not found')
+    const messages = list.querySelectorAll('[data-ui="message"]')
+    const state = {
+      anchor: messages.item(Math.max(0, messages.length - 2)),
+      anchorRemoved: false,
+      content,
+      list,
+      listRemoved: false,
+      listReplaced: false,
+      loadingSeen: false,
+      messageCounts: [] as number[],
+      recyclingSeen: false,
+    }
+    const sample = () => {
+      const currentList = state.content.querySelector('[data-ui="message-list"]')
+      state.messageCounts.push(currentList?.querySelectorAll('[data-ui="message"]').length ?? 0)
+      state.listRemoved ||= !state.list.isConnected
+      state.listReplaced ||= currentList !== state.list
+      state.anchorRemoved ||= !state.anchor.isConnected
+      state.loadingSeen ||= state.content.querySelector('[data-ui="surface-loading"]') !== null
+      state.recyclingSeen ||=
+        state.content.querySelector('[data-ui="message-list-recycling"]') !== null
+    }
+    const observer = new MutationObserver(sample)
+    observer.observe(content, { childList: true, subtree: true })
     sample()
-    win.__messageCountSamples = samples
-    win.__stopMessageCountSamples = () => observer?.disconnect()
+    win.__messageCountSamples = state
+    win.__stopMessageCountSamples = () => observer.disconnect()
   })
 }
 
-async function stopMessageCountRecorder(page: Page): Promise<number[]> {
+async function stopMessageCountRecorder(page: Page): Promise<{
+  anchorRemoved: boolean
+  listRemoved: boolean
+  listReplaced: boolean
+  loadingSeen: boolean
+  messageCountsIncludeZero: boolean
+  recyclingSeen: boolean
+}> {
   return page.evaluate(() => {
     const win = window as Window & {
-      __messageCountSamples?: number[]
+      __messageCountSamples?: {
+        anchor: Element
+        anchorRemoved: boolean
+        content: Element
+        list: Element
+        listRemoved: boolean
+        listReplaced: boolean
+        loadingSeen: boolean
+        messageCounts: number[]
+        recyclingSeen: boolean
+      }
       __stopMessageCountSamples?: () => void
     }
+    const state = win.__messageCountSamples
+    if (!state) throw new Error('Transcript continuity recorder not started')
+    const currentList = state.content.querySelector('[data-ui="message-list"]')
+    state.messageCounts.push(currentList?.querySelectorAll('[data-ui="message"]').length ?? 0)
+    state.listRemoved ||= !state.list.isConnected
+    state.listReplaced ||= currentList !== state.list
+    state.anchorRemoved ||= !state.anchor.isConnected
+    state.loadingSeen ||= state.content.querySelector('[data-ui="surface-loading"]') !== null
+    state.recyclingSeen ||=
+      state.content.querySelector('[data-ui="message-list-recycling"]') !== null
     win.__stopMessageCountSamples?.()
-    const samples = win.__messageCountSamples ?? []
     delete win.__messageCountSamples
     delete win.__stopMessageCountSamples
-    return samples
+    return {
+      anchorRemoved: state.anchorRemoved,
+      listRemoved: state.listRemoved,
+      listReplaced: state.listReplaced,
+      loadingSeen: state.loadingSeen,
+      messageCountsIncludeZero: state.messageCounts.includes(0),
+      recyclingSeen: state.recyclingSeen,
+    }
   })
 }
 
