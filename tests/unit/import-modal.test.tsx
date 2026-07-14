@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, waitFor } from '@testing-library/react'
 import 'fake-indexeddb/auto'
 import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -44,6 +44,47 @@ function message(id: string, parentId: string | null, siblingIndex: number): Mes
 }
 
 describe('ImportModal tree insertion', () => {
+  it('keeps a superseded new-chat import detached while its write completes', async () => {
+    const target = await createChat({
+      id: 'detached-import-chat',
+      settings: cloneDefaultChatSettings(),
+    })
+    const visible = await createChat({
+      id: 'newer-visible-chat',
+      settings: cloneDefaultChatSettings(),
+    })
+    let resolveMaterialized!: (value: { chatId: string; navigationIntent: null }) => void
+    const materialized = new Promise<{ chatId: string; navigationIntent: null }>((resolve) => {
+      resolveMaterialized = resolve
+    })
+    const materializeChat = vi.fn(() => materialized)
+    const onClose = vi.fn()
+    const { getAllByRole, getByRole } = render(
+      <ImportModal
+        chatId={null}
+        slot={{ kind: 'at-end' }}
+        cursor={{}}
+        materializeChat={materializeChat}
+        onClose={onClose}
+      />,
+    )
+    fireEvent.change(getAllByRole('textbox')[0] as HTMLTextAreaElement, {
+      target: { value: 'background import' },
+    })
+    fireEvent.click(getByRole('button', { name: 'Import' }))
+    await waitFor(() => expect(materializeChat).toHaveBeenCalledTimes(1))
+
+    const newerIntent = useChatStore
+      .getState()
+      .navigateToCursor(visible.id, { __root__: 'visible-message' })
+    await act(async () => resolveMaterialized({ chatId: target.id, navigationIntent: null }))
+
+    await waitFor(() => expect(onClose).toHaveBeenCalled())
+    expect(await getDb().messages.where('chatId').equals(target.id).count()).toBe(1)
+    expect(useChatStore.getState().getCursor(target.id)).toBeUndefined()
+    expect(useChatStore.getState().isNavigationIntentCurrent(newerIntent)).toBe(true)
+  })
+
   it('applies shared-trunk topology and the returned cursor effects', async () => {
     const chat = await createChat({
       id: 'shared-import-chat',
@@ -53,7 +94,9 @@ describe('ImportModal tree insertion', () => {
     const left = message('left', parent.id, 0)
     const right = message('right', parent.id, 1)
     await putTestMessages([parent, left, right])
-    useChatStore.getState().setCursor(chat.id, { __root__: parent.id, [parent.id]: right.id })
+    useChatStore
+      .getState()
+      .navigateToCursor(chat.id, { __root__: parent.id, [parent.id]: right.id })
     const onClose = vi.fn()
 
     const { getAllByRole, getByRole } = render(
@@ -92,6 +135,54 @@ describe('ImportModal tree insertion', () => {
         [first?.id ?? 'missing-first']: second?.id,
         [second?.id ?? 'missing-second']: right.id,
       })
+    })
+  })
+
+  it('selects the exact inserted path when the tree target is off the active branch', async () => {
+    const chat = await createChat({
+      id: 'shared-import-chat',
+      settings: cloneDefaultChatSettings(),
+    })
+    const leftRoot = message('left-root', null, 0)
+    const leftLeaf = message('left-leaf', leftRoot.id, 0)
+    const rightRoot = message('right-root', null, 1)
+    const rightLeaf = message('right-leaf', rightRoot.id, 0)
+    await putTestMessages([leftRoot, leftLeaf, rightRoot, rightLeaf])
+    useChatStore.getState().navigateToCursor(chat.id, {
+      __root__: rightRoot.id,
+      [rightRoot.id]: rightLeaf.id,
+    })
+    const onClose = vi.fn()
+
+    const { getAllByRole, getByRole } = render(
+      <ImportModal
+        chatId={chat.id}
+        slot={{ kind: 'after', messageId: leftLeaf.id }}
+        cursor={useChatStore.getState().getCursor(chat.id) ?? {}}
+        onClose={onClose}
+      />,
+    )
+    fireEvent.change(getAllByRole('textbox')[0] as HTMLTextAreaElement, {
+      target: { value: 'off-branch child' },
+    })
+    fireEvent.click(getByRole('button', { name: 'Import' }))
+
+    await waitFor(async () => {
+      expect(onClose).toHaveBeenCalled()
+      const inserted = (await getDb().messages.where('chatId').equals(chat.id).toArray()).find(
+        (row) => row.origin === 'imported',
+      )
+      expect(inserted?.parentId).toBe(leftLeaf.id)
+      expect(useChatStore.getState().getCursor(chat.id)).toMatchObject({
+        __root__: leftRoot.id,
+        [leftRoot.id]: leftLeaf.id,
+        [leftLeaf.id]: inserted?.id,
+      })
+      expect(useChatStore.getState().getPendingBranchNavigation(chat.id)?.pathMessageIds).toEqual([
+        leftRoot.id,
+        leftLeaf.id,
+        inserted?.id,
+      ])
     })
   })
 })

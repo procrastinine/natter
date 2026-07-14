@@ -56,6 +56,8 @@ const HOSTED_SERVER_TOOL_ITEM_TYPES = new Set<string>([
 
 export interface StreamAccumulator {
   initialContent: ContentItem[]
+  initialTextPrefix: string
+  initialNonTextContent: ContentItem[]
   textSections: string[]
   textPendingParts: string[]
   textPendingLength: number
@@ -177,8 +179,20 @@ export function createStreamAccumulator(input: {
   initialContent: ContentItem[]
   now: number
 }): StreamAccumulator {
+  const initialTextPrefix = input.initialContent
+    .filter(
+      (item): item is Extract<ContentItem, { type: 'text' | 'output_text' }> =>
+        item.type === 'text' || item.type === 'output_text',
+    )
+    .map((item) => item.text)
+    .join('')
+  const initialNonTextContent = input.initialContent.filter(
+    (item) => item.type !== 'text' && item.type !== 'output_text',
+  )
   return {
     initialContent: input.initialContent,
+    initialTextPrefix,
+    initialNonTextContent,
     textSections: [],
     textPendingParts: [],
     textPendingLength: 0,
@@ -394,11 +408,7 @@ export function projectStreamAccumulatorLive(
   const reasoningRows = collectLiveReasoningRows(acc)
   const toolCallRows = collectLiveToolCallRows(acc)
   return {
-    content: assistantContentWithStreamSections(
-      acc.initialContent,
-      materializedTextSections(acc.textSections, acc.textPendingParts, acc.textPendingLength),
-      streamPreviewGeneratedContent(acc.generatedContent),
-    ),
+    content: projectStreamAccumulatorLiveContent(acc),
     ...(reasoningRows.length > 0 ? { reasoningRows } : {}),
     ...(toolCallRows.length > 0 ? { toolCallRows } : {}),
     generation: projectStreamGeneration(undefined, acc, input.requestedModel, {
@@ -434,10 +444,12 @@ export function projectStreamAccumulatorFinal(
 ): StreamAccumulatorFinalProjection {
   const metadata = projectStreamAccumulatorFinalMetadata(acc)
   return {
-    content: assistantContentWithStreamPrefix(acc.initialContent, streamAccumulatorText(acc), [
-      ...acc.generatedContent,
-      ...audioOutputContent(acc),
-    ]),
+    content: assistantContentWithStreamPrefix(
+      acc.initialTextPrefix,
+      acc.initialNonTextContent,
+      streamAccumulatorText(acc),
+      [...acc.generatedContent, ...audioOutputContent(acc)],
+    ),
     ...metadata,
   }
 }
@@ -537,6 +549,8 @@ export function replayStreamAccumulator(input: {
 
 export function releaseStreamAccumulatorBuffers(acc: StreamAccumulator): void {
   acc.initialContent = []
+  acc.initialTextPrefix = ''
+  acc.initialNonTextContent = []
   acc.textSections = []
   acc.textPendingParts = []
   acc.textPendingLength = 0
@@ -562,8 +576,13 @@ export function streamAccumulatorText(acc: StreamAccumulator): string {
   return joinTextSections(acc.textSections, acc.textPendingParts)
 }
 
-export function streamAccumulatorTextSections(acc: StreamAccumulator): string[] {
-  return materializedTextSections(acc.textSections, acc.textPendingParts, acc.textPendingLength)
+export function projectStreamAccumulatorLiveContent(acc: StreamAccumulator): ContentItem[] {
+  return assistantContentWithStreamSections(
+    acc.initialTextPrefix,
+    acc.initialNonTextContent,
+    materializedTextSections(acc.textSections, acc.textPendingParts, acc.textPendingLength),
+    streamPreviewGeneratedContent(acc.generatedContent),
+  )
 }
 
 export function streamAccumulatorReasoningLength(acc: StreamAccumulator): number {
@@ -631,12 +650,23 @@ function appendTextToSections(
     pendingLength += part.length
     offset = nextOffset
     if (pendingLength === STREAM_LIVE_TEXT_SECTION_CHARS) {
-      sections.push(pendingParts.length === 1 ? (pendingParts[0] as string) : pendingParts.join(''))
+      appendGeometricTextSection(
+        sections,
+        pendingParts.length === 1 ? (pendingParts[0] as string) : pendingParts.join(''),
+      )
       pendingParts.length = 0
       pendingLength = 0
     }
   }
   return pendingLength
+}
+
+function appendGeometricTextSection(sections: string[], section: string): void {
+  let next = section
+  while (sections.length > 0 && sections.at(-1)?.length === next.length) {
+    next = `${sections.pop() as string}${next}`
+  }
+  sections.push(next)
 }
 
 function materializedTextSections(
@@ -761,7 +791,7 @@ function collectLiveToolCallRows(acc: StreamAccumulator): StreamAccumulatorLiveT
     const pendingArguments = buffer ? joinTextSections([], buffer.pendingParts) : undefined
     return {
       ...row,
-      argumentSections: buffer?.sections ?? [],
+      argumentSections: buffer ? [...buffer.sections] : [],
       ...(pendingArguments ? { pendingArguments } : {}),
       argumentLength: buffer?.length ?? 0,
     }
@@ -1251,62 +1281,34 @@ function syntheticReasoningDetailId(
 }
 
 function assistantContentWithStreamPrefix(
-  initialContent: readonly ContentItem[],
+  initialTextPrefix: string,
+  initialNonTextContent: readonly ContentItem[],
   streamedText: string,
   generatedContent: readonly ContentItem[] = [],
 ): ContentItem[] {
-  const prefix = initialContent
-    .filter(
-      (item): item is Extract<ContentItem, { type: 'text' | 'output_text' }> =>
-        item.type === 'text' || item.type === 'output_text',
-    )
-    .map((item) => item.text)
-    .join('')
-  const nonText = initialContent.filter(
-    (item) => item.type !== 'text' && item.type !== 'output_text',
-  )
-  const text = prefix.length > 0 ? `${prefix}${streamedText}` : streamedText
+  const text = initialTextPrefix.length > 0 ? `${initialTextPrefix}${streamedText}` : streamedText
   return [
     { type: 'output_text', text },
-    ...structuredClone(nonText),
+    ...structuredClone(initialNonTextContent),
     ...structuredClone(generatedContent),
   ]
 }
 
 function assistantContentWithStreamSections(
-  initialContent: readonly ContentItem[],
+  initialTextPrefix: string,
+  initialNonTextContent: readonly ContentItem[],
   streamedSections: readonly string[],
   generatedContent: readonly ContentItem[] = [],
 ): ContentItem[] {
-  const prefix = initialContent
-    .filter(
-      (item): item is Extract<ContentItem, { type: 'text' | 'output_text' }> =>
-        item.type === 'text' || item.type === 'output_text',
-    )
-    .map((item) => item.text)
-    .join('')
-  const nonText = initialContent.filter(
-    (item) => item.type !== 'text' && item.type !== 'output_text',
-  )
   const textItems: ContentItem[] = []
-  if (prefix.length > 0) {
-    const first = streamedSections[0]
-    if (first !== undefined) {
-      textItems.push({ type: 'output_text', text: `${prefix}${first}` })
-      for (let index = 1; index < streamedSections.length; index += 1) {
-        const section = streamedSections[index]
-        if (section) textItems.push({ type: 'output_text', text: section })
-      }
-    } else {
-      textItems.push({ type: 'output_text', text: prefix })
-    }
-  } else {
-    for (const section of streamedSections) {
-      if (section.length > 0) textItems.push({ type: 'output_text', text: section })
-    }
+  if (initialTextPrefix.length > 0) {
+    textItems.push({ type: 'output_text', text: initialTextPrefix })
+  }
+  for (const section of streamedSections) {
+    if (section.length > 0) textItems.push({ type: 'output_text', text: section })
   }
   if (textItems.length === 0) textItems.push({ type: 'output_text', text: '' })
-  return [...textItems, ...structuredClone(nonText), ...structuredClone(generatedContent)]
+  return [...textItems, ...initialNonTextContent, ...generatedContent]
 }
 
 function streamPreviewGeneratedContent(generatedContent: readonly ContentItem[]): ContentItem[] {

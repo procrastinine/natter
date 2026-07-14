@@ -51,11 +51,14 @@ import { ToolEvidenceBlock } from './ToolEvidenceBlock'
 interface MessageProps {
   chatId: ChatId
   message: MessageRow
+  bodyVersion: number
   branchContext?: BranchNavigationContext
   hasAnyReasoningDetails: boolean
   streaming?: boolean
   hasConnection: boolean
   generationBusy?: boolean
+  presentationOnly?: boolean
+  allowPresentationStreamProjection?: boolean
   // Effective capability for the chat's current model. Message-level quirks
   // should still prefer the stored message generation model when available.
   capability?: EffectiveCapability
@@ -116,11 +119,14 @@ export const Message = memo(
   },
   (prev, next) =>
     prev.message === next.message &&
+    prev.bodyVersion === next.bodyVersion &&
     prev.branchContext === next.branchContext &&
     prev.hasAnyReasoningDetails === next.hasAnyReasoningDetails &&
     prev.streaming === next.streaming &&
     prev.hasConnection === next.hasConnection &&
     prev.generationBusy === next.generationBusy &&
+    prev.presentationOnly === next.presentationOnly &&
+    prev.allowPresentationStreamProjection === next.allowPresentationStreamProjection &&
     prev.capability === next.capability &&
     prev.roleMismatch === next.roleMismatch &&
     prev.staleReplyHint === next.staleReplyHint &&
@@ -142,11 +148,14 @@ export const Message = memo(
 function MessageInner({
   chatId,
   message,
+  bodyVersion,
   branchContext,
   hasAnyReasoningDetails,
   streaming,
   hasConnection,
   generationBusy = false,
+  presentationOnly = false,
+  allowPresentationStreamProjection = false,
   capability,
   roleMismatch,
   staleReplyHint,
@@ -178,10 +187,11 @@ function MessageInner({
   // affordances.
   const [activeStream, liveSnapshot] = useRetainedMessageStreamProjection(
     message,
-    message.role === 'assistant',
+    bodyVersion,
+    message.role === 'assistant' && (!presentationOnly || allowPresentationStreamProjection),
   )
   const storeStreaming = activeStream !== undefined
-  const isStreaming = streaming === true || storeStreaming
+  const isStreaming = !presentationOnly && (streaming === true || storeStreaming)
   const remoteStreaming =
     activeStream !== undefined && activeStream.ownerClientId !== getStreamClientId()
   const renderedContent = liveSnapshot?.content ?? message.content
@@ -232,6 +242,7 @@ function MessageInner({
         item.type === 'output_video',
     )
   useEffect(() => {
+    if (presentationOnly) return
     if (isStreaming) return
     if (
       renderedContent.some(
@@ -247,7 +258,7 @@ function MessageInner({
     if (generatedOutputAttachmentIds(renderedContent).size > 0) {
       void normalizeGeneratedImageOutputAttachmentRefs(message.id).catch(() => {})
     }
-  }, [isStreaming, renderedContent, message.id])
+  }, [isStreaming, presentationOnly, renderedContent, message.id])
   const gen = renderedGeneration
   const suppressOriginalFailure = hasAppliedSuccessfulContinuation(message)
   const error = suppressOriginalFailure ? undefined : gen?.error
@@ -268,7 +279,9 @@ function MessageInner({
     (messageModelQuirks.hiddenReasoningOnChatApi === true ||
       capability?.quirks.hiddenReasoningOnChatApi === true) &&
     apiUsed === 'chat'
-  const canSwitchToResponses = Boolean(onRegenerate && hasConnection && !generationBusy)
+  const canSwitchToResponses = Boolean(
+    !presentationOnly && onRegenerate && hasConnection && !generationBusy,
+  )
   const handleSwitchToResponses = useCallback(async () => {
     await updateChatSettings(chatId, { api: 'responses' })
     if (onRegenerate) await onRegenerate(message)
@@ -321,6 +334,7 @@ function MessageInner({
     }
   }, [error, message.id])
   useEffect(() => {
+    if (presentationOnly) return
     if (!staleProvider) return
     // One banner per error id. The key is the message id so subsequent
     // swipes back to the same failed leaf don't stack a second banner.
@@ -349,6 +363,7 @@ function MessageInner({
     dismissBanner,
     handleRetryWithoutReasoning,
     handleCopyError,
+    presentationOnly,
   ])
   const collapseProfile = useMemo(
     () => collapseProfileFor(textLength, { streaming: isStreaming, longMessageDisplayMode }),
@@ -356,6 +371,12 @@ function MessageInner({
   )
   const manualCollapseRef = useRef(false)
   const [collapseMode, setCollapseMode] = useState<MessageCollapseMode>(collapseProfile.defaultMode)
+
+  useEffect(() => {
+    if (!presentationOnly) return
+    setEditing(false)
+    setShowInfo(false)
+  }, [presentationOnly])
 
   useEffect(() => {
     setCollapseMode((prev) => {
@@ -446,7 +467,7 @@ function MessageInner({
         data-collapse-enabled={collapseEnabled ? 'true' : 'false'}
         data-collapse-oversized={collapseProfile.oversized ? 'true' : undefined}
         onClick={cycleCollapse}
-        disabled={!collapseEnabled}
+        disabled={presentationOnly || !collapseEnabled}
         aria-label={collapseButtonLabel(message.role, collapseMode, collapseProfile.modes.length)}
         title={collapseButtonTitle(
           collapseMode,
@@ -532,7 +553,7 @@ function MessageInner({
           />
         ) : (
           <MessageContent
-            key={`${message.id}:${message.nodeVersion}`}
+            key={`${message.id}:${bodyVersion}`}
             content={renderedContent}
             text={text}
             textSegments={isStreaming ? textSegments : undefined}
@@ -596,11 +617,17 @@ function MessageInner({
         {null}
         <div data-ui="message-action-row">
           {branchContext ? (
-            <BranchControls chatId={chatId} message={message} context={branchContext} />
+            <BranchControls
+              key={presentationOnly ? 'branch-presentation' : 'branch-interactive'}
+              chatId={chatId}
+              message={message}
+              context={branchContext}
+            />
           ) : (
             <span data-ui="message-action-row-spacer" />
           )}
           <MessageActions
+            key={presentationOnly ? 'actions-presentation' : 'actions-interactive'}
             chatId={chatId}
             message={message}
             showInfo={showInfo}

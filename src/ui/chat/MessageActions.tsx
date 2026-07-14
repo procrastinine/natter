@@ -16,7 +16,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { hasAppliedSuccessfulContinuation } from '../../core/continuation-content'
-import { applyStructuralEffectsToCursor } from '../../core/messages'
+import { structuralEffectsCursorPatch } from '../../core/messages'
 import type { Message } from '../../core/types'
 import { applyStructuralSnapshot } from '../../core/undo'
 import {
@@ -92,6 +92,7 @@ function useRunDelete(chatId: string, message: Message, roleMismatch: boolean | 
   const pushToast = useToastStore((s) => s.push)
   return useCallback(
     async (kind: 'pair' | 'variant' | 'turn' | 'single') => {
+      const navigationIntent = useChatStore.getState().beginNavigationIntent(chatId)
       // Role-mismatched adjacencies almost always want a single-node
       // delete: the user is cleaning up the one stray turn that
       // delete-splice produced. Pair-delete would eat the NEIGHBORING
@@ -106,9 +107,7 @@ function useRunDelete(chatId: string, message: Message, roleMismatch: boolean | 
             : effectiveKind === 'variant'
               ? deleteVariantOp
               : deleteSingleOp
-      const priorCursor = {
-        ...(useChatStore.getState().getCursor(chatId) ?? {}),
-      }
+      const priorCursor = useChatStore.getState().getCursor(chatId) ?? {}
       let result: Awaited<ReturnType<typeof op>>
       try {
         result = await op({
@@ -124,10 +123,13 @@ function useRunDelete(chatId: string, message: Message, roleMismatch: boolean | 
         })
         return
       }
-      const latestCursor = useChatStore.getState().getCursor(chatId) ?? priorCursor
       useChatStore
         .getState()
-        .setCursor(chatId, applyStructuralEffectsToCursor(latestCursor, result.effects))
+        .patchCursorForIntent(
+          chatId,
+          navigationIntent,
+          structuralEffectsCursorPatch(result.effects),
+        )
       pushToast({
         level: 'info',
         text:
@@ -139,8 +141,9 @@ function useRunDelete(chatId: string, message: Message, roleMismatch: boolean | 
                 ? 'Deleted turn.'
                 : 'Deleted message.',
         undo: async () => {
+          const undoIntent = useChatStore.getState().beginNavigationIntent(chatId)
           await applyStructuralSnapshot(result.preImage)
-          useChatStore.getState().setCursor(chatId, priorCursor)
+          useChatStore.getState().setCursorForIntent(chatId, undoIntent, priorCursor)
         },
       })
     },

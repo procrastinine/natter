@@ -100,7 +100,7 @@ function message(overrides: Partial<Message>): Message {
 
 describe('branch-cache store', () => {
   it.each([
-    { kind: 'workspace-replaced' as const },
+    { kind: 'workspace-replaced' as const, replacementEpoch: 1 },
     { kind: 'workspace-invalidated' as const, mutationCounter: 7 },
   ])('clears the in-memory branch cache on $kind', async (event) => {
     await seedChat({ lastUpdatedLeafId: 'a', lastBranchUpdatedAt: 1 })
@@ -365,7 +365,7 @@ describe('branch-cache store', () => {
     expect(await getDb().messageBodies.get(appended.id)).toMatchObject({
       id: appended.id,
       content: appended.content,
-      nodeVersion: 0,
+      bodyVersion: 0,
       updatedAt: 1_000,
     })
     expect(await getDb().childLists.get(childListKey('chat-cache', leaf.id))).toEqual({

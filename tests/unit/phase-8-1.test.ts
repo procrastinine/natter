@@ -555,7 +555,7 @@ describe('undo snapshot for structural deletes', () => {
     expect(afterUndo.find((m) => m.id === assistant.id)?.deleted).toBe(false)
   })
 
-  it('restores attachment edges while hard-deleting rows introduced by the operation', async () => {
+  it('hard-deletes introduced rows without restoring unrelated header edits', async () => {
     const chat = await seedChat()
     await getDb().attachments.bulkPut([attachment('undo-a', 0), attachment('undo-b', 0)])
     const previous: Message = {
@@ -605,11 +605,11 @@ describe('undo snapshot for structural deletes', () => {
     })
 
     expect(await getBrowserRepository().getMessage(introduced.id)).toBeUndefined()
-    expect((await getBrowserRepository().getMessage(previous.id))?.attachmentRefs).toEqual(
-      previous.attachmentRefs,
-    )
-    expect((await getDb().attachments.get('undo-a'))?.refCount).toBe(1)
-    expect((await getDb().attachments.get('undo-b'))?.refCount).toBe(0)
+    expect((await getBrowserRepository().getMessage(previous.id))?.attachmentRefs).toEqual([
+      attachmentRef('undo-ref-b-replacement', 'undo-b'),
+    ])
+    expect((await getDb().attachments.get('undo-a'))?.refCount).toBe(0)
+    expect((await getDb().attachments.get('undo-b'))?.refCount).toBe(1)
     await expectAttachmentReferenceInvariants(getDb())
   })
 })

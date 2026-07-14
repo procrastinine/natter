@@ -1,6 +1,11 @@
 import { render } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
-import { MarkdownView, STREAMING_MARKDOWN_SEGMENT_CHARS } from '../../src/ui/chat/MarkdownView'
+import {
+  createStreamingMarkdownSegmentCache,
+  MarkdownView,
+  STREAMING_MARKDOWN_SEGMENT_CHARS,
+  segmentStreamingMarkdownForTests,
+} from '../../src/ui/chat/MarkdownView'
 import {
   DEFAULT_RENDERING_PREFS,
   RenderingPreferencesContext,
@@ -84,33 +89,69 @@ describe('MarkdownView', () => {
 
   it('does not rescan an unchanged frozen prefix when the live tail advances', () => {
     const prefix = `${'a'.repeat(STREAMING_MARKDOWN_SEGMENT_CHARS - 100)}\n\n${'b'.repeat(98)}`
+    const cache = createStreamingMarkdownSegmentCache()
     const nativeLastIndexOf = String.prototype.lastIndexOf
-    let prefixScans = 0
+    let boundaryScans = 0
     const lastIndexOf = vi.spyOn(String.prototype, 'lastIndexOf').mockImplementation(function (
       this: string,
       searchString: string,
       position?: number,
     ) {
-      if (String(this) === prefix && (searchString === '\n\n' || searchString === '\n')) {
-        prefixScans += 1
+      if (searchString === '\n\n' || searchString === '\n') {
+        boundaryScans += 1
       }
       return nativeLastIndexOf.call(this, searchString, position)
     })
 
     try {
-      const { rerender } = render(
-        <MarkdownView content="" contentSegments={[prefix, 'tail']} streaming />,
-      )
-      expect(prefixScans).toBeGreaterThan(0)
-      const scansAfterInitialRender = prefixScans
+      segmentStreamingMarkdownForTests([prefix, 'tail'], cache)
+      expect(boundaryScans).toBeGreaterThan(0)
+      const scansAfterInitialRender = boundaryScans
 
-      rerender(
-        <MarkdownView content="" contentSegments={[prefix, 'tail', '-advanced']} streaming />,
-      )
-      expect(prefixScans).toBe(scansAfterInitialRender)
+      segmentStreamingMarkdownForTests([prefix, 'tail', '-advanced'], cache)
+      expect(boundaryScans).toBe(scansAfterInitialRender)
     } finally {
       lastIndexOf.mockRestore()
     }
+  })
+
+  it('keeps cumulative prefix boundary work linear and projected blocks logarithmic', () => {
+    const cache = createStreamingMarkdownSegmentCache()
+    const section = 'x'.repeat(STREAMING_MARKDOWN_SEGMENT_CHARS)
+    const sectionCount = 64
+    const totalLength = section.length * sectionCount
+    const segmentBudget = Math.floor(Math.log2(sectionCount)) + 1
+    const nativeLastIndexOf = String.prototype.lastIndexOf
+    let boundaryScanChars = 0
+    let projectedSegmentVisits = 0
+    let content = ''
+    let finalSegments: ReadonlyArray<{ content: string; streaming: boolean }> = []
+    const lastIndexOf = vi.spyOn(String.prototype, 'lastIndexOf').mockImplementation(function (
+      this: string,
+      searchString: string,
+      position?: number,
+    ) {
+      if (searchString === '\n\n' || searchString === '\n') {
+        boundaryScanChars += String(this).length
+      }
+      return nativeLastIndexOf.call(this, searchString, position)
+    })
+
+    try {
+      for (let index = 0; index < sectionCount; index += 1) {
+        content += section
+        finalSegments = segmentStreamingMarkdownForTests([content], cache)
+        expect(finalSegments.length).toBeLessThanOrEqual(segmentBudget)
+        projectedSegmentVisits += finalSegments.length
+      }
+    } finally {
+      lastIndexOf.mockRestore()
+    }
+
+    expect(boundaryScanChars).toBeLessThanOrEqual(totalLength * 3)
+    expect(projectedSegmentVisits).toBeLessThanOrEqual(sectionCount * segmentBudget)
+    expect(finalSegments.map((segment) => segment.content).join('')).toBe(content)
+    expect(finalSegments.at(-1)?.streaming).toBe(true)
   })
 
   it('returns oversized stream content to Markdown after the stream completes', () => {

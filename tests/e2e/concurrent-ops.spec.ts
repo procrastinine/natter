@@ -191,6 +191,24 @@ test('a remote extension then newer sibling keeps each tab on its own branch wit
       .toBe(extension.assistantMessageId)
 
     await startMessageCountRecorder(first)
+    await first.evaluate(() => {
+      const win = window as typeof window & {
+        __remoteTailSamples?: string[]
+        __remoteTailObserver?: MutationObserver
+      }
+      const sample = () => {
+        const rows = document.querySelectorAll(
+          '[data-ui="message"][data-role="assistant"][data-message-id]',
+        )
+        const id =
+          rows.length === 0 ? null : rows.item(rows.length - 1).getAttribute('data-message-id')
+        if (id) win.__remoteTailSamples?.push(id)
+      }
+      win.__remoteTailSamples = []
+      win.__remoteTailObserver = new MutationObserver(sample)
+      win.__remoteTailObserver.observe(document.body, { childList: true, subtree: true })
+      sample()
+    })
     const newerSibling = await startDebugStream(second, {
       chatId: initial.chatId,
       parentMessageId: extension.userMessageId,
@@ -223,6 +241,16 @@ test('a remote extension then newer sibling keeps each tab on its own branch wit
     await expect
       .poll(() => readCursorSelection(second, initial.chatId, extension.userMessageId))
       .toBe(newerSibling.assistantMessageId)
+    const remoteTailSamples = await first.evaluate(() => {
+      const win = window as typeof window & {
+        __remoteTailSamples?: string[]
+        __remoteTailObserver?: MutationObserver
+      }
+      win.__remoteTailObserver?.disconnect()
+      return win.__remoteTailSamples ?? []
+    })
+    expect(remoteTailSamples).toContain(extension.assistantMessageId)
+    expect(remoteTailSamples).not.toContain(newerSibling.assistantMessageId)
     expect(await stopMessageCountRecorder(first)).toEqual({
       anchorRemoved: false,
       listRemoved: false,

@@ -121,7 +121,7 @@ describe('browser stream repository', () => {
       heartbeatAt: 4,
       attemptKind: 'continuation',
       continuationStrategy: 'prefill',
-      baseNodeVersion: 7,
+      baseBodyVersion: 7,
       requestedModel: 'model-a',
       apiUsed: 'responses',
     }

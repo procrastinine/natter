@@ -1,7 +1,8 @@
 import { buildContinuationAttempt } from '../core/continuation-attempt'
 import { appendContinuationText } from '../core/continuation-content'
 import { replayStreamAccumulator } from '../core/stream-accumulator'
-import type { ContentItem, Message, MessageId } from '../core/types'
+import type { ContentItem, MessageId } from '../core/types'
+import type { MessageHeaderRow } from './message-storage'
 import type { StreamLeaseRow, WorkspaceRepository } from './repository'
 import {
   announceStreamEnded,
@@ -71,8 +72,16 @@ export async function recoverStaleContinuationAttempts(input: {
       await input.repo.runMutation(
         [{ kind: 'message', messageId: claimedLease.messageId }],
         async (ctx) => {
+          const currentHeader = await ctx.getMessageHeader(claimedLease.messageId as MessageId)
           const current = await ctx.getMessage(claimedLease.messageId as MessageId)
-          if (!current || current.chatId !== claimedLease.chatId) return
+          if (
+            !currentHeader ||
+            !current ||
+            current.chatId !== claimedLease.chatId ||
+            currentHeader.chatId !== claimedLease.chatId
+          ) {
+            return
+          }
           if (
             current.continuationAttempts?.some(
               (attempt) => attempt.streamId === claimedLease.streamId,
@@ -94,7 +103,9 @@ export async function recoverStaleContinuationAttempts(input: {
               : 'interrupted'
           const streamedText = textFromContent(replayed.final.content)
           const unappliedText =
-            !baseVersionMatches(claimedLease, current) && streamedText ? streamedText : undefined
+            !baseVersionMatches(claimedLease, currentHeader) && streamedText
+              ? streamedText
+              : undefined
           const attempt = buildContinuationAttempt({
             streamId: claimedLease.streamId,
             strategy: claimedLease.continuationStrategy ?? 'unknown',
@@ -107,7 +118,7 @@ export async function recoverStaleContinuationAttempts(input: {
             ...(status === 'interrupted' ? { abortReason: 'tab-close' as const } : {}),
             ...(unappliedText ? { unappliedText } : {}),
           })
-          const baseUnchanged = baseVersionMatches(claimedLease, current)
+          const baseUnchanged = baseVersionMatches(claimedLease, currentHeader)
           const nextContent =
             baseUnchanged && streamedText.length > 0
               ? appendContinuationText(current.content, streamedText)
@@ -135,8 +146,12 @@ export async function recoverStaleContinuationAttempts(input: {
   return recovered
 }
 
-function baseVersionMatches(lease: StreamLeaseRow, message: Message): boolean {
-  return lease.baseNodeVersion === undefined || message.nodeVersion === lease.baseNodeVersion
+function baseVersionMatches(
+  lease: StreamLeaseRow,
+  header: Pick<MessageHeaderRow, 'bodyVersion' | 'nodeVersion'>,
+): boolean {
+  if (lease.baseBodyVersion !== undefined) return header.bodyVersion === lease.baseBodyVersion
+  return lease.baseNodeVersion === undefined || header.nodeVersion === lease.baseNodeVersion
 }
 
 function textFromContent(content: readonly ContentItem[]): string {
@@ -155,5 +170,6 @@ async function discardAttemptRows(repo: WorkspaceRepository, lease: StreamLeaseR
     streamId: lease.streamId,
     ...(lease.messageId ? { messageId: lease.messageId } : {}),
     outcome: 'abort',
+    replacementEpoch: streamWriteFenceForLease(lease).replacementEpoch,
   })
 }

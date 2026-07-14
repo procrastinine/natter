@@ -7,19 +7,19 @@
 
 import { type KeyboardEvent, type MouseEvent, useEffect, useRef, useState } from 'react'
 import { chatHref } from '../../app/router'
-import { cursorKeyOf } from '../../core/active-path'
-import { resolveLastUpdatedBranchBelow } from '../../core/branch-resolve'
-import { swipe } from '../../core/messages'
-import type { ChatId, CursorMap, Message } from '../../core/types'
+import {
+  cursorKeyOf,
+  type MessageTreeNode,
+  type MessageTreeProjection,
+} from '../../core/active-path'
+import { selectBranchProjected } from '../../core/branch-resolve'
+import { swipeProjected } from '../../core/messages'
+import type { ChatId, Message } from '../../core/types'
 import { announceVariantPosition } from '../../store/zustand/announcementStore'
 import { useChatStore } from '../../store/zustand/chatStore'
 import { Button } from '../primitives/Button'
 
-export interface BranchNavigationContext {
-  messages: readonly Message[]
-  byParent: Map<string | null, Message[]>
-  byId: Map<string, Message>
-}
+export type BranchNavigationContext = MessageTreeProjection
 
 interface BranchControlsProps {
   chatId: ChatId
@@ -45,25 +45,13 @@ export function BranchControls({ chatId, message, context }: BranchControlsProps
     el.select()
   }, [editing])
 
-  const { byId, byParent, messages } = context
-  const siblings = (byParent.get(message.parentId) ?? []).filter((m) => !m.deleted)
-  const sorted = [...siblings].sort((a, b) => a.siblingIndex - b.siblingIndex)
+  const siblings = context.liveByParent.get(message.parentId) ?? []
+  const sorted = siblings
   const idx = sorted.findIndex((s) => s.id === message.id)
   const jumpTo = (targetId: string) => {
     const cursor = useChatStore.getState().getCursor(chatId) ?? {}
-    const nextCursor: CursorMap = {
-      ...cursor,
-      [cursorKeyOf(message.parentId)]: targetId,
-    }
-    resolveLastUpdatedBranchBelow(
-      {
-        targetId,
-        byParent,
-        byId,
-      },
-      nextCursor,
-    )
-    useChatStore.getState().setCursor(chatId, nextCursor)
+    const patch = selectBranchProjected(context, targetId, cursor)
+    useChatStore.getState().navigateWithCursorPatch(chatId, patch)
     const targetIndex = sorted.findIndex((candidate) => candidate.id === targetId)
     if (targetIndex >= 0) announceVariantPosition(targetIndex, sorted.length)
   }
@@ -76,32 +64,21 @@ export function BranchControls({ chatId, message, context }: BranchControlsProps
   // existing §8.4.3 contract).
   const atStart = idx === 0
   const atEnd = idx === sorted.length - 1
-  const prev = atStart ? null : (sorted[idx - 1] as Message)
-  const next = atEnd ? null : (sorted[idx + 1] as Message)
-  const first = sorted[0] as Message
-  const last = sorted[sorted.length - 1] as Message
+  const prev = atStart ? null : (sorted[idx - 1] as MessageTreeNode)
+  const next = atEnd ? null : (sorted[idx + 1] as MessageTreeNode)
+  const first = sorted[0] as MessageTreeNode
+  const last = sorted[sorted.length - 1] as MessageTreeNode
 
   const applyStep = (direction: -1 | 1) => {
     const cursor = useChatStore.getState().getCursor(chatId) ?? {}
-    const { cursorUpdates } = swipe({
-      messages,
+    const { cursorUpdates } = swipeProjected({
+      projection: context,
       targetId: message.id,
       direction,
       cursor,
     })
-    const nextCursor: CursorMap = { ...cursor, ...cursorUpdates }
     const chosenId = cursorUpdates[cursorKeyOf(message.parentId)]
-    if (chosenId) {
-      resolveLastUpdatedBranchBelow(
-        {
-          targetId: chosenId,
-          byParent,
-          byId,
-        },
-        nextCursor,
-      )
-    }
-    useChatStore.getState().setCursor(chatId, nextCursor)
+    useChatStore.getState().navigateWithCursorPatch(chatId, cursorUpdates)
     if (chosenId) {
       const targetIndex = sorted.findIndex((candidate) => candidate.id === chosenId)
       if (targetIndex >= 0) announceVariantPosition(targetIndex, sorted.length)
@@ -129,7 +106,7 @@ export function BranchControls({ chatId, message, context }: BranchControlsProps
     setEditing(true)
   }
 
-  const resolveTarget = (raw: string): Message | null => {
+  const resolveTarget = (raw: string): MessageTreeNode | null => {
     const parsed = Number.parseInt(raw, 10)
     if (!Number.isFinite(parsed)) return null
     const clamped = Math.min(sorted.length, Math.max(1, parsed))

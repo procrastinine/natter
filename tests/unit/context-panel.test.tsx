@@ -227,5 +227,5 @@ describe('ContextPanel slider persistence', () => {
 function readGaugeValue(container: HTMLElement): number {
   const label = container.querySelector('[data-ui="context-gauge-label"] strong')
   if (!label) throw new Error('missing context gauge label')
-  return Number(label.textContent.replaceAll(',', ''))
+  return Number(label.textContent.replaceAll(',', '').replace('≈', '').trim())
 }

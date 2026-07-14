@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import {
   activePath,
+  activePathProjected,
+  createMessageTreeProjection,
   cursorKeyOf,
   findLastUpdatedLeafId,
   groupByParent,
@@ -9,6 +11,8 @@ import {
   liveLeaves,
   pickDefaultChild,
   ROOT_CURSOR_KEY,
+  resolveActiveLeafId,
+  resolveActiveLeafIdProjected,
 } from '../../src/core/active-path'
 import type { CursorMap, Message, MessageId } from '../../src/core/types'
 
@@ -34,15 +38,26 @@ const M = (n: number) => `M-${n.toString().padStart(4, '0')}`
 function referenceActivePath(messages: readonly Message[], cursor: CursorMap): Message[] {
   const byParent = groupByParent(messages)
   const byId = indexById(messages)
-  const subtreeScore = (rootId: MessageId): number => {
-    const start = byId.get(rootId)
-    let best = start && !start.deleted ? start.createdAt : -Infinity
+  const subtreeLeafScore = (
+    rootId: MessageId,
+  ): { createdAt: number; id: MessageId } | undefined => {
+    let best: { createdAt: number; id: MessageId } | undefined
     const stack = [rootId]
     while (stack.length > 0) {
       const id = stack.pop() as MessageId
-      for (const child of byParent.get(id) ?? []) {
-        if (!child.deleted && child.createdAt > best) best = child.createdAt
-        stack.push(child.id)
+      const message = byId.get(id)
+      if (!message || message.deleted) continue
+      const liveChildren = (byParent.get(id) ?? []).filter((child) => !child.deleted)
+      if (liveChildren.length > 0) {
+        for (const child of liveChildren) stack.push(child.id)
+        continue
+      }
+      if (
+        !best ||
+        message.createdAt > best.createdAt ||
+        (message.createdAt === best.createdAt && message.id > best.id)
+      ) {
+        best = { createdAt: message.createdAt, id: message.id }
       }
     }
     return best
@@ -57,13 +72,21 @@ function referenceActivePath(messages: readonly Message[], cursor: CursorMap): M
       pinnedId === undefined ? undefined : children.find((message) => message.id === pinnedId)
     let chosen: Message = pinned ?? (children[0] as Message)
     if (!pinned) {
-      let chosenScore = subtreeScore(chosen.id)
+      let chosenScore = subtreeLeafScore(chosen.id)
       for (let index = 1; index < children.length; index += 1) {
         const candidate = children[index] as Message
-        const candidateScore = subtreeScore(candidate.id)
+        const candidateScore = subtreeLeafScore(candidate.id)
+        const scoreOrder = candidateScore
+          ? chosenScore
+            ? candidateScore.createdAt - chosenScore.createdAt ||
+              (candidateScore.id < chosenScore.id ? -1 : candidateScore.id > chosenScore.id ? 1 : 0)
+            : 1
+          : chosenScore
+            ? -1
+            : 0
         if (
-          candidateScore > chosenScore ||
-          (candidateScore === chosenScore &&
+          scoreOrder > 0 ||
+          (scoreOrder === 0 &&
             (candidate.siblingIndex > chosen.siblingIndex ||
               (candidate.siblingIndex === chosen.siblingIndex && candidate.id > chosen.id)))
         ) {
@@ -151,15 +174,64 @@ describe('pickDefaultChild', () => {
     expect(chosen.id).toBe(M(1))
   })
 
-  it('breaks ties by greater siblingIndex, then greater id', () => {
+  it('breaks equal-createdAt leaf ties by greater leaf id before sibling order', () => {
     const msgs: Message[] = [
-      mkMessage({ id: M(1), parentId: null, siblingIndex: 0, createdAt: 5 }),
-      mkMessage({ id: M(2), parentId: null, siblingIndex: 1, createdAt: 5 }),
+      mkMessage({ id: M(1), parentId: null, siblingIndex: 10, createdAt: 5 }),
+      mkMessage({ id: M(2), parentId: null, siblingIndex: 0, createdAt: 5 }),
     ]
     const byParent = groupByParent(msgs)
     const byId = indexById(msgs)
     const chosen = pickDefaultChild(byParent.get(null) ?? [], byParent, byId)
-    expect(chosen.id).toBe(M(2)) // higher siblingIndex wins on tied score
+    expect(chosen.id).toBe(M(2))
+  })
+
+  it('scores only live leaves when a newer insert-between node is interior', () => {
+    const msgs: Message[] = [
+      mkMessage({ id: 'branch-a', parentId: null, siblingIndex: 0, createdAt: 100 }),
+      mkMessage({ id: 'leaf-a', parentId: 'branch-a', siblingIndex: 0, createdAt: 1 }),
+      mkMessage({ id: 'branch-b', parentId: null, siblingIndex: 1, createdAt: 50 }),
+    ]
+    const byParent = groupByParent(msgs)
+    const byId = indexById(msgs)
+
+    expect(pickDefaultChild(byParent.get(null) ?? [], byParent, byId).id).toBe('branch-b')
+    expect(activePath(msgs, {}).map((message) => message.id)).toEqual(['branch-b'])
+    expect(resolveActiveLeafId(msgs, {})).toBe('branch-b')
+    expect(findLastUpdatedLeafId(msgs)).toBe('branch-b')
+  })
+
+  it('excludes tombstones from leaf scores but treats a live node with only tombstones as a leaf', () => {
+    // Valid post-delete-splice shape: leaf-a has already been promoted beside
+    // the tombstone before active-path resolution sees the tree.
+    const withLiveDescendant: Message[] = [
+      mkMessage({ id: 'branch-a', parentId: null, siblingIndex: 0, createdAt: 100 }),
+      mkMessage({ id: 'leaf-a', parentId: 'branch-a', siblingIndex: 0, createdAt: 1 }),
+      mkMessage({
+        id: 'deleted-a',
+        parentId: 'branch-a',
+        siblingIndex: 1,
+        createdAt: 1_000,
+        deleted: true,
+      }),
+      mkMessage({ id: 'branch-b', parentId: null, siblingIndex: 1, createdAt: 50 }),
+    ]
+    expect(activePath(withLiveDescendant, {}).at(-1)?.id).toBe('branch-b')
+
+    const withOnlyTombstone = withLiveDescendant.filter((message) => message.id !== 'leaf-a')
+    expect(activePath(withOnlyTombstone, {}).at(-1)?.id).toBe('branch-a')
+    expect(findLastUpdatedLeafId(withOnlyTombstone)).toBe('branch-a')
+  })
+
+  it('uses the newest leaf id before candidate sibling order when leaf timestamps tie', () => {
+    const msgs: Message[] = [
+      mkMessage({ id: 'branch-a', parentId: null, siblingIndex: 10, createdAt: 1 }),
+      mkMessage({ id: 'leaf-a', parentId: 'branch-a', siblingIndex: 0, createdAt: 50 }),
+      mkMessage({ id: 'branch-z', parentId: null, siblingIndex: 0, createdAt: 2 }),
+      mkMessage({ id: 'leaf-z', parentId: 'branch-z', siblingIndex: 0, createdAt: 50 }),
+    ]
+
+    expect(activePath(msgs, {}).map((message) => message.id)).toEqual(['branch-z', 'leaf-z'])
+    expect(findLastUpdatedLeafId(msgs)).toBe('leaf-z')
   })
 })
 
@@ -206,12 +278,22 @@ describe('activePath', () => {
     expect(activePath([mkMessage({ id: M(1), deleted: true })], {})).toEqual([])
   })
 
-  it('matches the pre-optimization traversal across deterministic mixed trees', () => {
+  it('matches an independent live-leaf reference across deterministic mixed trees', () => {
     for (let seed = 1; seed <= 100; seed += 1) {
       const { messages, cursor } = seededTree(seed, 50 + (seed % 151))
       expect(activePath(messages, cursor).map((message) => message.id)).toEqual(
         referenceActivePath(messages, cursor).map((message) => message.id),
       )
+    }
+  })
+
+  it('converges an empty cursor to lastUpdatedLeafId across valid trees', () => {
+    for (let seed = 1; seed <= 100; seed += 1) {
+      const messages = seededTree(seed, 50 + (seed % 151)).messages.map((message) => ({
+        ...message,
+        deleted: false,
+      }))
+      expect(resolveActiveLeafId(messages, {})).toBe(findLastUpdatedLeafId(messages))
     }
   })
 
@@ -264,6 +346,43 @@ describe('activePath', () => {
       pathSteps: 1,
       childCandidates: 10_000,
     })
+  })
+
+  it('reuses one structural projection across cursor-only navigation', () => {
+    const messages = [
+      mkMessage({ id: M(1), parentId: null, siblingIndex: 0, createdAt: 1 }),
+      mkMessage({ id: M(2), parentId: null, siblingIndex: 1, createdAt: 2 }),
+      mkMessage({ id: M(3), parentId: M(1), siblingIndex: 0, createdAt: 3 }),
+      mkMessage({ id: M(4), parentId: M(2), siblingIndex: 0, createdAt: 4 }),
+    ]
+    let scoreBuilds = 0
+    const projection = createMessageTreeProjection(messages, {
+      onBuildScores: () => {
+        scoreBuilds += 1
+      },
+    })
+
+    expect(activePathProjected(projection, {}).map((message) => message.id)).toEqual([M(2), M(4)])
+    expect(
+      activePathProjected(projection, { [ROOT_CURSOR_KEY]: M(1) }).map((message) => message.id),
+    ).toEqual([M(1), M(3)])
+    expect(resolveActiveLeafIdProjected(projection, {})).toBe(M(4))
+    expect(scoreBuilds).toBe(1)
+  })
+
+  it('indexes live siblings once while preserving tombstones in the structural buckets', () => {
+    const messages = [
+      mkMessage({ id: M(1), parentId: null, siblingIndex: 0, createdAt: 1 }),
+      mkMessage({ id: M(2), parentId: M(1), siblingIndex: 0, createdAt: 2, deleted: true }),
+      mkMessage({ id: M(3), parentId: M(1), siblingIndex: 1, createdAt: 3 }),
+    ]
+    const projection = createMessageTreeProjection(messages)
+    const liveChildren = projection.liveByParent.get(M(1))
+
+    expect(projection.byParent.get(M(1))?.map((message) => message.id)).toEqual([M(2), M(3)])
+    expect(liveChildren?.map((message) => message.id)).toEqual([M(3)])
+    expect(activePathProjected(projection, {}).map((message) => message.id)).toEqual([M(1), M(3)])
+    expect(projection.liveByParent.get(M(1))).toBe(liveChildren)
   })
 })
 

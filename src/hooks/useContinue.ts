@@ -18,6 +18,7 @@ import { activePath, cursorKeyOf } from '../core/active-path'
 import { buildContinuationAttempt } from '../core/continuation-attempt'
 import { appendContinuationText } from '../core/continuation-content'
 import { resolveContinueSystemPromptTemplate } from '../core/continue-prompts'
+import { createCursorOverlay, createNonConflictingCursorPathGuard } from '../core/cursor-overlay'
 import {
   CONTINUE_GENERATION_ATTEMPT_ERROR_POLICY,
   runGenerationAttempt,
@@ -31,8 +32,8 @@ import {
 } from '../core/send-planning'
 import {
   createStreamAccumulator,
+  projectStreamAccumulatorLiveContent,
   streamAccumulatorText,
-  streamAccumulatorTextSections,
 } from '../core/stream-accumulator'
 // `globalPrefs` is still read for token-calibration mode; continue prompts
 // moved to `chat.settings` in the prompt-preset refactor.
@@ -47,7 +48,6 @@ import type {
   MessageId,
 } from '../core/types'
 import { newId } from '../lib/ulid'
-import { postEvent } from '../store/broadcast'
 import type { ConnectionRuntimeKeyCandidate } from '../store/connection-runtime'
 import {
   assertSendContextFresh,
@@ -56,6 +56,7 @@ import {
   loadSendContextForBranch,
 } from '../store/send-context'
 import { createStreamChunkWriter } from '../store/stream-chunk-writer'
+import { announceStreamEnded } from '../store/stream-leases'
 import { getWorkspaceRepository } from '../store/workspace-repository'
 import { announceGenerationOutcome } from '../store/zustand/announcementStore'
 import { useChatStore } from '../store/zustand/chatStore'
@@ -141,7 +142,7 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
     const baseCursor = useChatStore.getState().getCursor(input.chatId) ?? {}
     // Pin the cursor so the active-path walk ends at the target. Without
     // this, a fresh chat (no cursor) might resolve a different leaf.
-    const cursor: Record<string, MessageId> = { ...baseCursor }
+    const cursor = createCursorOverlay(baseCursor)
     const targetPathSelections: [string, MessageId][] = []
     let cur: (typeof allHeaders)[number] | undefined = targetHeader
     while (cur) {
@@ -281,7 +282,10 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
     const startedAt = now()
 
     const baseTextLength = textLengthOf(activeTarget.content)
-    const accumulator = createStreamAccumulator({ initialContent: [], now: startedAt })
+    const accumulator = createStreamAccumulator({
+      initialContent: activeTarget.content,
+      now: startedAt,
+    })
     const openStream =
       devOnlyOpenStreamOverride(input.openStream) ??
       ((open) =>
@@ -292,47 +296,36 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
           requestPlan: dispatchPlan,
           signal: open.signal,
         }))
+    const livePathGuard = createNonConflictingCursorPathGuard(targetPathSelections)
 
     const prepareLiveSnapshot = (publishedAt: number) => {
       if (useUiStore.getState().activeChatId !== input.chatId) {
-        clearLiveSnapshotIfPresent(activeTarget.id, streamId)
+        clearLiveSnapshotIfPresent(activeTarget.id, streamId, lifecycle.replacementEpoch)
         return undefined
       }
-      const preparedCursor = useChatStore.getState().getCursor(input.chatId) ?? {}
-      if (
-        targetPathSelections.some(
-          ([key, selectedMessageId]) =>
-            preparedCursor[key] !== undefined && preparedCursor[key] !== selectedMessageId,
-        )
-      ) {
-        clearLiveSnapshotIfPresent(activeTarget.id, streamId)
+      const preparedCursor = useChatStore.getState().getCursor(input.chatId)
+      if (!livePathGuard.matches(preparedCursor)) {
+        clearLiveSnapshotIfPresent(activeTarget.id, streamId, lifecycle.replacementEpoch)
         return undefined
       }
       const snapshot = {
         streamId,
         chatId: input.chatId,
         messageId: activeTarget.id,
-        content: appendLiveTextSections(
-          activeTarget.content,
-          streamAccumulatorTextSections(accumulator),
-        ),
+        replacementEpoch: lifecycle.replacementEpoch,
+        content: projectStreamAccumulatorLiveContent(accumulator),
         textLength: baseTextLength + accumulator.textLength,
         reasoningLength: 0,
         updatedAt: publishedAt,
       }
       return () => {
         if (useUiStore.getState().activeChatId !== input.chatId) {
-          clearLiveSnapshotIfPresent(activeTarget.id, streamId)
+          clearLiveSnapshotIfPresent(activeTarget.id, streamId, lifecycle.replacementEpoch)
           return
         }
-        const currentCursor = useChatStore.getState().getCursor(input.chatId) ?? {}
-        if (
-          targetPathSelections.some(
-            ([key, selectedMessageId]) =>
-              currentCursor[key] !== undefined && currentCursor[key] !== selectedMessageId,
-          )
-        ) {
-          clearLiveSnapshotIfPresent(activeTarget.id, streamId)
+        const currentCursor = useChatStore.getState().getCursor(input.chatId)
+        if (!livePathGuard.matches(currentCursor)) {
+          clearLiveSnapshotIfPresent(activeTarget.id, streamId, lifecycle.replacementEpoch)
           return
         }
         useStreamStore.getState().setLiveSnapshot(snapshot)
@@ -347,9 +340,10 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
       abort: lifecycle.abort,
       attemptKind: 'continuation',
       continuationStrategy: strategy,
-      baseNodeVersion: activeTarget.nodeVersion,
+      baseBodyVersion: targetHeader.bodyVersion,
       requestedModel,
       apiUsed,
+      replacementEpoch: lifecycle.replacementEpoch,
     })
     const journal = createStreamChunkWriter({
       port: repo,
@@ -435,14 +429,12 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
       cleanup: (attemptResult) => {
         if (attemptResult.journalCleanupPending) lifecycle.preserveLease()
         announceGenerationOutcome(streamId, attemptResult.outcome)
-        useStreamStore.getState().clearActive(streamId)
-        clearLiveSnapshotIfPresent(activeTarget.id, streamId)
-        postEvent({
-          kind: 'stream-ended',
+        announceStreamEnded({
           chatId: input.chatId,
           streamId,
           messageId: activeTarget.id,
           outcome: attemptResult.outcome,
+          replacementEpoch: streamFence.replacementEpoch,
         })
       },
     })
@@ -451,15 +443,16 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
     if (attemptState.started && !attemptState.canonicalFinalized) lifecycle.preserveLease()
     throw error
   } finally {
-    if (useStreamStore.getState().isActive(lifecycle.streamId)) {
-      useStreamStore.getState().clearActive(lifecycle.streamId)
-      if (target) clearLiveSnapshotIfPresent(target.id, lifecycle.streamId)
-      postEvent({
-        kind: 'stream-ended',
+    if (
+      useStreamStore.getState().getActive(lifecycle.streamId)?.replacementEpoch ===
+      lifecycle.replacementEpoch
+    ) {
+      announceStreamEnded({
         chatId: input.chatId,
         streamId: lifecycle.streamId,
         ...(target ? { messageId: target.id } : {}),
         outcome: lifecycleOutcome,
+        replacementEpoch: lifecycle.replacementEpoch,
       })
     }
     await lifecycle.end(lifecycleOutcome)
@@ -472,14 +465,4 @@ function textLengthOf(content: readonly ContentItem[]): number {
     if (item.type === 'text' || item.type === 'output_text') length += item.text.length
   }
   return length
-}
-
-function appendLiveTextSections(
-  content: readonly ContentItem[],
-  continuationSections: readonly string[],
-): ContentItem[] {
-  return [
-    ...content,
-    ...continuationSections.map((text) => ({ type: 'output_text' as const, text })),
-  ]
 }

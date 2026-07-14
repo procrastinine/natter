@@ -2,7 +2,12 @@ import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ChatStreamChunk } from '../../src/api/types'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
-import { editMessageContent, insertSibling, sendUserMessage } from '../../src/core/messages'
+import {
+  editMessageContent,
+  insertBetween,
+  insertSibling,
+  sendUserMessage,
+} from '../../src/core/messages'
 import type { ChatSettings, ConnectionProfile, Message } from '../../src/core/types'
 import { sendFromMessage, sendText } from '../../src/hooks/useChat'
 import { continueAssistantInPlace } from '../../src/hooks/useContinue'
@@ -293,6 +298,46 @@ describe('send-context freshness', () => {
     expect(
       (await getBrowserRepository().listMessages(chat.id)).filter((m) => m.role === 'assistant'),
     ).toEqual([])
+  })
+
+  it('rejects regenerate when its target moves before the placeholder mutation', async () => {
+    const { chatId, user, assistant } = await seedAssistantBranch()
+    await clearEndpointCache()
+    const discovery = delayEndpointDiscovery()
+    const openStream = vi.fn(() => completedStream())
+    const send = sendFromMessage({
+      chatId,
+      parentMessageId: user.id,
+      regenerateTargetMessageId: assistant.id,
+      connection: profile(),
+      apiKey: 'sk-test',
+      openStream,
+    })
+
+    await discovery.started
+    const inserted = await insertBetween({
+      chatId,
+      parentId: user.id,
+      childId: assistant.id,
+      content: [{ type: 'text', text: 'concurrent structural change' }],
+      role: 'system',
+    })
+    discovery.release()
+
+    await expect(send).rejects.toMatchObject({
+      name: 'TreeChangedError',
+      chatId,
+      detail: `regenerate target ${assistant.id} unavailable`,
+    })
+    expect(openStream).not.toHaveBeenCalled()
+    expect((await getBrowserRepository().getMessageHeader(assistant.id))?.parentId).toBe(
+      inserted.messageId,
+    )
+    expect(
+      (await getBrowserRepository().listMessageHeaders(chatId))
+        .filter((header) => header.role === 'assistant' && !header.deleted)
+        .map((header) => header.id),
+    ).toEqual([assistant.id])
   })
 
   it('rejects a settings change during delayed send planning', async () => {

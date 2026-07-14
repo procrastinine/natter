@@ -489,7 +489,7 @@ describe('almost-live request shape matrix', () => {
     expect(updated.content).toEqual([
       { type: 'output_text', text: `${LOREM_ASSISTANT}${expectedContinuation}` },
     ])
-    expect(useStreamStore.getState().liveByMessageId[target.id]).toBeUndefined()
+    expect(useStreamStore.getState().getLiveSnapshot(chat.id, target.id)).toBeUndefined()
   })
 
   it('Responses and Gemini native sends expose valid transport-specific request shapes', async () => {

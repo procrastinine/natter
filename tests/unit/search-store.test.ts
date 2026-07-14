@@ -198,7 +198,7 @@ describe('search store shell', () => {
   })
 
   it.each([
-    { kind: 'workspace-replaced' as const },
+    { kind: 'workspace-replaced' as const, replacementEpoch: 1 },
     { kind: 'workspace-invalidated' as const, mutationCounter: 7 },
   ])('clears derived search state on $kind', (event) => {
     startSearchStoreBroadcastListener()

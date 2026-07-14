@@ -13,6 +13,7 @@
 //      sibling under the existing user parent; old assistant stays as a
 //      swipe variant. One API call.
 
+import { cursorKeyOf } from '../core/active-path'
 import {
   deletePair,
   deleteSingleMessage,
@@ -37,6 +38,7 @@ import {
 import { bumpPresetLastUsedAt } from '../store/presets'
 import { bumpProfileLastUsedAt, getProfile } from '../store/profiles'
 import { getWorkspaceRepository } from '../store/workspace-repository'
+import type { NavigationIntent } from '../store/zustand/chatStore'
 import { useChatStore } from '../store/zustand/chatStore'
 import { writeTextInto } from '../ui/chat/InlineEditor'
 import type { SendTextResult } from './useChat'
@@ -44,14 +46,17 @@ import { continueAssistantInPlace } from './useContinue'
 
 export interface MessageOpsContext {
   chatId: ChatId
+  navigationIntent?: NavigationIntent
   // Start a fresh assistant completion stream under an existing message
   // (used by Edit & Send and Regenerate). Supplied by `useChat`.
   sendFrom: (input: {
     chatId: ChatId
+    navigationIntent: NavigationIntent
     connection: ConnectionProfile
     apiKey: string
     apiKeyCandidates?: readonly ConnectionRuntimeKeyCandidate[]
     parentMessageId: MessageId
+    regenerateTargetMessageId?: MessageId
     prefillContent?: ContentItem[]
   }) => Promise<SendTextResult>
 }
@@ -147,6 +152,8 @@ export async function editAndResend(
   newText: string,
   options: { prefillContent?: ContentItem[]; attachmentRefs?: AttachmentRef[] } = {},
 ): Promise<SendTextResult> {
+  const navigationIntent =
+    ctx.navigationIntent ?? useChatStore.getState().beginNavigationIntent(ctx.chatId)
   const conn = await resolveActiveConnection(ctx.chatId)
   if (!conn.ok) {
     throw new Error(`edit-and-resend: connection unavailable (${conn.reason})`)
@@ -160,14 +167,26 @@ export async function editAndResend(
     origin: 'user',
     ...(options.attachmentRefs ? { attachmentRefs: options.attachmentRefs } : {}),
   })
-  const existingCursor = useChatStore.getState().getCursor(ctx.chatId) ?? {}
-  useChatStore.getState().setCursor(ctx.chatId, {
-    ...existingCursor,
-    ...inserted.effects.cursorUpdates,
-  })
+  const insertedBranch = await getWorkspaceRepository().getBranchHeaderSnapshotByLeaf(
+    ctx.chatId,
+    inserted.messageId,
+  )
+  if (insertedBranch.branchHeaders.at(-1)?.id !== inserted.messageId) {
+    throw new Error(`edit-and-resend: inserted message unavailable (${inserted.messageId})`)
+  }
+  const insertedPathSelections = Object.fromEntries(
+    insertedBranch.branchHeaders.map((header) => [cursorKeyOf(header.parentId), header.id]),
+  )
+  useChatStore.getState().selectPathForIntent(
+    ctx.chatId,
+    navigationIntent,
+    insertedPathSelections,
+    insertedBranch.branchHeaders.map((header) => header.id),
+  )
   const hasPrefill = (options.prefillContent?.length ?? 0) > 0
   const result = await ctx.sendFrom({
     chatId: ctx.chatId,
+    navigationIntent,
     connection: conn.profile,
     apiKey: conn.apiKey,
     apiKeyCandidates: conn.apiKeyCandidates,
@@ -183,11 +202,17 @@ export async function regenerateFromMessage(
   ctx: MessageOpsContext,
   assistantMessage: Message,
 ): Promise<SendTextResult> {
+  const navigationIntent =
+    ctx.navigationIntent ?? useChatStore.getState().beginNavigationIntent(ctx.chatId)
   const conn = await resolveActiveConnection(ctx.chatId)
   if (!conn.ok) {
     throw new Error(`regenerate: connection unavailable (${conn.reason})`)
   }
-  if (assistantMessage.parentId === null) {
+  const assistantHeader = await getWorkspaceRepository().getMessageHeader(assistantMessage.id)
+  if (!assistantHeader || assistantHeader.chatId !== ctx.chatId || assistantHeader.deleted) {
+    throw new Error(`regenerate: assistant message unavailable (${assistantMessage.id})`)
+  }
+  if (assistantHeader.parentId === null) {
     throw new Error('regenerate: assistant message has no parent')
   }
   // `sendFrom` creates a new assistant placeholder under the user parent —
@@ -195,10 +220,12 @@ export async function regenerateFromMessage(
   // swipeable (§8.4.2) and the cursor advances to the new sibling.
   const result = await ctx.sendFrom({
     chatId: ctx.chatId,
+    navigationIntent,
     connection: conn.profile,
     apiKey: conn.apiKey,
     apiKeyCandidates: conn.apiKeyCandidates,
-    parentMessageId: assistantMessage.parentId,
+    parentMessageId: assistantHeader.parentId,
+    regenerateTargetMessageId: assistantHeader.id,
   })
   await bumpProfileLastUsedAt(conn.profile.id)
   if (conn.presetId) await bumpPresetLastUsedAt(conn.presetId)

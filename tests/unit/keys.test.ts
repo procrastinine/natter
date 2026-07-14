@@ -172,7 +172,7 @@ describe('createKey + resolveKey (passphrase mode)', () => {
   })
 
   it.each([
-    { kind: 'workspace-replaced' as const },
+    { kind: 'workspace-replaced' as const, replacementEpoch: 1 },
     { kind: 'workspace-invalidated' as const, mutationCounter: 7 },
   ])('drops derived wrapper keys on $kind', async (event) => {
     const record = await createKey({

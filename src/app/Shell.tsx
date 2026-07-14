@@ -12,8 +12,9 @@ import {
   useRef,
   useState,
 } from 'react'
+import { activePathProjected, createMessageTreeProjection } from '../core/active-path'
 import { attachmentsDisabledByTextProtocol } from '../core/attachments/context'
-import { seedCursorAtMessage } from '../core/branch-resolve'
+import { seedCursorAtMessageProjected } from '../core/branch-resolve'
 import { cloneDefaultChatSettings } from '../core/defaults'
 import {
   applyBaseFontSizeToDocument,
@@ -26,9 +27,9 @@ import {
   readGlobalPreferences,
 } from '../core/global-settings'
 import {
-  applyStructuralEffectsToCursor,
   deleteSingleMessage,
   type PasteImportSlot,
+  structuralEffectsCursorPatch,
 } from '../core/messages'
 import {
   forceEquivalentModelIdForConnection,
@@ -48,7 +49,7 @@ import type {
   MessageId,
   MessageRole,
 } from '../core/types'
-import { useBranchUrlSync } from '../hooks/useBranchUrlSync'
+import { useBranchUrlSync, useStableStructuralHeaders } from '../hooks/useBranchUrlSync'
 import { nextOrphanRecoveryAt, recoverOrphans, useChat } from '../hooks/useChat'
 import { useEndpoints } from '../hooks/useEndpoints'
 import { useModels } from '../hooks/useModels'
@@ -62,25 +63,34 @@ import {
   discardEmptyDraftChats,
   getChat,
   listChatSidebarRows,
-  loadActiveBranchWindowSnapshot,
+  loadKnownBranchPageSnapshot,
   markChatPermanent,
   toggleMessageHidden,
   touchLastViewed,
   updateChatSettings,
 } from '../store/chats'
 import { resolveConnectionRuntimeKeys } from '../store/connection-runtime'
+import type { MessageHeaderRow } from '../store/message-storage'
 import { bumpPresetLastUsedAt, getPreset, pickPreferredPreset } from '../store/presets'
 import { bumpProfileLastUsedAt, countProfiles, getProfile } from '../store/profiles'
 import { installPersistenceRequestOnFirstInteraction } from '../store/quota'
 import {
   allTable,
-  chatMessageDependencies,
   chatRowDependencies,
   GLOBAL_PREFERENCES_DEPENDENCIES,
   primaryKeys,
 } from '../store/reactive-dependencies'
-import { useRepositoryQuery, useRepositoryQueryState } from '../store/reactive-query'
-import type { ActiveBranchWindowSnapshot } from '../store/repository'
+import {
+  invalidateRepositoryQueriesForWorkspaceReplacement,
+  useRepositoryPresentationQuery,
+  useRepositoryQuery,
+  useRepositoryQueryState,
+} from '../store/reactive-query'
+import type {
+  ActiveBranchPageSnapshot,
+  ActiveBranchWindowSnapshot,
+  KnownBranchPageResult,
+} from '../store/repository'
 import { readSidebarSortMode, SIDEBAR_SORT_SETTING_KEY } from '../store/sidebar-preferences'
 import {
   installStreamLeaseListener,
@@ -91,7 +101,11 @@ import {
 import { getWorkspaceRepository } from '../store/workspace-repository'
 import { announceEditTreeMode, announceTreeBranchOpened } from '../store/zustand/announcementStore'
 import { useChatStore } from '../store/zustand/chatStore'
-import { useStreamStore } from '../store/zustand/streamStore'
+import {
+  useHasStreamForChat,
+  useIsStreamTargetActive,
+  useStreamStore,
+} from '../store/zustand/streamStore'
 import { useToastStore } from '../store/zustand/toastStore'
 import { useUiStore } from '../store/zustand/uiStore'
 import { BannerTray } from '../ui/chat/BannerTray'
@@ -122,12 +136,19 @@ import { LiveRegions } from '../ui/primitives/LiveRegions'
 import { ChatModelPanel } from '../ui/settings/ChatModelPanel'
 import { ChatList } from '../ui/sidebar/ChatList'
 import {
+  beginRouteIntent,
+  cancelRouteIntent,
+  chatHref,
   homeHref,
+  isRouteIntentCurrent,
   makeAnchorClickHandler,
+  navigateForIntent,
   navigateHome,
   navigateNew,
-  navigateToChat,
+  navigateToChatForIntent,
   newChatHref,
+  type RouteIntent,
+  refreshRouteForWorkspaceReplacement,
   storageHref,
   useRoute,
 } from './router'
@@ -191,19 +212,16 @@ const RECYCLE_TRANSCRIPT_EVENT = 'natter:recycle-transcript'
 const ORPHAN_RECOVERY_FAILURE_RETRY_MS = 2_000
 const CHAT_SNAPSHOT_CACHE_MAX_ENTRIES = 16
 
-interface ActiveBranchWindowSnapshotResult {
+interface ActiveBranchPageSnapshotResult {
   key: string
-  cursorKey: string
-  snapshot: ActiveBranchWindowSnapshot
+  intentKey: string
+  readEpoch: number
+  result: KnownBranchPageResult
 }
 
 interface LastBranchSnapshot {
-  cursorKey: string
+  intentKey: string
   snapshot: ActiveBranchWindowSnapshot
-}
-
-interface ActiveBranchSnapshotOverride extends ActiveBranchWindowSnapshotResult {
-  queryResultAtSet: ActiveBranchWindowSnapshotResult | null
 }
 
 interface ActiveProfileState {
@@ -215,7 +233,6 @@ interface TreeInsertTarget {
   chatId: ChatId
   slot: PasteImportSlot
   defaultRole: MessageRole
-  activateNodeId?: MessageId
 }
 
 function oppositeRole(role: MessageRole): MessageRole {
@@ -224,10 +241,164 @@ function oppositeRole(role: MessageRole): MessageRole {
   return role
 }
 
-function cursorCacheKey(chatId: ChatId, cursor: CursorMap): string {
-  const entries = Object.entries(cursor).sort(([left], [right]) => left.localeCompare(right))
-  return JSON.stringify([chatId, entries])
+let activeBranchWindowReadEpoch = 0
+
+function invalidateActiveBranchWindowReads(): void {
+  activeBranchWindowReadEpoch += 1
 }
+
+function overlayKnownPathHeaders(
+  headers: readonly MessageHeaderRow[],
+  pathHeaders: readonly MessageHeaderRow[],
+): readonly MessageHeaderRow[] {
+  const indexById = new Map(headers.map((header, index) => [header.id, index]))
+  const next = [...headers]
+  for (const header of pathHeaders) {
+    const index = indexById.get(header.id)
+    if (index === undefined) {
+      indexById.set(header.id, next.length)
+      next.push(header)
+    } else {
+      next[index] = header
+    }
+  }
+  return next
+}
+
+function overlayCanonicalMessageHeader(message: Message, header: MessageHeaderRow): Message {
+  const {
+    bodyVersion: _bodyVersion,
+    bodyWordCount: _bodyWordCount,
+    textPreview: _textPreview,
+    ...canonicalHeader
+  } = header
+  return { ...message, ...canonicalHeader }
+}
+
+function composeKnownBranchPage(
+  chatId: ChatId,
+  pathMessageIds: readonly MessageId[],
+  knownPathHeaders: readonly MessageHeaderRow[] | null,
+  knownHeaderById: ReadonlyMap<MessageId, MessageHeaderRow>,
+  page: ActiveBranchPageSnapshot,
+): ActiveBranchWindowSnapshot | null {
+  if (page.chatId !== chatId || page.branchLength !== pathMessageIds.length) return null
+  if (
+    page.pageOffset < 0 ||
+    page.pageOffset + page.pageHeaders.length > pathMessageIds.length ||
+    page.pageHeaders.length !== page.pageMessages.length
+  ) {
+    return null
+  }
+  let branchHeaders: readonly MessageHeaderRow[] | null = null
+  if (knownPathHeaders?.length === pathMessageIds.length) {
+    let pageMatchesKnownPath = true
+    for (let index = 0; index < page.pageHeaders.length; index += 1) {
+      const header = page.pageHeaders[index]
+      const known = knownPathHeaders[page.pageOffset + index]
+      if (!header || !known || header.id !== known.id || header.bodyVersion !== known.bodyVersion) {
+        pageMatchesKnownPath = false
+        break
+      }
+    }
+    if (pageMatchesKnownPath) branchHeaders = knownPathHeaders
+  }
+  const pageHeaderById = new Map(page.pageHeaders.map((header) => [header.id, header]))
+  const reconstructedHeaders: MessageHeaderRow[] = []
+  if (!branchHeaders) {
+    const seen = new Set<MessageId>()
+    for (let index = 0; index < pathMessageIds.length; index += 1) {
+      const messageId = pathMessageIds[index] as MessageId
+      if (seen.has(messageId)) return null
+      seen.add(messageId)
+      const header = knownHeaderById.get(messageId) ?? pageHeaderById.get(messageId)
+      const expectedParentId = index === 0 ? null : pathMessageIds[index - 1]
+      if (
+        !header ||
+        header.chatId !== chatId ||
+        header.deleted ||
+        header.parentId !== expectedParentId
+      ) {
+        return null
+      }
+      reconstructedHeaders.push(header)
+    }
+    branchHeaders = reconstructedHeaders
+  }
+  const branchMessages: Message[] = []
+  for (let index = 0; index < page.pageHeaders.length; index += 1) {
+    const header = page.pageHeaders[index]
+    const message = page.pageMessages[index]
+    const known = header ? knownHeaderById.get(header.id) : undefined
+    const authoritative = branchHeaders[page.pageOffset + index]
+    if (
+      !header ||
+      !message ||
+      !authoritative ||
+      pathMessageIds[page.pageOffset + index] !== header.id ||
+      message.id !== header.id ||
+      authoritative.id !== header.id ||
+      authoritative.bodyVersion !== header.bodyVersion ||
+      (known !== undefined && header.bodyVersion !== known.bodyVersion)
+    ) {
+      return null
+    }
+    branchMessages.push(overlayCanonicalMessageHeader(message, authoritative))
+  }
+  return {
+    chatId,
+    branchHeaders: branchHeaders as MessageHeaderRow[],
+    branchWindow: branchMessages,
+    windowOffset: page.pageOffset,
+    windowLimit: page.pageLimit,
+    branchLength: page.branchLength,
+  }
+}
+
+function rebaseBranchSnapshot(
+  snapshot: ActiveBranchWindowSnapshot,
+  path: readonly MessageHeaderRow[],
+): ActiveBranchWindowSnapshot | null {
+  if (snapshot.branchHeaders.length !== path.length) return null
+  for (let index = 0; index < path.length; index += 1) {
+    const retained = snapshot.branchHeaders[index]
+    const authoritative = path[index]
+    if (
+      !retained ||
+      !authoritative ||
+      retained.id !== authoritative.id ||
+      retained.bodyVersion !== authoritative.bodyVersion
+    ) {
+      return null
+    }
+  }
+  if (snapshot.branchHeaders === path) return snapshot
+  const branchWindow = snapshot.branchWindow.map((message, index) => {
+    const authoritative = path[snapshot.windowOffset + index]
+    return authoritative ? overlayCanonicalMessageHeader(message, authoritative) : message
+  })
+  return { ...snapshot, branchHeaders: path as MessageHeaderRow[], branchWindow }
+}
+
+function branchSnapshotMatchesStructure(
+  snapshot: ActiveBranchWindowSnapshot,
+  path: readonly Pick<Message, 'id' | 'parentId' | 'siblingIndex' | 'deleted'>[],
+): boolean {
+  if (snapshot.branchHeaders.length !== path.length) return false
+  return snapshot.branchHeaders.every((header, index) => {
+    const authoritative = path[index]
+    return (
+      authoritative !== undefined &&
+      header.id === authoritative.id &&
+      header.parentId === authoritative.parentId &&
+      header.siblingIndex === authoritative.siblingIndex &&
+      header.deleted === authoritative.deleted
+    )
+  })
+}
+
+export const __composeKnownBranchPageForTests = composeKnownBranchPage
+export const __rebaseBranchSnapshotForTests = rebaseBranchSnapshot
 
 function hasFileTransfer(dataTransfer: DataTransfer): boolean {
   return Array.from(dataTransfer.types).includes('Files')
@@ -253,6 +424,18 @@ function useMediaQuery(query: string): boolean {
   }, [query])
 
   return matches
+}
+
+function useStableMessageIdPath(path: readonly MessageId[]): readonly MessageId[] {
+  const stableRef = useRef<readonly MessageId[]>(path)
+  const stable = stableRef.current
+  if (
+    stable !== path &&
+    (stable.length !== path.length || stable.some((messageId, index) => messageId !== path[index]))
+  ) {
+    stableRef.current = path
+  }
+  return stableRef.current
 }
 
 // Seed settings for a new chat from this tab's remembered default first,
@@ -294,11 +477,13 @@ export function Shell() {
         ? 'new'
         : 'empty'
   const isNarrowScreen = useMediaQuery(MOBILE_SHELL_QUERY)
-  const activeTreeHeaders = useBranchUrlSync(activeChatId)
+  const {
+    headers: activeTreeHeaders,
+    structuralHeaders: structuralTreeHeaders,
+    projection: structuralTreeProjection,
+  } = useBranchUrlSync(activeChatId)
   const { send, sendFrom } = useChat()
-  const streamingOnActiveChat = useStreamStore((s) =>
-    activeChatId ? s.hasStreamForChat(activeChatId) : false,
-  )
+  const streamingOnActiveChat = useHasStreamForChat(activeChatId)
   const profileCount = useRepositoryQuery(
     'profile-count:include-archived',
     () => countProfiles({ includeArchived: true }),
@@ -323,6 +508,7 @@ export function Shell() {
   const [retainedAlternateViewsChatId, setRetainedAlternateViewsChatId] = useState<ChatId | null>(
     null,
   )
+  const [pendingTreeExitChatId, setPendingTreeExitChatId] = useState<ChatId | null>(null)
   const transcriptRemountTimerRef = useRef<number | null>(null)
   const editTreeMode = useUiStore((s) => s.editTreeMode)
   const setEditTreeMode = useUiStore((s) => s.setEditTreeMode)
@@ -338,8 +524,73 @@ export function Shell() {
   const pushToast = useToastStore((s) => s.push)
   const clearBannersByKind = useToastStore((s) => s.clearBannersByKind)
   const activeCursor = useChatStore((s) =>
-    activeChatId ? (s.cursors[activeChatId] ?? EMPTY_CURSOR) : EMPTY_CURSOR,
+    activeChatId ? (s.getCursor(activeChatId) ?? EMPTY_CURSOR) : EMPTY_CURSOR,
   )
+  const activeNavigationRevision = useChatStore((s) =>
+    activeChatId ? s.getNavigationRevision(activeChatId) : '0',
+  )
+  const activePendingBranchNavigation = useChatStore((s) =>
+    activeChatId ? s.getPendingBranchNavigation(activeChatId) : undefined,
+  )
+  const latestTreeHeaderById = useMemo(
+    () => new Map(activeTreeHeaders.map((header) => [header.id, header])),
+    [activeTreeHeaders],
+  )
+  const structuralPathHeaders = useMemo(
+    () => activePathProjected(structuralTreeProjection, activeCursor),
+    [activeCursor, structuralTreeProjection],
+  )
+  const livePathHeaders = useMemo(
+    () =>
+      structuralPathHeaders.map(
+        (header) => latestTreeHeaderById.get(header.id) as MessageHeaderRow,
+      ),
+    [latestTreeHeaderById, structuralPathHeaders],
+  )
+  const pendingLeafIntent =
+    activePendingBranchNavigation?.revision === activeNavigationRevision &&
+    Object.entries(activePendingBranchNavigation.selections).every(
+      ([key, value]) => activeCursor[key] === value,
+    )
+      ? activePendingBranchNavigation.targetMessageId
+      : null
+  const computedActivePathIntentIds = useMemo(
+    () =>
+      pendingLeafIntent
+        ? (activePendingBranchNavigation?.pathMessageIds ?? [])
+        : livePathHeaders.map((header) => header.id),
+    [activePendingBranchNavigation?.pathMessageIds, livePathHeaders, pendingLeafIntent],
+  )
+  const activePathIntentIds = useStableMessageIdPath(computedActivePathIntentIds)
+  const branchIntentIdentityRef = useRef<{
+    chatId: ChatId | null
+    pathMessageIds: readonly MessageId[]
+    serial: number
+    key: string | null
+  }>({ chatId: null, pathMessageIds: [], serial: 0, key: null })
+  if (
+    branchIntentIdentityRef.current.chatId !== activeChatId ||
+    branchIntentIdentityRef.current.pathMessageIds !== activePathIntentIds
+  ) {
+    const serial = branchIntentIdentityRef.current.serial + 1
+    branchIntentIdentityRef.current = {
+      chatId: activeChatId,
+      pathMessageIds: activePathIntentIds,
+      serial,
+      key:
+        activeChatId && activePathIntentIds.length > 0
+          ? `${activeChatId}:branch-intent:${serial}`
+          : null,
+    }
+  }
+  const activeBranchIntentKey = branchIntentIdentityRef.current.key
+  useLayoutEffect(() => {
+    const pending = activePendingBranchNavigation
+    if (!activeChatId || !pending) return
+    if (pending.revision !== activeNavigationRevision) return
+    if (!activeTreeHeaders.some((header) => header.id === pending.targetMessageId)) return
+    useChatStore.getState().acknowledgePendingBranchNavigation(activeChatId, pending)
+  }, [activeChatId, activeNavigationRevision, activePendingBranchNavigation, activeTreeHeaders])
   useEffect(() => {
     if (treeViewActive && editTreeMode) setEditTreeMode(false)
   }, [editTreeMode, setEditTreeMode, treeViewActive])
@@ -367,8 +618,13 @@ export function Shell() {
   useEffect(
     () =>
       onEvent((event) => {
-        if (event.kind === 'chat-deleted') chatSnapshotCacheRef.current.delete(event.chatId)
-        else if (event.kind === 'workspace-replaced') chatSnapshotCacheRef.current.clear()
+        if (event.kind === 'chat-deleted') {
+          chatSnapshotCacheRef.current.delete(event.chatId)
+          useChatStore.getState().clearCursor(event.chatId)
+        } else if (event.kind === 'workspace-replaced') {
+          chatSnapshotCacheRef.current.clear()
+          useChatStore.getState().resetForWorkspaceReplacement()
+        }
       }),
     [],
   )
@@ -384,41 +640,68 @@ export function Shell() {
   const loadedPrefs =
     globalPreferencesQuery.status === 'ready' ? globalPreferencesQuery.value : undefined
   const prefs = globalPreferencesQuery.value
-  const [messageBodyWindowLimit, setMessageBodyWindowLimit] = useState(
-    DEFAULT_GLOBAL_PREFERENCES.messageRenderWindowSize,
-  )
-  const effectiveMessageBodyWindowLimit = Math.max(1, messageBodyWindowLimit)
+  const [messageBodyWindow, setMessageBodyWindow] = useState({
+    intentKey: '__none__',
+    baseSize: DEFAULT_GLOBAL_PREFERENCES.messageRenderWindowSize,
+    limit: DEFAULT_GLOBAL_PREFERENCES.messageRenderWindowSize,
+  })
   const activeChatHasTranscript = resolvedActiveChatRow?.lastUpdatedLeafId != null
-  const activeCursorCacheKey =
-    activeChatId && activeChatHasTranscript ? cursorCacheKey(activeChatId, activeCursor) : null
+  const messageBodyWindowKey = activeBranchIntentKey ?? '__none__'
+  const defaultMessageBodyWindowLimit = Math.max(1, prefs.messageRenderWindowSize)
+  const effectiveMessageBodyWindowLimit =
+    messageBodyWindow.intentKey === messageBodyWindowKey &&
+    messageBodyWindow.baseSize === defaultMessageBodyWindowLimit
+      ? messageBodyWindow.limit
+      : defaultMessageBodyWindowLimit
   const alternateViewsRetained = retainedAlternateViewsChatId === activeChatId
   const activeBranchWindowQueryKey =
-    activeCursorCacheKey && (!treeViewActive || streamingOnActiveChat || alternateViewsRetained)
-      ? JSON.stringify([activeCursorCacheKey, effectiveMessageBodyWindowLimit])
+    activeBranchIntentKey && (!treeViewActive || streamingOnActiveChat || alternateViewsRetained)
+      ? JSON.stringify([activeBranchIntentKey, effectiveMessageBodyWindowLimit])
       : null
-  const activeBranchWindowResult = useRepositoryQuery(
+  const activeBodyWindowIntentIds = activePathIntentIds.slice(-effectiveMessageBodyWindowLimit)
+  const activeBranchWindowResult = useRepositoryPresentationQuery(
     JSON.stringify(['active-branch-window', activeChatId, activeBranchWindowQueryKey]),
-    async (): Promise<ActiveBranchWindowSnapshotResult | null> => {
-      const cursorKey = activeCursorCacheKey
-      if (!activeChatId || !activeBranchWindowQueryKey || !cursorKey) return null
-      const snapshot = await loadActiveBranchWindowSnapshot(activeChatId, activeCursor, {
+    async (signal): Promise<ActiveBranchPageSnapshotResult | null> => {
+      const intentKey = activeBranchIntentKey
+      if (!activeChatId || !activeBranchWindowQueryKey || !intentKey) return null
+      const readEpoch = activeBranchWindowReadEpoch
+      const result = await loadKnownBranchPageSnapshot(activeChatId, activePathIntentIds, {
         offset: -1,
         limit: effectiveMessageBodyWindowLimit,
+        signal,
       })
-      return { key: activeBranchWindowQueryKey, cursorKey, snapshot }
+      return { key: activeBranchWindowQueryKey, intentKey, readEpoch, result }
     },
-    null as ActiveBranchWindowSnapshotResult | null,
-    chatMessageDependencies(activeChatId),
+    null as ActiveBranchPageSnapshotResult | null,
+    activeBranchWindowQueryKey ? primaryKeys('messageBodies', ...activeBodyWindowIntentIds) : [],
   )
-  const activeBranchWindowResultRef = useRef(activeBranchWindowResult)
-  activeBranchWindowResultRef.current = activeBranchWindowResult
-  const [activeBranchSnapshotOverride, setActiveBranchSnapshotOverride] =
-    useState<ActiveBranchSnapshotOverride | null>(null)
-  useEffect(() => {
-    setActiveBranchSnapshotOverride((current) =>
-      current && current.queryResultAtSet !== activeBranchWindowResult ? null : current,
-    )
-  }, [activeBranchWindowResult])
+  const readyActiveBranchPage =
+    activeBranchWindowResult?.key === activeBranchWindowQueryKey &&
+    activeBranchWindowResult.intentKey === activeBranchIntentKey &&
+    activeBranchWindowResult.readEpoch === activeBranchWindowReadEpoch &&
+    activeBranchWindowResult.result.kind === 'ready'
+      ? activeBranchWindowResult.result.snapshot
+      : null
+  const readyActiveBranchSnapshot = useMemo(
+    () =>
+      activeChatId && readyActiveBranchPage
+        ? composeKnownBranchPage(
+            activeChatId,
+            activePathIntentIds,
+            pendingLeafIntent ? null : livePathHeaders,
+            latestTreeHeaderById,
+            readyActiveBranchPage,
+          )
+        : null,
+    [
+      activeChatId,
+      activePathIntentIds,
+      latestTreeHeaderById,
+      livePathHeaders,
+      pendingLeafIntent,
+      readyActiveBranchPage,
+    ],
+  )
   const branchSnapshotCacheRef = useRef(new Map<string, ActiveBranchWindowSnapshot>())
   const lastBranchSnapshotByChatRef = useRef(new Map<ChatId, LastBranchSnapshot>())
   const recycleTranscriptRenderTree = useCallback(() => {
@@ -442,35 +725,42 @@ export function Shell() {
     window.addEventListener(RECYCLE_TRANSCRIPT_EVENT, recycleTranscriptRenderTree)
     return () => window.removeEventListener(RECYCLE_TRANSCRIPT_EVENT, recycleTranscriptRenderTree)
   }, [recycleTranscriptRenderTree])
+  useEffect(
+    () =>
+      onEvent((event, delivery) => {
+        if (event.kind !== 'workspace-replaced') return
+        invalidateActiveBranchWindowReads()
+        branchSnapshotCacheRef.current.clear()
+        lastBranchSnapshotByChatRef.current.clear()
+        invalidateRepositoryQueriesForWorkspaceReplacement()
+        refreshRouteForWorkspaceReplacement(delivery)
+      }),
+    [],
+  )
   useEffect(() => {
     if (!activeChatId) {
       branchSnapshotCacheRef.current.clear()
       lastBranchSnapshotByChatRef.current.clear()
-      setActiveBranchSnapshotOverride(null)
       return
     }
     branchSnapshotCacheRef.current.clear()
     lastBranchSnapshotByChatRef.current.clear()
-    setActiveBranchSnapshotOverride(null)
+    setPendingTreeExitChatId(null)
   }, [activeChatId])
   useEffect(() => {
     if (!treeViewActive) return
     setTreeInsertTarget(null)
   }, [treeViewActive])
   useEffect(() => {
-    if (!activeBranchWindowResult) return
-    if (activeBranchWindowResult.snapshot.chatId !== activeChatId) return
+    if (!activeBranchWindowResult || !readyActiveBranchSnapshot) return
     branchSnapshotCacheRef.current.clear()
-    branchSnapshotCacheRef.current.set(
-      activeBranchWindowResult.key,
-      activeBranchWindowResult.snapshot,
-    )
+    branchSnapshotCacheRef.current.set(activeBranchWindowResult.key, readyActiveBranchSnapshot)
     lastBranchSnapshotByChatRef.current.clear()
-    lastBranchSnapshotByChatRef.current.set(activeBranchWindowResult.snapshot.chatId, {
-      cursorKey: activeBranchWindowResult.cursorKey,
-      snapshot: activeBranchWindowResult.snapshot,
+    lastBranchSnapshotByChatRef.current.set(readyActiveBranchSnapshot.chatId, {
+      intentKey: activeBranchWindowResult.intentKey,
+      snapshot: readyActiveBranchSnapshot,
     })
-  }, [activeBranchWindowResult, activeChatId])
+  }, [activeBranchWindowResult, readyActiveBranchSnapshot])
   useEffect(() => {
     void activeChatId
     setTranscriptMounted(true)
@@ -484,36 +774,154 @@ export function Shell() {
       }
     }
   }, [])
-  const exactActiveBranchSnapshot =
-    activeBranchSnapshotOverride?.key === activeBranchWindowQueryKey
-      ? activeBranchSnapshotOverride.snapshot
-      : activeBranchWindowResult?.key === activeBranchWindowQueryKey
-        ? activeBranchWindowResult.snapshot
-        : activeBranchWindowQueryKey
-          ? (branchSnapshotCacheRef.current.get(activeBranchWindowQueryKey) ?? null)
-          : null
+  const activePathIntentTailId = activePathIntentIds.at(-1) ?? null
+  const knownActivePathSnapshot = readyActiveBranchSnapshot
+  const authoritativeTreeHeaders = useMemo(() => {
+    if (!knownActivePathSnapshot || !activePathIntentTailId) return activeTreeHeaders
+    if (activeTreeHeaders.some((header) => header.id === activePathIntentTailId)) {
+      return activeTreeHeaders
+    }
+    return overlayKnownPathHeaders(activeTreeHeaders, knownActivePathSnapshot.branchHeaders)
+  }, [activePathIntentTailId, activeTreeHeaders, knownActivePathSnapshot])
+  const authoritativeStructuralTreeHeaders = useStableStructuralHeaders(
+    authoritativeTreeHeaders,
+    activeTreeHeaders,
+    structuralTreeHeaders,
+  )
+  const authoritativeHeaderById = useMemo(
+    () =>
+      authoritativeTreeHeaders === activeTreeHeaders
+        ? latestTreeHeaderById
+        : new Map(authoritativeTreeHeaders.map((header) => [header.id, header])),
+    [activeTreeHeaders, authoritativeTreeHeaders, latestTreeHeaderById],
+  )
+  const authoritativeStructuralTreeProjection = useMemo(
+    () =>
+      authoritativeStructuralTreeHeaders === structuralTreeHeaders
+        ? structuralTreeProjection
+        : createMessageTreeProjection(authoritativeStructuralTreeHeaders),
+    [authoritativeStructuralTreeHeaders, structuralTreeHeaders, structuralTreeProjection],
+  )
+  const authoritativeStructuralPathHeaders = useMemo(
+    () =>
+      authoritativeStructuralTreeProjection === structuralTreeProjection
+        ? structuralPathHeaders
+        : activePathProjected(authoritativeStructuralTreeProjection, activeCursor),
+    [
+      activeCursor,
+      authoritativeStructuralTreeProjection,
+      structuralPathHeaders,
+      structuralTreeProjection,
+    ],
+  )
+  const authoritativePathHeaders = useMemo(
+    () =>
+      authoritativeStructuralPathHeaders.map(
+        (header) => authoritativeHeaderById.get(header.id) as MessageHeaderRow,
+      ),
+    [authoritativeHeaderById, authoritativeStructuralPathHeaders],
+  )
+  const urlPinnedTargetPending =
+    route.kind === 'chat' &&
+    route.pinnedMessageId !== undefined &&
+    !authoritativePathHeaders.some((header) => header.id === route.pinnedMessageId)
+  const queryBranchSnapshot = readyActiveBranchSnapshot
+  const cachedBranchSnapshot = activeBranchWindowQueryKey
+    ? (branchSnapshotCacheRef.current.get(activeBranchWindowQueryKey) ?? null)
+    : null
+  const matchingCachedSnapshot = useMemo(
+    () =>
+      !queryBranchSnapshot && cachedBranchSnapshot
+        ? rebaseBranchSnapshot(cachedBranchSnapshot, authoritativePathHeaders)
+        : null,
+    [authoritativePathHeaders, cachedBranchSnapshot, queryBranchSnapshot],
+  )
+  const reactiveBranchSnapshot = queryBranchSnapshot ?? matchingCachedSnapshot
   const lastActiveBranchSnapshot = activeChatId
     ? lastBranchSnapshotByChatRef.current.get(activeChatId)
     : undefined
+  const matchingLoadedWindowSnapshot = useMemo(
+    () =>
+      !reactiveBranchSnapshot && lastActiveBranchSnapshot?.intentKey === activeBranchIntentKey
+        ? rebaseBranchSnapshot(lastActiveBranchSnapshot.snapshot, authoritativePathHeaders)
+        : null,
+    [
+      activeBranchIntentKey,
+      authoritativePathHeaders,
+      lastActiveBranchSnapshot,
+      reactiveBranchSnapshot,
+    ],
+  )
+  const exactActiveBranchSnapshot = reactiveBranchSnapshot ?? matchingLoadedWindowSnapshot
   const retainedActiveBranchSnapshot =
-    !treeViewActive || lastActiveBranchSnapshot?.cursorKey === activeCursorCacheKey
+    !treeViewActive || lastActiveBranchSnapshot?.intentKey === activeBranchIntentKey
       ? (lastActiveBranchSnapshot?.snapshot ?? null)
       : null
   const resolvedActiveBranchSnapshot = exactActiveBranchSnapshot ?? retainedActiveBranchSnapshot
-  const activeBranchLength = resolvedActiveBranchSnapshot?.branchLength ?? 0
-  const activeBranchTailId = resolvedActiveBranchSnapshot?.branchHeaders.at(-1)?.id ?? null
-  const messageBodyWindowResetKey = activeCursorCacheKey ?? '__none__'
+  const retainedPresentationMatchesActiveStructure =
+    exactActiveBranchSnapshot === null &&
+    resolvedActiveBranchSnapshot !== null &&
+    branchSnapshotMatchesStructure(resolvedActiveBranchSnapshot, authoritativePathHeaders)
+  const activeBranchTailId = pendingLeafIntent ?? authoritativePathHeaders.at(-1)?.id ?? null
+  const retainedPresentationTargetStreaming = useIsStreamTargetActive(
+    activeChatId,
+    activeBranchTailId,
+  )
+  const retainedPresentationIsExactStreamingPath =
+    !urlPinnedTargetPending &&
+    retainedPresentationMatchesActiveStructure &&
+    retainedPresentationTargetStreaming
+  const transcriptPresentationOnly =
+    urlPinnedTargetPending ||
+    (exactActiveBranchSnapshot === null &&
+      retainedActiveBranchSnapshot !== null &&
+      !retainedPresentationIsExactStreamingPath)
+  const transcriptReadyForTreeExit =
+    exactActiveBranchSnapshot !== null || retainedPresentationIsExactStreamingPath
   useEffect(() => {
-    void messageBodyWindowResetKey
-    setMessageBodyWindowLimit(Math.max(1, prefs.messageRenderWindowSize))
-  }, [messageBodyWindowResetKey, prefs.messageRenderWindowSize])
+    if (
+      !activeChatId ||
+      pendingTreeExitChatId !== activeChatId ||
+      !treeViewActive ||
+      !transcriptReadyForTreeExit
+    ) {
+      return
+    }
+    setPendingTreeExitChatId(null)
+    setTreeViewChatId(null)
+  }, [
+    activeChatId,
+    pendingTreeExitChatId,
+    setTreeViewChatId,
+    transcriptReadyForTreeExit,
+    treeViewActive,
+  ])
+  useEffect(() => {
+    if (urlPinnedTargetPending) {
+      setImportAtEndOpen(false)
+      setTreeInsertTarget(null)
+      return
+    }
+    if (!treeViewActive && transcriptPresentationOnly) setImportAtEndOpen(false)
+  }, [transcriptPresentationOnly, treeViewActive, urlPinnedTargetPending])
+  const activeBranchLength = authoritativePathHeaders.length
+  const activeTranscriptExists =
+    activeBranchTailId !== null ||
+    activeChatHasTranscript ||
+    (resolvedActiveBranchSnapshot?.branchLength ?? 0) > 0
   const loadOlderMessageWindow = useCallback(() => {
-    const increment = Math.max(1, prefs.messageRenderWindowSize)
-    const nextLimit = effectiveMessageBodyWindowLimit + increment
-    setMessageBodyWindowLimit(
-      activeBranchLength > 0 ? Math.min(activeBranchLength, nextLimit) : nextLimit,
-    )
-  }, [activeBranchLength, effectiveMessageBodyWindowLimit, prefs.messageRenderWindowSize])
+    const nextLimit = Math.max(defaultMessageBodyWindowLimit, effectiveMessageBodyWindowLimit * 2)
+    setMessageBodyWindow({
+      intentKey: messageBodyWindowKey,
+      baseSize: defaultMessageBodyWindowLimit,
+      limit: activeBranchLength > 0 ? Math.min(activeBranchLength, nextLimit) : nextLimit,
+    })
+  }, [
+    activeBranchLength,
+    defaultMessageBodyWindowLimit,
+    effectiveMessageBodyWindowLimit,
+    messageBodyWindowKey,
+  ])
   const activeEndpoints = useEndpoints(
     resolvedActiveChatRow?.settings.profileId ?? null,
     resolvedActiveChatRow?.settings.model || null,
@@ -616,7 +1024,7 @@ export function Shell() {
       await updateChatSettings(resolvedActiveChatRow.id, { model: only.id })
     })()
   }, [resolvedActiveChatRow, activeProfileId, activeProfileForModelList, autoSelectModels.models])
-  const activePathHeaders = resolvedActiveBranchSnapshot?.branchHeaders ?? []
+  const activePathHeaders = authoritativePathHeaders
   const sidebarSortMode = useRepositoryQuery(
     'sidebar-sort-mode',
     readSidebarSortMode,
@@ -788,10 +1196,25 @@ export function Shell() {
   }, [])
 
   const openingNewChatSettingsRef = useRef<Promise<void> | null>(null)
+  const openingNewChatSettingsRouteIntentRef = useRef<RouteIntent | null>(null)
   const openSettingsForNewChat = useCallback(async () => {
-    if (openingNewChatSettingsRef.current) return openingNewChatSettingsRef.current
+    const routeIntent = beginRouteIntent()
+    openingNewChatSettingsRouteIntentRef.current = routeIntent
+    if (openingNewChatSettingsRef.current) {
+      try {
+        await openingNewChatSettingsRef.current
+      } finally {
+        cancelRouteIntent(routeIntent)
+        if (openingNewChatSettingsRouteIntentRef.current === routeIntent) {
+          openingNewChatSettingsRouteIntentRef.current = null
+        }
+      }
+      return
+    }
     const task = (async () => {
       const { preset, settings } = await resolveNewChatSeed()
+      const routeIntent = openingNewChatSettingsRouteIntentRef.current
+      if (!routeIntent || !isRouteIntentCurrent(routeIntent)) return
       writeActiveSeedState({
         profileId: settings.profileId || null,
         presetId: preset?.id ?? null,
@@ -802,15 +1225,23 @@ export function Shell() {
         temporary: true,
         ...(preset ? { presetId: preset.id } : {}),
       })
-      moveComposerDraft('new', `chat:${chat.id}`)
-      navigateToChat(chat.id)
-      setChatModelOpen(true)
+      const latestRouteIntent = openingNewChatSettingsRouteIntentRef.current
+      if (latestRouteIntent && navigateForIntent(latestRouteIntent, chatHref(chat.id))) {
+        moveComposerDraft('new', `chat:${chat.id}`)
+        setChatModelOpen(true)
+      }
     })()
     openingNewChatSettingsRef.current = task
     try {
       await task
     } finally {
-      if (openingNewChatSettingsRef.current === task) openingNewChatSettingsRef.current = null
+      cancelRouteIntent(routeIntent)
+      if (openingNewChatSettingsRef.current === task) {
+        openingNewChatSettingsRef.current = null
+      }
+      if (openingNewChatSettingsRouteIntentRef.current === routeIntent) {
+        openingNewChatSettingsRouteIntentRef.current = null
+      }
     }
   }, [resolveNewChatSeed])
 
@@ -937,6 +1368,7 @@ export function Shell() {
     ) => {
       preloadMessageList()
       if (!activeChatId) return failSend('send: no active chat')
+      const navigationIntent = useChatStore.getState().beginNavigationIntent(activeChatId)
       const chat = await getChat(activeChatId)
       if (!chat) return failSend('send: chat row missing', { chatId: activeChatId })
       if (!chat.settings.profileId) {
@@ -961,6 +1393,7 @@ export function Shell() {
         const prefillText = opts?.prefillText ?? ''
         const result = await send({
           chatId: activeChatId,
+          navigationIntent,
           expectedLeafId: activeBranchTailId,
           connection: profile,
           apiKey: '',
@@ -991,70 +1424,103 @@ export function Shell() {
       text: string,
       opts?: { prefillText?: string; attachmentRefs?: MessageAttachmentRef[] },
     ) => {
-      preloadMessageList()
-      const { preset, settings } = await resolveNewChatSeed()
-      if (!settings.profileId) {
-        return failSend('send: chat.settings.profileId is empty — no profile selected')
-      }
-      if (!settings.model) {
-        return failSend('send: chat.settings.model is empty — no model selected')
-      }
-      const profile = await getProfile(settings.profileId)
-      if (!profile) {
-        return failSend('send: connection profile missing', { profileId: settings.profileId })
-      }
-      let apiKeyCandidates: Awaited<ReturnType<typeof resolveConnectionRuntimeKeys>>
+      const routeIntent = beginRouteIntent()
       try {
-        apiKeyCandidates = await resolveConnectionRuntimeKeys(profile)
-      } catch (err) {
-        return failSend('send: resolveKey failed', err)
-      }
-      writeActiveSeedState({
-        profileId: settings.profileId || null,
-        presetId: preset?.id ?? null,
-        settings,
-      })
-      const chat = await createChat({
-        settings,
-        temporary: true,
-        ...(preset ? { presetId: preset.id } : {}),
-      })
-      navigateToChat(chat.id)
-      try {
-        const prefillText = opts?.prefillText ?? ''
-        const result = await send({
-          chatId: chat.id,
-          expectedLeafId: null,
-          connection: profile,
-          apiKey: '',
-          apiKeyCandidates,
-          content: [{ type: 'text', text }],
-          ...(opts?.attachmentRefs ? { attachmentRefs: opts.attachmentRefs } : {}),
-          ...(prefillText.length > 0
-            ? { prefillContent: [{ type: 'text', text: prefillText }] }
-            : {}),
-        })
-        if (result.outcome !== 'done') {
-          console.info('send: stream ended with outcome', result.outcome, result.error?.kind)
+        preloadMessageList()
+        const { preset, settings } = await resolveNewChatSeed()
+        if (!settings.profileId) {
+          return failSend('send: chat.settings.profileId is empty — no profile selected')
         }
-        await markChatPermanent(chat.id)
-      } catch (err) {
-        if (isPageHidingAbortError(err)) return
-        return failSend('send: pipeline threw', err)
+        if (!settings.model) {
+          return failSend('send: chat.settings.model is empty — no model selected')
+        }
+        const profile = await getProfile(settings.profileId)
+        if (!profile) {
+          return failSend('send: connection profile missing', { profileId: settings.profileId })
+        }
+        let apiKeyCandidates: Awaited<ReturnType<typeof resolveConnectionRuntimeKeys>>
+        try {
+          apiKeyCandidates = await resolveConnectionRuntimeKeys(profile)
+        } catch (err) {
+          return failSend('send: resolveKey failed', err)
+        }
+        writeActiveSeedState({
+          profileId: settings.profileId || null,
+          presetId: preset?.id ?? null,
+          settings,
+        })
+        const chat = await createChat({
+          settings,
+          temporary: true,
+          ...(preset ? { presetId: preset.id } : {}),
+        })
+        const navigationIntent = navigateToChatForIntent(routeIntent, chat.id)
+        try {
+          const prefillText = opts?.prefillText ?? ''
+          const result = await send({
+            chatId: chat.id,
+            navigationIntent,
+            expectedLeafId: null,
+            connection: profile,
+            apiKey: '',
+            apiKeyCandidates,
+            content: [{ type: 'text', text }],
+            ...(opts?.attachmentRefs ? { attachmentRefs: opts.attachmentRefs } : {}),
+            ...(prefillText.length > 0
+              ? { prefillContent: [{ type: 'text', text: prefillText }] }
+              : {}),
+          })
+          if (result.outcome !== 'done') {
+            console.info('send: stream ended with outcome', result.outcome, result.error?.kind)
+          }
+          await markChatPermanent(chat.id)
+        } catch (err) {
+          if (isPageHidingAbortError(err)) return
+          return failSend('send: pipeline threw', err)
+        }
+        await bumpProfileLastUsedAt(profile.id)
+        if (chat.presetId) await bumpPresetLastUsedAt(chat.presetId)
+        await bumpRecentModel(chat.settings.model)
+      } finally {
+        cancelRouteIntent(routeIntent)
       }
-      await bumpProfileLastUsedAt(profile.id)
-      if (chat.presetId) await bumpPresetLastUsedAt(chat.presetId)
-      await bumpRecentModel(chat.settings.model)
     },
     [failSend, resolveNewChatSeed, send],
   )
+
+  const handleReplyToTrailingUser = useCallback(async () => {
+    if (!activeChatId || !trailingUserMessage) return
+    const navigationIntent = useChatStore.getState().beginNavigationIntent(activeChatId)
+    const chat = await getChat(activeChatId)
+    if (!chat) return
+    const profile = await getProfile(chat.settings.profileId)
+    if (!profile) return
+    try {
+      const apiKeyCandidates = await resolveConnectionRuntimeKeys(profile, {
+        chatId: activeChatId,
+      })
+      await sendFrom({
+        chatId: activeChatId,
+        navigationIntent,
+        connection: profile,
+        apiKey: '',
+        apiKeyCandidates,
+        parentMessageId: trailingUserMessage.id,
+      })
+      await bumpProfileLastUsedAt(profile.id)
+      if (chat.presetId) await bumpPresetLastUsedAt(chat.presetId)
+    } catch (err) {
+      if (isPageHidingAbortError(err)) return
+      console.error('reply-to-trailing failed', err)
+    }
+  }, [activeChatId, sendFrom, trailingUserMessage])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.defaultPrevented) return
       const activeTag = (document.activeElement?.tagName ?? '').toLowerCase()
       const isTyping = activeTag === 'input' || activeTag === 'textarea'
-      if (e.key === 'n' && (e.metaKey || e.ctrlKey) && !e.shiftKey && !isTyping) {
+      if (e.key.toLowerCase() === 'o' && (e.metaKey || e.ctrlKey) && e.shiftKey && !isTyping) {
         e.preventDefault()
         openNewChat()
       }
@@ -1078,7 +1544,14 @@ export function Shell() {
       // Import-at-end modal shortcut (§10.14). Only meaningful on an active
       // chat; the keystroke is swallowed either way so DevTools bindings
       // (`Ctrl+Shift+I`) don't stomp on it.
-      if (e.key === 'V' && e.shiftKey && (e.metaKey || e.ctrlKey) && activeChatId && !isTyping) {
+      if (
+        e.key === 'V' &&
+        e.shiftKey &&
+        (e.metaKey || e.ctrlKey) &&
+        activeChatId &&
+        !isTyping &&
+        (treeViewActive || !transcriptPresentationOnly)
+      ) {
         e.preventDefault()
         setImportAtEndOpen(true)
       }
@@ -1098,6 +1571,7 @@ export function Shell() {
     activeChatId,
     setEditTreeMode,
     openNewChat,
+    transcriptPresentationOnly,
     treeViewActive,
   ])
 
@@ -1112,43 +1586,20 @@ export function Shell() {
     setMobileSidebarOpen(false)
     setChatModelOpen(false)
   }, [])
-  const treeHeaderById = useMemo(
-    () => new Map(activeTreeHeaders.map((header) => [header.id, header])),
-    [activeTreeHeaders],
-  )
-  const refreshTranscriptForTreeHandoff = useCallback(async () => {
-    if (!activeChatId) return
-    const cursor = useChatStore.getState().getCursor(activeChatId) ?? {}
-    const cursorKey = cursorCacheKey(activeChatId, cursor)
-    const key = JSON.stringify([cursorKey, effectiveMessageBodyWindowLimit])
-    const snapshot = await loadActiveBranchWindowSnapshot(activeChatId, cursor, {
-      offset: -1,
-      limit: effectiveMessageBodyWindowLimit,
-    })
-    if (useUiStore.getState().activeChatId !== activeChatId) return
-    const latestCursor = useChatStore.getState().getCursor(activeChatId) ?? {}
-    if (cursorCacheKey(activeChatId, latestCursor) !== cursorKey) return
-    setActiveBranchSnapshotOverride({
-      key,
-      cursorKey,
-      snapshot,
-      queryResultAtSet: activeBranchWindowResultRef.current,
-    })
-  }, [activeChatId, effectiveMessageBodyWindowLimit])
+  const treeHeaderById = latestTreeHeaderById
   const activateTreeNode = useCallback(
     (messageId: MessageId) => {
       if (!activeChatId) return
       const header = treeHeaderById.get(messageId)
       if (!header || header.deleted) return
       const current = useChatStore.getState().getCursor(activeChatId) ?? {}
-      const next = { ...current }
-      seedCursorAtMessage(activeTreeHeaders as unknown as Message[], messageId, next, {
+      const patch = seedCursorAtMessageProjected(structuralTreeProjection, messageId, current, {
         preserveDescendantPins: false,
       })
-      useChatStore.getState().setCursor(activeChatId, next)
+      useChatStore.getState().navigateWithCursorPatch(activeChatId, patch)
       announceTreeBranchOpened(header.role)
     },
-    [activeChatId, activeTreeHeaders, treeHeaderById],
+    [activeChatId, structuralTreeProjection, treeHeaderById],
   )
   const insertAtSharedTreeTrunk = useCallback(
     (parentId: MessageId | null) => {
@@ -1206,7 +1657,6 @@ export function Shell() {
         chatId: activeChatId,
         slot: { kind: 'after', messageId },
         defaultRole: oppositeRole(leaf.role),
-        activateNodeId: messageId,
       })
     },
     [activeChatId, activeTreeHeaders, pushToast, treeHeaderById],
@@ -1222,14 +1672,34 @@ export function Shell() {
     },
     [activeChatId],
   )
+  const beginTreeActionNavigation = useCallback(
+    (messageId: MessageId) => {
+      if (!activeChatId || !structuralTreeProjection.byId.has(messageId)) return null
+      const state = useChatStore.getState()
+      const intent = state.beginNavigationIntent(activeChatId)
+      state.patchCursorForIntent(
+        activeChatId,
+        intent,
+        seedCursorAtMessageProjected(
+          structuralTreeProjection,
+          messageId,
+          state.getCursor(activeChatId) ?? EMPTY_CURSOR,
+          { preserveDescendantPins: false },
+        ),
+      )
+      return intent
+    },
+    [activeChatId, structuralTreeProjection],
+  )
   const editAndSendTreeMessage = useCallback(
     async (message: Message, text: string) => {
       if (!activeChatId || message.chatId !== activeChatId || message.role !== 'user') return
-      activateTreeNode(message.id)
+      const navigationIntent = beginTreeActionNavigation(message.id)
+      if (!navigationIntent) return
       try {
         const { editAndResend } = await import('../hooks/useMessageOps')
         const result = await editAndResend(
-          { chatId: activeChatId, sendFrom },
+          { chatId: activeChatId, navigationIntent, sendFrom },
           message,
           text,
           message.attachmentRefs ? { attachmentRefs: message.attachmentRefs } : {},
@@ -1243,7 +1713,7 @@ export function Shell() {
         throw error
       }
     },
-    [activateTreeNode, activeChatId, pushToast, sendFrom],
+    [activeChatId, beginTreeActionNavigation, pushToast, sendFrom],
   )
   const deleteTreeNode = useCallback(
     async (messageId: MessageId) => {
@@ -1252,9 +1722,8 @@ export function Shell() {
         pushToast({ level: 'info', text: 'Wait for this generation to finish before deleting it.' })
         return
       }
-      const priorCursor = {
-        ...(useChatStore.getState().getCursor(activeChatId) ?? {}),
-      }
+      const navigationIntent = useChatStore.getState().beginNavigationIntent(activeChatId)
+      const priorCursor = useChatStore.getState().getCursor(activeChatId) ?? EMPTY_CURSOR
       try {
         const result = await deleteSingleMessage({
           chatId: activeChatId,
@@ -1262,17 +1731,21 @@ export function Shell() {
           cursor: priorCursor,
           ...(useUiStore.getState().cascadeDelete ? { cascade: true } : {}),
         })
-        const latestCursor = useChatStore.getState().getCursor(activeChatId) ?? priorCursor
         useChatStore
           .getState()
-          .setCursor(activeChatId, applyStructuralEffectsToCursor(latestCursor, result.effects))
+          .patchCursorForIntent(
+            activeChatId,
+            navigationIntent,
+            structuralEffectsCursorPatch(result.effects),
+          )
         pushToast({
           level: 'info',
           text: 'Deleted message.',
           undo: async () => {
+            const undoIntent = useChatStore.getState().beginNavigationIntent(activeChatId)
             const { applyStructuralSnapshot } = await import('../core/undo')
             await applyStructuralSnapshot(result.preImage)
-            useChatStore.getState().setCursor(activeChatId, priorCursor)
+            useChatStore.getState().setCursorForIntent(activeChatId, undoIntent, priorCursor)
           },
         })
       } catch (error) {
@@ -1287,10 +1760,14 @@ export function Shell() {
   const regenerateTreeMessage = useCallback(
     async (message: Message) => {
       if (!activeChatId || message.chatId !== activeChatId || message.role !== 'assistant') return
-      activateTreeNode(message.id)
+      const navigationIntent = beginTreeActionNavigation(message.id)
+      if (!navigationIntent) return
       try {
         const { regenerateFromMessage } = await import('../hooks/useMessageOps')
-        const result = await regenerateFromMessage({ chatId: activeChatId, sendFrom }, message)
+        const result = await regenerateFromMessage(
+          { chatId: activeChatId, navigationIntent, sendFrom },
+          message,
+        )
         return result.assistantMessageId
       } catch (error) {
         pushToast({
@@ -1299,7 +1776,7 @@ export function Shell() {
         })
       }
     },
-    [activateTreeNode, activeChatId, pushToast, sendFrom],
+    [activeChatId, beginTreeActionNavigation, pushToast, sendFrom],
   )
   const continueTreeMessage = useCallback(
     async (message: Message) => {
@@ -1311,7 +1788,7 @@ export function Shell() {
         })
         return
       }
-      activateTreeNode(message.id)
+      if (!beginTreeActionNavigation(message.id)) return
       try {
         const { continueFromMessage } = await import('../hooks/useMessageOps')
         await continueFromMessage({ chatId: activeChatId, sendFrom }, message)
@@ -1323,11 +1800,12 @@ export function Shell() {
         })
       }
     },
-    [activateTreeNode, activeChatId, pushToast, sendFrom],
+    [activeChatId, beginTreeActionNavigation, pushToast, sendFrom],
   )
   const forkTreeMessage = useCallback(
     async (message: Message) => {
       if (!activeChatId || message.chatId !== activeChatId) return
+      const routeIntent = beginRouteIntent()
       try {
         const { computeBranchTitle, forkChatFromMessage } = await import('../core/chat-fork')
         const sourceChat = await getChat(activeChatId)
@@ -1337,6 +1815,7 @@ export function Shell() {
           sourceChat.title,
           existing.map((chat) => chat.title),
         )
+        if (!isRouteIntentCurrent(routeIntent)) return
         const chosen = window.prompt('Name the new chat:', defaultTitle)
         if (chosen === null) return
         const title = chosen.trim() || defaultTitle
@@ -1350,12 +1829,14 @@ export function Shell() {
           level: 'success',
           text: `Forked to "${title}" (${result.messageCount} messages).`,
         })
-        navigateToChat(result.chatId)
+        navigateForIntent(routeIntent, chatHref(result.chatId))
       } catch (error) {
         pushToast({
           level: 'danger',
           text: `Fork failed: ${error instanceof Error ? error.message : 'unknown error'}`,
         })
+      } finally {
+        cancelRouteIntent(routeIntent)
       }
     },
     [activeChatId, activeCursor, pushToast],
@@ -1470,7 +1951,8 @@ export function Shell() {
             href={newChatHref()}
             rel="noopener"
             aria-label="New chat"
-            title="New chat"
+            aria-keyshortcuts="Meta+Shift+O Control+Shift+O"
+            title="New chat (⌘⇧O / Ctrl+Shift+O)"
             onClick={handleNewChatClick}
           >
             <NewChatIcon size={18} />
@@ -1575,17 +2057,27 @@ export function Shell() {
                     onToggleTreeView={() => {
                       setRetainedAlternateViewsChatId(activeChatId)
                       if (!treeViewActive) {
+                        setPendingTreeExitChatId(null)
                         setEditTreeMode(false)
                         setTreeViewChatId(activeChatId)
                         return
                       }
-                      void refreshTranscriptForTreeHandoff()
-                        .catch(() => undefined)
-                        .finally(() => {
-                          if (useUiStore.getState().treeViewChatId === activeChatId) {
-                            setTreeViewChatId(null)
-                          }
-                        })
+                      if (
+                        resolvedActiveChatRow?.lastUpdatedLeafId === null &&
+                        activePathIntentIds.length === 0
+                      ) {
+                        setPendingTreeExitChatId(null)
+                        setTreeViewChatId(null)
+                        return
+                      }
+                      if (transcriptReadyForTreeExit) {
+                        setPendingTreeExitChatId(null)
+                        setTreeViewChatId(null)
+                        return
+                      }
+                      setPendingTreeExitChatId((pending) =>
+                        pending === activeChatId ? null : activeChatId,
+                      )
                     }}
                     mobileConnectionControl={activeMobileConnectionControl}
                   />
@@ -1601,6 +2093,7 @@ export function Shell() {
                       <BranchTreeView
                         chatId={activeChatId}
                         headers={activeTreeHeaders}
+                        projection={structuralTreeProjection}
                         cursor={activeCursor}
                         expanded={treeExpanded}
                         previewFontFamily={fontFamilyStack(prefs.fontFamily)}
@@ -1638,8 +2131,8 @@ export function Shell() {
                       streamFollowKey={activeBranchTailId}
                       onStateChange={setScrollState}
                     >
-                      {transcriptMounted && activeChatHasTranscript ? (
-                        resolvedActiveBranchSnapshot ? (
+                      {transcriptMounted && activeTranscriptExists ? (
+                        resolvedActiveBranchSnapshot && resolvedActiveChatRow ? (
                           <Suspense fallback={<SurfaceLoading label="Loading conversation…" />}>
                             <MessageList
                               key={`${activeChatId}:${transcriptRenderEpoch}`}
@@ -1647,6 +2140,13 @@ export function Shell() {
                               chatSettings={resolvedActiveChatRow.settings}
                               hasConnection={hasConnection}
                               branchSnapshot={resolvedActiveBranchSnapshot}
+                              treeProjection={authoritativeStructuralTreeProjection}
+                              authoritativePathHeaders={authoritativePathHeaders}
+                              presentationOnly={transcriptPresentationOnly}
+                              allowPresentationStreamProjection={
+                                !urlPinnedTargetPending &&
+                                retainedPresentationMatchesActiveStructure
+                              }
                               {...(activeCapability ? { capability: activeCapability } : {})}
                               prefillRecommendationEndpoints={activeEndpoints.endpoints}
                               longMessageDisplayMode={prefs.longMessageDisplayMode}
@@ -1666,6 +2166,7 @@ export function Shell() {
                       {transcriptFocusMode ? (
                         <Composer
                           onSubmit={handleSubmit}
+                          disabled={transcriptPresentationOnly}
                           streaming={streamingOnActiveChat}
                           onAbort={abortActiveChat}
                           autoSize
@@ -1702,32 +2203,7 @@ export function Shell() {
                           trailingUserMessage={Boolean(trailingUserMessage)}
                           {...(trailingUserMessage && hasConnection
                             ? {
-                                onReplyToTrailingUser: async () => {
-                                  const chat = await getChat(activeChatId)
-                                  if (!chat) return
-                                  const profile = await getProfile(chat.settings.profileId)
-                                  if (!profile) return
-                                  try {
-                                    const apiKeyCandidates = await resolveConnectionRuntimeKeys(
-                                      profile,
-                                      { chatId: activeChatId },
-                                    )
-                                    await sendFrom({
-                                      chatId: activeChatId,
-                                      connection: profile,
-                                      apiKey: '',
-                                      apiKeyCandidates,
-                                      parentMessageId: trailingUserMessage.id,
-                                    })
-                                    await bumpProfileLastUsedAt(profile.id)
-                                    if (chat.presetId) {
-                                      await bumpPresetLastUsedAt(chat.presetId)
-                                    }
-                                  } catch (err) {
-                                    if (isPageHidingAbortError(err)) return
-                                    console.error('reply-to-trailing failed', err)
-                                  }
-                                },
+                                onReplyToTrailingUser: handleReplyToTrailingUser,
                               }
                             : {})}
                         />
@@ -1736,6 +2212,7 @@ export function Shell() {
                     {transcriptFocusMode ? null : (
                       <Composer
                         onSubmit={handleSubmit}
+                        disabled={transcriptPresentationOnly}
                         streaming={streamingOnActiveChat}
                         onAbort={abortActiveChat}
                         autoSize
@@ -1771,34 +2248,7 @@ export function Shell() {
                         trailingUserMessage={Boolean(trailingUserMessage)}
                         {...(trailingUserMessage && hasConnection
                           ? {
-                              onReplyToTrailingUser: async () => {
-                                const chat = await getChat(activeChatId)
-                                if (!chat) return
-                                const profile = await getProfile(chat.settings.profileId)
-                                if (!profile) return
-                                try {
-                                  const apiKeyCandidates = await resolveConnectionRuntimeKeys(
-                                    profile,
-                                    {
-                                      chatId: activeChatId,
-                                    },
-                                  )
-                                  await sendFrom({
-                                    chatId: activeChatId,
-                                    connection: profile,
-                                    apiKey: '',
-                                    apiKeyCandidates,
-                                    parentMessageId: trailingUserMessage.id,
-                                  })
-                                  await bumpProfileLastUsedAt(profile.id)
-                                  if (chat.presetId) {
-                                    await bumpPresetLastUsedAt(chat.presetId)
-                                  }
-                                } catch (err) {
-                                  if (isPageHidingAbortError(err)) return
-                                  console.error('reply-to-trailing failed', err)
-                                }
-                              },
+                              onReplyToTrailingUser: handleReplyToTrailingUser,
                             }
                           : {})}
                         floatingAccessory={
@@ -1917,6 +2367,7 @@ export function Shell() {
         <ChatModelPanel
           chatSnapshot={resolvedActiveChatRow}
           profileSnapshot={activeProfileForModelList ?? null}
+          draftKey={activeComposerDraftKey}
           onClose={() => setChatModelOpen(false)}
         />
       ) : null}
@@ -1944,21 +2395,28 @@ export function Shell() {
             slot={{ kind: 'at-end' }}
             cursor={EMPTY_CURSOR}
             materializeChat={async () => {
-              // Fire only when the user clicks Import; if import never writes
-              // messages, the temporary row is discarded on navigation.
-              const { preset, settings } = await resolveNewChatSeed()
-              writeActiveSeedState({
-                profileId: settings.profileId || null,
-                presetId: preset?.id ?? null,
-                settings,
-              })
-              const chat = await createChat({
-                settings,
-                temporary: true,
-                ...(preset ? { presetId: preset.id } : {}),
-              })
-              navigateToChat(chat.id)
-              return chat.id
+              const routeIntent = beginRouteIntent()
+              try {
+                // Fire only when the user clicks Import; if import never writes
+                // messages, the temporary row is discarded on navigation.
+                const { preset, settings } = await resolveNewChatSeed()
+                writeActiveSeedState({
+                  profileId: settings.profileId || null,
+                  presetId: preset?.id ?? null,
+                  settings,
+                })
+                const chat = await createChat({
+                  settings,
+                  temporary: true,
+                  ...(preset ? { presetId: preset.id } : {}),
+                })
+                return {
+                  chatId: chat.id,
+                  navigationIntent: navigateToChatForIntent(routeIntent, chat.id),
+                }
+              } finally {
+                cancelRouteIntent(routeIntent)
+              }
             }}
             onClose={() => setImportAtEndOpen(false)}
             onDone={() => setImportAtEndOpen(false)}
@@ -1974,9 +2432,6 @@ export function Shell() {
             defaultRole={treeInsertTarget.defaultRole}
             onClose={() => setTreeInsertTarget(null)}
             onDone={() => {
-              if (treeInsertTarget.activateNodeId) {
-                activateTreeNode(treeInsertTarget.activateNodeId)
-              }
               setTreeInsertTarget(null)
             }}
           />

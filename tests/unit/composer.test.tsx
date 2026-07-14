@@ -5,6 +5,7 @@ import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import { __resetBrowserRepositoryForTests } from '../../src/store/browser-repo'
 import { __resetDbForTests } from '../../src/store/db'
 import { Composer } from '../../src/ui/chat/Composer'
+import { useComposerContextDraft } from '../../src/ui/chat/composer-draft-state'
 import { InlineEditor } from '../../src/ui/chat/InlineEditor'
 
 const DB_NAME = 'natter'
@@ -14,6 +15,18 @@ async function resetDb() {
   __resetDbForTests()
   __resetBroadcastForTests()
   await Dexie.delete(DB_NAME)
+}
+
+function ComposerContextProbe({ draftKey }: { draftKey: string }) {
+  const draft = useComposerContextDraft(draftKey)
+  return (
+    <output
+      data-ui="composer-context-probe"
+      data-text={draft.text}
+      data-prefill={draft.prefillText}
+      data-attachments={draft.attachmentRefs.length}
+    />
+  )
 }
 
 afterEach(async () => {
@@ -81,15 +94,39 @@ describe('Composer', () => {
     }
   })
 
-  it('updates the visible character count without announcing every keystroke', () => {
+  it('shows an approximate draft-token count without announcing every keystroke', () => {
     render(<Composer onSubmit={() => {}} />)
     const input = screen.getByRole('textbox')
 
     fireEvent.change(input, { target: { value: 'count this draft' } })
 
-    const counter = screen.getByText('16 chars')
+    const counter = screen.getByText('≈ 4 draft tokens')
     expect(counter).toBeInTheDocument()
     expect(counter).not.toHaveAttribute('aria-live')
+    expect(counter).toHaveAttribute(
+      'title',
+      expect.stringContaining('Approximate pending text only'),
+    )
+  })
+
+  it('publishes deferred text and prefill for the current tab context estimate', async () => {
+    const { container } = render(
+      <>
+        <Composer draftKey="context-probe" showPrefillButton onSubmit={() => {}} />
+        <ComposerContextProbe draftKey="context-probe" />
+      </>,
+    )
+    const probe = container.querySelector('[data-ui="composer-context-probe"]')
+    const input = container.querySelector('[data-ui="composer-input"]') as HTMLTextAreaElement
+
+    fireEvent.change(input, { target: { value: 'pending user text' } })
+    await waitFor(() => expect(probe).toHaveAttribute('data-text', 'pending user text'))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Open assistant prefill' }))
+    fireEvent.change(screen.getByRole('textbox', { name: 'Assistant prefill text' }), {
+      target: { value: 'pending assistant prefill' },
+    })
+    await waitFor(() => expect(probe).toHaveAttribute('data-prefill', 'pending assistant prefill'))
   })
 
   it('does not show an empty autosized textarea scrollbar', () => {
@@ -163,7 +200,12 @@ describe('Composer', () => {
 
   it('uploads selected files, shows a file tile, and sends attachment refs', async () => {
     const onSubmit = vi.fn().mockResolvedValue(undefined)
-    const { container } = render(<Composer onSubmit={onSubmit} />)
+    const { container } = render(
+      <>
+        <Composer draftKey="attachment-context-probe" onSubmit={onSubmit} />
+        <ComposerContextProbe draftKey="attachment-context-probe" />
+      </>,
+    )
     const fileInput = container.querySelector(
       '[data-ui="attachment-hidden-input"]',
     ) as HTMLInputElement
@@ -178,6 +220,12 @@ describe('Composer', () => {
       expect(
         container.querySelector('[data-ui="attachment-file-card"][data-storage="local"]'),
       ).toBeInTheDocument(),
+    )
+    await waitFor(() =>
+      expect(container.querySelector('[data-ui="composer-context-probe"]')).toHaveAttribute(
+        'data-attachments',
+        '1',
+      ),
     )
     fireEvent.submit(container.querySelector('[data-ui="composer"]') as HTMLFormElement)
 

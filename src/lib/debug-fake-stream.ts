@@ -1,6 +1,11 @@
 import type { GeminiStreamChunk } from '../api/gemini-types'
 import type { ChatStreamChunk, ResponsesStreamChunk } from '../api/types'
-import { navigateToChat } from '../app/router'
+import {
+  beginRouteIntent,
+  cancelRouteIntent,
+  navigateToChatForIntent,
+  parseRoute,
+} from '../app/router'
 import { cloneDefaultChatSettings } from '../core/defaults'
 import type { ChatId, ConnectionProfile, MessageId } from '../core/types'
 import { type SendTextResult, sendFromMessage, sendText } from '../hooks/useChat'
@@ -121,9 +126,9 @@ function installStreamStats(): void {
       )
       originalSetLiveSnapshot(snapshot)
     },
-    clearLiveSnapshot: (messageId) => {
+    clearLiveSnapshot: (messageId, expectedStreamId, replacementEpoch) => {
       streamStats.liveClearCount += 1
-      originalClearLiveSnapshot(messageId)
+      originalClearLiveSnapshot(messageId, expectedStreamId, replacementEpoch)
     },
   })
 }
@@ -143,18 +148,14 @@ function state(): DebugStoreSnapshot {
   const chatState = useChatStore.getState()
   const streamState = useStreamStore.getState()
   const uiState = useUiStore.getState()
-  const liveSnapshots = Object.values(streamState.liveByMessageId)
+  const liveSnapshots = streamState.listLiveSnapshots()
+  const activeStreams = streamState.listActive()
+  const chatStoreStats = chatState.getDebugStats()
   return {
-    chatStore: {
-      chatCursorCount: Object.keys(chatState.cursors).length,
-      cursorEntryCount: Object.values(chatState.cursors).reduce(
-        (sum, cursor) => sum + Object.keys(cursor).length,
-        0,
-      ),
-    },
+    chatStore: chatStoreStats,
     streamStore: {
-      activeCount: Object.keys(streamState.activeByStreamId).length,
-      activeTargets: Object.values(streamState.activeByStreamId).map(({ chatId, messageId }) => ({
+      activeCount: activeStreams.length,
+      activeTargets: activeStreams.map(({ chatId, messageId }) => ({
         chatId,
         ...(messageId ? { messageId } : {}),
       })),
@@ -173,14 +174,35 @@ function state(): DebugStoreSnapshot {
 }
 
 async function start(options: DebugFakeStreamOptions = {}): Promise<DebugFakeStreamResult> {
+  const routeIntent = options.openChat !== false ? beginRouteIntent() : null
+  const invocationRoute = typeof window === 'undefined' ? null : parseRoute(window.location.hash)
+  const foregroundChatIdAtInvocation =
+    !routeIntent && invocationRoute?.kind === 'chat' ? invocationRoute.chatId : null
   const targetChars = Math.max(0, Math.floor(options.targetChars ?? 100_000))
   const reasoningChars = Math.max(0, Math.floor(options.reasoningChars ?? 100_000))
   const chunkChars = Math.max(1, Math.floor(options.chunkChars ?? 128))
   const reasoningChunkChars = Math.max(1, Math.floor(options.reasoningChunkChars ?? chunkChars))
   const delayMs = Math.max(0, Math.floor(options.delayMs ?? 0))
-  const connection = await ensureDebugEnvironment()
-  const chatId = options.chatId ?? (await createDebugChat(connection.id)).id
-  if (options.openChat !== false) navigateToChat(chatId)
+  const { connection, chatId, navigationIntent } = await (async () => {
+    try {
+      const connection = await ensureDebugEnvironment()
+      const chatId = options.chatId ?? (await createDebugChat(connection.id)).id
+      const currentRoute = typeof window === 'undefined' ? null : parseRoute(window.location.hash)
+      return {
+        connection,
+        chatId,
+        navigationIntent: routeIntent
+          ? navigateToChatForIntent(routeIntent, chatId)
+          : foregroundChatIdAtInvocation === chatId &&
+              currentRoute?.kind === 'chat' &&
+              currentRoute.chatId === chatId
+            ? useChatStore.getState().beginNavigationIntent(chatId)
+            : null,
+      }
+    } finally {
+      if (routeIntent) cancelRouteIntent(routeIntent)
+    }
+  })()
 
   const openStream = ({ signal }: { signal: AbortSignal }) =>
     options.providerFixtureChunks
@@ -198,6 +220,7 @@ async function start(options: DebugFakeStreamOptions = {}): Promise<DebugFakeStr
   const result = options.parentMessageId
     ? await sendFromMessage({
         chatId,
+        navigationIntent,
         connection,
         apiKey: 'debug-fake-key',
         parentMessageId: options.parentMessageId,
@@ -205,6 +228,7 @@ async function start(options: DebugFakeStreamOptions = {}): Promise<DebugFakeStr
       })
     : await sendText({
         chatId,
+        navigationIntent,
         ...(options.expectedLeafId !== undefined ? { expectedLeafId: options.expectedLeafId } : {}),
         connection,
         apiKey: 'debug-fake-key',

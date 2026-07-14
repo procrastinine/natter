@@ -3,6 +3,8 @@
 // assertions. Live-API specs live in `*.live.spec.ts` and gate on
 // `process.env.RUN_LIVE === '1'`.
 
+import type { Message } from '../../src/core/types'
+import type * as MessageStorageModule from '../../src/store/message-storage'
 import { expect, type Page } from './fixtures'
 
 export interface IndexedDbDump {
@@ -230,6 +232,10 @@ export async function seedLinearChat(
   },
 ): Promise<string> {
   const chatId = await page.evaluate(async (seed) => {
+    const storagePath = '/src/store/message-storage.ts'
+    const { splitMessageForStorage } = (await import(
+      /* @vite-ignore */ storagePath
+    )) as typeof MessageStorageModule
     const db = await new Promise<IDBDatabase>((resolve, reject) => {
       const req = indexedDB.open('natter')
       req.onsuccess = () => resolve(req.result)
@@ -285,7 +291,7 @@ export async function seedLinearChat(
             const id = `msg-${String(i).padStart(3, '0')}`
             const role = i % 2 === 0 ? 'user' : 'assistant'
             const createdAt = now + i
-            messages.put({
+            const message: Message = {
               id,
               chatId,
               parentId,
@@ -297,19 +303,16 @@ export async function seedLinearChat(
               origin: role === 'user' ? 'user' : 'generated',
               nodeVersion: 0,
               deleted: false,
-            })
-            messageBodies.put({
-              id,
-              chatId,
-              nodeVersion: 0,
-              updatedAt: createdAt,
               content: [
                 {
                   type: role === 'assistant' ? assistantContentType : 'text',
                   text: `${textPrefix} ${i}`,
                 },
               ],
-            })
+            }
+            const { header, body } = splitMessageForStorage(message)
+            messages.put(header)
+            messageBodies.put(body)
             parentId = id
           }
         }

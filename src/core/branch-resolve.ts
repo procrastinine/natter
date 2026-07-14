@@ -9,13 +9,23 @@
 // can merge it into Zustand atomically after the IDB transaction (if any) has
 // committed.
 
-import { createDefaultChildPicker, cursorKeyOf, indexById } from './active-path'
-import type { CursorMap, Message, MessageId } from './types'
+import {
+  createDefaultChildPicker,
+  createMessageTreeProjection,
+  cursorKeyOf,
+  type DefaultChildPicker,
+  type MessageTreeNode,
+  type MessageTreeProjection,
+} from './active-path'
+import { createCursorOverlay } from './cursor-overlay'
+import type { CursorMap, CursorPatch, Message, MessageId } from './types'
 
-interface ResolveBranchInput {
+interface ResolveBranchInput<T extends MessageTreeNode = Message> {
   targetId: MessageId
-  byParent: Map<MessageId | null, Message[]>
-  byId: Map<MessageId, Message>
+  byParent: ReadonlyMap<MessageId | null, readonly T[]>
+  liveByParent?: ReadonlyMap<MessageId | null, readonly T[]>
+  byId: ReadonlyMap<MessageId, T>
+  pickDefaultChild?: DefaultChildPicker<T>
 }
 
 // Seed the cursor so the given messageId lands on the active path.
@@ -30,46 +40,65 @@ export function seedCursorAtMessage(
   cursor: CursorMap,
   options: { preserveDescendantPins?: boolean } = {},
 ): void {
-  const byId = indexById(messages)
-  let cur: Message | undefined = byId.get(targetId)
-  if (!cur) return
+  const projection = createMessageTreeProjection(messages)
+  const patch = seedCursorAtMessageProjected(projection, targetId, cursor, options)
+  for (const [key, value] of Object.entries(patch)) {
+    if (value === undefined) delete cursor[key]
+    else cursor[key] = value
+  }
+}
+
+export function seedCursorAtMessageProjected<T extends MessageTreeNode>(
+  projection: MessageTreeProjection<T>,
+  targetId: MessageId,
+  cursor: Readonly<CursorMap>,
+  options: { preserveDescendantPins?: boolean } = {},
+): CursorPatch {
+  const { byId } = projection
+  let cur: T | undefined = byId.get(targetId)
+  if (!cur) return {}
+  const patch: CursorPatch = {}
+  const overlay = createCursorOverlay(cursor)
   while (cur) {
     const parentId: MessageId | null = cur.parentId
-    cursor[cursorKeyOf(parentId)] = cur.id
+    const key = cursorKeyOf(parentId)
+    overlay[key] = cur.id
+    patch[key] = cur.id
     cur = parentId ? byId.get(parentId) : undefined
   }
-  const byParent = new Map<MessageId | null, Message[]>()
-  for (const m of messages) {
-    const bucket = byParent.get(m.parentId)
-    if (bucket) bucket.push(m)
-    else byParent.set(m.parentId, [m])
-  }
   if (options.preserveDescendantPins === false) {
-    const stack = [targetId]
-    while (stack.length > 0) {
-      const parentId = stack.pop() as MessageId
-      delete cursor[cursorKeyOf(parentId)]
-      for (const child of byParent.get(parentId) ?? []) stack.push(child.id)
-    }
+    Object.assign(
+      patch,
+      resolveLastUpdatedBranchBelow({ ...projection, targetId }, createCursorOverlay({})),
+    )
+    return patch
   }
-  resolveLastUpdatedBranchBelow({ targetId, byParent, byId }, cursor)
+  Object.assign(patch, resolveLastUpdatedBranchBelow({ ...projection, targetId }, overlay))
+  return patch
 }
 
 // §8.4.3.1 fork rule:
 //   1. If `cursor[current]` points at a live child, keep that entry and descend.
-//   2. Otherwise pick the child whose subtree has the greatest-`createdAt`
-//      live leaf, write `cursor[current] = chosenId`, descend.
+//   2. Otherwise pick the child whose subtree has the greatest live leaf by
+//      (`createdAt`, leaf id), write `cursor[current] = chosenId`, descend.
 // A walk that reaches a leaf (or an all-tombstoned fork) stops.
 //
 // This routine does NOT write `cursor[parentOfTarget] = target`. That entry is
 // the caller's responsibility — it's the swipe/search-click decision. The
 // helper only handles `target → leaf` below.
-export function resolveLastUpdatedBranchBelow(input: ResolveBranchInput, cursor: CursorMap): void {
-  const { byParent, byId } = input
-  const pickDefaultChild = createDefaultChildPicker(byParent, byId)
+export function resolveLastUpdatedBranchBelow<T extends MessageTreeNode>(
+  input: ResolveBranchInput<T>,
+  cursor: CursorMap,
+): CursorMap {
+  const { byParent, byId, liveByParent } = input
+  const pickDefaultChild =
+    input.pickDefaultChild ?? createDefaultChildPicker(byParent, byId, liveByParent)
+  const updates: CursorMap = {}
   let currentId: MessageId = input.targetId
   for (;;) {
-    const kids = (byParent.get(currentId) ?? []).filter((m) => !m.deleted)
+    const kids = liveByParent
+      ? (liveByParent.get(currentId) ?? [])
+      : (byParent.get(currentId) ?? []).filter((m) => !m.deleted)
     if (kids.length === 0) break
     const key = cursorKeyOf(currentId)
     const pinnedId = cursor[key]
@@ -79,6 +108,26 @@ export function resolveLastUpdatedBranchBelow(input: ResolveBranchInput, cursor:
     }
     const chosen = pickDefaultChild(kids)
     cursor[key] = chosen.id
+    updates[key] = chosen.id
     currentId = chosen.id
   }
+  return updates
+}
+
+export function selectBranchProjected<T extends MessageTreeNode>(
+  projection: MessageTreeProjection<T>,
+  targetId: MessageId,
+  cursor: Readonly<CursorMap>,
+): CursorMap {
+  const target = projection.byId.get(targetId)
+  if (!target) return {}
+  const key = cursorKeyOf(target.parentId)
+  const updates: CursorMap = { [key]: target.id }
+  const overlay = createCursorOverlay(cursor)
+  overlay[key] = target.id
+  Object.assign(
+    updates,
+    resolveLastUpdatedBranchBelow({ ...projection, targetId: target.id }, overlay),
+  )
+  return updates
 }

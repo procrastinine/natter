@@ -185,11 +185,12 @@ describe('message storage split', () => {
       generation: source.generation,
       attachmentRefs: source.attachmentRefs,
       nodeVersion: source.nodeVersion,
+      bodyVersion: source.nodeVersion,
     })
     expect(body).toMatchObject({
       id: source.id,
       chatId: source.chatId,
-      nodeVersion: source.nodeVersion,
+      bodyVersion: source.nodeVersion,
       updatedAt: 9,
       content: source.content,
       reasoningDetails: source.reasoningDetails,
@@ -256,7 +257,7 @@ describe('message storage split', () => {
     expect(() => hydrateMessage(header, { ...body, chatId: 'other-chat' })).toThrow(
       'MessageBodyChatMismatch:msg-1:chat-1:other-chat',
     )
-    expect(() => hydrateMessage(header, { ...body, nodeVersion: 5 })).toThrow(
+    expect(() => hydrateMessage(header, { ...body, bodyVersion: 5 })).toThrow(
       'MessageBodyVersionMismatch:msg-1:4:5',
     )
   })

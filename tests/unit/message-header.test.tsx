@@ -1,16 +1,48 @@
-import { fireEvent, render, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, waitFor } from '@testing-library/react'
+import type { ComponentProps } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { effectiveCapabilityFromEndpoints } from '../../src/core/capabilities'
 import type { Message as MessageRow, ModelEndpoint } from '../../src/core/types'
+import { __resetMessageStreamProjectionForTests } from '../../src/hooks/useMessageStreamProjection'
+import type * as GeneratedImagesModule from '../../src/store/generated-images'
 import { getStreamClientId } from '../../src/store/stream-leases'
 import { useStreamStore } from '../../src/store/zustand/streamStore'
-import { Message as ChatMessage } from '../../src/ui/chat/Message'
+import { useToastStore } from '../../src/store/zustand/toastStore'
+import { Message as ChatMessageComponent } from '../../src/ui/chat/Message'
 import { MessageHeader } from '../../src/ui/chat/MessageHeader'
 import { MessageInfo } from '../../src/ui/chat/MessageInfo'
 import { ReasoningBlock } from '../../src/ui/chat/ReasoningBlock'
 
+function ChatMessage(
+  props: Omit<ComponentProps<typeof ChatMessageComponent>, 'bodyVersion'> & {
+    bodyVersion?: number
+  },
+) {
+  return (
+    <ChatMessageComponent {...props} bodyVersion={props.bodyVersion ?? props.message.nodeVersion} />
+  )
+}
+
+const generatedImageMocks = vi.hoisted(() => ({
+  migrate: vi.fn(async () => {}),
+  normalize: vi.fn(async () => {}),
+}))
+
+vi.mock('../../src/store/generated-images', async (importOriginal) => {
+  const original = await importOriginal<typeof GeneratedImagesModule>()
+  return {
+    ...original,
+    migrateGeneratedOutputAttachments: generatedImageMocks.migrate,
+    normalizeGeneratedImageOutputAttachmentRefs: generatedImageMocks.normalize,
+  }
+})
+
 afterEach(() => {
+  __resetMessageStreamProjectionForTests()
   useStreamStore.getState().reset()
+  useToastStore.getState().reset()
+  generatedImageMocks.migrate.mockClear()
+  generatedImageMocks.normalize.mockClear()
 })
 
 function makeAssistant(overrides: Partial<MessageRow> = {}): MessageRow {
@@ -323,6 +355,142 @@ describe('Message content refresh', () => {
   })
 })
 
+describe('Message presentation-only snapshots', () => {
+  it('retains final stream output until the persisted message version catches up', async () => {
+    const message = makeAssistant({
+      id: 'final-persistence-order-message',
+      content: [{ type: 'output_text', text: 'Old persisted placeholder.' }],
+      nodeVersion: 1,
+    })
+    const generation = message.generation
+    if (!generation) throw new Error('expected generation metadata')
+    delete generation.finishedAt
+    generation.status = 'streaming'
+
+    act(() => {
+      useStreamStore.getState().setActive({
+        streamId: 'final-persistence-order-stream',
+        replacementEpoch: 0,
+        chatId: message.chatId,
+        messageId: message.id,
+        startedAt: generation.startedAt,
+        ownerClientId: getStreamClientId(),
+      })
+      useStreamStore.getState().setLiveSnapshot({
+        streamId: 'final-persistence-order-stream',
+        replacementEpoch: 0,
+        chatId: message.chatId,
+        messageId: message.id,
+        content: [{ type: 'output_text', text: 'Final live text.' }],
+        textLength: 16,
+        reasoningLength: 0,
+        updatedAt: generation.startedAt + 1,
+      })
+    })
+
+    const props = {
+      chatId: message.chatId,
+      hasAnyReasoningDetails: false,
+      hasConnection: false,
+      onEditInPlace: async () => {},
+    }
+    const view = render(<ChatMessage {...props} message={message} />)
+    const body = () => view.container.querySelector('[data-ui="message-body"]')
+
+    await waitFor(() => expect(body()).toHaveTextContent('Final live text.'))
+    expect(body()).not.toHaveTextContent('Old persisted placeholder.')
+
+    view.rerender(
+      <ChatMessage
+        {...props}
+        message={message}
+        presentationOnly
+        allowPresentationStreamProjection
+      />,
+    )
+
+    act(() =>
+      useStreamStore.getState().clearLiveSnapshot(message.id, 'final-persistence-order-stream', 0),
+    )
+    expect(body()).toHaveTextContent('Final live text.')
+    expect(body()).not.toHaveTextContent('Old persisted placeholder.')
+
+    act(() => useStreamStore.getState().clearActive('final-persistence-order-stream', 0))
+    expect(body()).toHaveTextContent('Final live text.')
+    expect(body()).not.toHaveTextContent('Old persisted placeholder.')
+
+    view.rerender(
+      <ChatMessage
+        {...props}
+        message={makeAssistant({
+          id: message.id,
+          content: [{ type: 'output_text', text: 'Canonical persisted text.' }],
+          nodeVersion: message.nodeVersion + 1,
+        })}
+        presentationOnly
+        allowPresentationStreamProjection
+      />,
+    )
+
+    await waitFor(() => expect(body()).toHaveTextContent('Canonical persisted text.'))
+    expect(body()).not.toHaveTextContent('Final live text.')
+    expect(body()).not.toHaveTextContent('Old persisted placeholder.')
+  })
+
+  it('does not run generated-output persistence migrations', async () => {
+    const message = makeAssistant({
+      content: [{ type: 'output_image', url: 'https://example.test/generated.png' }],
+    })
+
+    render(
+      <ChatMessage
+        chatId={message.chatId}
+        message={message}
+        hasAnyReasoningDetails={false}
+        hasConnection
+        presentationOnly
+        onEditInPlace={async () => {}}
+      />,
+    )
+
+    await Promise.resolve()
+    expect(generatedImageMocks.migrate).not.toHaveBeenCalled()
+    expect(generatedImageMocks.normalize).not.toHaveBeenCalled()
+  })
+
+  it('does not publish body-derived recovery banners', async () => {
+    const base = makeAssistant()
+    const generation = base.generation
+    if (!generation) throw new Error('expected generation metadata')
+    const message = makeAssistant({
+      generation: {
+        ...generation,
+        error: {
+          category: 'provider',
+          code: 'STALE_REASONING',
+          message: 'invalid encrypted reasoning content',
+          statusCode: 400,
+        },
+      },
+    })
+
+    render(
+      <ChatMessage
+        chatId={message.chatId}
+        message={message}
+        hasAnyReasoningDetails
+        hasConnection
+        presentationOnly
+        onEditInPlace={async () => {}}
+        onRegenerate={async () => {}}
+      />,
+    )
+
+    await Promise.resolve()
+    expect(useToastStore.getState().banners).toEqual([])
+  })
+})
+
 describe('Message streaming info surface', () => {
   it('marks the streaming message busy until its stream ends', () => {
     const msg = makeAssistant()
@@ -366,6 +534,7 @@ describe('Message streaming info surface', () => {
     if (!generation) throw new Error('expected generation metadata')
     useStreamStore.getState().setActive({
       streamId: 'stream-live',
+      replacementEpoch: 0,
       chatId: msg.chatId,
       messageId: msg.id,
       startedAt: generation.startedAt,
@@ -373,6 +542,7 @@ describe('Message streaming info surface', () => {
     })
     useStreamStore.getState().setLiveSnapshot({
       streamId: 'stream-live',
+      replacementEpoch: 0,
       chatId: msg.chatId,
       messageId: msg.id,
       content: [{ type: 'output_text', text: 'live streamed words' }],
@@ -423,6 +593,7 @@ describe('Message streaming info surface', () => {
     delete msg.generation
     useStreamStore.getState().setActive({
       streamId: 'remote-stream',
+      replacementEpoch: 0,
       chatId: msg.chatId,
       messageId: msg.id,
       startedAt: 1,

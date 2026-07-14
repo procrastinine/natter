@@ -1,7 +1,9 @@
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import { App } from './app/App'
-import { openDb } from './store/db'
+import { WorkspaceBootstrap, type WorkspaceOpenOptions } from './app/WorkspaceBootstrap'
+import { nukeSiteStorage } from './lib/debug-nuke'
+import { closeDb, openDb } from './store/db'
 import './app/theme.css'
 
 const debugToolsRequested =
@@ -10,26 +12,39 @@ const debugToolsRequested =
     import.meta.env.VITE_NATTER_DEBUG === '1' ||
     new URLSearchParams(window.location.search).has('debug'))
 
-if (debugToolsRequested) {
-  const [fakeStream, nuke, scroll, streams] = await Promise.all([
+let debugToolsPromise: Promise<void> | null = null
+
+function installDebugTools(): Promise<void> {
+  if (!debugToolsRequested) return Promise.resolve()
+  debugToolsPromise ??= Promise.all([
     import('./lib/debug-fake-stream'),
     import('./lib/debug-nuke'),
     import('./lib/debug-scroll'),
     import('./lib/debug-streams'),
-  ])
-  fakeStream.installDebugFakeStream()
-  nuke.installDebugNuke()
-  scroll.installDebugScroll()
-  streams.installDebugStreams()
+  ]).then(([fakeStream, nuke, scroll, streams]) => {
+    fakeStream.installDebugFakeStream()
+    nuke.installDebugNuke()
+    scroll.installDebugScroll()
+    streams.installDebugStreams()
+  })
+  return debugToolsPromise
+}
+
+async function prepareWorkspace(options: WorkspaceOpenOptions): Promise<void> {
+  await Promise.all([installDebugTools(), openDb(options)])
 }
 
 const container = document.getElementById('root')
 if (!container) throw new Error('#root element missing from index.html')
 
-void openDb().then(() => {
-  createRoot(container).render(
-    <StrictMode>
+createRoot(container).render(
+  <StrictMode>
+    <WorkspaceBootstrap
+      openWorkspace={prepareWorkspace}
+      beforeRetry={closeDb}
+      resetWorkspace={() => nukeSiteStorage({ skipReload: true })}
+    >
       <App />
-    </StrictMode>,
-  )
-})
+    </WorkspaceBootstrap>
+  </StrictMode>,
+)

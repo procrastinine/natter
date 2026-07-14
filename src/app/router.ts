@@ -1,6 +1,7 @@
-// Hash router. The URL is the source of truth for "which chat / which sibling
-// is in view" so reload restores the view and Cmd/middle-click on chat
-// affordances opens a new tab at the same route.
+// Hash router. The URL is the address/deep-link input and the per-tab cursor is
+// the live branch authority. Cursor changes mirror their leaf into the address
+// without publishing a new URL-arrival intent, so reload and new-tab opens
+// restore the view without letting a passive mirror steer this tab.
 //
 // Routes:
 //   #/             → home (launcher / sample prompts; no chat selected)
@@ -16,12 +17,122 @@
 //   #/storage/archive              → archived chats / trash
 //   #/storage/backups             → legacy alias for the storage overview
 //
-// The hash form is intentional: it works on static hosts without server config
-// configuration. The URL only carries the target pin for opens; subsequent
-// in-tab swipes update the per-tab Zustand cursor without touching the URL.
+// The hash form is intentional: it works on static hosts without server
+// configuration. The URL carries the target pin for opens and silently mirrors
+// subsequent in-tab cursor changes.
 
 import { type MouseEvent, useSyncExternalStore } from 'react'
 import type { AttachmentId, ChatId, MessageId } from '../core/types'
+import type { BroadcastDelivery } from '../store/broadcast'
+import { type NavigationIntent, useChatStore } from '../store/zustand/chatStore'
+import {
+  claimTabNavigation,
+  consumeTabNavigation,
+  invalidateTabNavigation,
+  isTabNavigationCurrent,
+  type TabNavigationAuthority,
+} from '../store/zustand/tabNavigation'
+
+const routeIntentBrand: unique symbol = Symbol('RouteIntent')
+const routeAuthority: unique symbol = Symbol('RouteAuthority')
+
+export interface RouteIntent {
+  readonly revision: string
+  readonly startedAtHash: string
+  readonly [routeIntentBrand]: true
+  readonly [routeAuthority]: TabNavigationAuthority
+}
+
+let currentRouteIntent: RouteIntent | null = null
+let localWorkspaceReplacementRouteIntent: RouteIntent | null = null
+let currentRouteExpectedHash = ''
+let workspaceRouteReplayPending = false
+
+function clearRouteIntent(): void {
+  currentRouteIntent = null
+  localWorkspaceReplacementRouteIntent = null
+  currentRouteExpectedHash = ''
+}
+
+function invalidateAllTabNavigation(): void {
+  clearRouteIntent()
+  invalidateTabNavigation()
+}
+
+export function beginRouteIntent(): RouteIntent {
+  ensureHashListener()
+  const authority = claimTabNavigation()
+  const startedAtHash = typeof window === 'undefined' ? '' : window.location.hash
+  const intent = Object.freeze({
+    revision: authority.revision,
+    startedAtHash,
+    [routeIntentBrand]: true as const,
+    [routeAuthority]: authority,
+  })
+  currentRouteIntent = intent
+  localWorkspaceReplacementRouteIntent = null
+  currentRouteExpectedHash = startedAtHash
+  return intent
+}
+
+export function beginWorkspaceReplacementRouteIntent(): RouteIntent {
+  const intent = beginRouteIntent()
+  localWorkspaceReplacementRouteIntent = intent
+  return intent
+}
+
+export function isRouteIntentCurrent(intent: RouteIntent): boolean {
+  return (
+    currentRouteIntent === intent &&
+    isTabNavigationCurrent(intent[routeAuthority]) &&
+    (typeof window === 'undefined' || window.location.hash === currentRouteExpectedHash)
+  )
+}
+
+export function navigateForIntent(intent: RouteIntent, href: string): boolean {
+  if (!consumeRouteIntent(intent)) return false
+  commitHashNavigation(href)
+  return true
+}
+
+// End an abandoned delayed route action without disturbing a newer action.
+// Cleanup belongs in every async owner's finally block; successful navigation
+// consumes the same object first, making that cleanup a harmless no-op.
+export function cancelRouteIntent(intent: RouteIntent): boolean {
+  if (currentRouteIntent !== intent) return false
+  const stillOwnsNavigation = isTabNavigationCurrent(intent[routeAuthority])
+  if (stillOwnsNavigation) {
+    consumeTabNavigation(intent[routeAuthority])
+  }
+  clearRouteIntent()
+  if (workspaceRouteReplayPending) {
+    workspaceRouteReplayPending = false
+    if (stillOwnsNavigation) publishRouteChange()
+  }
+  return true
+}
+
+function consumeRouteIntent(intent: RouteIntent): boolean {
+  if (!isRouteIntentCurrent(intent)) return false
+  if (!consumeTabNavigation(intent[routeAuthority])) return false
+  clearRouteIntent()
+  return true
+}
+
+// Atomically hand a successful delayed chat-route action over to the branch
+// navigator. A caller must not begin a branch intent after an awaited route
+// attempt on its own: if that route was superseded, the late branch claim
+// would steal authority back from the user's newer action.
+export function navigateToChatForIntent(
+  intent: RouteIntent,
+  chatId: ChatId,
+): NavigationIntent | null {
+  if (!consumeRouteIntent(intent)) return null
+  const routeChanged = commitHashNavigation(chatHref(chatId), false)
+  const navigationIntent = useChatStore.getState().beginNavigationIntent(chatId)
+  if (routeChanged) publishRouteChange()
+  return navigationIntent
+}
 
 export type StorageRoute =
   | { section: 'overview' }
@@ -135,27 +246,48 @@ function storageRouteToHref(route: StorageRoute): string {
 
 export function navigate(href: string): void {
   if (typeof window === 'undefined') return
-  if (window.location.hash === href) return
-  window.location.hash = href
+  invalidateAllTabNavigation()
+  commitHashNavigation(href)
 }
 
-// Silent URL rewrite via `history.replaceState`. Does NOT fire a
-// hashchange (so downstream hooks won't react) and does NOT push a new
-// history entry. Used by the branch↔URL sync so swiping through
+function commitHashNavigation(href: string, publish = true): boolean {
+  if (window.location.hash === href) {
+    if (publish) publishRouteChange()
+    return false
+  }
+  const url = new URL(window.location.href)
+  url.hash = href
+  // pushState gives the hash router normal back/forward history without an
+  // asynchronous hashchange echo. That removes the need for a bounded
+  // pending-event queue whose eviction could misclassify an old internal
+  // event as a new user navigation.
+  window.history.pushState(window.history.state, '', url.toString())
+  if (publish) publishRouteChange()
+  return true
+}
+
+// URL rewrite via `history.replaceState`. Does NOT fire a hashchange,
+// publish a new URL-arrival intent, or push a new history entry. It does
+// notify route-snapshot readers so rendered route state cannot lag behind
+// the address bar. Used by the branch↔URL sync so swiping through
 // variants updates the address bar without spamming back-history, and
 // interior-message URLs (#/chat/id/message/<mid>) can redirect to the
 // branch leaf (#/chat/id/message/<leafId>) without the user seeing a
 // back button that undoes the auto-redirect.
 export function replaceRoute(href: string): void {
   if (typeof window === 'undefined') return
+  // A completed cursor → URL projection proves this tab has reconciled the
+  // current workspace, even if the projected href is already in the bar.
+  workspaceRouteReplayPending = false
   if (window.location.hash === href) return
+  const routeIntent = currentRouteIntent
+  if (routeIntent && isTabNavigationCurrent(routeIntent[routeAuthority])) {
+    currentRouteExpectedHash = href
+  }
   const url = new URL(window.location.href)
   url.hash = href
   window.history.replaceState(window.history.state, '', url.toString())
-}
-
-export function navigateToChat(chatId: ChatId, pinnedMessageId?: MessageId): void {
-  navigate(chatHref(chatId, pinnedMessageId))
+  publishRouteSnapshotChange()
 }
 
 export function navigateHome(): void {
@@ -166,21 +298,58 @@ export function navigateNew(): void {
   navigate(newChatHref())
 }
 
-const hashSubscribers = new Set<() => void>()
+const routeSnapshotSubscribers = new Set<() => void>()
+const routeArrivalSubscribers = new Set<() => void>()
 let hashListenerInstalled = false
 
 function ensureHashListener(): void {
   if (typeof window === 'undefined' || hashListenerInstalled) return
   hashListenerInstalled = true
   window.addEventListener('hashchange', () => {
-    for (const fn of hashSubscribers) fn()
+    invalidateAllTabNavigation()
+    publishRouteChange()
   })
 }
 
-function subscribeHash(fn: () => void): () => void {
+function publishRouteChange(): void {
+  workspaceRouteReplayPending = false
+  publishRouteSnapshotChange()
+  for (const fn of [...routeArrivalSubscribers]) fn()
+}
+
+function publishRouteSnapshotChange(): void {
+  for (const fn of [...routeSnapshotSubscribers]) fn()
+}
+
+// The router owns the one native hashchange listener so invalidation and
+// internal/external classification always happen before downstream URL work.
+export function subscribeRouteChange(fn: () => void): () => void {
   ensureHashListener()
-  hashSubscribers.add(fn)
-  return () => hashSubscribers.delete(fn)
+  routeSnapshotSubscribers.add(fn)
+  return () => routeSnapshotSubscribers.delete(fn)
+}
+
+// URL-arrival subscribers own URL → view intent. Passive branch projection
+// through replaceRoute updates route snapshots but must never reseed a cursor.
+export function subscribeRouteArrival(fn: () => void): () => void {
+  ensureHashListener()
+  routeArrivalSubscribers.add(fn)
+  return () => routeArrivalSubscribers.delete(fn)
+}
+
+export function refreshRouteForWorkspaceReplacement(delivery: BroadcastDelivery): void {
+  ensureHashListener()
+  if (
+    delivery === 'local' &&
+    currentRouteIntent === localWorkspaceReplacementRouteIntent &&
+    currentRouteIntent &&
+    isRouteIntentCurrent(currentRouteIntent)
+  ) {
+    workspaceRouteReplayPending = true
+    return
+  }
+  invalidateAllTabNavigation()
+  publishRouteChange()
 }
 
 function getHashSnapshot(): string {
@@ -195,7 +364,7 @@ function getServerSnapshot(): string {
 // React hook surface. Rerenders the consumer whenever the hash changes —
 // any number of components can call this; one window listener feeds them all.
 export function useRoute(): Route {
-  const hash = useSyncExternalStore(subscribeHash, getHashSnapshot, getServerSnapshot)
+  const hash = useSyncExternalStore(subscribeRouteChange, getHashSnapshot, getServerSnapshot)
   return parseRoute(hash)
 }
 

@@ -29,6 +29,8 @@ const SEARCH_SCAN_CHUNK_CHARS = 64 * 1024
 
 export interface BranchTreeInspectorProps {
   message: Message
+  bodyVersion: number
+  bodyReady?: boolean
   onClose: () => void
   onActivate?: () => void
   onEdit?: (message: Message, text: string) => void | Promise<void>
@@ -124,6 +126,8 @@ function hasMatchBeyondPrefix(
 
 const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
   message,
+  bodyVersion,
+  bodyReady = true,
   onClose,
   onActivate,
   onEdit,
@@ -151,13 +155,14 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
   const [currentOccurrence, setCurrentOccurrence] = useState(-1)
   const [activeStream, liveSnapshot] = useRetainedMessageStreamProjection(
     message,
+    bodyVersion,
     message.role === 'assistant',
   )
   const persistedStreamBusy =
     message.generation?.status === 'streaming' && message.generation.finishedAt === undefined
   const streamTargetBusy =
     activeStream !== undefined || persistedStreamBusy || liveSnapshot !== undefined
-  const requestBusy = generationBusy || streamTargetBusy
+  const requestBusy = !bodyReady || generationBusy || streamTargetBusy
   const remoteStreaming =
     activeStream !== undefined && activeStream.ownerClientId !== getStreamClientId()
   const liveReasoningRows = liveSnapshot?.reasoningRows
@@ -379,6 +384,10 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
     fallbackMessage: string,
   ) => {
     if (!action) return
+    if (!bodyReady) {
+      setEditError({ messageId: message.id, text: 'Wait for the latest message body to load.' })
+      return
+    }
     if (streamTargetBusy) {
       setEditError({ messageId: message.id, text: busyMessage })
       return
@@ -418,6 +427,8 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
   return (
     <aside
       data-ui="branch-tree-inspector"
+      data-body-ready={bodyReady ? 'true' : 'false'}
+      data-body-version={bodyVersion}
       data-role={message.role}
       data-message-id={message.id}
       data-text-overflow={truncated ? (showingFull ? 'full' : 'prefix') : 'complete'}
@@ -470,7 +481,7 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
               aria-label="Edit message"
               title="Edit message in place"
               aria-pressed={editing}
-              disabled={editing || streamTargetBusy}
+              disabled={!bodyReady || editing || streamTargetBusy}
               onClick={() => {
                 setEditError(null)
                 setEditingMessageId(message.id)
@@ -486,11 +497,13 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
               data-action="regenerate"
               aria-label="Regenerate response"
               title={
-                !hasConnection
-                  ? 'Add a connection to regenerate.'
-                  : requestBusy
-                    ? 'A request is already running for this chat.'
-                    : 'Regenerate response'
+                !bodyReady
+                  ? 'Refreshing message details…'
+                  : !hasConnection
+                    ? 'Add a connection to regenerate.'
+                    : requestBusy
+                      ? 'A request is already running for this chat.'
+                      : 'Regenerate response'
               }
               disabled={!hasConnection || requestBusy}
               onClick={() => void onRegenerate()}
@@ -505,13 +518,15 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
               data-action="continue"
               aria-label="Continue from here"
               title={
-                streamTargetBusy
-                  ? "Can't continue while streaming."
-                  : generationBusy
-                    ? 'A request is already running for this chat.'
-                    : hasConnection
-                      ? 'Continue this assistant message'
-                      : 'Add a connection to continue.'
+                !bodyReady
+                  ? 'Refreshing message details…'
+                  : streamTargetBusy
+                    ? "Can't continue while streaming."
+                    : generationBusy
+                      ? 'A request is already running for this chat.'
+                      : hasConnection
+                        ? 'Continue this assistant message'
+                        : 'Add a connection to continue.'
               }
               disabled={!hasConnection || requestBusy}
               onClick={() => void onContinue()}
@@ -717,7 +732,9 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
                   streaming={streamTargetBusy}
                   hasContent={totalChars > 0}
                   deferContentUntilOpen
-                  toggleHiddenDisabled={streamTargetBusy || Boolean(liveReasoningRows)}
+                  toggleHiddenDisabled={
+                    !bodyReady || streamTargetBusy || Boolean(liveReasoningRows)
+                  }
                   {...(onToggleReasoningDetailHidden
                     ? {
                         onToggleHidden: toggleReasoningDetailHidden,
@@ -727,7 +744,7 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
               ) : null}
               <StaticToolEvidenceBlock
                 message={message}
-                toggleHiddenDisabled={streamTargetBusy}
+                toggleHiddenDisabled={!bodyReady || streamTargetBusy}
                 {...(onToggleProviderOutputItemHidden
                   ? {
                       onToggleHidden: toggleProviderOutputItemHidden,
@@ -735,7 +752,7 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
                   : {})}
               />
               <MessageContent
-                key={`${message.id}:${message.nodeVersion}`}
+                key={`${message.id}:${bodyVersion}`}
                 content={renderedContent}
                 text={streamTargetBusy ? '' : renderedText}
                 textSegments={streamTargetBusy ? textSegments : undefined}

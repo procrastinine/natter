@@ -1,5 +1,5 @@
 import Dexie, { type Collection, type Table, type Transaction } from 'dexie'
-import { type ActivePathMeasurement, activePath, findLastUpdatedLeafId } from '../core/active-path'
+import { activePath, compareLiveLeafRecency, findLastUpdatedLeafId } from '../core/active-path'
 import { buildBranchCacheRow } from '../core/branch-flatten'
 import type {
   Attachment,
@@ -59,16 +59,15 @@ import {
   hydrateMessages,
   type MessageBodyRow,
   type MessageHeaderRow,
-  previewTextFromContent,
+  messageHeaderTreeKey,
   previewTextFromMessages,
   previewTextFromStoredProjection,
   splitMessageForStorage,
   syncMessageHeaderProjections,
 } from './message-storage'
 import type {
-  ActiveBranchBodyWindow,
+  ActiveBranchBodyPage,
   ActiveBranchSnapshot,
-  ActiveBranchWindowSnapshot,
   AppendMessageToExpectedLeafInput,
   AppendMessageToExpectedLeafResult,
   AttachmentBundle,
@@ -90,8 +89,11 @@ import type {
   DeleteTagResult,
   ForkChatFromMessageInput,
   ForkChatFromMessageResult,
+  KnownBranchPageResult,
   MessageBodyPatch,
   MessageHeaderPatch,
+  MessagePresentationSnapshot,
+  MessageStructurePatch,
   MutationContext,
   PatchMessageBodyOptions,
   PutMessageOptions,
@@ -127,7 +129,7 @@ export { ChatMissingError } from './repository'
 interface ChatMutationState {
   beforeChat: Chat
   beforeHeaders?: MessageHeaderRow[]
-  afterHeaders?: MessageHeaderRow[]
+  afterHeadersById?: Map<MessageId, MessageHeaderRow>
   headersBeforeWrites: Map<MessageId, MessageHeaderRow | undefined>
   incrementalAppends: Message[]
   wordCountDeltas: Map<MessageId, number>
@@ -188,16 +190,26 @@ function streamOwnedMessageFieldsChanged(
   nextBody: MessageBodyRow,
 ): boolean {
   const comparableHeader = (header: MessageHeaderRow) => {
-    const { nodeVersion, hiddenFromContext, attachmentRefs, cachedMediaTokens, ...value } = header
+    const {
+      nodeVersion,
+      bodyVersion,
+      bodyWordCount,
+      hiddenFromContext,
+      attachmentRefs,
+      cachedMediaTokens,
+      ...value
+    } = header
     void nodeVersion
+    void bodyVersion
+    void bodyWordCount
     void hiddenFromContext
     void attachmentRefs
     void cachedMediaTokens
     return value
   }
   const comparableBody = (body: MessageBodyRow) => {
-    const { nodeVersion, updatedAt, ...value } = body
-    void nodeVersion
+    const { bodyVersion, updatedAt, ...value } = body
+    void bodyVersion
     void updatedAt
     return value
   }
@@ -228,11 +240,13 @@ async function assertStreamLeaseTargetAvailable(
 async function streamLeaseTargetFinalized(
   tx: Transaction,
   lease: StreamLeaseRow,
+  options: { readContinuationBody?: boolean } = {},
 ): Promise<boolean> {
   if (!lease.messageId) return false
   const header = await tx.table<MessageHeaderRow, MessageId>('messages').get(lease.messageId)
   if (lease.attemptKind === 'generation') return header?.generation?.finishedAt !== undefined
   if (lease.attemptKind !== 'continuation') return false
+  if (options.readContinuationBody === false) return false
   const body = await tx.table<MessageBodyRow, MessageId>('messageBodies').get(lease.messageId)
   return body?.continuationAttempts?.some((attempt) => attempt.streamId === lease.streamId) === true
 }
@@ -259,6 +273,10 @@ function isStreamLeaseRow(value: unknown): value is StreamLeaseRow {
       (typeof row.baseNodeVersion === 'number' &&
         Number.isSafeInteger(row.baseNodeVersion) &&
         row.baseNodeVersion >= 0)) &&
+    (row.baseBodyVersion === undefined ||
+      (typeof row.baseBodyVersion === 'number' &&
+        Number.isSafeInteger(row.baseBodyVersion) &&
+        row.baseBodyVersion >= 0)) &&
     (row.requestedModel === undefined || typeof row.requestedModel === 'string') &&
     (row.apiUsed === undefined ||
       row.apiUsed === 'chat' ||
@@ -373,12 +391,31 @@ function cloneMessageHeader(message: MessageHeaderRow): MessageHeaderRow {
 
 function branchWindowRange(
   total: number,
-  window: ActiveBranchBodyWindow,
+  window: Pick<ActiveBranchBodyPage, 'offset' | 'limit'>,
 ): { start: number; end: number; limit: number } {
   const limit = Math.max(0, Math.floor(window.limit))
   const offset = Math.floor(window.offset)
   const start = offset < 0 ? Math.max(0, total - limit) : Math.max(0, Math.min(total, offset))
   return { start, end: Math.min(total, start + limit), limit }
+}
+
+function throwIfReadonlyAborted(signal: AbortSignal | undefined, message: string): void {
+  if (signal?.aborted) throw new DOMException(message, 'AbortError')
+}
+
+function bindReadonlyTransactionAbort(
+  tx: Transaction,
+  signal: AbortSignal | undefined,
+  message: string,
+): () => void {
+  if (!signal) return () => undefined
+  const abort = () => tx.abort()
+  if (signal.aborted) {
+    abort()
+    throw new DOMException(message, 'AbortError')
+  }
+  signal.addEventListener('abort', abort, { once: true })
+  return () => signal.removeEventListener('abort', abort)
 }
 
 async function listChildHeaderRows(
@@ -445,7 +482,7 @@ function applyMessageBodyPatch(body: MessageBodyRow, patch: MessageBodyPatch): M
 function replacementMessageBody(
   header: MessageHeaderRow,
   patch: MessageBodyPatch,
-  options: { nodeVersion: number; updatedAt: number },
+  options: { bodyVersion: number; updatedAt: number },
 ): MessageBodyRow {
   if (!('content' in patch) || patch.content === undefined) {
     throw new Error(`MessageBodyPatchMissingContent:${header.id}`)
@@ -453,7 +490,7 @@ function replacementMessageBody(
   const body: MessageBodyRow = {
     id: header.id,
     chatId: header.chatId,
-    nodeVersion: options.nodeVersion,
+    bodyVersion: options.bodyVersion,
     updatedAt: options.updatedAt,
     content: structuredClone(patch.content),
   }
@@ -486,6 +523,8 @@ const FORBIDDEN_MESSAGE_HEADER_PATCH_KEYS = new Set<keyof MessageHeaderRow>([
   'role',
   'origin',
   'nodeVersion',
+  'bodyVersion',
+  'bodyWordCount',
   'deleted',
   'textPreview',
 ])
@@ -509,6 +548,35 @@ function applyMessageHeaderPatch(
 
 function hydrateStoredMessage(header: MessageHeaderRow, body: MessageBodyRow): Message {
   return hydrateMessage(cloneMessageHeader(header), body)
+}
+
+function hydrateStoredMessagePresentationSnapshot(
+  header: MessageHeaderRow,
+  body: MessageBodyRow,
+): MessagePresentationSnapshot {
+  return { message: hydrateStoredMessage(header, body), bodyVersion: body.bodyVersion }
+}
+
+async function readStoredMessage<T>(
+  messageId: MessageId,
+  signal: AbortSignal | undefined,
+  project: (header: MessageHeaderRow, body: MessageBodyRow) => T,
+): Promise<T | undefined> {
+  throwIfReadonlyAborted(signal, 'Message read aborted')
+  const db = await openDb()
+  return db.transaction('r', db.messages, db.messageBodies, async (tx: Transaction) => {
+    const unbind = bindReadonlyTransactionAbort(tx, signal, 'Message read aborted')
+    try {
+      const [header, body] = await Promise.all([
+        db.messages.get(messageId),
+        db.messageBodies.get(messageId),
+      ])
+      throwIfReadonlyAborted(signal, 'Message read aborted')
+      return header && body ? project(header, body) : undefined
+    } finally {
+      unbind()
+    }
+  })
 }
 
 async function hydrateStoredMessages(
@@ -538,8 +606,7 @@ async function chatPreviewInTransaction(tx: Transaction, chatId: ChatId): Promis
     .filter((row) => !row.deleted && row.role === 'user')
     .first()
   if (!header) return ''
-  const body = await tx.table<MessageBodyRow, MessageId>('messageBodies').get(header.id)
-  return previewTextFromContent(body?.content ?? [])
+  return previewTextFromStoredProjection(header.textPreview)
 }
 
 function branchHeadersByLeaf(
@@ -558,21 +625,6 @@ function branchHeadersByLeaf(
   }
   branch.reverse()
   return branch
-}
-
-function messageHeaderTreeKey(headers: readonly MessageHeaderRow[]): string {
-  return headers
-    .map((message) =>
-      [
-        message.id,
-        message.nodeVersion,
-        message.parentId ?? '',
-        message.siblingIndex,
-        message.createdAt,
-        message.deleted ? 1 : 0,
-      ].join(':'),
-    )
-    .join('|')
 }
 
 function siblingGroupsForBranch(
@@ -613,20 +665,11 @@ async function hydrateStoredAttachment(
   return hydrateAttachment(header, await artifacts.bulkGet(header.artifactIds))
 }
 
-function replaceMessageHeader(messages: MessageHeaderRow[], nextMessage: MessageHeaderRow): void {
-  const next = cloneMessageHeader(nextMessage)
-  const index = messages.findIndex((message) => message.id === next.id)
-  if (index === -1) {
-    messages.push(next)
-    return
-  }
-  messages[index] = next
-}
-
-function removeMessageHeader(messages: MessageHeaderRow[], messageId: MessageId): void {
-  const index = messages.findIndex((message) => message.id === messageId)
-  if (index === -1) return
-  messages.splice(index, 1)
+function setMessageHeader(
+  messagesById: Map<MessageId, MessageHeaderRow>,
+  nextMessage: MessageHeaderRow,
+): void {
+  messagesById.set(nextMessage.id, cloneMessageHeader(nextMessage))
 }
 
 function messageCost(message: Message): number {
@@ -1111,28 +1154,24 @@ function findLastUpdatedLeafIdFromHeaders(headers: readonly MessageHeaderRow[]):
   let best: MessageHeaderRow | undefined
   for (const header of headers) {
     if (header.deleted || parentsWithLiveChildren.has(header.id)) continue
-    if (
-      !best ||
-      header.createdAt > best.createdAt ||
-      (header.createdAt === best.createdAt && header.id > best.id)
-    ) {
+    if (!best || compareLiveLeafRecency(header, best) > 0) {
       best = header
     }
   }
   return best?.id ?? null
 }
 
-function headerIsOnPathToLeaf(
-  messageId: MessageId,
+function headerPathIdsToLeaf(
   leafId: MessageId,
   byId: ReadonlyMap<MessageId, MessageHeaderRow>,
-): boolean {
+): Set<MessageId> {
+  const path = new Set<MessageId>()
   let currentId: MessageId | null = leafId
   while (currentId !== null) {
-    if (currentId === messageId) return true
+    path.add(currentId)
     currentId = byId.get(currentId)?.parentId ?? null
   }
-  return false
+  return path
 }
 
 function shouldBumpLastBranchUpdatedAt(
@@ -1147,11 +1186,10 @@ function shouldBumpLastBranchUpdatedAt(
   if (changedMessageIds.size === 0) return false
   const beforeById = new Map(beforeHeaders.map((header) => [header.id, header]))
   const afterById = new Map(afterHeaders.map((header) => [header.id, header]))
+  const beforePathIds = headerPathIdsToLeaf(nextLeafId, beforeById)
+  const afterPathIds = headerPathIdsToLeaf(nextLeafId, afterById)
   for (const messageId of changedMessageIds) {
-    if (
-      headerIsOnPathToLeaf(messageId, nextLeafId, beforeById) ||
-      headerIsOnPathToLeaf(messageId, nextLeafId, afterById)
-    ) {
+    if (beforePathIds.has(messageId) || afterPathIds.has(messageId)) {
       return true
     }
   }
@@ -1177,87 +1215,21 @@ async function invalidateBranchCacheForSummary(tx: Transaction, chatId: ChatId):
   await tx.table<ChatBranchCache, ChatId>('chatBranchCache').delete(chatId)
 }
 
-function countStoredBodyWords(body: MessageBodyRow): number {
-  return countMessagesWords([body as unknown as Message])
-}
-
-function branchPathIsComplete(
-  branch: readonly MessageHeaderRow[],
-  leafId: MessageId | null,
-): boolean {
-  if (leafId === null) return branch.length === 0
-  return branch.at(-1)?.id === leafId
-}
-
-async function hydrateBranchWordCount(
-  headers: readonly MessageHeaderRow[],
-  bodyTable: Table<MessageBodyRow, MessageId>,
-): Promise<number> {
-  return countMessagesWords(await hydrateStoredMessages(headers, bodyTable))
-}
-
-async function structuralBranchWordCount(input: {
-  tx: Transaction
-  state: ChatMutationState
-  beforeHeaders: readonly MessageHeaderRow[]
+function structuralBranchWordCount(input: {
   afterHeaders: readonly MessageHeaderRow[]
   nextLeafId: MessageId | null
-}): Promise<number> {
-  const { state } = input
-  const bodyTable = input.tx.table<MessageBodyRow, MessageId>('messageBodies')
-  const oldBranch = branchHeadersByLeaf(input.beforeHeaders, state.beforeChat.lastUpdatedLeafId)
+}): number {
   const newBranch = branchHeadersByLeaf(input.afterHeaders, input.nextLeafId)
-  const fallback = () => hydrateBranchWordCount(newBranch, bodyTable)
-  if (
-    !branchPathIsComplete(oldBranch, state.beforeChat.lastUpdatedLeafId) ||
-    !branchPathIsComplete(newBranch, input.nextLeafId)
-  ) {
-    return fallback()
-  }
-
-  const oldIds = new Set(oldBranch.map((header) => header.id))
-  const newIds = new Set(newBranch.map((header) => header.id))
-  const beforeIds = new Set(input.beforeHeaders.map((header) => header.id))
-  let wordCount = state.beforeChat.wordCount
-
-  for (const messageId of state.changedMessageIds) {
-    if (!oldIds.has(messageId) || !newIds.has(messageId)) continue
-    const delta = state.wordCountDeltas.get(messageId)
-    if (delta === undefined) return fallback()
-    wordCount += delta
-  }
-
-  for (const header of oldBranch) {
-    if (newIds.has(header.id)) continue
-    const body = await bodyTable.get(header.id)
-    if (!body) return fallback()
-    const currentCount = countStoredBodyWords(body)
-    wordCount -= currentCount - (state.wordCountDeltas.get(header.id) ?? 0)
-  }
-
-  for (const header of newBranch) {
-    if (oldIds.has(header.id)) continue
-    const delta = state.wordCountDeltas.get(header.id)
-    if (!beforeIds.has(header.id) && delta !== undefined) {
-      wordCount += delta
-      continue
-    }
-    const body = await bodyTable.get(header.id)
-    if (!body) return fallback()
-    wordCount += countStoredBodyWords(body)
-  }
-
-  return Math.max(0, wordCount)
+  let wordCount = 0
+  for (const header of newBranch) wordCount += header.bodyWordCount
+  return wordCount
 }
 
 function messageOutranksLeaf(
   message: Pick<Message, 'createdAt' | 'id'>,
   leaf: Pick<MessageHeaderRow, 'createdAt' | 'id'>,
 ): boolean {
-  return (
-    message.createdAt > leaf.createdAt ||
-    (message.createdAt === leaf.createdAt && message.id > leaf.id)
-  )
+  return compareLiveLeafRecency(message, leaf) > 0
 }
 
 async function branchHeadersByLeafInTransaction(
@@ -2576,16 +2548,18 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     return result.deleted
   }
 
-  async getMessage(messageId: MessageId): Promise<Message | undefined> {
-    return openDb().then(async (db) => {
-      return db.transaction('r', db.messages, db.messageBodies, async () => {
-        const [header, body] = await Promise.all([
-          db.messages.get(messageId),
-          db.messageBodies.get(messageId),
-        ])
-        return header && body ? hydrateStoredMessage(header, body) : undefined
-      })
-    })
+  async getMessage(
+    messageId: MessageId,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<Message | undefined> {
+    return readStoredMessage(messageId, options.signal, hydrateStoredMessage)
+  }
+
+  async getMessagePresentationSnapshot(
+    messageId: MessageId,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<MessagePresentationSnapshot | undefined> {
+    return readStoredMessage(messageId, options.signal, hydrateStoredMessagePresentationSnapshot)
   }
 
   async getMessageTextPreview(
@@ -2665,9 +2639,22 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     })
   }
 
-  async listMessageHeaders(chatId: ChatId): Promise<MessageHeaderRow[]> {
+  async listMessageHeaders(
+    chatId: ChatId,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<MessageHeaderRow[]> {
+    throwIfReadonlyAborted(options.signal, 'Header read aborted')
     const db = await openDb()
-    return (await db.messages.where('chatId').equals(chatId).toArray()).map(cloneMessageHeader)
+    return db.transaction('r', db.messages, async (tx: Transaction) => {
+      const unbind = bindReadonlyTransactionAbort(tx, options.signal, 'Header read aborted')
+      try {
+        const headers = await db.messages.where('chatId').equals(chatId).toArray()
+        throwIfReadonlyAborted(options.signal, 'Header read aborted')
+        return headers.map(cloneMessageHeader)
+      } finally {
+        unbind()
+      }
+    })
   }
 
   async listChildHeaders(chatId: ChatId, parentId: MessageId | null): Promise<MessageHeaderRow[]> {
@@ -2699,52 +2686,100 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     })
   }
 
-  async getActiveBranchWindowSnapshot(
+  async getKnownBranchPageSnapshot(
     chatId: ChatId,
-    cursor: Record<string, MessageId>,
-    window: ActiveBranchBodyWindow,
-  ): Promise<ActiveBranchWindowSnapshot> {
+    pathMessageIds: readonly MessageId[],
+    page: ActiveBranchBodyPage,
+  ): Promise<KnownBranchPageResult> {
+    const branchLength = pathMessageIds.length
+    const range = branchWindowRange(branchLength, page)
+    const pageMessageIds = pathMessageIds.slice(range.start, range.end)
+    const boundaryParentId = range.start === 0 ? null : pathMessageIds[range.start - 1]
+    throwIfReadonlyAborted(page.signal, 'Branch page read aborted')
     const db = await openDb()
-    return db.transaction('r', db.messages, db.messageBodies, async () => {
-      const headers = await db.messages.where('chatId').equals(chatId).toArray()
-      let activePathMeasurement: ActivePathMeasurement | undefined
-      const branchHeaders = activePath(
-        headers as unknown as Message[],
-        cursor,
-        window.onMeasure
-          ? (measurement) => {
-              activePathMeasurement = measurement
+    return db.transaction('r', db.messages, db.messageBodies, async (tx: Transaction) => {
+      const unbind = bindReadonlyTransactionAbort(tx, page.signal, 'Branch page read aborted')
+      try {
+        if (branchLength === 0) {
+          return { kind: 'stale-path', chatId, reason: 'empty-path' }
+        }
+
+        const seen = new Set<MessageId>()
+        for (const messageId of pageMessageIds) {
+          if (seen.has(messageId)) {
+            return { kind: 'stale-path', chatId, reason: 'duplicate-id', messageId }
+          }
+          seen.add(messageId)
+        }
+
+        const storedHeaders = await db.messages.bulkGet(pageMessageIds)
+        throwIfReadonlyAborted(page.signal, 'Branch page read aborted')
+        const pageHeaders: MessageHeaderRow[] = []
+        for (let index = 0; index < pageMessageIds.length; index += 1) {
+          const messageId = pageMessageIds[index] as MessageId
+          const header = storedHeaders[index]
+          if (!header || header.id !== messageId) {
+            return { kind: 'stale-path', chatId, reason: 'missing-header', messageId }
+          }
+          if (header.chatId !== chatId) {
+            return { kind: 'stale-path', chatId, reason: 'wrong-chat', messageId }
+          }
+          if (header.deleted) {
+            return { kind: 'stale-path', chatId, reason: 'deleted-header', messageId }
+          }
+          const expectedParentId = index === 0 ? boundaryParentId : pageMessageIds[index - 1]
+          if (header.parentId !== expectedParentId) {
+            return {
+              kind: 'stale-path',
+              chatId,
+              reason: range.start === 0 && index === 0 ? 'non-root' : 'non-contiguous',
+              messageId,
             }
-          : undefined,
-      ).map((message) => message as unknown as MessageHeaderRow)
-      const range = branchWindowRange(branchHeaders.length, window)
-      const windowHeaders = branchHeaders.slice(range.start, range.end)
-      const bodies = (
-        await db.messageBodies.bulkGet(windowHeaders.map((header) => header.id))
-      ).filter((row): row is MessageBodyRow => row !== undefined)
-      const siblingGroups = siblingGroupsForBranch(headers, branchHeaders)
-      if (window.onMeasure && activePathMeasurement) {
-        window.onMeasure({
-          headerRowsRead: headers.length,
+          }
+          pageHeaders.push(cloneMessageHeader(header))
+        }
+
+        const bodies = await db.messageBodies.bulkGet(pageMessageIds)
+        throwIfReadonlyAborted(page.signal, 'Branch page read aborted')
+        const pageMessages: Message[] = []
+        for (let index = 0; index < pageHeaders.length; index += 1) {
+          const header = pageHeaders[index] as MessageHeaderRow
+          const body = bodies[index]
+          if (!body) {
+            return { kind: 'stale-path', chatId, reason: 'missing-body', messageId: header.id }
+          }
+          if (
+            body.id !== header.id ||
+            body.chatId !== chatId ||
+            body.bodyVersion !== header.bodyVersion
+          ) {
+            return {
+              kind: 'stale-path',
+              chatId,
+              reason: 'body-version-mismatch',
+              messageId: header.id,
+            }
+          }
+          pageMessages.push(hydrateMessage(header, body))
+        }
+
+        page.onMeasure?.({
+          pageHeaderRowsRead: storedHeaders.length,
           bodyRowsRead: bodies.length,
-          siblingRowsRetained: siblingGroups.reduce(
-            (total, group) => total + group.siblings.length,
-            0,
-          ),
-          treeKeyRows: headers.length,
-          activePath: activePathMeasurement,
         })
-      }
-      return {
-        chatId,
-        allHeaders: headers.map(cloneMessageHeader),
-        branchHeaders: branchHeaders.map(cloneMessageHeader),
-        branchWindow: hydrateMessages(windowHeaders.map(cloneMessageHeader), bodies),
-        windowOffset: range.start,
-        windowLimit: range.limit,
-        branchLength: branchHeaders.length,
-        siblingGroups,
-        treeKey: messageHeaderTreeKey(headers),
+        return {
+          kind: 'ready',
+          snapshot: {
+            chatId,
+            pageHeaders,
+            pageMessages,
+            pageOffset: range.start,
+            pageLimit: range.limit,
+            branchLength,
+          },
+        }
+      } finally {
+        unbind()
       }
     })
   }
@@ -2754,17 +2789,16 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     leafId: MessageId | null,
   ): Promise<BranchHeaderSnapshot> {
     const db = await openDb()
-    return db.transaction('r', db.chats, db.messages, async () => {
-      const [chat, headers] = await Promise.all([
+    return db.transaction('r', db.chats, db.messages, async (tx: Transaction) => {
+      const [chat, branchHeaders] = await Promise.all([
         db.chats.get(chatId),
-        db.messages.where('chatId').equals(chatId).toArray(),
+        branchHeadersByLeafInTransaction(tx, chatId, leafId),
       ])
       if (!chat) throw new ChatMissingError(chatId)
       return {
         chat,
         chatId,
-        allHeaders: headers.map(cloneMessageHeader),
-        branchHeaders: branchHeadersByLeaf(headers, leafId).map(cloneMessageHeader),
+        branchHeaders,
       }
     })
   }
@@ -2961,7 +2995,10 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
           let wroteWorkspaceState = false
           const targetLeasesByMessage = new Map<MessageId, StreamLeaseRow[]>()
 
-          const assertStreamTargetWriteAllowed = async (messageId: MessageId): Promise<void> => {
+          const assertStreamTargetWriteAllowed = async (
+            messageId: MessageId,
+            options: { readContinuationBody?: boolean } = {},
+          ): Promise<void> => {
             let targetLeases = targetLeasesByMessage.get(messageId)
             if (!targetLeases) {
               const candidates = await tx
@@ -2971,7 +3008,9 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
                 .toArray()
               targetLeases = []
               for (const lease of candidates) {
-                if (!(await streamLeaseTargetFinalized(tx, lease))) targetLeases.push(lease)
+                if (!(await streamLeaseTargetFinalized(tx, lease, options))) {
+                  targetLeases.push(lease)
+                }
               }
               targetLeasesByMessage.set(messageId, targetLeases)
             }
@@ -3041,18 +3080,8 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
             return state
           }
 
-          const ensureMessageHeaderSnapshots = async (
-            state: ChatMutationState,
-          ): Promise<{
-            beforeHeaders: MessageHeaderRow[]
-            afterHeaders: MessageHeaderRow[]
-          }> => {
-            if (state.beforeHeaders && state.afterHeaders) {
-              return {
-                beforeHeaders: state.beforeHeaders,
-                afterHeaders: state.afterHeaders,
-              }
-            }
+          const ensureMessageHeaderSnapshots = async (state: ChatMutationState): Promise<void> => {
+            if (state.beforeHeaders && state.afterHeadersById) return
             const currentHeaders = (
               await tx
                 .table<MessageHeaderRow, MessageId>('messages')
@@ -3060,17 +3089,15 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
                 .equals(state.beforeChat.id)
                 .toArray()
             ).map(cloneMessageHeader)
-            const beforeHeaders = currentHeaders.map(cloneMessageHeader)
+            const beforeHeadersById = new Map(
+              currentHeaders.map((header) => [header.id, cloneMessageHeader(header)]),
+            )
             for (const [messageId, before] of state.headersBeforeWrites) {
-              if (before) replaceMessageHeader(beforeHeaders, before)
-              else removeMessageHeader(beforeHeaders, messageId)
+              if (before) beforeHeadersById.set(messageId, cloneMessageHeader(before))
+              else beforeHeadersById.delete(messageId)
             }
-            state.beforeHeaders = beforeHeaders
-            state.afterHeaders = currentHeaders
-            return {
-              beforeHeaders: state.beforeHeaders,
-              afterHeaders: state.afterHeaders,
-            }
+            state.beforeHeaders = [...beforeHeadersById.values()]
+            state.afterHeadersById = new Map(currentHeaders.map((header) => [header.id, header]))
           }
 
           const recordHeaderBeforeWrite = (
@@ -3219,18 +3246,6 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
               ).map(cloneMessageHeader)
             },
 
-            listChildren: async (chatId, parentId) => {
-              const headers = await listChildHeaderRows(
-                tx.table<MessageHeaderRow, MessageId>('messages'),
-                chatId,
-                parentId,
-              )
-              return hydrateStoredMessages(
-                headers,
-                tx.table<MessageBodyRow, MessageId>('messageBodies'),
-              )
-            },
-
             putMessage: async (message, options: PutMessageOptions = {}) => {
               const { touchChatSummary = true, broadcast = touchChatSummary } = options
               const headerTable = tx.table<MessageHeaderRow, MessageId>('messages')
@@ -3262,6 +3277,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
                 if (!existingBody) throw new Error(`MessageBodyMissing:${clone.id}`)
                 const comparable = { ...clone, nodeVersion: existing.nodeVersion }
                 const comparableSplit = splitMessageForStorage(comparable, {
+                  bodyVersion: existing.bodyVersion,
                   updatedAt: existingBody.updatedAt,
                 })
                 const changed =
@@ -3301,7 +3317,10 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
                 }
                 recordHeaderBeforeWrite(state, clone.id, existing)
                 clone.nodeVersion = existing.nodeVersion + 1
-                const { header, body } = splitMessageForStorage(clone, { updatedAt: now })
+                const { header, body } = splitMessageForStorage(clone, {
+                  bodyVersion: existing.bodyVersion + 1,
+                  updatedAt: now,
+                })
                 await syncAttachmentReferenceOwner({
                   ownerKind: 'message',
                   ownerId: clone.id,
@@ -3312,8 +3331,8 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
                 await headerTable.put(header)
                 await bodyTable.put(body)
                 wroteWorkspaceState = true
-                if (state?.afterHeaders) {
-                  replaceMessageHeader(state.afterHeaders, header)
+                if (state?.afterHeadersById) {
+                  setMessageHeader(state.afterHeadersById, header)
                 }
                 if (moved || deletionChanged) {
                   await bumpChildList(chatId, existing.parentId)
@@ -3330,7 +3349,9 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
                   summaryState.incrementalAppends.at(-1)?.id ??
                   summaryState.beforeChat.lastUpdatedLeafId
                 let incrementalAppend =
-                  !summaryState.afterHeaders && !clone.deleted && clone.parentId === expectedLeafId
+                  !summaryState.afterHeadersById &&
+                  !clone.deleted &&
+                  clone.parentId === expectedLeafId
                 if (incrementalAppend && expectedLeafId !== null) {
                   const expectedLeaf = await headerTable.get(expectedLeafId)
                   incrementalAppend =
@@ -3356,8 +3377,8 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
                 wroteWorkspaceState = true
                 if (clone.role === 'user') summaryState.previewDirty = true
                 recordNewMessageSummary(summaryState, clone)
-                if (summaryState.afterHeaders) {
-                  replaceMessageHeader(summaryState.afterHeaders, header)
+                if (summaryState.afterHeadersById) {
+                  setMessageHeader(summaryState.afterHeadersById, header)
                 } else if (incrementalAppend) {
                   summaryState.incrementalAppends.push(clone)
                 }
@@ -3374,6 +3395,71 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
                 upsertAffected(state, { kind: 'message', chatId, messageId: clone.id })
               }
               affectedMessageIds.add(clone.id)
+            },
+
+            patchMessageStructure: async (
+              messageId,
+              patch: MessageStructurePatch,
+            ): Promise<void> => {
+              assertScope({ kind: 'message', messageId })
+              const keys = Object.keys(patch)
+              if (
+                keys.some(
+                  (key) => key !== 'deleted' && key !== 'parentId' && key !== 'siblingIndex',
+                )
+              ) {
+                throw new Error(`MessageStructurePatchForbidden:${messageId}`)
+              }
+              const headerTable = tx.table<MessageHeaderRow, MessageId>('messages')
+              const existing = await headerTable.get(messageId)
+              if (!existing) return
+              const next = cloneMessageHeader(existing)
+              if (patch.parentId !== undefined) next.parentId = patch.parentId
+              if (patch.siblingIndex !== undefined) next.siblingIndex = patch.siblingIndex
+              if (patch.deleted !== undefined) next.deleted = patch.deleted
+              const changed =
+                next.parentId !== existing.parentId ||
+                next.siblingIndex !== existing.siblingIndex ||
+                next.deleted !== existing.deleted
+              if (!changed) return
+
+              const state = await ensureChatState(existing.chatId)
+              await ensureMessageHeaderSnapshots(state)
+              assertScope({
+                kind: 'children',
+                chatId: existing.chatId,
+                parentId: existing.parentId,
+              })
+              if (next.parentId !== existing.parentId) {
+                assertScope({
+                  kind: 'children',
+                  chatId: existing.chatId,
+                  parentId: next.parentId,
+                })
+              }
+              await assertStreamTargetWriteAllowed(messageId, { readContinuationBody: false })
+              recordHeaderBeforeWrite(state, messageId, existing)
+              next.nodeVersion = existing.nodeVersion + 1
+              await headerTable.put(next)
+              wroteWorkspaceState = true
+              setMessageHeader(state.afterHeadersById as Map<MessageId, MessageHeaderRow>, next)
+              await bumpChildList(existing.chatId, existing.parentId)
+              if (next.parentId !== existing.parentId) {
+                await bumpChildList(existing.chatId, next.parentId)
+              }
+              if (existing.role === 'user' && next.deleted !== existing.deleted) {
+                state.previewDirty = true
+              }
+              state.summaryVersionDirty = true
+              state.messageSummaryDirty = true
+              state.broadcast = true
+              state.changedMessageIds.add(messageId)
+              affectedMessageIds.add(messageId)
+              upsertAffected(state, {
+                kind: 'message',
+                chatId: existing.chatId,
+                messageId,
+              })
             },
 
             patchMessageBody: async (messageId, patch, options: PatchMessageBodyOptions = {}) => {
@@ -3409,7 +3495,8 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
               if (!replaceBody) {
                 const patchedBody = applyMessageBodyPatch(existingBody as MessageBodyRow, patch)
                 nextHeader.nodeVersion = existing.nodeVersion
-                patchedBody.nodeVersion = (existingBody as MessageBodyRow).nodeVersion
+                nextHeader.bodyVersion = existing.bodyVersion
+                patchedBody.bodyVersion = (existingBody as MessageBodyRow).bodyVersion
                 patchedBody.updatedAt = (existingBody as MessageBodyRow).updatedAt
                 syncMessageHeaderProjections(nextHeader, patchedBody, {
                   replaceGenerationServerToolOutputs: generationReplaced,
@@ -3419,9 +3506,10 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
                   stableStringify(existingBody) !== stableStringify(patchedBody)
                 if (!changed) return
                 nextHeader.nodeVersion = existing.nodeVersion + 1
+                nextHeader.bodyVersion = existing.bodyVersion + 1
                 nextBody = {
                   ...patchedBody,
-                  nodeVersion: nextHeader.nodeVersion,
+                  bodyVersion: nextHeader.bodyVersion,
                   updatedAt: now,
                 }
                 if (touchChatSummary) {
@@ -3435,8 +3523,9 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
               } else {
                 await assertStreamTargetWriteAllowed(messageId)
                 nextHeader.nodeVersion = existing.nodeVersion + 1
+                nextHeader.bodyVersion = existing.bodyVersion + 1
                 nextBody = replacementMessageBody(nextHeader, patch, {
-                  nodeVersion: nextHeader.nodeVersion,
+                  bodyVersion: nextHeader.bodyVersion,
                   updatedAt: now,
                 })
                 if (preserveColdServerToolOutputs && existingBody?.generationServerToolOutputs) {
@@ -3489,8 +3578,8 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
                 const previewState = state ?? (await ensureChatState(existing.chatId))
                 previewState.previewDirty = true
               }
-              if (state?.afterHeaders) {
-                replaceMessageHeader(state.afterHeaders, nextHeader)
+              if (state?.afterHeadersById) {
+                setMessageHeader(state.afterHeadersById, nextHeader)
               }
               if (touchChatSummary && state) {
                 state.summaryVersionDirty = true
@@ -3533,7 +3622,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
               await tx.table<MessageBodyRow, MessageId>('messageBodies').delete(messageId)
               wroteWorkspaceState = true
               if (existing.role === 'user') state.previewDirty = true
-              removeMessageHeader(state.afterHeaders ?? [], messageId)
+              state.afterHeadersById?.delete(messageId)
               await bumpChildList(existing.chatId, existing.parentId)
               state.summaryVersionDirty = true
               state.messageSummaryDirty = true
@@ -3773,14 +3862,11 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
             }
 
             if (state.messageSummaryDirty) {
-              if (state.afterHeaders) {
-                const afterHeaders = state.afterHeaders
+              if (state.afterHeadersById) {
+                const afterHeaders = [...state.afterHeadersById.values()]
                 const nextLeafId = findLastUpdatedLeafIdFromHeaders(afterHeaders)
                 next.lastUpdatedLeafId = nextLeafId
-                next.wordCount = await structuralBranchWordCount({
-                  tx,
-                  state,
-                  beforeHeaders: state.beforeHeaders ?? [],
+                next.wordCount = structuralBranchWordCount({
                   afterHeaders,
                   nextLeafId,
                 })

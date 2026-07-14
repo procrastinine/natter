@@ -3,11 +3,13 @@
 // - "before" / "after" / "after-all" / "sibling": explicit tree insertion
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import { cursorKeyOf } from '../../core/active-path'
+import { createCursorOverlay } from '../../core/cursor-overlay'
 import { type PasteImportSlot, pasteImport } from '../../core/messages'
-import type { ChatId, ContentItem, CursorMap, MessageRole } from '../../core/types'
+import type { ChatId, ContentItem, CursorMap, MessageId, MessageRole } from '../../core/types'
 import { newId } from '../../lib/ulid'
 import { useAnnouncementStore } from '../../store/zustand/announcementStore'
-import { useChatStore } from '../../store/zustand/chatStore'
+import { type NavigationIntent, useChatStore } from '../../store/zustand/chatStore'
 import { CloseIcon, TrashIcon } from '../icons/Icon'
 import { Button, IconButton } from '../primitives/Button'
 import { Dialog } from '../primitives/Dialog'
@@ -19,7 +21,7 @@ interface ImportModalProps {
   // actually clicks Import.
   chatId: ChatId | null
   slot: PasteImportSlot
-  cursor: CursorMap
+  cursor: Readonly<CursorMap>
   // Initial role for the first row; defaults to "user" because the common
   // path is "paste a user turn from another app."
   defaultRole?: MessageRole
@@ -27,7 +29,10 @@ interface ImportModalProps {
   // null, invoked ONCE on commit to materialize the chat row, right
   // before the import mutation runs. Cancel / close never calls it;
   // route-level temporary-chat cleanup owns empty-row disposal.
-  materializeChat?: () => Promise<ChatId>
+  materializeChat?: () => Promise<{
+    chatId: ChatId
+    navigationIntent: NavigationIntent | null
+  }>
   onClose: () => void
   onDone?: () => void
 }
@@ -109,6 +114,7 @@ export function ImportModal({
       setError('Add at least one message to import.')
       return
     }
+    let navigationIntent = chatId ? useChatStore.getState().beginNavigationIntent(chatId) : null
     setBusy(true)
     setError(null)
     try {
@@ -117,22 +123,39 @@ export function ImportModal({
         if (!materializeChat) {
           throw new Error('import: no chat to write into and no materializeChat callback')
         }
-        effectiveChatId = await materializeChat()
+        const materialized = await materializeChat()
+        effectiveChatId = materialized.chatId
+        navigationIntent = materialized.navigationIntent
       }
+      const operationCursor = createCursorOverlay(
+        useChatStore.getState().getCursor(effectiveChatId) ?? cursor,
+      )
       const result = await pasteImport({
         chatId: effectiveChatId,
         slot,
-        cursor,
+        cursor: operationCursor,
         messages: cleaned.map((r) => ({
           role: r.role,
           content: [{ type: 'text', text: r.text } satisfies ContentItem],
         })),
       })
-      const currentCursor = useChatStore.getState().getCursor(effectiveChatId) ?? {}
-      useChatStore.getState().setCursor(effectiveChatId, {
-        ...currentCursor,
-        ...result.effects.cursorUpdates,
-      })
+      if (navigationIntent !== null) {
+        const selections: CursorMap = {}
+        for (let index = 0; index < result.selectedPathMessageIds.length; index += 1) {
+          const messageId = result.selectedPathMessageIds[index] as MessageId
+          const parentId =
+            index === 0 ? null : (result.selectedPathMessageIds[index - 1] as MessageId)
+          selections[cursorKeyOf(parentId)] = messageId
+        }
+        useChatStore
+          .getState()
+          .selectPathForIntent(
+            effectiveChatId,
+            navigationIntent,
+            selections,
+            result.selectedPathMessageIds,
+          )
+      }
       useAnnouncementStore.getState().announce({
         text: `Imported ${cleaned.length} ${cleaned.length === 1 ? 'message' : 'messages'} (${slotLabel(slot)}).`,
       })

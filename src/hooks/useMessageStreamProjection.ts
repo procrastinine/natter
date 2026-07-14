@@ -1,14 +1,12 @@
 import { useLayoutEffect, useRef, useState } from 'react'
 import type { ChatId, Message, MessageId } from '../core/types'
-import { useStreamStore } from '../store/zustand/streamStore'
+import { type LiveStreamSnapshot, useStreamTarget } from '../store/zustand/streamStore'
 
-type LiveSnapshot = NonNullable<
-  ReturnType<typeof useStreamStore.getState>['liveByMessageId'][string]
->
+type LiveSnapshot = LiveStreamSnapshot
 
 interface RetainedLiveSnapshot {
   snapshot: LiveSnapshot
-  baseNodeVersion: number
+  baseBodyVersion: number
   generationWasStreaming: boolean
 }
 
@@ -114,16 +112,15 @@ export function __resetMessageStreamProjectionForTests(): void {
 }
 
 function useMessageStreamProjection(chatId: ChatId, messageId: MessageId, enabled = true) {
-  const activeStream = useStreamStore((state) =>
-    enabled ? state.getTargetActive(chatId, messageId) : undefined,
-  )
-  const liveSnapshot = useStreamStore((state) =>
-    enabled ? state.liveByMessageId[messageId] : undefined,
-  )
+  const { activeStream, liveSnapshot } = useStreamTarget(chatId, messageId, enabled)
   return [activeStream, liveSnapshot] as const
 }
 
-export function useRetainedMessageStreamProjection(message: Message, enabled = true) {
+export function useRetainedMessageStreamProjection(
+  message: Message,
+  bodyVersion: number,
+  enabled = true,
+) {
   const key = projectionKey(message.chatId, message.id)
   const [activeStream, currentLiveSnapshot] = useMessageStreamProjection(
     message.chatId,
@@ -149,7 +146,7 @@ export function useRetainedMessageStreamProjection(message: Message, enabled = t
   const retainedCommitted =
     retained !== null &&
     !retainedSuperseded &&
-    message.nodeVersion > retained.baseNodeVersion &&
+    bodyVersion > retained.baseBodyVersion &&
     (activeStream === undefined ||
       message.continuationAttempts?.some(
         (attempt) => attempt.streamId === retained.snapshot.streamId,
@@ -186,12 +183,12 @@ export function useRetainedMessageStreamProjection(message: Message, enabled = t
       )
       const next = {
         snapshot: currentLiveSnapshot,
-        baseNodeVersion:
+        baseBodyVersion:
           current?.snapshot.streamId === currentLiveSnapshot.streamId
-            ? activeStream && message.nodeVersion > current.baseNodeVersion
-              ? message.nodeVersion
-              : current.baseNodeVersion
-            : message.nodeVersion,
+            ? activeStream && bodyVersion > current.baseBodyVersion
+              ? bodyVersion
+              : current.baseBodyVersion
+            : bodyVersion,
         generationWasStreaming:
           current?.snapshot.streamId === currentLiveSnapshot.streamId
             ? current.generationWasStreaming
@@ -225,6 +222,7 @@ export function useRetainedMessageStreamProjection(message: Message, enabled = t
     activeStream,
     currentLiveSnapshot,
     currentLiveSnapshotCommitted,
+    bodyVersion,
     enabled,
     key,
     message,

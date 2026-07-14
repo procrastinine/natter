@@ -16,7 +16,14 @@ import {
   useRef,
   useState,
 } from 'react'
-import { chatHref, makeAnchorClickHandler, navigateHome, navigateToChat } from '../../app/router'
+import {
+  beginRouteIntent,
+  cancelRouteIntent,
+  chatHref,
+  homeHref,
+  makeAnchorClickHandler,
+  navigateForIntent,
+} from '../../app/router'
 import { exportLastUpdatedChatAsTxt, triggerBrowserDownload } from '../../core/chat-export'
 import { DEFAULT_GLOBAL_PREFERENCES, readGlobalPreferences } from '../../core/global-settings'
 import {
@@ -712,8 +719,13 @@ export const ChatList = memo(function ChatList({
   // quiet until the user actually creates a message.
   const handleDelete = useCallback(
     async (chat: ChatSidebarRow) => {
-      await archiveChat(chat.id)
-      if (activeChatId === chat.id) navigateHome()
+      const routeIntent = activeChatId === chat.id ? beginRouteIntent() : null
+      try {
+        await archiveChat(chat.id)
+        if (routeIntent) navigateForIntent(routeIntent, homeHref())
+      } finally {
+        if (routeIntent) cancelRouteIntent(routeIntent)
+      }
     },
     [activeChatId],
   )
@@ -731,6 +743,7 @@ export const ChatList = memo(function ChatList({
       const file = input.files?.[0] ?? null
       input.value = ''
       if (!file) return
+      const routeIntent = beginRouteIntent()
       setImportingChat(true)
       try {
         let importedCount = 0
@@ -745,11 +758,14 @@ export const ChatList = memo(function ChatList({
           text: importedCount === 1 ? 'Imported chat.' : `Imported ${importedCount} chats.`,
           durationMs: 2500,
         })
-        if (imported.lastChatId) navigateToChat(imported.lastChatId)
+        if (imported.lastChatId) {
+          navigateForIntent(routeIntent, chatHref(imported.lastChatId))
+        }
       } catch (error) {
         console.error('Failed to import chat JSON/ZIP', error)
         pushToast({ level: 'danger', text: importExportErrorMessage(error) })
       } finally {
+        cancelRouteIntent(routeIntent)
         setImportingChat(false)
       }
     },
@@ -781,21 +797,23 @@ export const ChatList = memo(function ChatList({
     const folder = folderDeleteTarget
     if (!folder) return
     const chatsInFolder = model.chats.filter((chat) => chat.folderId === folder.id)
-    if (deleteFolderChats) {
-      await Promise.all(
-        chatsInFolder.filter((chat) => !chat.archived).map((chat) => archiveChat(chat.id)),
-      )
+    const routeIntent =
+      deleteFolderChats && activeChatId && chatsInFolder.some((chat) => chat.id === activeChatId)
+        ? beginRouteIntent()
+        : null
+    try {
+      if (deleteFolderChats) {
+        await Promise.all(
+          chatsInFolder.filter((chat) => !chat.archived).map((chat) => archiveChat(chat.id)),
+        )
+      }
+      await deleteFolder(folder.id)
+      if (routeIntent) navigateForIntent(routeIntent, homeHref())
+      setFolderDeleteTarget(null)
+      setDeleteFolderChats(false)
+    } finally {
+      if (routeIntent) cancelRouteIntent(routeIntent)
     }
-    await deleteFolder(folder.id)
-    if (
-      deleteFolderChats &&
-      activeChatId &&
-      chatsInFolder.some((chat) => chat.id === activeChatId)
-    ) {
-      navigateHome()
-    }
-    setFolderDeleteTarget(null)
-    setDeleteFolderChats(false)
   }, [activeChatId, deleteFolderChats, folderDeleteTarget, model.chats])
   const markRecentMove = useCallback((chatId: ChatId, folderId: FolderId) => {
     if (recentMoveTimerRef.current) window.clearTimeout(recentMoveTimerRef.current)

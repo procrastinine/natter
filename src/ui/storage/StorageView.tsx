@@ -12,9 +12,14 @@ import {
 import type { StorageRoute } from '../../app/router'
 import {
   attachmentHref,
+  beginRouteIntent,
+  beginWorkspaceReplacementRouteIntent,
+  cancelRouteIntent,
   chatHref,
+  isRouteIntentCurrent,
   makeAnchorClickHandler,
   navigate,
+  navigateForIntent,
   storageHref,
 } from '../../app/router'
 import {
@@ -157,6 +162,7 @@ import {
   triggerJsonZipDownload,
 } from '../import-export/json-file'
 import { Button, IconButton } from '../primitives/Button'
+import { ConfirmDialog } from '../primitives/ConfirmDialog'
 import { isEmptySidebarDraft, sortChats } from '../sidebar/chat-organization'
 
 interface StorageViewProps {
@@ -339,6 +345,7 @@ function StorageOverview() {
   const [workspaceTransferBusy, setWorkspaceTransferBusy] = useState<
     'export' | 'import' | 'clear' | null
   >(null)
+  const [workspaceExportConfirmOpen, setWorkspaceExportConfirmOpen] = useState(false)
   const workspaceImportInputRef = useRef<HTMLInputElement | null>(null)
   const isIndexedDbMode = workspaceMeta?.backendKind === 'browser-idb'
   const localBytes = attachments.reduce((sum, row) => sum + (row.sizeBytes ?? 0), 0)
@@ -403,6 +410,7 @@ function StorageOverview() {
     try {
       const backup = await exportWorkspaceBackup()
       triggerJsonDownload(natterJsonFilename('workspace-backup'), backup)
+      setWorkspaceExportConfirmOpen(false)
       pushToast({ level: 'success', text: 'Exported workspace backup.', durationMs: 2500 })
     } catch (error) {
       console.error('Failed to export workspace backup', error)
@@ -426,6 +434,7 @@ function StorageOverview() {
     ) {
       return
     }
+    const routeIntent = beginWorkspaceReplacementRouteIntent()
     setWorkspaceTransferBusy('import')
     try {
       const value = await readJsonFile(file)
@@ -435,7 +444,7 @@ function StorageOverview() {
         text: `Imported workspace backup (${result.chatCount} chats).`,
         durationMs: 3000,
       })
-      navigate(storageHref())
+      navigateForIntent(routeIntent, storageHref())
     } catch (error) {
       console.error('Failed to import workspace backup', error)
       pushToast({
@@ -443,6 +452,7 @@ function StorageOverview() {
         text: importExportErrorMessage(error),
       })
     } finally {
+      cancelRouteIntent(routeIntent)
       setWorkspaceTransferBusy(null)
     }
   }
@@ -528,7 +538,7 @@ function StorageOverview() {
                 <Button
                   type="button"
                   data-ui="storage-action"
-                  onClick={() => void handleExportWorkspace()}
+                  onClick={() => setWorkspaceExportConfirmOpen(true)}
                   disabled={workspaceTransferBusy !== null}
                   title="Export the full IndexedDB workspace"
                 >
@@ -589,6 +599,31 @@ function StorageOverview() {
       <div data-ui="storage-panel-row" data-role="calibration">
         <StorageGlobalCalibrationPanel />
       </div>
+      {workspaceExportConfirmOpen ? (
+        <ConfirmDialog
+          title="Export sensitive workspace backup?"
+          confirmLabel="Export sensitive backup"
+          busyLabel="Exporting…"
+          busy={workspaceTransferBusy === 'export'}
+          confirmTone="warning"
+          initialFocus="cancel"
+          onCancel={() => setWorkspaceExportConfirmOpen(false)}
+          onConfirm={handleExportWorkspace}
+          closeLabel="Cancel sensitive workspace export"
+        >
+          <div data-ui="confirm-dialog-copy">
+            <p>
+              This file can include all chats, attachments, connection settings, encrypted API-key
+              records, and this browser&apos;s install secret.
+            </p>
+            <p data-role="status" data-state="blocked">
+              <strong>Keys saved without a passphrase can be recovered from the backup.</strong>{' '}
+              Passphrase-protected keys still require their passphrase.
+            </p>
+            <p>Store the file like a password; do not share or upload it.</p>
+          </div>
+        </ConfirmDialog>
+      ) : null}
     </section>
   )
 }
@@ -1911,9 +1946,14 @@ function AttachmentManager({
     selected?.attachment ?? (selectedId ? rows.find((row) => row.id === selectedId) : rows[0])
   const handleDeleteAttachment = async (attachment: Attachment) => {
     if (!confirmDeleteAttachment(attachment)) return
-    const removed = await deleteAttachmentForStorage(attachment)
-    if (selectedId === attachment.id && removed) {
-      navigate(attachmentListHrefForFilter(filter))
+    const routeIntent = selectedId === attachment.id ? beginRouteIntent() : null
+    try {
+      const removed = await deleteAttachmentForStorage(attachment)
+      if (routeIntent && removed) {
+        navigateForIntent(routeIntent, attachmentListHrefForFilter(filter))
+      }
+    } finally {
+      if (routeIntent) cancelRouteIntent(routeIntent)
     }
   }
 
@@ -1949,16 +1989,19 @@ function AttachmentManager({
             disabled={bulkDeleting || rows.length === 0}
             onClick={() => {
               void (async () => {
+                const routeIntent = beginRouteIntent()
                 setBulkDeleting(true)
                 try {
                   const candidates = await listManagerAttachments({ query, filter })
                   if (candidates.length === 0) return
+                  if (!isRouteIntentCurrent(routeIntent)) return
                   if (!confirmDeleteAll(filter, query, candidates.length)) return
                   const removedIds = await deleteAttachmentsForStorage(candidates)
                   if (selectedId && removedIds.has(selectedId)) {
-                    navigate(attachmentListHrefForFilter(filter))
+                    navigateForIntent(routeIntent, attachmentListHrefForFilter(filter))
                   }
                 } finally {
+                  cancelRouteIntent(routeIntent)
                   setBulkDeleting(false)
                 }
               })()
@@ -2021,24 +2064,29 @@ function AttachmentManager({
           const file = event.currentTarget.files?.[0]
           event.currentTarget.value = ''
           if (!file || !displaySelected) return
+          const routeIntent = beginRouteIntent()
           void (async () => {
-            const result = await replaceAttachmentBytes({
-              attachmentId: displaySelected.id,
-              blob: file,
-              filename: file.name,
-              origin: 'user-upload',
-              ...(file.type ? { declaredMime: file.type } : {}),
-            })
-            if (result.reusedExisting && result.bundle.attachment.id !== displaySelected.id) {
-              if (references.length > 0) {
-                await batchRelinkAttachmentRefs({
-                  oldAttachmentId: displaySelected.id,
-                  newAttachmentId: result.bundle.attachment.id,
-                  refs: references.map(referenceTarget),
-                })
+            try {
+              const result = await replaceAttachmentBytes({
+                attachmentId: displaySelected.id,
+                blob: file,
+                filename: file.name,
+                origin: 'user-upload',
+                ...(file.type ? { declaredMime: file.type } : {}),
+              })
+              if (result.reusedExisting && result.bundle.attachment.id !== displaySelected.id) {
+                if (references.length > 0) {
+                  await batchRelinkAttachmentRefs({
+                    oldAttachmentId: displaySelected.id,
+                    newAttachmentId: result.bundle.attachment.id,
+                    refs: references.map(referenceTarget),
+                  })
+                }
+                await deleteUnreferencedAttachment(displaySelected.id)
+                navigateForIntent(routeIntent, attachmentHref(result.bundle.attachment.id))
               }
-              await deleteUnreferencedAttachment(displaySelected.id)
-              navigate(attachmentHref(result.bundle.attachment.id))
+            } finally {
+              cancelRouteIntent(routeIntent)
             }
           })()
         }}

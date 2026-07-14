@@ -1,7 +1,10 @@
 import { act, fireEvent, render } from '@testing-library/react'
+import { type ComponentProps, useMemo } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { createMessageTreeProjection } from '../../src/core/active-path'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import type { Message, MessageId } from '../../src/core/types'
+import { useStableStructuralHeaders } from '../../src/hooks/useBranchUrlSync'
 import type { MessageHeaderRow } from '../../src/store/message-storage'
 import type { ActiveBranchWindowSnapshot } from '../../src/store/repository'
 import { useChatStore } from '../../src/store/zustand/chatStore'
@@ -9,7 +12,10 @@ import { useStreamStore } from '../../src/store/zustand/streamStore'
 import { useToastStore } from '../../src/store/zustand/toastStore'
 import { useUiStore } from '../../src/store/zustand/uiStore'
 import { __setMessageRenderProbeForTests } from '../../src/ui/chat/Message'
-import { __setMessageListIndexProbeForTests, MessageList } from '../../src/ui/chat/MessageList'
+import {
+  __setMessageListIndexProbeForTests,
+  MessageList as MessageListComponent,
+} from '../../src/ui/chat/MessageList'
 import { __setReasoningPartitionProbeForTests } from '../../src/ui/chat/ReasoningBlock'
 
 vi.mock('../../src/ui/chat/MarkdownView', () => ({
@@ -33,6 +39,20 @@ function emptyCounts(): Counts {
 }
 
 let counts = emptyCounts()
+
+function MessageList(
+  props: Omit<ComponentProps<typeof MessageListComponent>, 'treeProjection'> & {
+    navigationHeaders: readonly MessageHeaderRow[]
+  },
+) {
+  const { navigationHeaders, ...listProps } = props
+  const structuralHeaders = useStableStructuralHeaders(navigationHeaders)
+  const treeProjection = useMemo(() => {
+    counts.listIndexes.push('tree-projection')
+    return createMessageTreeProjection(structuralHeaders)
+  }, [structuralHeaders])
+  return <MessageListComponent {...listProps} treeProjection={treeProjection} />
+}
 
 beforeEach(() => {
   counts = emptyCounts()
@@ -66,6 +86,7 @@ describe('message-list accessibility', () => {
         messageRenderWindowSize={100}
         messageRenderWindowLoadMode="manual"
         branchSnapshot={fixture.first}
+        navigationHeaders={fixture.navigationHeaders}
         onLoadOlderMessages={() => {}}
       />,
     )
@@ -75,9 +96,119 @@ describe('message-list accessibility', () => {
     expect(log).toHaveAttribute('aria-live', 'polite')
     expect(log).toHaveAttribute('aria-relevant', 'additions')
   })
+
+  it('keeps retained presentation snapshots inert beyond the DOM attribute', () => {
+    const fixture = branchFixture(2)
+    const initialCursor = {
+      __root__: 'message-0',
+      'message-0': 'message-1',
+    }
+    useChatStore.getState().navigateToCursor('chat-performance', initialCursor)
+    const view = render(
+      <MessageList
+        chatId="chat-performance"
+        chatSettings={cloneDefaultChatSettings()}
+        hasConnection
+        messageRenderWindowSize={100}
+        messageRenderWindowLoadMode="manual"
+        branchSnapshot={fixture.first}
+        navigationHeaders={fixture.navigationHeaders}
+        authoritativePathHeaders={fixture.first.branchHeaders}
+        presentationOnly
+        onLoadOlderMessages={() => {}}
+      />,
+    )
+
+    const log = view.getByRole('log')
+    expect(log).toHaveAttribute('aria-live', 'off')
+    const focusedAction = view.container.querySelector<HTMLButtonElement>(
+      '[data-message-id="message-1"] [data-action="copy"]',
+    )
+    if (!focusedAction) throw new Error('missing retained message action')
+    fireEvent.focus(focusedAction)
+    fireEvent.keyDown(window, { key: ']' })
+    expect(useChatStore.getState().getCursor('chat-performance')).toEqual(initialCursor)
+
+    const infoAction = view.container.querySelector<HTMLButtonElement>(
+      '[data-message-id="message-1"] [data-action="info"]',
+    )
+    if (!infoAction) throw new Error('missing retained message info action')
+    fireEvent.click(infoAction)
+    expect(view.container.querySelector('[data-ui="message-info"]')).toBeNull()
+  })
+
+  it('uses authoritative path headers for structural transcript metadata', () => {
+    const fixture = branchFixture(2)
+    const first = fixture.first.branchHeaders[0]
+    const second = fixture.first.branchHeaders[1]
+    if (!first || !second) throw new Error('missing branch headers')
+    const authoritativePath = [
+      first,
+      { ...second, role: 'user' as const, hiddenFromContext: true },
+      toHeader(makeMessage('message-2', second.id, 'assistant', 0, 2)),
+    ]
+    const view = render(
+      <MessageList
+        chatId="chat-performance"
+        chatSettings={cloneDefaultChatSettings()}
+        hasConnection
+        messageRenderWindowSize={100}
+        messageRenderWindowLoadMode="manual"
+        branchSnapshot={fixture.first}
+        navigationHeaders={fixture.navigationHeaders}
+        authoritativePathHeaders={authoritativePath}
+        onLoadOlderMessages={() => {}}
+      />,
+    )
+
+    expect(view.getByRole('log')).toHaveAttribute('data-total-count', '3')
+    expect(
+      view.container.querySelector(
+        '[data-message-id="message-1"] [data-ui="message-role-mismatch"]',
+      ),
+    ).not.toBeNull()
+    expect(
+      view.container.querySelector('[data-message-id="message-1"] [data-ui="profile-glyph"]'),
+    ).toHaveAttribute('data-excluded', 'true')
+  })
 })
 
 describe('message-list render budgets', () => {
+  it('does not rebuild structural indexes for body-only raw header publications', () => {
+    const fixture = branchFixture(12)
+    const settings = cloneDefaultChatSettings()
+    const renderList = (navigationHeaders: readonly MessageHeaderRow[]) => (
+      <MessageList
+        chatId="chat-performance"
+        chatSettings={settings}
+        hasConnection
+        messageRenderWindowSize={100}
+        messageRenderWindowLoadMode="manual"
+        branchSnapshot={fixture.first}
+        navigationHeaders={navigationHeaders}
+        onLoadOlderMessages={() => {}}
+      />
+    )
+    const view = render(renderList(fixture.navigationHeaders))
+    expect(counts.listIndexes).toEqual(['tree-projection', 'path-index'])
+
+    counts = emptyCounts()
+    const bodyOnlyHeaders = fixture.navigationHeaders.map((header) => ({
+      ...header,
+      nodeVersion: header.nodeVersion + 1,
+      textPreview: `Updated body preview for ${header.id}`,
+    }))
+    view.rerender(renderList(bodyOnlyHeaders))
+    expect(counts.listIndexes).toEqual([])
+
+    counts = emptyCounts()
+    const structuralHeaders = bodyOnlyHeaders.map((header, index) =>
+      index === 1 ? { ...header, siblingIndex: header.siblingIndex + 1 } : header,
+    )
+    view.rerender(renderList(structuralHeaders))
+    expect(counts.listIndexes).toEqual(['tree-projection'])
+  })
+
   it('uses hydrated window bodies for context rings while branch headers stay cold', () => {
     const fixture = branchFixture(3)
     const settings = {
@@ -93,6 +224,7 @@ describe('message-list render budgets', () => {
         messageRenderWindowSize={100}
         messageRenderWindowLoadMode="manual"
         branchSnapshot={fixture.first}
+        navigationHeaders={fixture.navigationHeaders}
         onLoadOlderMessages={() => {}}
       />,
     )
@@ -128,6 +260,7 @@ describe('message-list render budgets', () => {
         messageRenderWindowSize={1}
         messageRenderWindowLoadMode="manual"
         branchSnapshot={windowed}
+        navigationHeaders={fixture.navigationHeaders}
         onLoadOlderMessages={() => {}}
       />,
     )
@@ -149,12 +282,13 @@ describe('message-list render budgets', () => {
         messageRenderWindowSize={100}
         messageRenderWindowLoadMode="manual"
         branchSnapshot={fixture.first}
+        navigationHeaders={fixture.navigationHeaders}
         onLoadOlderMessages={() => {}}
       />,
     )
     expect(totalMessageRenders()).toBe(12)
     expect(counts.reasoningPartitions).toBe(1)
-    expect(counts.listIndexes).toEqual(['path-index', 'tree-index', 'parent-index'])
+    expect(counts.listIndexes).toEqual(['tree-projection', 'path-index'])
 
     counts = emptyCounts()
     const nextVariant = view.container.querySelector<HTMLAnchorElement>(
@@ -173,6 +307,7 @@ describe('message-list render budgets', () => {
         messageRenderWindowSize={100}
         messageRenderWindowLoadMode="manual"
         branchSnapshot={fixture.second}
+        navigationHeaders={fixture.navigationHeaders}
         onLoadOlderMessages={() => {}}
       />,
     )
@@ -184,6 +319,7 @@ describe('message-list render budgets', () => {
     act(() => {
       useStreamStore.getState().setActive({
         streamId: 'stream-performance',
+        replacementEpoch: 0,
         chatId: streamTarget.chatId,
         messageId: streamTarget.id,
         startedAt: 100,
@@ -191,6 +327,7 @@ describe('message-list render budgets', () => {
       })
       useStreamStore.getState().setLiveSnapshot({
         streamId: 'stream-performance',
+        replacementEpoch: 0,
         chatId: streamTarget.chatId,
         messageId: streamTarget.id,
         content: [{ type: 'text', text: 'live update' }],
@@ -253,6 +390,7 @@ describe('message-list render budgets', () => {
 
 function branchFixture(count: number): {
   active: Message[]
+  navigationHeaders: MessageHeaderRow[]
   first: ActiveBranchWindowSnapshot
   second: ActiveBranchWindowSnapshot
 } {
@@ -277,6 +415,7 @@ function branchFixture(count: number): {
   const secondBranch = [...active.slice(0, -1), alternates.at(-1) as Message]
   return {
     active,
+    navigationHeaders: all.map(toHeader),
     first: snapshot(active, all),
     second: snapshot(secondBranch, all),
   }
@@ -311,13 +450,10 @@ function snapshot(branch: readonly Message[], all: readonly Message[]): ActiveBr
   return {
     chatId: 'chat-performance',
     branchWindow: branch.map((message) => structuredClone(message)),
-    allHeaders,
     branchHeaders: branch.map((message) => branchHeadersById.get(message.id) as MessageHeaderRow),
     windowOffset: 0,
     windowLimit: branch.length,
     branchLength: branch.length,
-    siblingGroups: [],
-    treeKey: allHeaders.map((header) => `${header.id}:${header.nodeVersion}`).join('|'),
   }
 }
 
@@ -333,7 +469,12 @@ function toHeader(message: Message): MessageHeaderRow {
     continuationAttempts: _continuationAttempts,
     ...header
   } = structuredClone(message)
-  return { ...header, textPreview: `${message.role} ${message.id}` }
+  return {
+    ...header,
+    bodyVersion: message.nodeVersion,
+    bodyWordCount: 0,
+    textPreview: `${message.role} ${message.id}`,
+  }
 }
 
 function totalMessageRenders(): number {

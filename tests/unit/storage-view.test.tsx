@@ -367,6 +367,20 @@ describe('StorageView', () => {
       render(<StorageView route={{ section: 'overview' }} />)
 
       fireEvent.click(await screen.findByRole('button', { name: 'Export all' }))
+      expect(
+        screen.getByRole('dialog', { name: 'Export sensitive workspace backup?' }),
+      ).toBeVisible()
+      expect(screen.getByText(/browser's install secret/u)).toBeVisible()
+      expect(
+        screen.getByText(/Passphrase-protected keys still require their passphrase/u),
+      ).toBeVisible()
+      expect(downloads.clickSpy).not.toHaveBeenCalled()
+
+      fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+      expect(downloads.clickSpy).not.toHaveBeenCalled()
+
+      fireEvent.click(screen.getByRole('button', { name: 'Export all' }))
+      fireEvent.click(screen.getByRole('button', { name: 'Export sensitive backup' }))
 
       await waitFor(() => expect(downloads.clickSpy).toHaveBeenCalled())
       expect(downloads.createdBlobs).toHaveLength(1)

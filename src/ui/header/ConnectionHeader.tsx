@@ -28,6 +28,8 @@ import {
   deleteProfile,
   getProfile,
   listProfiles,
+  ProfileInUseError,
+  profileDependents,
   updateProfile,
 } from '../../store/profiles'
 import { allTable } from '../../store/reactive-dependencies'
@@ -464,6 +466,11 @@ export function ConnectionHeader({
   const [probeState, setProbeState] = useState<ProbeState>({ kind: 'idle' })
   const [deleteBusy, setDeleteBusy] = useState(false)
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false)
+  const [deleteDependents, setDeleteDependents] = useState<{
+    presetIds: PresetId[]
+    chatIds: string[]
+  } | null>(null)
+  const [deleteError, setDeleteError] = useState<string | null>(null)
   const detailId = `connection-title-detail-${useId().replace(/:/g, '')}`
   const titleEntryRef = useRef<HTMLDivElement | null>(null)
   const probeRunRef = useRef(0)
@@ -480,7 +487,27 @@ export function ConnectionHeader({
     setEditing(false)
     resetProbeState()
     setDeleteConfirmOpen(false)
+    setDeleteDependents(null)
+    setDeleteError(null)
   }, [selectedProfileId, resetProbeState])
+
+  useEffect(() => {
+    if (!deleteConfirmOpen || !selectedProfileId) return
+    let active = true
+    setDeleteDependents(null)
+    setDeleteError(null)
+    void profileDependents(selectedProfileId).then(
+      (dependents) => {
+        if (active) setDeleteDependents(dependents)
+      },
+      () => {
+        if (active) setDeleteError('Could not verify which presets and chats use this connection.')
+      },
+    )
+    return () => {
+      active = false
+    }
+  }, [deleteConfirmOpen, selectedProfileId])
 
   useEffect(() => {
     if (variant !== 'title-icon' || !open) return
@@ -580,18 +607,27 @@ export function ConnectionHeader({
 
   const deleteCurrentProfile = useCallback(async () => {
     const profile = state.profile
-    if (!profile) return
+    if (!profile || !deleteDependents) return
+    if (deleteDependents.presetIds.length > 0 || deleteDependents.chatIds.length > 0) return
     setDeleteBusy(true)
+    setDeleteError(null)
     try {
-      await deleteProfile(profile.id, { force: true })
+      await deleteProfile(profile.id)
       setEditing(false)
       setDeleteConfirmOpen(false)
-      writeActiveProfileId(null)
-      setActiveId(null)
+      const nextProfile = state.profiles.find((candidate) => candidate.id !== profile.id) ?? null
+      writeActiveProfileId(nextProfile?.id ?? null)
+      setActiveId(nextProfile?.id ?? null)
+    } catch (error) {
+      if (error instanceof ProfileInUseError) {
+        setDeleteDependents({ presetIds: error.presetIds, chatIds: error.chatIds })
+        return
+      }
+      setDeleteError('The connection could not be deleted. Nothing was changed.')
     } finally {
       setDeleteBusy(false)
     }
-  }, [state.profile])
+  }, [deleteDependents, state.profile, state.profiles])
 
   const runSavedProfileTest = useCallback(async () => {
     const profile = state.profile
@@ -734,6 +770,8 @@ export function ConnectionHeader({
         <ConnectionDeleteDialog
           profileName={profile.name}
           busy={deleteBusy}
+          dependents={deleteDependents}
+          error={deleteError}
           onCancel={() => setDeleteConfirmOpen(false)}
           onConfirm={deleteCurrentProfile}
         />
@@ -951,27 +989,53 @@ function ProfileSwitcher({ profiles, activeId, onSwitch, onCreateNew }: ProfileS
 function ConnectionDeleteDialog({
   profileName,
   busy,
+  dependents,
+  error,
   onCancel,
   onConfirm,
 }: {
   profileName: string
   busy: boolean
+  dependents: { presetIds: PresetId[]; chatIds: string[] } | null
+  error: string | null
   onCancel: () => void
   onConfirm: () => void | Promise<void>
 }) {
+  const presetCount = dependents?.presetIds.length ?? 0
+  const chatCount = dependents?.chatIds.length ?? 0
+  const blocked = presetCount > 0 || chatCount > 0
+  const dependencyLabel = `${presetCount} non-archived ${presetCount === 1 ? 'preset' : 'presets'} and ${chatCount} non-archived ${chatCount === 1 ? 'chat' : 'chats'}`
   return (
     <ConfirmDialog
       title="Delete connection?"
       confirmLabel="Delete"
       busyLabel="Deleting…"
       busy={busy}
+      confirmDisabled={dependents === null || blocked || error !== null}
+      initialFocus="cancel"
       onCancel={onCancel}
       onConfirm={onConfirm}
       closeLabel="Cancel connection delete"
     >
-      <blockquote data-ui="confirm-delete-preview">
-        Delete <strong>{profileName}</strong>? This cannot be undone.
-      </blockquote>
+      <div data-ui="confirm-dialog-copy">
+        <p>
+          Delete <strong>{profileName}</strong>? This cannot be undone.
+        </p>
+        <p data-role="status" data-state={error ? 'error' : blocked ? 'blocked' : 'ready'}>
+          {error ? (
+            <strong>{error}</strong>
+          ) : dependents === null ? (
+            'Checking dependent presets and chats…'
+          ) : blocked ? (
+            <>
+              <strong>Cannot delete:</strong> {dependencyLabel} still use this connection. Move or
+              archive them, then try again.
+            </>
+          ) : (
+            'No active presets or chats use this connection.'
+          )}
+        </p>
+      </div>
     </ConfirmDialog>
   )
 }

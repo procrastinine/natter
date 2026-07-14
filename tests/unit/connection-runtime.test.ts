@@ -168,7 +168,7 @@ describe('connection runtime keys', () => {
       { ref: 'primary', index: 0 },
     ])
 
-    postEvent({ kind: 'workspace-replaced' })
+    postEvent({ kind: 'workspace-replaced', replacementEpoch: 1 })
     const afterReplacement = await resolveConnectionRuntimeKeys(connection, {
       chatId: 'chat-a',
       access,

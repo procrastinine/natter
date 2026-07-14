@@ -37,11 +37,18 @@ interface MarkdownSegmentViewProps {
   rendererKey: string
 }
 
-interface PrefixSegmentCache {
-  scanTarget: number
-  scanRefs: readonly string[]
-  cut: number
+interface FrozenMarkdownBlock {
+  start: number
+  end: number
+  level: number
   content: string
+}
+
+export interface StreamingMarkdownSegmentCache {
+  inputLength: number
+  tailStart: number
+  tailContent: string
+  frozenBlocks: FrozenMarkdownBlock[]
 }
 
 // CJK plugin: adds remark plugins that make Chinese/Japanese/Korean text
@@ -115,14 +122,14 @@ export function MarkdownView({
         : undefined,
     [renderingPrefs.singleNewlineHardBreaks],
   )
-  const prefixSegmentCacheRef = useRef<PrefixSegmentCache | null>(null)
-  const segments = useMemo(
-    () =>
-      streaming && contentSegments && contentSegments.length > 0
-        ? segmentMarkdownSections(contentSegments, prefixSegmentCacheRef)
-        : segmentMarkdown(content, streaming),
-    [content, contentSegments, streaming],
-  )
+  const prefixSegmentCacheRef = useRef<StreamingMarkdownSegmentCache | null>(null)
+  const segments = useMemo(() => {
+    if (streaming && contentSegments && contentSegments.length > 0) {
+      return segmentMarkdownSections(contentSegments, prefixSegmentCacheRef)
+    }
+    prefixSegmentCacheRef.current = null
+    return segmentMarkdown(content, streaming)
+  }, [content, contentSegments, streaming])
   const segmented = segments.length > 1
 
   return (
@@ -268,89 +275,103 @@ function segmentMarkdown(content: string, streaming: boolean): MarkdownSegment[]
 
 function segmentMarkdownSections(
   contentSegments: readonly string[],
-  cacheRef: MutableRefObject<PrefixSegmentCache | null>,
+  cacheRef: MutableRefObject<StreamingMarkdownSegmentCache | null>,
 ): MarkdownSegment[] {
   const totalLength = contentSegments.reduce((sum, segment) => sum + segment.length, 0)
-  if (totalLength <= STREAMING_MARKDOWN_SEGMENT_CHARS) {
-    return [{ id: '0-live', content: contentSegments.join(''), streaming: true }]
+  let cache = cacheRef.current
+  if (!cache || totalLength < cache.inputLength) {
+    cache = createStreamingMarkdownSegmentCache()
+    cacheRef.current = cache
   }
-  const prefixTarget =
-    Math.floor((totalLength - 1) / STREAMING_MARKDOWN_SEGMENT_CHARS) *
-    STREAMING_MARKDOWN_SEGMENT_CHARS
-  const rawSplit = splitTextSegmentsAt(contentSegments, prefixTarget)
-  const cached = cacheRef.current
-  if (
-    cached &&
-    cached.scanTarget === prefixTarget &&
-    sameStringRefs(cached.scanRefs, rawSplit.prefixRefs)
-  ) {
-    const tailRefs =
-      cached.cut === prefixTarget
-        ? rawSplit.tailRefs
-        : splitTextSegmentsAt(contentSegments, cached.cut).tailRefs
-    return [
-      {
-        id: `0-${cached.cut}`,
-        content: cached.content,
-        streaming: false,
-      },
-      {
-        id: `${cached.cut}-live`,
-        content: tailRefs.join(''),
-        streaming: true,
-      },
-    ]
+  if (totalLength > cache.inputLength) {
+    appendMarkdownSuffix(cache, contentSegments, cache.inputLength)
+    cache.inputLength = totalLength
   }
-  const rawPrefixContent = rawSplit.prefixRefs.join('')
-  const cut = findSegmentCut(rawPrefixContent, 0, prefixTarget)
-  const { prefixRefs, tailRefs } =
-    cut === prefixTarget ? rawSplit : splitTextSegmentsAt(contentSegments, cut)
-  const prefixContent = cut === prefixTarget ? rawPrefixContent : prefixRefs.join('')
-  cacheRef.current = {
-    scanTarget: prefixTarget,
-    scanRefs: rawSplit.prefixRefs,
-    cut,
-    content: prefixContent,
+  if (cache.frozenBlocks.length === 0) {
+    return [{ id: '0-live', content: cache.tailContent, streaming: true }]
   }
   return [
-    {
-      id: `0-${cut}`,
-      content: prefixContent,
+    ...cache.frozenBlocks.map((block) => ({
+      id: `${block.start}-${block.end}`,
+      content: block.content,
       streaming: false,
-    },
+    })),
     {
-      id: `${cut}-live`,
-      content: tailRefs.join(''),
+      id: `${cache.tailStart}-live`,
+      content: cache.tailContent,
       streaming: true,
     },
   ]
 }
 
-function splitTextSegmentsAt(
+export function createStreamingMarkdownSegmentCache(): StreamingMarkdownSegmentCache {
+  return {
+    inputLength: 0,
+    tailStart: 0,
+    tailContent: '',
+    frozenBlocks: [],
+  }
+}
+
+export function segmentStreamingMarkdownForTests(
   segments: readonly string[],
-  target: number,
-): { prefixRefs: string[]; tailRefs: string[] } {
-  const prefixRefs: string[] = []
-  const tailRefs: string[] = []
+  cache: StreamingMarkdownSegmentCache,
+): ReadonlyArray<{ content: string; streaming: boolean }> {
+  const ref = { current: cache }
+  return segmentMarkdownSections(segments, ref)
+}
+
+function appendMarkdownSuffix(
+  cache: StreamingMarkdownSegmentCache,
+  segments: readonly string[],
+  start: number,
+): void {
   let consumed = 0
   for (const segment of segments) {
     const nextConsumed = consumed + segment.length
-    if (nextConsumed <= target) {
-      prefixRefs.push(segment)
-    } else if (consumed < target) {
-      const splitAt = target - consumed
-      prefixRefs.push(segment.slice(0, splitAt))
-      tailRefs.push(segment.slice(splitAt))
-    } else {
-      tailRefs.push(segment)
+    if (nextConsumed > start) {
+      appendMarkdownText(cache, segment, Math.max(0, start - consumed))
     }
     consumed = nextConsumed
   }
-  return { prefixRefs, tailRefs }
 }
 
-function sameStringRefs(a: readonly string[], b: readonly string[]): boolean {
-  return a.length === b.length && a.every((value, index) => value === b[index])
+function appendMarkdownText(
+  cache: StreamingMarkdownSegmentCache,
+  text: string,
+  initialOffset: number,
+): void {
+  let offset = initialOffset
+  while (offset < text.length) {
+    const take = Math.min(
+      text.length - offset,
+      STREAMING_MARKDOWN_SEGMENT_CHARS + 1 - cache.tailContent.length,
+    )
+    cache.tailContent += text.slice(offset, offset + take)
+    offset += take
+    if (cache.tailContent.length > STREAMING_MARKDOWN_SEGMENT_CHARS) {
+      freezeMarkdownPrefix(cache)
+    }
+  }
+}
+
+function freezeMarkdownPrefix(cache: StreamingMarkdownSegmentCache): void {
+  const cut = findSegmentCut(cache.tailContent, 0, STREAMING_MARKDOWN_SEGMENT_CHARS)
+  const block: FrozenMarkdownBlock = {
+    start: cache.tailStart,
+    end: cache.tailStart + cut,
+    level: 0,
+    content: cache.tailContent.slice(0, cut),
+  }
+  cache.tailStart = block.end
+  cache.tailContent = cache.tailContent.slice(cut)
+  while (cache.frozenBlocks.at(-1)?.level === block.level) {
+    const previous = cache.frozenBlocks.pop() as FrozenMarkdownBlock
+    block.start = previous.start
+    block.level += 1
+    block.content = `${previous.content}${block.content}`
+  }
+  cache.frozenBlocks.push(block)
 }
 
 function findSegmentCut(content: string, start: number, target: number): number {

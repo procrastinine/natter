@@ -121,7 +121,7 @@ describe('stream accumulator', () => {
     expect(accumulator.reasoningList).toEqual([
       { type: 'reasoning.text', id: 'text#0', index: 0, text: '' },
     ])
-    expect(accumulator.reasoningSegmentsByRow.get(0)?.sections.length).toBeGreaterThan(1)
+    expect(accumulator.reasoningSegmentsByRow.get(0)?.sections.length).toBe(1)
     expect(streamAccumulatorReasoningLength(accumulator)).toBe(chunk.length * chunkCount)
     const liveReasoningRows = projectStreamAccumulatorLive(accumulator, {
       requestedModel: 'requested/model',
@@ -334,7 +334,8 @@ describe('stream accumulator', () => {
       }),
     ).toEqual({
       content: [
-        { type: 'output_text', text: `prefill-continued-${firstSection}` },
+        { type: 'output_text', text: 'prefill-continued-' },
+        { type: 'output_text', text: firstSection },
         { type: 'output_text', text: 'b' },
         { type: 'image_url', url: 'data:image/png;base64,AA==' },
       ],
@@ -367,6 +368,84 @@ describe('stream accumulator', () => {
         { type: 'image_url', url: 'data:image/png;base64,AA==' },
       ],
     })
+  })
+
+  it('bounds cumulative text and reasoning live-projection visits logarithmically', () => {
+    const accumulator = createStreamAccumulator({ initialContent: [], now: 0 })
+    const section = 'x'.repeat(20_000)
+    const sectionCount = 64
+    const perProjectionBudget = Math.floor(Math.log2(sectionCount)) + 1
+    let textSectionVisits = 0
+    let reasoningSectionVisits = 0
+
+    for (let index = 0; index < sectionCount; index += 1) {
+      applyStreamAccumulatorEvent(accumulator, { lane: 'text', text: section }, index + 1)
+      applyStreamAccumulatorEvent(
+        accumulator,
+        { lane: 'reasoning', textDelta: section, outputIndex: 0 },
+        index + 1,
+      )
+      const live = projectStreamAccumulatorLive(accumulator, {
+        requestedModel: 'requested/model',
+        apiUsed: 'chat',
+        now: index + 1,
+      })
+      const textItems = live.content.filter(
+        (item) => item.type === 'text' || item.type === 'output_text',
+      )
+      const reasoningSections = live.reasoningRows?.[0]?.valueSections ?? []
+      expect(textItems.length).toBeLessThanOrEqual(perProjectionBudget)
+      expect(reasoningSections.length).toBeLessThanOrEqual(perProjectionBudget)
+      textSectionVisits += textItems.length
+      reasoningSectionVisits += reasoningSections.length
+    }
+
+    const cumulativeVisitBudget = sectionCount * perProjectionBudget
+    expect(textSectionVisits).toBeLessThanOrEqual(cumulativeVisitBudget)
+    expect(reasoningSectionVisits).toBeLessThanOrEqual(cumulativeVisitBudget)
+    expect(streamAccumulatorText(accumulator)).toBe(section.repeat(sectionCount))
+    expect(projectStreamAccumulatorFinal(accumulator).reasoningDetails?.[0]).toMatchObject({
+      text: section.repeat(sectionCount),
+    })
+  })
+
+  it('keeps published tool-argument sections immutable across geometric merges', () => {
+    const accumulator = createStreamAccumulator({ initialContent: [], now: 0 })
+    const firstSection = 'a'.repeat(20_000)
+    const secondSection = 'b'.repeat(20_000)
+    applyStreamAccumulatorEvent(
+      accumulator,
+      {
+        lane: 'tool-call',
+        index: 0,
+        id: 'call-0',
+        type: 'function',
+        name: 'tool',
+        argumentsDelta: firstSection,
+      },
+      1,
+    )
+    const published = projectStreamAccumulatorLive(accumulator, {
+      requestedModel: 'requested/model',
+      apiUsed: 'chat',
+      now: 1,
+    })
+    const publishedSections = published.toolCallRows?.[0]?.argumentSections
+
+    applyStreamAccumulatorEvent(
+      accumulator,
+      { lane: 'tool-call', index: 0, argumentsDelta: secondSection },
+      2,
+    )
+
+    expect(publishedSections).toEqual([firstSection])
+    expect(
+      projectStreamAccumulatorLive(accumulator, {
+        requestedModel: 'requested/model',
+        apiUsed: 'chat',
+        now: 2,
+      }).toolCallRows?.[0]?.argumentSections,
+    ).toEqual([firstSection + secondSection])
   })
 
   it('folds a mixed trace into stable reasoning, media, tools, provider state, and generation', () => {
@@ -567,7 +646,8 @@ describe('stream accumulator', () => {
       }),
     ).toEqual({
       content: [
-        { type: 'output_text', text: 'seed:answer' },
+        { type: 'output_text', text: 'seed:' },
+        { type: 'output_text', text: 'answer' },
         { type: 'output_image', url: 'image://one' },
       ],
       reasoningRows: [
@@ -948,8 +1028,10 @@ describe('stream accumulator', () => {
     const buffer = accumulator.toolCallArgumentsByRow.get(0)
     expect(expectedLength).toBeGreaterThan(1_000_000)
     expect(buffer?.length).toBe(expectedLength)
-    expect(buffer?.sections.length).toBeGreaterThan(1)
-    expect(buffer?.sections.every((section) => section.length === 20_000)).toBe(true)
+    expect(buffer?.sections.length).toBeLessThanOrEqual(
+      Math.floor(Math.log2(Math.ceil(expectedLength / 20_000))) + 1,
+    )
+    expect(buffer?.sections.every((section) => section.length % 20_000 === 0)).toBe(true)
     expect(buffer?.pendingLength).toBeLessThan(20_000)
     expect(accumulator.toolCallRows[0]).not.toHaveProperty('arguments')
 
@@ -1006,10 +1088,13 @@ describe('stream accumulator', () => {
     }
 
     expect(accumulator.audioOutput?.transcriptLength).toBe(fragment.length * 10_000)
-    expect(accumulator.audioOutput?.transcriptSections.length).toBeGreaterThan(1)
-    expect(accumulator.audioOutput?.transcriptSections.every((part) => part.length <= 20_000)).toBe(
-      true,
+    expect(accumulator.audioOutput?.transcriptSections.length).toBeLessThanOrEqual(
+      Math.floor(Math.log2(Math.ceil((accumulator.audioOutput?.transcriptLength ?? 0) / 20_000))) +
+        1,
     )
+    expect(
+      accumulator.audioOutput?.transcriptSections.every((part) => part.length % 20_000 === 0),
+    ).toBe(true)
     expect(projectStreamAccumulatorFinal(accumulator).content).toContainEqual({
       type: 'audio_output',
       format: 'pcm16',

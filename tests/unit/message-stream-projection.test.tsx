@@ -2,7 +2,10 @@ import { act, render, waitFor } from '@testing-library/react'
 import { Activity } from 'react'
 import { afterEach, describe, expect, it } from 'vitest'
 import type { Message } from '../../src/core/types'
-import { useRetainedMessageStreamProjection } from '../../src/hooks/useMessageStreamProjection'
+import {
+  __resetMessageStreamProjectionForTests,
+  useRetainedMessageStreamProjection,
+} from '../../src/hooks/useMessageStreamProjection'
 import { useStreamStore } from '../../src/store/zustand/streamStore'
 
 const pendingMessage: Message = {
@@ -20,9 +23,17 @@ const pendingMessage: Message = {
   deleted: false,
 }
 
-function ProjectionProbe({ view }: { view: string }) {
-  const [, snapshot] = useRetainedMessageStreamProjection(pendingMessage)
-  const content = snapshot?.content ?? pendingMessage.content
+function ProjectionProbe({
+  view,
+  message = pendingMessage,
+  bodyVersion = 0,
+}: {
+  view: string
+  message?: Message
+  bodyVersion?: number
+}) {
+  const [, snapshot] = useRetainedMessageStreamProjection(message, bodyVersion)
+  const content = snapshot?.content ?? message.content
   const text = content
     .filter((item) => item.type === 'text' || item.type === 'output_text')
     .map((item) => item.text)
@@ -43,7 +54,10 @@ function AlternateViews({ visible }: { visible: 'tree' | 'transcript' }) {
   )
 }
 
-afterEach(() => useStreamStore.getState().reset())
+afterEach(() => {
+  useStreamStore.getState().reset()
+  __resetMessageStreamProjectionForTests()
+})
 
 describe('retained message stream projection', () => {
   it('keeps the newest snapshot when live output hands off between retained views', async () => {
@@ -54,6 +68,7 @@ describe('retained message stream projection', () => {
     act(() => {
       useStreamStore.getState().setActive({
         streamId: 'projection-stream',
+        replacementEpoch: 0,
         chatId: pendingMessage.chatId,
         messageId: pendingMessage.id,
         startedAt: 1,
@@ -61,6 +76,7 @@ describe('retained message stream projection', () => {
       })
       useStreamStore.getState().setLiveSnapshot({
         streamId: 'projection-stream',
+        replacementEpoch: 0,
         chatId: pendingMessage.chatId,
         messageId: pendingMessage.id,
         content: [{ type: 'output_text', text: 'Snapshot five.' }],
@@ -75,6 +91,7 @@ describe('retained message stream projection', () => {
     act(() => {
       useStreamStore.getState().setLiveSnapshot({
         streamId: 'projection-stream',
+        replacementEpoch: 0,
         chatId: pendingMessage.chatId,
         messageId: pendingMessage.id,
         content: [{ type: 'output_text', text: 'Snapshot ten.' }],
@@ -86,8 +103,8 @@ describe('retained message stream projection', () => {
     await waitFor(() => expect(transcript()).toHaveTextContent('Snapshot ten.'))
 
     act(() => {
-      useStreamStore.getState().clearLiveSnapshot(pendingMessage.id)
-      useStreamStore.getState().clearActive('projection-stream')
+      useStreamStore.getState().clearLiveSnapshot(pendingMessage.id, 'projection-stream', 0)
+      useStreamStore.getState().clearActive('projection-stream', 0)
     })
     view.rerender(<AlternateViews visible="tree" />)
 
@@ -101,6 +118,7 @@ describe('retained message stream projection', () => {
     act(() => {
       useStreamStore.getState().setActive({
         streamId: 'old-stream',
+        replacementEpoch: 0,
         chatId: pendingMessage.chatId,
         messageId: pendingMessage.id,
         startedAt: 1,
@@ -108,6 +126,7 @@ describe('retained message stream projection', () => {
       })
       useStreamStore.getState().setLiveSnapshot({
         streamId: 'old-stream',
+        replacementEpoch: 0,
         chatId: pendingMessage.chatId,
         messageId: pendingMessage.id,
         content: [{ type: 'output_text', text: 'Old live output.' }],
@@ -119,10 +138,11 @@ describe('retained message stream projection', () => {
     await waitFor(() => expect(projection()).toHaveTextContent('Old live output.'))
 
     act(() => {
-      useStreamStore.getState().clearLiveSnapshot(pendingMessage.id)
-      useStreamStore.getState().clearActive('old-stream')
+      useStreamStore.getState().clearLiveSnapshot(pendingMessage.id, 'old-stream', 0)
+      useStreamStore.getState().clearActive('old-stream', 0)
       useStreamStore.getState().setActive({
         streamId: 'new-stream',
+        replacementEpoch: 0,
         chatId: pendingMessage.chatId,
         messageId: pendingMessage.id,
         startedAt: 2,
@@ -132,5 +152,58 @@ describe('retained message stream projection', () => {
 
     await waitFor(() => expect(projection()).toHaveTextContent('Persisted before streaming.'))
     expect(projection()).not.toHaveTextContent('Old live output.')
+  })
+
+  it('keeps live output across structural versions and retires it only on a body commit', async () => {
+    const view = render(<ProjectionProbe view="single" bodyVersion={4} />)
+    const projection = () => view.container.querySelector('[data-view="single"]')
+    act(() => {
+      useStreamStore.getState().setActive({
+        streamId: 'body-version-stream',
+        replacementEpoch: 0,
+        chatId: pendingMessage.chatId,
+        messageId: pendingMessage.id,
+        startedAt: 1,
+        ownerClientId: 'projection-client',
+      })
+      useStreamStore.getState().setLiveSnapshot({
+        streamId: 'body-version-stream',
+        replacementEpoch: 0,
+        chatId: pendingMessage.chatId,
+        messageId: pendingMessage.id,
+        content: [{ type: 'output_text', text: 'Uncommitted live output.' }],
+        textLength: 24,
+        reasoningLength: 0,
+        updatedAt: 5,
+      })
+    })
+    await waitFor(() => expect(projection()).toHaveTextContent('Uncommitted live output.'))
+
+    act(() => {
+      useStreamStore.getState().clearLiveSnapshot(pendingMessage.id, 'body-version-stream', 0)
+      useStreamStore.getState().clearActive('body-version-stream', 0)
+    })
+    view.rerender(
+      <ProjectionProbe
+        view="single"
+        bodyVersion={4}
+        message={{ ...pendingMessage, nodeVersion: 99 }}
+      />,
+    )
+    expect(projection()).toHaveTextContent('Uncommitted live output.')
+
+    view.rerender(
+      <ProjectionProbe
+        view="single"
+        bodyVersion={5}
+        message={{
+          ...pendingMessage,
+          nodeVersion: 100,
+          content: [{ type: 'output_text', text: 'Committed persisted output.' }],
+        }}
+      />,
+    )
+    await waitFor(() => expect(projection()).toHaveTextContent('Committed persisted output.'))
+    expect(projection()).not.toHaveTextContent('Uncommitted live output.')
   })
 })

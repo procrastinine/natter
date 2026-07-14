@@ -1341,6 +1341,7 @@ export interface KeyRecord {
 // Root key is `'__root__'` so `Record` lookup can represent "which child of the
 // virtual root is the active top-level message."
 export type CursorMap = Record<string, MessageId>
+export type CursorPatch = Record<string, MessageId | undefined>
 
 export type MutationScope =
   | { kind: 'chat-meta'; chatId: ChatId }

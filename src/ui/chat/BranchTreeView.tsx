@@ -14,18 +14,21 @@ import {
   useState,
 } from 'react'
 import { chatHref } from '../../app/router'
-import { resolveActiveLeafId } from '../../core/active-path'
+import { type MessageTreeProjection, resolveActiveLeafIdProjected } from '../../core/active-path'
 import {
   type BranchTreeLayout,
   type BranchTreeLayoutNode,
-  type BranchTreeSourceNode,
   layoutBranchTree,
 } from '../../core/branch-tree-layout'
 import type { ChatId, CursorMap, Message, MessageId, MessageRole } from '../../core/types'
+import type { StructuralMessageHeader } from '../../hooks/useBranchUrlSync'
+import { onEvent } from '../../store/broadcast'
 import type { MessageHeaderRow } from '../../store/message-storage'
+import { primaryKeys } from '../../store/reactive-dependencies'
+import { useRepositoryPresentationQuery } from '../../store/reactive-query'
 import type { WorkspaceRepository } from '../../store/repository'
 import { getWorkspaceRepository } from '../../store/workspace-repository'
-import { useStreamStore } from '../../store/zustand/streamStore'
+import { useActiveStreamsForChat, useStreamStore } from '../../store/zustand/streamStore'
 import {
   ChevronIcon,
   CloseIcon,
@@ -95,7 +98,7 @@ function setBranchTreeComputationProbeForTests(
 
 export type BranchTreeRepository = Pick<
   WorkspaceRepository,
-  'getMessage' | 'getMessageTextPreview' | 'searchChatMessageText'
+  'getMessagePresentationSnapshot' | 'getMessageTextPreview' | 'searchChatMessageText'
 >
 
 type BranchTreeAction = (messageId: MessageId) => void | Promise<void>
@@ -113,6 +116,7 @@ type BranchTreeMessageIndexedAction = (message: Message, index: number) => void 
 export interface BranchTreeViewProps {
   chatId: ChatId
   headers: readonly MessageHeaderRow[]
+  projection: MessageTreeProjection<StructuralMessageHeader>
   cursor: CursorMap
   expanded: boolean
   previewFontFamily?: string
@@ -155,6 +159,19 @@ interface ActivePreview {
   text?: string
   failed?: boolean
 }
+
+type InspectedMessageSnapshot =
+  | {
+      id: MessageId
+      bodyVersion: number
+      status: 'loading' | 'missing' | 'failed'
+    }
+  | {
+      id: MessageId
+      bodyVersion: number
+      status: 'ready'
+      message: Message
+    }
 
 interface PanGesture {
   pointerId: number
@@ -257,41 +274,6 @@ function pointerHitsScrollbarGutter(
     (verticalGutter > 0 && clientX >= bounds.right - verticalGutter) ||
     (horizontalGutter > 0 && clientY >= bounds.bottom - horizontalGutter)
   )
-}
-
-function sameStructuralNodes(
-  source: readonly BranchTreeSourceNode[],
-  headers: readonly MessageHeaderRow[],
-): boolean {
-  if (source.length !== headers.length) return false
-  for (let index = 0; index < headers.length; index += 1) {
-    const left = source[index]
-    const right = headers[index]
-    if (
-      !left ||
-      !right ||
-      left.id !== right.id ||
-      left.parentId !== right.parentId ||
-      left.siblingIndex !== right.siblingIndex ||
-      left.createdAt !== right.createdAt ||
-      left.role !== right.role ||
-      left.deleted !== right.deleted
-    ) {
-      return false
-    }
-  }
-  return true
-}
-
-function structuralNodes(headers: readonly MessageHeaderRow[]): BranchTreeSourceNode[] {
-  return headers.map((header) => ({
-    id: header.id,
-    parentId: header.parentId,
-    siblingIndex: header.siblingIndex,
-    createdAt: header.createdAt,
-    role: header.role,
-    deleted: header.deleted,
-  }))
 }
 
 function sameRevisionMap(
@@ -434,6 +416,16 @@ function isAbortError(error: unknown): boolean {
   return error instanceof Error && error.name === 'AbortError'
 }
 
+function isRepositoryLifecycleError(error: unknown): boolean {
+  const candidate = error as { name?: unknown; inner?: { name?: unknown } } | null
+  return (
+    candidate?.name === 'AbortError' ||
+    candidate?.name === 'DatabaseClosedError' ||
+    candidate?.inner?.name === 'AbortError' ||
+    candidate?.inner?.name === 'DatabaseClosedError'
+  )
+}
+
 function storePreview(cache: Map<string, PreviewCacheEntry>, key: string, text: string): string {
   const retainedText =
     text.length > PREVIEW_TEXT_MAX_CHARS ? `${text.slice(0, PREVIEW_TEXT_MAX_CHARS - 1)}…` : text
@@ -458,6 +450,7 @@ function runAction(action: (() => void | Promise<void>) | undefined): void {
 const BranchTreeViewComponent = memo(function BranchTreeView({
   chatId,
   headers,
+  projection,
   cursor,
   expanded,
   previewFontFamily = treePreviewFontFamily(),
@@ -494,6 +487,7 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
   const previewRevisionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const activePreviewKeyRef = useRef<string | null>(null)
   const previewScopeEpochRef = useRef(0)
+  const workspaceRevisionRef = useRef(0)
   const viewportFrameRef = useRef<number | null>(null)
   const inspectorResizeFrameRef = useRef<number | null>(null)
   const pendingInspectorClientXRef = useRef<number | null>(null)
@@ -504,53 +498,33 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
   const selectionScopeChatIdRef = useRef(chatId)
   const panGestureRef = useRef<PanGesture | null>(null)
   const suppressCanvasClickRef = useRef(false)
-  const structuralNodesRef = useRef<readonly BranchTreeSourceNode[]>([])
   const searchRevisionRef = useRef({ versions: new Map<MessageId, number>(), value: 0 })
   const currentMatchIdRef = useRef<MessageId | null>(null)
   const inspectedMessageIdRef = useRef<MessageId | null>(null)
-  const inspectedStreamRevisionRef = useRef<{ id: MessageId; version: number } | null>(null)
+  const retainedInspectedMessageRef = useRef<{
+    workspaceRevision: number
+    repository: BranchTreeRepository
+    chatId: ChatId
+    id: MessageId
+    bodyVersion: number
+    message: Message
+  } | null>(null)
   const requestLeafFollowTokenRef = useRef(0)
   const pendingRequestLeafFollowRef = useRef<PendingRequestLeafFollow | null>(null)
   const entryStreamFollowRef = useRef<EntryStreamFollow | null>(null)
-  const messageLoadTailRef = useRef<Promise<void>>(Promise.resolve())
   const lastSearchQueryRef = useRef('')
   const [viewport, setViewport] = useState<Viewport>(EMPTY_VIEWPORT)
   const [workspaceWidth, setWorkspaceWidth] = useState(EMPTY_VIEWPORT.width)
   const [inspectorRatio, setInspectorRatio] = useState(DEFAULT_INSPECTOR_RATIO)
   const [resizingInspector, setResizingInspector] = useState(false)
   const [panningCanvas, setPanningCanvas] = useState(false)
-  const [inspectedMessage, setInspectedMessage] = useState<{
-    id: MessageId
-    status: 'loading' | 'ready' | 'missing' | 'failed'
-    message?: Message
-  } | null>(null)
+  const [workspaceRevision, setWorkspaceRevision] = useState(0)
   const [, setPreviewRevision] = useState(0)
   const [activePreview, setActivePreview] = useState<ActivePreview | null>(null)
   const [localSelectedNodeId, setLocalSelectedNodeId] = useState<MessageId | null>(null)
   const [hoveredConnectorKey, setHoveredConnectorKey] = useState<string | null>(null)
   const [query, setQuery] = useState('')
-  const selectChatStreams = useMemo(() => {
-    let previousActiveByStreamId:
-      | ReturnType<typeof useStreamStore.getState>['activeByStreamId']
-      | null = null
-    let previous: ReturnType<typeof useStreamStore.getState>['activeByStreamId'][string][] = []
-    return (state: ReturnType<typeof useStreamStore.getState>) => {
-      if (state.activeByStreamId === previousActiveByStreamId) return previous
-      previousActiveByStreamId = state.activeByStreamId
-      const next = Object.values(state.activeByStreamId).filter(
-        (stream) => stream.chatId === chatId,
-      )
-      if (
-        next.length === previous.length &&
-        next.every((stream, index) => stream === previous[index])
-      ) {
-        return previous
-      }
-      previous = next
-      return next
-    }
-  }, [chatId])
-  const chatStreams = useStreamStore(selectChatStreams)
+  const chatStreams = useActiveStreamsForChat(chatId)
   const activeStreamTargetIds = useMemo(() => {
     const ids = new Set<MessageId>()
     for (const stream of chatStreams) if (stream.messageId) ids.add(stream.messageId)
@@ -595,14 +569,30 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
   const [searchFailed, setSearchFailed] = useState(false)
   currentMatchIdRef.current = currentMatchId
 
-  const stableStructuralNodes = useMemo(() => {
-    if (sameStructuralNodes(structuralNodesRef.current, headers)) {
-      return structuralNodesRef.current
+  const resetPreviewScope = useCallback(() => {
+    previewScopeEpochRef.current += 1
+    previewCacheRef.current = new Map()
+    pendingPreviewsRef.current = new Map()
+    expandedPreviewQueueRef.current.clear()
+    expandedPreviewInFlightKeysRef.current = new Set()
+    activePreviewKeyRef.current = null
+    if (previewRevisionTimerRef.current !== null) {
+      clearTimeout(previewRevisionTimerRef.current)
+      previewRevisionTimerRef.current = null
     }
-    const next = structuralNodes(headers)
-    structuralNodesRef.current = next
-    return next
-  }, [headers])
+    setActivePreview(null)
+  }, [])
+
+  useEffect(
+    () =>
+      onEvent((event) => {
+        if (event.kind !== 'workspace-replaced') return
+        resetPreviewScope()
+        workspaceRevisionRef.current += 1
+        setWorkspaceRevision(workspaceRevisionRef.current)
+      }),
+    [resetPreviewScope],
+  )
 
   const bodyRevisionById = useMemo(() => {
     if (normalizedQuery.length === 0) return searchRevisionRef.current.versions
@@ -611,8 +601,8 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
       headers.map((header) => [
         header.id,
         activeStreamTargetIds.has(header.id)
-          ? (previous.get(header.id) ?? header.nodeVersion)
-          : header.nodeVersion,
+          ? (previous.get(header.id) ?? header.bodyVersion)
+          : header.bodyVersion,
       ]),
     )
   }, [activeStreamTargetIds, headers, normalizedQuery])
@@ -631,16 +621,16 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
   const layoutOptions = expanded ? EXPANDED_LAYOUT : COMPACT_LAYOUT
   const layout = useMemo(() => {
     if (import.meta.env.MODE === 'test') branchTreeComputationProbe?.('layout')
-    return layoutBranchTree(stableStructuralNodes, layoutOptions)
-  }, [layoutOptions, stableStructuralNodes])
+    return layoutBranchTree(projection.nodes, layoutOptions)
+  }, [layoutOptions, projection])
   const headerById = useMemo(() => new Map(headers.map((header) => [header.id, header])), [headers])
   const connectorIndex = useMemo(() => {
     if (import.meta.env.MODE === 'test') branchTreeComputationProbe?.('connector-index')
     return connectorIndexFor(layout)
   }, [layout])
   const activeLeafId = useMemo(
-    () => resolveActiveLeafId(stableStructuralNodes, cursor),
-    [cursor, stableStructuralNodes],
+    () => resolveActiveLeafIdProjected(projection, cursor),
+    [cursor, projection],
   )
   const activePathIds = useMemo(() => {
     const path = new Set<MessageId>()
@@ -675,22 +665,7 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
     : undefined
   const liveSelectedHeader = selectedHeader?.deleted ? undefined : selectedHeader
   const inspectedMessageId = liveSelectedHeader?.id ?? null
-  const selectedNodeVersion = liveSelectedHeader?.nodeVersion ?? null
-  const selectedStreamActive = inspectedMessageId !== null && busyMessageIds.has(inspectedMessageId)
-  if (inspectedMessageId === null || selectedNodeVersion === null) {
-    inspectedStreamRevisionRef.current = null
-  } else if (!selectedStreamActive) {
-    inspectedStreamRevisionRef.current = null
-  } else if (inspectedStreamRevisionRef.current?.id !== inspectedMessageId) {
-    inspectedStreamRevisionRef.current = {
-      id: inspectedMessageId,
-      version: selectedNodeVersion,
-    }
-  }
-  const inspectedNodeVersion =
-    selectedStreamActive && inspectedStreamRevisionRef.current?.id === inspectedMessageId
-      ? inspectedStreamRevisionRef.current.version
-      : selectedNodeVersion
+  const selectedBodyVersion = liveSelectedHeader?.bodyVersion ?? null
   inspectedMessageIdRef.current = inspectedMessageId
   const planeWidth = Math.max(layout.width, viewport.width)
   const planeHeight = Math.max(layout.height, viewport.height)
@@ -794,7 +769,6 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
     requestLeafFollowTokenRef.current += 1
     pendingRequestLeafFollowRef.current = null
     setLocalSelectedNodeId(null)
-    setInspectedMessage(null)
   }, [chatId])
 
   useLayoutEffect(() => {
@@ -805,40 +779,53 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
     workspace.style.setProperty('--branch-tree-canvas-min-width', `${inspectorBounds.canvasMin}px`)
   }, [inspectorBounds.canvasMin, inspectorBounds.min, inspectorWidth])
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: nodeVersion invalidates the selected full-body snapshot after an in-place edit or stream commit.
-  useEffect(() => {
-    if (!inspectedMessageId) {
-      setInspectedMessage(null)
-      return
-    }
-    const controller = new AbortController()
-    const cancelled = () => controller.signal.aborted
-    setInspectedMessage((previous) =>
-      previous?.id === inspectedMessageId && previous.status === 'ready'
-        ? previous
-        : { id: inspectedMessageId, status: 'loading' },
-    )
-    const load = messageLoadTailRef.current.then(async () => {
-      if (cancelled()) return
+  // The local one-body retention below bridges versioned reads without keeping
+  // an idle hydrated-body query cache or remounting the inspector.
+  const inspectedMessage = useRepositoryPresentationQuery<InspectedMessageSnapshot | null>(
+    JSON.stringify([
+      'branch-tree-inspector',
+      workspaceRevision,
+      chatId,
+      inspectedMessageId,
+      selectedBodyVersion,
+    ]),
+    async (signal) => {
+      if (!inspectedMessageId) return null
       try {
-        const message = await repository.getMessage(inspectedMessageId)
-        if (cancelled()) return
-        if (!message || message.chatId !== chatId || message.deleted) {
-          setInspectedMessage({ id: inspectedMessageId, status: 'missing' })
-          return
+        const snapshot = await repository.getMessagePresentationSnapshot(inspectedMessageId, {
+          signal,
+        })
+        if (!snapshot || snapshot.message.chatId !== chatId || snapshot.message.deleted) {
+          return {
+            id: inspectedMessageId,
+            bodyVersion: selectedBodyVersion as number,
+            status: 'missing',
+          }
         }
-        setInspectedMessage({ id: inspectedMessageId, status: 'ready', message })
-      } catch {
-        if (!cancelled()) {
-          setInspectedMessage({ id: inspectedMessageId, status: 'failed' })
+        return {
+          id: inspectedMessageId,
+          bodyVersion: snapshot.bodyVersion,
+          status: 'ready',
+          message: snapshot.message,
+        }
+      } catch (error) {
+        if (signal.aborted || isRepositoryLifecycleError(error)) throw error
+        return {
+          id: inspectedMessageId,
+          bodyVersion: selectedBodyVersion as number,
+          status: 'failed',
         }
       }
-    })
-    messageLoadTailRef.current = load
-    return () => {
-      controller.abort()
-    }
-  }, [chatId, inspectedMessageId, inspectedNodeVersion, repository])
+    },
+    inspectedMessageId
+      ? {
+          id: inspectedMessageId,
+          bodyVersion: selectedBodyVersion as number,
+          status: 'loading',
+        }
+      : null,
+    inspectedMessageId ? primaryKeys('messageBodies', inspectedMessageId) : [],
+  )
 
   useEffect(() => {
     if (
@@ -848,18 +835,13 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
       return
     }
     previewScopeRef.current = { chatId, repository }
-    previewScopeEpochRef.current += 1
-    previewCacheRef.current = new Map()
-    pendingPreviewsRef.current = new Map()
-    expandedPreviewQueueRef.current.clear()
-    activePreviewKeyRef.current = null
-    setActivePreview(null)
-  }, [chatId, repository])
+    resetPreviewScope()
+  }, [chatId, repository, resetPreviewScope])
 
   const previewKeyFor = useCallback(
     (header: MessageHeaderRow) =>
-      `${previewScopeEpochRef.current}\u0000${chatId}\u0000${header.id}\u0000${header.nodeVersion}`,
-    [chatId],
+      `${workspaceRevision}\u0000${previewScopeEpochRef.current}\u0000${chatId}\u0000${header.id}\u0000${header.bodyVersion}`,
+    [chatId, workspaceRevision],
   )
 
   const cachedPreviewFor = useCallback(
@@ -913,13 +895,17 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
       const [key, header] = next
       queue.delete(key)
       inFlight.add(key)
+      const cache = previewCacheRef.current
       void loadPreview(header)
         .catch(() => {
-          storePreview(previewCacheRef.current, key, 'Preview unavailable')
+          if (previewCacheRef.current === cache) {
+            storePreview(cache, key, 'Preview unavailable')
+          }
         })
         .finally(() => {
           if (import.meta.env.MODE === 'test') branchTreeComputationProbe?.('preview-complete')
           inFlight.delete(key)
+          if (expandedPreviewInFlightKeysRef.current !== inFlight) return
           schedulePreviewRevision()
           pumpExpandedPreviewQueue()
         })
@@ -1100,7 +1086,7 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
       requestLeafFollowTokenRef.current = token
       pendingRequestLeafFollowRef.current = {
         token,
-        initialStreamIds: new Set(Object.keys(useStreamStore.getState().activeByStreamId)),
+        initialStreamIds: new Set(useStreamStore.getState().listStreamIds()),
       }
       try {
         const targetId = await action()
@@ -1182,6 +1168,7 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
     const previousCurrentId = currentMatchIdRef.current
     const previousInspectedId = inspectedMessageIdRef.current
     const requestRevision = searchRevision
+    const requestWorkspaceRevision = workspaceRevision
     const controller = new AbortController()
     setSearching(true)
     setSearchFailed(false)
@@ -1192,7 +1179,13 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
     void repository
       .searchChatMessageText(chatId, normalizedQuery, { signal: controller.signal })
       .then((ids) => {
-        if (controller.signal.aborted || requestRevision !== searchRevisionRef.current.value) return
+        if (
+          controller.signal.aborted ||
+          requestRevision !== searchRevisionRef.current.value ||
+          requestWorkspaceRevision !== workspaceRevisionRef.current
+        ) {
+          return
+        }
         const hitIds = new Set(ids)
         const ordered = layout.nodes.filter((node) => hitIds.has(node.id)).map((node) => node.id)
         const retainedIndex = queryChanged ? -1 : ordered.indexOf(previousCurrentId ?? '')
@@ -1222,7 +1215,15 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
         setSearchFailed(true)
       })
     return () => controller.abort()
-  }, [chatId, inspectAndCenterMessage, layout, normalizedQuery, repository, searchRevision])
+  }, [
+    chatId,
+    inspectAndCenterMessage,
+    layout,
+    normalizedQuery,
+    repository,
+    searchRevision,
+    workspaceRevision,
+  ])
 
   useEffect(() => {
     const focusSearch = (event: KeyboardEvent) => {
@@ -1451,20 +1452,52 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
 
   const matchSet = useMemo(() => new Set(matches), [matches])
   const previewNode = activePreview ? layout.byId.get(activePreview.messageId) : undefined
+  const readyInspectedMessage =
+    inspectedMessage?.status === 'ready' &&
+    inspectedMessage.bodyVersion === selectedBodyVersion &&
+    inspectedMessage.message.id === liveSelectedHeader?.id
+      ? inspectedMessage
+      : undefined
+  if (readyInspectedMessage) {
+    retainedInspectedMessageRef.current = {
+      workspaceRevision,
+      repository,
+      chatId,
+      id: readyInspectedMessage.id,
+      bodyVersion: readyInspectedMessage.bodyVersion,
+      message: readyInspectedMessage.message,
+    }
+  }
+  const retainedInspectedMessage = retainedInspectedMessageRef.current
+  const inspectorBody = readyInspectedMessage
+    ? readyInspectedMessage.message
+    : retainedInspectedMessage?.workspaceRevision === workspaceRevision &&
+        retainedInspectedMessage.repository === repository &&
+        retainedInspectedMessage.chatId === chatId &&
+        retainedInspectedMessage.id === inspectedMessageId
+      ? retainedInspectedMessage.message
+      : undefined
+  const inspectorBodyVersion = readyInspectedMessage
+    ? readyInspectedMessage.bodyVersion
+    : retainedInspectedMessage?.workspaceRevision === workspaceRevision &&
+        retainedInspectedMessage.repository === repository &&
+        retainedInspectedMessage.chatId === chatId &&
+        retainedInspectedMessage.id === inspectedMessageId
+      ? retainedInspectedMessage.bodyVersion
+      : undefined
   const inspectorMessage = useMemo<Message | undefined>(() => {
-    if (
-      inspectedMessage?.status !== 'ready' ||
-      !inspectedMessage.message ||
-      liveSelectedHeader?.id !== inspectedMessage.message.id
-    ) {
-      return undefined
-    }
+    if (!inspectorBody || liveSelectedHeader?.id !== inspectorBody.id) return undefined
+    const {
+      bodyVersion: _bodyVersion,
+      bodyWordCount: _bodyWordCount,
+      textPreview: _textPreview,
+      ...canonicalHeader
+    } = liveSelectedHeader
     return {
-      ...inspectedMessage.message,
-      ...liveSelectedHeader,
-      nodeVersion: inspectedMessage.message.nodeVersion,
+      ...inspectorBody,
+      ...canonicalHeader,
     }
-  }, [inspectedMessage, liveSelectedHeader])
+  }, [inspectorBody, liveSelectedHeader])
   const handleInspectorActivate = useCallback(() => {
     if (inspectedMessageId) activateNode(inspectedMessageId)
   }, [activateNode, inspectedMessageId])
@@ -1962,6 +1995,8 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
                   <BranchTreeInspector
                     key={inspectorMessage.id}
                     message={inspectorMessage}
+                    bodyVersion={inspectorBodyVersion as number}
+                    bodyReady={readyInspectedMessage !== undefined}
                     searchQuery={normalizedQuery}
                     searchMatched={matchSet.has(inspectedMessageId)}
                     hasConnection={hasConnection}

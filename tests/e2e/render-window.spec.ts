@@ -91,7 +91,7 @@ test('chat transcript mounts only the newest message window and loads older batc
   page,
 }) => {
   const chatId = await seedLinearChat(page, {
-    messageCount: 24,
+    messageCount: 35,
     chatId: 'render-window-chat',
     title: 'Render window chat',
     textPrefix: 'window message',
@@ -104,19 +104,48 @@ test('chat transcript mounts only the newest message window and loads older batc
   await page.goto(`/#/chat/${chatId}`)
   await page.reload()
   await expect(page.locator('[data-ui="message"]')).toHaveCount(10)
-  await expect(page.locator('[data-ui="message"]').first()).toContainText('window message 14')
-  await expect(page.locator('[data-ui="message-list"]')).toHaveAttribute('data-total-count', '24')
+  await expect(page.locator('[data-ui="message"]').first()).toContainText('window message 25')
+  await expect(page.locator('[data-ui="message-list"]')).toHaveAttribute('data-total-count', '35')
   await expect(page.locator('[data-ui="message-list"]')).toHaveAttribute(
     'data-rendered-count',
     '10',
   )
 
-  await page.locator('[data-ui="load-more-messages"]').click()
+  const retainedMessage = page
+    .locator('[data-ui="message"]')
+    .filter({ hasText: 'window message 25' })
+  const retainedTop = await retainedMessage.evaluate((element) => {
+    const scrollRegion = element.closest<HTMLElement>('[data-ui="scroll-region"]')
+    if (!scrollRegion) throw new Error('missing scroll region')
+    scrollRegion.scrollTop = 0
+    ;(element as HTMLElement & { retainedAcrossPrepend?: boolean }).retainedAcrossPrepend = true
+    const markdown = element.querySelector<HTMLElement>('[data-ui="markdown-segment"]')
+    if (!markdown) throw new Error('missing markdown segment')
+    ;(markdown as HTMLElement & { retainedAcrossPrepend?: boolean }).retainedAcrossPrepend = true
+    return element.getBoundingClientRect().top
+  })
+  await page
+    .locator('[data-ui="load-more-messages"]')
+    .evaluate((element: HTMLElement) => element.click())
   await expect(page.locator('[data-ui="message"]')).toHaveCount(20)
-  await expect(page.locator('[data-ui="message"]').first()).toContainText('window message 4')
+  await expect(page.locator('[data-ui="message"]').first()).toContainText('window message 15')
+  const retainedAfterPrepend = await retainedMessage.evaluate((element) => ({
+    top: element.getBoundingClientRect().top,
+    messageNodeRetained:
+      (element as HTMLElement & { retainedAcrossPrepend?: boolean }).retainedAcrossPrepend === true,
+    markdownNodeRetained:
+      (
+        element.querySelector<HTMLElement>('[data-ui="markdown-segment"]') as HTMLElement & {
+          retainedAcrossPrepend?: boolean
+        }
+      ).retainedAcrossPrepend === true,
+  }))
+  expect(Math.abs(retainedAfterPrepend.top - retainedTop)).toBeLessThan(2)
+  expect(retainedAfterPrepend.messageNodeRetained).toBe(true)
+  expect(retainedAfterPrepend.markdownNodeRetained).toBe(true)
 
   await page.locator('[data-ui="load-more-messages"]').click()
-  await expect(page.locator('[data-ui="message"]')).toHaveCount(24)
+  await expect(page.locator('[data-ui="message"]')).toHaveCount(35)
   await expect(page.locator('[data-ui="load-more-messages"]')).toHaveCount(0)
 })
 
@@ -124,9 +153,22 @@ test('send and regenerate keep the transcript mounted while the branch window re
   page,
 }) => {
   let requestCount = 0
+  let releaseRegenerate: () => void = () => undefined
+  const regenerateGate = new Promise<void>((resolve) => {
+    releaseRegenerate = resolve
+  })
+  let markRegenerateRequested: () => void = () => undefined
+  const regenerateRequested = new Promise<void>((resolve) => {
+    markRegenerateRequested = resolve
+  })
   await page.route('**/api/v1/chat/completions', async (route) => {
     requestCount += 1
-    await new Promise((resolve) => setTimeout(resolve, 120))
+    if (requestCount === 2) {
+      markRegenerateRequested()
+      await regenerateGate
+    } else {
+      await new Promise((resolve) => setTimeout(resolve, 120))
+    }
     const text = requestCount === 1 ? 'sent answer' : 'regenerated answer'
     await route.fulfill({
       contentType: 'text/event-stream',
@@ -165,15 +207,106 @@ test('send and regenerate keep the transcript mounted while the branch window re
     recyclingSeen: false,
   })
 
+  const previousAssistantId = await page
+    .locator('[data-ui="message"][data-role="assistant"]')
+    .last()
+    .getAttribute('data-message-id')
+  if (!previousAssistantId) throw new Error('Regenerate target has no message id')
   await startMessageCountRecorder(page)
+  await page.evaluate(() => {
+    const win = window as typeof window & {
+      __tailAssistantSamples?: string[]
+      __tailAssistantObserver?: MutationObserver
+    }
+    const sample = () => {
+      const rows = document.querySelectorAll(
+        '[data-ui="message"][data-role="assistant"][data-message-id]',
+      )
+      const id =
+        rows.length === 0 ? null : rows.item(rows.length - 1).getAttribute('data-message-id')
+      if (id) win.__tailAssistantSamples?.push(id)
+    }
+    win.__tailAssistantSamples = []
+    win.__tailAssistantObserver = new MutationObserver(sample)
+    win.__tailAssistantObserver.observe(document.body, { childList: true, subtree: true })
+    sample()
+  })
   await page
     .locator('[data-ui="message"][data-role="assistant"]')
     .last()
     .locator('[data-action="regenerate"]')
     .click()
+  let regeneratedId: string
+  try {
+    await regenerateRequested
+    const activeRegeneratedId = await page.evaluate(
+      () =>
+        (
+          window as typeof window & {
+            __debugFakeStream?: {
+              state(): { streamStore: { activeTargets: Array<{ messageId?: string }> } }
+            }
+          }
+        ).__debugFakeStream?.state().streamStore.activeTargets[0]?.messageId ?? null,
+    )
+    if (!activeRegeneratedId) throw new Error('Regenerate stream has no target message')
+    regeneratedId = activeRegeneratedId
+    await expect(
+      page.locator(`[data-ui="message"][data-message-id="${regeneratedId}"]`),
+    ).toBeVisible()
+    await expect(
+      page.locator(`[data-ui="message"][data-message-id="${previousAssistantId}"]`),
+    ).toHaveCount(0)
+    await expect(
+      page.locator(
+        `[data-ui="message"][data-message-id="${regeneratedId}"] [data-ui="branch-count"]`,
+      ),
+    ).toHaveText('2 / 2')
+    await expect
+      .poll(() => page.evaluate(() => window.location.hash))
+      .toBe(`#/chat/${chatId}/message/${regeneratedId}`)
+    await expect(page.locator('[data-ui="surface-loading"]')).toHaveCount(0)
+    await expect(page.locator('[data-ui="message-list"]')).not.toHaveAttribute('inert')
+    await page.evaluate(
+      () =>
+        new Promise<void>((resolve) =>
+          requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+        ),
+    )
+    const tailSamples = await page.evaluate(() => {
+      const win = window as typeof window & { __tailAssistantSamples?: string[] }
+      return win.__tailAssistantSamples ?? []
+    })
+    const firstRegenerated = tailSamples.indexOf(regeneratedId)
+    expect(firstRegenerated).toBeGreaterThanOrEqual(0)
+    expect(tailSamples.slice(firstRegenerated)).not.toContain(previousAssistantId)
+  } finally {
+    releaseRegenerate()
+  }
   await expect(
-    page.locator('[data-ui="message"]').last().locator('[data-ui="message-body"]'),
+    page.locator(
+      `[data-ui="message"][data-message-id="${regeneratedId}"] [data-ui="message-body"]`,
+    ),
   ).toContainText('regenerated answer')
+  await expect(
+    page.locator(
+      `[data-ui="message"][data-message-id="${regeneratedId}"] [data-ui="branch-count"]`,
+    ),
+  ).toHaveText('2 / 2')
+  await expect
+    .poll(() => page.evaluate(() => window.location.hash))
+    .toBe(`#/chat/${chatId}/message/${regeneratedId}`)
+  const tailSamples = await page.evaluate(() => {
+    const win = window as typeof window & {
+      __tailAssistantSamples?: string[]
+      __tailAssistantObserver?: MutationObserver
+    }
+    win.__tailAssistantObserver?.disconnect()
+    return win.__tailAssistantSamples ?? []
+  })
+  const firstRegenerated = tailSamples.indexOf(regeneratedId)
+  expect(firstRegenerated).toBeGreaterThanOrEqual(0)
+  expect(tailSamples.slice(firstRegenerated)).not.toContain(previousAssistantId)
   expect(await stopMessageCountRecorder(page)).toEqual({
     anchorRemoved: false,
     listRemoved: false,
@@ -261,6 +394,91 @@ test('switching message variants re-renders the selected branch window', async (
   await expect(page.locator('[data-ui="message"]').nth(2)).toContainText('branch B assistant')
   await expect(page.locator('[data-ui="message-list"]')).toHaveAttribute('data-rendered-count', '3')
   await expect(page.locator('[data-ui="message-list"]')).toHaveAttribute('data-total-count', '3')
+})
+
+test('cached leaves share one live sibling count revision', async ({ context, page }) => {
+  const chatId = await seedBranchedChat(page)
+  await rebuildSidebarProjection(page)
+  await page.goto(`/?debug#/chat/${chatId}/message/A2`)
+  await expect(page.locator('[data-ui="message"]').last()).toContainText('branch A assistant')
+
+  await page
+    .locator('[data-ui="message"]')
+    .filter({ hasText: 'branch A user' })
+    .getByLabel('Next variant')
+    .click()
+  await expect(page.locator('[data-ui="message"]').last()).toContainText('branch B assistant')
+
+  const otherTab = await context.newPage()
+  try {
+    await otherTab.goto(`/?debug#/chat/${chatId}/message/B2`)
+    await otherTab.waitForFunction(
+      () =>
+        typeof (window as typeof window & { __debugFakeStream?: unknown }).__debugFakeStream ===
+        'object',
+    )
+    await otherTab.evaluate(async (activeChatId) => {
+      const api = (
+        window as typeof window & {
+          __debugFakeStream?: {
+            start(options: Record<string, unknown>): Promise<unknown>
+          }
+        }
+      ).__debugFakeStream
+      if (!api) throw new Error('Debug stream API unavailable')
+      await api.start({
+        chatId: activeChatId,
+        parentMessageId: 'root',
+        targetChars: 8,
+        reasoningChars: 0,
+        chunkChars: 8,
+        openChat: false,
+      })
+    }, chatId)
+  } finally {
+    await otherTab.close()
+  }
+
+  const branchB = page.locator('[data-ui="message"]').filter({ hasText: 'branch B user' })
+  await expect(branchB.locator('[data-ui="branch-count"]')).toHaveText('2 / 3')
+  await page.evaluate(() => {
+    const win = window as typeof window & {
+      __branchCountSamples?: string[]
+      __branchCountObserver?: MutationObserver
+    }
+    const sample = () => {
+      const text = document.querySelector('[data-ui="branch-count"]')?.textContent.trim()
+      if (text) win.__branchCountSamples?.push(text)
+    }
+    win.__branchCountSamples = []
+    win.__branchCountObserver = new MutationObserver(sample)
+    win.__branchCountObserver.observe(document.body, {
+      childList: true,
+      characterData: true,
+      subtree: true,
+    })
+    sample()
+  })
+
+  await branchB.getByLabel('First variant').click()
+  const branchA = page.locator('[data-ui="message"]').filter({ hasText: 'branch A user' })
+  await expect(branchA.locator('[data-ui="branch-count"]')).toHaveText('1 / 3')
+  await page.evaluate(
+    () =>
+      new Promise<void>((resolve) =>
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+      ),
+  )
+  await expect(branchA.locator('[data-ui="branch-count"]')).toHaveText('1 / 3')
+  const samples = await page.evaluate(() => {
+    const win = window as typeof window & {
+      __branchCountSamples?: string[]
+      __branchCountObserver?: MutationObserver
+    }
+    win.__branchCountObserver?.disconnect()
+    return win.__branchCountSamples ?? []
+  })
+  expect(samples).not.toContain('1 / 2')
 })
 
 test('sidebar mounts only the first row window and loads more rows manually', async ({ page }) => {

@@ -1,6 +1,6 @@
 import { type ReactNode, useId, useRef } from 'react'
 import { CloseIcon } from '../icons/Icon'
-import { Button, IconButton } from './Button'
+import { Button, type ButtonTone, IconButton } from './Button'
 import { Dialog } from './Dialog'
 
 interface ConfirmDialogProps {
@@ -10,6 +10,9 @@ interface ConfirmDialogProps {
   busyLabel?: string
   cancelLabel?: string
   busy?: boolean
+  confirmDisabled?: boolean
+  confirmTone?: ButtonTone
+  initialFocus?: 'confirm' | 'cancel'
   onCancel: () => void
   onConfirm: () => void | Promise<void>
   closeLabel?: string
@@ -22,12 +25,16 @@ export function ConfirmDialog({
   busyLabel,
   cancelLabel = 'Cancel',
   busy = false,
+  confirmDisabled = false,
+  confirmTone = 'danger',
+  initialFocus = 'confirm',
   onCancel,
   onConfirm,
   closeLabel = 'Cancel delete',
 }: ConfirmDialogProps) {
   const titleId = useId()
   const confirmRef = useRef<HTMLButtonElement | null>(null)
+  const cancelRef = useRef<HTMLButtonElement | null>(null)
 
   return (
     <Dialog
@@ -36,7 +43,9 @@ export function ConfirmDialog({
       surfaceUi="confirm-delete"
       labelledBy={titleId}
       scrimLabel={closeLabel}
-      initialFocusRef={confirmRef}
+      initialFocusRef={initialFocus === 'cancel' ? cancelRef : confirmRef}
+      closeOnEscape={!busy}
+      closeOnScrim={!busy}
       onClose={onCancel}
     >
       <div data-ui="confirm-delete-header">
@@ -55,6 +64,7 @@ export function ConfirmDialog({
       {children}
       <div data-ui="confirm-delete-actions">
         <Button
+          ref={cancelRef}
           data-ui="confirm-delete-button"
           data-role="cancel"
           appearance="plain"
@@ -68,10 +78,11 @@ export function ConfirmDialog({
           ref={confirmRef}
           data-ui="confirm-delete-button"
           data-role="confirm"
-          tone="danger"
+          tone={confirmTone}
           appearance="solid"
           geometry="flush"
           busy={busy}
+          disabled={confirmDisabled}
           busyLabel={busyLabel}
           onClick={() => void onConfirm()}
         >

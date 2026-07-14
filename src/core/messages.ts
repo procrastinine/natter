@@ -1,5 +1,6 @@
 import { newId } from '../lib/ulid'
 import { attachmentRefsFromIds, attachmentScopes } from '../store/attachments'
+import type { MessageHeaderRow } from '../store/message-storage'
 import type {
   MutationContext,
   WorkspaceMutationResult,
@@ -8,12 +9,16 @@ import type {
 import { getWorkspaceRepository } from '../store/workspace-repository'
 import {
   createDefaultChildPicker,
+  createMessageTreeProjection,
   cursorKeyOf,
-  groupByParent,
-  indexById,
+  type MessageTreeNode,
+  type MessageTreeProjection,
   resolveActiveLeafId,
+  resolveActiveLeafIdProjected,
 } from './active-path'
+import { seedCursorAtMessageProjected, selectBranchProjected } from './branch-resolve'
 import { cloneForExplicitBranch } from './branching'
+import { createCursorOverlay } from './cursor-overlay'
 import { readGlobalPreferences } from './global-settings'
 import {
   calibrationFieldsForCreate,
@@ -23,6 +28,7 @@ import {
 import {
   cascadeSoftDelete,
   collectTurnChain,
+  createAncestorOutsideSetResolver,
   softDeleteWithSplice,
   TreeChangedError,
   turnHeadOf,
@@ -34,6 +40,7 @@ import type {
   ChatVersions,
   ContentItem,
   CursorMap,
+  CursorPatch,
   Message,
   MessageId,
   MessageOrigin,
@@ -46,7 +53,6 @@ import type { StructuralSnapshot } from './undo'
 export interface StructuralEffects {
   cursorUpdates: CursorMap
   cursorRemoveKeys: string[]
-  cursorRemoveValueIds: MessageId[]
   newMessageIds: MessageId[]
   tombstoned: MessageId[]
   reparented: Array<{
@@ -68,7 +74,6 @@ function emptyEffects(): StructuralEffects {
   return {
     cursorUpdates: {},
     cursorRemoveKeys: [],
-    cursorRemoveValueIds: [],
     newMessageIds: [],
     tombstoned: [],
     reparented: [],
@@ -393,14 +398,7 @@ function collectDeleteScopes(
   }
   const scopes: MutationScope[] = []
   const affectedNewParents = new Set<MessageId | null>()
-
-  const firstLiveAncestor = (message: MessageTreeRow): MessageId | null => {
-    let parentId = message.parentId
-    while (parentId && idsToDelete.has(parentId)) {
-      parentId = byId.get(parentId)?.parentId ?? null
-    }
-    return parentId
-  }
+  const firstLiveAncestor = createAncestorOutsideSetResolver(byId, idsToDelete)
 
   for (const member of messages) {
     if (!idsToDelete.has(member.id)) continue
@@ -449,9 +447,9 @@ async function applyDelete(
 }
 
 function cursorSelectedReparentedChild(
-  cursor: CursorMap,
+  cursor: Readonly<CursorMap>,
   effect: StructuralEffects['reparented'][number],
-  beforeById: ReadonlyMap<MessageId, Message>,
+  beforeById: ReadonlyMap<MessageId, MessageTreeRow>,
 ): boolean {
   if (cursor[cursorKeyOf(effect.previousParentId)] !== effect.id) return false
   let currentId = effect.previousParentId
@@ -465,12 +463,20 @@ function cursorSelectedReparentedChild(
 }
 
 function finalizeDelete(
-  cursor: CursorMap,
+  cursor: Readonly<CursorMap>,
   effects: StructuralEffects,
-  beforeById: ReadonlyMap<MessageId, Message>,
+  beforeById: ReadonlyMap<MessageId, MessageTreeRow>,
 ): void {
-  effects.cursorRemoveKeys = [...effects.tombstoned]
-  effects.cursorRemoveValueIds = [...effects.tombstoned]
+  const removeKeys = new Set<string>(effects.tombstoned)
+  for (const messageId of effects.tombstoned) {
+    const message = beforeById.get(messageId)
+    if (!message) continue
+    // A valid cursor can select a message only in its actual parent slot.
+    // Record that exact key so persistent application never scans every fork by value.
+    const parentKey = cursorKeyOf(message.parentId)
+    if (cursor[parentKey] === messageId) removeKeys.add(parentKey)
+  }
+  effects.cursorRemoveKeys = [...removeKeys]
   for (const effect of effects.reparented) {
     if (!cursorSelectedReparentedChild(cursor, effect, beforeById)) continue
     effects.cursorUpdates[cursorKeyOf(effect.newParentId)] = effect.id
@@ -479,15 +485,19 @@ function finalizeDelete(
 
 export function applyStructuralEffectsToCursor(
   cursor: CursorMap,
-  effects: Pick<StructuralEffects, 'cursorRemoveKeys' | 'cursorRemoveValueIds' | 'cursorUpdates'>,
+  effects: Pick<StructuralEffects, 'cursorRemoveKeys' | 'cursorUpdates'>,
 ): CursorMap {
   const next = { ...cursor }
   for (const key of effects.cursorRemoveKeys) delete next[key]
-  const removeValueIds = new Set(effects.cursorRemoveValueIds)
-  for (const [key, value] of Object.entries(next)) {
-    if (removeValueIds.has(value)) delete next[key]
-  }
   return { ...next, ...effects.cursorUpdates }
+}
+
+export function structuralEffectsCursorPatch(
+  effects: Pick<StructuralEffects, 'cursorRemoveKeys' | 'cursorUpdates'>,
+): CursorPatch {
+  const patch: CursorPatch = {}
+  for (const key of effects.cursorRemoveKeys) patch[key] = undefined
+  return Object.assign(patch, effects.cursorUpdates)
 }
 
 function deleteCandidateIds(scopes: readonly MutationScope[]): MessageId[] {
@@ -498,7 +508,7 @@ function deleteCandidateIds(scopes: readonly MutationScope[]): MessageId[] {
   return [...ids]
 }
 
-function structuralFieldsChanged(before: Message, after: Message): boolean {
+function structuralFieldsChanged(before: MessageTreeRow, after: MessageTreeRow): boolean {
   return (
     before.deleted !== after.deleted ||
     before.parentId !== after.parentId ||
@@ -506,7 +516,9 @@ function structuralFieldsChanged(before: Message, after: Message): boolean {
   )
 }
 
-function attachmentIdsFromRows(rows: readonly Message[]): AttachmentId[] {
+function attachmentIdsFromRows(
+  rows: readonly Pick<MessageHeaderRow, 'attachmentRefs'>[],
+): AttachmentId[] {
   const ids = new Set<AttachmentId>()
   for (const row of rows) {
     for (const ref of row.attachmentRefs ?? []) {
@@ -527,9 +539,9 @@ async function executeDeleteMutation(
     members.filter((member) => !member.deleted).map((member) => member.id),
   )
   const result = await repo.runMutation(scopes, async (ctx) => {
-    const beforeById = new Map<MessageId, Message>()
+    const beforeById = new Map<MessageId, MessageHeaderRow>()
     for (const id of candidateIds) {
-      const row = await ctx.getMessage(id)
+      const row = await ctx.getMessageHeader(id)
       if (!row || row.chatId !== input.chatId) {
         throw new TreeChangedError(input.chatId, `delete candidate ${id} unavailable`)
       }
@@ -546,13 +558,13 @@ async function executeDeleteMutation(
     const reportedTombstoned = new Set(effects.tombstoned)
     const reportedReparented = new Map(effects.reparented.map((effect) => [effect.id, effect]))
 
-    const changedBeforeRows: Message[] = []
-    const changedAfterRows: Message[] = []
+    const changedBeforeRows: MessageHeaderRow[] = []
+    const changedAfterRows: MessageHeaderRow[] = []
     const tombstoned: MessageId[] = []
     const reparented: StructuralEffects['reparented'] = []
     for (const id of candidateIds) {
-      const before = beforeById.get(id) as Message
-      const after = await ctx.getMessage(id)
+      const before = beforeById.get(id) as MessageHeaderRow
+      const after = await ctx.getMessageHeader(id)
       if (!after || after.chatId !== input.chatId) {
         throw new TreeChangedError(input.chatId, `delete candidate ${id} disappeared`)
       }
@@ -1040,21 +1052,44 @@ interface PasteImportInput {
   now?: number
 }
 
-export async function pasteImport(
-  input: PasteImportInput,
-): Promise<{ effects: StructuralEffects; versions: ChatVersions; newMessageIds: MessageId[] }> {
+export async function pasteImport(input: PasteImportInput): Promise<{
+  effects: StructuralEffects
+  versions: ChatVersions
+  newMessageIds: MessageId[]
+  selectedPathMessageIds: MessageId[]
+}> {
   if (input.messages.length === 0) {
-    return { effects: emptyEffects(), versions: ZERO_VERSIONS, newMessageIds: [] }
+    return {
+      effects: emptyEffects(),
+      versions: ZERO_VERSIONS,
+      newMessageIds: [],
+      selectedPathMessageIds: [],
+    }
   }
   const repo = getWorkspaceRepository()
   const snapshot = await repo.listMessageHeaders(input.chatId)
+  const projection = createMessageTreeProjection(snapshot)
+  const operationCursor = createCursorOverlay(input.cursor)
+  const navigationTargetId = pasteImportNavigationTarget(input.slot)
+  if (navigationTargetId !== null) {
+    Object.assign(
+      operationCursor,
+      seedCursorAtMessageProjected(projection, navigationTargetId, input.cursor),
+    )
+  }
   const newMessageIds = input.messages.map(() => newId())
+  const selectedLeafId = selectedLeafAfterPasteImport(
+    projection,
+    input.slot,
+    operationCursor,
+    newMessageIds,
+  )
   const attachmentIds = input.messages.flatMap((message) => message.attachmentRefs ?? [])
   const scopes = collectPasteImportScopes(
     input.chatId,
     snapshot,
     input.slot,
-    input.cursor,
+    operationCursor,
     newMessageIds,
     attachmentIds,
   )
@@ -1065,13 +1100,16 @@ export async function pasteImport(
         ctx,
         input.chatId,
         input.slot.parentId,
-        input.cursor,
+        operationCursor,
         input.messages,
         newMessageIds,
         snapshot,
         input.now ?? Date.now(),
       )
-      return { effects }
+      return {
+        effects,
+        selectedPathMessageIds: await selectedPathByLeaf(ctx, input.chatId, selectedLeafId),
+      }
     }
 
     const effects = emptyEffects()
@@ -1079,7 +1117,7 @@ export async function pasteImport(
       ctx,
       input.chatId,
       input.slot,
-      input.cursor,
+      operationCursor,
       input.messages[0] as PasteImportMessageInput,
       newMessageIds[0] as MessageId,
       input.now ?? Date.now(),
@@ -1125,14 +1163,17 @@ export async function pasteImport(
     if (displacedCursorTargetId !== undefined && tail.id !== firstRow.id) {
       for (let peerIndex = 0; peerIndex < displacedMessageIds.length; peerIndex += 1) {
         const displacedId = displacedMessageIds[peerIndex] as MessageId
-        const displaced = await ctx.getMessage(displacedId)
+        const displaced = await ctx.getMessageHeader(displacedId)
         if (!displaced || displaced.chatId !== input.chatId || displaced.parentId !== firstRow.id) {
           throw new TreeChangedError(
             input.chatId,
             `paste displaced child ${displacedId} unavailable`,
           )
         }
-        await ctx.putMessage({ ...displaced, parentId: tail.id, siblingIndex: peerIndex })
+        await ctx.patchMessageStructure(displaced.id, {
+          parentId: tail.id,
+          siblingIndex: peerIndex,
+        })
       }
       for (const effect of effects.reparented) {
         if (displacedMessageIdSet.has(effect.id)) effect.newParentId = tail.id
@@ -1140,14 +1181,67 @@ export async function pasteImport(
       effects.cursorUpdates[cursorKeyOf(tail.id)] = displacedCursorTargetId
     }
 
-    return { effects }
+    return {
+      effects,
+      selectedPathMessageIds: await selectedPathByLeaf(ctx, input.chatId, selectedLeafId),
+    }
   })
 
   return {
     effects: result.value.effects,
     versions: versionsFor(result, input.chatId),
     newMessageIds: result.value.effects.newMessageIds,
+    selectedPathMessageIds: result.value.selectedPathMessageIds,
   }
+}
+
+async function selectedPathByLeaf(
+  ctx: MutationContext,
+  chatId: ChatId,
+  leafId: MessageId,
+): Promise<MessageId[]> {
+  const reversed: MessageId[] = []
+  let currentId: MessageId | null = leafId
+  while (currentId !== null) {
+    const header = await ctx.getMessageHeader(currentId)
+    if (!header || header.chatId !== chatId || header.deleted) break
+    reversed.push(header.id)
+    currentId = header.parentId
+  }
+  reversed.reverse()
+  return reversed
+}
+
+function pasteImportNavigationTarget(slot: PasteImportSlot): MessageId | null {
+  if (slot.kind === 'at-end') return null
+  if (slot.kind === 'after-all') return slot.parentId
+  return slot.messageId
+}
+
+function selectedLeafAfterPasteImport(
+  projection: MessageTreeProjection<MessageTreeRow>,
+  slot: PasteImportSlot,
+  cursor: Readonly<CursorMap>,
+  newMessageIds: readonly MessageId[],
+): MessageId {
+  const insertedTailId = newMessageIds.at(-1) as MessageId
+  if (slot.kind === 'at-end' || slot.kind === 'sibling') return insertedTailId
+
+  const currentLeafId = resolveActiveLeafIdProjected(projection, cursor)
+  if (slot.kind === 'before') return currentLeafId ?? insertedTailId
+
+  if (slot.kind === 'after-all') {
+    return (projection.liveByParent.get(slot.parentId)?.length ?? 0) > 0
+      ? (currentLeafId ?? insertedTailId)
+      : insertedTailId
+  }
+
+  const targetMessageId = slot.messageId
+  const selectedChildId = cursor[cursorKeyOf(targetMessageId)]
+  const selectedChildIsLive = (projection.liveByParent.get(targetMessageId) ?? []).some(
+    (header) => header.id === selectedChildId,
+  )
+  return selectedChildIsLive ? (currentLeafId ?? insertedTailId) : insertedTailId
 }
 
 async function createAfterAllImportedChain(
@@ -1212,7 +1306,7 @@ async function createAfterAllImportedChain(
 
   for (let index = 0; index < currentChildren.length; index += 1) {
     const expected = currentChildren[index] as MessageTreeRow
-    const child = await ctx.getMessage(expected.id)
+    const child = await ctx.getMessageHeader(expected.id)
     if (
       !child ||
       child.chatId !== chatId ||
@@ -1222,7 +1316,7 @@ async function createAfterAllImportedChain(
     ) {
       throw new TreeChangedError(chatId, `paste child ${expected.id} changed`)
     }
-    await ctx.putMessage({ ...child, parentId: tailId, siblingIndex: index })
+    await ctx.patchMessageStructure(child.id, { parentId: tailId, siblingIndex: index })
     effects.reparented.push({
       id: child.id,
       previousParentId: parentId,
@@ -1424,11 +1518,11 @@ async function insertBetweenInner(
     .sort((a, b) => a.createdAt - b.createdAt)
   for (let i = 0; i < peerHeaders.length; i += 1) {
     const peerHeader = peerHeaders[i] as MessageTreeRow
-    const peer = await ctx.getMessage(peerHeader.id)
+    const peer = await ctx.getMessageHeader(peerHeader.id)
     if (!peer || peer.chatId !== chatId || peer.deleted || peer.parentId !== parentId) {
       throw new TreeChangedError(chatId, `insert-between peer ${peerHeader.id} unavailable`)
     }
-    await ctx.putMessage({ ...peer, parentId: row.id, siblingIndex: i })
+    await ctx.patchMessageStructure(peer.id, { parentId: row.id, siblingIndex: i })
     effects.reparented.push({
       id: peer.id,
       previousParentId: parentId,
@@ -1445,7 +1539,7 @@ async function insertBetweenInner(
 interface DeleteInput {
   chatId: ChatId
   messageId: MessageId
-  cursor: CursorMap
+  cursor: Readonly<CursorMap>
   cascade?: boolean
   now?: number
 }
@@ -1547,36 +1641,38 @@ interface SwipeInput {
   cursor: CursorMap
 }
 
-export function swipe(input: SwipeInput): { cursorUpdates: CursorMap; chosenSiblingId: MessageId } {
-  const { messages, targetId, direction, cursor } = input
-  const byParent = groupByParent(messages)
-  const byId = indexById(messages)
+interface ProjectedSwipeInput<T extends MessageTreeNode> {
+  projection: MessageTreeProjection<T>
+  targetId: MessageId
+  direction: -1 | 1
+  cursor: CursorMap
+}
+
+export function swipeProjected<T extends MessageTreeNode>(
+  input: ProjectedSwipeInput<T>,
+): {
+  cursorUpdates: CursorMap
+  chosenSiblingId: MessageId
+} {
+  const { projection, targetId, direction, cursor } = input
+  const { liveByParent, byId } = projection
   const target = byId.get(targetId)
   if (!target) throw new Error(`Swipe target not found: ${targetId}`)
-  const siblings = (byParent.get(target.parentId) ?? []).filter((message) => !message.deleted)
+  const siblings = liveByParent.get(target.parentId) ?? []
   if (siblings.length === 0) {
     return { cursorUpdates: {}, chosenSiblingId: targetId }
   }
-  siblings.sort((a, b) => a.siblingIndex - b.siblingIndex)
   const idx = siblings.findIndex((sibling) => sibling.id === target.id)
   const nextIdx = (idx + direction + siblings.length) % siblings.length
-  const chosen = siblings[nextIdx] as Message
-  const nextCursor: CursorMap = { ...cursor, [cursorKeyOf(target.parentId)]: chosen.id }
-  const updates: CursorMap = { [cursorKeyOf(target.parentId)]: chosen.id }
-  const pickDefaultChild = createDefaultChildPicker(byParent, byId)
-  let currentId: MessageId = chosen.id
-  for (;;) {
-    const kids: Message[] = (byParent.get(currentId) ?? []).filter((kid) => !kid.deleted)
-    if (kids.length === 0) break
-    const pinnedId: MessageId | undefined = nextCursor[cursorKeyOf(currentId)]
-    if (pinnedId !== undefined && kids.some((kid) => kid.id === pinnedId)) {
-      currentId = pinnedId
-      continue
-    }
-    const pick = pickDefaultChild(kids)
-    updates[cursorKeyOf(currentId)] = pick.id
-    nextCursor[cursorKeyOf(currentId)] = pick.id
-    currentId = pick.id
-  }
+  const chosen = siblings[nextIdx] as T
+  const updates = selectBranchProjected(projection, chosen.id, cursor)
   return { cursorUpdates: updates, chosenSiblingId: chosen.id }
+}
+
+export function swipe(input: SwipeInput): { cursorUpdates: CursorMap; chosenSiblingId: MessageId } {
+  const { messages, ...projectedInput } = input
+  return swipeProjected({
+    ...projectedInput,
+    projection: createMessageTreeProjection(messages),
+  })
 }

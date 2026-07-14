@@ -65,6 +65,19 @@ export default defineConfig(({ command, mode }) => {
     build: {
       target: 'es2022',
       sourcemap: false,
+      rolldownOptions: {
+        output: {
+          codeSplitting: {
+            groups: [
+              {
+                name: 'initial',
+                tags: ['$initial'],
+                maxSize: 900_000,
+              },
+            ],
+          },
+        },
+      },
     },
     test: {
       environment: 'jsdom',

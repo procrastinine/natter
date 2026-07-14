@@ -2,13 +2,17 @@ import { render } from '@testing-library/react'
 import { afterEach, describe, expect, it } from 'vitest'
 import type { Message as MessageRow } from '../../src/core/types'
 import { useStreamStore } from '../../src/store/zustand/streamStore'
-import { Message as ChatMessage } from '../../src/ui/chat/Message'
+import { Message as ChatMessageComponent } from '../../src/ui/chat/Message'
 import {
   collapseProfileFor,
   DEFAULT_OVERFLOW_THRESHOLD,
   MessageStreamOverflow,
   nextCollapseMode,
 } from '../../src/ui/chat/MessageStreamOverflow'
+
+const ChatMessage = (props: Omit<Parameters<typeof ChatMessageComponent>[0], 'bodyVersion'>) => (
+  <ChatMessageComponent {...props} bodyVersion={props.message.nodeVersion} />
+)
 
 afterEach(() => {
   useStreamStore.getState().reset()
@@ -116,6 +120,7 @@ describe('Message active-stream overflow behavior', () => {
     })
     useStreamStore.getState().setActive({
       streamId: 'stream-1',
+      replacementEpoch: 0,
       chatId: message.chatId,
       messageId: message.id,
       startedAt: 1,

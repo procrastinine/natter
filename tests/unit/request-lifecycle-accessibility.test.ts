@@ -47,6 +47,7 @@ async function targetLifecycle(streamId: string) {
     streamId,
     messageId: `message-${streamId}`,
     abort: lifecycle.abort,
+    replacementEpoch: lifecycle.replacementEpoch,
   })
   return lifecycle
 }
@@ -60,6 +61,7 @@ describe('request lifecycle announcements', () => {
       streamId: lifecycle.streamId,
       messageId: 'message-stream-repeated-target',
       abort: lifecycle.abort,
+      replacementEpoch: lifecycle.replacementEpoch,
     })
 
     expect(useAnnouncementStore.getState().polite.map((event) => event.text)).toEqual([

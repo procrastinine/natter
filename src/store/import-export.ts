@@ -9,7 +9,6 @@ import type {
 } from '../core/import-export/schema'
 import { assertEnvelopeKind } from '../core/import-export/schema'
 import type { ChatId, PresetId } from '../core/types'
-import { getBrowserImportExportBackend } from './browser-import-export'
 import type {
   ImportChatOptions,
   ImportChatPresetOptions,
@@ -29,12 +28,20 @@ export type {
   RestoreWorkspaceBackupResult,
 } from './import-export-contract'
 
-function backend(): WorkspaceImportExportBackend {
-  return getBrowserImportExportBackend()
+let backendPromise: Promise<WorkspaceImportExportBackend> | undefined
+
+function backend(): Promise<WorkspaceImportExportBackend> {
+  backendPromise ??= import('./browser-import-export').then((module) =>
+    module.getBrowserImportExportBackend(),
+  )
+  void backendPromise.catch(() => {
+    backendPromise = undefined
+  })
+  return backendPromise
 }
 
 export function __resetImportExportBackendForTests(): void {
-  // Retained for test cleanup symmetry while import/export uses the browser backend directly.
+  backendPromise = undefined
 }
 
 function parseChatExportEnvelope(value: unknown): ChatExportEnvelope {
@@ -56,34 +63,37 @@ function parseWorkspaceBackupEnvelope(value: unknown): WorkspaceBackupEnvelope {
 }
 
 export function exportChat(chatId: ChatId): Promise<ChatExportEnvelope> {
-  return backend().exportChat(chatId)
+  return backend().then((value) => value.exportChat(chatId))
 }
 
 export function importChat(
   value: unknown,
   options: ImportChatOptions = {},
 ): Promise<ImportChatResult> {
-  return backend().importChat(parseChatExportEnvelope(value), options)
+  const envelope = parseChatExportEnvelope(value)
+  return backend().then((backend) => backend.importChat(envelope, options))
 }
 
 export function exportChatPreset(presetId: PresetId): Promise<ChatPresetExportEnvelope> {
-  return backend().exportChatPreset(presetId)
+  return backend().then((value) => value.exportChatPreset(presetId))
 }
 
 export function importChatPreset(
   value: unknown,
   options: ImportChatPresetOptions = {},
 ): Promise<ImportChatPresetResult> {
-  return backend().importChatPreset(parseChatPresetExportEnvelope(value), options)
+  const envelope = parseChatPresetExportEnvelope(value)
+  return backend().then((backend) => backend.importChatPreset(envelope, options))
 }
 
 export function exportWorkspaceBackup(): Promise<WorkspaceBackupEnvelope> {
-  return backend().exportWorkspaceBackup()
+  return backend().then((value) => value.exportWorkspaceBackup())
 }
 
 export function restoreWorkspaceBackup(
   value: unknown,
   options: RestoreWorkspaceBackupOptions = {},
 ): Promise<RestoreWorkspaceBackupResult> {
-  return backend().restoreWorkspaceBackup(parseWorkspaceBackupEnvelope(value), options)
+  const envelope = parseWorkspaceBackupEnvelope(value)
+  return backend().then((backend) => backend.restoreWorkspaceBackup(envelope, options))
 }

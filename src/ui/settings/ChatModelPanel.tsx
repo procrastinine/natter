@@ -65,9 +65,10 @@ import {
 import { useRepositoryQuery } from '../../store/reactive-query'
 import { loadActiveBranchHeaderSnapshot, loadSendContextForBranch } from '../../store/send-context'
 import { useChatStore } from '../../store/zustand/chatStore'
-import { useStreamStore } from '../../store/zustand/streamStore'
+import { useActiveStreamsForChat } from '../../store/zustand/streamStore'
 import { useToastStore } from '../../store/zustand/toastStore'
 import { useAttachmentResolverForContext } from '../attachments/useAttachmentResolver'
+import { useComposerContextDraft } from '../chat/composer-draft-state'
 import { CloseIcon, DownloadIcon, GripVerticalIcon, UploadIcon } from '../icons/Icon'
 import {
   importExportErrorMessage,
@@ -88,6 +89,7 @@ import { ProviderPicker } from './ProviderPicker'
 interface ChatModelPanelProps {
   chatSnapshot: Chat
   profileSnapshot?: ConnectionProfile | null
+  draftKey?: string | null
   onClose: () => void
 }
 
@@ -98,6 +100,7 @@ const EMPTY_MESSAGES: Message[] = []
 export function ChatModelPanel({
   chatSnapshot,
   profileSnapshot = null,
+  draftKey = null,
   onClose,
 }: ChatModelPanelProps) {
   const chat = chatSnapshot
@@ -159,7 +162,7 @@ export function ChatModelPanel({
       capability.maxPromptTokens !== undefined ||
       capability.maxCompletionTokens !== undefined)
   const cursor = useChatStore((s) =>
-    canEstimatePrompt ? (s.cursors[chat.id] ?? EMPTY_CURSOR) : EMPTY_CURSOR,
+    canEstimatePrompt ? (s.getCursor(chat.id) ?? EMPTY_CURSOR) : EMPTY_CURSOR,
   )
   const activeSendContext = useRepositoryQuery(
     JSON.stringify([
@@ -203,21 +206,27 @@ export function ChatModelPanel({
     null,
     canEstimatePrompt ? GLOBAL_TOKEN_CALIBRATION_DEPENDENCIES : [],
   )
-  const streamActivityKey = useStreamStore((s) =>
-    canEstimatePrompt
-      ? Object.values(s.activeByStreamId)
-          .filter((stream) => stream.chatId === chat.id)
-          .map((stream) => (stream.messageId ? `m:${stream.messageId}` : `s:${stream.streamId}`))
-          .sort()
-          .join('|')
-      : '',
-  )
+  const activeChatStreams = useActiveStreamsForChat(chat.id, canEstimatePrompt)
+  const streamActivityKey = canEstimatePrompt
+    ? activeChatStreams
+        .map((stream) => (stream.messageId ? `m:${stream.messageId}` : `s:${stream.streamId}`))
+        .sort()
+        .join('|')
+    : ''
   const activePathMessages = canEstimatePrompt
     ? (activeSendContext?.pathMessages ?? EMPTY_MESSAGES)
     : EMPTY_MESSAGES
+  const composerDraft = useComposerContextDraft(draftKey)
+  const draftText = useMemo(
+    () => [composerDraft.text, composerDraft.prefillText].filter(Boolean).join('\n'),
+    [composerDraft],
+  )
+  const draftAttachmentRefs =
+    composerDraft.attachmentRefs.length > 0 ? composerDraft.attachmentRefs : undefined
   const attachmentResolver = useAttachmentResolverForContext({
     settings: chat.settings,
     messages: activePathMessages,
+    ...(draftAttachmentRefs ? { draftAttachmentRefs } : {}),
     enabled: canEstimatePrompt,
   })
   const promptEstimateInput = useMemo<PromptSizeEstimateInput | null>(() => {
@@ -225,7 +234,7 @@ export function ChatModelPanel({
     return buildSettingsPromptSizeEstimateInput(
       chat.settings,
       activePathMessages,
-      '',
+      draftText,
       endpointTokenizer,
       capability.maxPromptTokens ?? capability.contextLength ?? null,
       attachmentResolver,
@@ -234,13 +243,15 @@ export function ChatModelPanel({
         globalCalibration,
         mode: prefs.tokenCalibrationMode,
       },
-      undefined,
+      draftAttachmentRefs,
       activeSendContext?.preCutAttachmentIds,
     )
   }, [
     chat,
     canEstimatePrompt,
     activePathMessages,
+    draftText,
+    draftAttachmentRefs,
     endpointTokenizer,
     capability,
     attachmentResolver,

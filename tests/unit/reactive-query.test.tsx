@@ -8,6 +8,8 @@ import type {
 } from '../../src/store/reactive-query'
 import {
   __setRepositoryMutationSubscriberForTests,
+  invalidateRepositoryQueriesForWorkspaceReplacement,
+  useRepositoryPresentationQuery,
   useRepositoryQueryState,
 } from '../../src/store/reactive-query'
 import { runWithLocalWriteActivity } from '../../src/store/transaction-activity'
@@ -206,6 +208,156 @@ describe('repository reactive query adapter', () => {
     await secondWrite
     await flushAdapter()
     expect(screen.getByTestId('probe')).toHaveTextContent('ready:between-writes')
+  })
+
+  it('keeps presentation-only query promises out of the authoritative write gate', async () => {
+    const read = deferred<string>()
+    const query = vi.fn(() => read.promise)
+    render(<PresentationProbe id="probe" queryKey="non-blocking-presentation" query={query} />)
+    await act(nextTask)
+    expect(query).toHaveBeenCalledOnce()
+
+    const writeStarted = deferred<void>()
+    const write = runWithLocalWriteActivity(() => {
+      writeStarted.resolve()
+    })
+    await writeStarted.promise
+    await write
+
+    read.resolve('presentation-ready')
+    await flushAdapter()
+    expect(screen.getByTestId('probe')).toHaveTextContent('ready:presentation-ready')
+  })
+
+  it('aborts and supersedes a hung presentation read when its dependency changes', async () => {
+    const signals: AbortSignal[] = []
+    const query = vi.fn((signal: AbortSignal) => {
+      signals.push(signal)
+      if (signals.length === 1) return new Promise<string>(() => {})
+      return Promise.resolve('fresh-after-abort')
+    })
+    render(<PresentationProbe id="probe" queryKey="abort-on-invalidation" query={query} />)
+    await act(nextTask)
+
+    expect(query).toHaveBeenCalledOnce()
+    expect(signals[0]?.aborted).toBe(false)
+
+    mutationHarness.emit(settingMutation(WATCHED_SETTING))
+    await flushAdapter()
+
+    expect(signals[0]?.aborted).toBe(true)
+    expect(query).toHaveBeenCalledTimes(2)
+    expect(screen.getByTestId('probe')).toHaveTextContent('ready:fresh-after-abort')
+  })
+
+  it('bounds uncancellable presentation work and coalesces invalidations to the newest read', async () => {
+    const reads: Array<ReturnType<typeof deferred<string>>> = []
+    const signals: AbortSignal[] = []
+    let active = 0
+    let maxActive = 0
+    const query = vi.fn((signal: AbortSignal) => {
+      const read = deferred<string>()
+      reads.push(read)
+      signals.push(signal)
+      active += 1
+      maxActive = Math.max(maxActive, active)
+      return read.promise.then((value) => {
+        active -= 1
+        return value
+      })
+    })
+    render(<PresentationProbe id="probe" queryKey="bounded-presentation" query={query} />)
+    await act(nextTask)
+
+    mutationHarness.emit(settingMutation(WATCHED_SETTING))
+    await act(nextTask)
+    expect(query).toHaveBeenCalledTimes(2)
+
+    for (let index = 0; index < 100; index += 1) {
+      mutationHarness.emit(settingMutation(WATCHED_SETTING))
+    }
+    await flushReads()
+    expect(query).toHaveBeenCalledTimes(2)
+    expect(signals.every((signal) => signal.aborted)).toBe(true)
+    expect(maxActive).toBe(2)
+
+    reads[0]?.resolve('superseded-one')
+    await flushReads()
+    expect(query).toHaveBeenCalledTimes(3)
+    expect(maxActive).toBe(2)
+
+    reads[1]?.resolve('superseded-two')
+    reads[2]?.resolve('newest')
+    await flushAdapter()
+    expect(query).toHaveBeenCalledTimes(3)
+    expect(screen.getByTestId('probe')).toHaveTextContent('ready:newest')
+  })
+
+  it('bounds uncancellable presentation work across rapidly replaced query keys', async () => {
+    const reads: Array<ReturnType<typeof deferred<string>>> = []
+    let active = 0
+    let maxActive = 0
+    const query = vi.fn((_signal: AbortSignal) => {
+      const read = deferred<string>()
+      reads.push(read)
+      active += 1
+      maxActive = Math.max(maxActive, active)
+      return read.promise.then((value) => {
+        active -= 1
+        return value
+      })
+    })
+    const view = render(<PresentationProbe id="probe" queryKey="rapid-key-0" query={query} />)
+    await act(nextTask)
+
+    for (let index = 1; index <= 20; index += 1) {
+      view.rerender(<PresentationProbe id="probe" queryKey={`rapid-key-${index}`} query={query} />)
+      await act(nextTask)
+    }
+
+    expect(query).toHaveBeenCalledTimes(4)
+    expect(maxActive).toBe(4)
+    reads[0]?.resolve('oldest')
+    await flushReads()
+    expect(query).toHaveBeenCalledTimes(5)
+    expect(maxActive).toBe(4)
+
+    for (const read of reads.slice(1, 4)) read.resolve('superseded')
+    reads[4]?.resolve('latest-key')
+    await flushAdapter()
+    expect(screen.getByTestId('probe')).toHaveTextContent('ready:latest-key')
+  })
+
+  it('aborts a presentation read when its last observer unmounts', async () => {
+    let signal: AbortSignal | undefined
+    const query = vi.fn((nextSignal: AbortSignal) => {
+      signal = nextSignal
+      return new Promise<string>(() => {})
+    })
+    const view = render(<PresentationProbe id="probe" queryKey="abort-on-unmount" query={query} />)
+    await act(nextTask)
+
+    expect(signal?.aborted).toBe(false)
+    view.unmount()
+    expect(signal?.aborted).toBe(true)
+  })
+
+  it('aborts old-workspace presentation reads before starting replacement reads', async () => {
+    const signals: AbortSignal[] = []
+    const query = vi.fn((signal: AbortSignal) => {
+      signals.push(signal)
+      if (signals.length === 1) return new Promise<string>(() => {})
+      return Promise.resolve('replacement-ready')
+    })
+    render(<PresentationProbe id="probe" queryKey="abort-on-replacement" query={query} />)
+    await act(nextTask)
+
+    act(() => invalidateRepositoryQueriesForWorkspaceReplacement())
+    await flushAdapter()
+
+    expect(signals[0]?.aborted).toBe(true)
+    expect(query).toHaveBeenCalledTimes(2)
+    expect(screen.getByTestId('probe')).toHaveTextContent('ready:replacement-ready')
   })
 
   it('matches exact mutation keys and keeps identical ready snapshots stable', async () => {
@@ -498,6 +650,131 @@ describe('repository reactive query adapter', () => {
     expect(snapshots.some((snapshot) => snapshot.value === 'stale')).toBe(false)
   })
 
+  it('resets every active ready snapshot immediately and reruns each query', async () => {
+    const first = vi
+      .fn<() => Promise<string>>()
+      .mockResolvedValueOnce('first-before-replacement')
+      .mockResolvedValueOnce('first-after-replacement')
+    const second = vi
+      .fn<() => Promise<string>>()
+      .mockResolvedValueOnce('second-before-replacement')
+      .mockResolvedValueOnce('second-after-replacement')
+    render(
+      <>
+        <StateProbe id="first" queryKey="replacement-first" query={first} />
+        <StateProbe id="second" queryKey="replacement-second" query={second} />
+      </>,
+    )
+    await flushAdapter()
+    expect(screen.getByTestId('first')).toHaveTextContent('ready:first-before-replacement')
+    expect(screen.getByTestId('second')).toHaveTextContent('ready:second-before-replacement')
+
+    act(() => invalidateRepositoryQueriesForWorkspaceReplacement())
+
+    expect(screen.getByTestId('first')).toHaveTextContent('loading:initial')
+    expect(screen.getByTestId('second')).toHaveTextContent('loading:initial')
+    expect(Object.isFrozen(snapshots.at(-1))).toBe(true)
+
+    await flushAdapter()
+    expect(first).toHaveBeenCalledTimes(2)
+    expect(second).toHaveBeenCalledTimes(2)
+    expect(screen.getByTestId('first')).toHaveTextContent('ready:first-after-replacement')
+    expect(screen.getByTestId('second')).toHaveTextContent('ready:second-after-replacement')
+  })
+
+  it('never publishes an old in-flight completion after workspace replacement', async () => {
+    const stale = deferred<string>()
+    const query = vi
+      .fn<() => Promise<string>>()
+      .mockResolvedValueOnce('before-replacement')
+      .mockImplementationOnce(() => stale.promise)
+      .mockResolvedValueOnce('fresh-after-replacement')
+    render(<StateProbe id="probe" queryKey="replacement-in-flight" query={query} />)
+    await flushAdapter()
+
+    mutationHarness.emit(settingMutation(WATCHED_SETTING))
+    await act(nextTask)
+    expect(query).toHaveBeenCalledTimes(2)
+
+    const replacementRender = snapshots.length
+    act(() => invalidateRepositoryQueriesForWorkspaceReplacement())
+    expect(screen.getByTestId('probe')).toHaveTextContent('loading:initial')
+
+    stale.resolve('stale-from-replaced-workspace')
+    await flushAdapter()
+
+    expect(query).toHaveBeenCalledTimes(3)
+    expect(screen.getByTestId('probe')).toHaveTextContent('ready:fresh-after-replacement')
+    expect(
+      snapshots
+        .slice(replacementRender)
+        .some((snapshot) => snapshot.value === 'stale-from-replaced-workspace'),
+    ).toBe(false)
+  })
+
+  it('starts the replacement read without waiting for an abandoned workspace read', async () => {
+    const abandoned = deferred<string>()
+    const query = vi
+      .fn<() => Promise<string>>()
+      .mockResolvedValueOnce('before-replacement')
+      .mockImplementationOnce(() => abandoned.promise)
+      .mockResolvedValueOnce('fresh-without-old-settling')
+    render(<StateProbe id="probe" queryKey="replacement-abandons-read" query={query} />)
+    await flushAdapter()
+
+    mutationHarness.emit(settingMutation(WATCHED_SETTING))
+    await act(nextTask)
+    expect(query).toHaveBeenCalledTimes(2)
+
+    act(() => invalidateRepositoryQueriesForWorkspaceReplacement())
+    await flushAdapter()
+
+    expect(query).toHaveBeenCalledTimes(3)
+    expect(screen.getByTestId('probe')).toHaveTextContent('ready:fresh-without-old-settling')
+    expect(snapshots.some((snapshot) => snapshot.value === 'fresh-without-old-settling')).toBe(true)
+    abandoned.resolve('late-abandoned-value')
+    await act(async () => abandoned.promise)
+    await flushAdapter()
+    expect(query).toHaveBeenCalledTimes(3)
+  })
+
+  it('discards idle cached entries and their late reads on workspace replacement', async () => {
+    const stale = deferred<string>()
+    const oldQuery = vi
+      .fn<() => Promise<string>>()
+      .mockResolvedValueOnce('cached-before-replacement')
+      .mockImplementationOnce(() => stale.promise)
+    const first = render(<StateProbe id="probe" queryKey="replacement-idle" query={oldQuery} />)
+    await flushAdapter()
+    expect(screen.getByTestId('probe')).toHaveTextContent('ready:cached-before-replacement')
+
+    mutationHarness.emit(settingMutation(WATCHED_SETTING))
+    await act(nextTask)
+    expect(oldQuery).toHaveBeenCalledTimes(2)
+    first.unmount()
+    act(() => invalidateRepositoryQueriesForWorkspaceReplacement())
+
+    const replacementRender = snapshots.length
+    const freshQuery = vi.fn(async () => 'fresh-after-replacement')
+    render(<StateProbe id="probe" queryKey="replacement-idle" query={freshQuery} />)
+    expect(screen.getByTestId('probe')).toHaveTextContent('loading:initial')
+
+    stale.resolve('late-from-idle-replaced-entry')
+    await flushAdapter()
+
+    expect(freshQuery).toHaveBeenCalledTimes(1)
+    expect(screen.getByTestId('probe')).toHaveTextContent('ready:fresh-after-replacement')
+    expect(
+      snapshots
+        .slice(replacementRender)
+        .some(
+          (snapshot) =>
+            snapshot.value === 'cached-before-replacement' ||
+            snapshot.value === 'late-from-idle-replaced-entry',
+        ),
+    ).toBe(false)
+  })
+
   it('does not publish after unmount and restarts with the retained snapshot', async () => {
     const firstRead = deferred<string>()
     const query = vi
@@ -522,6 +799,33 @@ describe('repository reactive query adapter', () => {
         .some((snapshot) => snapshot.value === 'stale-after-unmount'),
     ).toBe(false)
     second.unmount()
+  })
+
+  it('lets an A to B to A return start a fresh A read while the first A read is abandoned', async () => {
+    const abandonedA = deferred<string>()
+    const queryA = vi
+      .fn<() => Promise<string>>()
+      .mockImplementationOnce(() => abandonedA.promise)
+      .mockResolvedValueOnce('fresh-a')
+    const queryB = vi.fn(async () => 'ready-b')
+    const view = render(<StateProbe id="probe" queryKey="branch-a" query={queryA} />)
+    await nextTask()
+    expect(queryA).toHaveBeenCalledTimes(1)
+
+    view.rerender(<StateProbe id="probe" queryKey="branch-b" query={queryB} />)
+    await flushAdapter()
+    expect(screen.getByTestId('probe')).toHaveTextContent('ready:ready-b')
+
+    view.rerender(<StateProbe id="probe" queryKey="branch-a" query={queryA} />)
+    await flushAdapter()
+
+    expect(queryA).toHaveBeenCalledTimes(2)
+    expect(screen.getByTestId('probe')).toHaveTextContent('ready:fresh-a')
+    expect(snapshots.some((snapshot) => snapshot.value === 'fresh-a')).toBe(true)
+    abandonedA.resolve('late-a')
+    await act(async () => abandonedA.promise)
+    await flushAdapter()
+    expect(queryA).toHaveBeenCalledTimes(2)
   })
 
   it('drops a publication queued before the final consumer unmounts', async () => {
@@ -553,6 +857,32 @@ describe('repository reactive query adapter', () => {
     expect(mutationHarness.subscriptionCount()).toBe(2)
     await flushAdapter()
     expect(screen.getByTestId('probe')).toHaveTextContent('ready:new')
+  })
+
+  it('uses the newest closure when a stable query entry reads again', async () => {
+    const first = vi.fn(async () => 'first-closure')
+    const second = vi.fn(async () => 'second-closure')
+    const third = vi.fn(async () => 'third-closure')
+    const view = render(<StateProbe id="probe" queryKey="closure-freshness" query={first} />)
+    await flushAdapter()
+    expect(screen.getByTestId('probe')).toHaveTextContent('ready:first-closure')
+
+    view.rerender(<StateProbe id="probe" queryKey="closure-freshness" query={second} />)
+    mutationHarness.emit(settingMutation(WATCHED_SETTING))
+    await flushAdapter()
+
+    expect(first).toHaveBeenCalledTimes(1)
+    expect(second).toHaveBeenCalledTimes(1)
+    expect(screen.getByTestId('probe')).toHaveTextContent('ready:second-closure')
+
+    view.unmount()
+    render(<StateProbe id="probe" queryKey="closure-freshness" query={third} />)
+    await flushAdapter()
+
+    expect(first).toHaveBeenCalledTimes(1)
+    expect(second).toHaveBeenCalledTimes(1)
+    expect(third).toHaveBeenCalledTimes(1)
+    expect(screen.getByTestId('probe')).toHaveTextContent('ready:third-closure')
   })
 
   it('fails loudly when consumers reuse a key with different dependencies', () => {
@@ -659,6 +989,19 @@ function StateProbe({
         : ''}
     </span>
   )
+}
+
+function PresentationProbe({
+  id,
+  queryKey,
+  query,
+}: {
+  id: string
+  queryKey: string
+  query: (signal: AbortSignal) => Promise<string>
+}) {
+  const value = useRepositoryPresentationQuery(queryKey, query, 'initial', SETTINGS_DEPENDENCY)
+  return <span data-testid={id}>ready:{value}</span>
 }
 
 function PairedProbe() {

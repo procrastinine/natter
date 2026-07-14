@@ -1,5 +1,14 @@
-import { type ReactNode, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import {
+  type ReactNode,
+  useCallback,
+  useDeferredValue,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from 'react'
 import type { SendShortcut } from '../../core/global-settings'
+import { estimateTokens } from '../../core/tokens'
 import type { MessageAttachmentRef } from '../../core/types'
 import { isPageHidingAbortError } from '../../lib/page-lifecycle'
 import { AttachmentDraftTray } from '../attachments/AttachmentDraftTray'
@@ -7,6 +16,13 @@ import { AttachmentPicker } from '../attachments/AttachmentPicker'
 import { useAttachmentDrafts } from '../attachments/useAttachmentDrafts'
 import { DatabaseIcon, InsertIcon, PaperclipIcon, PrefillIcon, StopIcon } from '../icons/Icon'
 import { Button } from '../primitives/Button'
+import {
+  publishComposerContextDraft,
+  readComposerDraftText,
+  writeComposerDraftText,
+} from './composer-draft-state'
+
+export { moveComposerDraft } from './composer-draft-state'
 
 interface ComposerProps {
   // Disables the textarea entirely.
@@ -109,6 +125,7 @@ const COMPOSER_HEIGHT_STORAGE_KEY = 'natter:composer-height'
 const COMPOSER_MIN_HEIGHT = 80
 const COMPOSER_MAX_HEIGHT = 600
 const COMPOSER_DEFAULT_HEIGHT = 120
+const EMPTY_ATTACHMENT_REFS: readonly MessageAttachmentRef[] = Object.freeze([])
 
 function readSavedHeight(): number {
   if (typeof window === 'undefined') return COMPOSER_DEFAULT_HEIGHT
@@ -177,29 +194,6 @@ function setComposerTextareaHeight(
   el.style.overflowY = measuredContentHeight > effectiveHeight + 1 ? 'auto' : 'hidden'
 }
 
-// Per-tab only: route switches preserve drafts without writing IDB or making
-// the app shell re-render on every keystroke. A full reload clears the map.
-const composerDrafts = new Map<string, string>()
-
-function readComposerDraft(key: string | null | undefined): string {
-  return key ? (composerDrafts.get(key) ?? '') : ''
-}
-
-function writeComposerDraft(key: string | null | undefined, text: string): void {
-  if (!key) return
-  if (text.length === 0) {
-    composerDrafts.delete(key)
-    return
-  }
-  composerDrafts.set(key, text)
-}
-
-export function moveComposerDraft(fromKey: string, toKey: string): void {
-  const text = composerDrafts.get(fromKey)
-  composerDrafts.delete(fromKey)
-  if (text && text.length > 0) composerDrafts.set(toKey, text)
-}
-
 export function Composer({
   disabled,
   sendBlockedReason,
@@ -228,11 +222,15 @@ export function Composer({
   droppedFiles,
   onDroppedFilesConsumed,
 }: ComposerProps) {
-  const [text, setText] = useState(() => readComposerDraft(draftKey))
+  const [text, setText] = useState(() => readComposerDraftText(draftKey))
   const [pickerOpen, setPickerOpen] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [prefillOpen, setPrefillOpen] = useState(false)
   const [prefillText, setPrefillText] = useState(defaultPrefill ?? '')
+  const deferredText = useDeferredValue(text)
+  const deferredPrefillText = useDeferredValue(prefillOpen ? prefillText : '')
+  const draftTokenEstimate =
+    estimateTokens(deferredText.trim(), 'unknown') + estimateTokens(deferredPrefillText, 'unknown')
   // Track whether the prefill textarea has ever been opened to avoid
   // accidental re-seeding on every open. Reset along with `defaultPrefill`
   // changes so an updated default does seed the next opening.
@@ -266,13 +264,13 @@ export function Composer({
     const next = typeof value === 'function' ? value(latestTextRef.current) : value
     latestTextRef.current = next
     setText(next)
-    writeComposerDraft(draftKeyRef.current, next)
+    writeComposerDraftText(draftKeyRef.current, next)
   }, [])
   useEffect(() => {
     if (draftKeyRef.current === draftKey) return
-    writeComposerDraft(draftKeyRef.current, latestTextRef.current)
+    writeComposerDraftText(draftKeyRef.current, latestTextRef.current)
     draftKeyRef.current = draftKey
-    const next = readComposerDraft(draftKey)
+    const next = readComposerDraftText(draftKey)
     latestTextRef.current = next
     setText(next)
   }, [draftKey])
@@ -425,6 +423,27 @@ export function Composer({
     lastAttachmentScopeRef.current = attachmentScopeKey
     clearAttachments()
   }, [attachmentScopeKey, clearAttachments])
+  const draftScopeStable = draftKeyRef.current === draftKey
+  const prefillScopeStable = lastPrefillScopeRef.current === prefillScopeKey
+  const attachmentScopeStable = lastAttachmentScopeRef.current === attachmentScopeKey
+  useEffect(() => {
+    if (!draftScopeStable) return
+    publishComposerContextDraft(draftKey, {
+      text: deferredText.trim(),
+      prefillText: prefillScopeStable ? deferredPrefillText : '',
+      attachmentRefs:
+        attachmentScopeStable && !attachmentsDisabled ? attachmentRefs : EMPTY_ATTACHMENT_REFS,
+    })
+  }, [
+    attachmentRefs,
+    attachmentScopeStable,
+    attachmentsDisabled,
+    deferredPrefillText,
+    deferredText,
+    draftKey,
+    draftScopeStable,
+    prefillScopeStable,
+  ])
   const uploadingAttachments = uploads.some((upload) => upload.state === 'uploading')
   const sendBlocked =
     Boolean(sendBlockedReason) ||
@@ -647,8 +666,11 @@ export function Composer({
           />
         ) : null}
         <div data-ui="composer-actions">
-          <span data-ui="token-counter">
-            {text.trim().length + (prefillOpen ? prefillText.length : 0)} chars
+          <span
+            data-ui="token-counter"
+            title="Approximate pending text only; Context settings combines this draft and included attachments with the active conversation."
+          >
+            ≈ {draftTokenEstimate.toLocaleString()} draft tokens
           </span>
           {showPrefillButton ? (
             <Button
@@ -659,6 +681,7 @@ export function Composer({
               onClick={() => void togglePrefill()}
               aria-label={prefillOpen ? 'Close prefill' : 'Open assistant prefill'}
               aria-pressed={prefillOpen}
+              disabled={disabled}
               title={
                 prefillOpen
                   ? 'Close prefill (assistant text editor)'
@@ -718,6 +741,7 @@ export function Composer({
               onClick={onImportAtEnd}
               aria-label="Import messages at the end of the chat"
               title="Import at end (⇧⌘V)"
+              disabled={disabled}
             >
               <InsertIcon size={14} />
               <span>Import</span>

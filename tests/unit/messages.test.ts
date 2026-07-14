@@ -16,9 +16,14 @@ import {
   pasteImport,
   regenerateAssistant,
   sendUserMessage,
+  structuralEffectsCursorPatch,
   swipe,
 } from '../../src/core/messages'
-import { nextSiblingIndex, TreeChangedError } from '../../src/core/tree-ops'
+import {
+  createAncestorOutsideSetResolver,
+  nextSiblingIndex,
+  TreeChangedError,
+} from '../../src/core/tree-ops'
 import type { Chat, ChatId, Message, MessageId, MessageRole } from '../../src/core/types'
 import { applyStructuralSnapshot } from '../../src/core/undo'
 import { newId } from '../../src/lib/ulid'
@@ -1023,6 +1028,11 @@ describe('delete atomic pre-images', () => {
       { id: 'K', previousParentId: 'A', newParentId: 'P' },
     ])
     expect(result.effects.cursorUpdates).toEqual({ P: 'K' })
+    expect(structuralEffectsCursorPatch(result.effects)).toEqual({
+      U: undefined,
+      A: undefined,
+      P: 'K',
+    })
     expect(
       applyStructuralEffectsToCursor({ __root__: 'P', P: 'U', U: 'A', A: 'K' }, result.effects),
     ).toEqual({ __root__: 'P', P: 'K' })
@@ -1313,6 +1323,7 @@ describe('pasteImport', () => {
     expect(first?.origin).toBe('imported')
     expect(second?.parentId).toBe(firstId)
     expect(second?.origin).toBe('imported')
+    expect(res.selectedPathMessageIds).toEqual([root.id, firstId, secondId])
   })
 
   it('insert-after on a leaf degenerates to append-as-child', async () => {
@@ -1327,6 +1338,7 @@ describe('pasteImport', () => {
     })
     const first = await getStoredMessage(res.newMessageIds[0] as MessageId)
     expect(first?.parentId).toBe('L')
+    expect(res.selectedPathMessageIds).toEqual(['L', res.newMessageIds[0]])
   })
 
   it('inserts every imported row before the displaced child as one chain', async () => {
@@ -1386,6 +1398,7 @@ describe('pasteImport', () => {
       [x2Id]: x3Id,
       [x3Id]: 'C',
     })
+    expect(res.selectedPathMessageIds).toEqual(['P', x1Id, x2Id, x3Id, 'C'])
   })
 
   it('inserts every imported row between a parent and its selected descendant as one chain', async () => {
@@ -1417,6 +1430,7 @@ describe('pasteImport', () => {
       [x1Id]: x2Id,
       [x2Id]: 'C',
     })
+    expect(res.selectedPathMessageIds).toEqual(['P', x1Id, x2Id, 'C'])
   })
 
   it('inserts one shared chain after a real parent and moves every live child under its tail', async () => {
@@ -1528,6 +1542,7 @@ describe('pasteImport', () => {
       [x2Id]: x3Id,
       [x3Id]: 'C2',
     })
+    expect(res.selectedPathMessageIds).toEqual(['P', x1Id, x2Id, x3Id, 'C2'])
   })
 
   it('supports the virtual root and falls back to the canonical selected branch', async () => {
@@ -1574,6 +1589,7 @@ describe('pasteImport', () => {
       [x1Id]: x2Id,
       [x2Id]: 'R1',
     })
+    expect(res.selectedPathMessageIds).toEqual([x1Id, x2Id, 'R1', 'R1L'])
   })
 
   it('appends the shared chain normally when the slot has no live children', async () => {
@@ -1607,6 +1623,7 @@ describe('pasteImport', () => {
     expect(res.effects.newMessageIds).toEqual([x1Id, x2Id])
     expect(res.effects.reparented).toEqual([])
     expect(res.effects.cursorUpdates).toEqual({ P: x1Id, [x1Id]: x2Id })
+    expect(res.selectedPathMessageIds).toEqual(['P', x1Id, x2Id])
   })
 
   it('rejects a stale shared-trunk snapshot before writing any imported row', async () => {
@@ -1854,5 +1871,24 @@ describe('nextSiblingIndex', () => {
     ])
     expect(nextSiblingIndex(byParent, 'P')).toBe(6)
     expect(nextSiblingIndex(byParent, 'nobody')).toBe(0)
+  })
+})
+
+describe('deleted ancestor resolution', () => {
+  it('path-compresses a deep deleted chain to linear total work', () => {
+    const length = 16_384
+    const rows = Array.from({ length }, (_, index) => ({
+      id: `deleted-${index}`,
+      parentId: index === 0 ? null : `deleted-${index - 1}`,
+    }))
+    const byId = new Map(rows.map((row) => [row.id, row]))
+    const excluded = new Set(rows.map((row) => row.id))
+    let visits = 0
+    const resolve = createAncestorOutsideSetResolver(byId, excluded, () => {
+      visits += 1
+    })
+
+    for (const row of rows) expect(resolve(row)).toBeNull()
+    expect(visits).toBeLessThanOrEqual(length)
   })
 })

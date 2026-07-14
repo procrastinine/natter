@@ -33,6 +33,11 @@ import { chatHref, parseRoute, replaceRoute } from '../app/router'
 import { activePath, cursorKeyOf } from '../core/active-path'
 import { toPersistedAttemptFailure } from '../core/attempt-outcome'
 import {
+  createCursorOverlay,
+  createExactCursorPathGuard,
+  type ExactCursorPathGuard,
+} from '../core/cursor-overlay'
+import {
   runGenerationAttempt,
   SEND_GENERATION_ATTEMPT_ERROR_POLICY,
 } from '../core/generation-attempt-runner'
@@ -68,6 +73,7 @@ import {
   readTokenCalibrationGlobal,
 } from '../core/token-calibration'
 import type { TokenizerFamily } from '../core/tokens'
+import { TreeChangedError } from '../core/tree-ops'
 import type {
   AbortReason,
   AttachmentRef,
@@ -87,7 +93,6 @@ import type {
 import { logStreamDebug, streamDebugEnabled } from '../lib/debug-streams'
 import { newId } from '../lib/ulid'
 import { attachmentScopes } from '../store/attachments'
-import { postEvent } from '../store/broadcast'
 import { getChat } from '../store/chats'
 import type { ConnectionRuntimeKeyCandidate } from '../store/connection-runtime'
 import { recoverStaleContinuationAttempts } from '../store/continuation-recovery'
@@ -130,6 +135,7 @@ import {
 } from '../store/stream-leases'
 import { getWorkspaceRepository } from '../store/workspace-repository'
 import { announceGenerationOutcome } from '../store/zustand/announcementStore'
+import type { NavigationIntent } from '../store/zustand/chatStore'
 import { useChatStore } from '../store/zustand/chatStore'
 import { clearLiveSnapshotIfPresent, useStreamStore } from '../store/zustand/streamStore'
 import { useUiStore } from '../store/zustand/uiStore'
@@ -220,6 +226,10 @@ type ChatAccumulator = StreamAccumulator
 
 interface SendTextInput {
   chatId: ChatId
+  // `undefined` means this invocation is an active-view action and may claim
+  // this tab's branch authority. `null` is an explicit detached/background
+  // send: persist and stream normally, but never steer this tab's cursor/URL.
+  navigationIntent?: NavigationIntent | null
   expectedLeafId?: MessageId | null
   connection: ConnectionProfile
   apiKey: string
@@ -251,6 +261,23 @@ interface SendFromMessageInput extends Omit<SendTextInput, 'content'> {
   // Any existing message on the active path; the assistant placeholder
   // will be created as its child. Typically a user-role message.
   parentMessageId: MessageId
+  regenerateTargetMessageId?: MessageId
+}
+
+function assertRegenerateTargetAvailable(
+  target: Pick<Message, 'chatId' | 'parentId' | 'deleted'> | undefined,
+  input: Pick<SendFromMessageInput, 'chatId' | 'parentMessageId' | 'regenerateTargetMessageId'>,
+): void {
+  const targetId = input.regenerateTargetMessageId
+  if (targetId === undefined) return
+  if (
+    !target ||
+    target.chatId !== input.chatId ||
+    target.deleted ||
+    target.parentId !== input.parentMessageId
+  ) {
+    throw new TreeChangedError(input.chatId, `regenerate target ${targetId} unavailable`)
+  }
 }
 
 interface OpenStreamInput {
@@ -296,6 +323,10 @@ export interface SendTextResult {
 // id, invalid invariants) throw.
 export async function sendText(input: SendTextInput): Promise<SendTextResult> {
   const now = input.now ?? Date.now
+  const navigationIntent =
+    input.navigationIntent === undefined
+      ? useChatStore.getState().beginNavigationIntent(input.chatId)
+      : input.navigationIntent
   const cursorAtSubmit = useChatStore.getState().getCursor(input.chatId) ?? {}
   const expectedLeafId =
     input.expectedLeafId !== undefined
@@ -329,9 +360,6 @@ export async function sendText(input: SendTextInput): Promise<SendTextResult> {
       ...(skipTurnCalibration ? { skipCalibration: true } : {}),
     })
     chat = null
-    for (const [parentKey, childId] of Object.entries(userMsg.effects.cursorUpdates)) {
-      useChatStore.getState().patchCursor(input.chatId, parentKey, childId)
-    }
 
     let branchSnapshot: Awaited<ReturnType<typeof loadBranchHeaderSnapshotByLeaf>> | undefined =
       await loadBranchHeaderSnapshotByLeaf(input.chatId, userMsg.messageId)
@@ -344,6 +372,14 @@ export async function sendText(input: SendTextInput): Promise<SendTextResult> {
     const targetPathSelections = branchHeaders.map(
       (header) => [cursorKeyOf(header.parentId), header.id] as const,
     )
+    if (navigationIntent) {
+      useChatStore.getState().selectPathForIntent(
+        input.chatId,
+        navigationIntent,
+        Object.fromEntries(targetPathSelections),
+        branchHeaders.map((header) => header.id),
+      )
+    }
     branchSnapshot = undefined
     const hasPrefill = (input.prefillContent?.length ?? 0) > 0
     const prefillMessageId = hasPrefill ? newId() : null
@@ -392,11 +428,13 @@ export async function sendText(input: SendTextInput): Promise<SendTextResult> {
       signal: lifecycle.signal,
       lifecycleAbort: lifecycle.abort,
       lifecyclePreserveLease: lifecycle.preserveLease,
+      lifecycleReplacementEpoch: lifecycle.replacementEpoch,
       streamId: lifecycle.streamId,
       parentMessageId: userMsg.messageId,
       userMessageId: userMsg.messageId,
       requireEmptyParent: true,
       sendContextGuard,
+      navigationIntent,
       targetPathSelections,
       ...(hasPrefill ? { initialAssistantContent: input.prefillContent ?? [] } : {}),
       requestPlan,
@@ -417,6 +455,10 @@ export async function sendText(input: SendTextInput): Promise<SendTextResult> {
 // role:'user', origin:'user'); all that's left is to attach an assistant
 // placeholder under it and stream the reply. No user message is created.
 export async function sendFromMessage(input: SendFromMessageInput): Promise<SendTextResult> {
+  const navigationIntent =
+    input.navigationIntent === undefined
+      ? useChatStore.getState().beginNavigationIntent(input.chatId)
+      : input.navigationIntent
   const lifecycle = await startRequestLifecycle({
     chatId: input.chatId,
     streamId: newId(),
@@ -434,8 +476,14 @@ export async function sendFromMessage(input: SendFromMessageInput): Promise<Send
     if (!parent || parent.chatId !== input.chatId || parent.deleted) {
       throw new Error(`sendFrom: parent ${input.parentMessageId} unavailable`)
     }
+    assertRegenerateTargetAvailable(
+      input.regenerateTargetMessageId !== undefined
+        ? byId.get(input.regenerateTargetMessageId)
+        : undefined,
+      input,
+    )
     const baseCursor = useChatStore.getState().getCursor(input.chatId) ?? {}
-    const cursor: Record<string, MessageId> = { ...baseCursor }
+    const cursor = createCursorOverlay(baseCursor)
     let cur: (typeof allHeaders)[number] | undefined = parent
     while (cur) {
       cursor[cursorKeyOf(cur.parentId)] = cur.id
@@ -497,10 +545,12 @@ export async function sendFromMessage(input: SendFromMessageInput): Promise<Send
       signal: lifecycle.signal,
       lifecycleAbort: lifecycle.abort,
       lifecyclePreserveLease: lifecycle.preserveLease,
+      lifecycleReplacementEpoch: lifecycle.replacementEpoch,
       streamId: lifecycle.streamId,
       parentMessageId: input.parentMessageId,
       userMessageId: input.parentMessageId,
       sendContextGuard,
+      navigationIntent,
       targetPathSelections: rawOutboundHeaders.map(
         (header) => [cursorKeyOf(header.parentId), header.id] as const,
       ),
@@ -523,12 +573,14 @@ async function openAssistantStreamUnder(
     userMessageId: MessageId
     requestPlan: AssistantRequestPlan
     sendContextGuard: SendContextGuard
+    navigationIntent: NavigationIntent | null
     targetPathSelections: ReadonlyArray<readonly [string, MessageId]>
     streamId?: string
     initialAssistantContent?: ContentItem[]
     signal: AbortSignal
     lifecycleAbort: () => void
     lifecyclePreserveLease: () => void
+    lifecycleReplacementEpoch: number
     requireEmptyParent?: boolean
   },
 ): Promise<SendTextResult> {
@@ -554,13 +606,16 @@ async function openAssistantStreamUnder(
     ...input.targetPathSelections,
     [cursorKeyOf(input.parentMessageId), assistantId] as const,
   ]
-  const placeholderMutation = await repo.runMutation(
+  await repo.runMutation(
     [
       { kind: 'chat-meta', chatId: input.chatId },
       ...input.sendContextGuard.messageRevisions.map((revision) => ({
         kind: 'message' as const,
         messageId: revision.id,
       })),
+      ...(input.regenerateTargetMessageId !== undefined
+        ? [{ kind: 'message' as const, messageId: input.regenerateTargetMessageId }]
+        : []),
       { kind: 'message', messageId: assistantId },
       { kind: 'children', chatId: input.chatId, parentId: input.parentMessageId },
     ],
@@ -570,6 +625,11 @@ async function openAssistantStreamUnder(
       if (!currentParent || currentParent.chatId !== input.chatId || currentParent.deleted) {
         throw new Error(`sendText: parent ${input.parentMessageId} unavailable`)
       }
+      const regenerateTarget =
+        input.regenerateTargetMessageId !== undefined
+          ? await ctx.getMessageHeader(input.regenerateTargetMessageId)
+          : undefined
+      assertRegenerateTargetAvailable(regenerateTarget, input)
       const siblings = await ctx.listChildHeaders(input.chatId, input.parentMessageId)
       const blockingChild = input.requireEmptyParent
         ? siblings.find((header) => !header.deleted)
@@ -607,7 +667,6 @@ async function openAssistantStreamUnder(
           startedAt: now(),
         },
       })
-      return { requiresCursorPin: siblings.length > 0 }
     },
   )
   const dispatchGuard = appendSendContextGuardMessage(input.sendContextGuard, {
@@ -618,12 +677,17 @@ async function openAssistantStreamUnder(
     deleted: false,
   })
 
-  if (placeholderMutation.value.requiresCursorPin) {
-    useChatStore
-      .getState()
-      .patchCursor(input.chatId, cursorKeyOf(input.parentMessageId), assistantId)
+  const selected = input.navigationIntent
+    ? useChatStore.getState().selectPathForIntent(
+        input.chatId,
+        input.navigationIntent,
+        Object.fromEntries(targetPathSelections),
+        targetPathSelections.map(([, messageId]) => messageId),
+      )
+    : false
+  if (selected) {
+    replaceActiveChatMessageRoute(input.chatId, assistantId)
   }
-  replaceActiveChatMessageRoute(input.chatId, assistantId)
 
   const streamId = input.streamId ?? newId()
   const debugScope = `send:${streamId}`
@@ -635,6 +699,7 @@ async function openAssistantStreamUnder(
       messageId: assistantId,
       abort: input.lifecycleAbort,
       attemptKind: 'generation',
+      replacementEpoch: input.lifecycleReplacementEpoch,
     })
   } catch (error) {
     const storageError = normalizeError(error, { midStream: false, cause: 'storage' })
@@ -705,6 +770,7 @@ async function openAssistantStreamUnder(
   })
   let selectedApiKey = input.apiKey
   let canonicalFinalized = false
+  const livePathGuard = createExactCursorPathGuard(targetPathSelections)
   const attempt = await runGenerationAttempt({
     open: () => {
       const source = openStream({
@@ -730,7 +796,8 @@ async function openAssistantStreamUnder(
         chatId: input.chatId,
         streamId,
         messageId: assistantId,
-        targetPathSelections,
+        pathGuard: livePathGuard,
+        replacementEpoch: streamFence.replacementEpoch,
         accumulator: current,
         requestedModel,
         apiUsed: resolvedApiUsed,
@@ -778,14 +845,12 @@ async function openAssistantStreamUnder(
     cleanup: (result) => {
       if (result.journalCleanupPending) input.lifecyclePreserveLease()
       announceGenerationOutcome(streamId, result.outcome)
-      useStreamStore.getState().clearActive(streamId)
-      clearLiveSnapshotIfPresent(assistantId, streamId)
-      postEvent({
-        kind: 'stream-ended',
+      announceStreamEnded({
         chatId: input.chatId,
         streamId,
         messageId: assistantId,
         outcome: result.outcome,
+        replacementEpoch: streamFence.replacementEpoch,
       })
     },
   }).catch((err) => {
@@ -935,24 +1000,20 @@ function prepareLiveSnapshot(ctx: {
   chatId: ChatId
   streamId: string
   messageId: MessageId
-  targetPathSelections: ReadonlyArray<readonly [string, MessageId]>
+  pathGuard: ExactCursorPathGuard
+  replacementEpoch: number
   accumulator: ChatAccumulator
   requestedModel: string
   apiUsed: GenerationMeta['apiUsed']
   now: number
 }): (() => void) | undefined {
   if (useUiStore.getState().activeChatId !== ctx.chatId) {
-    clearLiveSnapshotIfPresent(ctx.messageId, ctx.streamId)
+    clearLiveSnapshotIfPresent(ctx.messageId, ctx.streamId, ctx.replacementEpoch)
     return undefined
   }
-  const preparedCursor = useChatStore.getState().getCursor(ctx.chatId) ?? {}
-  if (
-    ctx.targetPathSelections.some(
-      ([key, selectedMessageId]) =>
-        preparedCursor[key] !== undefined && preparedCursor[key] !== selectedMessageId,
-    )
-  ) {
-    clearLiveSnapshotIfPresent(ctx.messageId, ctx.streamId)
+  const preparedCursor = useChatStore.getState().getCursor(ctx.chatId)
+  if (!ctx.pathGuard.matches(preparedCursor)) {
+    clearLiveSnapshotIfPresent(ctx.messageId, ctx.streamId, ctx.replacementEpoch)
     return undefined
   }
   const projection = projectStreamAccumulatorLive(ctx.accumulator, {
@@ -962,23 +1023,19 @@ function prepareLiveSnapshot(ctx: {
   })
   return () => {
     if (useUiStore.getState().activeChatId !== ctx.chatId) {
-      clearLiveSnapshotIfPresent(ctx.messageId, ctx.streamId)
+      clearLiveSnapshotIfPresent(ctx.messageId, ctx.streamId, ctx.replacementEpoch)
       return
     }
-    const cursor = useChatStore.getState().getCursor(ctx.chatId) ?? {}
-    if (
-      ctx.targetPathSelections.some(
-        ([key, selectedMessageId]) =>
-          cursor[key] !== undefined && cursor[key] !== selectedMessageId,
-      )
-    ) {
-      clearLiveSnapshotIfPresent(ctx.messageId, ctx.streamId)
+    const cursor = useChatStore.getState().getCursor(ctx.chatId)
+    if (!ctx.pathGuard.matches(cursor)) {
+      clearLiveSnapshotIfPresent(ctx.messageId, ctx.streamId, ctx.replacementEpoch)
       return
     }
     useStreamStore.getState().setLiveSnapshot({
       streamId: ctx.streamId,
       chatId: ctx.chatId,
       messageId: ctx.messageId,
+      replacementEpoch: ctx.replacementEpoch,
       ...projection,
     })
   }
@@ -1390,6 +1447,7 @@ async function ingestCalibrationSample(args: {
 // banner.
 export async function recoverOrphans(now = Date.now(), chatId?: ChatId): Promise<number> {
   const repo = getWorkspaceRepository()
+  const recoveryReplacementEpoch = (await repo.getWorkspaceMeta()).replacementEpoch
   const scopedChat = chatId !== undefined ? await repo.getChat(chatId) : undefined
   const chats = chatId !== undefined ? (scopedChat ? [scopedChat] : []) : await repo.listChats()
   const allLeases = await repo.listStreamLeases(chatId)
@@ -1442,6 +1500,7 @@ export async function recoverOrphans(now = Date.now(), chatId?: ChatId): Promise
         streamId: claimedLease.streamId,
         ...(claimedLease.messageId ? { messageId: claimedLease.messageId } : {}),
         outcome: 'abort',
+        replacementEpoch: streamWriteFenceForLease(claimedLease).replacementEpoch,
       })
       return true
     })
@@ -1606,6 +1665,7 @@ export async function recoverOrphans(now = Date.now(), chatId?: ChatId): Promise
               streamId,
               messageId: header.id,
               outcome: 'abort',
+              replacementEpoch: primaryClaim?.replacementEpoch ?? recoveryReplacementEpoch,
             })
           }
           return wroteCanonical
@@ -1709,7 +1769,9 @@ export function useChat(): UseChatApi {
     }
     const streamId = streamIdRef.current
     if (!streamId) return
-    useStreamStore.getState().abortStream(streamId)
+    const state = useStreamStore.getState()
+    const stream = state.getActive(streamId)
+    if (stream) state.abortStream(streamId, stream.replacementEpoch)
   }, [])
 
   const isStreaming = useCallback(() => controllerRef.current !== null, [])

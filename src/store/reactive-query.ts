@@ -54,9 +54,11 @@ type RepositoryPublicationScheduler = (task: () => void) => void
 
 interface QueryEntry<T> {
   key: string
-  query: () => T | Promise<T>
+  query: (signal?: AbortSignal) => T | Promise<T>
   dependencySignature: string
+  blocksLocalWrites: boolean
   dependencies: readonly CompiledDependency[]
+  initialValue: T
   snapshot: RepositoryQuerySnapshot<T>
   listeners: Set<() => void>
   unsubscribeChanges: (() => void) | null
@@ -64,12 +66,16 @@ interface QueryEntry<T> {
   revision: number
   idleOrder: number
   readScheduled: boolean
-  readInFlight: boolean
-  pendingPublications: Array<{
+  readInFlight: number | null
+  readAbortController: AbortController | null
+  presentationReadsActive: number
+  presentationReadDeferred: boolean
+  nextRead: number
+  pendingPublication: {
     generation: number
     revision: number
     snapshot: RepositoryQuerySnapshot<T>
-  }>
+  } | null
   publicationScheduled: boolean
 }
 
@@ -84,6 +90,8 @@ interface QueryDatabaseIdentity {
 }
 
 const MAX_IDLE_QUERIES = 128
+const MAX_PRESENTATION_READS_PER_QUERY = 2
+const MAX_PRESENTATION_READS = 4
 const PlatformPromise = Promise
 const entries = new Map<string, QueryEntry<unknown>>()
 let idleOrder = 0
@@ -94,8 +102,11 @@ let publicationScheduler: RepositoryPublicationScheduler = scheduleReactPublicat
 let readChannel: MessageChannel | null = null
 const readTasks: Array<() => void> = []
 const publicationEntries = new Set<QueryEntry<unknown>>()
+const deferredPresentationEntries = new Set<QueryEntry<unknown>>()
 let publicationFlushScheduled = false
 let publicationEpoch = 0
+let activePresentationReads = 0
+let presentationSchedulerEpoch = 0
 
 export function useRepositoryQueryState<T>(
   key: string,
@@ -103,7 +114,17 @@ export function useRepositoryQueryState<T>(
   initialValue: T,
   dependencies: readonly RepositoryQueryDependency[],
 ): RepositoryQuerySnapshot<T> {
-  const entry = queryEntry(key, query, initialValue, dependencies)
+  return useRepositoryQueryStateWithActivity(key, query, initialValue, dependencies, true)
+}
+
+function useRepositoryQueryStateWithActivity<T>(
+  key: string,
+  query: (signal?: AbortSignal) => T | Promise<T>,
+  initialValue: T,
+  dependencies: readonly RepositoryQueryDependency[],
+  blocksLocalWrites: boolean,
+): RepositoryQuerySnapshot<T> {
+  const entry = queryEntry(key, query, initialValue, dependencies, blocksLocalWrites)
   const subscribe = useCallback((listener: () => void) => subscribeEntry(entry, listener), [entry])
   const getSnapshot = useCallback(() => entry.snapshot, [entry])
   return useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
@@ -120,11 +141,32 @@ export function useRepositoryQuery<T>(
   return snapshot.value
 }
 
-function queryEntry<T>(
+// The query must obtain one coherent snapshot inside the repository boundary and honor
+// the signal. Only its abortable presentation promise bypasses the authoritative
+// local read/write activity gate.
+export function useRepositoryPresentationQuery<T>(
   key: string,
-  query: () => T | Promise<T>,
+  query: (signal: AbortSignal) => T | Promise<T>,
   initialValue: T,
   dependencies: readonly RepositoryQueryDependency[],
+): T {
+  const snapshot = useRepositoryQueryStateWithActivity(
+    key,
+    (signal) => query(signal as AbortSignal),
+    initialValue,
+    dependencies,
+    false,
+  )
+  if (snapshot.status === 'error') throw snapshot.error
+  return snapshot.value
+}
+
+function queryEntry<T>(
+  key: string,
+  query: (signal?: AbortSignal) => T | Promise<T>,
+  initialValue: T,
+  dependencies: readonly RepositoryQueryDependency[],
+  blocksLocalWrites: boolean,
 ): QueryEntry<T> {
   const existing = entries.get(key)
   const dependencySignature = JSON.stringify(dependencies)
@@ -132,13 +174,20 @@ function queryEntry<T>(
     if (existing.dependencySignature !== dependencySignature) {
       throw new Error(`RepositoryQueryDependencyMismatch:${key}`)
     }
+    if (existing.blocksLocalWrites !== blocksLocalWrites) {
+      throw new Error(`RepositoryQueryActivityMismatch:${key}`)
+    }
+    existing.query = query
+    existing.initialValue = initialValue
     return existing as QueryEntry<T>
   }
   const entry: QueryEntry<T> = {
     key,
     query,
     dependencySignature,
+    blocksLocalWrites,
     dependencies: compileDependencies(databaseNameReader(), dependencies),
+    initialValue,
     snapshot: Object.freeze({ status: 'loading', value: initialValue, error: null }),
     listeners: new Set(),
     unsubscribeChanges: null,
@@ -146,8 +195,12 @@ function queryEntry<T>(
     revision: 0,
     idleOrder: 0,
     readScheduled: false,
-    readInFlight: false,
-    pendingPublications: [],
+    readInFlight: null,
+    readAbortController: null,
+    presentationReadsActive: 0,
+    presentationReadDeferred: false,
+    nextRead: 0,
+    pendingPublication: null,
     publicationScheduled: false,
   }
   entries.set(key, entry)
@@ -162,9 +215,18 @@ function subscribeEntry<T>(entry: QueryEntry<T>, listener: () => void): () => vo
     if (entry.listeners.size !== 0) return
     entry.generation += 1
     entry.revision += 1
+    abortEntryRead(entry)
     entry.unsubscribeChanges?.()
     entry.unsubscribeChanges = null
     entry.readScheduled = false
+    entry.readInFlight = null
+    entry.presentationReadDeferred = false
+    deferredPresentationEntries.delete(entry)
+    if (!entry.blocksLocalWrites) {
+      entry.pendingPublication = null
+      if (entries.get(entry.key) === entry) entries.delete(entry.key)
+      return
+    }
     entry.idleOrder = ++idleOrder
     pruneIdleEntries()
   }
@@ -176,6 +238,7 @@ function startEntry<T>(entry: QueryEntry<T>): void {
     if (generation !== entry.generation || entry.listeners.size === 0) return
     if (!dependenciesOverlap(parts, entry.dependencies)) return
     entry.revision += 1
+    if (!entry.blocksLocalWrites) abandonEntryRead(entry)
     scheduleRead(entry, generation)
   })
   entry.revision += 1
@@ -183,7 +246,7 @@ function startEntry<T>(entry: QueryEntry<T>): void {
 }
 
 function scheduleRead<T>(entry: QueryEntry<T>, generation: number): void {
-  if (entry.readScheduled || entry.readInFlight) return
+  if (entry.readScheduled || entry.readInFlight !== null) return
   entry.readScheduled = true
   enqueueTask(() => {
     entry.readScheduled = false
@@ -193,15 +256,41 @@ function scheduleRead<T>(entry: QueryEntry<T>, generation: number): void {
 }
 
 function runRead<T>(entry: QueryEntry<T>, generation: number): void {
-  if (entry.readInFlight) return
+  if (entry.readInFlight !== null) return
+  const presentationRead = !entry.blocksLocalWrites
+  if (
+    presentationRead &&
+    (entry.presentationReadsActive >= MAX_PRESENTATION_READS_PER_QUERY ||
+      activePresentationReads >= MAX_PRESENTATION_READS)
+  ) {
+    entry.presentationReadDeferred = true
+    deferredPresentationEntries.add(entry)
+    return
+  }
   const revision = entry.revision
   const database = databaseIdentityReader()
-  entry.readInFlight = true
+  const read = ++entry.nextRead
+  entry.readInFlight = read
+  const abortController = entry.blocksLocalWrites ? null : new AbortController()
+  entry.readAbortController = abortController
+  const schedulerEpoch = presentationSchedulerEpoch
+  if (presentationRead) {
+    entry.presentationReadsActive += 1
+    activePresentationReads += 1
+    entry.presentationReadDeferred = false
+    deferredPresentationEntries.delete(entry)
+  }
   PlatformPromise.resolve()
-    .then(() => runWithLocalReadActivity(() => Dexie.ignoreTransaction(entry.query)))
+    .then(() =>
+      entry.blocksLocalWrites
+        ? runWithLocalReadActivity(() => Dexie.ignoreTransaction(() => entry.query()))
+        : startPresentationRead(entry, abortController as AbortController, schedulerEpoch),
+    )
     .then(
       (value) => {
-        entry.readInFlight = false
+        if (entry.readInFlight !== read) return
+        entry.readInFlight = null
+        entry.readAbortController = null
         if (generation !== entry.generation) {
           if (entry.listeners.size > 0) scheduleRead(entry, entry.generation)
           return
@@ -220,7 +309,9 @@ function runRead<T>(entry: QueryEntry<T>, generation: number): void {
         )
       },
       (error: unknown) => {
-        entry.readInFlight = false
+        if (entry.readInFlight !== read) return
+        entry.readInFlight = null
+        entry.readAbortController = null
         if (generation !== entry.generation) {
           if (entry.listeners.size > 0) scheduleRead(entry, entry.generation)
           return
@@ -230,6 +321,7 @@ function runRead<T>(entry: QueryEntry<T>, generation: number): void {
           scheduleRead(entry, generation)
           return
         }
+        if (isPresentationReadAbort(error)) return
         if (isDatabaseLifecycleReadError(error, database)) return
         enqueuePublication(
           entry,
@@ -241,13 +333,102 @@ function runRead<T>(entry: QueryEntry<T>, generation: number): void {
     )
 }
 
+function startPresentationRead<T>(
+  entry: QueryEntry<T>,
+  controller: AbortController,
+  schedulerEpoch: number,
+): Promise<T> {
+  return abortablePresentationRead(
+    () => Dexie.ignoreTransaction(() => entry.query(controller.signal)),
+    controller,
+    () => {
+      entry.presentationReadsActive -= 1
+      if (schedulerEpoch !== presentationSchedulerEpoch) return
+      activePresentationReads -= 1
+      drainDeferredPresentationReads()
+    },
+  )
+}
+
+function drainDeferredPresentationReads(): void {
+  if (activePresentationReads >= MAX_PRESENTATION_READS) return
+  for (const entry of [...deferredPresentationEntries]) {
+    if (entry.listeners.size === 0 || !entry.presentationReadDeferred) {
+      deferredPresentationEntries.delete(entry)
+      continue
+    }
+    scheduleRead(entry, entry.generation)
+    if (activePresentationReads >= MAX_PRESENTATION_READS) return
+  }
+}
+
+function abortablePresentationRead<T>(
+  query: () => T | Promise<T>,
+  controller: AbortController,
+  onUnderlyingSettled: () => void,
+): Promise<T> {
+  const { signal } = controller
+  return new PlatformPromise<T>((resolve, reject) => {
+    if (signal.aborted) {
+      onUnderlyingSettled()
+      reject(new PresentationReadAbortError())
+      return
+    }
+    const onAbort = () => reject(new PresentationReadAbortError())
+    signal.addEventListener('abort', onAbort, { once: true })
+    let value: T | Promise<T>
+    try {
+      value = query()
+    } catch (error) {
+      signal.removeEventListener('abort', onAbort)
+      onUnderlyingSettled()
+      reject(presentationReadError(error))
+      return
+    }
+    PlatformPromise.resolve(value).then(
+      (result) => {
+        signal.removeEventListener('abort', onAbort)
+        onUnderlyingSettled()
+        resolve(result)
+      },
+      (error: unknown) => {
+        signal.removeEventListener('abort', onAbort)
+        onUnderlyingSettled()
+        reject(presentationReadError(error))
+      },
+    )
+  })
+}
+
+class PresentationReadAbortError extends Error {
+  override name = 'PresentationReadAbortError'
+}
+
+function presentationReadError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error))
+}
+
+function isPresentationReadAbort(error: unknown): boolean {
+  return error instanceof PresentationReadAbortError
+}
+
+function abortEntryRead(entry: QueryEntry<unknown>): void {
+  entry.readAbortController?.abort()
+  entry.readAbortController = null
+}
+
+function abandonEntryRead(entry: QueryEntry<unknown>): void {
+  abortEntryRead(entry)
+  entry.readInFlight = null
+}
+
 function enqueuePublication<T>(
   entry: QueryEntry<T>,
   generation: number,
   revision: number,
   snapshot: RepositoryQuerySnapshot<T>,
 ): void {
-  entry.pendingPublications.push({ generation, revision, snapshot })
+  entry.pendingPublication = { generation, revision, snapshot }
   if (!entry.publicationScheduled) {
     entry.publicationScheduled = true
     publicationEntries.add(entry)
@@ -269,22 +450,19 @@ function enqueuePublication<T>(
 function collectPublicationListeners(entry: QueryEntry<unknown>, listeners: Set<() => void>): void {
   entry.publicationScheduled = false
   let changed = false
-  const pending = entry.pendingPublications.splice(0)
-  for (const publication of pending) {
-    if (
-      publication.generation !== entry.generation ||
-      publication.revision !== entry.revision ||
-      entry.listeners.size === 0
-    ) {
-      continue
-    }
-    if (
+  const publication = entry.pendingPublication
+  entry.pendingPublication = null
+  if (
+    publication &&
+    publication.generation === entry.generation &&
+    publication.revision === entry.revision &&
+    entry.listeners.size > 0 &&
+    !(
       publication.snapshot.status === 'ready' &&
       entry.snapshot.status === 'ready' &&
       Object.is(publication.snapshot.value, entry.snapshot.value)
-    ) {
-      continue
-    }
+    )
+  ) {
     entry.snapshot = publication.snapshot
     changed = true
   }
@@ -380,14 +558,43 @@ export function __resetRepositoryQueriesForTests(): void {
     entry.revision += 1
     entry.unsubscribeChanges?.()
     entry.unsubscribeChanges = null
+    abortEntryRead(entry)
+    entry.readInFlight = null
+    entry.presentationReadDeferred = false
     entry.listeners.clear()
-    entry.pendingPublications.length = 0
+    entry.pendingPublication = null
   }
   entries.clear()
   publicationEntries.clear()
+  deferredPresentationEntries.clear()
   publicationFlushScheduled = false
   publicationEpoch += 1
+  presentationSchedulerEpoch += 1
+  activePresentationReads = 0
   idleOrder = 0
+}
+
+export function invalidateRepositoryQueriesForWorkspaceReplacement(): void {
+  const listeners = new Set<() => void>()
+  for (const [key, entry] of entries) {
+    entry.revision += 1
+    entry.pendingPublication = null
+    abortEntryRead(entry)
+    if (entry.listeners.size === 0) {
+      entry.unsubscribeChanges?.()
+      entries.delete(key)
+      continue
+    }
+    entry.snapshot = Object.freeze({
+      status: 'loading',
+      value: entry.initialValue,
+      error: null,
+    })
+    entry.readInFlight = null
+    for (const listener of entry.listeners) listeners.add(listener)
+    scheduleRead(entry, entry.generation)
+  }
+  for (const listener of listeners) listener()
 }
 
 export function __setRepositoryMutationSubscriberForTests(

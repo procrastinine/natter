@@ -32,7 +32,11 @@ function observabilityDb(): Dexie {
 describe('broadcast', () => {
   it('fans out a posted event to local subscribers exactly once', () => {
     const received: BroadcastEvent[] = []
-    const unsub = onEvent((ev) => received.push(ev))
+    const deliveries: string[] = []
+    const unsub = onEvent((ev, delivery) => {
+      received.push(ev)
+      deliveries.push(delivery)
+    })
     postEvent({
       kind: 'chat-mutated',
       chatId: 'C1',
@@ -49,7 +53,42 @@ describe('broadcast', () => {
         affected: [{ kind: 'message', chatId: 'C1', messageId: 'M1' }],
       },
     ])
+    expect(deliveries).toEqual(['local'])
     unsub()
+  })
+
+  it('labels events arriving from another tab as remote', async () => {
+    const marker = `remote-delivery-${Math.random().toString(36).slice(2)}`
+    const otherTab = new BroadcastChannel('llm-api-frontend')
+    const deliveries: string[] = []
+    const unsubscribe = onEvent((event, delivery) => {
+      if (event.kind === 'preset-mutated' && event.presetId === marker) {
+        deliveries.push(delivery)
+      }
+    })
+
+    otherTab.postMessage({ kind: 'preset-mutated', presetId: marker } satisfies BroadcastEvent)
+    await tick()
+
+    expect(deliveries).toEqual(['remote'])
+    unsubscribe()
+    otherTab.close()
+  })
+
+  it('drops unstamped workspace-scoped events from remote tabs', async () => {
+    const otherTab = new BroadcastChannel('llm-api-frontend')
+    const received: BroadcastEvent[] = []
+    const unsubscribe = onEvent((event, delivery) => {
+      if (delivery === 'remote' && event.kind === 'workspace-replaced') received.push(event)
+    })
+
+    otherTab.postMessage({ kind: 'workspace-replaced' })
+    otherTab.postMessage({ kind: 'workspace-replaced', replacementEpoch: 7 })
+    await tick()
+
+    expect(received).toEqual([{ kind: 'workspace-replaced', replacementEpoch: 7 }])
+    unsubscribe()
+    otherTab.close()
   })
 
   it('delivers to every local subscriber, each exactly once', () => {
@@ -312,6 +351,77 @@ describe('broadcast', () => {
     unsubscribe()
     await vi.advanceTimersByTimeAsync(5_000)
     expect(read).toHaveBeenCalledTimes(4)
+    db.close()
+  })
+
+  it('preserves workspace replacement semantics through fallback polling', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('BroadcastChannel', undefined)
+    const db = observabilityDb()
+    let mutationCounter = 1
+    let replacementEpoch = 0
+    __setBroadcastFallbackReaderForTests(async () => ({
+      db,
+      mutationCounter,
+      replacementEpoch,
+    }))
+    const received: Array<{ event: BroadcastEvent; delivery: string }> = []
+    const unsubscribe = onEvent((event, delivery) => received.push({ event, delivery }))
+
+    await vi.advanceTimersByTimeAsync(0)
+    mutationCounter = 2
+    replacementEpoch = 1
+    await vi.advanceTimersByTimeAsync(1_000)
+    mutationCounter = 3
+    await vi.advanceTimersByTimeAsync(1_000)
+
+    expect(received).toEqual([
+      {
+        event: { kind: 'workspace-invalidated', mutationCounter: 1 },
+        delivery: 'remote',
+      },
+      {
+        event: { kind: 'workspace-replaced', replacementEpoch: 1 },
+        delivery: 'remote',
+      },
+      {
+        event: { kind: 'workspace-invalidated', mutationCounter: 3 },
+        delivery: 'remote',
+      },
+    ])
+
+    unsubscribe()
+    db.close()
+  })
+
+  it('establishes a historical replacement epoch as the fallback baseline', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('BroadcastChannel', undefined)
+    const db = observabilityDb()
+    let mutationCounter = 7
+    let replacementEpoch = 4
+    __setBroadcastFallbackReaderForTests(async () => ({
+      db,
+      mutationCounter,
+      replacementEpoch,
+    }))
+    const received: BroadcastEvent[] = []
+    const unsubscribe = onEvent((event) => received.push(event))
+
+    await vi.advanceTimersByTimeAsync(0)
+    mutationCounter = 8
+    await vi.advanceTimersByTimeAsync(1_000)
+    mutationCounter = 9
+    replacementEpoch = 5
+    await vi.advanceTimersByTimeAsync(1_000)
+
+    expect(received).toEqual([
+      { kind: 'workspace-invalidated', mutationCounter: 7 },
+      { kind: 'workspace-invalidated', mutationCounter: 8 },
+      { kind: 'workspace-replaced', replacementEpoch: 5 },
+    ])
+
+    unsubscribe()
     db.close()
   })
 

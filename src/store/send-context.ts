@@ -22,7 +22,7 @@ import type {
 import { getDb } from './db'
 import { hydrateMessages, type MessageBodyRow, type MessageHeaderRow } from './message-storage'
 import { flushPendingPromptSettingSaves } from './prompt-presets'
-import type { MutationContext } from './repository'
+import type { BranchHeaderSnapshot, MutationContext } from './repository'
 import { getWorkspaceRepository } from './workspace-repository'
 
 interface ChatHeaderSnapshot {
@@ -258,7 +258,7 @@ export async function loadActiveBranchHeaderSnapshot(
 export async function loadBranchHeaderSnapshotByLeaf(
   chatId: string,
   leafId: MessageId | null,
-): Promise<ActiveBranchHeaderSnapshot> {
+): Promise<BranchHeaderSnapshot> {
   await flushPendingPromptSettingSaves(chatId)
   return getWorkspaceRepository().getBranchHeaderSnapshotByLeaf(chatId, leafId)
 }

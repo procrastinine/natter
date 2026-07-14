@@ -1,4 +1,5 @@
 import type { ChatId, ContentItem, Message, MessageId } from '../core/types'
+import { countMessagesWords } from '../core/word-count'
 
 type MessageBodyKey =
   | 'content'
@@ -18,13 +19,30 @@ interface GenerationServerToolOutput {
 }
 
 export type MessageHeaderRow = Omit<Message, MessageBodyKey> & {
+  bodyVersion: number
+  bodyWordCount: number
   textPreview: string
+}
+
+export function messageHeaderTreeKey(headers: readonly MessageHeaderRow[]): string {
+  return headers
+    .map((message) =>
+      [
+        message.id,
+        message.nodeVersion,
+        message.parentId ?? '',
+        message.siblingIndex,
+        message.createdAt,
+        message.deleted ? 1 : 0,
+      ].join(':'),
+    )
+    .join('|')
 }
 
 export interface MessageBodyRow extends MessageBodyFields {
   id: MessageId
   chatId: ChatId
-  nodeVersion: number
+  bodyVersion: number
   updatedAt: number
   generationServerToolOutputs?: GenerationServerToolOutput[]
 }
@@ -159,7 +177,7 @@ export function previewTextsByChat(
 
 export function splitMessageForStorage(
   message: Message,
-  options: { updatedAt?: number } = {},
+  options: { bodyVersion?: number; updatedAt?: number } = {},
 ): { header: MessageHeaderRow; body: MessageBodyRow } {
   const {
     content,
@@ -174,12 +192,14 @@ export function splitMessageForStorage(
   } = message
   const header = structuredClone({
     ...headerFields,
+    bodyVersion: options.bodyVersion ?? message.nodeVersion,
+    bodyWordCount: 0,
     textPreview: '',
   }) as MessageHeaderRow
   const body: MessageBodyRow = {
     id: message.id,
     chatId: message.chatId,
-    nodeVersion: message.nodeVersion,
+    bodyVersion: header.bodyVersion,
     updatedAt:
       options.updatedAt ?? message.editedAt ?? message.generation?.finishedAt ?? message.createdAt,
     content: structuredClone(content),
@@ -210,13 +230,18 @@ export function hydrateMessage(header: MessageHeaderRow, body: MessageBodyRow): 
   if (header.chatId !== body.chatId) {
     throw new Error(`MessageBodyChatMismatch:${header.id}:${header.chatId}:${body.chatId}`)
   }
-  if (header.nodeVersion !== body.nodeVersion) {
+  if (header.bodyVersion !== body.bodyVersion) {
     throw new Error(
-      `MessageBodyVersionMismatch:${header.id}:${header.nodeVersion}:${body.nodeVersion}`,
+      `MessageBodyVersionMismatch:${header.id}:${header.bodyVersion}:${body.bodyVersion}`,
     )
   }
 
-  const { textPreview: _textPreview, ...headerFields } = structuredClone(header)
+  const {
+    bodyVersion: _bodyVersion,
+    bodyWordCount: _bodyWordCount,
+    textPreview: _textPreview,
+    ...headerFields
+  } = structuredClone(header)
   const message: Message = {
     ...headerFields,
     content: structuredClone(body.content),
@@ -262,6 +287,7 @@ export function syncMessageHeaderProjections(
   body: MessageBodyRow,
   options: { replaceGenerationServerToolOutputs?: boolean } = {},
 ): void {
+  header.bodyWordCount = countMessagesWords([body as unknown as Message])
   header.textPreview = previewTextFromContent(body.content, MESSAGE_TEXT_PREVIEW_MAX_CHARS)
   if (!options.replaceGenerationServerToolOutputs) return
   delete body.generationServerToolOutputs

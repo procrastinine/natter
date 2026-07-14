@@ -1,10 +1,12 @@
 import Dexie from 'dexie'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   __resetBrowserRepositoryForTests,
   getBrowserRepository,
 } from '../../src/store/browser-repo'
+import { loadKnownBranchPageSnapshot } from '../../src/store/chats'
 import { __resetDbForTests, openDb } from '../../src/store/db'
+import type { WorkspaceRepository } from '../../src/store/repository'
 import {
   __resetWorkspaceRepositoryForTests,
   __setWorkspaceRepositoryForTests,
@@ -51,5 +53,31 @@ describe('browser WorkspaceRepository contract', () => {
     expect(getWorkspaceRepository()).toBe(override)
     __resetWorkspaceRepositoryForTests()
     expect(getWorkspaceRepository()).toBe(browser)
+  })
+
+  it('routes the public active-branch page loader through the repository boundary', async () => {
+    const result = {
+      kind: 'stale-path' as const,
+      chatId: 'delegated-chat',
+      reason: 'non-contiguous' as const,
+      messageId: 'delegated-child',
+    }
+    const getKnownBranchPageSnapshot = vi.fn(async () => result)
+    __setWorkspaceRepositoryForTests({
+      getKnownBranchPageSnapshot,
+    } as unknown as WorkspaceRepository)
+
+    await expect(
+      loadKnownBranchPageSnapshot('delegated-chat', ['delegated-root', 'delegated-child'], {
+        offset: 1,
+        limit: 1,
+      }),
+    ).resolves.toBe(result)
+    expect(getKnownBranchPageSnapshot).toHaveBeenCalledOnce()
+    expect(getKnownBranchPageSnapshot).toHaveBeenCalledWith(
+      'delegated-chat',
+      ['delegated-root', 'delegated-child'],
+      { offset: 1, limit: 1 },
+    )
   })
 })

@@ -45,7 +45,7 @@ export type BroadcastEvent =
   | { kind: 'autotitle-completed'; chatId: ChatId; status: AutoTitleStatus }
   | { kind: 'key-rotated'; keyId: KeyId }
   | { kind: 'settings-mutated'; key: string }
-  | { kind: 'workspace-replaced' }
+  | { kind: 'workspace-replaced'; replacementEpoch: number }
   | { kind: 'workspace-invalidated'; mutationCounter: number }
   | { kind: 'privacy-refreshed'; profileId: ProfileId; modelId: string }
   | { kind: 'models-refreshed'; profileId: ProfileId }
@@ -55,6 +55,7 @@ export type BroadcastEvent =
       streamId: string
       messageId?: string
       ownerClientId: string
+      replacementEpoch: number
     }
   | { kind: 'stream-heartbeat'; lease: StreamLeaseRow }
   | {
@@ -62,6 +63,7 @@ export type BroadcastEvent =
       chatId: ChatId
       streamId: string
       ownerClientId: string
+      replacementEpoch: number
     }
   | {
       kind: 'stream-ended'
@@ -69,12 +71,18 @@ export type BroadcastEvent =
       streamId: string
       messageId?: string
       outcome: StreamOutcome
+      replacementEpoch: number
     }
   | { kind: 'engine-attached'; engineKind: EngineKind; version: string }
   | { kind: 'engine-detached'; reason: EngineDetachReason }
 
-type BroadcastHandler = (event: BroadcastEvent) => void
-type FallbackSnapshotReader = () => Promise<{ db: Dexie; mutationCounter: number }>
+export type BroadcastDelivery = 'local' | 'remote'
+type BroadcastHandler = (event: BroadcastEvent, delivery: BroadcastDelivery) => void
+type FallbackSnapshotReader = () => Promise<{
+  db: Dexie
+  mutationCounter: number
+  replacementEpoch?: number
+}>
 
 const CHANNEL_NAME = 'llm-api-frontend'
 const FALLBACK_POLL_INTERVAL_MS = 1_000
@@ -87,6 +95,7 @@ let fallbackPollActive = false
 let fallbackPollInFlight = false
 let fallbackPollGeneration = 0
 let lastMutationCounter: number | null = null
+let lastReplacementEpoch: number | null = null
 let productionFallbackSnapshotReader: FallbackSnapshotReader | null = null
 let fallbackSnapshotReader: FallbackSnapshotReader = readFallbackSnapshot
 
@@ -101,7 +110,7 @@ function ensureChannel(): BroadcastChannel | null {
   try {
     next = new BroadcastChannel(CHANNEL_NAME)
     next.addEventListener('message', (msg: MessageEvent) => {
-      fanOutLocal(msg.data as BroadcastEvent)
+      if (isEpochFencedBroadcastEvent(msg.data)) fanOutLocal(msg.data, 'remote')
     })
     next.addEventListener('messageerror', () => {
       makeChannelUnavailable(next)
@@ -113,6 +122,38 @@ function ensureChannel(): BroadcastChannel | null {
     makeChannelUnavailable(null)
     return null
   }
+}
+
+function isEpochFencedBroadcastEvent(value: unknown): value is BroadcastEvent {
+  if (
+    !value ||
+    typeof value !== 'object' ||
+    typeof (value as { kind?: unknown }).kind !== 'string'
+  ) {
+    return false
+  }
+  const event = value as { kind: string; replacementEpoch?: unknown; lease?: unknown }
+  if (event.kind === 'stream-heartbeat') {
+    const lease = event.lease
+    return (
+      !!lease &&
+      typeof lease === 'object' &&
+      isReplacementEpoch((lease as { replacementEpoch?: unknown }).replacementEpoch)
+    )
+  }
+  if (
+    event.kind === 'workspace-replaced' ||
+    event.kind === 'stream-started' ||
+    event.kind === 'stream-abort-requested' ||
+    event.kind === 'stream-ended'
+  ) {
+    return isReplacementEpoch(event.replacementEpoch)
+  }
+  return true
+}
+
+function isReplacementEpoch(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
 }
 
 export function isBroadcastChannelAvailable(): boolean {
@@ -148,10 +189,10 @@ function retryChannelPost(event: BroadcastEvent, failedChannel: BroadcastChannel
   }
 }
 
-function fanOutLocal(event: BroadcastEvent): void {
+function fanOutLocal(event: BroadcastEvent, delivery: BroadcastDelivery): void {
   for (const handler of [...localSubs]) {
     try {
-      handler(event)
+      handler(event, delivery)
     } catch {
       // Broadcast delivery is post-commit notification; subscriber failures are isolated.
     }
@@ -167,7 +208,7 @@ export function postEvent(event: BroadcastEvent): void {
       retryChannelPost(event, bc)
     }
   }
-  fanOutLocal(event)
+  fanOutLocal(event, 'local')
 }
 
 export function onEvent(handler: BroadcastHandler): () => void {
@@ -208,6 +249,7 @@ function stopFallbackPolling(): void {
   fallbackPollActive = false
   fallbackPollGeneration += 1
   lastMutationCounter = null
+  lastReplacementEpoch = null
   if (fallbackPollTimer !== null) clearTimeout(fallbackPollTimer)
   fallbackPollTimer = null
 }
@@ -221,12 +263,20 @@ async function pollWorkspaceMeta(generation: number): Promise<void> {
 
   fallbackPollInFlight = true
   try {
-    const { db, mutationCounter } = await fallbackSnapshotReader()
+    const { db, mutationCounter, replacementEpoch } = await fallbackSnapshotReader()
     if (!fallbackPollShouldRun(generation)) return
     if (mutationCounter === lastMutationCounter) return
+    const replacementChanged =
+      replacementEpoch !== undefined &&
+      lastReplacementEpoch !== null &&
+      replacementEpoch !== lastReplacementEpoch
     lastMutationCounter = mutationCounter
+    if (replacementEpoch !== undefined) lastReplacementEpoch = replacementEpoch
     fireBroadDexieInvalidation(db)
-    fanOutLocal({ kind: 'workspace-invalidated', mutationCounter })
+    const event: BroadcastEvent = replacementChanged
+      ? { kind: 'workspace-replaced', replacementEpoch }
+      : { kind: 'workspace-invalidated', mutationCounter }
+    fanOutLocal(event, 'remote')
   } catch {
     // A transient open/read failure must not stop later cross-tab checks.
   } finally {
@@ -277,7 +327,11 @@ function fullKeyRange(): RangeSet {
   return new RangeSet(Dexie.minKey, Dexie.maxKey)
 }
 
-async function readFallbackSnapshot(): Promise<{ db: Dexie; mutationCounter: number }> {
+async function readFallbackSnapshot(): Promise<{
+  db: Dexie
+  mutationCounter: number
+  replacementEpoch?: number
+}> {
   if (!productionFallbackSnapshotReader) throw new Error('BroadcastFallbackReaderUnavailable')
   return productionFallbackSnapshotReader()
 }

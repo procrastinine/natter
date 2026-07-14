@@ -34,6 +34,7 @@ import {
   messageBodySplitBackfillMarker,
   migrateInlineMessageBodies,
 } from '../backcompat/message-body-split'
+import { migrateMessageBodyVersions } from '../backcompat/message-body-version'
 import { migrateMessageHeaderProjections } from '../backcompat/message-header-projections'
 import {
   migrateLegacyPresetSortOrder,
@@ -1073,6 +1074,47 @@ export function registerSchema(db: Dexie): void {
     await migrateMessageHeaderProjections(tx)
     await migrateAttachmentHeaderProjection(tx)
   })
+
+  // v24: structural header revisions no longer invalidate cold message bodies.
+  // Body coherence and the branch word-count projection are explicit header
+  // fields so tree-only mutations never have to read or rewrite payload rows.
+  db.version(24)
+    .stores({
+      chats:
+        'id, updatedAt, createdAt, lastViewedAt, lastUpdatedLeafId, lastBranchUpdatedAt, wordCount, totalCostUsd, archived, pinned, presetId, folderId, *tags',
+      chatSidebarRows:
+        '&id, updatedAt, createdAt, lastViewedAt, lastUpdatedLeafId, lastBranchUpdatedAt, wordCount, totalCostUsd, archived, pinned, folderId, *tags',
+      messages:
+        'id, chatId, parentId, turnId, [chatId+parentId], [chatId+createdAt], [chatId+turnId], [chatId+deleted]',
+      messageBodies: '&id, chatId, updatedAt, bodyVersion',
+      childLists: 'id, [chatId+parentId], updatedAt',
+      attachments: 'id, contentHash, kind, mime, origin, refCount, createdAt, updatedAt, deletedAt',
+      attachmentBlobs: 'id, attachmentId, role, contentHash, createdAt',
+      attachmentArtifacts: 'artifactId, attachmentId, kind, processorId, createdAt',
+      attachmentJobs:
+        'id, attachmentId, processorId, status, updatedAt, [attachmentId+processorId+inputHash]',
+      profiles: 'id, name, kind, lastUsedAt, archived',
+      presets: 'id, name, connectionProfileId, sortIndex, lastUsedAt, archived',
+      promptPresets: 'id, kind, name, lastUsedAt',
+      folders: 'id, name, sortIndex, lastUsedAt',
+      tags: 'id, &nameLower, lastUsedAt',
+      chatBranchCache: '&chatId, branchLeafId, generatedAt',
+      keys: 'id, name',
+      settings: '&key',
+      browserLocks: '&name',
+      attachmentRefEdges:
+        '&[ownerKind+ownerId+refId], attachmentId, [attachmentId+ownerKind], [ownerKind+ownerId], chatId',
+      streamLeases: '&streamId, chatId, messageId, ownerClientId, heartbeatAt',
+      streamChunks: '&id, streamId, chatId, messageId, [streamId+seq], createdAt',
+      models: '&[profileId+queryKey], fetchedAt',
+      endpoints: '&[profileId+modelId], fetchedAt',
+      privacyPolicies: '&[profileId+modelId], fetchedAt',
+      providers: '&profileId, fetchedAt',
+      generations: 'id, chatId, gen_id',
+      presetResolutions: '&[profileId+presetSlug], fetchedAt',
+      drafts: '&chatId, updatedAt',
+    })
+    .upgrade(migrateMessageBodyVersions)
 }
 
 function organizationDefaultsPatch(
@@ -1208,9 +1250,19 @@ function resetBackfillState(): void {
 
 // Explicit open — resolves when the underlying IDBDatabase is ready and the
 // schema has settled. Safe to call repeatedly; Dexie caches the open call.
-export async function openDb(): Promise<NatterDb> {
+export interface OpenDbOptions {
+  onBlocked?: (event: IDBVersionChangeEvent) => void
+}
+
+export async function openDb(options: OpenDbOptions = {}): Promise<NatterDb> {
   const db = getDb()
-  if (!db.isOpen()) await db.open()
+  const blocked = options.onBlocked
+  if (blocked) db.on.blocked.subscribe(blocked)
+  try {
+    if (!db.isOpen()) await db.open()
+  } finally {
+    if (blocked) db.on.blocked.unsubscribe(blocked)
+  }
   attachmentRefsBackfillPromise ??= migrateAttachmentRefRows(db).catch((err) => {
     attachmentRefsBackfillPromise = null
     throw err
@@ -1269,8 +1321,8 @@ export async function openDb(): Promise<NatterDb> {
 configureLockDatabaseOpener(openDb)
 configureBroadcastFallbackReader(async () => {
   const db = await openDb()
-  const { mutationCounter } = await readBrowserWorkspaceMeta(db)
-  return { db, mutationCounter }
+  const { mutationCounter, replacementEpoch } = await readBrowserWorkspaceMeta(db)
+  return { db, mutationCounter, replacementEpoch }
 })
 
 export function closeDb(): void {

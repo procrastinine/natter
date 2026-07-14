@@ -3,11 +3,12 @@ import 'fake-indexeddb/auto'
 import Dexie from 'dexie'
 import { IDBFactory } from 'fake-indexeddb'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import { newId } from '../../src/lib/ulid'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import { __resetDbForTests, openDb } from '../../src/store/db'
 import { __resetKeyCacheForTests, createKey, getKey } from '../../src/store/keys'
-import { listPresets } from '../../src/store/presets'
+import { createPreset, listPresets } from '../../src/store/presets'
 import * as profileStore from '../../src/store/profiles'
 import { createProfile, getProfile, listProfiles } from '../../src/store/profiles'
 import { __setRepositoryMutationSubscriberForTests } from '../../src/store/reactive-query'
@@ -247,10 +248,29 @@ describe('ConnectionHeader', () => {
     await openConnectionPopover('OpenRouter')
     fireEvent.click(await screen.findByRole('button', { name: 'Delete connection' }))
     expect(screen.getByRole('dialog', { name: 'Delete connection?' })).toBeTruthy()
-    fireEvent.click(screen.getByRole('button', { name: 'Delete' }))
+    const confirm = screen.getByRole('button', { name: 'Delete' })
+    await waitFor(() => expect(confirm).toBeEnabled())
+    fireEvent.click(confirm)
     await waitFor(async () => {
       expect(await listProfiles()).toHaveLength(0)
     })
+  })
+
+  it('blocks deletion while a non-archived preset still uses the connection', async () => {
+    const profile = await seedProfile()
+    await createPreset({
+      name: 'Private reasoning',
+      connectionProfileId: profile.id,
+      settings: cloneDefaultChatSettings(),
+    })
+    writeActiveProfileId(profile.id)
+    render(<ConnectionHeader variant="title-icon" />)
+    await openConnectionPopover('OpenRouter')
+    fireEvent.click(await screen.findByRole('button', { name: 'Delete connection' }))
+
+    expect(await screen.findByText(/1 non-archived preset and 0 non-archived chats/u)).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Delete' })).toBeDisabled()
+    expect(await getProfile(profile.id)).toBeDefined()
   })
 
   it('saves in place when the name stays the same and keeps the original key when left blank', async () => {

@@ -1,6 +1,6 @@
 import { fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it } from 'vitest'
-import { cursorKeyOf } from '../../src/core/active-path'
+import { createMessageTreeProjection, cursorKeyOf } from '../../src/core/active-path'
 import type { Message } from '../../src/core/types'
 import { useAnnouncementStore } from '../../src/store/zustand/announcementStore'
 import { useChatStore } from '../../src/store/zustand/chatStore'
@@ -39,11 +39,7 @@ describe('BranchControls accessibility', () => {
       <BranchControls
         chatId={CHAT_ID}
         message={first}
-        context={{
-          messages,
-          byParent: new Map([[null, messages]]),
-          byId: new Map(messages.map((candidate) => [candidate.id, candidate])),
-        }}
+        context={createMessageTreeProjection(messages)}
       />,
     )
 

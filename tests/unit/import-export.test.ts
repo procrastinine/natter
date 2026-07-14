@@ -1555,6 +1555,7 @@ describe('workspace backup restore', () => {
     const abort = vi.fn()
     useStreamStore.getState().setActive({
       streamId: 'active-runtime-stream',
+      replacementEpoch: 0,
       chatId: seeded.chat.id,
       messageId: seeded.assistantMessage.id,
       ownerClientId: 'this-tab',

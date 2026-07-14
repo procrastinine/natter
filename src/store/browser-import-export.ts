@@ -485,6 +485,7 @@ class BrowserImportExportBackend implements WorkspaceImportExportBackend {
     const validatedBlobTypes = await validatePortableAttachmentBundles(envelope.payload.attachments)
     const previewTextByChatId = previewTextsByChat(envelope.payload.messages)
     const workspaceTables = db.tables.filter((table) => table.name !== 'browserLocks')
+    let replacementEpoch: number | undefined
     await withNamedLock('db:global', async (grant) => {
       const runtimeStreamIds = await replacementRuntimeStreamIds()
       if (runtimeStreamIds.length > 0) {
@@ -505,7 +506,7 @@ class BrowserImportExportBackend implements WorkspaceImportExportBackend {
             activeStreamIds.add(`streaming-message:${message.id}`)
           }
         })
-        for (const streamId of Object.keys(useStreamStore.getState().activeByStreamId)) {
+        for (const streamId of useStreamStore.getState().listStreamIds()) {
           activeStreamIds.add(streamId)
         }
         if (activeStreamIds.size > 0) {
@@ -556,9 +557,9 @@ class BrowserImportExportBackend implements WorkspaceImportExportBackend {
         }
         await bulkPutInPages(db.childLists, envelope.payload.childLists)
         await bulkPutInPages(db.chatBranchCache, envelope.payload.chatBranchCache)
-        await markBrowserWorkspaceReplaced(tx, now, beforeRestoreMeta)
+        replacementEpoch = await markBrowserWorkspaceReplaced(tx, now, beforeRestoreMeta)
       })
-      postEvent({ kind: 'workspace-replaced' })
+      postEvent({ kind: 'workspace-replaced', replacementEpoch: replacementEpoch as number })
     })
     return {
       chatCount: envelope.payload.chats.length,
@@ -590,7 +591,7 @@ async function replacementRuntimeStreamIds(): Promise<string[]> {
 }
 
 function addRuntimeStreamIds(ids: Set<string>): void {
-  for (const streamId of Object.keys(useStreamStore.getState().activeByStreamId)) ids.add(streamId)
+  for (const streamId of useStreamStore.getState().listStreamIds()) ids.add(streamId)
 }
 
 function lockQueryManager():

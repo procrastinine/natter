@@ -144,7 +144,8 @@ export function ContextPanel({
         aria-valuenow={usedTokens}
         aria-valuemin={0}
         aria-valuemax={effectivePromptBudget}
-        aria-label="Prompt tokens used"
+        aria-label="Estimated prompt tokens used"
+        title="Approximate: history may use provider-reported usage; draft text and media use tokenizer-family heuristics."
       >
         <div
           data-ui="context-gauge-fill"
@@ -155,7 +156,7 @@ export function ContextPanel({
           }}
         />
         <div data-ui="context-gauge-label">
-          <strong>{usedTokens.toLocaleString()}</strong>
+          <strong>≈ {usedTokens.toLocaleString()}</strong>
           <span>
             {' '}
             /{' '}

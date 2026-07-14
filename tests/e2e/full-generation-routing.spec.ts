@@ -49,6 +49,11 @@ test('GUI OpenRouter send, Continue, provider overrides, token-cap routing, and 
   await page.locator('[data-role="settings-cog"]').click()
   await expect(page.locator('[data-ui-section="provider-picker"]')).toBeVisible()
 
+  await page.getByRole('tab', { name: 'Context' }).click()
+  await expect(page.getByRole('meter', { name: 'Estimated prompt tokens used' })).toContainText('≈')
+  await expect(page.locator('[data-ui="context-gauge-breakdown-compact"]')).toContainText('draft')
+  await page.getByRole('tab', { name: 'Model' }).click()
+
   await expect(page.getByLabel('Use Tiny Context')).toBeVisible()
 
   await page.getByRole('radio', { name: 'Throughput' }).click()

@@ -133,16 +133,19 @@ function expectLifecycle(
   const [untargeted, targeted, ended] = lifecycle
   expect(untargeted).toMatchObject({
     kind: 'stream-started',
+    replacementEpoch: 0,
     chatId: expected.chatId,
   })
   expect(untargeted).not.toHaveProperty('messageId')
   expect(targeted).toMatchObject({
     kind: 'stream-started',
+    replacementEpoch: 0,
     chatId: expected.chatId,
     messageId: expected.messageId,
   })
   expect(ended).toMatchObject({
     kind: 'stream-ended',
+    replacementEpoch: 0,
     chatId: expected.chatId,
     messageId: expected.messageId,
     outcome: expected.outcome,
@@ -273,10 +276,10 @@ async function seedAssistant(chatId: string, suffix: string): Promise<Message> {
   return assistant
 }
 
-async function expectSettled(streamId: string, messageId: string): Promise<void> {
+async function expectSettled(streamId: string, _messageId: string): Promise<void> {
   const repo = getBrowserRepository()
-  expect(useStreamStore.getState().activeByStreamId[streamId]).toBeUndefined()
-  expect(useStreamStore.getState().liveByMessageId[messageId]).toBeUndefined()
+  expect(useStreamStore.getState().getActive(streamId)).toBeUndefined()
+  expect(useStreamStore.getState().getLiveSnapshotByStreamId(streamId)).toBeUndefined()
   await eventually(async () => {
     expect(await repo.listStreamLeases()).toHaveLength(0)
   })
@@ -351,7 +354,7 @@ describe('generation lifecycle contract', () => {
           }
           await eventually(async () => {
             expect(
-              useStreamStore.getState().liveByMessageId[targetMessageId as string],
+              useStreamStore.getState().getLiveSnapshot(chat.id, targetMessageId as string),
             ).toBeDefined()
             expect(
               await getDb()
@@ -522,7 +525,7 @@ describe('generation lifecycle contract', () => {
             chunk: { choices: [{ delta: { content: largeText } }] },
           }
           await eventually(async () => {
-            expect(useStreamStore.getState().liveByMessageId[target.id]).toBeDefined()
+            expect(useStreamStore.getState().getLiveSnapshot(chat.id, target.id)).toBeDefined()
             expect(
               await getDb()
                 .streamChunks.where('streamId')
@@ -717,15 +720,20 @@ describe('generation lifecycle contract', () => {
       content: [{ type: 'text', text: 'abort send' }],
       openStream: sendOpen,
     })
-    let sendActive: { streamId: string; messageId?: string } | undefined
+    let sendActive: { streamId: string; messageId?: string; replacementEpoch: number } | undefined
     await eventually(() => {
-      sendActive = Object.values(useStreamStore.getState().activeByStreamId).find(
-        (stream) => stream.chatId === sendChat.id && stream.messageId !== undefined,
-      )
+      sendActive = useStreamStore
+        .getState()
+        .listActive()
+        .find((stream) => stream.chatId === sendChat.id && stream.messageId !== undefined)
       expect(sendActive).toBeDefined()
     })
     const sendStreamId = expectDefined(sendActive?.streamId, 'active send stream')
-    expect(useStreamStore.getState().abortStream(sendStreamId)).toBe(true)
+    expect(
+      useStreamStore
+        .getState()
+        .abortStream(sendStreamId, expectDefined(sendActive?.replacementEpoch, 'stream epoch')),
+    ).toBe(true)
     const sendResult = await sendPromise
     const sendMessageId = expectDefined(sendActive?.messageId, 'active send target')
     expect(sendResult.outcome).toBe('abort')
@@ -761,12 +769,23 @@ describe('generation lifecycle contract', () => {
     })
     let continueStreamId: string | undefined
     await eventually(() => {
-      continueStreamId = Object.values(useStreamStore.getState().activeByStreamId).find(
-        (stream) => stream.chatId === continueChat.id && stream.messageId === continueTarget.id,
-      )?.streamId
+      continueStreamId = useStreamStore
+        .getState()
+        .listActive()
+        .find(
+          (stream) => stream.chatId === continueChat.id && stream.messageId === continueTarget.id,
+        )?.streamId
       expect(continueStreamId).toBeDefined()
     })
-    expect(useStreamStore.getState().abortStream(continueStreamId as string)).toBe(true)
+    const continueActive = useStreamStore.getState().getActive(continueStreamId as string)
+    expect(
+      useStreamStore
+        .getState()
+        .abortStream(
+          continueStreamId as string,
+          expectDefined(continueActive?.replacementEpoch, 'continue stream epoch'),
+        ),
+    ).toBe(true)
     await continuePromise
     expect(continueOpen).toHaveBeenCalledTimes(1)
     expectLifecycle(continueCapture.events, {
@@ -986,8 +1005,8 @@ describe('generation lifecycle contract', () => {
         outcome: 'error',
       })
       expect(endedStreamId).toBe(streamId)
-      expect(useStreamStore.getState().activeByStreamId[endedStreamId]).toBeUndefined()
-      expect(useStreamStore.getState().liveByMessageId[target]).toBeUndefined()
+      expect(useStreamStore.getState().getActive(endedStreamId)).toBeUndefined()
+      expect(useStreamStore.getState().getLiveSnapshot(chat.id, target)).toBeUndefined()
       expect(await repo.listStreamLeases()).toHaveLength(1)
       expect(
         await getDb().streamChunks.where('streamId').equals(endedStreamId).count(),
@@ -1378,11 +1397,70 @@ describe('generation lifecycle contract', () => {
     expect((await repo.getMessage(target.id))?.continuationAttempts).toHaveLength(1)
   })
 
+  it('recovers Continue output after a structure-only target revision', async () => {
+    const chat = await createChat({ settings: settings() })
+    const target = await seedAssistant(chat.id, 'continue-recovery-structure-only')
+    const repo = getBrowserRepository()
+    const baseline = expectDefined(await repo.getMessageHeader(target.id), 'Continue target header')
+    await repo.runMutation(
+      [
+        { kind: 'message', messageId: target.id },
+        { kind: 'children', chatId: chat.id, parentId: target.parentId },
+      ],
+      async (ctx) => {
+        await ctx.patchMessageStructure(target.id, {
+          siblingIndex: baseline.siblingIndex + 1,
+        })
+      },
+    )
+    const structurallyChanged = expectDefined(
+      await repo.getMessageHeader(target.id),
+      'structurally changed Continue target',
+    )
+    expect(structurallyChanged.nodeVersion).toBeGreaterThan(baseline.nodeVersion)
+    expect(structurallyChanged.bodyVersion).toBe(baseline.bodyVersion)
+
+    const streamId = 'continue-after-structure-only'
+    const staleLease = await repo.upsertStreamLease({
+      streamId,
+      chatId: chat.id,
+      messageId: target.id,
+      ownerClientId: 'closed-tab',
+      startedAt: 100,
+      heartbeatAt: 200,
+      attemptKind: 'continuation',
+      continuationStrategy: 'prompt',
+      baseBodyVersion: baseline.bodyVersion,
+      requestedModel: MODEL,
+      apiUsed: 'responses',
+    })
+    await repo.appendStreamChunks([
+      {
+        id: `${streamId}:0`,
+        streamId,
+        chatId: chat.id,
+        messageId: target.id,
+        seq: 0,
+        createdAt: 300,
+        event: { lane: 'text', text: '-recovered-after-move' },
+        ...chunkFence(staleLease),
+      },
+    ])
+
+    expect(await recoverOrphans(100_000, chat.id)).toBe(1)
+    const recovered = expectDefined(await repo.getMessage(target.id), 'recovered Continue target')
+    expect(recovered.content).toEqual([
+      { type: 'output_text', text: 'original-recovered-after-move' },
+    ])
+    expect(recovered.continuationAttempts?.[0]?.unappliedText).toBeUndefined()
+  })
+
   it('does not overwrite a newer edit while recovering a stale Continue tail', async () => {
     const chat = await createChat({ settings: settings() })
     const target = await seedAssistant(chat.id, 'continue-recovery-edit-race')
     const repo = getBrowserRepository()
     const streamId = 'stale-continue-after-edit'
+    const baseline = expectDefined(await repo.getMessageHeader(target.id), 'Continue target header')
     await repo.runMutation([{ kind: 'message', messageId: target.id }], async (ctx) => {
       const current = expectDefined(await ctx.getMessage(target.id), 'edited Continue target')
       await ctx.putMessage({
@@ -1400,7 +1478,7 @@ describe('generation lifecycle contract', () => {
       heartbeatAt: 200,
       attemptKind: 'continuation',
       continuationStrategy: 'prompt',
-      baseNodeVersion: target.nodeVersion,
+      baseBodyVersion: baseline.bodyVersion,
       requestedModel: MODEL,
       apiUsed: 'responses',
     })

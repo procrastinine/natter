@@ -1504,6 +1504,32 @@
   overflow-wrap: anywhere;
 }
 
+[data-ui="confirm-dialog-copy"] {
+  display: grid;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  color: var(--color-fg-muted);
+  font-size: var(--font-size-sm);
+  line-height: var(--line-height-body);
+}
+
+[data-ui="confirm-dialog-copy"] p {
+  margin: 0;
+}
+
+[data-ui="confirm-dialog-copy"] [data-role="status"] {
+  padding: var(--space-2) var(--space-3);
+  border-left: 3px solid var(--color-border-default);
+  background: var(--color-bg-surface-2);
+  color: var(--color-fg-primary);
+}
+
+[data-ui="confirm-dialog-copy"] [data-role="status"][data-state="blocked"],
+[data-ui="confirm-dialog-copy"] [data-role="status"][data-state="error"] {
+  border-left-color: var(--color-warning);
+  background: color-mix(in srgb, var(--color-warning) 9%, var(--color-bg-surface-1));
+}
+
 [data-ui="confirm-delete-pair"] {
   display: grid;
   grid-template-columns: auto 1fr;

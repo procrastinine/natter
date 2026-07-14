@@ -1,6 +1,6 @@
 import { expect } from 'vitest'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
-import type { Chat, CursorMap, Message } from '../../src/core/types'
+import type { Chat, Message } from '../../src/core/types'
 import { ExpectedLeafChangedError, type WorkspaceRepository } from '../../src/store/repository'
 
 function contractChat(id: string): Chat {
@@ -102,14 +102,82 @@ export async function expectWorkspaceRepositoryCoreContract(
 
   const defaultSnapshot = await repository.getActiveBranchSnapshot(chat.id, {})
   expect(defaultSnapshot.branch.map((message) => message.id)).toEqual([root.id, newer.id])
-  const cursor: CursorMap = { [root.id]: older.id }
-  const pinnedWindow = await repository.getActiveBranchWindowSnapshot(chat.id, cursor, {
-    offset: -1,
-    limit: 1,
+  const pageMeasurements: Array<{ pageHeaderRowsRead: number; bodyRowsRead: number }> = []
+  const pinnedPageResult = await repository.getKnownBranchPageSnapshot(
+    chat.id,
+    [root.id, older.id],
+    {
+      offset: -1,
+      limit: 1,
+      onMeasure: (measurement) => pageMeasurements.push(measurement),
+    },
+  )
+  expect(pinnedPageResult.kind).toBe('ready')
+  if (pinnedPageResult.kind !== 'ready') throw new Error('expected ready branch page')
+  expect(pinnedPageResult.snapshot.pageHeaders.map((message) => message.id)).toEqual([older.id])
+  expect(pinnedPageResult.snapshot.pageMessages.map((message) => message.id)).toEqual([older.id])
+  expect(pinnedPageResult.snapshot.pageOffset).toBe(1)
+  expect(pinnedPageResult.snapshot.branchLength).toBe(2)
+  expect(pageMeasurements).toEqual([{ pageHeaderRowsRead: 1, bodyRowsRead: 1 }])
+  await expect(
+    repository.getKnownBranchPageSnapshot(chat.id, [], { offset: -1, limit: 1 }),
+  ).resolves.toMatchObject({ kind: 'stale-path', reason: 'empty-path' })
+  await expect(
+    repository.getKnownBranchPageSnapshot(chat.id, [root.id, older.id, newer.id], {
+      offset: 1,
+      limit: 2,
+    }),
+  ).resolves.toMatchObject({
+    kind: 'stale-path',
+    reason: 'non-contiguous',
+    messageId: newer.id,
   })
-  expect(pinnedWindow.branchHeaders.map((message) => message.id)).toEqual([root.id, older.id])
-  expect(pinnedWindow.branchWindow.map((message) => message.id)).toEqual([older.id])
-  expect(pinnedWindow.branchLength).toBe(2)
+
+  await expect(
+    repository.getKnownBranchPageSnapshot(chat.id, [root.id, root.id], {
+      offset: 0,
+      limit: 2,
+    }),
+  ).resolves.toMatchObject({ kind: 'stale-path', reason: 'duplicate-id', messageId: root.id })
+  await expect(
+    repository.getKnownBranchPageSnapshot(chat.id, ['contract-missing'], {
+      offset: -1,
+      limit: 1,
+    }),
+  ).resolves.toMatchObject({
+    kind: 'stale-path',
+    reason: 'missing-header',
+    messageId: 'contract-missing',
+  })
+  await expect(
+    repository.getKnownBranchPageSnapshot('contract-other-chat', [root.id], {
+      offset: -1,
+      limit: 1,
+    }),
+  ).resolves.toMatchObject({ kind: 'stale-path', reason: 'wrong-chat', messageId: root.id })
+  await expect(
+    repository.getKnownBranchPageSnapshot(chat.id, [older.id], { offset: -1, limit: 1 }),
+  ).resolves.toMatchObject({ kind: 'stale-path', reason: 'non-root', messageId: older.id })
+  await expect(
+    repository.getKnownBranchPageSnapshot(chat.id, [root.id, older.id, newer.id], {
+      offset: -1,
+      limit: 1,
+    }),
+  ).resolves.toMatchObject({ kind: 'stale-path', reason: 'non-contiguous', messageId: newer.id })
+
+  await repository.runMutation(
+    [
+      { kind: 'message', messageId: older.id },
+      { kind: 'children', chatId: chat.id, parentId: root.id },
+    ],
+    async (context) => context.putMessage({ ...older, deleted: true }),
+  )
+  await expect(
+    repository.getKnownBranchPageSnapshot(chat.id, [root.id, older.id], {
+      offset: -1,
+      limit: 1,
+    }),
+  ).resolves.toMatchObject({ kind: 'stale-path', reason: 'deleted-header', messageId: older.id })
 }
 
 export async function expectWorkspaceRepositoryRollbackContract(

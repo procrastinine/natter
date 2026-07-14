@@ -1,9 +1,9 @@
 // Undo helpers for structural ops (delete-pair / delete-variant /
 // delete-turn / insert-*). The contract is intentionally simple: a
-// `StructuralSnapshot` captures the set of rows that a mutation was
+// `StructuralSnapshot` captures the structural fields a mutation was
 // about to overwrite or tombstone; `applyStructuralSnapshot` restores
-// them row-by-row via the scoped mutation executor so a 5-second undo
-// toast can cleanly unwind the structural change.
+// those fields via the scoped mutation executor so a 5-second undo toast
+// can cleanly unwind the structural change without clobbering body edits.
 //
 // Rationale: the 8.1 spec calls for "5s undo toasts" on structural ops
 // but doesn't mandate a full operation-journal. A tight
@@ -11,6 +11,7 @@
 // and matches the plan's 5s horizon. Guarded snapshots reject undo if a
 // captured row changed after the original operation.
 
+import type { MessageHeaderRow } from '../store/message-storage'
 import { getWorkspaceRepository } from '../store/workspace-repository'
 import { TreeChangedError } from './tree-ops'
 import type { AttachmentId, ChatId, Message, MessageId, MutationScope } from './types'
@@ -22,26 +23,38 @@ type StructuralSnapshotExpectedRow = Pick<
 
 export interface StructuralSnapshot {
   chatId: ChatId
-  // Row-by-row restore list. Each entry is an exact `Message` that was
-  // alive (or tombstoned) immediately before the mutation; on undo it
-  // is put back. Rows created by the mutation are not restored. The
-  // caller lists them in `newMessageIds` so the undo path deletes them.
-  previousRows: Message[]
+  // Row-by-row structural restore list. Rows created by the mutation are
+  // listed separately so the undo path can delete them.
+  previousRows: StructuralSnapshotRow[]
   newMessageIds: MessageId[]
   attachmentIds: AttachmentId[]
   expectedRows?: StructuralSnapshotExpectedRow[]
 }
 
+export type StructuralSnapshotRow = Pick<
+  Message,
+  'attachmentRefs' | 'chatId' | 'deleted' | 'id' | 'nodeVersion' | 'parentId' | 'siblingIndex'
+>
+
 // Collect rows for callers that already own a safe snapshot boundary.
 export async function snapshotMessages(
   chatId: ChatId,
   ids: readonly MessageId[],
-): Promise<Message[]> {
+): Promise<StructuralSnapshotRow[]> {
   const repo = getWorkspaceRepository()
-  const rows: Message[] = []
+  const rows: StructuralSnapshotRow[] = []
   for (const id of ids) {
-    const row = await repo.getMessage(id)
-    if (row && row.chatId === chatId) rows.push(row)
+    const row = await repo.getMessageHeader(id)
+    if (!row || row.chatId !== chatId) continue
+    rows.push({
+      id: row.id,
+      chatId: row.chatId,
+      parentId: row.parentId,
+      siblingIndex: row.siblingIndex,
+      nodeVersion: row.nodeVersion,
+      deleted: row.deleted,
+      ...(row.attachmentRefs ? { attachmentRefs: structuredClone(row.attachmentRefs) } : {}),
+    })
   }
   return rows
 }
@@ -55,13 +68,13 @@ export async function applyStructuralSnapshot(snapshot: StructuralSnapshot): Pro
   const currentRows = (
     await Promise.all(
       [...snapshot.previousRows.map((row) => row.id), ...snapshot.newMessageIds].map((id) =>
-        repo.getMessage(id),
+        repo.getMessageHeader(id),
       ),
     )
-  ).filter((row): row is Message => row !== undefined && row.chatId === snapshot.chatId)
+  ).filter((row): row is MessageHeaderRow => row !== undefined && row.chatId === snapshot.chatId)
   const scopes: MutationScope[] = []
   const parentSlots = new Set<string>()
-  const addParentScope = (row: Message): void => {
+  const addParentScope = (row: Pick<Message, 'parentId'>): void => {
     const parentKey = row.parentId ?? '__root__'
     if (parentSlots.has(parentKey)) return
     parentSlots.add(parentKey)
@@ -85,7 +98,7 @@ export async function applyStructuralSnapshot(snapshot: StructuralSnapshot): Pro
   }
   await repo.runMutation(scopes, async (ctx) => {
     for (const expected of snapshot.expectedRows ?? []) {
-      const current = await ctx.getMessage(expected.id)
+      const current = await ctx.getMessageHeader(expected.id)
       if (
         !current ||
         current.chatId !== snapshot.chatId ||
@@ -101,7 +114,11 @@ export async function applyStructuralSnapshot(snapshot: StructuralSnapshot): Pro
       await ctx.deleteMessage(id)
     }
     for (const row of snapshot.previousRows) {
-      await ctx.putMessage(row)
+      await ctx.patchMessageStructure(row.id, {
+        parentId: row.parentId,
+        siblingIndex: row.siblingIndex,
+        deleted: row.deleted,
+      })
     }
   })
 }

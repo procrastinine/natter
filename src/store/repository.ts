@@ -1,4 +1,3 @@
-import type { ActivePathMeasurement } from '../core/active-path'
 import type {
   Attachment,
   AttachmentArtifact,
@@ -49,6 +48,11 @@ export interface WorkspaceMeta {
   lastMutationAt: number
   mutationCounter: number
   replacementEpoch: number
+}
+
+export interface MessagePresentationSnapshot {
+  message: Message
+  bodyVersion: number
 }
 
 export interface StreamWriteFence {
@@ -162,6 +166,7 @@ export interface StreamLeaseRow {
   attemptKind?: 'generation' | 'continuation'
   continuationStrategy?: ContinuationStrategy
   baseNodeVersion?: number
+  baseBodyVersion?: number
   requestedModel?: string
   apiUsed?: GenerationMeta['apiUsed']
 }
@@ -180,7 +185,6 @@ export interface AppendMessageToExpectedLeafResult {
 export interface BranchHeaderSnapshot {
   chat: Chat
   chatId: ChatId
-  allHeaders: MessageHeaderRow[]
   branchHeaders: MessageHeaderRow[]
 }
 
@@ -281,6 +285,10 @@ export type MessageHeaderPatch = {
   [K in keyof MessageHeaderRow]?: MessageHeaderRow[K] | undefined
 }
 
+export type MessageStructurePatch = Partial<
+  Pick<MessageHeaderRow, 'deleted' | 'parentId' | 'siblingIndex'>
+>
+
 export interface PatchMessageBodyOptions extends PutMessageOptions {
   headerPatch?: MessageHeaderPatch
   // The patch is a full replacement for the message body fields. Used by
@@ -298,8 +306,8 @@ export interface MutationContext {
   listMessages(chatId: ChatId): Promise<Message[]>
   listMessageHeaders(chatId: ChatId): Promise<MessageHeaderRow[]>
   listChildHeaders(chatId: ChatId, parentId: MessageId | null): Promise<MessageHeaderRow[]>
-  listChildren(chatId: ChatId, parentId: MessageId | null): Promise<Message[]>
   putMessage(message: Message, options?: PutMessageOptions): Promise<void>
+  patchMessageStructure(messageId: MessageId, patch: MessageStructurePatch): Promise<void>
   patchMessageBody(
     messageId: MessageId,
     patch: MessageBodyPatch,
@@ -483,32 +491,59 @@ export interface ActiveBranchSnapshot {
   treeKey: string
 }
 
-export interface ActiveBranchBodyWindow {
-  // Negative offsets anchor the window to the newest branch messages.
+export interface ActiveBranchBodyPage {
+  // Negative offsets anchor the page to the newest branch messages.
   offset: number
   limit: number
-  onMeasure?: (measurement: ActiveBranchWindowMeasurement) => void
+  signal?: AbortSignal
+  onMeasure?: (measurement: KnownBranchPageMeasurement) => void
 }
 
-interface ActiveBranchWindowMeasurement {
-  headerRowsRead: number
+interface KnownBranchPageMeasurement {
+  pageHeaderRowsRead: number
   bodyRowsRead: number
-  siblingRowsRetained: number
-  treeKeyRows: number
-  activePath: ActivePathMeasurement
+}
+
+export interface ActiveBranchPageSnapshot {
+  chatId: ChatId
+  pageMessages: Message[]
+  pageHeaders: MessageHeaderRow[]
+  pageOffset: number
+  pageLimit: number
+  branchLength: number
 }
 
 export interface ActiveBranchWindowSnapshot {
   chatId: ChatId
   branchWindow: Message[]
-  allHeaders: MessageHeaderRow[]
   branchHeaders: MessageHeaderRow[]
   windowOffset: number
   windowLimit: number
   branchLength: number
-  siblingGroups: BranchSiblingGroup[]
-  treeKey: string
 }
+
+type KnownBranchStaleReason =
+  | 'database-unavailable'
+  | 'empty-path'
+  | 'duplicate-id'
+  | 'missing-header'
+  | 'wrong-chat'
+  | 'deleted-header'
+  | 'non-root'
+  | 'non-contiguous'
+  | 'missing-body'
+  | 'body-version-mismatch'
+
+interface KnownBranchStalePathResult {
+  kind: 'stale-path'
+  chatId: ChatId
+  reason: KnownBranchStaleReason
+  messageId?: MessageId
+}
+
+export type KnownBranchPageResult =
+  | { kind: 'ready'; snapshot: ActiveBranchPageSnapshot }
+  | KnownBranchStalePathResult
 
 export interface WorkspaceRepository {
   getWorkspaceMeta(): Promise<WorkspaceMeta>
@@ -573,7 +608,11 @@ export interface WorkspaceRepository {
     expected: ChatBranchCacheWriteGuard,
   ): Promise<ChatBranchCache | undefined>
   deleteChatBranchCache(chatId: ChatId, expected?: ChatBranchCacheWriteGuard): Promise<boolean>
-  getMessage(messageId: MessageId): Promise<Message | undefined>
+  getMessage(messageId: MessageId, options?: { signal?: AbortSignal }): Promise<Message | undefined>
+  getMessagePresentationSnapshot(
+    messageId: MessageId,
+    options?: { signal?: AbortSignal },
+  ): Promise<MessagePresentationSnapshot | undefined>
   getMessageTextPreview(
     messageId: MessageId,
     options?: { maxChars?: number },
@@ -591,14 +630,17 @@ export interface WorkspaceRepository {
     chatId: ChatId,
     messageIds: readonly MessageId[],
   ): Promise<SendContextRevisionSnapshot>
-  listMessageHeaders(chatId: ChatId): Promise<MessageHeaderRow[]>
+  listMessageHeaders(
+    chatId: ChatId,
+    options?: { signal?: AbortSignal },
+  ): Promise<MessageHeaderRow[]>
   listChildHeaders(chatId: ChatId, parentId: MessageId | null): Promise<MessageHeaderRow[]>
   getActiveBranchSnapshot(chatId: ChatId, cursor: CursorMap): Promise<ActiveBranchSnapshot>
-  getActiveBranchWindowSnapshot(
+  getKnownBranchPageSnapshot(
     chatId: ChatId,
-    cursor: CursorMap,
-    window: ActiveBranchBodyWindow,
-  ): Promise<ActiveBranchWindowSnapshot>
+    pathMessageIds: readonly MessageId[],
+    page: ActiveBranchBodyPage,
+  ): Promise<KnownBranchPageResult>
   getBranchHeaderSnapshotByLeaf(
     chatId: ChatId,
     leafId: MessageId | null,

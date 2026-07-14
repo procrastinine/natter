@@ -1,23 +1,31 @@
-import { act, cleanup, fireEvent, render, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, waitFor, within } from '@testing-library/react'
 import 'fake-indexeddb/auto'
 import Dexie from 'dexie'
 import { IDBFactory } from 'fake-indexeddb'
 import { afterEach, beforeEach, describe, expect, it, type MockInstance, vi } from 'vitest'
+import type { ChatStreamChunk } from '../../src/api/types'
 import { App } from '../../src/app/App'
+import {
+  __composeKnownBranchPageForTests,
+  __rebaseBranchSnapshotForTests,
+} from '../../src/app/Shell'
 import { cursorKeyOf } from '../../src/core/active-path'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
-import type { Chat, Message } from '../../src/core/types'
+import type { Chat, ConnectionProfile, Message } from '../../src/core/types'
+import { sendText } from '../../src/hooks/useChat'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
+import { getBrowserRepository } from '../../src/store/browser-repo'
 import { rebuildChatSidebarProjection } from '../../src/store/chat-sidebar-projection'
 import { archiveChat, createChat, updateChatSettings } from '../../src/store/chats'
 import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
 import { createFolder } from '../../src/store/folders'
 import { exportChat } from '../../src/store/import-export'
 import { __resetKeyCacheForTests, createKey } from '../../src/store/keys'
-import { splitMessageForStorage } from '../../src/store/message-storage'
+import { type MessageHeaderRow, splitMessageForStorage } from '../../src/store/message-storage'
 import { putCachedModels } from '../../src/store/models-cache'
 import { createPreset, getPreset } from '../../src/store/presets'
 import { createProfile } from '../../src/store/profiles'
+import type { ActiveBranchPageSnapshot } from '../../src/store/repository'
 import { __resetSearchSessionRunnerForTests } from '../../src/store/search-session'
 import { setSetting } from '../../src/store/settings'
 import {
@@ -26,12 +34,131 @@ import {
   STREAM_LEASE_TTL_MS,
 } from '../../src/store/stream-leases'
 import { createTag } from '../../src/store/tags'
+import {
+  __resetWorkspaceRepositoryForTests,
+  __setWorkspaceRepositoryForTests,
+} from '../../src/store/workspace-repository'
 import { useChatStore } from '../../src/store/zustand/chatStore'
 import { __resetSearchStoreForTests } from '../../src/store/zustand/searchStore'
 import { useStreamStore } from '../../src/store/zustand/streamStore'
 import { useUiStore } from '../../src/store/zustand/uiStore'
 import { readActiveSeedState } from '../../src/ui/header/ConnectionHeader'
 import { putTestMessageHeaderOnly, putTestMessages } from '../helpers/message-storage'
+
+function pageHeader(id: string, parentId: string | null, index: number): MessageHeaderRow {
+  return {
+    id,
+    chatId: 'page-chat',
+    parentId,
+    siblingIndex: 0,
+    turnId: id,
+    turnIndex: index,
+    createdAt: index,
+    role: index % 2 === 0 ? 'user' : 'assistant',
+    origin: index % 2 === 0 ? 'user' : 'generated',
+    bodyVersion: 7,
+    bodyWordCount: 1,
+    textPreview: id,
+    nodeVersion: 0,
+    deleted: false,
+  }
+}
+
+function pageMessage(header: MessageHeaderRow): Message {
+  return {
+    id: header.id,
+    chatId: header.chatId,
+    parentId: header.parentId,
+    siblingIndex: header.siblingIndex,
+    turnId: header.turnId,
+    turnIndex: header.turnIndex,
+    createdAt: header.createdAt,
+    role: header.role,
+    origin: header.origin,
+    content: [{ type: 'text', text: `Body ${header.id}` }],
+    nodeVersion: header.nodeVersion,
+    deleted: header.deleted,
+  }
+}
+
+describe('active branch page composition', () => {
+  it('rebases structural headers without copying bodies and rejects a changed body version', () => {
+    const pageRow = pageHeader('page-root', null, 0)
+    const body = pageMessage(pageRow)
+    const authoritative = { ...pageRow, siblingIndex: 3, nodeVersion: 1 }
+    const authoritativePath = [authoritative]
+    const page: ActiveBranchPageSnapshot = {
+      chatId: pageRow.chatId,
+      pageMessages: [body],
+      pageHeaders: [pageRow],
+      pageOffset: 0,
+      pageLimit: 1,
+      branchLength: 1,
+    }
+    const composed = __composeKnownBranchPageForTests(
+      pageRow.chatId,
+      [pageRow.id],
+      authoritativePath,
+      new Map([[authoritative.id, authoritative]]),
+      page,
+    )
+
+    expect(composed?.branchHeaders[0]).toBe(authoritative)
+    expect(composed?.branchWindow[0]?.siblingIndex).toBe(3)
+    expect(composed?.branchWindow[0]?.content).toBe(body.content)
+    expect(composed?.branchWindow[0]).not.toHaveProperty('bodyVersion')
+    expect(composed?.branchWindow[0]).not.toHaveProperty('bodyWordCount')
+    expect(composed?.branchWindow[0]).not.toHaveProperty('textPreview')
+    expect(
+      __rebaseBranchSnapshotForTests(composed as NonNullable<typeof composed>, authoritativePath),
+    ).toBe(composed)
+
+    const changedBody = { ...authoritative, bodyVersion: authoritative.bodyVersion + 1 }
+    expect(
+      __composeKnownBranchPageForTests(
+        pageRow.chatId,
+        [pageRow.id],
+        [changedBody],
+        new Map([[changedBody.id, changedBody]]),
+        page,
+      ),
+    ).toBeNull()
+  })
+
+  it('validates only the requested window when the exact path is already known', () => {
+    const length = 10_000
+    const windowSize = 16
+    const headers = Array.from({ length }, (_, index) =>
+      pageHeader(`page-${index}`, index === 0 ? null : `page-${index - 1}`, index),
+    )
+    let indexedHeaderReads = 0
+    const knownPath = new Proxy(headers, {
+      get(target, key, receiver) {
+        if (typeof key === 'string' && /^\d+$/u.test(key)) indexedHeaderReads += 1
+        return Reflect.get(target, key, receiver) as unknown
+      },
+    })
+    const pageHeaders = headers.slice(-windowSize)
+    const page: ActiveBranchPageSnapshot = {
+      chatId: 'page-chat',
+      pageMessages: pageHeaders.map(pageMessage),
+      pageHeaders,
+      pageOffset: length - windowSize,
+      pageLimit: windowSize,
+      branchLength: length,
+    }
+    const result = __composeKnownBranchPageForTests(
+      'page-chat',
+      headers.map((header) => header.id),
+      knownPath,
+      new Map(pageHeaders.map((header) => [header.id, header])),
+      page,
+    )
+
+    expect(result?.branchWindow).toHaveLength(windowSize)
+    expect(indexedHeaderReads).toBe(windowSize * 2)
+  })
+})
 
 describe('shell smoke render', () => {
   let errorSpy: MockInstance<typeof console.error>
@@ -48,6 +175,7 @@ describe('shell smoke render', () => {
     useChatStore.getState().reset()
     useStreamStore.getState().reset()
     useUiStore.getState().reset()
+    __resetWorkspaceRepositoryForTests()
     __resetDbForTests()
     window.localStorage.clear()
     window.sessionStorage.clear()
@@ -453,6 +581,32 @@ describe('shell smoke render', () => {
     })
   })
 
+  it('returns from tree view immediately when the chat has no messages', async () => {
+    const chat = await createChat({ title: 'Empty tree', settings: cloneDefaultChatSettings() })
+    window.location.hash = `#/chat/${chat.id}`
+    const { container } = render(<App />)
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-role="chat-branch-tree"]')).toBeInTheDocument()
+      expect(container.querySelector('[data-ui="composer"]')).toBeInTheDocument()
+    })
+    const treeButton = container.querySelector(
+      '[data-role="chat-branch-tree"]',
+    ) as HTMLButtonElement
+
+    fireEvent.click(treeButton)
+    await waitFor(() => {
+      expect(container.querySelector('[data-ui="branch-tree-view"]')).toBeVisible()
+    })
+
+    fireEvent.click(treeButton)
+    await waitFor(() => {
+      expect(useUiStore.getState().treeViewChatId).toBeNull()
+      expect(container.querySelector('[data-ui="branch-tree-view"]')).not.toBeVisible()
+      expect(container.querySelector('[data-ui="composer"]')).toBeVisible()
+    })
+  })
+
   it('opens a header-only tree without mounting the transcript, composer, or message bodies', async () => {
     const chat = await createChat({ title: 'Cold tree', settings: cloneDefaultChatSettings() })
     const root: Message = {
@@ -490,6 +644,10 @@ describe('shell smoke render', () => {
     await waitFor(() => {
       expect(container.querySelector('[data-ui="branch-tree-view"]')).toBeInTheDocument()
       expect(container.querySelectorAll('[data-ui="branch-tree-node"]')).toHaveLength(2)
+      expect(container.querySelector('[data-role="chat-branch-tree"]')).toHaveAttribute(
+        'aria-pressed',
+        'true',
+      )
     })
     expect(container.querySelector('[data-ui="message-list"]')).not.toBeInTheDocument()
     expect(container.querySelector('[data-ui="composer"]')).not.toBeInTheDocument()
@@ -500,10 +658,6 @@ describe('shell smoke render', () => {
         '[data-ui="branch-tree-canvas-pane"] [data-ui="tree-density-toggle"]',
       ),
     ).toBeInTheDocument()
-    expect(container.querySelector('[data-role="chat-branch-tree"]')).toHaveAttribute(
-      'aria-pressed',
-      'true',
-    )
     expect(container.querySelector('[data-connector-hit]')).toBeInTheDocument()
     const editTreeButton = container.querySelector(
       '[data-role="chat-edit-tree"]',
@@ -702,7 +856,7 @@ describe('shell smoke render', () => {
     })
     window.location.hash = `#/chat/${chat.id}`
 
-    const { container, findByText } = render(<App />)
+    const { container, findByText, queryByText } = render(<App />)
 
     expect(await findByText('stable answer before stream')).toBeInTheDocument()
 
@@ -713,12 +867,13 @@ describe('shell smoke render', () => {
       updatedAt: 4,
     })
     act(() => {
-      useChatStore.getState().setCursor(chat.id, {
+      useChatStore.getState().navigateToCursor(chat.id, {
         [cursorKeyOf(null)]: root.id,
         [cursorKeyOf(root.id)]: streamingLeaf.id,
       })
       useStreamStore.getState().setActive({
         streamId: 'stream-tree-handoff',
+        replacementEpoch: 0,
         chatId: chat.id,
         messageId: streamingLeaf.id,
         startedAt: 4,
@@ -726,6 +881,7 @@ describe('shell smoke render', () => {
       })
       useStreamStore.getState().setLiveSnapshot({
         streamId: 'stream-tree-handoff',
+        replacementEpoch: 0,
         chatId: chat.id,
         messageId: streamingLeaf.id,
         content: [{ type: 'output_text', text: 'live answer in progress' }],
@@ -742,14 +898,334 @@ describe('shell smoke render', () => {
     expect(treeButton).toHaveAttribute('aria-pressed', 'true')
     fireEvent.click(treeButton)
 
-    expect(container.querySelector('[data-ui="message-list"]')?.textContent ?? '').not.toContain(
-      'stable answer before stream',
-    )
-    expect(await findByText('live answer in progress')).toBeInTheDocument()
+    const staleAnswer = queryByText('stable answer before stream')
+    if (staleAnswer) expect(staleAnswer).not.toBeVisible()
+    await waitFor(() => {
+      expect(container.querySelector('[data-ui="message-list"]')).toBeVisible()
+    })
     const transcript = container.querySelector('[data-ui="message-list"]')
     expect(transcript).toBeInTheDocument()
+    expect(
+      await within(transcript as HTMLElement).findByText('live answer in progress'),
+    ).toBeVisible()
     expect(transcript?.querySelector('[data-ui="message"]')).toBeInTheDocument()
     expect(transcript).not.toHaveTextContent('stable answer before stream')
+  })
+
+  it('does not let a never-settling branch presentation read block generation', async () => {
+    const settings = cloneDefaultChatSettings()
+    settings.profileId = 'presentation-profile'
+    settings.model = 'gpt-4o-mini'
+    settings.api = 'chat'
+    const chat = await createChat({
+      id: 'chat-presentation-read-liveness',
+      title: 'Presentation read liveness',
+      settings,
+      now: 1,
+    })
+    const connection: ConnectionProfile = {
+      id: settings.profileId,
+      name: 'OpenAI test',
+      kind: 'openai-compatible',
+      baseUrl: 'https://api.openai.com/v1',
+      appTitle: 'natter',
+      appUrl: 'http://localhost:5173',
+      apiKeyRef: 'presentation-key',
+      defaultHeaders: {},
+      supportsEndpointsApi: false,
+      supportsGenerationApi: false,
+      supportsPrivacyScrape: false,
+      createdAt: 1,
+      updatedAt: 1,
+    }
+    window.location.hash = `#/chat/${chat.id}`
+
+    const browserRepo = getBrowserRepository()
+    let markPresentationReadStarted!: () => void
+    const presentationReadStarted = new Promise<void>((resolve) => {
+      markPresentationReadStarted = resolve
+    })
+    let markStructuralReadStarted!: () => void
+    const structuralReadStarted = new Promise<void>((resolve) => {
+      markStructuralReadStarted = resolve
+    })
+    const neverSettlingPresentationRead = new Promise<never>(() => {})
+    const neverSettlingStructuralRead = new Promise<never>(() => {})
+    const getKnownBranchPageSnapshot = vi.fn(() => {
+      markPresentationReadStarted()
+      return neverSettlingPresentationRead
+    })
+    __setWorkspaceRepositoryForTests(
+      new Proxy(browserRepo, {
+        get(target, property) {
+          if (property === 'getKnownBranchPageSnapshot') return getKnownBranchPageSnapshot
+          if (property === 'listMessageHeaders') {
+            return () => {
+              markStructuralReadStarted()
+              return neverSettlingStructuralRead
+            }
+          }
+          const value = Reflect.get(target, property) as unknown
+          if (typeof value !== 'function') return value
+          const callable = value as (...args: unknown[]) => unknown
+          return (...args: unknown[]) => callable.apply(target, args)
+        },
+      }),
+    )
+
+    render(<App />)
+    await waitFor(() => {
+      expect(useUiStore.getState().activeChatId).toBe(chat.id)
+    })
+
+    let targetAtProviderOpen: string | undefined
+    let persistedTargetAtProviderRead: string | undefined
+    const openStream = vi.fn(() => {
+      targetAtProviderOpen = useStreamStore.getState().listByChat(chat.id)[0]?.messageId
+      return (async function* () {
+        await Promise.all([presentationReadStarted, structuralReadStarted])
+        persistedTargetAtProviderRead = (await getDb().streamLeases.toArray())[0]?.messageId
+        yield {
+          type: 'delta',
+          chunk: {
+            id: 'presentation-independent-generation',
+            model: settings.model,
+            choices: [{ delta: { content: 'generation survived' }, finish_reason: 'stop' }],
+          },
+        } satisfies ChatStreamChunk
+      })()
+    })
+
+    const result = await sendText({
+      chatId: chat.id,
+      connection,
+      apiKey: 'sk-test',
+      content: [{ type: 'text', text: 'do not wait for presentation' }],
+      openStream,
+    })
+
+    expect(getKnownBranchPageSnapshot).toHaveBeenCalled()
+    expect(openStream).toHaveBeenCalledOnce()
+    expect(targetAtProviderOpen).toBe(result.assistantMessageId)
+    expect(persistedTargetAtProviderRead).toBe(result.assistantMessageId)
+    expect(result.outcome).toBe('done')
+    expect(useStreamStore.getState().hasStreamForChat(chat.id)).toBe(false)
+    expect(await getDb().streamLeases.count()).toBe(0)
+    expect(await browserRepo.getMessage(result.assistantMessageId)).toMatchObject({
+      content: [{ type: 'output_text', text: 'generation survived' }],
+      generation: { status: 'done' },
+    })
+  })
+
+  it('keeps a structurally exact retained stream interactive while its body read lags', async () => {
+    const chat = await createChat({
+      id: 'chat-retained-stream-exact-path',
+      title: 'Retained stream exact path',
+      settings: cloneDefaultChatSettings(),
+      now: 1,
+    })
+    const root: Message = {
+      id: 'retained-stream-root',
+      chatId: chat.id,
+      parentId: null,
+      siblingIndex: 0,
+      turnId: 'retained-stream-root',
+      turnIndex: 0,
+      createdAt: 2,
+      role: 'user',
+      origin: 'user',
+      content: [{ type: 'text', text: 'retained stream prompt' }],
+      nodeVersion: 0,
+      deleted: false,
+    }
+    const assistant: Message = {
+      ...root,
+      id: 'retained-stream-assistant',
+      parentId: root.id,
+      turnId: 'retained-stream-assistant',
+      createdAt: 3,
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: 'persisted stream prefix' }],
+    }
+    await putTestMessages([root, assistant])
+    await getDb().chats.put({
+      ...chat,
+      titleStatus: 'manual',
+      lastUpdatedLeafId: assistant.id,
+      lastBranchUpdatedAt: assistant.createdAt,
+      updatedAt: assistant.createdAt,
+    })
+    window.location.hash = `#/chat/${chat.id}`
+
+    const { container, findByText } = render(<App />)
+    expect(await findByText('persisted stream prefix')).toBeInTheDocument()
+
+    const browserRepo = getBrowserRepository()
+    let markLaggingReadStarted!: () => void
+    const laggingReadStarted = new Promise<void>((resolve) => {
+      markLaggingReadStarted = resolve
+    })
+    __setWorkspaceRepositoryForTests(
+      new Proxy(browserRepo, {
+        get(target, property) {
+          if (property === 'getKnownBranchPageSnapshot') {
+            return () => {
+              markLaggingReadStarted()
+              return new Promise<never>(() => {})
+            }
+          }
+          const value = Reflect.get(target, property) as unknown
+          if (typeof value !== 'function') return value
+          const callable = value as (...args: unknown[]) => unknown
+          return (...args: unknown[]) => callable.apply(target, args)
+        },
+      }),
+    )
+
+    await act(async () => {
+      await putTestMessages([
+        {
+          ...assistant,
+          nodeVersion: 1,
+          generation: {
+            id: '',
+            model: 'stream-model',
+            requestedModel: 'stream-model',
+            apiUsed: 'chat',
+            delivery: 'streaming',
+            status: 'streaming',
+            integrity: 'clean',
+            costSource: 'stream',
+            startedAt: 4,
+          },
+        },
+      ])
+      useStreamStore.getState().setActive({
+        streamId: 'retained-structure-stream',
+        replacementEpoch: 0,
+        chatId: chat.id,
+        messageId: assistant.id,
+        startedAt: 4,
+        ownerClientId: 'test-client',
+      })
+      useStreamStore.getState().setLiveSnapshot({
+        streamId: 'retained-structure-stream',
+        replacementEpoch: 0,
+        chatId: chat.id,
+        messageId: assistant.id,
+        content: [{ type: 'output_text', text: 'live retained stream content' }],
+        textLength: 28,
+        reasoningLength: 0,
+        updatedAt: 5,
+      })
+    })
+    await laggingReadStarted
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-ui="message-list"]')).not.toHaveAttribute('inert')
+      expect(
+        container.querySelector(`[data-ui="message"][data-message-id="${assistant.id}"]`),
+      ).toHaveAttribute('aria-busy', 'true')
+    })
+    expect(await findByText('live retained stream content')).toBeInTheDocument()
+    expect(
+      container.querySelector(`[data-message-id="${assistant.id}"] [data-ui="markdown-segment"]`),
+    ).toHaveAttribute('data-mode', 'streaming')
+  })
+
+  it('keeps the loaded branch interactive while geometric older pages resolve', async () => {
+    await setSetting('global:message-render-window-size', 10)
+    await setSetting('global:message-render-window-load-mode', 'manual')
+    const chat = await createChat({
+      id: 'chat-geometric-body-pages',
+      title: 'Geometric body pages',
+      settings: cloneDefaultChatSettings(),
+      now: 1,
+    })
+    const messages: Message[] = []
+    for (let index = 0; index < 35; index += 1) {
+      const id = `geometric-message-${index}`
+      const role = index % 2 === 0 ? 'user' : 'assistant'
+      messages.push({
+        id,
+        chatId: chat.id,
+        parentId: messages.at(-1)?.id ?? null,
+        siblingIndex: 0,
+        turnId: id,
+        turnIndex: index,
+        createdAt: index + 2,
+        role,
+        origin: role === 'user' ? 'user' : 'generated',
+        content: [
+          role === 'user'
+            ? { type: 'text', text: `geometric body ${index}` }
+            : { type: 'output_text', text: `geometric body ${index}` },
+        ],
+        nodeVersion: 0,
+        deleted: false,
+      })
+    }
+    await putTestMessages(messages)
+    const leaf = messages.at(-1) as Message
+    await getDb().chats.put({
+      ...chat,
+      titleStatus: 'manual',
+      lastUpdatedLeafId: leaf.id,
+      lastBranchUpdatedAt: leaf.createdAt,
+      updatedAt: leaf.createdAt,
+    })
+
+    const browserRepo = getBrowserRepository()
+    const requestedLimits: number[] = []
+    const releases: Array<() => void> = []
+    __setWorkspaceRepositoryForTests(
+      new Proxy(browserRepo, {
+        get(target, property) {
+          if (property === 'getKnownBranchPageSnapshot') {
+            return async (...args: Parameters<typeof target.getKnownBranchPageSnapshot>) => {
+              const page = args[2]
+              requestedLimits.push(page.limit)
+              if (page.limit > 10) {
+                await new Promise<void>((resolve) => releases.push(resolve))
+              }
+              return target.getKnownBranchPageSnapshot(...args)
+            }
+          }
+          const value = Reflect.get(target, property) as unknown
+          if (typeof value !== 'function') return value
+          const callable = value as (...args: unknown[]) => unknown
+          return (...args: unknown[]) => callable.apply(target, args)
+        },
+      }),
+    )
+    window.location.hash = `#/chat/${chat.id}`
+    const { container } = render(<App />)
+
+    await waitFor(() => {
+      expect(container.querySelectorAll('[data-ui="message"]')).toHaveLength(10)
+    })
+    fireEvent.click(container.querySelector('[data-ui="load-more-messages"]') as Element)
+    await waitFor(() => expect(requestedLimits).toContain(20))
+    expect(container.querySelectorAll('[data-ui="message"]')).toHaveLength(10)
+    expect(container.querySelector('[data-ui="message-list"]')).not.toHaveAttribute('inert')
+    expect(container.querySelector('[data-ui="composer"] textarea')).not.toBeDisabled()
+
+    releases.shift()?.()
+    await waitFor(() => {
+      expect(container.querySelectorAll('[data-ui="message"]')).toHaveLength(20)
+    })
+    fireEvent.click(container.querySelector('[data-ui="load-more-messages"]') as Element)
+    await waitFor(() => expect(requestedLimits).toContain(35))
+    expect(container.querySelectorAll('[data-ui="message"]')).toHaveLength(20)
+    expect(container.querySelector('[data-ui="message-list"]')).not.toHaveAttribute('inert')
+
+    releases.shift()?.()
+    await waitFor(() => {
+      expect(container.querySelectorAll('[data-ui="message"]')).toHaveLength(35)
+      expect(container.querySelector('[data-ui="load-more-messages"]')).not.toBeInTheDocument()
+    })
+    expect(requestedLimits).toEqual([10, 20, 35])
   })
 
   it('renders the active chat without hydrating irrelevant chat or branch bodies', async () => {
@@ -893,6 +1369,218 @@ describe('shell smoke render', () => {
       expect(queryByText('original branch answer')).toBeInTheDocument()
       expect(queryByText('newer sibling answer')).not.toBeInTheDocument()
     })
+  })
+
+  it('honors a repeated arrival at a message URL in the same mounted tab', async () => {
+    const chat = await createChat({ title: 'Repeated route', now: 1 })
+    const root: Message = {
+      id: 'repeat-route-root',
+      chatId: chat.id,
+      parentId: null,
+      siblingIndex: 0,
+      turnId: 'repeat-route-root',
+      turnIndex: 0,
+      createdAt: 2,
+      role: 'user',
+      origin: 'user',
+      content: [{ type: 'text', text: 'repeat route prompt' }],
+      nodeVersion: 0,
+      deleted: false,
+    }
+    const first: Message = {
+      ...root,
+      id: 'repeat-route-first',
+      parentId: root.id,
+      turnId: 'repeat-route-first',
+      createdAt: 3,
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: 'first route answer' }],
+    }
+    const second: Message = {
+      ...first,
+      id: 'repeat-route-second',
+      siblingIndex: 1,
+      turnId: 'repeat-route-second',
+      createdAt: 4,
+      content: [{ type: 'output_text', text: 'second route answer' }],
+    }
+    await putTestMessages([root, first, second])
+    await getDb().chats.put({
+      ...chat,
+      lastUpdatedLeafId: second.id,
+      lastBranchUpdatedAt: 4,
+      updatedAt: 4,
+    })
+    window.location.hash = `#/chat/${chat.id}/message/${first.id}`
+
+    const { findByText, queryByText } = render(<App />)
+    expect(await findByText('first route answer')).toBeInTheDocument()
+
+    act(() => {
+      window.location.hash = `#/chat/${chat.id}/message/${second.id}`
+      window.dispatchEvent(new HashChangeEvent('hashchange'))
+    })
+    expect(await findByText('second route answer')).toBeInTheDocument()
+    expect(queryByText('first route answer')).not.toBeInTheDocument()
+
+    act(() => {
+      window.location.hash = `#/chat/${chat.id}/message/${first.id}`
+      window.dispatchEvent(new HashChangeEvent('hashchange'))
+    })
+    expect(await findByText('first route answer')).toBeInTheDocument()
+    expect(queryByText('second route answer')).not.toBeInTheDocument()
+  })
+
+  it('keeps the retained branch painted but inert while a repeated message URL is resolving', async () => {
+    const chat = await createChat({ title: 'Delayed repeated route', now: 1 })
+    const root: Message = {
+      id: 'delayed-route-root',
+      chatId: chat.id,
+      parentId: null,
+      siblingIndex: 0,
+      turnId: 'delayed-route-root',
+      turnIndex: 0,
+      createdAt: 2,
+      role: 'user',
+      origin: 'user',
+      content: [{ type: 'text', text: 'delayed route prompt' }],
+      nodeVersion: 0,
+      deleted: false,
+    }
+    const first: Message = {
+      ...root,
+      id: 'delayed-route-first',
+      parentId: root.id,
+      turnId: 'delayed-route-first',
+      createdAt: 3,
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: 'retained route answer' }],
+    }
+    const second: Message = {
+      ...first,
+      id: 'delayed-route-second',
+      siblingIndex: 1,
+      turnId: 'delayed-route-second',
+      createdAt: 4,
+      content: [{ type: 'output_text', text: 'resolved route answer' }],
+    }
+    await putTestMessages([root, first, second])
+    await getDb().chats.put({
+      ...chat,
+      lastUpdatedLeafId: second.id,
+      lastBranchUpdatedAt: 4,
+      updatedAt: 4,
+    })
+    window.location.hash = `#/chat/${chat.id}/message/${first.id}`
+
+    const { container, findByText, queryByText } = render(<App />)
+    expect(await findByText('retained route answer')).toBeInTheDocument()
+
+    const browserRepo = getBrowserRepository()
+    let resolveFreshHeaders!: (
+      headers: Awaited<ReturnType<typeof browserRepo.listMessageHeaders>>,
+    ) => void
+    const freshHeaders = new Promise<Awaited<ReturnType<typeof browserRepo.listMessageHeaders>>>(
+      (resolve) => {
+        resolveFreshHeaders = resolve
+      },
+    )
+    __setWorkspaceRepositoryForTests(
+      new Proxy(browserRepo, {
+        get(target, property) {
+          if (property === 'listMessageHeaders') return () => freshHeaders
+          const value = Reflect.get(target, property) as unknown
+          if (typeof value !== 'function') return value
+          const callable = value as (...args: unknown[]) => unknown
+          return (...args: unknown[]) => callable.apply(target, args)
+        },
+      }),
+    )
+
+    act(() => {
+      window.location.hash = `#/chat/${chat.id}/message/${second.id}`
+      window.dispatchEvent(new HashChangeEvent('hashchange'))
+    })
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-ui="message-list"]')).toHaveAttribute(
+        'data-presentation-only',
+        'true',
+      )
+    })
+    expect(queryByText('retained route answer')).toBeInTheDocument()
+    expect(queryByText('resolved route answer')).not.toBeInTheDocument()
+    expect(container.querySelector('[data-ui="message-list"]')).toHaveAttribute('inert')
+    expect(container.querySelector('[data-ui="composer-input"]')).toBeDisabled()
+    expect(container.querySelector('[data-ui="composer-import-at-end"]')).toBeDisabled()
+
+    fireEvent.keyDown(window, { key: 'V', shiftKey: true, metaKey: true })
+    expect(container.querySelector('[data-ui="import-modal"]')).not.toBeInTheDocument()
+
+    const rows = [root, first, second].map((message) => splitMessageForStorage(message).header)
+    await act(async () => {
+      resolveFreshHeaders(rows)
+      await freshHeaders
+    })
+
+    expect(await findByText('resolved route answer')).toBeInTheDocument()
+    await waitFor(() => {
+      expect(container.querySelector('[data-ui="message-list"]')).not.toHaveAttribute(
+        'data-presentation-only',
+      )
+    })
+    expect(queryByText('retained route answer')).not.toBeInTheDocument()
+    expect(container.querySelector('[data-ui="composer-input"]')).not.toBeDisabled()
+    expect(container.querySelector('[data-ui="composer-import-at-end"]')).not.toBeDisabled()
+  })
+
+  it('canonicalizes a loaded chat URL whose message target does not exist', async () => {
+    const chat = await createChat({ title: 'Missing route target', now: 1 })
+    const root: Message = {
+      id: 'missing-route-root',
+      chatId: chat.id,
+      parentId: null,
+      siblingIndex: 0,
+      turnId: 'missing-route-root',
+      turnIndex: 0,
+      createdAt: 2,
+      role: 'user',
+      origin: 'user',
+      content: [{ type: 'text', text: 'missing route prompt' }],
+      nodeVersion: 0,
+      deleted: false,
+    }
+    const leaf: Message = {
+      ...root,
+      id: 'missing-route-leaf',
+      parentId: root.id,
+      turnId: 'missing-route-leaf',
+      createdAt: 3,
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: 'canonical route answer' }],
+    }
+    await putTestMessages([root, leaf])
+    await getDb().chats.put({
+      ...chat,
+      lastUpdatedLeafId: leaf.id,
+      lastBranchUpdatedAt: 3,
+      updatedAt: 3,
+    })
+    window.location.hash = `#/chat/${chat.id}/message/not-a-message`
+
+    const { container, findByText } = render(<App />)
+
+    expect(await findByText('canonical route answer')).toBeInTheDocument()
+    await waitFor(() => {
+      expect(window.location.hash).toBe(`#/chat/${chat.id}/message/${leaf.id}`)
+    })
+    expect(container.querySelector('[data-ui="message-list"]')).not.toHaveAttribute(
+      'data-presentation-only',
+    )
+    expect(container.querySelector('[data-ui="composer-input"]')).not.toBeDisabled()
   })
 
   it('pins a remotely extended path before a newer sibling can replace it', async () => {
@@ -1075,10 +1763,17 @@ describe('shell smoke render', () => {
     expect(originalList).toBeInTheDocument()
 
     act(() => {
-      useChatStore.getState().setCursor(chat.id, {
-        [cursorKeyOf(null)]: root.id,
-        [cursorKeyOf(root.id)]: localLeaf.id,
-      })
+      const store = useChatStore.getState()
+      const intent = store.beginNavigationIntent(chat.id)
+      store.selectPathForIntent(
+        chat.id,
+        intent,
+        {
+          [cursorKeyOf(null)]: root.id,
+          [cursorKeyOf(root.id)]: localLeaf.id,
+        },
+        [root.id, localLeaf.id],
+      )
     })
 
     expect(useChatStore.getState().getCursor(chat.id)?.[cursorKeyOf(root.id)]).toBe(localLeaf.id)
@@ -1170,6 +1865,53 @@ describe('shell smoke render', () => {
       const stored = await getDb().chats.get(newChatId)
       expect(stored?.temporary).toBe(true)
     })
+  })
+
+  it('leaves Cmd/Ctrl+N to the browser and uses Cmd/Ctrl+Shift+O for new chat', async () => {
+    const chat = await createChat({ settings: cloneDefaultChatSettings() })
+    window.location.hash = `#/chat/${chat.id}`
+    const { container } = render(<App />)
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-role="new-chat"]')).toBeInTheDocument()
+    })
+    const originalHash = window.location.hash
+    const browserNewWindow = new KeyboardEvent('keydown', {
+      key: 'n',
+      metaKey: true,
+      bubbles: true,
+      cancelable: true,
+    })
+    await act(async () => {
+      window.dispatchEvent(browserNewWindow)
+    })
+    expect(browserNewWindow.defaultPrevented).toBe(false)
+    expect(window.location.hash).toBe(originalHash)
+
+    const browserNewWindowCtrl = new KeyboardEvent('keydown', {
+      key: 'n',
+      ctrlKey: true,
+      bubbles: true,
+      cancelable: true,
+    })
+    await act(async () => {
+      window.dispatchEvent(browserNewWindowCtrl)
+    })
+    expect(browserNewWindowCtrl.defaultPrevented).toBe(false)
+    expect(window.location.hash).toBe(originalHash)
+
+    const natterNewChat = new KeyboardEvent('keydown', {
+      key: 'O',
+      ctrlKey: true,
+      shiftKey: true,
+      bubbles: true,
+      cancelable: true,
+    })
+    await act(async () => {
+      window.dispatchEvent(natterNewChat)
+    })
+    expect(natterNewChat.defaultPrevented).toBe(true)
+    await waitFor(() => expect(window.location.hash).toBe('#/new'))
   })
 
   it('focus mode keeps an open chat settings panel visible', async () => {

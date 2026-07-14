@@ -1,8 +1,103 @@
 /*
  * shell.css — app frame, overlays, status bar, empty states, responsive shell.
  * Owns: [data-ui='app-shell'|'main-pane'|'settings-overlay'|'status-bar'|
- *              'empty-state'|'sample-prompts'|'focus-mode-toggle'].
+ *              'empty-state'|'sample-prompts'|'focus-mode-toggle'|'workspace-bootstrap'].
  */
+
+[data-ui="workspace-bootstrap"] {
+  min-height: 100%;
+  display: grid;
+  place-items: center;
+  padding: var(--space-6);
+  background: var(--color-bg-app);
+  color: var(--color-fg-primary);
+}
+
+[data-ui="workspace-bootstrap-card"] {
+  width: min(600px, 100%);
+  padding: var(--space-6);
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-lg);
+  background: var(--color-bg-surface-1);
+  box-shadow: var(--shadow-md);
+}
+
+[data-ui="workspace-bootstrap-kicker"] {
+  display: block;
+  margin-bottom: var(--space-2);
+  color: var(--color-fg-muted);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-semibold);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+[data-ui="workspace-bootstrap-card"] h1 {
+  margin: 0 0 var(--space-3);
+  font-size: var(--font-size-xl);
+  line-height: var(--line-height-tight);
+}
+
+[data-ui="workspace-bootstrap-card"] p {
+  margin: 0;
+  color: var(--color-fg-muted);
+  font-size: var(--font-size-sm);
+  line-height: var(--line-height-body);
+}
+
+[data-ui="workspace-bootstrap-card"] [data-ui="workspace-bootstrap-safety"] {
+  margin-top: var(--space-3);
+  padding: var(--space-3);
+  border-left: 3px solid var(--color-warning);
+  background: color-mix(in srgb, var(--color-warning) 10%, transparent);
+  color: var(--color-fg-primary);
+}
+
+[data-ui="workspace-bootstrap-actions"] {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: var(--space-5);
+}
+
+[data-ui="workspace-bootstrap-diagnostics"],
+[data-ui="workspace-bootstrap-reset"] {
+  margin-top: var(--space-4);
+  color: var(--color-fg-muted);
+  font-size: var(--font-size-sm);
+}
+
+[data-ui="workspace-bootstrap-diagnostics"] summary,
+[data-ui="workspace-bootstrap-reset"] summary {
+  width: fit-content;
+  cursor: pointer;
+  color: var(--color-fg-primary);
+  font-weight: var(--font-weight-medium);
+}
+
+[data-ui="workspace-bootstrap-diagnostics"] pre {
+  max-height: 13rem;
+  overflow: auto;
+  margin: var(--space-3) 0 0;
+  padding: var(--space-3);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-surface-2);
+  color: var(--color-fg-primary);
+  font-size: var(--font-size-xs);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+[data-ui="workspace-bootstrap-reset"] p {
+  margin: var(--space-3) 0;
+}
+
+[data-ui="workspace-bootstrap-card"] [data-ui="workspace-bootstrap-inline-error"] {
+  margin-top: var(--space-3);
+  color: var(--color-danger);
+}
 
 /* Floating eye toggle — fixed at the bottom-right so it survives the
  * chrome-hide switch. Circular, translucent at rest so it doesn't

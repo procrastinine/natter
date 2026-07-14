@@ -2,6 +2,7 @@ import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from '../../src/api/errors'
 import type { ChatStreamChunk, ResponsesStreamChunk } from '../../src/api/types'
+import { beginRouteIntent } from '../../src/app/router'
 import { cursorKeyOf } from '../../src/core/active-path'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import { tokenCalibrationKey } from '../../src/core/model-ids'
@@ -306,6 +307,37 @@ async function seedOpenRouterDiscovery(
 }
 
 describe('sendText — chat-completions streaming', () => {
+  it('keeps an explicitly detached background send from reclaiming tab navigation', async () => {
+    const backgroundChat = await createChat({ settings: chatSettings() })
+    const visibleChat = await createChat({ settings: chatSettings() })
+    useUiStore.getState().setActiveChatId(visibleChat.id)
+    const visibleIntent = useChatStore
+      .getState()
+      .navigateToCursor(visibleChat.id, { __root__: 'visible-message' })
+
+    const result = await sendText({
+      chatId: backgroundChat.id,
+      navigationIntent: null,
+      connection: makeProfile(),
+      apiKey: 'sk-test',
+      content: [{ type: 'text', text: 'finish in the background' }],
+      openStream: () =>
+        stream({
+          type: 'delta',
+          chunk: {
+            id: 'detached-generation',
+            choices: [{ delta: { content: 'done' }, finish_reason: 'stop' }],
+          },
+        } satisfies ChatStreamChunk),
+    })
+
+    expect(result.outcome).toBe('done')
+    expect(await messagesFor(backgroundChat.id)).toHaveLength(2)
+    expect(useChatStore.getState().getCursor(backgroundChat.id)).toBeUndefined()
+    expect(useChatStore.getState().isNavigationIntentCurrent(visibleIntent)).toBe(true)
+    expect(window.location.hash).not.toContain(backgroundChat.id)
+  })
+
   it('persists the user row while Stop can still abort template preflight before the stream opens', async () => {
     const chat = await createChat({
       settings: chatSettings({
@@ -482,7 +514,10 @@ describe('sendText — chat-completions streaming', () => {
     expect(assistant.parentId).toBe(user.id)
     expect(assistant.content).toEqual([{ type: 'output_text', text: '' }])
     expect(useStreamStore.getState().listByChat(chat.id)[0]?.messageId).toBe(assistant.id)
-    expect(useChatStore.getState().getCursor(chat.id)).toBeUndefined()
+    expect(useChatStore.getState().getCursor(chat.id)).toEqual({
+      [cursorKeyOf(null)]: user.id,
+      [cursorKeyOf(user.id)]: assistant.id,
+    })
     const active = await getBrowserRepository().getActiveBranchSnapshot(chat.id, {})
     expect(active.branch.map((message) => message.id)).toEqual([user.id, assistant.id])
 
@@ -738,7 +773,9 @@ describe('sendText — chat-completions streaming', () => {
     })
 
     expect(result.outcome).toBe('done')
-    expect(useStreamStore.getState().liveByMessageId[result.assistantMessageId]).toBeUndefined()
+    expect(
+      useStreamStore.getState().getLiveSnapshot(chat.id, result.assistantMessageId),
+    ).toBeUndefined()
     const assistant = requireDefined(
       await getBrowserRepository().getMessage(result.assistantMessageId),
       'assistant message',
@@ -809,7 +846,7 @@ describe('sendText — chat-completions streaming', () => {
     })
     await paused
     await eventually(() => {
-      const live = Object.values(useStreamStore.getState().liveByMessageId)[0]
+      const live = useStreamStore.getState().listLiveSnapshots()[0]
       expect(live?.content).toEqual([
         { type: 'output_text', text: first },
         { type: 'output_text', text: second },
@@ -1337,7 +1374,7 @@ describe('sendText — chat-completions streaming', () => {
         await ctx.putMessage(right)
       },
     )
-    useChatStore.getState().setCursor(chat.id, {
+    useChatStore.getState().navigateToCursor(chat.id, {
       [cursorKeyOf(null)]: root.id,
       [cursorKeyOf(root.id)]: left.id,
     })
@@ -1395,21 +1432,23 @@ describe('sendText — chat-completions streaming', () => {
     })
     await paused
     expect(useStreamStore.getState().hasStreamForChat(chat.id)).toBe(true)
-    const liveMessageId = Object.keys(useStreamStore.getState().liveByMessageId)[0]
+    const liveMessageId = useStreamStore.getState().listLiveSnapshots()[0]?.messageId
     expect(liveMessageId).toBeDefined()
 
     const rightBranchCursor = {
       [cursorKeyOf(null)]: root.id,
       [cursorKeyOf(root.id)]: right.id,
     }
-    useChatStore.getState().setCursor(chat.id, rightBranchCursor)
+    useChatStore.getState().navigateToCursor(chat.id, rightBranchCursor)
     const rightBranch = await repo.getActiveBranchSnapshot(chat.id, rightBranchCursor)
     expect(rightBranch.branch.map((message) => message.id)).toEqual([root.id, right.id])
     expect(useStreamStore.getState().hasStreamForChat(chat.id)).toBe(true)
 
     release()
     await offBranchDeltaProcessed
-    expect(useStreamStore.getState().liveByMessageId[liveMessageId as string]).toBeUndefined()
+    expect(
+      useStreamStore.getState().getLiveSnapshot(chat.id, liveMessageId as string),
+    ).toBeUndefined()
     releaseCompletion()
     const result = await sendPromise
     expect(result.outcome).toBe('done')
@@ -1419,9 +1458,73 @@ describe('sendText — chat-completions streaming', () => {
     expect(useChatStore.getState().getCursor(chat.id)?.[cursorKeyOf(root.id)]).toBe(right.id)
   })
 
+  it('keeps live projection visible while an unrelated delayed route action is pending', async () => {
+    const chat = await createChat({ settings: chatSettings() })
+    useUiStore.getState().setActiveChatId(chat.id)
+    let releaseSecond!: () => void
+    const secondGate = new Promise<void>((resolve) => {
+      releaseSecond = resolve
+    })
+    let releaseDone!: () => void
+    const doneGate = new Promise<void>((resolve) => {
+      releaseDone = resolve
+    })
+    let markFirst!: () => void
+    const firstPublished = new Promise<void>((resolve) => {
+      markFirst = resolve
+    })
+    let markSecond!: () => void
+    const secondPublished = new Promise<void>((resolve) => {
+      markSecond = resolve
+    })
+    const sendPromise = sendText({
+      chatId: chat.id,
+      connection: makeProfile(),
+      apiKey: 'sk-test',
+      content: [{ type: 'text', text: 'keep showing this stream' }],
+      openStream: () =>
+        (async function* () {
+          yield {
+            type: 'delta',
+            chunk: { choices: [{ delta: { content: 'still ' } }] },
+          }
+          markFirst()
+          await secondGate
+          yield {
+            type: 'delta',
+            chunk: { choices: [{ delta: { content: 'visible' } }] },
+          }
+          markSecond()
+          await doneGate
+          yield {
+            type: 'delta',
+            chunk: { choices: [{ delta: {}, finish_reason: 'stop' }] },
+          }
+        })(),
+    })
+    await firstPublished
+    await eventually(() => {
+      expect(useStreamStore.getState().listLiveSnapshots()[0]?.content).toEqual([
+        { type: 'output_text', text: 'still ' },
+      ])
+    })
+
+    beginRouteIntent()
+    releaseSecond()
+    await secondPublished
+    await eventually(() => {
+      expect(useStreamStore.getState().listLiveSnapshots()[0]?.content).toEqual([
+        { type: 'output_text', text: 'still visible' },
+      ])
+    })
+
+    releaseDone()
+    expect((await sendPromise).outcome).toBe('done')
+  })
+
   it('releases the stream store entry on completion', async () => {
     const chat = await createChat({ settings: chatSettings() })
-    const before = Object.keys(useStreamStore.getState().activeByStreamId).length
+    const before = useStreamStore.getState().listActive().length
     await sendText({
       chatId: chat.id,
       connection: makeProfile(),
@@ -1436,7 +1539,7 @@ describe('sendText — chat-completions streaming', () => {
           },
         }),
     })
-    const after = Object.keys(useStreamStore.getState().activeByStreamId).length
+    const after = useStreamStore.getState().listActive().length
     expect(after).toBe(before)
     expect(await getBrowserRepository().listStreamLeases(chat.id)).toEqual([])
   })
@@ -2426,13 +2529,15 @@ describe('sendText — token calibration sample ingest', () => {
       const db = await openDb()
       expect(await db.streamChunks.count()).toBeGreaterThan(0)
     })
-    const ownerStream = Object.values(useStreamStore.getState().activeByStreamId).find(
-      (stream) => stream.chatId === chat.id && stream.messageId !== undefined,
-    )
+    const ownerStream = useStreamStore
+      .getState()
+      .listActive()
+      .find((stream) => stream.chatId === chat.id && stream.messageId !== undefined)
     expect(ownerStream).toBeDefined()
 
     postEvent({
       kind: 'stream-abort-requested',
+      replacementEpoch: 0,
       chatId: chat.id,
       streamId: ownerStream?.streamId ?? '',
       ownerClientId: getStreamClientId(),

@@ -2,6 +2,7 @@ import { act, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Message } from '../../src/core/types'
 import { useChatStore } from '../../src/store/zustand/chatStore'
+import { __setPersistentCursorEnumerationProbeForTests } from '../../src/store/zustand/persistentCursor'
 import { useToastStore } from '../../src/store/zustand/toastStore'
 import { MessageActions } from '../../src/ui/chat/MessageActions'
 
@@ -61,6 +62,7 @@ afterEach(() => {
   vi.useRealTimers()
   vi.unstubAllGlobals()
   vi.resetAllMocks()
+  __setPersistentCursorEnumerationProbeForTests(undefined)
   useChatStore.getState().reset()
   useToastStore.getState().reset()
 })
@@ -155,13 +157,13 @@ describe('MessageActions', () => {
     expect(screen.getByRole('button', { name: 'Copied' })).toBeTruthy()
   })
 
-  it('applies delete cursor effects to the latest cursor and restores the prior cursor on undo', async () => {
+  it('applies delete cursor effects without letting undo overwrite later navigation', async () => {
     const priorCursor = {
       __root__: 'root',
       'user-1': 'assistant-1',
       'assistant-1': 'child-1',
     }
-    useChatStore.getState().setCursor('chat-1', priorCursor)
+    useChatStore.getState().navigateToCursor('chat-1', priorCursor)
     let resolveDelete: ((value: unknown) => void) | undefined
     const pendingDelete = new Promise((resolve) => {
       resolveDelete = resolve
@@ -177,11 +179,9 @@ describe('MessageActions', () => {
       messageId: 'assistant-1',
       cursor: priorCursor,
     })
+    const cursorEnumeration = vi.fn()
+    __setPersistentCursorEnumerationProbeForTests(cursorEnumeration)
 
-    useChatStore.getState().setCursor('chat-1', {
-      ...priorCursor,
-      other: 'survivor',
-    })
     const preImage = {
       chatId: 'chat-1',
       previousRows: [assistantMessage()],
@@ -193,7 +193,6 @@ describe('MessageActions', () => {
         effects: {
           cursorUpdates: { 'user-1': 'replacement' },
           cursorRemoveKeys: ['assistant-1'],
-          cursorRemoveValueIds: ['assistant-1'],
           newMessageIds: [],
           tombstoned: ['assistant-1'],
           reparented: [],
@@ -204,23 +203,115 @@ describe('MessageActions', () => {
       await pendingDelete
     })
 
+    expect(cursorEnumeration).not.toHaveBeenCalled()
+    __setPersistentCursorEnumerationProbeForTests(undefined)
     expect(useChatStore.getState().getCursor('chat-1')).toEqual({
       __root__: 'root',
       'user-1': 'replacement',
-      other: 'survivor',
     })
     const toast = useToastStore.getState().toasts.at(-1)
     expect(toast?.text).toBe('Deleted pair.')
-    await act(async () => {
-      await toast?.undo?.()
+    let resolveUndo: (() => void) | undefined
+    const pendingUndo = new Promise<void>((resolve) => {
+      resolveUndo = resolve
     })
+    undoMocks.apply.mockReturnValueOnce(pendingUndo)
+    let undoPromise: Promise<void> | undefined
+    await act(async () => {
+      undoPromise = Promise.resolve(toast?.undo?.())
+      await Promise.resolve()
+    })
+    const laterCursor = { __root__: 'other-root', 'other-root': 'other-leaf' }
+    useChatStore.getState().navigateToCursor('chat-1', laterCursor)
+    resolveUndo?.()
+    await act(async () => undoPromise)
     expect(undoMocks.apply).toHaveBeenCalledWith(preImage)
+    expect(useChatStore.getState().getCursor('chat-1')).toEqual(laterCursor)
+  })
+
+  it('restores the pre-delete cursor when undo remains the latest local intent', async () => {
+    const priorCursor = {
+      __root__: 'root',
+      'user-1': 'assistant-1',
+      'assistant-1': 'child-1',
+    }
+    useChatStore.getState().navigateToCursor('chat-1', priorCursor)
+    undoMocks.apply.mockResolvedValue(undefined)
+    deleteMocks.pair.mockResolvedValue({
+      effects: {
+        cursorUpdates: { 'user-1': 'child-1' },
+        cursorRemoveKeys: ['assistant-1'],
+        newMessageIds: [],
+        tombstoned: ['assistant-1'],
+        reparented: [],
+      },
+      versions: { metaVersion: 1, summaryVersion: 1 },
+      preImage: {
+        chatId: 'chat-1',
+        previousRows: [assistantMessage()],
+        newMessageIds: [],
+        attachmentIds: [],
+      },
+    })
+    renderActions()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Delete message' }))
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Delete' }))
+      await Promise.resolve()
+    })
+    const cursorEnumeration = vi.fn()
+    __setPersistentCursorEnumerationProbeForTests(cursorEnumeration)
+    await act(async () => {
+      await useToastStore.getState().toasts.at(-1)?.undo?.()
+    })
+
+    expect(cursorEnumeration).not.toHaveBeenCalled()
+    __setPersistentCursorEnumerationProbeForTests(undefined)
     expect(useChatStore.getState().getCursor('chat-1')).toEqual(priorCursor)
+  })
+
+  it('does not let a delayed delete overwrite newer navigation', async () => {
+    const priorCursor = { __root__: 'root', root: 'assistant-1' }
+    useChatStore.getState().navigateToCursor('chat-1', priorCursor)
+    let resolveDelete: ((value: unknown) => void) | undefined
+    const pendingDelete = new Promise((resolve) => {
+      resolveDelete = resolve
+    })
+    deleteMocks.pair.mockReturnValue(pendingDelete)
+    renderActions()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Delete message' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Delete' }))
+    const laterCursor = { __root__: 'other-root', 'other-root': 'other-leaf' }
+    useChatStore.getState().navigateToCursor('chat-1', laterCursor)
+
+    await act(async () => {
+      resolveDelete?.({
+        effects: {
+          cursorUpdates: { root: 'replacement' },
+          cursorRemoveKeys: [],
+          newMessageIds: [],
+          tombstoned: ['assistant-1'],
+          reparented: [],
+        },
+        versions: { metaVersion: 1, summaryVersion: 1 },
+        preImage: {
+          chatId: 'chat-1',
+          previousRows: [assistantMessage()],
+          newMessageIds: [],
+          attachmentIds: [],
+        },
+      })
+      await pendingDelete
+    })
+
+    expect(useChatStore.getState().getCursor('chat-1')).toEqual(laterCursor)
   })
 
   it('leaves the cursor unchanged when delete is rejected', async () => {
     const priorCursor = { __root__: 'root', 'user-1': 'assistant-1' }
-    useChatStore.getState().setCursor('chat-1', priorCursor)
+    useChatStore.getState().navigateToCursor('chat-1', priorCursor)
     deleteMocks.pair.mockRejectedValue(new Error('tree changed'))
     renderActions()
 

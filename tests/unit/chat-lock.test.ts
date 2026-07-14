@@ -527,7 +527,7 @@ describe('browser repository mutation executor', () => {
     await expect(repo.listMessages(otherChat.id)).rejects.toThrow('MessageBodyMissing:OTHER')
   })
 
-  it('loads only the requested active-branch body window', async () => {
+  it('loads only the requested active-branch body page', async () => {
     const repo = getBrowserRepository()
     const chat = await seedChat()
     const rows = [
@@ -542,10 +542,16 @@ describe('browser repository mutation executor', () => {
       await getDb().messages.put(split.header)
     }
 
-    const snapshot = await repo.getActiveBranchWindowSnapshot(chat.id, {}, { offset: 1, limit: 2 })
+    const result = await repo.getKnownBranchPageSnapshot(chat.id, ['W0', 'W1', 'W2', 'W3'], {
+      offset: 1,
+      limit: 2,
+    })
+    expect(result.kind).toBe('ready')
+    if (result.kind !== 'ready') throw new Error('expected ready branch page')
+    const snapshot = result.snapshot
 
-    expect(snapshot.branchHeaders.map((row) => row.id)).toEqual(['W0', 'W1', 'W2', 'W3'])
-    expect(snapshot.branchWindow.map((row) => row.id)).toEqual(['W1', 'W2'])
+    expect(snapshot.pageHeaders.map((row) => row.id)).toEqual(['W1', 'W2'])
+    expect(snapshot.pageMessages.map((row) => row.id)).toEqual(['W1', 'W2'])
     expect(snapshot.branchLength).toBe(4)
     await expect(repo.getActiveBranchSnapshot(chat.id, {})).rejects.toThrow('MessageBodyMissing:W0')
   })
@@ -667,12 +673,13 @@ describe('browser repository mutation executor', () => {
     expect(header).toMatchObject({
       id: row.id,
       nodeVersion: 1,
+      bodyVersion: 1,
       generation: { id: 'gen-1', model: 'resolved', apiUsed: 'responses' },
     })
     expect(header && 'content' in header).toBe(false)
     expect(body).toMatchObject({
       id: row.id,
-      nodeVersion: 1,
+      bodyVersion: 1,
       content: [{ type: 'output_text', text: 'partial' }],
       reasoningDetails: [{ type: 'reasoning.text', text: 'thinking' }],
       continuationAttempts: [continuationAttempt],

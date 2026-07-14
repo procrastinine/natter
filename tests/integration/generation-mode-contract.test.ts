@@ -308,7 +308,7 @@ describe('generation mode contract', () => {
     expect(__retainedContinueRequestPlanCountForTests()).toBe(0)
   })
 
-  it('send creates one user and one generated assistant without redundant linear cursor pins', async () => {
+  it('send creates one user and one generated assistant with an explicit local path', async () => {
     const chat = await createChat({ settings: settings() })
     const calls: CapturedOpen[] = []
 
@@ -349,15 +349,19 @@ describe('generation mode contract', () => {
     })
     expect(assistant?.turnId).not.toBe(user?.turnId)
     expect(result.outcome).toBe('done')
-    expect(useChatStore.getState().getCursor(chat.id)).toBeUndefined()
-    const active = await getBrowserRepository().getActiveBranchSnapshot(chat.id, {})
+    const cursor = useChatStore.getState().getCursor(chat.id)
+    expect(cursor).toEqual({
+      [cursorKeyOf(null)]: result.userMessageId,
+      [cursorKeyOf(result.userMessageId)]: result.assistantMessageId,
+    })
+    const active = await getBrowserRepository().getActiveBranchSnapshot(chat.id, cursor ?? {})
     expect(active.branch.map((row) => row.id)).toEqual([
       result.userMessageId,
       result.assistantMessageId,
     ])
   })
 
-  it('keeps repeated linear sends cursor-free while the default walk follows the full branch', async () => {
+  it('keeps repeated linear sends on their complete explicit local path', async () => {
     const chat = await createChat({ settings: settings() })
     const first = await sendText({
       chatId: chat.id,
@@ -376,8 +380,14 @@ describe('generation mode contract', () => {
       now: () => 200,
     })
 
-    expect(useChatStore.getState().getCursor(chat.id)).toBeUndefined()
-    const active = await getBrowserRepository().getActiveBranchSnapshot(chat.id, {})
+    const cursor = useChatStore.getState().getCursor(chat.id)
+    expect(cursor).toEqual({
+      [cursorKeyOf(null)]: first.userMessageId,
+      [cursorKeyOf(first.userMessageId)]: first.assistantMessageId,
+      [cursorKeyOf(first.assistantMessageId)]: second.userMessageId,
+      [cursorKeyOf(second.userMessageId)]: second.assistantMessageId,
+    })
+    const active = await getBrowserRepository().getActiveBranchSnapshot(chat.id, cursor ?? {})
     expect(active.branch.map((row) => row.id)).toEqual([
       first.userMessageId,
       first.assistantMessageId,
@@ -580,40 +590,69 @@ describe('generation mode contract', () => {
     expect(useStreamStore.getState().listByChat(chat.id)).toEqual([])
   })
 
-  it('sendFromMessage adds only the assistant-fork cursor pin required by regenerate', async () => {
+  it('sendFromMessage publishes the complete regenerate path in one tab-local cursor write', async () => {
     const chat = await createChat({ settings: settings() })
     const user = message(chat.id, 'regen-user', 'user', 'same question')
-    const original = message(chat.id, 'regen-original', 'assistant', 'old answer', {
+    const otherBranch = message(chat.id, 'regen-other-branch', 'assistant', 'other answer', {
       parentId: user.id,
       createdAt: 2,
     })
-    await putMessages([user, original])
+    const targetBranch = message(chat.id, 'regen-target-branch', 'assistant', 'target answer', {
+      parentId: user.id,
+      siblingIndex: 1,
+      createdAt: 3,
+    })
+    const followup = message(chat.id, 'regen-followup', 'user', 'follow-up question', {
+      parentId: targetBranch.id,
+      createdAt: 4,
+    })
+    const original = message(chat.id, 'regen-original', 'assistant', 'old answer', {
+      parentId: followup.id,
+      createdAt: 5,
+    })
+    await putMessages([user, otherBranch, targetBranch, followup, original])
+    useChatStore.getState().navigateToCursor(chat.id, {
+      [cursorKeyOf(null)]: user.id,
+      [cursorKeyOf(user.id)]: otherBranch.id,
+    })
+    const cursorPublications: Array<Record<string, string>> = []
+    let previousCursor = useChatStore.getState().getCursor(chat.id)
+    const unsubscribe = useChatStore.subscribe((state) => {
+      const cursor = state.getCursor(chat.id)
+      if (cursor !== previousCursor) {
+        previousCursor = cursor
+        cursorPublications.push({ ...(cursor ?? {}) })
+      }
+    })
     const calls: CapturedOpen[] = []
 
     const result = await sendFromMessage({
       chatId: chat.id,
-      parentMessageId: user.id,
+      parentMessageId: followup.id,
       connection: profile(),
       apiKey: 'sk-test',
       openStream: captureOpen(calls, 'regenerated answer'),
       now: () => 100,
-    })
+    }).finally(unsubscribe)
 
     expect(calls).toEqual([
       {
         route: expectedRoute(),
-        wireBody: expectedWire(CHAT_MODEL, [{ role: 'user', content: 'same question' }]),
+        wireBody: expectedWire(CHAT_MODEL, [
+          { role: 'user', content: 'same question' },
+          { role: 'assistant', content: 'target answer' },
+          { role: 'user', content: 'follow-up question' },
+        ]),
       },
     ])
     const rows = await getBrowserRepository().listMessages(chat.id)
-    expect(rows).toHaveLength(3)
-    expect(rows.filter((row) => row.role === 'user').map((row) => row.id)).toEqual([user.id])
+    expect(rows).toHaveLength(6)
     expect(await getBrowserRepository().getMessage(original.id)).toEqual(
       expect.objectContaining({ content: [{ type: 'output_text', text: 'old answer' }] }),
     )
     const regenerated = await getBrowserRepository().getMessage(result.assistantMessageId)
     expect(regenerated).toMatchObject({
-      parentId: user.id,
+      parentId: followup.id,
       siblingIndex: 1,
       turnIndex: 0,
       role: 'assistant',
@@ -621,9 +660,14 @@ describe('generation mode contract', () => {
       content: [{ type: 'output_text', text: 'regenerated answer' }],
     })
     expect(regenerated?.turnId).not.toBe(original.turnId)
-    expect(useChatStore.getState().getCursor(chat.id)).toEqual({
-      [cursorKeyOf(user.id)]: result.assistantMessageId,
-    })
+    const expectedCursor = {
+      [cursorKeyOf(null)]: user.id,
+      [cursorKeyOf(user.id)]: targetBranch.id,
+      [cursorKeyOf(targetBranch.id)]: followup.id,
+      [cursorKeyOf(followup.id)]: result.assistantMessageId,
+    }
+    expect(useChatStore.getState().getCursor(chat.id)).toEqual(expectedCursor)
+    expect(cursorPublications).toEqual([expectedCursor])
   })
 
   it('legacy Continue appends in place while preserving original provenance and tree identity', async () => {
@@ -656,7 +700,7 @@ describe('generation mode contract', () => {
       [cursorKeyOf(null)]: user.id,
       [cursorKeyOf(user.id)]: target.id,
     }
-    useChatStore.getState().setCursor(chat.id, cursorBefore)
+    useChatStore.getState().navigateToCursor(chat.id, cursorBefore)
     const calls: CapturedOpen[] = []
     const messageCountBefore = (await getBrowserRepository().listMessages(chat.id)).length
     const chatCostBefore = (await getBrowserRepository().getChat(chat.id))?.totalCostUsd
@@ -704,7 +748,7 @@ describe('generation mode contract', () => {
     expect((await getBrowserRepository().getChat(chat.id))?.totalCostUsd).toBe(chatCostBefore)
   })
 
-  it('keeps a 100k base plus 100k fragmented Continue segmented until one final join', async () => {
+  it('keeps a 100k base plus 100k fragmented Continue geometrically segmented until final', async () => {
     const chat = await createChat({
       settings: settings({ continueSystemPrompt: '', continueUserPrompt: '' }),
     })
@@ -748,15 +792,27 @@ describe('generation mode contract', () => {
 
     const snapshots = setLiveSnapshot.mock.calls.map(([snapshot]) => snapshot)
     expect(snapshots.length).toBeGreaterThan(10)
+    const continuationBlockBudget =
+      Math.floor(Math.log2(Math.ceil(continuation.length / 20_000))) + 2
     for (const snapshot of snapshots) {
       const textItems = snapshot.content.filter(
         (item) => item.type === 'text' || item.type === 'output_text',
       )
       expect(textItems[0]?.text).toBe(base)
-      expect(textItems.slice(1).every((item) => item.text.length <= 20_000)).toBe(true)
+      expect(textItems.length).toBeLessThanOrEqual(continuationBlockBudget)
       expect(snapshot.textLength).toBeGreaterThanOrEqual(base.length)
       expect(snapshot.textLength).toBeLessThanOrEqual(base.length + continuation.length)
     }
+    expect(
+      snapshots.some((snapshot) =>
+        snapshot.content.some(
+          (item, index) =>
+            index > 0 &&
+            (item.type === 'text' || item.type === 'output_text') &&
+            item.text.length > 20_000,
+        ),
+      ),
+    ).toBe(true)
     expect(await getBrowserRepository().getMessage(target.id)).toMatchObject({
       content: [{ type: 'output_text', text: base + continuation }],
     })
@@ -960,7 +1016,7 @@ describe('generation mode contract', () => {
       [cursorKeyOf(null)]: user.id,
       [cursorKeyOf(user.id)]: target.id,
     }
-    useChatStore.getState().setCursor(chat.id, cursorBefore)
+    useChatStore.getState().navigateToCursor(chat.id, cursorBefore)
     const calls: CapturedOpen[] = []
 
     await continueAssistantInPlace({
@@ -1067,7 +1123,7 @@ describe('generation mode contract', () => {
       [cursorKeyOf(null)]: user.id,
       [cursorKeyOf(user.id)]: right.id,
     }
-    useChatStore.getState().setCursor(chat.id, cursorBefore)
+    useChatStore.getState().navigateToCursor(chat.id, cursorBefore)
     const calls: CapturedOpen[] = []
 
     await continueAssistantInPlace({

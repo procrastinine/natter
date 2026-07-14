@@ -74,7 +74,9 @@ export function ChatHeader({
     undefined,
     chatRowDependencies(chatId),
   )
-  const cursor = useChatStore((s) => (chatId ? (s.cursors[chatId] ?? EMPTY_CURSOR) : EMPTY_CURSOR))
+  const cursor = useChatStore((s) =>
+    chatId ? (s.getCursor(chatId) ?? EMPTY_CURSOR) : EMPTY_CURSOR,
+  )
   const [editing, setEditing] = useState(false)
   const [draftTitle, setDraftTitle] = useState('')
   const [showInfo, setShowInfo] = useState(false)

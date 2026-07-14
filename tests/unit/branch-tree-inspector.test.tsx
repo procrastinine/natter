@@ -4,7 +4,26 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Message } from '../../src/core/types'
 import { getStreamClientId } from '../../src/store/stream-leases'
 import { useStreamStore } from '../../src/store/zustand/streamStore'
-import { BranchTreeInspector } from '../../src/ui/chat/BranchTreeInspector'
+import {
+  BranchTreeInspector as BranchTreeInspectorComponent,
+  type BranchTreeInspectorProps,
+} from '../../src/ui/chat/BranchTreeInspector'
+
+const BranchTreeInspector = Object.assign(
+  function TestBranchTreeInspector(
+    props: Omit<BranchTreeInspectorProps, 'bodyVersion'> & { bodyVersion?: number },
+  ) {
+    return (
+      <BranchTreeInspectorComponent
+        {...props}
+        bodyVersion={props.bodyVersion ?? props.message.nodeVersion}
+      />
+    )
+  },
+  {
+    __setComputationProbeForTests: BranchTreeInspectorComponent.__setComputationProbeForTests,
+  },
+)
 
 const SEARCH_MATCH_HIGHLIGHT = 'branch-tree-inspector-search-match'
 const SEARCH_CURRENT_HIGHLIGHT = 'branch-tree-inspector-search-current'
@@ -431,6 +450,7 @@ describe('BranchTreeInspector', () => {
     })
     useStreamStore.getState().setActive({
       streamId: 'stream-1',
+      replacementEpoch: 0,
       chatId: row.chatId,
       messageId: row.id,
       startedAt: 1,
@@ -438,6 +458,7 @@ describe('BranchTreeInspector', () => {
     })
     useStreamStore.getState().setLiveSnapshot({
       streamId: 'stream-1',
+      replacementEpoch: 0,
       chatId: row.chatId,
       messageId: row.id,
       content: [{ type: 'output_text', text: 'Live inspector output.' }],
@@ -485,9 +506,9 @@ describe('BranchTreeInspector', () => {
     expect(screen.getByRole('button', { name: 'Regenerate response' })).toBeDisabled()
     expect(screen.getByRole('button', { name: 'Branch this chat from here' })).toBeEnabled()
 
-    useStreamStore.getState().clearLiveSnapshot(row.id)
+    useStreamStore.getState().clearLiveSnapshot(row.id, 'stream-1', 0)
     expect(screen.getByRole('button', { name: 'Hide this reasoning block' })).toBeDisabled()
-    useStreamStore.getState().clearActive('stream-1')
+    useStreamStore.getState().clearActive('stream-1', 0)
     await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('Finishing response…'))
     expect(screen.getByRole('button', { name: 'Hide this reasoning block' })).toBeDisabled()
     expect(screen.getByRole('button', { name: 'Hide tool call' })).toBeDisabled()
@@ -523,6 +544,7 @@ describe('BranchTreeInspector', () => {
     act(() => {
       useStreamStore.getState().setActive({
         streamId: 'status-stream',
+        replacementEpoch: 0,
         chatId: row.chatId,
         messageId: row.id,
         startedAt: 1,
@@ -538,6 +560,7 @@ describe('BranchTreeInspector', () => {
     act(() => {
       useStreamStore.getState().setLiveSnapshot({
         streamId: 'status-stream',
+        replacementEpoch: 0,
         chatId: row.chatId,
         messageId: row.id,
         content: [{ type: 'output_text', text: 'Live status content.' }],
@@ -558,6 +581,7 @@ describe('BranchTreeInspector', () => {
     act(() => {
       useStreamStore.getState().setActive({
         streamId: 'status-stream',
+        replacementEpoch: 0,
         chatId: row.chatId,
         messageId: row.id,
         startedAt: 1,
@@ -583,6 +607,7 @@ describe('BranchTreeInspector', () => {
     act(() => {
       useStreamStore.getState().setActive({
         streamId: 'commit-gap-stream',
+        replacementEpoch: 0,
         chatId: row.chatId,
         messageId: row.id,
         startedAt: 1,
@@ -590,6 +615,7 @@ describe('BranchTreeInspector', () => {
       })
       useStreamStore.getState().setLiveSnapshot({
         streamId: 'commit-gap-stream',
+        replacementEpoch: 0,
         chatId: row.chatId,
         messageId: row.id,
         content: [{ type: 'output_text', text: 'Last complete live snapshot.' }],
@@ -609,8 +635,8 @@ describe('BranchTreeInspector', () => {
     expect(screen.getByText('Last complete live snapshot.')).toBeInTheDocument()
 
     act(() => {
-      useStreamStore.getState().clearLiveSnapshot(row.id)
-      useStreamStore.getState().clearActive('commit-gap-stream')
+      useStreamStore.getState().clearLiveSnapshot(row.id, 'commit-gap-stream', 0)
+      useStreamStore.getState().clearActive('commit-gap-stream', 0)
     })
 
     expect(screen.getByText('Last complete live snapshot.')).toBeInTheDocument()
@@ -646,6 +672,7 @@ describe('BranchTreeInspector', () => {
     act(() => {
       useStreamStore.getState().setActive({
         streamId: 'commit-first-stream',
+        replacementEpoch: 0,
         chatId: pending.chatId,
         messageId: pending.id,
         startedAt: 1,
@@ -653,6 +680,7 @@ describe('BranchTreeInspector', () => {
       })
       useStreamStore.getState().setLiveSnapshot({
         streamId: 'commit-first-stream',
+        replacementEpoch: 0,
         chatId: pending.chatId,
         messageId: pending.id,
         content: [{ type: 'output_text', text: 'Commit-first live snapshot.' }],
@@ -693,8 +721,8 @@ describe('BranchTreeInspector', () => {
     expect(screen.getByText('Commit-first persisted snapshot.')).toBeInTheDocument()
 
     act(() => {
-      useStreamStore.getState().clearActive('commit-first-stream')
-      useStreamStore.getState().clearLiveSnapshot(pending.id)
+      useStreamStore.getState().clearActive('commit-first-stream', 0)
+      useStreamStore.getState().clearLiveSnapshot(pending.id, 'commit-first-stream', 0)
     })
     await waitFor(() => expect(screen.queryByText('Finishing response…')).not.toBeInTheDocument())
     expect(screen.getByRole('button', { name: 'Edit message' })).toBeEnabled()
@@ -708,6 +736,7 @@ describe('BranchTreeInspector', () => {
     act(() => {
       useStreamStore.getState().setActive({
         streamId: 'cross-view-stream',
+        replacementEpoch: 0,
         chatId: pending.chatId,
         messageId: pending.id,
         startedAt: 1,
@@ -715,6 +744,7 @@ describe('BranchTreeInspector', () => {
       })
       useStreamStore.getState().setLiveSnapshot({
         streamId: 'cross-view-stream',
+        replacementEpoch: 0,
         chatId: pending.chatId,
         messageId: pending.id,
         content: [{ type: 'output_text', text: 'Visible before changing views.' }],
@@ -730,8 +760,8 @@ describe('BranchTreeInspector', () => {
     firstView.unmount()
 
     act(() => {
-      useStreamStore.getState().clearLiveSnapshot(pending.id)
-      useStreamStore.getState().clearActive('cross-view-stream')
+      useStreamStore.getState().clearLiveSnapshot(pending.id, 'cross-view-stream', 0)
+      useStreamStore.getState().clearActive('cross-view-stream', 0)
     })
     const nextView = render(
       <BranchTreeInspector message={pending} onClose={() => undefined} generationBusy={false} />,
@@ -870,6 +900,7 @@ describe('BranchTreeInspector', () => {
     const row = message()
     useStreamStore.getState().setActive({
       streamId: 'stream-projection',
+      replacementEpoch: 0,
       chatId: row.chatId,
       messageId: row.id,
       startedAt: 1,
@@ -879,6 +910,7 @@ describe('BranchTreeInspector', () => {
       const text = `needle ${'x'.repeat(length - 7)}`
       useStreamStore.getState().setLiveSnapshot({
         streamId: 'stream-projection',
+        replacementEpoch: 0,
         chatId: row.chatId,
         messageId: row.id,
         content: [{ type: 'output_text', text }],

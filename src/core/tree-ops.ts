@@ -2,6 +2,7 @@
 // transactions of their own, do not broadcast, and do not write cursor state.
 // They return the data the caller needs to apply those side effects.
 
+import type { MessageHeaderRow } from '../store/message-storage'
 import type { MutationContext } from '../store/repository'
 import type { ChatId, Message, MessageId } from './types'
 
@@ -19,8 +20,8 @@ export class TreeChangedError extends Error {
 // `max(siblingIndex) + 1` across live AND tombstoned children. The uniqueness
 // invariant in §2.3.1 requires staying above tombstones too. Returns 0 when
 // the parent has no children at all.
-export function nextSiblingIndex(
-  byParent: Map<MessageId | null, Message[]>,
+export function nextSiblingIndex<T extends Pick<Message, 'siblingIndex'>>(
+  byParent: Map<MessageId | null, T[]>,
   parentId: MessageId | null,
 ): number {
   const kids = byParent.get(parentId)
@@ -33,6 +34,39 @@ export function nextSiblingIndex(
 }
 
 type MessageTreeRow = Pick<Message, 'id' | 'parentId'>
+
+export function createAncestorOutsideSetResolver<T extends MessageTreeRow>(
+  byId: ReadonlyMap<MessageId, T>,
+  excluded: ReadonlySet<MessageId>,
+  onVisit?: () => void,
+): (message: T) => MessageId | null {
+  const resolved = new Map<MessageId, MessageId | null>()
+  return (message) => {
+    const path: MessageId[] = []
+    let current: T | undefined = message
+    let ancestor: MessageId | null
+    for (;;) {
+      if (resolved.has(current.id)) {
+        ancestor = resolved.get(current.id) ?? null
+        break
+      }
+      if (import.meta.env.MODE === 'test') onVisit?.()
+      path.push(current.id)
+      const parentId = current.parentId
+      if (parentId === null || !excluded.has(parentId)) {
+        ancestor = parentId
+        break
+      }
+      current = byId.get(parentId)
+      if (!current) {
+        ancestor = null
+        break
+      }
+    }
+    for (const messageId of path) resolved.set(messageId, ancestor)
+    return ancestor
+  }
+}
 
 function groupTreeRowsByParent(
   messages: readonly MessageTreeRow[],
@@ -55,15 +89,15 @@ async function renumberSiblingsByCreatedAt(
   chatId: ChatId,
   parentId: MessageId | null,
 ): Promise<void> {
-  const rows = await ctx.listChildren(chatId, parentId)
+  const rows = await ctx.listChildHeaders(chatId, parentId)
   rows.sort((a, b) => {
     if (a.createdAt !== b.createdAt) return a.createdAt - b.createdAt
     return a.id < b.id ? -1 : a.id > b.id ? 1 : 0
   })
   for (let i = 0; i < rows.length; i++) {
-    const row = rows[i] as Message
+    const row = rows[i] as MessageHeaderRow
     if (row.siblingIndex !== i) {
-      await ctx.putMessage({ ...row, siblingIndex: i })
+      await ctx.patchMessageStructure(row.id, { siblingIndex: i })
     }
   }
 }
@@ -92,44 +126,30 @@ export async function softDeleteWithSplice(
     return { tombstoned: [], reparented: [] }
   }
   const deletedSet = new Set<MessageId>(nodeIdsToDelete)
-  const cache = new Map<MessageId, Message>()
+  const deletedById = new Map<MessageId, MessageHeaderRow>()
 
-  const deletedNodes: Message[] = []
+  const deletedNodes: MessageHeaderRow[] = []
   for (const id of nodeIdsToDelete) {
-    const row = await ctx.getMessage(id)
+    const row = await ctx.getMessageHeader(id)
     if (!row) continue
     if (row.chatId !== chatId) {
       throw new TreeChangedError(chatId, `node ${id} belongs to another chat`)
     }
     deletedNodes.push(row)
-    cache.set(row.id, row)
+    deletedById.set(row.id, row)
   }
   if (deletedNodes.length === 0) {
     return { tombstoned: [], reparented: [] }
   }
 
-  async function firstLiveAncestor(node: Message): Promise<MessageId | null> {
-    let p = node.parentId
-    while (p && deletedSet.has(p)) {
-      let parent = cache.get(p)
-      if (!parent) {
-        const fetched = await ctx.getMessage(p)
-        if (fetched) {
-          parent = fetched
-          cache.set(p, fetched)
-        }
-      }
-      p = parent?.parentId ?? null
-    }
-    return p
-  }
+  const firstLiveAncestor = createAncestorOutsideSetResolver(deletedById, deletedSet)
 
   const reparented: SoftDeleteResult['reparented'] = []
   const affectedParents = new Set<MessageId | null>()
 
   for (const node of deletedNodes) {
-    const kids = await ctx.listChildren(chatId, node.id)
-    const newParentId = await firstLiveAncestor(node)
+    const kids = await ctx.listChildHeaders(chatId, node.id)
+    const newParentId = firstLiveAncestor(node)
     for (const kid of kids) {
       if (deletedSet.has(kid.id)) continue
       // Pre-tombstoned kids stay where they are: already dead, and
@@ -142,13 +162,13 @@ export async function softDeleteWithSplice(
         previousParentId: node.id,
         newParentId,
       })
-      await ctx.putMessage({ ...kid, parentId: newParentId })
+      await ctx.patchMessageStructure(kid.id, { parentId: newParentId })
       affectedParents.add(newParentId)
     }
   }
 
   for (const node of deletedNodes) {
-    await ctx.putMessage({ ...node, deleted: true })
+    await ctx.patchMessageStructure(node.id, { deleted: true })
   }
 
   for (const parent of affectedParents) {
@@ -184,10 +204,10 @@ export async function cascadeSoftDelete(
   }
   const tombstoned: MessageId[] = []
   for (const id of toTombstone) {
-    const row = await ctx.getMessage(id)
+    const row = await ctx.getMessageHeader(id)
     if (!row) continue
     if (!row.deleted) {
-      await ctx.putMessage({ ...row, deleted: true })
+      await ctx.patchMessageStructure(row.id, { deleted: true })
       tombstoned.push(id)
     }
   }

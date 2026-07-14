@@ -165,12 +165,14 @@ describe('stream leases', () => {
       messageId: 'M-target',
       startedAt: 2,
       attemptKind: 'generation',
+      baseBodyVersion: 7,
     })
     expect(manager.isHeld('stream-owner:S-admit')).toBe(true)
     expect(written.at(-1)).toMatchObject({
       streamId: 'S-admit',
       messageId: 'M-target',
       attemptKind: 'generation',
+      baseBodyVersion: 7,
       startedAt: 1,
     })
 
@@ -216,6 +218,7 @@ describe('stream leases', () => {
       kind: 'stream-heartbeat',
       lease: {
         streamId: 'S-remote',
+        replacementEpoch: 0,
         chatId: 'C1',
         messageId: 'M1',
         ownerClientId: 'other-tab',
@@ -230,6 +233,7 @@ describe('stream leases', () => {
       kind: 'stream-heartbeat',
       lease: {
         streamId: 'S-remote',
+        replacementEpoch: 0,
         chatId: 'C1',
         messageId: 'M1',
         ownerClientId: 'other-tab',
@@ -241,6 +245,7 @@ describe('stream leases', () => {
 
     postEvent({
       kind: 'stream-ended',
+      replacementEpoch: 0,
       chatId: 'C1',
       streamId: 'S-remote',
       messageId: 'M1',
@@ -261,6 +266,7 @@ describe('stream leases', () => {
       kind: 'stream-heartbeat',
       lease: {
         streamId: 'S-announced-end',
+        replacementEpoch: 0,
         chatId: 'C1',
         messageId: 'M-announced-end',
         ownerClientId: 'other-tab',
@@ -274,11 +280,13 @@ describe('stream leases', () => {
       streamId: 'S-announced-end',
       messageId: 'M-announced-end',
       outcome: 'abort',
+      replacementEpoch: 0,
     })
     postEvent({
       kind: 'stream-heartbeat',
       lease: {
         streamId: 'S-announced-end',
+        replacementEpoch: 0,
         chatId: 'C1',
         messageId: 'M-announced-end',
         ownerClientId: 'other-tab',
@@ -291,6 +299,7 @@ describe('stream leases', () => {
     expect(seen).toEqual([
       {
         kind: 'stream-ended',
+        replacementEpoch: 0,
         chatId: 'C1',
         streamId: 'S-announced-end',
         messageId: 'M-announced-end',
@@ -325,6 +334,7 @@ describe('stream leases', () => {
       kind: 'stream-heartbeat',
       lease: {
         streamId: 'S-later-expiry',
+        replacementEpoch: 0,
         chatId: 'C1',
         ownerClientId: 'other-tab',
         startedAt: 1,
@@ -335,6 +345,7 @@ describe('stream leases', () => {
       kind: 'stream-heartbeat',
       lease: {
         streamId: 'S-earlier-expiry',
+        replacementEpoch: 0,
         chatId: 'C2',
         ownerClientId: 'other-tab',
         startedAt: 1,
@@ -364,6 +375,7 @@ describe('stream leases', () => {
       kind: 'stream-heartbeat',
       lease: {
         streamId: 'S-refresh-backoff',
+        replacementEpoch: 0,
         chatId: 'C1',
         ownerClientId: 'other-tab',
         startedAt: 1,
@@ -385,6 +397,7 @@ describe('stream leases', () => {
     vi.setSystemTime(100_000)
     const lease: StreamLeaseRow = {
       streamId: 'S-expired-notification',
+      replacementEpoch: 0,
       chatId: 'C1',
       messageId: 'M-expired-notification',
       ownerClientId: 'other-tab',
@@ -412,6 +425,7 @@ describe('stream leases', () => {
     __setStreamLockManagerForTests(manager)
     const lease: StreamLeaseRow = {
       streamId: 'S-reload-release',
+      replacementEpoch: 0,
       chatId: 'C1',
       messageId: 'M-reload-release',
       ownerClientId: 'old-page',
@@ -453,6 +467,7 @@ describe('stream leases', () => {
   it('aborts a queued ownership-release observation when its chat subscription stops', async () => {
     const lease: StreamLeaseRow = {
       streamId: 'S-observer-teardown',
+      replacementEpoch: 0,
       chatId: 'C1',
       ownerClientId: 'other-page',
       startedAt: 1,
@@ -490,6 +505,7 @@ describe('stream leases', () => {
     const clearLiveSnapshot = vi.spyOn(useStreamStore.getState(), 'clearLiveSnapshot')
     postEvent({
       kind: 'stream-ended',
+      replacementEpoch: 0,
       chatId: 'C1',
       streamId: 'S-ended',
       messageId: 'M-ended',
@@ -500,6 +516,7 @@ describe('stream leases', () => {
       kind: 'stream-heartbeat',
       lease: {
         streamId: 'S-ended',
+        replacementEpoch: 0,
         chatId: 'C1',
         messageId: 'M-ended',
         ownerClientId: 'other-tab',
@@ -509,6 +526,7 @@ describe('stream leases', () => {
     })
     postEvent({
       kind: 'stream-started',
+      replacementEpoch: 0,
       chatId: 'C1',
       streamId: 'S-ended',
       messageId: 'M-ended',
@@ -523,6 +541,7 @@ describe('stream leases', () => {
     installStreamLeaseListener()
     useStreamStore.getState().setActive({
       streamId: 'S-new',
+      replacementEpoch: 0,
       chatId: 'C1',
       messageId: 'M-shared',
       ownerClientId: 'other-tab',
@@ -530,6 +549,7 @@ describe('stream leases', () => {
     })
     useStreamStore.getState().setLiveSnapshot({
       streamId: 'S-new',
+      replacementEpoch: 0,
       chatId: 'C1',
       messageId: 'M-shared',
       content: [{ type: 'output_text', text: 'new reasoning' }],
@@ -540,6 +560,7 @@ describe('stream leases', () => {
 
     postEvent({
       kind: 'stream-ended',
+      replacementEpoch: 0,
       chatId: 'C1',
       streamId: 'S-old',
       messageId: 'M-shared',
@@ -547,7 +568,207 @@ describe('stream leases', () => {
     })
 
     expect(useStreamStore.getState().getActive('S-new')).toBeDefined()
-    expect(useStreamStore.getState().liveByMessageId['M-shared']?.streamId).toBe('S-new')
+    expect(useStreamStore.getState().getLiveSnapshot('C1', 'M-shared')?.streamId).toBe('S-new')
+  })
+
+  it('fences same-id late events across workspace replacement', () => {
+    __setWorkspaceRepositoryForTests({
+      listStreamLeases: async () => [],
+    } as unknown as WorkspaceRepository)
+    installStreamLeaseListener()
+    const oldAbort = vi.fn()
+    useStreamStore.getState().setActive({
+      streamId: 'S-same',
+      replacementEpoch: 0,
+      chatId: 'C-same',
+      messageId: 'M-same',
+      ownerClientId: getStreamClientId(),
+      startedAt: 1,
+      abort: oldAbort,
+    })
+    useStreamStore.getState().setLiveSnapshot({
+      streamId: 'S-same',
+      replacementEpoch: 0,
+      chatId: 'C-same',
+      messageId: 'M-same',
+      content: [{ type: 'output_text', text: 'old workspace' }],
+      textLength: 13,
+      reasoningLength: 0,
+      updatedAt: 1,
+    })
+
+    postEvent({ kind: 'workspace-replaced', replacementEpoch: 1 })
+    expect(oldAbort).toHaveBeenCalledTimes(1)
+    expect(useStreamStore.getState().listActive()).toEqual([])
+    expect(useStreamStore.getState().listLiveSnapshots()).toEqual([])
+
+    postEvent({
+      kind: 'stream-started',
+      replacementEpoch: 0,
+      chatId: 'C-same',
+      streamId: 'S-same',
+      messageId: 'M-same',
+      ownerClientId: 'old-remote-tab',
+    })
+    postEvent({
+      kind: 'stream-heartbeat',
+      lease: {
+        streamId: 'S-same',
+        replacementEpoch: 0,
+        chatId: 'C-same',
+        messageId: 'M-same',
+        ownerClientId: 'old-remote-tab',
+        startedAt: 1,
+        heartbeatAt: Date.now(),
+      },
+    })
+    postEvent({
+      kind: 'stream-ended',
+      replacementEpoch: 0,
+      chatId: 'C-same',
+      streamId: 'S-same',
+      messageId: 'M-same',
+      outcome: 'done',
+    })
+    expect(useStreamStore.getState().listActive()).toEqual([])
+
+    postEvent({
+      kind: 'stream-started',
+      replacementEpoch: 1,
+      chatId: 'C-same',
+      streamId: 'S-same',
+      messageId: 'M-same',
+      ownerClientId: 'new-remote-tab',
+    })
+    useStreamStore.getState().setLiveSnapshot({
+      streamId: 'S-same',
+      replacementEpoch: 1,
+      chatId: 'C-same',
+      messageId: 'M-same',
+      content: [{ type: 'output_text', text: 'new workspace' }],
+      textLength: 13,
+      reasoningLength: 0,
+      updatedAt: 2,
+    })
+    postEvent({ kind: 'workspace-replaced', replacementEpoch: 1 })
+    postEvent({
+      kind: 'stream-ended',
+      replacementEpoch: 0,
+      chatId: 'C-same',
+      streamId: 'S-same',
+      messageId: 'M-same',
+      outcome: 'done',
+    })
+
+    expect(useStreamStore.getState().getActive('S-same')).toMatchObject({
+      replacementEpoch: 1,
+      ownerClientId: 'new-remote-tab',
+    })
+    expect(useStreamStore.getState().getLiveSnapshot('C-same', 'M-same')?.content).toEqual([
+      { type: 'output_text', text: 'new workspace' },
+    ])
+  })
+
+  it('hydrates only leases from the current workspace epoch', async () => {
+    const listStreamLeases = vi.fn(async () => [
+      {
+        streamId: 'S-old-epoch',
+        replacementEpoch: 0,
+        chatId: 'C1',
+        messageId: 'M-old-epoch',
+        ownerClientId: 'old-tab',
+        startedAt: 1,
+        heartbeatAt: Date.now(),
+      },
+      {
+        streamId: 'S-current-epoch',
+        replacementEpoch: 1,
+        chatId: 'C1',
+        messageId: 'M-current-epoch',
+        ownerClientId: 'current-tab',
+        startedAt: 2,
+        heartbeatAt: Date.now(),
+      },
+    ])
+    __setWorkspaceRepositoryForTests({ listStreamLeases } as unknown as WorkspaceRepository)
+    installStreamLeaseListener()
+    await drainMicrotasks()
+    expect(useStreamStore.getState().isTargetActive('C1', 'M-old-epoch')).toBe(true)
+    expect(useStreamStore.getState().isTargetActive('C1', 'M-current-epoch')).toBe(false)
+
+    postEvent({ kind: 'workspace-replaced', replacementEpoch: 1 })
+    await drainMicrotasks()
+
+    expect(useStreamStore.getState().isTargetActive('C1', 'M-old-epoch')).toBe(false)
+    expect(useStreamStore.getState().isTargetActive('C1', 'M-current-epoch')).toBe(true)
+  })
+
+  it('releases local lease ownership and its shared heartbeat scheduler on replacement', async () => {
+    const manager = new TestStreamLockManager()
+    __setStreamLockManagerForTests(manager)
+    __setWorkspaceRepositoryForTests({
+      upsertStreamLease: async (lease: StreamLeaseRow) => persistedLease(lease),
+      renewStreamLease: async (lease: StreamLeaseRow) => persistedLease(lease),
+      deleteStreamLease: async () => true,
+      deleteOwnedStreamLease: async () => true,
+      listStreamLeases: async () => [],
+    } as unknown as WorkspaceRepository)
+    installStreamLeaseListener()
+    await startStreamLease(leaseInput('S-replaced-owner'))
+
+    expect(manager.isHeld('stream-owner:S-replaced-owner')).toBe(true)
+    expect(__streamLeaseHeartbeatSchedulerStateForTests()).toMatchObject({
+      activeWriters: 1,
+      timerScheduled: true,
+    })
+
+    postEvent({ kind: 'workspace-replaced', replacementEpoch: 1 })
+
+    expect(__streamLeaseHeartbeatSchedulerStateForTests()).toMatchObject({
+      activeWriters: 0,
+      timerScheduled: false,
+      deadline: null,
+    })
+    await __flushStreamOwnershipForTests()
+    expect(manager.isHeld('stream-owner:S-replaced-owner')).toBe(false)
+  })
+
+  it('cancels old-workspace ownership watches on replacement', async () => {
+    const lease: StreamLeaseRow = {
+      streamId: 'S-replaced-watch',
+      replacementEpoch: 0,
+      chatId: 'C1',
+      ownerClientId: 'other-page',
+      startedAt: 1,
+      heartbeatAt: Date.now(),
+    }
+    __setWorkspaceRepositoryForTests({
+      listStreamLeases: async () => [lease],
+    } as unknown as WorkspaceRepository)
+    let observedSignal: AbortSignal | undefined
+    __setStreamLockManagerForTests({
+      request: vi.fn(
+        (_name: string, options: LockOptions, _callback: (lock: Lock | null) => unknown) => {
+          observedSignal = options.signal
+          return new Promise<unknown>((_resolve, reject) => {
+            options.signal?.addEventListener(
+              'abort',
+              () => reject(new DOMException('aborted', 'AbortError')),
+              { once: true },
+            )
+          })
+        },
+      ),
+    } as unknown as Pick<LockManager, 'request'>)
+    installStreamLeaseListener()
+    const stopObserving = onRemoteStreamOwnershipReleased('C1', vi.fn())
+    await drainMicrotasks()
+    expect(observedSignal?.aborted).toBe(false)
+
+    postEvent({ kind: 'workspace-replaced', replacementEpoch: 1 })
+
+    expect(observedSignal?.aborted).toBe(true)
+    stopObserving()
   })
 
   it('does not resurrect an ended stream from an older lease refresh result', async () => {
@@ -567,6 +788,7 @@ describe('stream leases', () => {
     await listStarted.promise
     postEvent({
       kind: 'stream-ended',
+      replacementEpoch: 0,
       chatId: 'C1',
       streamId: 'S-refresh-race',
       messageId: 'M-refresh-race',
@@ -575,6 +797,7 @@ describe('stream leases', () => {
     releaseList([
       {
         streamId: 'S-refresh-race',
+        replacementEpoch: 0,
         chatId: 'C1',
         messageId: 'M-refresh-race',
         ownerClientId: 'other-tab',
@@ -606,6 +829,7 @@ describe('stream leases', () => {
       kind: 'stream-heartbeat',
       lease: {
         streamId: 'S-retarget-refresh-race',
+        replacementEpoch: 0,
         chatId: 'C1',
         messageId: 'M-new-target',
         ownerClientId: 'other-tab',
@@ -616,6 +840,7 @@ describe('stream leases', () => {
     releaseList([
       {
         streamId: 'S-retarget-refresh-race',
+        replacementEpoch: 0,
         chatId: 'C1',
         ownerClientId: 'other-tab',
         startedAt: 1,
@@ -646,6 +871,7 @@ describe('stream leases', () => {
     await listStarted.promise
     postEvent({
       kind: 'stream-started',
+      replacementEpoch: 0,
       chatId: 'C1',
       streamId: 'S-new-during-refresh',
       messageId: 'M-new-during-refresh',
@@ -667,6 +893,7 @@ describe('stream leases', () => {
     await drainMicrotasks()
     postEvent({
       kind: 'stream-started',
+      replacementEpoch: 0,
       chatId: 'C1',
       streamId: 'S-start-before-refresh',
       messageId: 'M-start-before-refresh',
@@ -693,6 +920,7 @@ describe('stream leases', () => {
       kind: 'stream-heartbeat',
       lease: {
         streamId: 'S-monotonic',
+        replacementEpoch: 0,
         chatId: 'C1',
         messageId: 'M-monotonic',
         ownerClientId: 'other-tab',
@@ -704,6 +932,7 @@ describe('stream leases', () => {
       kind: 'stream-heartbeat',
       lease: {
         streamId: 'S-monotonic',
+        replacementEpoch: 0,
         chatId: 'C1',
         ownerClientId: 'other-tab',
         startedAt: 1,
@@ -727,6 +956,7 @@ describe('stream leases', () => {
 
     useStreamStore.getState().setActive({
       streamId: 'S-remote',
+      replacementEpoch: 0,
       chatId: 'C1',
       messageId: 'M1',
       startedAt: 1,
@@ -738,6 +968,7 @@ describe('stream leases', () => {
     expect(seen).toEqual([
       {
         kind: 'stream-abort-requested',
+        replacementEpoch: 0,
         chatId: 'C1',
         streamId: 'S-remote',
         ownerClientId: 'other-tab',
@@ -751,6 +982,7 @@ describe('stream leases', () => {
     const abort = vi.fn()
     useStreamStore.getState().setActive({
       streamId: 'S-local',
+      replacementEpoch: 0,
       chatId: 'C1',
       messageId: 'M1',
       startedAt: 1,

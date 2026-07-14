@@ -84,12 +84,13 @@ export async function markBrowserWorkspaceReplaced(
   tx: Transaction,
   now: number,
   previous: WorkspaceMeta,
-): Promise<void> {
+): Promise<number> {
   if (previous.replacementEpoch >= Number.MAX_SAFE_INTEGER) {
     throw new Error('WorkspaceReplacementEpochExhausted')
   }
   const settings = tx.table<SettingsValueRow, string>('settings')
   const imported = storedWorkspaceMeta((await settings.get(WORKSPACE_META_KEY))?.value)
+  const replacementEpoch = previous.replacementEpoch + 1
   await settings.put({
     key: WORKSPACE_META_KEY,
     value: {
@@ -98,7 +99,8 @@ export async function markBrowserWorkspaceReplaced(
       backendKind: 'browser-idb',
       lastMutationAt: now,
       mutationCounter: Math.max(imported?.mutationCounter ?? 0, previous.mutationCounter) + 1,
-      replacementEpoch: previous.replacementEpoch + 1,
+      replacementEpoch,
     } satisfies StoredWorkspaceMeta,
   })
+  return replacementEpoch
 }

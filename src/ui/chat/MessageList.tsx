@@ -2,6 +2,7 @@ import {
   lazy,
   memo,
   Suspense,
+  type SyntheticEvent,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -9,13 +10,18 @@ import {
   useRef,
   useState,
 } from 'react'
-import { navigateToChat } from '../../app/router'
-import { cursorKeyOf, groupByParent, indexById } from '../../core/active-path'
-import { resolveLastUpdatedBranchBelow } from '../../core/branch-resolve'
+import {
+  beginRouteIntent,
+  cancelRouteIntent,
+  chatHref,
+  isRouteIntentCurrent,
+  navigateForIntent,
+} from '../../app/router'
+import { cursorKeyOf, indexById, type MessageTreeProjection } from '../../core/active-path'
 import type { EffectiveCapability } from '../../core/capabilities'
 import { computeBranchTitle, forkChatFromMessage } from '../../core/chat-fork'
 import type { LongMessageDisplayMode, RenderWindowLoadMode } from '../../core/global-settings'
-import { swipe } from '../../core/messages'
+import { swipeProjected } from '../../core/messages'
 import { UNLIMITED_CONTEXT } from '../../core/prompt-size'
 import { prefillClassFor } from '../../core/quirks'
 import type {
@@ -28,6 +34,7 @@ import type {
   Message as MessageRow,
   ModelEndpoint,
 } from '../../core/types'
+import type { StructuralMessageHeader } from '../../hooks/useBranchUrlSync'
 import { useChat } from '../../hooks/useChat'
 import {
   continueFromMessage,
@@ -64,6 +71,10 @@ interface MessageListProps {
   messageRenderWindowSize: number
   messageRenderWindowLoadMode: RenderWindowLoadMode
   branchSnapshot: ActiveBranchWindowSnapshot | null
+  treeProjection: MessageTreeProjection<StructuralMessageHeader>
+  authoritativePathHeaders?: readonly MessageHeaderRow[]
+  presentationOnly?: boolean
+  allowPresentationStreamProjection?: boolean
   onLoadOlderMessages: () => void
 }
 
@@ -80,7 +91,7 @@ interface InsertTarget {
   defaultRole: MessageRole
 }
 
-type MessageListIndexOperation = 'path-index' | 'tree-index' | 'parent-index'
+type MessageListIndexOperation = 'path-index'
 let messageListIndexProbe: ((operation: MessageListIndexOperation) => void) | undefined
 
 export function __setMessageListIndexProbeForTests(
@@ -111,45 +122,26 @@ export const MessageList = memo(function MessageList({
   messageRenderWindowSize,
   messageRenderWindowLoadMode,
   branchSnapshot,
+  treeProjection,
+  authoritativePathHeaders,
+  presentationOnly = false,
+  allowPresentationStreamProjection = false,
   onLoadOlderMessages,
 }: MessageListProps) {
-  const cursor = useChatStore((state) => state.cursors[chatId] ?? EMPTY_CURSOR)
+  const cursor = useChatStore((state) => state.getCursor(chatId) ?? EMPTY_CURSOR)
   const messages = useStableMessageRows(branchSnapshot?.branchWindow ?? [])
-  const treeMessages = useStableMessageRows(
-    (branchSnapshot?.allHeaders ?? []) as unknown as MessageRow[],
-  )
   const branchHeaders = branchSnapshot?.branchHeaders ?? EMPTY_MESSAGE_HEADERS
-  // Tree indices are O(N) over the message set — memoize so swipes /
-  // keyboard shortcuts (§10.6.1) don't rebuild them per keystroke. `byId`
-  // and `byParent` only change when the repository query refires with a new
-  // message array; `path` additionally depends on the cursor.
+  const activePathHeaders = authoritativePathHeaders ?? branchHeaders
   const pathById = useMemo(() => {
     messageListIndexProbe?.('path-index')
     return indexById(messages)
   }, [messages])
-  const byId = useMemo(() => {
-    messageListIndexProbe?.('tree-index')
-    return indexById(treeMessages)
-  }, [treeMessages])
-  const byParent = useMemo(() => {
-    messageListIndexProbe?.('parent-index')
-    return groupByParent(treeMessages)
-  }, [treeMessages])
-  const liveSiblingsByParent = useMemo(() => {
-    const live = new Map<MessageId | null, MessageRow[]>()
-    for (const [parentId, kids] of byParent) {
-      const kept = kids.filter((kid) => !kid.deleted)
-      if (kept.length > 0) live.set(parentId, kept)
-    }
-    return live
-  }, [byParent])
-  const branchContext = useMemo<BranchNavigationContext>(
-    () => ({ messages: treeMessages, byId, byParent }),
-    [byId, byParent, treeMessages],
-  )
+  const { liveByParent } = treeProjection
+  const branchContext: BranchNavigationContext = treeProjection
   const visiblePath = messages
   const hiddenOlderCount = branchSnapshot?.windowOffset ?? 0
-  const branchLength = branchSnapshot?.branchLength ?? visiblePath.length
+  const branchLength =
+    authoritativePathHeaders?.length ?? branchSnapshot?.branchLength ?? visiblePath.length
   const path = visiblePath
   const hasAnyReasoningDetails = useMemo(
     () => path.some((m) => (m.reasoningDetails?.length ?? 0) > 0),
@@ -194,6 +186,10 @@ export const MessageList = memo(function MessageList({
     const el = listRef.current?.querySelector<HTMLElement>('[data-ui="message"]:focus-within')
     return el?.getAttribute('data-message-id') ?? null
   }, [])
+
+  useEffect(() => {
+    if (presentationOnly) setInsertTarget(null)
+  }, [presentationOnly])
 
   const handleEditInPlace = useCallback(
     async (m: MessageRow, text: string) => {
@@ -290,23 +286,25 @@ export const MessageList = memo(function MessageList({
 
   const handleForkChat = useCallback(
     async (m: MessageRow) => {
-      const sourceChat = await getChat(chatId)
-      if (!sourceChat) {
-        pushToast({ level: 'danger', text: 'Chat not found.' })
-        return
-      }
-      const existing = await listChatSidebarRows()
-      const defaultTitle = computeBranchTitle(
-        sourceChat.title,
-        existing.map((c) => c.title),
-      )
-      const chosen =
-        typeof window !== 'undefined'
-          ? window.prompt('Name the new chat:', defaultTitle)
-          : defaultTitle
-      if (chosen === null) return
-      const title = chosen.trim() || defaultTitle
+      const routeIntent = beginRouteIntent()
       try {
+        const sourceChat = await getChat(chatId)
+        if (!sourceChat) {
+          pushToast({ level: 'danger', text: 'Chat not found.' })
+          return
+        }
+        const existing = await listChatSidebarRows()
+        const defaultTitle = computeBranchTitle(
+          sourceChat.title,
+          existing.map((c) => c.title),
+        )
+        if (!isRouteIntentCurrent(routeIntent)) return
+        const chosen =
+          typeof window !== 'undefined'
+            ? window.prompt('Name the new chat:', defaultTitle)
+            : defaultTitle
+        if (chosen === null) return
+        const title = chosen.trim() || defaultTitle
         const currentCursor = useChatStore.getState().getCursor(chatId) ?? EMPTY_CURSOR
         const result = await forkChatFromMessage({
           chatId,
@@ -318,12 +316,14 @@ export const MessageList = memo(function MessageList({
           level: 'success',
           text: `Forked to "${title}" (${result.messageCount} messages).`,
         })
-        navigateToChat(result.chatId)
+        navigateForIntent(routeIntent, chatHref(result.chatId))
       } catch (err) {
         pushToast({
           level: 'danger',
           text: err instanceof Error ? `Fork failed: ${err.message}` : 'Fork failed.',
         })
+      } finally {
+        cancelRouteIntent(routeIntent)
       }
     },
     [chatId, pushToast],
@@ -346,6 +346,7 @@ export const MessageList = memo(function MessageList({
   // `⇧⌘R` regenerates the focused assistant. Ignored while typing in a
   // textarea/input so users don't fight with their composer.
   useEffect(() => {
+    if (presentationOnly) return
     const onKey = (e: KeyboardEvent) => {
       if (e.defaultPrevented) return
       const activeTag = (document.activeElement?.tagName ?? '').toLowerCase()
@@ -359,22 +360,16 @@ export const MessageList = memo(function MessageList({
         e.preventDefault()
         const direction = e.key === '[' ? -1 : 1
         const base = useChatStore.getState().getCursor(chatId) ?? {}
-        const { cursorUpdates } = swipe({
-          messages: treeMessages,
+        const { cursorUpdates } = swipeProjected({
+          projection: treeProjection,
           targetId: focusedId,
           direction,
           cursor: base,
         })
-        const next: CursorMap = { ...base, ...cursorUpdates }
         const chosenId = cursorUpdates[cursorKeyOf(focused.parentId)]
+        useChatStore.getState().navigateWithCursorPatch(chatId, cursorUpdates)
         if (chosenId) {
-          resolveLastUpdatedBranchBelow({ targetId: chosenId, byParent, byId }, next)
-        }
-        useChatStore.getState().setCursor(chatId, next)
-        if (chosenId) {
-          const siblings = (byParent.get(focused.parentId) ?? [])
-            .filter((candidate) => !candidate.deleted)
-            .sort((a, b) => a.siblingIndex - b.siblingIndex)
+          const siblings = liveByParent.get(focused.parentId) ?? []
           const targetIndex = siblings.findIndex((candidate) => candidate.id === chosenId)
           if (targetIndex >= 0) announceVariantPosition(targetIndex, siblings.length)
         }
@@ -387,26 +382,44 @@ export const MessageList = memo(function MessageList({
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [chatId, treeMessages, pathById, byId, byParent, focusedMessageId, handleRegenerate])
+  }, [
+    chatId,
+    pathById,
+    liveByParent,
+    treeProjection,
+    focusedMessageId,
+    handleRegenerate,
+    presentationOnly,
+  ])
+
+  const activePathIndexById = useMemo(() => {
+    const indexes = new Map<MessageId, number>()
+    for (let index = 0; index < activePathHeaders.length; index += 1) {
+      const header = activePathHeaders[index]
+      if (header) indexes.set(header.id, index)
+    }
+    return indexes
+  }, [activePathHeaders])
 
   const roleMismatchIdsOnPath = useMemo(() => {
     const set = new Set<MessageId>()
-    for (let i = Math.max(1, hiddenOlderCount); i < hiddenOlderCount + visiblePath.length; i += 1) {
-      const prev = branchHeaders[i - 1]
-      const cur = branchHeaders[i]
+    for (let i = 1; i < activePathHeaders.length; i += 1) {
+      const prev = activePathHeaders[i - 1]
+      const cur = activePathHeaders[i]
       if (!prev || !cur) continue
       if (prev.role === cur.role) {
         set.add(cur.id)
       }
     }
     return set
-  }, [branchHeaders, hiddenOlderCount, visiblePath.length])
+  }, [activePathHeaders])
 
   const excludedIds = useMemo(() => {
-    return computeExcludedIds(branchHeaders, pathById, chatSettings, capability)
-  }, [branchHeaders, pathById, chatSettings, capability])
+    return computeExcludedIds(activePathHeaders, pathById, chatSettings, capability)
+  }, [activePathHeaders, pathById, chatSettings, capability])
   const effectiveRenderedMessageCount = visiblePath.length
   const loadOlderMessages = useCallback(() => {
+    if (presentationOnly) return
     if (hiddenOlderCount <= 0) return
     const container = listRef.current?.closest<HTMLDivElement>('[data-ui="scroll-region"]')
     if (container) {
@@ -416,7 +429,7 @@ export const MessageList = memo(function MessageList({
       }
     }
     onLoadOlderMessages()
-  }, [hiddenOlderCount, onLoadOlderMessages])
+  }, [hiddenOlderCount, onLoadOlderMessages, presentationOnly])
 
   const visiblePathLength = visiblePath.length
   useLayoutEffect(() => {
@@ -431,6 +444,7 @@ export const MessageList = memo(function MessageList({
   }, [visiblePathLength])
 
   useEffect(() => {
+    if (presentationOnly) return
     if (messageRenderWindowLoadMode !== 'auto') return
     if (hiddenOlderCount <= 0) return
     if (typeof IntersectionObserver === 'undefined') return
@@ -445,40 +459,69 @@ export const MessageList = memo(function MessageList({
     )
     observer.observe(target)
     return () => observer.disconnect()
-  }, [hiddenOlderCount, loadOlderMessages, messageRenderWindowLoadMode])
+  }, [hiddenOlderCount, loadOlderMessages, messageRenderWindowLoadMode, presentationOnly])
+
+  const blockPresentationInteraction = useCallback(
+    (event: SyntheticEvent) => {
+      if (!presentationOnly) return
+      event.preventDefault()
+      event.stopPropagation()
+    },
+    [presentationOnly],
+  )
 
   return (
     <div
       data-ui="message-list"
       role="log"
-      aria-live="polite"
+      aria-live={presentationOnly ? 'off' : 'polite'}
       aria-relevant="additions"
       ref={listRef}
       data-render-window-size={messageRenderWindowSize}
       data-rendered-count={effectiveRenderedMessageCount}
       data-total-count={branchLength}
+      inert={presentationOnly || undefined}
+      aria-busy={presentationOnly || undefined}
+      data-presentation-only={presentationOnly || undefined}
+      onClickCapture={blockPresentationInteraction}
+      onAuxClickCapture={blockPresentationInteraction}
+      onContextMenuCapture={blockPresentationInteraction}
+      onKeyDownCapture={blockPresentationInteraction}
+      onSubmitCapture={blockPresentationInteraction}
     >
       {hiddenOlderCount > 0 ? (
         <div ref={loadOlderRef} data-ui="message-window-load">
-          <Button type="button" data-ui="load-more-messages" onClick={loadOlderMessages}>
+          <Button
+            type="button"
+            data-ui="load-more-messages"
+            onClick={loadOlderMessages}
+            disabled={presentationOnly}
+          >
             Load more
           </Button>
           <span>{hiddenOlderCount} older</span>
         </div>
       ) : null}
-      {visiblePath.map((m, idx) => {
-        const fullIndex = hiddenOlderCount + idx
-        const prev = branchHeaders[fullIndex - 1]
+      {visiblePath.map((m, visibleIndex) => {
+        const activePathIndex = activePathIndexById.get(m.id)
+        const bodyVersion = branchHeaders[hiddenOlderCount + visibleIndex]?.bodyVersion as number
+        const prev =
+          activePathIndex !== undefined && activePathIndex > 0
+            ? activePathHeaders[activePathIndex - 1]
+            : undefined
         const showStaleHint = m.role === 'assistant' && prev && staleHintFor.has(prev.id)
-        const hasSiblingVariants = (liveSiblingsByParent.get(m.parentId)?.length ?? 0) > 1
+        const hasSiblingVariants = (liveByParent.get(m.parentId)?.length ?? 0) > 1
         return (
           <Message
             key={m.id}
             chatId={chatId}
             message={m}
+            bodyVersion={bodyVersion}
             {...(hasSiblingVariants ? { branchContext } : {})}
             hasAnyReasoningDetails={m.generation?.error ? hasAnyReasoningDetails : false}
             hasConnection={hasConnection}
+            presentationOnly={presentationOnly}
+            allowPresentationStreamProjection={allowPresentationStreamProjection}
             onEditInPlace={handleEditInPlace}
             onToggleReasoningDetailHidden={handleToggleReasoningHidden}
             onToggleProviderOutputItemHidden={handleToggleToolHidden}

@@ -2,7 +2,7 @@
 // repository boundary. Visible chat-row writes go through `WorkspaceRepository`
 // so browser mode already matches the future daemon contract.
 
-import { type ActivePathMeasurement, activePath } from '../core/active-path'
+import { activePath } from '../core/active-path'
 import { cloneDefaultChatSettings } from '../core/defaults'
 import { tokenCalibrationKeyForStoredRecordKey } from '../core/model-ids'
 import { normalizeReasoningSettings } from '../core/reasoning'
@@ -42,11 +42,12 @@ import {
   hydrateMessages,
   type MessageBodyRow,
   type MessageHeaderRow,
+  messageHeaderTreeKey,
 } from './message-storage'
 import type {
-  ActiveBranchBodyWindow,
+  ActiveBranchBodyPage,
   ActiveBranchSnapshot,
-  ActiveBranchWindowSnapshot,
+  KnownBranchPageResult,
 } from './repository'
 import { ChatMissingError } from './repository'
 import { getWorkspaceRepository } from './workspace-repository'
@@ -269,13 +270,11 @@ export async function getMessage(messageId: MessageId): Promise<Message | undefi
   }
 }
 
-export async function loadMessageHeaders(chatId: ChatId): Promise<MessageHeaderRow[]> {
-  try {
-    return await getDb().messages.where('chatId').equals(chatId).toArray()
-  } catch (error) {
-    if (isDatabaseClosedError(error)) return []
-    throw error
-  }
+export async function loadMessageHeaders(
+  chatId: ChatId,
+  options: { signal?: AbortSignal } = {},
+): Promise<MessageHeaderRow[]> {
+  return getWorkspaceRepository().listMessageHeaders(chatId, options)
 }
 
 export async function loadActiveBranchSnapshot(
@@ -316,81 +315,12 @@ export async function loadActiveBranchSnapshot(
   }
 }
 
-function branchWindowRange(
-  total: number,
-  window: ActiveBranchBodyWindow,
-): { start: number; end: number; limit: number } {
-  const limit = Math.max(0, Math.floor(window.limit))
-  const offset = Math.floor(window.offset)
-  const start = offset < 0 ? Math.max(0, total - limit) : Math.max(0, Math.min(total, offset))
-  return { start, end: Math.min(total, start + limit), limit }
-}
-
-export async function loadActiveBranchWindowSnapshot(
+export async function loadKnownBranchPageSnapshot(
   chatId: ChatId,
-  cursor: Record<string, MessageId>,
-  window: ActiveBranchBodyWindow,
-): Promise<ActiveBranchWindowSnapshot> {
-  try {
-    const db = getDb()
-    return await db.transaction('r', db.messages, db.messageBodies, async () => {
-      const headers = await db.messages.where('chatId').equals(chatId).toArray()
-      let activePathMeasurement: ActivePathMeasurement | undefined
-      const branchHeaders = activePath(
-        headers as unknown as Message[],
-        cursor,
-        window.onMeasure
-          ? (measurement) => {
-              activePathMeasurement = measurement
-            }
-          : undefined,
-      ).map((message) => message as unknown as MessageHeaderRow)
-      const range = branchWindowRange(branchHeaders.length, window)
-      const windowHeaders = branchHeaders.slice(range.start, range.end)
-      const bodies = (
-        await db.messageBodies.bulkGet(windowHeaders.map((header) => header.id))
-      ).filter((row): row is MessageBodyRow => row !== undefined)
-      const siblingGroups = siblingGroupsForBranch(headers, branchHeaders)
-      if (window.onMeasure && activePathMeasurement) {
-        window.onMeasure({
-          headerRowsRead: headers.length,
-          bodyRowsRead: bodies.length,
-          siblingRowsRetained: siblingGroups.reduce(
-            (total, group) => total + group.siblings.length,
-            0,
-          ),
-          treeKeyRows: headers.length,
-          activePath: activePathMeasurement,
-        })
-      }
-      return {
-        chatId,
-        allHeaders: headers,
-        branchHeaders,
-        branchWindow: hydrateMessages(windowHeaders, bodies),
-        windowOffset: range.start,
-        windowLimit: range.limit,
-        branchLength: branchHeaders.length,
-        siblingGroups,
-        treeKey: messageHeaderTreeKey(headers),
-      }
-    })
-  } catch (error) {
-    if (isDatabaseClosedError(error)) {
-      return {
-        chatId,
-        allHeaders: [],
-        branchHeaders: [],
-        branchWindow: [],
-        windowOffset: 0,
-        windowLimit: Math.max(0, Math.floor(window.limit)),
-        branchLength: 0,
-        siblingGroups: [],
-        treeKey: '',
-      }
-    }
-    throw error
-  }
+  pathMessageIds: readonly MessageId[],
+  page: ActiveBranchBodyPage,
+): Promise<KnownBranchPageResult> {
+  return getWorkspaceRepository().getKnownBranchPageSnapshot(chatId, pathMessageIds, page)
 }
 
 function siblingGroupsForBranch(
@@ -413,21 +343,6 @@ function siblingGroupsForBranch(
     parentId,
     siblings: byParent.get(parentId) ?? [],
   }))
-}
-
-function messageHeaderTreeKey(headers: readonly MessageHeaderRow[]): string {
-  return headers
-    .map((message) =>
-      [
-        message.id,
-        message.nodeVersion,
-        message.parentId ?? '',
-        message.siblingIndex,
-        message.createdAt,
-        message.deleted ? 1 : 0,
-      ].join(':'),
-    )
-    .join('|')
 }
 
 // Soft-deletes a chat by setting `archived: true` (the reversible variant).

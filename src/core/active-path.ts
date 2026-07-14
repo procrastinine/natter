@@ -3,8 +3,9 @@
 // an ephemeral per-tab Zustand value; the algorithm receives it as a plain
 // `Record<parentKey, childId>` and returns the ordered list of messages on
 // the active path. At each fork without a cursor entry the algorithm picks
-// the default child — the one whose subtree contains the greatest-`createdAt`
-// live leaf (tiebreak: greater `siblingIndex`, then greater `id`).
+// the default child — the one whose subtree contains the greatest live leaf
+// by (`createdAt`, leaf id). Candidate order is only a final deterministic
+// fallback when two candidates have the same score.
 
 import type { CursorMap, Message, MessageId } from './types'
 
@@ -71,26 +72,90 @@ export function indexById(messages: readonly Message[]): Map<MessageId, Message>
   return indexTreeNodesById(messages)
 }
 
+export type DefaultChildPicker<T extends MessageTreeNode> = <U extends T>(
+  liveChildren: readonly U[],
+) => U
+
+export interface MessageTreeProjection<T extends MessageTreeNode = MessageTreeNode> {
+  readonly nodes: readonly T[]
+  readonly byParent: ReadonlyMap<MessageId | null, readonly T[]>
+  readonly liveByParent: ReadonlyMap<MessageId | null, readonly T[]>
+  readonly byId: ReadonlyMap<MessageId, T>
+  readonly pickDefaultChild: DefaultChildPicker<T>
+}
+
+export interface MessageTreeProjectionOptions {
+  readonly onBuildScores?: () => void
+}
+
+export function createMessageTreeProjection<T extends MessageTreeNode>(
+  messages: readonly T[],
+  options: MessageTreeProjectionOptions = {},
+): MessageTreeProjection<T> {
+  const byParent = groupTreeNodesByParent(messages)
+  const liveByParent = new Map<MessageId | null, readonly T[]>()
+  for (const [parentId, children] of byParent) {
+    const liveChildren = children.filter((message) => !message.deleted)
+    if (liveChildren.length > 0) liveByParent.set(parentId, liveChildren)
+  }
+  const byId = indexTreeNodesById(messages)
+  let picker: DefaultChildPicker<T> | undefined
+  return {
+    nodes: messages,
+    byParent,
+    liveByParent,
+    byId,
+    pickDefaultChild: (liveChildren) => {
+      if (!picker) {
+        options.onBuildScores?.()
+        picker = createDefaultChildPicker(byParent, byId, liveByParent)
+      }
+      return picker(liveChildren)
+    },
+  }
+}
+
+interface LiveLeafScore {
+  readonly createdAt: number
+  readonly id: MessageId
+}
+
+export function compareLiveLeafRecency(
+  left: Pick<MessageTreeNode, 'createdAt' | 'id'>,
+  right: Pick<MessageTreeNode, 'createdAt' | 'id'>,
+): number {
+  return left.createdAt - right.createdAt || (left.id < right.id ? -1 : left.id > right.id ? 1 : 0)
+}
+
 function subtreeScores<T extends MessageTreeNode>(
-  byParent: Map<MessageId | null, T[]>,
-  byId: Map<MessageId, T>,
-): Map<MessageId, number> {
-  const scores = new Map<MessageId, number>()
+  byParent: ReadonlyMap<MessageId | null, readonly T[]>,
+  byId: ReadonlyMap<MessageId, T>,
+  liveByParent?: ReadonlyMap<MessageId | null, readonly T[]>,
+): Map<MessageId, LiveLeafScore> {
+  const scores = new Map<MessageId, LiveLeafScore>()
   const remainingChildren = new Map<MessageId, number>()
   const ready: T[] = []
   for (const message of byId.values()) {
-    scores.set(message.id, message.deleted ? -Infinity : message.createdAt)
-    const childCount = byParent.get(message.id)?.length ?? 0
+    if (message.deleted) continue
+    const childCount = liveByParent
+      ? (liveByParent.get(message.id)?.length ?? 0)
+      : (byParent.get(message.id) ?? []).filter((child) => !child.deleted).length
     remainingChildren.set(message.id, childCount)
-    if (childCount === 0) ready.push(message)
+    if (childCount === 0) {
+      scores.set(message.id, { createdAt: message.createdAt, id: message.id })
+      ready.push(message)
+    }
   }
   for (let index = 0; index < ready.length; index += 1) {
     const message = ready[index] as T
     if (message.parentId === null) continue
     const parent = byId.get(message.parentId)
-    if (!parent) continue
-    const childScore = scores.get(message.id) ?? -Infinity
-    if (childScore > (scores.get(parent.id) ?? -Infinity)) scores.set(parent.id, childScore)
+    if (!parent || parent.deleted) continue
+    const childScore = scores.get(message.id)
+    const parentScore = scores.get(parent.id)
+    if (childScore && (!parentScore || compareLiveLeafRecency(childScore, parentScore) > 0)) {
+      scores.set(parent.id, childScore)
+    }
     const remaining = (remainingChildren.get(parent.id) ?? 1) - 1
     remainingChildren.set(parent.id, remaining)
     if (remaining === 0) ready.push(parent)
@@ -100,16 +165,23 @@ function subtreeScores<T extends MessageTreeNode>(
 
 function pickDefaultChildFromScores<T extends MessageTreeNode>(
   liveChildren: readonly T[],
-  scores: Map<MessageId, number>,
+  scores: ReadonlyMap<MessageId, LiveLeafScore>,
 ): T {
   let best = liveChildren[0] as T
-  let bestScore = scores.get(best.id) ?? -Infinity
+  let bestScore = scores.get(best.id)
   for (let index = 1; index < liveChildren.length; index += 1) {
     const candidate = liveChildren[index] as T
-    const score = scores.get(candidate.id) ?? -Infinity
+    const score = scores.get(candidate.id)
+    const scoreOrder = score
+      ? bestScore
+        ? compareLiveLeafRecency(score, bestScore)
+        : 1
+      : bestScore
+        ? -1
+        : 0
     if (
-      score > bestScore ||
-      (score === bestScore &&
+      scoreOrder > 0 ||
+      (scoreOrder === 0 &&
         (candidate.siblingIndex > best.siblingIndex ||
           (candidate.siblingIndex === best.siblingIndex && candidate.id > best.id)))
     ) {
@@ -120,22 +192,24 @@ function pickDefaultChildFromScores<T extends MessageTreeNode>(
   return best
 }
 
-// §8.4.3.1 rule 4: pick the child whose subtree contains the greatest
-// `createdAt` leaf. Tiebreak: greater `siblingIndex`, then greater `id`.
+// §8.4.3.1 rule 4: pick the child whose subtree contains the greatest live
+// leaf by (`createdAt`, leaf id). Tiebreak identical candidate scores by
+// greater `siblingIndex`, then greater candidate id.
 // Precondition: `liveChildren` is non-empty and all members have `!deleted`.
 function pickDefaultTreeChild<T extends MessageTreeNode>(
   liveChildren: readonly T[],
-  byParent: Map<MessageId | null, T[]>,
-  byId: Map<MessageId, T>,
+  byParent: ReadonlyMap<MessageId | null, readonly T[]>,
+  byId: ReadonlyMap<MessageId, T>,
 ): T {
   return createDefaultChildPicker(byParent, byId)(liveChildren)
 }
 
 export function createDefaultChildPicker<T extends MessageTreeNode>(
-  byParent: Map<MessageId | null, T[]>,
-  byId: Map<MessageId, T>,
-): (liveChildren: readonly T[]) => T {
-  const scores = subtreeScores(byParent, byId)
+  byParent: ReadonlyMap<MessageId | null, readonly T[]>,
+  byId: ReadonlyMap<MessageId, T>,
+  liveByParent?: ReadonlyMap<MessageId | null, readonly T[]>,
+): DefaultChildPicker<T> {
+  const scores = subtreeScores(byParent, byId, liveByParent)
   return (liveChildren) => pickDefaultChildFromScores(liveChildren, scores)
 }
 
@@ -193,6 +267,24 @@ export function activePath(
   return path
 }
 
+export function activePathProjected<T extends MessageTreeNode>(
+  projection: MessageTreeProjection<T>,
+  cursor: Readonly<CursorMap>,
+): T[] {
+  const path: T[] = []
+  let parentId: MessageId | null = null
+  for (;;) {
+    const children: readonly T[] = projection.liveByParent.get(parentId) ?? []
+    if (children.length === 0) return path
+    const pinnedId: MessageId | undefined = cursor[cursorKeyOf(parentId)]
+    const pinned: T | undefined =
+      pinnedId === undefined ? undefined : children.find((message) => message.id === pinnedId)
+    const chosen: T = pinned ?? projection.pickDefaultChild(children)
+    path.push(chosen)
+    parentId = chosen.id
+  }
+}
+
 export function resolveActiveLeafId<T extends MessageTreeNode>(
   messages: readonly T[],
   cursor: CursorMap,
@@ -208,6 +300,21 @@ export function resolveActiveLeafId<T extends MessageTreeNode>(
     const pinned: T | undefined =
       pinnedId === undefined ? undefined : children.find((message) => message.id === pinnedId)
     parentId = (pinned ?? pickDefaultChildFromScores(children, scores)).id
+  }
+}
+
+export function resolveActiveLeafIdProjected<T extends MessageTreeNode>(
+  projection: MessageTreeProjection<T>,
+  cursor: Readonly<CursorMap>,
+): MessageId | null {
+  let parentId: MessageId | null = null
+  for (;;) {
+    const children: readonly T[] = projection.liveByParent.get(parentId) ?? []
+    if (children.length === 0) return parentId
+    const pinnedId: MessageId | undefined = cursor[cursorKeyOf(parentId)]
+    const pinned: T | undefined =
+      pinnedId === undefined ? undefined : children.find((message) => message.id === pinnedId)
+    parentId = (pinned ?? projection.pickDefaultChild(children)).id
   }
 }
 
@@ -235,10 +342,7 @@ export function findLastUpdatedLeafId(messages: readonly Message[]): MessageId |
       best = leaf
       continue
     }
-    if (
-      leaf.createdAt > best.createdAt ||
-      (leaf.createdAt === best.createdAt && leaf.id > best.id)
-    ) {
+    if (compareLiveLeafRecency(leaf, best) > 0) {
       best = leaf
     }
   }
