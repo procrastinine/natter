@@ -75,14 +75,6 @@ import { useStreamStore } from '../store/zustand/streamStore'
 import { useUiStore } from '../store/zustand/uiStore'
 import { markLifecycleTarget, startRequestLifecycle } from './requestLifecycle'
 
-const retainedRequestPlansForTests = import.meta.env.DEV
-  ? new Set<AssistantRequestPlan>()
-  : undefined
-
-export function __retainedContinueRequestPlanCountForTests(): number | undefined {
-  return retainedRequestPlansForTests?.size
-}
-
 interface ContinueInPlaceInput {
   chatId: ChatId
   targetMessageId: MessageId
@@ -108,16 +100,6 @@ function throwWithZeroEligibleUi(chatId: ChatId, err: unknown): never {
     useUiStore.getState().setZeroEligibleChatId(chatId)
   }
   throw err
-}
-
-function devOnlyOpenStreamOverride(
-  openStream: ContinueInPlaceInput['openStream'],
-): ContinueInPlaceInput['openStream'] {
-  if (!openStream) return undefined
-  if ((import.meta as { env?: { DEV?: boolean } }).env?.DEV !== true) {
-    throw new Error('openStream override is dev-only; production sends must use assistant-stream')
-  }
-  return openStream
 }
 
 export async function continueAssistantInPlace(input: ContinueInPlaceInput): Promise<void> {
@@ -324,10 +306,8 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
     }
     const chatModel = chat.settings.model
     const calibrationChat = { tokenCalibration: chat.tokenCalibration }
-    retainedRequestPlansForTests?.add(requestPlan)
     requestPlan.outboundPath = []
     requestPlan.wire = {}
-    retainedRequestPlansForTests?.delete(requestPlan)
     requestPlan = undefined
     settingsForContinue = undefined
     continueUserPrompt = ''
@@ -352,7 +332,7 @@ export async function continueAssistantInPlace(input: ContinueInPlaceInput): Pro
       now: startedAt,
     })
     const openStream =
-      devOnlyOpenStreamOverride(input.openStream) ??
+      input.openStream ??
       ((open) =>
         openAssistantRequestStream({
           connection: open.connection,

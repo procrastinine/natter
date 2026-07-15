@@ -1,5 +1,5 @@
 import { expect, type Page, test } from './fixtures'
-import { clearIndexedDb } from './helpers'
+import { clearIndexedDb, seedFirstRun, seedLinearChat } from './helpers'
 
 test.beforeEach(async ({ page }) => {
   await clearIndexedDb(page)
@@ -11,7 +11,7 @@ test.beforeEach(async ({ page }) => {
 })
 
 test('focus mode keeps an open chat settings panel visible', async ({ page }) => {
-  await startDebugChat(page)
+  await startChat(page)
 
   const shell = page.locator('[data-ui="app-shell"]')
   await page.locator('[data-role="settings-cog"]').click()
@@ -34,7 +34,7 @@ test('focus mode keeps an open chat settings panel visible', async ({ page }) =>
 })
 
 test('focus composer keeps auto-growing until the user resizes it', async ({ page }) => {
-  await startDebugChat(page)
+  await startChat(page)
   await page.getByRole('button', { name: 'Enter reading mode' }).click()
 
   const input = page.locator('[data-ui="composer-input"]')
@@ -51,27 +51,14 @@ test('focus composer keeps auto-growing until the user resizes it', async ({ pag
   expect(metrics.overflowY).toBe('hidden')
 })
 
-async function startDebugChat(page: Page): Promise<void> {
-  await page.evaluate(async () => {
-    const api = (
-      window as unknown as {
-        __debugFakeStream?: {
-          start(options: {
-            targetChars: number
-            reasoningChars: number
-            prompt: string
-            openChat: boolean
-          }): Promise<unknown>
-        }
-      }
-    ).__debugFakeStream
-    if (!api) throw new Error('__debugFakeStream is not installed')
-    await api.start({
-      targetChars: 24,
-      reasoningChars: 0,
-      prompt: 'Focus mode layout check',
-      openChat: true,
-    })
+async function startChat(page: Page): Promise<void> {
+  await seedFirstRun(page)
+  const chatId = await seedLinearChat(page, {
+    chatId: 'focus-layout-chat',
+    messageCount: 2,
+    textPrefix: 'focus layout message',
+    title: 'Focus mode layout check',
   })
-  await page.locator('[data-ui="message"][data-role="assistant"]').waitFor({ state: 'visible' })
+  await page.goto(`/#/chat/${chatId}/message/msg-001`)
+  await expect(page.locator('[data-ui="message"][data-role="assistant"]')).toBeVisible()
 }

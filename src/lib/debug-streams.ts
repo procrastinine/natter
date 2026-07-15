@@ -1,11 +1,6 @@
 import type { ConnectionProfile } from '../core/types'
 import { isSensitiveDiagnosticKey } from './diagnostic-redaction'
 
-const STORAGE_KEY = 'natter.debug.streams'
-const PLAN_STORAGE_KEY = 'natter.debug.request_plans'
-const DEBUG_API_VERSION = 'request-plan-full-request-v1'
-const MAX_BUFFER_ENTRIES = 2000
-const MAX_PLAN_ENTRIES = 200
 const MAX_STRING_CHARS = 360
 const STRING_TAIL_CHARS = 96
 const MAX_ARRAY_ITEMS = 8
@@ -18,66 +13,38 @@ export interface StreamDebugTrace {
   startedAt: number
 }
 
-interface StreamDebugEntry {
+export interface StreamDebugEntry {
   label: string
   payload: unknown
 }
 
-interface RequestPlanDebugEntry {
+export interface RequestPlanDebugEvent {
   label: string
   payload: unknown
-}
-
-interface StreamDebugApi {
-  version(): string
-  enable(): void
-  disable(): void
-  status(): { enabled: boolean; entries: number }
-  clear(): void
-  dump(): string
-  last(count?: number): string
-  copy(): Promise<string>
-  enablePlans(): void
-  disablePlans(): void
-  planStatus(): { enabled: boolean; entries: number }
-  clearPlans(): void
-  dumpPlans(): string
-  lastPlans(count?: number): string
-  copyPlans(): Promise<string>
-  plans(): RequestPlanDebugEntry[]
-  lastPlan(): RequestPlanDebugEntry | null
-  lastRequest(): unknown
+  request?: unknown
 }
 
 let seq = 0
-const entryBuffer: StreamDebugEntry[] = []
-const planBuffer: RequestPlanDebugEntry[] = []
+let streamDebugSink: ((entry: StreamDebugEntry) => void) | undefined
+let requestPlanDebugSink: ((entry: RequestPlanDebugEvent) => void) | undefined
 
 function nextTraceId(adapter: string): string {
   seq += 1
   return `${adapter}-${Date.now().toString(36)}-${seq.toString(36)}`
 }
 
-function globalDebugEnabled(): boolean {
-  if (typeof window === 'undefined') return false
-  try {
-    return window.localStorage.getItem(STORAGE_KEY) === '1'
-  } catch {
-    return false
-  }
+export function setStreamDebugSink(sink: ((entry: StreamDebugEntry) => void) | undefined): void {
+  streamDebugSink = sink
 }
 
-function requestPlanDebugEnabled(): boolean {
-  if (typeof window === 'undefined') return false
-  try {
-    return window.localStorage.getItem(PLAN_STORAGE_KEY) === '1'
-  } catch {
-    return false
-  }
+export function setRequestPlanDebugSink(
+  sink: ((entry: RequestPlanDebugEvent) => void) | undefined,
+): void {
+  requestPlanDebugSink = sink
 }
 
 export function streamDebugEnabled(profile?: Pick<ConnectionProfile, 'debugRequests'>): boolean {
-  return profile?.debugRequests === true || globalDebugEnabled()
+  return profile?.debugRequests === true || streamDebugSink !== undefined
 }
 
 export function snapshotStreamDebugRequest(
@@ -101,32 +68,6 @@ function redactHeaders(headers: Record<string, string>): Record<string, string> 
 
 function elapsedMs(trace: StreamDebugTrace): number {
   return Date.now() - trace.startedAt
-}
-
-function pushEntry(label: string, payload: unknown): void {
-  entryBuffer.push({ label, payload })
-  if (entryBuffer.length > MAX_BUFFER_ENTRIES) {
-    entryBuffer.splice(0, entryBuffer.length - MAX_BUFFER_ENTRIES)
-  }
-}
-
-function pushPlanEntry(label: string, payload: unknown): void {
-  planBuffer.push({ label, payload: cloneDebugPayload(payload) })
-  if (planBuffer.length > MAX_PLAN_ENTRIES) {
-    planBuffer.splice(0, planBuffer.length - MAX_PLAN_ENTRIES)
-  }
-}
-
-function cloneDebugPayload(payload: unknown): unknown {
-  try {
-    return structuredClone(payload)
-  } catch {
-    try {
-      return JSON.parse(JSON.stringify(payload)) as unknown
-    } catch {
-      return payload
-    }
-  }
 }
 
 function compactString(value: string): string {
@@ -280,25 +221,33 @@ function summarizePayload(stage: string, payload: unknown): unknown {
   }
 }
 
-function formatEntry(label: string, payload: unknown): string {
-  if (payload === undefined) return label
-  return `${label} ${JSON.stringify(payload)}`
-}
-
 function emitDebug(label: string, stage: string, payload?: unknown): void {
   const summarized = summarizePayload(stage, payload)
-  pushEntry(label, summarized)
-
+  streamDebugSink?.({ label, payload: summarized })
   console.debug(label, summarized)
 }
 
 export function logRequestPlanDebug(label: string, payload?: unknown): void {
-  if (!requestPlanDebugEnabled()) return
-  const summarized = sanitize(payload)
+  if (!requestPlanDebugSink) return
+  const { request, summary } = summarizeRequestPlan(payload)
   const fullLabel = `[request-plan] ${label}`
-  pushPlanEntry(fullLabel, payload)
+  requestPlanDebugSink({
+    label: fullLabel,
+    payload: summary,
+    ...(request === undefined ? {} : { request }),
+  })
+  console.debug(fullLabel, summary)
+}
 
-  console.debug(fullLabel, summarized)
+function summarizeRequestPlan(payload: unknown): { request?: unknown; summary: unknown } {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return { summary: sanitize(payload) }
+  }
+  const { request, ...metadata } = payload as Record<string, unknown>
+  return {
+    ...(request === undefined ? {} : { request }),
+    summary: sanitize(metadata),
+  }
 }
 
 export function startStreamDebug(args: {
@@ -336,150 +285,14 @@ export function logStreamDebug(
   payload?: unknown,
 ): void {
   if (scope === null || scope === undefined) {
-    if (!globalDebugEnabled()) return
+    if (!streamDebugSink) return
     emitDebug(`[stream-debug][global] ${stage}`, stage, payload)
     return
   }
   if (typeof scope === 'string') {
-    if (!globalDebugEnabled()) return
+    if (!streamDebugSink) return
     emitDebug(`[stream-debug][${scope}] ${stage}`, stage, payload)
     return
   }
   emitDebug(`[stream-debug][${scope.id}] +${elapsedMs(scope)}ms ${stage}`, stage, payload)
-}
-
-async function copyDumpText(text: string): Promise<string> {
-  try {
-    if (
-      typeof document !== 'undefined' &&
-      typeof document.hasFocus === 'function' &&
-      !document.hasFocus()
-    ) {
-      throw new DOMException('Document is not focused.', 'NotAllowedError')
-    }
-    const clipboard =
-      typeof navigator !== 'undefined'
-        ? (navigator as Navigator & { clipboard?: Clipboard }).clipboard
-        : undefined
-    if (clipboard?.writeText) {
-      await clipboard.writeText(text)
-    }
-  } catch (err) {
-    if (typeof window !== 'undefined') {
-      ;(window as unknown as { __debugStreamsLastCopyText?: string }).__debugStreamsLastCopyText =
-        text
-    }
-
-    console.warn(
-      '[debug] clipboard copy unavailable; returning dump text and storing it on window.__debugStreamsLastCopyText',
-      err,
-    )
-  }
-  return text
-}
-
-function bufferDump(entries: readonly StreamDebugEntry[]): string {
-  return entries.map((entry) => formatEntry(entry.label, entry.payload)).join('\n')
-}
-
-function planDump(entries: readonly RequestPlanDebugEntry[]): string {
-  return entries.map((entry) => formatEntry(entry.label, entry.payload)).join('\n')
-}
-
-export function installDebugStreams(): void {
-  if (typeof window === 'undefined') return
-  const api: StreamDebugApi = {
-    version() {
-      return DEBUG_API_VERSION
-    },
-    enable() {
-      window.localStorage.setItem(STORAGE_KEY, '1')
-      entryBuffer.splice(0, entryBuffer.length)
-
-      console.info('[debug] stream logging enabled and buffer reset')
-    },
-    disable() {
-      window.localStorage.removeItem(STORAGE_KEY)
-
-      console.info('[debug] stream logging disabled')
-    },
-    status() {
-      return { enabled: globalDebugEnabled(), entries: entryBuffer.length }
-    },
-    clear() {
-      entryBuffer.splice(0, entryBuffer.length)
-
-      console.info('[debug] stream log buffer cleared')
-    },
-    dump() {
-      return bufferDump(entryBuffer)
-    },
-    last(count = 100) {
-      return bufferDump(entryBuffer.slice(-count))
-    },
-    async copy() {
-      return copyDumpText(bufferDump(entryBuffer))
-    },
-    enablePlans() {
-      window.localStorage.setItem(PLAN_STORAGE_KEY, '1')
-      planBuffer.splice(0, planBuffer.length)
-
-      console.info('[debug] compact request-plan logging enabled and buffer reset')
-    },
-    disablePlans() {
-      window.localStorage.removeItem(PLAN_STORAGE_KEY)
-
-      console.info('[debug] compact request-plan logging disabled')
-    },
-    planStatus() {
-      return { enabled: requestPlanDebugEnabled(), entries: planBuffer.length }
-    },
-    clearPlans() {
-      planBuffer.splice(0, planBuffer.length)
-
-      console.info('[debug] compact request-plan buffer cleared')
-    },
-    dumpPlans() {
-      return planDump(planBuffer)
-    },
-    lastPlans(count = 20) {
-      return planDump(planBuffer.slice(-count))
-    },
-    async copyPlans() {
-      return copyDumpText(planDump(planBuffer))
-    },
-    plans() {
-      return planBuffer.map((entry) => ({
-        label: entry.label,
-        payload: structuredClone(entry.payload),
-      }))
-    },
-    lastPlan() {
-      const entry = planBuffer.at(-1)
-      if (!entry) return null
-      return {
-        label: entry.label,
-        payload: cloneDebugPayload(entry.payload),
-      }
-    },
-    lastRequest() {
-      for (let index = planBuffer.length - 1; index >= 0; index -= 1) {
-        const entry = planBuffer[index]
-        const request = requestFromPlanPayload(entry?.payload)
-        if (request !== undefined) return cloneDebugPayload(request)
-      }
-      return null
-    },
-  }
-  ;(window as unknown as { __debugStreams: StreamDebugApi }).__debugStreams = api
-
-  console.info(
-    '%c[debug] window.__debugStreams.enable() — compact stream logging with buffer helpers (`dump()`, `last()`, `copy()`, `clear()`). Use `enablePlans()` for one-line request-plan logs.',
-    'color:#888;font-style:italic',
-  )
-}
-
-function requestFromPlanPayload(payload: unknown): unknown {
-  if (!payload || typeof payload !== 'object') return undefined
-  return (payload as { request?: unknown }).request
 }

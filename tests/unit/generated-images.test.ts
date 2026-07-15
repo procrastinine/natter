@@ -422,6 +422,11 @@ describe('generated image output storage migration', () => {
     expect(generated).toHaveLength(1)
     expect(generated[0]?.id).toBe(attachmentId)
     expect(generated[0]?.refCount).toBe(1)
+    expect(
+      await getDb()
+        .browserLocks.filter((row) => row.name.startsWith('natter:coordination:'))
+        .count(),
+    ).toBe(0)
     await expectAttachmentReferenceInvariants(getDb())
   })
 

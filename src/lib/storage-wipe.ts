@@ -1,5 +1,6 @@
 // Local wipe helper: clears every browser-side store this app touches and
-// hard-reloads. Dev mode also attaches it to `window.__nuke` for console use.
+// hard-reloads. Production reaches it through the storage UI; development also
+// installs the console shortcut from `tools/browser-devtools.ts`.
 //
 // Wipes (this origin only):
 //   - IndexedDB databases
@@ -14,12 +15,12 @@
 
 import { closeDb } from '../store/db'
 
-interface NukeOptions {
-  /** Skip the reload at the end. Useful when chaining debug commands. */
+interface StorageWipeOptions {
+  /** Skip the reload when the caller is already recovering the workspace. */
   skipReload?: boolean
 }
 
-export async function nukeSiteStorage(opts: NukeOptions = {}): Promise<void> {
+export async function wipeSiteStorage(opts: StorageWipeOptions = {}): Promise<void> {
   const tasks: Array<Promise<unknown>> = []
 
   // IndexedDB — enumerate via the modern API, fall back to the known db name.
@@ -46,12 +47,12 @@ export async function nukeSiteStorage(opts: NukeOptions = {}): Promise<void> {
       try {
         localStorage.clear()
       } catch (err) {
-        console.warn('[nuke] localStorage clear failed', err)
+        console.warn('[storage-wipe] localStorage clear failed', err)
       }
       try {
         sessionStorage.clear()
       } catch (err) {
-        console.warn('[nuke] sessionStorage clear failed', err)
+        console.warn('[storage-wipe] sessionStorage clear failed', err)
       }
     }),
   )
@@ -74,7 +75,7 @@ export async function nukeSiteStorage(opts: NukeOptions = {}): Promise<void> {
           }
         }
       } catch (err) {
-        console.warn('[nuke] cookie clear failed', err)
+        console.warn('[storage-wipe] cookie clear failed', err)
       }
     }),
   )
@@ -87,7 +88,7 @@ export async function nukeSiteStorage(opts: NukeOptions = {}): Promise<void> {
         const keys = await caches.keys()
         await Promise.all(keys.map((k) => caches.delete(k)))
       } catch (err) {
-        console.warn('[nuke] CacheStorage wipe failed', err)
+        console.warn('[storage-wipe] CacheStorage wipe failed', err)
       }
     })(),
   )
@@ -100,7 +101,7 @@ export async function nukeSiteStorage(opts: NukeOptions = {}): Promise<void> {
         const regs = await navigator.serviceWorker.getRegistrations()
         await Promise.all(regs.map((r) => r.unregister()))
       } catch (err) {
-        console.warn('[nuke] service-worker unregister failed', err)
+        console.warn('[storage-wipe] service-worker unregister failed', err)
       }
     })(),
   )
@@ -125,18 +126,9 @@ function deleteIndexedDb(name: string): Promise<void> {
       reject(req.error ?? new Error(`IndexedDBDeleteFailed:${name}`))
     }
     req.onblocked = () => {
-      console.warn(`[nuke] IndexedDB delete blocked for ${name}; close other tabs for this origin.`)
+      console.warn(
+        `[storage-wipe] IndexedDB delete blocked for ${name}; close other tabs for this origin.`,
+      )
     }
   })
-}
-
-export function installDebugNuke(): void {
-  if (typeof window === 'undefined') return
-  ;(window as unknown as { __nuke: typeof nukeSiteStorage }).__nuke = nukeSiteStorage
-  // Friendly hint in the console — fires once on first load.
-
-  console.info(
-    '%c[debug] window.__nuke() — wipe IDB / storage / cookies / cache and reload.',
-    'color:#888;font-style:italic',
-  )
 }

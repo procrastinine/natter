@@ -1,6 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
-  __apiKeyRequestBuilderPendingForTests,
   buildHeaders,
   computeBackoffMs,
   fetchWithApiKeyFallback,
@@ -567,7 +566,7 @@ describe('fetchWithKeyFallback', () => {
     }
   })
 
-  it('releases the request builder at response headers before key metadata settles', async () => {
+  it('builds the request before selected-key metadata and settles after metadata completes', async () => {
     let releaseMetadata: (() => void) | undefined
     const metadataBlocked = new Promise<void>((resolve) => {
       releaseMetadata = resolve
@@ -576,8 +575,13 @@ describe('fetchWithKeyFallback', () => {
     const metadataStart = new Promise<void>((resolve) => {
       metadataStarted = resolve
     })
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response(200)))
+    const fetchMock = vi.fn().mockResolvedValue(response(200))
+    vi.stubGlobal('fetch', fetchMock)
     const body = JSON.stringify({ prompt: 'x'.repeat(100_000) })
+    const buildRequest = vi.fn((apiKey: string) => ({
+      url: 'https://x',
+      init: { method: 'POST', body, headers: { Authorization: `Bearer ${apiKey}` } },
+    }))
     const requested = fetchWithApiKeyFallback(
       {
         apiKey: 'key',
@@ -586,18 +590,21 @@ describe('fetchWithKeyFallback', () => {
           await metadataBlocked
         },
       },
-      (apiKey) => ({
-        url: 'https://x',
-        init: { method: 'POST', body, headers: { Authorization: `Bearer ${apiKey}` } },
-      }),
+      buildRequest,
     )
+    let settled = false
+    void requested.then(() => {
+      settled = true
+    })
 
-    expect(__apiKeyRequestBuilderPendingForTests(requested)).toBe(true)
     await metadataStart
-    expect(__apiKeyRequestBuilderPendingForTests(requested)).toBe(false)
+    expect(buildRequest).toHaveBeenCalledOnce()
+    expect(fetchMock).toHaveBeenCalledOnce()
+    expect(settled).toBe(false)
 
     releaseMetadata?.()
     await expect(requested).resolves.toMatchObject({ response: { status: 200 } })
+    expect(settled).toBe(true)
   })
 
   it('supports lazy async candidate resolution and resolves only attempted candidates', async () => {

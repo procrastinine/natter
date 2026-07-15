@@ -4,7 +4,10 @@
 // `process.env.RUN_LIVE === '1'`.
 
 import type { Message } from '../../src/core/types'
-import type * as MessageStorageModule from '../../src/store/message-storage'
+import {
+  previewTextFromStoredProjection,
+  splitMessageForStorage,
+} from '../../src/store/message-storage'
 import { expect, type Page } from './fixtures'
 
 export interface IndexedDbDump {
@@ -17,6 +20,7 @@ interface SeedOptions {
   apiKey?: string
   model?: string
   disablePrivacyFilter?: boolean
+  corsProxyUrl?: string
 }
 
 const DEFAULT_E2E_MODEL = 'google/gemini-3.1-flash-lite-preview:free'
@@ -41,6 +45,28 @@ export async function seedFirstRun(page: Page, opts: SeedOptions = {}): Promise<
   await page.locator('[data-ui="connection-empty-action"]').waitFor({
     state: 'detached',
   })
+  if (opts.corsProxyUrl !== undefined) {
+    await page.evaluate(async (corsProxyUrl) => {
+      const db = await new Promise<IDBDatabase>((resolve, reject) => {
+        const req = indexedDB.open('natter')
+        req.onsuccess = () => resolve(req.result)
+        req.onerror = () => reject(req.error)
+      })
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const tx = db.transaction('settings', 'readwrite')
+          tx.objectStore('settings').put({ key: 'global:cors-proxy-url', value: corsProxyUrl })
+          tx.oncomplete = () => resolve()
+          tx.onerror = () => reject(tx.error)
+          tx.onabort = () => reject(tx.error)
+        })
+      } finally {
+        db.close()
+      }
+    }, opts.corsProxyUrl)
+    await page.reload()
+    await page.locator('[data-role="new-chat"]').waitFor({ state: 'visible' })
+  }
   if (opts.disablePrivacyFilter === false) return
   await page.evaluate(
     async ({ model }) => {
@@ -231,116 +257,198 @@ export async function seedLinearChat(
     assistantContentType?: 'text' | 'output_text'
   },
 ): Promise<string> {
-  const chatId = await page.evaluate(async (seed) => {
-    const storagePath = '/src/store/message-storage.ts'
-    const { splitMessageForStorage } = (await import(
-      /* @vite-ignore */ storagePath
-    )) as typeof MessageStorageModule
-    const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const req = indexedDB.open('natter')
-      req.onsuccess = () => resolve(req.result)
-      req.onerror = () => reject(req.error)
-    })
-    const now = Date.now()
-    const chatId = seed.chatId ?? 'linear-window-chat'
-    const title = seed.title ?? 'Linear window chat'
-    const textPrefix = seed.textPrefix ?? 'window message'
-    const assistantContentType = seed.assistantContentType ?? 'text'
-    try {
-      await new Promise<void>((resolve, reject) => {
-        const tx = db.transaction(
-          ['presets', 'settings', 'chats', 'messages', 'messageBodies'],
-          'readwrite',
-        )
-        const presets = tx.objectStore('presets')
-        const settingsStore = tx.objectStore('settings')
-        const chats = tx.objectStore('chats')
-        const messages = tx.objectStore('messages')
-        const messageBodies = tx.objectStore('messageBodies')
-        const presetsReq = presets.getAll()
-        presetsReq.onsuccess = () => {
-          const preset = (presetsReq.result as Array<{ id?: string; settings?: unknown }>)[0]
-          const chatSettings = structuredClone(preset?.settings ?? {})
-          for (const [key, value] of Object.entries(seed.settings ?? {})) {
-            settingsStore.put({ key, value })
-          }
-          const lastMessageId = `msg-${String(seed.messageCount - 1).padStart(3, '0')}`
-          chats.put({
-            id: chatId,
-            title,
-            titleStatus: 'manual',
-            createdAt: now,
-            updatedAt: now + seed.messageCount,
-            lastViewedAt: now + seed.messageCount,
-            wordCount: seed.messageCount * 2,
-            totalCostUsd: 0,
-            metaVersion: 0,
-            summaryVersion: 0,
-            settings: chatSettings,
-            presetId: preset?.id,
-            lastUpdatedLeafId: lastMessageId,
-            lastBranchUpdatedAt: now + seed.messageCount,
-            archived: false,
-            pinned: false,
-            folderId: null,
-            tags: [],
-            previewText: `${textPrefix} 0`,
-          })
-          let parentId: string | null = null
-          for (let i = 0; i < seed.messageCount; i += 1) {
-            const id = `msg-${String(i).padStart(3, '0')}`
-            const role = i % 2 === 0 ? 'user' : 'assistant'
-            const createdAt = now + i
-            const message: Message = {
-              id,
-              chatId,
-              parentId,
-              siblingIndex: 0,
-              turnId: `turn-${String(i).padStart(3, '0')}`,
-              turnIndex: i,
-              createdAt,
-              role,
-              origin: role === 'user' ? 'user' : 'generated',
-              nodeVersion: 0,
-              deleted: false,
-              content: [
-                {
-                  type: role === 'assistant' ? assistantContentType : 'text',
-                  text: `${textPrefix} ${i}`,
-                },
-              ],
-            }
-            const { header, body } = splitMessageForStorage(message)
-            messages.put(header)
-            messageBodies.put(body)
-            parentId = id
-          }
-        }
-        tx.oncomplete = () => resolve()
-        tx.onerror = () => reject(tx.error)
-        tx.onabort = () => reject(tx.error)
-      })
-    } finally {
-      db.close()
+  if (!Number.isSafeInteger(input.messageCount) || input.messageCount < 1) {
+    throw new Error('seedLinearChat requires a positive integer messageCount')
+  }
+  const now = Date.now()
+  const chatId = input.chatId ?? 'linear-window-chat'
+  const title = input.title ?? 'Linear window chat'
+  const textPrefix = input.textPrefix ?? 'window message'
+  const assistantContentType = input.assistantContentType ?? 'text'
+  let parentId: string | null = null
+  const storedMessages = Array.from({ length: input.messageCount }, (_, index) => {
+    const id = `msg-${String(index).padStart(3, '0')}`
+    const role = index % 2 === 0 ? 'user' : 'assistant'
+    const message: Message = {
+      id,
+      chatId,
+      parentId,
+      siblingIndex: 0,
+      turnId: `turn-${String(index).padStart(3, '0')}`,
+      turnIndex: index,
+      createdAt: now + index,
+      role,
+      origin: role === 'user' ? 'user' : 'generated',
+      nodeVersion: 0,
+      deleted: false,
+      content: [
+        {
+          type: role === 'assistant' ? assistantContentType : 'text',
+          text: `${textPrefix} ${index}`,
+        },
+      ],
     }
-    return chatId
-  }, input)
+    parentId = id
+    return splitMessageForStorage(message)
+  })
+  const chatWordCount = storedMessages.reduce(
+    (total, stored) => total + stored.header.bodyWordCount,
+    0,
+  )
+  const firstHeader = storedMessages[0]?.header
+  if (!firstHeader) throw new Error('seedLinearChat did not construct a first message')
+  const lastMessageId = storedMessages.at(-1)?.header.id
+  if (!lastMessageId) throw new Error('seedLinearChat did not construct a last message')
+
+  await page.evaluate(
+    async (seed) => {
+      const db = await new Promise<IDBDatabase>((resolve, reject) => {
+        const req = indexedDB.open('natter')
+        req.onsuccess = () => resolve(req.result)
+        req.onerror = () => reject(req.error)
+      })
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const tx = db.transaction(
+            ['presets', 'settings', 'chats', 'messages', 'messageBodies'],
+            'readwrite',
+          )
+          const presets = tx.objectStore('presets')
+          const settingsStore = tx.objectStore('settings')
+          const chats = tx.objectStore('chats')
+          const messages = tx.objectStore('messages')
+          const messageBodies = tx.objectStore('messageBodies')
+          const presetsReq = presets.getAll()
+          presetsReq.onsuccess = () => {
+            const preset = (presetsReq.result as Array<{ id?: string; settings?: unknown }>)[0]
+            const chatSettings = structuredClone(preset?.settings ?? {})
+            for (const [key, value] of Object.entries(seed.settings)) {
+              settingsStore.put({ key, value })
+            }
+            chats.put({
+              id: seed.chatId,
+              title: seed.title,
+              titleStatus: 'manual',
+              createdAt: seed.now,
+              updatedAt: seed.now + seed.storedMessages.length,
+              lastViewedAt: seed.now + seed.storedMessages.length,
+              wordCount: seed.chatWordCount,
+              totalCostUsd: 0,
+              metaVersion: 0,
+              summaryVersion: 0,
+              settings: chatSettings,
+              presetId: preset?.id,
+              lastUpdatedLeafId: seed.lastMessageId,
+              lastBranchUpdatedAt: seed.now + seed.storedMessages.length,
+              archived: false,
+              pinned: false,
+              folderId: null,
+              tags: [],
+              previewText: seed.previewText,
+            })
+            for (const stored of seed.storedMessages) {
+              messages.put(stored.header)
+              messageBodies.put(stored.body)
+            }
+          }
+          tx.oncomplete = () => resolve()
+          tx.onerror = () => reject(tx.error)
+          tx.onabort = () => reject(tx.error)
+        })
+      } finally {
+        db.close()
+      }
+    },
+    {
+      chatId,
+      chatWordCount,
+      lastMessageId,
+      now,
+      previewText: previewTextFromStoredProjection(firstHeader.textPreview),
+      settings: input.settings ?? {},
+      storedMessages,
+      title,
+    },
+  )
   await rebuildSidebarProjection(page)
   return chatId
 }
 
 export async function rebuildSidebarProjection(page: Page): Promise<void> {
   await page.evaluate(async () => {
-    const projectionPath = '/src/store/chat-sidebar-projection.ts'
-    const dbPath = '/src/store/db.ts'
-    const [projectionModule, dbModule] = (await Promise.all([
-      import(/* @vite-ignore */ projectionPath),
-      import(/* @vite-ignore */ dbPath),
-    ])) as unknown as [
-      { rebuildChatSidebarProjection(database: unknown): Promise<void> },
-      { getDb(): unknown },
-    ]
-    await projectionModule.rebuildChatSidebarProjection(dbModule.getDb())
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open('natter')
+      request.onsuccess = () => resolve(request.result)
+      request.onerror = () => reject(request.error)
+    })
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const transaction = db.transaction(['chats', 'chatSidebarRows', 'settings'], 'readwrite')
+        const rows = transaction.objectStore('chatSidebarRows')
+        const settings = transaction.objectStore('settings')
+        rows.clear()
+        const chatsRequest = transaction.objectStore('chats').getAll()
+        chatsRequest.onsuccess = () => {
+          const chats = chatsRequest.result as Array<Record<string, unknown>>
+          for (const chat of chats) {
+            const row: Record<string, unknown> = {
+              id: chat.id,
+              title: chat.title,
+              titleStatus: chat.titleStatus,
+              createdAt: chat.createdAt,
+              updatedAt: chat.updatedAt,
+              lastViewedAt: chat.lastViewedAt,
+              wordCount: chat.wordCount,
+              totalCostUsd: chat.totalCostUsd,
+              lastUpdatedLeafId: chat.lastUpdatedLeafId,
+              lastBranchUpdatedAt: chat.lastBranchUpdatedAt,
+              archived: chat.archived,
+              pinned: chat.pinned,
+              folderId: chat.folderId,
+              tags: structuredClone(chat.tags),
+              ...(chat.previewText === undefined ? {} : { previewText: chat.previewText }),
+            }
+            const serialized = JSON.stringify([
+              row.id,
+              row.title,
+              row.titleStatus,
+              row.createdAt,
+              row.updatedAt,
+              row.lastViewedAt,
+              row.wordCount,
+              row.totalCostUsd,
+              row.lastUpdatedLeafId,
+              row.lastBranchUpdatedAt,
+              row.archived,
+              row.pinned,
+              row.folderId,
+              row.tags,
+              row.previewText ?? null,
+            ])
+            let hash = 0x811c9dc5
+            for (let index = 0; index < serialized.length; index += 1) {
+              hash ^= serialized.charCodeAt(index)
+              hash = Math.imul(hash, 0x01000193)
+            }
+            rows.put({
+              ...row,
+              projectionVersion: 1,
+              checksum: (hash >>> 0).toString(16).padStart(8, '0'),
+            })
+          }
+          settings.put({ key: 'backfill:chat-sidebar-projection-v1', value: 1 })
+          settings.put({
+            key: 'projection:chat-sidebar-v1',
+            value: { projectionVersion: 1, expectedCount: chats.length },
+          })
+        }
+        transaction.oncomplete = () => resolve()
+        transaction.onerror = () => reject(transaction.error)
+        transaction.onabort = () => reject(transaction.error)
+      })
+    } finally {
+      db.close()
+    }
   })
 }
 
@@ -400,7 +508,6 @@ interface TranscriptContinuityState {
   listReplaced: boolean
   loadingSeen: boolean
   messageCounts: number[]
-  recyclingSeen: boolean
 }
 
 interface TranscriptContinuityWindow extends Window {
@@ -414,7 +521,6 @@ export interface TranscriptContinuityResult {
   listReplaced: boolean
   loadingSeen: boolean
   messageCountsIncludeZero: boolean
-  recyclingSeen: boolean
 }
 
 export async function startMessageCountRecorder(page: Page): Promise<void> {
@@ -434,7 +540,6 @@ export async function startMessageCountRecorder(page: Page): Promise<void> {
       listReplaced: false,
       loadingSeen: false,
       messageCounts: [],
-      recyclingSeen: false,
     }
     const sample = () => {
       const currentList = state.content.querySelector('[data-ui="message-list"]')
@@ -443,8 +548,6 @@ export async function startMessageCountRecorder(page: Page): Promise<void> {
       state.listReplaced ||= currentList !== state.list
       state.anchorRemoved ||= !state.anchor.isConnected
       state.loadingSeen ||= state.content.querySelector('[data-ui="surface-loading"]') !== null
-      state.recyclingSeen ||=
-        state.content.querySelector('[data-ui="message-list-recycling"]') !== null
     }
     const observer = new MutationObserver(sample)
     observer.observe(content, { childList: true, subtree: true })
@@ -465,8 +568,6 @@ export async function stopMessageCountRecorder(page: Page): Promise<TranscriptCo
     state.listReplaced ||= currentList !== state.list
     state.anchorRemoved ||= !state.anchor.isConnected
     state.loadingSeen ||= state.content.querySelector('[data-ui="surface-loading"]') !== null
-    state.recyclingSeen ||=
-      state.content.querySelector('[data-ui="message-list-recycling"]') !== null
     win.__stopMessageCountSamples?.()
     delete win.__messageCountSamples
     delete win.__stopMessageCountSamples
@@ -476,7 +577,6 @@ export async function stopMessageCountRecorder(page: Page): Promise<TranscriptCo
       listReplaced: state.listReplaced,
       loadingSeen: state.loadingSeen,
       messageCountsIncludeZero: state.messageCounts.includes(0),
-      recyclingSeen: state.recyclingSeen,
     }
   })
 }

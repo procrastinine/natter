@@ -1,6 +1,20 @@
 import { existsSync, readFileSync } from 'node:fs'
+import {
+  createFakeStreamScenario,
+  type FakeProviderProfileTarget,
+  type FakeStreamScenario,
+  retargetOnlyProfileToFakeProvider,
+} from './fake-stream-provider'
 import { expect, type Page, test } from './fixtures'
-import { clearIndexedDb, readMessages } from './helpers'
+import {
+  clearIndexedDb,
+  createChatAndOpen,
+  firstChatId,
+  readMessages,
+  seedFirstRun,
+  sendMessage,
+  waitForAssistantGenerationFinished,
+} from './helpers'
 
 const PROBE_DIR = new URL(
   '../../../plan/direct-provider-server-tools-probes/latest/',
@@ -190,6 +204,8 @@ const COMPACT_PROBE_BODIES: Record<string, Record<string, unknown>> = {
   },
 }
 
+const scenarios = new Set<FakeStreamScenario>()
+
 test.beforeEach(async ({ page }) => {
   await clearIndexedDb(page)
   await page.evaluate(() => {
@@ -199,7 +215,12 @@ test.beforeEach(async ({ page }) => {
   await page.reload()
 })
 
-test('debug fake stream replays OpenAI Responses hosted-tool fixtures through the UI', async ({
+test.afterEach(async () => {
+  await Promise.all([...scenarios].map((scenario) => scenario.dispose()))
+  scenarios.clear()
+})
+
+test('OpenAI Responses hosted-tool fixtures cross the provider boundary into the UI', async ({
   page,
 }) => {
   await replayProviderFixture(page, {
@@ -225,7 +246,7 @@ test('debug fake stream replays OpenAI Responses hosted-tool fixtures through th
   })
 })
 
-test('debug fake stream replays Google native tool fixtures through the UI', async ({ page }) => {
+test('Google native tool fixtures cross the provider boundary into the UI', async ({ page }) => {
   await replayProviderFixture(page, {
     id: 'google-code-execution',
     expectedText: '55',
@@ -235,7 +256,7 @@ test('debug fake stream replays Google native tool fixtures through the UI', asy
   })
 })
 
-test('debug fake stream replays Anthropic Messages hosted-tool fixtures through the UI', async ({
+test('Anthropic Messages hosted-tool fixtures cross the provider boundary into the UI', async ({
   page,
 }) => {
   await replayProviderFixture(page, {
@@ -379,10 +400,10 @@ async function replayProviderFixture(
   const info = assistant.locator('[data-ui="message-info"]')
   await expect(info).toContainText('Tool calls')
   for (const label of input.expectedInfoLabels) await expect(info).toContainText(label)
-  for (const details of await info.locator('[data-ui="tool-call"]').all())
-    await details.evaluate((node) => {
-      ;(node as HTMLDetailsElement).open = true
-    })
+  for (const details of await info.locator('[data-ui="tool-call"]').all()) {
+    await details.locator('summary').click()
+    await expect(details.locator('pre')).toBeVisible()
+  }
   await expect(info).toContainText(input.expectedPayloadText)
 
   const rows = await readMessages(page, result.chatId)
@@ -398,32 +419,67 @@ async function startProviderFixture(
   id: string,
   body = loadProbeBody(id),
 ): Promise<{ chatId: string }> {
-  return page.evaluate(
-    async ({ body, id }) => {
-      const api = (
-        window as unknown as {
-          __debugFakeStream?: {
-            start(options: {
-              targetChars: number
-              reasoningChars: number
-              prompt: string
-              providerFixtureChunks: unknown[]
-            }): Promise<{ chatId: string }>
-          }
-        }
-      ).__debugFakeStream
-      if (!api) throw new Error('__debugFakeStream is not installed')
-      return api.start({
-        targetChars: 0,
-        reasoningChars: 0,
-        prompt: `Replay ${id} fixture.`,
-        providerFixtureChunks: [
-          { type: 'buffered_result', result: body, generationId: body.id ?? body.responseId ?? id },
-        ],
-      })
-    },
-    { body, id },
-  )
+  const transport = fixtureTransport(id)
+  const scenario = await createFakeStreamScenario({
+    responses: [{ method: 'POST', path: transport.path, json: body }],
+  })
+  scenarios.add(scenario)
+  await clearIndexedDb(page)
+  await seedFirstRun(page, { model: transport.profile.model })
+  await retargetOnlyProfileToFakeProvider(page, scenario.providerBaseUrl, transport.profile)
+  await scenario.snapshot()
+  await createChatAndOpen(page)
+  await sendMessage(page, `Replay ${id} fixture.`)
+  await expect(page.locator('[data-ui="chat-row"]')).toHaveCount(1)
+  const chatId = await firstChatId(page)
+  expect(chatId).not.toBe('')
+  await waitForAssistantGenerationFinished(page, chatId)
+  await expect(page.locator('[data-ui="abort"]')).toHaveCount(0)
+  await expect.poll(async () => (await scenario.snapshot()).activeStreams).toBe(0)
+  const snapshot = await scenario.snapshot()
+  expect(
+    snapshot.requests.filter(
+      (request) => request.method === 'POST' && request.path === transport.path,
+    ),
+  ).toHaveLength(1)
+  return { chatId }
+}
+
+function fixtureTransport(id: string): {
+  path: string
+  profile: Required<Pick<FakeProviderProfileTarget, 'kind' | 'api' | 'model'>>
+} {
+  if (id.startsWith('openai-')) {
+    return {
+      path: '/responses',
+      profile: {
+        kind: 'openai-compatible',
+        api: 'responses',
+        model: 'openai/gpt-5.4',
+      },
+    }
+  }
+  if (id.startsWith('google-')) {
+    return {
+      path: '/models/gemini-3.1-flash-lite-preview:streamGenerateContent',
+      profile: {
+        kind: 'google',
+        api: 'gemini-native',
+        model: 'google/gemini-3.1-flash-lite-preview',
+      },
+    }
+  }
+  if (id.startsWith('anthropic-')) {
+    return {
+      path: '/messages',
+      profile: {
+        kind: 'anthropic',
+        api: 'anthropic-messages',
+        model: 'anthropic/claude-sonnet-4.6',
+      },
+    }
+  }
+  throw new Error(`unknown provider fixture transport: ${id}`)
 }
 
 function escapeRegExp(value: string): string {

@@ -24,7 +24,7 @@ function ChatMessage(
 }
 
 const generatedImageMocks = vi.hoisted(() => ({
-  migrate: vi.fn(async () => {}),
+  schedule: vi.fn(() => true),
   normalize: vi.fn(async () => {}),
 }))
 
@@ -32,7 +32,7 @@ vi.mock('../../src/store/generated-images', async (importOriginal) => {
   const original = await importOriginal<typeof GeneratedImagesModule>()
   return {
     ...original,
-    migrateGeneratedOutputAttachments: generatedImageMocks.migrate,
+    scheduleGeneratedOutputMigration: generatedImageMocks.schedule,
     normalizeGeneratedImageOutputAttachmentRefs: generatedImageMocks.normalize,
   }
 })
@@ -41,7 +41,7 @@ afterEach(() => {
   __resetMessageStreamProjectionForTests()
   useStreamStore.getState().reset()
   useToastStore.getState().reset()
-  generatedImageMocks.migrate.mockClear()
+  generatedImageMocks.schedule.mockClear()
   generatedImageMocks.normalize.mockClear()
 })
 
@@ -454,7 +454,7 @@ describe('Message presentation-only snapshots', () => {
     )
 
     await Promise.resolve()
-    expect(generatedImageMocks.migrate).not.toHaveBeenCalled()
+    expect(generatedImageMocks.schedule).not.toHaveBeenCalled()
     expect(generatedImageMocks.normalize).not.toHaveBeenCalled()
   })
 

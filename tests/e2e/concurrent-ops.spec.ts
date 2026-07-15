@@ -1,3 +1,4 @@
+import type { Route } from '@playwright/test'
 import { expect, type Page, test } from './fixtures'
 import {
   buildSseBody,
@@ -134,79 +135,66 @@ test('a send that leaves before its first receipt finishes exactly when returnin
     .poll(() => page.evaluate(() => window.location.hash))
     .toContain(`#/chat/${firstChat}/message/`)
 
-  await page.evaluate(async () => {
-    const dbPath = '/src/store/db.ts'
-    const { getDb } = (await import(/* @vite-ignore */ dbPath)) as unknown as {
-      getDb(): {
-        keys: {
-          get(key: string): Promise<unknown>
-        }
-      }
-    }
-    const table = getDb().keys
-    const originalGet = table.get.bind(table)
-    let release: () => void = () => undefined
-    const gate = {
-      entered: false,
-      released: false,
-      release: () => release(),
-    }
-    const blocked = new Promise<void>((resolve) => {
-      release = () => {
-        gate.released = true
-        resolve()
-      }
-    })
-    let used = false
-    table.get = async (key) => {
-      if (!used) {
-        used = true
-        gate.entered = true
-        await blocked
-      }
-      return originalGet(key)
-    }
-    ;(
-      window as typeof window & {
-        __backgroundReceiptKeyGate?: typeof gate
-      }
-    ).__backgroundReceiptKeyGate = gate
-  })
-
   await page.locator('[data-ui="composer-input"]').fill('finish while another chat is active')
-  await page.locator('[data-ui="send"]').click()
-  await expect
-    .poll(() =>
-      page.evaluate(
-        () =>
-          (
-            window as typeof window & {
-              __backgroundReceiptKeyGate?: { entered: boolean }
-            }
-          ).__backgroundReceiptKeyGate?.entered ?? false,
-      ),
+  await page.evaluate((chatId) => {
+    const send = document.querySelector<HTMLButtonElement>('[data-ui="send"]')
+    const destination = document.querySelector<HTMLAnchorElement>(
+      `[data-ui="chat-row-link"][href="#/chat/${chatId}"]`,
     )
-    .toBe(true)
-  expect(await readMessages(page, firstChat)).toHaveLength(2)
-
-  await sidebarLink(secondChat).click()
+    if (!send || !destination) throw new Error('send or destination control missing')
+    // Both events run in one host task, so the send registers its producer but
+    // cannot resume past its first await before the destination click navigates.
+    send.click()
+    destination.click()
+  }, secondChat)
   await expect
     .poll(() => page.evaluate(() => window.location.hash))
     .toContain(`#/chat/${secondChat}/message/`)
-  await page.evaluate(() => {
-    ;(
-      window as typeof window & {
-        __backgroundReceiptKeyGate?: { release(): void }
-      }
-    ).__backgroundReceiptKeyGate?.release()
-  })
   await backgroundRequestSeen
   await expect
     .poll(() => page.evaluate(() => window.location.hash))
     .toContain(`#/chat/${secondChat}/message/`)
 
-  releaseBackgroundResponse()
   let backgroundAssistantId = ''
+  try {
+    await expect
+      .poll(async () => {
+        const rows = await readMessages(page, firstChat)
+        const backgroundUser = rows.find(
+          (row) =>
+            row.role === 'user' &&
+            Array.isArray(row.content) &&
+            row.content.some(
+              (item) =>
+                typeof item === 'object' &&
+                item !== null &&
+                (item as { text?: unknown }).text === 'finish while another chat is active',
+            ),
+        )
+        const assistant = rows.find(
+          (row) => row.role === 'assistant' && row.parentId === backgroundUser?.id,
+        )
+        backgroundAssistantId = typeof assistant?.id === 'string' ? assistant.id : ''
+        return {
+          rowCount: rows.length,
+          assistantId: backgroundAssistantId,
+          assistantContent: assistant?.content,
+          generationStatus:
+            assistant?.generation && typeof assistant.generation === 'object'
+              ? (assistant.generation as { status?: unknown }).status
+              : undefined,
+        }
+      })
+      .toEqual({
+        rowCount: 4,
+        assistantId: expect.any(String),
+        assistantContent: [{ type: 'output_text', text: '' }],
+        generationStatus: 'streaming',
+      })
+    expect(backgroundAssistantId).not.toBe('')
+  } finally {
+    releaseBackgroundResponse()
+  }
   await expect
     .poll(async () => {
       const rows = await readMessages(page, firstChat)
@@ -221,36 +209,113 @@ test('a send that leaves before its first receipt finishes exactly when returnin
               (item as { text?: unknown }).text === 'background answer survived',
           ),
       )
-      backgroundAssistantId = typeof assistant?.id === 'string' ? assistant.id : ''
-      return backgroundAssistantId
-    })
-    .not.toBe('')
-
-  await page.evaluate(async (chatId) => {
-    const repositoryPath = '/src/store/workspace-repository.ts'
-    const { getWorkspaceRepository } = (await import(
-      /* @vite-ignore */ repositoryPath
-    )) as unknown as {
-      getWorkspaceRepository(): {
-        listMessageHeaders(id: string, options?: unknown): Promise<unknown>
-        getKnownBranchPageSnapshot(
-          id: string,
-          pathMessageIds: readonly string[],
-          page: unknown,
-        ): Promise<unknown>
+      const generation =
+        assistant?.generation && typeof assistant.generation === 'object'
+          ? (assistant.generation as { finishedAt?: unknown; status?: unknown })
+          : undefined
+      return {
+        assistantId: typeof assistant?.id === 'string' ? assistant.id : '',
+        finished: typeof generation?.finishedAt === 'number',
+        status: generation?.status,
       }
-    }
-    const repository = getWorkspaceRepository()
-    const listMessageHeaders = repository.listMessageHeaders.bind(repository)
-    const getKnownBranchPageSnapshot = repository.getKnownBranchPageSnapshot.bind(repository)
-    const never = new Promise<never>(() => undefined)
-    repository.listMessageHeaders = (id, options) =>
-      id === chatId ? never : listMessageHeaders(id, options)
-    repository.getKnownBranchPageSnapshot = (id, pathMessageIds, options) =>
-      id === chatId ? never : getKnownBranchPageSnapshot(id, pathMessageIds, options)
-  }, firstChat)
+    })
+    .toEqual({ assistantId: backgroundAssistantId, finished: true, status: 'done' })
+  await expect
+    .poll(() => page.evaluate(() => window.location.hash))
+    .toContain(`#/chat/${secondChat}/message/`)
 
-  await sidebarLink(firstChat).click()
+  const continuity = await page.evaluate(
+    async ({ chatId, assistantId, expectedText }) => {
+      const main = document.querySelector<HTMLElement>('[data-ui="main-pane"]')
+      const destination = document.querySelector<HTMLAnchorElement>(
+        `[data-ui="chat-row-link"][href="#/chat/${chatId}"]`,
+      )
+      if (!main || !destination) throw new Error('main pane or destination control missing')
+      const priorMessageIds = new Set(
+        Array.from(main.querySelectorAll<HTMLElement>('[data-ui="message"][data-message-id]'))
+          .map((message) => message.dataset.messageId)
+          .filter((id): id is string => Boolean(id)),
+      )
+      const result = {
+        blankSeen: false,
+        loadingSeen: false,
+        earlierBranchTailSeen: false,
+        targetBodyMismatchSeen: false,
+        targetDisappearedAfterSeen: false,
+      }
+      let targetSeen = false
+      let stopped = false
+      const targetHash = `#/chat/${chatId}/message/${assistantId}`
+      const sample = () => {
+        if (!window.location.hash.startsWith(`#/chat/${chatId}`)) return
+        const list = main.querySelector<HTMLElement>('[data-ui="message-list"]')
+        const messages = Array.from(
+          list?.querySelectorAll<HTMLElement>('[data-ui="message"][data-message-id]') ?? [],
+        )
+        result.blankSeen ||= !list || messages.length === 0
+        result.loadingSeen ||= main.querySelector('[data-ui="surface-loading"]') !== null
+        const target = messages.find((message) => message.dataset.messageId === assistantId)
+        if (target) {
+          targetSeen = true
+          result.targetBodyMismatchSeen ||=
+            target.querySelector('[data-ui="message-body"]')?.textContent !== expectedText
+        } else if (targetSeen) {
+          result.targetDisappearedAfterSeen = true
+        }
+        const assistantTail = messages
+          .filter((message) => message.dataset.role === 'assistant')
+          .at(-1)?.dataset.messageId
+        if (assistantTail && assistantTail !== assistantId && !priorMessageIds.has(assistantTail)) {
+          result.earlierBranchTailSeen = true
+        }
+      }
+      const observer = new MutationObserver(sample)
+      observer.observe(main, { childList: true, subtree: true, characterData: true })
+      const sampleFrame = () => {
+        sample()
+        if (!stopped) requestAnimationFrame(sampleFrame)
+      }
+      requestAnimationFrame(sampleFrame)
+      destination.click()
+      try {
+        const deadline = performance.now() + 5_000
+        let rendered = false
+        while (performance.now() < deadline) {
+          sample()
+          const targetBody = main.querySelector<HTMLElement>(
+            `[data-ui="message"][data-message-id="${assistantId}"] [data-ui="message-body"]`,
+          )
+          if (window.location.hash === targetHash && targetBody?.textContent === expectedText) {
+            rendered = true
+            break
+          }
+          await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+        }
+        if (!rendered) throw new Error('exact background receipt did not render')
+        await new Promise<void>((resolve) =>
+          requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+        )
+        sample()
+        return result
+      } finally {
+        stopped = true
+        observer.disconnect()
+      }
+    },
+    {
+      chatId: firstChat,
+      assistantId: backgroundAssistantId,
+      expectedText: 'background answer survived',
+    },
+  )
+
+  expect(continuity).toEqual({
+    blankSeen: false,
+    loadingSeen: false,
+    earlierBranchTailSeen: false,
+    targetBodyMismatchSeen: false,
+    targetDisappearedAfterSeen: false,
+  })
   await expect(
     page.locator(
       `[data-ui="message"][data-message-id="${backgroundAssistantId}"] [data-ui="message-body"]`,
@@ -262,110 +327,209 @@ test('a send that leaves before its first receipt finishes exactly when returnin
   await expect(page.locator('[data-ui="surface-loading"]')).toHaveCount(0)
 })
 
-test('two tabs cannot turn simultaneous composer sends into an implicit branch', async ({
-  page,
-}) => {
-  await page.goto('/?debug')
-  const initial = await startDebugStream(page, {
-    openChat: false,
-    prompt: 'baseline',
-    targetChars: 8,
-    reasoningChars: 0,
-    chunkChars: 8,
+test.describe('same-leaf composer admission', () => {
+  test.use({
+    runtimeDiagnosticAllowances: [
+      {
+        category: 'console-other',
+        message: '^(?:send: pipeline threw|composer submit failed)',
+        detail: '\\bExpectedLeafChangedError: ExpectedLeafChanged:',
+      },
+    ],
   })
-  const second = await page.context().newPage()
-  await second.goto(`/?debug#/chat/${initial.chatId}`)
 
-  const start = (target: typeof page, prompt: string) =>
-    startDebugStream(target, {
-      chatId: initial.chatId,
-      expectedLeafId: initial.assistantMessageId,
-      openChat: false,
-      prompt,
-      targetChars: 256,
-      reasoningChars: 0,
-      chunkChars: 8,
-      delayMs: 50,
+  test('two tabs cannot turn simultaneous composer sends into an implicit branch', async ({
+    page,
+  }) => {
+    const completionRoute = '**/api/v1/chat/completions'
+    await mockChatCompletions(page, {
+      body: buildSseBody([
+        { id: 'simultaneous-baseline', content: 'baseline answer' },
+        { finish: 'stop' },
+      ]),
     })
-  const settled = await Promise.allSettled([
-    start(page, 'same-chat A'),
-    start(second, 'same-chat B'),
-  ])
+    await createChatAndOpen(page)
+    await sendMessage(page, 'baseline')
+    const baseline = page.locator('[data-ui="message"][data-role="assistant"]').last()
+    await expect(baseline.locator('[data-ui="message-body"]')).toHaveText('baseline answer')
+    const chatId = await firstChatId(page)
+    const baselineId = await baseline.getAttribute('data-message-id')
+    if (!baselineId) throw new Error('baseline assistant has no id')
+    await page.unroute(completionRoute)
 
-  expect(settled.filter((result) => result.status === 'fulfilled')).toHaveLength(1)
-  const rejected = settled.filter(
-    (result): result is PromiseRejectedResult => result.status === 'rejected',
-  )
-  expect(rejected).toHaveLength(1)
-  expect(String(rejected[0]?.reason)).toContain('ExpectedLeafChanged')
+    const second = await page.context().newPage()
+    let releaseResponse!: () => void
+    const responseGate = new Promise<void>((resolve) => {
+      releaseResponse = resolve
+    })
+    let requestCount = 0
+    const routeCompletion = async (route: Route) => {
+      requestCount += 1
+      await responseGate
+      await route.fulfill({
+        status: 200,
+        contentType: 'text/event-stream',
+        body: buildSseBody([
+          { id: 'simultaneous-winner', content: 'accepted answer' },
+          { finish: 'stop' },
+        ]),
+      })
+    }
+    try {
+      await second.goto(`/#/chat/${chatId}/message/${baselineId}`)
+      await expect(
+        second.locator(`[data-ui="message"][data-message-id="${baselineId}"]`),
+      ).toBeVisible()
+      await page.route(completionRoute, routeCompletion)
+      await second.route(completionRoute, routeCompletion)
+      await page.locator('[data-ui="composer-input"]').fill('same-chat A')
+      await second.locator('[data-ui="composer-input"]').fill('same-chat B')
+      const admissionLockName = `message:${baselineId}`
+      await page.evaluate(
+        (lockName) =>
+          new Promise<void>((ready) => {
+            void navigator.locks.request(
+              lockName,
+              () =>
+                new Promise<void>((release) => {
+                  ;(
+                    window as typeof window & {
+                      __releaseE2EAdmissionGate?: () => void
+                    }
+                  ).__releaseE2EAdmissionGate = release
+                  ready()
+                }),
+            )
+          }),
+        admissionLockName,
+      )
 
-  const rows = (await readMessages(page, initial.chatId)).filter((row) => row.deleted !== true)
-  expect(rows).toHaveLength(4)
-  const roots = rows.filter((row) => row.parentId === null)
-  expect(roots).toHaveLength(1)
-  const childrenByParent = new Map<string, Array<Record<string, unknown>>>()
-  for (const row of rows) {
-    if (typeof row.parentId !== 'string') continue
-    const bucket = childrenByParent.get(row.parentId) ?? []
-    bucket.push(row)
-    childrenByParent.set(row.parentId, bucket)
-  }
-  expect([...childrenByParent.values()].every((children) => children.length === 1)).toBe(true)
+      await Promise.all([
+        page.locator('[data-ui="send"]').click(),
+        second.locator('[data-ui="send"]').click(),
+      ])
+      await expect
+        .poll(() =>
+          page
+            .evaluate(async () => {
+              const snapshot = await navigator.locks.query()
+              return snapshot.pending?.map((entry) => entry.name) ?? []
+            })
+            .then((names) => names.filter((name) => name === admissionLockName).length),
+        )
+        .toBe(2)
+      await page.evaluate(() => {
+        ;(
+          window as typeof window & {
+            __releaseE2EAdmissionGate?: () => void
+          }
+        ).__releaseE2EAdmissionGate?.()
+      })
+      await expect.poll(() => requestCount).toBe(1)
+      await expect
+        .poll(async () => {
+          const values = [
+            await page.locator('[data-ui="composer-input"]').inputValue(),
+            await second.locator('[data-ui="composer-input"]').inputValue(),
+          ]
+          return values.filter((value) => value === 'same-chat A' || value === 'same-chat B').length
+        })
+        .toBe(1)
 
-  const roles: unknown[] = []
-  let current = roots[0]
-  while (current) {
-    roles.push(current.role)
-    current = childrenByParent.get(String(current.id))?.[0]
-  }
-  expect(roles).toEqual(['user', 'assistant', 'user', 'assistant'])
-  await second.close()
+      releaseResponse()
+      const winningPage =
+        (await page.locator('[data-ui="composer-input"]').inputValue()) === '' ? page : second
+      await expect(
+        winningPage
+          .locator('[data-ui="message"][data-role="assistant"] [data-ui="message-body"]')
+          .last(),
+      ).toContainText('accepted answer')
+
+      await expect
+        .poll(async () => (await readMessages(page, chatId)).filter((row) => row.deleted !== true))
+        .toHaveLength(4)
+      const rows = (await readMessages(page, chatId)).filter((row) => row.deleted !== true)
+      const roots = rows.filter((row) => row.parentId === null)
+      expect(roots).toHaveLength(1)
+      const childrenByParent = new Map<string, Array<Record<string, unknown>>>()
+      for (const row of rows) {
+        if (typeof row.parentId !== 'string') continue
+        const bucket = childrenByParent.get(row.parentId) ?? []
+        bucket.push(row)
+        childrenByParent.set(row.parentId, bucket)
+      }
+      expect([...childrenByParent.values()].every((children) => children.length === 1)).toBe(true)
+
+      const roles: unknown[] = []
+      let current = roots[0]
+      while (current) {
+        roles.push(current.role)
+        current = childrenByParent.get(String(current.id))?.[0]
+      }
+      expect(roles).toEqual(['user', 'assistant', 'user', 'assistant'])
+    } finally {
+      await page.evaluate(() => {
+        ;(
+          window as typeof window & {
+            __releaseE2EAdmissionGate?: () => void
+          }
+        ).__releaseE2EAdmissionGate?.()
+      })
+      releaseResponse()
+      await second.close()
+    }
+  })
 })
 
 test('a remote extension then newer sibling keeps each tab on its own branch without flashing', async ({
-  context,
   page,
 }) => {
-  await page.goto('/?debug')
-  const initial = await startDebugStream(page, {
-    openChat: false,
-    prompt: 'tab-local baseline',
-    targetChars: 16,
-    reasoningChars: 0,
-    chunkChars: 16,
+  const completionRoute = '**/api/v1/chat/completions'
+  await mockChatCompletions(page, {
+    body: buildSseBody([
+      { id: 'remote-baseline', content: 'tab-local baseline answer' },
+      { finish: 'stop' },
+    ]),
   })
+  await createChatAndOpen(page)
+  await sendMessage(page, 'tab-local baseline')
+  const baseline = page.locator('[data-ui="message"][data-role="assistant"]').last()
+  await expect(baseline.locator('[data-ui="message-body"]')).toHaveText('tab-local baseline answer')
+  const chatId = await firstChatId(page)
+  const baselineId = await baseline.getAttribute('data-message-id')
+  if (!baselineId) throw new Error('baseline assistant has no id')
+  await page.unroute(completionRoute)
 
-  const first = await context.newPage()
-  await page.close()
-  const second = await context.newPage()
+  const first = page
+  const second = await page.context().newPage()
   try {
-    await first.goto(`/?debug#/chat/${initial.chatId}`)
+    await second.goto(`/#/chat/${chatId}/message/${baselineId}`)
     await expect(
-      first.locator(`[data-ui="message"][data-message-id="${initial.assistantMessageId}"]`),
+      second.locator(`[data-ui="message"][data-message-id="${baselineId}"]`),
     ).toBeVisible()
     await expect
       .poll(() => first.evaluate(() => window.location.hash))
-      .toBe(`#/chat/${initial.chatId}/message/${initial.assistantMessageId}`)
+      .toBe(`#/chat/${chatId}/message/${baselineId}`)
 
-    await second.goto(`/?debug#/chat/${initial.chatId}/message/${initial.assistantMessageId}`)
-    await expect(
-      second.locator(`[data-ui="message"][data-message-id="${initial.assistantMessageId}"]`),
-    ).toBeVisible()
-
-    const extension = await startDebugStream(second, {
-      chatId: initial.chatId,
-      openChat: false,
-      prompt: 'shared linear extension',
-      targetChars: 24,
-      reasoningChars: 0,
-      chunkChars: 24,
+    await mockChatCompletions(second, {
+      body: buildSseBody([
+        { id: 'remote-extension', content: 'shared linear extension answer' },
+        { finish: 'stop' },
+      ]),
     })
+    await sendMessage(second, 'shared linear extension')
+    const extension = second.locator('[data-ui="message"][data-role="assistant"]').last()
+    await expect(extension.locator('[data-ui="message-body"]')).toHaveText(
+      'shared linear extension answer',
+    )
+    const extensionId = await extension.getAttribute('data-message-id')
+    if (!extensionId) throw new Error('extension assistant has no id')
     await expect(
-      first.locator(`[data-ui="message"][data-message-id="${extension.assistantMessageId}"]`),
+      first.locator(`[data-ui="message"][data-message-id="${extensionId}"]`),
     ).toBeVisible()
     await expect
       .poll(() => first.evaluate(() => window.location.hash))
-      .toBe(`#/chat/${initial.chatId}/message/${extension.assistantMessageId}`)
+      .toBe(`#/chat/${chatId}/message/${extensionId}`)
     await startMessageCountRecorder(first)
     await first.evaluate(() => {
       const win = window as typeof window & {
@@ -385,32 +549,37 @@ test('a remote extension then newer sibling keeps each tab on its own branch wit
       win.__remoteTailObserver.observe(document.body, { childList: true, subtree: true })
       sample()
     })
-    const newerSibling = await startDebugStream(second, {
-      chatId: initial.chatId,
-      parentMessageId: extension.userMessageId,
-      openChat: false,
-      targetChars: 32,
-      reasoningChars: 0,
-      chunkChars: 32,
+    await second.unroute(completionRoute)
+    await mockChatCompletions(second, {
+      body: buildSseBody([
+        { id: 'remote-sibling', content: 'newer sibling answer' },
+        { finish: 'stop' },
+      ]),
     })
+    await extension.locator('[data-action="regenerate"]').click()
+    await expect
+      .poll(() => second.evaluate(() => window.location.hash))
+      .not.toBe(`#/chat/${chatId}/message/${extensionId}`)
+    const newerSiblingId = await readRouteMessageId(second, chatId)
+    expect(newerSiblingId).not.toBe(extensionId)
+    const newerSibling = second.locator(`[data-ui="message"][data-message-id="${newerSiblingId}"]`)
+    await expect(newerSibling.locator('[data-ui="message-body"]')).toHaveText(
+      'newer sibling answer',
+    )
 
-    const firstAccepted = first.locator(
-      `[data-ui="message"][data-message-id="${extension.assistantMessageId}"]`,
-    )
-    const secondAccepted = second.locator(
-      `[data-ui="message"][data-message-id="${newerSibling.assistantMessageId}"]`,
-    )
+    const firstAccepted = first.locator(`[data-ui="message"][data-message-id="${extensionId}"]`)
+    const secondAccepted = newerSibling
     await expect(firstAccepted.locator('[data-ui="branch-count"]')).toHaveText('1 / 2')
     await expect(secondAccepted.locator('[data-ui="branch-count"]')).toHaveText('2 / 2')
     await expect(
-      first.locator(`[data-ui="message"][data-message-id="${newerSibling.assistantMessageId}"]`),
+      first.locator(`[data-ui="message"][data-message-id="${newerSiblingId}"]`),
     ).toHaveCount(0)
     await expect
       .poll(() => first.evaluate(() => window.location.hash))
-      .toBe(`#/chat/${initial.chatId}/message/${extension.assistantMessageId}`)
+      .toBe(`#/chat/${chatId}/message/${extensionId}`)
     await expect
       .poll(() => second.evaluate(() => window.location.hash))
-      .toBe(`#/chat/${initial.chatId}/message/${newerSibling.assistantMessageId}`)
+      .toBe(`#/chat/${chatId}/message/${newerSiblingId}`)
     const remoteTailSamples = await first.evaluate(() => {
       const win = window as typeof window & {
         __remoteTailSamples?: string[]
@@ -419,18 +588,17 @@ test('a remote extension then newer sibling keeps each tab on its own branch wit
       win.__remoteTailObserver?.disconnect()
       return win.__remoteTailSamples ?? []
     })
-    expect(remoteTailSamples).toContain(extension.assistantMessageId)
-    expect(remoteTailSamples).not.toContain(newerSibling.assistantMessageId)
+    expect(remoteTailSamples).toContain(extensionId)
+    expect(remoteTailSamples).not.toContain(newerSiblingId)
     expect(await stopMessageCountRecorder(first)).toEqual({
       anchorRemoved: false,
       listRemoved: false,
       listReplaced: false,
       loadingSeen: false,
       messageCountsIncludeZero: false,
-      recyclingSeen: false,
     })
   } finally {
-    await Promise.allSettled([first.close(), second.close()])
+    await second.close()
   }
 })
 
@@ -640,34 +808,6 @@ test('renaming the chat while streaming does not abort the stream', async ({ pag
       .locator('[data-ui="message-body"]'),
   ).toHaveText('renamed-ok', { timeout: 5000 })
 })
-
-interface DebugStreamResult {
-  chatId: string
-  userMessageId: string
-  assistantMessageId: string
-}
-
-async function startDebugStream(
-  page: Page,
-  options: Record<string, unknown>,
-): Promise<DebugStreamResult> {
-  await page.waitForFunction(
-    () =>
-      typeof (window as typeof window & { __debugFakeStream?: unknown }).__debugFakeStream ===
-      'object',
-  )
-  return page.evaluate(async (input) => {
-    const api = (
-      window as typeof window & {
-        __debugFakeStream?: {
-          start(options: Record<string, unknown>): Promise<DebugStreamResult>
-        }
-      }
-    ).__debugFakeStream
-    if (!api) throw new Error('debug fake stream API unavailable')
-    return api.start(input)
-  }, options)
-}
 
 async function readRouteMessageId(page: Page, chatId: string): Promise<string> {
   const routePrefix = `#/chat/${chatId}/message/`

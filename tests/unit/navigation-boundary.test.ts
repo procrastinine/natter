@@ -47,7 +47,6 @@ const CHAT_STORE_MODULE = 'store/zustand/chatStore.ts'
 const ROUTE_INTENT_USERS = new Set([
   'app/Shell.tsx',
   'app/router.ts',
-  'lib/debug-fake-stream.ts',
   'ui/chat/MessageList.tsx',
   'ui/sidebar/ChatList.tsx',
   'ui/storage/StorageView.tsx',
@@ -108,7 +107,6 @@ describe('tab branch navigation boundary', () => {
     expect(filesCalling(/\bnavigateToChatForIntent\s*\(/)).toEqual([
       'app/Shell.tsx',
       'app/router.ts',
-      'lib/debug-fake-stream.ts',
     ])
     expect(filesCalling(/\bnavigateToChat\s*\(/)).toEqual([])
     expect(asyncUnguardedRouteCalls()).toEqual([])

@@ -1,46 +1,36 @@
+import {
+  createFakeStreamScenario,
+  type FakeStreamScenario,
+  retargetOnlyProfileToFakeProvider,
+} from './fake-stream-provider'
 import { type CDPSession, expect, type Page, test } from './fixtures'
-import { clearIndexedDb } from './helpers'
+import {
+  clearIndexedDb,
+  createChatAndOpen,
+  firstChatId,
+  seedFirstRun,
+  sendMessage,
+} from './helpers'
 
-interface DebugState {
-  chatStore: { chatCursorCount: number; cursorEntryCount: number }
-  streamStore: { activeCount: number; liveSnapshotCount: number; liveClearCount: number }
+interface RetentionStorageState {
+  assistantCount: number
+  latestAssistantId: string | null
+  latestContentChars: number
+  latestReasoningChars: number
+  latestUserAssistantChildren: number
+  latestUserId: string | null
+  streamChunkCount: number
+  streamLeaseCount: number
+  unfinishedAssistantCount: number
+  userCount: number
 }
 
-interface DebugStreamResult {
-  chatId: string
-  userMessageId: string
-}
+const scenarios = new Set<FakeStreamScenario>()
 
-async function startFakeStream(
-  page: Page,
-  options: {
-    chatId?: string
-    parentMessageId?: string
-    prompt?: string
-    targetChars?: number
-    reasoningChars?: number
-  } = {},
-): Promise<DebugStreamResult> {
-  return page.evaluate(async (input) => {
-    const api = (
-      window as unknown as {
-        __debugFakeStream?: {
-          start(options: Record<string, unknown>): Promise<DebugStreamResult>
-        }
-      }
-    ).__debugFakeStream
-    if (!api) throw new Error('__debugFakeStream is not installed')
-    return api.start({
-      targetChars: 0,
-      reasoningChars: 0,
-      chunkChars: 128,
-      reasoningChunkChars: 128,
-      delayMs: 0,
-      openChat: false,
-      ...input,
-    })
-  }, options)
-}
+test.afterEach(async () => {
+  await Promise.all([...scenarios].map((scenario) => scenario.dispose()))
+  scenarios.clear()
+})
 
 async function inspectAndReleaseInstances(
   client: CDPSession,
@@ -101,75 +91,320 @@ async function settleBrowserWrappers(page: Page, client: CDPSession) {
   }
 }
 
-async function debugState(page: Page): Promise<DebugState> {
-  return page.evaluate(() => {
-    const api = (
-      window as unknown as {
-        __debugFakeStream?: { state(): DebugState }
+async function readRetentionStorageState(
+  page: Page,
+  chatId: string,
+): Promise<RetentionStorageState> {
+  return page.evaluate(async (id) => {
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open('natter')
+      request.onsuccess = () => resolve(request.result)
+      request.onerror = () => reject(request.error)
+    })
+    const read = <T>(request: IDBRequest<T>) =>
+      new Promise<T>((resolve, reject) => {
+        request.onsuccess = () => resolve(request.result)
+        request.onerror = () => reject(request.error)
+      })
+    try {
+      const transaction = db.transaction(
+        ['messages', 'messageBodies', 'streamLeases', 'streamChunks'],
+        'readonly',
+      )
+      const [headers, bodies, leases, chunks] = await Promise.all([
+        read(transaction.objectStore('messages').index('chatId').getAll(id)),
+        read(transaction.objectStore('messageBodies').getAll()),
+        read(transaction.objectStore('streamLeases').getAll()),
+        read(transaction.objectStore('streamChunks').getAll()),
+      ])
+      const messageHeaders = (headers as Array<Record<string, unknown>>).sort(
+        (left, right) =>
+          Number(left.createdAt ?? 0) - Number(right.createdAt ?? 0) ||
+          String(left.id).localeCompare(String(right.id)),
+      )
+      const users = messageHeaders.filter((row) => row.role === 'user')
+      const assistants = messageHeaders.filter((row) => row.role === 'assistant')
+      const latestUser = users.at(-1)
+      const latestAssistant = assistants.at(-1)
+      const body = (bodies as Array<Record<string, unknown>>).find(
+        (row) => row.id === latestAssistant?.id,
+      )
+      const content: unknown[] = Array.isArray(body?.content) ? body.content : []
+      const reasoning: unknown[] = Array.isArray(body?.reasoningDetails)
+        ? body.reasoningDetails
+        : []
+      const generationFinished = (row: Record<string, unknown>) => {
+        const generation = row.generation
+        return (
+          typeof generation === 'object' &&
+          generation !== null &&
+          typeof (generation as { finishedAt?: unknown }).finishedAt === 'number'
+        )
       }
-    ).__debugFakeStream
-    if (!api) throw new Error('__debugFakeStream is not installed')
-    return api.state()
-  })
+      return {
+        assistantCount: assistants.length,
+        latestAssistantId: typeof latestAssistant?.id === 'string' ? latestAssistant.id : null,
+        latestContentChars: content.reduce<number>(
+          (total, item) =>
+            total +
+            (typeof item === 'object' &&
+            item !== null &&
+            typeof (item as { text?: unknown }).text === 'string'
+              ? (item as { text: string }).text.length
+              : 0),
+          0,
+        ),
+        latestReasoningChars: reasoning.reduce<number>(
+          (total, item) =>
+            total +
+            (typeof item === 'object' &&
+            item !== null &&
+            typeof (item as { text?: unknown }).text === 'string'
+              ? (item as { text: string }).text.length
+              : 0),
+          0,
+        ),
+        latestUserAssistantChildren:
+          typeof latestUser?.id === 'string'
+            ? assistants.filter((row) => row.parentId === latestUser.id).length
+            : 0,
+        latestUserId: typeof latestUser?.id === 'string' ? latestUser.id : null,
+        streamChunkCount: (chunks as Array<{ chatId?: unknown }>).filter((row) => row.chatId === id)
+          .length,
+        streamLeaseCount: (leases as Array<{ chatId?: unknown }>).filter((row) => row.chatId === id)
+          .length,
+        unfinishedAssistantCount: assistants.filter((row) => !generationFinished(row)).length,
+        userCount: users.length,
+      }
+    } finally {
+      db.close()
+    }
+  }, chatId)
 }
 
-test('settled streams release transient wrappers and retain only real branch pins', async ({
+async function waitForDurableBatch(
+  page: Page,
+  scenario: FakeStreamScenario,
+  chatId: string,
+  expected: { assistantCount: number; generationCount: number; userCount: number },
+): Promise<RetentionStorageState> {
+  await expect
+    .poll(async () => {
+      const state = await readRetentionStorageState(page, chatId)
+      return {
+        assistantCount: state.assistantCount,
+        streamChunkCount: state.streamChunkCount,
+        streamLeaseCount: state.streamLeaseCount,
+        unfinishedAssistantCount: state.unfinishedAssistantCount,
+        userCount: state.userCount,
+      }
+    })
+    .toEqual({
+      assistantCount: expected.assistantCount,
+      streamChunkCount: 0,
+      streamLeaseCount: 0,
+      unfinishedAssistantCount: 0,
+      userCount: expected.userCount,
+    })
+  await expect.poll(async () => (await scenario.snapshot()).activeStreams).toBe(0)
+  const provider = await scenario.snapshot()
+  expect(generationRequestCount(provider)).toBe(expected.generationCount)
+  const state = await readRetentionStorageState(page, chatId)
+  expect(state.latestContentChars).toBe(100_000)
+  expect(state.latestReasoningChars).toBe(100_000)
+  return state
+}
+
+async function openStoredChat(page: Page, chatId: string): Promise<void> {
+  await page.locator(`[data-ui="chat-row-link"][href="#/chat/${chatId}"]`).click()
+  await expect.poll(() => page.evaluate(() => window.location.hash)).toContain(`#/chat/${chatId}`)
+  await expect(page.locator('[data-ui="composer"]')).toBeVisible()
+}
+
+async function leaveForBlankChat(page: Page): Promise<void> {
+  await page.locator('[data-role="new-chat"]').click()
+  await expect.poll(() => page.evaluate(() => window.location.hash)).toBe('#/new')
+  await expect(page.locator('[data-ui="message"]')).toHaveCount(0)
+  await expect(page.locator('[data-ui="abort"]')).toHaveCount(0)
+}
+
+async function waitForProviderStream(
+  scenario: FakeStreamScenario,
+  expectedGenerationCount: number,
+): Promise<void> {
+  await expect
+    .poll(async () => {
+      const snapshot = await scenario.snapshot()
+      return {
+        activeStreams: snapshot.activeStreams,
+        generationCount: generationRequestCount(snapshot),
+      }
+    })
+    .toEqual({ activeStreams: 1, generationCount: expectedGenerationCount })
+}
+
+function generationRequestCount(
+  snapshot: Awaited<ReturnType<FakeStreamScenario['snapshot']>>,
+): number {
+  return snapshot.requests.filter(
+    (request) => request.method === 'POST' && request.path === '/chat/completions',
+  ).length
+}
+
+async function sendDetachedTurn(
+  page: Page,
+  scenario: FakeStreamScenario,
+  input: {
+    assistantCount: number
+    chatId?: string
+    generationCount: number
+    prompt: string
+    userCount: number
+  },
+): Promise<{ chatId: string; state: RetentionStorageState }> {
+  if (input.chatId) await openStoredChat(page, input.chatId)
+  else await createChatAndOpen(page)
+  await sendMessage(page, input.prompt)
+  if (!input.chatId) await expect(page.locator('[data-ui="chat-row"]')).toHaveCount(1)
+  const chatId = input.chatId ?? (await firstChatId(page))
+  expect(chatId).not.toBe('')
+  await waitForProviderStream(scenario, input.generationCount)
+  await leaveForBlankChat(page)
+  return {
+    chatId,
+    state: await waitForDurableBatch(page, scenario, chatId, input),
+  }
+}
+
+async function regenerateDetached(
+  page: Page,
+  scenario: FakeStreamScenario,
+  input: {
+    assistantCount: number
+    chatId: string
+    generationCount: number
+    userCount: number
+  },
+): Promise<RetentionStorageState> {
+  await openStoredChat(page, input.chatId)
+  const assistant = page.locator('[data-ui="message"][data-role="assistant"]').last()
+  await expect(assistant).toBeVisible()
+  await assistant.locator('[data-action="regenerate"]').click()
+  await waitForProviderStream(scenario, input.generationCount)
+  await leaveForBlankChat(page)
+  return waitForDurableBatch(page, scenario, input.chatId, input)
+}
+
+test('settled detached streams release wrappers without retaining tab branch state', async ({
   page,
   browserName,
 }) => {
   test.setTimeout(180_000)
   test.skip(browserName !== 'chromium', 'CDP heap and DOM counters are Chromium-only')
   await clearIndexedDb(page)
-  await page.waitForFunction(() =>
-    Boolean((window as unknown as { __debugFakeStream?: unknown }).__debugFakeStream),
-  )
-  const client = await page.context().newCDPSession(page)
-
-  const first = await startFakeStream(page, {
-    prompt: 'warmup',
+  const scenario = await createFakeStreamScenario({
     targetChars: 100_000,
     reasoningChars: 100_000,
+    chunkChars: 128,
+    initialDelayMs: 250,
   })
-  expect((await debugState(page)).streamStore.liveClearCount).toBeLessThanOrEqual(2)
+  scenarios.add(scenario)
+  await seedFirstRun(page, { model: 'natter/fake-stream' })
+  await retargetOnlyProfileToFakeProvider(page, scenario.providerBaseUrl)
+  const client = await page.context().newCDPSession(page)
+
+  const first = await sendDetachedTurn(page, scenario, {
+    prompt: 'warmup',
+    assistantCount: 1,
+    generationCount: 1,
+    userCount: 1,
+  })
+  expect(first.state.latestUserAssistantChildren).toBe(1)
+  await sendDetachedTurn(page, scenario, {
+    chatId: first.chatId,
+    prompt: 'warmup linear navigation',
+    assistantCount: 2,
+    generationCount: 2,
+    userCount: 2,
+  })
+  const warmRegenerateState = await regenerateDetached(page, scenario, {
+    chatId: first.chatId,
+    assistantCount: 3,
+    generationCount: 3,
+    userCount: 2,
+  })
+  expect(warmRegenerateState.latestUserAssistantChildren).toBe(2)
   const baseline = await settleBrowserWrappers(page, client)
   const baselineRangeSets = await countPrototypeInstances(
     client,
     'globalThis[Symbol.for("Dexie")].RangeSet.prototype',
   )
-  let latest = first
+
+  let assistantCount = 3
+  let generationCount = 3
+  let userCount = 2
+  let linearState = warmRegenerateState
   for (let index = 0; index < 10; index += 1) {
-    latest = await startFakeStream(page, {
+    assistantCount += 1
+    generationCount += 1
+    userCount += 1
+    const completed = await sendDetachedTurn(page, scenario, {
       chatId: first.chatId,
       prompt: `linear ${index + 1}`,
-      targetChars: 100_000,
-      reasoningChars: 100_000,
+      assistantCount,
+      generationCount,
+      userCount,
     })
+    linearState = completed.state
   }
-  expect(await debugState(page)).toMatchObject({
-    chatStore: { chatCursorCount: 0, cursorEntryCount: 0 },
-    streamStore: { activeCount: 0, liveSnapshotCount: 0 },
-  })
-  const afterLinear = await settleBrowserWrappers(page, client)
-  expect(afterLinear.dom.jsEventListeners).toBeLessThanOrEqual(baseline.dom.jsEventListeners + 12)
-  expect(afterLinear.heap.usedSize).toBeLessThanOrEqual(baseline.heap.usedSize + 2_000_000)
+  expect(linearState.latestUserAssistantChildren).toBe(1)
+  await expect.poll(() => page.evaluate(() => window.location.hash)).toBe('#/new')
+  const afterFirstLinearBatch = await settleBrowserWrappers(page, client)
 
   for (let index = 0; index < 10; index += 1) {
-    await startFakeStream(page, {
+    assistantCount += 1
+    generationCount += 1
+    userCount += 1
+    const completed = await sendDetachedTurn(page, scenario, {
       chatId: first.chatId,
-      parentMessageId: latest.userMessageId,
-      targetChars: 100_000,
-      reasoningChars: 100_000,
+      prompt: `linear ${index + 11}`,
+      assistantCount,
+      generationCount,
+      userCount,
+    })
+    linearState = completed.state
+  }
+  expect(linearState.latestUserAssistantChildren).toBe(1)
+  await expect.poll(() => page.evaluate(() => window.location.hash)).toBe('#/new')
+  const afterSecondLinearBatch = await settleBrowserWrappers(page, client)
+  expect(afterSecondLinearBatch.dom.jsEventListeners).toBeLessThanOrEqual(
+    baseline.dom.jsEventListeners + 12,
+  )
+  expect(afterSecondLinearBatch.heap.usedSize).toBeLessThanOrEqual(
+    afterFirstLinearBatch.heap.usedSize + 2_000_000,
+  )
+
+  let regenerateState = linearState
+  for (let index = 0; index < 10; index += 1) {
+    assistantCount += 1
+    generationCount += 1
+    regenerateState = await regenerateDetached(page, scenario, {
+      chatId: first.chatId,
+      assistantCount,
+      generationCount,
+      userCount,
     })
   }
-  expect(await debugState(page)).toMatchObject({
-    chatStore: { chatCursorCount: 1, cursorEntryCount: 1 },
-    streamStore: { activeCount: 0, liveSnapshotCount: 0 },
-  })
+  expect(regenerateState.latestUserId).toBe(linearState.latestUserId)
+  expect(regenerateState.latestUserAssistantChildren).toBe(11)
+  await expect.poll(() => page.evaluate(() => window.location.hash)).toBe('#/new')
   const afterRegenerate = await settleBrowserWrappers(page, client)
   expect(afterRegenerate.dom.jsEventListeners).toBeLessThanOrEqual(
     baseline.dom.jsEventListeners + 12,
   )
-  expect(afterRegenerate.heap.usedSize).toBeLessThanOrEqual(baseline.heap.usedSize + 2_500_000)
+  expect(afterRegenerate.heap.usedSize).toBeLessThanOrEqual(
+    afterSecondLinearBatch.heap.usedSize + 2_500_000,
+  )
   const afterRegenerateRangeSets = await countPrototypeInstances(
     client,
     'globalThis[Symbol.for("Dexie")].RangeSet.prototype',

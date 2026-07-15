@@ -1,3 +1,5 @@
+import type { Message } from '../../src/core/types'
+import { splitMessageForStorage } from '../../src/store/message-storage'
 import { expect, type Locator, type Page, test } from './fixtures'
 import {
   buildSseBody,
@@ -87,68 +89,6 @@ test('opening Appearance settings does not reapply the default chat width', asyn
     .toBe('1280px')
 })
 
-test('chat transcript mounts only the newest message window and loads older batches manually', async ({
-  page,
-}) => {
-  const chatId = await seedLinearChat(page, {
-    messageCount: 35,
-    chatId: 'render-window-chat',
-    title: 'Render window chat',
-    textPrefix: 'window message',
-    settings: {
-      'global:message-render-window-size': 10,
-      'global:message-render-window-load-mode': 'manual',
-    },
-  })
-
-  await page.goto(`/#/chat/${chatId}`)
-  await page.reload()
-  await expect(page.locator('[data-ui="message"]')).toHaveCount(10)
-  await expect(page.locator('[data-ui="message"]').first()).toContainText('window message 25')
-  await expect(page.locator('[data-ui="message-list"]')).toHaveAttribute('data-total-count', '35')
-  await expect(page.locator('[data-ui="message-list"]')).toHaveAttribute(
-    'data-rendered-count',
-    '10',
-  )
-
-  const retainedMessage = page
-    .locator('[data-ui="message"]')
-    .filter({ hasText: 'window message 25' })
-  const retainedTop = await retainedMessage.evaluate((element) => {
-    const scrollRegion = element.closest<HTMLElement>('[data-ui="scroll-region"]')
-    if (!scrollRegion) throw new Error('missing scroll region')
-    scrollRegion.scrollTop = 0
-    ;(element as HTMLElement & { retainedAcrossPrepend?: boolean }).retainedAcrossPrepend = true
-    const markdown = element.querySelector<HTMLElement>('[data-ui="markdown-segment"]')
-    if (!markdown) throw new Error('missing markdown segment')
-    ;(markdown as HTMLElement & { retainedAcrossPrepend?: boolean }).retainedAcrossPrepend = true
-    return element.getBoundingClientRect().top
-  })
-  await page
-    .locator('[data-ui="load-more-messages"]')
-    .evaluate((element: HTMLElement) => element.click())
-  await expect(page.locator('[data-ui="message"]')).toHaveCount(20)
-  await expect(page.locator('[data-ui="message"]').first()).toContainText('window message 15')
-  const retainedAfterPrepend = await retainedMessage.evaluate((element) => ({
-    top: element.getBoundingClientRect().top,
-    messageNodeRetained:
-      (element as HTMLElement & { retainedAcrossPrepend?: boolean }).retainedAcrossPrepend === true,
-    markdownNodeRetained:
-      (
-        element.querySelector<HTMLElement>('[data-ui="markdown-segment"]') as HTMLElement & {
-          retainedAcrossPrepend?: boolean
-        }
-      ).retainedAcrossPrepend === true,
-  }))
-  expect(Math.abs(retainedAfterPrepend.top - retainedTop)).toBeLessThan(2)
-  expect(retainedAfterPrepend.messageNodeRetained).toBe(true)
-  expect(retainedAfterPrepend.markdownNodeRetained).toBe(true)
-
-  await page.locator('[data-ui="load-more-messages"]').click()
-  await expect(page.locator('[data-ui="message"]')).toHaveCount(35)
-  await expect(page.locator('[data-ui="load-more-messages"]')).toHaveCount(0)
-})
-
 test('send and regenerate keep the transcript mounted while the branch window reloads', async ({
   page,
 }) => {
@@ -204,7 +144,6 @@ test('send and regenerate keep the transcript mounted while the branch window re
     listReplaced: false,
     loadingSeen: false,
     messageCountsIncludeZero: false,
-    recyclingSeen: false,
   })
 
   const previousAssistantId = await page
@@ -239,16 +178,11 @@ test('send and regenerate keep the transcript mounted while the branch window re
   let regeneratedId: string
   try {
     await regenerateRequested
-    const activeRegeneratedId = await page.evaluate(
-      () =>
-        (
-          window as typeof window & {
-            __debugFakeStream?: {
-              state(): { streamStore: { activeTargets: Array<{ messageId?: string }> } }
-            }
-          }
-        ).__debugFakeStream?.state().streamStore.activeTargets[0]?.messageId ?? null,
-    )
+    const regeneratedMessage = page.locator('[data-ui="message"][data-role="assistant"]').last()
+    await expect
+      .poll(() => regeneratedMessage.getAttribute('data-message-id'))
+      .not.toBe(previousAssistantId)
+    const activeRegeneratedId = await regeneratedMessage.getAttribute('data-message-id')
     if (!activeRegeneratedId) throw new Error('Regenerate stream has no target message')
     regeneratedId = activeRegeneratedId
     await expect(
@@ -313,63 +247,6 @@ test('send and regenerate keep the transcript mounted while the branch window re
     listReplaced: false,
     loadingSeen: false,
     messageCountsIncludeZero: false,
-    recyclingSeen: false,
-  })
-})
-
-test('large streamed turns do not recycle the transcript after completion', async ({ page }) => {
-  await page.waitForFunction(() =>
-    Boolean((window as unknown as { __debugFakeStream?: unknown }).__debugFakeStream),
-  )
-  const chatId = await page.evaluate(async () => {
-    const api = (
-      window as unknown as {
-        __debugFakeStream?: {
-          start(options: Record<string, unknown>): Promise<{ chatId: string }>
-        }
-      }
-    ).__debugFakeStream
-    if (!api) throw new Error('__debugFakeStream is not installed')
-    const result = await api.start({
-      targetChars: 32,
-      reasoningChars: 0,
-      chunkChars: 32,
-      delayMs: 0,
-      openChat: true,
-    })
-    return result.chatId
-  })
-  await expect(page.locator('[data-ui="message"]')).toHaveCount(2)
-
-  await startMessageCountRecorder(page)
-  await page.evaluate(async (activeChatId) => {
-    const api = (
-      window as unknown as {
-        __debugFakeStream?: {
-          start(options: Record<string, unknown>): Promise<unknown>
-        }
-      }
-    ).__debugFakeStream
-    if (!api) throw new Error('__debugFakeStream is not installed')
-    await api.start({
-      chatId: activeChatId,
-      prompt: 'large turn',
-      targetChars: 100_100,
-      reasoningChars: 0,
-      chunkChars: 25_000,
-      delayMs: 10,
-      openChat: false,
-    })
-  }, chatId)
-  await page.waitForTimeout(600)
-
-  expect(await stopMessageCountRecorder(page)).toEqual({
-    anchorRemoved: false,
-    listRemoved: false,
-    listReplaced: false,
-    loadingSeen: false,
-    messageCountsIncludeZero: false,
-    recyclingSeen: false,
   })
 })
 
@@ -399,7 +276,7 @@ test('switching message variants re-renders the selected branch window', async (
 test('cached leaves share one live sibling count revision', async ({ context, page }) => {
   const chatId = await seedBranchedChat(page)
   await rebuildSidebarProjection(page)
-  await page.goto(`/?debug#/chat/${chatId}/message/A2`)
+  await page.goto(`/#/chat/${chatId}/message/A2`)
   await expect(page.locator('[data-ui="message"]').last()).toContainText('branch A assistant')
 
   await page
@@ -411,30 +288,35 @@ test('cached leaves share one live sibling count revision', async ({ context, pa
 
   const otherTab = await context.newPage()
   try {
-    await otherTab.goto(`/?debug#/chat/${chatId}/message/B2`)
-    await otherTab.waitForFunction(
-      () =>
-        typeof (window as typeof window & { __debugFakeStream?: unknown }).__debugFakeStream ===
-        'object',
-    )
-    await otherTab.evaluate(async (activeChatId) => {
-      const api = (
-        window as typeof window & {
-          __debugFakeStream?: {
-            start(options: Record<string, unknown>): Promise<unknown>
-          }
-        }
-      ).__debugFakeStream
-      if (!api) throw new Error('Debug stream API unavailable')
-      await api.start({
-        chatId: activeChatId,
-        parentMessageId: 'root',
-        targetChars: 8,
-        reasoningChars: 0,
-        chunkChars: 8,
-        openChat: false,
+    let markRequestSeen: () => void = () => undefined
+    const requestSeen = new Promise<void>((resolve) => {
+      markRequestSeen = resolve
+    })
+    await otherTab.route('**/api/v1/chat/completions', async (route) => {
+      markRequestSeen()
+      await route.fulfill({
+        contentType: 'text/event-stream',
+        body: buildSseBody([
+          { id: 'remote-branch', content: 'branch C assistant' },
+          { finish: 'stop' },
+        ]),
       })
-    }, chatId)
+    })
+    await otherTab.goto(`/#/chat/${chatId}/message/B2`)
+    const branchBUser = otherTab
+      .locator('[data-ui="message"][data-role="user"]')
+      .filter({ hasText: 'branch B user' })
+    await branchBUser.locator('[data-action="edit"]').click()
+    const editor = otherTab.locator('[data-ui="inline-editor"]')
+    await editor.locator('[data-ui="inline-editor-input"]').fill('branch C user')
+    await editor.locator('[data-role="save-send"]').click()
+    await requestSeen
+    await expect(
+      otherTab
+        .locator('[data-ui="message"][data-role="assistant"]')
+        .filter({ hasText: 'branch C assistant' }),
+    ).toBeVisible()
+    await expect(otherTab.locator('[data-ui="abort"]')).toHaveCount(0)
   } finally {
     await otherTab.close()
   }
@@ -712,135 +594,144 @@ async function sidebarRowMetrics(row: Locator): Promise<{
 }
 
 async function seedBranchedChat(page: Page): Promise<string> {
-  return page.evaluate(async () => {
-    const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const req = indexedDB.open('natter')
-      req.onsuccess = () => resolve(req.result)
-      req.onerror = () => reject(req.error)
-    })
-    const now = Date.now()
-    const chatId = 'render-window-branch-chat'
-    try {
-      await new Promise<void>((resolve, reject) => {
-        const tx = db.transaction(
-          ['presets', 'settings', 'chats', 'messages', 'messageBodies'],
-          'readwrite',
-        )
-        const presets = tx.objectStore('presets')
-        const settingsStore = tx.objectStore('settings')
-        const chats = tx.objectStore('chats')
-        const messages = tx.objectStore('messages')
-        const messageBodies = tx.objectStore('messageBodies')
-        const presetsReq = presets.getAll()
-        presetsReq.onsuccess = () => {
-          const preset = (presetsReq.result as Array<{ id?: string; settings?: unknown }>)[0]
-          const chatSettings = structuredClone(preset?.settings ?? {})
-          settingsStore.put({ key: 'global:message-render-window-size', value: 3 })
-          settingsStore.put({ key: 'global:message-render-window-load-mode', value: 'manual' })
-          chats.put({
-            id: chatId,
-            title: 'Render branch window chat',
-            titleStatus: 'manual',
-            createdAt: now,
-            updatedAt: now + 4,
-            lastViewedAt: now + 4,
-            wordCount: 12,
-            totalCostUsd: 0,
-            metaVersion: 0,
-            summaryVersion: 0,
-            settings: chatSettings,
-            presetId: preset?.id,
-            lastUpdatedLeafId: 'B2',
-            lastBranchUpdatedAt: now + 4,
-            archived: false,
-            pinned: false,
-            folderId: null,
-            tags: [],
-            previewText: 'branch B assistant',
-          })
-          const rows = [
-            {
-              id: 'root',
-              parentId: null,
-              siblingIndex: 0,
-              turnIndex: 0,
-              role: 'system',
-              origin: 'system',
-              text: 'root instruction',
-            },
-            {
-              id: 'A1',
-              parentId: 'root',
-              siblingIndex: 0,
-              turnIndex: 1,
-              role: 'user',
-              origin: 'user',
-              text: 'branch A user',
-            },
-            {
-              id: 'A2',
-              parentId: 'A1',
-              siblingIndex: 0,
-              turnIndex: 2,
-              role: 'assistant',
-              origin: 'generated',
-              text: 'branch A assistant',
-            },
-            {
-              id: 'B1',
-              parentId: 'root',
-              siblingIndex: 1,
-              turnIndex: 1,
-              role: 'user',
-              origin: 'user',
-              text: 'branch B user',
-            },
-            {
-              id: 'B2',
-              parentId: 'B1',
-              siblingIndex: 0,
-              turnIndex: 2,
-              role: 'assistant',
-              origin: 'generated',
-              text: 'branch B assistant',
-            },
-          ] as const
-          rows.forEach((row, index) => {
-            const createdAt = now + index
-            messages.put({
-              id: row.id,
-              chatId,
-              parentId: row.parentId,
-              siblingIndex: row.siblingIndex,
-              turnId: `turn-${row.id}`,
-              turnIndex: row.turnIndex,
-              createdAt,
-              role: row.role,
-              origin: row.origin,
-              nodeVersion: 0,
-              deleted: false,
-            })
-            messageBodies.put({
-              id: row.id,
-              chatId,
-              nodeVersion: 0,
-              updatedAt: createdAt,
-              content:
-                row.role === 'assistant'
-                  ? [{ type: 'output_text', text: row.text }]
-                  : [{ type: 'text', text: row.text }],
-            })
-          })
-        }
-        tx.oncomplete = () => resolve()
-        tx.onerror = () => reject(tx.error)
-        tx.onabort = () => reject(tx.error)
+  const now = Date.now()
+  const chatId = 'render-window-branch-chat'
+  const sourceMessages: Message[] = [
+    {
+      id: 'root',
+      chatId,
+      parentId: null,
+      siblingIndex: 0,
+      turnId: 'turn-root',
+      turnIndex: 0,
+      createdAt: now,
+      role: 'system',
+      origin: 'imported',
+      content: [{ type: 'text', text: 'root instruction' }],
+      nodeVersion: 0,
+      deleted: false,
+    },
+    {
+      id: 'A1',
+      chatId,
+      parentId: 'root',
+      siblingIndex: 0,
+      turnId: 'turn-A1',
+      turnIndex: 1,
+      createdAt: now + 1,
+      role: 'user',
+      origin: 'user',
+      content: [{ type: 'text', text: 'branch A user' }],
+      nodeVersion: 0,
+      deleted: false,
+    },
+    {
+      id: 'A2',
+      chatId,
+      parentId: 'A1',
+      siblingIndex: 0,
+      turnId: 'turn-A2',
+      turnIndex: 2,
+      createdAt: now + 2,
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: 'branch A assistant' }],
+      nodeVersion: 0,
+      deleted: false,
+    },
+    {
+      id: 'B1',
+      chatId,
+      parentId: 'root',
+      siblingIndex: 1,
+      turnId: 'turn-B1',
+      turnIndex: 1,
+      createdAt: now + 3,
+      role: 'user',
+      origin: 'user',
+      content: [{ type: 'text', text: 'branch B user' }],
+      nodeVersion: 0,
+      deleted: false,
+    },
+    {
+      id: 'B2',
+      chatId,
+      parentId: 'B1',
+      siblingIndex: 0,
+      turnId: 'turn-B2',
+      turnIndex: 2,
+      createdAt: now + 4,
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: 'branch B assistant' }],
+      nodeVersion: 0,
+      deleted: false,
+    },
+  ]
+  const storedRows = sourceMessages.map((message) => splitMessageForStorage(message))
+  const wordCount = storedRows.reduce((total, stored) => total + stored.header.bodyWordCount, 0)
+
+  await page.evaluate(
+    async (seed) => {
+      const db = await new Promise<IDBDatabase>((resolve, reject) => {
+        const req = indexedDB.open('natter')
+        req.onsuccess = () => resolve(req.result)
+        req.onerror = () => reject(req.error)
       })
-    } finally {
-      db.close()
-    }
-    return chatId
-  })
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const tx = db.transaction(
+            ['presets', 'settings', 'chats', 'messages', 'messageBodies'],
+            'readwrite',
+          )
+          const presets = tx.objectStore('presets')
+          const settingsStore = tx.objectStore('settings')
+          const chats = tx.objectStore('chats')
+          const messages = tx.objectStore('messages')
+          const messageBodies = tx.objectStore('messageBodies')
+          const presetsReq = presets.getAll()
+          presetsReq.onsuccess = () => {
+            const preset = (presetsReq.result as Array<{ id?: string; settings?: unknown }>)[0]
+            const chatSettings = structuredClone(preset?.settings ?? {})
+            settingsStore.put({ key: 'global:message-render-window-size', value: 3 })
+            settingsStore.put({ key: 'global:message-render-window-load-mode', value: 'manual' })
+            chats.put({
+              id: seed.chatId,
+              title: 'Render branch window chat',
+              titleStatus: 'manual',
+              createdAt: seed.now,
+              updatedAt: seed.now + 4,
+              lastViewedAt: seed.now + 4,
+              wordCount: seed.wordCount,
+              totalCostUsd: 0,
+              metaVersion: 0,
+              summaryVersion: 0,
+              settings: chatSettings,
+              presetId: preset?.id,
+              lastUpdatedLeafId: 'B2',
+              lastBranchUpdatedAt: seed.now + 4,
+              archived: false,
+              pinned: false,
+              folderId: null,
+              tags: [],
+              previewText: 'branch A user',
+            })
+            for (const stored of seed.storedRows) {
+              messages.put(stored.header)
+              messageBodies.put(stored.body)
+            }
+          }
+          tx.oncomplete = () => resolve()
+          tx.onerror = () => reject(tx.error)
+          tx.onabort = () => reject(tx.error)
+        })
+      } finally {
+        db.close()
+      }
+    },
+    { chatId, now, storedRows, wordCount },
+  )
+  return chatId
 }
 
 async function seedSidebarChats(

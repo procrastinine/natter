@@ -40,9 +40,15 @@ module.exports = {
       from: { path: '^src/store/' },
       to: { path: '^src/ui/' },
     },
+    {
+      name: 'runtime-must-not-import-devtools',
+      severity: 'error',
+      from: { path: '^src/' },
+      to: { path: '^tools/' },
+    },
   ],
   options: {
-    includeOnly: '^src',
+    includeOnly: '^(src|tools)/',
     doNotFollow: { path: 'node_modules' },
     tsPreCompilationDeps: true,
     tsConfig: { fileName: 'tsconfig.app.json' },

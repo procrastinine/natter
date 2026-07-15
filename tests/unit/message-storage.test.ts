@@ -9,6 +9,7 @@ import {
   type MessageHeaderRow,
   previewTextFromContent,
   previewTextFromStoredProjection,
+  rebaseHydratedMessageHeader,
   splitMessageForStorage,
 } from '../../src/store/message-storage'
 
@@ -319,6 +320,56 @@ describe('message storage split', () => {
     expect(
       Object.hasOwn(hydrateMessage(header, body).generation?.serverTools?.[2] ?? {}, 'output'),
     ).toBe(true)
+  })
+
+  it('rebases canonical header metadata without dropping cold server-tool outputs', () => {
+    const baseGeneration = message().generation
+    if (!baseGeneration) throw new Error('Expected generation fixture')
+    const source = message({
+      generation: {
+        ...baseGeneration,
+        serverTools: [
+          {
+            type: 'web_search_call',
+            source: 'responses-output',
+            id: 'search-1',
+            output: { results: [{ url: 'https://example.com/result' }] },
+          },
+        ],
+      },
+    })
+    const { header, body } = splitMessageForStorage(source)
+    const hydrated = hydrateMessage(header, body)
+    const hydratedOutput = hydrated.generation?.serverTools?.[0]?.output
+    const canonicalGeneration = header.generation
+    if (!canonicalGeneration) throw new Error('Expected canonical generation metadata')
+    const canonicalHeader = {
+      ...header,
+      nodeVersion: header.nodeVersion + 1,
+      cachedTokenEstimate: 12,
+      generation: {
+        ...canonicalGeneration,
+        provider: 'canonical-provider',
+      },
+    }
+
+    const rebased = rebaseHydratedMessageHeader(hydrated, canonicalHeader)
+
+    expect(rebased).toMatchObject({
+      nodeVersion: canonicalHeader.nodeVersion,
+      cachedTokenEstimate: 12,
+      generation: {
+        provider: 'canonical-provider',
+        serverTools: [
+          {
+            type: 'web_search_call',
+            output: { results: [{ url: 'https://example.com/result' }] },
+          },
+        ],
+      },
+    })
+    expect(rebased.generation?.serverTools?.[0]?.output).toBe(hydratedOutput)
+    expect(canonicalHeader.generation.serverTools?.[0]).not.toHaveProperty('output')
   })
 
   it('preserves the existing preview normalization and truncation semantics', () => {

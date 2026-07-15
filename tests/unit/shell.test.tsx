@@ -99,7 +99,29 @@ function pageMessage(header: MessageHeaderRow): Message {
 describe('active branch page composition', () => {
   it('rebases a route-independent exact body onto the authoritative metadata header', () => {
     const header = pageHeader('off-path', null, 0)
-    const message = pageMessage(header)
+    const message: Message = {
+      ...pageMessage(header),
+      generation: {
+        id: 'generation-1',
+        model: 'model-1',
+        requestedModel: 'model-1',
+        apiUsed: 'responses',
+        delivery: 'streaming',
+        costSource: 'stream',
+        startedAt: 1,
+        serverTools: [
+          {
+            type: 'web_search_call',
+            source: 'responses-output',
+            output: { sources: ['https://example.com/result'] },
+          },
+        ],
+      },
+    }
+    const messageGeneration = message.generation
+    const messageServerTools = messageGeneration?.serverTools
+    if (!messageGeneration || !messageServerTools)
+      throw new Error('tool generation fixture missing')
     const receipt: CommittedMessagePresentationReceipt = {
       chatId: header.chatId,
       presentation: { header, message, bodyVersion: header.bodyVersion },
@@ -113,14 +135,31 @@ describe('active branch page composition', () => {
     )
     expect(snapshots.size).toBe(0)
 
-    const authoritative = { ...header, siblingIndex: 3, nodeVersion: header.nodeVersion + 1 }
+    const authoritative = {
+      ...header,
+      siblingIndex: 3,
+      nodeVersion: header.nodeVersion + 1,
+      generation: {
+        ...messageGeneration,
+        provider: 'canonical-provider',
+        serverTools: messageServerTools.map(({ output: _output, ...tool }) => tool),
+      },
+    }
     __addExactMessagePresentationSnapshotForTests(
       snapshots,
       receipt,
       new Map([[header.id, authoritative]]),
     )
     expect(snapshots.get(header.id)).toEqual({
-      message: { ...message, siblingIndex: 3, nodeVersion: header.nodeVersion + 1 },
+      message: {
+        ...message,
+        siblingIndex: 3,
+        nodeVersion: header.nodeVersion + 1,
+        generation: {
+          ...messageGeneration,
+          provider: 'canonical-provider',
+        },
+      },
       bodyVersion: header.bodyVersion,
     })
     expect(snapshots.get(header.id)?.message).not.toHaveProperty('requestContextVersion')
@@ -1471,8 +1510,12 @@ describe('shell smoke render', () => {
 
     act(() => {
       __resetMessageStreamProjectionForTests()
-      window.dispatchEvent(new Event('natter:recycle-transcript'))
     })
+    fireEvent.click(treeButton)
+    await waitFor(() =>
+      expect(container.querySelector('[data-ui="branch-tree-view"]')).toBeVisible(),
+    )
+    fireEvent.click(treeButton)
     await waitFor(() => {
       expect(container.querySelector('[data-ui="message-list"]')).toBeVisible()
       expect(container.querySelectorAll('[data-ui="message"]')).toHaveLength(2)
@@ -1515,8 +1558,12 @@ describe('shell smoke render', () => {
     })
     act(() => {
       __resetMessageStreamProjectionForTests()
-      window.dispatchEvent(new Event('natter:recycle-transcript'))
     })
+    fireEvent.click(treeButton)
+    await waitFor(() =>
+      expect(container.querySelector('[data-ui="branch-tree-view"]')).toBeVisible(),
+    )
+    fireEvent.click(treeButton)
     await waitFor(() => {
       const transcript = container.querySelector('[data-ui="message-list"]') as HTMLElement
       expect(within(transcript).getByText('edited answer survived')).toBeVisible()
@@ -1544,8 +1591,12 @@ describe('shell smoke render', () => {
 
     act(() => {
       __resetMessageStreamProjectionForTests()
-      window.dispatchEvent(new Event('natter:recycle-transcript'))
     })
+    fireEvent.click(treeButton)
+    await waitFor(() =>
+      expect(container.querySelector('[data-ui="branch-tree-view"]')).toBeVisible(),
+    )
+    fireEvent.click(treeButton)
     await waitFor(() => {
       expect(container.querySelectorAll('[data-ui="message"]')).toHaveLength(4)
     })

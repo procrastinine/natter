@@ -1,5 +1,5 @@
 import { expect, type Locator, type Page, test } from './fixtures'
-import { clearIndexedDb } from './helpers'
+import { clearIndexedDb, seedFirstRun, seedLinearChat } from './helpers'
 
 test.beforeEach(async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 740 })
@@ -42,7 +42,7 @@ test('narrow storage shell keeps sidebar reachable', async ({ page }) => {
 })
 
 test('narrow chat shell uses overlay sidebars without moving the chat', async ({ page }) => {
-  await startDebugChat(page)
+  await startChat(page)
 
   const shell = page.locator('[data-ui="app-shell"]')
   const main = page.locator('[data-ui="main-pane"]')
@@ -83,7 +83,7 @@ test('narrow chat shell uses overlay sidebars without moving the chat', async ({
 })
 
 test('hamburger menu exposes connection and chat controls on narrow screens', async ({ page }) => {
-  await startDebugChat(page)
+  await startChat(page)
 
   await page.locator('[data-role="chat-controls-menu"]').click()
   const menu = page.locator('[data-ui="chat-controls-menu"]')
@@ -108,27 +108,16 @@ async function box(locator: Locator) {
   return box
 }
 
-async function startDebugChat(page: Page): Promise<void> {
-  await page.evaluate(async () => {
-    const api = (
-      window as unknown as {
-        __debugFakeStream?: {
-          start(options: {
-            targetChars: number
-            reasoningChars: number
-            prompt: string
-            openChat: boolean
-          }): Promise<unknown>
-        }
-      }
-    ).__debugFakeStream
-    if (!api) throw new Error('__debugFakeStream is not installed')
-    await api.start({
-      targetChars: 24,
-      reasoningChars: 0,
-      prompt: 'Mobile shell layout check',
-      openChat: true,
-    })
+async function startChat(page: Page): Promise<void> {
+  await page.setViewportSize({ width: 1280, height: 740 })
+  await seedFirstRun(page)
+  const chatId = await seedLinearChat(page, {
+    chatId: 'mobile-layout-chat',
+    messageCount: 2,
+    textPrefix: 'mobile layout message',
+    title: 'Mobile shell layout check',
   })
-  await page.locator('[data-ui="message"][data-role="assistant"]').waitFor({ state: 'visible' })
+  await page.setViewportSize({ width: 390, height: 740 })
+  await page.goto(`/#/chat/${chatId}/message/msg-001`)
+  await expect(page.locator('[data-ui="message"][data-role="assistant"]')).toBeVisible()
 }

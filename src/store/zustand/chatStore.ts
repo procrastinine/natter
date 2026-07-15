@@ -5,7 +5,11 @@
 
 import { create } from 'zustand'
 import type { ChatId, CursorMap, CursorPatch, MessageId } from '../../core/types'
-import type { MessageHeaderRow, MessagePresentation } from '../message-storage'
+import {
+  type MessageHeaderRow,
+  type MessagePresentation,
+  rebaseHydratedMessageHeader,
+} from '../message-storage'
 import {
   isPersistentCursor,
   patchPersistentCursor,
@@ -672,17 +676,10 @@ function presentationWithCanonicalHeader(
   header: MessageHeaderRow,
 ): CommittedMessagePresentation {
   if (presentation.header === header) return presentation
-  const {
-    requestContextVersion: _requestContextVersion,
-    bodyVersion,
-    bodyWordCount: _bodyWordCount,
-    textPreview: _textPreview,
-    ...messageHeader
-  } = header
   return {
     header,
-    bodyVersion,
-    message: { ...presentation.message, ...messageHeader },
+    bodyVersion: header.bodyVersion,
+    message: rebaseHydratedMessageHeader(presentation.message, header),
   }
 }
 

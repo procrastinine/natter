@@ -5,7 +5,7 @@ import { newId } from '../lib/ulid'
 import {
   BROWSER_WRITER_LOCK_NAME,
   type BrowserLockRow,
-  emptyBrowserWriterLockRow,
+  emptyBrowserLockRow,
 } from './browser-lock-record'
 import { runWithLocalWriteActivity } from './transaction-activity'
 
@@ -21,6 +21,7 @@ const DEFAULT_FALLBACK_LOCK_LEASE_MS = 15_000
 const DEFAULT_FALLBACK_LOCK_RENEW_MS = 3_000
 const DEFAULT_FALLBACK_LOCK_RETRY_MS = 100
 const WORKSPACE_AUTHORITATIVE_GATE = 'workspace:authoritative'
+const COORDINATION_LOCK_PREFIX = 'natter:coordination:'
 
 const TEST_HELD_SCOPES: string[] = []
 let productionDatabaseOpener: (() => Promise<Dexie>) | null = null
@@ -50,6 +51,8 @@ interface IndexedDbLockBackendOptions {
   leaseMs?: number
   renewMs?: number
   retryMs?: number
+  recordName?: string
+  deleteRecordOnRelease?: boolean
 }
 
 interface FenceIdentity {
@@ -73,31 +76,34 @@ export class ScopeOrderError extends Error {
 }
 
 export class LockFenceLostError extends Error {
-  readonly lockName = BROWSER_WRITER_LOCK_NAME
+  readonly lockName: string
   readonly fencingToken: number
 
-  constructor(fencingToken: number) {
-    super(`LockFenceLost:${BROWSER_WRITER_LOCK_NAME}:${fencingToken}`)
+  constructor(fencingToken: number, lockName = BROWSER_WRITER_LOCK_NAME) {
+    super(`LockFenceLost:${lockName}:${fencingToken}`)
     this.name = 'LockFenceLostError'
+    this.lockName = lockName
     this.fencingToken = fencingToken
   }
 }
 
 class LockOwnershipUncertainError extends Error {
-  readonly lockName = BROWSER_WRITER_LOCK_NAME
+  readonly lockName: string
 
-  constructor() {
-    super(`LockOwnershipUncertain:${BROWSER_WRITER_LOCK_NAME}`)
+  constructor(lockName = BROWSER_WRITER_LOCK_NAME) {
+    super(`LockOwnershipUncertain:${lockName}`)
     this.name = 'LockOwnershipUncertainError'
+    this.lockName = lockName
   }
 }
 
 class LockRecordCorruptError extends Error {
-  readonly lockName = BROWSER_WRITER_LOCK_NAME
+  readonly lockName: string
 
-  constructor() {
-    super(`LockRecordCorrupt:${BROWSER_WRITER_LOCK_NAME}`)
+  constructor(lockName = BROWSER_WRITER_LOCK_NAME) {
+    super(`LockRecordCorrupt:${lockName}`)
     this.name = 'LockRecordCorruptError'
+    this.lockName = lockName
   }
 }
 
@@ -185,9 +191,9 @@ function uniqueTransactionTables(
   return [...byName.values()]
 }
 
-function validLockRow(row: BrowserLockRow): boolean {
+function validLockRow(row: BrowserLockRow, recordName: string): boolean {
   return (
-    row.name === BROWSER_WRITER_LOCK_NAME &&
+    row.name === recordName &&
     Number.isSafeInteger(row.fencingToken) &&
     row.fencingToken >= 0 &&
     ((row.ownerClientId === null && row.leaseId === null) ||
@@ -198,10 +204,14 @@ function validLockRow(row: BrowserLockRow): boolean {
   )
 }
 
-function ownsFence(row: BrowserLockRow | undefined, identity: FenceIdentity): boolean {
+function ownsFence(
+  row: BrowserLockRow | undefined,
+  identity: FenceIdentity,
+  recordName: string,
+): boolean {
   return (
     row !== undefined &&
-    row.name === BROWSER_WRITER_LOCK_NAME &&
+    row.name === recordName &&
     row.ownerClientId === identity.ownerClientId &&
     row.leaseId === identity.leaseId &&
     row.fencingToken === identity.fencingToken
@@ -242,6 +252,8 @@ class IndexedDbLockBackend implements LockBackend {
   private readonly leaseMs: number
   private readonly renewMs: number
   private readonly retryMs: number
+  private readonly recordName: string
+  private readonly deleteRecordOnRelease: boolean
   private queue: Promise<void> = Promise.resolve()
   private readonly timers = new Set<ReturnType<typeof setTimeout>>()
   private readonly delayRejectors = new Map<ReturnType<typeof setTimeout>, (error: Error) => void>()
@@ -267,6 +279,8 @@ class IndexedDbLockBackend implements LockBackend {
     this.leaseMs = options.leaseMs ?? DEFAULT_FALLBACK_LOCK_LEASE_MS
     this.renewMs = options.renewMs ?? DEFAULT_FALLBACK_LOCK_RENEW_MS
     this.retryMs = options.retryMs ?? DEFAULT_FALLBACK_LOCK_RETRY_MS
+    this.recordName = options.recordName ?? BROWSER_WRITER_LOCK_NAME
+    this.deleteRecordOnRelease = options.deleteRecordOnRelease ?? false
     if (
       this.leaseMs <= 0 ||
       this.renewMs <= 0 ||
@@ -340,13 +354,17 @@ class IndexedDbLockBackend implements LockBackend {
       const identity = await runWithLocalWriteActivity(() =>
         db.transaction('rw', db.table('browserLocks'), async () => {
           const table = db.table<BrowserLockRow, string>('browserLocks')
-          const stored = await table.get(BROWSER_WRITER_LOCK_NAME)
-          const row = stored ?? emptyBrowserWriterLockRow()
-          if (!validLockRow(row)) throw new LockRecordCorruptError()
+          const stored = await table.get(this.recordName)
+          const row = stored ?? emptyBrowserLockRow(this.recordName)
+          if (!validLockRow(row, this.recordName)) {
+            throw new LockRecordCorruptError(this.recordName)
+          }
           if (row.ownerClientId !== null && row.expiresAt > now) return undefined
-          if (row.fencingToken >= Number.MAX_SAFE_INTEGER) throw new LockRecordCorruptError()
+          if (row.fencingToken >= Number.MAX_SAFE_INTEGER) {
+            throw new LockRecordCorruptError(this.recordName)
+          }
           const next: BrowserLockRow = {
-            name: BROWSER_WRITER_LOCK_NAME,
+            name: this.recordName,
             ownerClientId: this.clientId,
             leaseId: newId(),
             fencingToken: row.fencingToken + 1,
@@ -393,8 +411,10 @@ class IndexedDbLockBackend implements LockBackend {
       logicalNames,
       runTransaction: async (db, tables, transactionFn) => {
         if (this.disposed) throw new Error('LockBackendDisposed')
-        if (ownership === 'lost') throw new LockFenceLostError(identity.fencingToken)
-        if (ownership === 'uncertain') throw new LockOwnershipUncertainError()
+        if (ownership === 'lost') {
+          throw new LockFenceLostError(identity.fencingToken, this.recordName)
+        }
+        if (ownership === 'uncertain') throw new LockOwnershipUncertainError(this.recordName)
         if (db.name !== acquiredDb.name) throw new Error('LockDatabaseMismatch')
         return runWithLocalWriteActivity(() =>
           db.transaction(
@@ -404,10 +424,13 @@ class IndexedDbLockBackend implements LockBackend {
               if (this.disposed) throw new Error('LockBackendDisposed')
               const row = await tx
                 .table<BrowserLockRow, string>('browserLocks')
-                .get(BROWSER_WRITER_LOCK_NAME)
-              if (!ownsFence(row, identity) || (row?.expiresAt ?? 0) <= this.now()) {
+                .get(this.recordName)
+              if (
+                !ownsFence(row, identity, this.recordName) ||
+                (row?.expiresAt ?? 0) <= this.now()
+              ) {
                 ownership = 'lost'
-                throw new LockFenceLostError(identity.fencingToken)
+                throw new LockFenceLostError(identity.fencingToken, this.recordName)
               }
               return transactionFn(tx)
             },
@@ -430,8 +453,8 @@ class IndexedDbLockBackend implements LockBackend {
     return runWithLocalWriteActivity(() =>
       db.transaction('rw', db.table('browserLocks'), async () => {
         const table = db.table<BrowserLockRow, string>('browserLocks')
-        const row = await table.get(BROWSER_WRITER_LOCK_NAME)
-        if (!row || !ownsFence(row, identity) || row.expiresAt <= now) return false
+        const row = await table.get(this.recordName)
+        if (!row || !ownsFence(row, identity, this.recordName) || row.expiresAt <= now) return false
         await table.put({ ...row, heartbeatAt: now, expiresAt: now + this.leaseMs })
         return true
       }),
@@ -442,8 +465,12 @@ class IndexedDbLockBackend implements LockBackend {
     await runWithLocalWriteActivity(() =>
       db.transaction('rw', db.table('browserLocks'), async () => {
         const table = db.table<BrowserLockRow, string>('browserLocks')
-        const row = await table.get(BROWSER_WRITER_LOCK_NAME)
-        if (!row || !ownsFence(row, identity)) return
+        const row = await table.get(this.recordName)
+        if (!row || !ownsFence(row, identity, this.recordName)) return
+        if (this.deleteRecordOnRelease) {
+          await table.delete(this.recordName)
+          return
+        }
         await table.put({
           ...row,
           ownerClientId: null,
@@ -515,6 +542,32 @@ export function createIndexedDbLockBackend(options: IndexedDbLockBackendOptions 
 
 export function configureLockDatabaseOpener(opener: () => Promise<Dexie>): void {
   productionDatabaseOpener = opener
+}
+
+export async function withCoordinationLock<T>(
+  resourceName: string,
+  fn: () => Promise<T> | T,
+  options: { signal?: AbortSignal } = {},
+): Promise<T> {
+  const lockName = `${COORDINATION_LOCK_PREFIX}${resourceName}`
+  if (options.signal?.aborted) throw new DOMException('Coordination aborted', 'AbortError')
+  if (hasWebLocks()) {
+    return options.signal
+      ? navigator.locks.request(lockName, { signal: options.signal }, () => fn())
+      : navigator.locks.request(lockName, () => fn())
+  }
+  const coordinationBackend = new IndexedDbLockBackend({
+    recordName: lockName,
+    deleteRecordOnRelease: true,
+  })
+  const abort = () => coordinationBackend.dispose()
+  options.signal?.addEventListener('abort', abort, { once: true })
+  try {
+    return await coordinationBackend.run([lockName], () => fn())
+  } finally {
+    options.signal?.removeEventListener('abort', abort)
+    coordinationBackend.dispose()
+  }
 }
 
 export async function withNamedLocks<T>(

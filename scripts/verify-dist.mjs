@@ -13,9 +13,15 @@ const forbiddenMarkers = [
   '/Users/',
   '[Streamdown Code]',
   '__debugFakeStream',
+  '__debugRuntime',
   '__debugScroll',
   '__debugStreams',
-  'window.__nuke',
+  '__nuke',
+  'VITE_NATTER_DEBUG',
+  'natter.debug.streams',
+  'natter.debug.request_plans',
+  'natter.debug.scroll',
+  'browser-devtools',
 ]
 const problems = [...delivery.topologyProblems]
 const javascriptArtifacts = []

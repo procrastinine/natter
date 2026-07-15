@@ -389,7 +389,7 @@ function OutputAudio({
     >
       {src ? (
         // biome-ignore lint/a11y/useMediaCaption: audio-output captions arrive as transcript text, not a timed VTT track.
-        <audio controls src={src} preload="metadata" />
+        <audio controls src={src} preload={objectUrl ? 'metadata' : 'none'} />
       ) : null}
       {audio.transcript ? <figcaption>{audio.transcript}</figcaption> : null}
       {messageId && attachmentRef ? (
@@ -441,12 +441,7 @@ function OutputVideo({
     >
       {src ? (
         // biome-ignore lint/a11y/useMediaCaption: generated video jobs do not return timed caption tracks.
-        <video
-          controls
-          src={src}
-          title={title}
-          preload={video.attachmentId ? 'auto' : 'metadata'}
-        />
+        <video controls src={src} title={title} preload={objectUrl ? 'auto' : 'none'} />
       ) : null}
       {messageId && attachmentRef ? (
         <OutputMediaContextToggle

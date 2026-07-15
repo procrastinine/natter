@@ -132,8 +132,7 @@
       "ImportModal",
       "MessageList",
       "StorageView",
-      "ToolEvidenceBlock",
-      "debug-fake-stream"
+      "ToolEvidenceBlock"
     ]
   }
 }

@@ -21,18 +21,8 @@ type CapturedRequest = {
   headers: Record<string, string>
 }
 
-type PlanEntry = {
-  label: string
-  payload: Record<string, unknown>
-}
-
 test.beforeEach(async ({ page }) => {
   await clearIndexedDb(page)
-  await page.evaluate(() =>
-    (
-      window as unknown as { __debugStreams?: { enablePlans(): void } }
-    ).__debugStreams?.enablePlans(),
-  )
 })
 
 test('GUI OpenRouter Responses GPT-5.4 xhigh reasoning and Continue stay on the unified planner', async ({
@@ -45,7 +35,11 @@ test('GUI OpenRouter Responses GPT-5.4 xhigh reasoning and Continue stay on the 
   })
   await mockOpenRouterResponses(page, requests)
 
-  await seedFirstRun(page, { model: OR_RESPONSES_MODEL, disablePrivacyFilter: false })
+  await seedFirstRun(page, {
+    model: OR_RESPONSES_MODEL,
+    disablePrivacyFilter: false,
+    corsProxyUrl: '/_or_scrape',
+  })
   await createChatAndOpen(page)
   await openSettingsPanel(page)
 
@@ -61,10 +55,6 @@ test('GUI OpenRouter Responses GPT-5.4 xhigh reasoning and Continue stay on the 
     'aria-pressed',
     'true',
   )
-  await page.evaluate(() =>
-    (window as unknown as { __debugStreams?: { clearPlans(): void } }).__debugStreams?.clearPlans(),
-  )
-
   const composer = page.locator('[data-ui="composer-input"]')
   await composer.fill('Are most CJK characters 1 token in tokenizers?')
   await composer.press('Enter')
@@ -102,13 +92,6 @@ test('GUI OpenRouter Responses GPT-5.4 xhigh reasoning and Continue stay on the 
   expect(summaries[0]?.summary).toContain('fragment-000 fragment-001 fragment-002')
   expect(summaries[0]?.summary).toContain('fragment-119')
 
-  const plans = await requestPlans(page)
-  const sendPlan = findLastPlan(plans, 'send')
-  const continuePlan = findLastPlan(plans, 'continue')
-  expect(sendPlan.payload.route).toMatchObject({ kind: 'responses' })
-  expect(continuePlan.payload.route).toMatchObject({ kind: 'responses' })
-  expect(sendPlan.payload.wireShape).toMatchObject({ hasInput: true, hasMessages: false })
-  expect(providerSummary(sendPlan).privacy).toMatchObject({ applicable: true })
   expectNoConsoleProblems(consoleLines)
 })
 
@@ -120,7 +103,11 @@ test('GUI OpenRouter Text completions posts /completions with a selected templat
   await mockOpenRouterDiscovery(page, OR_CHAT_MODEL)
   await mockOpenRouterTextCompletions(page, requests)
 
-  await seedFirstRun(page, { model: OR_CHAT_MODEL, disablePrivacyFilter: false })
+  await seedFirstRun(page, {
+    model: OR_CHAT_MODEL,
+    disablePrivacyFilter: false,
+    corsProxyUrl: '/_or_scrape',
+  })
   await createChatAndOpen(page)
   await openSettingsPanel(page)
 
@@ -130,28 +117,6 @@ test('GUI OpenRouter Text completions posts /completions with a selected templat
   await expect(textMode).toHaveAttribute('aria-pressed', 'true')
   await page.getByRole('tab', { name: 'Generation' }).click()
   await page.locator('[data-ui="text-template-picker"]').selectOption('raw')
-  await page.evaluate(() =>
-    (
-      window as unknown as {
-        __debugStreams?: { clear(): void; clearPlans(): void; enable(): void }
-      }
-    ).__debugStreams?.enable(),
-  )
-  await page.evaluate(() =>
-    (
-      window as unknown as {
-        __debugStreams?: { clear(): void; clearPlans(): void; enable(): void }
-      }
-    ).__debugStreams?.clear(),
-  )
-  await page.evaluate(() =>
-    (
-      window as unknown as {
-        __debugStreams?: { clear(): void; clearPlans(): void; enable(): void }
-      }
-    ).__debugStreams?.clearPlans(),
-  )
-
   const composer = page.locator('[data-ui="composer-input"]')
   await composer.fill('OpenRouter text route check')
   await composer.press('Enter')
@@ -165,39 +130,6 @@ test('GUI OpenRouter Text completions posts /completions with a selected templat
   expect(requests[0]?.body.prompt).toBe('OpenRouter text route check')
   expect(requests[0]?.body.messages).toBeUndefined()
   expect(requests[0]?.body.provider).toMatchObject({ data_collection: 'deny' })
-  const streamDump = await page.evaluate(
-    () =>
-      (
-        window as unknown as { __debugStreams?: { disable(): void; last(count?: number): string } }
-      ).__debugStreams?.last(20) ?? '',
-  )
-  expect(streamDump).toContain('[stream-debug]')
-  expect(streamDump).toContain('text-completions')
-  expect(streamDump).toContain('https://openrouter.ai/api/v1/completions')
-  expect(streamDump).toContain('OpenRouter text route check')
-  await page.evaluate(() =>
-    (
-      window as unknown as { __debugStreams?: { disable(): void; last(count?: number): string } }
-    ).__debugStreams?.disable(),
-  )
-
-  const plans = await requestPlans(page)
-  const sendPlan = findLastPlan(plans, 'send')
-  expect(sendPlan.payload.profile).toMatchObject({ kind: 'openrouter' })
-  expect(sendPlan.payload.route).toMatchObject({ kind: 'text-completions' })
-  expect(sendPlan.payload.useTextProtocol).toBe(true)
-  expect(sendPlan.payload.request).toMatchObject({
-    model: OR_CHAT_MODEL,
-    prompt: 'OpenRouter text route check',
-    stream: true,
-  })
-  expect((sendPlan.payload.request as Record<string, unknown>).messages).toBeUndefined()
-  expect(sendPlan.payload.wireShape).toMatchObject({
-    hasPrompt: true,
-    hasMessages: false,
-    prompt: { length: 27, preview: 'OpenRouter text route check' },
-  })
-  expect(providerSummary(sendPlan).privacy).toMatchObject({ applicable: true })
   expectNoConsoleProblems(consoleLines)
 })
 
@@ -229,7 +161,11 @@ test('GUI OpenRouter hosted tools serialize for chat routes but not text complet
   })
   await mockOpenRouterTextCompletions(page, textRequests)
 
-  await seedFirstRun(page, { model: OR_CHAT_MODEL, disablePrivacyFilter: false })
+  await seedFirstRun(page, {
+    model: OR_CHAT_MODEL,
+    disablePrivacyFilter: false,
+    corsProxyUrl: '/_or_scrape',
+  })
   await createChatAndOpen(page)
   await openSettingsPanel(page)
   await page.getByRole('tab', { name: 'Generation' }).click()
@@ -244,9 +180,6 @@ test('GUI OpenRouter hosted tools serialize for chat routes but not text complet
   await expect(webSearch).toBeChecked()
   await datetime.click()
   await expect(datetime).toBeChecked()
-  await page.evaluate(() =>
-    (window as unknown as { __debugStreams?: { clearPlans(): void } }).__debugStreams?.clearPlans(),
-  )
 
   const composer = page.locator('[data-ui="composer-input"]')
   await composer.fill('OpenRouter hosted tools route check')
@@ -277,9 +210,6 @@ test('GUI OpenRouter hosted tools serialize for chat routes but not text complet
   const textTools = page.locator('[data-ui-section="hosted-tools"]')
   await expect(textTools).toHaveCount(0)
   await page.locator('[data-ui="text-template-picker"]').selectOption('raw')
-  await page.evaluate(() =>
-    (window as unknown as { __debugStreams?: { clearPlans(): void } }).__debugStreams?.clearPlans(),
-  )
 
   await composer.fill('OpenRouter text completions omit tools')
   await composer.press('Enter')
@@ -293,11 +223,6 @@ test('GUI OpenRouter hosted tools serialize for chat routes but not text complet
   expect(textRequests[0]?.url).toBe('https://openrouter.ai/api/v1/completions')
   expect(textRequests[0]?.body.tools).toBeUndefined()
 
-  const plans = await requestPlans(page)
-  const sendPlan = findLastPlan(plans, 'send')
-  expect(sendPlan.payload.profile).toMatchObject({ kind: 'openrouter' })
-  expect(sendPlan.payload.route).toMatchObject({ kind: 'text-completions' })
-  expect((sendPlan.payload.request as Record<string, unknown>).tools).toBeUndefined()
   expectNoConsoleProblems(consoleLines)
 })
 
@@ -307,7 +232,11 @@ test('GUI OpenAI direct hosted tools serialize only as Responses tools', async (
   await mockOpenRouterDiscovery(page, OR_CHAT_MODEL)
   await mockOpenAiDirect(page, requests)
 
-  await seedFirstRun(page, { model: OR_CHAT_MODEL, disablePrivacyFilter: false })
+  await seedFirstRun(page, {
+    model: OR_CHAT_MODEL,
+    disablePrivacyFilter: false,
+    corsProxyUrl: '/_or_scrape',
+  })
   await createChatAndOpen(page)
   await addConnectionThroughGui(page, 'openai-compatible', { key: 'sk-openai-test' })
   await selectModelThroughSettings(page, OPENAI_MODEL)
@@ -322,9 +251,6 @@ test('GUI OpenAI direct hosted tools serialize only as Responses tools', async (
   await imageGeneration.click()
   await expect(webSearch).toBeChecked()
   await expect(imageGeneration).toBeChecked()
-  await page.evaluate(() =>
-    (window as unknown as { __debugStreams?: { clearPlans(): void } }).__debugStreams?.clearPlans(),
-  )
 
   const composer = page.locator('[data-ui="composer-input"]')
   await composer.fill('OpenAI hosted tools route check')
@@ -342,13 +268,6 @@ test('GUI OpenAI direct hosted tools serialize only as Responses tools', async (
   expect(requests[0]?.body.input).toBeDefined()
   expect(requests[0]?.body.tools).toEqual([{ type: 'web_search' }, { type: 'image_generation' }])
 
-  const plans = await requestPlans(page)
-  const sendPlan = findLastPlan(plans, 'send')
-  expect(sendPlan.payload.profile).toMatchObject({ kind: 'openai-compatible' })
-  expect(sendPlan.payload.route).toMatchObject({ kind: 'responses' })
-  expect(providerSummary(sendPlan).wire).toBeNull()
-  expect(providerSummary(sendPlan).privacy).toMatchObject({ applicable: false })
-  expect(sendPlan.payload.wireShape).toMatchObject({ hasProvider: false, hasInput: true })
   expectNoConsoleProblems(consoleLines)
 })
 
@@ -358,7 +277,11 @@ test('GUI edit Save & Send reuses provider planning for the edited branch', asyn
   await mockOpenRouterDiscovery(page, OR_CHAT_MODEL)
   await mockChatCompletionsCapture(page, requests, ['original answer', 'edited answer'])
 
-  await seedFirstRun(page, { model: OR_CHAT_MODEL, disablePrivacyFilter: false })
+  await seedFirstRun(page, {
+    model: OR_CHAT_MODEL,
+    disablePrivacyFilter: false,
+    corsProxyUrl: '/_or_scrape',
+  })
   await createChatAndOpen(page)
   await openSettingsPanel(page)
   const alphaRow = page.locator('[data-ui="provider-picker-row"]').filter({ hasText: 'Alpha ZDR' })
@@ -368,9 +291,6 @@ test('GUI edit Save & Send reuses provider planning for the edited branch', asyn
     'Budget Clean',
   )
   await waitForProviderOrder(page, ['Budget Clean', 'Alpha ZDR', 'Tiny Context'])
-  await page.evaluate(() =>
-    (window as unknown as { __debugStreams?: { clearPlans(): void } }).__debugStreams?.clearPlans(),
-  )
 
   const composer = page.locator('[data-ui="composer-input"]')
   await composer.fill('original user prompt')
@@ -398,14 +318,6 @@ test('GUI edit Save & Send reuses provider planning for the edited branch', asyn
     expect.arrayContaining(['Fast Retain', 'Training Host', 'Tiny Context', 'UserID Host']),
   )
 
-  const plans = await requestPlans(page)
-  const editPlan = findLastPlan(plans, 'send-from-message')
-  const editProvider = providerSummary(editPlan).wire as { order?: string[]; ignore?: string[] }
-  expect(editPlan.payload.wireShape).toMatchObject({ hasProvider: true, hasMessages: true })
-  expect(editProvider.order?.slice(0, 3)).toEqual(['Budget Clean', 'Alpha ZDR', 'Tiny Context'])
-  expect(editProvider.ignore).toEqual(
-    expect.arrayContaining(['Fast Retain', 'Training Host', 'Tiny Context', 'UserID Host']),
-  )
   expectNoConsoleProblems(consoleLines)
 })
 
@@ -417,7 +329,11 @@ test('GUI manual provider allow updates privacy badge and overrides red tiers', 
   await mockOpenRouterDiscovery(page, OR_CHAT_MODEL)
   await mockChatCompletionsCapture(page, requests, ['manual provider ok'])
 
-  await seedFirstRun(page, { model: OR_CHAT_MODEL, disablePrivacyFilter: false })
+  await seedFirstRun(page, {
+    model: OR_CHAT_MODEL,
+    disablePrivacyFilter: false,
+    corsProxyUrl: '/_or_scrape',
+  })
   await createChatAndOpen(page)
   await openSettingsPanel(page)
 
@@ -464,9 +380,6 @@ test('GUI manual provider allow updates privacy badge and overrides red tiers', 
   await expect(trainingRow).toHaveAttribute('data-allowed', 'true')
   await expect(headerLock).toHaveAttribute('data-privacy-tier', 'red')
 
-  await page.evaluate(() =>
-    (window as unknown as { __debugStreams?: { clearPlans(): void } }).__debugStreams?.clearPlans(),
-  )
   const composer = page.locator('[data-ui="composer-input"]')
   await composer.fill('manual provider override route check')
   await composer.press('Enter')
@@ -481,12 +394,6 @@ test('GUI manual provider allow updates privacy badge and overrides red tiers', 
   expect(provider.ignore).not.toContain('UserID Host')
   expect(provider.ignore).not.toContain('Training Host')
 
-  const plans = await requestPlans(page)
-  const sendPlan = findLastPlan(plans, 'send')
-  const plannedProvider = providerSummary(sendPlan).wire as { ignore?: string[] }
-  expect(plannedProvider.ignore).not.toContain('Fast Retain')
-  expect(plannedProvider.ignore).not.toContain('UserID Host')
-  expect(plannedProvider.ignore).not.toContain('Training Host')
   expectNoConsoleProblems(consoleLines)
 })
 
@@ -503,6 +410,7 @@ test('GUI duplicate provider display names stay independently selectable by slug
   await seedFirstRun(page, {
     model: 'anthropic/claude-opus-4.7',
     disablePrivacyFilter: false,
+    corsProxyUrl: '/_or_scrape',
   })
   await createChatAndOpen(page)
   await openSettingsPanel(page)
@@ -535,9 +443,6 @@ test('GUI duplicate provider display names stay independently selectable by slug
   await expect(anth2).toHaveAttribute('data-allowed', 'false')
   await expect(anth).toHaveAttribute('data-allowed', 'true')
 
-  await page.evaluate(() =>
-    (window as unknown as { __debugStreams?: { clearPlans(): void } }).__debugStreams?.clearPlans(),
-  )
   const composer = page.locator('[data-ui="composer-input"]')
   await composer.fill('duplicate provider route check')
   await composer.press('Enter')
@@ -549,11 +454,6 @@ test('GUI duplicate provider display names stay independently selectable by slug
   const provider = requests[0]?.body.provider as { ignore?: string[]; order?: string[] }
   expect(provider.ignore).toEqual(['anthropic/2'])
   expect(provider.order).toBeUndefined()
-  const plans = await requestPlans(page)
-  const sendPlan = findLastPlan(plans, 'send')
-  const plannedProvider = providerSummary(sendPlan).wire as { ignore?: string[]; order?: string[] }
-  expect(plannedProvider.ignore).toEqual(['anthropic/2'])
-  expect(plannedProvider.order).toBeUndefined()
   expectNoConsoleProblems(consoleLines)
 })
 
@@ -568,7 +468,11 @@ test('GUI provider quantization bulk actions update the selected provider list',
   })
   await mockChatCompletionsCapture(page, requests, ['quantization provider ok'])
 
-  await seedFirstRun(page, { model: OR_CHAT_MODEL, disablePrivacyFilter: false })
+  await seedFirstRun(page, {
+    model: OR_CHAT_MODEL,
+    disablePrivacyFilter: false,
+    corsProxyUrl: '/_or_scrape',
+  })
   await createChatAndOpen(page)
   await openSettingsPanel(page)
 
@@ -589,9 +493,6 @@ test('GUI provider quantization bulk actions update the selected provider list',
   await expect(fp8Row).toHaveAttribute('data-allowed', 'true')
   await expect(fp4Row).toHaveAttribute('data-allowed', 'false')
 
-  await page.evaluate(() =>
-    (window as unknown as { __debugStreams?: { clearPlans(): void } }).__debugStreams?.clearPlans(),
-  )
   const composer = page.locator('[data-ui="composer-input"]')
   await composer.fill('quantization provider route check')
   await composer.press('Enter')
@@ -605,11 +506,6 @@ test('GUI provider quantization bulk actions update the selected provider list',
   expect(provider.ignore).not.toContain('streamlake/fp8')
   expect(provider).not.toHaveProperty('quantizations')
 
-  const plans = await requestPlans(page)
-  const sendPlan = findLastPlan(plans, 'send')
-  const plannedProvider = providerSummary(sendPlan).wire as { ignore?: string[] }
-  expect(plannedProvider.ignore).toEqual(expect.arrayContaining(['deepinfra/fp4', 'deepseek']))
-  expect(plannedProvider.ignore).not.toContain('streamlake/fp8')
   expectNoConsoleProblems(consoleLines)
 })
 
@@ -687,9 +583,6 @@ test('GUI Google native sends generateContent without OpenRouter provider/privac
   await urlContext.click()
   await expect(googleSearch).toBeChecked()
   await expect(urlContext).toBeChecked()
-  await page.evaluate(() =>
-    (window as unknown as { __debugStreams?: { clearPlans(): void } }).__debugStreams?.clearPlans(),
-  )
 
   const composer = page.locator('[data-ui="composer-input"]')
   await composer.fill('Gemini native route check')
@@ -710,16 +603,6 @@ test('GUI Google native sends generateContent without OpenRouter provider/privac
   expect(requests[0]?.body.contents).toBeDefined()
   expect(requests[0]?.body.tools).toEqual([{ googleSearch: {} }, { urlContext: {} }])
 
-  const plans = await requestPlans(page)
-  const sendPlan = findLastPlan(plans, 'send')
-  expect(sendPlan.payload.profile).toMatchObject({ kind: 'google' })
-  expect(sendPlan.payload.route).toMatchObject({ kind: 'gemini-generate' })
-  expect(providerSummary(sendPlan).wire).toBeNull()
-  expect(providerSummary(sendPlan).privacy).toMatchObject({ applicable: false })
-  expect(sendPlan.payload.wireShape).toMatchObject({
-    hasProvider: false,
-    hasSystemInstruction: false,
-  })
   expectNoConsoleProblems(consoleLines)
 })
 
@@ -841,9 +724,6 @@ test('GUI llama-server text protocol posts /completions prompt through the unifi
   const textProtocol = page.getByRole('button', { name: 'Text completion', exact: true })
   await textProtocol.click()
   await expect(textProtocol).toHaveAttribute('aria-pressed', 'true')
-  await page.evaluate(() =>
-    (window as unknown as { __debugStreams?: { clearPlans(): void } }).__debugStreams?.clearPlans(),
-  )
 
   const composer = page.locator('[data-ui="composer-input"]')
   await composer.fill('Local llama text route check')
@@ -860,22 +740,14 @@ test('GUI llama-server text protocol posts /completions prompt through the unifi
   expect(requests[0]?.body.messages).toBeUndefined()
   expect(requests[0]?.body.provider).toBeUndefined()
 
-  const plans = await requestPlans(page)
-  const sendPlan = findLastPlan(plans, 'send')
-  expect(sendPlan.payload.profile).toMatchObject({ kind: 'llama-server' })
-  expect(sendPlan.payload.useTextProtocol).toBe(true)
-  expect(providerSummary(sendPlan).wire).toBeNull()
-  expect(providerSummary(sendPlan).privacy).toMatchObject({ applicable: false })
-  expect(sendPlan.payload.wireShape).toMatchObject({ hasPrompt: true, hasMessages: false })
   expectNoConsoleProblems(consoleLines)
 })
 
 function captureConsole(page: Page): string[] {
   const lines: string[] = []
   page.on('console', (msg) => {
-    const text = msg.text()
-    if (text.includes('[request-plan]') || msg.type() === 'error' || msg.type() === 'warning') {
-      lines.push(`${msg.type()}: ${text}`)
+    if (msg.type() === 'error' || msg.type() === 'warning') {
+      lines.push(`${msg.type()}: ${msg.text()}`)
     }
   })
   return lines
@@ -885,7 +757,6 @@ function expectNoConsoleProblems(lines: string[]): void {
   expect(lines.filter((line) => line.startsWith('error:') || line.startsWith('warning:'))).toEqual(
     [],
   )
-  expect(lines.some((line) => line.includes('[request-plan] prepared'))).toBe(true)
 }
 
 async function openSettingsPanel(page: Page): Promise<void> {
@@ -1817,31 +1688,4 @@ function parsePostBody(raw: string | null): Record<string, unknown> {
 function stringField(record: Record<string, unknown>, key: string): string {
   const value = record[key]
   return typeof value === 'string' ? value : ''
-}
-
-async function requestPlans(page: Page): Promise<PlanEntry[]> {
-  return page.evaluate(
-    () =>
-      (
-        window as unknown as { __debugStreams?: { plans(): PlanEntry[] } }
-      ).__debugStreams?.plans() ?? [],
-  )
-}
-
-function findLastPlan(plans: PlanEntry[], source: string): PlanEntry {
-  const matches = plans.filter((entry) => entry.payload.source === source)
-  expect(matches, `missing request plan for ${source}`).not.toEqual([])
-  return matches.at(-1) as PlanEntry
-}
-
-function providerSummary(plan: PlanEntry): {
-  wire: Record<string, unknown> | null
-  contextIgnored: string[]
-  privacy: Record<string, unknown>
-} {
-  return plan.payload.provider as {
-    wire: Record<string, unknown> | null
-    contextIgnored: string[]
-    privacy: Record<string, unknown>
-  }
 }

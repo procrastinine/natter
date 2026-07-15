@@ -1,5 +1,22 @@
 import { createHash } from 'node:crypto'
 import { chromium } from '@playwright/test'
+import {
+  assertLoopbackUrl,
+  createProviderScenario,
+  FAKE_REASONING_SEED,
+  FAKE_TEXT_SEED,
+  monitorScenario,
+  navigateToChat,
+  openNewChat,
+  prepareAdditionalPage,
+  repeatedSeedText,
+  seedAndRetargetWorkspace,
+  startComposerSend,
+  startFakeProvider,
+  startRegenerate,
+  waitForProviderIdle,
+  waitForWorkspaceStreamQuiescence,
+} from './profile-stream-harness.mjs'
 
 const DEFAULTS = Object.freeze({
   url: 'http://127.0.0.1:5173/',
@@ -9,8 +26,10 @@ const DEFAULTS = Object.freeze({
   targetChars: 100_000,
   reasoningChars: 100_000,
   chunkChars: 128,
+  initialDelayMs: 5_000,
   regenerationCount: 100,
   timeoutMs: 180_000,
+  providerUrl: null,
 })
 const options = parseArgs(process.argv.slice(2))
 if (options.help) {
@@ -25,138 +44,100 @@ const {
   targetChars,
   reasoningChars,
   chunkChars,
+  initialDelayMs,
   regenerationCount,
   timeoutMs,
+  providerUrl,
 } = options
 const totalStreams = pageCount * streamsPerPage
-const target = new URL(url)
-const LOREM =
-  'Lorem ipsum dolor sit amet, consectetur adipiscing elit. Integer vitae sem sed nulla gravida feugiat. '
-
-if (!['127.0.0.1', 'localhost', '[::1]'].includes(target.hostname)) {
-  throw new Error('stress harness only accepts a loopback URL')
-}
+assertLoopbackUrl(url, 'stress harness')
 if (regenerationCount > totalStreams) {
   throw new Error('regenerationCount cannot exceed totalStreams')
 }
 
-const browser = await chromium.launch({
-  headless: true,
-  args: ['--enable-precise-memory-info'],
-})
-const context = await browser.newContext()
+const provider = await startFakeProvider({ providerUrl, timeoutMs })
+let scenario
+let browser
+let context
 const pages = []
 const cdpSessions = []
 const consoleProblems = []
 
 try {
-  for (let index = 0; index < pageCount; index += 1) {
-    const page = await context.newPage()
-    page.setDefaultTimeout(timeoutMs)
-    page.setDefaultNavigationTimeout(timeoutMs)
-    page.on('console', (message) => {
-      if (message.type() === 'error' || message.type() === 'warning') {
-        consoleProblems.push({ page: index, type: message.type(), text: message.text() })
-      }
-    })
-    page.on('pageerror', (error) => {
-      consoleProblems.push({ page: index, type: 'pageerror', text: error.message })
-    })
-    await page.goto(url, { waitUntil: 'domcontentloaded' })
-    await page.waitForFunction(() => Boolean(window.__debugFakeStream), null, {
-      timeout: timeoutMs,
-    })
-    pages.push(page)
-    cdpSessions.push(await context.newCDPSession(page))
-  }
+  scenario = await createProviderScenario(provider.origin, generatedConfig(1, 0, 0))
+  browser = await chromium.launch({
+    headless: true,
+    args: ['--enable-precise-memory-info'],
+  })
+  context = await browser.newContext()
 
-  const seed = await withinTimeout(
-    pages[0].evaluate(async () =>
-      window.__debugFakeStream.start({
-        targetChars: 1,
-        reasoningChars: 0,
-        chunkChars: 1,
-        reasoningChunkChars: 1,
-        delayMs: 0,
-        openChat: false,
-        prompt: 'concurrency stress seed',
-      }),
-    ),
-    'seed stream',
+  const firstPage = await createMeasuredPage(0)
+  await seedAndRetargetWorkspace(firstPage, {
+    appUrl: url,
+    providerBaseUrl: scenario.providerBaseUrl,
+  })
+  await scenario.update(generatedConfig(1, 0, 0))
+  await openNewChat(firstPage)
+  const seedStarted = performance.now()
+  const seedAdmission = await startComposerSend(firstPage, 'concurrency stress seed')
+  await waitForProviderIdle(scenario, timeoutMs)
+  const [seedState] = await waitForWorkspaceStreamQuiescence(
+    firstPage,
+    [seedAdmission.assistantMessageId],
     timeoutMs,
   )
+  const seed = {
+    ...seedAdmission,
+    elapsedMs: performance.now() - seedStarted,
+    outcome: seedState.status === 'done' ? 'done' : seedState.status,
+  }
+  for (let index = 1; index < pageCount; index += 1) {
+    const page = await createMeasuredPage(index)
+    await prepareAdditionalPage(page, { appUrl: url, providerBaseUrl: scenario.providerBaseUrl })
+  }
   const baselineHeap = await measureHeap(pages, cdpSessions)
 
-  const startedAt = Date.now()
-  const previousBatches = await withinTimeout(
-    Promise.all(
-      pages.map((page, pageIndex) =>
-        page.evaluate(
-          async ({ pageIndex, streamsPerPage, contextChars, chunkChars }) =>
-            Promise.all(
-              Array.from({ length: streamsPerPage }, (_, streamIndex) =>
-                window.__debugFakeStream.start({
-                  targetChars: contextChars,
-                  reasoningChars: 0,
-                  chunkChars,
-                  reasoningChunkChars: chunkChars,
-                  delayMs: 0,
-                  openChat: false,
-                  prompt: `prior turn ${pageIndex}:${streamIndex}`,
-                }),
-              ),
-            ),
-          { pageIndex, streamsPerPage, contextChars, chunkChars },
-        ),
-      ),
-    ),
-    'previous-turn phase',
-    timeoutMs,
-  )
-  const previousElapsedMs = Date.now() - startedAt
+  const previousPhase = await runPhase({
+    label: 'previous-turn phase',
+    expectedConcurrent: totalStreams,
+    config: generatedConfig(contextChars, 0, initialDelayMs),
+    start: async (page, pageIndex) => {
+      const batch = []
+      for (let streamIndex = 0; streamIndex < streamsPerPage; streamIndex += 1) {
+        await openNewChat(page)
+        batch.push(await startComposerSend(page, `prior turn ${pageIndex}:${streamIndex}`))
+      }
+      return batch
+    },
+  })
+  const previousBatches = previousPhase.batches
+  const previousElapsedMs = previousPhase.elapsedMs
   const afterPreviousHeap = await measureHeap(pages, cdpSessions)
   console.error(`previous-turn phase: ${previousElapsedMs} ms`)
 
-  const currentStartedAt = Date.now()
-  const resultBatches = await withinTimeout(
-    Promise.all(
-      pages.map((page, pageIndex) =>
-        page.evaluate(
-          async ({ pageIndex, previous, targetChars, reasoningChars, chunkChars }) =>
-            Promise.all(
-              previous.map(async (prior, streamIndex) => {
-                const current = await window.__debugFakeStream.start({
-                  chatId: prior.chatId,
-                  targetChars,
-                  reasoningChars,
-                  chunkChars,
-                  reasoningChunkChars: chunkChars,
-                  delayMs: 0,
-                  openChat: false,
-                  prompt: `next turn ${pageIndex}:${streamIndex}`,
-                })
-                return {
-                  ...current,
-                  previousAssistantMessageId: prior.assistantMessageId,
-                  previousOutcome: prior.outcome,
-                }
-              }),
-            ),
-          {
-            pageIndex,
-            previous: previousBatches[pageIndex],
-            targetChars,
-            reasoningChars,
-            chunkChars,
-          },
-        ),
-      ),
-    ),
-    'current-turn phase',
-    timeoutMs,
-  )
+  const currentPhase = await runPhase({
+    label: 'current-turn phase',
+    expectedConcurrent: totalStreams,
+    config: generatedConfig(targetChars, reasoningChars, initialDelayMs),
+    start: async (page, pageIndex) => {
+      const batch = []
+      const previous = previousBatches[pageIndex]
+      for (let streamIndex = 0; streamIndex < previous.length; streamIndex += 1) {
+        const prior = previous[streamIndex]
+        await navigateToChat(page, prior.chatId, prior.assistantMessageId)
+        const current = await startComposerSend(page, `next turn ${pageIndex}:${streamIndex}`)
+        batch.push({
+          ...current,
+          previousAssistantMessageId: prior.assistantMessageId,
+          previousOutcome: prior.outcome,
+        })
+      }
+      return batch
+    },
+  })
+  const resultBatches = currentPhase.batches
   const results = resultBatches.flat()
-  const currentElapsedMs = Date.now() - currentStartedAt
+  const currentElapsedMs = currentPhase.elapsedMs
   const elapsedMs = previousElapsedMs + currentElapsedMs
   const afterCurrentHeap = await measureHeap(pages, cdpSessions)
   console.error(`current-turn phase: ${currentElapsedMs} ms`)
@@ -171,40 +152,27 @@ try {
       sourceAssistantId: result.assistantMessageId,
     }))
   })
-  const regenerationStartedAt = Date.now()
-  const regenerationBatches = await withinTimeout(
-    Promise.all(
-      pages.map((page, pageIndex) =>
-        page.evaluate(
-          async ({ inputs, targetChars, reasoningChars, chunkChars }) =>
-            Promise.all(
-              inputs.map(async (input) => {
-                const regenerated = await window.__debugFakeStream.start({
-                  chatId: input.chatId,
-                  parentMessageId: input.parentUserId,
-                  targetChars,
-                  reasoningChars,
-                  chunkChars,
-                  reasoningChunkChars: chunkChars,
-                  delayMs: 0,
-                  openChat: false,
-                })
-                return {
-                  ...regenerated,
-                  parentUserId: input.parentUserId,
-                  sourceAssistantId: input.sourceAssistantId,
-                }
-              }),
-            ),
-          { inputs: regenerationInputsByPage[pageIndex], targetChars, reasoningChars, chunkChars },
-        ),
-      ),
-    ),
-    'regeneration phase',
-    timeoutMs,
-  )
+  const regenerationPhase = await runPhase({
+    label: 'regeneration phase',
+    expectedConcurrent: regenerationCount,
+    config: generatedConfig(targetChars, reasoningChars, initialDelayMs),
+    start: async (page, pageIndex) => {
+      const batch = []
+      for (const input of regenerationInputsByPage[pageIndex]) {
+        await navigateToChat(page, input.chatId, input.sourceAssistantId)
+        const regenerated = await startRegenerate(page, input.sourceAssistantId)
+        batch.push({
+          ...regenerated,
+          parentUserId: input.parentUserId,
+          sourceAssistantId: input.sourceAssistantId,
+        })
+      }
+      return batch
+    },
+  })
+  const regenerationBatches = regenerationPhase.batches
   const regenerations = regenerationBatches.flat()
-  const regenerationElapsedMs = Date.now() - regenerationStartedAt
+  const regenerationElapsedMs = regenerationPhase.elapsedMs
   const afterRegenerationHeap =
     regenerations.length > 0 ? await measureHeap(pages, cdpSessions) : afterCurrentHeap
   if (regenerations.length > 0) {
@@ -221,27 +189,21 @@ try {
     previousAssistantIds,
     chatIds,
     regenerations,
-    expectedContextHash: hashText(loremText(contextChars)),
-    expectedTextHash: hashText(loremText(targetChars)),
-    expectedReasoningHash: hashText(loremText(reasoningChars)),
+    expectedContextHash: hashText(repeatedSeedText(FAKE_TEXT_SEED, contextChars)),
+    expectedTextHash: hashText(repeatedSeedText(FAKE_TEXT_SEED, targetChars)),
+    expectedReasoningHash: hashText(repeatedSeedText(FAKE_REASONING_SEED, reasoningChars)),
     contextChars,
     targetChars,
     reasoningChars,
   })
-  const pageStates = await Promise.all(
-    pages.map((page) => page.evaluate(() => window.__debugFakeStream.state())),
-  )
+  const pageStates = await Promise.all(pages.map((page) => collectPageState(page)))
 
   await withinTimeout(
     Promise.all(pages.map((page) => page.reload({ waitUntil: 'domcontentloaded' }))),
     'reload phase',
     timeoutMs,
   )
-  await Promise.all(
-    pages.map((page) =>
-      page.waitForFunction(() => Boolean(window.__debugFakeStream), null, { timeout: timeoutMs }),
-    ),
-  )
+  await Promise.all(pages.map((page) => page.locator('#root > *').first().waitFor()))
   const afterReloadHeap = await measureHeap(pages, cdpSessions)
   const afterReload = await verifyStored(pages[0], {
     assistantIds,
@@ -249,9 +211,9 @@ try {
     previousAssistantIds,
     chatIds,
     regenerations,
-    expectedContextHash: hashText(loremText(contextChars)),
-    expectedTextHash: hashText(loremText(targetChars)),
-    expectedReasoningHash: hashText(loremText(reasoningChars)),
+    expectedContextHash: hashText(repeatedSeedText(FAKE_TEXT_SEED, contextChars)),
+    expectedTextHash: hashText(repeatedSeedText(FAKE_TEXT_SEED, targetChars)),
+    expectedReasoningHash: hashText(repeatedSeedText(FAKE_REASONING_SEED, reasoningChars)),
     contextChars,
     targetChars,
     reasoningChars,
@@ -266,11 +228,15 @@ try {
         `${result.previousAssistantMessageId}: previous outcome ${result.previousOutcome}`,
       )
     }
-    if (result.outcome !== 'done') failures.push(`${result.streamId}: outcome ${result.outcome}`)
+    if (result.outcome !== 'done') {
+      failures.push(`${result.assistantMessageId}: outcome ${result.outcome}`)
+    }
   }
   for (const regeneration of regenerations) {
     if (regeneration.outcome !== 'done') {
-      failures.push(`${regeneration.streamId}: regeneration outcome ${regeneration.outcome}`)
+      failures.push(
+        `${regeneration.assistantMessageId}: regeneration outcome ${regeneration.outcome}`,
+      )
     }
   }
   failures.push(...beforeReload.failures.map((failure) => `before reload: ${failure}`))
@@ -283,10 +249,22 @@ try {
       failures.push(`page ${index}: ${state.streamStore.liveSnapshotCount} live snapshots remain`)
     }
   }
+  for (const [label, phase] of [
+    ['previous-turn', previousPhase],
+    ['current-turn', currentPhase],
+    ['regeneration', regenerationPhase],
+  ]) {
+    if (phase.provider.maxActiveStreams !== phase.expectedConcurrent) {
+      failures.push(
+        `${label}: provider high-water ${phase.provider.maxActiveStreams}/${phase.expectedConcurrent}`,
+      )
+    }
+  }
   if (consoleProblems.length > 0) failures.push(`${consoleProblems.length} console problems`)
 
   const report = {
     schemaVersion: 1,
+    measurementModel: 'external-http-ui-v1',
     scenario: {
       pageCount,
       streamsPerPage,
@@ -295,8 +273,10 @@ try {
       targetChars,
       reasoningChars,
       chunkChars,
+      initialDelayMs,
       regenerationCount,
       timeoutMs,
+      providerOwned: provider.owned,
       totalPersistedChars:
         totalStreams * (contextChars + targetChars + reasoningChars) +
         regenerationCount * (targetChars + reasoningChars),
@@ -306,6 +286,11 @@ try {
       previousTurn: previousElapsedMs,
       currentTurn: currentElapsedMs,
       regeneration: regenerationElapsedMs,
+    },
+    providerPhases: {
+      previousTurn: previousPhase.provider,
+      currentTurn: currentPhase.provider,
+      regeneration: regenerationPhase.provider,
     },
     seed: {
       chatId: seed.chatId,
@@ -330,7 +315,122 @@ try {
   console.log(JSON.stringify(report, null, 2))
   if (failures.length > 0) process.exitCode = 1
 } finally {
-  await browser.close()
+  await browser?.close()
+  await scenario?.dispose().catch(() => undefined)
+  await provider.stop()
+}
+
+async function createMeasuredPage(index) {
+  const page = await context.newPage()
+  page.setDefaultTimeout(timeoutMs)
+  page.setDefaultNavigationTimeout(timeoutMs)
+  page.on('console', (message) => {
+    if (message.type() === 'error' || message.type() === 'warning') {
+      consoleProblems.push({ page: index, type: message.type(), text: message.text() })
+    }
+  })
+  page.on('pageerror', (error) => {
+    consoleProblems.push({ page: index, type: 'pageerror', text: error.message })
+  })
+  pages.push(page)
+  cdpSessions.push(await context.newCDPSession(page))
+  return page
+}
+
+function generatedConfig(textChars, hiddenReasoningChars, admissionDelayMs) {
+  return {
+    targetChars: textChars,
+    reasoningChars: hiddenReasoningChars,
+    chunkChars,
+    reasoningChunkChars: chunkChars,
+    initialDelayMs: admissionDelayMs,
+    delayMs: 0,
+  }
+}
+
+async function runPhase({ label, expectedConcurrent, config, start }) {
+  if (expectedConcurrent === 0) {
+    const final = await scenario.update(config)
+    return {
+      batches: pages.map(() => []),
+      elapsedMs: 0,
+      expectedConcurrent,
+      provider: { maxActiveStreams: 0, samples: 0, final },
+    }
+  }
+  await scenario.update(config)
+  const monitor = monitorScenario(scenario, 5)
+  const startedAt = performance.now()
+  const batches = await withinTimeout(
+    Promise.all(pages.map((page, pageIndex) => start(page, pageIndex))),
+    `${label} admission`,
+    timeoutMs,
+  )
+  const admissions = batches.flat()
+  await waitForProviderIdle(scenario, timeoutMs)
+  const states = await waitForWorkspaceStreamQuiescence(
+    pages[0],
+    admissions.map((entry) => entry.assistantMessageId),
+    timeoutMs,
+  )
+  const providerEvidence = await monitor.stop()
+  const byId = new Map(states.map((state) => [state.id, state]))
+  const settledBatches = batches.map((batch) =>
+    batch.map((entry) => {
+      const state = byId.get(entry.assistantMessageId)
+      return {
+        ...entry,
+        outcome: state?.status === 'done' ? 'done' : (state?.status ?? 'missing'),
+      }
+    }),
+  )
+  return {
+    batches: settledBatches,
+    elapsedMs: performance.now() - startedAt,
+    expectedConcurrent,
+    provider: providerEvidence,
+  }
+}
+
+async function collectPageState(page) {
+  return page.evaluate(async () => {
+    const db = await new Promise((resolve, reject) => {
+      const request = indexedDB.open('natter')
+      request.onsuccess = () => resolve(request.result)
+      request.onerror = () => reject(request.error)
+    })
+    const requestResult = (request) =>
+      new Promise((resolve, reject) => {
+        request.onsuccess = () => resolve(request.result)
+        request.onerror = () => reject(request.error)
+      })
+    try {
+      const transaction = db.transaction(['messages', 'streamLeases', 'streamChunks'], 'readonly')
+      const [messages, leases, chunkCount] = await Promise.all([
+        requestResult(transaction.objectStore('messages').getAll()),
+        requestResult(transaction.objectStore('streamLeases').getAll()),
+        requestResult(transaction.objectStore('streamChunks').count()),
+      ])
+      const active = messages.filter((message) => message.generation?.status === 'streaming')
+      return {
+        streamStore: {
+          activeCount: active.length,
+          activeTargets: active.map((message) => ({
+            chatId: message.chatId,
+            messageId: message.id,
+          })),
+          liveSnapshotCount: leases.length,
+          liveTextLength: null,
+          liveReasoningLength: null,
+          streamChunkCount: chunkCount,
+          visibleStopButtons: document.querySelectorAll('[data-ui="abort"]').length,
+          evidenceSource: 'dom-indexeddb',
+        },
+      }
+    } finally {
+      db.close()
+    }
+  })
 }
 
 function parseArgs(args) {
@@ -359,6 +459,9 @@ function parseArgs(args) {
       case '--url':
         parsed.url = value
         break
+      case '--provider-url':
+        parsed.providerUrl = value
+        break
       case '--pages':
         parsed.pageCount = integerArg(value, 'pages')
         break
@@ -376,6 +479,9 @@ function parseArgs(args) {
         break
       case '--chunk-chars':
         parsed.chunkChars = integerArg(value, 'chunk-chars')
+        break
+      case '--initial-delay-ms':
+        parsed.initialDelayMs = integerArg(value, 'initial-delay-ms', true)
         break
       case '--regenerations':
         parsed.regenerationCount = integerArg(value, 'regenerations', true)
@@ -400,12 +506,14 @@ heap use, and post-reload data. The default scenario persists 30M characters bef
 
 Options:
   --url <url>                 Loopback app URL (default: ${DEFAULTS.url})
+  --provider-url <url>        Reuse an explicit loopback fake-provider origin
   --pages <count>             Browser pages (default: ${DEFAULTS.pageCount})
   --streams-per-page <count>  Streams on each page (default: ${DEFAULTS.streamsPerPage})
   --context-chars <count>     Prior assistant text per stream (default: ${DEFAULTS.contextChars})
   --target-chars <count>      Current or regenerated text (default: ${DEFAULTS.targetChars})
   --reasoning-chars <count>   Current or regenerated reasoning (default: ${DEFAULTS.reasoningChars})
   --chunk-chars <count>       Fake provider chunk size (default: ${DEFAULTS.chunkChars})
+  --initial-delay-ms <ms>     Reported UI-admission barrier (default: ${DEFAULTS.initialDelayMs})
   --regenerations <count>     Regeneration siblings (default: ${DEFAULTS.regenerationCount})
   --timeout-ms <ms>           Timeout per long-running phase (default: ${DEFAULTS.timeoutMs})
   -h, --help                  Show this help`)
@@ -443,13 +551,6 @@ function countBy(values, keyOf) {
     counts[key] = (counts[key] ?? 0) + 1
   }
   return counts
-}
-
-function loremText(size) {
-  if (size === 0) return ''
-  let output = ''
-  while (output.length < size) output += LOREM
-  return output.slice(0, size)
 }
 
 function hashText(text) {

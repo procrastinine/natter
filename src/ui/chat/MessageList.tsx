@@ -95,6 +95,126 @@ interface InsertTarget {
   defaultRole: MessageRole
 }
 
+interface PrependViewportAnchor {
+  readonly anchorMessageId: MessageId
+  readonly initialWindowOffset: number
+  readonly active: boolean
+  readonly retained: boolean
+  activate(input: { windowOffset: number; anchorMessageId: MessageId | undefined }): void
+  dispose(): void
+}
+
+const PREPEND_ANCHOR_TOLERANCE_PX = 0.5
+const PREPEND_CANCEL_EVENTS = ['wheel', 'touchmove', 'pointerdown', 'keydown'] as const
+const PASSIVE_LISTENER = { passive: true }
+
+function createPrependViewportAnchor({
+  element,
+  container,
+  anchorMessageId,
+  initialWindowOffset,
+  onDispose,
+}: {
+  element: HTMLElement
+  container: HTMLDivElement
+  anchorMessageId: MessageId
+  initialWindowOffset: number
+  onDispose: (anchor: PrependViewportAnchor) => void
+}): PrependViewportAnchor {
+  const targetTop = element.getBoundingClientRect().top
+  let active = false
+  let disposed = false
+  let frame: number | null = null
+  let acceptedScrollTop = container.scrollTop
+  let resizeObserver: ResizeObserver | null = null
+
+  const dispose = () => {
+    if (disposed) return
+    disposed = true
+    resizeObserver?.disconnect()
+    resizeObserver = null
+    if (frame !== null) cancelAnimationFrame(frame)
+    frame = null
+    container.removeEventListener('scroll', cancelForUserScroll)
+    for (const event of PREPEND_CANCEL_EVENTS) {
+      container.removeEventListener(event, cancelForUserIntent)
+    }
+    onDispose(anchor)
+  }
+
+  const correct = () => {
+    if (!element.isConnected || !container.isConnected) {
+      dispose()
+      return false
+    }
+    const delta = element.getBoundingClientRect().top - targetTop
+    if (Math.abs(delta) <= PREPEND_ANCHOR_TOLERANCE_PX) return false
+    container.scrollTop += delta
+    acceptedScrollTop = container.scrollTop
+    return true
+  }
+
+  const schedule = () => {
+    if (disposed || !active || frame !== null) return
+    frame = requestAnimationFrame(() => {
+      frame = null
+      correct()
+    })
+  }
+
+  function cancelForUserIntent() {
+    dispose()
+  }
+
+  function cancelForUserScroll() {
+    if (Math.abs(container.scrollTop - acceptedScrollTop) <= PREPEND_ANCHOR_TOLERANCE_PX) return
+    dispose()
+  }
+
+  container.addEventListener('scroll', cancelForUserScroll, PASSIVE_LISTENER)
+  for (const event of PREPEND_CANCEL_EVENTS) {
+    container.addEventListener(event, cancelForUserIntent, PASSIVE_LISTENER)
+  }
+
+  const anchor: PrependViewportAnchor = {
+    anchorMessageId,
+    initialWindowOffset,
+    get active() {
+      return active
+    },
+    get retained() {
+      return element.isConnected && element.getAttribute('data-message-id') === anchorMessageId
+    },
+    activate({ windowOffset, anchorMessageId }) {
+      if (disposed) return
+      const prependedCount = initialWindowOffset - windowOffset
+      if (
+        active ||
+        prependedCount <= 0 ||
+        anchorMessageId !== anchor.anchorMessageId ||
+        !element.isConnected ||
+        element.getAttribute('data-message-id') !== anchor.anchorMessageId
+      ) {
+        if (!active) dispose()
+        return
+      }
+      active = true
+      if (typeof ResizeObserver !== 'undefined') {
+        resizeObserver = new ResizeObserver(schedule)
+        let candidate = element.previousElementSibling
+        for (let index = 0; index < prependedCount && candidate; index += 1) {
+          resizeObserver.observe(candidate)
+          candidate = candidate.previousElementSibling
+        }
+      }
+      correct()
+      schedule()
+    },
+    dispose,
+  }
+  return anchor
+}
+
 type MessageListIndexOperation = 'path-index'
 let messageListIndexProbe: ((operation: MessageListIndexOperation) => void) | undefined
 
@@ -185,7 +305,7 @@ export const MessageList = memo(function MessageList({
   // clicked" without forcing a controlled-selection state.
   const listRef = useRef<HTMLDivElement | null>(null)
   const loadOlderRef = useRef<HTMLDivElement | null>(null)
-  const pendingPrependAnchorRef = useRef<{ scrollTop: number; scrollHeight: number } | null>(null)
+  const pendingPrependAnchorRef = useRef<PrependViewportAnchor | null>(null)
   const focusedMessageId = useCallback((): MessageId | null => {
     const el = listRef.current?.querySelector<HTMLElement>('[data-ui="message"]:focus-within')
     return el?.getAttribute('data-message-id') ?? null
@@ -456,26 +576,72 @@ export const MessageList = memo(function MessageList({
     if (presentationOnly) return
     if (hiddenOlderCount <= 0) return
     const container = listRef.current?.closest<HTMLDivElement>('[data-ui="scroll-region"]')
-    if (container) {
-      pendingPrependAnchorRef.current = {
-        scrollTop: container.scrollTop,
-        scrollHeight: container.scrollHeight,
-      }
+    const observed = listRef.current
+    const element = observed?.querySelector<HTMLElement>('[data-ui="message"]')
+    const anchorMessageId = element?.getAttribute('data-message-id') as MessageId | null
+    pendingPrependAnchorRef.current?.dispose()
+    if (container && observed && element && anchorMessageId) {
+      const anchor = createPrependViewportAnchor({
+        element,
+        container,
+        anchorMessageId,
+        initialWindowOffset: hiddenOlderCount,
+        onDispose: (disposedAnchor) => {
+          if (pendingPrependAnchorRef.current === disposedAnchor) {
+            pendingPrependAnchorRef.current = null
+          }
+        },
+      })
+      pendingPrependAnchorRef.current = anchor
     }
     onLoadOlderMessages()
   }, [hiddenOlderCount, onLoadOlderMessages, presentationOnly])
 
-  const visiblePathLength = visiblePath.length
   useLayoutEffect(() => {
-    void visiblePathLength
     const anchor = pendingPrependAnchorRef.current
     if (!anchor) return
-    pendingPrependAnchorRef.current = null
-    const container = listRef.current?.closest<HTMLDivElement>('[data-ui="scroll-region"]')
-    if (!container) return
-    const delta = container.scrollHeight - anchor.scrollHeight
-    container.scrollTop = anchor.scrollTop + delta
-  }, [visiblePathLength])
+    if (anchor.active) {
+      const anchorIndex = anchor.initialWindowOffset - hiddenOlderCount
+      if (
+        !anchor.retained ||
+        anchorIndex < 0 ||
+        visiblePath[anchorIndex]?.id !== anchor.anchorMessageId
+      ) {
+        anchor.dispose()
+      }
+      return
+    }
+    if (hiddenOlderCount === anchor.initialWindowOffset) {
+      if (!anchor.retained || visiblePath[0]?.id !== anchor.anchorMessageId) {
+        anchor.dispose()
+      }
+      return
+    }
+    const prependedCount = anchor.initialWindowOffset - hiddenOlderCount
+    if (prependedCount <= 0) {
+      anchor.dispose()
+      return
+    }
+    anchor.activate({
+      windowOffset: hiddenOlderCount,
+      anchorMessageId: visiblePath[prependedCount]?.id,
+    })
+  }, [hiddenOlderCount, visiblePath])
+
+  const prependAnchorScope = `${chatId}\u0000${messageRenderWindowLoadMode}\u0000${messageRenderWindowSize}`
+  const previousPrependAnchorScopeRef = useRef(prependAnchorScope)
+  useLayoutEffect(() => {
+    if (previousPrependAnchorScopeRef.current === prependAnchorScope) return
+    previousPrependAnchorScopeRef.current = prependAnchorScope
+    pendingPrependAnchorRef.current?.dispose()
+  }, [prependAnchorScope])
+
+  useEffect(
+    () => () => {
+      pendingPrependAnchorRef.current?.dispose()
+    },
+    [],
+  )
 
   useEffect(() => {
     if (presentationOnly) return

@@ -1604,9 +1604,9 @@
  * full row height, rounded corners would clip weirdly against the
  * adjacent slots). Shaded a step darker than the action-row background
  * so it reads as a proper affordance. */
-[data-ui="composer-import-at-end"],
-[data-ui="composer-attach"],
-[data-ui="composer-attach-existing"] {
+[data-control="button"][data-ui="composer-import-at-end"],
+[data-control="button"][data-ui="composer-attach"],
+[data-control="button"][data-ui="composer-attach-existing"] {
   border: none;
   border-left: 1px solid var(--color-border-subtle);
   padding: 0 var(--space-4);
@@ -1620,7 +1620,7 @@
 /* Prefill toggle — same shape as import-at-end so the action row reads as a
  * uniform strip. Pressed state lights the button so the user knows the
  * prefill textarea is open. */
-[data-ui="composer-prefill-toggle"] {
+[data-control="button"][data-ui="composer-prefill-toggle"] {
   border: none;
   border-left: 1px solid var(--color-border-subtle);
   padding: 0 var(--space-4);

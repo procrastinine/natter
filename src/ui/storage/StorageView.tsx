@@ -54,7 +54,7 @@ import type {
   TagId,
   TokenCalibrationSample,
 } from '../../core/types'
-import { nukeSiteStorage } from '../../lib/debug-nuke'
+import { wipeSiteStorage } from '../../lib/storage-wipe'
 import {
   type AttachmentReferenceRow,
   batchRelinkAttachmentRefs,
@@ -466,7 +466,7 @@ function StorageOverview() {
     }
     setWorkspaceTransferBusy('clear')
     try {
-      await nukeSiteStorage()
+      await wipeSiteStorage()
     } catch (error) {
       console.error('Failed to clear local workspace data', error)
       pushToast({ level: 'danger', text: importExportErrorMessage(error) })

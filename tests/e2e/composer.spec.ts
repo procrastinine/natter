@@ -190,9 +190,26 @@ test('composer sections square off internal corners and match divider strength',
     const body = el as HTMLElement
     const input = body.querySelector('[data-ui="composer-input"]') as HTMLElement
     const actions = body.querySelector('[data-ui="composer-actions"]') as HTMLElement
+    const dividerProbe = document.createElement('span')
+    dividerProbe.style.borderLeft = '1px solid var(--color-border-subtle)'
+    body.append(dividerProbe)
     const bodyStyle = getComputedStyle(body)
     const inputStyle = getComputedStyle(input)
     const actionsStyle = getComputedStyle(actions)
+    const dividerColor = getComputedStyle(dividerProbe).borderLeftColor
+    dividerProbe.remove()
+    const actionDividers = [
+      '[data-ui="composer-attach"]',
+      '[data-ui="composer-attach-existing"]',
+      '[data-ui="composer-import-at-end"]',
+    ].map((selector) => {
+      const style = getComputedStyle(body.querySelector(selector) as HTMLElement)
+      return {
+        color: style.borderLeftColor,
+        style: style.borderLeftStyle,
+        width: style.borderLeftWidth,
+      }
+    })
     return {
       bodyTopLeftRadius: bodyStyle.borderTopLeftRadius,
       bodyTopRightRadius: bodyStyle.borderTopRightRadius,
@@ -204,6 +221,8 @@ test('composer sections square off internal corners and match divider strength',
       bodyBorderTopWidth: bodyStyle.borderTopWidth,
       actionsBorderTopColor: actionsStyle.borderTopColor,
       actionsBorderTopWidth: actionsStyle.borderTopWidth,
+      actionDividers,
+      dividerColor,
     }
   })
 
@@ -213,6 +232,11 @@ test('composer sections square off internal corners and match divider strength',
   expect(closedMetrics.inputBottomRightRadius).toBe('0px')
   expect(closedMetrics.actionsBorderTopColor).toBe(closedMetrics.bodyBorderTopColor)
   expect(closedMetrics.actionsBorderTopWidth).toBe(closedMetrics.bodyBorderTopWidth)
+  expect(closedMetrics.actionDividers).toEqual([
+    { color: closedMetrics.dividerColor, style: 'solid', width: '1px' },
+    { color: closedMetrics.dividerColor, style: 'solid', width: '1px' },
+    { color: closedMetrics.dividerColor, style: 'solid', width: '1px' },
+  ])
 
   await page.locator('[data-ui="composer-prefill-toggle"]').click()
 
@@ -220,9 +244,16 @@ test('composer sections square off internal corners and match divider strength',
     const body = el as HTMLElement
     const prefill = body.querySelector('[data-ui="composer-prefill"]') as HTMLElement
     const actions = body.querySelector('[data-ui="composer-actions"]') as HTMLElement
+    const prefillToggle = body.querySelector('[data-ui="composer-prefill-toggle"]') as HTMLElement
+    const dividerProbe = document.createElement('span')
+    dividerProbe.style.borderLeft = '1px solid var(--color-border-subtle)'
+    body.append(dividerProbe)
     const bodyStyle = getComputedStyle(body)
     const prefillStyle = getComputedStyle(prefill)
     const actionsStyle = getComputedStyle(actions)
+    const prefillToggleStyle = getComputedStyle(prefillToggle)
+    const dividerColor = getComputedStyle(dividerProbe).borderLeftColor
+    dividerProbe.remove()
     return {
       prefillTopLeftRadius: prefillStyle.borderTopLeftRadius,
       prefillTopRightRadius: prefillStyle.borderTopRightRadius,
@@ -232,6 +263,10 @@ test('composer sections square off internal corners and match divider strength',
       actionsBorderTopWidth: actionsStyle.borderTopWidth,
       bodyBorderTopColor: bodyStyle.borderTopColor,
       bodyBorderTopWidth: bodyStyle.borderTopWidth,
+      dividerColor,
+      prefillToggleBorderLeftColor: prefillToggleStyle.borderLeftColor,
+      prefillToggleBorderLeftStyle: prefillToggleStyle.borderLeftStyle,
+      prefillToggleBorderLeftWidth: prefillToggleStyle.borderLeftWidth,
     }
   })
 
@@ -241,6 +276,9 @@ test('composer sections square off internal corners and match divider strength',
   expect(openMetrics.prefillBorderTopWidth).toBe(openMetrics.bodyBorderTopWidth)
   expect(openMetrics.actionsBorderTopColor).toBe(openMetrics.bodyBorderTopColor)
   expect(openMetrics.actionsBorderTopWidth).toBe(openMetrics.bodyBorderTopWidth)
+  expect(openMetrics.prefillToggleBorderLeftColor).toBe(openMetrics.dividerColor)
+  expect(openMetrics.prefillToggleBorderLeftStyle).toBe('solid')
+  expect(openMetrics.prefillToggleBorderLeftWidth).toBe('1px')
 })
 
 test('send button enables on non-empty input', async ({ page }) => {

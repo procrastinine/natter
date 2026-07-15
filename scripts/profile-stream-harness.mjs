@@ -1,0 +1,504 @@
+import { spawn } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
+import { once } from 'node:events'
+import { createInterface } from 'node:readline'
+import { fileURLToPath } from 'node:url'
+
+export const FAKE_TEXT_SEED =
+  'Lorem ipsum dolor sit amet, consectetur adipiscing elit. Integer vitae sem sed nulla gravida feugiat. '
+export const FAKE_REASONING_SEED =
+  'Reasoning fragment for deterministic loopback stream validation and bounded memory profiling. '
+
+export function assertLoopbackUrl(raw, label) {
+  const url = new URL(raw)
+  if (!['127.0.0.1', 'localhost', '[::1]', '::1'].includes(url.hostname)) {
+    throw new Error(`${label} only accepts a loopback URL`)
+  }
+  return url
+}
+
+export async function startFakeProvider({ providerUrl, timeoutMs = 10_000 } = {}) {
+  if (providerUrl) {
+    const explicit = assertLoopbackUrl(providerUrl, 'provider URL')
+    const origin = explicit.origin
+    await waitUntil(
+      async () => {
+        const response = await fetch(`${origin}/healthz`).catch(() => null)
+        return response?.ok === true
+      },
+      timeoutMs,
+      'fake provider health check',
+    )
+    return { origin, owned: false, stop: async () => undefined }
+  }
+
+  const scriptPath = fileURLToPath(new URL('./fake-stream-server.mjs', import.meta.url))
+  const child = spawn(process.execPath, [scriptPath, '--host', '127.0.0.1', '--port', '0'], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  let stderr = ''
+  child.stderr.setEncoding('utf8')
+  child.stderr.on('data', (chunk) => {
+    stderr = `${stderr}${chunk}`.slice(-32_768)
+  })
+  const lines = createInterface({ input: child.stdout })
+  const listening = new Promise((resolve, reject) => {
+    const onExit = (code, signal) => {
+      reject(
+        new Error(
+          `fake provider exited before listening (code=${code}, signal=${signal})${stderr ? `\n${stderr}` : ''}`,
+        ),
+      )
+    }
+    child.once('exit', onExit)
+    lines.on('line', (line) => {
+      let event
+      try {
+        event = JSON.parse(line)
+      } catch {
+        return
+      }
+      if (event?.event !== 'listening' || typeof event.url !== 'string') return
+      child.off('exit', onExit)
+      resolve(event)
+    })
+  })
+  let event
+  try {
+    event = await withTimeout(listening, timeoutMs, 'fake provider startup')
+  } catch (error) {
+    child.kill('SIGTERM')
+    throw error
+  }
+  const origin = assertLoopbackUrl(event.url, 'spawned provider URL').origin
+  return {
+    origin,
+    owned: true,
+    async stop() {
+      lines.close()
+      if (child.exitCode !== null || child.signalCode !== null) return
+      child.kill('SIGTERM')
+      const exited = once(child, 'exit')
+      try {
+        await withTimeout(exited, 5_000, 'fake provider shutdown')
+      } catch {
+        child.kill('SIGKILL')
+        await once(child, 'exit')
+      }
+    },
+  }
+}
+
+export async function createProviderScenario(providerOrigin, config) {
+  const scenarioId = `profile-${process.pid}-${randomUUID()}`
+  const controlUrl = `${providerOrigin}/__control/scenarios/${scenarioId}`
+  const initial = await requestScenario(controlUrl, 'PUT', config)
+  return {
+    scenarioId,
+    providerBaseUrl: initial.providerBaseUrl,
+    update: (next) => requestScenario(controlUrl, 'PUT', next),
+    snapshot: () => requestScenario(controlUrl, 'GET'),
+    async dispose() {
+      const response = await fetch(controlUrl, { method: 'DELETE' })
+      if (!response.ok && response.status !== 404) {
+        throw new Error(`fake provider scenario delete failed: ${response.status}`)
+      }
+    },
+  }
+}
+
+async function requestScenario(controlUrl, method, config) {
+  const response = await fetch(controlUrl, {
+    method,
+    ...(config
+      ? {
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(config),
+        }
+      : {}),
+  })
+  if (!response.ok) {
+    const body = await response.text().catch(() => '')
+    throw new Error(`fake provider control ${method} failed: ${response.status} ${body}`)
+  }
+  const snapshot = await response.json()
+  if (
+    typeof snapshot?.providerBaseUrl !== 'string' ||
+    typeof snapshot?.activeStreams !== 'number' ||
+    typeof snapshot?.requestCount !== 'number' ||
+    !Array.isArray(snapshot?.requests)
+  ) {
+    throw new Error('fake provider returned an invalid control snapshot')
+  }
+  return snapshot
+}
+
+async function resetWorkspace(page, appUrl) {
+  const resetUrl = new URL('/__natter-profile-reset__', appUrl).href
+  await page.route(resetUrl, (route) =>
+    route.fulfill({ contentType: 'text/html', body: '<!doctype html><title>Reset</title>' }),
+  )
+  try {
+    await page.goto(resetUrl, { waitUntil: 'domcontentloaded' })
+  } finally {
+    await page.unroute(resetUrl)
+  }
+  await page.evaluate(async () => {
+    localStorage.clear()
+    sessionStorage.clear()
+    await new Promise((resolve, reject) => {
+      const request = indexedDB.deleteDatabase('natter')
+      request.onsuccess = () => resolve()
+      request.onerror = () => reject(request.error)
+      request.onblocked = () => reject(new Error('natter database deletion was blocked'))
+    })
+  })
+  await page.goto(appUrl, { waitUntil: 'domcontentloaded' })
+}
+
+export async function seedAndRetargetWorkspace(page, { appUrl, providerBaseUrl }) {
+  await resetWorkspace(page, appUrl)
+  const addConnection = page.locator('[data-ui="connection-add"]')
+  await addConnection.waitFor({ state: 'visible' })
+  await addConnection.click()
+  await page.locator('[data-ui="connection-setup-key"]').fill('sk-profile-loopback-placeholder')
+  await page.locator('[data-ui="connection-setup-submit"]').click()
+  await page.locator('[data-ui="connection-setup-modal"]').waitFor({ state: 'detached' })
+  await retargetWorkspaceForCurrentTab(page, providerBaseUrl)
+  await page.reload({ waitUntil: 'domcontentloaded' })
+  await page.locator('#root > *').first().waitFor({ state: 'visible' })
+}
+
+export async function prepareAdditionalPage(page, { appUrl, providerBaseUrl }) {
+  await page.goto(appUrl, { waitUntil: 'domcontentloaded' })
+  await retargetWorkspaceForCurrentTab(page, providerBaseUrl)
+  await page.reload({ waitUntil: 'domcontentloaded' })
+  await page.locator('#root > *').first().waitFor({ state: 'visible' })
+}
+
+async function retargetWorkspaceForCurrentTab(page, providerBaseUrl) {
+  await page.evaluate(async (baseUrl) => {
+    const db = await new Promise((resolve, reject) => {
+      const request = indexedDB.open('natter')
+      request.onsuccess = () => resolve(request.result)
+      request.onerror = () => reject(request.error)
+    })
+    let profileId
+    let presetId
+    let presetSettings
+    try {
+      await new Promise((resolve, reject) => {
+        const transaction = db.transaction(['profiles', 'presets', 'chats'], 'readwrite')
+        const profiles = transaction.objectStore('profiles')
+        const presets = transaction.objectStore('presets')
+        const chats = transaction.objectStore('chats')
+        const profileRead = profiles.getAll()
+        let explicitAbort
+        profileRead.onsuccess = () => {
+          if (profileRead.result.length !== 1) {
+            explicitAbort = new Error(`expected one profile, found ${profileRead.result.length}`)
+            transaction.abort()
+            return
+          }
+          const profile = profileRead.result[0]
+          profileId = profile.id
+          profiles.put({
+            ...profile,
+            name: 'Loopback profiling provider',
+            kind: 'openai-compatible',
+            baseUrl,
+            supportsEndpointsApi: false,
+            supportsGenerationApi: false,
+            supportsPrivacyScrape: false,
+            updatedAt: Date.now(),
+          })
+          const presetRead = presets.getAll()
+          presetRead.onsuccess = () => {
+            if (presetRead.result.length === 0) {
+              explicitAbort = new Error('profiling preset missing')
+              transaction.abort()
+              return
+            }
+            for (const preset of presetRead.result) {
+              const settings = preset.settings ?? {}
+              const privacy = settings.privacy ?? {}
+              const nextSettings = {
+                ...settings,
+                profileId,
+                model: 'natter/fake-stream',
+                api: 'chat',
+                privacy: { ...privacy, paretoFilter: false },
+              }
+              if (presetId === undefined) {
+                presetId = preset.id
+                presetSettings = nextSettings
+              }
+              presets.put({
+                ...preset,
+                connectionProfileId: profileId,
+                settings: nextSettings,
+                updatedAt: Date.now(),
+              })
+            }
+            const chatRead = chats.getAll()
+            chatRead.onsuccess = () => {
+              for (const chat of chatRead.result) {
+                const settings = chat.settings ?? {}
+                const privacy = settings.privacy ?? {}
+                chats.put({
+                  ...chat,
+                  settings: {
+                    ...settings,
+                    profileId,
+                    model: 'natter/fake-stream',
+                    api: 'chat',
+                    privacy: { ...privacy, paretoFilter: false },
+                  },
+                })
+              }
+            }
+          }
+        }
+        transaction.oncomplete = () => resolve()
+        transaction.onerror = () => reject(transaction.error)
+        transaction.onabort = () =>
+          reject(explicitAbort ?? transaction.error ?? new Error('workspace retarget aborted'))
+      })
+    } finally {
+      db.close()
+    }
+    sessionStorage.setItem(
+      'natter:active-seed',
+      JSON.stringify({ profileId, presetId, settings: presetSettings }),
+    )
+  }, providerBaseUrl)
+}
+
+export async function openNewChat(page) {
+  const newChat = page.locator('[data-role="new-chat"]')
+  await newChat.waitFor({ state: 'visible' })
+  await newChat.click()
+  await page.locator('[data-ui="composer"]').waitFor({ state: 'visible' })
+  await page.waitForFunction(() => location.hash === '#/new')
+}
+
+export async function navigateToChat(page, chatId, leafId) {
+  const hash = `#/chat/${chatId}/message/${leafId}`
+  await page.evaluate((nextHash) => {
+    location.hash = nextHash
+  }, hash)
+  await page.waitForFunction((expected) => location.hash === expected, hash)
+  await page
+    .locator(`[data-ui="message"][data-message-id="${leafId}"]`)
+    .waitFor({ state: 'visible' })
+  await page.locator('[data-ui="composer"]').waitFor({ state: 'visible' })
+}
+
+export async function startComposerSend(page, prompt) {
+  const previous = parseChatRoute(await page.evaluate(() => location.hash))
+  await page.locator('[data-ui="composer-input"]').fill(prompt)
+  await page.locator('[data-ui="send"]').click()
+  const route = await waitForNewAssistantRoute(page, previous?.assistantMessageId)
+  const header = await waitForMessageHeader(page, route.assistantMessageId)
+  if (typeof header.parentId !== 'string') {
+    throw new Error(`assistant ${route.assistantMessageId} has no user parent`)
+  }
+  return {
+    chatId: route.chatId,
+    userMessageId: header.parentId,
+    assistantMessageId: route.assistantMessageId,
+  }
+}
+
+export async function startRegenerate(page, sourceAssistantId) {
+  const source = page.locator(`[data-ui="message"][data-message-id="${sourceAssistantId}"]`)
+  await source.waitFor({ state: 'visible' })
+  await source.locator('[data-action="regenerate"]').click()
+  const route = await waitForNewAssistantRoute(page, sourceAssistantId)
+  const header = await waitForMessageHeader(page, route.assistantMessageId)
+  if (typeof header.parentId !== 'string') {
+    throw new Error(`regenerated assistant ${route.assistantMessageId} has no user parent`)
+  }
+  return {
+    chatId: route.chatId,
+    userMessageId: header.parentId,
+    assistantMessageId: route.assistantMessageId,
+  }
+}
+
+async function waitForNewAssistantRoute(page, previousAssistantId) {
+  const handle = await page.waitForFunction((previous) => {
+    const match = /^#\/chat\/([^/]+)\/message\/([^/?#]+)$/u.exec(location.hash)
+    if (!match?.[1] || !match[2] || match[2] === previous) return null
+    const message = document.querySelector(
+      `[data-ui="message"][data-role="assistant"][data-message-id="${match[2]}"]`,
+    )
+    return message ? { chatId: match[1], assistantMessageId: match[2] } : null
+  }, previousAssistantId ?? null)
+  return handle.jsonValue()
+}
+
+function parseChatRoute(hash) {
+  const match = /^#\/chat\/([^/]+)\/message\/([^/?#]+)$/u.exec(hash)
+  return match?.[1] && match[2] ? { chatId: match[1], assistantMessageId: match[2] } : null
+}
+
+async function waitForMessageHeader(page, messageId) {
+  let header
+  await waitUntil(
+    async () => {
+      header = await page.evaluate(async (id) => {
+        const db = await new Promise((resolve, reject) => {
+          const request = indexedDB.open('natter')
+          request.onsuccess = () => resolve(request.result)
+          request.onerror = () => reject(request.error)
+        })
+        try {
+          return await new Promise((resolve, reject) => {
+            const request = db.transaction('messages', 'readonly').objectStore('messages').get(id)
+            request.onsuccess = () => resolve(request.result ?? null)
+            request.onerror = () => reject(request.error)
+          })
+        } finally {
+          db.close()
+        }
+      }, messageId)
+      return header !== null && header !== undefined
+    },
+    30_000,
+    `message header ${messageId}`,
+  )
+  return header
+}
+
+export async function waitForWorkspaceStreamQuiescence(page, assistantIds, timeoutMs) {
+  if (assistantIds.length === 0) return []
+  let snapshot
+  await waitUntil(
+    async () => {
+      snapshot = await readWorkspaceStreamState(page, assistantIds)
+      return (
+        snapshot.leaseCount === 0 &&
+        snapshot.chunkCount === 0 &&
+        snapshot.states.every(
+          (state) => state.status !== 'streaming' && typeof state.finishedAt === 'number',
+        )
+      )
+    },
+    timeoutMs,
+    'workspace streams to quiesce',
+  )
+  return snapshot.states
+}
+
+async function readWorkspaceStreamState(page, assistantIds) {
+  return page.evaluate(async (ids) => {
+    const db = await new Promise((resolve, reject) => {
+      const request = indexedDB.open('natter')
+      request.onsuccess = () => resolve(request.result)
+      request.onerror = () => reject(request.error)
+    })
+    try {
+      const transaction = db.transaction(['messages', 'streamLeases', 'streamChunks'], 'readonly')
+      const requestResult = (request) =>
+        new Promise((resolve, reject) => {
+          request.onsuccess = () => resolve(request.result)
+          request.onerror = () => reject(request.error)
+        })
+      const messageStore = transaction.objectStore('messages')
+      const [rows, leaseCount, chunkCount] = await Promise.all([
+        Promise.all(ids.map((id) => requestResult(messageStore.get(id)))),
+        requestResult(transaction.objectStore('streamLeases').count()),
+        requestResult(transaction.objectStore('streamChunks').count()),
+      ])
+      return {
+        states: rows.map((row, index) => ({
+          id: ids[index],
+          status: row?.generation?.status ?? 'missing',
+          integrity: row?.generation?.integrity ?? null,
+          finishedAt: row?.generation?.finishedAt ?? null,
+        })),
+        leaseCount,
+        chunkCount,
+      }
+    } finally {
+      db.close()
+    }
+  }, assistantIds)
+}
+
+export async function waitForProviderIdle(scenario, timeoutMs) {
+  await waitUntil(
+    async () => (await scenario.snapshot()).activeStreams === 0,
+    timeoutMs,
+    'fake provider streams to finish',
+  )
+}
+
+export function monitorScenario(scenario, intervalMs = 10) {
+  let running = true
+  let maxActiveStreams = 0
+  let samples = 0
+  let failure
+  const loop = (async () => {
+    while (running) {
+      try {
+        const snapshot = await scenario.snapshot()
+        maxActiveStreams = Math.max(maxActiveStreams, snapshot.activeStreams)
+        samples += 1
+      } catch (error) {
+        failure = error
+        running = false
+        break
+      }
+      await delay(intervalMs)
+    }
+  })()
+  return {
+    async stop() {
+      running = false
+      await loop
+      if (failure) throw failure
+      const final = await scenario.snapshot()
+      maxActiveStreams = Math.max(maxActiveStreams, final.activeStreams)
+      return { maxActiveStreams, samples, final }
+    },
+  }
+}
+
+export function repeatedSeedText(seed, size) {
+  if (size === 0) return ''
+  return seed.repeat(Math.ceil(size / seed.length)).slice(0, size)
+}
+
+async function waitUntil(predicate, timeoutMs, label, intervalMs = 25) {
+  const deadline = Date.now() + timeoutMs
+  let lastError
+  while (Date.now() < deadline) {
+    try {
+      if (await predicate()) return
+    } catch (error) {
+      lastError = error
+    }
+    await delay(intervalMs)
+  }
+  throw new Error(`${label} exceeded ${timeoutMs} ms${lastError ? `: ${lastError}` : ''}`)
+}
+
+async function withTimeout(promise, timeoutMs, label) {
+  let timer
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} exceeded ${timeoutMs} ms`)), timeoutMs)
+      }),
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}

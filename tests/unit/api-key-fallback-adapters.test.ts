@@ -3,7 +3,6 @@ import { anthropicOnce } from '../../src/api/anthropic-messages'
 import { openAssistantRequestStream } from '../../src/api/assistant-stream'
 import { chatCompletions } from '../../src/api/chat-completions'
 import type { ApiKeyCandidate } from '../../src/api/client'
-import { __adapterRequestPendingForTests } from '../../src/api/deferred-request'
 import { geminiOnce } from '../../src/api/gemini-native'
 import { responsesOnce } from '../../src/api/responses'
 import { textCompletionsOnce } from '../../src/api/text-completions'
@@ -528,7 +527,7 @@ describe('provider adapter key fallback', () => {
       onKeyCandidateSelected: selected,
       requestPlan,
     })
-    expect(__adapterRequestPendingForTests(stream as object)).toBe(true)
+    expect(seen).toEqual([])
     requestPlan.wire = {}
     for await (const chunk of stream) {
       chunks.push(chunk)
@@ -541,7 +540,6 @@ describe('provider adapter key fallback', () => {
       '{"model":"m","input":"hi","stream":false}',
       '{"model":"m","input":"hi","stream":false}',
     ])
-    expect(__adapterRequestPendingForTests(stream as object)).toBe(false)
     expect(selected).toHaveBeenCalledWith(second, 1, 'key-two')
   })
 })

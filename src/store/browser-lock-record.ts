@@ -10,9 +10,9 @@ export interface BrowserLockRow {
   expiresAt: number
 }
 
-export function emptyBrowserWriterLockRow(): BrowserLockRow {
+export function emptyBrowserLockRow(name: string): BrowserLockRow {
   return {
-    name: BROWSER_WRITER_LOCK_NAME,
+    name,
     ownerClientId: null,
     leaseId: null,
     fencingToken: 0,
@@ -20,4 +20,8 @@ export function emptyBrowserWriterLockRow(): BrowserLockRow {
     heartbeatAt: 0,
     expiresAt: 0,
   }
+}
+
+export function emptyBrowserWriterLockRow(): BrowserLockRow {
+  return emptyBrowserLockRow(BROWSER_WRITER_LOCK_NAME)
 }

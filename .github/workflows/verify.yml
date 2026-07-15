@@ -53,18 +53,17 @@ jobs:
         env:
           NODE_OPTIONS: --localstorage-file=/tmp/natter-vitest-${{ github.run_id }}-${{ github.run_attempt }}.json
 
-      - run: pnpm build
+      - run: pnpm exec playwright install --with-deps chromium
+
+      - name: Test the built app against the loopback fake provider
+        run: pnpm e2e
+        env:
+          E2E_FAKE_PROVIDER_PORT: 4174
 
       - name: Check performance budgets (advisory)
         id: performance
         continue-on-error: true
         run: pnpm perf:report
-
-      - run: pnpm exec playwright install --with-deps chromium
-
-      - run: pnpm e2e:smoke
-        env:
-          E2E_SERVER_MODE: preview
 
       - name: Report advisory findings
         if: >-

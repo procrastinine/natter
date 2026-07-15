@@ -25,9 +25,10 @@ import { useRetainedMessageStreamProjection } from '../../hooks/useMessageStream
 import type { MessageAttachmentRefMutation } from '../../store/attachments'
 import { updateChatSettings } from '../../store/chats'
 import {
+  contentNeedsGeneratedOutputMaterialization,
   generatedOutputAttachmentIds,
-  migrateGeneratedOutputAttachments,
   normalizeGeneratedImageOutputAttachmentRefs,
+  scheduleGeneratedOutputMigration,
 } from '../../store/generated-images'
 import { getStreamClientId } from '../../store/stream-leases'
 import { useToastStore } from '../../store/zustand/toastStore'
@@ -257,15 +258,8 @@ function MessageInner({
   useEffect(() => {
     if (presentationOnly) return
     if (isStreaming) return
-    if (
-      renderedContent.some(
-        (item) =>
-          item.type === 'output_image' ||
-          item.type === 'audio_output' ||
-          item.type === 'output_video',
-      )
-    ) {
-      void migrateGeneratedOutputAttachments(message.id).catch(() => {})
+    if (contentNeedsGeneratedOutputMaterialization(renderedContent)) {
+      scheduleGeneratedOutputMigration(message.id)
       return
     }
     if (generatedOutputAttachmentIds(renderedContent).size > 0) {

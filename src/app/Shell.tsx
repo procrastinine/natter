@@ -71,7 +71,7 @@ import {
   updateChatSettings,
 } from '../store/chats'
 import { resolveConnectionRuntimeKeys } from '../store/connection-runtime'
-import type { MessageHeaderRow } from '../store/message-storage'
+import { type MessageHeaderRow, rebaseHydratedMessageHeader } from '../store/message-storage'
 import { bumpPresetLastUsedAt, getPreset, pickPreferredPreset } from '../store/presets'
 import { bumpProfileLastUsedAt, countProfiles, getProfile } from '../store/profiles'
 import { installPersistenceRequestOnFirstInteraction } from '../store/quota'
@@ -215,8 +215,6 @@ const MODEL_AUTOSELECT_QUERY = {
   outputModalities: ['text', 'image', 'audio', 'file', 'video'],
 } as const
 const DIRECT_MODEL_AUTOSELECT_QUERY = {} as const
-const TRANSCRIPT_RECYCLE_REMOUNT_DELAY_MS = 50
-const RECYCLE_TRANSCRIPT_EVENT = 'natter:recycle-transcript'
 const ORPHAN_RECOVERY_FAILURE_RETRY_MS = 2_000
 const CHAT_SNAPSHOT_CACHE_MAX_ENTRIES = 16
 
@@ -371,14 +369,7 @@ function overlayCommittedPathHeaders(
 export const __overlayCommittedPathHeadersForTests = overlayCommittedPathHeaders
 
 function overlayCanonicalMessageHeader(message: Message, header: MessageHeaderRow): Message {
-  const {
-    requestContextVersion: _requestContextVersion,
-    bodyVersion: _bodyVersion,
-    bodyWordCount: _bodyWordCount,
-    textPreview: _textPreview,
-    ...canonicalHeader
-  } = header
-  return { ...message, ...canonicalHeader }
+  return rebaseHydratedMessageHeader(message, header)
 }
 
 interface VisibleHeaderOverlayState {
@@ -842,16 +833,12 @@ export function Shell() {
     null,
   )
   const [scrollState, setScrollState] = useState<ScrollState>('follow')
-  const [transcriptRenderEpoch, setTranscriptRenderEpoch] = useState(0)
-  const [transcriptMounted, setTranscriptMounted] = useState(true)
-  const [transcriptPlaceholderHeight, setTranscriptPlaceholderHeight] = useState(0)
   const [importAtEndOpen, setImportAtEndOpen] = useState(false)
   const [treeInsertTarget, setTreeInsertTarget] = useState<TreeInsertTarget | null>(null)
   const [retainedAlternateViewsChatId, setRetainedAlternateViewsChatId] = useState<ChatId | null>(
     null,
   )
   const [pendingTreeExitChatId, setPendingTreeExitChatId] = useState<ChatId | null>(null)
-  const transcriptRemountTimerRef = useRef<number | null>(null)
   const editTreeMode = useUiStore((s) => s.editTreeMode)
   const setEditTreeMode = useUiStore((s) => s.setEditTreeMode)
   const treeViewChatId = useUiStore((s) => s.treeViewChatId)
@@ -1124,27 +1111,6 @@ export function Shell() {
   )
   const branchSnapshotCacheRef = useRef(new Map<string, ActiveBranchWindowSnapshot>())
   const lastBranchSnapshotByChatRef = useRef(new Map<ChatId, LastBranchSnapshot>())
-  const recycleTranscriptRenderTree = useCallback(() => {
-    if (transcriptRemountTimerRef.current !== null) {
-      window.clearTimeout(transcriptRemountTimerRef.current)
-      transcriptRemountTimerRef.current = null
-    }
-    const list = document.querySelector<HTMLElement>('[data-ui="message-list"]')
-    setTranscriptPlaceholderHeight(list?.offsetHeight ?? 0)
-    branchSnapshotCacheRef.current.clear()
-    lastBranchSnapshotByChatRef.current.clear()
-    setTranscriptMounted(false)
-    transcriptRemountTimerRef.current = window.setTimeout(() => {
-      transcriptRemountTimerRef.current = null
-      setTranscriptRenderEpoch((epoch) => epoch + 1)
-      setTranscriptMounted(true)
-      setTranscriptPlaceholderHeight(0)
-    }, TRANSCRIPT_RECYCLE_REMOUNT_DELAY_MS)
-  }, [])
-  useEffect(() => {
-    window.addEventListener(RECYCLE_TRANSCRIPT_EVENT, recycleTranscriptRenderTree)
-    return () => window.removeEventListener(RECYCLE_TRANSCRIPT_EVENT, recycleTranscriptRenderTree)
-  }, [recycleTranscriptRenderTree])
   useEffect(
     () =>
       onEvent((event, delivery) => {
@@ -1181,19 +1147,6 @@ export function Shell() {
       snapshot: readyActiveBranchSnapshot,
     })
   }, [activeBranchWindowResult, readyActiveBranchSnapshot])
-  useEffect(() => {
-    void activeChatId
-    setTranscriptMounted(true)
-    setTranscriptPlaceholderHeight(0)
-  }, [activeChatId])
-  useEffect(() => {
-    return () => {
-      if (transcriptRemountTimerRef.current !== null) {
-        window.clearTimeout(transcriptRemountTimerRef.current)
-        transcriptRemountTimerRef.current = null
-      }
-    }
-  }, [])
   const activePathIntentTailId = activePathIntentIds.at(-1) ?? null
   const knownActivePathSnapshot = readyActiveBranchSnapshot
   const authoritativeTreeHeaders = useMemo(() => {
@@ -1595,7 +1548,6 @@ export function Shell() {
     return window.localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === '1'
   })
   const scrollRef = useRef<ScrollRegionHandle>(null)
-  const transcriptPlaceholderRef = useRef<HTMLDivElement | null>(null)
   const activeComposerDraftKey = activeChatId
     ? `chat:${activeChatId}`
     : onNewChatSurface
@@ -1630,12 +1582,6 @@ export function Shell() {
   }, [isNarrowScreen])
 
   const previousActiveSurfaceKeyRef = useRef(activeSurfaceKey)
-  useLayoutEffect(() => {
-    const placeholder = transcriptPlaceholderRef.current
-    if (!placeholder) return
-    placeholder.style.minHeight = `${transcriptPlaceholderHeight}px`
-  }, [transcriptPlaceholderHeight])
-
   useEffect(() => {
     if (previousActiveSurfaceKeyRef.current === activeSurfaceKey) return
     previousActiveSurfaceKeyRef.current = activeSurfaceKey
@@ -2822,11 +2768,11 @@ export function Shell() {
                       streamFollowKey={selectedPathFollowKey}
                       onStateChange={setScrollState}
                     >
-                      {transcriptMounted && activeTranscriptExists ? (
+                      {activeTranscriptExists ? (
                         resolvedActiveBranchSnapshot && resolvedActiveChatRow ? (
                           <Suspense fallback={<SurfaceLoading label="Loading conversation…" />}>
                             <MessageList
-                              key={`${activeChatId}:${transcriptRenderEpoch}`}
+                              key={activeChatId}
                               chatId={activeChatId}
                               chatSettings={resolvedActiveChatRow.settings}
                               hasConnection={hasConnection}
@@ -2851,9 +2797,7 @@ export function Shell() {
                         ) : (
                           <SurfaceLoading label="Loading conversation…" />
                         )
-                      ) : (
-                        <div ref={transcriptPlaceholderRef} data-ui="message-list-recycling" />
-                      )}
+                      ) : null}
                       {transcriptFocusMode ? (
                         <Composer
                           onSubmit={handleSubmit}

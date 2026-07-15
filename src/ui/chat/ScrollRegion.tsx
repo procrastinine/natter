@@ -8,7 +8,7 @@ import {
   useRef,
   useState,
 } from 'react'
-import { logScrollDebug } from '../../lib/debug-scroll'
+import { hasScrollDebugSink, logScrollDebug } from '../../lib/debug-scroll'
 import { scheduleReactPublication } from '../../lib/react-publication'
 
 export type ScrollState = 'follow' | 'pinned'
@@ -193,6 +193,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
 
   const debugScroll = useCallback(
     (event: ScrollDebugEvent, details: Record<string, unknown> = {}) => {
+      if (!hasScrollDebugSink()) return
       const container = containerRef.current
       const timestamp = nowMs()
       logScrollDebug(event, {

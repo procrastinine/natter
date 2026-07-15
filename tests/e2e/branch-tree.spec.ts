@@ -1,46 +1,19 @@
+import type { Message } from '../../src/core/types'
+import {
+  previewTextFromStoredProjection,
+  splitMessageForStorage,
+} from '../../src/store/message-storage'
 import { expect, type Page, test } from './fixtures'
 import {
   buildSseBody,
   clearIndexedDb,
   createChatAndOpen,
   mockChatCompletions,
+  readMessages,
+  rebuildSidebarProjection,
   seedFirstRun,
   sendMessage,
 } from './helpers'
-
-interface BranchTreeStoredMessage {
-  id: string
-  parentId: string | null
-  content?: ReadonlyArray<{ type?: string; text?: string }>
-}
-
-interface BranchTreeRepository {
-  runMutation(
-    scopes: readonly unknown[],
-    mutation: (context: {
-      putMessage(message: Record<string, unknown>): Promise<void>
-    }) => Promise<void>,
-  ): Promise<void>
-  getMessage(messageId: string): Promise<BranchTreeStoredMessage | undefined>
-  getMessageHeader(messageId: string): Promise<{ hiddenFromContext?: boolean } | undefined>
-  listMessages(chatId: string): Promise<BranchTreeStoredMessage[]>
-}
-
-interface BranchTreeRepositoryModule {
-  getWorkspaceRepository(): BranchTreeRepository
-}
-
-interface BranchTreeChatModule {
-  createChat(input: { id: string; title: string; settings: unknown; now: number }): Promise<unknown>
-}
-
-interface BranchTreeDefaultsModule {
-  cloneDefaultChatSettings(): unknown
-}
-
-interface BranchTreePresetsModule {
-  listPresets(): Promise<Array<{ settings?: unknown }>>
-}
 
 test.beforeEach(async ({ page }) => {
   await clearIndexedDb(page)
@@ -685,7 +658,12 @@ test('Save & Send from an off-branch tree node hands its live stream to the tran
   const responseGate = new Promise<void>((resolve) => {
     releaseResponse = resolve
   })
+  let markRequestSeen: () => void = () => undefined
+  const requestSeen = new Promise<void>((resolve) => {
+    markRequestSeen = resolve
+  })
   await page.route('**/api/v1/chat/completions', async (route) => {
+    markRequestSeen()
     await responseGate
     await route.fulfill({
       contentType: 'text/event-stream',
@@ -709,25 +687,18 @@ test('Save & Send from an off-branch tree node hands its live stream to the tran
     .locator('[data-ui="branch-tree-inspector"] [data-ui="inline-editor-input"]')
     .fill('edited prompt sent from the tree')
 
+  let streamTargetId: string | null
   try {
     await page.getByRole('button', { name: 'Save & Send' }).click()
-    const streamTargetId = await page
-      .waitForFunction(
-        () =>
-          (
-            window as unknown as {
-              __debugFakeStream?: {
-                state(): { streamStore: { activeTargets: Array<{ messageId?: string }> } }
-              }
-            }
-          ).__debugFakeStream?.state().streamStore.activeTargets[0]?.messageId ?? null,
-      )
-      .then((handle) => handle.jsonValue())
+    await requestSeen
+    const streamingLeaf = page.locator(
+      '[data-ui="branch-tree-node"][data-current-leaf="true"][data-selected="true"]',
+    )
+    await expect(streamingLeaf).toHaveCount(1)
+    await expect(page.locator('[data-ui="branch-tree-stop"]')).toBeVisible()
+    streamTargetId = await streamingLeaf.getAttribute('data-message-id')
     if (!streamTargetId) throw new Error('Tree Save & Send has no active target')
 
-    const streamingLeaf = page.locator(
-      `[data-ui="branch-tree-node"][data-message-id="${streamTargetId}"]`,
-    )
     await expect(streamingLeaf).toHaveAttribute('data-current-leaf', 'true')
     await expect(streamingLeaf).toHaveAttribute('data-selected', 'true')
     await expect(page.locator('[data-ui="branch-tree-inspector"]')).toHaveAttribute(
@@ -747,21 +718,12 @@ test('Save & Send from an off-branch tree node hands its live stream to the tran
     releaseResponse()
   }
 
-  await expect
-    .poll(() =>
-      page.evaluate(
-        () =>
-          (
-            window as unknown as {
-              __debugFakeStream?: { state(): { streamStore: { activeCount: number } } }
-            }
-          ).__debugFakeStream?.state().streamStore.activeCount,
-      ),
-    )
-    .toBe(0)
   await expect(page.locator('[data-ui="message-list"]')).toContainText(
     'reply streamed after leaving the tree',
   )
+  await expect(page.getByRole('button', { name: 'Stop generating' })).toHaveCount(0)
+  if (!streamTargetId) throw new Error('Tree Save & Send lost its target id')
+  await waitForMessageGenerationFinished(page, streamTargetId)
 })
 
 test('tree inspector keeps header controls live and guards body actions during a target stream', async ({
@@ -771,7 +733,12 @@ test('tree inspector keeps header controls live and guards body actions during a
   const responseGate = new Promise<void>((resolve) => {
     releaseResponse = resolve
   })
+  let markRequestSeen: () => void = () => undefined
+  const requestSeen = new Promise<void>((resolve) => {
+    markRequestSeen = resolve
+  })
   await page.route('**/api/v1/chat/completions', async (route) => {
+    markRequestSeen()
     await responseGate
     await route.fulfill({
       contentType: 'text/event-stream',
@@ -793,25 +760,8 @@ test('tree inspector keeps header controls live and guards body actions during a
 
   try {
     await page.getByRole('button', { name: 'Continue from here' }).click()
-    await expect
-      .poll(() =>
-        page.evaluate(() =>
-          Object.values(
-            (
-              window as unknown as {
-                __debugFakeStream?: {
-                  state(): {
-                    streamStore: {
-                      activeTargets: Array<{ messageId?: string }>
-                    }
-                  }
-                }
-              }
-            ).__debugFakeStream?.state().streamStore.activeTargets ?? [],
-          ).some((target) => target.messageId === 'A2'),
-        ),
-      )
-      .toBe(true)
+    await requestSeen
+    await expect(page.locator('[data-ui="branch-tree-stop"]')).toBeVisible()
 
     await expect(
       page.locator('[data-ui="branch-tree-node"][data-message-id="A2"]'),
@@ -847,138 +797,11 @@ test('tree inspector keeps header controls live and guards body actions during a
     releaseResponse()
   }
 
-  await expect
-    .poll(() =>
-      page.evaluate(
-        () =>
-          (
-            window as unknown as {
-              __debugFakeStream?: { state(): { streamStore: { activeCount: number } } }
-            }
-          ).__debugFakeStream?.state().streamStore.activeCount,
-      ),
-    )
-    .toBe(0)
+  await expect(page.locator('[data-ui="branch-tree-stop"]')).toHaveCount(0)
+  await expect.poll(() => readStoredMessageText(page, 'A2')).toContain('guarded continuation')
+  await waitForMessageGenerationFinished(page, 'A2')
   await expect(page.getByRole('button', { name: 'Hide this reasoning block' })).toBeEnabled()
   await expect(page.getByRole('button', { name: 'Hide tool call' })).toBeEnabled()
-})
-
-test('switching to the tree during a stream does not stop or lose the generation', async ({
-  page,
-}) => {
-  const resultPromise = page.evaluate(() => {
-    const api = (
-      window as unknown as {
-        __debugFakeStream?: {
-          start(options: Record<string, unknown>): Promise<{ chatId: string }>
-        }
-      }
-    ).__debugFakeStream
-    if (!api) throw new Error('debug fake stream unavailable')
-    return api
-      .start({
-        targetChars: 12_000,
-        reasoningChars: 12_000,
-        chunkChars: 120,
-        delayMs: 30,
-      })
-      .then((result) => result.chatId)
-  })
-  await expect
-    .poll(() =>
-      page.evaluate(
-        () =>
-          (
-            window as unknown as {
-              __debugFakeStream?: { state(): { streamStore: { activeCount: number } } }
-            }
-          ).__debugFakeStream?.state().streamStore.activeCount,
-      ),
-    )
-    .toBe(1)
-  const streamTargetId = await page
-    .waitForFunction(
-      () =>
-        (
-          window as unknown as {
-            __debugFakeStream?: {
-              state(): { streamStore: { activeTargets: Array<{ messageId?: string }> } }
-            }
-          }
-        ).__debugFakeStream
-          ?.state()
-          .streamStore.activeTargets.find((target) => target.messageId)?.messageId ?? null,
-    )
-    .then((handle) => handle.jsonValue())
-  if (!streamTargetId) throw new Error('Active fake stream has no target message')
-  await expect(page.getByRole('button', { name: 'Stop generating' })).toBeVisible()
-  await page.locator('[data-role="chat-branch-tree"]').click()
-  await expect(page.locator('[data-ui="branch-tree-view"]')).toBeVisible()
-  const streamingNode = page.locator(
-    `[data-ui="branch-tree-node"][data-message-id="${streamTargetId}"]`,
-  )
-  await expect(streamingNode).toHaveAttribute('data-current-leaf', 'true')
-  await expect(streamingNode).toHaveAttribute('data-selected', 'true')
-  await expect(page.locator('[data-ui="branch-tree-inspector"]')).toHaveAttribute(
-    'data-message-id',
-    streamTargetId,
-  )
-  await expect
-    .poll(() =>
-      page
-        .locator('[data-ui="branch-tree-inspector"] [data-ui="markdown"]')
-        .textContent()
-        .then((text) => text?.length ?? 0),
-    )
-    .toBeGreaterThan(0)
-  await expect(page.locator('[data-ui="branch-tree-inspector-stream-status"]')).toHaveText(
-    'Streaming response…',
-  )
-  await expect(page.locator('[data-ui="branch-tree-stop"]')).toBeVisible()
-  await expect(page.getByRole('button', { name: 'Edit message' })).toBeDisabled()
-  await expect(page.getByRole('button', { name: 'Delete message' })).toBeDisabled()
-  await expect(page.locator('[data-connector-hit][data-stream-busy="true"]')).not.toHaveCount(0)
-
-  await page.locator('[data-role="chat-branch-tree"]').click()
-  await expect(
-    page.locator(`[data-ui="message"][data-message-id="${streamTargetId}"]`),
-  ).toBeVisible()
-  await expect(page.getByRole('button', { name: 'Stop generating' })).toBeVisible()
-
-  await page.locator('[data-role="chat-branch-tree"]').click()
-  await expect(streamingNode).toHaveAttribute('data-selected', 'true')
-  await expect(page.locator('[data-ui="branch-tree-inspector"]')).toHaveAttribute(
-    'data-message-id',
-    streamTargetId,
-  )
-  await expect
-    .poll(() =>
-      page
-        .locator('[data-ui="branch-tree-inspector"] [data-ui="markdown"]')
-        .textContent()
-        .then((text) => text?.length ?? 0),
-    )
-    .toBeGreaterThan(0)
-  await expect(page.locator('[data-ui="branch-tree-stop"]')).toBeVisible()
-
-  const chatId = await resultPromise
-  await expect
-    .poll(() =>
-      page.evaluate(
-        () =>
-          (
-            window as unknown as {
-              __debugFakeStream?: { state(): { streamStore: { activeCount: number } } }
-            }
-          ).__debugFakeStream?.state().streamStore.activeCount,
-      ),
-    )
-    .toBe(0)
-
-  await page.locator('[data-role="chat-branch-tree"]').click()
-  await expect(page.locator('[data-ui="message-list"]')).toBeVisible()
-  const persisted = await readAssistantLengths(page, chatId)
-  expect(persisted).toEqual({ text: 12_000, reasoning: 12_000 })
 })
 
 test('tree shows and follows a pending response before the first byte arrives', async ({
@@ -1011,20 +834,9 @@ test('tree shows and follows a pending response before the first byte arrives', 
   await createChatAndOpen(page)
   await sendMessage(page, 'wait before replying')
   await requestSeen
-  const streamTargetId = await page
-    .waitForFunction(
-      () =>
-        (
-          window as unknown as {
-            __debugFakeStream?: {
-              state(): { streamStore: { activeTargets: Array<{ messageId?: string }> } }
-            }
-          }
-        ).__debugFakeStream
-          ?.state()
-          .streamStore.activeTargets.find((target) => target.messageId)?.messageId ?? null,
-    )
-    .then((handle) => handle.jsonValue())
+  const pendingMessage = page.locator('[data-ui="message"][data-role="assistant"]').last()
+  await expect(pendingMessage).toBeVisible()
+  const streamTargetId = await pendingMessage.getAttribute('data-message-id')
   if (!streamTargetId) throw new Error('Pending response has no target message')
   await expect(page.getByRole('button', { name: 'Stop generating' })).toBeVisible()
 
@@ -1060,18 +872,6 @@ test('tree shows and follows a pending response before the first byte arrives', 
       'Waiting for response…',
     )
     releaseResponse()
-    await expect
-      .poll(() =>
-        page.evaluate(
-          () =>
-            (
-              window as unknown as {
-                __debugFakeStream?: { state(): { streamStore: { activeCount: number } } }
-              }
-            ).__debugFakeStream?.state().streamStore.activeCount,
-        ),
-      )
-      .toBe(0)
     await expect(page.locator('[data-ui="branch-tree-stop"]')).toHaveCount(0)
     await expect(page.locator('[data-ui="branch-tree-inspector"] [data-ui="markdown"]')).toHaveText(
       'response released after tree waiting state',
@@ -1090,114 +890,221 @@ test('tree shows and follows a pending response before the first byte arrives', 
     await expect
       .poll(() => page.evaluate(() => window.location.hash))
       .toContain(`/message/${streamTargetId}`)
+    await waitForMessageGenerationFinished(page, streamTargetId)
   } finally {
     releaseResponse()
   }
 })
 
 async function seedBranchTreeChat(page: Page): Promise<string> {
-  return page.evaluate(async () => {
-    const chatsPath = '/src/store/chats.ts'
-    const defaultsPath = '/src/core/defaults.ts'
-    const presetsPath = '/src/store/presets.ts'
-    const repositoryPath = '/src/store/workspace-repository.ts'
-    const [chatModule, defaultsModule, presetsModule, repositoryModule] = (await Promise.all([
-      import(/* @vite-ignore */ chatsPath),
-      import(/* @vite-ignore */ defaultsPath),
-      import(/* @vite-ignore */ presetsPath),
-      import(/* @vite-ignore */ repositoryPath),
-    ])) as unknown as [
-      BranchTreeChatModule,
-      BranchTreeDefaultsModule,
-      BranchTreePresetsModule,
-      BranchTreeRepositoryModule,
-    ]
-    const now = Date.now()
-    const chatId = 'branch-tree-chat'
-    const preset = (await presetsModule.listPresets())[0]
-    await chatModule.createChat({
-      id: chatId,
-      title: 'Branch tree chat',
-      settings: preset?.settings ?? defaultsModule.cloneDefaultChatSettings(),
-      now,
-    })
-    const rows = [
-      ['root', null, 0, 'system', 'system', 'root instruction'],
-      ['A1', 'root', 0, 'user', 'user', 'branch A user'],
-      [
-        'A2',
-        'A1',
-        0,
-        'assistant',
-        'generated',
-        'branch A assistant, with branch A repeated for inspector navigation\n\n```ts\nconst label = "branch A"\n```',
+  const now = Date.now()
+  const chatId = 'branch-tree-chat'
+  const sourceMessages: Message[] = [
+    {
+      id: 'root',
+      chatId,
+      parentId: null,
+      siblingIndex: 0,
+      turnId: 'turn-root',
+      turnIndex: 0,
+      createdAt: now,
+      role: 'system',
+      origin: 'imported',
+      content: [{ type: 'text', text: 'root instruction' }],
+      nodeVersion: 0,
+      deleted: false,
+    },
+    {
+      id: 'A1',
+      chatId,
+      parentId: 'root',
+      siblingIndex: 0,
+      turnId: 'turn-A1',
+      turnIndex: 1,
+      createdAt: now + 1,
+      role: 'user',
+      origin: 'user',
+      content: [{ type: 'text', text: 'branch A user' }],
+      nodeVersion: 0,
+      deleted: false,
+    },
+    {
+      id: 'A2',
+      chatId,
+      parentId: 'A1',
+      siblingIndex: 0,
+      turnId: 'turn-A2',
+      turnIndex: 2,
+      createdAt: now + 2,
+      role: 'assistant',
+      origin: 'generated',
+      content: [
+        {
+          type: 'output_text',
+          text: 'branch A assistant, with branch A repeated for inspector navigation\n\n```ts\nconst label = "branch A"\n```',
+        },
       ],
-      ['B1', 'root', 1, 'user', 'user', 'branch B user'],
-      ['B2', 'B1', 0, 'assistant', 'generated', 'branch B assistant'],
-    ] as const
-    const repository = repositoryModule.getWorkspaceRepository()
-    await repository.runMutation(
-      [
-        { kind: 'chat-meta', chatId },
-        ...rows.map(([id]) => ({ kind: 'message' as const, messageId: id })),
-        ...rows.map(([, parentId]) => ({ kind: 'children' as const, chatId, parentId })),
+      reasoningDetails: [
+        {
+          type: 'reasoning.text',
+          text: 'Tree inspector reasoning detail.',
+          format: 'anthropic-claude-v1',
+        },
       ],
-      async (context: { putMessage(message: Record<string, unknown>): Promise<void> }) => {
-        for (let index = 0; index < rows.length; index += 1) {
-          const [id, parentId, siblingIndex, role, origin, text] = rows[
-            index
-          ] as (typeof rows)[number]
-          const createdAt = now + index
-          await context.putMessage({
-            id,
-            chatId,
-            parentId,
-            siblingIndex,
-            turnId: `turn-${id}`,
-            turnIndex: parentId === null ? 0 : parentId === 'root' ? 1 : 2,
-            createdAt,
-            role,
-            origin,
-            content:
-              role === 'assistant' ? [{ type: 'output_text', text }] : [{ type: 'text', text }],
-            ...(id === 'A2'
-              ? {
-                  reasoningDetails: [
-                    {
-                      type: 'reasoning.text',
-                      text: 'Tree inspector reasoning detail.',
-                      format: 'anthropic-claude-v1',
-                    },
-                  ],
-                  providerOutputItems: [
-                    {
-                      dialect: 'openai-responses',
-                      type: 'web_search_call',
-                      outputIndex: 0,
-                      item: {
-                        type: 'web_search_call',
-                        id: 'tree-search-1',
-                        status: 'completed',
-                        action: { type: 'search', query: 'tree inspector action parity' },
-                      },
-                    },
-                  ],
-                }
-              : {}),
-            nodeVersion: 0,
-            deleted: false,
-          })
-        }
-      },
-    )
-    return chatId
-  })
+      providerOutputItems: [
+        {
+          dialect: 'openai-responses',
+          type: 'web_search_call',
+          outputIndex: 0,
+          item: {
+            type: 'web_search_call',
+            id: 'tree-search-1',
+            status: 'completed',
+            action: { type: 'search', query: 'tree inspector action parity' },
+          },
+        },
+      ],
+      nodeVersion: 0,
+      deleted: false,
+    },
+    {
+      id: 'B1',
+      chatId,
+      parentId: 'root',
+      siblingIndex: 1,
+      turnId: 'turn-B1',
+      turnIndex: 1,
+      createdAt: now + 3,
+      role: 'user',
+      origin: 'user',
+      content: [{ type: 'text', text: 'branch B user' }],
+      nodeVersion: 0,
+      deleted: false,
+    },
+    {
+      id: 'B2',
+      chatId,
+      parentId: 'B1',
+      siblingIndex: 0,
+      turnId: 'turn-B2',
+      turnIndex: 2,
+      createdAt: now + 4,
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: 'branch B assistant' }],
+      nodeVersion: 0,
+      deleted: false,
+    },
+  ]
+  const storedMessages = sourceMessages.map((message) => splitMessageForStorage(message))
+  const wordCount = storedMessages.reduce((total, stored) => total + stored.header.bodyWordCount, 0)
+  const previewText = previewTextFromStoredProjection(
+    storedMessages.find((stored) => stored.header.id === 'A1')?.header.textPreview ?? '',
+  )
+
+  await page.evaluate(
+    async (seed) => {
+      const db = await new Promise<IDBDatabase>((resolve, reject) => {
+        const request = indexedDB.open('natter')
+        request.onsuccess = () => resolve(request.result)
+        request.onerror = () => reject(request.error)
+      })
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const tx = db.transaction(['presets', 'chats', 'messages', 'messageBodies'], 'readwrite')
+          const presets = tx.objectStore('presets')
+          const chats = tx.objectStore('chats')
+          const messages = tx.objectStore('messages')
+          const messageBodies = tx.objectStore('messageBodies')
+          const presetsRequest = presets.getAll()
+          presetsRequest.onsuccess = () => {
+            const preset = (
+              presetsRequest.result as Array<{ id?: string; settings?: Record<string, unknown> }>
+            )[0]
+            if (!preset?.id || !preset.settings) {
+              reject(new Error('missing seed preset'))
+              return
+            }
+            chats.put({
+              id: seed.chatId,
+              title: 'Branch tree chat',
+              titleStatus: 'manual',
+              createdAt: seed.now,
+              updatedAt: seed.now + seed.storedMessages.length - 1,
+              lastViewedAt: seed.now + seed.storedMessages.length - 1,
+              wordCount: seed.wordCount,
+              totalCostUsd: 0,
+              metaVersion: 0,
+              summaryVersion: 0,
+              settings: structuredClone(preset.settings),
+              presetId: preset.id,
+              lastUpdatedLeafId: 'B2',
+              lastBranchUpdatedAt: seed.now + seed.storedMessages.length - 1,
+              archived: false,
+              pinned: false,
+              folderId: null,
+              tags: [],
+              previewText: seed.previewText,
+            })
+            for (const stored of seed.storedMessages) {
+              messages.put(stored.header)
+              messageBodies.put(stored.body)
+            }
+          }
+          presetsRequest.onerror = () => reject(presetsRequest.error)
+          tx.oncomplete = () => resolve()
+          tx.onerror = () => reject(tx.error)
+          tx.onabort = () => reject(tx.error)
+        })
+      } finally {
+        db.close()
+      }
+    },
+    { chatId, now, previewText, storedMessages, wordCount },
+  )
+  await rebuildSidebarProjection(page)
+  return chatId
 }
 
-async function readAssistantLengths(
+async function readStoredMessageText(page: Page, messageId: string): Promise<string> {
+  const message = await readStoredMessage(page, messageId)
+  return ((message?.content ?? []) as Array<{ text?: string }>)
+    .map((item) => item.text ?? '')
+    .join('')
+}
+
+async function readStoredMessageHidden(page: Page, messageId: string): Promise<boolean> {
+  return (await readStoredMessage(page, messageId))?.hiddenFromContext === true
+}
+
+async function readRegeneratedSiblingText(page: Page): Promise<string> {
+  const messages = await readMessages(page, 'branch-tree-chat')
+  const regenerated = messages.find((message) => message.parentId === 'A1' && message.id !== 'A2')
+  return ((regenerated?.content ?? []) as Array<{ text?: string }>)
+    .map((item) => item.text ?? '')
+    .join('')
+}
+
+async function waitForMessageGenerationFinished(page: Page, messageId: string): Promise<void> {
+  await expect
+    .poll(async () => {
+      const message = await readStoredMessage(page, messageId)
+      const generation = message?.generation as { finishedAt?: unknown } | undefined
+      const continuationAttempts = message?.continuationAttempts as
+        | Array<{ finishedAt?: unknown }>
+        | undefined
+      return (
+        typeof generation?.finishedAt === 'number' ||
+        continuationAttempts?.some((attempt) => typeof attempt.finishedAt === 'number') === true
+      )
+    })
+    .toBe(true)
+}
+
+async function readStoredMessage(
   page: Page,
-  chatId: string,
-): Promise<{ text: number; reasoning: number }> {
+  messageId: string,
+): Promise<Record<string, unknown> | undefined> {
   return page.evaluate(async (id) => {
     const db = await new Promise<IDBDatabase>((resolve, reject) => {
       const request = indexedDB.open('natter')
@@ -1205,82 +1112,26 @@ async function readAssistantLengths(
       request.onerror = () => reject(request.error)
     })
     try {
-      return await new Promise((resolve, reject) => {
+      return await new Promise<Record<string, unknown> | undefined>((resolve, reject) => {
         const tx = db.transaction(['messages', 'messageBodies'], 'readonly')
-        const headers = tx.objectStore('messages').getAll()
-        headers.onsuccess = () => {
-          const assistant = (headers.result as Array<Record<string, unknown>>).find(
-            (row) => row.chatId === id && row.role === 'assistant' && row.deleted === false,
-          )
-          if (!assistant || typeof assistant.id !== 'string') {
-            reject(new Error('assistant missing'))
+        const headerRequest = tx.objectStore('messages').get(id)
+        headerRequest.onsuccess = () => {
+          const header = headerRequest.result as Record<string, unknown> | undefined
+          if (!header) {
+            resolve(undefined)
             return
           }
-          const body = tx.objectStore('messageBodies').get(assistant.id)
-          body.onsuccess = () => {
-            const value = body.result as {
-              content?: Array<{ type?: string; text?: string }>
-              reasoningDetails?: Array<{ type?: string; text?: string; summary?: string }>
-            }
-            resolve({
-              text: (value.content ?? []).reduce((sum, item) => sum + (item.text?.length ?? 0), 0),
-              reasoning: (value.reasoningDetails ?? []).reduce(
-                (sum, item) => sum + (item.text?.length ?? item.summary?.length ?? 0),
-                0,
-              ),
-            })
+          const bodyRequest = tx.objectStore('messageBodies').get(id)
+          bodyRequest.onsuccess = () => {
+            const body = bodyRequest.result as Record<string, unknown> | undefined
+            resolve(body ? { ...header, ...body, nodeVersion: header.nodeVersion } : header)
           }
-          body.onerror = () => reject(body.error)
+          bodyRequest.onerror = () => reject(bodyRequest.error)
         }
-        headers.onerror = () => reject(headers.error)
+        headerRequest.onerror = () => reject(headerRequest.error)
       })
     } finally {
       db.close()
     }
-  }, chatId)
-}
-
-async function readStoredMessageText(page: Page, messageId: string): Promise<string> {
-  return page.evaluate(async (id) => {
-    const repositoryPath = '/src/store/workspace-repository.ts'
-    const repositoryModule = (await import(
-      /* @vite-ignore */ repositoryPath
-    )) as unknown as BranchTreeRepositoryModule
-    const message = await repositoryModule.getWorkspaceRepository().getMessage(id)
-    return (message?.content ?? [])
-      .map((item: { type?: string; text?: string }) => item.text ?? '')
-      .join('')
   }, messageId)
-}
-
-async function readStoredMessageHidden(page: Page, messageId: string): Promise<boolean> {
-  return page.evaluate(async (id) => {
-    const repositoryPath = '/src/store/workspace-repository.ts'
-    const repositoryModule = (await import(
-      /* @vite-ignore */ repositoryPath
-    )) as unknown as BranchTreeRepositoryModule
-    return (
-      (await repositoryModule.getWorkspaceRepository().getMessageHeader(id))?.hiddenFromContext ===
-      true
-    )
-  }, messageId)
-}
-
-async function readRegeneratedSiblingText(page: Page): Promise<string> {
-  return page.evaluate(async () => {
-    const repositoryPath = '/src/store/workspace-repository.ts'
-    const repositoryModule = (await import(
-      /* @vite-ignore */ repositoryPath
-    )) as unknown as BranchTreeRepositoryModule
-    const messages = await repositoryModule
-      .getWorkspaceRepository()
-      .listMessages('branch-tree-chat')
-    const regenerated = messages.find(
-      (message: { id: string; parentId: string | null }) =>
-        message.parentId === 'A1' && message.id !== 'A2',
-    )
-    return (regenerated?.content ?? [])
-      .map((item: { type?: string; text?: string }) => item.text ?? '')
-      .join('')
-  })
 }

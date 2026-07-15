@@ -1,3 +1,8 @@
+import type { Message } from '../../src/core/types'
+import {
+  previewTextFromStoredProjection,
+  splitMessageForStorage,
+} from '../../src/store/message-storage'
 import { expect, test } from './fixtures'
 import { clearIndexedDb, rebuildSidebarProjection, seedFirstRun } from './helpers'
 
@@ -11,8 +16,45 @@ test('oversized stream lane auto-compacts and the avatar cycles compact -> peek 
 }) => {
   const huge = 'abcdefghij'.repeat(2500)
   const chatId = 'oversize-chat'
+  const now = Date.now()
+  const userId = 'oversize-user'
+  const assistantId = 'oversize-assistant'
+  const sourceMessages: Message[] = [
+    {
+      id: userId,
+      chatId,
+      parentId: null,
+      siblingIndex: 0,
+      turnId: 'oversize-turn-user',
+      turnIndex: 0,
+      createdAt: now,
+      role: 'user',
+      origin: 'user',
+      content: [{ type: 'text', text: 'flood me' }],
+      nodeVersion: 0,
+      deleted: false,
+    },
+    {
+      id: assistantId,
+      chatId,
+      parentId: userId,
+      siblingIndex: 0,
+      turnId: 'oversize-turn-assistant',
+      turnIndex: 0,
+      createdAt: now + 1,
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: huge }],
+      nodeVersion: 0,
+      deleted: false,
+    },
+  ]
+  const storedMessages = sourceMessages.map((message) => splitMessageForStorage(message))
+  const wordCount = storedMessages.reduce((total, stored) => total + stored.header.bodyWordCount, 0)
+  const previewText = previewTextFromStoredProjection(storedMessages[0]?.header.textPreview ?? '')
+
   await page.evaluate(
-    async ({ activeChatId, hugeMessage }) => {
+    async ({ activeChatId, assistantId, now, previewText, storedMessages, wordCount }) => {
       const db = await new Promise<IDBDatabase>((resolve, reject) => {
         const req = indexedDB.open('natter')
         req.onsuccess = () => resolve(req.result)
@@ -20,9 +62,6 @@ test('oversized stream lane auto-compacts and the avatar cycles compact -> peek 
       })
       try {
         await new Promise<void>((resolve, reject) => {
-          const now = Date.now()
-          const userId = 'oversize-user'
-          const assistantId = 'oversize-assistant'
           const tx = db.transaction(
             ['presets', 'messages', 'messageBodies', 'chats', 'settings'],
             'readwrite',
@@ -32,30 +71,6 @@ test('oversized stream lane auto-compacts and the avatar cycles compact -> peek 
           const messageBodies = tx.objectStore('messageBodies')
           const presets = tx.objectStore('presets')
           const settings = tx.objectStore('settings')
-          const putMessage = (row: Record<string, unknown>) => {
-            const {
-              content,
-              reasoningDetails,
-              toolCalls,
-              refusal,
-              phase,
-              responsesEchoItem,
-              ...header
-            } = row
-            messages.put(header)
-            messageBodies.put({
-              id: row.id,
-              chatId: row.chatId,
-              nodeVersion: row.nodeVersion,
-              updatedAt: now,
-              content,
-              ...(reasoningDetails !== undefined ? { reasoningDetails } : {}),
-              ...(toolCalls !== undefined ? { toolCalls } : {}),
-              ...(refusal !== undefined ? { refusal } : {}),
-              ...(phase !== undefined ? { phase } : {}),
-              ...(responsesEchoItem !== undefined ? { responsesEchoItem } : {}),
-            })
-          }
           settings.put({ key: 'global:long-message-display-mode', value: 'compact' })
           const getPresetsReq = presets.getAll()
           getPresetsReq.onsuccess = () => {
@@ -73,7 +88,7 @@ test('oversized stream lane auto-compacts and the avatar cycles compact -> peek 
               createdAt: now,
               updatedAt: now + 1,
               lastViewedAt: now + 1,
-              wordCount: 0,
+              wordCount,
               totalCostUsd: 0,
               metaVersion: 0,
               summaryVersion: 0,
@@ -85,35 +100,12 @@ test('oversized stream lane auto-compacts and the avatar cycles compact -> peek 
               pinned: false,
               folderId: null,
               tags: [],
+              previewText,
             })
-            putMessage({
-              id: userId,
-              chatId: activeChatId,
-              parentId: null,
-              siblingIndex: 0,
-              turnId: 'oversize-turn-user',
-              turnIndex: 0,
-              createdAt: now,
-              role: 'user',
-              origin: 'user',
-              content: [{ type: 'text', text: 'flood me' }],
-              nodeVersion: 0,
-              deleted: false,
-            })
-            putMessage({
-              id: assistantId,
-              chatId: activeChatId,
-              parentId: userId,
-              siblingIndex: 0,
-              turnId: 'oversize-turn-assistant',
-              turnIndex: 0,
-              createdAt: now + 1,
-              role: 'assistant',
-              origin: 'generated',
-              content: [{ type: 'output_text', text: hugeMessage }],
-              nodeVersion: 0,
-              deleted: false,
-            })
+            for (const stored of storedMessages) {
+              messages.put(stored.header)
+              messageBodies.put(stored.body)
+            }
           }
           tx.oncomplete = () => resolve()
           tx.onerror = () => reject(tx.error)
@@ -123,7 +115,7 @@ test('oversized stream lane auto-compacts and the avatar cycles compact -> peek 
         db.close()
       }
     },
-    { activeChatId: chatId, hugeMessage: huge },
+    { activeChatId: chatId, assistantId, now, previewText, storedMessages, wordCount },
   )
   await rebuildSidebarProjection(page)
   await page.goto(`/?overflow=${Date.now()}#/chat/${chatId}`)

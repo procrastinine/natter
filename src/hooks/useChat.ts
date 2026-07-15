@@ -106,10 +106,12 @@ import {
 import { recoverStaleContinuationAttempts } from '../store/continuation-recovery'
 import {
   commitPreparedGeneratedOutputAttachments,
+  contentNeedsGeneratedOutputMaterialization,
   type GeneratedOutputDownloader,
   prepareGeneratedOutputAttachments,
+  withGeneratedOutputLocalizationClaim,
 } from '../store/generated-images'
-import type { MessageHeaderRow } from '../store/message-storage'
+import { type MessageHeaderRow, rebaseHydratedMessageHeader } from '../store/message-storage'
 import { ENDPOINTS_TTL_MS, getCachedEndpoints, isFresh } from '../store/models-cache'
 import { getCachedPrivacyPolicy } from '../store/privacy-cache'
 import { flushPendingPromptSettingSaves } from '../store/prompt-presets'
@@ -152,14 +154,7 @@ import { useStreamStore } from '../store/zustand/streamStore'
 import { useUiStore } from '../store/zustand/uiStore'
 import { startRequestLifecycle } from './requestLifecycle'
 
-const retainedRequestPlansForTests = import.meta.env.DEV
-  ? new Set<AssistantRequestPlan>()
-  : undefined
 const ORPHAN_RECOVERY_RETRY_MS = 2_000
-
-export function __retainedSendRequestPlanCountForTests(): number | undefined {
-  return retainedRequestPlansForTests?.size
-}
 
 export async function __flushPostCommitCalibrationForTests(): Promise<void> {
   await flushPostCommitTasksForTests()
@@ -258,9 +253,8 @@ interface SendTextInput {
   attachmentRefs?: AttachmentRef[]
   capabilities?: CapabilityDescriptor
   transform?: AssistantRequestTransform
-  // Injection seam for integration tests that want to mock the stream
-  // generator instead of `fetch`. The default opens a real chat-completions
-  // call; tests pass a replacement iterable.
+  // Optional transport dependency for exercising orchestration in isolation.
+  // Browser callers omit it and use the normal assistant transport.
   openStream?: (input: OpenStreamInput) => AsyncIterable<OpenStreamChunk>
   signal?: AbortSignal
   now?: () => number
@@ -310,16 +304,6 @@ interface OpenStreamInput {
 }
 
 type OpenStreamChunk = AssistantStreamChunk
-
-function devOnlyOpenStreamOverride(
-  openStream: SendTextInput['openStream'],
-): SendTextInput['openStream'] {
-  if (!openStream) return undefined
-  if ((import.meta as { env?: { DEV?: boolean } }).env?.DEV !== true) {
-    throw new Error('openStream override is dev-only; production sends must use assistant-stream')
-  }
-  return openStream
-}
 
 function replaceActiveChatMessageRoute(chatId: ChatId, messageId: MessageId): void {
   if (typeof window === 'undefined') return
@@ -480,7 +464,6 @@ export async function sendText(input: SendTextInput): Promise<SendTextResult> {
     }
     if (lifecycle.signal.aborted) throw new DOMException('Request aborted.', 'AbortError')
 
-    retainedRequestPlansForTests?.add(requestPlan)
     const requested = openAssistantStreamUnder({
       ...input,
       signal: lifecycle.signal,
@@ -508,7 +491,6 @@ export async function sendText(input: SendTextInput): Promise<SendTextResult> {
       ...(hasPrefill ? { initialAssistantContent: input.prefillContent ?? [] } : {}),
       requestPlan,
     })
-    retainedRequestPlansForTests?.delete(requestPlan)
     requestPlan = undefined as never
     plannedPath = []
     sendContext = undefined
@@ -631,7 +613,6 @@ export async function sendFromMessage(input: SendFromMessageInput): Promise<Send
     }
     if (lifecycle.signal.aborted) throw new DOMException('Request aborted.', 'AbortError')
 
-    retainedRequestPlansForTests?.add(requestPlan)
     const requested = openAssistantStreamUnder({
       ...input,
       signal: lifecycle.signal,
@@ -653,7 +634,6 @@ export async function sendFromMessage(input: SendFromMessageInput): Promise<Send
       ...(hasPrefill ? { initialAssistantContent: input.prefillContent ?? [] } : {}),
       requestPlan,
     })
-    retainedRequestPlansForTests?.delete(requestPlan)
     requestPlan = undefined as never
     plannedPath = []
     sendContext = undefined
@@ -827,7 +807,7 @@ async function openAssistantStreamUnder(
   }
 
   const openStream =
-    devOnlyOpenStreamOverride(input.openStream) ??
+    input.openStream ??
     ((open) =>
       openAssistantRequestStream({
         connection: open.connection,
@@ -1229,41 +1209,49 @@ async function localizeCommittedGeneratedOutput(input: {
   isCurrent: () => boolean
   onCommittedPresentation?: (presentation: CommittedMessagePresentation) => void
 }): Promise<void> {
-  const controller = new AbortController()
-  let cancel!: () => void
-  const cancelled = new Promise<undefined>((resolve) => {
-    cancel = () => {
-      controller.abort()
-      resolve(undefined)
-    }
-  })
-  input.requestSignal.addEventListener('abort', cancel, { once: true })
-  input.taskSignal.addEventListener('abort', cancel, { once: true })
-  if (input.requestSignal.aborted || input.taskSignal.aborted) cancel()
-  const preparing = prepareGeneratedOutputAttachments({
-    messageId: input.presentation.message.id,
-    content: input.presentation.message.content,
-    now: input.now,
-    downloader: generatedOutputDownloader({
-      connection: input.connection,
-      apiKey: input.apiKey,
-      signal: controller.signal,
-    }),
-    preserveRemoteUrlOnDownloadFailure: true,
-  })
-  const prepared = await Promise.race([preparing, cancelled]).finally(() => {
-    input.requestSignal.removeEventListener('abort', cancel)
-    input.taskSignal.removeEventListener('abort', cancel)
-  })
-  if (!prepared || controller.signal.aborted || !input.isCurrent()) return
-  const presentation = await commitPreparedGeneratedOutputAttachments({
-    repo: input.repo,
-    presentation: input.presentation,
-    prepared,
-    expectedReplacementEpoch: input.expectedReplacementEpoch,
-    isCurrent: input.isCurrent,
-  })
-  if (presentation && input.isCurrent()) input.onCommittedPresentation?.(presentation)
+  await withGeneratedOutputLocalizationClaim(
+    input.repo,
+    input.presentation.message.id,
+    async (current) => {
+      if (current.bodyVersion !== input.presentation.bodyVersion || !input.isCurrent()) return
+      const controller = new AbortController()
+      let cancel!: () => void
+      const cancelled = new Promise<undefined>((resolve) => {
+        cancel = () => {
+          controller.abort()
+          resolve(undefined)
+        }
+      })
+      input.requestSignal.addEventListener('abort', cancel, { once: true })
+      input.taskSignal.addEventListener('abort', cancel, { once: true })
+      if (input.requestSignal.aborted || input.taskSignal.aborted) cancel()
+      const preparing = prepareGeneratedOutputAttachments({
+        messageId: input.presentation.message.id,
+        content: current.message.content,
+        now: input.now,
+        downloader: generatedOutputDownloader({
+          connection: input.connection,
+          apiKey: input.apiKey,
+          signal: controller.signal,
+        }),
+        preserveRemoteUrlOnDownloadFailure: true,
+      })
+      const prepared = await Promise.race([preparing, cancelled]).finally(() => {
+        input.requestSignal.removeEventListener('abort', cancel)
+        input.taskSignal.removeEventListener('abort', cancel)
+      })
+      if (!prepared || controller.signal.aborted || !input.isCurrent()) return
+      const presentation = await commitPreparedGeneratedOutputAttachments({
+        repo: input.repo,
+        presentation: input.presentation,
+        prepared,
+        expectedReplacementEpoch: input.expectedReplacementEpoch,
+        isCurrent: input.isCurrent,
+      })
+      if (presentation && input.isCurrent()) input.onCommittedPresentation?.(presentation)
+    },
+    { signal: input.taskSignal },
+  )
 }
 
 function shouldAuthorizeGeneratedOutputUrl(url: string, connection: ConnectionProfile): boolean {
@@ -1414,18 +1402,6 @@ function isNonTextContentItem(item: ContentItem): boolean {
   return item.type !== 'text' && item.type !== 'output_text'
 }
 
-function contentNeedsGeneratedOutputMaterialization(content: readonly ContentItem[]): boolean {
-  return content.some(
-    (item) =>
-      (item.type === 'output_image' ||
-        item.type === 'audio_output' ||
-        item.type === 'output_video') &&
-      !item.attachmentId &&
-      typeof item.url === 'string' &&
-      item.url.length > 0,
-  )
-}
-
 function presentationVersionMatches(
   header: MessageHeaderRow | undefined,
   presentation: CommittedMessagePresentation,
@@ -1449,17 +1425,10 @@ function presentationWithMetadataHeader(
   presentation: CommittedMessagePresentation,
   header: MessageHeaderRow,
 ): CommittedMessagePresentation {
-  const {
-    requestContextVersion: _requestContextVersion,
-    bodyVersion,
-    bodyWordCount: _bodyWordCount,
-    textPreview: _textPreview,
-    ...messageHeader
-  } = header
   return {
     header,
-    bodyVersion,
-    message: { ...presentation.message, ...messageHeader },
+    bodyVersion: header.bodyVersion,
+    message: rebaseHydratedMessageHeader(presentation.message, header),
   }
 }
 

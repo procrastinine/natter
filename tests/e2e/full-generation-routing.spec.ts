@@ -14,18 +14,8 @@ type CapturedRequest = {
   body: Record<string, unknown>
 }
 
-type PlanEntry = {
-  label: string
-  payload: Record<string, unknown>
-}
-
 test.beforeEach(async ({ page }) => {
   await clearIndexedDb(page)
-  await page.evaluate(() =>
-    (
-      window as unknown as { __debugStreams?: { enablePlans(): void } }
-    ).__debugStreams?.enablePlans(),
-  )
 })
 
 test('GUI OpenRouter send, Continue, provider overrides, token-cap routing, and preset save stay on the unified planner', async ({
@@ -39,9 +29,6 @@ test('GUI OpenRouter send, Continue, provider overrides, token-cap routing, and 
   await seedFirstRun(page, { model: OSS_MODEL, disablePrivacyFilter: false })
   const profileId = await activeProfileId(page)
   await seedOpenRouterDiscovery(page, profileId, OSS_MODEL)
-  await page.evaluate(() =>
-    (window as unknown as { __debugStreams?: { clearPlans(): void } }).__debugStreams?.clearPlans(),
-  )
 
   await createChatAndOpen(page)
   const composer = page.locator('[data-ui="composer-input"]')
@@ -103,32 +90,7 @@ test('GUI OpenRouter send, Continue, provider overrides, token-cap routing, and 
     )
   }
 
-  const plans = await requestPlans(page)
-  const sendPlan = findPlan(plans, 'send')
-  const continuePlan = findPlan(plans, 'continue')
-  const sendProvider = providerSummary(sendPlan)
-  expect(sendProvider.wire).toMatchObject({
-    data_collection: 'deny',
-    sort: 'throughput',
-    require_parameters: true,
-  })
-  expect(sendProvider.contextIgnored).toEqual(['Tiny Context'])
-  expect(sendProvider.privacy).toMatchObject({
-    applicable: true,
-    kept: expect.arrayContaining([
-      expect.objectContaining({ provider: 'Alpha ZDR' }),
-      expect.objectContaining({ provider: 'Budget Clean' }),
-      expect.objectContaining({ provider: 'Tiny Context' }),
-    ]),
-  })
-  expect(sendProvider.wire?.ignore).toEqual(
-    expect.arrayContaining(['Training Host', 'Fast Retain', 'UserID Host']),
-  )
-  expect(sendPlan.payload.wireShape).toMatchObject({ hasProvider: true, hasMessages: true })
-  expect(continuePlan.payload.route).toMatchObject({ kind: 'chat-completions' })
-  expect(providerSummary(continuePlan).contextIgnored).toEqual(['Tiny Context'])
   expect(consoleLines.filter((line) => line.startsWith('error:'))).toEqual([])
-  expect(consoleLines.some((line) => line.includes('[request-plan] prepared'))).toBe(true)
 })
 
 test('GUI OpenAI-compatible send uses Responses and never carries OpenRouter provider/privacy wire', async ({
@@ -141,9 +103,6 @@ test('GUI OpenAI-compatible send uses Responses and never carries OpenRouter pro
   await seedFirstRun(page, { model: OSS_MODEL, disablePrivacyFilter: false })
   await createChatAndOpen(page)
   await addOpenAiConnectionThroughGui(page)
-  await page.evaluate(() =>
-    (window as unknown as { __debugStreams?: { clearPlans(): void } }).__debugStreams?.clearPlans(),
-  )
 
   await page.locator('[data-role="settings-cog"]').click()
   await expect(page.locator('[data-ui-section="provider-picker"]')).toHaveCount(0)
@@ -169,17 +128,6 @@ test('GUI OpenAI-compatible send uses Responses and never carries OpenRouter pro
   expect(responsesRequests[0]?.body.input).toBeDefined()
   expect(responsesRequests[0]?.body.messages).toBeUndefined()
 
-  const plans = await requestPlans(page)
-  const sendPlan = findPlan(plans, 'send')
-  expect(sendPlan.payload.profile).toMatchObject({ kind: 'openai-compatible' })
-  expect(sendPlan.payload.route).toMatchObject({ kind: 'responses' })
-  expect(providerSummary(sendPlan).wire).toBeNull()
-  expect(providerSummary(sendPlan).privacy).toMatchObject({
-    applicable: false,
-    kept: [],
-    excluded: [],
-  })
-  expect(sendPlan.payload.wireShape).toMatchObject({ hasProvider: false, hasInput: true })
   expect(consoleLines.filter((line) => line.startsWith('error:'))).toEqual([])
 })
 
@@ -195,9 +143,6 @@ test('GUI OpenRouter video model uses parent /endpoints architecture for UI and 
   await seedFirstRun(page, { model: VIDEO_MODEL, disablePrivacyFilter: false })
   const profileId = await activeProfileId(page)
   await seedOpenRouterDiscovery(page, profileId, VIDEO_MODEL)
-  await page.evaluate(() =>
-    (window as unknown as { __debugStreams?: { clearPlans(): void } }).__debugStreams?.clearPlans(),
-  )
 
   await createChatAndOpen(page)
   const composer = page.locator('[data-ui="composer-input"]')
@@ -236,27 +181,13 @@ test('GUI OpenRouter video model uses parent /endpoints architecture for UI and 
   expect(videoSrcs).toHaveLength(2)
   expect(videoSrcs.every((src) => src.startsWith('blob:'))).toBe(true)
 
-  const plans = await requestPlans(page)
-  const sendPlan = findPlan(plans, 'send')
-  expect(sendPlan.payload.route).toMatchObject({
-    kind: 'video-generation',
-    transport: 'openrouter-video',
-  })
-  expect(sendPlan.payload.wireShape).toMatchObject({ hasProvider: true, hasMessages: false })
-  expect(providerSummary(sendPlan).privacy).toMatchObject({
-    applicable: true,
-    kept: [expect.objectContaining({ provider: 'Google' })],
-  })
   expect(consoleLines.filter((line) => line.startsWith('error:'))).toEqual([])
 })
 
 function captureConsole(page: Page): string[] {
   const lines: string[] = []
   page.on('console', (msg) => {
-    const text = msg.text()
-    if (text.includes('[request-plan]') || msg.type() === 'error') {
-      lines.push(`${msg.type()}: ${text}`)
-    }
+    if (msg.type() === 'error') lines.push(`${msg.type()}: ${msg.text()}`)
   })
   return lines
 }
@@ -698,31 +629,4 @@ async function seedDirectModels(page: Page, profileId: string): Promise<void> {
       modelId: OPENAI_MODEL,
     },
   )
-}
-
-async function requestPlans(page: Page): Promise<PlanEntry[]> {
-  return page.evaluate(
-    () =>
-      (
-        window as unknown as { __debugStreams?: { plans(): PlanEntry[] } }
-      ).__debugStreams?.plans() ?? [],
-  )
-}
-
-function findPlan(plans: PlanEntry[], source: string): PlanEntry {
-  const plan = plans.find((entry) => entry.payload.source === source)
-  expect(plan, `missing request plan for ${source}`).toBeTruthy()
-  return plan as PlanEntry
-}
-
-function providerSummary(plan: PlanEntry): {
-  wire: Record<string, unknown> | null
-  contextIgnored: string[]
-  privacy: Record<string, unknown>
-} {
-  return plan.payload.provider as {
-    wire: Record<string, unknown> | null
-    contextIgnored: string[]
-    privacy: Record<string, unknown>
-  }
 }

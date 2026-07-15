@@ -189,27 +189,8 @@ test('stop also aborts continue-in-place streams on existing assistant messages'
   await sendMessage(page, 'hello')
   const assistant = page.locator('[data-ui="message"][data-role="assistant"]').first()
   await expect(assistant).toContainText('ready')
-  const assistantMessageId = await assistant.getAttribute('data-message-id')
-  if (!assistantMessageId) throw new Error('Assistant message has no data-message-id')
   await assistant.locator('[data-action="continue"]').click()
   await continuationRequestSeen
-  await expect
-    .poll(() =>
-      page.evaluate(
-        (messageId) =>
-          (
-            window as unknown as {
-              __debugFakeStream?: {
-                state(): { streamStore: { activeTargets: Array<{ messageId?: string }> } }
-              }
-            }
-          ).__debugFakeStream
-            ?.state()
-            .streamStore.activeTargets.some((target) => target.messageId === messageId) ?? false,
-        assistantMessageId,
-      ),
-    )
-    .toBe(true)
   await expect(page.locator('[data-ui="abort"]')).toBeVisible()
   await page.locator('[data-ui="abort"]').click()
   releaseContinuationResponse()

@@ -1,3 +1,4 @@
+import { schedulePostCommitTask } from '../core/post-commit-task'
 import type {
   Attachment,
   AttachmentRef,
@@ -20,9 +21,14 @@ import {
 } from './attachments'
 import { getBrowserRepository } from './browser-repo'
 import { resolveKeyIfPresent } from './keys'
+import { withCoordinationLock } from './locks'
 import type { MessagePresentation } from './message-storage'
 import { getProfile } from './profiles'
-import type { MutationContext, WorkspaceRepository } from './repository'
+import type {
+  MessagePresentationSnapshot,
+  MutationContext,
+  WorkspaceRepository,
+} from './repository'
 
 type OutputImageItem = Extract<ContentItem, { type: 'output_image' }>
 type OutputAudioItem = Extract<ContentItem, { type: 'audio_output' }>
@@ -35,6 +41,9 @@ export type GeneratedOutputDownloader = (input: {
 }) => Promise<Blob | null | undefined>
 
 type GeneratedVideoUrlResolver = (url: string) => Promise<string[]>
+
+const GENERATED_OUTPUT_LOCALIZATION_LOCK_PREFIX = 'generated-output-localization:'
+const GENERATED_OUTPUT_MIGRATION_TIMEOUT_MS = 20_000
 
 interface GeneratedImageReplacement {
   sourceUrl: string
@@ -64,6 +73,44 @@ interface GeneratedOutputMaterialization {
 
 export interface PreparedGeneratedOutputMaterialization extends GeneratedOutputMaterialization {
   attachmentBundles: PreparedAttachmentBundle[]
+}
+
+export function contentNeedsGeneratedOutputMaterialization(
+  content: readonly ContentItem[],
+): boolean {
+  return content.some(
+    (item) =>
+      (item.type === 'output_image' ||
+        item.type === 'audio_output' ||
+        item.type === 'output_video') &&
+      !item.attachmentId &&
+      typeof item.url === 'string' &&
+      item.url.length > 0,
+  )
+}
+
+export async function withGeneratedOutputLocalizationClaim<T>(
+  repo: WorkspaceRepository,
+  messageId: MessageId,
+  operation: (snapshot: MessagePresentationSnapshot) => Promise<T>,
+  options: { signal?: AbortSignal } = {},
+): Promise<T | undefined> {
+  return withCoordinationLock(
+    `${GENERATED_OUTPUT_LOCALIZATION_LOCK_PREFIX}${messageId}`,
+    async () => {
+      const snapshot = await repo.getMessagePresentationSnapshot(messageId)
+      if (!snapshot || snapshot.message.deleted) return undefined
+      return operation(snapshot)
+    },
+    options,
+  )
+}
+
+export function scheduleGeneratedOutputMigration(messageId: MessageId): boolean {
+  return schedulePostCommitTask(
+    (isCurrent, signal) => migrateGeneratedOutputAttachments(messageId, { isCurrent, signal }),
+    { timeoutMs: GENERATED_OUTPUT_MIGRATION_TIMEOUT_MS },
+  )
 }
 
 function generatedImageOutputAttachmentIds(content: readonly ContentItem[]): Set<string> {
@@ -315,64 +362,78 @@ export async function migrateGeneratedImageOutputAttachments(messageId: MessageI
   await migrateGeneratedOutputAttachments(messageId)
 }
 
-export async function migrateGeneratedOutputAttachments(messageId: MessageId): Promise<void> {
+export async function migrateGeneratedOutputAttachments(
+  messageId: MessageId,
+  options: { isCurrent?: () => boolean; signal?: AbortSignal } = {},
+): Promise<void> {
   const repo = getBrowserRepository()
-  const existing = await repo.getMessage(messageId)
-  if (!existing || existing.deleted) return
-  const migrationContext = await generatedOutputMigrationContext(existing)
-  const expanded = await expandVideoPollingOutputs(existing.content, migrationContext)
-  const materialized = await materializeGeneratedImageOutputAttachments({
+  await withGeneratedOutputLocalizationClaim(
+    repo,
     messageId,
-    content: expanded.content,
-    now: Date.now(),
-    ...(migrationContext?.downloader ? { downloader: migrationContext.downloader } : {}),
-  })
-  const mediaMaterialized = await materializeGeneratedAudioVideoOutputAttachments({
-    messageId,
-    content: materialized.content,
-    now: Date.now(),
-    ...(migrationContext?.downloader ? { downloader: migrationContext.downloader } : {}),
-  })
-  const combined: GeneratedOutputMaterialization = {
-    content: mediaMaterialized.content,
-    replacements: [...materialized.replacements, ...mediaMaterialized.replacements],
-    newRefs: [...materialized.newRefs, ...mediaMaterialized.newRefs],
-    changed: expanded.changed || materialized.changed || mediaMaterialized.changed,
-  }
-  if (!combined.changed) {
-    await localizeReferencedGeneratedOutputAttachments(existing, migrationContext)
-    return
-  }
-  const originalContent = JSON.stringify(existing.content)
-  await repo.runMutation(
-    [{ kind: 'message', messageId }, ...attachmentScopes(combined.newRefs)],
-    async (ctx) => {
-      const current = await ctx.getMessage(messageId)
-      if (!current || current.deleted) return
-      if (JSON.stringify(current.content) !== originalContent) return
-      const merged = mergeGeneratedImageAttachmentRefs(
-        current.attachmentRefs,
-        combined.newRefs,
+    async ({ message: existing }) => {
+      if (options.isCurrent?.() === false || options.signal?.aborted) return
+      const migrationContext = await generatedOutputMigrationContext(existing, options.signal)
+      const expanded = await expandVideoPollingOutputs(existing.content, migrationContext)
+      if (options.isCurrent?.() === false || options.signal?.aborted) return
+      const materialized = await materializeGeneratedImageOutputAttachments({
         messageId,
-        Date.now(),
-      )
-      const next: Message = {
-        ...current,
-        content: combined.content,
-        attachmentRefs: merged.refs,
+        content: expanded.content,
+        now: Date.now(),
+        ...(migrationContext?.downloader ? { downloader: migrationContext.downloader } : {}),
+      })
+      const mediaMaterialized = await materializeGeneratedAudioVideoOutputAttachments({
+        messageId,
+        content: materialized.content,
+        now: Date.now(),
+        ...(migrationContext?.downloader ? { downloader: migrationContext.downloader } : {}),
+      })
+      const combined: GeneratedOutputMaterialization = {
+        content: mediaMaterialized.content,
+        replacements: [...materialized.replacements, ...mediaMaterialized.replacements],
+        newRefs: [...materialized.newRefs, ...mediaMaterialized.newRefs],
+        changed: expanded.changed || materialized.changed || mediaMaterialized.changed,
       }
-      delete next.cachedMediaTokens
-      await ctx.putMessage(next, { touchChatSummary: false, broadcast: true })
+      if (!combined.changed) {
+        await localizeReferencedGeneratedOutputAttachments(existing, migrationContext)
+        return
+      }
+      if (options.isCurrent?.() === false || options.signal?.aborted) return
+      const originalContent = JSON.stringify(existing.content)
+      await repo.runMutation(
+        [{ kind: 'message', messageId }, ...attachmentScopes(combined.newRefs)],
+        async (ctx) => {
+          const current = await ctx.getMessage(messageId)
+          if (!current || current.deleted) return
+          if (JSON.stringify(current.content) !== originalContent) return
+          const merged = mergeGeneratedImageAttachmentRefs(
+            current.attachmentRefs,
+            combined.newRefs,
+            messageId,
+            Date.now(),
+          )
+          const next: Message = {
+            ...current,
+            content: combined.content,
+            attachmentRefs: merged.refs,
+          }
+          delete next.cachedMediaTokens
+          await ctx.putMessage(next, { touchChatSummary: false, broadcast: true })
+        },
+      )
+      await localizeReferencedGeneratedOutputAttachments(
+        { ...existing, content: combined.content },
+        migrationContext,
+      )
+      await normalizeGeneratedImageOutputAttachmentRefs(messageId)
     },
+    options,
   )
-  await localizeReferencedGeneratedOutputAttachments(
-    { ...existing, content: combined.content },
-    migrationContext,
-  )
-  await normalizeGeneratedImageOutputAttachmentRefs(messageId)
 }
 
-async function generatedOutputMigrationContext(message: Message): Promise<
+async function generatedOutputMigrationContext(
+  message: Message,
+  signal?: AbortSignal,
+): Promise<
   | {
       downloader: GeneratedOutputDownloader
       videoUrlResolver: GeneratedVideoUrlResolver
@@ -397,13 +458,19 @@ async function generatedOutputMigrationContext(message: Message): Promise<
     return { Authorization: `Bearer ${apiKey}` }
   }
   const downloader: GeneratedOutputDownloader = async ({ url }) => {
-    const response = await fetch(url, { headers: headersFor(url) })
+    const response = await fetch(url, {
+      headers: headersFor(url),
+      ...(signal ? { signal } : {}),
+    })
     if (!response.ok) return null
     return response.blob()
   }
   const videoUrlResolver: GeneratedVideoUrlResolver = async (url) => {
     if (!apiKey || !isOpenRouterVideoPollingUrl(url, profile.baseUrl)) return []
-    const response = await fetch(url, { headers: headersFor(url) })
+    const response = await fetch(url, {
+      headers: headersFor(url),
+      ...(signal ? { signal } : {}),
+    })
     if (!response.ok) return []
     const body: unknown = await response.json().catch(() => null)
     return videoContentUrlsFromJob(body)

@@ -18,14 +18,23 @@ type RuntimeDiagnosticCategory =
   | 'react-cross-component-update'
   | 'console-other'
 
+type RuntimeDiagnosticSource = 'console' | 'pageerror' | 'vite-forward-console'
+
 export interface RuntimeDiagnosticAllowance {
-  category: RuntimeDiagnosticCategory
+  category: RuntimeDiagnosticCategory | readonly RuntimeDiagnosticCategory[]
   message: string
+  detail?: string
+}
+
+export interface RuntimeDiagnosticExpectation extends RuntimeDiagnosticAllowance {
+  source: RuntimeDiagnosticSource
+  level: 'warning' | 'error'
+  count: number
 }
 
 interface RuntimeDiagnostic {
   category: RuntimeDiagnosticCategory
-  source: 'console' | 'pageerror' | 'vite-forward-console'
+  source: RuntimeDiagnosticSource
   level: string
   message: string
   stack?: string
@@ -36,13 +45,25 @@ interface RuntimeDiagnostic {
 
 interface RuntimeDiagnosticFixtures {
   runtimeDiagnosticAllowances: RuntimeDiagnosticAllowance[]
+  runtimeDiagnosticExpectations: RuntimeDiagnosticExpectation[]
+  expectRuntimeDiagnostic: (expectation: RuntimeDiagnosticExpectation) => void
   runtimeDiagnosticGate: undefined
 }
 
 export const test = base.extend<RuntimeDiagnosticFixtures>({
   runtimeDiagnosticAllowances: [[], { option: true }],
+  runtimeDiagnosticExpectations: async ({ context: _context }, use) => {
+    await use([])
+  },
+  expectRuntimeDiagnostic: async ({ runtimeDiagnosticExpectations }, use) => {
+    await use((expectation) => runtimeDiagnosticExpectations.push(expectation))
+  },
   runtimeDiagnosticGate: [
-    async ({ context, runtimeDiagnosticAllowances }, use, testInfo) => {
+    async (
+      { context, runtimeDiagnosticAllowances, runtimeDiagnosticExpectations },
+      use,
+      testInfo,
+    ) => {
       const diagnostics: RuntimeDiagnostic[] = []
       const pendingConsoleDetails = new Set<Promise<void>>()
       let lifecycleDrainStarted = false
@@ -67,6 +88,7 @@ export const test = base.extend<RuntimeDiagnosticFixtures>({
             allowed: false,
           },
           runtimeDiagnosticAllowances,
+          runtimeDiagnosticExpectations,
         )
         diagnostics.push(
           lifecycleDrainStarted && isFixtureLifecycleNavigationWarning(message)
@@ -78,7 +100,11 @@ export const test = base.extend<RuntimeDiagnosticFixtures>({
           diagnostic.detail = detail
           diagnostic.category =
             classifyConsoleDiagnostic(`${diagnostic.message}\n${detail}`) ?? diagnostic.category
-          diagnostic.allowed = classifyAllowance(diagnostic, runtimeDiagnosticAllowances).allowed
+          diagnostic.allowed = classifyAllowance(
+            diagnostic,
+            runtimeDiagnosticAllowances,
+            runtimeDiagnosticExpectations,
+          ).allowed
         })
         pendingConsoleDetails.add(detailTask)
         void detailTask.finally(() => pendingConsoleDetails.delete(detailTask))
@@ -100,6 +126,7 @@ export const test = base.extend<RuntimeDiagnosticFixtures>({
               matchingConsole.allowed = classifyAllowance(
                 matchingConsole,
                 runtimeDiagnosticAllowances,
+                runtimeDiagnosticExpectations,
               ).allowed
               return
             }
@@ -115,6 +142,7 @@ export const test = base.extend<RuntimeDiagnosticFixtures>({
                 allowed: false,
               },
               runtimeDiagnosticAllowances,
+              runtimeDiagnosticExpectations,
             ),
           )
         }
@@ -137,6 +165,7 @@ export const test = base.extend<RuntimeDiagnosticFixtures>({
                 allowed: false,
               },
               runtimeDiagnosticAllowances,
+              runtimeDiagnosticExpectations,
             ),
           )
         }
@@ -175,9 +204,17 @@ export const test = base.extend<RuntimeDiagnosticFixtures>({
           webSocket.off('framesent', onFrameSent)
         }
         webSocketHandlers.clear()
-        await attachDiagnosticEvidence(testInfo, diagnostics)
+        const expectationResults = evaluateDiagnosticExpectations(
+          diagnostics,
+          runtimeDiagnosticExpectations,
+        )
+        await attachDiagnosticEvidence(testInfo, diagnostics, expectationResults)
         const unexpected = diagnostics.filter((diagnostic) => !diagnostic.allowed)
         expect(unexpected, formatUnexpectedDiagnostics(unexpected)).toEqual([])
+        const unmetExpectations = expectationResults.filter(
+          (result) => result.actualCount !== result.expectation.count,
+        )
+        expect(unmetExpectations, formatUnmetDiagnosticExpectations(unmetExpectations)).toEqual([])
       }
     },
     { auto: true },
@@ -392,20 +429,63 @@ async function nextHostTask(): Promise<void> {
 function classifyAllowance(
   diagnostic: RuntimeDiagnostic,
   allowances: readonly RuntimeDiagnosticAllowance[],
+  expectations: readonly RuntimeDiagnosticExpectation[],
 ): RuntimeDiagnostic {
   return {
     ...diagnostic,
-    allowed: allowances.some(
-      (allowance) =>
-        allowance.category === diagnostic.category &&
-        new RegExp(allowance.message, 'u').test(diagnostic.message),
-    ),
+    allowed:
+      allowances.some((allowance) => diagnosticMatchesAllowance(diagnostic, allowance)) ||
+      expectations.some((expectation) => diagnosticMatchesExpectation(diagnostic, expectation)),
   }
+}
+
+function diagnosticMatchesAllowance(
+  diagnostic: RuntimeDiagnostic,
+  allowance: RuntimeDiagnosticAllowance,
+): boolean {
+  return (
+    (Array.isArray(allowance.category)
+      ? allowance.category.includes(diagnostic.category)
+      : allowance.category === diagnostic.category) &&
+    new RegExp(allowance.message, 'u').test(diagnostic.message) &&
+    (allowance.detail === undefined ||
+      (diagnostic.detail !== undefined &&
+        new RegExp(allowance.detail, 'u').test(diagnostic.detail)))
+  )
+}
+
+function diagnosticMatchesExpectation(
+  diagnostic: RuntimeDiagnostic,
+  expectation: RuntimeDiagnosticExpectation,
+): boolean {
+  return (
+    diagnostic.source === expectation.source &&
+    diagnostic.level === expectation.level &&
+    diagnosticMatchesAllowance(diagnostic, expectation)
+  )
+}
+
+interface RuntimeDiagnosticExpectationResult {
+  expectation: RuntimeDiagnosticExpectation
+  actualCount: number
+}
+
+function evaluateDiagnosticExpectations(
+  diagnostics: readonly RuntimeDiagnostic[],
+  expectations: readonly RuntimeDiagnosticExpectation[],
+): RuntimeDiagnosticExpectationResult[] {
+  return expectations.map((expectation) => ({
+    expectation,
+    actualCount: diagnostics.filter((diagnostic) =>
+      diagnosticMatchesExpectation(diagnostic, expectation),
+    ).length,
+  }))
 }
 
 async function attachDiagnosticEvidence(
   testInfo: TestInfo,
   diagnostics: readonly RuntimeDiagnostic[],
+  expectationResults: readonly RuntimeDiagnosticExpectationResult[],
 ): Promise<void> {
   const payload = {
     summary: {
@@ -414,13 +494,37 @@ async function attachDiagnosticEvidence(
       allowed: diagnostics.filter((diagnostic) => diagnostic.allowed).length,
       otherConsole: diagnostics.filter((diagnostic) => diagnostic.category === 'console-other')
         .length,
+      expected: expectationResults.length,
+      unmetExpected: expectationResults.filter(
+        (result) => result.actualCount !== result.expectation.count,
+      ).length,
     },
     diagnostics,
+    expectationResults,
   }
   await testInfo.attach('runtime-diagnostics', {
     body: JSON.stringify(payload, null, 2),
     contentType: 'application/json',
   })
+}
+
+function formatUnmetDiagnosticExpectations(
+  results: readonly RuntimeDiagnosticExpectationResult[],
+): string {
+  if (results.length === 0) return 'All expected browser runtime diagnostics were observed.'
+  return results
+    .map(
+      ({ expectation, actualCount }, index) =>
+        `${index + 1}. Expected ${expectation.count}, observed ${actualCount}: ` +
+        `[${formatDiagnosticCategories(expectation.category)}/${expectation.source}/${expectation.level}] ${expectation.message}`,
+    )
+    .join('\n')
+}
+
+function formatDiagnosticCategories(
+  categories: RuntimeDiagnosticCategory | readonly RuntimeDiagnosticCategory[],
+): string {
+  return typeof categories === 'string' ? categories : categories.join('|')
 }
 
 function formatUnexpectedDiagnostics(diagnostics: readonly RuntimeDiagnostic[]): string {

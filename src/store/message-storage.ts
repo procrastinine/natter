@@ -274,6 +274,31 @@ export function hydrateMessage(header: MessageHeaderRow, body: MessageBodyRow): 
   return message
 }
 
+export function rebaseHydratedMessageHeader(message: Message, header: MessageHeaderRow): Message {
+  const {
+    requestContextVersion: _requestContextVersion,
+    bodyVersion: _bodyVersion,
+    bodyWordCount: _bodyWordCount,
+    textPreview: _textPreview,
+    ...headerFields
+  } = header
+  const next: Message = { ...message, ...headerFields }
+  const canonicalGeneration = headerFields.generation
+  const headerTools = canonicalGeneration?.serverTools
+  const hydratedTools = message.generation?.serverTools
+  if (!canonicalGeneration || !headerTools || !hydratedTools) return next
+  next.generation = {
+    ...canonicalGeneration,
+    serverTools: headerTools.map((tool, index) => {
+      const hydrated = hydratedTools[index]
+      return hydrated && Object.hasOwn(hydrated, 'output')
+        ? { ...tool, output: hydrated.output }
+        : tool
+    }),
+  }
+  return next
+}
+
 export function previewTextFromStoredProjection(
   textPreview: string,
   maxChars = CHAT_PREVIEW_MAX_CHARS,

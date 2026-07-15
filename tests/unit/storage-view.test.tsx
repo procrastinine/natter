@@ -39,11 +39,11 @@ import { __resetSearchStoreForTests } from '../../src/store/zustand/searchStore'
 import { jsonEntriesZipBlob } from '../../src/ui/import-export/json-file'
 import { deleteAttachmentForStorage, StorageView } from '../../src/ui/storage/StorageView'
 
-const debugNukeMocks = vi.hoisted(() => ({
-  nukeSiteStorage: vi.fn<() => Promise<void>>(),
+const storageWipeMocks = vi.hoisted(() => ({
+  wipeSiteStorage: vi.fn<() => Promise<void>>(),
 }))
 
-vi.mock('../../src/lib/debug-nuke', () => debugNukeMocks)
+vi.mock('../../src/lib/storage-wipe', () => storageWipeMocks)
 
 const DB_NAME = 'natter'
 const originalStorageDescriptor = Object.getOwnPropertyDescriptor(navigator, 'storage')
@@ -158,8 +158,8 @@ describe('StorageView', () => {
   beforeEach(async () => {
     ;(globalThis as unknown as { indexedDB: IDBFactory }).indexedDB = new IDBFactory()
     await resetAll()
-    debugNukeMocks.nukeSiteStorage.mockReset()
-    debugNukeMocks.nukeSiteStorage.mockResolvedValue(undefined)
+    storageWipeMocks.wipeSiteStorage.mockReset()
+    storageWipeMocks.wipeSiteStorage.mockResolvedValue(undefined)
     const estimate = {
       usage: 4096,
       quota: 8192,
@@ -353,7 +353,7 @@ describe('StorageView', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Clear all' }))
 
     await waitFor(() => {
-      expect(debugNukeMocks.nukeSiteStorage).toHaveBeenCalledTimes(1)
+      expect(storageWipeMocks.wipeSiteStorage).toHaveBeenCalledTimes(1)
     })
     expect(confirmSpy).toHaveBeenCalledWith(
       expect.stringContaining('Clear all local Natter data for this browser origin?'),

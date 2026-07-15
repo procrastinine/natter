@@ -12,9 +12,9 @@ import {
 test.use({
   runtimeDiagnosticAllowances: [
     {
-      category: 'page-error',
+      category: ['page-error', 'console-other'],
       message:
-        '(?:Message debug crash|The above error occurred in the <MessageInner> component\\.)',
+        '^(?:(?:Error: )?Message debug crash(?:\\n|$)|The above error occurred in the <MessageInner> component\\.)',
     },
   ],
 })

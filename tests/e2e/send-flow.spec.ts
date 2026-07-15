@@ -206,35 +206,72 @@ test('network drop mid-stream persists partial text + abortReason=network + Cont
   expect(typeof assistantRow.generation.finishedAt).toBe('number')
 })
 
-test.describe('malformed stream diagnostics', () => {
-  test.use({
-    runtimeDiagnosticAllowances: [
-      {
-        category: 'console-other',
-        message:
-          '^chatCompletions: malformed SSE chunk skipped (?:JSHandle@object|\\{eventType: message, characterCount: 10, fingerprint: fnv1a32:d7b44597, error: Object\\})$',
-      },
-    ],
+test('malformed SSE JSON warns once while valid output completes cleanly', async ({
+  page,
+  expectRuntimeDiagnostic,
+}) => {
+  expectRuntimeDiagnostic({
+    category: 'console-other',
+    source: 'console',
+    level: 'warning',
+    message:
+      '^chatCompletions: invalid SSE frame skipped \\{eventType: message, characterCount: 10, fingerprint: fnv1a32:d7b44597, error: Object\\}$',
+    count: 1,
   })
 
-  test('malformed SSE JSON is skipped; surrounding stream commits cleanly', async ({ page }) => {
-    const body = [
-      'data: {"id":"g1","choices":[{"delta":{"content":"A"}}]}',
-      '',
-      'data: {malformed',
-      '',
-      'data: {"id":"g1","choices":[{"delta":{"content":"B"}}]}',
-      '',
-      'data: {"id":"g1","choices":[{"delta":{},"finish_reason":"stop"}]}',
-      '',
-      'data: [DONE]',
-      '',
-      '',
-    ].join('\n')
-    await mockChatCompletions(page, { body })
-    await createChatAndOpen(page)
-    await sendMessage(page, 'x')
-    const assistant = page.locator('[data-ui="message"][data-role="assistant"]').first()
-    await expect(assistant.locator('[data-ui="message-body"]')).toHaveText('AB')
+  const body = [
+    'data: {"id":"g1","choices":[{"delta":{"content":"A"}}]}',
+    '',
+    'data: {malformed',
+    '',
+    'data: {"id":"g1","choices":[{"delta":{"content":"B"}}]}',
+    '',
+    'data: {"id":"g1","choices":[{"delta":{},"finish_reason":"stop"}]}',
+    '',
+    'data: [DONE]',
+    '',
+    '',
+  ].join('\n')
+  await mockChatCompletions(page, { body })
+  await createChatAndOpen(page)
+  await sendMessage(page, 'x')
+  const assistant = page.locator('[data-ui="message"][data-role="assistant"]').first()
+  await expect(assistant.locator('[data-ui="message-body"]')).toHaveText('AB')
+
+  const chatId = await firstChatId(page)
+  const assistantRow = (await readMessages(page, chatId)).find(
+    (row) => row.role === 'assistant',
+  ) as {
+    generation: {
+      status: string
+      finishedAt?: number
+      abortReason?: string
+      error?: unknown
+      integrity: string
+      integritySummary: {
+        count: number
+        characterCount: number
+        entries: Array<Record<string, unknown>>
+      }
+    }
+  }
+  expect(assistantRow.generation.status).toBe('done')
+  expect(typeof assistantRow.generation.finishedAt).toBe('number')
+  expect(assistantRow.generation.abortReason).toBeUndefined()
+  expect(assistantRow.generation.error).toBeUndefined()
+  expect(assistantRow.generation.integrity).toBe('degraded')
+  expect(assistantRow.generation.integritySummary).toEqual({
+    count: 1,
+    characterCount: 10,
+    entries: [
+      {
+        category: 'malformed-json-frame',
+        adapter: 'chat-completions',
+        eventType: 'message',
+        count: 1,
+        fingerprint: 'fnv1a32:d7b44597',
+        characterCount: 10,
+      },
+    ],
   })
 })

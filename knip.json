@@ -1,4 +1,4 @@
 {
   "$schema": "./node_modules/knip/schema.json",
-  "entry": ["src/lib/debug-{fake-stream,nuke,scroll,streams}.ts"]
+  "entry": ["tools/browser-devtools.ts"]
 }

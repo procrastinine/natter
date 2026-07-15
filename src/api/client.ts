@@ -450,14 +450,6 @@ interface ApiKeyFallbackResult {
   apiKey: string
 }
 
-interface RequestBuilderState {
-  pending: boolean
-}
-
-const requestBuilderStates = import.meta.env.DEV
-  ? new WeakMap<object, RequestBuilderState>()
-  : undefined
-
 function throwIfAborted(signal: AbortSignal | undefined): void {
   if (signal?.aborted) {
     throw normalizeError(signal.reason, { midStream: false, cause: 'abort' })
@@ -525,19 +517,13 @@ export function fetchWithApiKeyFallback(
   build: ApiKeyRequestBuilder,
   opts: { signal?: AbortSignal; timeoutMs?: number } = {},
 ): Promise<ApiKeyFallbackResult> {
-  const state: RequestBuilderState | undefined = requestBuilderStates
-    ? { pending: true }
-    : undefined
-  const requested = fetchWithApiKeyFallbackImpl(ctx, build, opts, state)
-  if (state) requestBuilderStates?.set(requested, state)
-  return requested
+  return fetchWithApiKeyFallbackImpl(ctx, build, opts)
 }
 
 async function fetchWithApiKeyFallbackImpl(
   ctx: ApiKeyDispatchContext,
   buildRequest: ApiKeyRequestBuilder | undefined,
   opts: { signal?: AbortSignal; timeoutMs?: number },
-  state: RequestBuilderState | undefined,
 ): Promise<ApiKeyFallbackResult> {
   const legacyCandidate: ApiKeyCandidate = { resolve: () => ctx.apiKey }
   const candidates =
@@ -558,7 +544,6 @@ async function fetchWithApiKeyFallbackImpl(
     )
   } finally {
     buildRequest = undefined
-    if (state) state.pending = false
   }
   const apiKey = resolvedKeys.get(result.candidateIndex)
   if (apiKey === undefined) {
@@ -574,8 +559,4 @@ async function fetchWithApiKeyFallbackImpl(
     }
   }
   return { ...result, apiKey }
-}
-
-export function __apiKeyRequestBuilderPendingForTests(request: object): boolean | undefined {
-  return requestBuilderStates?.get(request)?.pending
 }

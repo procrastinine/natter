@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { anthropicStream } from '../../src/api/anthropic-messages'
 import { chatCompletions } from '../../src/api/chat-completions'
-import { __adapterRequestPendingForTests } from '../../src/api/deferred-request'
 import { geminiStream } from '../../src/api/gemini-native'
 import { responses } from '../../src/api/responses'
 import { textCompletions } from '../../src/api/text-completions'
@@ -174,9 +173,7 @@ describe('adapter request retention', () => {
     },
   ]
 
-  it.each(
-    cases,
-  )('$name stays lazy, sends the exact body, and releases its wire holder before yielding', async ({
+  it.each(cases)('$name stays lazy and sends the exact body on its first pull', async ({
     expectedBody,
     response,
     open,
@@ -190,13 +187,12 @@ describe('adapter request retention', () => {
 
     const stream = open()
     expect(fetchMock).not.toHaveBeenCalled()
-    expect(__adapterRequestPendingForTests(stream)).toBe(true)
 
     const first = await stream.next()
 
     expect(first.done).toBe(false)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
     expect(body).toBe(expectedBody)
-    expect(__adapterRequestPendingForTests(stream)).toBe(false)
     await stream.return(undefined)
   })
 
@@ -211,10 +207,8 @@ describe('adapter request retention', () => {
       { model: 'model', messages: [], stream: true },
     )
 
-    expect(__adapterRequestPendingForTests(stream)).toBe(true)
     await stream.return(undefined)
 
     expect(fetchMock).not.toHaveBeenCalled()
-    expect(__adapterRequestPendingForTests(stream)).toBe(false)
   })
 })

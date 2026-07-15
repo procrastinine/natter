@@ -73,7 +73,9 @@ pnpm dev
 
 Run `pnpm check:ci` for the clean, non-writing Biome check. The broader source checks are `pnpm typecheck`, `pnpm lint:semantic`, `pnpm test:run`, and `pnpm build`. The checked build rejects unexpected distribution paths and unsafe artifacts, including invalid module-entry topology. `pnpm perf:report` reports delivery ratchets and the zero-dependency-cycle gate; CI treats that performance step as advisory, while wall time and heap measurements remain informational.
 
-GitHub Pages publication is intentionally independent from the quality workflow. Only dependency installation, `pnpm build:pages`, the production-artifact startup smoke, artifact upload, and the Pages deployment itself can block publication. Verification still runs on pull requests and `main`; peer, formatting/lint, dead-code, and performance findings are advisory, while correctness failures remain visible without holding the published site stale.
+GitHub Pages publication is intentionally independent from the quality workflow. Only dependency installation, the production-artifact startup smoke (which builds the Pages artifact), artifact upload, and the Pages deployment itself can block publication. Verification still runs on pull requests and `main`; unit tests plus the exhaustive built-artifact browser suite are correctness gates, while peer, formatting/lint, dead-code, and performance findings are advisory so findings remain visible without holding the published site stale. Playwright starts a standalone loopback fake-provider process for deterministic HTTP/SSE cases; the application contains no fake transport or test stream entry point.
+
+Application behavior uses the same code paths under `pnpm dev` and the built artifact. The one deliberate runtime-default exception is the OpenRouter provider-privacy scrape: Vite development can use its same-origin `/_or_scrape` proxy, while a static production deployment performs no live scrape unless a CORS proxy is configured in Settings. This exception does not affect chat, branch, storage, navigation, or streaming state.
 
 `pnpm dev` is the normal unbundled Vite/HMR environment, so its request count and decoded source are intentionally much larger than the minified application. Use `pnpm preview` when testing production-like delivery weight. With either server running, `pnpm perf:delivery dev <url>` or `pnpm perf:delivery preview <url>` records a fresh Chromium context. Preview enforces production request/byte budgets; dev reports request/byte/time/heap measurements without rewarding bundled modules or disabled development tooling. Both modes fail on runtime/network diagnostics or cold-loading a forbidden lazy feature. The frequently used per-chat settings pane stays in the eager graph; Markdown, tree, global settings, storage, and import chunks must stay out of a cold load. The shared ratchets live in `scripts/performance-baseline.json` so the build, report, and browser measurement do not drift.
 
@@ -85,9 +87,12 @@ GitHub Pages publication is intentionally independent from the quality workflow.
 | `pnpm build` | checked production bundle in `dist/` with type and distribution-policy gates |
 | `pnpm build:pages` | artifact-only production bundle used by GitHub Pages |
 | `pnpm preview` | serve the built bundle locally |
+| `pnpm fake-provider` | standalone loopback LLM API server with bounded generated and scripted streaming scenarios |
 | `pnpm test` | Vitest in watch mode |
 | `pnpm test:run` | Vitest single run |
-| `pnpm e2e` | Playwright end-to-end suite |
+| `pnpm e2e` | exhaustive Chromium gate against one freshly built artifact and the standalone fake provider |
+| `pnpm e2e:production` | alias for the same built-artifact Chromium gate |
+| `pnpm e2e:smoke` | focused Chromium production-artifact smoke, including the production-runtime boundary proof |
 | `pnpm typecheck` | native TypeScript 7 `tsc -b --noEmit` across all projects |
 | `pnpm lint` | Biome lint |
 | `pnpm lint:semantic` | type-aware ESLint checks |

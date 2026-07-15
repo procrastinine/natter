@@ -116,11 +116,14 @@ describe('tooling telemetry audit', () => {
     const deploy = readText('.github/workflows/deploy.yml')
 
     expect(packageJson.scripts['build:pages']).toBe('vite build && node scripts/verify-dist.mjs')
+    expect(packageJson.scripts['e2e:production-startup']).toContain('E2E_BUILD_KIND=pages')
     expect(deploy).not.toContain('uses: ./.github/workflows/verify.yml')
     expect(deploy).toContain('needs: build_pages')
-    expect(deploy).toContain('run: pnpm build:pages')
     expect(deploy).toContain('run: pnpm e2e:production-startup')
-    expect(deploy).toContain('E2E_SERVER_MODE: preview')
+    expect(deploy).not.toContain('E2E_SERVER_MODE')
+    expect(deploy.indexOf('run: pnpm e2e:production-startup')).toBeLessThan(
+      deploy.indexOf('uses: actions/upload-pages-artifact'),
+    )
   })
 
   it('keeps delivery ratchets advisory and artifact correctness blocking', () => {

@@ -2,12 +2,6 @@ import { errorFromUnknown } from '../lib/error'
 
 type AdapterStream<Item> = AsyncGenerator<Item, void, unknown>
 
-interface RequestState {
-  pending: boolean
-}
-
-const requestStates = import.meta.env.DEV ? new WeakMap<object, RequestState>() : undefined
-
 export function deferAdapterRequest<Request, Item>(
   request: Request,
   open: (request: Request) => AdapterStream<Item>,
@@ -16,12 +10,10 @@ export function deferAdapterRequest<Request, Item>(
   let pendingOpen: ((request: Request) => AdapterStream<Item>) | undefined = open
   let delegate: AdapterStream<Item> | undefined
   let closedBeforeOpen = false
-  const state: RequestState = { pending: true }
 
   const releasePending = () => {
     pendingRequest = undefined
     pendingOpen = undefined
-    state.pending = false
   }
 
   const openDelegate = (): AdapterStream<Item> => {
@@ -78,10 +70,5 @@ export function deferAdapterRequest<Request, Item>(
     })
   }
 
-  requestStates?.set(iterator, state)
   return iterator
-}
-
-export function __adapterRequestPendingForTests(stream: object): boolean | undefined {
-  return requestStates?.get(stream)?.pending
 }

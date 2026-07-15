@@ -24,7 +24,11 @@ import type { ChatId, CursorMap, Message, MessageId, MessageRole } from '../../c
 import type { StructuralMessageHeader } from '../../hooks/useBranchUrlSync'
 import type { MessageAttachmentRefMutation } from '../../store/attachments'
 import { onEvent } from '../../store/broadcast'
-import { type MessageHeaderRow, previewTextFromContent } from '../../store/message-storage'
+import {
+  type MessageHeaderRow,
+  previewTextFromContent,
+  rebaseHydratedMessageHeader,
+} from '../../store/message-storage'
 import { primaryKeys } from '../../store/reactive-dependencies'
 import { useRepositoryPresentationQuery } from '../../store/reactive-query'
 import type { MessagePresentationSnapshot, WorkspaceRepository } from '../../store/repository'
@@ -1896,17 +1900,7 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
       : undefined
   const inspectorMessage = useMemo<Message | undefined>(() => {
     if (!inspectorBody || liveSelectedHeader?.id !== inspectorBody.id) return undefined
-    const {
-      requestContextVersion: _requestContextVersion,
-      bodyVersion: _bodyVersion,
-      bodyWordCount: _bodyWordCount,
-      textPreview: _textPreview,
-      ...canonicalHeader
-    } = liveSelectedHeader
-    return {
-      ...inspectorBody,
-      ...canonicalHeader,
-    }
+    return rebaseHydratedMessageHeader(inspectorBody, liveSelectedHeader)
   }, [inspectorBody, liveSelectedHeader])
   const handleInspectorActivate = useCallback(() => {
     if (inspectedMessageId) activateNode(inspectedMessageId)

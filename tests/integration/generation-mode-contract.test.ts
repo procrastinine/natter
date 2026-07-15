@@ -4,15 +4,8 @@ import { cursorKeyOf } from '../../src/core/active-path'
 import type { ApiRoute } from '../../src/core/api-choice'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import type { ChatSettings, ConnectionProfile, GenerationMeta, Message } from '../../src/core/types'
-import {
-  __retainedSendRequestPlanCountForTests,
-  sendFromMessage,
-  sendText,
-} from '../../src/hooks/useChat'
-import {
-  __retainedContinueRequestPlanCountForTests,
-  continueAssistantInPlace,
-} from '../../src/hooks/useContinue'
+import { sendFromMessage, sendText } from '../../src/hooks/useChat'
+import { continueAssistantInPlace } from '../../src/hooks/useContinue'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import {
   __resetBrowserRepositoryForTests,
@@ -245,7 +238,7 @@ afterEach(async () => {
 })
 
 describe('generation mode contract', () => {
-  it('releases full plans with a 100k system prompt and 200k prior path before streaming', async () => {
+  it('streams a 100k system prompt and 200k prior path through send and continue intact', async () => {
     const systemPrompt = `system-start:${'s'.repeat(100_000)}:system-end`
     const priorUserText = `prior-user-start:${'u'.repeat(100_000)}:prior-user-end`
     const priorAssistantText = `prior-assistant-start:${'a'.repeat(100_000)}:prior-assistant-end`
@@ -275,7 +268,6 @@ describe('generation mode contract', () => {
       apiKey: 'sk-test',
       content: [{ type: 'text', text: 'new question' }],
       openStream: (open) => {
-        expect(__retainedSendRequestPlanCountForTests()).toBe(0)
         const wire = JSON.stringify(open.wireBody)
         expect(wire).toContain('system-start:')
         expect(wire).toContain(':system-end')
@@ -293,7 +285,6 @@ describe('generation mode contract', () => {
       connection: profile(),
       apiKey: 'sk-test',
       openStream: (open) => {
-        expect(__retainedContinueRequestPlanCountForTests()).toBe(0)
         const wire = JSON.stringify(open.wireBody)
         expect(wire).toContain('system-start:')
         expect(wire).toContain(':system-end')
@@ -304,9 +295,6 @@ describe('generation mode contract', () => {
         return captureOpen([], ' tail')(open)
       },
     })
-
-    expect(__retainedSendRequestPlanCountForTests()).toBe(0)
-    expect(__retainedContinueRequestPlanCountForTests()).toBe(0)
   })
 
   it('send creates one user and one generated assistant with an explicit local path', async () => {

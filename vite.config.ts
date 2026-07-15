@@ -26,13 +26,57 @@ function katexWoff2Only() {
   }
 }
 
+const STATEFUL_RUNTIME_PATHS = [
+  '/src/api/',
+  '/src/app/',
+  '/src/backcompat/',
+  '/src/core/',
+  '/src/hooks/',
+  '/src/lib/',
+  '/src/store/',
+]
+
+function fullReloadStatefulRuntime() {
+  return {
+    name: 'natter:full-reload-stateful-runtime',
+    handleHotUpdate(ctx: { file: string; server: { ws: { send(payload: unknown): void } } }) {
+      const file = ctx.file.replaceAll('\\', '/')
+      if (!STATEFUL_RUNTIME_PATHS.some((path) => file.includes(path))) return
+      ctx.server.ws.send({ type: 'full-reload', path: '*' })
+      return []
+    },
+  }
+}
+
+function browserDevtools() {
+  return {
+    name: 'natter:browser-devtools',
+    apply: 'serve' as const,
+    transformIndexHtml() {
+      return [
+        {
+          tag: 'script',
+          attrs: { type: 'module', src: '/tools/browser-devtools.ts' },
+          injectTo: 'head' as const,
+        },
+      ]
+    },
+  }
+}
+
 export default defineConfig(({ command, mode }) => {
   const isViteDevServer = command === 'serve' && mode !== 'test' && !process.env.VITEST
   return {
     // Relative asset URLs keep the exported bundle portable across static hosts
     // and subpaths instead of assuming deployment at `/`.
     base: './',
-    plugins: [katexWoff2Only(), react(), tailwindcss()],
+    plugins: [
+      browserDevtools(),
+      fullReloadStatefulRuntime(),
+      katexWoff2Only(),
+      react(),
+      tailwindcss(),
+    ],
     server: {
       port: 5173,
       ...(isViteDevServer
