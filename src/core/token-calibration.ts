@@ -428,11 +428,29 @@ function normalizeGlobalPayload(stored: unknown): GlobalTokenCalibration {
   return {
     version: 1,
     updatedAt: finiteNumber(row.updatedAt) ? row.updatedAt : 0,
+    ...(validCalibrationGeneration(row.clearGeneration)
+      ? { clearGeneration: row.clearGeneration }
+      : {}),
     byModel:
       row.byModel && typeof row.byModel === 'object'
         ? (normalizedCalibrationSamples(row.byModel) ?? {})
         : {},
   }
+}
+
+function validCalibrationGeneration(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+}
+
+export function tokenCalibrationClearGeneration(
+  calibration: Pick<GlobalTokenCalibration, 'clearGeneration'> | null | undefined,
+): number {
+  return validCalibrationGeneration(calibration?.clearGeneration) ? calibration.clearGeneration : 0
+}
+
+function nextCalibrationGeneration(current: number): number {
+  if (current >= Number.MAX_SAFE_INTEGER) throw new Error('TokenCalibrationGenerationExhausted')
+  return current + 1
 }
 
 function subtractValidatedSample(
@@ -465,32 +483,66 @@ export async function addAcceptedSampleToGlobal(
   tokens: number,
   now: number = Date.now(),
 ): Promise<void> {
+  await addAcceptedSamplesToGlobal(modelId, [{ chars, tokens }], now)
+}
+
+export async function addAcceptedSamplesToGlobal(
+  modelId: string,
+  samples: readonly { chars: number; tokens: number }[],
+  now: number = Date.now(),
+  options: {
+    expectedClearGeneration?: number
+    expectedReplacementEpoch?: number
+  } = {},
+): Promise<boolean> {
+  let applied = false
   try {
-    const validatedTokens = safeServerTokens(tokens)
-    if (
-      typeof chars !== 'number' ||
-      !Number.isFinite(chars) ||
-      chars <= 0 ||
-      validatedTokens === undefined ||
-      validatedTokens <= 0
-    ) {
-      return
-    }
-    const calibrationKey = tokenCalibrationKey(modelId)
-    await updateSetting<GlobalTokenCalibration>(GLOBAL_TOKEN_CALIBRATION_KEY, (stored) => {
-      const global = normalizeGlobalPayload(stored)
-      let globalSample = global.byModel[calibrationKey]
-      if (!globalSample) {
-        globalSample = emptySample()
-        global.byModel[calibrationKey] = globalSample
+    const accepted: Array<{ chars: number; tokens: number }> = []
+    for (const sample of samples) {
+      const validatedTokens = safeServerTokens(sample.tokens)
+      if (
+        typeof sample.chars !== 'number' ||
+        !Number.isFinite(sample.chars) ||
+        sample.chars <= 0 ||
+        validatedTokens === undefined ||
+        validatedTokens <= 0
+      ) {
+        continue
       }
-      applyValidatedSample(globalSample, chars, validatedTokens, now)
-      global.updatedAt = now
-      return global
-    })
+      accepted.push({ chars: sample.chars, tokens: validatedTokens })
+    }
+    if (accepted.length === 0) return false
+    const calibrationKey = tokenCalibrationKey(modelId)
+    await updateSetting<GlobalTokenCalibration>(
+      GLOBAL_TOKEN_CALIBRATION_KEY,
+      (stored) => {
+        const global = normalizeGlobalPayload(stored)
+        if (
+          options.expectedClearGeneration !== undefined &&
+          tokenCalibrationClearGeneration(global) !== options.expectedClearGeneration
+        ) {
+          return global
+        }
+        let globalSample = global.byModel[calibrationKey]
+        if (!globalSample) {
+          globalSample = emptySample()
+          global.byModel[calibrationKey] = globalSample
+        }
+        for (const sample of accepted) {
+          applyValidatedSample(globalSample, sample.chars, sample.tokens, now)
+        }
+        global.updatedAt = now
+        applied = true
+        return global
+      },
+      options.expectedReplacementEpoch === undefined
+        ? {}
+        : { expectedReplacementEpoch: options.expectedReplacementEpoch },
+    )
   } catch {
     // Non-fatal: per-chat sample remains the source of truth.
   }
+  return applied
 }
 
 export async function subtractSamplesFromTokenCalibrationGlobal(
@@ -498,10 +550,10 @@ export async function subtractSamplesFromTokenCalibrationGlobal(
   now: number = Date.now(),
 ): Promise<void> {
   const removedByFamily = aggregateCalibrationSamples(samples)
-  if (Object.keys(removedByFamily).length === 0) return
   try {
     await updateSetting<GlobalTokenCalibration>(GLOBAL_TOKEN_CALIBRATION_KEY, (stored) => {
       const global = normalizeGlobalPayload(stored)
+      global.clearGeneration = nextCalibrationGeneration(tokenCalibrationClearGeneration(global))
       let changed = false
       for (const [calibrationKey, removed] of Object.entries(removedByFamily)) {
         const current = aggregateSamplesForCalibrationKey(global.byModel, calibrationKey)
@@ -511,12 +563,44 @@ export async function subtractSamplesFromTokenCalibrationGlobal(
         else delete global.byModel[calibrationKey]
         changed = true
       }
-      if (changed) global.updatedAt = now
+      if (changed || Object.keys(removedByFamily).length === 0) global.updatedAt = now
       return global
     })
   } catch {
     // Non-fatal: estimation falls back through remaining per-chat samples.
   }
+}
+
+export async function clearTokenCalibrationGlobalFamily(
+  calibrationKey: string,
+  now: number = Date.now(),
+): Promise<boolean> {
+  let changed = false
+  await updateSetting<GlobalTokenCalibration>(GLOBAL_TOKEN_CALIBRATION_KEY, (stored) => {
+    const global = normalizeGlobalPayload(stored)
+    for (const storedKey of Object.keys(global.byModel)) {
+      if (tokenCalibrationKeyForStoredRecordKey(storedKey) !== calibrationKey) continue
+      delete global.byModel[storedKey]
+      changed = true
+    }
+    global.clearGeneration = nextCalibrationGeneration(tokenCalibrationClearGeneration(global))
+    global.updatedAt = now
+    return global
+  })
+  return changed
+}
+
+export async function clearAllTokenCalibrationGlobal(now: number = Date.now()): Promise<boolean> {
+  let changed = false
+  await updateSetting<GlobalTokenCalibration>(GLOBAL_TOKEN_CALIBRATION_KEY, (stored) => {
+    const global = normalizeGlobalPayload(stored)
+    changed = Object.keys(global.byModel).length > 0
+    global.byModel = {}
+    global.clearGeneration = nextCalibrationGeneration(tokenCalibrationClearGeneration(global))
+    global.updatedAt = now
+    return global
+  })
+  return changed
 }
 
 // Convenience: apply a sample to both the per-chat map AND the global
@@ -557,6 +641,9 @@ export async function readTokenCalibrationGlobal(): Promise<GlobalTokenCalibrati
   return {
     version: 1,
     updatedAt: typeof row.updatedAt === 'number' ? row.updatedAt : 0,
+    ...(validCalibrationGeneration(row.clearGeneration)
+      ? { clearGeneration: row.clearGeneration }
+      : {}),
     byModel:
       row.byModel && typeof row.byModel === 'object'
         ? (normalizedCalibrationSamples(row.byModel) ?? {})
@@ -564,11 +651,21 @@ export async function readTokenCalibrationGlobal(): Promise<GlobalTokenCalibrati
   }
 }
 
-export async function writeTokenCalibrationGlobal(value: GlobalTokenCalibration): Promise<void> {
-  await updateSetting<GlobalTokenCalibration>(GLOBAL_TOKEN_CALIBRATION_KEY, () => ({
-    ...value,
-    byModel: normalizedCalibrationSamples(value.byModel) ?? {},
-  }))
+export async function writeTokenCalibrationGlobal(
+  value: GlobalTokenCalibration,
+  options: { invalidatePending?: boolean } = {},
+): Promise<void> {
+  await updateSetting<GlobalTokenCalibration>(GLOBAL_TOKEN_CALIBRATION_KEY, (stored) => {
+    const current = normalizeGlobalPayload(stored)
+    const clearGeneration = options.invalidatePending
+      ? nextCalibrationGeneration(tokenCalibrationClearGeneration(current))
+      : tokenCalibrationClearGeneration(current)
+    return {
+      ...value,
+      ...(clearGeneration > 0 ? { clearGeneration } : {}),
+      byModel: normalizedCalibrationSamples(value.byModel) ?? {},
+    }
+  })
 }
 
 // ---------------------------------------------------------------------------

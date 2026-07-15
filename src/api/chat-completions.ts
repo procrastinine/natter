@@ -28,7 +28,8 @@ import {
 } from './client'
 import { deferAdapterRequest } from './deferred-request'
 import { normalizeError } from './errors'
-import { decodeProviderJson, malformedJsonFrameReport, parseSSE } from './sse'
+import { validateChatCompletionChunk, validateChatCompletionResult } from './provider-json-boundary'
+import { decodeProviderStreamFrame, decodeValidatedProviderJson, parseSSE } from './sse'
 import type {
   CallOpts,
   ChatCompletionRequestWire,
@@ -163,7 +164,7 @@ async function* consumeChatCompletions(
   // JSON even though SSE was requested. Normalize into a single terminal
   // chunk so the rest of the app can keep one consumer shape.
   if (!/text\/event-stream/i.test(contentType)) {
-    const result = await decodeProviderJson<ChatCompletionResultWire>(response)
+    const result = await decodeValidatedProviderJson(response, validateChatCompletionResult)
     logStreamDebug(debugTrace, 'buffered_result', result)
     const chunk: ChatStreamChunk = generationId
       ? { type: 'buffered_result', result, generationId }
@@ -181,27 +182,25 @@ async function* consumeChatCompletions(
       yield { type: 'keepalive', comment: ev.comment }
       continue
     }
-    try {
-      logStreamDebug(debugTrace, 'sse.raw', { event: ev.event, data: ev.data })
-      const parsed = JSON.parse(ev.data) as Record<string, unknown>
-      if (generationId && parsed.id === undefined) parsed.id = generationId
-      logStreamDebug(debugTrace, 'sse.parsed', parsed)
-      const chunk: ChatStreamChunk = generationId
-        ? { type: 'delta', chunk: parsed, generationId }
-        : { type: 'delta', chunk: parsed }
-      yield chunk
-    } catch (err) {
-      // Malformed SSE JSON — skip and log. Streams survive single-chunk
-      // corruption; one bad frame is not a reason to abort the whole turn.
-      const report = malformedJsonFrameReport({
-        adapter: 'chat-completions',
-        eventType: ev.event,
-        data: ev.data,
-        error: err,
-      })
-      console.warn('chatCompletions: malformed SSE chunk skipped', report.diagnostic)
-      yield { type: 'integrity', integrity: report.integrity }
+    logStreamDebug(debugTrace, 'sse.raw', { event: ev.event, data: ev.data })
+    const decoded = decodeProviderStreamFrame({
+      adapter: 'chat-completions',
+      eventType: ev.event,
+      data: ev.data,
+      validate: validateChatCompletionChunk,
+    })
+    if (!decoded.ok) {
+      console.warn('chatCompletions: invalid SSE frame skipped', decoded.diagnostic)
+      yield { type: 'integrity', integrity: decoded.integrity }
+      continue
     }
+    const parsed = decoded.value
+    if (generationId && parsed.id === undefined) parsed.id = generationId
+    logStreamDebug(debugTrace, 'sse.parsed', parsed)
+    const chunk: ChatStreamChunk = generationId
+      ? { type: 'delta', chunk: parsed, generationId }
+      : { type: 'delta', chunk: parsed }
+    yield chunk
   }
 }
 
@@ -222,7 +221,7 @@ async function consumeChatCompletionsOnce(
   dispatched: Promise<DispatchResult>,
 ): Promise<ChatCompletionResultWire> {
   const { response, debugTrace } = await requireSuccessfulDispatch(dispatched)
-  const result = await decodeProviderJson<ChatCompletionResultWire>(response)
+  const result = await decodeValidatedProviderJson(response, validateChatCompletionResult)
   logStreamDebug(debugTrace, 'once.result', result)
   return result
 }

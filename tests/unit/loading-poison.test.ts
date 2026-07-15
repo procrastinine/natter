@@ -40,6 +40,7 @@ import {
   loadActiveBranchHeaderSnapshot,
   loadSendContextForBranch,
 } from '../../src/store/send-context'
+import { useChatStore } from '../../src/store/zustand/chatStore'
 
 const DB_NAME = 'natter'
 
@@ -1234,6 +1235,100 @@ describe('loading poison boundaries', () => {
     expect(messagesWhere).not.toHaveBeenCalled()
   })
 
+  it('keeps an open generation receipt owned while publishing an earlier-row edit', async () => {
+    const chat = await createChat({
+      id: 'edit-during-generation-chat',
+      title: 'Edit during generation',
+      settings: cloneDefaultChatSettings(),
+    })
+    const root = message(chat.id, 'edit-during-generation-root', { createdAt: 0 })
+    const placeholder = message(chat.id, 'edit-during-generation-placeholder', {
+      parentId: root.id,
+      createdAt: 1,
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: '' }],
+    })
+    await putFullMessages([root, placeholder])
+    const [rootHeader, placeholderHeader] = await getDb().messages.bulkGet([
+      root.id,
+      placeholder.id,
+    ])
+    if (!rootHeader || !placeholderHeader) throw new Error('fixture headers missing')
+
+    const store = useChatStore.getState()
+    const producerIntent = store.beginNavigationIntent(chat.id)
+    const producer = store.registerCommittedPathProducer(chat.id, producerIntent)
+    if (!producer) throw new Error('committed path producer registration failed')
+    store.selectCommittedPathForProducer(
+      chat.id,
+      producer,
+      { __root__: root.id, [root.id]: placeholder.id },
+      {
+        phase: 'open',
+        pathHeaders: [rootHeader, placeholderHeader],
+        presentations: [
+          { header: rootHeader, message: root, bodyVersion: rootHeader.bodyVersion },
+          {
+            header: placeholderHeader,
+            message: placeholder,
+            bodyVersion: placeholderHeader.bodyVersion,
+          },
+        ],
+      },
+    )
+    const cursor = store.getCursor(chat.id)
+    const revision = store.getNavigationRevision(chat.id)
+    store.beginNavigationIntent('different-chat')
+
+    await editInPlace(chat.id, root, 'edited while the assistant waits', {
+      pathHeaders: [rootHeader, placeholderHeader],
+    })
+
+    expect(store.getCursor(chat.id)).toBe(cursor)
+    expect(store.getNavigationRevision(chat.id)).toBe(revision)
+    expect(store.getCommittedPathPresentation(chat.id)?.phase).toBe('open')
+    expect(store.getCommittedPathPresentation(chat.id)?.pathHeaders.at(-1)?.id).toBe(placeholder.id)
+    expect(
+      store
+        .getCommittedPathPresentation(chat.id)
+        ?.presentations.find((presentation) => presentation.message.id === root.id)?.message
+        .content,
+    ).toEqual([{ type: 'text', text: 'edited while the assistant waits' }])
+
+    const finalPlaceholder = {
+      ...placeholder,
+      nodeVersion: placeholderHeader.nodeVersion + 1,
+      content: [{ type: 'output_text' as const, text: 'late answer' }],
+    }
+    const finalSplit = splitMessageForStorage(finalPlaceholder, {
+      bodyVersion: placeholderHeader.bodyVersion + 1,
+    })
+    expect(
+      store.updateCommittedMessageForProducer(
+        chat.id,
+        producer,
+        {
+          header: finalSplit.header,
+          message: finalPlaceholder,
+          bodyVersion: finalSplit.header.bodyVersion,
+        },
+        'terminal',
+      ),
+    ).toBe(true)
+    const finalReceipt = store.getCommittedPathPresentation(chat.id)
+    expect(finalReceipt?.phase).toBe('terminal')
+    expect(finalReceipt?.pathHeaders.at(-1)?.id).toBe(placeholder.id)
+    expect(
+      finalReceipt?.presentations.find((presentation) => presentation.message.id === root.id)
+        ?.message.content,
+    ).toEqual([{ type: 'text', text: 'edited while the assistant waits' }])
+    expect(
+      finalReceipt?.presentations.find((presentation) => presentation.message.id === placeholder.id)
+        ?.message.content,
+    ).toEqual([{ type: 'output_text', text: 'late answer' }])
+  })
+
   it('loads send context from the tail without hydrating cold branch bodies', async () => {
     const settings = cloneDefaultChatSettings()
     settings.model = 'openai/gpt-4o'
@@ -1286,6 +1381,23 @@ describe('loading poison boundaries', () => {
 
     const bulkGet = vi.spyOn(getDb().messageBodies, 'bulkGet')
     const branch = await loadActiveBranchHeaderSnapshot(chat.id, {})
+    const messageTable = getDb().messages
+    const readHeaders = messageTable.bulkGet.bind(messageTable)
+    let calibrationCommits = 0
+    vi.spyOn(messageTable, 'bulkGet').mockImplementation((async (ids) => {
+      const headers = await readHeaders(ids)
+      if (ids.length === branch.branchHeaders.length && calibrationCommits < 2) {
+        const target = headers.at(-1)
+        if (!target) throw new Error('calibration target missing')
+        calibrationCommits += 1
+        await getDb().messages.put({
+          ...target,
+          nodeVersion: target.nodeVersion + 1,
+          cachedTokenEstimate: calibrationCommits,
+        })
+      }
+      return headers
+    }) as typeof messageTable.bulkGet)
     const pending = message(chat.id, 'pending-user', {
       parentId,
       createdAt: 20,
@@ -1300,6 +1412,7 @@ describe('loading poison boundaries', () => {
 
     const requestedBodyIds = bulkGet.mock.calls.flatMap((call) => call[0])
     expect(snapshot.usedFullBranch).toBe(false)
+    expect(calibrationCommits).toBe(2)
     expect(snapshot.pathMessages.at(-1)?.id).toBe('pending-user')
     expect(requestedBodyIds).not.toContain('u0')
     expect(requestedBodyIds).not.toContain('a0')

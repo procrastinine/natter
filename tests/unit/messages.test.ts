@@ -24,8 +24,15 @@ import {
   nextSiblingIndex,
   TreeChangedError,
 } from '../../src/core/tree-ops'
-import type { Chat, ChatId, Message, MessageId, MessageRole } from '../../src/core/types'
-import { applyStructuralSnapshot } from '../../src/core/undo'
+import type {
+  Chat,
+  ChatId,
+  Message,
+  MessageId,
+  MessageRole,
+  MutationScope,
+} from '../../src/core/types'
+import { applyStructuralSnapshot, snapshotMessages } from '../../src/core/undo'
 import { newId } from '../../src/lib/ulid'
 import { buildAttachment, putAttachment } from '../../src/store/attachments'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
@@ -39,7 +46,12 @@ import {
 } from '../../src/store/chats'
 import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
 import { splitMessageForStorage } from '../../src/store/message-storage'
-import type { WorkspaceRepository } from '../../src/store/repository'
+import type {
+  MutationContext,
+  WorkspaceMutationOptions,
+  WorkspaceMutationResult,
+  WorkspaceRepository,
+} from '../../src/store/repository'
 import {
   __resetWorkspaceRepositoryForTests,
   __setWorkspaceRepositoryForTests,
@@ -1237,9 +1249,21 @@ describe('delete atomic pre-images', () => {
       content: [{ type: 'text', text: 'untouched after delete' }],
       now: 8,
     })
-    await applyStructuralSnapshot(result.preImage)
+    const restored = await applyStructuralSnapshot(result.preImage, {
+      cursor: priorCursor,
+      presentationWindowLimit: 2,
+    })
 
-    expect((await getStoredMessage('S'))?.siblingIndex).toBe(9)
+    expect(restored?.selectedPathHeaders.map((header) => header.id)).toEqual(['P', 'A', 'C', 'G'])
+    expect(new Set(restored?.structuralHeaders.map((header) => header.id))).toEqual(
+      new Set(['U', 'S', 'A', 'C']),
+    )
+    expect(restored?.presentations.map((presentation) => presentation.message.id)).toEqual([
+      'C',
+      'G',
+    ])
+
+    expect((await getStoredMessage('S'))?.siblingIndex).toBe(1)
     expect((await getStoredMessage('A'))?.deleted).toBe(false)
     expect((await getStoredMessage('A'))?.siblingIndex).toBe(2)
     expect((await getStoredMessage('C'))?.parentId).toBe('A')
@@ -1277,6 +1301,28 @@ describe('delete atomic pre-images', () => {
     ])
   })
 
+  it('allows structural undo after calibration-only metadata changes', async () => {
+    const chat = await seedChat()
+    await putMessage(chat.id, { id: 'A', parentId: null, createdAt: 1, role: 'assistant' })
+    await putMessage(chat.id, { id: 'C', parentId: 'A', createdAt: 2, role: 'user' })
+    const result = await deleteSingleMessage({
+      chatId: chat.id,
+      messageId: 'A',
+      cursor: { __root__: 'A', A: 'C' },
+    })
+    const repo = getBrowserRepository()
+    await repo.runMutation([{ kind: 'message', messageId: 'C' }], (ctx) =>
+      ctx.patchMessageCalibration('C', {
+        originalCharCount: 1,
+        originalTokenEstimate: 1,
+      }),
+    )
+
+    await expect(applyStructuralSnapshot(result.preImage)).resolves.toBeUndefined()
+    expect((await getStoredMessage('A'))?.deleted).toBe(false)
+    expect((await getStoredMessage('C'))?.parentId).toBe('A')
+  })
+
   it('allows only one of two concurrent deletes to commit', async () => {
     const chat = await seedChat()
     await putMessage(chat.id, { id: 'A', parentId: null, createdAt: 1, role: 'assistant' })
@@ -1296,6 +1342,174 @@ describe('delete atomic pre-images', () => {
 
 // -----------------------------------------------------------------------------
 
+describe('structural undo for inserts', () => {
+  it('tombstones the introduced row, restores displaced children, and returns every affected header', async () => {
+    const chat = await seedChat()
+    await putMessage(chat.id, { id: 'P', parentId: null, createdAt: 0 })
+    await putMessage(chat.id, {
+      id: 'U',
+      parentId: 'P',
+      siblingIndex: 0,
+      createdAt: 1,
+    })
+    await putMessage(chat.id, {
+      id: 'C',
+      parentId: 'P',
+      siblingIndex: 7,
+      createdAt: 2,
+    })
+    const previousRows = await snapshotMessages(chat.id, ['C'])
+    const inserted = await insertBetween({
+      chatId: chat.id,
+      parentId: 'P',
+      childId: 'C',
+      content: [{ type: 'text', text: 'inserted' }],
+      role: 'assistant',
+      now: 3,
+    })
+    await editMessageContent({
+      chatId: chat.id,
+      messageId: inserted.messageId,
+      content: [{ type: 'text', text: 'edited after insertion' }],
+      now: 4,
+    })
+
+    const restored = await applyStructuralSnapshot(
+      {
+        chatId: chat.id,
+        previousRows,
+        newMessageIds: [inserted.messageId],
+        attachmentIds: [],
+      },
+      {
+        cursor: { __root__: 'P', P: 'C' },
+        presentationWindowLimit: 2,
+      },
+    )
+
+    const introduced = await getStoredMessage(inserted.messageId)
+    expect(introduced).toMatchObject({
+      id: inserted.messageId,
+      parentId: 'P',
+      siblingIndex: 2,
+      deleted: true,
+    })
+    expect(introduced?.content).toEqual([{ type: 'text', text: 'edited after insertion' }])
+    expect((await getStoredMessage('C'))?.parentId).toBe('P')
+
+    const parentChildren = (await getBrowserRepository().listMessageHeaders(chat.id)).filter(
+      (row) => row.parentId === 'P',
+    )
+    expect(parentChildren.map((row) => row.siblingIndex).sort((a, b) => a - b)).toEqual([0, 1, 2])
+    expect(new Set(parentChildren.map((row) => row.siblingIndex)).size).toBe(parentChildren.length)
+    expect(restored?.selectedPathHeaders.map((row) => row.id)).toEqual(['P', 'C'])
+    expect(new Set(restored?.structuralHeaders.map((row) => row.id))).toEqual(
+      new Set(['U', 'C', inserted.messageId]),
+    )
+    expect(restored?.structuralHeaders.find((row) => row.id === inserted.messageId)?.deleted).toBe(
+      true,
+    )
+    expect(restored?.presentations.map((entry) => entry.message.id)).toEqual(['P', 'C'])
+  })
+
+  it('does one bounded set of header traversals and structural writes', async () => {
+    const chat = await seedChat()
+    await putMessage(chat.id, { id: 'P', parentId: null, createdAt: 0 })
+    const peerCount = 96
+    const peerIds: MessageId[] = []
+    for (let index = 0; index < peerCount; index += 1) {
+      const id = `peer-${index.toString().padStart(3, '0')}`
+      peerIds.push(id)
+      await putMessage(chat.id, {
+        id,
+        parentId: 'P',
+        siblingIndex: index * 3,
+        createdAt: index + 1,
+        turnId: 'shared-turn',
+      })
+    }
+    const previousRows = await snapshotMessages(chat.id, peerIds)
+    const inserted = await insertBetween({
+      chatId: chat.id,
+      parentId: 'P',
+      childId: peerIds[0] as MessageId,
+      content: [{ type: 'text', text: 'inserted' }],
+      role: 'assistant',
+      now: peerCount + 2,
+    })
+
+    const base = getBrowserRepository()
+    let headerRowsRead = 0
+    let structuralWrites = 0
+    const measured = Object.create(base) as WorkspaceRepository
+    measured.listMessageHeaders = async (chatId) => {
+      const rows = await base.listMessageHeaders(chatId)
+      headerRowsRead += rows.length
+      return rows
+    }
+    measured.runMutation = async <T>(
+      scopes: MutationScope[],
+      fn: (ctx: MutationContext) => Promise<T> | T,
+      options?: WorkspaceMutationOptions,
+    ): Promise<WorkspaceMutationResult<T>> =>
+      base.runMutation(
+        scopes,
+        async (ctx) => {
+          const measuredContext: MutationContext = {
+            ...ctx,
+            getMessageHeader: async (messageId) => {
+              headerRowsRead += 1
+              return ctx.getMessageHeader(messageId)
+            },
+            listMessageHeaders: async (chatId) => {
+              const rows = await ctx.listMessageHeaders(chatId)
+              headerRowsRead += rows.length
+              return rows
+            },
+            listChildHeaders: async (chatId, parentId) => {
+              const rows = await ctx.listChildHeaders(chatId, parentId)
+              headerRowsRead += rows.length
+              return rows
+            },
+            patchMessageStructure: async (messageId, patch) => {
+              structuralWrites += 1
+              await ctx.patchMessageStructure(messageId, patch)
+            },
+          }
+          return fn(measuredContext)
+        },
+        options,
+      )
+    __setWorkspaceRepositoryForTests(measured)
+
+    try {
+      await applyStructuralSnapshot(
+        {
+          chatId: chat.id,
+          previousRows,
+          newMessageIds: [inserted.messageId],
+          attachmentIds: [],
+        },
+        {
+          cursor: { __root__: 'P', P: peerIds[0] as MessageId },
+          presentationWindowLimit: 1,
+        },
+      )
+    } finally {
+      __resetWorkspaceRepositoryForTests()
+    }
+
+    const rowCount = peerCount + 2
+    expect(headerRowsRead).toBeLessThanOrEqual(rowCount * 6)
+    expect(structuralWrites).toBeLessThanOrEqual(rowCount * 3)
+    const headers = await base.listMessageHeaders(chat.id)
+    expect(headers.filter((row) => row.parentId === 'P')).toHaveLength(peerCount + 1)
+    expect(headers.find((row) => row.id === inserted.messageId)?.deleted).toBe(true)
+  })
+})
+
+// -----------------------------------------------------------------------------
+
 describe('pasteImport', () => {
   it('appends a multi-message chain under the active leaf', async () => {
     const chat = await seedChat()
@@ -1309,6 +1523,7 @@ describe('pasteImport', () => {
       chatId: chat.id,
       slot: { kind: 'at-end' },
       cursor: { __root__: root.id },
+      presentationWindowLimit: 2,
       messages: [
         { role: 'assistant', content: [{ type: 'text', text: 'A' }] },
         { role: 'user', content: [{ type: 'text', text: 'B' }] },
@@ -1333,6 +1548,7 @@ describe('pasteImport', () => {
       chatId: chat.id,
       slot: { kind: 'after', messageId: 'L' },
       cursor: {},
+      presentationWindowLimit: 1,
       messages: [{ role: 'assistant', content: [{ type: 'text', text: 'x' }] }],
       now: 5,
     })
@@ -1370,6 +1586,7 @@ describe('pasteImport', () => {
       chatId: chat.id,
       slot: { kind: 'before', messageId: 'C' },
       cursor: { __root__: 'P', P: 'C' },
+      presentationWindowLimit: 2,
       messages: [
         { role: 'assistant', content: [{ type: 'text', text: 'X1' }] },
         { role: 'user', content: [{ type: 'text', text: 'X2' }] },
@@ -1399,6 +1616,11 @@ describe('pasteImport', () => {
       [x3Id]: 'C',
     })
     expect(res.selectedPathMessageIds).toEqual(['P', x1Id, x2Id, x3Id, 'C'])
+    expect(res.selectedPathHeaders.map((header) => header.id)).toEqual(['P', x1Id, x2Id, x3Id, 'C'])
+    expect(res.presentations.map((presentation) => presentation.message.id)).toEqual([x3Id, 'C'])
+    expect(res.presentations[1]?.header.parentId).toBe(x3Id)
+    expect(res.presentations[1]?.message.parentId).toBe(x3Id)
+    expect(res.presentations[1]?.message.content).toEqual([{ type: 'text', text: 'x' }])
   })
 
   it('inserts every imported row between a parent and its selected descendant as one chain', async () => {
@@ -1411,6 +1633,7 @@ describe('pasteImport', () => {
       chatId: chat.id,
       slot: { kind: 'after', messageId: 'P' },
       cursor: { __root__: 'P', P: 'C' },
+      presentationWindowLimit: 2,
       messages: [
         { role: 'assistant', content: [{ type: 'text', text: 'X1' }] },
         { role: 'user', content: [{ type: 'text', text: 'X2' }] },
@@ -1483,6 +1706,7 @@ describe('pasteImport', () => {
       chatId: chat.id,
       slot: { kind: 'after-all', parentId: 'P' },
       cursor: { __root__: 'P', P: 'C2' },
+      presentationWindowLimit: 2,
       messages: [
         {
           role: 'assistant',
@@ -1562,6 +1786,7 @@ describe('pasteImport', () => {
       chatId: chat.id,
       slot: { kind: 'after-all', parentId: null },
       cursor: { __root__: 'missing' },
+      presentationWindowLimit: 2,
       messages: [
         { role: 'system', content: [{ type: 'text', text: 'X1' }] },
         { role: 'user', content: [{ type: 'text', text: 'X2' }] },
@@ -1607,6 +1832,7 @@ describe('pasteImport', () => {
       chatId: chat.id,
       slot: { kind: 'after-all', parentId: 'P' },
       cursor: { P: 'T' },
+      presentationWindowLimit: 2,
       messages: [
         { role: 'assistant', content: [{ type: 'text', text: 'X1' }] },
         { role: 'user', content: [{ type: 'text', text: 'X2' }] },
@@ -1654,6 +1880,7 @@ describe('pasteImport', () => {
         chatId: chat.id,
         slot: { kind: 'after-all', parentId: 'P' },
         cursor: { P: 'C' },
+        presentationWindowLimit: 1,
         messages: [{ role: 'assistant', content: [{ type: 'text', text: 'X' }] }],
         now: 5,
       }),

@@ -6,7 +6,7 @@ export type StreamAdapter =
   | 'text-completions'
 
 export interface StreamIntegrityEvent {
-  category: 'malformed-json-frame'
+  category: 'malformed-json-frame' | 'malformed-event-shape'
   adapter: StreamAdapter
   eventType: string
   count: number

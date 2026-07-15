@@ -6,6 +6,7 @@ import {
   ConnectionRuntimeKeysUnavailableError,
   connectionKeyRefs,
   connectionRequiresKey,
+  primeConnectionRuntimeKeyCandidates,
   resolveConnectionRuntimeKeys,
 } from '../../src/store/connection-runtime'
 import { PassphraseRequiredError, WrongPassphraseError } from '../../src/store/keys'
@@ -134,6 +135,32 @@ describe('connection runtime keys', () => {
     expect(JSON.stringify([candidate])).not.toContain(secret)
     await expect(candidate?.resolve()).resolves.toBe(secret)
     expect(JSON.stringify(candidate)).not.toContain(secret)
+  })
+
+  it('freezes only the primary plaintext in an opaque candidate and leaves fallbacks lazy', async () => {
+    const secret = 'sk-primary-closure-only'
+    const access = keyAccess(['primary', 'fallback'], async (ref) =>
+      ref === 'primary' ? secret : 'fallback-secret',
+    )
+    const candidates = await resolveConnectionRuntimeKeys(profile('primary', ['fallback']), {
+      access,
+    })
+
+    const primed = await primeConnectionRuntimeKeyCandidates(candidates)
+
+    expect(access.resolve.mock.calls.map(([ref]) => ref)).toEqual(['primary'])
+    expect(primed?.map(({ ref, index }) => ({ ref, index }))).toEqual([
+      { ref: 'primary', index: 0 },
+      { ref: 'fallback', index: 1 },
+    ])
+    expect(Object.keys(primed?.[0] ?? {})).toEqual(['ref', 'index'])
+    expect(JSON.stringify(primed)).not.toContain(secret)
+    await expect(primed?.[0]?.resolve()).resolves.toBe(secret)
+    expect(access.resolve).toHaveBeenCalledOnce()
+    await expect(primed?.[0]?.markUsed()).resolves.toBeUndefined()
+    expect(access.markUsed).toHaveBeenCalledWith('primary')
+    await expect(primed?.[1]?.resolve()).resolves.toBe('fallback-secret')
+    expect(access.resolve.mock.calls.map(([ref]) => ref)).toEqual(['primary', 'fallback'])
   })
 
   it.each([

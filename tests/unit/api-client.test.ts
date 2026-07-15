@@ -314,7 +314,7 @@ describe('fetchWithTimeout', () => {
     await expectation
   })
 
-  it('does not apply the request deadline to SSE reads after headers', async () => {
+  it('releases the absolute request deadline before the independent SSE watchdog', async () => {
     vi.useFakeTimers()
     let stream: ReadableStreamDefaultController<Uint8Array> | undefined
     vi.stubGlobal(
@@ -657,6 +657,36 @@ describe('fetchWithKeyFallback', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 
+  it('aborts while rejected-response cancellation never settles', async () => {
+    const controller = new AbortController()
+    let markCancelStarted: (() => void) | undefined
+    const cancelStarted = new Promise<void>((resolve) => {
+      markCancelStarted = resolve
+    })
+    const cancel = vi.fn(() => {
+      markCancelStarted?.()
+      return new Promise<void>(() => {})
+    })
+    const rejected = response(401, {}, new ReadableStream({ cancel }))
+    const fetchMock = vi.fn().mockResolvedValue(rejected)
+    vi.stubGlobal('fetch', fetchMock)
+    const requested = fetchWithKeyFallback(
+      ['ref-1', 'ref-2'],
+      (candidate) => ({
+        url: 'https://x',
+        init: { headers: { Authorization: `Bearer ${candidate}` } },
+      }),
+      { signal: controller.signal },
+    )
+
+    await cancelStarted
+    controller.abort()
+
+    await expect(requested).rejects.toMatchObject({ kind: 'abort', retryable: false })
+    expect(cancel).toHaveBeenCalledOnce()
+    expect(fetchMock).toHaveBeenCalledOnce()
+  })
+
   it('returns the last response unread when all candidates are exhausted', async () => {
     const firstCancel = vi.fn()
     const lastCancel = vi.fn()
@@ -747,6 +777,30 @@ describe('fetchWithKeyFallback', () => {
         { signal: controller.signal },
       ),
     ).rejects.toMatchObject({ kind: 'abort', retryable: false })
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('aborts while asynchronous candidate preparation never settles', async () => {
+    const controller = new AbortController()
+    let markBuildStarted: (() => void) | undefined
+    const buildStarted = new Promise<void>((resolve) => {
+      markBuildStarted = resolve
+    })
+    const build = vi.fn(() => {
+      markBuildStarted?.()
+      return new Promise<never>(() => {})
+    })
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    const requested = fetchWithKeyFallback(['ref-1', 'ref-2'], build, {
+      signal: controller.signal,
+    })
+
+    await buildStarted
+    controller.abort()
+
+    await expect(requested).rejects.toMatchObject({ kind: 'abort', retryable: false })
+    expect(build).toHaveBeenCalledOnce()
     expect(fetchMock).not.toHaveBeenCalled()
   })
 

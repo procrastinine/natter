@@ -34,6 +34,7 @@ test('a peer release observer cannot preempt stream ownership admission', async 
         startRequestLifecycle(args: {
           chatId: string
           streamId: string
+          messageId: string
           attemptKind: 'generation'
         }): Promise<{ end(outcome: 'done'): Promise<void> }>
       },
@@ -43,6 +44,7 @@ test('a peer release observer cannot preempt stream ownership admission', async 
       const lifecycle = await startRequestLifecycle({
         chatId: id,
         streamId: newId(),
+        messageId: newId(),
         attemptKind: 'generation',
       })
       await lifecycle.end('done')

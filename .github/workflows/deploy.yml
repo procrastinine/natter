@@ -32,8 +32,12 @@ jobs:
 
       - run: pnpm build:pages
 
-      - name: Validate Pages artifact
-        run: test -s dist/index.html
+      - run: pnpm exec playwright install --with-deps chromium
+
+      - name: Smoke-test Pages artifact
+        run: pnpm e2e:production-startup
+        env:
+          E2E_SERVER_MODE: preview
 
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
         with:

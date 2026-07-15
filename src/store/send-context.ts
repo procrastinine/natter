@@ -22,7 +22,7 @@ import type {
 import { getDb } from './db'
 import { hydrateMessages, type MessageBodyRow, type MessageHeaderRow } from './message-storage'
 import { flushPendingPromptSettingSaves } from './prompt-presets'
-import type { BranchHeaderSnapshot, MutationContext } from './repository'
+import type { BranchHeaderSnapshot, MutationContext, WorkspaceMutationOptions } from './repository'
 import { getWorkspaceRepository } from './workspace-repository'
 
 interface ChatHeaderSnapshot {
@@ -72,7 +72,7 @@ export interface SendContextMessageRevision {
   id: MessageId
   chatId: string
   parentId: MessageId | null
-  nodeVersion: number
+  requestContextVersion: number
   deleted: boolean
 }
 
@@ -131,7 +131,7 @@ export function createSendContextGuard(
 
 export function appendSendContextGuardMessage(
   guard: SendContextGuard,
-  message: Pick<MessageHeaderRow, 'id' | 'chatId' | 'parentId' | 'nodeVersion' | 'deleted'>,
+  message: MessageHeaderRow,
 ): SendContextGuard {
   return {
     ...guard,
@@ -168,9 +168,25 @@ export async function assertSendContextGuardInMutation(
 ): Promise<void> {
   const [chat, headers] = await Promise.all([
     ctx.getChat(guard.chatId),
-    Promise.all(guard.messageRevisions.map((revision) => ctx.getMessageHeader(revision.id))),
+    ctx.getMessageHeaders(guard.messageRevisions.map((revision) => revision.id)),
   ])
   assertSendContextGuard(chat, headers, guard)
+}
+
+export async function linearizeSendContextGuard(
+  guard: SendContextGuard,
+  options?: WorkspaceMutationOptions,
+): Promise<void> {
+  const anchor = guard.messageRevisions.at(-1)
+  const scopes = [
+    { kind: 'chat-meta' as const, chatId: guard.chatId },
+    ...(anchor ? [{ kind: 'message' as const, messageId: anchor.id }] : []),
+  ]
+  await getWorkspaceRepository().runMutation(
+    scopes,
+    (ctx) => assertSendContextGuardInMutation(ctx, guard),
+    options,
+  )
 }
 
 export async function assertSendContextFresh(guard: SendContextGuard): Promise<void> {
@@ -181,27 +197,25 @@ export async function assertSendContextFresh(guard: SendContextGuard): Promise<v
   assertSendContextGuard(snapshot.chat, snapshot.headers, guard)
 }
 
-function messageRevision(
-  message: Pick<MessageHeaderRow, 'id' | 'chatId' | 'parentId' | 'nodeVersion' | 'deleted'>,
-): SendContextMessageRevision {
+function messageRevision(message: MessageHeaderRow): SendContextMessageRevision {
   return {
     id: message.id,
     chatId: message.chatId,
     parentId: message.parentId,
-    nodeVersion: message.nodeVersion,
+    requestContextVersion: message.requestContextVersion,
     deleted: message.deleted,
   }
 }
 
 function messageRevisionMatches(
-  actual: Pick<MessageHeaderRow, 'id' | 'chatId' | 'parentId' | 'nodeVersion' | 'deleted'>,
+  actual: MessageHeaderRow,
   expected: SendContextMessageRevision,
 ): boolean {
   return (
     actual.id === expected.id &&
     actual.chatId === expected.chatId &&
     actual.parentId === expected.parentId &&
-    actual.nodeVersion === expected.nodeVersion &&
+    actual.requestContextVersion === expected.requestContextVersion &&
     actual.deleted === expected.deleted
   )
 }
@@ -560,21 +574,11 @@ function branchHeaderContextSignature(headers: readonly MessageHeaderRow[]): str
   return JSON.stringify(
     headers.map((header) => ({
       id: header.id,
+      chatId: header.chatId,
       parentId: header.parentId,
-      siblingIndex: header.siblingIndex,
       role: header.role,
-      createdAt: header.createdAt,
-      nodeVersion: header.nodeVersion,
       deleted: header.deleted,
-      hiddenFromContext: header.hiddenFromContext === true,
-      attachmentRefs: header.attachmentRefs ?? [],
-      originalCharCount: header.originalCharCount,
-      originalTokenEstimate: header.originalTokenEstimate,
-      originalModelId: header.originalModelId,
-      originalCalibrationKey: header.originalCalibrationKey,
-      charCountDelta: header.charCountDelta,
-      cachedTokenEstimate: header.cachedTokenEstimate,
-      cachedMediaTokens: header.cachedMediaTokens,
+      requestContextVersion: header.requestContextVersion,
     })),
   )
 }

@@ -229,8 +229,19 @@ export function Composer({
   const [prefillText, setPrefillText] = useState(defaultPrefill ?? '')
   const deferredText = useDeferredValue(text)
   const deferredPrefillText = useDeferredValue(prefillOpen ? prefillText : '')
+  const deferredDraftText = deferredText.trim()
+  const deferredDraftPrefillText = deferredPrefillText.trim()
+  const draftCharacterCount =
+    Array.from(deferredDraftText).length + Array.from(deferredDraftPrefillText).length
   const draftTokenEstimate =
-    estimateTokens(deferredText.trim(), 'unknown') + estimateTokens(deferredPrefillText, 'unknown')
+    estimateTokens(deferredDraftText, 'unknown') +
+    estimateTokens(deferredDraftPrefillText, 'unknown')
+  const draftTokenLabel =
+    draftCharacterCount === 0
+      ? '0 draft tokens'
+      : draftCharacterCount === 1
+        ? '1 draft token'
+        : `≈ ${draftTokenEstimate.toLocaleString()} draft tokens`
   // Track whether the prefill textarea has ever been opened to avoid
   // accidental re-seeding on every open. Reset along with `defaultPrefill`
   // changes so an updated default does seed the next opening.
@@ -668,9 +679,9 @@ export function Composer({
         <div data-ui="composer-actions">
           <span
             data-ui="token-counter"
-            title="Approximate pending text only; Context settings combines this draft and included attachments with the active conversation."
+            title="Pending text only; drafts longer than one character are approximate. Context settings combines this draft and included attachments with the active conversation."
           >
-            ≈ {draftTokenEstimate.toLocaleString()} draft tokens
+            {draftTokenLabel}
           </span>
           {showPrefillButton ? (
             <Button

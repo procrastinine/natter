@@ -20,8 +20,9 @@ import {
 } from './attachments'
 import { getBrowserRepository } from './browser-repo'
 import { resolveKeyIfPresent } from './keys'
+import type { MessagePresentation } from './message-storage'
 import { getProfile } from './profiles'
-import type { MutationContext } from './repository'
+import type { MutationContext, WorkspaceRepository } from './repository'
 
 type OutputImageItem = Extract<ContentItem, { type: 'output_image' }>
 type OutputAudioItem = Extract<ContentItem, { type: 'audio_output' }>
@@ -85,6 +86,7 @@ async function materializeGeneratedImageOutputAttachments(input: {
   now?: number
   downloader?: GeneratedOutputDownloader
   attachmentBundles?: PreparedAttachmentBundle[]
+  preserveRemoteUrlOnDownloadFailure?: boolean
 }): Promise<GeneratedImageMaterialization> {
   const now = input.now ?? Date.now()
   const replacements: GeneratedImageReplacement[] = []
@@ -107,6 +109,9 @@ async function materializeGeneratedImageOutputAttachments(input: {
       now,
       ...(input.downloader ? { downloader: input.downloader } : {}),
       ...(input.attachmentBundles ? { attachmentBundles: input.attachmentBundles } : {}),
+      ...(input.preserveRemoteUrlOnDownloadFailure
+        ? { preserveRemoteUrlOnDownloadFailure: true }
+        : {}),
     })
     if (!materialized) {
       content.push(structuredClone(item))
@@ -129,6 +134,7 @@ export async function materializeGeneratedOutputAttachments(input: {
   content: readonly ContentItem[]
   now?: number
   downloader?: GeneratedOutputDownloader
+  preserveRemoteUrlOnDownloadFailure?: boolean
 }): Promise<GeneratedOutputMaterialization> {
   const imageMaterialized = await materializeGeneratedImageOutputAttachments(input)
   const mediaMaterialized = await materializeGeneratedAudioVideoOutputAttachments({
@@ -148,6 +154,7 @@ export async function prepareGeneratedOutputAttachments(input: {
   content: readonly ContentItem[]
   now?: number
   downloader?: GeneratedOutputDownloader
+  preserveRemoteUrlOnDownloadFailure?: boolean
 }): Promise<PreparedGeneratedOutputMaterialization> {
   const attachmentBundles: PreparedAttachmentBundle[] = []
   const imageMaterialized = await materializeGeneratedImageOutputAttachments({
@@ -177,12 +184,82 @@ export async function persistPreparedGeneratedOutputAttachments(
   }
 }
 
+class GeneratedOutputLocalizationStaleError extends Error {}
+
+export async function commitPreparedGeneratedOutputAttachments(input: {
+  repo: WorkspaceRepository
+  presentation: MessagePresentation
+  prepared: PreparedGeneratedOutputMaterialization
+  expectedReplacementEpoch: number
+  isCurrent: () => boolean
+}): Promise<MessagePresentation | undefined> {
+  if (!input.prepared.changed || !input.isCurrent()) return undefined
+  const { message, bodyVersion } = input.presentation
+  const assertCurrent = (): void => {
+    if (!input.isCurrent()) throw new GeneratedOutputLocalizationStaleError()
+  }
+  try {
+    const mutation = await input.repo.runMutation(
+      [{ kind: 'message', messageId: message.id }, ...attachmentScopes(input.prepared.newRefs)],
+      async (ctx) => {
+        assertCurrent()
+        const current = await ctx.getMessageHeader(message.id)
+        assertCurrent()
+        if (
+          !current ||
+          current.deleted ||
+          current.chatId !== message.chatId ||
+          current.bodyVersion !== bodyVersion
+        ) {
+          return undefined
+        }
+        await persistPreparedGeneratedOutputAttachments(ctx, input.prepared)
+        assertCurrent()
+        const merged = mergeGeneratedImageAttachmentRefs(
+          current.attachmentRefs,
+          input.prepared.newRefs,
+          message.id,
+          Date.now(),
+        )
+        await ctx.patchMessageBody(
+          message.id,
+          { content: input.prepared.content },
+          {
+            touchChatSummary: false,
+            broadcast: true,
+            headerPatch: {
+              attachmentRefs: merged.refs,
+              cachedMediaTokens: undefined,
+            },
+          },
+        )
+        assertCurrent()
+        const [header, localizedMessage] = await Promise.all([
+          ctx.getMessageHeader(message.id),
+          ctx.getMessage(message.id),
+        ])
+        assertCurrent()
+        if (!header || !localizedMessage) {
+          throw new Error(`GeneratedOutputLocalizationMissing:${message.id}`)
+        }
+        return { header, message: localizedMessage, bodyVersion: header.bodyVersion }
+      },
+      { workspaceFence: { replacementEpoch: input.expectedReplacementEpoch } },
+    )
+    return mutation.value
+  } catch (error) {
+    if (error instanceof GeneratedOutputLocalizationStaleError) return undefined
+    throw error
+  }
+}
+
 async function materializeGeneratedAudioVideoOutputAttachments(input: {
   messageId: MessageId
   content: readonly ContentItem[]
   now?: number
   downloader?: GeneratedOutputDownloader
   attachmentBundles?: PreparedAttachmentBundle[]
+  preserveRemoteUrlOnDownloadFailure?: boolean
 }): Promise<GeneratedOutputMaterialization> {
   const now = input.now ?? Date.now()
   const replacements: GeneratedOutputReplacement[] = []
@@ -208,6 +285,9 @@ async function materializeGeneratedAudioVideoOutputAttachments(input: {
             now,
             ...(input.downloader ? { downloader: input.downloader } : {}),
             ...(input.attachmentBundles ? { attachmentBundles: input.attachmentBundles } : {}),
+            ...(input.preserveRemoteUrlOnDownloadFailure
+              ? { preserveRemoteUrlOnDownloadFailure: true }
+              : {}),
           })
         : await materializeOneGeneratedVideo({
             messageId: input.messageId,
@@ -216,6 +296,9 @@ async function materializeGeneratedAudioVideoOutputAttachments(input: {
             now,
             ...(input.downloader ? { downloader: input.downloader } : {}),
             ...(input.attachmentBundles ? { attachmentBundles: input.attachmentBundles } : {}),
+            ...(input.preserveRemoteUrlOnDownloadFailure
+              ? { preserveRemoteUrlOnDownloadFailure: true }
+              : {}),
           })
     if (!materialized) {
       content.push(structuredClone(item))
@@ -507,6 +590,7 @@ async function materializeOneGeneratedImage(input: {
   now: number
   downloader?: GeneratedOutputDownloader
   attachmentBundles?: PreparedAttachmentBundle[]
+  preserveRemoteUrlOnDownloadFailure?: boolean
 }): Promise<GeneratedImageReplacement | null> {
   const sourceUrl = input.item.url
   if (!sourceUrl) return null
@@ -518,6 +602,9 @@ async function materializeOneGeneratedImage(input: {
       now: input.now,
       ...(input.downloader ? { downloader: input.downloader } : {}),
       ...(input.attachmentBundles ? { attachmentBundles: input.attachmentBundles } : {}),
+      ...(input.preserveRemoteUrlOnDownloadFailure
+        ? { preserveRemoteUrlOnDownloadFailure: true }
+        : {}),
     })
     const ref = createAttachmentRef(attachment.id, {
       messageId: input.messageId,
@@ -541,6 +628,7 @@ async function materializeOneGeneratedAudio(input: {
   now: number
   downloader?: GeneratedOutputDownloader
   attachmentBundles?: PreparedAttachmentBundle[]
+  preserveRemoteUrlOnDownloadFailure?: boolean
 }): Promise<GeneratedOutputReplacement | null> {
   const sourceUrl = input.item.url
   if (!sourceUrl) return null
@@ -552,6 +640,9 @@ async function materializeOneGeneratedAudio(input: {
       now: input.now,
       ...(input.downloader ? { downloader: input.downloader } : {}),
       ...(input.attachmentBundles ? { attachmentBundles: input.attachmentBundles } : {}),
+      ...(input.preserveRemoteUrlOnDownloadFailure
+        ? { preserveRemoteUrlOnDownloadFailure: true }
+        : {}),
     })
     const ref = createAttachmentRef(attachment.id, {
       messageId: input.messageId,
@@ -577,6 +668,7 @@ async function materializeOneGeneratedVideo(input: {
   now: number
   downloader?: GeneratedOutputDownloader
   attachmentBundles?: PreparedAttachmentBundle[]
+  preserveRemoteUrlOnDownloadFailure?: boolean
 }): Promise<GeneratedOutputReplacement | null> {
   const sourceUrl = input.item.url
   if (!sourceUrl) return null
@@ -588,6 +680,9 @@ async function materializeOneGeneratedVideo(input: {
       now: input.now,
       ...(input.downloader ? { downloader: input.downloader } : {}),
       ...(input.attachmentBundles ? { attachmentBundles: input.attachmentBundles } : {}),
+      ...(input.preserveRemoteUrlOnDownloadFailure
+        ? { preserveRemoteUrlOnDownloadFailure: true }
+        : {}),
     })
     const ref = createAttachmentRef(attachment.id, {
       messageId: input.messageId,
@@ -611,6 +706,7 @@ async function createGeneratedImageAttachment(input: {
   now: number
   downloader?: GeneratedOutputDownloader
   attachmentBundles?: PreparedAttachmentBundle[]
+  preserveRemoteUrlOnDownloadFailure?: boolean
 }): Promise<Attachment> {
   const parsed = parseImagePayload(input.sourceUrl)
   if (parsed) {
@@ -648,6 +744,8 @@ async function createGeneratedImageAttachment(input: {
     )
     return bundle.attachment
   }
+  if (input.preserveRemoteUrlOnDownloadFailure)
+    throw new Error('GeneratedOutputDownloadUnavailable')
   return createOrPrepareGeneratedRemoteAttachment(
     {
       url: input.sourceUrl,
@@ -669,6 +767,7 @@ async function createGeneratedAudioAttachment(input: {
   now: number
   downloader?: GeneratedOutputDownloader
   attachmentBundles?: PreparedAttachmentBundle[]
+  preserveRemoteUrlOnDownloadFailure?: boolean
 }): Promise<Attachment> {
   const parsed = parseMediaDataUrl(input.sourceUrl, 'audio/')
   if (parsed) {
@@ -706,6 +805,8 @@ async function createGeneratedAudioAttachment(input: {
     )
     return bundle.attachment
   }
+  if (input.preserveRemoteUrlOnDownloadFailure)
+    throw new Error('GeneratedOutputDownloadUnavailable')
   return createOrPrepareGeneratedRemoteAttachment(
     {
       url: input.sourceUrl,
@@ -727,6 +828,7 @@ async function createGeneratedVideoAttachment(input: {
   now: number
   downloader?: GeneratedOutputDownloader
   attachmentBundles?: PreparedAttachmentBundle[]
+  preserveRemoteUrlOnDownloadFailure?: boolean
 }): Promise<Attachment> {
   const parsed = parseMediaDataUrl(input.sourceUrl, 'video/')
   if (parsed) {
@@ -764,6 +866,8 @@ async function createGeneratedVideoAttachment(input: {
     )
     return bundle.attachment
   }
+  if (input.preserveRemoteUrlOnDownloadFailure)
+    throw new Error('GeneratedOutputDownloadUnavailable')
   return createOrPrepareGeneratedRemoteAttachment(
     {
       url: input.sourceUrl,

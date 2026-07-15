@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from '../../src/api/errors'
 import { parseSSE, type SSEEvent } from '../../src/api/sse'
 
@@ -21,6 +21,10 @@ async function collect(response: Response): Promise<SSEEvent[]> {
   for await (const ev of parseSSE(response)) out.push(ev)
   return out
 }
+
+afterEach(() => {
+  vi.useRealTimers()
+})
 
 describe('parseSSE', () => {
   it('handles CRLF line endings', async () => {
@@ -91,6 +95,18 @@ describe('parseSSE', () => {
     ])
   })
 
+  it('does not allocate one watchdog timer per incoming chunk', async () => {
+    vi.useFakeTimers()
+    const timeout = vi.spyOn(globalThis, 'setTimeout')
+    const source = `data: ${'x'.repeat(10_000)}\n\n`
+    const chunks = Array.from(enc(source), (byte) => Uint8Array.of(byte))
+
+    await expect(collect(responseFromChunks(chunks))).resolves.toEqual([
+      { kind: 'data', data: 'x'.repeat(10_000) },
+    ])
+    expect(timeout).toHaveBeenCalledTimes(2)
+  })
+
   it('assembles a large unterminated line from fragments without changing its payload', async () => {
     const payload = 'x'.repeat(100_000)
     const source = `data: ${payload}`
@@ -100,6 +116,42 @@ describe('parseSSE', () => {
     }
 
     expect(await collect(responseFromChunks(chunks))).toEqual([{ kind: 'data', data: payload }])
+  })
+
+  it('bounds a trickled unterminated line even while bytes keep arriving', async () => {
+    const source = `data: ${'x'.repeat(32)}`
+    const response = responseFromChunks(Array.from(enc(source), (byte) => Uint8Array.of(byte)))
+    const run = async () => {
+      for await (const _ of parseSSE(response, {
+        watchdog: { firstByteTimeoutMs: 0, idleTimeoutMs: 0 },
+        maxPendingEventChars: 16,
+      })) {
+        /* drain */
+      }
+    }
+
+    await expect(run()).rejects.toMatchObject({
+      kind: 'protocol',
+      code: 'SSE_FRAME_TOO_LARGE',
+      midStream: true,
+      retryable: false,
+    })
+  })
+
+  it('bounds a multi-line event even when each individual line is within the limit', async () => {
+    const response = responseFromChunks([enc('data: 1234567890\ndata: abcdefghij\n\n')])
+    const run = async () => {
+      for await (const _ of parseSSE(response, { maxPendingEventChars: 16 })) {
+        /* drain */
+      }
+    }
+
+    await expect(run()).rejects.toMatchObject({
+      kind: 'protocol',
+      code: 'SSE_FRAME_TOO_LARGE',
+      midStream: true,
+      retryable: false,
+    })
   })
 
   it('strips a single leading space after `data:` per the SSE spec', async () => {
@@ -128,6 +180,203 @@ describe('parseSSE', () => {
       midStream: true,
       retryable: false,
     })
+  })
+
+  it('times out when an open stream produces no bytes', async () => {
+    vi.useFakeTimers()
+    const response = new Response(new ReadableStream<Uint8Array>({}), {
+      headers: { 'content-type': 'text/event-stream' },
+    })
+    const next = parseSSE(response, { watchdog: { firstByteTimeoutMs: 100 } }).next()
+    const expectation = expect(next).rejects.toMatchObject({
+      kind: 'timeout',
+      code: 'TIMEOUT',
+      midStream: true,
+      retryable: true,
+    })
+
+    await vi.advanceTimersByTimeAsync(100)
+    await expectation
+  })
+
+  it('starts a fresh idle deadline after a keepalive', async () => {
+    vi.useFakeTimers()
+    let stream: ReadableStreamDefaultController<Uint8Array> | undefined
+    const response = new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          stream = controller
+        },
+      }),
+      { headers: { 'content-type': 'text/event-stream' } },
+    )
+    const iterator = parseSSE(response, {
+      watchdog: { firstByteTimeoutMs: 100, idleTimeoutMs: 100 },
+    })
+    const keepalive = iterator.next()
+
+    await vi.advanceTimersByTimeAsync(90)
+    stream?.enqueue(enc(': still working\n\n'))
+    await expect(keepalive).resolves.toEqual({
+      done: false,
+      value: { kind: 'keepalive', comment: 'still working' },
+    })
+
+    let settled = false
+    const data = iterator.next()
+    void data.then(
+      () => {
+        settled = true
+      },
+      () => {
+        settled = true
+      },
+    )
+    await vi.advanceTimersByTimeAsync(90)
+    expect(settled).toBe(false)
+    stream?.enqueue(enc('data: ready\n\n'))
+    stream?.close()
+    await expect(data).resolves.toEqual({
+      done: false,
+      value: { kind: 'data', data: 'ready' },
+    })
+  })
+
+  it('does not count consumer backpressure as upstream silence', async () => {
+    vi.useFakeTimers()
+    let stream: ReadableStreamDefaultController<Uint8Array> | undefined
+    const response = new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          stream = controller
+          controller.enqueue(enc('data: first\n\n'))
+        },
+      }),
+      { headers: { 'content-type': 'text/event-stream' } },
+    )
+    const iterator = parseSSE(response, {
+      watchdog: { firstByteTimeoutMs: 100, idleTimeoutMs: 100 },
+    })
+    await expect(iterator.next()).resolves.toEqual({
+      done: false,
+      value: { kind: 'data', data: 'first' },
+    })
+
+    await vi.advanceTimersByTimeAsync(10_000)
+    const next = iterator.next()
+    await vi.advanceTimersByTimeAsync(90)
+    stream?.enqueue(enc('data: second\n\n'))
+    stream?.close()
+    await expect(next).resolves.toEqual({
+      done: false,
+      value: { kind: 'data', data: 'second' },
+    })
+  })
+
+  it('resets on partial bytes but times out if the frame never completes', async () => {
+    vi.useFakeTimers()
+    let stream: ReadableStreamDefaultController<Uint8Array> | undefined
+    const response = new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          stream = controller
+        },
+      }),
+      { headers: { 'content-type': 'text/event-stream' } },
+    )
+    const next = parseSSE(response, {
+      watchdog: { firstByteTimeoutMs: 100, idleTimeoutMs: 100 },
+    }).next()
+    let settled = false
+    void next.then(
+      () => {
+        settled = true
+      },
+      () => {
+        settled = true
+      },
+    )
+
+    await vi.advanceTimersByTimeAsync(90)
+    stream?.enqueue(enc('data: partial'))
+    await vi.advanceTimersByTimeAsync(0)
+    await vi.advanceTimersByTimeAsync(90)
+    expect(settled).toBe(false)
+    const expectation = expect(next).rejects.toMatchObject({
+      kind: 'timeout',
+      code: 'TIMEOUT',
+      midStream: true,
+    })
+    await vi.advanceTimersByTimeAsync(10)
+    await expectation
+  })
+
+  it('does not treat a zero-length read as stream activity', async () => {
+    vi.useFakeTimers()
+    let stream: ReadableStreamDefaultController<Uint8Array> | undefined
+    const response = new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          stream = controller
+        },
+      }),
+      { headers: { 'content-type': 'text/event-stream' } },
+    )
+    const next = parseSSE(response, { watchdog: { firstByteTimeoutMs: 100 } }).next()
+    let settled = false
+    void next.then(
+      () => {
+        settled = true
+      },
+      () => {
+        settled = true
+      },
+    )
+
+    await vi.advanceTimersByTimeAsync(90)
+    stream?.enqueue(new Uint8Array())
+    await vi.advanceTimersByTimeAsync(0)
+    await vi.advanceTimersByTimeAsync(9)
+    expect(settled).toBe(false)
+    const expectation = expect(next).rejects.toMatchObject({ kind: 'timeout', midStream: true })
+    await vi.advanceTimersByTimeAsync(1)
+    await expectation
+  })
+
+  it('lets user abort win while a non-cooperative read is stalled', async () => {
+    const controller = new AbortController()
+    let cancelCalled = false
+    let markReadStarted: (() => void) | undefined
+    const readStarted = new Promise<void>((resolve) => {
+      markReadStarted = resolve
+    })
+    const response = {
+      body: {
+        getReader: () => ({
+          read: () => {
+            markReadStarted?.()
+            return new Promise<ReadableStreamReadResult<Uint8Array>>(() => {})
+          },
+          cancel: async () => {
+            cancelCalled = true
+          },
+        }),
+      },
+    } as unknown as Response
+    const next = parseSSE(response, {
+      signal: controller.signal,
+      watchdog: { firstByteTimeoutMs: 60_000, idleTimeoutMs: 60_000 },
+    }).next()
+
+    await readStarted
+    controller.abort()
+    await expect(next).rejects.toMatchObject({
+      kind: 'abort',
+      code: 'ABORTED',
+      midStream: true,
+      retryable: false,
+    })
+    expect(cancelCalled).toBe(true)
   })
 
   it('aborts an already-open stream when the caller signal fires mid-read', async () => {

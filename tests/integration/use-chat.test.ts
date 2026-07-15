@@ -6,8 +6,10 @@ import { beginRouteIntent } from '../../src/app/router'
 import { cursorKeyOf } from '../../src/core/active-path'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import { tokenCalibrationKey } from '../../src/core/model-ids'
+import { invalidatePostCommitTasks } from '../../src/core/post-commit-task'
 import type { ChatSettings, ConnectionProfile, Message } from '../../src/core/types'
 import {
+  __flushPostCommitCalibrationForTests,
   nextOrphanRecoveryAt,
   recoverOrphans,
   sendFromMessage,
@@ -262,6 +264,20 @@ async function eventually(assertion: () => Promise<void> | void): Promise<void> 
   throw lastError
 }
 
+async function within<T>(promise: Promise<T>, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timed out`)), 500)
+      }),
+    ])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+}
+
 function liveMessagesSortedByCreated(messages: Message[]): Message[] {
   return messages.filter((m) => !m.deleted).sort((a, b) => a.createdAt - b.createdAt)
 }
@@ -385,7 +401,12 @@ describe('sendText — chat-completions streaming', () => {
 
     const active = useStreamStore.getState().listByChat(chat.id)
     expect(active).toHaveLength(1)
-    expect(active[0]?.messageId).toBeUndefined()
+    expect(active[0]?.messageId).toBeTypeOf('string')
+    expect(active[0]).toMatchObject({
+      attemptKind: 'generation',
+      originNavigationRevision: useChatStore.getState().getNavigationRevision(chat.id),
+    })
+    expect(await getBrowserRepository().getMessage(active[0]?.messageId as string)).toBeUndefined()
     const midMessages = liveMessagesSortedByCreated(await messagesFor(chat.id))
     expect(midMessages).toHaveLength(1)
     expect(midMessages[0]).toMatchObject({
@@ -400,6 +421,7 @@ describe('sendText — chat-completions streaming', () => {
   })
 
   it('persists a huge OpenRouter user row before cold provider discovery resolves', async () => {
+    const controller = new AbortController()
     const profile: ConnectionProfile = {
       ...makeProfile(),
       id: 'prof-cold',
@@ -449,7 +471,6 @@ describe('sendText — chat-completions streaming', () => {
         },
       }),
     )
-    const controller = new AbortController()
 
     const sendPromise = sendText({
       chatId: chat.id,
@@ -690,14 +711,19 @@ describe('sendText — chat-completions streaming', () => {
       parentMessageId: parent.id,
       connection: makeProfile(),
       apiKey: 'sk-test',
-      openStream: () =>
-        stream({
+      openStream: () => {
+        expect(useStreamStore.getState().listByChat(chat.id)[0]).toMatchObject({
+          attemptKind: 'generation',
+          originNavigationRevision: useChatStore.getState().getNavigationRevision(chat.id),
+        })
+        return stream({
           type: 'delta',
           chunk: {
             id: 'gen-header-only-siblings',
             choices: [{ delta: { content: 'new sibling' }, finish_reason: 'stop' }],
           },
-        }),
+        })
+      },
       now: () => 1000,
     })
 
@@ -1434,6 +1460,10 @@ describe('sendText — chat-completions streaming', () => {
     expect(useStreamStore.getState().hasStreamForChat(chat.id)).toBe(true)
     const liveMessageId = useStreamStore.getState().listLiveSnapshots()[0]?.messageId
     expect(liveMessageId).toBeDefined()
+    const retainedBeforeBranchChange = useStreamStore
+      .getState()
+      .getLiveSnapshot(chat.id, liveMessageId as string)
+    expect(retainedBeforeBranchChange?.content).toEqual([{ type: 'output_text', text: 'Partial ' }])
 
     const rightBranchCursor = {
       [cursorKeyOf(null)]: root.id,
@@ -1446,9 +1476,9 @@ describe('sendText — chat-completions streaming', () => {
 
     release()
     await offBranchDeltaProcessed
-    expect(
-      useStreamStore.getState().getLiveSnapshot(chat.id, liveMessageId as string),
-    ).toBeUndefined()
+    expect(useStreamStore.getState().getLiveSnapshot(chat.id, liveMessageId as string)).toBe(
+      retainedBeforeBranchChange,
+    )
     releaseCompletion()
     const result = await sendPromise
     expect(result.outcome).toBe('done')
@@ -1997,6 +2027,7 @@ describe('sendText — token calibration sample ingest', () => {
           },
         ),
     })
+    await __flushPostCommitCalibrationForTests()
     const chatRow = await getBrowserRepository().getChat(chat.id)
     expect(chatRow?.tokenCalibration).toBeDefined()
     const sample = chatRow?.tokenCalibration?.[tokenCalibrationKey('openai/gpt-4o')]
@@ -2213,6 +2244,7 @@ describe('sendText — token calibration sample ingest', () => {
           },
         ),
     })
+    await __flushPostCommitCalibrationForTests()
     const chatRow = await getBrowserRepository().getChat(chat.id)
     // Calibration is skipped on non-done outcome.
     expect(chatRow?.tokenCalibration?.[tokenCalibrationKey('openai/gpt-4o')]).toBeUndefined()
@@ -2246,6 +2278,7 @@ describe('sendText — token calibration sample ingest', () => {
           },
         ),
     })
+    await __flushPostCommitCalibrationForTests()
     const chatRow = await getBrowserRepository().getChat(chat.id)
     expect(chatRow?.tokenCalibration?.[tokenCalibrationKey('openai/gpt-4o')]?.sampleCount).toBe(1)
     const [user, assistant] = liveMessagesSortedByCreated(await messagesFor(chat.id))
@@ -2299,6 +2332,7 @@ describe('sendText — token calibration sample ingest', () => {
           },
         ),
     })
+    await __flushPostCommitCalibrationForTests()
     const chatRow = await getBrowserRepository().getChat(chat.id)
     expect(
       chatRow?.tokenCalibration?.[tokenCalibrationKey('black-forest-labs/flux.2-klein-4b')],
@@ -2329,21 +2363,29 @@ describe('sendText — token calibration sample ingest', () => {
     })
     expect(bundle?.blobs.some((blob) => blob.role === 'original')).toBe(true)
     expect(assistant?.originalCalibrationKey).toBeUndefined()
+    const receiptPresentation = useChatStore
+      .getState()
+      .getCommittedPathPresentation(chat.id)
+      ?.presentations.find((presentation) => presentation.message.id === assistant?.id)
+    expect(receiptPresentation?.message.content).toContainEqual({
+      type: 'output_image',
+      attachmentId,
+    })
   })
 
-  it('lets an explicit abort cancel generated-output localization without losing the response', async () => {
+  it('commits raw generated output before a stalled localization and aborts the optional fetch', async () => {
     const chat = await createChat({
       settings: chatSettings({ model: 'black-forest-labs/flux.2-klein-4b', systemPrompt: '' }),
     })
     const imageUrl = 'https://cdn.example/generated.png'
-    const controller = new AbortController()
     let markDownloadStarted!: () => void
     const downloadStarted = new Promise<void>((resolve) => {
       markDownloadStarted = resolve
     })
+    let downloadSignal: AbortSignal | undefined
     const fetchMock = vi.fn((_url: string | URL | Request, init?: RequestInit) => {
       markDownloadStarted()
-      expect(init?.signal).toBe(controller.signal)
+      downloadSignal = init?.signal ?? undefined
       return new Promise<Response>((_resolve, reject) => {
         const rejectAbort = () => reject(new DOMException('aborted', 'AbortError'))
         if (init?.signal?.aborted) {
@@ -2360,7 +2402,81 @@ describe('sendText — token calibration sample ingest', () => {
       connection: makeProfile(),
       apiKey: 'sk-test',
       content: [{ type: 'text', text: 'draw it' }],
-      signal: controller.signal,
+      openStream: () =>
+        stream(
+          {
+            type: 'delta',
+            chunk: {
+              id: 'g',
+              choices: [
+                {
+                  delta: {
+                    role: 'assistant',
+                    content: '',
+                    images: [{ type: 'image_url', image_url: { url: imageUrl } }],
+                  },
+                },
+              ],
+            },
+          },
+          {
+            type: 'delta',
+            chunk: { choices: [{ delta: {}, finish_reason: 'stop' }] },
+          },
+        ),
+    })
+
+    await within(downloadStarted, 'generated-output download start')
+    const result = await within(sendPromise, 'canonical generated-output commit')
+    expect(result.outcome).toBe('done')
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(downloadSignal).toBeDefined()
+
+    const assistant = liveMessagesSortedByCreated(await messagesFor(chat.id)).find(
+      (message) => message.role === 'assistant',
+    )
+    expect(assistant?.generation?.status).toBe('done')
+    const output = assistant?.content.find((item) => item.type === 'output_image')
+    expect(output).toEqual({ type: 'output_image', url: imageUrl })
+    expect(assistant?.attachmentRefs).toHaveLength(0)
+
+    invalidatePostCommitTasks()
+    await within(__flushPostCommitCalibrationForTests(), 'generated-output cancellation')
+    expect(downloadSignal?.aborted).toBe(true)
+    expect((await getBrowserRepository().getMessage(assistant?.id ?? ''))?.content).toContainEqual({
+      type: 'output_image',
+      url: imageUrl,
+    })
+  })
+
+  it('does not let delayed generated-output localization overwrite an assistant edit', async () => {
+    const chat = await createChat({
+      settings: chatSettings({ model: 'black-forest-labs/flux.2-klein-4b', systemPrompt: '' }),
+    })
+    const imageUrl = 'https://cdn.example/generated.png'
+    let markDownloadStarted!: () => void
+    const downloadStarted = new Promise<void>((resolve) => {
+      markDownloadStarted = resolve
+    })
+    let finishDownload!: (response: Response) => void
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((_url: string | URL | Request, init?: RequestInit) => {
+        markDownloadStarted()
+        return new Promise<Response>((resolve, reject) => {
+          finishDownload = resolve
+          const rejectAbort = () => reject(new DOMException('aborted', 'AbortError'))
+          if (init?.signal?.aborted) rejectAbort()
+          else init?.signal?.addEventListener('abort', rejectAbort, { once: true })
+        })
+      }),
+    )
+
+    const resultPromise = sendText({
+      chatId: chat.id,
+      connection: makeProfile(),
+      apiKey: 'sk-test',
+      content: [{ type: 'text', text: 'draw it' }],
       openStream: () =>
         stream(
           {
@@ -2386,23 +2502,29 @@ describe('sendText — token calibration sample ingest', () => {
     })
 
     await downloadStarted
-    controller.abort()
-    const result = await sendPromise
-    expect(result.outcome).toBe('done')
-    expect(fetchMock).toHaveBeenCalledTimes(1)
-
-    const assistant = liveMessagesSortedByCreated(await messagesFor(chat.id)).find(
-      (message) => message.role === 'assistant',
+    const result = await resultPromise
+    const assistant = await getBrowserRepository().getMessage(result.assistantMessageId)
+    expect(assistant?.content).toContainEqual({ type: 'output_image', url: imageUrl })
+    await getBrowserRepository().runMutation(
+      [{ kind: 'message', messageId: result.assistantMessageId }],
+      (ctx) =>
+        ctx.patchMessageBody(result.assistantMessageId, {
+          content: [{ type: 'output_text', text: 'edited while media was downloading' }],
+        }),
     )
-    expect(assistant?.generation?.status).toBe('done')
-    const output = assistant?.content.find((item) => item.type === 'output_image')
-    const attachmentId = output?.type === 'output_image' ? output.attachmentId : undefined
-    expect(attachmentId).toBeTruthy()
-    const bundle = attachmentId
-      ? await getBrowserRepository().getAttachmentBundle(attachmentId)
-      : undefined
-    expect(bundle?.attachment.storage).toEqual({ kind: 'remote-url', url: imageUrl })
-    expect(bundle?.blobs).toHaveLength(0)
+
+    finishDownload(
+      new Response(new Blob(['png'], { type: 'image/png' }), {
+        status: 200,
+        headers: { 'content-type': 'image/png' },
+      }),
+    )
+    await __flushPostCommitCalibrationForTests()
+
+    expect(await getBrowserRepository().getMessage(result.assistantMessageId)).toMatchObject({
+      content: [{ type: 'output_text', text: 'edited while media was downloading' }],
+    })
+    expect(await getDb().attachments.count()).toBe(0)
   })
 
   it('populates per-message calibration fields on user + assistant messages', async () => {
@@ -2427,6 +2549,7 @@ describe('sendText — token calibration sample ingest', () => {
           },
         ),
     })
+    await __flushPostCommitCalibrationForTests()
     const all = liveMessagesSortedByCreated(await messagesFor(chat.id))
     const [user, assistant] = all as [Message, Message]
     // User message fields
@@ -2669,6 +2792,7 @@ describe('sendText — token calibration sample ingest', () => {
           },
         ),
     })
+    await __flushPostCommitCalibrationForTests()
     const chatRow = await getBrowserRepository().getChat(chat.id)
     // Neither prompt nor completion sample should land: both too short /
     // ratio out of bounds (completion 2 chars / 1 token is also outside).
@@ -2797,6 +2921,28 @@ describe('recoverOrphans', () => {
         finishedAt: recoveryNow,
       },
     })
+  })
+
+  it('deletes a targeted generation admission when its reserved row never committed', async () => {
+    const manager = new TestExclusiveLockManager()
+    __setStreamLockManagerForTests(manager)
+    const chat = await createChat({ settings: chatSettings() })
+    const repo = getBrowserRepository()
+    const recoveryNow = Date.now()
+    await repo.upsertStreamLease({
+      streamId: 'reserved-target-without-row',
+      chatId: chat.id,
+      messageId: 'assistant-id-reserved-before-placeholder',
+      ownerClientId: 'closed-tab',
+      startedAt: recoveryNow,
+      heartbeatAt: recoveryNow,
+      attemptKind: 'generation',
+    })
+
+    expect(await repo.getMessage('assistant-id-reserved-before-placeholder')).toBeUndefined()
+    expect(await recoverOrphans(recoveryNow, chat.id)).toBe(1)
+    expect(await repo.listStreamLeases(chat.id)).toEqual([])
+    expect(await repo.getMessage('assistant-id-reserved-before-placeholder')).toBeUndefined()
   })
 
   it.each([

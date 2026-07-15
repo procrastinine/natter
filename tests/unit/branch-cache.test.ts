@@ -529,6 +529,108 @@ describe('branch-cache store', () => {
     expect(await getDb().chatBranchCache.get('chat-cache')).toBeUndefined()
   })
 
+  it('invalidates and fences the branch cache for deferred on-path body updates', async () => {
+    const revision = Date.now()
+    const user = message({
+      id: 'deferred-user',
+      content: [{ type: 'text', text: 'user words' }],
+    })
+    const assistant = message({
+      id: 'deferred-assistant',
+      role: 'assistant',
+      parentId: user.id,
+      createdAt: 2,
+      content: [{ type: 'output_text', text: 'raw answer' }],
+    })
+    const stale = buildBranchCacheRow({
+      chatId: 'chat-cache',
+      branchLeafId: assistant.id,
+      messages: [user, assistant],
+      generatedAt: revision,
+    })
+    const before = await seedChat({
+      updatedAt: 7,
+      lastUpdatedLeafId: assistant.id,
+      lastBranchUpdatedAt: revision,
+      summaryVersion: 4,
+      wordCount: stale.wordCount,
+    })
+    await putTestMessages([user, assistant])
+    await getDb().chatBranchCache.put(stale)
+    const repo = getBrowserRepository()
+    const expected = chatBranchCacheWriteGuard(
+      before,
+      (await repo.getWorkspaceMeta()).replacementEpoch,
+    )
+    const now = vi.spyOn(Date, 'now').mockReturnValue(revision)
+    try {
+      await repo.runMutation([{ kind: 'message', messageId: assistant.id }], async (ctx) => {
+        await ctx.patchMessageBody(
+          assistant.id,
+          { content: [{ type: 'output_text', text: 'localized answer' }] },
+          { touchChatSummary: false, broadcast: false },
+        )
+      })
+    } finally {
+      now.mockRestore()
+    }
+
+    const after = await getDb().chats.get('chat-cache')
+    expect(after?.lastBranchUpdatedAt).toBe(revision + 1)
+    expect(after?.updatedAt).toBe(before.updatedAt)
+    expect(after?.summaryVersion).toBe(before.summaryVersion)
+    expect(await getDb().chatBranchCache.get('chat-cache')).toBeUndefined()
+    await expect(repo.putChatBranchCache(stale, expected)).resolves.toBeUndefined()
+    expect(await getDb().chatBranchCache.get('chat-cache')).toBeUndefined()
+  })
+
+  it('retains the branch cache for deferred off-path body updates', async () => {
+    const root = message({ id: 'deferred-root', content: [{ type: 'text', text: 'root' }] })
+    const selected = message({
+      id: 'deferred-selected',
+      role: 'assistant',
+      parentId: root.id,
+      siblingIndex: 1,
+      createdAt: 3,
+      content: [{ type: 'output_text', text: 'selected' }],
+    })
+    const offPath = message({
+      id: 'deferred-off-path',
+      role: 'assistant',
+      parentId: root.id,
+      createdAt: 2,
+      content: [{ type: 'output_text', text: 'old' }],
+    })
+    const cached = buildBranchCacheRow({
+      chatId: 'chat-cache',
+      branchLeafId: selected.id,
+      messages: [root, selected],
+      generatedAt: 20,
+    })
+    await seedChat({
+      lastUpdatedLeafId: selected.id,
+      lastBranchUpdatedAt: 10,
+      summaryVersion: 3,
+      wordCount: cached.wordCount,
+    })
+    await putTestMessages([root, selected, offPath])
+    await getDb().chatBranchCache.put(cached)
+
+    await getBrowserRepository().runMutation(
+      [{ kind: 'message', messageId: offPath.id }],
+      async (ctx) => {
+        await ctx.patchMessageBody(
+          offPath.id,
+          { content: [{ type: 'output_text', text: 'localized off path' }] },
+          { touchChatSummary: false, broadcast: false },
+        )
+      },
+    )
+
+    expect((await getDb().chats.get('chat-cache'))?.lastBranchUpdatedAt).toBe(10)
+    expect(await getDb().chatBranchCache.get('chat-cache')).toEqual(cached)
+  })
+
   it('rejects a stale lazy cache write after the last-updated leaf changes', async () => {
     const root = message({ id: 'leaf-cas-root', content: [{ type: 'text', text: 'root words' }] })
     const oldLeaf = message({

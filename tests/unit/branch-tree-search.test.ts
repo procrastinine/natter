@@ -79,6 +79,17 @@ describe('branch-tree text reads', () => {
     expect(richerPreview?.endsWith('…')).toBe(true)
   })
 
+  it('rejects an already-cancelled preview read', async () => {
+    await putMessage(message('preview-cancelled', 'preview'))
+    const controller = new AbortController()
+    controller.abort()
+    await expect(
+      getBrowserRepository().getMessageTextPreview('preview-cancelled', {
+        signal: controller.signal,
+      }),
+    ).rejects.toMatchObject({ name: 'AbortError' })
+  })
+
   it('rejects an already-cancelled search before retaining results', async () => {
     await putMessage(message('match', 'needle'))
     const controller = new AbortController()

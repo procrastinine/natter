@@ -34,14 +34,22 @@ test('connection deletion is blocked while its seeded preset remains active', as
   await expect(dialog.getByRole('button', { name: 'Delete', exact: true })).toBeDisabled()
 })
 
-test('composer reports an approximate draft-token count', async ({ page }) => {
+test('composer uses exact zero and one labels before approximating longer drafts', async ({
+  page,
+}) => {
   await page.locator('[data-role="new-chat"]').click()
-  await page.locator('[data-ui="composer-input"]').fill('count this draft')
+  const input = page.locator('[data-ui="composer-input"]')
+  const counter = page.locator('[data-ui="token-counter"]')
 
-  await expect(page.locator('[data-ui="token-counter"]')).toHaveText('≈ 4 draft tokens')
-  await expect(page.locator('[data-ui="token-counter"]')).toHaveAttribute(
+  await expect(counter).toHaveText('0 draft tokens')
+  await input.fill('x')
+  await expect(counter).toHaveText('1 draft token')
+  await input.fill('count this draft')
+
+  await expect(counter).toHaveText('≈ 4 draft tokens')
+  await expect(counter).toHaveAttribute(
     'title',
-    /Approximate pending text only/u,
+    /drafts longer than one character are approximate/u,
   )
 })
 

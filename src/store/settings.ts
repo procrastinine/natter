@@ -5,7 +5,7 @@
 import { postEvent } from './broadcast'
 import { getDb } from './db'
 import { withNamedLock } from './locks'
-import { bumpBrowserWorkspaceMeta } from './workspace-meta'
+import { bumpBrowserWorkspaceMeta, readBrowserWorkspaceMetaFromTransaction } from './workspace-meta'
 
 function stableStringify(value: unknown): string {
   return JSON.stringify(value)
@@ -54,6 +54,7 @@ export async function deleteSetting(key: string): Promise<void> {
 export async function updateSetting<T>(
   key: string,
   updater: (current: T | undefined) => T | undefined | Promise<T | undefined>,
+  options: { expectedReplacementEpoch?: number } = {},
 ): Promise<T | undefined> {
   return withNamedLock(`setting:${key}`, async (grant) => {
     const db = getDb()
@@ -61,6 +62,10 @@ export async function updateSetting<T>(
     const next = await grant.runTransaction(db, [db.settings], async (tx) => {
       const settings = tx.table<{ key: string; value: unknown }, string>('settings')
       const current = (await settings.get(key))?.value as T | undefined
+      if (options.expectedReplacementEpoch !== undefined) {
+        const meta = await readBrowserWorkspaceMetaFromTransaction(tx)
+        if (meta.replacementEpoch !== options.expectedReplacementEpoch) return current
+      }
       const updated = await updater(current)
       if (updated === undefined) {
         if (current === undefined) return undefined

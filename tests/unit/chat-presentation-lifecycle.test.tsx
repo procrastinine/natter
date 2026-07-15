@@ -28,6 +28,7 @@ const HEADER = {
   role: 'user',
   origin: 'user',
   nodeVersion: 0,
+  requestContextVersion: 0,
   bodyVersion: 0,
   bodyWordCount: 1,
   textPreview: 'retained',

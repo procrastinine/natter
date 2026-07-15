@@ -1,7 +1,11 @@
+import { render, waitFor } from '@testing-library/react'
 import Dexie from 'dexie'
+import { createElement } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from '../../src/api/errors'
 import type { ChatStreamChunk } from '../../src/api/types'
+import { createMessageTreeProjection } from '../../src/core/active-path'
+import { layoutBranchTree } from '../../src/core/branch-tree-layout'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import type { ChatSettings, ConnectionProfile, ContentItem, Message } from '../../src/core/types'
 import { recoverOrphans, sendText } from '../../src/hooks/useChat'
@@ -22,6 +26,7 @@ import { useAnnouncementStore } from '../../src/store/zustand/announcementStore'
 import { useChatStore } from '../../src/store/zustand/chatStore'
 import { useStreamStore } from '../../src/store/zustand/streamStore'
 import { useUiStore } from '../../src/store/zustand/uiStore'
+import { BranchTreeView } from '../../src/ui/chat/BranchTreeView'
 
 const DB_NAME = 'natter'
 const MODEL = 'openai/gpt-4o'
@@ -130,14 +135,14 @@ function expectLifecycle(
 ): string {
   const lifecycle = streamEvents(events)
   expect(lifecycle).toHaveLength(3)
-  const [untargeted, targeted, ended] = lifecycle
-  expect(untargeted).toMatchObject({
+  const [admitted, published, ended] = lifecycle
+  expect(admitted).toMatchObject({
     kind: 'stream-started',
     replacementEpoch: 0,
     chatId: expected.chatId,
+    messageId: expected.messageId,
   })
-  expect(untargeted).not.toHaveProperty('messageId')
-  expect(targeted).toMatchObject({
+  expect(published).toMatchObject({
     kind: 'stream-started',
     replacementEpoch: 0,
     chatId: expected.chatId,
@@ -150,9 +155,9 @@ function expectLifecycle(
     messageId: expected.messageId,
     outcome: expected.outcome,
   })
-  expect(targeted?.streamId).toBe(untargeted?.streamId)
-  expect(ended?.streamId).toBe(untargeted?.streamId)
-  return expectDefined(untargeted?.streamId, 'stream id')
+  expect(published?.streamId).toBe(admitted?.streamId)
+  expect(ended?.streamId).toBe(admitted?.streamId)
+  return expectDefined(admitted?.streamId, 'stream id')
 }
 
 async function eventually(assertion: () => Promise<void> | void): Promise<void> {
@@ -188,6 +193,35 @@ function completionChunk(text = ''): ChatStreamChunk {
 
 async function* finiteStream(...chunks: ChatStreamChunk[]): AsyncGenerator<ChatStreamChunk> {
   for (const chunk of chunks) yield chunk
+}
+
+function delayedMalformedResponsesStream(): Response {
+  const encoder = new TextEncoder()
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(encoder.encode(': upstream still working\n\n'))
+      queueMicrotask(() => {
+        controller.enqueue(
+          encoder.encode(
+            [
+              'event: response.output_text.delta',
+              'data: {"type":"response.output_text.delta","delta":{"text":"wrong-shape"},"output_index":0,"content_index":0}',
+              '',
+              'event: response.completed',
+              'data: {"type":"response.completed","response":{"status":"completed"}}',
+              '',
+              '',
+            ].join('\n'),
+          ),
+        )
+        controller.close()
+      })
+    },
+  })
+  return new Response(stream, {
+    status: 200,
+    headers: { 'content-type': 'text/event-stream' },
+  })
 }
 
 function throwingStream(error: unknown): AsyncIterable<ChatStreamChunk> {
@@ -286,7 +320,7 @@ async function expectSettled(streamId: string, _messageId: string): Promise<void
 }
 
 describe('generation lifecycle contract', () => {
-  it('finalizes the placeholder and never dispatches when lease retargeting fails', async () => {
+  it('never creates the placeholder or dispatches when the pre-commit lease refresh fails', async () => {
     const chat = await createChat({ settings: settings() })
     const repo = getBrowserRepository()
     vi.spyOn(repo, 'renewStreamLease').mockRejectedValueOnce(new Error('retarget failed'))
@@ -310,17 +344,13 @@ describe('generation lifecycle contract', () => {
     expect(openStream).not.toHaveBeenCalled()
     const messages = await repo.listMessages(chat.id)
     const assistant = messages.find((message) => message.role === 'assistant')
-    expect(assistant?.generation).toMatchObject({
-      status: 'error',
-      error: { category: 'storage' },
-    })
-    expect(assistant?.generation?.finishedAt).toBeDefined()
+    expect(assistant).toBeUndefined()
     expect(messages.some((message) => message.generation?.status === 'streaming')).toBe(false)
     expect(await repo.listStreamLeases(chat.id)).toEqual([])
     expect(await repo.listStreamChunksForChat(chat.id)).toEqual([])
   })
 
-  it('send orders untargeted/targeted start before one provider open and settles lease/chunks', async () => {
+  it('send admits and republishes one exact target before provider open and settles lease/chunks', async () => {
     const chat = await createChat({ settings: settings() })
     useUiStore.getState().setActiveChatId(chat.id)
     const capture = captureBroadcasts()
@@ -333,12 +363,13 @@ describe('generation lifecycle contract', () => {
     const openStream = vi.fn((open: { signal: AbortSignal }) => {
       const starts = streamEvents(capture.events)
       expect(starts).toHaveLength(2)
-      expect(starts[0]).not.toHaveProperty('messageId')
+      expect(starts[0]).toMatchObject({ kind: 'stream-started', attemptKind: 'generation' })
       targetMessageId = expectDefined(
-        starts[1]?.kind === 'stream-started' ? starts[1].messageId : undefined,
+        starts[0]?.kind === 'stream-started' ? starts[0].messageId : undefined,
         'send target',
       )
-      streamId = expectDefined(starts[1]?.streamId, 'send stream')
+      expect(starts[1]).toMatchObject({ messageId: targetMessageId })
+      streamId = expectDefined(starts[0]?.streamId, 'send stream')
       expect(useStreamStore.getState().getActive(streamId)?.messageId).toBe(targetMessageId)
       return {
         async *[Symbol.asyncIterator]() {
@@ -465,6 +496,50 @@ describe('generation lifecycle contract', () => {
     await expectSettled(result.streamId, result.assistantMessageId)
   })
 
+  it('finalizes a silent-stream watchdog timeout and leaves the branch readable', async () => {
+    const chat = await createChat({ settings: settings() })
+    const timeout = new ApiError({
+      kind: 'timeout',
+      code: 'TIMEOUT',
+      message: 'Request timed out',
+      midStream: true,
+      retryable: true,
+    })
+
+    const result = await sendText({
+      chatId: chat.id,
+      connection: profile(),
+      apiKey: 'sk-test',
+      content: [{ type: 'text', text: 'silent stream' }],
+      openStream: () => throwingStream(timeout),
+    })
+
+    expect(result).toMatchObject({ outcome: 'error', error: timeout })
+    const repo = getBrowserRepository()
+    const assistant = expectDefined(
+      await repo.getMessage(result.assistantMessageId),
+      'timed-out assistant',
+    )
+    expect(assistant.content).toEqual([{ type: 'output_text', text: '' }])
+    expect(assistant.generation).toMatchObject({
+      status: 'error',
+      error: {
+        category: 'network',
+        code: 'TIMEOUT',
+        retryable: true,
+        midStream: true,
+      },
+    })
+    await expectSettled(result.streamId, result.assistantMessageId)
+
+    const headers = await repo.listMessageHeaders(chat.id)
+    const projection = createMessageTreeProjection(headers)
+    expect(layoutBranchTree(projection.nodes).byId.has(result.assistantMessageId)).toBe(true)
+    await expect(
+      repo.getMessagePresentationSnapshot(result.assistantMessageId),
+    ).resolves.toMatchObject({ message: { id: result.assistantMessageId } })
+  })
+
   it('accepts a chat [DONE] sentinel as clean terminal evidence', async () => {
     const chat = await createChat({ settings: { ...settings(), api: 'chat' } })
     vi.stubGlobal(
@@ -497,6 +572,81 @@ describe('generation lifecycle contract', () => {
     expect(assistant.generation?.error).toBeUndefined()
   })
 
+  it('finalizes a delayed malformed Responses content frame before branch-tree reads', async () => {
+    const chat = await createChat({ settings: { ...settings(), api: 'responses' } })
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => delayedMalformedResponsesStream()),
+    )
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    const result = await sendText({
+      chatId: chat.id,
+      connection: profile(),
+      apiKey: 'sk-test',
+      content: [{ type: 'text', text: 'malformed frame lifecycle' }],
+    })
+
+    expect(result).toMatchObject({ outcome: 'done', finishReason: 'stop' })
+    const repo = getBrowserRepository()
+    const assistant = expectDefined(
+      await repo.getMessage(result.assistantMessageId),
+      'malformed-frame assistant',
+    )
+    expect(assistant.content).toEqual([{ type: 'output_text', text: '' }])
+    expect(assistant.generation).toMatchObject({
+      apiUsed: 'responses',
+      status: 'done',
+      integrity: 'degraded',
+      integritySummary: {
+        count: 1,
+        entries: [
+          {
+            category: 'malformed-event-shape',
+            adapter: 'responses',
+            eventType: 'response.output_text.delta',
+            count: 1,
+          },
+        ],
+      },
+    })
+    expect(assistant.generation?.error).toBeUndefined()
+    await expectSettled(result.streamId, result.assistantMessageId)
+
+    const headers = await repo.listMessageHeaders(chat.id)
+    const projection = createMessageTreeProjection(headers)
+    const layout = layoutBranchTree(projection.nodes)
+    expect(layout.byId.has(result.assistantMessageId)).toBe(true)
+    await expect(repo.getMessageTextPreview(result.assistantMessageId)).resolves.toBe('')
+    const presentation = expectDefined(
+      await repo.getMessagePresentationSnapshot(result.assistantMessageId),
+      'malformed-frame presentation',
+    )
+    expect(presentation.message).toEqual(assistant)
+    expect(typeof presentation.bodyVersion).toBe('number')
+
+    const tree = render(
+      createElement(BranchTreeView, {
+        chatId: chat.id,
+        headers,
+        projection,
+        cursor: {},
+        expanded: false,
+        selectedNodeId: result.assistantMessageId,
+        repository: repo,
+        onActivateNode: () => undefined,
+        onSelectNode: () => undefined,
+      }),
+    )
+    await waitFor(() =>
+      expect(document.querySelector('[data-ui="branch-tree-inspector"]')).toHaveAttribute(
+        'data-message-id',
+        result.assistantMessageId,
+      ),
+    )
+    tree.unmount()
+  })
+
   it('Continue has the same event ordering, durable chunks, cleanup, and attempt history', async () => {
     const chat = await createChat({ settings: settings() })
     useUiStore.getState().setActiveChatId(chat.id)
@@ -510,10 +660,18 @@ describe('generation lifecycle contract', () => {
     const openStream = vi.fn(() => {
       const starts = streamEvents(capture.events)
       expect(starts).toHaveLength(2)
-      expect(starts[0]).not.toHaveProperty('messageId')
+      expect(starts[0]).toMatchObject({
+        kind: 'stream-started',
+        messageId: target.id,
+        attemptKind: 'continuation',
+      })
       expect(starts[1]).toMatchObject({ kind: 'stream-started', messageId: target.id })
-      streamId = expectDefined(starts[1]?.streamId, 'Continue stream')
-      expect(useStreamStore.getState().getActive(streamId)?.messageId).toBe(target.id)
+      streamId = expectDefined(starts[0]?.streamId, 'Continue stream')
+      expect(useStreamStore.getState().getActive(streamId)).toMatchObject({
+        messageId: target.id,
+        attemptKind: 'continuation',
+        originNavigationRevision: useChatStore.getState().getNavigationRevision(chat.id),
+      })
       return {
         async *[Symbol.asyncIterator]() {
           await eventually(async () => {
@@ -720,6 +878,7 @@ describe('generation lifecycle contract', () => {
       content: [{ type: 'text', text: 'abort send' }],
       openStream: sendOpen,
     })
+    await eventually(() => expect(sendOpen).toHaveBeenCalledTimes(1))
     let sendActive: { streamId: string; messageId?: string; replacementEpoch: number } | undefined
     await eventually(() => {
       sendActive = useStreamStore
@@ -767,6 +926,7 @@ describe('generation lifecycle contract', () => {
       apiKey: 'sk-test',
       openStream: continueOpen,
     })
+    await eventually(() => expect(continueOpen).toHaveBeenCalledTimes(1))
     let continueStreamId: string | undefined
     await eventually(() => {
       continueStreamId = useStreamStore
@@ -962,10 +1122,10 @@ describe('generation lifecycle contract', () => {
     const openStream = vi.fn(() => {
       const starts = streamEvents(capture.events)
       targetMessageId = expectDefined(
-        starts[1]?.kind === 'stream-started' ? starts[1].messageId : undefined,
+        starts[0]?.kind === 'stream-started' ? starts[0].messageId : undefined,
         'failed send target',
       )
-      streamId = expectDefined(starts[1]?.streamId, 'failed send stream')
+      streamId = expectDefined(starts[0]?.streamId, 'failed send stream')
       return {
         async *[Symbol.asyncIterator]() {
           yield {
@@ -1042,7 +1202,16 @@ describe('generation lifecycle contract', () => {
     const originalRunMutation = repo.runMutation.bind(repo)
     let injectedFailure = false
     vi.spyOn(repo, 'runMutation').mockImplementation(async (scopes, fn, options) => {
-      if (!injectedFailure && options?.streamFence) {
+      const lease = options?.streamFence
+        ? (await repo.listStreamLeases(chat.id)).find(
+            (row) => row.streamId === options.streamFence?.streamId,
+          )
+        : undefined
+      const targetExists = lease?.messageId ? await repo.getMessage(lease.messageId) : undefined
+      const isTargetMutation = lease?.messageId
+        ? scopes.some((scope) => scope.kind === 'message' && scope.messageId === lease.messageId)
+        : false
+      if (!injectedFailure && options?.streamFence && targetExists && isTargetMutation) {
         injectedFailure = true
         throw new Error('injected truncated-stream final write failure')
       }
@@ -1105,7 +1274,16 @@ describe('generation lifecycle contract', () => {
     const originalRunMutation = repo.runMutation.bind(repo)
     let injectedFailure = false
     vi.spyOn(repo, 'runMutation').mockImplementation(async (scopes, fn, options) => {
-      if (!injectedFailure && options?.streamFence) {
+      const lease = options?.streamFence
+        ? (await repo.listStreamLeases(chat.id)).find(
+            (row) => row.streamId === options.streamFence?.streamId,
+          )
+        : undefined
+      const targetExists = lease?.messageId ? await repo.getMessage(lease.messageId) : undefined
+      const isTargetMutation = lease?.messageId
+        ? scopes.some((scope) => scope.kind === 'message' && scope.messageId === lease.messageId)
+        : false
+      if (!injectedFailure && options?.streamFence && targetExists && isTargetMutation) {
         injectedFailure = true
         throw new Error('injected network-failure final write failure')
       }
@@ -1177,6 +1355,7 @@ describe('generation lifecycle contract', () => {
   it('prevents a recovered stream from being overwritten by a stale send finalizer', async () => {
     const chat = await createChat({ settings: settings() })
     const repo = getBrowserRepository()
+    const durableTail = 'race-safe send'.repeat(12_000)
     const originalRunMutation = repo.runMutation.bind(repo)
     let claimedStreamId: string | undefined
     let claimAt = 0
@@ -1186,10 +1365,26 @@ describe('generation lifecycle contract', () => {
           (lease) => lease.streamId === options.streamFence?.streamId,
         )
         if (!expected) throw new Error('expected live send lease before finalization')
-        claimAt = Date.now()
-        const claimed = await repo.claimStreamLeaseForRecovery(expected, claimAt)
-        if (!claimed) throw new Error('expected send recovery claim')
-        claimedStreamId = claimed.streamId
+        const targetExists = expected.messageId
+          ? await repo.getMessage(expected.messageId)
+          : undefined
+        const isTargetMutation = expected.messageId
+          ? scopes.some(
+              (scope) => scope.kind === 'message' && scope.messageId === expected.messageId,
+            )
+          : false
+        if (targetExists && isTargetMutation) {
+          claimAt = Date.now()
+          let claimed = await repo.claimStreamLeaseForRecovery(expected, claimAt)
+          if (!claimed) {
+            const refreshed = (await repo.listStreamLeases(chat.id)).find(
+              (lease) => lease.streamId === expected.streamId,
+            )
+            if (refreshed) claimed = await repo.claimStreamLeaseForRecovery(refreshed, claimAt)
+          }
+          if (!claimed) throw new Error('expected send recovery claim')
+          claimedStreamId = claimed.streamId
+        }
       }
       return originalRunMutation(scopes, fn, options)
     })
@@ -1200,7 +1395,7 @@ describe('generation lifecycle contract', () => {
         connection: profile(),
         apiKey: 'sk-test',
         content: [{ type: 'text', text: 'stale send race' }],
-        openStream: () => finiteStream(completionChunk('race-safe send')),
+        openStream: () => finiteStream(completionChunk(durableTail)),
       }),
     ).rejects.toThrow(/StreamFenceLost:/u)
 
@@ -1216,7 +1411,7 @@ describe('generation lifecycle contract', () => {
       (await repo.listMessages(chat.id)).find((message) => message.role === 'assistant'),
       'recovered assistant',
     )
-    expect(recovered.content).toEqual([{ type: 'output_text', text: 'race-safe send' }])
+    expect(recovered.content).toEqual([{ type: 'output_text', text: durableTail }])
     expect(await repo.listStreamLeases(chat.id)).toEqual([])
     expect(await repo.listStreamChunks(streamId)).toEqual([])
   })
@@ -1563,7 +1758,7 @@ describe('generation lifecycle contract', () => {
     })
     const openStream = vi.fn(() => {
       const starts = streamEvents(capture.events)
-      streamId = expectDefined(starts[1]?.streamId, 'failed Continue stream')
+      streamId = expectDefined(starts[0]?.streamId, 'failed Continue stream')
       return {
         async *[Symbol.asyncIterator]() {
           yield {
@@ -1634,19 +1829,41 @@ describe('generation lifecycle contract', () => {
     const chat = await createChat({ settings: settings() })
     const target = await seedAssistant(chat.id, 'continue-stale-finalizer')
     const repo = getBrowserRepository()
+    const durableTail = '-tail'.repeat(40_000)
     const originalRunMutation = repo.runMutation.bind(repo)
     let claimedStreamId: string | undefined
     let claimAt = 0
+    let fencedTargetMutationCount = 0
     vi.spyOn(repo, 'runMutation').mockImplementation(async (scopes, fn, options) => {
       if (!claimedStreamId && options?.streamFence) {
         const expected = (await repo.listStreamLeases(chat.id)).find(
           (lease) => lease.streamId === options.streamFence?.streamId,
         )
         if (!expected) throw new Error('expected live Continue lease before finalization')
-        claimAt = Date.now()
-        const claimed = await repo.claimStreamLeaseForRecovery(expected, claimAt)
-        if (!claimed) throw new Error('expected Continue recovery claim')
-        claimedStreamId = claimed.streamId
+        const isTargetMutation = expected.messageId
+          ? scopes.some(
+              (scope) => scope.kind === 'message' && scope.messageId === expected.messageId,
+            )
+          : false
+        if (isTargetMutation) {
+          fencedTargetMutationCount += 1
+          // The first fenced target transaction is Continue's read-only
+          // pre-dispatch certificate. Claim at the subsequent final write so
+          // the durable journal already contains the provider result.
+          if (fencedTargetMutationCount === 1) {
+            return originalRunMutation(scopes, fn, options)
+          }
+          claimAt = Date.now()
+          let claimed = await repo.claimStreamLeaseForRecovery(expected, claimAt)
+          if (!claimed) {
+            const refreshed = (await repo.listStreamLeases(chat.id)).find(
+              (lease) => lease.streamId === expected.streamId,
+            )
+            if (refreshed) claimed = await repo.claimStreamLeaseForRecovery(refreshed, claimAt)
+          }
+          if (!claimed) throw new Error('expected Continue recovery claim')
+          claimedStreamId = claimed.streamId
+        }
       }
       return originalRunMutation(scopes, fn, options)
     })
@@ -1657,7 +1874,7 @@ describe('generation lifecycle contract', () => {
         targetMessageId: target.id,
         connection: profile(),
         apiKey: 'sk-test',
-        openStream: () => finiteStream(completionChunk('-tail')),
+        openStream: () => finiteStream(completionChunk(durableTail)),
       }),
     ).rejects.toThrow(/StreamFenceLost:/u)
 
@@ -1667,7 +1884,7 @@ describe('generation lifecycle contract', () => {
 
     expect(await recoverOrphans(claimAt + 60_000, chat.id)).toBe(1)
     const recovered = expectDefined(await repo.getMessage(target.id), 'recovered Continue target')
-    expect(recovered.content).toEqual([{ type: 'output_text', text: 'original-tail' }])
+    expect(recovered.content).toEqual([{ type: 'output_text', text: `original${durableTail}` }])
     expect(recovered.continuationAttempts).toHaveLength(1)
     expect(recovered.continuationAttempts?.[0]?.streamId).toBe(streamId)
     expect(await repo.listStreamLeases(chat.id)).toEqual([])

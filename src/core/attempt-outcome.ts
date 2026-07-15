@@ -27,6 +27,10 @@ const INTEGRITY_ADAPTERS = new Set<AttemptIntegrityEntry['adapter']>([
   'anthropic-messages',
   'text-completions',
 ])
+const INTEGRITY_CATEGORIES = new Set<AttemptIntegrityEntry['category']>([
+  'malformed-json-frame',
+  'malformed-event-shape',
+])
 
 export function toPersistedAttemptFailure(
   input: unknown,
@@ -78,12 +82,15 @@ export function normalizeAttemptIntegritySummary(
 
 function normalizeIntegrityEntry(input: unknown): AttemptIntegrityEntry | undefined {
   const record = objectRecord(input)
-  if (record?.category !== 'malformed-json-frame') return undefined
+  if (!record) return undefined
+  if (!INTEGRITY_CATEGORIES.has(record.category as AttemptIntegrityEntry['category'])) {
+    return undefined
+  }
   if (!INTEGRITY_ADAPTERS.has(record.adapter as AttemptIntegrityEntry['adapter'])) return undefined
   const fingerprint = boundedPlainString(record.fingerprint, 32)
   if (!fingerprint || !/^fnv1a32:[0-9a-f]{8}$/u.test(fingerprint)) return undefined
   return {
-    category: 'malformed-json-frame',
+    category: record.category as AttemptIntegrityEntry['category'],
     adapter: record.adapter as AttemptIntegrityEntry['adapter'],
     eventType: boundedPlainString(record.eventType, 80) ?? 'unknown',
     count: nonNegativeInteger(record.count),

@@ -26,7 +26,8 @@ import type {
   GenerateContentRequestWire,
   GenerateContentResponseWire,
 } from './gemini-types'
-import { decodeProviderJson, malformedJsonFrameReport, parseSSE } from './sse'
+import { validateGeminiResponse } from './provider-json-boundary'
+import { decodeProviderStreamFrame, decodeValidatedProviderJson, parseSSE } from './sse'
 import type { CallOpts } from './types'
 
 export interface GeminiContext extends ApiKeyDispatchContext {
@@ -121,7 +122,7 @@ async function* consumeGeminiStream(
   // despite `?alt=sse`, yield a buffered_result chunk so downstream code
   // can unify the consumer path.
   if (!/text\/event-stream/i.test(contentType)) {
-    const result = await decodeProviderJson<GenerateContentResponseWire>(response)
+    const result = await decodeValidatedProviderJson(response, validateGeminiResponse)
     yield generationId
       ? { type: 'buffered_result', result, generationId }
       : { type: 'buffered_result', result }
@@ -134,21 +135,20 @@ async function* consumeGeminiStream(
       yield { type: 'keepalive', comment: ev.comment }
       continue
     }
-    try {
-      const parsed = JSON.parse(ev.data) as GenerateContentResponseWire
-      yield generationId
-        ? { type: 'chunk', chunk: parsed, generationId }
-        : { type: 'chunk', chunk: parsed }
-    } catch (err) {
-      const report = malformedJsonFrameReport({
-        adapter: 'gemini-native',
-        eventType: ev.event,
-        data: ev.data,
-        error: err,
-      })
-      console.warn('geminiStream: malformed SSE chunk skipped', report.diagnostic)
-      yield { type: 'integrity', integrity: report.integrity }
+    const decoded = decodeProviderStreamFrame({
+      adapter: 'gemini-native',
+      eventType: ev.event,
+      data: ev.data,
+      validate: validateGeminiResponse,
+    })
+    if (!decoded.ok) {
+      console.warn('geminiStream: invalid SSE frame skipped', decoded.diagnostic)
+      yield { type: 'integrity', integrity: decoded.integrity }
+      continue
     }
+    yield generationId
+      ? { type: 'chunk', chunk: decoded.value, generationId }
+      : { type: 'chunk', chunk: decoded.value }
   }
 }
 
@@ -169,5 +169,5 @@ async function consumeGeminiOnce(
   dispatched: Promise<Response>,
 ): Promise<GenerateContentResponseWire> {
   const response = await dispatched
-  return decodeProviderJson<GenerateContentResponseWire>(response)
+  return decodeValidatedProviderJson(response, validateGeminiResponse)
 }

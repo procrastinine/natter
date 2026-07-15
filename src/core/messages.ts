@@ -1,6 +1,10 @@
 import { newId } from '../lib/ulid'
 import { attachmentRefsFromIds, attachmentScopes } from '../store/attachments'
-import type { MessageHeaderRow } from '../store/message-storage'
+import {
+  type MessageHeaderRow,
+  type MessagePresentation,
+  splitMessageForStorage,
+} from '../store/message-storage'
 import type {
   MutationContext,
   WorkspaceMutationResult,
@@ -8,6 +12,7 @@ import type {
 } from '../store/repository'
 import { getWorkspaceRepository } from '../store/workspace-repository'
 import {
+  activePathProjected,
   createDefaultChildPicker,
   createMessageTreeProjection,
   cursorKeyOf,
@@ -66,6 +71,9 @@ export interface DeleteResult {
   effects: StructuralEffects
   versions: ChatVersions
   preImage: StructuralSnapshot
+  selectedPathHeaders: MessageHeaderRow[]
+  structuralHeaders: MessageHeaderRow[]
+  presentations: MessagePresentation[]
 }
 
 const ZERO_VERSIONS: ChatVersions = { metaVersion: 0, summaryVersion: 0 }
@@ -500,6 +508,17 @@ export function structuralEffectsCursorPatch(
   return Object.assign(patch, effects.cursorUpdates)
 }
 
+export function structuralEffectsUndoCursorPatch(
+  cursor: Readonly<CursorMap>,
+  effects: Pick<StructuralEffects, 'cursorRemoveKeys' | 'cursorUpdates'>,
+): CursorPatch {
+  const patch: CursorPatch = {}
+  for (const key of new Set([...effects.cursorRemoveKeys, ...Object.keys(effects.cursorUpdates)])) {
+    patch[key] = cursor[key]
+  }
+  return patch
+}
+
 function deleteCandidateIds(scopes: readonly MutationScope[]): MessageId[] {
   const ids = new Set<MessageId>()
   for (const scope of scopes) {
@@ -619,15 +638,28 @@ async function executeDeleteMutation(
         parentId: row.parentId,
         siblingIndex: row.siblingIndex,
         deleted: row.deleted,
-        nodeVersion: row.nodeVersion,
+        requestContextVersion: row.requestContextVersion,
       })),
     }
-    return { effects, preImage }
+    const selectedPathHeaders = activePathProjected(
+      createMessageTreeProjection(await ctx.listMessageHeaders(input.chatId)),
+      applyStructuralEffectsToCursor({ ...input.cursor }, effects),
+    )
+    return {
+      effects,
+      preImage,
+      selectedPathHeaders,
+      structuralHeaders: changedAfterRows,
+      presentations: [],
+    }
   })
   return {
     effects: result.value.effects,
     versions: versionsFor(result, input.chatId),
     preImage: result.value.preImage,
+    selectedPathHeaders: result.value.selectedPathHeaders,
+    structuralHeaders: result.value.structuralHeaders,
+    presentations: result.value.presentations,
   }
 }
 
@@ -644,9 +676,14 @@ interface SendUserMessageInput {
   skipCalibration?: boolean
 }
 
-export async function sendUserMessage(
-  input: SendUserMessageInput,
-): Promise<{ effects: StructuralEffects; versions: ChatVersions; messageId: MessageId }> {
+export async function sendUserMessage(input: SendUserMessageInput): Promise<{
+  effects: StructuralEffects
+  versions: ChatVersions
+  messageId: MessageId
+  message: Message
+  header: MessageHeaderRow
+  branchHeaders: MessageHeaderRow[]
+}> {
   const repo = getWorkspaceRepository()
   const { chatId, expectedLeafId, content, attachmentRefs, now = Date.now() } = input
   const role = input.role ?? 'user'
@@ -696,7 +733,14 @@ export async function sendUserMessage(
   const effects = emptyEffects()
   effects.newMessageIds.push(messageId)
   if (result.hadExistingSiblings) effects.cursorUpdates[cursorKeyOf(expectedLeafId)] = messageId
-  return { effects, versions: result.versions, messageId }
+  return {
+    effects,
+    versions: result.versions,
+    messageId,
+    message: result.message,
+    header: result.header,
+    branchHeaders: result.branchHeaders,
+  }
 }
 
 interface RegenerateInput {
@@ -759,7 +803,7 @@ interface EditMessageInput {
 
 export async function editMessageContent(
   input: EditMessageInput,
-): Promise<{ versions: ChatVersions }> {
+): Promise<{ versions: ChatVersions; message: Message; header: MessageHeaderRow }> {
   const repo = getWorkspaceRepository()
   const target = await repo.getMessage(input.messageId)
   if (!target || target.chatId !== input.chatId || target.deleted) {
@@ -817,9 +861,15 @@ export async function editMessageContent(
         } else delete next.attachmentRefs
       }
       await ctx.putMessage(next)
+      const [message, header] = await Promise.all([
+        ctx.getMessage(input.messageId),
+        ctx.getMessageHeader(input.messageId),
+      ])
+      if (!message || !header) throw new Error(`EditMessagePresentationMissing:${input.messageId}`)
+      return { message, header }
     },
   )
-  return { versions: versionsFor(result, input.chatId) }
+  return { ...result.value, versions: versionsFor(result, input.chatId) }
 }
 
 export async function branchExplicit(params: {
@@ -875,9 +925,14 @@ interface InsertSiblingInput {
   now?: number
 }
 
-export async function insertSibling(
-  input: InsertSiblingInput,
-): Promise<{ effects: StructuralEffects; versions: ChatVersions; messageId: MessageId }> {
+export async function insertSibling(input: InsertSiblingInput): Promise<{
+  effects: StructuralEffects
+  versions: ChatVersions
+  messageId: MessageId
+  message: Message
+  header: MessageHeaderRow
+  branchHeaders: MessageHeaderRow[]
+}> {
   const repo = getWorkspaceRepository()
   const target = await repo.getMessageHeader(input.targetId)
   if (!target || target.chatId !== input.chatId || target.deleted) {
@@ -915,13 +970,40 @@ export async function insertSibling(
         input.attachmentRefs,
       )
       await ctx.putMessage(row)
+      const branchHeaders: MessageHeaderRow[] = []
+      let header = await ctx.getMessageHeader(messageId)
+      while (header) {
+        branchHeaders.push(header)
+        header = header.parentId ? await ctx.getMessageHeader(header.parentId) : undefined
+      }
+      branchHeaders.reverse()
+      const committedHeader = branchHeaders.at(-1)
+      if (!committedHeader || committedHeader.id !== messageId) {
+        throw new Error(`InsertSiblingPresentationMissing:${messageId}`)
+      }
+      const { header: expectedHeader } = splitMessageForStorage(row)
+      if (
+        committedHeader.nodeVersion !== expectedHeader.nodeVersion ||
+        committedHeader.bodyVersion !== expectedHeader.bodyVersion
+      ) {
+        throw new Error(`InsertSiblingPresentationVersionMismatch:${messageId}`)
+      }
       const effects = emptyEffects()
       effects.newMessageIds.push(messageId)
       effects.cursorUpdates[cursorKeyOf(current.parentId)] = messageId
-      return { effects, messageId }
+      return {
+        effects,
+        messageId,
+        message: structuredClone(row),
+        header: committedHeader,
+        branchHeaders,
+      }
     },
   )
-  return { effects: result.value.effects, versions: versionsFor(result, input.chatId), messageId }
+  return {
+    ...result.value,
+    versions: versionsFor(result, input.chatId),
+  }
 }
 
 interface InsertBetweenInput {
@@ -1049,6 +1131,7 @@ interface PasteImportInput {
   slot: PasteImportSlot
   cursor: CursorMap
   messages: readonly PasteImportMessageInput[]
+  presentationWindowLimit: number
   now?: number
 }
 
@@ -1057,6 +1140,9 @@ export async function pasteImport(input: PasteImportInput): Promise<{
   versions: ChatVersions
   newMessageIds: MessageId[]
   selectedPathMessageIds: MessageId[]
+  selectedPathHeaders: MessageHeaderRow[]
+  structuralHeaders: MessageHeaderRow[]
+  presentations: MessagePresentation[]
 }> {
   if (input.messages.length === 0) {
     return {
@@ -1064,6 +1150,9 @@ export async function pasteImport(input: PasteImportInput): Promise<{
       versions: ZERO_VERSIONS,
       newMessageIds: [],
       selectedPathMessageIds: [],
+      selectedPathHeaders: [],
+      structuralHeaders: [],
+      presentations: [],
     }
   }
   const repo = getWorkspaceRepository()
@@ -1106,9 +1195,17 @@ export async function pasteImport(input: PasteImportInput): Promise<{
         snapshot,
         input.now ?? Date.now(),
       )
+      const selectedPathHeaders = await selectedPathHeadersByLeaf(ctx, input.chatId, selectedLeafId)
       return {
         effects,
-        selectedPathMessageIds: await selectedPathByLeaf(ctx, input.chatId, selectedLeafId),
+        selectedPathHeaders,
+        structuralHeaders: await structuralHeadersForEffects(ctx, input.chatId, effects),
+        presentations: await selectedPathPresentations(
+          ctx,
+          input.chatId,
+          selectedPathHeaders,
+          input.presentationWindowLimit,
+        ),
       }
     }
 
@@ -1181,9 +1278,17 @@ export async function pasteImport(input: PasteImportInput): Promise<{
       effects.cursorUpdates[cursorKeyOf(tail.id)] = displacedCursorTargetId
     }
 
+    const selectedPathHeaders = await selectedPathHeadersByLeaf(ctx, input.chatId, selectedLeafId)
     return {
       effects,
-      selectedPathMessageIds: await selectedPathByLeaf(ctx, input.chatId, selectedLeafId),
+      selectedPathHeaders,
+      structuralHeaders: await structuralHeadersForEffects(ctx, input.chatId, effects),
+      presentations: await selectedPathPresentations(
+        ctx,
+        input.chatId,
+        selectedPathHeaders,
+        input.presentationWindowLimit,
+      ),
     }
   })
 
@@ -1191,25 +1296,78 @@ export async function pasteImport(input: PasteImportInput): Promise<{
     effects: result.value.effects,
     versions: versionsFor(result, input.chatId),
     newMessageIds: result.value.effects.newMessageIds,
-    selectedPathMessageIds: result.value.selectedPathMessageIds,
+    selectedPathMessageIds: result.value.selectedPathHeaders.map((header) => header.id),
+    selectedPathHeaders: result.value.selectedPathHeaders,
+    structuralHeaders: result.value.structuralHeaders,
+    presentations: result.value.presentations,
   }
 }
 
-async function selectedPathByLeaf(
+async function structuralHeadersForEffects(
+  ctx: MutationContext,
+  chatId: ChatId,
+  effects: Pick<StructuralEffects, 'newMessageIds' | 'reparented' | 'tombstoned'>,
+): Promise<MessageHeaderRow[]> {
+  const ids = new Set<MessageId>([
+    ...effects.newMessageIds,
+    ...effects.reparented.map((effect) => effect.id),
+    ...effects.tombstoned,
+  ])
+  const headers: MessageHeaderRow[] = []
+  for (const id of ids) {
+    const header = await ctx.getMessageHeader(id)
+    if (!header || header.chatId !== chatId) {
+      throw new TreeChangedError(chatId, `structural result ${id} unavailable`)
+    }
+    headers.push(header)
+  }
+  return headers
+}
+
+async function selectedPathHeadersByLeaf(
   ctx: MutationContext,
   chatId: ChatId,
   leafId: MessageId,
-): Promise<MessageId[]> {
-  const reversed: MessageId[] = []
+): Promise<MessageHeaderRow[]> {
+  const reversed: MessageHeaderRow[] = []
   let currentId: MessageId | null = leafId
   while (currentId !== null) {
     const header = await ctx.getMessageHeader(currentId)
     if (!header || header.chatId !== chatId || header.deleted) break
-    reversed.push(header.id)
+    reversed.push(header)
     currentId = header.parentId
   }
   reversed.reverse()
+  if (reversed.at(-1)?.id !== leafId || reversed[0]?.parentId !== null) {
+    throw new TreeChangedError(chatId, `paste selected leaf ${leafId} unavailable`)
+  }
   return reversed
+}
+
+async function selectedPathPresentations(
+  ctx: MutationContext,
+  chatId: ChatId,
+  selectedPathHeaders: readonly MessageHeaderRow[],
+  windowLimit: number,
+): Promise<MessagePresentation[]> {
+  const boundedLimit = Number.isFinite(windowLimit) ? Math.max(1, Math.floor(windowLimit)) : 1
+  const visibleHeaders = selectedPathHeaders.slice(-boundedLimit)
+  const presentations: MessagePresentation[] = []
+  for (const header of visibleHeaders) {
+    const message = await ctx.getMessage(header.id)
+    if (
+      !message ||
+      message.chatId !== chatId ||
+      message.deleted ||
+      message.nodeVersion !== header.nodeVersion ||
+      message.parentId !== header.parentId ||
+      message.siblingIndex !== header.siblingIndex
+    ) {
+      throw new TreeChangedError(chatId, `paste selected message ${header.id} unavailable`)
+    }
+    presentations.push({ header, message, bodyVersion: header.bodyVersion })
+  }
+  return presentations
 }
 
 function pasteImportNavigationTarget(slot: PasteImportSlot): MessageId | null {

@@ -1668,7 +1668,7 @@ describe('workspace backup restore', () => {
   it.each([
     'normal send',
     'Continue',
-  ])('sees message-less %s admission with neither BroadcastChannel nor Web Locks', async (kind) => {
+  ])('sees pre-mutation %s admission with neither BroadcastChannel nor Web Locks', async (kind) => {
     const seeded = await seedPortableChat()
     const exported = await exportWorkspaceBackup()
     vi.stubGlobal('BroadcastChannel', undefined)
@@ -1676,16 +1676,28 @@ describe('workspace backup restore', () => {
     __resetBroadcastForTests()
     __setStreamLockManagerForTests(null)
     const streamId = kind === 'Continue' ? 'admitted-continue' : 'admitted-send'
-    const lifecycle = await startRequestLifecycle({
-      chatId: seeded.chat.id,
-      streamId,
-      attemptKind: kind === 'Continue' ? 'continuation' : 'generation',
-    })
+    const lifecycle = await startRequestLifecycle(
+      kind === 'Continue'
+        ? {
+            chatId: seeded.chat.id,
+            streamId,
+            messageId: seeded.assistantMessage.id,
+            attemptKind: 'continuation',
+          }
+        : {
+            chatId: seeded.chat.id,
+            streamId,
+            messageId: 'reserved-send-target',
+            attemptKind: 'generation',
+          },
+    )
     expect(await getDb().streamLeases.get(streamId)).toMatchObject({
       streamId,
       chatId: seeded.chat.id,
     })
-    expect(await getDb().streamLeases.get(streamId)).not.toHaveProperty('messageId')
+    expect(await getDb().streamLeases.get(streamId)).toMatchObject({
+      messageId: kind === 'Continue' ? seeded.assistantMessage.id : 'reserved-send-target',
+    })
     useStreamStore.getState().reset()
     __resetBroadcastForTests()
     const before = await authoritativeSnapshot()

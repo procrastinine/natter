@@ -30,15 +30,24 @@ import type {
   Message,
   MessageId,
 } from '../core/types'
-import { getChat } from '../store/chats'
+import {
+  type MessageAttachmentRefMutation,
+  mutateMessageAttachmentRef as mutateStoredMessageAttachmentRef,
+} from '../store/attachments'
+import {
+  dismissAbortReason as dismissStoredAbortReason,
+  getChat,
+  toggleMessageHidden as toggleStoredMessageHidden,
+} from '../store/chats'
 import {
   type ConnectionRuntimeKeyCandidate,
   resolveConnectionRuntimeKeys,
 } from '../store/connection-runtime'
+import type { MessageHeaderRow, MessagePresentation } from '../store/message-storage'
 import { bumpPresetLastUsedAt } from '../store/presets'
 import { bumpProfileLastUsedAt, getProfile } from '../store/profiles'
 import { getWorkspaceRepository } from '../store/workspace-repository'
-import type { NavigationIntent } from '../store/zustand/chatStore'
+import type { CommittedPathProducer, NavigationIntent } from '../store/zustand/chatStore'
 import { useChatStore } from '../store/zustand/chatStore'
 import { writeTextInto } from '../ui/chat/InlineEditor'
 import type { SendTextResult } from './useChat'
@@ -47,11 +56,13 @@ import { continueAssistantInPlace } from './useContinue'
 export interface MessageOpsContext {
   chatId: ChatId
   navigationIntent?: NavigationIntent
+  committedPathProducer?: CommittedPathProducer
   // Start a fresh assistant completion stream under an existing message
   // (used by Edit & Send and Regenerate). Supplied by `useChat`.
   sendFrom: (input: {
     chatId: ChatId
     navigationIntent: NavigationIntent
+    committedPathProducer: CommittedPathProducer
     connection: ConnectionProfile
     apiKey: string
     apiKeyCandidates?: readonly ConnectionRuntimeKeyCandidate[]
@@ -61,16 +72,47 @@ export interface MessageOpsContext {
   }) => Promise<SendTextResult>
 }
 
+interface LocalMessageMutationOptions {
+  pathHeaders?: readonly MessageHeaderRow[]
+}
+
+function selectedPathBeforeMutation(
+  chatId: ChatId,
+  options: LocalMessageMutationOptions,
+): readonly MessageHeaderRow[] | undefined {
+  return (
+    options.pathHeaders ?? useChatStore.getState().getCommittedPathPresentation(chatId)?.pathHeaders
+  )
+}
+
+function publishLocalMessageMutation(
+  chatId: ChatId,
+  sourcePath: readonly MessageHeaderRow[] | undefined,
+  presentation: MessagePresentation | undefined,
+): void {
+  if (!sourcePath || !presentation) return
+  useChatStore.getState().publishCommittedMessageMutation(chatId, sourcePath, presentation)
+}
+
 export async function editInPlace(
   chatId: ChatId,
   message: Message,
   newText: string,
+  options: LocalMessageMutationOptions = {},
 ): Promise<void> {
+  const store = useChatStore.getState()
+  const sourcePath = selectedPathBeforeMutation(chatId, options)
   const nextContent = writeTextInto(message.content, newText)
-  await editMessageContent({
+  const edited = await editMessageContent({
     chatId,
     messageId: message.id,
     content: nextContent,
+  })
+  if (!sourcePath) return
+  store.publishCommittedMessageMutation(chatId, sourcePath, {
+    header: edited.header,
+    message: edited.message,
+    bodyVersion: edited.header.bodyVersion,
   })
 }
 
@@ -78,9 +120,11 @@ export async function toggleReasoningDetailHidden(
   chatId: ChatId,
   messageId: MessageId,
   detailIndex: number,
+  options: LocalMessageMutationOptions = {},
 ): Promise<void> {
+  const sourcePath = selectedPathBeforeMutation(chatId, options)
   const repo = getWorkspaceRepository()
-  await repo.runMutation([{ kind: 'message', messageId }], async (ctx) => {
+  const result = await repo.runMutation([{ kind: 'message', messageId }], async (ctx) => {
     const current = await ctx.getMessage(messageId)
     if (!current || current.chatId !== chatId) return
     const details = current.reasoningDetails
@@ -89,16 +133,25 @@ export async function toggleReasoningDetailHidden(
     const nextDetails = [...details]
     nextDetails[detailIndex] = { ...detail, hidden: !detail.hidden }
     await ctx.putMessage({ ...current, reasoningDetails: nextDetails })
+    const [header, message] = await Promise.all([
+      ctx.getMessageHeader(messageId),
+      ctx.getMessage(messageId),
+    ])
+    if (!header || !message) return
+    return { header, message, bodyVersion: header.bodyVersion }
   })
+  publishLocalMessageMutation(chatId, sourcePath, result.value)
 }
 
 export async function toggleProviderOutputItemHidden(
   chatId: ChatId,
   messageId: MessageId,
   itemIndex: number,
+  options: LocalMessageMutationOptions = {},
 ): Promise<void> {
+  const sourcePath = selectedPathBeforeMutation(chatId, options)
   const repo = getWorkspaceRepository()
-  await repo.runMutation([{ kind: 'message', messageId }], async (ctx) => {
+  const result = await repo.runMutation([{ kind: 'message', messageId }], async (ctx) => {
     const current = await ctx.getMessage(messageId)
     if (!current || current.chatId !== chatId) return
     const items = current.providerOutputItems
@@ -110,7 +163,45 @@ export async function toggleProviderOutputItemHidden(
     const nextItems = [...items]
     nextItems[itemIndex] = nextItem
     await ctx.putMessage({ ...current, providerOutputItems: nextItems })
+    const [header, message] = await Promise.all([
+      ctx.getMessageHeader(messageId),
+      ctx.getMessage(messageId),
+    ])
+    if (!header || !message) return
+    return { header, message, bodyVersion: header.bodyVersion }
   })
+  publishLocalMessageMutation(chatId, sourcePath, result.value)
+}
+
+export async function toggleMessageContextHidden(
+  chatId: ChatId,
+  messageId: MessageId,
+  options: LocalMessageMutationOptions = {},
+): Promise<void> {
+  const sourcePath = selectedPathBeforeMutation(chatId, options)
+  const presentation = await toggleStoredMessageHidden(messageId)
+  publishLocalMessageMutation(chatId, sourcePath, presentation)
+}
+
+export async function dismissMessageGenerationNotice(
+  chatId: ChatId,
+  messageId: MessageId,
+  options: LocalMessageMutationOptions = {},
+): Promise<void> {
+  const sourcePath = selectedPathBeforeMutation(chatId, options)
+  const presentation = await dismissStoredAbortReason(messageId)
+  publishLocalMessageMutation(chatId, sourcePath, presentation)
+}
+
+export async function mutateMessageAttachmentReference(
+  chatId: ChatId,
+  messageId: MessageId,
+  mutation: MessageAttachmentRefMutation,
+  options: LocalMessageMutationOptions = {},
+): Promise<void> {
+  const sourcePath = selectedPathBeforeMutation(chatId, options)
+  const presentation = await mutateStoredMessageAttachmentRef({ chatId, messageId, mutation })
+  publishLocalMessageMutation(chatId, sourcePath, presentation)
 }
 
 async function resolveActiveConnection(chatId: ChatId): Promise<
@@ -152,84 +243,102 @@ export async function editAndResend(
   newText: string,
   options: { prefillContent?: ContentItem[]; attachmentRefs?: AttachmentRef[] } = {},
 ): Promise<SendTextResult> {
-  const navigationIntent =
-    ctx.navigationIntent ?? useChatStore.getState().beginNavigationIntent(ctx.chatId)
-  const conn = await resolveActiveConnection(ctx.chatId)
-  if (!conn.ok) {
-    throw new Error(`edit-and-resend: connection unavailable (${conn.reason})`)
+  const store = useChatStore.getState()
+  const navigationIntent = ctx.navigationIntent ?? store.beginNavigationIntent(ctx.chatId)
+  const committedPathProducer =
+    ctx.committedPathProducer ?? store.registerCommittedPathProducer(ctx.chatId, navigationIntent)
+  if (!committedPathProducer) throw new Error('edit-and-resend: navigation was superseded')
+  try {
+    const conn = await resolveActiveConnection(ctx.chatId)
+    if (!conn.ok) {
+      throw new Error(`edit-and-resend: connection unavailable (${conn.reason})`)
+    }
+    const nextContent: ContentItem[] = [{ type: 'text', text: newText }]
+    const inserted = await insertSibling({
+      chatId: ctx.chatId,
+      targetId: originalUser.id,
+      content: nextContent,
+      role: originalUser.role,
+      origin: 'user',
+      ...(options.attachmentRefs ? { attachmentRefs: options.attachmentRefs } : {}),
+    })
+    const insertedPathSelections = Object.fromEntries(
+      inserted.branchHeaders.map((header) => [cursorKeyOf(header.parentId), header.id]),
+    )
+    store.selectCommittedPathForProducer(
+      ctx.chatId,
+      committedPathProducer,
+      insertedPathSelections,
+      {
+        phase: 'open',
+        pathHeaders: inserted.branchHeaders,
+        presentations: [
+          {
+            header: inserted.header,
+            message: inserted.message,
+            bodyVersion: inserted.header.bodyVersion,
+          },
+        ],
+      },
+    )
+    const hasPrefill = (options.prefillContent?.length ?? 0) > 0
+    const result = await ctx.sendFrom({
+      chatId: ctx.chatId,
+      navigationIntent,
+      committedPathProducer,
+      connection: conn.profile,
+      apiKey: conn.apiKey,
+      apiKeyCandidates: conn.apiKeyCandidates,
+      parentMessageId: inserted.messageId,
+      ...(hasPrefill ? { prefillContent: options.prefillContent } : {}),
+    })
+    await bumpProfileLastUsedAt(conn.profile.id)
+    if (conn.presetId) await bumpPresetLastUsedAt(conn.presetId)
+    return result
+  } catch (error) {
+    store.sealCommittedPathProducer(ctx.chatId, committedPathProducer)
+    throw error
   }
-  const nextContent: ContentItem[] = [{ type: 'text', text: newText }]
-  const inserted = await insertSibling({
-    chatId: ctx.chatId,
-    targetId: originalUser.id,
-    content: nextContent,
-    role: originalUser.role,
-    origin: 'user',
-    ...(options.attachmentRefs ? { attachmentRefs: options.attachmentRefs } : {}),
-  })
-  const insertedBranch = await getWorkspaceRepository().getBranchHeaderSnapshotByLeaf(
-    ctx.chatId,
-    inserted.messageId,
-  )
-  if (insertedBranch.branchHeaders.at(-1)?.id !== inserted.messageId) {
-    throw new Error(`edit-and-resend: inserted message unavailable (${inserted.messageId})`)
-  }
-  const insertedPathSelections = Object.fromEntries(
-    insertedBranch.branchHeaders.map((header) => [cursorKeyOf(header.parentId), header.id]),
-  )
-  useChatStore.getState().selectPathForIntent(
-    ctx.chatId,
-    navigationIntent,
-    insertedPathSelections,
-    insertedBranch.branchHeaders.map((header) => header.id),
-  )
-  const hasPrefill = (options.prefillContent?.length ?? 0) > 0
-  const result = await ctx.sendFrom({
-    chatId: ctx.chatId,
-    navigationIntent,
-    connection: conn.profile,
-    apiKey: conn.apiKey,
-    apiKeyCandidates: conn.apiKeyCandidates,
-    parentMessageId: inserted.messageId,
-    ...(hasPrefill ? { prefillContent: options.prefillContent } : {}),
-  })
-  await bumpProfileLastUsedAt(conn.profile.id)
-  if (conn.presetId) await bumpPresetLastUsedAt(conn.presetId)
-  return result
 }
 
 export async function regenerateFromMessage(
   ctx: MessageOpsContext,
   assistantMessage: Message,
 ): Promise<SendTextResult> {
-  const navigationIntent =
-    ctx.navigationIntent ?? useChatStore.getState().beginNavigationIntent(ctx.chatId)
-  const conn = await resolveActiveConnection(ctx.chatId)
-  if (!conn.ok) {
-    throw new Error(`regenerate: connection unavailable (${conn.reason})`)
+  const store = useChatStore.getState()
+  const navigationIntent = ctx.navigationIntent ?? store.beginNavigationIntent(ctx.chatId)
+  const committedPathProducer =
+    ctx.committedPathProducer ?? store.registerCommittedPathProducer(ctx.chatId, navigationIntent)
+  if (!committedPathProducer) throw new Error('regenerate: navigation was superseded')
+  try {
+    const conn = await resolveActiveConnection(ctx.chatId)
+    if (!conn.ok) {
+      throw new Error(`regenerate: connection unavailable (${conn.reason})`)
+    }
+    const assistantHeader = await getWorkspaceRepository().getMessageHeader(assistantMessage.id)
+    if (!assistantHeader || assistantHeader.chatId !== ctx.chatId || assistantHeader.deleted) {
+      throw new Error(`regenerate: assistant message unavailable (${assistantMessage.id})`)
+    }
+    if (assistantHeader.parentId === null) {
+      throw new Error('regenerate: assistant message has no parent')
+    }
+    const result = await ctx.sendFrom({
+      chatId: ctx.chatId,
+      navigationIntent,
+      committedPathProducer,
+      connection: conn.profile,
+      apiKey: conn.apiKey,
+      apiKeyCandidates: conn.apiKeyCandidates,
+      parentMessageId: assistantHeader.parentId,
+      regenerateTargetMessageId: assistantHeader.id,
+    })
+    await bumpProfileLastUsedAt(conn.profile.id)
+    if (conn.presetId) await bumpPresetLastUsedAt(conn.presetId)
+    return result
+  } catch (error) {
+    store.sealCommittedPathProducer(ctx.chatId, committedPathProducer)
+    throw error
   }
-  const assistantHeader = await getWorkspaceRepository().getMessageHeader(assistantMessage.id)
-  if (!assistantHeader || assistantHeader.chatId !== ctx.chatId || assistantHeader.deleted) {
-    throw new Error(`regenerate: assistant message unavailable (${assistantMessage.id})`)
-  }
-  if (assistantHeader.parentId === null) {
-    throw new Error('regenerate: assistant message has no parent')
-  }
-  // `sendFrom` creates a new assistant placeholder under the user parent —
-  // that IS a new sibling of the existing assistant. The old variant stays
-  // swipeable (§8.4.2) and the cursor advances to the new sibling.
-  const result = await ctx.sendFrom({
-    chatId: ctx.chatId,
-    navigationIntent,
-    connection: conn.profile,
-    apiKey: conn.apiKey,
-    apiKeyCandidates: conn.apiKeyCandidates,
-    parentMessageId: assistantHeader.parentId,
-    regenerateTargetMessageId: assistantHeader.id,
-  })
-  await bumpProfileLastUsedAt(conn.profile.id)
-  if (conn.presetId) await bumpPresetLastUsedAt(conn.presetId)
-  return result
 }
 
 // Continue in place. Instead of creating a new assistant sibling (which
@@ -258,19 +367,31 @@ export async function continueFromMessage(
   ctx: MessageOpsContext,
   assistantMessage: Message,
 ): Promise<void> {
-  const conn = await resolveActiveConnection(ctx.chatId)
-  if (!conn.ok) {
-    throw new Error(`continue: connection unavailable (${conn.reason})`)
+  const store = useChatStore.getState()
+  const navigationIntent = ctx.navigationIntent ?? store.beginNavigationIntent(ctx.chatId)
+  const committedPathProducer =
+    ctx.committedPathProducer ?? store.registerCommittedPathProducer(ctx.chatId, navigationIntent)
+  if (!committedPathProducer) throw new Error('continue: navigation was superseded')
+  try {
+    const conn = await resolveActiveConnection(ctx.chatId)
+    if (!conn.ok) {
+      throw new Error(`continue: connection unavailable (${conn.reason})`)
+    }
+    await continueAssistantInPlace({
+      chatId: ctx.chatId,
+      targetMessageId: assistantMessage.id,
+      navigationIntent,
+      committedPathProducer,
+      connection: conn.profile,
+      apiKey: conn.apiKey,
+      apiKeyCandidates: conn.apiKeyCandidates,
+    })
+    await bumpProfileLastUsedAt(conn.profile.id)
+    if (conn.presetId) await bumpPresetLastUsedAt(conn.presetId)
+  } catch (error) {
+    store.sealCommittedPathProducer(ctx.chatId, committedPathProducer)
+    throw error
   }
-  await continueAssistantInPlace({
-    chatId: ctx.chatId,
-    targetMessageId: assistantMessage.id,
-    connection: conn.profile,
-    apiKey: conn.apiKey,
-    apiKeyCandidates: conn.apiKeyCandidates,
-  })
-  await bumpProfileLastUsedAt(conn.profile.id)
-  if (conn.presetId) await bumpPresetLastUsedAt(conn.presetId)
 }
 
 interface DeleteOpArgs {

@@ -15,12 +15,18 @@ import {
 } from '../../src/store/browser-repo'
 import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
 import {
+  commitPreparedGeneratedOutputAttachments,
   materializeGeneratedOutputAttachments,
   migrateGeneratedImageOutputAttachments,
   normalizeGeneratedImageOutputAttachmentRefs,
   persistPreparedGeneratedOutputAttachments,
   prepareGeneratedOutputAttachments,
 } from '../../src/store/generated-images'
+import { WorkspaceReplacementFenceError } from '../../src/store/repository'
+import {
+  markBrowserWorkspaceReplaced,
+  readBrowserWorkspaceMeta,
+} from '../../src/store/workspace-meta'
 import { expectAttachmentReferenceInvariants } from '../helpers/attachment-reference-invariants'
 
 const DB_NAME = 'natter'
@@ -83,6 +89,86 @@ async function putMessage(message: Message): Promise<void> {
 }
 
 describe('generated image output storage migration', () => {
+  it('keeps raw remote output URLs when background download fails', async () => {
+    const content = [{ type: 'output_image' as const, url: 'https://cdn.example/output.png' }]
+    const prepared = await prepareGeneratedOutputAttachments({
+      messageId: 'm-download-failed',
+      content,
+      downloader: async () => {
+        throw new Error('offline')
+      },
+      preserveRemoteUrlOnDownloadFailure: true,
+    })
+
+    expect(prepared.changed).toBe(false)
+    expect(prepared.content).toEqual(content)
+    expect(prepared.newRefs).toHaveLength(0)
+    expect(prepared.attachmentBundles).toHaveLength(0)
+  })
+
+  it('prepares a local attachment when the background remote download succeeds', async () => {
+    const prepared = await prepareGeneratedOutputAttachments({
+      messageId: 'm-download-succeeded',
+      content: [{ type: 'output_image', url: 'https://cdn.example/output.png' }],
+      downloader: async () => new Blob(['png'], { type: 'image/png' }),
+      preserveRemoteUrlOnDownloadFailure: true,
+    })
+
+    expect(prepared.changed).toBe(true)
+    expect(prepared.content).toEqual([
+      { type: 'output_image', attachmentId: 'generated:m-download-succeeded:1' },
+    ])
+    expect(prepared.attachmentBundles[0]?.attachment.storage.kind).toBe('local-blob')
+  })
+
+  it('rejects delayed localization from an older workspace epoch', async () => {
+    const chat = await seedChat()
+    const message: Message = {
+      id: 'm-replaced-workspace',
+      chatId: chat.id,
+      parentId: null,
+      siblingIndex: 0,
+      turnId: newId(),
+      turnIndex: 0,
+      createdAt: 2,
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_image', url: ONE_PIXEL_PNG }],
+      nodeVersion: 0,
+      deleted: false,
+    }
+    await putMessage(message)
+    const repo = getBrowserRepository()
+    const [header, persistedMessage, workspace] = await Promise.all([
+      repo.getMessageHeader(message.id),
+      repo.getMessage(message.id),
+      readBrowserWorkspaceMeta(getDb()),
+    ])
+    if (!header || !persistedMessage) throw new Error('MessagePresentationMissing')
+    const prepared = await prepareGeneratedOutputAttachments({
+      messageId: message.id,
+      content: message.content,
+      now: 10,
+      preserveRemoteUrlOnDownloadFailure: true,
+    })
+    const db = getDb()
+    await db.transaction('rw', db.settings, async (tx) => {
+      await markBrowserWorkspaceReplaced(tx, 20, workspace)
+    })
+
+    await expect(
+      commitPreparedGeneratedOutputAttachments({
+        repo,
+        presentation: { header, message: persistedMessage, bodyVersion: header.bodyVersion },
+        prepared,
+        expectedReplacementEpoch: workspace.replacementEpoch,
+        isCurrent: () => true,
+      }),
+    ).rejects.toBeInstanceOf(WorkspaceReplacementFenceError)
+    expect((await repo.getMessage(message.id))?.content).toEqual(message.content)
+    expect(await db.attachments.count()).toBe(0)
+  })
+
   it('prepares generated output without writes and commits its attachment with the message', async () => {
     const chat = await seedChat()
     const message: Message = {

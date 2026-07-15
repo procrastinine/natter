@@ -15,8 +15,9 @@
 // content block for a textarea cleanly.
 
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { cursorKeyOf } from '../../core/active-path'
 import { hasAppliedSuccessfulContinuation } from '../../core/continuation-content'
-import { structuralEffectsCursorPatch } from '../../core/messages'
+import { structuralEffectsCursorPatch, structuralEffectsUndoCursorPatch } from '../../core/messages'
 import type { Message } from '../../core/types'
 import { applyStructuralSnapshot } from '../../core/undo'
 import {
@@ -28,7 +29,6 @@ import {
 // The type imports above are used by the props interface even when the
 // runtime references shrink; leaving them here keeps the component's
 // public contract readable from a single file.
-import { toggleMessageHidden } from '../../store/chats'
 import { useChatStore } from '../../store/zustand/chatStore'
 import { useToastStore } from '../../store/zustand/toastStore'
 import { useUiStore } from '../../store/zustand/uiStore'
@@ -75,6 +75,7 @@ interface MessageActionsProps {
   // branch-sibling button — alternate siblings come from regenerate /
   // edit-&-send / insert-sibling (in edit-tree mode).
   onForkChat?: () => void | Promise<void>
+  onToggleContextVisibility?: () => void | Promise<void>
   // Copy override — if unset, falls back to a navigator.clipboard write
   // of the plaintext content.
   onCopy?: () => void | Promise<void>
@@ -92,7 +93,13 @@ function useRunDelete(chatId: string, message: Message, roleMismatch: boolean | 
   const pushToast = useToastStore((s) => s.push)
   return useCallback(
     async (kind: 'pair' | 'variant' | 'turn' | 'single') => {
-      const navigationIntent = useChatStore.getState().beginNavigationIntent(chatId)
+      const chatStore = useChatStore.getState()
+      const navigationIntent = chatStore.beginNavigationIntent(chatId)
+      const committedPathProducer = chatStore.registerCommittedPathProducer(
+        chatId,
+        navigationIntent,
+      )
+      if (!committedPathProducer) return
       // Role-mismatched adjacencies almost always want a single-node
       // delete: the user is cleaning up the one stray turn that
       // delete-splice produced. Pair-delete would eat the NEIGHBORING
@@ -108,7 +115,7 @@ function useRunDelete(chatId: string, message: Message, roleMismatch: boolean | 
               ? deleteVariantOp
               : deleteSingleOp
       const priorCursor = useChatStore.getState().getCursor(chatId) ?? {}
-      let result: Awaited<ReturnType<typeof op>>
+      let result: Awaited<ReturnType<typeof op>> | undefined
       try {
         result = await op({
           chatId,
@@ -122,14 +129,26 @@ function useRunDelete(chatId: string, message: Message, roleMismatch: boolean | 
           text: `Delete failed: ${err instanceof Error ? err.message : 'unknown error'}`,
         })
         return
+      } finally {
+        if (!result) {
+          chatStore.sealCommittedPathProducer(chatId, committedPathProducer)
+        }
       }
-      useChatStore
-        .getState()
-        .patchCursorForIntent(
-          chatId,
-          navigationIntent,
-          structuralEffectsCursorPatch(result.effects),
-        )
+      chatStore.selectCommittedPathForProducer(
+        chatId,
+        committedPathProducer,
+        Object.fromEntries(
+          result.selectedPathHeaders.map((header) => [cursorKeyOf(header.parentId), header.id]),
+        ),
+        {
+          phase: 'terminal',
+          pathHeaders: result.selectedPathHeaders,
+          structuralHeaders: result.structuralHeaders,
+          presentations: result.presentations,
+        },
+        structuralEffectsCursorPatch(result.effects),
+      )
+      chatStore.sealCommittedPathProducer(chatId, committedPathProducer)
       pushToast({
         level: 'info',
         text:
@@ -141,9 +160,36 @@ function useRunDelete(chatId: string, message: Message, roleMismatch: boolean | 
                 ? 'Deleted turn.'
                 : 'Deleted message.',
         undo: async () => {
-          const undoIntent = useChatStore.getState().beginNavigationIntent(chatId)
-          await applyStructuralSnapshot(result.preImage)
-          useChatStore.getState().setCursorForIntent(chatId, undoIntent, priorCursor)
+          const undoStore = useChatStore.getState()
+          const undoIntent = undoStore.beginNavigationIntent(chatId)
+          const undoProducer = undoStore.registerCommittedPathProducer(chatId, undoIntent)
+          if (!undoProducer) return
+          try {
+            const restored = await applyStructuralSnapshot(result.preImage, {
+              cursor: priorCursor,
+              presentationWindowLimit: 10,
+            })
+            if (!restored) return
+            const state = useChatStore.getState()
+            const selections: Record<string, string> = {}
+            for (const header of restored.selectedPathHeaders) {
+              selections[cursorKeyOf(header.parentId)] = header.id
+            }
+            state.selectCommittedPathForProducer(
+              chatId,
+              undoProducer,
+              selections,
+              {
+                phase: 'terminal',
+                pathHeaders: restored.selectedPathHeaders,
+                structuralHeaders: restored.structuralHeaders,
+                presentations: restored.presentations,
+              },
+              structuralEffectsUndoCursorPatch(priorCursor, result.effects),
+            )
+          } finally {
+            useChatStore.getState().sealCommittedPathProducer(chatId, undoProducer)
+          }
         },
       })
     },
@@ -165,6 +211,7 @@ export function MessageActions(props: MessageActionsProps) {
     onRegenerate,
     onContinue,
     onForkChat,
+    onToggleContextVisibility,
     onCopy,
     chatId,
     roleMismatch,
@@ -330,7 +377,8 @@ export function MessageActions(props: MessageActionsProps) {
         data-role="message-action"
         data-action="toggle-visible"
         aria-pressed={Boolean(message.hiddenFromContext)}
-        onClick={() => void toggleMessageHidden(message.id)}
+        onClick={() => void onToggleContextVisibility?.()}
+        disabled={onToggleContextVisibility === undefined}
         aria-label={
           message.hiddenFromContext
             ? 'Show in context (send to model)'

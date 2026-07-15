@@ -23,9 +23,11 @@ describe('search store shell', () => {
     expect(useSearchStore.getState().session).toMatchObject({
       query: 'needle',
       status: 'debouncing',
-      invalidatedChatIds: ['chat-1'],
-      tailPassChatIds: [],
     })
+    expect([...(useSearchStore.getState().session?.invalidatedChatIds.keys() ?? [])]).toEqual([
+      'chat-1',
+    ])
+    expect(useSearchStore.getState().session?.tailPassChatIds.size).toBe(0)
   })
 
   it('tracks chat mutations separately for tail-pass rescans', () => {
@@ -40,13 +42,12 @@ describe('search store shell', () => {
       affected: [{ kind: 'message', chatId: 'chat-1' }],
     })
 
-    expect(useSearchStore.getState().session).toMatchObject({
-      invalidatedChatIds: ['chat-1'],
-      tailPassChatIds: ['chat-1'],
-    })
+    const session = useSearchStore.getState().session
+    expect([...(session?.invalidatedChatIds.keys() ?? [])]).toEqual(['chat-1'])
+    expect([...(session?.tailPassChatIds.keys() ?? [])]).toEqual(['chat-1'])
 
     useSearchStore.getState().clearTailPassChatIds(['chat-1'])
-    expect(useSearchStore.getState().session?.tailPassChatIds).toEqual([])
+    expect(useSearchStore.getState().session?.tailPassChatIds.size).toBe(0)
   })
 
   it('drops deleted chats and ignores late hits for them', () => {
@@ -54,44 +55,16 @@ describe('search store shell', () => {
     useSearchStore.getState().setQuery('needle')
 
     postEvent({ kind: 'chat-deleted', chatId: 'chat-1' })
-    useSearchStore.getState().mergeResult({
-      id: 'chat-1',
-      chatId: 'chat-1',
-      chat: {
-        id: 'chat-1',
-        title: 'late',
-        titleStatus: 'manual',
-        createdAt: 1,
-        updatedAt: 1,
-        lastViewedAt: 1,
-        wordCount: 0,
-        totalCostUsd: 0,
-        metaVersion: 0,
-        summaryVersion: 0,
-        settings: {} as never,
-        lastUpdatedLeafId: null,
-        lastBranchUpdatedAt: 1,
-        archived: false,
-        pinned: false,
-        folderId: null,
-        tags: [],
-      },
-      source: 'title',
-      title: 'late',
-      snippet: 'late',
-      highlightRanges: [],
-      prefixTruncated: false,
-      suffixTruncated: false,
-      rank: 0,
-    })
+    useSearchStore
+      .getState()
+      .applyResultBatch([{ kind: 'upsert', result: searchResult('chat-1') }], 1, 1)
 
     expect(useSearchStore.getState().session?.results.size).toBe(0)
-    expect(useSearchStore.getState().session?.deletedChatIds).toEqual(['chat-1'])
+    expect(useSearchStore.getState().session?.deletedChatIds.has('chat-1')).toBe(true)
   })
 
-  it('delivers 1,001 progressive ordered hits without copying or rescanning prior results', () => {
+  it('commits 100,003 results in one immutable linear batch', () => {
     useSearchStore.getState().setQuery('needle')
-    let chatIdReads = 0
     const revisions: number[] = []
     const unsubscribe = useSearchStore.subscribe((state, previous) => {
       const revision = state.session?.results.revision
@@ -99,55 +72,61 @@ describe('search store shell', () => {
         revisions.push(revision)
       }
     })
-
-    const first = searchResultWithTrackedChatId('chat-0', () => {
-      chatIdReads += 1
-    })
-    useSearchStore.getState().mergeResult(first)
     const initial = useSearchStore.getState().session?.results
     if (!initial) throw new Error('missing search result collection')
-    const orderedIds = initial.orderedIds
-    const byChatId = initial.byChatId
-    const orderedValues = orderedSearchResults(initial)
-
-    for (let index = 1; index < 1_001; index += 1) {
-      const chatId = `chat-${index}`
-      const result = searchResultWithTrackedChatId(chatId, () => {
-        chatIdReads += 1
-      })
-      useSearchStore.getState().mergeResult(result)
-    }
+    const count = 100_003
+    const mutations = Array.from({ length: count }, (_, index) => ({
+      kind: 'upsert' as const,
+      result: searchResult(`chat-${index}`),
+    }))
+    const startedAt = performance.now()
+    useSearchStore.getState().applyResultBatch(mutations, count, count)
+    const elapsedMs = performance.now() - startedAt
 
     unsubscribe()
     const results = useSearchStore.getState().session?.results
-    expect(results?.size).toBe(1_001)
+    expect(results?.size).toBe(count)
     expect(results).not.toBe(initial)
-    expect(results?.orderedIds).toBe(orderedIds)
-    expect(results?.byChatId).toBe(byChatId)
-    expect(orderedSearchResults(results)).toBe(orderedValues)
-    expect(results?.orderedIds).toEqual(
-      Array.from({ length: 1_001 }, (_, index) => `chat-${index}`),
-    )
-    expect(chatIdReads).toBe(1_001)
-    expect(revisions).toEqual(Array.from({ length: 1_001 }, (_, index) => index + 1))
+    expect(initial.size).toBe(0)
+    expect(results?.orderedIds[0]).toBe('chat-0')
+    expect(results?.orderedIds.at(-1)).toBe(`chat-${count - 1}`)
+    expect(orderedSearchResults(results)[50_000]?.chatId).toBe('chat-50000')
+    expect(Object.isFrozen(results?.orderedIds)).toBe(true)
+    expect(Object.isFrozen(orderedSearchResults(results))).toBe(true)
+    expect(revisions).toEqual([1])
+    expect(elapsedMs).toBeLessThan(2_500)
   })
 
   it('replaces a repeated chat hit in place without changing result order', () => {
     useSearchStore.getState().setQuery('needle')
-    useSearchStore.getState().mergeResult(searchResult('first'))
-    useSearchStore.getState().mergeResult(searchResult('second'))
+    useSearchStore.getState().applyResultBatch(
+      [
+        { kind: 'upsert', result: searchResult('first') },
+        { kind: 'upsert', result: searchResult('second') },
+      ],
+      2,
+      2,
+    )
     const initial = useSearchStore.getState().session?.results
     if (!initial) throw new Error('missing search result collection')
-    const orderedIds = initial.orderedIds
-    const byChatId = initial.byChatId
-    const orderedValues = orderedSearchResults(initial)
-    useSearchStore.getState().mergeResult({ ...searchResult('first'), title: 'updated' })
+    useSearchStore
+      .getState()
+      .applyResultBatch(
+        [{ kind: 'upsert', result: { ...searchResult('first'), title: 'updated' } }],
+        2,
+        2,
+      )
 
     const results = useSearchStore.getState().session?.results
     expect(results).not.toBe(initial)
-    expect(results?.orderedIds).toBe(orderedIds)
-    expect(results?.byChatId).toBe(byChatId)
-    expect(orderedSearchResults(results)).toBe(orderedValues)
+    expect(results?.orderedIds).toEqual(initial.orderedIds)
+    expect(results?.orderedIds).not.toBe(initial.orderedIds)
+    expect(results?.byChatId).not.toBe(initial.byChatId)
+    expect(orderedSearchResults(results)).not.toBe(orderedSearchResults(initial))
+    expect(orderedSearchResults(initial)).toMatchObject([
+      { chatId: 'first', title: 'first' },
+      { chatId: 'second' },
+    ])
     expect(orderedSearchResults(results)).toMatchObject([
       { chatId: 'first', title: 'updated' },
       { chatId: 'second' },
@@ -159,17 +138,28 @@ describe('search store shell', () => {
 
   it('removes misses and appends a later hit without disturbing surviving order', () => {
     useSearchStore.getState().setQuery('needle')
-    useSearchStore.getState().mergeResult(searchResult('first'))
-    useSearchStore.getState().mergeResult(searchResult('second'))
-    useSearchStore.getState().mergeResult(searchResult('third'))
+    useSearchStore.getState().applyResultBatch(
+      ['first', 'second', 'third'].map((chatId) => ({
+        kind: 'upsert' as const,
+        result: searchResult(chatId),
+      })),
+      3,
+      3,
+    )
 
-    useSearchStore.getState().removeResult('second')
+    useSearchStore.getState().applyResultBatch([{ kind: 'remove', chatId: 'second' }], 1, 1)
     expect(orderedSearchResults(useSearchStore.getState().session?.results)).toMatchObject([
       { chatId: 'first' },
       { chatId: 'third' },
     ])
 
-    useSearchStore.getState().mergeResult({ ...searchResult('second'), title: 'later' })
+    useSearchStore
+      .getState()
+      .applyResultBatch(
+        [{ kind: 'upsert', result: { ...searchResult('second'), title: 'later' } }],
+        1,
+        1,
+      )
     expect(orderedSearchResults(useSearchStore.getState().session?.results)).toMatchObject([
       { chatId: 'first' },
       { chatId: 'third' },
@@ -241,17 +231,4 @@ function searchResult(chatId: string): SearchResult {
     suffixTruncated: false,
     rank: 0,
   }
-}
-
-function searchResultWithTrackedChatId(chatId: string, onRead: () => void): SearchResult {
-  const result = searchResult(chatId)
-  Object.defineProperty(result, 'chatId', {
-    configurable: true,
-    enumerable: true,
-    get: () => {
-      onRead()
-      return chatId
-    },
-  })
-  return result
 }

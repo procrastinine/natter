@@ -555,7 +555,7 @@ describe('undo snapshot for structural deletes', () => {
     expect(afterUndo.find((m) => m.id === assistant.id)?.deleted).toBe(false)
   })
 
-  it('hard-deletes introduced rows without restoring unrelated header edits', async () => {
+  it('tombstones introduced rows without restoring unrelated header edits', async () => {
     const chat = await seedChat()
     await getDb().attachments.bulkPut([attachment('undo-a', 0), attachment('undo-b', 0)])
     const previous: Message = {
@@ -604,12 +604,20 @@ describe('undo snapshot for structural deletes', () => {
       attachmentIds: ['undo-a', 'undo-b'],
     })
 
-    expect(await getBrowserRepository().getMessage(introduced.id)).toBeUndefined()
+    const undoneIntroduced = await getBrowserRepository().getMessage(introduced.id)
+    expect(undoneIntroduced).toMatchObject({
+      id: introduced.id,
+      turnId: introduced.turnId,
+      turnIndex: introduced.turnIndex,
+      deleted: true,
+    })
+    expect(undoneIntroduced?.content).toEqual(introduced.content)
+    expect(undoneIntroduced?.attachmentRefs).toEqual(introduced.attachmentRefs)
     expect((await getBrowserRepository().getMessage(previous.id))?.attachmentRefs).toEqual([
       attachmentRef('undo-ref-b-replacement', 'undo-b'),
     ])
     expect((await getDb().attachments.get('undo-a'))?.refCount).toBe(0)
-    expect((await getDb().attachments.get('undo-b'))?.refCount).toBe(1)
+    expect((await getDb().attachments.get('undo-b'))?.refCount).toBe(2)
     await expectAttachmentReferenceInvariants(getDb())
   })
 })

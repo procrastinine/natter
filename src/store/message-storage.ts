@@ -19,9 +19,16 @@ interface GenerationServerToolOutput {
 }
 
 export type MessageHeaderRow = Omit<Message, MessageBodyKey> & {
+  requestContextVersion: number
   bodyVersion: number
   bodyWordCount: number
   textPreview: string
+}
+
+export interface MessagePresentation {
+  readonly header: MessageHeaderRow
+  readonly message: Message
+  readonly bodyVersion: number
 }
 
 export function messageHeaderTreeKey(headers: readonly MessageHeaderRow[]): string {
@@ -177,7 +184,7 @@ export function previewTextsByChat(
 
 export function splitMessageForStorage(
   message: Message,
-  options: { bodyVersion?: number; updatedAt?: number } = {},
+  options: { bodyVersion?: number; requestContextVersion?: number; updatedAt?: number } = {},
 ): { header: MessageHeaderRow; body: MessageBodyRow } {
   const {
     content,
@@ -192,6 +199,7 @@ export function splitMessageForStorage(
   } = message
   const header = structuredClone({
     ...headerFields,
+    requestContextVersion: options.requestContextVersion ?? message.nodeVersion,
     bodyVersion: options.bodyVersion ?? message.nodeVersion,
     bodyWordCount: 0,
     textPreview: '',
@@ -237,6 +245,7 @@ export function hydrateMessage(header: MessageHeaderRow, body: MessageBodyRow): 
   }
 
   const {
+    requestContextVersion: _requestContextVersion,
     bodyVersion: _bodyVersion,
     bodyWordCount: _bodyWordCount,
     textPreview: _textPreview,

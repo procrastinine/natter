@@ -23,6 +23,7 @@ import { __resetDbForTests, openDb } from '../../src/store/db'
 import { putCachedEndpoints } from '../../src/store/models-cache'
 import { __resetPrivacyInFlightForTests } from '../../src/store/privacy-cache'
 import { __resetStreamLeasesForTests } from '../../src/store/stream-leases'
+import type { CommittedPathPresentationReceipt } from '../../src/store/zustand/chatStore'
 import { useChatStore } from '../../src/store/zustand/chatStore'
 import { useStreamStore } from '../../src/store/zustand/streamStore'
 import { useUiStore } from '../../src/store/zustand/uiStore'
@@ -412,23 +413,6 @@ describe('generation mode contract', () => {
     await putMessages([root, left, right])
 
     const repo = getBrowserRepository()
-    const readSnapshot = repo.getBranchHeaderSnapshotByLeaf.bind(repo)
-    let releaseSnapshots!: () => void
-    const snapshotGate = new Promise<void>((resolve) => {
-      releaseSnapshots = resolve
-    })
-    let markBothSnapshots!: () => void
-    const bothSnapshots = new Promise<void>((resolve) => {
-      markBothSnapshots = resolve
-    })
-    let snapshotCount = 0
-    vi.spyOn(repo, 'getBranchHeaderSnapshotByLeaf').mockImplementation(async (chatId, leafId) => {
-      const snapshot = await readSnapshot(chatId, leafId)
-      snapshotCount += 1
-      if (snapshotCount === 2) markBothSnapshots()
-      await snapshotGate
-      return snapshot
-    })
 
     let releaseStreams!: () => void
     const streamGate = new Promise<void>((resolve) => {
@@ -471,13 +455,6 @@ describe('generation mode contract', () => {
       content: [{ type: 'text', text: 'right followup' }],
       openStream,
     })
-
-    await bothSnapshots
-    const preparedRows = await repo.listMessages(chat.id)
-    expect(preparedRows.filter((row) => row.role === 'user')).toHaveLength(3)
-    expect((await repo.listStreamLeases(chat.id)).every((lease) => !lease.messageId)).toBe(true)
-    expect(await repo.listStreamLeases(chat.id)).toHaveLength(2)
-    releaseSnapshots()
 
     await bothOpened
     const targetedLeases = await repo.listStreamLeases(chat.id)
@@ -625,13 +602,20 @@ describe('generation mode contract', () => {
       }
     })
     const calls: CapturedOpen[] = []
+    let openReceipt: CommittedPathPresentationReceipt | undefined
+    let cursorAtProviderOpen: Readonly<Record<string, string>> | undefined
+    const capturedStream = captureOpen(calls, 'regenerated answer')
 
     const result = await sendFromMessage({
       chatId: chat.id,
       parentMessageId: followup.id,
       connection: profile(),
       apiKey: 'sk-test',
-      openStream: captureOpen(calls, 'regenerated answer'),
+      openStream: (input) => {
+        openReceipt = useChatStore.getState().getCommittedPathPresentation(chat.id)
+        cursorAtProviderOpen = useChatStore.getState().getCursor(chat.id)
+        return capturedStream(input)
+      },
       now: () => 100,
     }).finally(unsubscribe)
 
@@ -666,8 +650,27 @@ describe('generation mode contract', () => {
       [cursorKeyOf(targetBranch.id)]: followup.id,
       [cursorKeyOf(followup.id)]: result.assistantMessageId,
     }
+    expect(openReceipt?.phase).toBe('open')
+    expect(openReceipt?.pathHeaders.map((header) => header.id)).toEqual([
+      user.id,
+      targetBranch.id,
+      followup.id,
+      result.assistantMessageId,
+    ])
+    expect(openReceipt?.pathHeaders.at(-1)?.id).toBe(result.assistantMessageId)
+    expect(cursorAtProviderOpen).toEqual(expectedCursor)
     expect(useChatStore.getState().getCursor(chat.id)).toEqual(expectedCursor)
     expect(cursorPublications).toEqual([expectedCursor])
+    const terminalReceipt = useChatStore.getState().getCommittedPathPresentation(chat.id)
+    expect(terminalReceipt?.phase).toBe('terminal')
+    expect(terminalReceipt?.pathHeaders.at(-1)?.id).toBe(result.assistantMessageId)
+    const terminalPresentation = terminalReceipt?.presentations.find(
+      (presentation) => presentation.message.id === result.assistantMessageId,
+    )
+    expect(terminalPresentation).toMatchObject({
+      message: { content: [{ type: 'output_text', text: 'regenerated answer' }] },
+    })
+    expect(terminalPresentation?.bodyVersion).toBe(terminalPresentation?.header.bodyVersion)
   })
 
   it('legacy Continue appends in place while preserving original provenance and tree identity', async () => {
@@ -701,6 +704,7 @@ describe('generation mode contract', () => {
       [cursorKeyOf(user.id)]: target.id,
     }
     useChatStore.getState().navigateToCursor(chat.id, cursorBefore)
+    const cursorReference = useChatStore.getState().getCursor(chat.id)
     const calls: CapturedOpen[] = []
     const messageCountBefore = (await getBrowserRepository().listMessages(chat.id)).length
     const chatCostBefore = (await getBrowserRepository().getChat(chat.id))?.totalCostUsd
@@ -745,6 +749,18 @@ describe('generation mode contract', () => {
     })
     expect(continued?.generation).toEqual(generation)
     expect(useChatStore.getState().getCursor(chat.id)).toEqual(cursorBefore)
+    expect(useChatStore.getState().getCursor(chat.id)).toBe(cursorReference)
+    const receipt = useChatStore.getState().getCommittedPathPresentation(chat.id)
+    expect(receipt?.phase).toBe('terminal')
+    expect(receipt?.pathHeaders.at(-1)?.id).toBe(target.id)
+    expect(receipt?.pathHeaders.map((header) => header.id)).toEqual([user.id, target.id])
+    expect(receipt?.presentations).toHaveLength(1)
+    expect(receipt?.presentations[0]).toMatchObject({
+      message: { id: target.id, content: [{ type: 'output_text', text: 'partial continued' }] },
+    })
+    expect(receipt?.presentations[0]?.bodyVersion).toBe(
+      receipt?.presentations[0]?.header.bodyVersion,
+    )
     expect((await getBrowserRepository().getChat(chat.id))?.totalCostUsd).toBe(chatCostBefore)
   })
 

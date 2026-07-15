@@ -33,10 +33,10 @@ import {
 } from './client'
 import { deferAdapterRequest } from './deferred-request'
 import { normalizeError } from './errors'
-import { decodeProviderJson, malformedJsonFrameReport, parseSSE } from './sse'
+import { validateResponsesEvent, validateResponsesResult } from './provider-json-boundary'
+import { decodeProviderStreamFrame, decodeValidatedProviderJson, parseSSE } from './sse'
 import type {
   CallOpts,
-  ResponsesEventWire,
   ResponsesRequestWire,
   ResponsesResultWire,
   ResponsesStreamChunk,
@@ -158,7 +158,7 @@ async function* consumeResponses(
   const contentType = response.headers.get('content-type') ?? ''
 
   if (!/text\/event-stream/i.test(contentType)) {
-    const result = await decodeProviderJson<ResponsesResultWire>(response)
+    const result = await decodeValidatedProviderJson(response, validateResponsesResult)
     logStreamDebug(debugTrace, 'buffered_result', result)
     yield generationId
       ? { type: 'buffered_result', result, generationId }
@@ -172,28 +172,22 @@ async function* consumeResponses(
       yield { type: 'keepalive', comment: ev.comment }
       continue
     }
-    try {
-      logStreamDebug(debugTrace, 'sse.raw', { event: ev.event, data: ev.data })
-      const raw = JSON.parse(ev.data) as Record<string, unknown>
-      // Accept either the inline `type` field (canonical — OpenAI and
-      // OpenRouter both include it) or the SSE `event:` name as a fallback.
-      if (typeof raw.type !== 'string' && typeof ev.event === 'string') {
-        raw.type = ev.event
-      }
-      logStreamDebug(debugTrace, 'sse.parsed', raw)
-      yield generationId
-        ? { type: 'event', event: raw as ResponsesEventWire, generationId }
-        : { type: 'event', event: raw as ResponsesEventWire }
-    } catch (err) {
-      const report = malformedJsonFrameReport({
-        adapter: 'responses',
-        eventType: ev.event,
-        data: ev.data,
-        error: err,
-      })
-      console.warn('responses: malformed SSE chunk skipped', report.diagnostic)
-      yield { type: 'integrity', integrity: report.integrity }
+    logStreamDebug(debugTrace, 'sse.raw', { event: ev.event, data: ev.data })
+    const decoded = decodeProviderStreamFrame({
+      adapter: 'responses',
+      eventType: ev.event,
+      data: ev.data,
+      validate: validateResponsesEvent,
+    })
+    if (!decoded.ok) {
+      console.warn('responses: invalid SSE frame skipped', decoded.diagnostic)
+      yield { type: 'integrity', integrity: decoded.integrity }
+      continue
     }
+    logStreamDebug(debugTrace, 'sse.parsed', decoded.value)
+    yield generationId
+      ? { type: 'event', event: decoded.value, generationId }
+      : { type: 'event', event: decoded.value }
   }
 }
 
@@ -214,7 +208,7 @@ async function consumeResponsesOnce(
   dispatched: Promise<DispatchResult>,
 ): Promise<ResponsesResultWire> {
   const { response, debugTrace } = await requireSuccessfulDispatch(dispatched)
-  const result = await decodeProviderJson<ResponsesResultWire>(response)
+  const result = await decodeValidatedProviderJson(response, validateResponsesResult)
   logStreamDebug(debugTrace, 'once.result', result)
   return result
 }

@@ -15,8 +15,12 @@ import { __resetDbForTests, openDb } from '../../src/store/db'
 import { putCachedEndpoints } from '../../src/store/models-cache'
 import { __resetPrivacyInFlightForTests } from '../../src/store/privacy-cache'
 import { __resetStreamLeasesForTests } from '../../src/store/stream-leases'
+import {
+  __resetWorkspaceRepositoryForTests,
+  __setWorkspaceRepositoryForTests,
+} from '../../src/store/workspace-repository'
 import { useChatStore } from '../../src/store/zustand/chatStore'
-import { useStreamStore } from '../../src/store/zustand/streamStore'
+import { type ActiveStream, useStreamStore } from '../../src/store/zustand/streamStore'
 import { useUiStore } from '../../src/store/zustand/uiStore'
 
 const DB_NAME = 'natter'
@@ -130,6 +134,20 @@ function postCalls(fetchMock: ReturnType<typeof vi.fn>): unknown[][] {
   })
 }
 
+async function eventually(assertion: () => Promise<void> | void): Promise<void> {
+  let lastError: unknown
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    try {
+      await assertion()
+      return
+    } catch (error) {
+      lastError = error
+      await new Promise((resolve) => setTimeout(resolve, 5))
+    }
+  }
+  throw lastError
+}
+
 function expectTwoIdenticalCandidatePosts(fetchMock: ReturnType<typeof vi.fn>): void {
   const posts = postCalls(fetchMock)
   expect(posts).toHaveLength(2)
@@ -199,6 +217,7 @@ function seededMessage(
 }
 
 async function reset(): Promise<void> {
+  __resetWorkspaceRepositoryForTests()
   __resetBrowserRepositoryForTests()
   __resetDbForTests()
   __resetBroadcastForTests()
@@ -392,5 +411,217 @@ describe('production generation key fallback', () => {
     const rows = await getBrowserRepository().listMessages(chat.id)
     expect(rows).toHaveLength(2)
     expect(rows.filter((row) => row.role === 'assistant')).toHaveLength(1)
+  })
+
+  it('stops a never-settling primary resolution before creating the assistant placeholder', async () => {
+    const chat = await createChat({ settings: settings() })
+    const primaryResolve = vi.fn(() => new Promise<string>(() => {}))
+    const primaryMarkUsed = vi.fn(async () => {})
+    const fallback = runtimeCandidate('key-fallback', 1, FALLBACK_KEY)
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+
+    const sending = sendText({
+      chatId: chat.id,
+      connection: profile(),
+      apiKey: 'legacy-key-must-not-be-used',
+      apiKeyCandidates: [
+        { ref: 'key-primary', index: 0, resolve: primaryResolve, markUsed: primaryMarkUsed },
+        fallback.candidate,
+      ],
+      content: [{ type: 'text', text: 'stop before credentials resolve' }],
+      now: () => 500,
+    })
+
+    let active: ActiveStream | undefined
+    await eventually(() => {
+      expect(primaryResolve).toHaveBeenCalledOnce()
+      active = useStreamStore.getState().listByChat(chat.id)[0]
+      expect(active).toBeDefined()
+    })
+    if (!active) throw new Error('primary-resolution stream was not admitted')
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(
+      (await getBrowserRepository().listMessages(chat.id)).filter(
+        (row) => row.role === 'assistant',
+      ),
+    ).toEqual([])
+
+    expect(useStreamStore.getState().abortStream(active.streamId, active.replacementEpoch)).toBe(
+      true,
+    )
+    await expect(sending).rejects.toMatchObject({ name: 'AbortError' })
+
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(fallback.resolve).not.toHaveBeenCalled()
+    expect(primaryMarkUsed).not.toHaveBeenCalled()
+    expect(useStreamStore.getState().listByChat(chat.id)).toEqual([])
+    expect(await getBrowserRepository().listStreamLeases(chat.id)).toEqual([])
+    expect(
+      (await getBrowserRepository().listMessages(chat.id)).filter(
+        (row) => row.role === 'assistant',
+      ),
+    ).toEqual([])
+  })
+
+  it('stops and finalizes while a lazy fallback resolution never settles after a rejected key', async () => {
+    const chat = await createChat({ settings: settings() })
+    const primary = runtimeCandidate('key-primary', 0, PRIMARY_KEY)
+    const fallbackResolve = vi.fn(() => new Promise<string>(() => {}))
+    const fallbackMarkUsed = vi.fn(async () => {})
+    const fetchMock = vi.fn().mockResolvedValueOnce(authError())
+    vi.stubGlobal('fetch', fetchMock)
+
+    const sending = sendText({
+      chatId: chat.id,
+      connection: profile(),
+      apiKey: 'legacy-key-must-not-be-used',
+      apiKeyCandidates: [
+        primary.candidate,
+        {
+          ref: 'key-fallback',
+          index: 1,
+          resolve: fallbackResolve,
+          markUsed: fallbackMarkUsed,
+        },
+      ],
+      content: [{ type: 'text', text: 'stop during fallback resolution' }],
+      now: () => 600,
+    })
+
+    let active: ActiveStream | undefined
+    await eventually(() => {
+      expect(fallbackResolve).toHaveBeenCalledOnce()
+      active = useStreamStore.getState().listByChat(chat.id)[0]
+      expect(active).toBeDefined()
+    })
+    if (!active) throw new Error('fallback-resolution stream was not active')
+    expect(postCalls(fetchMock)).toHaveLength(1)
+
+    expect(useStreamStore.getState().abortStream(active.streamId, active.replacementEpoch)).toBe(
+      true,
+    )
+    const result = await sending
+
+    expect(result.outcome).toBe('abort')
+    expect(result.assistantMessageId).toBe(active.messageId)
+    expect(primary.resolve).toHaveBeenCalledOnce()
+    expect(fallbackResolve).toHaveBeenCalledOnce()
+    expect(primary.markUsed).not.toHaveBeenCalled()
+    expect(fallbackMarkUsed).not.toHaveBeenCalled()
+    expect(postCalls(fetchMock)).toHaveLength(1)
+    expect(useStreamStore.getState().listByChat(chat.id)).toEqual([])
+    expect(await getBrowserRepository().listStreamLeases(chat.id)).toEqual([])
+    expect(await getBrowserRepository().listStreamChunksForChat(chat.id)).toEqual([])
+    expect(await getBrowserRepository().getMessage(result.assistantMessageId)).toMatchObject({
+      generation: { status: 'abort', abortReason: 'user' },
+    })
+  })
+
+  it('stops Continue while its final freshness guard never settles', async () => {
+    const chat = await createChat({
+      settings: settings({
+        continuePrefill: false,
+        continueSystemPrompt: 'Continue the assistant response.',
+        continueUserPrompt: 'Continue from the exact next token.',
+      }),
+    })
+    const user = seededMessage(chat.id, 'guard-user', 'user', 'write a sentence')
+    const assistant = seededMessage(chat.id, 'guard-assistant', 'assistant', 'partial', {
+      parentId: user.id,
+      generation: {
+        id: 'guard-generation',
+        model: MODEL,
+        requestedModel: MODEL,
+        apiUsed: 'chat',
+        delivery: 'streaming',
+        costSource: 'stream',
+        startedAt: 1,
+      },
+    })
+    await putMessage(user)
+    await putMessage(assistant)
+    const runtime = candidates()
+    const repository = getBrowserRepository()
+    let freshnessReads = 0
+    let finalGuardWrites = 0
+    let markFinalGuardStarted: (() => void) | undefined
+    const finalGuardStarted = new Promise<void>((resolve) => {
+      markFinalGuardStarted = resolve
+    })
+    const neverSettlingFinalGuard = new Promise<never>(() => {})
+    __setWorkspaceRepositoryForTests(
+      new Proxy(repository, {
+        get(target, property, receiver) {
+          if (property === 'getSendContextRevisionSnapshot') {
+            return (...args: Parameters<typeof repository.getSendContextRevisionSnapshot>) => {
+              freshnessReads += 1
+              return repository.getSendContextRevisionSnapshot(...args)
+            }
+          }
+          if (property === 'runMutation') {
+            return (...args: Parameters<typeof repository.runMutation>) => {
+              if (args[2]?.streamFence && finalGuardWrites === 0) {
+                finalGuardWrites += 1
+                markFinalGuardStarted?.()
+                return neverSettlingFinalGuard
+              }
+              return repository.runMutation(...args)
+            }
+          }
+          return Reflect.get(target, property, receiver) as unknown
+        },
+      }),
+    )
+    const openStream = vi.fn(() => ({
+      async *[Symbol.asyncIterator]() {
+        yield {
+          type: 'delta' as const,
+          chunk: { choices: [{ delta: {}, finish_reason: 'stop' }] },
+        }
+      },
+    }))
+
+    const continuing = continueAssistantInPlace({
+      chatId: chat.id,
+      targetMessageId: assistant.id,
+      connection: profile(),
+      apiKey: 'legacy-key-must-not-be-used',
+      apiKeyCandidates: runtime.values,
+      openStream,
+      now: () => 700,
+    })
+
+    await finalGuardStarted
+    const active = useStreamStore
+      .getState()
+      .listByChat(chat.id)
+      .find((stream) => stream.messageId === assistant.id)
+    expect(active).toBeDefined()
+    if (!active) throw new Error('Continue freshness-guard stream was not active')
+    expect(openStream).not.toHaveBeenCalled()
+
+    expect(useStreamStore.getState().abortStream(active.streamId, active.replacementEpoch)).toBe(
+      true,
+    )
+    await continuing
+
+    expect(freshnessReads).toBe(1)
+    expect(finalGuardWrites).toBe(1)
+    expect(openStream).not.toHaveBeenCalled()
+    expect(runtime.primary.resolve).toHaveBeenCalledOnce()
+    expect(runtime.fallback.resolve).not.toHaveBeenCalled()
+    expect(useStreamStore.getState().listByChat(chat.id)).toEqual([])
+    expect(await repository.listStreamLeases(chat.id)).toEqual([])
+    expect(await repository.getMessage(assistant.id)).toMatchObject({
+      content: [{ type: 'output_text', text: 'partial' }],
+      continuationAttempts: [
+        expect.objectContaining({
+          streamId: active.streamId,
+          status: 'abort',
+          abortReason: 'user',
+        }),
+      ],
+    })
   })
 })

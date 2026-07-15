@@ -22,9 +22,11 @@ import {
   touchLastViewed,
   updateChatSettings,
 } from '../../src/store/chats'
+import { recoverStaleContinuationAttempts } from '../../src/store/continuation-recovery'
 import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
 import {
   assertSendContextFresh,
+  assertSendContextGuard,
   createSendContextGuard,
   StaleSendContextError,
 } from '../../src/store/send-context'
@@ -184,6 +186,19 @@ async function seedAssistantBranch(): Promise<{
     role: 'assistant',
     origin: 'generated',
     content: [{ type: 'output_text', text: 'partial' }],
+    generation: {
+      id: 'freshness-generation',
+      model: MODEL,
+      requestedModel: MODEL,
+      requestedModels: [MODEL],
+      apiUsed: 'chat',
+      delivery: 'streaming',
+      status: 'done',
+      integrity: 'clean',
+      costSource: 'stream',
+      startedAt: 1,
+      finishedAt: 2,
+    },
     nodeVersion: 0,
     deleted: false,
   }
@@ -364,7 +379,7 @@ describe('send-context freshness', () => {
     ).toEqual([])
   })
 
-  it('revalidates after the placeholder commits and before the lazy provider opens', async () => {
+  it('uses the placeholder commit as the final dispatch freshness linearization point', async () => {
     const chat = await createChat({ settings: settings() })
     const openStream = vi.fn(() => completedStream())
     let messageMutationCount = 0
@@ -397,10 +412,10 @@ describe('send-context freshness', () => {
       openStream,
     })
 
-    await expect(send).rejects.toBeInstanceOf(StaleSendContextError)
+    await expect(send).resolves.toMatchObject({ outcome: 'done' })
     unsubscribe()
     await concurrentUpdate
-    expect(openStream).not.toHaveBeenCalled()
+    expect(openStream).toHaveBeenCalledOnce()
     expect(useStreamStore.getState().listByChat(chat.id)).toEqual([])
     await vi.waitFor(async () => {
       expect(await getBrowserRepository().listStreamLeases(chat.id)).toEqual([])
@@ -432,6 +447,248 @@ describe('send-context freshness', () => {
     expect(openStream).toHaveBeenCalledTimes(1)
   })
 
+  it('does not confuse deferred calibration metadata with an outbound-context change', async () => {
+    const { chatId, user, assistant } = await seedAssistantBranch()
+    const repo = getBrowserRepository()
+    const chat = await repo.getChat(chatId)
+    const headers = await Promise.all([
+      repo.getMessageHeader(user.id),
+      repo.getMessageHeader(assistant.id),
+    ])
+    if (!chat || !headers[0] || !headers[1]) throw new Error('freshness seed missing')
+    const guard = createSendContextGuard(chat, [headers[0], headers[1]])
+    const generation = headers[1].generation
+    if (!generation) throw new Error('assistant generation missing')
+
+    const mutation = await repo.runMutation([{ kind: 'message', messageId: assistant.id }], (ctx) =>
+      ctx.patchMessageCalibration(assistant.id, {
+        originalCharCount: 7,
+        originalTokenEstimate: 2,
+        originalModelId: MODEL,
+        originalCalibrationKey: 'family:gemini',
+        charCountDelta: 0,
+        cachedTokenEstimate: 2,
+        generation: {
+          ...generation,
+          tokenCalibration: {
+            sampleId: assistant.id,
+            modelId: MODEL,
+            calibrationKey: 'family:gemini',
+            promptSample: true,
+            completionSample: true,
+            sampleCount: 2,
+            appliedAt: 3,
+          },
+        },
+      }),
+    )
+
+    expect(mutation.value?.nodeVersion).toBe(headers[1].nodeVersion + 1)
+    await expect(assertSendContextFresh(guard)).resolves.toBeUndefined()
+  })
+
+  it('stores only a compact scalar request-context revision', async () => {
+    const { chatId, user, assistant } = await seedAssistantBranch()
+    const repo = getBrowserRepository()
+    const chat = await repo.getChat(chatId)
+    const headers = await Promise.all([
+      repo.getMessageHeader(user.id),
+      repo.getMessageHeader(assistant.id),
+    ])
+    if (!chat || !headers[0] || !headers[1]) throw new Error('freshness seed missing')
+    const guard = createSendContextGuard(chat, [headers[0], headers[1]])
+
+    expect(guard.messageRevisions[1]).toEqual({
+      id: assistant.id,
+      chatId,
+      parentId: user.id,
+      requestContextVersion: headers[1].requestContextVersion,
+      deleted: false,
+    })
+
+    const requestedModels = headers[1].generation?.requestedModels
+    if (!requestedModels) throw new Error('requested-model snapshot missing')
+    requestedModels[0] = 'mutated-only-in-caller'
+
+    await expect(assertSendContextFresh(guard)).resolves.toBeUndefined()
+  })
+
+  it('guards the dedicated request-context revision rather than presentation metadata', async () => {
+    const { chatId, assistant } = await seedAssistantBranch()
+    const repo = getBrowserRepository()
+    const chat = await repo.getChat(chatId)
+    const header = await repo.getMessageHeader(assistant.id)
+    if (!chat || !header) throw new Error('freshness seed missing')
+    const guard = createSendContextGuard(chat, [header])
+    const derivedOnly = structuredClone(header)
+    derivedOnly.nodeVersion += 1
+    derivedOnly.siblingIndex += 1
+    derivedOnly.createdAt += 1
+    derivedOnly.cachedMediaTokens = 999
+    if (derivedOnly.generation) derivedOnly.generation.provider = 'metadata-only'
+
+    expect(() => assertSendContextGuard(chat, [derivedOnly], guard)).not.toThrow()
+    expect(() =>
+      assertSendContextGuard(
+        chat,
+        [{ ...derivedOnly, bodyVersion: header.bodyVersion + 1 }],
+        guard,
+      ),
+    ).not.toThrow()
+    expect(() =>
+      assertSendContextGuard(
+        chat,
+        [
+          {
+            ...derivedOnly,
+            hiddenFromContext: true,
+            requestContextVersion: header.requestContextVersion + 1,
+          },
+        ],
+        guard,
+      ),
+    ).toThrow(StaleSendContextError)
+    expect(() =>
+      assertSendContextGuard(
+        chat,
+        [
+          {
+            ...derivedOnly,
+            parentId: null,
+            requestContextVersion: header.requestContextVersion + 1,
+          },
+        ],
+        guard,
+      ),
+    ).toThrow(StaleSendContextError)
+    expect(() =>
+      assertSendContextGuard(
+        chat,
+        [
+          {
+            ...derivedOnly,
+            requestContextVersion: header.requestContextVersion + 1,
+            attachmentRefs: [
+              {
+                refId: 'freshness-ref',
+                attachmentId: 'freshness-attachment',
+                includeInContext: true,
+                presentation: {},
+                createdAt: 1,
+                updatedAt: 1,
+              },
+            ],
+          },
+        ],
+        guard,
+      ),
+    ).toThrow(StaleSendContextError)
+    expect(() =>
+      assertSendContextGuard(
+        chat,
+        [
+          {
+            ...derivedOnly,
+            pinCache: true,
+            requestContextVersion: header.requestContextVersion + 1,
+          },
+        ],
+        guard,
+      ),
+    ).toThrow(StaleSendContextError)
+  })
+
+  it('allows calibration to finish during delayed planning without dropping the send', async () => {
+    const { chatId, assistant } = await seedAssistantBranch()
+    await clearEndpointCache()
+    const discovery = delayEndpointDiscovery()
+    const openStream = vi.fn(() => completedStream('next answer'))
+    const send = sendFromMessage({
+      chatId,
+      parentMessageId: assistant.id,
+      connection: profile(),
+      apiKey: 'sk-test',
+      openStream,
+    })
+
+    await discovery.started
+    const repo = getBrowserRepository()
+    const header = await repo.getMessageHeader(assistant.id)
+    if (!header?.generation) throw new Error('assistant generation missing')
+    const generation = header.generation
+    await repo.runMutation([{ kind: 'message', messageId: assistant.id }], (ctx) =>
+      ctx.patchMessageCalibration(assistant.id, {
+        originalCharCount: 7,
+        originalTokenEstimate: 2,
+        originalModelId: MODEL,
+        originalCalibrationKey: 'family:gemini',
+        charCountDelta: 0,
+        cachedTokenEstimate: 2,
+        generation: {
+          ...generation,
+          tokenCalibration: {
+            sampleId: assistant.id,
+            modelId: MODEL,
+            calibrationKey: 'family:gemini',
+            promptSample: true,
+            completionSample: true,
+            sampleCount: 2,
+            appliedAt: 3,
+          },
+        },
+      }),
+    )
+    discovery.release()
+
+    await expect(send).resolves.toMatchObject({ outcome: 'done' })
+    expect(openStream).toHaveBeenCalledOnce()
+  })
+
+  it('builds a Continue guard from stored prompt revisions after metadata-only target updates', async () => {
+    const { chatId, assistant } = await seedAssistantBranch()
+    const repo = getBrowserRepository()
+    const before = await repo.getMessageHeader(assistant.id)
+    if (!before?.generation) throw new Error('assistant generation missing')
+    const generation = before.generation
+    await repo.runMutation([{ kind: 'message', messageId: assistant.id }], (ctx) =>
+      ctx.patchMessageCalibration(assistant.id, {
+        originalCharCount: 7,
+        originalTokenEstimate: 2,
+        originalModelId: MODEL,
+        originalCalibrationKey: 'family:gemini',
+        charCountDelta: 0,
+        cachedTokenEstimate: 2,
+        generation: {
+          ...generation,
+          tokenCalibration: {
+            sampleId: assistant.id,
+            modelId: MODEL,
+            calibrationKey: 'family:gemini',
+            promptSample: true,
+            completionSample: true,
+            sampleCount: 2,
+            appliedAt: 3,
+          },
+        },
+      }),
+    )
+    const after = await repo.getMessageHeader(assistant.id)
+    expect(after?.nodeVersion).toBe(before.nodeVersion + 1)
+    expect(after?.requestContextVersion).toBe(before.requestContextVersion)
+    const openStream = vi.fn(() => completedStream(' continued'))
+
+    await expect(
+      continueAssistantInPlace({
+        chatId,
+        targetMessageId: assistant.id,
+        connection: profile(),
+        apiKey: 'sk-test',
+        openStream,
+      }),
+    ).resolves.toBeUndefined()
+    expect(openStream).toHaveBeenCalledOnce()
+  })
+
   it.each([
     'target',
     'ancestor',
@@ -449,6 +706,14 @@ describe('send-context freshness', () => {
     })
 
     await discovery.started
+    const planningLease = (await getBrowserRepository().listStreamLeases(chatId))[0]
+    expect(planningLease).toMatchObject({
+      chatId,
+      messageId: assistant.id,
+      attemptKind: 'continuation',
+    })
+    expect(planningLease).not.toHaveProperty('continuationStrategy')
+    expect(planningLease).not.toHaveProperty('baseBodyVersion')
     const messageId = changedMessage === 'target' ? assistant.id : user.id
     await editMessageContent({
       chatId,
@@ -467,6 +732,35 @@ describe('send-context freshness', () => {
     expect(
       (await getBrowserRepository().getMessage(assistant.id))?.continuationAttempts,
     ).toBeUndefined()
+  })
+
+  it('discards an orphaned exact-target Continue planning lease without mutating the target', async () => {
+    const { chatId, assistant } = await seedAssistantBranch()
+    const repo = getBrowserRepository()
+    const planningLease = await repo.upsertStreamLease({
+      streamId: 'orphaned-continue-planning',
+      chatId,
+      messageId: assistant.id,
+      ownerClientId: 'closed-tab',
+      startedAt: 100,
+      heartbeatAt: 200,
+      attemptKind: 'continuation',
+    })
+
+    await expect(
+      recoverStaleContinuationAttempts({
+        repo,
+        leases: [planningLease],
+        now: 100_000,
+        isTargetActive: () => false,
+      }),
+    ).resolves.toBe(1)
+
+    const target = await repo.getMessage(assistant.id)
+    expect(target?.content).toEqual(assistant.content)
+    expect(target?.continuationAttempts).toBeUndefined()
+    expect(await repo.listStreamLeases(chatId)).toEqual([])
+    expect(await repo.listStreamChunks(planningLease.streamId)).toEqual([])
   })
 
   it('checks settings and branch revisions without reading message bodies', async () => {

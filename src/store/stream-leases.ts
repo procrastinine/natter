@@ -1,3 +1,4 @@
+import { invalidatePostCommitTasks } from '../core/post-commit-task'
 import type { ChatId, MessageId } from '../core/types'
 import { newId } from '../lib/ulid'
 import { type BroadcastEvent, isBroadcastChannelAvailable, onEvent, postEvent } from './broadcast'
@@ -172,6 +173,7 @@ function replaceStreamWorkspace(replacementEpoch: number): boolean {
     return false
   }
   currentReplacementEpoch = replacementEpoch
+  invalidatePostCommitTasks()
   refreshGeneration += 1
   refreshInFlight = null
   const writers = [...activeLeaseWriters.values()]
@@ -360,20 +362,32 @@ export function stopStreamLease(
 }
 
 export function requestAbortForChat(chatId: ChatId): number {
-  const state = useStreamStore.getState()
-  let count = state.abortChat(chatId)
-  for (const stream of state.listByChat(chatId)) {
-    if (stream.ownerClientId === clientId || stream.abort) continue
-    postEvent({
-      kind: 'stream-abort-requested',
-      chatId,
-      streamId: stream.streamId,
-      ownerClientId: stream.ownerClientId,
-      replacementEpoch: stream.replacementEpoch,
-    })
-    count += 1
+  let count = 0
+  const streamIds = useStreamStore
+    .getState()
+    .listByChat(chatId)
+    .map((stream) => stream.streamId)
+  for (const streamId of streamIds) {
+    if (requestAbortForStream(streamId)) count += 1
   }
   return count
+}
+
+export function requestAbortForStream(streamId: string): boolean {
+  const state = useStreamStore.getState()
+  const stream = state.getActive(streamId)
+  if (!stream) return false
+  if (stream.ownerClientId === clientId) {
+    return state.abortStream(streamId, stream.replacementEpoch)
+  }
+  postEvent({
+    kind: 'stream-abort-requested',
+    chatId: stream.chatId,
+    streamId: stream.streamId,
+    ownerClientId: stream.ownerClientId,
+    replacementEpoch: stream.replacementEpoch,
+  })
+  return true
 }
 
 function applyRemoteLease(
@@ -400,6 +414,7 @@ function applyRemoteLease(
   if (options.recordObservation) recordRemoteObservation(lease.streamId)
   const state = useStreamStore.getState()
   const current = state.getActive(lease.streamId)
+  const attemptKind = lease.attemptKind ?? current?.attemptKind
   const knownHeartbeatAt = remoteHeartbeatAtByStreamId.get(lease.streamId)
   const targetImproves = current?.messageId === undefined && lease.messageId !== undefined
   const targetRegresses = current?.messageId !== undefined && lease.messageId === undefined
@@ -419,6 +434,7 @@ function applyRemoteLease(
     streamId: lease.streamId,
     chatId: lease.chatId,
     ...(lease.messageId ? { messageId: lease.messageId } : {}),
+    ...(attemptKind ? { attemptKind } : {}),
     replacementEpoch: lease.replacementEpoch,
     startedAt: lease.startedAt,
     ownerClientId: lease.ownerClientId,
@@ -442,12 +458,14 @@ function applyRemoteStreamStarted(
   )
   remoteHeartbeatAtByStreamId.set(event.streamId, heartbeatAt)
   reportedExpiredStreamIds.delete(event.streamId)
+  const attemptKind = event.attemptKind ?? current?.attemptKind
   setRemoteActiveIfChanged({
     streamId: event.streamId,
     chatId: event.chatId,
     ...((event.messageId ?? current?.messageId)
       ? { messageId: (event.messageId ?? current?.messageId) as MessageId }
       : {}),
+    ...(attemptKind ? { attemptKind } : {}),
     replacementEpoch: event.replacementEpoch,
     startedAt: current?.startedAt ?? heartbeatAt,
     ownerClientId: event.ownerClientId,
@@ -671,6 +689,7 @@ function setRemoteActiveIfChanged(stream: {
   streamId: string
   chatId: ChatId
   messageId?: MessageId
+  attemptKind?: 'generation' | 'continuation'
   replacementEpoch: number
   startedAt: number
   ownerClientId: string
@@ -680,6 +699,7 @@ function setRemoteActiveIfChanged(stream: {
   if (
     current?.chatId === stream.chatId &&
     current.messageId === stream.messageId &&
+    current.attemptKind === stream.attemptKind &&
     current.replacementEpoch === stream.replacementEpoch &&
     current.startedAt === stream.startedAt &&
     current.ownerClientId === stream.ownerClientId

@@ -54,6 +54,7 @@ export type BroadcastEvent =
       chatId: ChatId
       streamId: string
       messageId?: string
+      attemptKind?: 'generation' | 'continuation'
       ownerClientId: string
       replacementEpoch: number
     }

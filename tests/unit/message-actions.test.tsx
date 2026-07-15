@@ -1,6 +1,7 @@
 import { act, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Message } from '../../src/core/types'
+import { splitMessageForStorage } from '../../src/store/message-storage'
 import { useChatStore } from '../../src/store/zustand/chatStore'
 import { __setPersistentCursorEnumerationProbeForTests } from '../../src/store/zustand/persistentCursor'
 import { useToastStore } from '../../src/store/zustand/toastStore'
@@ -40,6 +41,33 @@ function assistantMessage(): Message {
     content: [{ type: 'output_text', text: 'partial' }],
     nodeVersion: 0,
     deleted: false,
+  }
+}
+
+function restoredDeletePresentation() {
+  const assistant = assistantMessage()
+  const root: Message = {
+    ...assistant,
+    id: 'user-1',
+    parentId: null,
+    role: 'user',
+    origin: 'user',
+    content: [{ type: 'text', text: 'prompt' }],
+  }
+  const child: Message = {
+    ...root,
+    id: 'child-1',
+    parentId: assistant.id,
+    content: [{ type: 'text', text: 'child' }],
+  }
+  const presentations = [root, assistant, child].map((message) => {
+    const { header } = splitMessageForStorage(message)
+    return { header, message, bodyVersion: header.bodyVersion }
+  })
+  return {
+    selectedPathHeaders: presentations.map((presentation) => presentation.header),
+    structuralHeaders: presentations.map((presentation) => presentation.header),
+    presentations,
   }
 }
 
@@ -159,7 +187,7 @@ describe('MessageActions', () => {
 
   it('applies delete cursor effects without letting undo overwrite later navigation', async () => {
     const priorCursor = {
-      __root__: 'root',
+      __root__: 'user-1',
       'user-1': 'assistant-1',
       'assistant-1': 'child-1',
     }
@@ -199,6 +227,9 @@ describe('MessageActions', () => {
         },
         versions: { metaVersion: 1, summaryVersion: 1 },
         preImage,
+        selectedPathHeaders: [],
+        structuralHeaders: [],
+        presentations: [],
       })
       await pendingDelete
     })
@@ -206,13 +237,13 @@ describe('MessageActions', () => {
     expect(cursorEnumeration).not.toHaveBeenCalled()
     __setPersistentCursorEnumerationProbeForTests(undefined)
     expect(useChatStore.getState().getCursor('chat-1')).toEqual({
-      __root__: 'root',
+      __root__: 'user-1',
       'user-1': 'replacement',
     })
     const toast = useToastStore.getState().toasts.at(-1)
     expect(toast?.text).toBe('Deleted pair.')
-    let resolveUndo: (() => void) | undefined
-    const pendingUndo = new Promise<void>((resolve) => {
+    let resolveUndo: ((value: ReturnType<typeof restoredDeletePresentation>) => void) | undefined
+    const pendingUndo = new Promise<ReturnType<typeof restoredDeletePresentation>>((resolve) => {
       resolveUndo = resolve
     })
     undoMocks.apply.mockReturnValueOnce(pendingUndo)
@@ -223,20 +254,23 @@ describe('MessageActions', () => {
     })
     const laterCursor = { __root__: 'other-root', 'other-root': 'other-leaf' }
     useChatStore.getState().navigateToCursor('chat-1', laterCursor)
-    resolveUndo?.()
+    resolveUndo?.(restoredDeletePresentation())
     await act(async () => undoPromise)
-    expect(undoMocks.apply).toHaveBeenCalledWith(preImage)
+    expect(undoMocks.apply).toHaveBeenCalledWith(preImage, {
+      cursor: priorCursor,
+      presentationWindowLimit: 10,
+    })
     expect(useChatStore.getState().getCursor('chat-1')).toEqual(laterCursor)
   })
 
   it('restores the pre-delete cursor when undo remains the latest local intent', async () => {
     const priorCursor = {
-      __root__: 'root',
+      __root__: 'user-1',
       'user-1': 'assistant-1',
       'assistant-1': 'child-1',
     }
     useChatStore.getState().navigateToCursor('chat-1', priorCursor)
-    undoMocks.apply.mockResolvedValue(undefined)
+    undoMocks.apply.mockResolvedValue(restoredDeletePresentation())
     deleteMocks.pair.mockResolvedValue({
       effects: {
         cursorUpdates: { 'user-1': 'child-1' },
@@ -252,6 +286,9 @@ describe('MessageActions', () => {
         newMessageIds: [],
         attachmentIds: [],
       },
+      selectedPathHeaders: [],
+      structuralHeaders: [],
+      presentations: [],
     })
     renderActions()
 
@@ -269,6 +306,12 @@ describe('MessageActions', () => {
     expect(cursorEnumeration).not.toHaveBeenCalled()
     __setPersistentCursorEnumerationProbeForTests(undefined)
     expect(useChatStore.getState().getCursor('chat-1')).toEqual(priorCursor)
+    expect(
+      useChatStore
+        .getState()
+        .getCommittedPathPresentation('chat-1')
+        ?.pathHeaders.map((header) => header.id),
+    ).toEqual(['user-1', 'assistant-1', 'child-1'])
   })
 
   it('does not let a delayed delete overwrite newer navigation', async () => {
@@ -302,6 +345,9 @@ describe('MessageActions', () => {
           newMessageIds: [],
           attachmentIds: [],
         },
+        selectedPathHeaders: [],
+        structuralHeaders: [],
+        presentations: [],
       })
       await pendingDelete
     })

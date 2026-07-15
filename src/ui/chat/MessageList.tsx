@@ -38,13 +38,17 @@ import type { StructuralMessageHeader } from '../../hooks/useBranchUrlSync'
 import { useChat } from '../../hooks/useChat'
 import {
   continueFromMessage,
+  dismissMessageGenerationNotice,
   editAndResend,
   editInPlace,
   type MessageOpsContext,
+  mutateMessageAttachmentReference,
   regenerateFromMessage,
+  toggleMessageContextHidden,
   toggleProviderOutputItemHidden,
   toggleReasoningDetailHidden,
 } from '../../hooks/useMessageOps'
+import type { MessageAttachmentRefMutation } from '../../store/attachments'
 import { getChat, listChatSidebarRows } from '../../store/chats'
 import type { MessageHeaderRow } from '../../store/message-storage'
 import type { ActiveBranchWindowSnapshot } from '../../store/repository'
@@ -193,7 +197,9 @@ export const MessageList = memo(function MessageList({
 
   const handleEditInPlace = useCallback(
     async (m: MessageRow, text: string) => {
-      await editInPlace(chatId, m, text)
+      await editInPlace(chatId, m, text, {
+        ...(authoritativePathHeaders ? { pathHeaders: authoritativePathHeaders } : {}),
+      })
       if (m.role === 'user') {
         setStaleHintFor((prev) => {
           if (prev.has(m.id)) return prev
@@ -203,12 +209,14 @@ export const MessageList = memo(function MessageList({
         })
       }
     },
-    [chatId],
+    [authoritativePathHeaders, chatId],
   )
   const handleToggleReasoningHidden = useCallback(
     async (m: MessageRow, detailIndex: number) => {
       try {
-        await toggleReasoningDetailHidden(chatId, m.id, detailIndex)
+        await toggleReasoningDetailHidden(chatId, m.id, detailIndex, {
+          ...(authoritativePathHeaders ? { pathHeaders: authoritativePathHeaders } : {}),
+        })
       } catch (error) {
         pushToast({
           level: 'danger',
@@ -216,12 +224,14 @@ export const MessageList = memo(function MessageList({
         })
       }
     },
-    [chatId, pushToast],
+    [authoritativePathHeaders, chatId, pushToast],
   )
   const handleToggleToolHidden = useCallback(
     async (m: MessageRow, itemIndex: number) => {
       try {
-        await toggleProviderOutputItemHidden(chatId, m.id, itemIndex)
+        await toggleProviderOutputItemHidden(chatId, m.id, itemIndex, {
+          ...(authoritativePathHeaders ? { pathHeaders: authoritativePathHeaders } : {}),
+        })
       } catch (error) {
         pushToast({
           level: 'danger',
@@ -229,7 +239,31 @@ export const MessageList = memo(function MessageList({
         })
       }
     },
-    [chatId, pushToast],
+    [authoritativePathHeaders, chatId, pushToast],
+  )
+  const handleToggleContextVisibility = useCallback(
+    async (m: MessageRow) => {
+      await toggleMessageContextHidden(chatId, m.id, {
+        ...(authoritativePathHeaders ? { pathHeaders: authoritativePathHeaders } : {}),
+      })
+    },
+    [authoritativePathHeaders, chatId],
+  )
+  const handleDismissGenerationNotice = useCallback(
+    async (m: MessageRow) => {
+      await dismissMessageGenerationNotice(chatId, m.id, {
+        ...(authoritativePathHeaders ? { pathHeaders: authoritativePathHeaders } : {}),
+      })
+    },
+    [authoritativePathHeaders, chatId],
+  )
+  const handleMutateAttachmentRef = useCallback(
+    async (m: MessageRow, mutation: MessageAttachmentRefMutation) => {
+      await mutateMessageAttachmentReference(chatId, m.id, mutation, {
+        ...(authoritativePathHeaders ? { pathHeaders: authoritativePathHeaders } : {}),
+      })
+    },
+    [authoritativePathHeaders, chatId],
   )
 
   const handleEditAndSend = useCallback(
@@ -523,6 +557,9 @@ export const MessageList = memo(function MessageList({
             presentationOnly={presentationOnly}
             allowPresentationStreamProjection={allowPresentationStreamProjection}
             onEditInPlace={handleEditInPlace}
+            onToggleContextVisibility={handleToggleContextVisibility}
+            onDismissGenerationNotice={handleDismissGenerationNotice}
+            onMutateAttachmentRef={handleMutateAttachmentRef}
             onToggleReasoningDetailHidden={handleToggleReasoningHidden}
             onToggleProviderOutputItemHidden={handleToggleToolHidden}
             {...(m.role === 'user'
@@ -572,6 +609,10 @@ export const MessageList = memo(function MessageList({
               messageId: insertTarget.messageId,
             }}
             cursor={cursor}
+            presentationWindowLimit={Math.max(
+              1,
+              branchSnapshot?.windowLimit ?? messageRenderWindowSize,
+            )}
             defaultRole={insertTarget.defaultRole}
             onClose={() => setInsertTarget(null)}
             onDone={() => setInsertTarget(null)}

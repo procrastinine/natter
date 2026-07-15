@@ -72,10 +72,12 @@ describe('tooling telemetry audit', () => {
 
     for (const adapter of adapters) {
       const source = readText(adapter)
-      expect(source).toContain('malformedJsonFrameReport({')
+      expect(source).toContain('decodeProviderStreamFrame({')
       expect(source).not.toMatch(/console\.warn\([\s\S]{0,200}data:\s*ev\.data/u)
     }
-    expect(readText('src/api/sse.ts')).toContain('malformedStreamFrameDiagnostic(')
+    const boundary = readText('src/api/sse.ts')
+    expect(boundary).toContain('malformedJsonFrameReport({')
+    expect(boundary).toContain('malformedStreamFrameDiagnostic(')
   })
 
   it('keeps the native compiler and tooling API on bounded aliases', () => {
@@ -113,13 +115,15 @@ describe('tooling telemetry audit', () => {
     const packageJson = readJson<{ scripts: Record<string, string> }>('package.json')
     const deploy = readText('.github/workflows/deploy.yml')
 
-    expect(packageJson.scripts['build:pages']).toBe('vite build')
+    expect(packageJson.scripts['build:pages']).toBe('vite build && node scripts/verify-dist.mjs')
     expect(deploy).not.toContain('uses: ./.github/workflows/verify.yml')
     expect(deploy).toContain('needs: build_pages')
     expect(deploy).toContain('run: pnpm build:pages')
+    expect(deploy).toContain('run: pnpm e2e:production-startup')
+    expect(deploy).toContain('E2E_SERVER_MODE: preview')
   })
 
-  it('keeps delivery ratchets in one shared baseline', () => {
+  it('keeps delivery ratchets advisory and artifact correctness blocking', () => {
     const baseline = readJson<{
       deliveryBudgets: {
         maximums: Record<string, number>
@@ -149,6 +153,10 @@ describe('tooling telemetry audit', () => {
     ]) {
       expect(readText(script)).toContain('baseline.deliveryBudgets')
     }
+    const distributionVerifier = readText('scripts/verify-dist.mjs')
+    expect(distributionVerifier).not.toContain('deliveryBudgetProblems')
+    expect(distributionVerifier).toContain('expected one module entry script')
+    expect(readText('scripts/report-performance-baseline.mjs')).toContain('deliveryBudgetProblems')
     const browserMeasurement = readText('scripts/measure-delivery.mjs')
     expect(browserMeasurement).toContain('coldForbiddenRequests')
     expect(browserMeasurement).toContain('diagnostics')

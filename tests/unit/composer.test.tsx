@@ -94,18 +94,22 @@ describe('Composer', () => {
     }
   })
 
-  it('shows an approximate draft-token count without announcing every keystroke', () => {
+  it('uses exact zero and one labels before approximating longer drafts', () => {
     render(<Composer onSubmit={() => {}} />)
     const input = screen.getByRole('textbox')
+    const counter = screen.getByText('0 draft tokens')
+
+    expect(counter).not.toHaveAttribute('aria-live')
+
+    fireEvent.change(input, { target: { value: 'x' } })
+    expect(counter).toHaveTextContent('1 draft token')
 
     fireEvent.change(input, { target: { value: 'count this draft' } })
 
-    const counter = screen.getByText('≈ 4 draft tokens')
-    expect(counter).toBeInTheDocument()
-    expect(counter).not.toHaveAttribute('aria-live')
+    expect(counter).toHaveTextContent('≈ 4 draft tokens')
     expect(counter).toHaveAttribute(
       'title',
-      expect.stringContaining('Approximate pending text only'),
+      expect.stringContaining('drafts longer than one character are approximate'),
     )
   })
 

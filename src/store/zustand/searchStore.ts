@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import type { ChatId } from '../../core/types'
+import { PersistentStringMap } from '../../lib/persistent-string-map'
 import { onEvent } from '../broadcast'
 import {
   cloneSearchFilters,
@@ -24,10 +25,11 @@ export interface SearchSession {
   completedAt?: number
   error?: string
   invalidatedAt?: number
-  invalidatedChatIds: ChatId[]
-  tailPassChatIds: ChatId[]
-  deletedChatIds: ChatId[]
-  deletedChatIdSet: ReadonlySet<ChatId>
+  invalidationRevision: number
+  fullRescanRevision: number
+  invalidatedChatIds: PersistentStringMap<true>
+  tailPassChatIds: PersistentStringMap<true>
+  deletedChatIds: PersistentStringMap<true>
 }
 
 export interface SearchResultCollection {
@@ -37,31 +39,36 @@ export interface SearchResultCollection {
   readonly size: number
 }
 
+export type SearchResultMutation =
+  | { readonly kind: 'upsert'; readonly result: SearchResult }
+  | { readonly kind: 'remove'; readonly chatId: ChatId }
+
 interface SearchStoreState {
   session: SearchSession | null
   setQuery: (query: string, options?: Partial<Pick<SearchSession, 'scope' | 'filters'>>) => void
   setStatus: (status: SearchStatus, error?: string) => void
   setProgress: (completedCount: number, candidateCount: number) => void
-  mergeResult: (result: SearchResult, completedCount?: number, candidateCount?: number) => void
+  applyResultBatch: (
+    mutations: readonly SearchResultMutation[],
+    completedCount: number,
+    candidateCount: number,
+  ) => void
   replaceResults: (results: SearchResult[]) => void
-  removeResult: (chatId: ChatId) => void
   markChatDeleted: (chatId: ChatId) => void
   markChatInvalidated: (chatId: ChatId, options?: { rescan?: boolean }) => void
+  requestFullRescan: () => void
+  prepareFullRescan: (queryId: string, fullRescanRevision: number) => boolean
   clearTailPassChatIds: (chatIds: readonly ChatId[]) => void
   abort: () => void
   reset: () => void
 }
 
 let unsubscribe: (() => void) | null = null
-const RESULT_INDEX = Symbol('resultIndex')
 const RESULT_VALUES = Symbol('resultValues')
 const EMPTY_ORDERED_RESULTS: readonly SearchResult[] = []
 
 interface MutableSearchResultCollection extends SearchResultCollection {
-  readonly orderedIds: ChatId[]
-  readonly byChatId: Map<ChatId, SearchResult>
-  readonly [RESULT_INDEX]: Map<ChatId, number>
-  readonly [RESULT_VALUES]: SearchResult[]
+  readonly [RESULT_VALUES]: readonly SearchResult[]
 }
 
 function nextQueryId(): string {
@@ -83,10 +90,11 @@ export const useSearchStore = create<SearchStoreState>((set) => ({
         candidateCount: 0,
         completedCount: 0,
         startedAt: Date.now(),
-        invalidatedChatIds: [],
-        tailPassChatIds: [],
-        deletedChatIds: [],
-        deletedChatIdSet: new Set(),
+        invalidationRevision: 0,
+        fullRescanRevision: 0,
+        invalidatedChatIds: PersistentStringMap.empty(),
+        tailPassChatIds: PersistentStringMap.empty(),
+        deletedChatIds: PersistentStringMap.empty(),
       },
     })
   },
@@ -113,18 +121,19 @@ export const useSearchStore = create<SearchStoreState>((set) => ({
           }
         : state,
     ),
-  mergeResult: (result, completedCount, candidateCount) =>
+  applyResultBatch: (mutations, completedCount, candidateCount) =>
     set((state) => {
       if (!state.session) return state
-      const chatId = result.chatId
-      if (state.session.deletedChatIdSet.has(chatId)) return state
-      const results = upsertResult(state.session.results, chatId, result)
+      const allowed = mutations.filter(
+        (mutation) =>
+          mutation.kind === 'remove' || !state.session?.deletedChatIds.has(mutation.result.chatId),
+      )
       return {
         session: {
           ...state.session,
-          results,
-          completedCount: completedCount ?? state.session.completedCount,
-          candidateCount: candidateCount ?? state.session.candidateCount,
+          results: applyResultMutations(state.session.results, allowed),
+          completedCount,
+          candidateCount,
         },
       }
     }),
@@ -135,64 +144,96 @@ export const useSearchStore = create<SearchStoreState>((set) => ({
             session: {
               ...state.session,
               results: createResultCollection(
-                results.filter((result) => !state.session?.deletedChatIdSet.has(result.chatId)),
+                results.filter((result) => !state.session?.deletedChatIds.has(result.chatId)),
                 state.session.results.revision + 1,
               ),
             },
           }
         : state,
     ),
-  removeResult: (chatId) =>
-    set((state) => {
-      if (!state.session) return state
-      return {
-        session: {
-          ...state.session,
-          results: removeResult(state.session.results, chatId),
-        },
-      }
-    }),
   markChatDeleted: (chatId) =>
     set((state) => {
       if (!state.session) return state
-      const deletedChatIdSet = new Set(state.session.deletedChatIdSet)
-      deletedChatIdSet.add(chatId)
       return {
         session: {
           ...state.session,
-          results: removeResult(state.session.results, chatId),
-          invalidatedChatIds: state.session.invalidatedChatIds.filter((id) => id !== chatId),
-          tailPassChatIds: state.session.tailPassChatIds.filter((id) => id !== chatId),
-          deletedChatIds: appendUnique(state.session.deletedChatIds, chatId),
-          deletedChatIdSet,
+          results: applyResultMutations(state.session.results, [{ kind: 'remove', chatId }]),
+          invalidationRevision: state.session.invalidationRevision + 1,
+          invalidatedChatIds: state.session.invalidatedChatIds.delete(chatId),
+          tailPassChatIds: state.session.tailPassChatIds.delete(chatId),
+          deletedChatIds: state.session.deletedChatIds.set(chatId, true),
         },
       }
     }),
   markChatInvalidated: (chatId, options = {}) =>
     set((state) => {
       if (!state.session) return state
-      const invalidatedChatIds = appendUnique(state.session.invalidatedChatIds, chatId)
+      if (state.session.deletedChatIds.has(chatId)) return state
+      const invalidatedChatIds = state.session.invalidatedChatIds.set(chatId, true)
       const tailPassChatIds =
         options.rescan === true
-          ? appendUnique(state.session.tailPassChatIds, chatId)
+          ? state.session.tailPassChatIds.set(chatId, true)
           : state.session.tailPassChatIds
       return {
         session: {
           ...state.session,
           invalidatedAt: Date.now(),
+          invalidationRevision: state.session.invalidationRevision + 1,
           invalidatedChatIds,
           tailPassChatIds,
+          ...(options.rescan === true && state.session.status === 'done'
+            ? { status: 'debouncing' as const }
+            : {}),
         },
       }
     }),
-  clearTailPassChatIds: (chatIds) =>
+  requestFullRescan: () =>
+    set((state) =>
+      state.session
+        ? {
+            session: {
+              ...state.session,
+              status: 'debouncing',
+              invalidatedAt: Date.now(),
+              invalidationRevision: state.session.invalidationRevision + 1,
+              fullRescanRevision: state.session.fullRescanRevision + 1,
+            },
+          }
+        : state,
+    ),
+  prepareFullRescan: (queryId, fullRescanRevision) => {
+    let prepared = false
     set((state) => {
-      if (!state.session) return state
-      const cleared = new Set(chatIds)
+      if (
+        !state.session ||
+        state.session.queryId !== queryId ||
+        state.session.fullRescanRevision !== fullRescanRevision
+      ) {
+        return state
+      }
+      prepared = true
       return {
         session: {
           ...state.session,
-          tailPassChatIds: state.session.tailPassChatIds.filter((chatId) => !cleared.has(chatId)),
+          status: 'scanning',
+          results: createResultCollection([], state.session.results.revision + 1),
+          completedCount: 0,
+          candidateCount: 0,
+          tailPassChatIds: PersistentStringMap.empty(),
+        },
+      }
+    })
+    return prepared
+  },
+  clearTailPassChatIds: (chatIds) =>
+    set((state) => {
+      if (!state.session) return state
+      let tailPassChatIds = state.session.tailPassChatIds
+      for (const chatId of chatIds) tailPassChatIds = tailPassChatIds.delete(chatId)
+      return {
+        session: {
+          ...state.session,
+          tailPassChatIds,
         },
       }
     }),
@@ -228,9 +269,7 @@ export function startSearchStoreBroadcastListener(): void {
         session.filters.includeTagIds.includes(event.tagId) ||
         session.filters.excludeTagIds.includes(event.tagId)
       ) {
-        useSearchStore.setState({
-          session: { ...session, invalidatedAt: Date.now(), status: 'debouncing' },
-        })
+        useSearchStore.getState().requestFullRescan()
       }
     }
   })
@@ -252,74 +291,89 @@ function createResultCollection(
   results: readonly SearchResult[] = [],
   revision = 0,
 ): SearchResultCollection {
-  const collection: MutableSearchResultCollection = {
-    orderedIds: [],
-    byChatId: new Map(),
-    revision,
-    size: 0,
-    [RESULT_INDEX]: new Map(),
-    [RESULT_VALUES]: [],
-  }
+  const orderedIds: ChatId[] = []
+  const byChatId = new Map<ChatId, SearchResult>()
   for (const result of results) {
     const chatId = result.chatId
-    const index = collection[RESULT_INDEX].get(chatId)
-    if (index === undefined) {
-      collection[RESULT_INDEX].set(chatId, collection.orderedIds.length)
-      collection.orderedIds.push(chatId)
-      collection[RESULT_VALUES].push(result)
-    } else {
-      collection[RESULT_VALUES][index] = result
-    }
-    collection.byChatId.set(chatId, result)
+    if (!byChatId.has(chatId)) orderedIds.push(chatId)
+    byChatId.set(chatId, result)
   }
-  return { ...collection, size: collection.byChatId.size }
+  const orderedValues = collectOrderedValues(orderedIds, byChatId)
+  return {
+    orderedIds: Object.freeze(orderedIds),
+    byChatId,
+    revision,
+    size: byChatId.size,
+    [RESULT_VALUES]: Object.freeze(orderedValues),
+  } as MutableSearchResultCollection
 }
 
-function upsertResult(
+function applyResultMutations(
   results: SearchResultCollection,
-  chatId: ChatId,
-  result: SearchResult,
+  mutations: readonly SearchResultMutation[],
 ): SearchResultCollection {
-  const mutable = mutableResults(results)
-  const index = mutable[RESULT_INDEX].get(chatId)
-  if (index !== undefined) {
-    mutable[RESULT_VALUES][index] = result
-  } else {
-    mutable[RESULT_INDEX].set(chatId, mutable.orderedIds.length)
-    mutable.orderedIds.push(chatId)
-    mutable[RESULT_VALUES].push(result)
-  }
-  mutable.byChatId.set(chatId, result)
-  return {
-    ...mutable,
-    revision: results.revision + 1,
-    size: mutable.byChatId.size,
-  }
-}
+  let byChatId: Map<ChatId, SearchResult> | null = null
+  const removedFromOrder = new Set<ChatId>()
+  const appendedIds: ChatId[] = []
+  const appendedIdSet = new Set<ChatId>()
+  const queuedAppendIds = new Set<ChatId>()
 
-function removeResult(results: SearchResultCollection, chatId: ChatId): SearchResultCollection {
-  const mutable = mutableResults(results)
-  const index = mutable[RESULT_INDEX].get(chatId)
-  if (index === undefined) return results
-  mutable.orderedIds.splice(index, 1)
-  mutable[RESULT_VALUES].splice(index, 1)
-  mutable.byChatId.delete(chatId)
-  mutable[RESULT_INDEX].delete(chatId)
-  for (let position = index; position < mutable.orderedIds.length; position += 1) {
-    const shiftedChatId = mutable.orderedIds[position]
-    if (shiftedChatId !== undefined) mutable[RESULT_INDEX].set(shiftedChatId, position)
+  for (const mutation of mutations) {
+    const current = byChatId === null ? results.byChatId : byChatId
+    if (mutation.kind === 'remove') {
+      if (!current.has(mutation.chatId)) continue
+      if (byChatId === null) byChatId = new Map(results.byChatId)
+      byChatId.delete(mutation.chatId)
+      removedFromOrder.add(mutation.chatId)
+      appendedIdSet.delete(mutation.chatId)
+      continue
+    }
+
+    const chatId = mutation.result.chatId
+    const existing = current.get(chatId)
+    if (Object.is(existing, mutation.result)) continue
+    if (!existing) {
+      if (!queuedAppendIds.has(chatId)) {
+        queuedAppendIds.add(chatId)
+        appendedIds.push(chatId)
+      }
+      appendedIdSet.add(chatId)
+    }
+    if (byChatId === null) byChatId = new Map(results.byChatId)
+    byChatId.set(chatId, mutation.result)
   }
+
+  if (byChatId === null) return results
+  const nextByChatId = byChatId
+  const nextOrderedIds: ChatId[] = []
+  for (const chatId of results.orderedIds) {
+    if (!removedFromOrder.has(chatId) && nextByChatId.has(chatId)) nextOrderedIds.push(chatId)
+  }
+  for (const chatId of appendedIds) {
+    if (appendedIdSet.has(chatId) && nextByChatId.has(chatId)) nextOrderedIds.push(chatId)
+  }
+  const orderedValues = collectOrderedValues(nextOrderedIds, nextByChatId)
   return {
-    ...mutable,
+    orderedIds: Object.freeze(nextOrderedIds),
+    byChatId: nextByChatId,
     revision: results.revision + 1,
-    size: mutable.byChatId.size,
-  }
+    size: nextByChatId.size,
+    [RESULT_VALUES]: Object.freeze(orderedValues),
+  } as MutableSearchResultCollection
 }
 
 function mutableResults(results: SearchResultCollection): MutableSearchResultCollection {
   return results as MutableSearchResultCollection
 }
 
-function appendUnique<T>(values: readonly T[], value: T): T[] {
-  return values.includes(value) ? [...values] : [...values, value]
+function collectOrderedValues(
+  orderedIds: readonly ChatId[],
+  byChatId: ReadonlyMap<ChatId, SearchResult>,
+): SearchResult[] {
+  const values: SearchResult[] = []
+  for (const chatId of orderedIds) {
+    const result = byChatId.get(chatId)
+    if (result) values.push(result)
+  }
+  return values
 }

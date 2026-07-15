@@ -3,8 +3,11 @@ import { createRoot } from 'react-dom/client'
 import { App } from './app/App'
 import { WorkspaceBootstrap, type WorkspaceOpenOptions } from './app/WorkspaceBootstrap'
 import { nukeSiteStorage } from './lib/debug-nuke'
+import { installPreloadErrorRecovery } from './lib/preload-recovery'
 import { closeDb, openDb } from './store/db'
 import './app/theme.css'
+
+installPreloadErrorRecovery()
 
 const debugToolsRequested =
   import.meta.env.DEV &&

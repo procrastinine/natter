@@ -56,7 +56,7 @@ describe('persisted attempt outcomes', () => {
 
   it('normalizes and caps integrity summaries without accepting arbitrary diagnostics', () => {
     const entries = Array.from({ length: 20 }, (_, index) => ({
-      category: 'malformed-json-frame',
+      category: index === 0 ? 'malformed-event-shape' : 'malformed-json-frame',
       adapter: 'responses',
       eventType: `response.output_text.delta.${index}`,
       count: 1,
@@ -74,6 +74,7 @@ describe('persisted attempt outcomes', () => {
 
     expect(summary).toMatchObject({ count: 20, characterCount: 200 })
     expect(summary?.entries).toHaveLength(16)
+    expect(summary?.entries[0]?.category).toBe('malformed-event-shape')
     expect(JSON.stringify(summary)).not.toContain('private frame')
   })
 })

@@ -1,7 +1,7 @@
 import { readdirSync, readFileSync } from 'node:fs'
 import { basename, extname, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { collectDeliveryWeight, deliveryBudgetProblems } from './delivery-weight.mjs'
+import { collectDeliveryWeight } from './delivery-weight.mjs'
 
 const root = resolve(fileURLToPath(new URL('..', import.meta.url)))
 const dist = join(root, 'dist')
@@ -17,8 +17,15 @@ const forbiddenMarkers = [
   '__debugStreams',
   'window.__nuke',
 ]
-const problems = deliveryBudgetProblems(delivery, baseline.deliveryBudgets)
+const problems = [...delivery.topologyProblems]
 const javascriptArtifacts = []
+const indexHtml = readFileSync(join(dist, 'index.html'), 'utf8')
+const moduleEntryCount = [...indexHtml.matchAll(/<script\b(?=[^>]*\btype=["']module["'])[^>]*>/giu)]
+  .length
+
+if (moduleEntryCount !== 1) {
+  problems.push(`expected one module entry script, found ${moduleEntryCount}`)
+}
 
 for (const file of files) {
   const relativePath = relative(dist, file)
@@ -74,7 +81,7 @@ if (problems.length > 0) {
 }
 
 process.stdout.write(
-  `Verified dist: ${delivery.fileCount} files, ${delivery.totalBytes} raw bytes, ${delivery.totalGzipBytes} gzip bytes; cold static graph ${delivery.coldStaticGraph.fileCount} files / ${delivery.coldStaticGraph.gzipBytes} gzip bytes; topology and named feature budgets pass; no maps/debug paths/legacy fonts/WebAssembly; four Shiki themes.\n`,
+  `Verified dist: ${delivery.fileCount} files, ${delivery.totalBytes} raw bytes, ${delivery.totalGzipBytes} gzip bytes; cold static graph ${delivery.coldStaticGraph.fileCount} files / ${delivery.coldStaticGraph.gzipBytes} gzip bytes; topology and module entry checks pass; no maps/debug paths/legacy fonts/WebAssembly; four Shiki themes.\n`,
 )
 
 function walkFiles(directory) {

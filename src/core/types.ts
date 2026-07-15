@@ -665,6 +665,9 @@ export interface Chat {
   // completion in this chat. Optional for backcompat; absence falls through
   // to global + hardcoded tiers.
   tokenCalibration?: Record<string, TokenCalibrationSample>
+  // Monotonic fence for optional post-commit calibration work. Explicit
+  // calibration clears advance it even when the sample map is already empty.
+  tokenCalibrationGeneration?: number
 }
 
 export type ChatSidebarRow = Pick<
@@ -709,6 +712,9 @@ export interface TokenCalibrationSample {
 export interface GlobalTokenCalibration {
   version: 1
   updatedAt: number
+  // Explicit clears advance this fence so an older deferred rollup cannot
+  // repopulate data after the clear.
+  clearGeneration?: number
   // Same keying contract as `Chat.tokenCalibration`.
   byModel: Record<string, TokenCalibrationSample>
 }
@@ -862,7 +868,7 @@ export interface PersistedAttemptFailure {
 export type AttemptIntegrityState = 'clean' | 'degraded' | 'failed'
 
 export interface AttemptIntegrityEntry {
-  category: 'malformed-json-frame'
+  category: 'malformed-json-frame' | 'malformed-event-shape'
   adapter:
     | 'chat-completions'
     | 'responses'

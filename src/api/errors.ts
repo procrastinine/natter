@@ -64,7 +64,7 @@ export interface NormalizeCtx {
 
 function classifyStatus(
   status: number,
-  body: { error?: { metadata?: Record<string, unknown> } } | undefined,
+  body: ErrorLike | undefined,
 ): { kind: ApiErrorKind; retryable: boolean } {
   if (status === 400) return { kind: 'bad_request', retryable: false }
   if (status === 401) return { kind: 'unauthorized', retryable: false }
@@ -93,8 +93,19 @@ interface ErrorLike {
 }
 
 function extractErrorBody(input: unknown): ErrorLike {
-  if (input && typeof input === 'object') return input
-  return {}
+  if (!isRecord(input) || !isRecord(input.error)) return {}
+  const source = input.error
+  const error: NonNullable<ErrorLike['error']> = {}
+  if (typeof source.code === 'number' || typeof source.code === 'string') {
+    error.code = source.code
+  }
+  if (typeof source.message === 'string') error.message = source.message
+  if (isRecord(source.metadata)) error.metadata = source.metadata
+  return { error }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
 }
 
 export function normalizeError(input: unknown, ctx: NormalizeCtx): ApiError {

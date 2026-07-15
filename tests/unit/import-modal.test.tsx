@@ -5,14 +5,21 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import type { Message } from '../../src/core/types'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
+import { getBrowserRepository } from '../../src/store/browser-repo'
 import { createChat } from '../../src/store/chats'
 import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
+import type { WorkspaceRepository } from '../../src/store/repository'
+import {
+  __resetWorkspaceRepositoryForTests,
+  __setWorkspaceRepositoryForTests,
+} from '../../src/store/workspace-repository'
 import { useChatStore } from '../../src/store/zustand/chatStore'
 import { ImportModal } from '../../src/ui/chat/ImportModal'
 import { putTestMessages } from '../helpers/message-storage'
 
 async function resetAll(): Promise<void> {
   cleanup()
+  __resetWorkspaceRepositoryForTests()
   useChatStore.getState().reset()
   __resetBroadcastForTests()
   __resetDbForTests()
@@ -44,6 +51,73 @@ function message(id: string, parentId: string | null, siblingIndex: number): Mes
 }
 
 describe('ImportModal tree insertion', () => {
+  it('keeps an existing-chat import owned by its tab after another chat is opened', async () => {
+    const target = await createChat({
+      id: 'shared-import-chat',
+      settings: cloneDefaultChatSettings(),
+    })
+    const visible = await createChat({
+      id: 'newer-visible-chat',
+      settings: cloneDefaultChatSettings(),
+    })
+    const root = message('root', null, 0)
+    await putTestMessages([root])
+    useChatStore.getState().navigateToCursor(target.id, { __root__: root.id })
+
+    const repo = getBrowserRepository()
+    let releaseHeaders!: () => void
+    const headersReleased = new Promise<void>((resolve) => {
+      releaseHeaders = resolve
+    })
+    let signalHeadersStarted!: () => void
+    const headersStarted = new Promise<void>((resolve) => {
+      signalHeadersStarted = resolve
+    })
+    __setWorkspaceRepositoryForTests({
+      listMessageHeaders: async (chatId) => {
+        signalHeadersStarted()
+        await headersReleased
+        return repo.listMessageHeaders(chatId)
+      },
+      runMutation: repo.runMutation.bind(repo),
+    } as WorkspaceRepository)
+
+    const onClose = vi.fn()
+    const { getAllByRole, getByRole } = render(
+      <ImportModal
+        chatId={target.id}
+        slot={{ kind: 'at-end' }}
+        cursor={useChatStore.getState().getCursor(target.id) ?? {}}
+        presentationWindowLimit={1}
+        onClose={onClose}
+      />,
+    )
+    fireEvent.change(getAllByRole('textbox')[0] as HTMLTextAreaElement, {
+      target: { value: 'background import' },
+    })
+    fireEvent.click(getByRole('button', { name: 'Import' }))
+    await headersStarted
+
+    const newerIntent = useChatStore
+      .getState()
+      .navigateToCursor(visible.id, { __root__: 'visible-message' })
+    await act(async () => releaseHeaders())
+
+    await waitFor(() => expect(onClose).toHaveBeenCalled())
+    const receipt = useChatStore.getState().getCommittedPathPresentation(target.id)
+    const importedLeafId = receipt?.pathHeaders.at(-1)?.id
+    expect(receipt?.phase).toBe('terminal')
+    expect(receipt?.pathHeaders.map((header) => header.id)).toEqual([root.id, importedLeafId])
+    expect(receipt?.presentations.map((presentation) => presentation.message.id)).toEqual([
+      importedLeafId,
+    ])
+    expect(useChatStore.getState().getCursor(target.id)).toMatchObject({
+      __root__: root.id,
+      [root.id]: importedLeafId,
+    })
+    expect(useChatStore.getState().isNavigationIntentCurrent(newerIntent)).toBe(true)
+  })
+
   it('keeps a superseded new-chat import detached while its write completes', async () => {
     const target = await createChat({
       id: 'detached-import-chat',
@@ -64,6 +138,7 @@ describe('ImportModal tree insertion', () => {
         chatId={null}
         slot={{ kind: 'at-end' }}
         cursor={{}}
+        presentationWindowLimit={10}
         materializeChat={materializeChat}
         onClose={onClose}
       />,
@@ -104,6 +179,7 @@ describe('ImportModal tree insertion', () => {
         chatId={chat.id}
         slot={{ kind: 'after-all', parentId: parent.id }}
         cursor={useChatStore.getState().getCursor(chat.id) ?? {}}
+        presentationWindowLimit={2}
         onClose={onClose}
       />,
     )
@@ -135,6 +211,15 @@ describe('ImportModal tree insertion', () => {
         [first?.id ?? 'missing-first']: second?.id,
         [second?.id ?? 'missing-second']: right.id,
       })
+      const structuralById = new Map(
+        useChatStore
+          .getState()
+          .getCommittedPathPresentation(chat.id)
+          ?.structuralHeaders.map((header) => [header.id, header]),
+      )
+      expect(structuralById.size).toBe(5)
+      expect(structuralById.get(left.id)?.parentId).toBe(second?.id)
+      expect(structuralById.get(right.id)?.parentId).toBe(second?.id)
     })
   })
 
@@ -159,6 +244,7 @@ describe('ImportModal tree insertion', () => {
         chatId={chat.id}
         slot={{ kind: 'after', messageId: leftLeaf.id }}
         cursor={useChatStore.getState().getCursor(chat.id) ?? {}}
+        presentationWindowLimit={2}
         onClose={onClose}
       />,
     )
@@ -180,6 +266,17 @@ describe('ImportModal tree insertion', () => {
       })
       expect(useChatStore.getState().getPendingBranchNavigation(chat.id)?.pathMessageIds).toEqual([
         leftRoot.id,
+        leftLeaf.id,
+        inserted?.id,
+      ])
+      const receipt = useChatStore.getState().getCommittedPathPresentation(chat.id)
+      expect(receipt?.phase).toBe('terminal')
+      expect(receipt?.pathHeaders.map((header) => header.id)).toEqual([
+        leftRoot.id,
+        leftLeaf.id,
+        inserted?.id,
+      ])
+      expect(receipt?.presentations.map((presentation) => presentation.message.id)).toEqual([
         leftLeaf.id,
         inserted?.id,
       ])

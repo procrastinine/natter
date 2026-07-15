@@ -40,6 +40,35 @@ describe('normalizeError', () => {
     expect(generic.kind).toBe('unauthorized')
   })
 
+  it('treats primitive or array metadata as absent instead of throwing during 403 classification', () => {
+    for (const metadata of [null, 'invalid', 7, true, ['invalid']]) {
+      const error = normalizeError(
+        { error: { code: 403, message: 'blocked', metadata } },
+        { midStream: false, httpStatus: 403 },
+      )
+      expect(error).toMatchObject({
+        kind: 'unauthorized',
+        code: 403,
+        message: 'blocked',
+        httpStatus: 403,
+      })
+      expect(error.metadata).toBeUndefined()
+    }
+  })
+
+  it('sanitizes malformed nested error fields before constructing an ApiError', () => {
+    const error = normalizeError(
+      { error: { code: {}, message: ['private'], metadata: { reasons: ['flagged'] } } },
+      { midStream: false, httpStatus: 403 },
+    )
+    expect(error).toMatchObject({
+      kind: 'moderation',
+      code: 403,
+      message: 'HTTP 403',
+      metadata: { reasons: ['flagged'] },
+    })
+  })
+
   it('marks 408/429/502/503 as retryable', () => {
     for (const status of [408, 429, 502, 503]) {
       const err = normalizeError({}, { midStream: false, httpStatus: status })

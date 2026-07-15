@@ -9,6 +9,7 @@ import type {
 import {
   __setRepositoryMutationSubscriberForTests,
   invalidateRepositoryQueriesForWorkspaceReplacement,
+  useRepositoryKeyedPresentationQuery,
   useRepositoryPresentationQuery,
   useRepositoryQueryState,
 } from '../../src/store/reactive-query'
@@ -495,6 +496,76 @@ describe('repository reactive query adapter', () => {
     }
   })
 
+  it('uses exact primary keys from a real Dexie header publication for a batched delta read', async () => {
+    await Dexie.delete(DATABASE_NAME)
+    const database = new Dexie(DATABASE_NAME)
+    database.version(1).stores({ messages: 'id, chatId' })
+    await database.open()
+    await database.table('messages').bulkPut([
+      { id: 'active-message', chatId: 'chat-a', version: 0 },
+      { id: 'other-message', chatId: 'chat-b', version: 0 },
+    ])
+    const fullRead = vi.fn(async () =>
+      database.table<KeyedTestRow>('messages').where('chatId').equals('chat-a').toArray(),
+    )
+    const deltaRead = vi.fn(async (ids: readonly string[]) =>
+      database.table<KeyedTestRow>('messages').bulkGet([...ids]),
+    )
+    render(<KeyedRowsProbe fullRead={fullRead} deltaRead={deltaRead} />)
+    await flushAdapter()
+
+    try {
+      expect(screen.getByTestId('keyed-rows')).toHaveTextContent('active-message:0')
+      const mutation = await captureDatabaseMutation(database, () =>
+        database.table('messages').put({ id: 'active-message', chatId: 'chat-a', version: 1 }),
+      )
+      mutationHarness.emit(mutation)
+      await flushAdapter()
+
+      expect(fullRead).toHaveBeenCalledTimes(1)
+      expect(deltaRead).toHaveBeenCalledTimes(1)
+      expect(deltaRead.mock.calls[0]?.[0]).toEqual(['active-message'])
+      expect(screen.getByTestId('keyed-rows')).toHaveTextContent('active-message:1')
+    } finally {
+      database.close()
+      await Dexie.delete(DATABASE_NAME)
+    }
+  })
+
+  it('composes a newer delta onto an unflushed delta publication', async () => {
+    const publicationTasks: Array<() => void> = []
+    __setRepositoryMutationSubscriberForTests(
+      mutationHarness.subscribe,
+      DATABASE_NAME,
+      undefined,
+      (task) => publicationTasks.push(task),
+    )
+    const current = new Map<string, KeyedTestRow>([
+      ['message-a', { id: 'message-a', chatId: 'chat-a', version: 0 }],
+      ['message-b', { id: 'message-b', chatId: 'chat-a', version: 0 }],
+    ])
+    const fullRead = vi.fn(async () => [...current.values()])
+    const deltaRead = vi.fn(async (ids: readonly string[]) => ids.map((id) => current.get(id)))
+    render(<KeyedRowsProbe fullRead={fullRead} deltaRead={deltaRead} />)
+    await flushReads()
+    act(() => publicationTasks.shift()?.())
+    expect(screen.getByTestId('keyed-rows')).toHaveTextContent('message-a:0,message-b:0')
+
+    current.set('message-a', { id: 'message-a', chatId: 'chat-a', version: 1 })
+    mutationHarness.emit(messageMutation('message-a'))
+    await flushReads()
+    expect(publicationTasks).toHaveLength(1)
+
+    current.set('message-b', { id: 'message-b', chatId: 'chat-a', version: 1 })
+    mutationHarness.emit(messageMutation('message-b'))
+    await flushReads()
+    act(() => publicationTasks.shift()?.())
+
+    expect(fullRead).toHaveBeenCalledTimes(1)
+    expect(deltaRead.mock.calls.map(([ids]) => ids)).toEqual([['message-a'], ['message-b']])
+    expect(screen.getByTestId('keyed-rows')).toHaveTextContent('message-a:1,message-b:1')
+  })
+
   it('publishes errors without discarding the last good value', async () => {
     const query = vi
       .fn<() => Promise<string>>()
@@ -905,6 +976,13 @@ function settingMutation(key: string): ObservabilitySet {
   return { [`idb://${DATABASE_NAME}/settings/`]: new RangeSet(key) }
 }
 
+function messageMutation(messageId: string): ObservabilitySet {
+  return {
+    [`idb://${DATABASE_NAME}/messages/`]: new RangeSet(messageId),
+    [`idb://${DATABASE_NAME}/messages/chatId`]: new RangeSet('chat-a'),
+  }
+}
+
 async function captureDatabaseMutation(
   database: Dexie,
   write: () => Promise<unknown>,
@@ -1002,6 +1080,41 @@ function PresentationProbe({
 }) {
   const value = useRepositoryPresentationQuery(queryKey, query, 'initial', SETTINGS_DEPENDENCY)
   return <span data-testid={id}>ready:{value}</span>
+}
+
+interface KeyedTestRow {
+  id: string
+  chatId: string
+  version: number
+}
+
+function KeyedRowsProbe({
+  fullRead,
+  deltaRead,
+}: {
+  fullRead: (signal: AbortSignal) => Promise<readonly KeyedTestRow[]>
+  deltaRead: (
+    ids: readonly string[],
+    signal: AbortSignal,
+  ) => Promise<readonly (KeyedTestRow | undefined)[]>
+}) {
+  const snapshot = useRepositoryKeyedPresentationQuery(
+    'keyed-message-headers',
+    fullRead,
+    deltaRead,
+    [],
+    [{ table: 'messages', index: 'chatId', keys: ['chat-a'] }],
+    {
+      table: 'messages',
+      keyOf: (row) => row.id,
+      include: (row) => row.chatId === 'chat-a',
+    },
+  )
+  return (
+    <span data-testid="keyed-rows">
+      {[...snapshot.byKey.values()].map((row) => `${row.id}:${row.version}`).join(',')}
+    </span>
+  )
 }
 
 function PairedProbe() {

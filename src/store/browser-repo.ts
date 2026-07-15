@@ -91,6 +91,7 @@ import type {
   ForkChatFromMessageResult,
   KnownBranchPageResult,
   MessageBodyPatch,
+  MessageCalibrationPatch,
   MessageHeaderPatch,
   MessagePresentationSnapshot,
   MessageStructurePatch,
@@ -117,6 +118,8 @@ import {
   chatMatchesBranchCacheWriteGuard,
   ExpectedLeafChangedError,
   StreamTargetBusyError,
+  streamLeaseOwnsTargetWrites,
+  WorkspaceReplacementFenceError,
 } from './repository'
 import {
   bumpBrowserWorkspaceMeta,
@@ -140,6 +143,7 @@ interface ChatMutationState {
   visibleMetaDirty: boolean
   summaryVersionDirty: boolean
   messageSummaryDirty: boolean
+  branchCorpusDirtyMessageIds: Set<MessageId>
   previewDirty: boolean
   broadcast: boolean
   changedMessageIds: Set<MessageId>
@@ -192,6 +196,7 @@ function streamOwnedMessageFieldsChanged(
   const comparableHeader = (header: MessageHeaderRow) => {
     const {
       nodeVersion,
+      requestContextVersion,
       bodyVersion,
       bodyWordCount,
       hiddenFromContext,
@@ -200,6 +205,7 @@ function streamOwnedMessageFieldsChanged(
       ...value
     } = header
     void nodeVersion
+    void requestContextVersion
     void bodyVersion
     void bodyWordCount
     void hiddenFromContext
@@ -218,6 +224,107 @@ function streamOwnedMessageFieldsChanged(
       stableStringify(comparableHeader(nextHeader)) ||
     stableStringify(comparableBody(existingBody)) !== stableStringify(comparableBody(nextBody))
   )
+}
+
+type RequestContextFieldClass = 'semantic' | 'advisory'
+
+const MESSAGE_HEADER_REQUEST_CONTEXT_FIELDS = {
+  id: 'semantic',
+  chatId: 'semantic',
+  parentId: 'semantic',
+  siblingIndex: 'advisory',
+  turnId: 'advisory',
+  turnIndex: 'advisory',
+  createdAt: 'advisory',
+  editedAt: 'advisory',
+  role: 'semantic',
+  origin: 'semantic',
+  generation: 'advisory',
+  attachmentRefs: 'semantic',
+  approval: 'semantic',
+  nodeVersion: 'advisory',
+  pinCache: 'semantic',
+  hiddenFromContext: 'semantic',
+  deleted: 'semantic',
+  originalCharCount: 'advisory',
+  originalTokenEstimate: 'advisory',
+  originalModelId: 'advisory',
+  originalCalibrationKey: 'advisory',
+  charCountDelta: 'advisory',
+  cachedTokenEstimate: 'advisory',
+  cachedMediaTokens: 'advisory',
+  requestContextVersion: 'advisory',
+  bodyVersion: 'advisory',
+  bodyWordCount: 'advisory',
+  textPreview: 'advisory',
+} as const satisfies Record<keyof MessageHeaderRow, RequestContextFieldClass>
+
+const MESSAGE_BODY_REQUEST_CONTEXT_FIELDS = {
+  id: 'semantic',
+  chatId: 'semantic',
+  bodyVersion: 'advisory',
+  updatedAt: 'advisory',
+  content: 'semantic',
+  reasoningDetails: 'semantic',
+  toolCalls: 'semantic',
+  refusal: 'semantic',
+  phase: 'semantic',
+  responsesEchoItem: 'semantic',
+  providerOutputItems: 'semantic',
+  continuationAttempts: 'advisory',
+  generationServerToolOutputs: 'advisory',
+} as const satisfies Record<keyof MessageBodyRow, RequestContextFieldClass>
+
+function requestContextProjection<Row extends object>(
+  row: Row,
+  fields: Record<keyof Row, RequestContextFieldClass>,
+): Partial<Row> {
+  const projected: Partial<Row> = {}
+  for (const key of Object.keys(fields) as Array<keyof Row>) {
+    if (fields[key] === 'semantic') projected[key] = row[key]
+  }
+  return projected
+}
+
+export function __messageRequestContextChangedForTests(
+  existingHeader: MessageHeaderRow,
+  existingBody: MessageBodyRow,
+  nextHeader: MessageHeaderRow,
+  nextBody: MessageBodyRow,
+): boolean {
+  return (
+    stableStringify(
+      requestContextProjection(existingHeader, MESSAGE_HEADER_REQUEST_CONTEXT_FIELDS),
+    ) !==
+      stableStringify(
+        requestContextProjection(nextHeader, MESSAGE_HEADER_REQUEST_CONTEXT_FIELDS),
+      ) ||
+    stableStringify(requestContextProjection(existingBody, MESSAGE_BODY_REQUEST_CONTEXT_FIELDS)) !==
+      stableStringify(requestContextProjection(nextBody, MESSAGE_BODY_REQUEST_CONTEXT_FIELDS))
+  )
+}
+
+const messageRequestContextChanged = __messageRequestContextChangedForTests
+
+function messageBranchCorpusChanged(
+  existingHeader: MessageHeaderRow,
+  existingBody: MessageBodyRow,
+  nextHeader: MessageHeaderRow,
+  nextBody: MessageBodyRow,
+): boolean {
+  return (
+    existingHeader.role !== nextHeader.role ||
+    existingHeader.editedAt !== nextHeader.editedAt ||
+    stableStringify(existingHeader.attachmentRefs ?? []) !==
+      stableStringify(nextHeader.attachmentRefs ?? []) ||
+    stableStringify(existingBody.content) !== stableStringify(nextBody.content) ||
+    stableStringify(existingBody.toolCalls ?? []) !== stableStringify(nextBody.toolCalls ?? []) ||
+    existingBody.phase !== nextBody.phase
+  )
+}
+
+function nextBranchUpdatedAt(current: number, now: number): number {
+  return Math.max(now, current + 1)
 }
 
 async function assertStreamLeaseTargetAvailable(
@@ -523,6 +630,7 @@ const FORBIDDEN_MESSAGE_HEADER_PATCH_KEYS = new Set<keyof MessageHeaderRow>([
   'role',
   'origin',
   'nodeVersion',
+  'requestContextVersion',
   'bodyVersion',
   'bodyWordCount',
   'deleted',
@@ -544,6 +652,36 @@ function applyMessageHeaderPatch(
     else next[key] = structuredClone(value) as never
   }
   return next
+}
+
+const CALIBRATION_MESSAGE_PATCH_KEYS = new Set<keyof MessageCalibrationPatch>([
+  'originalCharCount',
+  'originalTokenEstimate',
+  'originalModelId',
+  'originalCalibrationKey',
+  'charCountDelta',
+  'cachedTokenEstimate',
+  'generation',
+])
+
+function applyMessageCalibrationPatch(
+  header: MessageHeaderRow,
+  patch: MessageCalibrationPatch,
+): MessageHeaderRow {
+  for (const key of Object.keys(patch) as Array<keyof MessageCalibrationPatch>) {
+    if (!CALIBRATION_MESSAGE_PATCH_KEYS.has(key)) {
+      throw new Error(`MessageCalibrationPatchForbidden:${header.id}:${String(key)}`)
+    }
+  }
+  if (patch.generation) {
+    const { tokenCalibration: _beforeCalibration, ...beforeGeneration } =
+      header.generation ?? ({} as NonNullable<Message['generation']>)
+    const { tokenCalibration: _afterCalibration, ...afterGeneration } = patch.generation
+    if (stableStringify(beforeGeneration) !== stableStringify(afterGeneration)) {
+      throw new Error(`MessageCalibrationGenerationPatchForbidden:${header.id}`)
+    }
+  }
+  return applyMessageHeaderPatch(header, patch)
 }
 
 function hydrateStoredMessage(header: MessageHeaderRow, body: MessageBodyRow): Message {
@@ -1560,7 +1698,23 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
           deleted: false,
         }
         await ctx.putMessage(appended)
-        return { message: appended, hadExistingSiblings: siblings.length > 0 }
+        const branchHeaders: MessageHeaderRow[] = []
+        let current = await ctx.getMessageHeader(appended.id)
+        while (current) {
+          branchHeaders.push(current)
+          current = current.parentId ? await ctx.getMessageHeader(current.parentId) : undefined
+        }
+        branchHeaders.reverse()
+        const header = branchHeaders.at(-1)
+        if (!header || header.id !== appended.id) {
+          throw new Error(`AppendMessageHeaderMissing:${appended.id}`)
+        }
+        return {
+          message: appended,
+          header,
+          branchHeaders,
+          hadExistingSiblings: siblings.length > 0,
+        }
       },
     )
     const versions = result.chatVersions[message.chatId]
@@ -2116,6 +2270,11 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     return result.deletedChatIds.includes(chatId)
   }
 
+  async deleteArchivedChatReturningRow(chatId: ChatId): Promise<Chat | undefined> {
+    const result = await this.deleteArchivedChats([chatId])
+    return result.deletedChats.find((chat) => chat.id === chatId)
+  }
+
   async emptyArchivedChats(): Promise<DeleteArchivedChatsResult> {
     const db = await openDb()
     const archivedIds = (await db.chats.filter((chat) => chat.archived).toArray()).map(
@@ -2127,11 +2286,11 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
   private async deleteArchivedChats(
     chatIds: readonly ChatId[],
   ): Promise<DeleteArchivedChatsResult> {
-    if (chatIds.length === 0) return { deletedChatIds: [] }
+    if (chatIds.length === 0) return { deletedChatIds: [], deletedChats: [] }
     const db = await openDb()
     for (;;) {
       const snapshots = await archivedDeleteSnapshots(db, chatIds)
-      if (snapshots.length === 0) return { deletedChatIds: [] }
+      if (snapshots.length === 0) return { deletedChatIds: [], deletedChats: [] }
       const scopes: MutationScope[] = []
       const attachmentScopeIds = new Set<AttachmentId>()
       for (const snapshot of snapshots) {
@@ -2148,6 +2307,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
       }
 
       const deletedChatIds: ChatId[] = []
+      const deletedChats: Chat[] = []
       const now = Date.now()
       try {
         await withMutationLocks(scopes, async (grant) =>
@@ -2224,6 +2384,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
                   .delete()
                 await chats.delete(snapshot.chatId)
                 deletedChatIds.push(snapshot.chatId)
+                deletedChats.push(structuredClone(chat))
               }
               if (deletedChatIds.length > 0) {
                 await deleteChatSidebarProjections(tx, deletedChatIds)
@@ -2241,7 +2402,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
         postEvent({ kind: 'chat-deleted', chatId })
         postEvent({ kind: 'branch-cache-refreshed', chatId })
       }
-      return { deletedChatIds }
+      return { deletedChatIds, deletedChats }
     }
   }
 
@@ -2564,17 +2725,28 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
 
   async getMessageTextPreview(
     messageId: MessageId,
-    options: { maxChars?: number } = {},
+    options: { maxChars?: number; signal?: AbortSignal } = {},
   ): Promise<string | undefined> {
+    throwIfReadonlyAborted(options.signal, 'Message preview read aborted')
     const db = await openDb()
     const maxChars = Math.min(4_096, Math.max(1, Math.floor(options.maxChars ?? 240)))
-    return db.transaction('r', db.messages, db.messageBodies, async () => {
-      const [header, bodyKey] = await Promise.all([
-        db.messages.get(messageId),
-        db.messageBodies.where(':id').equals(messageId).firstKey(),
-      ])
-      if (!header || bodyKey === undefined) return undefined
-      return previewTextFromStoredProjection(header.textPreview, maxChars)
+    return db.transaction('r', db.messages, db.messageBodies, async (tx: Transaction) => {
+      const unbind = bindReadonlyTransactionAbort(
+        tx,
+        options.signal,
+        'Message preview read aborted',
+      )
+      try {
+        const [header, bodyKey] = await Promise.all([
+          db.messages.get(messageId),
+          db.messageBodies.where(':id').equals(messageId).firstKey(),
+        ])
+        throwIfReadonlyAborted(options.signal, 'Message preview read aborted')
+        if (!header || bodyKey === undefined) return undefined
+        return previewTextFromStoredProjection(header.textPreview, maxChars)
+      } finally {
+        unbind()
+      }
     })
   }
 
@@ -2620,6 +2792,24 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     const db = await openDb()
     const header = await db.messages.get(messageId)
     return header ? cloneMessageHeader(header) : undefined
+  }
+
+  async getMessageHeaders(
+    messageIds: readonly MessageId[],
+    options: { signal?: AbortSignal } = {},
+  ): Promise<Array<MessageHeaderRow | undefined>> {
+    throwIfReadonlyAborted(options.signal, 'Header read aborted')
+    const db = await openDb()
+    return db.transaction('r', db.messages, async (tx: Transaction) => {
+      const unbind = bindReadonlyTransactionAbort(tx, options.signal, 'Header read aborted')
+      try {
+        const headers = await db.messages.bulkGet([...messageIds])
+        throwIfReadonlyAborted(options.signal, 'Header read aborted')
+        return headers.map((header) => (header ? cloneMessageHeader(header) : undefined))
+      } finally {
+        unbind()
+      }
+    })
   }
 
   async getSendContextRevisionSnapshot(
@@ -2979,6 +3169,12 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
         db,
         mutationTables,
         async (tx: Transaction) => {
+          if (options?.workspaceFence) {
+            const meta = await readBrowserWorkspaceMetaFromTransaction(tx)
+            if (meta.replacementEpoch !== options.workspaceFence.replacementEpoch) {
+              throw new WorkspaceReplacementFenceError()
+            }
+          }
           let ownedStreamLease: StreamLeaseRow | undefined
           if (options?.streamFence) {
             const { streamId, fence } = options.streamFence
@@ -3008,6 +3204,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
                 .toArray()
               targetLeases = []
               for (const lease of candidates) {
+                if (!streamLeaseOwnsTargetWrites(lease)) continue
                 if (!(await streamLeaseTargetFinalized(tx, lease, options))) {
                   targetLeases.push(lease)
                 }
@@ -3071,6 +3268,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
               visibleMetaDirty: false,
               summaryVersionDirty: false,
               messageSummaryDirty: false,
+              branchCorpusDirtyMessageIds: new Set<MessageId>(),
               previewDirty: false,
               broadcast: false,
               changedMessageIds: new Set<MessageId>(),
@@ -3225,6 +3423,13 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
               return header ? cloneMessageHeader(header) : undefined
             },
 
+            getMessageHeaders: async (messageIds) => {
+              const headers = await tx
+                .table<MessageHeaderRow, MessageId>('messages')
+                .bulkGet([...messageIds])
+              return headers.map((header) => (header ? cloneMessageHeader(header) : undefined))
+            },
+
             listMessages: async (chatId) => listMessagesInTransaction(tx, chatId),
 
             listMessageHeaders: async (chatId) =>
@@ -3254,7 +3459,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
               const existingBody = existing ? await bodyTable.get(message.id) : undefined
               const chatId = existing?.chatId ?? message.chatId
               const needsChatState = touchChatSummary || broadcast
-              const state = needsChatState ? await ensureChatState(chatId) : undefined
+              let state = needsChatState ? await ensureChatState(chatId) : undefined
               const clone = cloneMessage(message)
 
               assertScope({ kind: 'message', messageId: clone.id })
@@ -3278,12 +3483,26 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
                 const comparable = { ...clone, nodeVersion: existing.nodeVersion }
                 const comparableSplit = splitMessageForStorage(comparable, {
                   bodyVersion: existing.bodyVersion,
+                  requestContextVersion: existing.requestContextVersion,
                   updatedAt: existingBody.updatedAt,
                 })
-                const changed =
-                  stableStringify(existing) !== stableStringify(comparableSplit.header) ||
+                const headerChanged =
+                  stableStringify(existing) !== stableStringify(comparableSplit.header)
+                const bodyChanged =
                   stableStringify(existingBody) !== stableStringify(comparableSplit.body)
-                if (!changed) return
+                if (!headerChanged && !bodyChanged) return
+                if (
+                  !touchChatSummary &&
+                  messageBranchCorpusChanged(
+                    existing,
+                    existingBody,
+                    comparableSplit.header,
+                    comparableSplit.body,
+                  )
+                ) {
+                  state ??= await ensureChatState(chatId)
+                  state.branchCorpusDirtyMessageIds.add(clone.id)
+                }
                 if (
                   streamOwnedMessageFieldsChanged(
                     existing,
@@ -3316,11 +3535,33 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
                   )
                 }
                 recordHeaderBeforeWrite(state, clone.id, existing)
+                const requestContextChanged = messageRequestContextChanged(
+                  existing,
+                  existingBody,
+                  comparableSplit.header,
+                  comparableSplit.body,
+                )
                 clone.nodeVersion = existing.nodeVersion + 1
-                const { header, body } = splitMessageForStorage(clone, {
-                  bodyVersion: existing.bodyVersion + 1,
-                  updatedAt: now,
-                })
+                const requestContextVersion =
+                  existing.requestContextVersion + (requestContextChanged ? 1 : 0)
+                let header: MessageHeaderRow
+                let body: MessageBodyRow | undefined
+                if (bodyChanged) {
+                  const split = splitMessageForStorage(clone, {
+                    bodyVersion: existing.bodyVersion + 1,
+                    requestContextVersion,
+                    updatedAt: now,
+                  })
+                  header = split.header
+                  body = split.body
+                } else {
+                  header = {
+                    ...comparableSplit.header,
+                    nodeVersion: clone.nodeVersion,
+                    requestContextVersion,
+                    bodyVersion: existing.bodyVersion,
+                  }
+                }
                 await syncAttachmentReferenceOwner({
                   ownerKind: 'message',
                   ownerId: clone.id,
@@ -3329,7 +3570,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
                   nextRefs: clone.attachmentRefs,
                 })
                 await headerTable.put(header)
-                await bodyTable.put(body)
+                if (body) await bodyTable.put(body)
                 wroteWorkspaceState = true
                 if (state?.afterHeadersById) {
                   setMessageHeader(state.afterHeadersById, header)
@@ -3440,6 +3681,9 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
               await assertStreamTargetWriteAllowed(messageId, { readContinuationBody: false })
               recordHeaderBeforeWrite(state, messageId, existing)
               next.nodeVersion = existing.nodeVersion + 1
+              next.requestContextVersion =
+                existing.requestContextVersion +
+                (next.parentId !== existing.parentId || next.deleted !== existing.deleted ? 1 : 0)
               await headerTable.put(next)
               wroteWorkspaceState = true
               setMessageHeader(state.afterHeadersById as Map<MessageId, MessageHeaderRow>, next)
@@ -3474,7 +3718,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
               const bodyTable = tx.table<MessageBodyRow, MessageId>('messageBodies')
               const existing = await headerTable.get(messageId)
               if (!existing) return
-              const state =
+              let state =
                 touchChatSummary || broadcast ? await ensureChatState(existing.chatId) : undefined
               const nextHeader = applyMessageHeaderPatch(existing, headerPatch)
               const generationReplaced =
@@ -3492,6 +3736,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
                 throw new Error(`MessageBodyMissing:${messageId}`)
               }
               let nextBody: MessageBodyRow
+              let bodyChanged = true
               if (!replaceBody) {
                 const patchedBody = applyMessageBodyPatch(existingBody as MessageBodyRow, patch)
                 nextHeader.nodeVersion = existing.nodeVersion
@@ -3501,17 +3746,26 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
                 syncMessageHeaderProjections(nextHeader, patchedBody, {
                   replaceGenerationServerToolOutputs: generationReplaced,
                 })
-                const changed =
-                  stableStringify(existing) !== stableStringify(nextHeader) ||
-                  stableStringify(existingBody) !== stableStringify(patchedBody)
-                if (!changed) return
+                const headerChanged = stableStringify(existing) !== stableStringify(nextHeader)
+                bodyChanged = stableStringify(existingBody) !== stableStringify(patchedBody)
+                if (!headerChanged && !bodyChanged) return
+                const requestContextChanged = messageRequestContextChanged(
+                  existing,
+                  existingBody as MessageBodyRow,
+                  nextHeader,
+                  patchedBody,
+                )
                 nextHeader.nodeVersion = existing.nodeVersion + 1
-                nextHeader.bodyVersion = existing.bodyVersion + 1
-                nextBody = {
-                  ...patchedBody,
-                  bodyVersion: nextHeader.bodyVersion,
-                  updatedAt: now,
-                }
+                nextHeader.requestContextVersion =
+                  existing.requestContextVersion + (requestContextChanged ? 1 : 0)
+                nextHeader.bodyVersion = existing.bodyVersion + (bodyChanged ? 1 : 0)
+                nextBody = bodyChanged
+                  ? {
+                      ...patchedBody,
+                      bodyVersion: nextHeader.bodyVersion,
+                      updatedAt: now,
+                    }
+                  : (existingBody as MessageBodyRow)
                 if (touchChatSummary) {
                   recordMessageSummaryDeltas(
                     state,
@@ -3536,6 +3790,12 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
                 syncMessageHeaderProjections(nextHeader, nextBody, {
                   replaceGenerationServerToolOutputs: generationReplaced,
                 })
+                nextHeader.requestContextVersion =
+                  existing.requestContextVersion +
+                  (existingBody &&
+                  !messageRequestContextChanged(existing, existingBody, nextHeader, nextBody)
+                    ? 0
+                    : 1)
                 if (touchChatSummary) {
                   recordMessageSummaryDeltas(
                     state,
@@ -3544,6 +3804,14 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
                     hydrateStoredMessage(nextHeader, nextBody),
                   )
                 }
+              }
+              if (
+                !touchChatSummary &&
+                (!existingBody ||
+                  messageBranchCorpusChanged(existing, existingBody, nextHeader, nextBody))
+              ) {
+                state ??= await ensureChatState(existing.chatId)
+                state.branchCorpusDirtyMessageIds.add(messageId)
               }
               if (
                 !replaceBody &&
@@ -3572,7 +3840,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
               }
               recordHeaderBeforeWrite(state, messageId, existing)
               await headerTable.put(nextHeader)
-              await bodyTable.put(nextBody)
+              if (bodyChanged) await bodyTable.put(nextBody)
               wroteWorkspaceState = true
               if (existing.role === 'user' && Object.hasOwn(patch, 'content')) {
                 const previewState = state ?? (await ensureChatState(existing.chatId))
@@ -3595,6 +3863,24 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
                 })
               }
               affectedMessageIds.add(messageId)
+            },
+
+            patchMessageCalibration: async (messageId, patch) => {
+              assertScope({ kind: 'message', messageId })
+              const headerTable = tx.table<MessageHeaderRow, MessageId>('messages')
+              const existing = await headerTable.get(messageId)
+              if (!existing) return undefined
+              const next = applyMessageCalibrationPatch(existing, patch)
+              if (stableStringify(existing) === stableStringify(next)) {
+                return cloneMessageHeader(existing)
+              }
+              next.nodeVersion = existing.nodeVersion + 1
+              next.requestContextVersion = existing.requestContextVersion
+              next.bodyVersion = existing.bodyVersion
+              await headerTable.put(next)
+              wroteWorkspaceState = true
+              affectedMessageIds.add(messageId)
+              return cloneMessageHeader(next)
             },
 
             deleteMessage: async (messageId) => {
@@ -3877,7 +4163,9 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
                   afterHeaders,
                   state.changedMessageIds,
                 )
-                if (lastBranchUpdatedAtChanged) next.lastBranchUpdatedAt = now
+                if (lastBranchUpdatedAtChanged) {
+                  next.lastBranchUpdatedAt = nextBranchUpdatedAt(current.lastBranchUpdatedAt, now)
+                }
                 if (
                   nextLeafId !== state.beforeChat.lastUpdatedLeafId ||
                   lastBranchUpdatedAtChanged
@@ -3904,7 +4192,9 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
                   branchHeaders,
                   state.changedMessageIds,
                 )
-                if (lastBranchUpdatedAtChanged) next.lastBranchUpdatedAt = now
+                if (lastBranchUpdatedAtChanged) {
+                  next.lastBranchUpdatedAt = nextBranchUpdatedAt(current.lastBranchUpdatedAt, now)
+                }
                 if (
                   nextLeafId !== state.beforeChat.lastUpdatedLeafId ||
                   lastBranchUpdatedAtChanged
@@ -3913,6 +4203,22 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
                   wroteWorkspaceState = true
                   pendingBranchCacheEvents.add(chatId)
                 }
+              }
+            }
+
+            if (state.branchCorpusDirtyMessageIds.size > 0 && next.lastUpdatedLeafId !== null) {
+              const branchHeaders = await branchHeadersByLeafInTransaction(
+                tx,
+                chatId,
+                next.lastUpdatedLeafId,
+              )
+              if (
+                branchHeaders.some((header) => state.branchCorpusDirtyMessageIds.has(header.id))
+              ) {
+                next.lastBranchUpdatedAt = nextBranchUpdatedAt(current.lastBranchUpdatedAt, now)
+                await invalidateBranchCacheForSummary(tx, chatId)
+                wroteWorkspaceState = true
+                pendingBranchCacheEvents.add(chatId)
               }
             }
 

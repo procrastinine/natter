@@ -26,7 +26,7 @@ import {
   type AssistantStreamChunk,
   openAssistantRequestStream,
 } from '../api/assistant-stream'
-import { type ApiError, normalizeError } from '../api/errors'
+import type { ApiError } from '../api/errors'
 import { readCachedPrivacyPayload } from '../api/privacy-scrape'
 import { normalizeEndpointsResponse } from '../api/providers'
 import { chatHref, parseRoute, replaceRoute } from '../app/router'
@@ -45,6 +45,11 @@ import { readGlobalPreferences } from '../core/global-settings'
 import { nextSiblingIndexFromChildren, sendUserMessage } from '../core/messages'
 import { tokenCalibrationKey } from '../core/model-ids'
 import { isFreeModel } from '../core/model-predicates'
+import {
+  flushPostCommitTasksForTests,
+  resetPostCommitTasksForTests,
+  schedulePostCommitTask,
+} from '../core/post-commit-task'
 import { buildWireProviderPrivacy, filterEndpointsByPrivacy } from '../core/privacy-filter'
 import { hasEnabledHostedTools, isOpenAiDirectProfile } from '../core/provider-hosted-tools'
 import {
@@ -63,7 +68,7 @@ import {
   streamAccumulatorHasCompletionCalibrationBlockers,
 } from '../core/stream-accumulator'
 import {
-  addAcceptedSampleToGlobal,
+  addAcceptedSamplesToGlobal,
   addSampleToChat,
   calibrationFieldsForCreate,
   deriveCompletionSample,
@@ -71,6 +76,7 @@ import {
   derivePromptSampleFromBasis,
   type PromptCalibrationBasis,
   readTokenCalibrationGlobal,
+  tokenCalibrationClearGeneration,
 } from '../core/token-calibration'
 import type { TokenizerFamily } from '../core/tokens'
 import { TreeChangedError } from '../core/tree-ops'
@@ -92,32 +98,33 @@ import type {
 } from '../core/types'
 import { logStreamDebug, streamDebugEnabled } from '../lib/debug-streams'
 import { newId } from '../lib/ulid'
-import { attachmentScopes } from '../store/attachments'
 import { getChat } from '../store/chats'
-import type { ConnectionRuntimeKeyCandidate } from '../store/connection-runtime'
+import {
+  type ConnectionRuntimeKeyCandidate,
+  primeConnectionRuntimeKeyCandidates,
+} from '../store/connection-runtime'
 import { recoverStaleContinuationAttempts } from '../store/continuation-recovery'
 import {
+  commitPreparedGeneratedOutputAttachments,
   type GeneratedOutputDownloader,
-  mergeGeneratedImageAttachmentRefs,
-  persistPreparedGeneratedOutputAttachments,
   prepareGeneratedOutputAttachments,
 } from '../store/generated-images'
+import type { MessageHeaderRow } from '../store/message-storage'
 import { ENDPOINTS_TTL_MS, getCachedEndpoints, isFresh } from '../store/models-cache'
 import { getCachedPrivacyPolicy } from '../store/privacy-cache'
 import { flushPendingPromptSettingSaves } from '../store/prompt-presets'
 import {
   ExpectedLeafChangedError,
+  type MessageCalibrationPatch,
   type MessageHeaderPatch,
+  type MutationContext,
   type StreamLeaseRow,
   type StreamWriteFence,
 } from '../store/repository'
 import {
-  appendSendContextGuardMessage,
-  assertSendContextFresh,
   assertSendContextGuardInMutation,
   createSendContextGuard,
   loadActiveBranchHeaderSnapshot,
-  loadBranchHeaderSnapshotByLeaf,
   loadChatHeaderSnapshot,
   loadSendContextForBranch,
   type SendContextGuard,
@@ -135,11 +142,15 @@ import {
 } from '../store/stream-leases'
 import { getWorkspaceRepository } from '../store/workspace-repository'
 import { announceGenerationOutcome } from '../store/zustand/announcementStore'
-import type { NavigationIntent } from '../store/zustand/chatStore'
+import type {
+  CommittedMessagePresentation,
+  CommittedPathProducer,
+  NavigationIntent,
+} from '../store/zustand/chatStore'
 import { useChatStore } from '../store/zustand/chatStore'
-import { clearLiveSnapshotIfPresent, useStreamStore } from '../store/zustand/streamStore'
+import { useStreamStore } from '../store/zustand/streamStore'
 import { useUiStore } from '../store/zustand/uiStore'
-import { markLifecycleTarget, startRequestLifecycle } from './requestLifecycle'
+import { startRequestLifecycle } from './requestLifecycle'
 
 const retainedRequestPlansForTests = import.meta.env.DEV
   ? new Set<AssistantRequestPlan>()
@@ -148,6 +159,14 @@ const ORPHAN_RECOVERY_RETRY_MS = 2_000
 
 export function __retainedSendRequestPlanCountForTests(): number | undefined {
   return retainedRequestPlansForTests?.size
+}
+
+export async function __flushPostCommitCalibrationForTests(): Promise<void> {
+  await flushPostCommitTasksForTests()
+}
+
+export function __resetPostCommitCalibrationForTests(): void {
+  resetPostCommitTasksForTests()
 }
 
 function pendingPrefillMessage(input: {
@@ -230,6 +249,7 @@ interface SendTextInput {
   // this tab's branch authority. `null` is an explicit detached/background
   // send: persist and stream normally, but never steer this tab's cursor/URL.
   navigationIntent?: NavigationIntent | null
+  committedPathProducer?: CommittedPathProducer | null
   expectedLeafId?: MessageId | null
   connection: ConnectionProfile
   apiKey: string
@@ -308,6 +328,25 @@ function replaceActiveChatMessageRoute(chatId: ChatId, messageId: MessageId): vo
   replaceRoute(chatHref(chatId, messageId))
 }
 
+async function committedMessagePresentation(
+  ctx: MutationContext,
+  messageId: MessageId,
+): Promise<CommittedMessagePresentation> {
+  const [header, message] = await Promise.all([
+    ctx.getMessageHeader(messageId),
+    ctx.getMessage(messageId),
+  ])
+  if (!header || !message) throw new Error(`CommittedMessagePresentationMissing:${messageId}`)
+  return { header, message, bodyVersion: header.bodyVersion }
+}
+
+function knownCommittedMessagePresentation(
+  header: MessageHeaderRow,
+  message: Message,
+): CommittedMessagePresentation {
+  return { header, message, bodyVersion: header.bodyVersion }
+}
+
 export interface SendTextResult {
   streamId: string
   userMessageId: MessageId
@@ -323,29 +362,39 @@ export interface SendTextResult {
 // id, invalid invariants) throw.
 export async function sendText(input: SendTextInput): Promise<SendTextResult> {
   const now = input.now ?? Date.now
+  const chatStore = useChatStore.getState()
   const navigationIntent =
     input.navigationIntent === undefined
-      ? useChatStore.getState().beginNavigationIntent(input.chatId)
+      ? chatStore.beginNavigationIntent(input.chatId)
       : input.navigationIntent
-  const cursorAtSubmit = useChatStore.getState().getCursor(input.chatId) ?? {}
-  const expectedLeafId =
-    input.expectedLeafId !== undefined
-      ? input.expectedLeafId
-      : ((await loadActiveBranchHeaderSnapshot(input.chatId, cursorAtSubmit)).branchHeaders.at(-1)
-          ?.id ?? null)
-  const lifecycle = await startRequestLifecycle({
-    chatId: input.chatId,
-    streamId: newId(),
-    attemptKind: 'generation',
-    ...(input.signal ? { userSignal: input.signal } : {}),
-  })
+  const committedPathProducer = navigationIntent
+    ? input.committedPathProducer === undefined
+      ? chatStore.registerCommittedPathProducer(input.chatId, navigationIntent)
+      : input.committedPathProducer
+    : null
+  const cursorAtSubmit = chatStore.getCursor(input.chatId) ?? {}
+  let lifecycle: Awaited<ReturnType<typeof startRequestLifecycle>> | undefined
   try {
+    const expectedLeafId =
+      input.expectedLeafId !== undefined
+        ? input.expectedLeafId
+        : ((await loadActiveBranchHeaderSnapshot(input.chatId, cursorAtSubmit)).branchHeaders.at(-1)
+            ?.id ?? null)
+    const userMessageId = newId()
+    const assistantMessageId = newId()
+    lifecycle = await startRequestLifecycle({
+      chatId: input.chatId,
+      streamId: newId(),
+      messageId: assistantMessageId,
+      attemptKind: 'generation',
+      ...(navigationIntent ? { originNavigationRevision: navigationIntent.revision } : {}),
+      ...(input.signal ? { userSignal: input.signal } : {}),
+    })
     await flushPendingPromptSettingSaves(input.chatId)
     let chat: Chat | null | undefined = await getChat(input.chatId)
     if (!chat) throw new Error(`sendText: chat not found: ${input.chatId}`)
 
     const createdAt = now()
-    const userMessageId = newId()
     const userTurnId = newId()
     const skipTurnCalibration = settingsMayRequestTools(input.connection, chat.settings)
     await throwIfCachedPrivacyPreflightZeroEligible({ chat, connection: input.connection })
@@ -361,28 +410,37 @@ export async function sendText(input: SendTextInput): Promise<SendTextResult> {
     })
     chat = null
 
-    let branchSnapshot: Awaited<ReturnType<typeof loadBranchHeaderSnapshotByLeaf>> | undefined =
-      await loadBranchHeaderSnapshotByLeaf(input.chatId, userMsg.messageId)
-    let planningChat: Chat | undefined = branchSnapshot.chat
-    const branchHeaders = branchSnapshot.branchHeaders
-    if (branchHeaders.at(-1)?.id !== userMsg.messageId) {
+    const committedBranchHeaders = userMsg.branchHeaders
+    if (committedBranchHeaders.at(-1)?.id !== userMsg.messageId) {
       throw new ExpectedLeafChangedError(input.chatId, userMsg.messageId, 'missing')
     }
+    const committedPathSelections = committedBranchHeaders.map(
+      (header) => [cursorKeyOf(header.parentId), header.id] as const,
+    )
+    if (committedPathProducer) {
+      useChatStore
+        .getState()
+        .selectCommittedPathForProducer(
+          input.chatId,
+          committedPathProducer,
+          Object.fromEntries(committedPathSelections),
+          {
+            phase: 'open',
+            pathHeaders: committedBranchHeaders,
+            presentations: [knownCommittedMessagePresentation(userMsg.header, userMsg.message)],
+          },
+        )
+    }
+
+    let planningChat: Chat | null | undefined = await getChat(input.chatId)
+    if (!planningChat) throw new Error(`sendText: chat not found: ${input.chatId}`)
+    const branchHeaders = committedBranchHeaders
     const sendContextGuard = createSendContextGuard(planningChat, branchHeaders)
     const targetPathSelections = branchHeaders.map(
       (header) => [cursorKeyOf(header.parentId), header.id] as const,
     )
-    if (navigationIntent) {
-      useChatStore.getState().selectPathForIntent(
-        input.chatId,
-        navigationIntent,
-        Object.fromEntries(targetPathSelections),
-        branchHeaders.map((header) => header.id),
-      )
-    }
-    branchSnapshot = undefined
     const hasPrefill = (input.prefillContent?.length ?? 0) > 0
-    const prefillMessageId = hasPrefill ? newId() : null
+    const prefillMessageId = hasPrefill ? assistantMessageId : null
     const pendingPrefill = hasPrefill
       ? pendingPrefillMessage({
           chatId: input.chatId,
@@ -426,16 +484,27 @@ export async function sendText(input: SendTextInput): Promise<SendTextResult> {
     const requested = openAssistantStreamUnder({
       ...input,
       signal: lifecycle.signal,
-      lifecycleAbort: lifecycle.abort,
       lifecyclePreserveLease: lifecycle.preserveLease,
-      lifecycleReplacementEpoch: lifecycle.replacementEpoch,
+      lifecyclePublishTarget: lifecycle.publishTarget,
+      lifecycleRefreshLease: lifecycle.refreshLease,
       streamId: lifecycle.streamId,
+      streamFence: lifecycle.streamFence,
+      assistantMessageId,
       parentMessageId: userMsg.messageId,
       userMessageId: userMsg.messageId,
       requireEmptyParent: true,
       sendContextGuard,
-      navigationIntent,
+      committedPathProducer,
       targetPathSelections,
+      targetPathHeaders: branchHeaders,
+      targetPresentations: committedPathProducer
+        ? [
+            knownCommittedMessagePresentation(
+              branchHeaders.at(-1) as MessageHeaderRow,
+              userMsg.message,
+            ),
+          ]
+        : [],
       ...(hasPrefill ? { initialAssistantContent: input.prefillContent ?? [] } : {}),
       requestPlan,
     })
@@ -445,8 +514,13 @@ export async function sendText(input: SendTextInput): Promise<SendTextResult> {
     sendContext = undefined
     planningChat = undefined
     return await requested
+  } catch (error) {
+    if (committedPathProducer) {
+      useChatStore.getState().sealCommittedPathProducer(input.chatId, committedPathProducer)
+    }
+    throw error
   } finally {
-    await lifecycle.end(lifecycle.signal.aborted ? 'abort' : 'error')
+    if (lifecycle) await lifecycle.end(lifecycle.signal.aborted ? 'abort' : 'error')
   }
 }
 
@@ -455,17 +529,27 @@ export async function sendText(input: SendTextInput): Promise<SendTextResult> {
 // role:'user', origin:'user'); all that's left is to attach an assistant
 // placeholder under it and stream the reply. No user message is created.
 export async function sendFromMessage(input: SendFromMessageInput): Promise<SendTextResult> {
+  const chatStore = useChatStore.getState()
   const navigationIntent =
     input.navigationIntent === undefined
-      ? useChatStore.getState().beginNavigationIntent(input.chatId)
+      ? chatStore.beginNavigationIntent(input.chatId)
       : input.navigationIntent
-  const lifecycle = await startRequestLifecycle({
-    chatId: input.chatId,
-    streamId: newId(),
-    attemptKind: 'generation',
-    ...(input.signal ? { userSignal: input.signal } : {}),
-  })
+  const committedPathProducer = navigationIntent
+    ? input.committedPathProducer === undefined
+      ? chatStore.registerCommittedPathProducer(input.chatId, navigationIntent)
+      : input.committedPathProducer
+    : null
+  let lifecycle: Awaited<ReturnType<typeof startRequestLifecycle>> | undefined
   try {
+    const assistantMessageId = newId()
+    lifecycle = await startRequestLifecycle({
+      chatId: input.chatId,
+      streamId: newId(),
+      messageId: assistantMessageId,
+      attemptKind: 'generation',
+      ...(navigationIntent ? { originNavigationRevision: navigationIntent.revision } : {}),
+      ...(input.signal ? { userSignal: input.signal } : {}),
+    })
     let headerSnapshot: Awaited<ReturnType<typeof loadChatHeaderSnapshot>> | undefined =
       await loadChatHeaderSnapshot(input.chatId)
     let chat: Chat | undefined = headerSnapshot.chat
@@ -497,7 +581,7 @@ export async function sendFromMessage(input: SendFromMessageInput): Promise<Send
       parentIdx >= 0 ? branchHeaders.slice(0, parentIdx + 1) : branchHeaders
     const sendContextGuard = createSendContextGuard(chat, rawOutboundHeaders)
     const hasPrefill = (input.prefillContent?.length ?? 0) > 0
-    const prefillMessageId = hasPrefill ? newId() : null
+    const prefillMessageId = hasPrefill ? assistantMessageId : null
     const createdAt = (input.now ?? Date.now)()
     const pendingPrefill =
       hasPrefill && prefillMessageId
@@ -519,6 +603,14 @@ export async function sendFromMessage(input: SendFromMessageInput): Promise<Send
         pendingMessages: pendingPrefill ? [pendingPrefill] : [],
       })
     let plannedPath = sendContext.pathMessages
+    const committedParentHeader = rawOutboundHeaders.at(-1)
+    const committedParentMessage = plannedPath.find(
+      (message) => message.id === input.parentMessageId,
+    )
+    const targetPresentations =
+      committedParentHeader && committedParentMessage
+        ? [knownCommittedMessagePresentation(committedParentHeader, committedParentMessage)]
+        : []
     let requestPlan: AssistantRequestPlan
     try {
       requestPlan = (
@@ -543,17 +635,21 @@ export async function sendFromMessage(input: SendFromMessageInput): Promise<Send
     const requested = openAssistantStreamUnder({
       ...input,
       signal: lifecycle.signal,
-      lifecycleAbort: lifecycle.abort,
       lifecyclePreserveLease: lifecycle.preserveLease,
-      lifecycleReplacementEpoch: lifecycle.replacementEpoch,
+      lifecyclePublishTarget: lifecycle.publishTarget,
+      lifecycleRefreshLease: lifecycle.refreshLease,
       streamId: lifecycle.streamId,
+      streamFence: lifecycle.streamFence,
+      assistantMessageId,
       parentMessageId: input.parentMessageId,
       userMessageId: input.parentMessageId,
       sendContextGuard,
-      navigationIntent,
+      committedPathProducer,
       targetPathSelections: rawOutboundHeaders.map(
         (header) => [cursorKeyOf(header.parentId), header.id] as const,
       ),
+      targetPathHeaders: rawOutboundHeaders,
+      targetPresentations,
       ...(hasPrefill ? { initialAssistantContent: input.prefillContent ?? [] } : {}),
       requestPlan,
     })
@@ -563,8 +659,13 @@ export async function sendFromMessage(input: SendFromMessageInput): Promise<Send
     sendContext = undefined
     chat = undefined
     return await requested
+  } catch (error) {
+    if (committedPathProducer) {
+      useChatStore.getState().sealCommittedPathProducer(input.chatId, committedPathProducer)
+    }
+    throw error
   } finally {
-    await lifecycle.end(lifecycle.signal.aborted ? 'abort' : 'error')
+    if (lifecycle) await lifecycle.end(lifecycle.signal.aborted ? 'abort' : 'error')
   }
 }
 
@@ -573,19 +674,29 @@ async function openAssistantStreamUnder(
     userMessageId: MessageId
     requestPlan: AssistantRequestPlan
     sendContextGuard: SendContextGuard
-    navigationIntent: NavigationIntent | null
+    committedPathProducer: CommittedPathProducer | null
     targetPathSelections: ReadonlyArray<readonly [string, MessageId]>
-    streamId?: string
+    targetPathHeaders: readonly MessageHeaderRow[]
+    targetPresentations: readonly CommittedMessagePresentation[]
+    streamId: string
+    streamFence: StreamWriteFence
+    assistantMessageId: MessageId
     initialAssistantContent?: ContentItem[]
     signal: AbortSignal
-    lifecycleAbort: () => void
     lifecyclePreserveLease: () => void
-    lifecycleReplacementEpoch: number
+    lifecyclePublishTarget: () => void
+    lifecycleRefreshLease: () => Promise<void>
     requireEmptyParent?: boolean
   },
 ): Promise<SendTextResult> {
   const now = input.now ?? Date.now
   const repo = getWorkspaceRepository()
+  const apiKeyCandidates = await primeConnectionRuntimeKeyCandidates(
+    input.apiKeyCandidates,
+    input.signal,
+  )
+  await input.lifecycleRefreshLease()
+  if (input.signal.aborted) throw new DOMException('Request aborted.', 'AbortError')
   const {
     requestModel,
     useTextProtocol,
@@ -601,18 +712,14 @@ async function openAssistantStreamUnder(
   const initialAssistantContent = input.initialAssistantContent ?? []
   const initialStoredContent = assistantContentWithStreamPrefix(initialAssistantContent, '')
 
-  const assistantId = newId()
+  const assistantId = input.assistantMessageId
   const targetPathSelections = [
     ...input.targetPathSelections,
     [cursorKeyOf(input.parentMessageId), assistantId] as const,
   ]
-  await repo.runMutation(
+  const placeholderMutation = await repo.runMutation(
     [
       { kind: 'chat-meta', chatId: input.chatId },
-      ...input.sendContextGuard.messageRevisions.map((revision) => ({
-        kind: 'message' as const,
-        messageId: revision.id,
-      })),
       ...(input.regenerateTargetMessageId !== undefined
         ? [{ kind: 'message' as const, messageId: input.regenerateTargetMessageId }]
         : []),
@@ -667,62 +774,35 @@ async function openAssistantStreamUnder(
           startedAt: now(),
         },
       })
+      return committedMessagePresentation(ctx, assistantId)
     },
+    { streamFence: { streamId: input.streamId, fence: input.streamFence } },
   )
-  const dispatchGuard = appendSendContextGuardMessage(input.sendContextGuard, {
-    id: assistantId,
-    chatId: input.chatId,
-    parentId: input.parentMessageId,
-    nodeVersion: 0,
-    deleted: false,
-  })
+  const assistantPlaceholder = placeholderMutation.value
 
-  const selected = input.navigationIntent
-    ? useChatStore.getState().selectPathForIntent(
-        input.chatId,
-        input.navigationIntent,
-        Object.fromEntries(targetPathSelections),
-        targetPathSelections.map(([, messageId]) => messageId),
-      )
+  const selectedPathHeaders = [...input.targetPathHeaders, assistantPlaceholder.header]
+  const selected = input.committedPathProducer
+    ? useChatStore
+        .getState()
+        .selectCommittedPathForProducer(
+          input.chatId,
+          input.committedPathProducer,
+          Object.fromEntries(targetPathSelections),
+          {
+            phase: 'open',
+            pathHeaders: selectedPathHeaders,
+            presentations: [...input.targetPresentations, assistantPlaceholder],
+          },
+        )
     : false
   if (selected) {
     replaceActiveChatMessageRoute(input.chatId, assistantId)
   }
+  input.lifecyclePublishTarget()
 
-  const streamId = input.streamId ?? newId()
+  const streamId = input.streamId
   const debugScope = `send:${streamId}`
-  let streamFence: Awaited<ReturnType<typeof markLifecycleTarget>>
-  try {
-    streamFence = await markLifecycleTarget({
-      chatId: input.chatId,
-      streamId,
-      messageId: assistantId,
-      abort: input.lifecycleAbort,
-      attemptKind: 'generation',
-      replacementEpoch: input.lifecycleReplacementEpoch,
-    })
-  } catch (error) {
-    const storageError = normalizeError(error, { midStream: false, cause: 'storage' })
-    await repo.runMutation([{ kind: 'message', messageId: assistantId }], async (ctx) => {
-      const current = await ctx.getMessageHeader(assistantId)
-      if (!current?.generation || current.generation.finishedAt !== undefined) return
-      await ctx.patchMessageBody(
-        assistantId,
-        {},
-        {
-          headerPatch: {
-            generation: {
-              ...current.generation,
-              status: 'error',
-              finishedAt: now(),
-              error: toPersistedAttemptFailure(storageError, 'storage'),
-            },
-          },
-        },
-      )
-    })
-    throw storageError
-  }
+  const streamFence = input.streamFence
 
   const accumulator = createStreamAccumulator({
     initialContent: initialAssistantContent,
@@ -752,7 +832,7 @@ async function openAssistantStreamUnder(
       openAssistantRequestStream({
         connection: open.connection,
         apiKey: open.apiKey,
-        ...(input.apiKeyCandidates ? { apiKeyCandidates: input.apiKeyCandidates } : {}),
+        ...(apiKeyCandidates ? { apiKeyCandidates } : {}),
         onKeyCandidateSelected: (_candidate, _candidateIndex, apiKey) => {
           selectedApiKey = apiKey
         },
@@ -770,6 +850,7 @@ async function openAssistantStreamUnder(
   })
   let selectedApiKey = input.apiKey
   let canonicalFinalized = false
+  let canonicalAnnounced = false
   const livePathGuard = createExactCursorPathGuard(targetPathSelections)
   const attempt = await runGenerationAttempt({
     open: () => {
@@ -784,7 +865,6 @@ async function openAssistantStreamUnder(
       dispatchPlan.wire = {}
       return source
     },
-    beforeDispatch: () => assertSendContextFresh(dispatchGuard),
     ...(route?.transport !== undefined ? { transportHint: route.transport } : {}),
     accumulator,
     journal,
@@ -820,6 +900,7 @@ async function openAssistantStreamUnder(
               completionCalibrationAllowed,
             }
           : undefined
+      const committedPathProducer = input.committedPathProducer
       await finalize({
         repo,
         chatId: input.chatId,
@@ -838,12 +919,30 @@ async function openAssistantStreamUnder(
         now: now(),
         ...(calibrationInputs ? { calibrationInputs } : {}),
         ...(streamDebugEnabled(input.connection) ? { debugScope } : {}),
+        ...(committedPathProducer
+          ? {
+              onCommittedPresentation: (presentation: CommittedMessagePresentation) => {
+                useChatStore
+                  .getState()
+                  .updateCommittedMessageForProducer(
+                    input.chatId,
+                    committedPathProducer,
+                    presentation,
+                    'terminal',
+                  )
+              },
+            }
+          : {}),
+        onPostCommitPresentation: (presentation: CommittedMessagePresentation) => {
+          useChatStore
+            .getState()
+            .publishCommittedMessageMutation(input.chatId, selectedPathHeaders, presentation)
+        },
       })
       canonicalFinalized = true
     },
-    cleanupJournal: () => repo.deleteStreamChunks(streamId, streamFence),
-    cleanup: (result) => {
-      if (result.journalCleanupPending) input.lifecyclePreserveLease()
+    onCanonicalCommitted: (result) => {
+      canonicalAnnounced = true
       announceGenerationOutcome(streamId, result.outcome)
       announceStreamEnded({
         chatId: input.chatId,
@@ -852,6 +951,20 @@ async function openAssistantStreamUnder(
         outcome: result.outcome,
         replacementEpoch: streamFence.replacementEpoch,
       })
+    },
+    cleanupJournal: () => repo.deleteStreamChunks(streamId, streamFence),
+    cleanup: (result) => {
+      if (result.journalCleanupPending) input.lifecyclePreserveLease()
+      if (!canonicalAnnounced) {
+        announceGenerationOutcome(streamId, result.outcome)
+        announceStreamEnded({
+          chatId: input.chatId,
+          streamId,
+          messageId: assistantId,
+          outcome: result.outcome,
+          replacementEpoch: streamFence.replacementEpoch,
+        })
+      }
     },
   }).catch((err) => {
     if (!canonicalFinalized) input.lifecyclePreserveLease()
@@ -1007,30 +1120,18 @@ function prepareLiveSnapshot(ctx: {
   apiUsed: GenerationMeta['apiUsed']
   now: number
 }): (() => void) | undefined {
-  if (useUiStore.getState().activeChatId !== ctx.chatId) {
-    clearLiveSnapshotIfPresent(ctx.messageId, ctx.streamId, ctx.replacementEpoch)
-    return undefined
-  }
+  if (useUiStore.getState().activeChatId !== ctx.chatId) return undefined
   const preparedCursor = useChatStore.getState().getCursor(ctx.chatId)
-  if (!ctx.pathGuard.matches(preparedCursor)) {
-    clearLiveSnapshotIfPresent(ctx.messageId, ctx.streamId, ctx.replacementEpoch)
-    return undefined
-  }
+  if (!ctx.pathGuard.matches(preparedCursor)) return undefined
   const projection = projectStreamAccumulatorLive(ctx.accumulator, {
     requestedModel: ctx.requestedModel,
     apiUsed: ctx.apiUsed,
     now: ctx.now,
   })
   return () => {
-    if (useUiStore.getState().activeChatId !== ctx.chatId) {
-      clearLiveSnapshotIfPresent(ctx.messageId, ctx.streamId, ctx.replacementEpoch)
-      return
-    }
+    if (useUiStore.getState().activeChatId !== ctx.chatId) return
     const cursor = useChatStore.getState().getCursor(ctx.chatId)
-    if (!ctx.pathGuard.matches(cursor)) {
-      clearLiveSnapshotIfPresent(ctx.messageId, ctx.streamId, ctx.replacementEpoch)
-      return
-    }
+    if (!ctx.pathGuard.matches(cursor)) return
     useStreamStore.getState().setLiveSnapshot({
       streamId: ctx.streamId,
       chatId: ctx.chatId,
@@ -1084,6 +1185,8 @@ interface FinalizeContext extends FlushContext {
   error?: ApiError
   now: number
   debugScope?: string
+  onCommittedPresentation?: (presentation: CommittedMessagePresentation) => void
+  onPostCommitPresentation?: (presentation: CommittedMessagePresentation) => void
   // Token-calibration inputs — present when the send can produce a
   // calibration sample on success. When omitted, calibration is skipped
   // (e.g., text-protocol / llama-server, where usage is not returned).
@@ -1095,6 +1198,8 @@ interface FinalizeContext extends FlushContext {
     completionCalibrationAllowed: boolean
   }
 }
+
+const GENERATED_OUTPUT_POST_COMMIT_TIMEOUT_MS = 20_000
 
 function generatedOutputDownloader(input: {
   connection: ConnectionProfile
@@ -1112,6 +1217,55 @@ function generatedOutputDownloader(input: {
   }
 }
 
+async function localizeCommittedGeneratedOutput(input: {
+  repo: ReturnType<typeof getWorkspaceRepository>
+  presentation: CommittedMessagePresentation
+  connection: ConnectionProfile
+  apiKey: string
+  requestSignal: AbortSignal
+  taskSignal: AbortSignal
+  now: number
+  expectedReplacementEpoch: number
+  isCurrent: () => boolean
+  onCommittedPresentation?: (presentation: CommittedMessagePresentation) => void
+}): Promise<void> {
+  const controller = new AbortController()
+  let cancel!: () => void
+  const cancelled = new Promise<undefined>((resolve) => {
+    cancel = () => {
+      controller.abort()
+      resolve(undefined)
+    }
+  })
+  input.requestSignal.addEventListener('abort', cancel, { once: true })
+  input.taskSignal.addEventListener('abort', cancel, { once: true })
+  if (input.requestSignal.aborted || input.taskSignal.aborted) cancel()
+  const preparing = prepareGeneratedOutputAttachments({
+    messageId: input.presentation.message.id,
+    content: input.presentation.message.content,
+    now: input.now,
+    downloader: generatedOutputDownloader({
+      connection: input.connection,
+      apiKey: input.apiKey,
+      signal: controller.signal,
+    }),
+    preserveRemoteUrlOnDownloadFailure: true,
+  })
+  const prepared = await Promise.race([preparing, cancelled]).finally(() => {
+    input.requestSignal.removeEventListener('abort', cancel)
+    input.taskSignal.removeEventListener('abort', cancel)
+  })
+  if (!prepared || controller.signal.aborted || !input.isCurrent()) return
+  const presentation = await commitPreparedGeneratedOutputAttachments({
+    repo: input.repo,
+    presentation: input.presentation,
+    prepared,
+    expectedReplacementEpoch: input.expectedReplacementEpoch,
+    isCurrent: input.isCurrent,
+  })
+  if (presentation && input.isCurrent()) input.onCommittedPresentation?.(presentation)
+}
+
 function shouldAuthorizeGeneratedOutputUrl(url: string, connection: ConnectionProfile): boolean {
   if (connection.kind !== 'openrouter') return false
   let target: URL
@@ -1127,7 +1281,7 @@ function shouldAuthorizeGeneratedOutputUrl(url: string, connection: ConnectionPr
   return target.pathname.startsWith(`${basePath}/videos/`)
 }
 
-async function finalize(ctx: FinalizeContext): Promise<void> {
+async function finalize(ctx: FinalizeContext): Promise<CommittedMessagePresentation> {
   const {
     repo,
     chatId,
@@ -1145,63 +1299,19 @@ async function finalize(ctx: FinalizeContext): Promise<void> {
   } = ctx
 
   const finalProjection = projectStreamAccumulatorFinal(accumulator)
-  const rawFinalContent = finalProjection.content
-  const generatedImageAttachments = contentNeedsGeneratedOutputMaterialization(rawFinalContent)
-    ? await prepareGeneratedOutputAttachments({
-        messageId,
-        content: rawFinalContent,
-        now,
-        downloader: generatedOutputDownloader(ctx),
-      })
-    : {
-        content: rawFinalContent,
-        replacements: [],
-        newRefs: [],
-        changed: false,
-        attachmentBundles: [],
-      }
-  const finalContent = generatedImageAttachments.content
+  const finalContent = finalProjection.content
   const reasoning = finalProjection.reasoningDetails ?? []
 
-  // Pre-compute calibration fields for the assistant row. On a successful
-  // `done`, `originalCharCount` / `originalTokenEstimate` /
-  // `originalModelId` / `cachedTokenEstimate` are populated so the next
-  // gauge tick can read the cache directly instead of re-multiplying
-  // chars × ratio.
-  // This block only runs when the assistant side is text-only. Multimodal
-  // or tool output can still preserve generation usage, but it must not
-  // seed text calibration caches.
-  let assistantCalibrationFields: ReturnType<typeof calibrationFieldsForCreate> | null = null
   const completionCalibrationBlocked =
     calibrationInputs !== undefined &&
     (streamAccumulatorHasCompletionCalibrationBlockers(accumulator) ||
       finalContent.some(isNonTextContentItem))
-  if (outcome === 'done' && calibrationInputs && !completionCalibrationBlocked) {
-    try {
-      const [chatForRatio, globalCal, prefs] = await Promise.all([
-        repo.getChat(chatId),
-        readTokenCalibrationGlobal(),
-        readGlobalPreferences(),
-      ])
-      assistantCalibrationFields = calibrationFieldsForCreate(
-        finalContent,
-        calibrationInputs.modelId,
-        chatForRatio,
-        globalCal,
-        prefs.tokenCalibrationMode,
-      )
-    } catch {
-      assistantCalibrationFields = null
-    }
-  }
 
-  const persistedAssistant = { value: null as Message | null }
-  await repo.runMutation(
-    [{ kind: 'message', messageId }, ...attachmentScopes(generatedImageAttachments.newRefs)],
+  const persistedAssistantMutation = await repo.runMutation(
+    [{ kind: 'message', messageId }],
     async (inner) => {
       const current = await inner.getMessageHeader(messageId)
-      if (!current) return
-      await persistPreparedGeneratedOutputAttachments(inner, generatedImageAttachments)
+      if (!current) throw new Error(`FinalizeMessageMissing:${messageId}`)
       const generation = projectStreamGeneration(current.generation, accumulator, requestedModel, {
         apiUsed,
         finishedAt: now,
@@ -1221,20 +1331,7 @@ async function finalize(ctx: FinalizeContext): Promise<void> {
       if (finalError) {
         generation.error = toPersistedAttemptFailure(finalError, 'provider')
       }
-      const headerPatch: MessageHeaderPatch = {
-        generation,
-        ...(assistantCalibrationFields ?? {}),
-      }
-      if (generatedImageAttachments.newRefs.length > 0) {
-        const merged = mergeGeneratedImageAttachmentRefs(
-          current.attachmentRefs,
-          generatedImageAttachments.newRefs,
-          messageId,
-          now,
-        )
-        headerPatch.attachmentRefs = merged.refs
-        headerPatch.cachedMediaTokens = undefined
-      }
+      const headerPatch: MessageHeaderPatch = { generation }
       await inner.patchMessageBody(
         messageId,
         {
@@ -1258,49 +1355,59 @@ async function finalize(ctx: FinalizeContext): Promise<void> {
           generation,
         })
       }
-      persistedAssistant.value = {
-        ...current,
-        ...headerPatch,
-        content: finalContent,
-        ...(reasoning.length > 0 ? { reasoningDetails: reasoning } : {}),
-        ...(finalProjection.toolCalls
-          ? { toolCalls: structuredClone(finalProjection.toolCalls) }
-          : {}),
-        ...(finalProjection.phase !== undefined ? { phase: finalProjection.phase } : {}),
-        ...(finalProjection.providerOutputItems
-          ? { providerOutputItems: structuredClone(finalProjection.providerOutputItems) }
-          : {}),
-      } as Message
+      const chat = await inner.getChat(chatId)
+      if (!chat) throw new Error(`FinalizeChatMissing:${chatId}`)
+      return {
+        presentation: await committedMessagePresentation(inner, messageId),
+        tokenCalibrationGeneration: chatTokenCalibrationGeneration(chat),
+      }
     },
     { streamFence: { streamId: ctx.streamId, fence: streamFence } },
   )
+  const persistedAssistant = persistedAssistantMutation.value.presentation
+  ctx.onCommittedPresentation?.(persistedAssistant)
 
-  // Token calibration happens AFTER the assistant message is persisted
-  // so the final content + reasoningDetails + usage are available. Skips
-  // on anything other than a clean `done`, because error/abort streams
-  // don't have reliable usage from the server.
-  if (
-    outcome === 'done' &&
-    calibrationInputs &&
-    !completionCalibrationBlocked &&
-    persistedAssistant.value !== null &&
-    accumulator.usage
-  ) {
-    try {
-      await ingestCalibrationSample({
+  if (contentNeedsGeneratedOutputMaterialization(finalContent)) {
+    schedulePostCommitTask(
+      (isCurrent, taskSignal) =>
+        localizeCommittedGeneratedOutput({
+          repo,
+          presentation: persistedAssistant,
+          connection: ctx.connection,
+          apiKey: ctx.apiKey,
+          requestSignal: ctx.signal,
+          taskSignal,
+          now,
+          expectedReplacementEpoch: streamFence.replacementEpoch,
+          isCurrent,
+          ...(ctx.onPostCommitPresentation
+            ? { onCommittedPresentation: ctx.onPostCommitPresentation }
+            : {}),
+        }),
+      { timeoutMs: GENERATED_OUTPUT_POST_COMMIT_TIMEOUT_MS },
+    )
+  }
+
+  if (outcome === 'done' && calibrationInputs && !completionCalibrationBlocked) {
+    schedulePostCommitTask((isCurrent) =>
+      calibrateCommittedAssistant({
         repo,
         chatId,
-        assistantMessage: persistedAssistant.value,
-        usage: accumulator.usage,
+        presentation: persistedAssistant,
+        ...(accumulator.usage ? { usage: accumulator.usage } : {}),
         calibrationInputs,
         now,
-        streamId: ctx.streamId,
-        streamFence,
-      })
-    } catch {
-      // Non-fatal: calibration failure must not surface to the user.
-    }
+        expectedChatCalibrationGeneration:
+          persistedAssistantMutation.value.tokenCalibrationGeneration,
+        expectedReplacementEpoch: streamFence.replacementEpoch,
+        ...(ctx.onPostCommitPresentation
+          ? { onCommittedPresentation: ctx.onPostCommitPresentation }
+          : {}),
+        isCurrent,
+      }),
+    )
   }
+  return persistedAssistant
 }
 
 function isNonTextContentItem(item: ContentItem): boolean {
@@ -1319,57 +1426,112 @@ function contentNeedsGeneratedOutputMaterialization(content: readonly ContentIte
   )
 }
 
-async function ingestCalibrationSample(args: {
+function presentationVersionMatches(
+  header: MessageHeaderRow | undefined,
+  presentation: CommittedMessagePresentation,
+): boolean {
+  return (
+    header?.id === presentation.header.id &&
+    header.nodeVersion === presentation.header.nodeVersion &&
+    header.bodyVersion === presentation.bodyVersion
+  )
+}
+
+function chatTokenCalibrationGeneration(chat: Pick<Chat, 'tokenCalibrationGeneration'>): number {
+  return typeof chat.tokenCalibrationGeneration === 'number' &&
+    Number.isSafeInteger(chat.tokenCalibrationGeneration) &&
+    chat.tokenCalibrationGeneration >= 0
+    ? chat.tokenCalibrationGeneration
+    : 0
+}
+
+function presentationWithMetadataHeader(
+  presentation: CommittedMessagePresentation,
+  header: MessageHeaderRow,
+): CommittedMessagePresentation {
+  const {
+    requestContextVersion: _requestContextVersion,
+    bodyVersion,
+    bodyWordCount: _bodyWordCount,
+    textPreview: _textPreview,
+    ...messageHeader
+  } = header
+  return {
+    header,
+    bodyVersion,
+    message: { ...presentation.message, ...messageHeader },
+  }
+}
+
+async function calibrateCommittedAssistant(args: {
   repo: ReturnType<typeof getWorkspaceRepository>
   chatId: ChatId
-  assistantMessage: Message
-  usage: ChatUsage
+  presentation: CommittedMessagePresentation
+  usage?: ChatUsage
   calibrationInputs: NonNullable<FinalizeContext['calibrationInputs']>
   now: number
-  streamId: string
-  streamFence: StreamWriteFence
+  expectedChatCalibrationGeneration: number
+  expectedReplacementEpoch: number
+  onCommittedPresentation?: (presentation: CommittedMessagePresentation) => void
+  isCurrent: () => boolean
 }): Promise<void> {
-  const { repo, chatId, assistantMessage, usage, calibrationInputs, now, streamId, streamFence } =
-    args
+  const { repo, chatId, calibrationInputs, now } = args
+  const [chatForRatio, globalCal, prefs] = await Promise.all([
+    repo.getChat(chatId),
+    readTokenCalibrationGlobal(),
+    readGlobalPreferences(),
+  ])
+  if (!args.isCurrent()) return
+  const assistantCalibrationFields = calibrationFieldsForCreate(
+    args.presentation.message.content,
+    calibrationInputs.modelId,
+    chatForRatio,
+    globalCal,
+    prefs.tokenCalibrationMode,
+  )
+  const assistantMessage = args.presentation.message
   if (assistantMessage.generation?.tokenCalibration) return
 
   const calibrationKey = tokenCalibrationKey(calibrationInputs.modelId)
   const promptSample =
-    calibrationInputs.promptCalibrationAllowed && calibrationInputs.promptBasis
-      ? derivePromptSampleFromBasis(calibrationInputs.promptBasis, usage)
+    args.usage && calibrationInputs.promptCalibrationAllowed && calibrationInputs.promptBasis
+      ? derivePromptSampleFromBasis(calibrationInputs.promptBasis, args.usage)
       : null
   const completionSample =
+    args.usage &&
     calibrationInputs.completionCalibrationAllowed &&
     !assistantMessage.content.some(isNonTextContentItem) &&
     !messageHasToolArtifacts(assistantMessage)
       ? deriveCompletionSample({
           assistantMessage,
-          usage,
+          usage: args.usage,
           family: calibrationInputs.family,
         })
       : null
-
-  if (promptSample === null && completionSample === null) return
-
-  // Step 1: apply per-chat samples in memory. `patchChatMeta` with
-  // `touchVisibleState: false` writes into the hidden meta patch so
-  // `metaVersion` doesn't bump and a sidebar broadcast doesn't fire just
-  // for a calibration delta.
-  const acceptedSamples: Array<{ chars: number; tokens: number }> = []
-  await repo.runMutation(
+  if (!args.isCurrent()) return
+  const expectedGlobalClearGeneration = tokenCalibrationClearGeneration(globalCal)
+  const mutation = await repo.runMutation(
     [
       { kind: 'chat-meta', chatId },
       { kind: 'message', messageId: assistantMessage.id },
     ],
     async (inner) => {
+      const chat = await inner.getChat(chatId)
       const assistantHeader = await inner.getMessageHeader(assistantMessage.id)
-      if (!assistantHeader?.generation || assistantHeader.generation.tokenCalibration) return
+      if (
+        !chat ||
+        chatTokenCalibrationGeneration(chat) !== args.expectedChatCalibrationGeneration ||
+        assistantHeader?.chatId !== chatId ||
+        !assistantHeader.generation ||
+        assistantHeader.generation.tokenCalibration ||
+        !presentationVersionMatches(assistantHeader, args.presentation)
+      ) {
+        return undefined
+      }
 
       let promptAccepted = false
       let completionAccepted = false
       const localAcceptedSamples: Array<{ chars: number; tokens: number }> = []
-      const chat = await inner.getChat(chatId)
-      if (!chat) return
       const staged = {
         tokenCalibration: { ...(chat.tokenCalibration ?? {}) },
       }
@@ -1399,45 +1561,40 @@ async function ingestCalibrationSample(args: {
           completionAccepted = true
         }
       }
+      const headerPatch: MessageCalibrationPatch = { ...assistantCalibrationFields }
       if (localAcceptedSamples.length > 0) {
         inner.patchChatMeta(
           chatId,
           { tokenCalibration: staged.tokenCalibration },
           { touchVisibleState: false, broadcast: false },
         )
-        await inner.patchMessageBody(
-          assistantMessage.id,
-          {},
-          {
-            headerPatch: {
-              generation: {
-                ...assistantHeader.generation,
-                tokenCalibration: {
-                  sampleId: assistantMessage.id,
-                  modelId: calibrationInputs.modelId,
-                  calibrationKey,
-                  promptSample: promptAccepted,
-                  completionSample: completionAccepted,
-                  sampleCount: localAcceptedSamples.length,
-                  appliedAt: now,
-                },
-              },
-            },
-            touchChatSummary: false,
-            broadcast: false,
+        headerPatch.generation = {
+          ...assistantHeader.generation,
+          tokenCalibration: {
+            sampleId: assistantMessage.id,
+            modelId: calibrationInputs.modelId,
+            calibrationKey,
+            promptSample: promptAccepted,
+            completionSample: completionAccepted,
+            sampleCount: localAcceptedSamples.length,
+            appliedAt: now,
           },
-        )
-        acceptedSamples.push(...localAcceptedSamples)
+        }
       }
+      const header = await inner.patchMessageCalibration(assistantMessage.id, headerPatch)
+      return header ? { header, acceptedSamples: localAcceptedSamples } : undefined
     },
-    { streamFence: { streamId, fence: streamFence } },
+    { workspaceFence: { replacementEpoch: args.expectedReplacementEpoch } },
   )
-
-  // Step 2: roll up to global AFTER the chat mutation closes — separate
-  // transaction on the settings table.
-  for (const s of acceptedSamples) {
-    await addAcceptedSampleToGlobal(calibrationInputs.modelId, s.chars, s.tokens, now)
-  }
+  if (!args.isCurrent() || !mutation.value) return
+  args.onCommittedPresentation?.(
+    presentationWithMetadataHeader(args.presentation, mutation.value.header),
+  )
+  if (mutation.value.acceptedSamples.length === 0 || !args.isCurrent()) return
+  await addAcceptedSamplesToGlobal(calibrationInputs.modelId, mutation.value.acceptedSamples, now, {
+    expectedClearGeneration: expectedGlobalClearGeneration,
+    expectedReplacementEpoch: args.expectedReplacementEpoch,
+  })
 }
 
 // Orphan sweep for interrupted streams. The active-chat shell runs it on open

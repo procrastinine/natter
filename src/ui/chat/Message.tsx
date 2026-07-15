@@ -22,7 +22,8 @@ import type {
   ReasoningDetail,
 } from '../../core/types'
 import { useRetainedMessageStreamProjection } from '../../hooks/useMessageStreamProjection'
-import { dismissAbortReason, updateChatSettings } from '../../store/chats'
+import type { MessageAttachmentRefMutation } from '../../store/attachments'
+import { updateChatSettings } from '../../store/chats'
 import {
   generatedOutputAttachmentIds,
   migrateGeneratedOutputAttachments,
@@ -76,6 +77,12 @@ interface MessageProps {
   // Structural op handlers. Threaded from the list so `<Message>` can stay
   // presentational except for its own edit-swap state.
   onEditInPlace: (message: MessageRow, text: string) => Promise<void>
+  onToggleContextVisibility?: (message: MessageRow) => Promise<void>
+  onDismissGenerationNotice?: (message: MessageRow) => Promise<void>
+  onMutateAttachmentRef?: (
+    message: MessageRow,
+    mutation: MessageAttachmentRefMutation,
+  ) => Promise<void>
   onToggleReasoningDetailHidden?: (message: MessageRow, detailIndex: number) => Promise<void>
   onToggleProviderOutputItemHidden?: (message: MessageRow, itemIndex: number) => Promise<void>
   onEditAndSend?: (
@@ -132,6 +139,9 @@ export const Message = memo(
     prev.staleReplyHint === next.staleReplyHint &&
     prev.excludedFromContext === next.excludedFromContext &&
     prev.onEditInPlace === next.onEditInPlace &&
+    prev.onToggleContextVisibility === next.onToggleContextVisibility &&
+    prev.onDismissGenerationNotice === next.onDismissGenerationNotice &&
+    prev.onMutateAttachmentRef === next.onMutateAttachmentRef &&
     prev.onToggleReasoningDetailHidden === next.onToggleReasoningDetailHidden &&
     prev.onToggleProviderOutputItemHidden === next.onToggleProviderOutputItemHidden &&
     prev.onEditAndSend === next.onEditAndSend &&
@@ -161,6 +171,9 @@ function MessageInner({
   staleReplyHint,
   excludedFromContext,
   onEditInPlace,
+  onToggleContextVisibility,
+  onDismissGenerationNotice,
+  onMutateAttachmentRef,
   onToggleReasoningDetailHidden,
   onToggleProviderOutputItemHidden,
   onEditAndSend,
@@ -561,10 +574,25 @@ function MessageInner({
             collapseMode={collapseMode}
             messageId={message.id}
             attachmentRefs={message.attachmentRefs}
+            {...(onMutateAttachmentRef
+              ? {
+                  onMutateAttachmentRef: (mutation: MessageAttachmentRefMutation) =>
+                    onMutateAttachmentRef(message, mutation),
+                }
+              : {})}
           />
         )}
         {!editing ? (
-          <AttachmentRefChips refs={message.attachmentRefs} messageId={message.id} />
+          <AttachmentRefChips
+            refs={message.attachmentRefs}
+            messageId={message.id}
+            {...(onMutateAttachmentRef
+              ? {
+                  onMutateMessageRef: (mutation: MessageAttachmentRefMutation) =>
+                    onMutateAttachmentRef(message, mutation),
+                }
+              : {})}
+          />
         ) : null}
         {error ? (
           <div data-ui="message-error" data-role="error">
@@ -572,7 +600,7 @@ function MessageInner({
             <Button
               type="button"
               data-ui="message-error-dismiss"
-              onClick={() => void dismissAbortReason(message.id)}
+              onClick={() => void onDismissGenerationNotice?.(message)}
               aria-label="Dismiss error"
               title="Dismiss"
             >
@@ -601,7 +629,7 @@ function MessageInner({
             <Button
               type="button"
               data-ui="message-error-dismiss"
-              onClick={() => void dismissAbortReason(message.id)}
+              onClick={() => void onDismissGenerationNotice?.(message)}
               aria-label="Dismiss banner"
               title="Dismiss"
             >
@@ -637,6 +665,9 @@ function MessageInner({
             hasConnection={hasConnection}
             generationBusy={generationBusy}
             streamTargetBusy={isStreaming}
+            {...(onToggleContextVisibility
+              ? { onToggleContextVisibility: () => onToggleContextVisibility(message) }
+              : {})}
             {...(roleMismatch ? { roleMismatch: true } : {})}
             {...(onRegenerate ? { onRegenerate: handleRegenerate } : {})}
             {...(onContinue ? { onContinue: handleContinue } : {})}

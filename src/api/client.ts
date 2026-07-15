@@ -4,6 +4,7 @@
 // in-tab engine and the daemon engine build import it directly.
 
 import type { ConnectionProfile } from '../core/types'
+import { raceWithAbortSignal } from '../lib/abort'
 import type { CallOpts } from './call-opts'
 import { ApiError, normalizeError } from './errors'
 
@@ -463,6 +464,20 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
   }
 }
 
+async function runAbortableRequestStep<T>(
+  start: () => T | PromiseLike<T>,
+  signal: AbortSignal | undefined,
+): Promise<T> {
+  try {
+    return await raceWithAbortSignal(start, signal)
+  } catch (error) {
+    if (signal?.aborted) {
+      throw normalizeError(error, { midStream: false, cause: 'abort' })
+    }
+    throw error
+  }
+}
+
 // Tries each opaque candidate in order. The caller rebuilds authentication
 // headers per candidate while reusing the same request body. Rotation is only
 // allowed before response-body consumption; the selected candidate is returned
@@ -481,7 +496,7 @@ export async function fetchWithKeyFallback<Candidate>(
   for (let i = 0; i < candidates.length; i += 1) {
     throwIfAborted(opts.signal)
     const candidate = candidates[i] as Candidate
-    const { url, init } = await build(candidate, i)
+    const { url, init } = await runAbortableRequestStep(() => build(candidate, i), opts.signal)
     throwIfAborted(opts.signal)
     const res = await fetchWithTimeout(url, init, opts)
     const result = { response: res, candidate, candidateIndex: i }
@@ -490,8 +505,9 @@ export async function fetchWithKeyFallback<Candidate>(
     // Non-last rotate trigger: cancel the body to free the socket before
     // the next attempt. A response returned to the caller stays unread.
     try {
-      await res.body?.cancel()
-    } catch {
+      await runAbortableRequestStep(() => res.body?.cancel(), opts.signal)
+    } catch (error) {
+      if (opts.signal?.aborted) throw error
       return result
     }
   }
@@ -534,7 +550,7 @@ async function fetchWithApiKeyFallbackImpl(
     result = await fetchWithKeyFallback(
       candidates,
       async (candidate, candidateIndex) => {
-        const apiKey = await candidate.resolve()
+        const apiKey = await runAbortableRequestStep(candidate.resolve, opts.signal)
         resolvedKeys.set(candidateIndex, apiKey)
         return (buildRequest as ApiKeyRequestBuilder)(apiKey, candidate, candidateIndex)
       },

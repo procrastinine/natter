@@ -4,6 +4,7 @@ import type { AttachmentRef, ChatId, MessageId } from '../../core/types'
 import { liveAttachmentRefs } from '../../store/attachment-refs'
 import {
   detachAttachmentRef,
+  type MessageAttachmentRefMutation,
   relinkAttachmentRef,
   setAttachmentRefVisibility,
 } from '../../store/attachments'
@@ -21,6 +22,7 @@ interface AttachmentRefChipsProps {
   messageId?: MessageId
   draftChatId?: ChatId
   editable?: boolean
+  onMutateMessageRef?: (mutation: MessageAttachmentRefMutation) => void | Promise<void>
 }
 
 export function AttachmentRefChips({
@@ -28,6 +30,7 @@ export function AttachmentRefChips({
   messageId,
   draftChatId,
   editable = true,
+  onMutateMessageRef,
 }: AttachmentRefChipsProps) {
   const liveRefs = liveAttachmentRefs(refs)
   const attachmentIds = liveRefs.map((ref) => ref.attachmentId).join('|')
@@ -101,14 +104,22 @@ export function AttachmentRefChips({
                       ? 'Hide this attachment from future context'
                       : 'Include this attachment in future context'
                   }
-                  onClick={() =>
+                  onClick={() => {
+                    if (messageId) {
+                      void onMutateMessageRef?.({
+                        kind: 'visibility',
+                        refId: ref.refId,
+                        includeInContext: !ref.includeInContext,
+                      })
+                      return
+                    }
                     void setAttachmentRefVisibility({
-                      ...(messageId ? { messageId } : { draftChatId: draftChatId as ChatId }),
+                      draftChatId: draftChatId as ChatId,
                       refId: ref.refId,
                       includeInContext: !ref.includeInContext,
                     })
-                  }
-                  disabled={!messageId && !draftChatId}
+                  }}
+                  disabled={messageId ? !onMutateMessageRef : !draftChatId}
                 >
                   {ref.includeInContext ? <EyeIcon size={13} /> : <EyeOffIcon size={13} />}
                 </IconButton>
@@ -119,7 +130,7 @@ export function AttachmentRefChips({
                   aria-label="Relink attachment reference"
                   title="Relink this reference to another stored attachment"
                   onClick={() => setReplaceRefId(ref.refId)}
-                  disabled={!messageId && !draftChatId}
+                  disabled={messageId ? !onMutateMessageRef : !draftChatId}
                 >
                   <DatabaseIcon size={13} />
                 </IconButton>
@@ -129,13 +140,17 @@ export function AttachmentRefChips({
                   data-size="xs"
                   aria-label="Detach attachment from this message"
                   title="Detach from this message; stored file remains"
-                  onClick={() =>
+                  onClick={() => {
+                    if (messageId) {
+                      void onMutateMessageRef?.({ kind: 'detach', refId: ref.refId })
+                      return
+                    }
                     void detachAttachmentRef({
-                      ...(messageId ? { messageId } : { draftChatId: draftChatId as ChatId }),
+                      draftChatId: draftChatId as ChatId,
                       refId: ref.refId,
                     })
-                  }
-                  disabled={!messageId && !draftChatId}
+                  }}
+                  disabled={messageId ? !onMutateMessageRef : !draftChatId}
                 >
                   <TrashIcon size={13} />
                 </IconButton>
@@ -149,11 +164,19 @@ export function AttachmentRefChips({
           title="Relink reference"
           onClose={() => setReplaceRefId(null)}
           onPick={async (attachment) => {
-            await relinkAttachmentRef({
-              ...(messageId ? { messageId } : { draftChatId: draftChatId as ChatId }),
-              refId: replaceRefId,
-              newAttachmentId: attachment.id,
-            })
+            if (messageId) {
+              await onMutateMessageRef?.({
+                kind: 'relink',
+                refId: replaceRefId,
+                newAttachmentId: attachment.id,
+              })
+            } else {
+              await relinkAttachmentRef({
+                draftChatId: draftChatId as ChatId,
+                refId: replaceRefId,
+                newAttachmentId: attachment.id,
+              })
+            }
             setReplaceRefId(null)
           }}
         />

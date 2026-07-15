@@ -6,10 +6,14 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { cursorKeyOf } from '../../core/active-path'
 import { createCursorOverlay } from '../../core/cursor-overlay'
 import { type PasteImportSlot, pasteImport } from '../../core/messages'
-import type { ChatId, ContentItem, CursorMap, MessageId, MessageRole } from '../../core/types'
+import type { ChatId, ContentItem, CursorMap, MessageRole } from '../../core/types'
 import { newId } from '../../lib/ulid'
 import { useAnnouncementStore } from '../../store/zustand/announcementStore'
-import { type NavigationIntent, useChatStore } from '../../store/zustand/chatStore'
+import {
+  type CommittedPathProducer,
+  type NavigationIntent,
+  useChatStore,
+} from '../../store/zustand/chatStore'
 import { CloseIcon, TrashIcon } from '../icons/Icon'
 import { Button, IconButton } from '../primitives/Button'
 import { Dialog } from '../primitives/Dialog'
@@ -22,6 +26,7 @@ interface ImportModalProps {
   chatId: ChatId | null
   slot: PasteImportSlot
   cursor: Readonly<CursorMap>
+  presentationWindowLimit: number
   // Initial role for the first row; defaults to "user" because the common
   // path is "paste a user turn from another app."
   defaultRole?: MessageRole
@@ -66,6 +71,7 @@ export function ImportModal({
   chatId,
   slot,
   cursor,
+  presentationWindowLimit,
   defaultRole = 'user',
   materializeChat,
   onClose,
@@ -114,18 +120,30 @@ export function ImportModal({
       setError('Add at least one message to import.')
       return
     }
-    let navigationIntent = chatId ? useChatStore.getState().beginNavigationIntent(chatId) : null
+    let effectiveChatId: ChatId | null = chatId
+    let committedPathProducer: CommittedPathProducer | null = null
+    if (effectiveChatId !== null) {
+      const chatStore = useChatStore.getState()
+      const navigationIntent = chatStore.beginNavigationIntent(effectiveChatId)
+      committedPathProducer = chatStore.registerCommittedPathProducer(
+        effectiveChatId,
+        navigationIntent,
+      )
+    }
     setBusy(true)
     setError(null)
     try {
-      let effectiveChatId: ChatId | null = chatId
       if (effectiveChatId === null) {
         if (!materializeChat) {
           throw new Error('import: no chat to write into and no materializeChat callback')
         }
         const materialized = await materializeChat()
         effectiveChatId = materialized.chatId
-        navigationIntent = materialized.navigationIntent
+        if (materialized.navigationIntent !== null) {
+          committedPathProducer = useChatStore
+            .getState()
+            .registerCommittedPathProducer(effectiveChatId, materialized.navigationIntent)
+        }
       }
       const operationCursor = createCursorOverlay(
         useChatStore.getState().getCursor(effectiveChatId) ?? cursor,
@@ -134,27 +152,28 @@ export function ImportModal({
         chatId: effectiveChatId,
         slot,
         cursor: operationCursor,
+        presentationWindowLimit,
         messages: cleaned.map((r) => ({
           role: r.role,
           content: [{ type: 'text', text: r.text } satisfies ContentItem],
         })),
       })
-      if (navigationIntent !== null) {
+      if (committedPathProducer !== null) {
         const selections: CursorMap = {}
-        for (let index = 0; index < result.selectedPathMessageIds.length; index += 1) {
-          const messageId = result.selectedPathMessageIds[index] as MessageId
-          const parentId =
-            index === 0 ? null : (result.selectedPathMessageIds[index - 1] as MessageId)
-          selections[cursorKeyOf(parentId)] = messageId
+        for (const header of result.selectedPathHeaders) {
+          selections[cursorKeyOf(header.parentId)] = header.id
         }
-        useChatStore
-          .getState()
-          .selectPathForIntent(
-            effectiveChatId,
-            navigationIntent,
-            selections,
-            result.selectedPathMessageIds,
-          )
+        const selectedLeafId = result.selectedPathHeaders.at(-1)?.id
+        if (selectedLeafId !== undefined) {
+          useChatStore
+            .getState()
+            .selectCommittedPathForProducer(effectiveChatId, committedPathProducer, selections, {
+              phase: 'terminal',
+              pathHeaders: result.selectedPathHeaders,
+              structuralHeaders: result.structuralHeaders,
+              presentations: result.presentations,
+            })
+        }
       }
       useAnnouncementStore.getState().announce({
         text: `Imported ${cleaned.length} ${cleaned.length === 1 ? 'message' : 'messages'} (${slotLabel(slot)}).`,
@@ -164,9 +183,12 @@ export function ImportModal({
     } catch (err) {
       setError(err instanceof Error ? `Import failed: ${err.message}` : 'Import failed.')
     } finally {
+      if (effectiveChatId !== null && committedPathProducer !== null) {
+        useChatStore.getState().sealCommittedPathProducer(effectiveChatId, committedPathProducer)
+      }
       setBusy(false)
     }
-  }, [busy, rows, chatId, slot, cursor, materializeChat, onDone, onClose])
+  }, [busy, rows, chatId, slot, cursor, presentationWindowLimit, materializeChat, onDone, onClose])
 
   const roleOptions = useMemo(() => ROLE_OPTIONS, [])
 

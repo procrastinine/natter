@@ -471,6 +471,7 @@ function toHeader(message: Message): MessageHeaderRow {
   } = structuredClone(message)
   return {
     ...header,
+    requestContextVersion: message.nodeVersion,
     bodyVersion: message.nodeVersion,
     bodyWordCount: 0,
     textPreview: `${message.role} ${message.id}`,

@@ -550,8 +550,8 @@ async function verifyStored(page, expected) {
           headerExists: Boolean(header),
           bodyExists: Boolean(body),
           chatExists: Boolean(chat),
-          nodeVersionsMatch: header?.nodeVersion === body?.nodeVersion,
-          previousNodeVersionsMatch: previousHeader?.nodeVersion === previousBody?.nodeVersion,
+          bodyVersionsMatch: header?.bodyVersion === body?.bodyVersion,
+          previousBodyVersionsMatch: previousHeader?.bodyVersion === previousBody?.bodyVersion,
           multiTurnParentsMatch:
             userHeader?.parentId === previousAssistantId && header?.parentId === userId,
           previousStatus: previousHeader?.generation?.status,
@@ -593,7 +593,7 @@ async function verifyStored(page, expected) {
           bodyExists: Boolean(body),
           sourceHeaderExists: Boolean(sourceHeader),
           parentHeaderExists: Boolean(parentHeader),
-          nodeVersionsMatch: header?.nodeVersion === body?.nodeVersion,
+          bodyVersionsMatch: header?.bodyVersion === body?.bodyVersion,
           branchShapeMatches:
             header?.parentId === regeneration.parentUserId &&
             sourceHeader?.parentId === regeneration.parentUserId &&
@@ -631,8 +631,8 @@ async function verifyStored(page, expected) {
         failures.push(`${row.assistantId}: missing previous context body`)
       if (!row.userHeaderExists) failures.push(`${row.assistantId}: missing current user header`)
       if (!row.chatExists) failures.push(`${row.assistantId}: missing chat`)
-      if (!row.nodeVersionsMatch) failures.push(`${row.assistantId}: header/body version mismatch`)
-      if (!row.previousNodeVersionsMatch) {
+      if (!row.bodyVersionsMatch) failures.push(`${row.assistantId}: header/body version mismatch`)
+      if (!row.previousBodyVersionsMatch) {
         failures.push(`${row.assistantId}: previous header/body version mismatch`)
       }
       if (!row.multiTurnParentsMatch)
@@ -671,7 +671,7 @@ async function verifyStored(page, expected) {
       if (!row.bodyExists) failures.push(`${row.assistantId}: missing regeneration body`)
       if (!row.sourceHeaderExists) failures.push(`${row.assistantId}: missing source sibling`)
       if (!row.parentHeaderExists) failures.push(`${row.assistantId}: missing shared parent`)
-      if (!row.nodeVersionsMatch) {
+      if (!row.bodyVersionsMatch) {
         failures.push(`${row.assistantId}: regeneration header/body version mismatch`)
       }
       if (!row.branchShapeMatches) failures.push(`${row.assistantId}: copied or malformed branch`)

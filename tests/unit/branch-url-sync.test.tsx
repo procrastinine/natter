@@ -1,10 +1,11 @@
 import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
-import type { ObservabilitySet } from 'dexie'
+import { type ObservabilitySet, RangeSet } from 'dexie'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { navigate, refreshRouteForWorkspaceReplacement } from '../../src/app/router'
 import { cursorKeyOf } from '../../src/core/active-path'
 import type { ChatId, Message } from '../../src/core/types'
 import {
+  __setBranchHeaderMergeProbeForTests,
   __setBranchProjectionBuildProbeForTests,
   useBranchUrlSync,
   useStableStructuralHeaders,
@@ -19,13 +20,22 @@ import { useChatStore } from '../../src/store/zustand/chatStore'
 const chatReads = vi.hoisted(() => ({
   loadMessageHeaders:
     vi.fn<(chatId: ChatId, options?: { signal?: AbortSignal }) => Promise<MessageHeaderRow[]>>(),
+  loadMessageHeadersById:
+    vi.fn<
+      (
+        messageIds: readonly string[],
+        options?: { signal?: AbortSignal },
+      ) => Promise<Array<MessageHeaderRow | undefined>>
+    >(),
 }))
 
 vi.mock('../../src/store/chats', () => ({
   loadMessageHeaders: chatReads.loadMessageHeaders,
+  loadMessageHeadersById: chatReads.loadMessageHeadersById,
 }))
 
 const CHAT_ID = 'branch-url-chat'
+const DATABASE_NAME = 'branch-url-sync-test'
 
 const silentChanges: RepositoryMutationSubscriber =
   (_listener: (parts: ObservabilitySet) => void) => () => {}
@@ -47,6 +57,7 @@ function header(input: {
     createdAt: input.createdAt,
     role: input.role,
     origin: input.role === 'user' ? 'user' : 'generated',
+    requestContextVersion: 0,
     bodyVersion: 0,
     bodyWordCount: 0,
     textPreview: '',
@@ -102,8 +113,27 @@ function deferred<T>() {
 }
 
 function BranchUrlProbe({ chatId }: { chatId: ChatId }) {
-  const { headers } = useBranchUrlSync(chatId)
-  return <output data-testid="headers">{headers.map((row) => row.id).join(',')}</output>
+  const { headerById, structuralHeaders } = useBranchUrlSync(chatId)
+  const headers = structuralHeaders.map(
+    (structural) => headerById.get(structural.id) as MessageHeaderRow,
+  )
+  return (
+    <>
+      <output data-testid="headers">{headers.map((row) => row.id).join(',')}</output>
+      <output data-testid="header-versions">
+        {headers.map((row) => `${row.id}:${row.nodeVersion}`).join(',')}
+      </output>
+    </>
+  )
+}
+
+function BranchHeaderBudgetProbe({ chatId, targetId }: { chatId: ChatId; targetId: string }) {
+  const { headerById, structuralHeaders } = useBranchUrlSync(chatId)
+  return (
+    <output data-testid="header-budget">
+      {structuralHeaders.length}:{headerById.get(targetId)?.nodeVersion ?? -1}
+    </output>
+  )
 }
 
 function navigateTo(messageId: string) {
@@ -115,12 +145,14 @@ describe('branch URL synchronization', () => {
   beforeEach(() => {
     useChatStore.getState().reset()
     chatReads.loadMessageHeaders.mockReset()
-    __setRepositoryMutationSubscriberForTests(silentChanges, 'branch-url-sync-test')
+    chatReads.loadMessageHeadersById.mockReset()
+    __setRepositoryMutationSubscriberForTests(silentChanges, DATABASE_NAME)
     window.history.replaceState(null, '', `#/chat/${CHAT_ID}`)
   })
 
   afterEach(() => {
     cleanup()
+    __setBranchHeaderMergeProbeForTests(undefined)
     __setBranchProjectionBuildProbeForTests(undefined)
     __setRepositoryMutationSubscriberForTests(undefined)
     useChatStore.getState().reset()
@@ -176,7 +208,7 @@ describe('branch URL synchronization', () => {
     const href = `#/chat/${CHAT_ID}/message/${firstNewLeaf.id}`
     chatReads.loadMessageHeaders
       .mockRejectedValueOnce(new DOMException('lifecycle replay', 'AbortError'))
-      .mockReturnValueOnce(publishedHeaders.promise)
+      .mockReturnValue(publishedHeaders.promise)
     window.history.replaceState(null, '', href)
 
     render(<BranchUrlProbe chatId={CHAT_ID} />)
@@ -195,6 +227,77 @@ describe('branch URL synchronization', () => {
       )
       expect(window.location.hash).toBe(href)
     })
+  })
+
+  it('retries a failed fresh URL-target read and resolves the same arrival', async () => {
+    const href = `#/chat/${CHAT_ID}/message/${firstNewLeaf.id}`
+    chatReads.loadMessageHeaders
+      .mockResolvedValueOnce([root, oldLeaf])
+      .mockRejectedValueOnce(new Error('transient header read failure'))
+      .mockResolvedValueOnce([root, oldLeaf, firstNewLeaf])
+
+    render(<BranchUrlProbe chatId={CHAT_ID} />)
+    await waitFor(() => expect(screen.getByTestId('headers')).toHaveTextContent(oldLeaf.id))
+    act(() => navigateTo(firstNewLeaf.id))
+
+    await waitFor(() => expect(chatReads.loadMessageHeaders).toHaveBeenCalledTimes(3))
+    await waitFor(() => {
+      expect(useChatStore.getState().getCursor(CHAT_ID)?.[cursorKeyOf(root.id)]).toBe(
+        firstNewLeaf.id,
+      )
+      expect(window.location.hash).toBe(href)
+    })
+    expect(chatReads.loadMessageHeaders.mock.calls[1]?.[1]?.signal?.aborted).toBe(true)
+  })
+
+  it('cancels a scheduled URL-target retry when a newer arrival supersedes it', async () => {
+    const newerRead = deferred<MessageHeaderRow[]>()
+    chatReads.loadMessageHeaders
+      .mockResolvedValueOnce([root, oldLeaf])
+      .mockRejectedValueOnce(new Error('transient header read failure'))
+      .mockReturnValueOnce(newerRead.promise)
+
+    render(<BranchUrlProbe chatId={CHAT_ID} />)
+    await waitFor(() => expect(screen.getByTestId('headers')).toHaveTextContent(oldLeaf.id))
+    await act(async () => {
+      navigateTo(firstNewLeaf.id)
+      await Promise.resolve()
+    })
+    expect(chatReads.loadMessageHeaders).toHaveBeenCalledTimes(2)
+
+    act(() => navigateTo(secondNewLeaf.id))
+    await waitFor(() => expect(chatReads.loadMessageHeaders).toHaveBeenCalledTimes(3))
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    expect(chatReads.loadMessageHeaders).toHaveBeenCalledTimes(3)
+
+    await act(async () => {
+      newerRead.resolve([root, oldLeaf, firstNewLeaf, secondNewLeaf])
+      await newerRead.promise
+    })
+    await waitFor(() => {
+      expect(useChatStore.getState().getCursor(CHAT_ID)?.[cursorKeyOf(root.id)]).toBe(
+        secondNewLeaf.id,
+      )
+      expect(window.location.hash).toBe(`#/chat/${CHAT_ID}/message/${secondNewLeaf.id}`)
+    })
+  })
+
+  it('cancels a scheduled URL-target retry on unmount', async () => {
+    chatReads.loadMessageHeaders
+      .mockResolvedValueOnce([root, oldLeaf])
+      .mockRejectedValueOnce(new Error('transient header read failure'))
+
+    const view = render(<BranchUrlProbe chatId={CHAT_ID} />)
+    await waitFor(() => expect(screen.getByTestId('headers')).toHaveTextContent(oldLeaf.id))
+    await act(async () => {
+      navigateTo(firstNewLeaf.id)
+      await Promise.resolve()
+    })
+    expect(chatReads.loadMessageHeaders).toHaveBeenCalledTimes(2)
+
+    view.unmount()
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    expect(chatReads.loadMessageHeaders).toHaveBeenCalledTimes(2)
   })
 
   it('fences a fresh header read that ignores abort and settles after unmount', async () => {
@@ -475,6 +578,463 @@ describe('branch URL synchronization', () => {
     )
   })
 
+  it('mirrors the committed path leaf while repository headers are still unavailable', async () => {
+    chatReads.loadMessageHeaders.mockReturnValue(new Promise<MessageHeaderRow[]>(() => undefined))
+    const store = useChatStore.getState()
+    const intent = store.beginNavigationIntent(CHAT_ID)
+    const producer = store.registerCommittedPathProducer(CHAT_ID, intent)
+    if (!producer) throw new Error('committed path producer registration failed')
+    expect(
+      store.selectCommittedPathForProducer(
+        CHAT_ID,
+        producer,
+        {
+          [cursorKeyOf(null)]: root.id,
+          [cursorKeyOf(root.id)]: firstNewLeaf.id,
+        },
+        {
+          phase: 'terminal',
+          pathHeaders: [root, firstNewLeaf],
+          presentations: [],
+        },
+      ),
+    ).toBe(true)
+
+    render(<BranchUrlProbe chatId={CHAT_ID} />)
+
+    await waitFor(() => {
+      expect(window.location.hash).toBe(`#/chat/${CHAT_ID}/message/${firstNewLeaf.id}`)
+    })
+    expect(screen.getByTestId('headers')).toHaveTextContent('')
+  })
+
+  it('never projects an interior operation node as the selected path leaf', async () => {
+    chatReads.loadMessageHeaders.mockReturnValue(new Promise<MessageHeaderRow[]>(() => undefined))
+    const interior = header({
+      id: 'continued-assistant',
+      parentId: root.id,
+      siblingIndex: 4,
+      createdAt: 5,
+      role: 'assistant',
+    })
+    const descendant = header({
+      id: 'continued-descendant',
+      parentId: interior.id,
+      siblingIndex: 0,
+      createdAt: 6,
+      role: 'user',
+    })
+    const store = useChatStore.getState()
+    const intent = store.beginNavigationIntent(CHAT_ID)
+    const producer = store.registerCommittedPathProducer(CHAT_ID, intent)
+    if (!producer) throw new Error('committed path producer registration failed')
+    expect(
+      store.selectCommittedPathForProducer(
+        CHAT_ID,
+        producer,
+        {
+          [cursorKeyOf(null)]: root.id,
+          [cursorKeyOf(root.id)]: interior.id,
+          [cursorKeyOf(interior.id)]: descendant.id,
+        },
+        {
+          phase: 'terminal',
+          pathHeaders: [root, interior, descendant],
+          presentations: [],
+        },
+      ),
+    ).toBe(true)
+
+    render(<BranchUrlProbe chatId={CHAT_ID} />)
+
+    await waitFor(() => {
+      expect(window.location.hash).toBe(`#/chat/${CHAT_ID}/message/${descendant.id}`)
+    })
+  })
+
+  it('clears a stale repository leaf when a committed delete selects an empty path', async () => {
+    chatReads.loadMessageHeaders.mockResolvedValue([root, oldLeaf])
+    render(<BranchUrlProbe chatId={CHAT_ID} />)
+    await waitFor(() => {
+      expect(window.location.hash).toBe(`#/chat/${CHAT_ID}/message/${oldLeaf.id}`)
+    })
+
+    const store = useChatStore.getState()
+    const intent = store.beginNavigationIntent(CHAT_ID)
+    const producer = store.registerCommittedPathProducer(CHAT_ID, intent)
+    if (!producer) throw new Error('committed path producer registration failed')
+    expect(
+      store.patchCursorForIntent(CHAT_ID, intent, {
+        [cursorKeyOf(null)]: undefined,
+        [cursorKeyOf(root.id)]: undefined,
+      }),
+    ).toBe(true)
+    expect(
+      store.selectCommittedPathForProducer(
+        CHAT_ID,
+        producer,
+        {},
+        {
+          phase: 'terminal',
+          pathHeaders: [],
+          structuralHeaders: [
+            { ...root, deleted: true, nodeVersion: 1 },
+            { ...oldLeaf, deleted: true, nodeVersion: 1 },
+          ],
+          presentations: [],
+        },
+      ),
+    ).toBe(true)
+
+    await waitFor(() => {
+      expect(window.location.hash).toBe(`#/chat/${CHAT_ID}`)
+    })
+    expect(screen.getByTestId('headers')).toHaveTextContent(`${root.id},${oldLeaf.id}`)
+  })
+
+  it('bootstraps headers once and merges exact message publications without rescanning the chat', async () => {
+    let mutationListener: ((parts: ObservabilitySet) => void) | null = null
+    const subscribe: RepositoryMutationSubscriber = (listener) => {
+      mutationListener = listener
+      return () => {
+        if (mutationListener === listener) mutationListener = null
+      }
+    }
+    __setRepositoryMutationSubscriberForTests(subscribe, DATABASE_NAME)
+
+    const rows: MessageHeaderRow[] = [root]
+    let parentId = root.id
+    for (let index = 1; index < 256; index += 1) {
+      const row = header({
+        id: `long-chat-${index.toString().padStart(3, '0')}`,
+        parentId,
+        siblingIndex: 0,
+        createdAt: index + 1,
+        role: index % 2 === 0 ? 'user' : 'assistant',
+      })
+      rows.push(row)
+      parentId = row.id
+    }
+    const current = new Map(rows.map((row) => [row.id, row]))
+    chatReads.loadMessageHeaders.mockResolvedValue(rows)
+    chatReads.loadMessageHeadersById.mockImplementation(async (messageIds) =>
+      messageIds.map((messageId) => current.get(messageId)),
+    )
+    const merges: Array<{ kind: 'full' | 'delta'; rows: number }> = []
+    __setBranchHeaderMergeProbeForTests((kind, rowCount) => {
+      merges.push({ kind, rows: rowCount })
+    })
+    let projectionBuilds = 0
+    __setBranchProjectionBuildProbeForTests(() => {
+      projectionBuilds += 1
+    })
+
+    render(<BranchUrlProbe chatId={CHAT_ID} />)
+    const target = rows.at(-1) as MessageHeaderRow
+    await waitFor(() => expect(screen.getByTestId('headers')).toHaveTextContent(target.id))
+    const bootstrapProjectionBuilds = projectionBuilds
+
+    for (let version = 1; version <= 12; version += 1) {
+      current.set(target.id, {
+        ...(current.get(target.id) as MessageHeaderRow),
+        nodeVersion: version,
+        textPreview: `stream-${version}`,
+      })
+      act(() => mutationListener?.(messageMutation(target.id)))
+      await waitFor(() =>
+        expect(screen.getByTestId('header-versions')).toHaveTextContent(`${target.id}:${version}`),
+      )
+    }
+
+    expect(chatReads.loadMessageHeaders).toHaveBeenCalledTimes(1)
+    expect(chatReads.loadMessageHeadersById).toHaveBeenCalledTimes(12)
+    expect(
+      chatReads.loadMessageHeadersById.mock.calls.every(
+        ([messageIds]) => messageIds.length === 1 && messageIds[0] === target.id,
+      ),
+    ).toBe(true)
+    expect(merges).toEqual([
+      { kind: 'full', rows: rows.length },
+      ...Array.from({ length: 12 }, () => ({ kind: 'delta' as const, rows: 1 })),
+    ])
+    expect(projectionBuilds).toBe(bootstrapProjectionBuilds)
+  })
+
+  it('falls back to one full header snapshot when a publication lacks exact primary keys', async () => {
+    let mutationListener: ((parts: ObservabilitySet) => void) | null = null
+    __setRepositoryMutationSubscriberForTests((listener) => {
+      mutationListener = listener
+      return () => {
+        if (mutationListener === listener) mutationListener = null
+      }
+    }, DATABASE_NAME)
+    chatReads.loadMessageHeaders
+      .mockResolvedValueOnce([root, oldLeaf])
+      .mockResolvedValueOnce([root, oldLeaf, firstNewLeaf])
+
+    render(<BranchUrlProbe chatId={CHAT_ID} />)
+    await waitFor(() => expect(screen.getByTestId('headers')).toHaveTextContent(oldLeaf.id))
+
+    act(() =>
+      mutationListener?.({
+        [`idb://${DATABASE_NAME}/messages/chatId`]: new RangeSet(CHAT_ID),
+      }),
+    )
+
+    await waitFor(() => expect(screen.getByTestId('headers')).toHaveTextContent(firstNewLeaf.id))
+    expect(chatReads.loadMessageHeaders).toHaveBeenCalledTimes(2)
+    expect(chatReads.loadMessageHeadersById).not.toHaveBeenCalled()
+  })
+
+  it('merges a remote sibling without steering this tab away from its selected leaf', async () => {
+    let mutationListener: ((parts: ObservabilitySet) => void) | null = null
+    __setRepositoryMutationSubscriberForTests((listener) => {
+      mutationListener = listener
+      return () => {
+        if (mutationListener === listener) mutationListener = null
+      }
+    }, DATABASE_NAME)
+    const current = new Map<string, MessageHeaderRow>([
+      [root.id, root],
+      [oldLeaf.id, oldLeaf],
+    ])
+    chatReads.loadMessageHeaders.mockResolvedValue([...current.values()])
+    chatReads.loadMessageHeadersById.mockImplementation(async (messageIds) =>
+      messageIds.map((messageId) => current.get(messageId)),
+    )
+
+    render(<BranchUrlProbe chatId={CHAT_ID} />)
+    await waitFor(() => {
+      expect(window.location.hash).toBe(`#/chat/${CHAT_ID}/message/${oldLeaf.id}`)
+    })
+
+    current.set(firstNewLeaf.id, firstNewLeaf)
+    act(() => mutationListener?.(messageMutation(firstNewLeaf.id)))
+    await waitFor(() => expect(screen.getByTestId('headers')).toHaveTextContent(firstNewLeaf.id))
+
+    expect(useChatStore.getState().getCursor(CHAT_ID)?.[cursorKeyOf(root.id)]).toBe(oldLeaf.id)
+    expect(window.location.hash).toBe(`#/chat/${CHAT_ID}/message/${oldLeaf.id}`)
+    expect(chatReads.loadMessageHeaders).toHaveBeenCalledTimes(1)
+    expect(chatReads.loadMessageHeadersById).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps the newest-leaf default for the initial authoritative snapshot', async () => {
+    chatReads.loadMessageHeaders.mockResolvedValue([root, oldLeaf, firstNewLeaf, secondNewLeaf])
+
+    render(<BranchUrlProbe chatId={CHAT_ID} />)
+
+    await waitFor(() => {
+      expect(useChatStore.getState().getCursor(CHAT_ID)?.[cursorKeyOf(root.id)]).toBe(
+        secondNewLeaf.id,
+      )
+      expect(window.location.hash).toBe(`#/chat/${CHAT_ID}/message/${secondNewLeaf.id}`)
+    })
+  })
+
+  it('pins the earliest child when multiple remote continuations arrive atomically', async () => {
+    let mutationListener: ((parts: ObservabilitySet) => void) | null = null
+    __setRepositoryMutationSubscriberForTests((listener) => {
+      mutationListener = listener
+      return () => {
+        if (mutationListener === listener) mutationListener = null
+      }
+    }, DATABASE_NAME)
+    const earliestChild = header({
+      id: 'url-atomic-earliest',
+      parentId: oldLeaf.id,
+      siblingIndex: 0,
+      createdAt: 5,
+      role: 'user',
+    })
+    const newestChild = header({
+      id: 'url-atomic-newest',
+      parentId: oldLeaf.id,
+      siblingIndex: 1,
+      createdAt: 6,
+      role: 'user',
+    })
+    const current = new Map<string, MessageHeaderRow>([
+      [root.id, root],
+      [oldLeaf.id, oldLeaf],
+    ])
+    chatReads.loadMessageHeaders.mockResolvedValue([...current.values()])
+    chatReads.loadMessageHeadersById.mockImplementation(async (messageIds) =>
+      messageIds.map((messageId) => current.get(messageId)),
+    )
+
+    render(<BranchUrlProbe chatId={CHAT_ID} />)
+    await waitFor(() => {
+      expect(window.location.hash).toBe(`#/chat/${CHAT_ID}/message/${oldLeaf.id}`)
+    })
+
+    current.set(newestChild.id, newestChild)
+    current.set(earliestChild.id, earliestChild)
+    act(() =>
+      mutationListener?.({
+        [`idb://${DATABASE_NAME}/messages/`]: new RangeSet().addKeys([
+          newestChild.id,
+          earliestChild.id,
+        ]),
+        [`idb://${DATABASE_NAME}/messages/chatId`]: new RangeSet(CHAT_ID),
+      }),
+    )
+    await waitFor(() => {
+      expect(screen.getByTestId('headers')).toHaveTextContent(earliestChild.id)
+      expect(screen.getByTestId('headers')).toHaveTextContent(newestChild.id)
+    })
+
+    expect(useChatStore.getState().getCursor(CHAT_ID)?.[cursorKeyOf(oldLeaf.id)]).toBe(
+      earliestChild.id,
+    )
+    expect(window.location.hash).toBe(`#/chat/${CHAT_ID}/message/${earliestChild.id}`)
+    expect(window.location.hash).not.toContain(newestChild.id)
+    expect(chatReads.loadMessageHeaders).toHaveBeenCalledTimes(1)
+    expect(chatReads.loadMessageHeadersById).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps normal newest defaults when entering a previously observed unpinned subtree', async () => {
+    let mutationListener: ((parts: ObservabilitySet) => void) | null = null
+    __setRepositoryMutationSubscriberForTests((listener) => {
+      mutationListener = listener
+      return () => {
+        if (mutationListener === listener) mutationListener = null
+      }
+    }, DATABASE_NAME)
+    const olderBranch = header({
+      id: 'url-observed-older-branch',
+      parentId: root.id,
+      siblingIndex: 0,
+      createdAt: 2,
+      role: 'assistant',
+    })
+    const defaultBranch = header({
+      id: 'url-observed-default-branch',
+      parentId: root.id,
+      siblingIndex: 1,
+      createdAt: 3,
+      role: 'assistant',
+    })
+    const olderDescendant = header({
+      id: 'url-observed-older-descendant',
+      parentId: olderBranch.id,
+      siblingIndex: 0,
+      createdAt: 4,
+      role: 'user',
+    })
+    const newestDescendant = header({
+      id: 'url-observed-newest-descendant',
+      parentId: olderBranch.id,
+      siblingIndex: 1,
+      createdAt: 5,
+      role: 'user',
+    })
+    const defaultDescendant = header({
+      id: 'url-observed-default-descendant',
+      parentId: defaultBranch.id,
+      siblingIndex: 0,
+      createdAt: 6,
+      role: 'user',
+    })
+    const unrelatedNewChild = header({
+      id: 'url-observed-unrelated-new-child',
+      parentId: defaultBranch.id,
+      siblingIndex: 1,
+      createdAt: 7,
+      role: 'user',
+    })
+    const current = new Map<string, MessageHeaderRow>(
+      [root, olderBranch, defaultBranch, olderDescendant, newestDescendant, defaultDescendant].map(
+        (row) => [row.id, row],
+      ),
+    )
+    chatReads.loadMessageHeaders.mockResolvedValue([...current.values()])
+    chatReads.loadMessageHeadersById.mockImplementation(async (messageIds) =>
+      messageIds.map((messageId) => current.get(messageId)),
+    )
+
+    render(<BranchUrlProbe chatId={CHAT_ID} />)
+    await waitFor(() => {
+      expect(window.location.hash).toBe(`#/chat/${CHAT_ID}/message/${defaultDescendant.id}`)
+    })
+
+    act(() => {
+      useChatStore.getState().navigateWithCursorPatch(CHAT_ID, {
+        [cursorKeyOf(root.id)]: olderBranch.id,
+      })
+    })
+    await waitFor(() => {
+      expect(window.location.hash).toBe(`#/chat/${CHAT_ID}/message/${newestDescendant.id}`)
+    })
+
+    current.set(unrelatedNewChild.id, unrelatedNewChild)
+    act(() => mutationListener?.(messageMutation(unrelatedNewChild.id)))
+    await waitFor(() =>
+      expect(screen.getByTestId('headers')).toHaveTextContent(unrelatedNewChild.id),
+    )
+
+    expect(useChatStore.getState().getCursor(CHAT_ID)?.[cursorKeyOf(olderBranch.id)]).toBe(
+      newestDescendant.id,
+    )
+    expect(window.location.hash).toBe(`#/chat/${CHAT_ID}/message/${newestDescendant.id}`)
+  })
+
+  it('keeps repeated metadata publications delta-bounded after a 100k-header bootstrap', async () => {
+    let mutationListener: ((parts: ObservabilitySet) => void) | null = null
+    __setRepositoryMutationSubscriberForTests((listener) => {
+      mutationListener = listener
+      return () => {
+        if (mutationListener === listener) mutationListener = null
+      }
+    }, DATABASE_NAME)
+    const rows: MessageHeaderRow[] = []
+    let parentId: string | null = null
+    for (let index = 0; index < 100_000; index += 1) {
+      const row = header({
+        id: `budget-${index.toString().padStart(6, '0')}`,
+        parentId,
+        siblingIndex: 0,
+        createdAt: index,
+        role: index % 2 === 0 ? 'user' : 'assistant',
+      })
+      rows.push(row)
+      parentId = row.id
+    }
+    const target = rows.at(-1) as MessageHeaderRow
+    let currentTarget = target
+    chatReads.loadMessageHeaders.mockResolvedValue(rows)
+    chatReads.loadMessageHeadersById.mockImplementation(async (messageIds) =>
+      messageIds.map((messageId) => (messageId === target.id ? currentTarget : undefined)),
+    )
+    const merges: Array<{ kind: 'full' | 'delta'; rows: number }> = []
+    __setBranchHeaderMergeProbeForTests((kind, rowCount) => {
+      merges.push({ kind, rows: rowCount })
+    })
+    let projectionBuilds = 0
+    __setBranchProjectionBuildProbeForTests(() => {
+      projectionBuilds += 1
+    })
+
+    render(<BranchHeaderBudgetProbe chatId={CHAT_ID} targetId={target.id} />)
+    await waitFor(() => expect(screen.getByTestId('header-budget')).toHaveTextContent('100000:0'))
+    const bootstrapProjectionBuilds = projectionBuilds
+
+    for (let version = 1; version <= 24; version += 1) {
+      currentTarget = { ...currentTarget, nodeVersion: version, cachedTokenEstimate: version }
+      act(() => mutationListener?.(messageMutation(target.id)))
+      await waitFor(() =>
+        expect(screen.getByTestId('header-budget')).toHaveTextContent(`100000:${version}`),
+      )
+    }
+
+    expect(chatReads.loadMessageHeaders).toHaveBeenCalledTimes(1)
+    expect(chatReads.loadMessageHeadersById).toHaveBeenCalledTimes(24)
+    expect(merges).toEqual([
+      { kind: 'full', rows: 100_000 },
+      ...Array.from({ length: 24 }, () => ({ kind: 'delta' as const, rows: 1 })),
+    ])
+    expect(projectionBuilds).toBe(bootstrapProjectionBuilds)
+  }, 30_000)
+
   it('builds one shared projection for each ordinary structural header snapshot', async () => {
     let builds = 0
     __setBranchProjectionBuildProbeForTests(() => {
@@ -499,3 +1059,10 @@ describe('branch URL synchronization', () => {
     expect(builds).toBe(2)
   })
 })
+
+function messageMutation(messageId: string): ObservabilitySet {
+  return {
+    [`idb://${DATABASE_NAME}/messages/`]: new RangeSet(messageId),
+    [`idb://${DATABASE_NAME}/messages/chatId`]: new RangeSet(CHAT_ID),
+  }
+}

@@ -8,9 +8,9 @@ import { tokenCalibrationKeyForStoredRecordKey } from '../core/model-ids'
 import { normalizeReasoningSettings } from '../core/reasoning'
 import {
   aggregateCalibrationSamples,
-  readTokenCalibrationGlobal,
+  clearAllTokenCalibrationGlobal,
+  clearTokenCalibrationGlobalFamily,
   subtractSamplesFromTokenCalibrationGlobal,
-  writeTokenCalibrationGlobal,
 } from '../core/token-calibration'
 import type {
   Chat,
@@ -42,6 +42,7 @@ import {
   hydrateMessages,
   type MessageBodyRow,
   type MessageHeaderRow,
+  type MessagePresentation,
   messageHeaderTreeKey,
 } from './message-storage'
 import type {
@@ -277,6 +278,13 @@ export async function loadMessageHeaders(
   return getWorkspaceRepository().listMessageHeaders(chatId, options)
 }
 
+export async function loadMessageHeadersById(
+  messageIds: readonly MessageId[],
+  options: { signal?: AbortSignal } = {},
+): Promise<Array<MessageHeaderRow | undefined>> {
+  return getWorkspaceRepository().getMessageHeaders(messageIds, options)
+}
+
 export async function loadActiveBranchSnapshot(
   chatId: ChatId,
   cursor: Record<string, MessageId>,
@@ -371,23 +379,19 @@ export async function deleteArchivedChatPermanently(
   now = Date.now(),
 ): Promise<boolean> {
   const repo = getWorkspaceRepository()
-  const chat = await repo.getChat(chatId)
-  const deleted = await repo.deleteArchivedChat(chatId)
-  if (deleted) {
-    await subtractSamplesFromTokenCalibrationGlobal(chat?.tokenCalibration, now)
+  const deletedChat = await repo.deleteArchivedChatReturningRow(chatId)
+  if (deletedChat) {
+    await subtractSamplesFromTokenCalibrationGlobal(deletedChat.tokenCalibration, now)
   }
-  return deleted
+  return deletedChat !== undefined
 }
 
 export async function emptyArchivedChats(now = Date.now()): Promise<ChatId[]> {
   const repo = getWorkspaceRepository()
-  const archivedById = new Map(
-    (await repo.listChats()).filter((chat) => chat.archived).map((chat) => [chat.id, chat]),
-  )
   const result = await repo.emptyArchivedChats()
   const removedCalibration: Record<string, TokenCalibrationSample> = {}
-  for (const chatId of result.deletedChatIds) {
-    accumulateCalibrationSamples(removedCalibration, archivedById.get(chatId)?.tokenCalibration)
+  for (const chat of result.deletedChats) {
+    accumulateCalibrationSamples(removedCalibration, chat.tokenCalibration)
   }
   await subtractSamplesFromTokenCalibrationGlobal(removedCalibration, now)
   return result.deletedChatIds
@@ -533,42 +537,41 @@ export async function clearChatTokenCalibration(
   now = Date.now(),
 ): Promise<boolean> {
   const repo = getWorkspaceRepository()
-  const result = { changed: false }
+  const result = { changed: false, found: false }
   const removedSamples: Record<string, TokenCalibrationSample> = {}
   await repo.runMutation([{ kind: 'chat-meta', chatId }], async (ctx) => {
     const chat = await ctx.getChat(chatId)
     if (!chat) return
+    result.found = true
     const current = chat.tokenCalibration ?? {}
     const entries = Object.entries(current)
+    let next: Record<string, TokenCalibrationSample>
     if (!calibrationKey) {
-      if (entries.length === 0) return
-      result.changed = true
+      result.changed = entries.length > 0
       Object.assign(removedSamples, current)
-      ctx.patchChatMeta(
-        chatId,
-        { tokenCalibration: {} },
-        { touchVisibleState: false, broadcast: true },
-      )
-      return
-    }
-
-    const next: Record<string, TokenCalibrationSample> = {}
-    for (const [storedKey, sample] of entries) {
-      if (tokenCalibrationKeyForStoredRecordKey(storedKey) === calibrationKey) {
-        result.changed = true
-        removedSamples[storedKey] = sample
-        continue
+      next = {}
+    } else {
+      const retained: Record<string, TokenCalibrationSample> = {}
+      for (const [storedKey, sample] of entries) {
+        if (tokenCalibrationKeyForStoredRecordKey(storedKey) === calibrationKey) {
+          result.changed = true
+          removedSamples[storedKey] = sample
+          continue
+        }
+        retained[storedKey] = sample
       }
-      next[storedKey] = sample
+      next = aggregateCalibrationSamples(retained)
     }
-    if (!result.changed) return
     ctx.patchChatMeta(
       chatId,
-      { tokenCalibration: aggregateCalibrationSamples(next) },
-      { touchVisibleState: false, broadcast: true },
+      {
+        tokenCalibration: next,
+        tokenCalibrationGeneration: nextChatCalibrationGeneration(chat),
+      },
+      { touchVisibleState: false, broadcast: result.changed },
     )
   })
-  if (result.changed) {
+  if (result.found) {
     await subtractSamplesFromTokenCalibrationGlobal(removedSamples, now)
   }
   return result.changed
@@ -579,63 +582,73 @@ export async function clearTokenCalibrationFamilyEverywhere(
   now = Date.now(),
 ): Promise<{ globalChanged: boolean; chatCount: number }> {
   const repo = getWorkspaceRepository()
-  const [global, chats] = await Promise.all([readTokenCalibrationGlobal(), repo.listChats()])
-  const globalNext = calibrationRecordWithoutFamily(global.byModel, calibrationKey)
-  if (globalNext.changed) {
-    await writeTokenCalibrationGlobal({
-      version: 1,
-      updatedAt: now,
-      byModel: globalNext.samples,
-    })
-  }
-  const affected = chats
-    .map((chat) => ({
-      chat,
-      next: calibrationRecordWithoutFamily(chat.tokenCalibration, calibrationKey),
-    }))
-    .filter((row) => row.next.changed)
-  if (affected.length > 0) {
+  const chats = await repo.listChats()
+  let chatCount = 0
+  if (chats.length > 0) {
     await repo.runMutation(
-      affected.map(({ chat }) => ({ kind: 'chat-meta' as const, chatId: chat.id })),
-      (ctx) => {
-        for (const { chat, next } of affected) {
+      chats.map((chat) => ({ kind: 'chat-meta' as const, chatId: chat.id })),
+      async (ctx) => {
+        for (const listed of chats) {
+          const chat = await ctx.getChat(listed.id)
+          if (!chat) continue
+          const next = calibrationRecordWithoutFamily(chat.tokenCalibration, calibrationKey)
+          if (next.changed) chatCount += 1
           ctx.patchChatMeta(
             chat.id,
-            { tokenCalibration: aggregateCalibrationSamples(next.samples) },
-            { touchVisibleState: false, broadcast: true },
+            {
+              tokenCalibration: aggregateCalibrationSamples(next.samples),
+              tokenCalibrationGeneration: nextChatCalibrationGeneration(chat),
+            },
+            { touchVisibleState: false, broadcast: next.changed },
           )
         }
       },
     )
   }
-  return { globalChanged: globalNext.changed, chatCount: affected.length }
+  const globalChanged = await clearTokenCalibrationGlobalFamily(calibrationKey, now)
+  return { globalChanged, chatCount }
 }
 
 export async function clearAllTokenCalibrationEverywhere(
   now = Date.now(),
 ): Promise<{ globalChanged: boolean; chatCount: number }> {
   const repo = getWorkspaceRepository()
-  const [global, chats] = await Promise.all([readTokenCalibrationGlobal(), repo.listChats()])
-  const globalChanged = Object.keys(global.byModel).length > 0
-  if (globalChanged) {
-    await writeTokenCalibrationGlobal({ version: 1, updatedAt: now, byModel: {} })
-  }
-  const affected = chats.filter((chat) => Object.keys(chat.tokenCalibration ?? {}).length > 0)
-  if (affected.length > 0) {
+  const chats = await repo.listChats()
+  let chatCount = 0
+  if (chats.length > 0) {
     await repo.runMutation(
-      affected.map((chat) => ({ kind: 'chat-meta' as const, chatId: chat.id })),
-      (ctx) => {
-        for (const chat of affected) {
+      chats.map((chat) => ({ kind: 'chat-meta' as const, chatId: chat.id })),
+      async (ctx) => {
+        for (const listed of chats) {
+          const chat = await ctx.getChat(listed.id)
+          if (!chat) continue
+          const changed = Object.keys(chat.tokenCalibration ?? {}).length > 0
+          if (changed) chatCount += 1
           ctx.patchChatMeta(
             chat.id,
-            { tokenCalibration: {} },
-            { touchVisibleState: false, broadcast: true },
+            {
+              tokenCalibration: {},
+              tokenCalibrationGeneration: nextChatCalibrationGeneration(chat),
+            },
+            { touchVisibleState: false, broadcast: changed },
           )
         }
       },
     )
   }
-  return { globalChanged, chatCount: affected.length }
+  const globalChanged = await clearAllTokenCalibrationGlobal(now)
+  return { globalChanged, chatCount }
+}
+
+function nextChatCalibrationGeneration(chat: Pick<Chat, 'tokenCalibrationGeneration'>): number {
+  const current =
+    typeof chat.tokenCalibrationGeneration === 'number' &&
+    Number.isSafeInteger(chat.tokenCalibrationGeneration) &&
+    chat.tokenCalibrationGeneration >= 0
+      ? chat.tokenCalibrationGeneration
+      : 0
+  if (current >= Number.MAX_SAFE_INTEGER) throw new Error('ChatCalibrationGenerationExhausted')
+  return current + 1
 }
 
 function calibrationRecordWithoutFamily(
@@ -726,24 +739,35 @@ export async function setManualTitle(
 // the flag) and surfaced with a dashed profile ring in the UI. The
 // message stays visible in the chat — this is context visibility, not
 // deletion. Idempotent; no-op if the flag is already the desired value.
-export async function toggleMessageHidden(messageId: MessageId): Promise<void> {
+export async function toggleMessageHidden(
+  messageId: MessageId,
+): Promise<MessagePresentation | undefined> {
   const repo = getWorkspaceRepository()
-  await repo.runMutation([{ kind: 'message', messageId }], async (ctx) => {
+  const result = await repo.runMutation([{ kind: 'message', messageId }], async (ctx) => {
     const current = await ctx.getMessage(messageId)
     if (!current) return
     const next = !current.hiddenFromContext
     if (current.hiddenFromContext === next) return
     await ctx.putMessage({ ...current, hiddenFromContext: next })
+    const [header, message] = await Promise.all([
+      ctx.getMessageHeader(messageId),
+      ctx.getMessage(messageId),
+    ])
+    if (!header || !message) return
+    return { header, message, bodyVersion: header.bodyVersion }
   })
+  return result.value
 }
 
 // Clears `generation.abortReason` and any recorded error on a message,
 // removing the "Stream interrupted" banner. Keeps all other generation
 // metadata intact (usage, model, reasoning details). Used for the explicit
 // dismiss button on the abort banner.
-export async function dismissAbortReason(messageId: MessageId): Promise<void> {
+export async function dismissAbortReason(
+  messageId: MessageId,
+): Promise<MessagePresentation | undefined> {
   const repo = getWorkspaceRepository()
-  await repo.runMutation([{ kind: 'message', messageId }], async (ctx) => {
+  const result = await repo.runMutation([{ kind: 'message', messageId }], async (ctx) => {
     const current = await ctx.getMessage(messageId)
     if (!current) return
     const gen = current.generation
@@ -753,7 +777,14 @@ export async function dismissAbortReason(messageId: MessageId): Promise<void> {
     delete (nextGen as { abortReason?: unknown }).abortReason
     delete (nextGen as { error?: unknown }).error
     await ctx.putMessage({ ...current, generation: nextGen })
+    const [header, message] = await Promise.all([
+      ctx.getMessageHeader(messageId),
+      ctx.getMessage(messageId),
+    ])
+    if (!header || !message) return
+    return { header, message, bodyVersion: header.bodyVersion }
   })
+  return result.value
 }
 
 export async function setChatPreset(

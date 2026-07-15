@@ -3,8 +3,10 @@ import type { ConnectionProfile, Message } from '../../src/core/types'
 import {
   editAndResend,
   type MessageOpsContext,
+  mutateMessageAttachmentReference,
   regenerateFromMessage,
 } from '../../src/hooks/useMessageOps'
+import { splitMessageForStorage } from '../../src/store/message-storage'
 import { useChatStore } from '../../src/store/zustand/chatStore'
 
 const mocks = vi.hoisted(() => ({
@@ -15,7 +17,12 @@ const mocks = vi.hoisted(() => ({
   getMessageHeader: vi.fn(),
   getProfile: vi.fn(),
   insertSibling: vi.fn(),
+  mutateMessageAttachmentRef: vi.fn(),
   resolveConnectionRuntimeKeys: vi.fn(),
+}))
+
+vi.mock('../../src/store/attachments', () => ({
+  mutateMessageAttachmentRef: mocks.mutateMessageAttachmentRef,
 }))
 
 vi.mock('../../src/core/messages', () => ({
@@ -93,6 +100,39 @@ function message(overrides: Partial<Message> = {}): Message {
     nodeVersion: 0,
     deleted: false,
     ...overrides,
+  }
+}
+
+function insertedSiblingResult(
+  messageId: string,
+  path: Array<{ id: string; parentId: string | null; role: Message['role'] }> = [
+    { id: messageId, parentId: null, role: 'user' },
+  ],
+) {
+  const pathMessages = path.map((item, index) =>
+    message({
+      id: item.id,
+      parentId: item.parentId,
+      role: item.role,
+      origin: item.role === 'assistant' ? 'generated' : 'user',
+      content: [
+        item.role === 'assistant'
+          ? { type: 'output_text' as const, text: item.id }
+          : { type: 'text' as const, text: item.id },
+      ],
+      createdAt: index + 1,
+    }),
+  )
+  const inserted = pathMessages.at(-1)
+  if (!inserted || inserted.id !== messageId) throw new Error('invalid inserted sibling fixture')
+  const header = splitMessageForStorage(inserted).header
+  return {
+    messageId,
+    message: inserted,
+    header,
+    branchHeaders: pathMessages.map((row) => splitMessageForStorage(row).header),
+    effects: { cursorUpdates: { [inserted.parentId ?? '__root__']: messageId } },
+    versions: { metaVersion: 0, summaryVersion: 0 },
   }
 }
 
@@ -195,16 +235,8 @@ describe('message generation navigation intents', () => {
     const olderChatRead = deferred<typeof chat>()
     mocks.getChat.mockImplementationOnce(() => olderChatRead.promise).mockResolvedValueOnce(chat)
     mocks.insertSibling
-      .mockResolvedValueOnce({
-        messageId: 'new-user-2',
-        effects: { cursorUpdates: { __root__: 'new-user-2' } },
-        versions: {},
-      })
-      .mockResolvedValueOnce({
-        messageId: 'new-user-1',
-        effects: { cursorUpdates: { __root__: 'new-user-1' } },
-        versions: {},
-      })
+      .mockResolvedValueOnce(insertedSiblingResult('new-user-2'))
+      .mockResolvedValueOnce(insertedSiblingResult('new-user-1'))
 
     const sendFrom = vi.fn(async (input: Parameters<MessageOpsContext['sendFrom']>[0]) => ({
       streamId: `stream-${input.navigationIntent.revision}`,
@@ -247,20 +279,13 @@ describe('message generation navigation intents', () => {
 
   it('selects the complete off-path inserted branch before assistant planning starts', async () => {
     mocks.getChat.mockResolvedValue(chat)
-    mocks.insertSibling.mockResolvedValue({
-      messageId: 'new-user',
-      effects: { cursorUpdates: { 'target-parent': 'new-user' } },
-      versions: {},
-    })
-    mocks.getBranchHeaderSnapshotByLeaf.mockResolvedValue({
-      chat,
-      chatId: 'chat-1',
-      branchHeaders: [
-        { id: 'target-root', parentId: null },
-        { id: 'target-parent', parentId: 'target-root' },
-        { id: 'new-user', parentId: 'target-parent' },
-      ],
-    })
+    mocks.insertSibling.mockResolvedValue(
+      insertedSiblingResult('new-user', [
+        { id: 'target-root', parentId: null, role: 'user' },
+        { id: 'target-parent', parentId: 'target-root', role: 'assistant' },
+        { id: 'new-user', parentId: 'target-parent', role: 'user' },
+      ]),
+    )
     useChatStore.getState().navigateToCursor('chat-1', {
       __root__: 'other-root',
       'other-root': 'other-leaf',
@@ -293,8 +318,63 @@ describe('message generation navigation intents', () => {
       'target-parent': 'new-user',
     })
     expect(useChatStore.getState().getPendingBranchNavigation('chat-1')).toMatchObject({
-      targetMessageId: 'new-user',
       pathMessageIds: ['target-root', 'target-parent', 'new-user'],
     })
+    expect(mocks.getBranchHeaderSnapshotByLeaf).not.toHaveBeenCalled()
+  })
+})
+
+describe('same-tab exact message presentations', () => {
+  it('publishes an attachment mutation against the captured path after route authority moves', async () => {
+    const before = message({ id: 'assistant-1', parentId: null })
+    const beforeHeader = splitMessageForStorage(before).header
+    const intent = useChatStore.getState().beginNavigationIntent('chat-1')
+    useChatStore
+      .getState()
+      .selectPathForIntent('chat-1', intent, { __root__: before.id }, [before.id])
+    useChatStore.getState().beginNavigationIntent('chat-2')
+
+    const after: Message = {
+      ...before,
+      attachmentRefs: [
+        {
+          refId: 'ref-1',
+          attachmentId: 'attachment-1',
+          includeInContext: false,
+          presentation: {},
+          createdAt: 1,
+          updatedAt: 2,
+        },
+      ],
+      nodeVersion: before.nodeVersion + 1,
+    }
+    const afterHeader = splitMessageForStorage(after, {
+      bodyVersion: beforeHeader.bodyVersion + 1,
+    }).header
+    mocks.mutateMessageAttachmentRef.mockResolvedValue({
+      header: afterHeader,
+      message: after,
+      bodyVersion: afterHeader.bodyVersion,
+    })
+
+    await mutateMessageAttachmentReference(
+      'chat-1',
+      before.id,
+      { kind: 'visibility', refId: 'ref-1', includeInContext: false },
+      { pathHeaders: [beforeHeader] },
+    )
+
+    const receipt = useChatStore.getState().getCommittedPathPresentation('chat-1')
+    expect(receipt).toMatchObject({
+      phase: 'terminal',
+      pathHeaders: [expect.objectContaining({ id: before.id })],
+      presentations: [
+        expect.objectContaining({
+          bodyVersion: afterHeader.bodyVersion,
+        }),
+      ],
+    })
+    expect(receipt?.presentations[0]?.message.attachmentRefs).toEqual(after.attachmentRefs)
+    expect(useChatStore.getState().getCursor('chat-2')).toEqual({})
   })
 })

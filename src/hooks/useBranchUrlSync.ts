@@ -28,15 +28,19 @@ import {
 } from '../core/active-path'
 import { seedCursorAtMessageProjected } from '../core/branch-resolve'
 import type { ChatId, CursorMap } from '../core/types'
-import { loadMessageHeaders } from '../store/chats'
+import type { PersistentStringMap } from '../lib/persistent-string-map'
+import { loadMessageHeaders, loadMessageHeadersById } from '../store/chats'
 import type { MessageHeaderRow } from '../store/message-storage'
 import { indexKeys } from '../store/reactive-dependencies'
-import { useRepositoryPresentationQuery } from '../store/reactive-query'
+import { useRepositoryKeyedPresentationQuery } from '../store/reactive-query'
 import type { NavigationIntent } from '../store/zustand/chatStore'
 import { useChatStore } from '../store/zustand/chatStore'
 
 export interface BranchUrlSyncState {
-  headers: readonly MessageHeaderRow[]
+  headerById: PersistentStringMap<MessageHeaderRow>
+  changedHeaderKeys: readonly string[] | null
+  changedHeaders: readonly (MessageHeaderRow | undefined)[] | null
+  navigationHeaders: readonly MessageHeaderRow[]
   structuralHeaders: readonly StructuralMessageHeader[]
   projection: MessageTreeProjection<StructuralMessageHeader>
 }
@@ -54,33 +58,125 @@ interface PendingUrlTarget {
   headersAtCapture: readonly StructuralMessageHeader[]
   freshReadStarted: boolean
   abortController: AbortController
+  retryAttempt: number
+  retryTimer: ReturnType<typeof setTimeout> | null
+}
+
+const URL_READ_RETRY_BASE_MS = 50
+const URL_READ_RETRY_MAX_MS = 2_000
+
+function clearPendingUrlRetry(pending: PendingUrlTarget): void {
+  if (pending.retryTimer === null) return
+  clearTimeout(pending.retryTimer)
+  pending.retryTimer = null
 }
 
 function resetPendingUrlRead(pending: PendingUrlTarget): void {
   pending.abortController.abort()
+  clearPendingUrlRetry(pending)
   pending.abortController = new AbortController()
   pending.freshReadStarted = false
 }
 
+function cancelPendingUrlTarget(pending: PendingUrlTarget): void {
+  pending.abortController.abort()
+  clearPendingUrlRetry(pending)
+  pending.freshReadStarted = false
+}
+
 let branchProjectionBuildProbe: (() => void) | undefined
+let branchHeaderMergeProbe: ((kind: 'full' | 'delta', rowCount: number) => void) | undefined
 
 export function __setBranchProjectionBuildProbeForTests(probe: (() => void) | undefined): void {
   if (import.meta.env.MODE === 'test') branchProjectionBuildProbe = probe
+}
+
+export function __setBranchHeaderMergeProbeForTests(
+  probe: ((kind: 'full' | 'delta', rowCount: number) => void) | undefined,
+): void {
+  if (import.meta.env.MODE === 'test') branchHeaderMergeProbe = probe
 }
 
 export function useStableStructuralHeaders(
   headers: readonly MessageHeaderRow[],
   reusableSource?: readonly MessageHeaderRow[],
   reusableProjection?: readonly StructuralMessageHeader[],
+  changedKeys?: readonly string[] | null,
+  changedRows?: readonly (MessageHeaderRow | undefined)[] | null,
 ): readonly StructuralMessageHeader[] {
   const rowsRef = useRef(new Map<string, StructuralMessageHeader>())
+  const indexesRef = useRef(new Map<string, number>())
   const arrayRef = useRef<readonly StructuralMessageHeader[]>([])
   return useMemo(() => {
     if (headers === reusableSource && reusableProjection) {
       arrayRef.current = reusableProjection
       return reusableProjection
     }
+    if (
+      changedKeys !== undefined &&
+      changedKeys !== null &&
+      changedRows !== undefined &&
+      changedRows !== null &&
+      changedKeys.length === changedRows.length
+    ) {
+      let next = arrayRef.current
+      let copied = false
+      const deletedIndexes = new Set<number>()
+      for (let changeIndex = 0; changeIndex < changedKeys.length; changeIndex += 1) {
+        const id = changedKeys[changeIndex] as string
+        const header = changedRows[changeIndex]
+        const existing = rowsRef.current.get(id)
+        const existingIndex = indexesRef.current.get(id)
+        if (!header) {
+          if (existingIndex !== undefined) deletedIndexes.add(existingIndex)
+          rowsRef.current.delete(id)
+          indexesRef.current.delete(id)
+          continue
+        }
+        if (
+          existing &&
+          existing.chatId === header.chatId &&
+          existing.parentId === header.parentId &&
+          existing.siblingIndex === header.siblingIndex &&
+          existing.createdAt === header.createdAt &&
+          existing.deleted === header.deleted &&
+          existing.role === header.role
+        ) {
+          continue
+        }
+        const structuralHeader: StructuralMessageHeader = {
+          id: header.id,
+          chatId: header.chatId,
+          parentId: header.parentId,
+          siblingIndex: header.siblingIndex,
+          createdAt: header.createdAt,
+          role: header.role,
+          deleted: header.deleted,
+        }
+        rowsRef.current.set(id, structuralHeader)
+        if (!copied) {
+          next = [...next]
+          copied = true
+        }
+        if (existingIndex === undefined) {
+          indexesRef.current.set(id, next.length)
+          ;(next as StructuralMessageHeader[]).push(structuralHeader)
+        } else {
+          ;(next as StructuralMessageHeader[])[existingIndex] = structuralHeader
+        }
+      }
+      if (deletedIndexes.size > 0) {
+        next = next.filter((_, index) => !deletedIndexes.has(index))
+        indexesRef.current.clear()
+        for (let index = 0; index < next.length; index += 1) {
+          indexesRef.current.set((next[index] as StructuralMessageHeader).id, index)
+        }
+      }
+      if (next !== arrayRef.current) arrayRef.current = next
+      return arrayRef.current
+    }
     const nextRows = new Map<string, StructuralMessageHeader>()
+    const nextIndexes = new Map<string, number>()
     const next = headers.map((header) => {
       const cached = rowsRef.current.get(header.id)
       if (
@@ -93,6 +189,7 @@ export function useStableStructuralHeaders(
         cached.role === header.role
       ) {
         nextRows.set(header.id, cached)
+        nextIndexes.set(header.id, nextIndexes.size)
         return cached
       }
       const structuralHeader: StructuralMessageHeader = {
@@ -105,26 +202,104 @@ export function useStableStructuralHeaders(
         deleted: header.deleted,
       }
       nextRows.set(header.id, structuralHeader)
+      nextIndexes.set(header.id, nextIndexes.size)
       return structuralHeader
     })
     rowsRef.current = nextRows
+    indexesRef.current = nextIndexes
     const previous = arrayRef.current
     if (previous.length === next.length && previous.every((row, index) => row === next[index])) {
       return previous
     }
     arrayRef.current = next
     return next
-  }, [headers, reusableProjection, reusableSource])
+  }, [changedKeys, changedRows, headers, reusableProjection, reusableSource])
+}
+
+function sameStructuralHeader(left: MessageHeaderRow, right: MessageHeaderRow): boolean {
+  return (
+    left.id === right.id &&
+    left.chatId === right.chatId &&
+    left.parentId === right.parentId &&
+    left.siblingIndex === right.siblingIndex &&
+    left.createdAt === right.createdAt &&
+    left.deleted === right.deleted &&
+    left.role === right.role
+  )
+}
+
+function useStableNavigationHeaders(
+  allRows: readonly MessageHeaderRow[] | null,
+  changedKeys: readonly string[] | null,
+  changedRows: readonly (MessageHeaderRow | undefined)[] | null,
+): readonly MessageHeaderRow[] {
+  const rowsRef = useRef<readonly MessageHeaderRow[]>([])
+  const indexesRef = useRef(new Map<string, number>())
+  const fullSourceRef = useRef<readonly MessageHeaderRow[] | null>(null)
+  if (allRows !== null) {
+    if (fullSourceRef.current !== allRows) {
+      fullSourceRef.current = allRows
+      rowsRef.current = allRows
+      indexesRef.current = new Map(allRows.map((header, index) => [header.id, index]))
+    }
+    return rowsRef.current
+  }
+  if (!changedKeys || !changedRows || changedKeys.length !== changedRows.length) {
+    return rowsRef.current
+  }
+  let next = rowsRef.current
+  let copied = false
+  const deletedIndexes = new Set<number>()
+  for (let changeIndex = 0; changeIndex < changedKeys.length; changeIndex += 1) {
+    const id = changedKeys[changeIndex] as string
+    const header = changedRows[changeIndex]
+    const existingIndex = indexesRef.current.get(id)
+    const existing = existingIndex === undefined ? undefined : next[existingIndex]
+    if (!header) {
+      if (existingIndex !== undefined) deletedIndexes.add(existingIndex)
+      indexesRef.current.delete(id)
+      continue
+    }
+    if (existing && sameStructuralHeader(existing, header)) continue
+    if (!copied) {
+      next = [...next]
+      copied = true
+    }
+    if (existingIndex === undefined) {
+      indexesRef.current.set(id, next.length)
+      ;(next as MessageHeaderRow[]).push(header)
+    } else {
+      ;(next as MessageHeaderRow[])[existingIndex] = header
+    }
+  }
+  if (deletedIndexes.size > 0) {
+    next = next.filter((_, index) => !deletedIndexes.has(index))
+    indexesRef.current = new Map(next.map((header, index) => [header.id, index]))
+  }
+  rowsRef.current = next
+  return next
 }
 
 export function useBranchUrlSync(chatId: ChatId | null): BranchUrlSyncState {
-  const headers = useRepositoryPresentationQuery(
+  const headerSnapshot = useRepositoryKeyedPresentationQuery(
     JSON.stringify(['message-headers', chatId]),
     (signal) => (chatId ? loadMessageHeaders(chatId, { signal }) : Promise.resolve([])),
+    (messageIds, signal) => loadMessageHeadersById(messageIds, { signal }),
     [],
     indexKeys('messages', 'chatId', chatId),
+    {
+      table: 'messages',
+      keyOf: (header) => header.id,
+      include: (header) => header.chatId === chatId,
+      onMerge: (kind, rowCount) => branchHeaderMergeProbe?.(kind, rowCount),
+    },
   )
-  const structuralHeaders = useStableStructuralHeaders(headers)
+  const navigationHeaders = useStableNavigationHeaders(
+    headerSnapshot.allRows,
+    headerSnapshot.changedKeys,
+    headerSnapshot.changedRows,
+  )
+  const structuralHeaders = useStableStructuralHeaders(navigationHeaders)
   const messages = structuralHeaders
   const messagesRef = useRef<readonly StructuralMessageHeader[]>(messages)
   messagesRef.current = messages
@@ -141,6 +316,15 @@ export function useBranchUrlSync(chatId: ChatId | null): BranchUrlSyncState {
     rows === messagesRef.current ? projectionRef.current : createMessageTreeProjection(rows)
 
   const pendingUrlTargetRef = useRef<PendingUrlTarget | null>(null)
+  const observedRowsRef = useRef<{
+    chatId: ChatId | null
+    initialized: boolean
+    ids: { has(messageId: string): boolean }
+  }>({
+    chatId: null,
+    initialized: false,
+    ids: new Set(),
+  })
   const nextUrlArrivalRef = useRef(0)
   const previousChatIdRef = useRef<ChatId | null | undefined>(undefined)
   const activeChatIdRef = useRef(chatId)
@@ -149,7 +333,8 @@ export function useBranchUrlSync(chatId: ChatId | null): BranchUrlSyncState {
 
   const captureUrlIntent = useRef<(() => void) | null>(null)
   captureUrlIntent.current = () => {
-    pendingUrlTargetRef.current?.abortController.abort()
+    const previous = pendingUrlTargetRef.current
+    if (previous) cancelPendingUrlTarget(previous)
     const arrival = ++nextUrlArrivalRef.current
     if (!chatId || typeof window === 'undefined') {
       pendingUrlTargetRef.current = null
@@ -170,6 +355,8 @@ export function useBranchUrlSync(chatId: ChatId | null): BranchUrlSyncState {
         headersAtCapture: messagesRef.current,
         freshReadStarted: false,
         abortController: new AbortController(),
+        retryAttempt: 0,
+        retryTimer: null,
       }
     } finally {
       capturingUrlIntentRef.current = false
@@ -189,23 +376,31 @@ export function useBranchUrlSync(chatId: ChatId | null): BranchUrlSyncState {
     const pendingUrlTarget = pendingUrlTargetRef.current
     if (pendingUrlTarget?.chatId === chatId) {
       if (chatState.isNavigationIntentCurrent(pendingUrlTarget.navigationIntent)) return
-      pendingUrlTarget.abortController.abort()
+      cancelPendingUrlTarget(pendingUrlTarget)
       pendingUrlTargetRef.current = null
-    }
-    if (rows.length === 0) {
-      replaceRoute(chatHref(chatId))
-      return
     }
     const cursor = chatState.getCursor(chatId) ?? {}
     const path = activePathProjected(rowProjection, cursor)
     const pending = chatState.getPendingBranchNavigation(chatId)
+    const committed = chatState.getCommittedPathPresentation(chatId)
+    if (committed && committed.pathHeaders.length === 0) {
+      replaceRoute(chatHref(chatId))
+      return
+    }
+    const committedPathLeaf = committed?.pathHeaders.at(-1)?.id
     const pendingLeaf =
       pending &&
       pending.revision === chatState.getNavigationRevision(chatId) &&
       Object.entries(pending.selections).every(([key, value]) => cursor[key] === value)
-        ? pending.targetMessageId
+        ? (pending.pathMessageIds.at(-1) ?? null)
         : null
-    const leaf = pendingLeaf ?? path.at(-1)?.id
+    const repositoryContainsCommittedLeaf =
+      committedPathLeaf !== undefined && path.some((header) => header.id === committedPathLeaf)
+    const leaf =
+      pendingLeaf ??
+      (committedPathLeaf && !repositoryContainsCommittedLeaf
+        ? committedPathLeaf
+        : (path.at(-1)?.id ?? committedPathLeaf))
     if (!leaf) {
       replaceRoute(chatHref(chatId))
       return
@@ -220,38 +415,70 @@ export function useBranchUrlSync(chatId: ChatId | null): BranchUrlSyncState {
   const seedCursorFromUrl = useRef<(() => boolean) | null>(null)
 
   // Materialize every path edge this tab has accepted from an authoritative
-  // header snapshot. A later remote sibling then cannot replace an observed
-  // linear extension. Missing selections are preserved and stop the walk:
-  // they can be local send/regenerate pins whose rows are not observable yet.
+  // header snapshot. Bootstrap keeps the normal newest-leaf default. After
+  // that, a batch of children at an unpinned edge chooses the first sorted
+  // child, exactly as serial observation would have pinned the first arrival.
+  // Missing pending selections stop the walk until their local row appears.
   const pinObservedPath = useRef<(() => void) | null>(null)
   const pinObservedRows = (
     rows: readonly StructuralMessageHeader[],
     rowProjection = projectionForRows(rows),
   ) => {
     if (!chatId || typeof window === 'undefined') return
-    if (rows.length === 0) return
     const route = parseRoute(window.location.hash)
     if (route.kind !== 'chat' || route.chatId !== chatId) return
+    const observation = observedRowsRef.current
+    const hadPriorSnapshot = observation.chatId === chatId && observation.initialized
+    const previousObservedIds = observation.ids
+    const observedIds =
+      rows === messagesRef.current ? headerSnapshot.byKey : new Set(rows.map((row) => row.id))
+    observedRowsRef.current = { chatId, initialized: true, ids: observedIds }
+    if (rows.length === 0) return
     const state = useChatStore.getState()
     const cursor = state.getCursor(chatId) ?? {}
     const pending = state.getPendingBranchNavigation(chatId)
     const currentPending =
       pending?.revision === state.getNavigationRevision(chatId) ? pending : undefined
-    const path = activePathProjected(rowProjection, cursor)
     const patch: CursorMap = {}
-    for (const child of path) {
-      const key = cursorKeyOf(child.parentId)
-      const selectedId = cursor[key]
-      if (selectedId === child.id) continue
-      if (selectedId !== undefined) {
-        const selected = rowProjection.byId.get(selectedId)
-        if (!selected) {
-          if (currentPending?.selections[key] === selectedId) break
-        } else if (!selected.deleted && selected.parentId === child.parentId) {
-          break
+    if (!hadPriorSnapshot) {
+      const path = activePathProjected(rowProjection, cursor)
+      for (const child of path) {
+        const key = cursorKeyOf(child.parentId)
+        const selectedId = cursor[key]
+        if (selectedId === child.id) continue
+        if (selectedId !== undefined) {
+          const selected = rowProjection.byId.get(selectedId)
+          if (!selected) {
+            if (currentPending?.selections[key] === selectedId) break
+          } else if (!selected.deleted && selected.parentId === child.parentId) {
+            break
+          }
         }
+        patch[key] = child.id
       }
-      patch[key] = child.id
+    } else {
+      let parentId: string | null = null
+      const visited = new Set<string>()
+      for (;;) {
+        const children: readonly StructuralMessageHeader[] =
+          rowProjection.liveByParent.get(parentId) ?? []
+        if (children.length === 0) break
+        const key = cursorKeyOf(parentId)
+        const selectedId = cursor[key]
+        let child = selectedId ? rowProjection.byId.get(selectedId) : undefined
+        if (!child || child.deleted || child.parentId !== parentId) {
+          if (selectedId !== undefined && currentPending?.selections[key] === selectedId) break
+          const newlyObservedChild = children.find(
+            (candidate) => !previousObservedIds.has(candidate.id),
+          )
+          child = newlyObservedChild ?? children.at(-1)
+          if (!child) break
+          patch[key] = child.id
+        }
+        if (visited.has(child.id)) break
+        visited.add(child.id)
+        parentId = child.id
+      }
     }
     if (Object.keys(patch).length > 0) {
       useChatStore.getState().reconcileCursorPatch(chatId, patch)
@@ -268,7 +495,7 @@ export function useBranchUrlSync(chatId: ChatId | null): BranchUrlSyncState {
     }
     const state = useChatStore.getState()
     if (!state.isNavigationIntentCurrent(pending.navigationIntent)) {
-      pending.abortController.abort()
+      cancelPendingUrlTarget(pending)
       pendingUrlTargetRef.current = null
       writeUrlFromRows(messagesRef.current)
       return
@@ -279,16 +506,48 @@ export function useBranchUrlSync(chatId: ChatId | null): BranchUrlSyncState {
       const cursor = state.getCursor(pending.chatId) ?? {}
       const patch = seedCursorAtMessageProjected(rowProjection, target.id, cursor)
       if (!state.patchCursorForIntent(pending.chatId, pending.navigationIntent, patch)) {
-        pending.abortController.abort()
+        cancelPendingUrlTarget(pending)
         pendingUrlTargetRef.current = null
         writeUrlFromRows(messagesRef.current)
         return
       }
     }
-    pending.abortController.abort()
+    cancelPendingUrlTarget(pending)
     pendingUrlTargetRef.current = null
     pinObservedRows(rows, rowProjection)
     writeUrlFromRows(rows, rowProjection)
+  }
+
+  const scheduleUrlReadRetry = (pending: PendingUrlTarget) => {
+    resetPendingUrlRead(pending)
+    const delay = Math.min(
+      URL_READ_RETRY_MAX_MS,
+      URL_READ_RETRY_BASE_MS * 2 ** Math.min(pending.retryAttempt, 10),
+    )
+    pending.retryAttempt += 1
+    const retryController = pending.abortController
+    const retryTimer = setTimeout(() => {
+      if (
+        pendingUrlTargetRef.current !== pending ||
+        pending.retryTimer !== retryTimer ||
+        pending.abortController !== retryController
+      ) {
+        return
+      }
+      pending.retryTimer = null
+      const stillOnChat = activeChatIdRef.current === pending.chatId
+      if (
+        !stillOnChat ||
+        !useChatStore.getState().isNavigationIntentCurrent(pending.navigationIntent)
+      ) {
+        cancelPendingUrlTarget(pending)
+        pendingUrlTargetRef.current = null
+        if (stillOnChat) writeUrlFromRows(messagesRef.current)
+        return
+      }
+      seedCursorFromUrl.current?.()
+    }, delay)
+    pending.retryTimer = retryTimer
   }
 
   seedCursorFromUrl.current = () => {
@@ -302,6 +561,7 @@ export function useBranchUrlSync(chatId: ChatId | null): BranchUrlSyncState {
       return true
     }
     if (!pending.freshReadStarted) {
+      clearPendingUrlRetry(pending)
       pending.freshReadStarted = true
       const readController = pending.abortController
       void loadMessageHeaders(pending.chatId, { signal: readController.signal }).then(
@@ -321,7 +581,7 @@ export function useBranchUrlSync(chatId: ChatId | null): BranchUrlSyncState {
           ) {
             return
           }
-          resetPendingUrlRead(pending)
+          scheduleUrlReadRetry(pending)
         },
       )
     }
@@ -346,12 +606,13 @@ export function useBranchUrlSync(chatId: ChatId | null): BranchUrlSyncState {
   useLayoutEffect(() => {
     if (previousChatIdRef.current !== chatId) {
       previousChatIdRef.current = chatId
+      observedRowsRef.current = { chatId, initialized: false, ids: new Set() }
       captureUrlIntent.current?.()
     }
     if (seedCursorFromUrl.current?.() === false) return
-    pinObservedPath.current?.()
+    if (headerSnapshot.loaded) pinObservedPath.current?.()
     writeUrlFromCursor.current?.()
-  }, [chatId, messages])
+  }, [chatId, headerSnapshot.loaded, messages])
 
   // Cursor changes (swipe / send / delete / jump): URL follows.
   // DO NOT call seedCursorFromUrl here — that would re-seed from the
@@ -362,20 +623,24 @@ export function useBranchUrlSync(chatId: ChatId | null): BranchUrlSyncState {
     let previousCursor = initialState.getCursor(chatId)
     let previousRevision = initialState.getNavigationRevision(chatId)
     let previousPending = initialState.getPendingBranchNavigation(chatId)
+    let previousCommitted = initialState.getCommittedPathPresentation(chatId)
     const unsub = useChatStore.subscribe((state) => {
       const cursor = state.getCursor(chatId)
       const revision = state.getNavigationRevision(chatId)
       const pending = state.getPendingBranchNavigation(chatId)
+      const committed = state.getCommittedPathPresentation(chatId)
       if (
         cursor === previousCursor &&
         revision === previousRevision &&
-        pending === previousPending
+        pending === previousPending &&
+        committed === previousCommitted
       ) {
         return
       }
       previousCursor = cursor
       previousRevision = revision
       previousPending = pending
+      previousCommitted = committed
       if (!capturingUrlIntentRef.current) writeUrlFromCursor.current?.()
     })
     return unsub
@@ -395,7 +660,21 @@ export function useBranchUrlSync(chatId: ChatId | null): BranchUrlSyncState {
   }, [])
 
   return useMemo(
-    () => ({ headers, structuralHeaders, projection }),
-    [headers, projection, structuralHeaders],
+    () => ({
+      headerById: headerSnapshot.byKey,
+      changedHeaderKeys: headerSnapshot.changedKeys,
+      changedHeaders: headerSnapshot.changedRows,
+      navigationHeaders,
+      structuralHeaders,
+      projection,
+    }),
+    [
+      headerSnapshot.byKey,
+      headerSnapshot.changedKeys,
+      headerSnapshot.changedRows,
+      navigationHeaders,
+      projection,
+      structuralHeaders,
+    ],
   )
 }

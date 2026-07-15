@@ -56,7 +56,7 @@ describe('Dexie schema', () => {
   it('opens on a fresh IndexedDB with all declared tables', async () => {
     const db = await openDb()
     expect(db.isOpen()).toBe(true)
-    expect(db.verno).toBe(24)
+    expect(db.verno).toBe(25)
     const names = db.tables.map((t) => t.name).sort()
     expect(names).toEqual(
       [
@@ -205,7 +205,7 @@ describe('Dexie schema', () => {
 
     const migrated = createDbForTests(name)
     await migrated.open()
-    expect(migrated.verno).toBe(24)
+    expect(migrated.verno).toBe(25)
     const [header, body, storedAttachment, storedArtifact] = await Promise.all([
       migrated.messages.get(message.id),
       migrated.messageBodies.get(message.id),
@@ -234,11 +234,60 @@ describe('Dexie schema', () => {
 
     const reopened = createDbForTests(name)
     await reopened.open()
-    expect(reopened.verno).toBe(24)
+    expect(reopened.verno).toBe(25)
     expect(
       (await reopened.messageBodies.get(message.id))?.generationServerToolOutputs,
     ).toHaveLength(1)
     expect(await reopened.attachmentArtifacts.count()).toBe(1)
+    await reopened.delete()
+  })
+
+  it('adds a request-context revision without reading or rewriting cold bodies', async () => {
+    const name = `natter-test-request-context-v25-${Math.random().toString(36).slice(2)}`
+    await Dexie.delete(name)
+    const legacy = new Dexie(name)
+    legacy.version(24).stores({
+      messages:
+        'id, chatId, parentId, turnId, [chatId+parentId], [chatId+createdAt], [chatId+turnId], [chatId+deleted]',
+      messageBodies: '&id, chatId, updatedAt, bodyVersion',
+    })
+    await legacy.open()
+    const message: Message = {
+      id: 'request-context-message',
+      chatId: 'request-context-chat',
+      parentId: null,
+      siblingIndex: 0,
+      turnId: 'request-context-turn',
+      turnIndex: 0,
+      createdAt: 1,
+      role: 'user',
+      origin: 'user',
+      content: [{ type: 'text', text: 'unchanged cold body' }],
+      nodeVersion: 7,
+      deleted: false,
+    }
+    const split = splitMessageForStorage(message, { bodyVersion: 3 })
+    const legacyHeader = structuredClone(split.header) as Record<string, unknown>
+    delete legacyHeader.requestContextVersion
+    await legacy.table('messages').put(legacyHeader)
+    await legacy.table('messageBodies').put(split.body)
+    legacy.close()
+
+    const migrated = createDbForTests(name)
+    await migrated.open()
+    expect(migrated.verno).toBe(25)
+    expect(await migrated.messages.get(message.id)).toMatchObject({
+      nodeVersion: 7,
+      bodyVersion: 3,
+      requestContextVersion: 0,
+    })
+    expect(await migrated.messageBodies.get(message.id)).toEqual(split.body)
+    migrated.close()
+
+    const reopened = createDbForTests(name)
+    await reopened.open()
+    expect((await reopened.messages.get(message.id))?.requestContextVersion).toBe(0)
+    expect(await reopened.messageBodies.get(message.id)).toEqual(split.body)
     await reopened.delete()
   })
 
@@ -293,7 +342,7 @@ describe('Dexie schema', () => {
 
     const migrated = createDbForTests(name)
     await migrated.open()
-    expect(migrated.verno).toBe(24)
+    expect(migrated.verno).toBe(25)
     const seeded = await migrated.browserLocks.get(BROWSER_WRITER_LOCK_NAME)
     expect(seeded?.fencingToken).toBe(0)
     await migrated.browserLocks.put({
@@ -688,7 +737,7 @@ describe('Dexie migrations', () => {
 
     const migrated = createDbForTests(name)
     await migrated.open()
-    expect(migrated.verno).toBe(24)
+    expect(migrated.verno).toBe(25)
     expect(await migrated.attachmentRefEdges.toArray()).toEqual(
       expect.arrayContaining<AttachmentReferenceEdge>([
         {
@@ -940,7 +989,7 @@ describe('Dexie migrations', () => {
 
     const retried = createDbForTests(name)
     await retried.open()
-    expect(retried.verno).toBe(24)
+    expect(retried.verno).toBe(25)
     expect(await retried.attachmentRefEdges.count()).toBe(1)
     expect((await retried.settings.get('backfill:attachment-refs-v1'))?.value).toBe(1)
     await retried.delete()
@@ -1117,7 +1166,7 @@ describe('Dexie migrations', () => {
 
     const migrated = createDbForTests(name)
     await migrated.open()
-    expect(migrated.verno).toBe(24)
+    expect(migrated.verno).toBe(25)
     expect(await migrated.streamLeases.get('original-stream')).toEqual({
       ...legacyLeases[0],
       attemptKind: 'generation',
@@ -1319,7 +1368,7 @@ describe('Dexie migrations', () => {
 
     const migrated = createDbForTests(name)
     await migrated.open()
-    expect(migrated.verno).toBe(24)
+    expect(migrated.verno).toBe(25)
     expect((await migrated.messages.get('streaming'))?.generation).toMatchObject({
       status: 'streaming',
       integrity: 'clean',
@@ -1444,7 +1493,7 @@ describe('Dexie migrations', () => {
 
     const migrated = createDbForTests(name)
     await migrated.open()
-    expect(migrated.verno).toBe(24)
+    expect(migrated.verno).toBe(25)
     const migratedHeader = (await migrated.messages.get('continued-message')) as unknown as Record<
       string,
       unknown
@@ -1532,7 +1581,7 @@ describe('Dexie migrations', () => {
     const db = await freshDb(name)
     await db.open()
 
-    expect(db.verno).toBe(24)
+    expect(db.verno).toBe(25)
     expect(await db.streamLeases.count()).toBe(0)
     expect((await db.settings.get('backfill:message-body-split-v1'))?.value).toBe(1)
     const lease: StreamLeaseRow = {
@@ -1587,7 +1636,7 @@ describe('Dexie migrations', () => {
 
     const migrated = createDbForTests(name)
     await migrated.open()
-    expect(migrated.verno).toBe(24)
+    expect(migrated.verno).toBe(25)
     expect((await migrated.settings.get('global:message-render-window-size'))?.value).toBe(33)
     expect((await migrated.settings.get('global:sidebar-render-window-size'))?.value).toBe(50)
     expect((await migrated.settings.get('global:message-render-window-load-mode'))?.value).toBe(
@@ -1967,7 +2016,7 @@ describe('Dexie migrations', () => {
 
     const migrated = createDbForTests(name)
     await migrated.open()
-    expect(migrated.verno).toBe(24)
+    expect(migrated.verno).toBe(25)
     const chat = await migrated.chats.get('chat-settings-snapshot')
     const preset = await migrated.presets.get('preset-settings-snapshot')
     for (const settings of [chat?.settings, preset?.settings]) {
@@ -2113,7 +2162,7 @@ describe('Dexie migrations', () => {
 
     const migrated = createDbForTests(name)
     await migrated.open()
-    expect(migrated.verno).toBe(24)
+    expect(migrated.verno).toBe(25)
     const openaiChat = await migrated.chats.get('chat-openai')
     const googleChat = await migrated.chats.get('chat-google')
     const anthropicChat = await migrated.chats.get('chat-anthropic')
@@ -2171,7 +2220,7 @@ describe('Dexie migrations', () => {
 
     const migrated = createDbForTests(name)
     await migrated.open()
-    expect(migrated.verno).toBe(24)
+    expect(migrated.verno).toBe(25)
     const rows = (await migrated.presets.toArray()).sort(
       (left, right) => left.sortIndex - right.sortIndex,
     )
@@ -2209,7 +2258,7 @@ describe('Dexie migrations', () => {
 
     const migrated = createDbForTests(name)
     await migrated.open()
-    expect(migrated.verno).toBe(24)
+    expect(migrated.verno).toBe(25)
     expect((await migrated.settings.get('rendering-preferences'))?.value).toEqual({
       shikiLight: 'tokyo-night',
       shikiDark: 'dracula',

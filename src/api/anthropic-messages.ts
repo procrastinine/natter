@@ -16,7 +16,8 @@ import {
 } from './client'
 import { deferAdapterRequest } from './deferred-request'
 import { normalizeError } from './errors'
-import { decodeProviderJson, malformedJsonFrameReport, parseSSE } from './sse'
+import { validateAnthropicEvent, validateAnthropicResult } from './provider-json-boundary'
+import { decodeProviderStreamFrame, decodeValidatedProviderJson, parseSSE } from './sse'
 import type { CallOpts } from './types'
 
 export interface AnthropicContext extends ApiKeyDispatchContext {
@@ -112,7 +113,7 @@ async function* consumeAnthropicStream(
   const contentType = response.headers.get('content-type') ?? ''
 
   if (!/text\/event-stream/i.test(contentType)) {
-    const result = await decodeProviderJson<AnthropicMessagesResultWire>(response)
+    const result = await decodeValidatedProviderJson(response, validateAnthropicResult)
     yield generationId
       ? { type: 'buffered_result', result, generationId }
       : { type: 'buffered_result', result }
@@ -125,26 +126,20 @@ async function* consumeAnthropicStream(
       yield { type: 'keepalive', comment: ev.comment }
       continue
     }
-    try {
-      const parsed = JSON.parse(ev.data) as AnthropicStreamChunk extends {
-        type: 'anthropic_event'
-        event: infer E
-      }
-        ? E
-        : never
-      yield generationId
-        ? { type: 'anthropic_event', event: parsed, generationId }
-        : { type: 'anthropic_event', event: parsed }
-    } catch (err) {
-      const report = malformedJsonFrameReport({
-        adapter: 'anthropic-messages',
-        eventType: ev.event,
-        data: ev.data,
-        error: err,
-      })
-      console.warn('anthropicStream: malformed SSE chunk skipped', report.diagnostic)
-      yield { type: 'integrity', integrity: report.integrity }
+    const decoded = decodeProviderStreamFrame({
+      adapter: 'anthropic-messages',
+      eventType: ev.event,
+      data: ev.data,
+      validate: validateAnthropicEvent,
+    })
+    if (!decoded.ok) {
+      console.warn('anthropicStream: invalid SSE frame skipped', decoded.diagnostic)
+      yield { type: 'integrity', integrity: decoded.integrity }
+      continue
     }
+    yield generationId
+      ? { type: 'anthropic_event', event: decoded.value, generationId }
+      : { type: 'anthropic_event', event: decoded.value }
   }
 }
 
@@ -164,5 +159,5 @@ async function consumeAnthropicOnce(
   dispatched: Promise<Response>,
 ): Promise<AnthropicMessagesResultWire> {
   const response = await dispatched
-  return decodeProviderJson<AnthropicMessagesResultWire>(response)
+  return decodeValidatedProviderJson(response, validateAnthropicResult)
 }

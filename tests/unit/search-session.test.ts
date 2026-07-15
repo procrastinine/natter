@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import type { Chat, ChatBranchCache, Message } from '../../src/core/types'
+import { __resetBroadcastForTests, postEvent } from '../../src/store/broadcast'
 import type { WorkspaceRepository } from '../../src/store/repository'
 import {
   __resetSearchSessionRunnerForTests,
@@ -9,12 +10,14 @@ import {
 import {
   __resetSearchStoreForTests,
   orderedSearchResults,
+  startSearchStoreBroadcastListener,
   useSearchStore,
 } from '../../src/store/zustand/searchStore'
 
 afterEach(() => {
   __resetSearchSessionRunnerForTests()
   __resetSearchStoreForTests()
+  __resetBroadcastForTests()
 })
 
 function chat(overrides: Partial<Chat> & Pick<Chat, 'id'>): Chat {
@@ -137,10 +140,190 @@ describe('search session runner', () => {
         .sort(),
     ).toEqual(['body', 'title'])
   })
+
+  it('drains exact chat invalidations that arrive after done in both result directions', async () => {
+    const mutableChat = chat({ id: 'mutable', title: 'needle' })
+    const repository = repo({ chats: [mutableChat] })
+    startSearchStoreBroadcastListener()
+
+    requestSearchSession({ query: 'needle', repo: repository, debounceMs: 0 })
+    await waitFor(
+      () =>
+        useSearchStore.getState().session?.status === 'done' &&
+        useSearchStore.getState().session?.results.size === 1,
+    )
+
+    mutableChat.title = 'other'
+    postEvent({
+      kind: 'chat-mutated',
+      chatId: mutableChat.id,
+      metaVersion: 1,
+      summaryVersion: 1,
+      affected: [{ kind: 'chat-meta', chatId: mutableChat.id }],
+    })
+    await waitFor(
+      () =>
+        useSearchStore.getState().session?.status === 'done' &&
+        useSearchStore.getState().session?.results.size === 0,
+    )
+
+    mutableChat.title = 'needle again'
+    postEvent({
+      kind: 'chat-mutated',
+      chatId: mutableChat.id,
+      metaVersion: 2,
+      summaryVersion: 2,
+      affected: [{ kind: 'chat-meta', chatId: mutableChat.id }],
+    })
+    await waitFor(
+      () =>
+        useSearchStore.getState().session?.status === 'done' &&
+        orderedSearchResults(useSearchStore.getState().session?.results)[0]?.chat.title ===
+          'needle again',
+    )
+
+    expect(repository.listChats).toHaveBeenCalledTimes(3)
+    expect(repository.listMessages).not.toHaveBeenCalled()
+  })
+
+  it('requeues an invalidation for the same chat while its tail pass is in flight', async () => {
+    const mutableChat = chat({ id: 'mutable', title: 'needle' })
+    const repository = repo({ chats: [mutableChat] })
+    startSearchStoreBroadcastListener()
+
+    requestSearchSession({ query: 'needle', repo: repository, debounceMs: 0 })
+    await waitFor(
+      () =>
+        useSearchStore.getState().session?.status === 'done' &&
+        useSearchStore.getState().session?.results.size === 1,
+    )
+
+    let markTailStarted!: () => void
+    let releaseTail!: () => void
+    const tailStarted = new Promise<void>((resolve) => {
+      markTailStarted = resolve
+    })
+    const tailGate = new Promise<void>((resolve) => {
+      releaseTail = resolve
+    })
+    vi.mocked(repository.listChats).mockImplementationOnce(async () => {
+      const snapshot = { ...mutableChat }
+      markTailStarted()
+      await tailGate
+      return [snapshot]
+    })
+
+    mutableChat.title = 'other'
+    postEvent({
+      kind: 'chat-mutated',
+      chatId: mutableChat.id,
+      metaVersion: 1,
+      summaryVersion: 1,
+      affected: [{ kind: 'chat-meta', chatId: mutableChat.id }],
+    })
+    await tailStarted
+
+    mutableChat.title = 'needle again'
+    postEvent({
+      kind: 'chat-mutated',
+      chatId: mutableChat.id,
+      metaVersion: 2,
+      summaryVersion: 2,
+      affected: [{ kind: 'chat-meta', chatId: mutableChat.id }],
+    })
+    releaseTail()
+
+    await waitFor(
+      () =>
+        useSearchStore.getState().session?.status === 'done' &&
+        orderedSearchResults(useSearchStore.getState().session?.results)[0]?.chat.title ===
+          'needle again',
+    )
+    expect(repository.listChats).toHaveBeenCalledTimes(3)
+    expect(repository.listMessages).not.toHaveBeenCalled()
+  })
+
+  it('turns a post-done filtered-tag invalidation into a full rescan', async () => {
+    const mutableChat = chat({ id: 'tagged', title: 'tagged', tags: ['tag-1'] })
+    const repository = repo({ chats: [mutableChat] })
+    startSearchStoreBroadcastListener()
+
+    requestSearchSession({
+      query: '',
+      repo: repository,
+      debounceMs: 0,
+      filters: {
+        includeFolderIds: [],
+        excludeFolderIds: [],
+        includeTagIds: ['tag-1'],
+        excludeTagIds: [],
+        archived: 'exclude',
+        titleOnly: false,
+      },
+    })
+    await waitFor(
+      () =>
+        useSearchStore.getState().session?.status === 'done' &&
+        useSearchStore.getState().session?.results.size === 1,
+    )
+
+    mutableChat.tags = []
+    postEvent({ kind: 'tag-deleted', tagId: 'tag-1' })
+    await waitFor(
+      () =>
+        useSearchStore.getState().session?.status === 'done' &&
+        useSearchStore.getState().session?.results.size === 0,
+    )
+
+    expect(repository.listChats).toHaveBeenCalledTimes(2)
+    expect(repository.listMessages).not.toHaveBeenCalled()
+  })
+
+  it('publishes a 100,003-title-hit session geometrically without hydrating bodies', async () => {
+    const count = 100_003
+    const base = chat({ id: 'base', title: 'needle' })
+    const chats = Array.from({ length: count }, (_, index) => ({
+      ...base,
+      id: `chat-${index}`,
+      title: `needle ${index}`,
+    }))
+    const repository = repo({ chats })
+    const resultRevisions: number[] = []
+    const unsubscribe = useSearchStore.subscribe((state, previous) => {
+      const revision = state.session?.results.revision
+      if (revision !== undefined && revision !== previous.session?.results.revision) {
+        resultRevisions.push(revision)
+      }
+    })
+    const startedAt = performance.now()
+
+    requestSearchSession({ query: 'needle', repo: repository, debounceMs: 0 })
+    await waitFor(
+      () =>
+        useSearchStore.getState().session?.status === 'done' &&
+        useSearchStore.getState().session?.results.size === count,
+      10_000,
+    )
+    const elapsedMs = performance.now() - startedAt
+    unsubscribe()
+
+    const results = orderedSearchResults(useSearchStore.getState().session?.results)
+    expect(results).toHaveLength(count)
+    expect(results[0]?.chatId).toBe('chat-0')
+    expect(results.at(-1)?.chatId).toBe(`chat-${count - 1}`)
+    expect(resultRevisions.length).toBeLessThanOrEqual(18)
+    expect(resultRevisions).toEqual(
+      Array.from({ length: resultRevisions.length }, (_, index) => index),
+    )
+    expect(repository.listMessages).not.toHaveBeenCalled()
+    expect(repository.getBranchByLeaf).not.toHaveBeenCalled()
+    expect(elapsedMs).toBeLessThan(5_000)
+  }, 15_000)
 })
 
-async function waitFor(assertion: () => boolean): Promise<void> {
-  for (let attempt = 0; attempt < 50; attempt += 1) {
+async function waitFor(assertion: () => boolean, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
     if (assertion()) return
     await new Promise((resolve) => setTimeout(resolve, 0))
   }

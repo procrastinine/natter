@@ -1,6 +1,7 @@
 import { memo, useCallback, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { Message, MessageRole } from '../../core/types'
 import { useRetainedMessageStreamProjection } from '../../hooks/useMessageStreamProjection'
+import type { MessageAttachmentRefMutation } from '../../store/attachments'
 import { getStreamClientId } from '../../store/stream-leases'
 import { AttachmentRefChips } from '../attachments/AttachmentRefChips'
 import {
@@ -40,10 +41,10 @@ export interface BranchTreeInspectorProps {
   onContinue?: () => void | Promise<void>
   onForkChat?: () => void | Promise<void>
   onToggleContextVisibility?: () => void | Promise<void>
+  onMutateAttachmentRef?: (mutation: MessageAttachmentRefMutation) => void | Promise<void>
   onToggleReasoningDetailHidden?: (detailIndex: number) => void | Promise<void>
   onToggleProviderOutputItemHidden?: (itemIndex: number) => void | Promise<void>
   hasConnection?: boolean
-  generationBusy?: boolean
   streamOnActivePath?: boolean
   searchQuery?: string
   searchMatched?: boolean
@@ -137,10 +138,10 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
   onContinue,
   onForkChat,
   onToggleContextVisibility,
+  onMutateAttachmentRef,
   onToggleReasoningDetailHidden,
   onToggleProviderOutputItemHidden,
   hasConnection = false,
-  generationBusy = false,
   streamOnActivePath = true,
   searchQuery,
   searchMatched = false,
@@ -162,7 +163,7 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
     message.generation?.status === 'streaming' && message.generation.finishedAt === undefined
   const streamTargetBusy =
     activeStream !== undefined || persistedStreamBusy || liveSnapshot !== undefined
-  const requestBusy = !bodyReady || generationBusy || streamTargetBusy
+  const requestBusy = !bodyReady || streamTargetBusy
   const remoteStreaming =
     activeStream !== undefined && activeStream.ownerClientId !== getStreamClientId()
   const liveReasoningRows = liveSnapshot?.reasoningRows
@@ -180,9 +181,7 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
           ? { text: 'Streaming response…' }
           : { text: 'Waiting for response…' }
         : persistedStreamBusy
-          ? liveSnapshot || !generationBusy
-            ? { text: 'Finishing response…' }
-            : { text: 'Preparing response…' }
+          ? { text: 'Finishing response…' }
           : liveSnapshot
             ? { text: 'Finishing response…' }
             : finalError
@@ -501,8 +500,8 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
                   ? 'Refreshing message details…'
                   : !hasConnection
                     ? 'Add a connection to regenerate.'
-                    : requestBusy
-                      ? 'A request is already running for this chat.'
+                    : streamTargetBusy
+                      ? "Can't regenerate while this message is streaming."
                       : 'Regenerate response'
               }
               disabled={!hasConnection || requestBusy}
@@ -522,11 +521,9 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
                   ? 'Refreshing message details…'
                   : streamTargetBusy
                     ? "Can't continue while streaming."
-                    : generationBusy
-                      ? 'A request is already running for this chat.'
-                      : hasConnection
-                        ? 'Continue this assistant message'
-                        : 'Add a connection to continue.'
+                    : hasConnection
+                      ? 'Continue this assistant message'
+                      : 'Add a connection to continue.'
               }
               disabled={!hasConnection || requestBusy}
               onClick={() => void onContinue()}
@@ -759,8 +756,13 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
                 streaming={streamTargetBusy}
                 messageId={message.id}
                 attachmentRefs={message.attachmentRefs}
+                {...(onMutateAttachmentRef ? { onMutateAttachmentRef } : {})}
               />
-              <StaticAttachmentRefChips refs={message.attachmentRefs} messageId={message.id} />
+              <StaticAttachmentRefChips
+                refs={message.attachmentRefs}
+                messageId={message.id}
+                {...(onMutateAttachmentRef ? { onMutateMessageRef: onMutateAttachmentRef } : {})}
+              />
             </>
           )}
         </section>

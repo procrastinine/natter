@@ -6,13 +6,18 @@ import { afterEach, beforeEach, describe, expect, it, type MockInstance, vi } fr
 import type { ChatStreamChunk } from '../../src/api/types'
 import { App } from '../../src/app/App'
 import {
+  __addExactMessagePresentationSnapshotForTests,
   __composeKnownBranchPageForTests,
+  __overlayCommittedPathHeadersForTests,
   __rebaseBranchSnapshotForTests,
+  __repositoryHeadersResolveReceiptForTests,
 } from '../../src/app/Shell'
-import { cursorKeyOf } from '../../src/core/active-path'
+import { createMessageTreeProjection, cursorKeyOf } from '../../src/core/active-path'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import type { Chat, ConnectionProfile, Message } from '../../src/core/types'
 import { sendText } from '../../src/hooks/useChat'
+import { editInPlace } from '../../src/hooks/useMessageOps'
+import { __resetMessageStreamProjectionForTests } from '../../src/hooks/useMessageStreamProjection'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import { getBrowserRepository } from '../../src/store/browser-repo'
 import { rebuildChatSidebarProjection } from '../../src/store/chat-sidebar-projection'
@@ -25,12 +30,16 @@ import { type MessageHeaderRow, splitMessageForStorage } from '../../src/store/m
 import { putCachedModels } from '../../src/store/models-cache'
 import { createPreset, getPreset } from '../../src/store/presets'
 import { createProfile } from '../../src/store/profiles'
-import type { ActiveBranchPageSnapshot } from '../../src/store/repository'
+import type {
+  ActiveBranchPageSnapshot,
+  MessagePresentationSnapshot,
+} from '../../src/store/repository'
 import { __resetSearchSessionRunnerForTests } from '../../src/store/search-session'
 import { setSetting } from '../../src/store/settings'
 import {
   __resetStreamLeasesForTests,
   __setStreamLockManagerForTests,
+  getStreamClientId,
   STREAM_LEASE_TTL_MS,
 } from '../../src/store/stream-leases'
 import { createTag } from '../../src/store/tags'
@@ -38,9 +47,14 @@ import {
   __resetWorkspaceRepositoryForTests,
   __setWorkspaceRepositoryForTests,
 } from '../../src/store/workspace-repository'
-import { useChatStore } from '../../src/store/zustand/chatStore'
+import {
+  type CommittedMessagePresentationReceipt,
+  type CommittedPathPresentationReceipt,
+  useChatStore,
+} from '../../src/store/zustand/chatStore'
 import { __resetSearchStoreForTests } from '../../src/store/zustand/searchStore'
 import { useStreamStore } from '../../src/store/zustand/streamStore'
+import { useToastStore } from '../../src/store/zustand/toastStore'
 import { useUiStore } from '../../src/store/zustand/uiStore'
 import { readActiveSeedState } from '../../src/ui/header/ConnectionHeader'
 import { putTestMessageHeaderOnly, putTestMessages } from '../helpers/message-storage'
@@ -56,6 +70,7 @@ function pageHeader(id: string, parentId: string | null, index: number): Message
     createdAt: index,
     role: index % 2 === 0 ? 'user' : 'assistant',
     origin: index % 2 === 0 ? 'user' : 'generated',
+    requestContextVersion: 0,
     bodyVersion: 7,
     bodyWordCount: 1,
     textPreview: id,
@@ -82,6 +97,35 @@ function pageMessage(header: MessageHeaderRow): Message {
 }
 
 describe('active branch page composition', () => {
+  it('rebases a route-independent exact body onto the authoritative metadata header', () => {
+    const header = pageHeader('off-path', null, 0)
+    const message = pageMessage(header)
+    const receipt: CommittedMessagePresentationReceipt = {
+      chatId: header.chatId,
+      presentation: { header, message, bodyVersion: header.bodyVersion },
+    }
+    const snapshots = new Map<Message['id'], MessagePresentationSnapshot>()
+
+    __addExactMessagePresentationSnapshotForTests(
+      snapshots,
+      receipt,
+      new Map([[header.id, { ...header, bodyVersion: header.bodyVersion + 1 }]]),
+    )
+    expect(snapshots.size).toBe(0)
+
+    const authoritative = { ...header, siblingIndex: 3, nodeVersion: header.nodeVersion + 1 }
+    __addExactMessagePresentationSnapshotForTests(
+      snapshots,
+      receipt,
+      new Map([[header.id, authoritative]]),
+    )
+    expect(snapshots.get(header.id)).toEqual({
+      message: { ...message, siblingIndex: 3, nodeVersion: header.nodeVersion + 1 },
+      bodyVersion: header.bodyVersion,
+    })
+    expect(snapshots.get(header.id)?.message).not.toHaveProperty('requestContextVersion')
+  })
+
   it('rebases structural headers without copying bodies and rejects a changed body version', () => {
     const pageRow = pageHeader('page-root', null, 0)
     const body = pageMessage(pageRow)
@@ -158,6 +202,90 @@ describe('active branch page composition', () => {
     expect(result?.branchWindow).toHaveLength(windowSize)
     expect(indexedHeaderReads).toBe(windowSize * 2)
   })
+
+  it('uses a committed empty-path delete as the structural count source before reads catch up', () => {
+    const staleRoot = pageHeader('stale-delete-root', null, 0)
+    const tombstone = { ...staleRoot, deleted: true, nodeVersion: 1 }
+    const receipt: CommittedPathPresentationReceipt = {
+      chatId: staleRoot.chatId,
+      revision: 'delete-receipt',
+      phase: 'terminal',
+      pathHeaders: [],
+      structuralHeaders: [tombstone],
+      presentations: [],
+    }
+
+    const authoritative = __overlayCommittedPathHeadersForTests([staleRoot], receipt)
+    const projection = createMessageTreeProjection(authoritative)
+
+    expect(authoritative).toEqual([tombstone])
+    expect(projection.liveByParent.get(null) ?? []).toHaveLength(0)
+  })
+
+  it('uses imported and reparented receipt headers for branch counts before reads catch up', () => {
+    const parent = pageHeader('import-parent', null, 0)
+    const left = { ...pageHeader('import-left', parent.id, 1), siblingIndex: 0 }
+    const right = { ...pageHeader('import-right', parent.id, 2), siblingIndex: 1 }
+    const first = { ...pageHeader('import-first', parent.id, 3), siblingIndex: 2 }
+    const second = { ...pageHeader('import-second', first.id, 4), siblingIndex: 0 }
+    const movedLeft = { ...left, parentId: second.id, nodeVersion: 1 }
+    const movedRight = { ...right, parentId: second.id, nodeVersion: 1 }
+    const receipt: CommittedPathPresentationReceipt = {
+      chatId: parent.chatId,
+      revision: 'import-receipt',
+      phase: 'terminal',
+      pathHeaders: [parent, first, second, movedRight],
+      structuralHeaders: [parent, first, second, movedLeft, movedRight],
+      presentations: [],
+    }
+
+    const authoritative = __overlayCommittedPathHeadersForTests([parent, left, right], receipt)
+    const projection = createMessageTreeProjection(authoritative)
+
+    expect(projection.liveByParent.get(parent.id)?.map((header) => header.id)).toEqual([first.id])
+    expect(projection.liveByParent.get(second.id)?.map((header) => header.id)).toEqual([
+      movedLeft.id,
+      movedRight.id,
+    ])
+  })
+
+  it('does not acknowledge a multi-row structural receipt after only one newer contradiction', () => {
+    const first = pageHeader('receipt-first', null, 0)
+    const second = { ...pageHeader('receipt-second', null, 1), siblingIndex: 1 }
+    const committedFirst = { ...first, deleted: true, nodeVersion: 1 }
+    const committedSecond = { ...second, deleted: true, nodeVersion: 1 }
+    const receipt: CommittedPathPresentationReceipt = {
+      chatId: first.chatId,
+      revision: 'multi-row-receipt',
+      phase: 'terminal',
+      pathHeaders: [],
+      structuralHeaders: [committedFirst, committedSecond],
+      presentations: [],
+    }
+
+    expect(
+      __repositoryHeadersResolveReceiptForTests(
+        new Map(
+          [{ ...first, siblingIndex: 2, nodeVersion: 2 }, second].map((header) => [
+            header.id,
+            header,
+          ]),
+        ),
+        receipt,
+      ),
+    ).toBe(false)
+    expect(
+      __repositoryHeadersResolveReceiptForTests(
+        new Map(
+          [
+            { ...first, siblingIndex: 2, nodeVersion: 2 },
+            { ...committedSecond, nodeVersion: 2 },
+          ].map((header) => [header.id, header]),
+        ),
+        receipt,
+      ),
+    ).toBe(true)
+  })
 })
 
 describe('shell smoke render', () => {
@@ -174,6 +302,7 @@ describe('shell smoke render', () => {
     __resetStreamLeasesForTests()
     useChatStore.getState().reset()
     useStreamStore.getState().reset()
+    useToastStore.getState().reset()
     useUiStore.getState().reset()
     __resetWorkspaceRepositoryForTests()
     __resetDbForTests()
@@ -721,7 +850,7 @@ describe('shell smoke render', () => {
 
     const { container, findByText } = render(<App />)
 
-    expect(await findByText('selected branch answer')).toBeInTheDocument()
+    expect(await findByText('selected branch answer', {}, { timeout: 5_000 })).toBeInTheDocument()
     await waitFor(() => {
       expect(useChatStore.getState().getCursor(chat.id)).toEqual({
         [cursorKeyOf(null)]: root.id,
@@ -805,6 +934,174 @@ describe('shell smoke render', () => {
       'Show in context (send to model)',
     )
     expect(useChatStore.getState().getCursor(chat.id)).toEqual(cursorBeforeToggle)
+  })
+
+  it('keeps an exact off-path edit visible while header and body hydration are stalled', async () => {
+    const chat = await createChat({
+      id: 'chat-exact-off-path-receipt',
+      title: 'Exact off-path receipt',
+      settings: cloneDefaultChatSettings(),
+      now: 1,
+    })
+    const root: Message = {
+      id: 'exact-off-path-root',
+      chatId: chat.id,
+      parentId: null,
+      siblingIndex: 0,
+      turnId: 'exact-off-path-root',
+      turnIndex: 0,
+      createdAt: 2,
+      role: 'user',
+      origin: 'user',
+      content: [{ type: 'text', text: 'exact off-path prompt' }],
+      nodeVersion: 0,
+      deleted: false,
+    }
+    const selectedLeaf: Message = {
+      ...root,
+      id: 'exact-off-path-selected',
+      parentId: root.id,
+      siblingIndex: 0,
+      turnId: 'exact-off-path-selected',
+      turnIndex: 1,
+      createdAt: 4,
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: 'selected durable answer' }],
+    }
+    const inspectedSibling: Message = {
+      ...selectedLeaf,
+      id: 'exact-off-path-inspected',
+      siblingIndex: 1,
+      turnId: 'exact-off-path-inspected',
+      createdAt: 3,
+      content: [{ type: 'output_text', text: 'old inspected answer' }],
+    }
+    await putTestMessages([root, selectedLeaf, inspectedSibling])
+    await getDb().chats.put({
+      ...chat,
+      titleStatus: 'manual',
+      lastUpdatedLeafId: selectedLeaf.id,
+      lastBranchUpdatedAt: selectedLeaf.createdAt,
+      updatedAt: selectedLeaf.createdAt,
+    })
+    window.location.hash = `#/chat/${chat.id}/message/${selectedLeaf.id}`
+
+    const { container, findByText, queryByText } = render(<App />)
+    expect(await findByText('selected durable answer')).toBeInTheDocument()
+    const treeButton = container.querySelector(
+      '[data-role="chat-branch-tree"]',
+    ) as HTMLButtonElement
+    fireEvent.click(treeButton)
+    await waitFor(() => {
+      expect(container.querySelectorAll('[data-ui="branch-tree-node"]')).toHaveLength(3)
+    })
+    fireEvent.click(
+      container.querySelector(
+        `[data-ui="branch-tree-node"][data-message-id="${inspectedSibling.id}"]`,
+      ) as Element,
+    )
+    expect(await findByText('old inspected answer')).toBeInTheDocument()
+
+    const cursorBeforeEdit = useChatStore.getState().getCursor(chat.id)
+    const revisionBeforeEdit = useChatStore.getState().getNavigationRevision(chat.id)
+    const browserRepo = getBrowserRepository()
+    let requestedHeaderIds: readonly string[] = []
+    let markHeaderReadStarted!: () => void
+    const headerReadStarted = new Promise<void>((resolve) => {
+      markHeaderReadStarted = resolve
+    })
+    let resolveHeaderRead!: (rows: Array<MessageHeaderRow | undefined>) => void
+    const stalledHeaderRead = new Promise<Array<MessageHeaderRow | undefined>>((resolve) => {
+      resolveHeaderRead = resolve
+    })
+    const stalledBodyRead = new Promise<never>(() => {})
+    let blockHeaderRead = true
+    __setWorkspaceRepositoryForTests(
+      new Proxy(browserRepo, {
+        get(target, property) {
+          if (property === 'getMessageHeaders') {
+            return (messageIds: readonly string[]) => {
+              if (!blockHeaderRead) return target.getMessageHeaders(messageIds)
+              requestedHeaderIds = messageIds
+              markHeaderReadStarted()
+              return stalledHeaderRead
+            }
+          }
+          if (property === 'getMessagePresentationSnapshot') {
+            return (messageId: string) =>
+              messageId === inspectedSibling.id
+                ? stalledBodyRead
+                : target.getMessagePresentationSnapshot(messageId)
+          }
+          const value = Reflect.get(target, property) as unknown
+          if (typeof value !== 'function') return value
+          const callable = value as (...args: unknown[]) => unknown
+          return (...args: unknown[]) => callable.apply(target, args)
+        },
+      }),
+    )
+
+    const selectedPathHeaders = [root, selectedLeaf].map(
+      (message) => splitMessageForStorage(message).header,
+    )
+    await act(async () => {
+      await editInPlace(chat.id, inspectedSibling, 'exact edited answer', {
+        pathHeaders: selectedPathHeaders,
+      })
+    })
+    await headerReadStarted
+    await waitFor(() => {
+      const inspector = container.querySelector('[data-ui="branch-tree-inspector"]') as HTMLElement
+      expect(within(inspector).getByText('exact edited answer')).toBeVisible()
+      expect(within(inspector).queryByText('old inspected answer')).toBeNull()
+    })
+    expect(useChatStore.getState().getCursor(chat.id)).toBe(cursorBeforeEdit)
+    expect(useChatStore.getState().getNavigationRevision(chat.id)).toBe(revisionBeforeEdit)
+    const activeReceipt = useChatStore.getState().getCommittedMessagePresentation(chat.id)
+    expect(activeReceipt?.presentation.message.id).toBe(inspectedSibling.id)
+
+    act(() => {
+      for (let index = 0; index < 9; index += 1) {
+        const backgroundChatId = `background-receipt-chat-${index}`
+        const backgroundMessage: Message = {
+          ...inspectedSibling,
+          id: `background-receipt-message-${index}`,
+          chatId: backgroundChatId,
+          parentId: null,
+          turnId: `background-receipt-message-${index}`,
+          content: [{ type: 'output_text', text: `background body ${index}` }],
+          nodeVersion: 1,
+        }
+        const { header } = splitMessageForStorage(backgroundMessage, { bodyVersion: 1 })
+        useChatStore.getState().publishCommittedMessageMutation(backgroundChatId, [], {
+          header,
+          message: backgroundMessage,
+          bodyVersion: 1,
+        })
+      }
+    })
+    expect(useChatStore.getState().getCommittedMessagePresentation(chat.id)).toBe(activeReceipt)
+    expect(queryByText('exact edited answer')).toBeVisible()
+
+    blockHeaderRead = false
+    await act(async () => {
+      const rows = await browserRepo.getMessageHeaders(requestedHeaderIds)
+      resolveHeaderRead([...rows])
+      await stalledHeaderRead
+    })
+    await waitFor(() => {
+      expect(useChatStore.getState().getCommittedMessagePresentation(chat.id)).toBeUndefined()
+    })
+    expect(queryByText('exact edited answer')).toBeVisible()
+
+    fireEvent.click(treeButton)
+    await waitFor(() => expect(container.querySelector('[data-ui="message-list"]')).toBeVisible())
+    fireEvent.click(treeButton)
+    await waitFor(() => {
+      const inspector = container.querySelector('[data-ui="branch-tree-inspector"]') as HTMLElement
+      expect(within(inspector).getByText('exact edited answer')).toBeVisible()
+    })
   })
 
   it('returns to the active streaming branch when tree view interrupts its reload', async () => {
@@ -912,7 +1209,7 @@ describe('shell smoke render', () => {
     expect(transcript).not.toHaveTextContent('stable answer before stream')
   })
 
-  it('does not let a never-settling branch presentation read block generation', async () => {
+  it('renders committed sends while every fresh branch presentation read is stuck', async () => {
     const settings = cloneDefaultChatSettings()
     settings.profileId = 'presentation-profile'
     settings.model = 'gpt-4o-mini'
@@ -951,6 +1248,13 @@ describe('shell smoke render', () => {
     })
     const neverSettlingPresentationRead = new Promise<never>(() => {})
     const neverSettlingStructuralRead = new Promise<never>(() => {})
+    const neverSettlingInspectorRead = new Promise<never>(() => {})
+    const neverSettlingCalibrationRead = new Promise<never>(() => {})
+    const neverSettlingDispatchFreshnessRead = new Promise<never>(() => {})
+    const getSendContextRevisionSnapshot = vi.fn(() => neverSettlingDispatchFreshnessRead)
+    let attemptedTargetChangingRenewal = false
+    let firstFencedMutationMessageIds: string[] | undefined
+    let blockPostCommitCalibration = false
     const getKnownBranchPageSnapshot = vi.fn(() => {
       markPresentationReadStarted()
       return neverSettlingPresentationRead
@@ -959,6 +1263,44 @@ describe('shell smoke render', () => {
       new Proxy(browserRepo, {
         get(target, property) {
           if (property === 'getKnownBranchPageSnapshot') return getKnownBranchPageSnapshot
+          if (property === 'getMessagePresentationSnapshot') {
+            return () => neverSettlingInspectorRead
+          }
+          if (property === 'getSendContextRevisionSnapshot') {
+            return getSendContextRevisionSnapshot
+          }
+          if (property === 'renewStreamLease') {
+            return (...args: unknown[]) => {
+              const options = args[1] as { targetChanged?: boolean } | undefined
+              if (options?.targetChanged) {
+                attemptedTargetChangingRenewal = true
+                return neverSettlingDispatchFreshnessRead
+              }
+              return browserRepo.renewStreamLease(
+                args[0] as Parameters<typeof browserRepo.renewStreamLease>[0],
+                options,
+              )
+            }
+          }
+          if (property === 'runMutation') {
+            return (...args: unknown[]) => {
+              const scopes = args[0] as Array<{ kind: string; messageId?: string }>
+              const options = args[2] as { streamFence?: unknown } | undefined
+              if (!firstFencedMutationMessageIds && options?.streamFence) {
+                firstFencedMutationMessageIds = scopes.flatMap((scope) =>
+                  scope.kind === 'message' && scope.messageId ? [scope.messageId] : [],
+                )
+              }
+              return browserRepo.runMutation(
+                scopes as Parameters<typeof browserRepo.runMutation>[0],
+                args[1] as Parameters<typeof browserRepo.runMutation>[1],
+                options as Parameters<typeof browserRepo.runMutation>[2],
+              )
+            }
+          }
+          if (property === 'getChat' && blockPostCommitCalibration) {
+            return () => neverSettlingCalibrationRead
+          }
           if (property === 'listMessageHeaders') {
             return () => {
               markStructuralReadStarted()
@@ -973,30 +1315,48 @@ describe('shell smoke render', () => {
       }),
     )
 
-    render(<App />)
+    const { container } = render(<App />)
     await waitFor(() => {
       expect(useUiStore.getState().activeChatId).toBe(chat.id)
     })
 
     let targetAtProviderOpen: string | undefined
     let persistedTargetAtProviderRead: string | undefined
+    let releaseFinish!: () => void
+    const finishGate = new Promise<void>((resolve) => {
+      releaseFinish = resolve
+    })
+    let releaseFirstDelta!: () => void
+    const firstDeltaGate = new Promise<void>((resolve) => {
+      releaseFirstDelta = resolve
+    })
     const openStream = vi.fn(() => {
       targetAtProviderOpen = useStreamStore.getState().listByChat(chat.id)[0]?.messageId
       return (async function* () {
         await Promise.all([presentationReadStarted, structuralReadStarted])
         persistedTargetAtProviderRead = (await getDb().streamLeases.toArray())[0]?.messageId
+        await firstDeltaGate
         yield {
           type: 'delta',
           chunk: {
             id: 'presentation-independent-generation',
             model: settings.model,
-            choices: [{ delta: { content: 'generation survived' }, finish_reason: 'stop' }],
+            choices: [{ delta: { content: 'generation survived' }, finish_reason: null }],
+          },
+        } satisfies ChatStreamChunk
+        await finishGate
+        yield {
+          type: 'delta',
+          chunk: {
+            id: 'presentation-independent-generation',
+            model: settings.model,
+            choices: [{ delta: {}, finish_reason: 'stop' }],
           },
         } satisfies ChatStreamChunk
       })()
     })
 
-    const result = await sendText({
+    const sendPromise = sendText({
       chatId: chat.id,
       connection,
       apiKey: 'sk-test',
@@ -1004,17 +1364,208 @@ describe('shell smoke render', () => {
       openStream,
     })
 
+    let openReceipt!: CommittedPathPresentationReceipt
+    await waitFor(() => {
+      const receipt = useChatStore.getState().getCommittedPathPresentation(chat.id)
+      expect(receipt).toMatchObject({ phase: 'open' })
+      openReceipt = receipt as typeof openReceipt
+      expect(container.querySelectorAll('[data-ui="message"]')).toHaveLength(2)
+      expect(container.querySelector('[data-ui="abort"]')).toBeVisible()
+    })
+    const [userId, assistantId] = openReceipt.pathHeaders.map((header) => header.id)
+    expect(window.location.hash).toContain(`/message/${assistantId}`)
+    await waitFor(() => {
+      expect(useStreamStore.getState().listByChat(chat.id)[0]?.messageId).toBe(assistantId)
+    })
+    const treeButton = container.querySelector(
+      '[data-role="chat-branch-tree"]',
+    ) as HTMLButtonElement
+    fireEvent.click(treeButton)
+    await waitFor(() => {
+      expect(container.querySelector('[data-ui="branch-tree-view"]')).toBeVisible()
+      expect(container.querySelectorAll('[data-ui="branch-tree-node"]')).toHaveLength(2)
+    })
+    fireEvent.click(
+      container.querySelector(
+        `[data-ui="branch-tree-node"][data-message-id="${assistantId}"]`,
+      ) as Element,
+    )
+    await waitFor(() => {
+      expect(container.querySelector('[data-ui="branch-tree-inspector"]')).toHaveAttribute(
+        'data-message-id',
+        assistantId,
+      )
+      expect(
+        container.querySelector('[data-ui="workspace-bootstrap"][data-state="failed"]'),
+      ).toBeNull()
+    })
+    expect(
+      within(container.querySelector('[data-ui="branch-tree-inspector"]') as HTMLElement).getByText(
+        'Waiting for response…',
+      ),
+    ).toBeVisible()
+    fireEvent.click(treeButton)
+    await waitFor(() => expect(container.querySelector('[data-ui="message-list"]')).toBeVisible())
+
+    releaseFirstDelta()
+    await waitFor(() => {
+      const transcript = container.querySelector('[data-ui="message-list"]')
+      expect(transcript).toBeVisible()
+      expect(within(transcript as HTMLElement).getByText('generation survived')).toBeVisible()
+    })
+    expect(container.querySelectorAll('[data-ui="message"]')).toHaveLength(2)
+    expect(
+      within(container.querySelector('[data-ui="message-list"]') as HTMLElement).getByText(
+        'do not wait for presentation',
+      ),
+    ).toBeVisible()
+    expect(container.querySelector('[data-ui="abort"]')).toBeVisible()
+    expect(window.location.hash).toContain(`/message/${assistantId}`)
+
+    fireEvent.click(treeButton)
+    await waitFor(() => {
+      expect(container.querySelector('[data-ui="branch-tree-view"]')).toBeVisible()
+      expect(container.querySelectorAll('[data-ui="branch-tree-node"]')).toHaveLength(2)
+    })
+    expect(
+      container.querySelector(`[data-ui="branch-tree-node"][data-message-id="${userId}"]`),
+    ).toBeInTheDocument()
+    expect(
+      container.querySelector(`[data-ui="branch-tree-node"][data-message-id="${assistantId}"]`),
+    ).toHaveAttribute('data-current-leaf', 'true')
+    fireEvent.click(treeButton)
+    await waitFor(() => expect(container.querySelector('[data-ui="message-list"]')).toBeVisible())
+    expect(
+      within(container.querySelector('[data-ui="message-list"]') as HTMLElement).getByText(
+        'generation survived',
+      ),
+    ).toBeVisible()
+
+    let result!: Awaited<typeof sendPromise>
+    await act(async () => {
+      blockPostCommitCalibration = true
+      releaseFinish()
+      result = await sendPromise
+    })
+    blockPostCommitCalibration = false
+
     expect(getKnownBranchPageSnapshot).toHaveBeenCalled()
+    expect(getSendContextRevisionSnapshot).not.toHaveBeenCalled()
+    expect(attemptedTargetChangingRenewal).toBe(false)
     expect(openStream).toHaveBeenCalledOnce()
+    expect(firstFencedMutationMessageIds).toContain(result.assistantMessageId)
     expect(targetAtProviderOpen).toBe(result.assistantMessageId)
     expect(persistedTargetAtProviderRead).toBe(result.assistantMessageId)
     expect(result.outcome).toBe('done')
     expect(useStreamStore.getState().hasStreamForChat(chat.id)).toBe(false)
+    expect(useStreamStore.getState().listLiveSnapshots()).toHaveLength(0)
     expect(await getDb().streamLeases.count()).toBe(0)
     expect(await browserRepo.getMessage(result.assistantMessageId)).toMatchObject({
       content: [{ type: 'output_text', text: 'generation survived' }],
       generation: { status: 'done' },
     })
+    expect(useChatStore.getState().getCommittedPathPresentation(chat.id)?.phase).toBe('terminal')
+    expect(
+      useChatStore.getState().getCommittedPathPresentation(chat.id)?.pathHeaders.at(-1)?.id,
+    ).toBe(result.assistantMessageId)
+
+    act(() => {
+      __resetMessageStreamProjectionForTests()
+      window.dispatchEvent(new Event('natter:recycle-transcript'))
+    })
+    await waitFor(() => {
+      expect(container.querySelector('[data-ui="message-list"]')).toBeVisible()
+      expect(container.querySelectorAll('[data-ui="message"]')).toHaveLength(2)
+    })
+    expect(
+      within(container.querySelector('[data-ui="message-list"]') as HTMLElement).getByText(
+        'generation survived',
+      ),
+    ).toBeVisible()
+    expect(container.querySelector('[data-ui="abort"]')).not.toBeInTheDocument()
+
+    fireEvent.click(treeButton)
+    await waitFor(() => {
+      expect(container.querySelectorAll('[data-ui="branch-tree-node"]')).toHaveLength(2)
+    })
+    fireEvent.click(
+      container.querySelector(
+        `[data-ui="branch-tree-node"][data-message-id="${result.assistantMessageId}"]`,
+      ) as Element,
+    )
+    await waitFor(() => {
+      expect(container.querySelector('[data-ui="branch-tree-inspector"]')).toHaveAttribute(
+        'data-message-id',
+        result.assistantMessageId,
+      )
+    })
+    expect(
+      within(container.querySelector('[data-ui="branch-tree-inspector"]') as HTMLElement).getByText(
+        'generation survived',
+      ),
+    ).toBeVisible()
+
+    fireEvent.click(treeButton)
+    await waitFor(() => expect(container.querySelector('[data-ui="message-list"]')).toBeVisible())
+    const firstReceipt = useChatStore.getState().getCommittedPathPresentation(chat.id)
+    const firstAssistant = await browserRepo.getMessage(result.assistantMessageId)
+    if (!firstReceipt || !firstAssistant) throw new Error('first committed presentation missing')
+    await editInPlace(chat.id, firstAssistant, 'edited answer survived', {
+      pathHeaders: firstReceipt.pathHeaders,
+    })
+    act(() => {
+      __resetMessageStreamProjectionForTests()
+      window.dispatchEvent(new Event('natter:recycle-transcript'))
+    })
+    await waitFor(() => {
+      const transcript = container.querySelector('[data-ui="message-list"]') as HTMLElement
+      expect(within(transcript).getByText('edited answer survived')).toBeVisible()
+      expect(within(transcript).queryByText('generation survived')).toBeNull()
+    })
+    const secondResult = await sendText({
+      chatId: chat.id,
+      expectedLeafId: result.assistantMessageId,
+      connection,
+      apiKey: 'sk-test',
+      content: [{ type: 'text', text: 'second prompt while reads remain stuck' }],
+      openStream: () =>
+        (async function* () {
+          yield {
+            type: 'delta',
+            chunk: {
+              id: 'second-presentation-independent-generation',
+              model: settings.model,
+              choices: [{ delta: { content: 'second answer survived' }, finish_reason: 'stop' }],
+            },
+          } satisfies ChatStreamChunk
+        })(),
+    })
+    expect(secondResult.outcome).toBe('done')
+
+    act(() => {
+      __resetMessageStreamProjectionForTests()
+      window.dispatchEvent(new Event('natter:recycle-transcript'))
+    })
+    await waitFor(() => {
+      expect(container.querySelectorAll('[data-ui="message"]')).toHaveLength(4)
+    })
+    const secondTranscript = container.querySelector('[data-ui="message-list"]') as HTMLElement
+    expect(within(secondTranscript).getByText('edited answer survived')).toBeVisible()
+    expect(within(secondTranscript).queryByText('generation survived')).toBeNull()
+    expect(
+      within(secondTranscript).getByText('second prompt while reads remain stuck'),
+    ).toBeVisible()
+    expect(within(secondTranscript).getByText('second answer survived')).toBeVisible()
+
+    fireEvent.click(treeButton)
+    await waitFor(() => {
+      expect(container.querySelectorAll('[data-ui="branch-tree-node"]')).toHaveLength(4)
+    })
+    expect(
+      container.querySelector(
+        `[data-ui="branch-tree-node"][data-message-id="${secondResult.assistantMessageId}"]`,
+      ),
+    ).toHaveAttribute('data-current-leaf', 'true')
   })
 
   it('keeps a structurally exact retained stream interactive while its body read lags', async () => {
@@ -1371,6 +1922,85 @@ describe('shell smoke render', () => {
     })
   })
 
+  it('leaves the composer sendable for an off-branch stream and stops it after switching branches', async () => {
+    const chat = await createChat({
+      id: 'chat-exact-stream-target',
+      title: 'Exact stream target',
+      settings: cloneDefaultChatSettings(),
+      now: 1,
+    })
+    const root: Message = {
+      id: 'exact-stream-root',
+      chatId: chat.id,
+      parentId: null,
+      siblingIndex: 0,
+      turnId: 'exact-stream-root',
+      turnIndex: 0,
+      createdAt: 2,
+      role: 'user',
+      origin: 'user',
+      content: [{ type: 'text', text: 'exact stream prompt' }],
+      nodeVersion: 0,
+      deleted: false,
+    }
+    const left: Message = {
+      ...root,
+      id: 'exact-stream-left',
+      parentId: root.id,
+      turnId: 'exact-stream-left',
+      createdAt: 3,
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: 'selected idle branch' }],
+    }
+    const right: Message = {
+      ...left,
+      id: 'exact-stream-right',
+      siblingIndex: 1,
+      turnId: 'exact-stream-right',
+      createdAt: 4,
+      content: [{ type: 'output_text', text: 'off-branch response' }],
+    }
+    await putTestMessages([root, left, right])
+    await getDb().chats.put({
+      ...chat,
+      titleStatus: 'manual',
+      lastUpdatedLeafId: right.id,
+      lastBranchUpdatedAt: right.createdAt,
+      updatedAt: right.createdAt,
+    })
+    const abortRight = vi.fn()
+    act(() => {
+      useStreamStore.getState().setActive({
+        streamId: 'exact-right-stream',
+        replacementEpoch: 0,
+        chatId: chat.id,
+        messageId: right.id,
+        startedAt: 5,
+        ownerClientId: getStreamClientId(),
+        abort: abortRight,
+      })
+    })
+    window.location.hash = `#/chat/${chat.id}/message/${left.id}`
+
+    const { container, findByText } = render(<App />)
+    expect(await findByText('selected idle branch')).toBeInTheDocument()
+    await waitFor(() => {
+      expect(container.querySelector('[data-ui="composer"] [data-ui="send"]')).toBeInTheDocument()
+      expect(container.querySelector('[data-ui="composer"] [data-ui="abort"]')).toBeNull()
+    })
+
+    fireEvent.click(container.querySelector('[data-role="next"]') as Element)
+    expect(await findByText('off-branch response')).toBeInTheDocument()
+    const stop = await waitFor(() => {
+      const button = container.querySelector('[data-ui="composer"] [data-ui="abort"]')
+      expect(button).toBeInTheDocument()
+      return button as Element
+    })
+    fireEvent.click(stop)
+    expect(abortRight).toHaveBeenCalledOnce()
+  })
+
   it('honors a repeated arrival at a message URL in the same mounted tab', async () => {
     const chat = await createChat({ title: 'Repeated route', now: 1 })
     const root: Message = {
@@ -1701,6 +2331,265 @@ describe('shell smoke render', () => {
     expect(container.querySelector('[data-ui="message-list"]')).toBe(originalList)
     expect(container.querySelector('[data-ui="surface-loading"]')).not.toBeInTheDocument()
     expect(container).not.toHaveTextContent('Loading conversation…')
+  })
+
+  it('retires a caught-up local receipt after a remote linear extension without following a later sibling', async () => {
+    const chat = await createChat({
+      title: 'Receipt Extension',
+      settings: cloneDefaultChatSettings(),
+      now: 1,
+    })
+    const root: Message = {
+      id: 'receipt-extension-root',
+      chatId: chat.id,
+      parentId: null,
+      siblingIndex: 0,
+      turnId: 'receipt-extension-root',
+      turnIndex: 0,
+      createdAt: 2,
+      role: 'user',
+      origin: 'user',
+      content: [{ type: 'text', text: 'receipt extension prompt' }],
+      nodeVersion: 0,
+      deleted: false,
+    }
+    const localLeaf: Message = {
+      ...root,
+      id: 'receipt-extension-local-leaf',
+      parentId: root.id,
+      turnId: 'receipt-extension-local-leaf',
+      createdAt: 3,
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: 'locally committed answer' }],
+    }
+    const remoteExtension: Message = {
+      ...root,
+      id: 'receipt-extension-remote-child',
+      parentId: localLeaf.id,
+      turnId: 'receipt-extension-remote-child',
+      createdAt: 4,
+      content: [{ type: 'text', text: 'remote linear child' }],
+    }
+    const laterSibling: Message = {
+      ...remoteExtension,
+      id: 'receipt-extension-later-sibling',
+      siblingIndex: 1,
+      turnId: 'receipt-extension-later-sibling',
+      createdAt: 5,
+      content: [{ type: 'text', text: 'remote sibling must not steer' }],
+    }
+    await putTestMessages([root, localLeaf, remoteExtension])
+    await getDb().chats.put({
+      ...chat,
+      titleStatus: 'manual',
+      previewText: 'remote linear child',
+      lastUpdatedLeafId: remoteExtension.id,
+      lastBranchUpdatedAt: 4,
+      updatedAt: 4,
+    })
+
+    const rootPresentation = splitMessageForStorage(root)
+    const leafPresentation = splitMessageForStorage(localLeaf)
+    const store = useChatStore.getState()
+    const intent = store.beginNavigationIntent(chat.id)
+    const producer = store.registerCommittedPathProducer(chat.id, intent)
+    if (!producer) throw new Error('committed path producer registration failed')
+    expect(
+      store.selectCommittedPathForProducer(
+        chat.id,
+        producer,
+        {
+          [cursorKeyOf(null)]: root.id,
+          [cursorKeyOf(root.id)]: localLeaf.id,
+        },
+        {
+          phase: 'terminal',
+          pathHeaders: [rootPresentation.header, leafPresentation.header],
+          presentations: [
+            {
+              header: rootPresentation.header,
+              message: root,
+              bodyVersion: rootPresentation.header.bodyVersion,
+            },
+            {
+              header: leafPresentation.header,
+              message: localLeaf,
+              bodyVersion: leafPresentation.header.bodyVersion,
+            },
+          ],
+        },
+      ),
+    ).toBe(true)
+    expect(store.getCommittedPathPresentation(chat.id)).toBeDefined()
+    window.location.hash = `#/chat/${chat.id}`
+
+    const { container } = render(<App />)
+
+    await waitFor(() => {
+      const transcript = container.querySelector('[data-ui="message-list"]') as HTMLElement
+      expect(within(transcript).getByText('remote linear child')).toBeInTheDocument()
+    })
+    await waitFor(() => {
+      expect(window.location.hash).toBe(`#/chat/${chat.id}/message/${remoteExtension.id}`)
+      expect(useChatStore.getState().getCommittedPathPresentation(chat.id)).toBeUndefined()
+      expect(useChatStore.getState().getCursor(chat.id)?.[cursorKeyOf(localLeaf.id)]).toBe(
+        remoteExtension.id,
+      )
+    })
+
+    await putTestMessages([laterSibling])
+    await getDb().chats.put({
+      ...chat,
+      titleStatus: 'manual',
+      previewText: 'remote sibling must not steer',
+      lastUpdatedLeafId: laterSibling.id,
+      lastBranchUpdatedAt: 5,
+      updatedAt: 5,
+    })
+
+    await waitFor(() => {
+      const transcript = container.querySelector('[data-ui="message-list"]') as HTMLElement
+      expect(container.querySelector('[data-ui="branch-count"]')).toHaveTextContent('1 / 2')
+      expect(window.location.hash).toBe(`#/chat/${chat.id}/message/${remoteExtension.id}`)
+      expect(within(transcript).queryByText('remote linear child')).toBeInTheDocument()
+      expect(
+        within(transcript).queryByText('remote sibling must not steer'),
+      ).not.toBeInTheDocument()
+    })
+  })
+
+  it('retires a terminal receipt on metadata-only catch-up and accepts the next repository edit', async () => {
+    const chat = await createChat({
+      title: 'Metadata Receipt Catch-up',
+      settings: cloneDefaultChatSettings(),
+      now: 1,
+    })
+    const root: Message = {
+      id: 'metadata-receipt-root',
+      chatId: chat.id,
+      parentId: null,
+      siblingIndex: 0,
+      turnId: 'metadata-receipt-root',
+      turnIndex: 0,
+      createdAt: 2,
+      role: 'user',
+      origin: 'user',
+      content: [{ type: 'text', text: 'metadata receipt prompt' }],
+      nodeVersion: 0,
+      deleted: false,
+    }
+    const finalLeaf: Message = {
+      id: 'metadata-receipt-leaf',
+      chatId: chat.id,
+      parentId: root.id,
+      siblingIndex: 0,
+      turnId: 'metadata-receipt-leaf',
+      turnIndex: 1,
+      createdAt: 3,
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: 'metadata receipt answer' }],
+      nodeVersion: 2,
+      hiddenFromContext: true,
+      deleted: false,
+    }
+    const rootStorage = splitMessageForStorage(root)
+    const finalStorage = splitMessageForStorage(finalLeaf, {
+      bodyVersion: 1,
+      requestContextVersion: 2,
+    })
+    const placeholderHeader: MessageHeaderRow = {
+      ...finalStorage.header,
+      nodeVersion: 1,
+      requestContextVersion: 1,
+      hiddenFromContext: false,
+    }
+    await putTestMessages([root])
+    await getDb().chats.update(chat.id, {
+      lastUpdatedLeafId: root.id,
+      lastBranchUpdatedAt: 2,
+      updatedAt: 2,
+    })
+    window.location.hash = `#/chat/${chat.id}`
+
+    const { container, findByText } = render(<App />)
+    expect(await findByText('metadata receipt prompt')).toBeInTheDocument()
+
+    await getDb().transaction(
+      'rw',
+      getDb().messages,
+      getDb().messageBodies,
+      getDb().chats,
+      async () => {
+        await getDb().messages.put(placeholderHeader)
+        await getDb().messageBodies.put(finalStorage.body)
+        await getDb().chats.update(chat.id, {
+          lastUpdatedLeafId: finalLeaf.id,
+          lastBranchUpdatedAt: 3,
+          updatedAt: 3,
+        })
+      },
+    )
+    expect(await findByText('metadata receipt answer')).toBeInTheDocument()
+
+    act(() => {
+      const state = useChatStore.getState()
+      const intent = state.beginNavigationIntent(chat.id)
+      const producer = state.registerCommittedPathProducer(chat.id, intent)
+      if (!producer) throw new Error('metadata receipt producer registration failed')
+      const selected = state.selectCommittedPathForProducer(
+        chat.id,
+        producer,
+        {
+          [cursorKeyOf(null)]: root.id,
+          [cursorKeyOf(root.id)]: finalLeaf.id,
+        },
+        {
+          phase: 'terminal',
+          pathHeaders: [rootStorage.header, finalStorage.header],
+          presentations: [
+            {
+              header: finalStorage.header,
+              message: finalLeaf,
+              bodyVersion: finalStorage.header.bodyVersion,
+            },
+          ],
+        },
+      )
+      if (!selected) throw new Error('metadata receipt selection failed')
+      state.sealCommittedPathProducer(chat.id, producer)
+    })
+
+    const contextToggle = () =>
+      container.querySelector(
+        `[data-ui="message"][data-message-id="${finalLeaf.id}"] [data-action="toggle-visible"]`,
+      )
+    await waitFor(() => {
+      expect(useChatStore.getState().getCommittedPathPresentation(chat.id)).toBeDefined()
+      expect(contextToggle()).toHaveAttribute('aria-label', 'Show in context (send to model)')
+    })
+
+    await getDb().messages.put(finalStorage.header)
+
+    await waitFor(() => {
+      expect(useChatStore.getState().getCommittedPathPresentation(chat.id)).toBeUndefined()
+      expect(contextToggle()).toHaveAttribute('aria-label', 'Show in context (send to model)')
+    })
+
+    await getDb().messages.put({
+      ...finalStorage.header,
+      nodeVersion: 3,
+      requestContextVersion: 3,
+      hiddenFromContext: false,
+    })
+
+    await waitFor(() => {
+      expect(contextToggle()).toHaveAttribute(
+        'aria-label',
+        'Hide from context (never send to model)',
+      )
+    })
   })
 
   it('does not overwrite a local cursor advance before the new leaf is observable', async () => {

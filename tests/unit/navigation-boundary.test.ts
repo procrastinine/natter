@@ -13,17 +13,36 @@ const PATCH_NAVIGATION_WRITERS = new Set([
 ])
 
 const RECONCILIATION_WRITERS = new Set(['hooks/useBranchUrlSync.ts'])
-const GUARDED_PATCH_WRITERS = new Set([
+const GUARDED_PATCH_WRITERS = new Set(['app/Shell.tsx', 'hooks/useBranchUrlSync.ts'])
+const GUARDED_STRUCTURAL_WRITERS = new Set<string>()
+const PATH_SELECTION_WRITERS = new Set<string>()
+const COMMITTED_PATH_PRODUCER_REGISTRARS = new Set([
   'app/Shell.tsx',
-  'hooks/useBranchUrlSync.ts',
-  'ui/chat/MessageActions.tsx',
-])
-const GUARDED_STRUCTURAL_WRITERS = new Set(['app/Shell.tsx', 'ui/chat/MessageActions.tsx'])
-const PATH_SELECTION_WRITERS = new Set([
   'hooks/useChat.ts',
+  'hooks/useContinue.ts',
   'hooks/useMessageOps.ts',
   'ui/chat/ImportModal.tsx',
+  'ui/chat/MessageActions.tsx',
 ])
+const COMMITTED_PATH_SELECTION_WRITERS = new Set([
+  'app/Shell.tsx',
+  'hooks/useChat.ts',
+  'hooks/useContinue.ts',
+  'hooks/useMessageOps.ts',
+  'ui/chat/ImportModal.tsx',
+  'ui/chat/MessageActions.tsx',
+])
+const COMMITTED_PRESENTATION_UPDATE_WRITERS = new Set(['hooks/useChat.ts', 'hooks/useContinue.ts'])
+const COMMITTED_MESSAGE_MUTATION_WRITERS = new Set(['hooks/useChat.ts', 'hooks/useMessageOps.ts'])
+const COMMITTED_PRESENTATION_SEAL_WRITERS = new Set([
+  'app/Shell.tsx',
+  'hooks/useChat.ts',
+  'hooks/useContinue.ts',
+  'hooks/useMessageOps.ts',
+  'ui/chat/ImportModal.tsx',
+  'ui/chat/MessageActions.tsx',
+])
+const COMMITTED_PRESENTATION_ACK_WRITERS = new Set(['app/Shell.tsx'])
 const CHAT_STORE_MODULE = 'store/zustand/chatStore.ts'
 const ROUTE_INTENT_USERS = new Set([
   'app/Shell.tsx',
@@ -41,6 +60,24 @@ describe('tab branch navigation boundary', () => {
     )
     expect(filesCalling(/\bpatchCursorForIntent\s*\(/)).toEqual([...GUARDED_PATCH_WRITERS].sort())
     expect(filesCalling(/\bselectPathForIntent\s*\(/)).toEqual([...PATH_SELECTION_WRITERS].sort())
+    expect(filesCalling(/\bregisterCommittedPathProducer\s*\(/)).toEqual(
+      [...COMMITTED_PATH_PRODUCER_REGISTRARS].sort(),
+    )
+    expect(filesCalling(/\bselectCommittedPathForProducer\s*\(/)).toEqual(
+      [...COMMITTED_PATH_SELECTION_WRITERS].sort(),
+    )
+    expect(filesCalling(/\bupdateCommittedMessageForProducer\s*\(/)).toEqual(
+      [...COMMITTED_PRESENTATION_UPDATE_WRITERS].sort(),
+    )
+    expect(filesCalling(/\bpublishCommittedMessageMutation\s*\(/)).toEqual(
+      [...COMMITTED_MESSAGE_MUTATION_WRITERS].sort(),
+    )
+    expect(filesCalling(/\bsealCommittedPathProducer\s*\(/)).toEqual(
+      [...COMMITTED_PRESENTATION_SEAL_WRITERS].sort(),
+    )
+    expect(filesCalling(/\backnowledgeCommittedPathPresentation\s*\(/)).toEqual(
+      [...COMMITTED_PRESENTATION_ACK_WRITERS].sort(),
+    )
     expect(filesCalling(/\bsetCursorForIntent\s*\(/)).toEqual(
       [...GUARDED_STRUCTURAL_WRITERS].sort(),
     )
@@ -80,7 +117,10 @@ describe('tab branch navigation boundary', () => {
   it('centralizes browser history writes and silent branch URL projections', () => {
     expect(filesCalling(/window\.location\.hash\s*=(?!=)/)).toEqual([])
     expect(filesCalling(/history\.pushState\s*\(/)).toEqual(['app/router.ts'])
-    expect(filesCalling(/history\.replaceState\s*\(/)).toEqual(['app/router.ts'])
+    expect(filesCalling(/history\.replaceState\s*\(/)).toEqual([
+      'app/router.ts',
+      'lib/preload-recovery.ts',
+    ])
     expect(filesCalling(/addEventListener\s*\(\s*['"]hashchange['"]/)).toEqual(['app/router.ts'])
     expect(filesCalling(/\breplaceRoute\s*\(/)).toEqual([
       'app/router.ts',
@@ -90,8 +130,8 @@ describe('tab branch navigation boundary', () => {
   })
 
   it('restricts non-blocking repository reads to active branch presentation observers', () => {
-    expect(filesCalling(/\buseRepositoryPresentationQuery\s*\(/)).toEqual([
-      'app/Shell.tsx',
+    expect(filesCalling(/\buseRepositoryPresentationQuery\s*\(/)).toEqual(['app/Shell.tsx'])
+    expect(filesCalling(/\buseRepositoryKeyedPresentationQuery\s*\(/)).toEqual([
       'hooks/useBranchUrlSync.ts',
     ])
     expect(
@@ -102,7 +142,7 @@ describe('tab branch navigation boundary', () => {
         )
         .map(({ rel }) => rel)
         .sort(),
-    ).toEqual(['app/Shell.tsx', 'hooks/useBranchUrlSync.ts', 'ui/chat/BranchTreeView.tsx'])
+    ).toEqual(['app/Shell.tsx', 'ui/chat/BranchTreeView.tsx'])
     expect(sourceRecord('app/Shell.tsx').source).not.toMatch(
       /activeBranchHandoff|activeBranchSnapshotOverride|refreshTranscriptForTreeHandoff|flushSync/,
     )

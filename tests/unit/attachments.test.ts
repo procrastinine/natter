@@ -20,6 +20,7 @@ import {
   getAttachmentBundle,
   ingestAttachmentBytes,
   listAttachmentReferences,
+  mutateMessageAttachmentRef,
   putAttachment,
   reapOrphanedAttachments,
   relinkAttachmentRef,
@@ -608,6 +609,63 @@ describe('attachment backend storage', () => {
     ).toBe(1)
     expect(await getBrowserRepository().getMessage(message.id)).toMatchObject({ id: message.id })
     await expectAttachmentReferenceInvariants(getDb())
+  })
+
+  it('returns the exact committed presentation for each message attachment mutation', async () => {
+    const chat = await seedChat()
+    const message = makeMessage(chat.id)
+    await putMessage(message)
+    const first = await ingestAttachmentBytes({
+      blob: bytes('first exact attachment'),
+      filename: 'first.txt',
+      now: 10,
+    })
+    const second = await ingestAttachmentBytes({
+      blob: bytes('second exact attachment'),
+      filename: 'second.txt',
+      now: 11,
+    })
+    const ref = await addExistingAttachmentRef({
+      messageId: message.id,
+      attachmentId: first.attachment.id,
+      now: 12,
+    })
+
+    const hidden = await mutateMessageAttachmentRef({
+      chatId: chat.id,
+      messageId: message.id,
+      mutation: { kind: 'visibility', refId: ref.refId, includeInContext: false },
+      now: 13,
+    })
+    expect(hidden?.message.attachmentRefs?.[0]).toMatchObject({
+      refId: ref.refId,
+      includeInContext: false,
+    })
+    expect(hidden?.bodyVersion).toBe(hidden?.header.bodyVersion)
+    expect(hidden?.message.nodeVersion).toBe(hidden?.header.nodeVersion)
+
+    const relinked = await mutateMessageAttachmentRef({
+      chatId: chat.id,
+      messageId: message.id,
+      mutation: {
+        kind: 'relink',
+        refId: ref.refId,
+        newAttachmentId: second.attachment.id,
+      },
+      now: 14,
+    })
+    expect(relinked?.message.attachmentRefs?.[0]?.attachmentId).toBe(second.attachment.id)
+    expect((await getDb().attachments.get(first.attachment.id))?.refCount).toBe(0)
+    expect((await getDb().attachments.get(second.attachment.id))?.refCount).toBe(1)
+
+    const detached = await mutateMessageAttachmentRef({
+      chatId: chat.id,
+      messageId: message.id,
+      mutation: { kind: 'detach', refId: ref.refId },
+      now: 15,
+    })
+    expect(detached?.message.attachmentRefs).toEqual([])
+    expect((await getDb().attachments.get(second.attachment.id))?.refCount).toBe(0)
   })
 
   it('atomically removes blob-derived pointers while retaining independent artifacts', async () => {

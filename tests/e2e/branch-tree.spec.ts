@@ -1059,7 +1059,7 @@ test('tree shows and follows a pending response before the first byte arrives', 
     await expect(page.locator('[data-ui="branch-tree-inspector-stream-status"]')).toHaveText(
       'Waiting for response…',
     )
-    await page.locator('[data-ui="branch-tree-stop"]').click()
+    releaseResponse()
     await expect
       .poll(() =>
         page.evaluate(
@@ -1073,9 +1073,23 @@ test('tree shows and follows a pending response before the first byte arrives', 
       )
       .toBe(0)
     await expect(page.locator('[data-ui="branch-tree-stop"]')).toHaveCount(0)
-    await expect(page.locator('[data-ui="branch-tree-inspector-stream-status"]')).toContainText(
-      'Cancelled — partial response kept above.',
+    await expect(page.locator('[data-ui="branch-tree-inspector"] [data-ui="markdown"]')).toHaveText(
+      'response released after tree waiting state',
     )
+    await expect(page.locator('[data-ui="branch-tree-inspector"]')).toHaveAttribute(
+      'data-message-id',
+      streamTargetId,
+    )
+
+    await page.locator('[data-role="chat-branch-tree"]').click()
+    await expect(
+      page.locator(
+        `[data-ui="message"][data-message-id="${streamTargetId}"] [data-ui="message-body"]`,
+      ),
+    ).toHaveText('response released after tree waiting state')
+    await expect
+      .poll(() => page.evaluate(() => window.location.hash))
+      .toContain(`/message/${streamTargetId}`)
   } finally {
     releaseResponse()
   }

@@ -625,12 +625,7 @@ describe('BranchTreeInspector', () => {
       })
     })
     const view = render(
-      <BranchTreeInspector
-        message={row}
-        onClose={() => undefined}
-        generationBusy
-        streamOnActivePath
-      />,
+      <BranchTreeInspector message={row} onClose={() => undefined} streamOnActivePath />,
     )
     expect(screen.getByText('Last complete live snapshot.')).toBeInTheDocument()
 
@@ -655,7 +650,6 @@ describe('BranchTreeInspector', () => {
           },
         })}
         onClose={() => undefined}
-        generationBusy={false}
         streamOnActivePath
       />,
     )
@@ -691,12 +685,7 @@ describe('BranchTreeInspector', () => {
     })
     const view = render(
       <StrictMode>
-        <BranchTreeInspector
-          message={pending}
-          onClose={() => undefined}
-          onEdit={() => undefined}
-          generationBusy
-        />
+        <BranchTreeInspector message={pending} onClose={() => undefined} onEdit={() => undefined} />
       </StrictMode>,
     )
     expect(screen.getByText('Commit-first live snapshot.')).toBeInTheDocument()
@@ -753,9 +742,7 @@ describe('BranchTreeInspector', () => {
         updatedAt: 2,
       })
     })
-    const firstView = render(
-      <BranchTreeInspector message={pending} onClose={() => undefined} generationBusy />,
-    )
+    const firstView = render(<BranchTreeInspector message={pending} onClose={() => undefined} />)
     expect(screen.getByText('Visible before changing views.')).toBeInTheDocument()
     firstView.unmount()
 
@@ -763,9 +750,7 @@ describe('BranchTreeInspector', () => {
       useStreamStore.getState().clearLiveSnapshot(pending.id, 'cross-view-stream', 0)
       useStreamStore.getState().clearActive('cross-view-stream', 0)
     })
-    const nextView = render(
-      <BranchTreeInspector message={pending} onClose={() => undefined} generationBusy={false} />,
-    )
+    const nextView = render(<BranchTreeInspector message={pending} onClose={() => undefined} />)
     expect(screen.getByText('Visible before changing views.')).toBeInTheDocument()
     expect(screen.queryByText('Inspector body.')).not.toBeInTheDocument()
     expect(screen.getByRole('status')).toHaveTextContent('Finishing response…')
@@ -857,26 +842,36 @@ describe('BranchTreeInspector', () => {
     expect(screen.getByRole('status')).toHaveAttribute('data-state', 'warning')
   })
 
-  it('disables every model-request action while another generation is busy', () => {
+  it('keeps model-request actions available while another message is streaming', () => {
     const onRegenerate = vi.fn()
     const onContinue = vi.fn()
+    const row = message()
+    act(() => {
+      useStreamStore.getState().setActive({
+        streamId: 'other-message-stream',
+        replacementEpoch: 0,
+        chatId: row.chatId,
+        messageId: 'other-message',
+        startedAt: 1,
+        ownerClientId: getStreamClientId(),
+      })
+    })
     const assistant = render(
       <BranchTreeInspector
-        message={message()}
+        message={row}
         onClose={() => undefined}
         onRegenerate={onRegenerate}
         onContinue={onContinue}
         hasConnection
-        generationBusy
       />,
     )
 
     fireEvent.click(screen.getByRole('button', { name: 'Regenerate response' }))
     fireEvent.click(screen.getByRole('button', { name: 'Continue from here' }))
-    expect(screen.getByRole('button', { name: 'Regenerate response' })).toBeDisabled()
-    expect(screen.getByRole('button', { name: 'Continue from here' })).toBeDisabled()
-    expect(onRegenerate).not.toHaveBeenCalled()
-    expect(onContinue).not.toHaveBeenCalled()
+    expect(screen.getByRole('button', { name: 'Regenerate response' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Continue from here' })).toBeEnabled()
+    expect(onRegenerate).toHaveBeenCalledOnce()
+    expect(onContinue).toHaveBeenCalledOnce()
     assistant.unmount()
 
     render(
@@ -886,12 +881,11 @@ describe('BranchTreeInspector', () => {
         onEdit={() => undefined}
         onEditAndSend={() => undefined}
         hasConnection
-        generationBusy
       />,
     )
     fireEvent.click(screen.getByRole('button', { name: 'Edit message' }))
     expect(screen.getByRole('button', { name: 'Save' })).toBeEnabled()
-    expect(screen.getByRole('button', { name: 'Save & Send' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Save & Send' })).toBeEnabled()
   })
 
   it('does not rebuild bounded prefixes or search ranges for cumulative streaming snapshots', () => {

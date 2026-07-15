@@ -45,7 +45,9 @@ describe('generation attempt runner', () => {
         if (event.lane === 'text') expect(streamAccumulatorText(accumulator)).toBe(event.text)
       },
       scheduledFlush: () => log.push('schedule'),
-      settle: () => log.push('settle'),
+      settle: () => {
+        log.push('settle')
+      },
       release: () => log.push('release'),
     })
     const publishLive = vi.fn(() => {
@@ -90,8 +92,8 @@ describe('generation attempt runner', () => {
       'schedule',
       'append:finish',
       'schedule',
-      'settle',
       'finalize',
+      'settle',
       'cleanup-journal',
       'release',
       'cleanup',
@@ -126,10 +128,22 @@ describe('generation attempt runner', () => {
     expect(publishLive.mock.calls[1]?.[0]).toMatchObject({ now: 0 })
   })
 
-  it('does not publish live output until the matching recovery journal is durable', async () => {
+  it('publishes live and canonical output before waiting for recovery-journal durability', async () => {
     const durable = deferred<void>()
+    const settleStarted = deferred<void>()
     const publishLive = vi.fn()
-    let immediateFlushes = 0
+    const order: string[] = []
+    const journal = journalDouble({
+      settle: () => {
+        order.push('settle')
+        settleStarted.resolve()
+        return durable.promise
+      },
+    })
+    const finalize = vi.fn(async () => {
+      order.push('finalize')
+    })
+    let completed = false
     const attempt = runGenerationAttempt({
       open: () =>
         chunks(
@@ -137,26 +151,26 @@ describe('generation attempt runner', () => {
           { type: 'delta', chunk: { choices: [{ delta: {}, finish_reason: 'stop' }] } },
         ),
       accumulator: createStreamAccumulator({ initialContent: [], now: 0 }),
-      journal: journalDouble({
-        immediateFlush: () => {
-          immediateFlushes += 1
-          return durable.promise
-        },
-      }),
+      journal,
       errorPolicy: SEND_GENERATION_ATTEMPT_ERROR_POLICY,
       prepareLive: prepareLiveCallback(publishLive),
-      finalize: async () => {},
+      finalize,
+      onCanonicalCommitted: () => order.push('canonical-committed'),
       cleanupJournal: async () => {},
       cleanup: () => {},
+    }).finally(() => {
+      completed = true
     })
 
-    await drainMicrotasks()
-    expect(immediateFlushes).toBe(1)
-    expect(publishLive).not.toHaveBeenCalled()
+    await settleStarted.promise
+    expect(publishLive).toHaveBeenCalled()
+    expect(finalize).toHaveBeenCalledTimes(1)
+    expect(order).toEqual(['finalize', 'canonical-committed', 'settle'])
+    expect(completed).toBe(false)
+    expect(journal.flush).not.toHaveBeenCalledWith({ mode: 'immediate' })
 
     durable.resolve()
     await expect(attempt).resolves.toMatchObject({ outcome: 'done' })
-    expect(publishLive).toHaveBeenCalled()
   })
 
   it('does not force publication flushes when the target chat is not visible', async () => {
@@ -456,18 +470,17 @@ describe('generation attempt runner', () => {
     }
   })
 
-  it('applies only the prepared durable revision when newer output arrives during a flush', async () => {
+  it('applies only the prepared revision when newer output arrives during publication', async () => {
     vi.useFakeTimers()
     try {
       const allowThirdChunk = deferred<void>()
       const thirdChunkConsumed = deferred<void>()
       const releaseStream = deferred<void>()
-      const blockedFlush = deferred<void>()
-      const blockedFlushStarted = deferred<void>()
+      const blockedPublish = deferred<void>()
+      const blockedPublishStarted = deferred<void>()
       const firstPublished = deferred<void>()
       const secondPublished = deferred<void>()
       let clock = 0
-      let immediateFlushes = 0
       const source = async function* (): AsyncGenerator<AssistantStreamChunk> {
         yield { type: 'delta', chunk: { choices: [{ delta: { content: 'a' } }] } }
         clock = 1
@@ -484,19 +497,16 @@ describe('generation attempt runner', () => {
       const attempt = runGenerationAttempt({
         open: () => source(),
         accumulator: createStreamAccumulator({ initialContent: [], now: 0 }),
-        journal: journalDouble({
-          immediateFlush: () => {
-            immediateFlushes += 1
-            if (immediateFlushes !== 2) return Promise.resolve()
-            blockedFlushStarted.resolve()
-            return blockedFlush.promise
-          },
-        }),
+        journal: journalDouble(),
         errorPolicy: SEND_GENERATION_ATTEMPT_ERROR_POLICY,
         now: () => clock,
         prepareLive: ({ accumulator: current }) => {
           const text = streamAccumulatorText(current)
-          return () => {
+          return async () => {
+            if (text === 'ab') {
+              blockedPublishStarted.resolve()
+              await blockedPublish.promise
+            }
             published.push(text)
             if (published.length === 1) firstPublished.resolve()
             if (published.length === 2) secondPublished.resolve()
@@ -509,12 +519,12 @@ describe('generation attempt runner', () => {
 
       await firstPublished.promise
       await vi.advanceTimersByTimeAsync(124)
-      await blockedFlushStarted.promise
+      await blockedPublishStarted.promise
       allowThirdChunk.resolve()
       await thirdChunkConsumed.promise
       expect(published).toEqual(['a'])
 
-      blockedFlush.resolve()
+      blockedPublish.resolve()
       await secondPublished.promise
       expect(published).toEqual(['a', 'ab'])
 
@@ -665,6 +675,41 @@ describe('generation attempt runner', () => {
       'release',
       'cleanup:error',
     ])
+  })
+
+  it('abort-races a never-settling dispatch guard and finalizes it as an abort', async () => {
+    const controller = new AbortController()
+    let markGuardStarted: (() => void) | undefined
+    const guardStarted = new Promise<void>((resolve) => {
+      markGuardStarted = resolve
+    })
+    const open = vi.fn(() => chunks())
+    const finalize = vi.fn(async () => {})
+    const cleanup = vi.fn()
+    const attempt = runGenerationAttempt({
+      beforeDispatch: () => {
+        markGuardStarted?.()
+        return new Promise<never>(() => {})
+      },
+      open,
+      signal: controller.signal,
+      isAborted: () => controller.signal.aborted,
+      accumulator: createStreamAccumulator({ initialContent: [], now: 0 }),
+      journal: journalDouble(),
+      errorPolicy: CONTINUE_GENERATION_ATTEMPT_ERROR_POLICY,
+      finalize,
+      cleanupJournal: async () => {},
+      cleanup,
+    })
+
+    await guardStarted
+    controller.abort()
+    await expect(attempt).resolves.toEqual({ outcome: 'abort', abortReason: 'user' })
+    expect(open).not.toHaveBeenCalled()
+    expect(finalize).toHaveBeenCalledWith(
+      expect.objectContaining({ outcome: 'abort', abortReason: 'user' }),
+    )
+    expect(cleanup).toHaveBeenCalledWith({ outcome: 'abort', abortReason: 'user' })
   })
 
   it.each([
@@ -886,28 +931,31 @@ describe('generation attempt runner', () => {
     expect(finalized.mock.calls[0]?.[0]).toMatchObject(result)
   })
 
-  it('commits an explicit storage outcome when journal settlement remains degraded', async () => {
+  it('keeps the committed provider outcome and recovery anchor when journal settlement fails', async () => {
     const settleError = new Error('journal settlement failed')
     const finalized = vi.fn<(input: GenerationAttemptFinalizationInput) => void>()
     const cleaned = vi.fn<(input: GenerationAttemptResult) => void>()
+    const cleanupJournal = vi.fn(async () => {})
 
     const result = await runGenerationAttempt({
       open: () =>
-        chunks({ type: 'delta', chunk: { choices: [{ delta: { content: 'partial' } }] } }),
+        chunks(
+          { type: 'delta', chunk: { choices: [{ delta: { content: 'complete' } }] } },
+          { type: 'transport_terminal', evidence: 'done-sentinel' },
+        ),
       accumulator: createStreamAccumulator({ initialContent: [], now: 0 }),
       journal: journalDouble({ settleError }),
       errorPolicy: SEND_GENERATION_ATTEMPT_ERROR_POLICY,
       finalize: async (input) => finalized(input),
-      cleanupJournal: async () => {},
+      cleanupJournal,
       cleanup: (input) => cleaned(input),
     })
 
-    expect(result).toMatchObject({
-      outcome: 'error',
-      error: { kind: 'storage', code: 'STORAGE', message: settleError.message },
-    })
+    expect(result).toEqual({ outcome: 'done', journalCleanupPending: true })
     expect(finalized).toHaveBeenCalledTimes(1)
-    expect(finalized.mock.calls[0]?.[0]).toMatchObject(result)
+    expect(finalized.mock.calls[0]?.[0]).toMatchObject({ outcome: 'done' })
+    expect(finalized.mock.calls[0]?.[0]).not.toHaveProperty('journalCleanupPending')
+    expect(cleanupJournal).not.toHaveBeenCalled()
     expect(cleaned).toHaveBeenCalledWith(result)
   })
 
@@ -935,11 +983,16 @@ describe('generation attempt runner', () => {
     expect(cleaned).toHaveBeenCalledWith(result)
   })
 
-  it('rejects a canonical finalizer failure after recovery flush and guaranteed cleanup', async () => {
+  it('rejects a canonical finalizer failure after settling recovery and preserving its anchor', async () => {
     const finalizerError = new Error('canonical write failed')
     const cleanupJournal = vi.fn(async () => {})
     const cleaned: GenerationAttemptResult[] = []
-    const journal = journalDouble({ immediateFlushError: new Error('journal also failed') })
+    const order: string[] = []
+    const journal = journalDouble({
+      settle: () => {
+        order.push('settle')
+      },
+    })
     const accumulator = createStreamAccumulator({ initialContent: [], now: 0 })
 
     const attempt = runGenerationAttempt({
@@ -949,6 +1002,7 @@ describe('generation attempt runner', () => {
       journal,
       errorPolicy: SEND_GENERATION_ATTEMPT_ERROR_POLICY,
       finalize: async () => {
+        order.push('finalize')
         throw finalizerError
       },
       cleanupJournal,
@@ -964,18 +1018,60 @@ describe('generation attempt runner', () => {
       message: finalizerError.message,
     })
     expect(journal.settle).toHaveBeenCalledTimes(1)
-    expect(journal.flush).toHaveBeenCalledWith({ mode: 'immediate' })
-    expect(
-      journal.flush.mock.calls.filter(([request]) => request?.mode === 'immediate'),
-    ).toHaveLength(1)
+    expect(journal.flush).not.toHaveBeenCalledWith({ mode: 'immediate' })
+    expect(order).toEqual(['finalize', 'settle'])
     expect(cleanupJournal).not.toHaveBeenCalled()
     expect(journal.release).toHaveBeenCalledTimes(1)
     expect(cleaned).toHaveLength(1)
     expect(cleaned[0]).toMatchObject({
       outcome: 'error',
       error: { kind: 'storage', code: 'STORAGE', message: finalizerError.message },
+      journalCleanupPending: true,
     })
     expect(accumulator.textSections).toEqual([])
+  })
+
+  it('keeps the canonical failure primary when recovery settlement and fallback flush fail', async () => {
+    const finalizerError = new Error('canonical write failed')
+    const settleError = new Error('journal settlement failed')
+    const flushError = new Error('journal fallback flush failed')
+    const cleanupJournal = vi.fn(async () => {})
+    const order: string[] = []
+    const journal = journalDouble({
+      settle: async () => {
+        order.push('settle')
+        throw settleError
+      },
+      immediateFlush: async () => {
+        order.push('flush')
+        throw flushError
+      },
+    })
+
+    const attempt = runGenerationAttempt({
+      open: () =>
+        chunks({ type: 'delta', chunk: { choices: [{ delta: { content: 'retained' } }] } }),
+      accumulator: createStreamAccumulator({ initialContent: [], now: 0 }),
+      journal,
+      errorPolicy: SEND_GENERATION_ATTEMPT_ERROR_POLICY,
+      finalize: async () => {
+        order.push('finalize')
+        throw finalizerError
+      },
+      cleanupJournal,
+      cleanup: () => {},
+    })
+
+    await expect(attempt).rejects.toMatchObject({
+      name: 'ApiError',
+      kind: 'storage',
+      code: 'STORAGE',
+      message: finalizerError.message,
+    })
+    expect(journal.settle).toHaveBeenCalledTimes(1)
+    expect(journal.flush).toHaveBeenCalledWith({ mode: 'immediate' })
+    expect(cleanupJournal).not.toHaveBeenCalled()
+    expect(order).toEqual(['finalize', 'settle', 'flush'])
   })
 })
 
@@ -983,7 +1079,7 @@ function journalDouble(
   options: {
     append?: (event: Parameters<StreamChunkWriter['append']>[0]) => void
     scheduledFlush?: () => void
-    settle?: () => void
+    settle?: () => void | Promise<void>
     backpressure?: () => Promise<void> | undefined
     release?: () => void
     immediateFlush?: () => Promise<void>
@@ -1009,7 +1105,7 @@ function journalDouble(
     return Promise.resolve()
   })
   const settle = vi.fn(async () => {
-    options.settle?.()
+    await options.settle?.()
     if (options.settleError) throw options.settleError
   })
   const backpressure = vi.fn(() => options.backpressure?.())

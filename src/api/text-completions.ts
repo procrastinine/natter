@@ -28,11 +28,13 @@ import {
 } from './client'
 import { deferAdapterRequest } from './deferred-request'
 import { normalizeError } from './errors'
-import { decodeProviderJson, malformedJsonFrameReport, parseSSE } from './sse'
+import { validateTextCompletionPayload } from './provider-json-boundary'
+import { decodeProviderStreamFrame, decodeValidatedProviderJson, parseSSE } from './sse'
 import type {
   CallOpts,
   ChatCompletionChunkWire,
   ChatCompletionResultWire,
+  ChatCompletionUsageWire,
   ChatStreamChunk,
 } from './types'
 
@@ -143,7 +145,7 @@ interface TextCompletionChunkWire {
   id?: string
   model?: string
   choices?: TextCompletionChoiceWire[]
-  usage?: unknown
+  usage?: ChatCompletionUsageWire
   [extra: string]: unknown
 }
 
@@ -156,7 +158,7 @@ function liftTextToDelta(chunk: TextCompletionChunkWire): ChatCompletionChunkWir
     }
     return base
   })
-  const { usage: _usage, choices: _choices, ...rest } = chunk
+  const { choices: _choices, ...rest } = chunk
   return { ...rest, choices: liftedChoices }
 }
 
@@ -169,7 +171,7 @@ function liftBufferedToChat(result: TextCompletionChunkWire): ChatCompletionResu
     }
     return base
   })
-  return { ...result, choices: liftedChoices } as ChatCompletionResultWire
+  return { ...result, choices: liftedChoices }
 }
 
 export function textCompletions(
@@ -196,7 +198,7 @@ async function* consumeTextCompletions(
   const contentType = response.headers.get('content-type') ?? ''
 
   if (!/text\/event-stream/i.test(contentType)) {
-    const body = await decodeProviderJson<TextCompletionChunkWire>(response)
+    const body = await decodeValidatedProviderJson(response, validateTextCompletionPayload)
     logStreamDebug(debugTrace, 'buffered_result', body)
     const lifted = liftBufferedToChat(body)
     const chunk: ChatStreamChunk = generationId
@@ -215,26 +217,26 @@ async function* consumeTextCompletions(
       yield { type: 'keepalive', comment: ev.comment }
       continue
     }
-    try {
-      logStreamDebug(debugTrace, 'sse.raw', { event: ev.event, data: ev.data })
-      const parsed = JSON.parse(ev.data) as TextCompletionChunkWire
-      if (generationId && parsed.id === undefined) parsed.id = generationId
-      logStreamDebug(debugTrace, 'sse.parsed', parsed)
-      const lifted = liftTextToDelta(parsed)
-      const chunk: ChatStreamChunk = generationId
-        ? { type: 'delta', chunk: lifted, generationId }
-        : { type: 'delta', chunk: lifted }
-      yield chunk
-    } catch (err) {
-      const report = malformedJsonFrameReport({
-        adapter: 'text-completions',
-        eventType: ev.event,
-        data: ev.data,
-        error: err,
-      })
-      console.warn('textCompletions: malformed SSE chunk skipped', report.diagnostic)
-      yield { type: 'integrity', integrity: report.integrity }
+    logStreamDebug(debugTrace, 'sse.raw', { event: ev.event, data: ev.data })
+    const decoded = decodeProviderStreamFrame({
+      adapter: 'text-completions',
+      eventType: ev.event,
+      data: ev.data,
+      validate: validateTextCompletionPayload,
+    })
+    if (!decoded.ok) {
+      console.warn('textCompletions: invalid SSE frame skipped', decoded.diagnostic)
+      yield { type: 'integrity', integrity: decoded.integrity }
+      continue
     }
+    const parsed = decoded.value
+    if (generationId && parsed.id === undefined) parsed.id = generationId
+    logStreamDebug(debugTrace, 'sse.parsed', parsed)
+    const lifted = liftTextToDelta(parsed)
+    const chunk: ChatStreamChunk = generationId
+      ? { type: 'delta', chunk: lifted, generationId }
+      : { type: 'delta', chunk: lifted }
+    yield chunk
   }
 }
 
@@ -255,7 +257,7 @@ async function consumeTextCompletionsOnce(
   dispatched: Promise<DispatchResult>,
 ): Promise<ChatCompletionResultWire> {
   const { response, debugTrace } = await requireSuccessfulDispatch(dispatched)
-  const result = await decodeProviderJson<TextCompletionChunkWire>(response)
+  const result = await decodeValidatedProviderJson(response, validateTextCompletionPayload)
   logStreamDebug(debugTrace, 'once.result', result)
   return liftBufferedToChat(result)
 }

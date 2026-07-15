@@ -3,7 +3,11 @@ import { appendContinuationText } from '../core/continuation-content'
 import { replayStreamAccumulator } from '../core/stream-accumulator'
 import type { ContentItem, MessageId } from '../core/types'
 import type { MessageHeaderRow } from './message-storage'
-import type { StreamLeaseRow, WorkspaceRepository } from './repository'
+import {
+  type StreamLeaseRow,
+  streamLeaseOwnsTargetWrites,
+  type WorkspaceRepository,
+} from './repository'
 import {
   announceStreamEnded,
   isFreshStreamLease,
@@ -29,13 +33,14 @@ export async function recoverStaleContinuationAttempts(input: {
     ) {
       continue
     }
-    if (!lease.messageId) {
+    if (!streamLeaseOwnsTargetWrites(lease)) {
       const guarded = await withStreamRecoveryLocks([lease.streamId], async (ownershipVerified) => {
         const currentLease = (await input.repo.listStreamLeases(lease.chatId)).find(
           (candidate) => candidate.streamId === lease.streamId,
         )
         if (
           !currentLease ||
+          streamLeaseOwnsTargetWrites(currentLease) ||
           (isFreshStreamLease(currentLease, input.now) &&
             !ownershipVerified &&
             !isRecoveryClaimedStreamLease(currentLease))
@@ -50,10 +55,12 @@ export async function recoverStaleContinuationAttempts(input: {
       if (guarded.acquired && guarded.value) recovered += 1
       continue
     }
-    if (input.isTargetActive(lease.chatId, lease.messageId)) continue
+    const targetMessageId = lease.messageId
+    if (!targetMessageId) continue
+    if (input.isTargetActive(lease.chatId, targetMessageId)) continue
 
     const guarded = await withStreamRecoveryLocks([lease.streamId], async (ownershipVerified) => {
-      if (input.isTargetActive(lease.chatId, lease.messageId as MessageId)) return false
+      if (input.isTargetActive(lease.chatId, targetMessageId)) return false
       const currentLease = (await input.repo.listStreamLeases(lease.chatId)).find(
         (candidate) => candidate.streamId === lease.streamId,
       )

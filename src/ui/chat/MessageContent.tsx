@@ -1,7 +1,7 @@
 import { useMemo } from 'react'
 import type { AttachmentBlob, AttachmentRef, ContentItem, MessageId } from '../../core/types'
 import { liveAttachmentRefs } from '../../store/attachment-refs'
-import { setAttachmentRefVisibility } from '../../store/attachments'
+import type { MessageAttachmentRefMutation } from '../../store/attachments'
 import { attachmentBundleDependencies } from '../../store/reactive-dependencies'
 import { useRepositoryQuery } from '../../store/reactive-query'
 import type { AttachmentBundle } from '../../store/repository'
@@ -19,6 +19,9 @@ interface MessageContentProps {
   collapseMode?: MessageCollapseMode
   messageId?: MessageId | undefined
   attachmentRefs?: readonly AttachmentRef[] | undefined
+  onMutateAttachmentRef?:
+    | ((mutation: MessageAttachmentRefMutation) => void | Promise<void>)
+    | undefined
 }
 
 const COMPACT_PREVIEW_CHARS = 8_000
@@ -51,6 +54,7 @@ export function MessageContent({
   collapseMode = 'full',
   messageId,
   attachmentRefs,
+  onMutateAttachmentRef,
 }: MessageContentProps) {
   const markdownSegments = textSegments && textSegments.length > 0 ? textSegments : undefined
   const textLength = markdownSegments
@@ -94,9 +98,24 @@ export function MessageContent({
         {compactText.length > 0 ? (
           <MarkdownView content={compactText} streaming={streaming} />
         ) : null}
-        <OutputImages images={images} messageId={messageId} attachmentRefs={mediaRefs} />
-        <OutputAudios audios={audios} messageId={messageId} attachmentRefs={mediaRefs} />
-        <OutputVideos videos={videos} messageId={messageId} attachmentRefs={mediaRefs} />
+        <OutputImages
+          images={images}
+          messageId={messageId}
+          attachmentRefs={mediaRefs}
+          onMutateAttachmentRef={onMutateAttachmentRef}
+        />
+        <OutputAudios
+          audios={audios}
+          messageId={messageId}
+          attachmentRefs={mediaRefs}
+          onMutateAttachmentRef={onMutateAttachmentRef}
+        />
+        <OutputVideos
+          videos={videos}
+          messageId={messageId}
+          attachmentRefs={mediaRefs}
+          onMutateAttachmentRef={onMutateAttachmentRef}
+        />
       </div>
     )
   }
@@ -105,9 +124,24 @@ export function MessageContent({
       {textLength > 0 ? (
         <MarkdownView content={text} contentSegments={markdownSegments} streaming={streaming} />
       ) : null}
-      <OutputImages images={images} messageId={messageId} attachmentRefs={mediaRefs} />
-      <OutputAudios audios={audios} messageId={messageId} attachmentRefs={mediaRefs} />
-      <OutputVideos videos={videos} messageId={messageId} attachmentRefs={mediaRefs} />
+      <OutputImages
+        images={images}
+        messageId={messageId}
+        attachmentRefs={mediaRefs}
+        onMutateAttachmentRef={onMutateAttachmentRef}
+      />
+      <OutputAudios
+        audios={audios}
+        messageId={messageId}
+        attachmentRefs={mediaRefs}
+        onMutateAttachmentRef={onMutateAttachmentRef}
+      />
+      <OutputVideos
+        videos={videos}
+        messageId={messageId}
+        attachmentRefs={mediaRefs}
+        onMutateAttachmentRef={onMutateAttachmentRef}
+      />
     </div>
   )
 }
@@ -170,10 +204,14 @@ function OutputImages({
   images,
   messageId,
   attachmentRefs,
+  onMutateAttachmentRef,
 }: {
   images: Array<Extract<ContentItem, { type: 'output_image' }>>
   messageId?: MessageId | undefined
   attachmentRefs: ReturnType<typeof liveAttachmentRefs>
+  onMutateAttachmentRef?:
+    | ((mutation: MessageAttachmentRefMutation) => void | Promise<void>)
+    | undefined
 }) {
   if (images.length === 0) return null
   return (
@@ -189,6 +227,7 @@ function OutputImages({
             index={index}
             messageId={messageId}
             attachmentRef={ref}
+            onMutateAttachmentRef={onMutateAttachmentRef}
           />
         )
       })}
@@ -200,10 +239,14 @@ function OutputAudios({
   audios,
   messageId,
   attachmentRefs,
+  onMutateAttachmentRef,
 }: {
   audios: Array<Extract<ContentItem, { type: 'audio_output' }>>
   messageId?: MessageId | undefined
   attachmentRefs: ReturnType<typeof liveAttachmentRefs>
+  onMutateAttachmentRef?:
+    | ((mutation: MessageAttachmentRefMutation) => void | Promise<void>)
+    | undefined
 }) {
   if (audios.length === 0) return null
   return (
@@ -219,6 +262,7 @@ function OutputAudios({
             index={index}
             messageId={messageId}
             attachmentRef={ref}
+            onMutateAttachmentRef={onMutateAttachmentRef}
           />
         )
       })}
@@ -230,10 +274,14 @@ function OutputVideos({
   videos,
   messageId,
   attachmentRefs,
+  onMutateAttachmentRef,
 }: {
   videos: Array<Extract<ContentItem, { type: 'output_video' }>>
   messageId?: MessageId | undefined
   attachmentRefs: ReturnType<typeof liveAttachmentRefs>
+  onMutateAttachmentRef?:
+    | ((mutation: MessageAttachmentRefMutation) => void | Promise<void>)
+    | undefined
 }) {
   if (videos.length === 0) return null
   return (
@@ -249,6 +297,7 @@ function OutputVideos({
             index={index}
             messageId={messageId}
             attachmentRef={ref}
+            onMutateAttachmentRef={onMutateAttachmentRef}
           />
         )
       })}
@@ -261,11 +310,15 @@ function OutputImage({
   index,
   messageId,
   attachmentRef,
+  onMutateAttachmentRef,
 }: {
   image: Extract<ContentItem, { type: 'output_image' }>
   index: number
   messageId?: MessageId | undefined
   attachmentRef?: ReturnType<typeof liveAttachmentRefs>[number] | undefined
+  onMutateAttachmentRef?:
+    | ((mutation: MessageAttachmentRefMutation) => void | Promise<void>)
+    | undefined
 }) {
   const bundle = useRepositoryQuery(
     JSON.stringify(['attachment-bundle', image.attachmentId ?? null]),
@@ -291,9 +344,9 @@ function OutputImage({
       {src ? <img src={src} alt={alt} /> : <span data-ui="message-output-image-missing" />}
       {messageId && attachmentRef ? (
         <OutputMediaContextToggle
-          messageId={messageId}
           attachmentRef={attachmentRef}
           noun="image"
+          onMutateAttachmentRef={onMutateAttachmentRef}
         />
       ) : null}
     </figure>
@@ -304,11 +357,15 @@ function OutputAudio({
   audio,
   messageId,
   attachmentRef,
+  onMutateAttachmentRef,
 }: {
   audio: Extract<ContentItem, { type: 'audio_output' }>
   index: number
   messageId?: MessageId | undefined
   attachmentRef?: ReturnType<typeof liveAttachmentRefs>[number] | undefined
+  onMutateAttachmentRef?:
+    | ((mutation: MessageAttachmentRefMutation) => void | Promise<void>)
+    | undefined
 }) {
   const bundle = useRepositoryQuery(
     JSON.stringify(['attachment-bundle', audio.attachmentId ?? null]),
@@ -337,9 +394,9 @@ function OutputAudio({
       {audio.transcript ? <figcaption>{audio.transcript}</figcaption> : null}
       {messageId && attachmentRef ? (
         <OutputMediaContextToggle
-          messageId={messageId}
           attachmentRef={attachmentRef}
           noun="audio"
+          onMutateAttachmentRef={onMutateAttachmentRef}
         />
       ) : null}
     </figure>
@@ -351,11 +408,15 @@ function OutputVideo({
   index,
   messageId,
   attachmentRef,
+  onMutateAttachmentRef,
 }: {
   video: Extract<ContentItem, { type: 'output_video' }>
   index: number
   messageId?: MessageId | undefined
   attachmentRef?: ReturnType<typeof liveAttachmentRefs>[number] | undefined
+  onMutateAttachmentRef?:
+    | ((mutation: MessageAttachmentRefMutation) => void | Promise<void>)
+    | undefined
 }) {
   const bundle = useRepositoryQuery(
     JSON.stringify(['attachment-bundle', video.attachmentId ?? null]),
@@ -389,9 +450,9 @@ function OutputVideo({
       ) : null}
       {messageId && attachmentRef ? (
         <OutputMediaContextToggle
-          messageId={messageId}
           attachmentRef={attachmentRef}
           noun="video"
+          onMutateAttachmentRef={onMutateAttachmentRef}
         />
       ) : null}
     </figure>
@@ -399,13 +460,15 @@ function OutputVideo({
 }
 
 function OutputMediaContextToggle({
-  messageId,
   attachmentRef,
   noun,
+  onMutateAttachmentRef,
 }: {
-  messageId: MessageId
   attachmentRef: ReturnType<typeof liveAttachmentRefs>[number]
   noun: 'image' | 'audio' | 'video'
+  onMutateAttachmentRef?:
+    | ((mutation: MessageAttachmentRefMutation) => void | Promise<void>)
+    | undefined
 }) {
   return (
     <Button
@@ -423,12 +486,13 @@ function OutputMediaContextToggle({
           : `Include this generated ${noun} in future context`
       }
       onClick={() =>
-        void setAttachmentRefVisibility({
-          messageId,
+        void onMutateAttachmentRef?.({
+          kind: 'visibility',
           refId: attachmentRef.refId,
           includeInContext: !attachmentRef.includeInContext,
         })
       }
+      disabled={onMutateAttachmentRef === undefined}
     >
       {attachmentRef.includeInContext ? <EyeIcon size={14} /> : <EyeOffIcon size={14} />}
     </Button>

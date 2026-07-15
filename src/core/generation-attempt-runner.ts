@@ -2,6 +2,7 @@ import { splitAssistantStream } from '../api/assistant-lanes'
 import type { AssistantStreamChunk } from '../api/assistant-stream'
 import { ApiError, normalizeError } from '../api/errors'
 import type { StreamLaneEvent } from '../api/stream-transforms'
+import { raceWithAbortSignal } from '../lib/abort'
 import { errorFromUnknown } from '../lib/error'
 import type { StreamChunkWriter } from '../store/stream-chunk-writer'
 import type { ApiRoute } from './api-choice'
@@ -52,6 +53,7 @@ export interface GenerationAttemptRunnerInput {
   journal: StreamChunkWriter
   errorPolicy: GenerationAttemptErrorPolicy
   now?: () => number
+  signal?: AbortSignal
   isAborted?: () => boolean
   abortReason?: AbortReason | (() => AbortReason)
   prepareLive?: (input: {
@@ -59,6 +61,7 @@ export interface GenerationAttemptRunnerInput {
     now: number
   }) => (() => void | Promise<void>) | undefined
   finalize: (input: GenerationAttemptFinalizationContext) => Promise<void>
+  onCanonicalCommitted?: (result: GenerationAttemptResult) => void
   cleanupJournal: () => Promise<unknown>
   cleanup: (result: GenerationAttemptResult) => void | Promise<void>
 }
@@ -79,9 +82,14 @@ export async function runGenerationAttempt(
   try {
     let source: AsyncIterable<AssistantStreamChunk>
     if (input.beforeDispatch) {
-      source = openAfterDispatchGuard(input.beforeDispatch, input.open, () => {
-        attemptState.beforeDispatchFailed = true
-      })
+      source = openAfterDispatchGuard(
+        input.beforeDispatch,
+        input.open,
+        () => {
+          attemptState.beforeDispatchFailed = true
+        },
+        input.signal,
+      )
     } else {
       try {
         source = input.open()
@@ -173,14 +181,14 @@ export async function runGenerationAttempt(
     }
   } catch (caught) {
     let recoveryFailure: ApiError | undefined
-    if (attemptState.beforeDispatchFailed) {
+    if (input.signal?.aborted || input.isAborted?.()) {
+      outcome = 'abort'
+      abortReason = resolveAbortReason(input.abortReason)
+    } else if (attemptState.beforeDispatchFailed) {
       outcome = 'error'
       error = normalizeError(caught, { midStream: false, cause: 'internal' })
       deferredError = caught
       hasDeferredError = true
-    } else if (input.isAborted?.()) {
-      outcome = 'abort'
-      abortReason = resolveAbortReason(input.abortReason)
     } else if (caught instanceof ApiError) {
       if (caught.kind === 'abort') {
         outcome = 'abort'
@@ -231,20 +239,8 @@ export async function runGenerationAttempt(
   }
   let primaryError: unknown
   let hasPrimaryError = false
-  let journalSettleError: ApiError | undefined
 
   try {
-    try {
-      await input.journal.settle()
-    } catch (caught) {
-      journalSettleError = normalizeError(caught, { midStream: true, cause: 'storage' })
-      effectiveResult = {
-        outcome: 'error',
-        error: journalSettleError,
-        ...(input.accumulator.finishReason ? { finishReason: input.accumulator.finishReason } : {}),
-      }
-    }
-
     try {
       await input.finalize({ ...effectiveResult, accumulator: input.accumulator })
     } catch (caught) {
@@ -254,21 +250,26 @@ export async function runGenerationAttempt(
           : normalizeError(caught, { midStream: true, cause: 'storage' })
       effectiveResult = {
         outcome: 'error',
-        error: journalSettleError ?? canonicalError,
+        error: canonicalError,
         ...(input.accumulator.finishReason ? { finishReason: input.accumulator.finishReason } : {}),
+        journalCleanupPending: true,
       }
-      try {
-        await input.journal.flush({ mode: 'immediate' })
-      } catch (caught) {
-        void caught
-      }
-      throw journalSettleError ?? canonicalError
+      await preserveRecoveryJournal(input.journal)
+      throw canonicalError
     }
+    input.onCanonicalCommitted?.(effectiveResult)
 
     try {
-      await input.cleanupJournal()
+      await input.journal.settle()
     } catch {
       effectiveResult = { ...effectiveResult, journalCleanupPending: true }
+    }
+    if (!effectiveResult.journalCleanupPending) {
+      try {
+        await input.cleanupJournal()
+      } catch {
+        effectiveResult = { ...effectiveResult, journalCleanupPending: true }
+      }
     }
   } catch (caught) {
     primaryError = caught
@@ -300,6 +301,19 @@ export async function runGenerationAttempt(
   if (hasDeferredError && effectiveResult.error?.kind !== 'storage') throw deferredError
   if (hasCleanupError) throw cleanupError
   return effectiveResult
+}
+
+async function preserveRecoveryJournal(journal: StreamChunkWriter): Promise<void> {
+  try {
+    await journal.settle()
+    return
+  } catch {
+    try {
+      await journal.flush({ mode: 'immediate' })
+    } catch {
+      return
+    }
+  }
 }
 
 function createAttemptLivePublisher(
@@ -334,7 +348,6 @@ function createAttemptLivePublisher(
         markStreamAccumulatorPublished(input.accumulator, publishNow, revision)
         return
       }
-      await input.journal.flush({ mode: 'immediate' })
       await apply()
       markStreamAccumulatorPublished(input.accumulator, publishNow, revision)
     })
@@ -392,9 +405,10 @@ async function* openAfterDispatchGuard(
   beforeDispatch: () => Promise<void> | void,
   open: () => AsyncIterable<AssistantStreamChunk>,
   onFailure: () => void,
+  signal: AbortSignal | undefined,
 ): AsyncGenerator<AssistantStreamChunk> {
   try {
-    await beforeDispatch()
+    await raceWithAbortSignal(beforeDispatch, signal)
   } catch (error) {
     onFailure()
     throw error

@@ -6,12 +6,13 @@ import type { AssistantStreamChunk } from '../../src/api/assistant-stream'
 import type { ChatCompletionUsageWire } from '../../src/api/types'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import { tokenCalibrationKey } from '../../src/core/model-ids'
+import { schedulePostCommitTask } from '../../src/core/post-commit-task'
 import { readTokenCalibrationGlobal } from '../../src/core/token-calibration'
 import type { CapabilityDescriptor } from '../../src/core/types'
-import { sendText } from '../../src/hooks/useChat'
+import { __flushPostCommitCalibrationForTests, sendText } from '../../src/hooks/useChat'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import { __resetBrowserRepositoryForTests } from '../../src/store/browser-repo'
-import { createChat } from '../../src/store/chats'
+import { clearChatTokenCalibration, createChat } from '../../src/store/chats'
 import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
 import { createKey } from '../../src/store/keys'
 import { putCachedEndpoints } from '../../src/store/models-cache'
@@ -117,6 +118,12 @@ function streamText(text: string, usage: ChatCompletionUsageWire, finishReason =
   }
 }
 
+async function sendAndFlush(input: Parameters<typeof sendText>[0]) {
+  const result = await sendText(input)
+  await __flushPostCommitCalibrationForTests()
+  return result
+}
+
 describe('sendText token calibration gates', () => {
   beforeEach(async () => {
     ;(globalThis as unknown as { indexedDB: IDBFactory }).indexedDB = new IDBFactory()
@@ -131,7 +138,7 @@ describe('sendText token calibration gates', () => {
   it('calibrates prompt and completion for completed text-only requests', async () => {
     const { chat, profile } = await seedChat()
 
-    await sendText({
+    await sendAndFlush({
       chatId: chat.id,
       connection: profile,
       apiKey: 'sk-test',
@@ -160,10 +167,50 @@ describe('sendText token calibration gates', () => {
     })
   })
 
+  it('does not repopulate a chat after an explicit clear overtakes deferred calibration', async () => {
+    const { chat, profile } = await seedChat()
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    for (let index = 0; index < 2; index += 1) {
+      schedulePostCommitTask(async () => gate, { timeoutMs: 1_000 })
+    }
+    await Promise.resolve()
+
+    await sendText({
+      chatId: chat.id,
+      connection: profile,
+      apiKey: 'sk-test',
+      capabilities: TEXT_CAPABILITIES,
+      content: [{ type: 'text', text: 'a'.repeat(400) }],
+      openStream: streamText('b'.repeat(200), {
+        prompt_tokens: 100,
+        completion_tokens: 50,
+        total_tokens: 150,
+      }),
+    })
+    expect(await clearChatTokenCalibration(chat.id)).toBe(false)
+    release()
+    await __flushPostCommitCalibrationForTests()
+
+    const stored = await getDb().chats.get(chat.id)
+    expect(stored?.tokenCalibrationGeneration).toBe(1)
+    expect(stored?.tokenCalibration).toEqual({})
+    const assistant = (await getDb().messages.where('chatId').equals(chat.id).toArray()).find(
+      (message) => message.role === 'assistant',
+    )
+    expect(assistant?.generation?.tokenCalibration).toBeUndefined()
+    expect(assistant).not.toHaveProperty('originalCharCount')
+    expect(
+      (await readTokenCalibrationGlobal()).byModel[tokenCalibrationKey('openai/gpt-4o')],
+    ).toBeUndefined()
+  })
+
   it('calibrates only completion when tool schemas are present but no tool call happens', async () => {
     const { chat, profile } = await seedChat({ tools: true })
 
-    await sendText({
+    await sendAndFlush({
       chatId: chat.id,
       connection: profile,
       apiKey: 'sk-test',
@@ -193,7 +240,7 @@ describe('sendText token calibration gates', () => {
   it('calibrates only completion for multimodal context with text-only output', async () => {
     const { chat, profile } = await seedChat()
 
-    await sendText({
+    await sendAndFlush({
       chatId: chat.id,
       connection: profile,
       apiKey: 'sk-test',
@@ -216,7 +263,7 @@ describe('sendText token calibration gates', () => {
   it('does not calibrate a request that finishes with a tool call', async () => {
     const { chat, profile } = await seedChat({ tools: true })
 
-    await sendText({
+    await sendAndFlush({
       chatId: chat.id,
       connection: profile,
       apiKey: 'sk-test',
@@ -242,7 +289,7 @@ describe('sendText token calibration gates', () => {
   it('does not calibrate a request that reports server tool usage', async () => {
     const { chat, profile } = await seedChat({ tools: true })
 
-    await sendText({
+    await sendAndFlush({
       chatId: chat.id,
       connection: profile,
       apiKey: 'sk-test',

@@ -1,6 +1,7 @@
 import Dexie, { type IndexableType, type ObservabilitySet, RangeSet, rangesOverlap } from 'dexie'
 import { useCallback, useSyncExternalStore } from 'react'
 import { isPageHiding } from '../lib/page-lifecycle'
+import { PersistentStringMap } from '../lib/persistent-string-map'
 import { scheduleReactPublication } from '../lib/react-publication'
 import { getDb } from './db'
 import { runWithLocalReadActivity } from './transaction-activity'
@@ -77,12 +78,44 @@ interface QueryEntry<T> {
     snapshot: RepositoryQuerySnapshot<T>
   } | null
   publicationScheduled: boolean
+  incremental: IncrementalQueryAdapter<T> | null
+  incrementalState: unknown
+  incrementalFullRead: boolean
+  incrementalKeys: Set<IndexableType>
 }
 
 interface CompiledDependency {
   part: string
   deletedPart: string | null
   range: RangeSet
+}
+
+interface IncrementalQueryAdapter<T> {
+  signature: string
+  table: RepositoryQueryTable
+  read(keys: readonly IndexableType[], signal: AbortSignal): unknown
+  merge(state: unknown, base: T, keys: readonly IndexableType[], value: unknown): T
+  acceptFull(state: unknown, value: T): void
+  createState(): unknown
+}
+
+interface IncrementalReadPlan {
+  keys: readonly IndexableType[]
+}
+
+export interface RepositoryKeyedRowsSnapshot<Row> {
+  loaded: boolean
+  allRows: readonly Row[] | null
+  byKey: PersistentStringMap<Row>
+  changedKeys: readonly string[] | null
+  changedRows: readonly (Row | undefined)[] | null
+}
+
+export interface RepositoryKeyedRowsOptions<Row> {
+  table: RepositoryQueryTable
+  keyOf(row: Row): string
+  include(row: Row): boolean
+  onMerge?: (kind: 'full' | 'delta', rowCount: number) => void
 }
 
 interface QueryDatabaseIdentity {
@@ -123,8 +156,9 @@ function useRepositoryQueryStateWithActivity<T>(
   initialValue: T,
   dependencies: readonly RepositoryQueryDependency[],
   blocksLocalWrites: boolean,
+  incremental: IncrementalQueryAdapter<T> | null = null,
 ): RepositoryQuerySnapshot<T> {
-  const entry = queryEntry(key, query, initialValue, dependencies, blocksLocalWrites)
+  const entry = queryEntry(key, query, initialValue, dependencies, blocksLocalWrites, incremental)
   const subscribe = useCallback((listener: () => void) => subscribeEntry(entry, listener), [entry])
   const getSnapshot = useCallback(() => entry.snapshot, [entry])
   return useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
@@ -161,12 +195,101 @@ export function useRepositoryPresentationQuery<T>(
   return snapshot.value
 }
 
+export function useRepositoryKeyedPresentationQuery<Row>(
+  key: string,
+  query: (signal: AbortSignal) => readonly Row[] | Promise<readonly Row[]>,
+  readChanged: (
+    keys: readonly string[],
+    signal: AbortSignal,
+  ) => readonly (Row | undefined)[] | Promise<readonly (Row | undefined)[]>,
+  initialValue: readonly Row[],
+  dependencies: readonly RepositoryQueryDependency[],
+  options: RepositoryKeyedRowsOptions<Row>,
+): RepositoryKeyedRowsSnapshot<Row> {
+  const initialSnapshot: RepositoryKeyedRowsSnapshot<Row> = {
+    loaded: false,
+    allRows: initialValue,
+    byKey: PersistentStringMap.from(initialValue.map((row) => [options.keyOf(row), row] as const)),
+    changedKeys: null,
+    changedRows: null,
+  }
+  const snapshot = useRepositoryQueryStateWithActivity(
+    key,
+    async (signal) => {
+      const rows = await query(signal as AbortSignal)
+      options.onMerge?.('full', rows.length)
+      return {
+        loaded: true,
+        allRows: rows,
+        byKey: PersistentStringMap.from(rows.map((row) => [options.keyOf(row), row] as const)),
+        changedKeys: null,
+        changedRows: null,
+      }
+    },
+    initialSnapshot,
+    dependencies,
+    false,
+    keyedRowsAdapter(readChanged, options),
+  )
+  if (snapshot.status === 'error') throw snapshot.error
+  return snapshot.value
+}
+
+function keyedRowsAdapter<Row>(
+  readChanged: (
+    keys: readonly string[],
+    signal: AbortSignal,
+  ) => readonly (Row | undefined)[] | Promise<readonly (Row | undefined)[]>,
+  options: RepositoryKeyedRowsOptions<Row>,
+): IncrementalQueryAdapter<RepositoryKeyedRowsSnapshot<Row>> {
+  return {
+    signature: `keyed-rows:${options.table}`,
+    table: options.table,
+    read: (keys, signal) => readChanged(keys as readonly string[], signal),
+    merge: (_state, base, rawKeys, rawValue) => {
+      const keys = rawKeys as readonly string[]
+      const values = rawValue as readonly (Row | undefined)[]
+      if (values.length !== keys.length) throw new Error('RepositoryKeyedReadLengthMismatch')
+      options.onMerge?.('delta', keys.length)
+
+      let nextByKey = base.byKey
+      const changedKeys: string[] = []
+      const changedRows: Array<Row | undefined> = []
+      for (let index = 0; index < keys.length; index += 1) {
+        const key = keys[index] as string
+        const value = values[index]
+        const existing = nextByKey.get(key)
+        const accepted = value !== undefined && options.include(value) ? value : undefined
+        if (accepted !== undefined && options.keyOf(accepted) !== key) {
+          throw new Error('RepositoryKeyedReadKeyMismatch')
+        }
+        if (accepted === undefined) {
+          if (existing === undefined) continue
+          nextByKey = nextByKey.delete(key)
+          changedKeys.push(key)
+          changedRows.push(undefined)
+          continue
+        }
+        nextByKey = nextByKey.set(key, accepted)
+        changedKeys.push(key)
+        changedRows.push(accepted)
+      }
+      return nextByKey === base.byKey
+        ? base
+        : { loaded: base.loaded, allRows: null, byKey: nextByKey, changedKeys, changedRows }
+    },
+    acceptFull: () => {},
+    createState: () => undefined,
+  }
+}
+
 function queryEntry<T>(
   key: string,
   query: (signal?: AbortSignal) => T | Promise<T>,
   initialValue: T,
   dependencies: readonly RepositoryQueryDependency[],
   blocksLocalWrites: boolean,
+  incremental: IncrementalQueryAdapter<T> | null = null,
 ): QueryEntry<T> {
   const existing = entries.get(key)
   const dependencySignature = JSON.stringify(dependencies)
@@ -177,8 +300,12 @@ function queryEntry<T>(
     if (existing.blocksLocalWrites !== blocksLocalWrites) {
       throw new Error(`RepositoryQueryActivityMismatch:${key}`)
     }
+    if (existing.incremental?.signature !== incremental?.signature) {
+      throw new Error(`RepositoryQueryIncrementalMismatch:${key}`)
+    }
     existing.query = query
     existing.initialValue = initialValue
+    existing.incremental = incremental
     return existing as QueryEntry<T>
   }
   const entry: QueryEntry<T> = {
@@ -202,6 +329,10 @@ function queryEntry<T>(
     nextRead: 0,
     pendingPublication: null,
     publicationScheduled: false,
+    incremental,
+    incrementalState: incremental?.createState(),
+    incrementalFullRead: incremental !== null,
+    incrementalKeys: new Set(),
   }
   entries.set(key, entry)
   return entry
@@ -237,6 +368,19 @@ function startEntry<T>(entry: QueryEntry<T>): void {
   entry.unsubscribeChanges = mutationSubscriber((parts) => {
     if (generation !== entry.generation || entry.listeners.size === 0) return
     if (!dependenciesOverlap(parts, entry.dependencies)) return
+    if (entry.incremental) {
+      const keys = exactChangedPrimaryStringKeys(
+        parts,
+        databaseNameReader(),
+        entry.incremental.table,
+      )
+      if (keys === null) {
+        entry.incrementalFullRead = true
+        entry.incrementalKeys.clear()
+      } else if (!entry.incrementalFullRead) {
+        for (const key of keys) entry.incrementalKeys.add(key)
+      }
+    }
     entry.revision += 1
     if (!entry.blocksLocalWrites) abandonEntryRead(entry)
     scheduleRead(entry, generation)
@@ -257,6 +401,10 @@ function scheduleRead<T>(entry: QueryEntry<T>, generation: number): void {
 
 function runRead<T>(entry: QueryEntry<T>, generation: number): void {
   if (entry.readInFlight !== null) return
+  const incrementalPlan: IncrementalReadPlan | null =
+    entry.incremental && !entry.incrementalFullRead && entry.incrementalKeys.size > 0
+      ? { keys: [...entry.incrementalKeys] }
+      : null
   const presentationRead = !entry.blocksLocalWrites
   if (
     presentationRead &&
@@ -284,7 +432,12 @@ function runRead<T>(entry: QueryEntry<T>, generation: number): void {
     .then(() =>
       entry.blocksLocalWrites
         ? runWithLocalReadActivity(() => Dexie.ignoreTransaction(() => entry.query()))
-        : startPresentationRead(entry, abortController as AbortController, schedulerEpoch),
+        : startPresentationRead(
+            entry,
+            abortController as AbortController,
+            schedulerEpoch,
+            incrementalPlan,
+          ),
     )
     .then(
       (value) => {
@@ -300,12 +453,39 @@ function runRead<T>(entry: QueryEntry<T>, generation: number): void {
           scheduleRead(entry, generation)
           return
         }
-        if (entry.snapshot.status === 'ready' && Object.is(entry.snapshot.value, value)) return
+        let nextValue: T
+        try {
+          if (entry.incremental && incrementalPlan) {
+            const base = latestReadyValue(entry)
+            nextValue = entry.incremental.merge(
+              entry.incrementalState,
+              base,
+              incrementalPlan.keys,
+              value,
+            )
+          } else {
+            nextValue = value as T
+            entry.incremental?.acceptFull(entry.incrementalState, nextValue)
+          }
+        } catch (error) {
+          enqueuePublication(
+            entry,
+            generation,
+            revision,
+            Object.freeze({ status: 'error', value: entry.snapshot.value, error }),
+          )
+          return
+        }
+        if (entry.incremental) {
+          entry.incrementalFullRead = false
+          entry.incrementalKeys.clear()
+        }
+        if (Object.is(latestReadyValue(entry), nextValue)) return
         enqueuePublication(
           entry,
           generation,
           revision,
-          Object.freeze({ status: 'ready', value, error: null }),
+          Object.freeze({ status: 'ready', value: nextValue, error: null }),
         )
       },
       (error: unknown) => {
@@ -337,9 +517,15 @@ function startPresentationRead<T>(
   entry: QueryEntry<T>,
   controller: AbortController,
   schedulerEpoch: number,
-): Promise<T> {
+  incrementalPlan: IncrementalReadPlan | null,
+): Promise<unknown> {
   return abortablePresentationRead(
-    () => Dexie.ignoreTransaction(() => entry.query(controller.signal)),
+    () =>
+      Dexie.ignoreTransaction(() =>
+        entry.incremental && incrementalPlan
+          ? entry.incremental.read(incrementalPlan.keys, controller.signal)
+          : entry.query(controller.signal),
+      ),
     controller,
     () => {
       entry.presentationReadsActive -= 1
@@ -348,6 +534,11 @@ function startPresentationRead<T>(
       drainDeferredPresentationReads()
     },
   )
+}
+
+function latestReadyValue<T>(entry: QueryEntry<T>): T {
+  const pending = entry.pendingPublication?.snapshot
+  return pending?.status === 'ready' ? pending.value : entry.snapshot.value
 }
 
 function drainDeferredPresentationReads(): void {
@@ -512,6 +703,38 @@ function dependenciesOverlap(
   return false
 }
 
+function exactChangedPrimaryStringKeys(
+  parts: ObservabilitySet,
+  databaseName: string,
+  table: RepositoryQueryTable,
+): readonly string[] | null {
+  if (parts.all) return null
+  const tablePart = `idb://${databaseName}/${table}/`
+  const ranges = [parts[tablePart], parts[`${tablePart}:dels`]].filter(
+    (range): range is NonNullable<typeof range> => range !== undefined,
+  )
+  if (ranges.length === 0) return null
+  const keys = new Set<string>()
+  for (const range of ranges) {
+    const pending = 'from' in range ? [range] : []
+    while (pending.length > 0) {
+      const interval = pending.pop()
+      if (!interval) continue
+      if (
+        typeof interval.from !== 'string' ||
+        typeof interval.to !== 'string' ||
+        interval.from !== interval.to
+      ) {
+        return null
+      }
+      keys.add(interval.from)
+      if (interval.l) pending.push(interval.l)
+      if (interval.r) pending.push(interval.r)
+    }
+  }
+  return [...keys]
+}
+
 function compileDependencies(
   databaseName: string,
   dependencies: readonly RepositoryQueryDependency[],
@@ -580,6 +803,11 @@ export function invalidateRepositoryQueriesForWorkspaceReplacement(): void {
     entry.revision += 1
     entry.pendingPublication = null
     abortEntryRead(entry)
+    if (entry.incremental) {
+      entry.incrementalFullRead = true
+      entry.incrementalKeys.clear()
+      entry.incrementalState = entry.incremental.createState()
+    }
     if (entry.listeners.size === 0) {
       entry.unsubscribeChanges?.()
       entries.delete(key)

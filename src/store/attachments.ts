@@ -39,7 +39,9 @@ import {
 } from './attachment-refs'
 import { getBrowserRepository } from './browser-repo'
 import { openDb } from './db'
+import type { MessagePresentation } from './message-storage'
 import type { MutationContext } from './repository'
+import { getWorkspaceRepository } from './workspace-repository'
 
 const DEFAULT_ORPHAN_GC_AGE_MS = 24 * 60 * 60 * 1000
 
@@ -117,6 +119,11 @@ interface RelinkAttachmentRefInput extends AttachmentRefTarget {
   newAttachmentId: AttachmentId
   now?: number
 }
+
+export type MessageAttachmentRefMutation =
+  | { kind: 'visibility'; refId: string; includeInContext: boolean }
+  | { kind: 'detach'; refId: string }
+  | { kind: 'relink'; refId: string; newAttachmentId: AttachmentId }
 
 interface BatchRelinkAttachmentRefsInput {
   oldAttachmentId: AttachmentId
@@ -588,6 +595,67 @@ export async function relinkAttachmentRef(
   const updated = result[0]
   if (!updated) throw new Error(`AttachmentRefMissing:${input.refId}`)
   return updated
+}
+
+export async function mutateMessageAttachmentRef(input: {
+  chatId: ChatId
+  messageId: MessageId
+  mutation: MessageAttachmentRefMutation
+  now?: number
+}): Promise<MessagePresentation | undefined> {
+  const repo = getWorkspaceRepository()
+  const target = await repo.getMessage(input.messageId)
+  if (!target || target.chatId !== input.chatId) return undefined
+  const extraAttachmentIds =
+    input.mutation.kind === 'relink' ? [input.mutation.newAttachmentId] : []
+  const result = await repo.runMutation(
+    scopesForTarget({ kind: 'message', message: target }, extraAttachmentIds),
+    async (ctx) => {
+      const current = await ctx.getMessage(input.messageId)
+      if (!current || current.chatId !== input.chatId) return undefined
+      const refs = normalizeAttachmentRefs(current.attachmentRefs, {
+        messageId: current.id,
+        createdAt: current.createdAt,
+      })
+      const index = refs.findIndex((ref) => ref.refId === input.mutation.refId)
+      if (index < 0) return undefined
+
+      const nextRefs = [...refs]
+      if (input.mutation.kind === 'detach') {
+        nextRefs.splice(index, 1)
+      } else {
+        const existing = refs[index] as MessageAttachmentRef
+        if (input.mutation.kind === 'relink') {
+          if (!(await ctx.getAttachment(input.mutation.newAttachmentId))) {
+            throw new Error(`AttachmentMissing:${input.mutation.newAttachmentId}`)
+          }
+          nextRefs[index] = {
+            ...existing,
+            attachmentId: input.mutation.newAttachmentId,
+            updatedAt: input.now ?? Date.now(),
+          }
+        } else {
+          nextRefs[index] = {
+            ...existing,
+            includeInContext: input.mutation.includeInContext,
+            updatedAt: input.now ?? Date.now(),
+          }
+        }
+      }
+
+      await ctx.putMessage(messageWithAttachmentRefs(current, nextRefs), {
+        touchChatSummary: false,
+        broadcast: true,
+      })
+      const [header, message] = await Promise.all([
+        ctx.getMessageHeader(input.messageId),
+        ctx.getMessage(input.messageId),
+      ])
+      if (!header || !message) return undefined
+      return { header, message, bodyVersion: header.bodyVersion }
+    },
+  )
+  return result.value
 }
 
 export async function batchRelinkAttachmentRefs(

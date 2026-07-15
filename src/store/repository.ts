@@ -73,6 +73,13 @@ export class StreamTargetBusyError extends Error {
   }
 }
 
+export class WorkspaceReplacementFenceError extends Error {
+  constructor() {
+    super('WorkspaceReplacementFenceChanged')
+    this.name = 'WorkspaceReplacementFenceError'
+  }
+}
+
 export type ExpectedLeafChangedReason =
   | 'missing'
   | 'deleted'
@@ -107,6 +114,9 @@ export interface WorkspaceMutationOptions {
   streamFence?: {
     streamId: string
     fence: StreamWriteFence
+  }
+  workspaceFence?: {
+    replacementEpoch: number
   }
 }
 
@@ -171,6 +181,21 @@ export interface StreamLeaseRow {
   apiUsed?: GenerationMeta['apiUsed']
 }
 
+export function streamLeaseOwnsTargetWrites(
+  lease: Pick<
+    StreamLeaseRow,
+    'messageId' | 'attemptKind' | 'continuationStrategy' | 'baseNodeVersion' | 'baseBodyVersion'
+  >,
+): boolean {
+  if (!lease.messageId) return false
+  if (lease.attemptKind !== 'continuation') return true
+  return (
+    lease.continuationStrategy !== undefined ||
+    lease.baseNodeVersion !== undefined ||
+    lease.baseBodyVersion !== undefined
+  )
+}
+
 export interface AppendMessageToExpectedLeafInput {
   expectedLeafId: MessageId | null
   message: Omit<Message, 'parentId' | 'siblingIndex' | 'nodeVersion' | 'deleted'>
@@ -178,6 +203,8 @@ export interface AppendMessageToExpectedLeafInput {
 
 export interface AppendMessageToExpectedLeafResult {
   message: Message
+  header: MessageHeaderRow
+  branchHeaders: MessageHeaderRow[]
   versions: ChatVersions
   hadExistingSiblings: boolean
 }
@@ -285,6 +312,18 @@ export type MessageHeaderPatch = {
   [K in keyof MessageHeaderRow]?: MessageHeaderRow[K] | undefined
 }
 
+export type MessageCalibrationPatch = Partial<
+  Pick<
+    Message,
+    | 'originalCharCount'
+    | 'originalTokenEstimate'
+    | 'originalModelId'
+    | 'originalCalibrationKey'
+    | 'charCountDelta'
+    | 'cachedTokenEstimate'
+  >
+> & { generation?: GenerationMeta }
+
 export type MessageStructurePatch = Partial<
   Pick<MessageHeaderRow, 'deleted' | 'parentId' | 'siblingIndex'>
 >
@@ -303,6 +342,7 @@ export interface MutationContext {
   patchChatSummary(chatId: ChatId, patch: Partial<Chat>): void
   getMessage(messageId: MessageId): Promise<Message | undefined>
   getMessageHeader(messageId: MessageId): Promise<MessageHeaderRow | undefined>
+  getMessageHeaders(messageIds: readonly MessageId[]): Promise<Array<MessageHeaderRow | undefined>>
   listMessages(chatId: ChatId): Promise<Message[]>
   listMessageHeaders(chatId: ChatId): Promise<MessageHeaderRow[]>
   listChildHeaders(chatId: ChatId, parentId: MessageId | null): Promise<MessageHeaderRow[]>
@@ -313,6 +353,10 @@ export interface MutationContext {
     patch: MessageBodyPatch,
     options?: PatchMessageBodyOptions,
   ): Promise<void>
+  patchMessageCalibration(
+    messageId: MessageId,
+    patch: MessageCalibrationPatch,
+  ): Promise<MessageHeaderRow | undefined>
   deleteMessage(messageId: MessageId): Promise<void>
   getChildList(chatId: ChatId, parentId: MessageId | null): Promise<ChildListState>
   bumpChildList(chatId: ChatId, parentId: MessageId | null, now?: number): Promise<ChildListState>
@@ -386,6 +430,7 @@ export interface DeleteTagResult {
 
 export interface DeleteArchivedChatsResult {
   deletedChatIds: ChatId[]
+  deletedChats: Chat[]
 }
 
 export interface ChatCascadeVersion extends ChatVersions {
@@ -591,6 +636,7 @@ export interface WorkspaceRepository {
   listChats(): Promise<Chat[]>
   getChat(chatId: ChatId): Promise<Chat | undefined>
   deleteArchivedChat(chatId: ChatId): Promise<boolean>
+  deleteArchivedChatReturningRow(chatId: ChatId): Promise<Chat | undefined>
   emptyArchivedChats(): Promise<DeleteArchivedChatsResult>
   listFolders(): Promise<ChatFolder[]>
   getFolder(folderId: FolderId): Promise<ChatFolder | undefined>
@@ -615,7 +661,7 @@ export interface WorkspaceRepository {
   ): Promise<MessagePresentationSnapshot | undefined>
   getMessageTextPreview(
     messageId: MessageId,
-    options?: { maxChars?: number },
+    options?: { maxChars?: number; signal?: AbortSignal },
   ): Promise<string | undefined>
   searchChatMessageText(
     chatId: ChatId,
@@ -624,6 +670,10 @@ export interface WorkspaceRepository {
   ): Promise<MessageId[]>
   listMessages(chatId: ChatId): Promise<Message[]>
   getMessageHeader(messageId: MessageId): Promise<MessageHeaderRow | undefined>
+  getMessageHeaders(
+    messageIds: readonly MessageId[],
+    options?: { signal?: AbortSignal },
+  ): Promise<Array<MessageHeaderRow | undefined>>
   // One coherent settings+header read. Header slots preserve messageIds order;
   // this path must never hydrate message bodies.
   getSendContextRevisionSnapshot(

@@ -1,4 +1,5 @@
 import type { ChatId, ConnectionProfile, KeyId, ProfileId } from '../core/types'
+import { raceWithAbortSignal } from '../lib/abort'
 import { onEvent } from './broadcast'
 import { getKey, markKeyUsed, resolveKeyForDispatch } from './keys'
 
@@ -113,6 +114,22 @@ export async function resolveConnectionRuntimeKeys(
     ])
   }
   throw new ConnectionRuntimeKeysUnavailableError(profile.id, issues)
+}
+
+export async function primeConnectionRuntimeKeyCandidates(
+  candidates: readonly ConnectionRuntimeKeyCandidate[] | undefined,
+  signal?: AbortSignal,
+): Promise<readonly ConnectionRuntimeKeyCandidate[] | undefined> {
+  const primary = candidates?.[0]
+  if (!primary) return candidates
+  const apiKey = await raceWithAbortSignal(primary.resolve, signal)
+  const primedPrimary = makeCandidate(
+    primary.ref,
+    primary.index,
+    () => Promise.resolve(apiKey),
+    () => primary.markUsed(),
+  )
+  return Object.freeze([primedPrimary, ...candidates.slice(1)])
 }
 
 function makeCandidate(

@@ -36,6 +36,7 @@ import {
 } from '../backcompat/message-body-split'
 import { migrateMessageBodyVersions } from '../backcompat/message-body-version'
 import { migrateMessageHeaderProjections } from '../backcompat/message-header-projections'
+import { migrateMessageRequestContextVersions } from '../backcompat/message-request-context-version'
 import {
   migrateLegacyPresetSortOrder,
   PRESET_SORT_MIGRATION_INDEX,
@@ -1115,6 +1116,11 @@ export function registerSchema(db: Dexie): void {
       drafts: '&chatId, updatedAt',
     })
     .upgrade(migrateMessageBodyVersions)
+
+  // v25: request freshness has its own semantic revision. Generic header
+  // metadata, sibling renumbering, and derived calibration no longer
+  // impersonate a changed outbound prompt.
+  db.version(25).upgrade(migrateMessageRequestContextVersions)
 }
 
 function organizationDefaultsPatch(

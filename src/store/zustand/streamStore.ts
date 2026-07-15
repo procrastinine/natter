@@ -10,6 +10,8 @@ export interface ActiveStream {
   streamId: string
   chatId: ChatId
   messageId?: MessageId
+  attemptKind?: 'generation' | 'continuation'
+  originNavigationRevision?: string
   replacementEpoch: number
   startedAt: number
   heartbeatAt?: number
@@ -115,7 +117,11 @@ function notifyTarget(key: string): void {
 
 function notifyChat(chatId: ChatId): void {
   chatLifecycleSequence += 1
-  chatLifecycleRevision.set(chatId, chatLifecycleSequence)
+  if (activeStreamIdsByChat.has(chatId)) {
+    chatLifecycleRevision.set(chatId, chatLifecycleSequence)
+  } else {
+    chatLifecycleRevision.delete(chatId)
+  }
   const listeners = chatListeners.get(chatId)
   if (!listeners) return
   for (const listener of [...listeners]) listener()
@@ -355,6 +361,16 @@ export function subscribeChatStreams(chatId: ChatId, listener: () => void): () =
   }
 }
 
+export function __streamStoreIndexStatsForTests(): {
+  activeChats: number
+  chatLifecycleRevisions: number
+} {
+  return {
+    activeChats: activeStreamIdsByChat.size,
+    chatLifecycleRevisions: chatLifecycleRevision.size,
+  }
+}
+
 function useChatLifecycleRevision(chatId: ChatId | null, enabled: boolean): number {
   const active = enabled && chatId !== null
   const subscribe = useCallback(
@@ -378,12 +394,31 @@ export function useIsStreamTargetActive(
   messageId: MessageId | null,
   enabled = true,
 ): boolean {
-  useChatLifecycleRevision(chatId, enabled)
+  const active = enabled && chatId !== null && messageId !== null
+  const subscribe = useCallback(
+    (listener: () => void) =>
+      active ? subscribeStreamTarget(chatId, messageId, listener) : () => undefined,
+    [active, chatId, messageId],
+  )
+  const getSnapshot = useCallback(
+    () => active && firstActiveForTarget(targetKey(chatId, messageId)) !== undefined,
+    [active, chatId, messageId],
+  )
+  return useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
+}
+
+export function isStreamRelevantToSelectedPath(
+  stream: ActiveStream,
+  selectedPathMessageIds: ReadonlySet<MessageId>,
+  knownHeaderMessageIds: ReadonlySet<MessageId>,
+  currentNavigationRevision: string,
+): boolean {
+  const targetMessageId = stream.messageId
+  if (targetMessageId && selectedPathMessageIds.has(targetMessageId)) return true
+  if (!targetMessageId || knownHeaderMessageIds.has(targetMessageId)) return false
   return (
-    enabled &&
-    chatId !== null &&
-    messageId !== null &&
-    firstActiveForTarget(targetKey(chatId, messageId)) !== undefined
+    stream.attemptKind === 'generation' &&
+    stream.originNavigationRevision === currentNavigationRevision
   )
 }
 

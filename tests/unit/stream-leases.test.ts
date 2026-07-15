@@ -19,6 +19,7 @@ import {
   onRemoteStreamLeasesExpired,
   onRemoteStreamOwnershipReleased,
   requestAbortForChat,
+  requestAbortForStream,
   startStreamLease,
   stopStreamLease,
   withStreamRecoveryLocks,
@@ -926,6 +927,7 @@ describe('stream leases', () => {
         ownerClientId: 'other-tab',
         startedAt: 1,
         heartbeatAt: 100_000,
+        attemptKind: 'generation',
       },
     })
     postEvent({
@@ -942,6 +944,7 @@ describe('stream leases', () => {
 
     expect(useStreamStore.getState().getActive('S-monotonic')).toMatchObject({
       messageId: 'M-monotonic',
+      attemptKind: 'generation',
     })
     await vi.advanceTimersByTimeAsync(5_002)
     expect(listStreamLeases).toHaveBeenCalledTimes(1)
@@ -977,6 +980,47 @@ describe('stream leases', () => {
     unsubscribe()
   })
 
+  it('routes one exact remote abort request and leaves its sibling untouched', () => {
+    installStreamLeaseListener()
+    const seen: BroadcastEvent[] = []
+    const unsubscribe = onEvent((event) => {
+      if (event.kind === 'stream-abort-requested') seen.push(event)
+    })
+    const misleadingRemoteCallback = vi.fn()
+    useStreamStore.getState().setActive({
+      streamId: 'S-remote-target',
+      replacementEpoch: 0,
+      chatId: 'C1',
+      messageId: 'M-target',
+      startedAt: 1,
+      ownerClientId: 'other-tab',
+      abort: misleadingRemoteCallback,
+    })
+    useStreamStore.getState().setActive({
+      streamId: 'S-remote-sibling',
+      replacementEpoch: 0,
+      chatId: 'C1',
+      messageId: 'M-sibling',
+      startedAt: 2,
+      ownerClientId: 'other-tab',
+    })
+
+    expect(requestAbortForStream('S-remote-target')).toBe(true)
+    expect(misleadingRemoteCallback).not.toHaveBeenCalled()
+    expect(seen).toEqual([
+      {
+        kind: 'stream-abort-requested',
+        replacementEpoch: 0,
+        chatId: 'C1',
+        streamId: 'S-remote-target',
+        ownerClientId: 'other-tab',
+      },
+    ])
+    expect(useStreamStore.getState().getActive('S-remote-sibling')).toBeDefined()
+    expect(requestAbortForStream('missing-stream')).toBe(false)
+    unsubscribe()
+  })
+
   it('aborts local streams directly', () => {
     installStreamLeaseListener()
     const abort = vi.fn()
@@ -992,6 +1036,40 @@ describe('stream leases', () => {
 
     expect(requestAbortForChat('C1')).toBe(1)
     expect(abort).toHaveBeenCalledTimes(1)
+  })
+
+  it('aborts one exact local stream and leaves its sibling callback untouched', () => {
+    installStreamLeaseListener()
+    const abortTarget = vi.fn()
+    const abortSibling = vi.fn()
+    const seen: BroadcastEvent[] = []
+    const unsubscribe = onEvent((event) => {
+      if (event.kind === 'stream-abort-requested') seen.push(event)
+    })
+    useStreamStore.getState().setActive({
+      streamId: 'S-local-target',
+      replacementEpoch: 0,
+      chatId: 'C1',
+      messageId: 'M-target',
+      startedAt: 1,
+      ownerClientId: getStreamClientId(),
+      abort: abortTarget,
+    })
+    useStreamStore.getState().setActive({
+      streamId: 'S-local-sibling',
+      replacementEpoch: 0,
+      chatId: 'C1',
+      messageId: 'M-sibling',
+      startedAt: 2,
+      ownerClientId: getStreamClientId(),
+      abort: abortSibling,
+    })
+
+    expect(requestAbortForStream('S-local-target')).toBe(true)
+    expect(abortTarget).toHaveBeenCalledTimes(1)
+    expect(abortSibling).not.toHaveBeenCalled()
+    expect(seen).toEqual([])
+    unsubscribe()
   })
 
   it('orders deletion after an in-flight heartbeat so a stopped lease cannot reappear', async () => {

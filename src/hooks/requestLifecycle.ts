@@ -13,19 +13,30 @@ import { useStreamStore } from '../store/zustand/streamStore'
 
 interface RequestLifecycle {
   streamId: string
+  messageId?: MessageId
+  streamFence: StreamWriteFence
   replacementEpoch: number
   signal: AbortSignal
   abort: () => void
+  publishTarget: () => void
+  refreshLease: () => Promise<void>
   preserveLease: () => void
   end: (outcome: 'done' | 'error' | 'abort') => Promise<void>
 }
 
-export async function startRequestLifecycle(args: {
+type RequestLifecycleInput = {
   chatId: ChatId
   streamId: string
-  attemptKind: 'generation' | 'continuation'
+  originNavigationRevision?: string
   userSignal?: AbortSignal
-}): Promise<RequestLifecycle> {
+} & (
+  | { attemptKind: 'generation'; messageId: MessageId }
+  | { attemptKind: 'continuation'; messageId: MessageId }
+)
+
+export async function startRequestLifecycle(
+  args: RequestLifecycleInput,
+): Promise<RequestLifecycle> {
   const controller = new AbortController()
   const abort = () => controller.abort()
   let shouldPreserveLease = false
@@ -45,6 +56,7 @@ export async function startRequestLifecycle(args: {
     fence = await startStreamLease({
       streamId: args.streamId,
       chatId: args.chatId,
+      ...(args.messageId ? { messageId: args.messageId } : {}),
       startedAt,
       attemptKind: args.attemptKind,
     })
@@ -56,6 +68,11 @@ export async function startRequestLifecycle(args: {
   useStreamStore.getState().setActive({
     streamId: args.streamId,
     chatId: args.chatId,
+    ...(args.messageId ? { messageId: args.messageId } : {}),
+    attemptKind: args.attemptKind,
+    ...(args.originNavigationRevision
+      ? { originNavigationRevision: args.originNavigationRevision }
+      : {}),
     replacementEpoch: fence.replacementEpoch,
     startedAt,
     heartbeatAt: startedAt,
@@ -66,15 +83,48 @@ export async function startRequestLifecycle(args: {
     kind: 'stream-started',
     chatId: args.chatId,
     streamId: args.streamId,
+    ...(args.messageId ? { messageId: args.messageId } : {}),
+    attemptKind: args.attemptKind,
     ownerClientId: getStreamClientId(),
     replacementEpoch: fence.replacementEpoch,
   })
 
   return {
     streamId: args.streamId,
+    ...(args.messageId ? { messageId: args.messageId } : {}),
+    streamFence: fence,
     replacementEpoch: fence.replacementEpoch,
     signal: controller.signal,
     abort,
+    publishTarget() {
+      if (!args.messageId) return
+      publishLifecycleTarget({
+        chatId: args.chatId,
+        streamId: args.streamId,
+        messageId: args.messageId,
+        abort,
+        replacementEpoch: fence.replacementEpoch,
+        startedAt,
+        attemptKind: args.attemptKind,
+        ...(args.originNavigationRevision
+          ? { originNavigationRevision: args.originNavigationRevision }
+          : {}),
+      })
+    },
+    async refreshLease() {
+      try {
+        await startStreamLease({
+          streamId: args.streamId,
+          chatId: args.chatId,
+          ...(args.messageId ? { messageId: args.messageId } : {}),
+          startedAt,
+          attemptKind: args.attemptKind,
+          replacementEpoch: fence.replacementEpoch,
+        })
+      } catch (error) {
+        throw normalizeError(error, { midStream: false, cause: 'storage' })
+      }
+    },
     preserveLease() {
       shouldPreserveLease = true
     },
@@ -97,40 +147,27 @@ export async function startRequestLifecycle(args: {
   }
 }
 
-export async function markLifecycleTarget(args: {
+function publishLifecycleTarget(args: {
   chatId: ChatId
   streamId: string
   messageId: MessageId
   abort: () => void
-  attemptKind?: 'generation' | 'continuation'
-  continuationStrategy?: 'prompt' | 'prefill'
-  baseBodyVersion?: number
-  baseNodeVersion?: number
-  requestedModel?: string
-  apiUsed?: GenerationMeta['apiUsed']
   replacementEpoch: number
-}): Promise<StreamWriteFence> {
-  const startedAt = Date.now()
-  const fence = await startStreamLease({
-    streamId: args.streamId,
-    chatId: args.chatId,
-    messageId: args.messageId,
-    startedAt,
-    ...(args.attemptKind ? { attemptKind: args.attemptKind } : {}),
-    ...(args.continuationStrategy ? { continuationStrategy: args.continuationStrategy } : {}),
-    ...(args.baseBodyVersion !== undefined ? { baseBodyVersion: args.baseBodyVersion } : {}),
-    ...(args.baseNodeVersion !== undefined ? { baseNodeVersion: args.baseNodeVersion } : {}),
-    ...(args.requestedModel ? { requestedModel: args.requestedModel } : {}),
-    ...(args.apiUsed ? { apiUsed: args.apiUsed } : {}),
-    replacementEpoch: args.replacementEpoch,
-  })
+  startedAt: number
+  attemptKind: 'generation' | 'continuation'
+  originNavigationRevision?: string
+}): void {
   useStreamStore.getState().setActive({
     streamId: args.streamId,
     chatId: args.chatId,
     messageId: args.messageId,
-    replacementEpoch: fence.replacementEpoch,
-    startedAt,
-    heartbeatAt: startedAt,
+    attemptKind: args.attemptKind,
+    ...(args.originNavigationRevision
+      ? { originNavigationRevision: args.originNavigationRevision }
+      : {}),
+    replacementEpoch: args.replacementEpoch,
+    startedAt: args.startedAt,
+    heartbeatAt: Date.now(),
     ownerClientId: getStreamClientId(),
     abort: args.abort,
   })
@@ -139,12 +176,55 @@ export async function markLifecycleTarget(args: {
     chatId: args.chatId,
     streamId: args.streamId,
     messageId: args.messageId,
+    attemptKind: args.attemptKind,
     ownerClientId: getStreamClientId(),
-    replacementEpoch: fence.replacementEpoch,
+    replacementEpoch: args.replacementEpoch,
   })
   useAnnouncementStore.getState().announce({
     text: 'Assistant is responding.',
     eventKey: `stream-start:${args.streamId}`,
+  })
+}
+
+export async function markLifecycleTarget(args: {
+  chatId: ChatId
+  streamId: string
+  messageId: MessageId
+  abort: () => void
+  attemptKind: 'generation' | 'continuation'
+  continuationStrategy?: 'prompt' | 'prefill'
+  baseBodyVersion?: number
+  baseNodeVersion?: number
+  requestedModel?: string
+  apiUsed?: GenerationMeta['apiUsed']
+  replacementEpoch: number
+}): Promise<StreamWriteFence> {
+  const active = useStreamStore.getState().getActive(args.streamId)
+  const startedAt = active?.startedAt ?? Date.now()
+  const fence = await startStreamLease({
+    streamId: args.streamId,
+    chatId: args.chatId,
+    messageId: args.messageId,
+    startedAt,
+    attemptKind: args.attemptKind,
+    ...(args.continuationStrategy ? { continuationStrategy: args.continuationStrategy } : {}),
+    ...(args.baseBodyVersion !== undefined ? { baseBodyVersion: args.baseBodyVersion } : {}),
+    ...(args.baseNodeVersion !== undefined ? { baseNodeVersion: args.baseNodeVersion } : {}),
+    ...(args.requestedModel ? { requestedModel: args.requestedModel } : {}),
+    ...(args.apiUsed ? { apiUsed: args.apiUsed } : {}),
+    replacementEpoch: args.replacementEpoch,
+  })
+  publishLifecycleTarget({
+    chatId: args.chatId,
+    streamId: args.streamId,
+    messageId: args.messageId,
+    abort: args.abort,
+    replacementEpoch: fence.replacementEpoch,
+    startedAt,
+    attemptKind: args.attemptKind,
+    ...(active?.originNavigationRevision
+      ? { originNavigationRevision: active.originNavigationRevision }
+      : {}),
   })
   return fence
 }

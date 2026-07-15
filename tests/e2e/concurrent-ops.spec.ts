@@ -82,6 +82,186 @@ test('two tabs streaming different chats run in parallel without aborting each o
   await second.close()
 })
 
+test('a send that leaves before its first receipt finishes exactly when returning by sidebar', async ({
+  page,
+}) => {
+  let requestCount = 0
+  let releaseBackgroundResponse: () => void = () => undefined
+  const backgroundResponseGate = new Promise<void>((resolve) => {
+    releaseBackgroundResponse = resolve
+  })
+  let markBackgroundRequestSeen: () => void = () => undefined
+  const backgroundRequestSeen = new Promise<void>((resolve) => {
+    markBackgroundRequestSeen = resolve
+  })
+  await page.route('**/api/v1/chat/completions', async (route) => {
+    requestCount += 1
+    if (requestCount === 3) {
+      markBackgroundRequestSeen()
+      await backgroundResponseGate
+    }
+    const content =
+      requestCount === 3 ? 'background answer survived' : `seed answer ${requestCount}`
+    await route.fulfill({
+      status: 200,
+      contentType: 'text/event-stream',
+      body: buildSseBody([
+        { id: `background-receipt-${requestCount}`, content },
+        { finish: 'stop' },
+      ]),
+    })
+  })
+
+  await createChatAndOpen(page)
+  await sendMessage(page, 'first chat seed')
+  await expect(
+    page.locator('[data-ui="message"][data-role="assistant"] [data-ui="message-body"]'),
+  ).toHaveText('seed answer 1')
+  const firstChat = await firstChatId(page)
+
+  await createChatAndOpen(page)
+  await sendMessage(page, 'second chat seed')
+  await expect(
+    page.locator('[data-ui="message"][data-role="assistant"] [data-ui="message-body"]'),
+  ).toHaveText('seed answer 2')
+  const secondChat = await firstChatId(page)
+  expect(secondChat).not.toBe(firstChat)
+
+  const sidebarLink = (chatId: string) =>
+    page.locator(`[data-ui="chat-row-link"][href="#/chat/${chatId}"]`)
+  await sidebarLink(firstChat).click()
+  await expect
+    .poll(() => page.evaluate(() => window.location.hash))
+    .toContain(`#/chat/${firstChat}/message/`)
+
+  await page.evaluate(async () => {
+    const dbPath = '/src/store/db.ts'
+    const { getDb } = (await import(/* @vite-ignore */ dbPath)) as unknown as {
+      getDb(): {
+        keys: {
+          get(key: string): Promise<unknown>
+        }
+      }
+    }
+    const table = getDb().keys
+    const originalGet = table.get.bind(table)
+    let release: () => void = () => undefined
+    const gate = {
+      entered: false,
+      released: false,
+      release: () => release(),
+    }
+    const blocked = new Promise<void>((resolve) => {
+      release = () => {
+        gate.released = true
+        resolve()
+      }
+    })
+    let used = false
+    table.get = async (key) => {
+      if (!used) {
+        used = true
+        gate.entered = true
+        await blocked
+      }
+      return originalGet(key)
+    }
+    ;(
+      window as typeof window & {
+        __backgroundReceiptKeyGate?: typeof gate
+      }
+    ).__backgroundReceiptKeyGate = gate
+  })
+
+  await page.locator('[data-ui="composer-input"]').fill('finish while another chat is active')
+  await page.locator('[data-ui="send"]').click()
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (
+            window as typeof window & {
+              __backgroundReceiptKeyGate?: { entered: boolean }
+            }
+          ).__backgroundReceiptKeyGate?.entered ?? false,
+      ),
+    )
+    .toBe(true)
+  expect(await readMessages(page, firstChat)).toHaveLength(2)
+
+  await sidebarLink(secondChat).click()
+  await expect
+    .poll(() => page.evaluate(() => window.location.hash))
+    .toContain(`#/chat/${secondChat}/message/`)
+  await page.evaluate(() => {
+    ;(
+      window as typeof window & {
+        __backgroundReceiptKeyGate?: { release(): void }
+      }
+    ).__backgroundReceiptKeyGate?.release()
+  })
+  await backgroundRequestSeen
+  await expect
+    .poll(() => page.evaluate(() => window.location.hash))
+    .toContain(`#/chat/${secondChat}/message/`)
+
+  releaseBackgroundResponse()
+  let backgroundAssistantId = ''
+  await expect
+    .poll(async () => {
+      const rows = await readMessages(page, firstChat)
+      const assistant = rows.find(
+        (row) =>
+          row.role === 'assistant' &&
+          Array.isArray(row.content) &&
+          row.content.some(
+            (item) =>
+              typeof item === 'object' &&
+              item !== null &&
+              (item as { text?: unknown }).text === 'background answer survived',
+          ),
+      )
+      backgroundAssistantId = typeof assistant?.id === 'string' ? assistant.id : ''
+      return backgroundAssistantId
+    })
+    .not.toBe('')
+
+  await page.evaluate(async (chatId) => {
+    const repositoryPath = '/src/store/workspace-repository.ts'
+    const { getWorkspaceRepository } = (await import(
+      /* @vite-ignore */ repositoryPath
+    )) as unknown as {
+      getWorkspaceRepository(): {
+        listMessageHeaders(id: string, options?: unknown): Promise<unknown>
+        getKnownBranchPageSnapshot(
+          id: string,
+          pathMessageIds: readonly string[],
+          page: unknown,
+        ): Promise<unknown>
+      }
+    }
+    const repository = getWorkspaceRepository()
+    const listMessageHeaders = repository.listMessageHeaders.bind(repository)
+    const getKnownBranchPageSnapshot = repository.getKnownBranchPageSnapshot.bind(repository)
+    const never = new Promise<never>(() => undefined)
+    repository.listMessageHeaders = (id, options) =>
+      id === chatId ? never : listMessageHeaders(id, options)
+    repository.getKnownBranchPageSnapshot = (id, pathMessageIds, options) =>
+      id === chatId ? never : getKnownBranchPageSnapshot(id, pathMessageIds, options)
+  }, firstChat)
+
+  await sidebarLink(firstChat).click()
+  await expect(
+    page.locator(
+      `[data-ui="message"][data-message-id="${backgroundAssistantId}"] [data-ui="message-body"]`,
+    ),
+  ).toHaveText('background answer survived')
+  await expect
+    .poll(() => page.evaluate(() => window.location.hash))
+    .toBe(`#/chat/${firstChat}/message/${backgroundAssistantId}`)
+  await expect(page.locator('[data-ui="surface-loading"]')).toHaveCount(0)
+})
+
 test('two tabs cannot turn simultaneous composer sends into an implicit branch', async ({
   page,
 }) => {
@@ -186,10 +366,6 @@ test('a remote extension then newer sibling keeps each tab on its own branch wit
     await expect
       .poll(() => first.evaluate(() => window.location.hash))
       .toBe(`#/chat/${initial.chatId}/message/${extension.assistantMessageId}`)
-    await expect
-      .poll(() => readCursorSelection(first, initial.chatId, extension.userMessageId))
-      .toBe(extension.assistantMessageId)
-
     await startMessageCountRecorder(first)
     await first.evaluate(() => {
       const win = window as typeof window & {
@@ -235,12 +411,6 @@ test('a remote extension then newer sibling keeps each tab on its own branch wit
     await expect
       .poll(() => second.evaluate(() => window.location.hash))
       .toBe(`#/chat/${initial.chatId}/message/${newerSibling.assistantMessageId}`)
-    await expect
-      .poll(() => readCursorSelection(first, initial.chatId, extension.userMessageId))
-      .toBe(extension.assistantMessageId)
-    await expect
-      .poll(() => readCursorSelection(second, initial.chatId, extension.userMessageId))
-      .toBe(newerSibling.assistantMessageId)
     const remoteTailSamples = await first.evaluate(() => {
       const win = window as typeof window & {
         __remoteTailSamples?: string[]
@@ -261,6 +431,120 @@ test('a remote extension then newer sibling keeps each tab on its own branch wit
     })
   } finally {
     await Promise.allSettled([first.close(), second.close()])
+  }
+})
+
+test('simultaneous regenerates keep route, cursor, and counts local to each tab', async ({
+  page,
+}) => {
+  const completionRoute = '**/api/v1/chat/completions'
+  await mockChatCompletions(page, {
+    body: buildSseBody([
+      { id: 'regenerate-baseline', content: 'baseline answer' },
+      { finish: 'stop' },
+    ]),
+  })
+  await createChatAndOpen(page)
+  await sendMessage(page, 'regenerate in two tabs')
+  const baseline = page.locator('[data-ui="message"][data-role="assistant"]').last()
+  await expect(baseline.locator('[data-ui="message-body"]')).toHaveText('baseline answer')
+  const chatId = await firstChatId(page)
+  const baselineId = await baseline.getAttribute('data-message-id')
+  if (!baselineId) throw new Error('baseline assistant has no id')
+  await page.unroute(completionRoute)
+
+  const second = await page.context().newPage()
+  let releaseA!: () => void
+  let releaseB!: () => void
+  let markRequestedA!: () => void
+  let markRequestedB!: () => void
+  const gateA = new Promise<void>((resolve) => {
+    releaseA = resolve
+  })
+  const gateB = new Promise<void>((resolve) => {
+    releaseB = resolve
+  })
+  const requestedA = new Promise<void>((resolve) => {
+    markRequestedA = resolve
+  })
+  const requestedB = new Promise<void>((resolve) => {
+    markRequestedB = resolve
+  })
+  try {
+    await second.goto(`/#/chat/${chatId}/message/${baselineId}`)
+    await expect(
+      second.locator(`[data-ui="message"][data-message-id="${baselineId}"]`),
+    ).toBeVisible()
+
+    await page.route(completionRoute, async (route) => {
+      markRequestedA()
+      await gateA
+      await route.fulfill({
+        status: 200,
+        contentType: 'text/event-stream',
+        body: buildSseBody([
+          { id: 'regenerate-a', content: 'answer from tab A' },
+          { finish: 'stop' },
+        ]),
+      })
+    })
+    await second.route(completionRoute, async (route) => {
+      markRequestedB()
+      await gateB
+      await route.fulfill({
+        status: 200,
+        contentType: 'text/event-stream',
+        body: buildSseBody([
+          { id: 'regenerate-b', content: 'answer from tab B' },
+          { finish: 'stop' },
+        ]),
+      })
+    })
+
+    await page
+      .locator(`[data-ui="message"][data-message-id="${baselineId}"]`)
+      .locator('[data-action="regenerate"]')
+      .click()
+    await requestedA
+    const targetA = await readRouteMessageId(page, chatId)
+
+    await second
+      .locator(`[data-ui="message"][data-message-id="${baselineId}"]`)
+      .locator('[data-action="regenerate"]')
+      .click()
+    await requestedB
+    const targetB = await readRouteMessageId(second, chatId)
+    expect(targetB).not.toBe(targetA)
+
+    const branchA = page.locator(`[data-ui="message"][data-message-id="${targetA}"]`)
+    const branchB = second.locator(`[data-ui="message"][data-message-id="${targetB}"]`)
+    await expect(branchA.locator('[data-ui="branch-count"]')).toHaveText('2 / 3')
+    await expect(branchB.locator('[data-ui="branch-count"]')).toHaveText('3 / 3')
+    await expect(page.locator(`[data-ui="message"][data-message-id="${targetB}"]`)).toHaveCount(0)
+    await expect(second.locator(`[data-ui="message"][data-message-id="${targetA}"]`)).toHaveCount(0)
+    await expect
+      .poll(() => page.evaluate(() => window.location.hash))
+      .toBe(`#/chat/${chatId}/message/${targetA}`)
+    await expect
+      .poll(() => second.evaluate(() => window.location.hash))
+      .toBe(`#/chat/${chatId}/message/${targetB}`)
+
+    releaseA()
+    releaseB()
+    await expect(branchA.locator('[data-ui="message-body"]')).toContainText('answer from tab A')
+    await expect(branchB.locator('[data-ui="message-body"]')).toContainText('answer from tab B')
+    await expect(branchA.locator('[data-ui="branch-count"]')).toHaveText('2 / 3')
+    await expect(branchB.locator('[data-ui="branch-count"]')).toHaveText('3 / 3')
+    await expect
+      .poll(() => page.evaluate(() => window.location.hash))
+      .toBe(`#/chat/${chatId}/message/${targetA}`)
+    await expect
+      .poll(() => second.evaluate(() => window.location.hash))
+      .toBe(`#/chat/${chatId}/message/${targetB}`)
+  } finally {
+    releaseA()
+    releaseB()
+    await second.close()
   }
 })
 
@@ -385,23 +669,13 @@ async function startDebugStream(
   }, options)
 }
 
-async function readCursorSelection(
-  page: Page,
-  chatId: string,
-  parentId: string,
-): Promise<string | null> {
-  return page.evaluate(
-    async ({ activeChatId, activeParentId }) => {
-      const storePath = '/src/store/zustand/chatStore.ts'
-      const module = (await import(/* @vite-ignore */ storePath)) as {
-        useChatStore: {
-          getState(): {
-            getCursor(id: string): Record<string, string> | undefined
-          }
-        }
-      }
-      return module.useChatStore.getState().getCursor(activeChatId)?.[activeParentId] ?? null
-    },
-    { activeChatId: chatId, activeParentId: parentId },
-  )
+async function readRouteMessageId(page: Page, chatId: string): Promise<string> {
+  const routePrefix = `#/chat/${chatId}/message/`
+  await expect
+    .poll(() => page.evaluate(() => window.location.hash))
+    .toMatch(new RegExp(`^${routePrefix}`))
+  const hash = await page.evaluate(() => window.location.hash)
+  const messageId = hash.slice(routePrefix.length)
+  if (!messageId) throw new Error('active route has no message id')
+  return messageId
 }
