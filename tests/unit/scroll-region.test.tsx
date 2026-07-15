@@ -171,6 +171,42 @@ describe('ScrollRegion programmatic intent ledger', () => {
     expect(region.dataset.scrollState).toBe('follow')
   })
 
+  it('lets a local stream claim follow once, then honors later manual scrolling', async () => {
+    const { region, ref, rerender, setHeight } = setup()
+    act(() => {
+      setHeight(1200)
+      ref.current?.scrollToBottom({ smooth: false })
+      region.scrollTop = 250
+      fireEvent.scroll(region)
+    })
+    expect(ref.current?.getState()).toBe('pinned')
+
+    act(() => {
+      rerender(
+        <ScrollRegion
+          ref={ref}
+          streamActive
+          autoScrollOnStream
+          streamFollowKey="local-tail"
+          streamFollowClaimKey="local-stream"
+        >
+          <div>local replacement tail</div>
+        </ScrollRegion>,
+      )
+    })
+    expect(region.scrollTop).toBe(1100)
+    expect(ref.current?.getState()).toBe('follow')
+
+    act(() => {
+      region.scrollTop = 400
+      fireEvent.wheel(region)
+      fireEvent.scroll(region)
+    })
+    expect(ref.current?.getState()).toBe('pinned')
+    await act(nextTask)
+    expect(region.dataset.scrollState).toBe('pinned')
+  })
+
   it('does not recognize an old target after its rendering-batch cleanup', async () => {
     const { region, ref, setHeight } = setup()
     act(() => {

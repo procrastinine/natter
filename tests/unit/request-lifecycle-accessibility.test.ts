@@ -48,6 +48,14 @@ async function targetLifecycle(streamId: string) {
   return lifecycle
 }
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  const promise = new Promise<T>((next) => {
+    resolve = next
+  })
+  return { promise, resolve }
+}
+
 describe('request lifecycle announcements', () => {
   it('announces a targeted stream once even when its target is marked repeatedly', async () => {
     const lifecycle = await targetLifecycle('stream-repeated-target')
@@ -166,5 +174,64 @@ describe('request lifecycle announcements', () => {
       attemptKind: 'continuation',
       originNavigationRevision: 'continue-navigation-revision',
     })
+  })
+
+  it('does not announce stream end until persistent target ownership is released', async () => {
+    const releaseLease = deferred<void>()
+    streamLeaseMocks.stopStreamLease.mockReturnValueOnce(releaseLease.promise)
+    const lifecycle = await targetLifecycle('stream-slow-release')
+
+    const ending = lifecycle.end('done')
+    await Promise.resolve()
+
+    expect(streamLeaseMocks.announceStreamEnded).not.toHaveBeenCalled()
+    expect(useStreamStore.getState().getActive(lifecycle.streamId)).toBeDefined()
+
+    releaseLease.resolve()
+    await expect(ending).resolves.toEqual({ recoveryPending: false })
+    expect(streamLeaseMocks.announceStreamEnded).toHaveBeenCalledWith(
+      expect.objectContaining({
+        streamId: lifecycle.streamId,
+        messageId: lifecycle.messageId,
+        outcome: 'done',
+      }),
+    )
+  })
+
+  it('keeps a failed finalization projected and recovery-eligible without announcing end', async () => {
+    const lifecycle = await targetLifecycle('stream-recovery-pending')
+    lifecycle.preserveLease()
+
+    await expect(lifecycle.end('error')).resolves.toEqual({ recoveryPending: true })
+
+    expect(streamLeaseMocks.announceStreamEnded).not.toHaveBeenCalled()
+    expect(useStreamStore.getState().getActive(lifecycle.streamId)).toMatchObject({
+      streamId: lifecycle.streamId,
+      phase: 'recovery-pending',
+      recoveryOutcome: 'error',
+    })
+    expect(streamLeaseMocks.stopStreamLease).toHaveBeenCalledWith(lifecycle.streamId, {
+      deleteRow: false,
+    })
+  })
+
+  it('keeps a failed lease cleanup recovery-eligible without retaining visible target ownership', async () => {
+    streamLeaseMocks.stopStreamLease.mockRejectedValueOnce(new Error('lease delete unavailable'))
+    const lifecycle = await targetLifecycle('stream-lease-cleanup-pending')
+
+    await expect(lifecycle.end('done')).resolves.toEqual({ recoveryPending: true })
+
+    expect(streamLeaseMocks.announceStreamEnded).not.toHaveBeenCalled()
+    expect(useStreamStore.getState().getActive(lifecycle.streamId)).toMatchObject({
+      streamId: lifecycle.streamId,
+      phase: 'cleanup-pending',
+      recoveryOutcome: 'done',
+    })
+    expect(
+      useStreamStore.getState().getTargetActive('chat-a11y', `message-${lifecycle.streamId}`),
+    ).toBeUndefined()
+    expect(
+      useStreamStore.getState().getLiveSnapshot('chat-a11y', `message-${lifecycle.streamId}`),
+    ).toBeUndefined()
   })
 })

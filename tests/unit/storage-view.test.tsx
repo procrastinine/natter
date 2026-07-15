@@ -16,7 +16,10 @@ import {
   ingestAttachmentBytes,
 } from '../../src/store/attachments'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
-import { __resetBrowserRepositoryForTests } from '../../src/store/browser-repo'
+import {
+  __resetBrowserRepositoryForTests,
+  getBrowserRepository,
+} from '../../src/store/browser-repo'
 import { putChatSidebarProjection } from '../../src/store/chat-sidebar-projection'
 import {
   archiveChat,
@@ -36,6 +39,7 @@ import {
   __setWorkspaceRepositoryForTests,
 } from '../../src/store/workspace-repository'
 import { __resetSearchStoreForTests } from '../../src/store/zustand/searchStore'
+import { useToastStore } from '../../src/store/zustand/toastStore'
 import { jsonEntriesZipBlob } from '../../src/ui/import-export/json-file'
 import { deleteAttachmentForStorage, StorageView } from '../../src/ui/storage/StorageView'
 
@@ -139,6 +143,7 @@ async function resetAll() {
   __resetBroadcastForTests()
   __resetSearchSessionRunnerForTests()
   __resetSearchStoreForTests()
+  useToastStore.getState().reset()
   __resetDbForTests()
   await Dexie.delete(DB_NAME)
 }
@@ -706,6 +711,69 @@ describe('StorageView', () => {
     } finally {
       errorSpy.mockRestore()
     }
+  })
+
+  it('keeps an archived selection and explains when an active stream blocks bulk deletion', async () => {
+    const archived = await createChat({ id: 'chat-streaming-bulk', title: 'Streaming bulk' })
+    await updateChatForTest(archived.id, { archived: true, previewText: 'Streaming response' })
+    await getBrowserRepository().upsertStreamLease({
+      streamId: 'streaming-bulk-lease',
+      chatId: archived.id,
+      messageId: 'reserved-assistant',
+      ownerClientId: 'other-tab',
+      startedAt: 1,
+      heartbeatAt: 1,
+    })
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+
+    const { container } = render(<StorageView route={{ section: 'chats' }} />)
+    fireEvent.click(
+      container.querySelector<HTMLInputElement>(
+        '[data-ui="storage-chat-filters"] label:nth-of-type(3) input',
+      ) as HTMLInputElement,
+    )
+    await waitFor(() => expect(container).toHaveTextContent('Streaming bulk'))
+    fireEvent.click(
+      container.querySelector<HTMLInputElement>('[data-ui="storage-chat-select"]') as HTMLElement,
+    )
+    fireEvent.click(await screen.findByRole('button', { name: 'Delete' }))
+
+    await waitFor(() => {
+      expect(useToastStore.getState().toasts.at(-1)).toMatchObject({
+        level: 'warning',
+        text: 'Wait for the active response to finish before permanently deleting this chat.',
+      })
+    })
+    expect(container).toHaveTextContent('1 selected')
+    expect(await getDb().chats.get(archived.id)).toBeDefined()
+  })
+
+  it('explains when an active stream blocks permanent deletion from the archive', async () => {
+    const archived = await createChat({ id: 'chat-streaming-archive', title: 'Streaming archive' })
+    await updateChatForTest(archived.id, { archived: true })
+    await getBrowserRepository().upsertStreamLease({
+      streamId: 'streaming-archive-lease',
+      chatId: archived.id,
+      messageId: 'reserved-assistant',
+      ownerClientId: 'other-tab',
+      startedAt: 1,
+      heartbeatAt: 1,
+    })
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+
+    render(<StorageView route={{ section: 'archive' }} />)
+    fireEvent.click(
+      await screen.findByRole('button', { name: 'Permanently delete Streaming archive' }),
+    )
+
+    await waitFor(() => {
+      expect(useToastStore.getState().toasts.at(-1)).toMatchObject({
+        level: 'warning',
+        text: 'Wait for the active response to finish before permanently deleting this chat.',
+      })
+    })
+    expect(screen.getByText('Streaming archive')).toBeInTheDocument()
+    expect(await getDb().chats.get(archived.id)).toBeDefined()
   })
 
   it('selects chats with shift-click and applies mixed bulk tags from a blank default', async () => {

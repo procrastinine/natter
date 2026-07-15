@@ -15,6 +15,7 @@ import {
   __streamLeaseHeartbeatSchedulerStateForTests,
   announceStreamEnded,
   getStreamClientId,
+  indexStreamLeasesForRecovery,
   installStreamLeaseListener,
   onRemoteStreamLeasesExpired,
   onRemoteStreamOwnershipReleased,
@@ -123,6 +124,41 @@ class TestStreamLockManager {
 }
 
 describe('stream leases', () => {
+  it('indexes the orphan-recovery lease snapshot in one pass', () => {
+    let messageIdReads = 0
+    const leases = Array.from({ length: 256 }, (_, index) => {
+      const messageId = index % 4 === 0 ? undefined : `M-${index % 16}`
+      return Object.defineProperty(
+        {
+          streamId: `S-${index}`,
+          chatId: `C-${index % 8}`,
+          ownerClientId: 'owner',
+          startedAt: 1,
+          heartbeatAt: 1,
+          attemptKind: index % 2 === 0 ? 'generation' : 'continuation',
+        } satisfies StreamLeaseRow,
+        'messageId',
+        {
+          enumerable: true,
+          get: () => {
+            messageIdReads += 1
+            return messageId
+          },
+        },
+      )
+    })
+
+    const indexed = indexStreamLeasesForRecovery(leases)
+
+    expect(messageIdReads).toBe(leases.length)
+    expect(indexed.byMessageId.get('M-1')).toHaveLength(16)
+    expect(indexed.byMessageId.get('M-1')?.[0]?.streamId).toBe('S-1')
+    expect(indexed.byMessageId.get('M-1')?.at(-1)?.streamId).toBe('S-241')
+    expect(
+      [...(indexed.messageLessGenerationByChatId.get('C-0') ?? [])].map((lease) => lease.streamId),
+    ).toHaveLength(32)
+  })
+
   it('awaits message-less admission and retargets the same owned lease', async () => {
     const manager = new TestStreamLockManager()
     __setStreamLockManagerForTests(manager)
@@ -1136,6 +1172,29 @@ describe('stream leases', () => {
 
     expect(deleteAttempts).toBe(2)
     expect(manager.isHeld('stream-owner:S-delete-retry')).toBe(false)
+  })
+
+  it('reports a permanent owned-lease deletion failure after releasing ownership', async () => {
+    const manager = new TestStreamLockManager()
+    __setStreamLockManagerForTests(manager)
+    const deleteError = new Error('persistent delete failure')
+    let deleteAttempts = 0
+    __setWorkspaceRepositoryForTests({
+      upsertStreamLease: async (lease: StreamLeaseRow) => persistedLease(lease),
+      renewStreamLease: async (lease: StreamLeaseRow) => persistedLease(lease),
+      deleteStreamLease: async () => true,
+      deleteOwnedStreamLease: async () => {
+        deleteAttempts += 1
+        throw deleteError
+      },
+    } as unknown as WorkspaceRepository)
+    await startStreamLease(leaseInput('S-delete-failure'))
+
+    await expect(stopStreamLease('S-delete-failure')).rejects.toBe(deleteError)
+    await __flushStreamOwnershipForTests()
+
+    expect(deleteAttempts).toBe(2)
+    expect(manager.isHeld('stream-owner:S-delete-failure')).toBe(false)
   })
 
   it('coalesces timer ticks while a heartbeat write is pending', async () => {

@@ -27,6 +27,7 @@ const navigationIntentBrand: unique symbol = Symbol('NavigationIntent')
 const navigationAuthority: unique symbol = Symbol('NavigationAuthority')
 const committedPathProducerBrand: unique symbol = Symbol('CommittedPathProducer')
 const committedPresentationFocusBrand: unique symbol = Symbol('CommittedPresentationFocus')
+const committedPresentationWorkspaceBrand: unique symbol = Symbol('CommittedPresentationWorkspace')
 
 export interface NavigationIntent {
   readonly chatId: ChatId
@@ -44,6 +45,10 @@ export interface CommittedPathProducer {
 export interface CommittedPresentationFocus {
   readonly chatId: ChatId
   readonly [committedPresentationFocusBrand]: true
+}
+
+export interface CommittedPresentationWorkspace {
+  readonly [committedPresentationWorkspaceBrand]: true
 }
 
 export interface PendingBranchNavigation {
@@ -84,17 +89,30 @@ interface TabBranchState {
 
 interface ChatStoreState {
   publication: number
-  getDebugStats: () => { chatCursorCount: number; cursorEntryCount: number }
+  getDebugStats: () => {
+    chatCursorCount: number
+    cursorEntryCount: number
+    presentationWindowScopeCount: number
+  }
   getCursor: (chatId: ChatId) => Readonly<CursorMap> | undefined
   getNavigationRevision: (chatId: ChatId) => string
   getPendingBranchNavigation: (chatId: ChatId) => PendingBranchNavigation | undefined
   getCommittedPathPresentation: (chatId: ChatId) => CommittedPathPresentationReceipt | undefined
+  getCommittedMessagePresentations: (
+    chatId: ChatId,
+  ) => readonly CommittedMessagePresentationReceipt[]
   getCommittedMessagePresentation: (
     chatId: ChatId,
+    messageId: MessageId,
   ) => CommittedMessagePresentationReceipt | undefined
   beginCommittedPresentationFocus: (chatId: ChatId) => CommittedPresentationFocus
+  setCommittedPresentationFocusMessage: (
+    focus: CommittedPresentationFocus,
+    messageId: MessageId | null,
+  ) => void
   endCommittedPresentationFocus: (focus: CommittedPresentationFocus) => void
   setCommittedPresentationWindowLimit: (chatId: ChatId, limit: number) => void
+  clearCommittedPresentationWindowLimit: (chatId: ChatId, expectedLimit: number) => boolean
   isNavigationIntentCurrent: (intent: NavigationIntent) => boolean
   beginNavigationIntent: (chatId: ChatId) => NavigationIntent
   navigateToCursor: (chatId: ChatId, cursor: Readonly<CursorMap>) => NavigationIntent
@@ -138,7 +156,13 @@ interface ChatStoreState {
     chatId: ChatId,
     selectedPathHeaders: readonly MessageHeaderRow[],
     presentation: CommittedMessagePresentation,
+    workspace?: CommittedPresentationWorkspace,
   ) => boolean
+  publishCommittedMessageBatch: (
+    chatId: ChatId,
+    presentations: readonly CommittedMessagePresentation[],
+    workspace?: CommittedPresentationWorkspace,
+  ) => number
   sealCommittedPathProducer: (chatId: ChatId, producer: CommittedPathProducer) => boolean
   acknowledgePendingBranchNavigation: (chatId: ChatId, pending: PendingBranchNavigation) => void
   acknowledgeCommittedPathPresentation: (
@@ -149,31 +173,63 @@ interface ChatStoreState {
     chatId: ChatId,
     receipt: CommittedMessagePresentationReceipt,
   ) => void
+  acknowledgeCommittedMessagePresentations: (
+    chatId: ChatId,
+    receipts: readonly CommittedMessagePresentationReceipt[],
+  ) => number
   clearCursor: (chatId: ChatId) => void
   resetForWorkspaceReplacement: () => void
   reset: () => void
 }
 
 const branches = new Map<ChatId, TabBranchState>()
-const committedPresentationWindowLimits = new Map<ChatId, number>()
+let committedPresentationWindowScope: { chatId: ChatId; limit: number } | null = null
 interface CommittedPathPresentationState {
   readonly receipt: CommittedPathPresentationReceipt
   readonly producer: CommittedPathProducer | null
 }
 
 const committedPathPresentations = new Map<ChatId, CommittedPathPresentationState>()
-const committedMessagePresentations = new Map<ChatId, CommittedMessagePresentationReceipt>()
+interface CommittedMessagePresentationBucket {
+  readonly byMessageId: Map<MessageId, CommittedMessagePresentationReceipt>
+  snapshot: readonly CommittedMessagePresentationReceipt[]
+}
+
+const committedMessagePresentations = new Map<ChatId, CommittedMessagePresentationBucket>()
 const committedBodyRetention = new Map<ChatId, true>()
 const pendingCommittedPathProducers = new Map<ChatId, CommittedPathProducer>()
 const consumedCommittedPathIntents = new WeakSet<NavigationIntent>()
 const DEFAULT_COMMITTED_PRESENTATION_WINDOW = 10
 const MAX_COMMITTED_BODY_CHATS = 8
 const EMPTY_COMMITTED_PRESENTATIONS = Object.freeze([]) as readonly CommittedMessagePresentation[]
+const EMPTY_COMMITTED_MESSAGE_RECEIPTS = Object.freeze(
+  [],
+) as readonly CommittedMessagePresentationReceipt[]
 let committedPresentationFocus: CommittedPresentationFocus | null = null
+let committedPresentationFocusMessageId: MessageId | null = null
+let committedPresentationWorkspace: CommittedPresentationWorkspace = Object.freeze({
+  [committedPresentationWorkspaceBrand]: true as const,
+})
+
+function committedPresentationWindowLimit(chatId: ChatId): number {
+  return committedPresentationWindowScope?.chatId === chatId
+    ? committedPresentationWindowScope.limit
+    : DEFAULT_COMMITTED_PRESENTATION_WINDOW
+}
+
+export function claimCommittedPresentationWorkspace(): CommittedPresentationWorkspace {
+  return committedPresentationWorkspace
+}
+
+function replaceCommittedPresentationWorkspace(): void {
+  committedPresentationWorkspace = Object.freeze({
+    [committedPresentationWorkspaceBrand]: true as const,
+  })
+}
 
 function chatHasCommittedBodies(chatId: ChatId): boolean {
   return (
-    committedMessagePresentations.has(chatId) ||
+    (committedMessagePresentations.get(chatId)?.byMessageId.size ?? 0) > 0 ||
     (committedPathPresentations.get(chatId)?.receipt.presentations.length ?? 0) > 0
   )
 }
@@ -224,9 +280,72 @@ function retainCommittedMessagePresentation(
   chatId: ChatId,
   receipt: CommittedMessagePresentationReceipt,
 ): void {
-  committedMessagePresentations.delete(chatId)
-  committedMessagePresentations.set(chatId, receipt)
+  retainCommittedMessagePresentations(chatId, [receipt])
+}
+
+function retainCommittedMessagePresentations(
+  chatId: ChatId,
+  receipts: readonly CommittedMessagePresentationReceipt[],
+): void {
+  const bucket = committedMessagePresentations.get(chatId) ?? {
+    byMessageId: new Map<MessageId, CommittedMessagePresentationReceipt>(),
+    snapshot: EMPTY_COMMITTED_MESSAGE_RECEIPTS,
+  }
+  const limit = committedPresentationWindowLimit(chatId)
+  for (const receipt of receipts) {
+    const messageId = receipt.presentation.message.id
+    bucket.byMessageId.delete(messageId)
+    bucket.byMessageId.set(messageId, receipt)
+  }
+  trimCommittedMessagePresentations(chatId, bucket, limit)
+  bucket.snapshot = Object.freeze([...bucket.byMessageId.values()])
+  committedMessagePresentations.set(chatId, bucket)
   reconcileCommittedBodyRetention(chatId, true)
+}
+
+function trimCommittedMessagePresentations(
+  chatId: ChatId,
+  bucket: CommittedMessagePresentationBucket,
+  limit: number,
+): boolean {
+  const focusedMessageId =
+    committedPresentationFocus?.chatId === chatId ? committedPresentationFocusMessageId : null
+  const focusedReceiptRetained =
+    focusedMessageId !== null && bucket.byMessageId.has(focusedMessageId)
+  const capacity = limit + (focusedReceiptRetained ? 1 : 0)
+  let changed = false
+  while (bucket.byMessageId.size > capacity) {
+    let evicted = false
+    for (const messageId of bucket.byMessageId.keys()) {
+      if (focusedReceiptRetained && messageId === focusedMessageId) continue
+      bucket.byMessageId.delete(messageId)
+      changed = true
+      evicted = true
+      break
+    }
+    if (!evicted) break
+  }
+  return changed
+}
+
+function removeCommittedMessagePresentations(
+  chatId: ChatId,
+  receipts: readonly CommittedMessagePresentationReceipt[],
+): number {
+  const bucket = committedMessagePresentations.get(chatId)
+  if (!bucket) return 0
+  let removed = 0
+  for (const receipt of receipts) {
+    if (receipt.chatId !== chatId) continue
+    const messageId = receipt.presentation.message.id
+    if (bucket.byMessageId.get(messageId) !== receipt) continue
+    bucket.byMessageId.delete(messageId)
+    removed += 1
+  }
+  if (removed === 0) return 0
+  if (bucket.byMessageId.size === 0) committedMessagePresentations.delete(chatId)
+  else bucket.snapshot = Object.freeze([...bucket.byMessageId.values()])
+  return removed
 }
 
 function clearCommittedPathPresentation(chatId: ChatId): void {
@@ -335,8 +454,7 @@ function ownedCommittedPathPresentation(
   input: CommittedPathPresentationInput,
   previous: CommittedPathPresentationReceipt | null,
 ): CommittedPathPresentationReceipt {
-  const presentationWindowLimit =
-    committedPresentationWindowLimits.get(chatId) ?? DEFAULT_COMMITTED_PRESENTATION_WINDOW
+  const presentationWindowLimit = committedPresentationWindowLimit(chatId)
   const retainedIds = new Set(
     input.pathHeaders.slice(-presentationWindowLimit).map((header) => header.id),
   )
@@ -378,6 +496,31 @@ function ownedCommittedPathPresentation(
     structuralHeaders: Object.freeze(structuralHeaders),
     presentations: Object.freeze(presentations),
   })
+}
+
+function trimCommittedPresentationBodies(chatId: ChatId, limit: number): boolean {
+  let changed = false
+  const committedMessages = committedMessagePresentations.get(chatId)
+  if (committedMessages && trimCommittedMessagePresentations(chatId, committedMessages, limit)) {
+    committedMessages.snapshot = Object.freeze([...committedMessages.byMessageId.values()])
+    changed = true
+  }
+  const committed = committedPathPresentations.get(chatId)
+  if (!committed) return changed
+  const { receipt } = committed
+  const retainedIds = new Set(receipt.pathHeaders.slice(-limit).map((header) => header.id))
+  if (receipt.presentations.every((presentation) => retainedIds.has(presentation.message.id))) {
+    return changed
+  }
+  committedPathPresentations.set(
+    chatId,
+    Object.freeze({
+      receipt: ownedCommittedPathPresentation(chatId, receipt.revision, receipt, receipt),
+      producer: committed.producer,
+    }),
+  )
+  reconcileCommittedBodyRetention(chatId, false)
+  return true
 }
 
 function ownedCursor(cursor: Readonly<CursorMap>): Readonly<CursorMap> {
@@ -764,6 +907,16 @@ function selectedBranchState(
 
 export const useChatStore = create<ChatStoreState>((set) => {
   const publish = () => set((state) => ({ publication: state.publication + 1 }))
+  const acknowledgeCommittedMessagePresentations = (
+    chatId: ChatId,
+    receipts: readonly CommittedMessagePresentationReceipt[],
+  ): number => {
+    const removed = removeCommittedMessagePresentations(chatId, receipts)
+    if (removed === 0) return 0
+    reconcileCommittedBodyRetention(chatId, false)
+    publish()
+    return removed
+  }
 
   return {
     publication: 0,
@@ -772,7 +925,11 @@ export const useChatStore = create<ChatStoreState>((set) => {
       for (const branch of branches.values()) {
         cursorEntryCount += persistentCursorSize(branch.cursor)
       }
-      return { chatCursorCount: branches.size, cursorEntryCount }
+      return {
+        chatCursorCount: branches.size,
+        cursorEntryCount,
+        presentationWindowScopeCount: committedPresentationWindowScope ? 1 : 0,
+      }
     },
     getCursor: (chatId) => branches.get(chatId)?.cursor,
     getNavigationRevision: (chatId) => branches.get(chatId)?.revision ?? '0',
@@ -792,38 +949,51 @@ export const useChatStore = create<ChatStoreState>((set) => {
         ? receipt
         : undefined
     },
-    getCommittedMessagePresentation: (chatId) => committedMessagePresentations.get(chatId),
+    getCommittedMessagePresentations: (chatId) =>
+      committedMessagePresentations.get(chatId)?.snapshot ?? EMPTY_COMMITTED_MESSAGE_RECEIPTS,
+    getCommittedMessagePresentation: (chatId, messageId) => {
+      return committedMessagePresentations.get(chatId)?.byMessageId.get(messageId)
+    },
     beginCommittedPresentationFocus: (chatId) => {
       const focus = Object.freeze({
         chatId,
         [committedPresentationFocusBrand]: true as const,
       })
       committedPresentationFocus = focus
+      committedPresentationFocusMessageId = null
       return focus
     },
+    setCommittedPresentationFocusMessage: (focus, messageId) => {
+      if (committedPresentationFocus === focus) committedPresentationFocusMessageId = messageId
+    },
     endCommittedPresentationFocus: (focus) => {
-      if (committedPresentationFocus === focus) committedPresentationFocus = null
+      if (committedPresentationFocus !== focus) return
+      committedPresentationFocus = null
+      committedPresentationFocusMessageId = null
     },
     setCommittedPresentationWindowLimit: (chatId, limit) => {
       const normalized = Math.max(1, Math.floor(limit))
-      if (committedPresentationWindowLimits.get(chatId) === normalized) return
-      committedPresentationWindowLimits.set(chatId, normalized)
-      const committed = committedPathPresentations.get(chatId)
-      if (!committed) return
-      const { receipt } = committed
-      const retainedIds = new Set(receipt.pathHeaders.slice(-normalized).map((header) => header.id))
-      if (receipt.presentations.every((presentation) => retainedIds.has(presentation.message.id))) {
-        return
+      const previous = committedPresentationWindowScope
+      if (previous?.chatId === chatId && previous.limit === normalized) return
+      committedPresentationWindowScope = { chatId, limit: normalized }
+      const changedPrevious =
+        previous && previous.chatId !== chatId
+          ? trimCommittedPresentationBodies(previous.chatId, DEFAULT_COMMITTED_PRESENTATION_WINDOW)
+          : false
+      const changedCurrent = trimCommittedPresentationBodies(chatId, normalized)
+      if (changedPrevious || changedCurrent) publish()
+    },
+    clearCommittedPresentationWindowLimit: (chatId, expectedLimit) => {
+      const normalized = Math.max(1, Math.floor(expectedLimit))
+      if (
+        committedPresentationWindowScope?.chatId !== chatId ||
+        committedPresentationWindowScope.limit !== normalized
+      ) {
+        return false
       }
-      committedPathPresentations.set(
-        chatId,
-        Object.freeze({
-          receipt: ownedCommittedPathPresentation(chatId, receipt.revision, receipt, receipt),
-          producer: committed.producer,
-        }),
-      )
-      reconcileCommittedBodyRetention(chatId, false)
-      publish()
+      committedPresentationWindowScope = null
+      if (trimCommittedPresentationBodies(chatId, DEFAULT_COMMITTED_PRESENTATION_WINDOW)) publish()
+      return true
     },
     isNavigationIntentCurrent: (intent) => isCurrent(intent.chatId, intent),
     beginNavigationIntent: (chatId) => {
@@ -1059,9 +1229,29 @@ export const useChatStore = create<ChatStoreState>((set) => {
       publish()
       return true
     },
-    publishCommittedMessageMutation: (chatId, selectedPathHeaders, presentation) => {
+    publishCommittedMessageMutation: (chatId, selectedPathHeaders, presentation, workspace) => {
+      if (workspace && workspace !== committedPresentationWorkspace) return false
       if (!validCommittedMessagePresentation(chatId, presentation)) return false
-      const previousLocalPresentation = committedMessagePresentations.get(chatId)?.presentation
+      const previousPathReceipt = committedPathPresentations.get(chatId)?.receipt
+      const previousPathHeader = previousPathReceipt?.structuralHeaders.find(
+        (header) => header.id === presentation.message.id,
+      )
+      const previousPathPresentation = previousPathReceipt?.presentations.find(
+        (candidate) => candidate.message.id === presentation.message.id,
+      )
+      if (
+        (previousPathHeader &&
+          (presentation.header.nodeVersion < previousPathHeader.nodeVersion ||
+            presentation.bodyVersion < previousPathHeader.bodyVersion)) ||
+        (previousPathPresentation &&
+          presentation.header.nodeVersion <= previousPathPresentation.header.nodeVersion &&
+          presentation.bodyVersion <= previousPathPresentation.bodyVersion)
+      ) {
+        return false
+      }
+      const previousLocalPresentation = committedMessagePresentations
+        .get(chatId)
+        ?.byMessageId.get(presentation.message.id)?.presentation
       if (
         previousLocalPresentation?.message.id === presentation.message.id &&
         (presentation.header.nodeVersion < previousLocalPresentation.header.nodeVersion ||
@@ -1085,10 +1275,10 @@ export const useChatStore = create<ChatStoreState>((set) => {
             candidate.bodyVersion === presentation.bodyVersion,
         )
         if (pathCoversBody) {
-          const generic = committedMessagePresentations.get(chatId)
-          if (generic?.presentation.message.id === presentation.message.id) {
-            committedMessagePresentations.delete(chatId)
-          }
+          const generic = committedMessagePresentations
+            .get(chatId)
+            ?.byMessageId.get(presentation.message.id)
+          if (generic) removeCommittedMessagePresentations(chatId, [generic])
           reconcileCommittedBodyRetention(chatId, true)
         } else {
           retainCommittedMessagePresentation(
@@ -1187,6 +1377,27 @@ export const useChatStore = create<ChatStoreState>((set) => {
       )
       return publishPathPresentation()
     },
+    publishCommittedMessageBatch: (chatId, presentations, workspace) => {
+      if (workspace && workspace !== committedPresentationWorkspace) return 0
+      const accepted: CommittedMessagePresentationReceipt[] = []
+      const bucket = committedMessagePresentations.get(chatId)
+      for (const presentation of presentations) {
+        if (!validCommittedMessagePresentation(chatId, presentation)) continue
+        const previous = bucket?.byMessageId.get(presentation.message.id)?.presentation
+        if (
+          previous &&
+          (presentation.header.nodeVersion < previous.header.nodeVersion ||
+            presentation.bodyVersion < previous.bodyVersion)
+        ) {
+          continue
+        }
+        accepted.push(ownedMessagePresentationReceipt(chatId, presentation))
+      }
+      if (accepted.length === 0) return 0
+      retainCommittedMessagePresentations(chatId, accepted)
+      publish()
+      return accepted.length
+    },
     sealCommittedPathProducer: (chatId, producer) => {
       if (pendingCommittedPathProducers.get(chatId) === producer) {
         pendingCommittedPathProducers.delete(chatId)
@@ -1241,15 +1452,17 @@ export const useChatStore = create<ChatStoreState>((set) => {
       publish()
     },
     acknowledgeCommittedMessagePresentation: (chatId, receipt) => {
-      if (committedMessagePresentations.get(chatId) !== receipt || receipt.chatId !== chatId) return
-      committedMessagePresentations.delete(chatId)
-      reconcileCommittedBodyRetention(chatId, false)
-      publish()
+      acknowledgeCommittedMessagePresentations(chatId, [receipt])
     },
+    acknowledgeCommittedMessagePresentations,
     clearCursor: (chatId) => {
       const current = branches.get(chatId)
+      if (committedPresentationFocus?.chatId === chatId) {
+        committedPresentationFocusMessageId = null
+      }
       const hadBranch = branches.delete(chatId)
-      const hadPresentationLimit = committedPresentationWindowLimits.delete(chatId)
+      const hadPresentationLimit = committedPresentationWindowScope?.chatId === chatId
+      if (hadPresentationLimit) committedPresentationWindowScope = null
       const hadCommittedPresentation = committedPathPresentations.delete(chatId)
       const hadCommittedMessagePresentation = committedMessagePresentations.delete(chatId)
       committedBodyRetention.delete(chatId)
@@ -1269,22 +1482,26 @@ export const useChatStore = create<ChatStoreState>((set) => {
       publish()
     },
     resetForWorkspaceReplacement: () => {
+      replaceCommittedPresentationWorkspace()
       branches.clear()
-      committedPresentationWindowLimits.clear()
+      committedPresentationWindowScope = null
       committedPathPresentations.clear()
       committedMessagePresentations.clear()
       committedBodyRetention.clear()
       pendingCommittedPathProducers.clear()
+      committedPresentationFocusMessageId = null
       publish()
     },
     reset: () => {
+      replaceCommittedPresentationWorkspace()
       branches.clear()
-      committedPresentationWindowLimits.clear()
+      committedPresentationWindowScope = null
       committedPathPresentations.clear()
       committedMessagePresentations.clear()
       committedBodyRetention.clear()
       pendingCommittedPathProducers.clear()
       committedPresentationFocus = null
+      committedPresentationFocusMessageId = null
       invalidateTabNavigation()
       publish()
     },

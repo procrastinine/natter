@@ -122,6 +122,7 @@ import {
   type MutationContext,
   type StreamLeaseRow,
   type StreamWriteFence,
+  streamLeaseOwnsTargetWrites,
 } from '../store/repository'
 import {
   assertSendContextGuardInMutation,
@@ -135,9 +136,12 @@ import { createStreamChunkWriter } from '../store/stream-chunk-writer'
 import {
   announceStreamEnded,
   getStreamClientId,
+  indexStreamLeasesForRecovery,
   isFreshStreamLease,
   isRecoveryClaimedStreamLease,
+  newestStreamLeaseByAdmission,
   STREAM_LEASE_TTL_MS,
+  streamLeaseRecoveryKind,
   streamOwnershipLocksSupported,
   streamWriteFenceForLease,
   withStreamRecoveryLocks,
@@ -149,7 +153,7 @@ import type {
   CommittedPathProducer,
   NavigationIntent,
 } from '../store/zustand/chatStore'
-import { useChatStore } from '../store/zustand/chatStore'
+import { claimCommittedPresentationWorkspace, useChatStore } from '../store/zustand/chatStore'
 import { useStreamStore } from '../store/zustand/streamStore'
 import { useUiStore } from '../store/zustand/uiStore'
 import { startRequestLifecycle } from './requestLifecycle'
@@ -358,6 +362,7 @@ export async function sendText(input: SendTextInput): Promise<SendTextResult> {
     : null
   const cursorAtSubmit = chatStore.getCursor(input.chatId) ?? {}
   let lifecycle: Awaited<ReturnType<typeof startRequestLifecycle>> | undefined
+  let lifecycleOutcome: SendTextResult['outcome'] = 'error'
   try {
     const expectedLeafId =
       input.expectedLeafId !== undefined
@@ -468,6 +473,7 @@ export async function sendText(input: SendTextInput): Promise<SendTextResult> {
       ...input,
       signal: lifecycle.signal,
       lifecyclePreserveLease: lifecycle.preserveLease,
+      lifecycleAbort: lifecycle.abort,
       lifecyclePublishTarget: lifecycle.publishTarget,
       lifecycleRefreshLease: lifecycle.refreshLease,
       streamId: lifecycle.streamId,
@@ -495,14 +501,32 @@ export async function sendText(input: SendTextInput): Promise<SendTextResult> {
     plannedPath = []
     sendContext = undefined
     planningChat = undefined
-    return await requested
+    const result = await requested
+    lifecycleOutcome = result.outcome
+    return result
   } catch (error) {
     if (committedPathProducer) {
       useChatStore.getState().sealCommittedPathProducer(input.chatId, committedPathProducer)
     }
     throw error
   } finally {
-    if (lifecycle) await lifecycle.end(lifecycle.signal.aborted ? 'abort' : 'error')
+    if (lifecycle) {
+      if (lifecycle.signal.aborted) lifecycleOutcome = 'abort'
+      const ended = await lifecycle.end(lifecycleOutcome)
+      if (ended.recoveryPending) {
+        await recoverStreamOrphan(
+          {
+            chatId: input.chatId,
+            streamId: lifecycle.streamId,
+            ...(lifecycle.messageId ? { messageId: lifecycle.messageId } : {}),
+            attemptKind: 'generation',
+            replacementEpoch: lifecycle.replacementEpoch,
+            outcome: lifecycleOutcome,
+          },
+          Date.now(),
+        ).catch(() => {})
+      }
+    }
   }
 }
 
@@ -522,6 +546,7 @@ export async function sendFromMessage(input: SendFromMessageInput): Promise<Send
       : input.committedPathProducer
     : null
   let lifecycle: Awaited<ReturnType<typeof startRequestLifecycle>> | undefined
+  let lifecycleOutcome: SendTextResult['outcome'] = 'error'
   try {
     const assistantMessageId = newId()
     lifecycle = await startRequestLifecycle({
@@ -617,6 +642,7 @@ export async function sendFromMessage(input: SendFromMessageInput): Promise<Send
       ...input,
       signal: lifecycle.signal,
       lifecyclePreserveLease: lifecycle.preserveLease,
+      lifecycleAbort: lifecycle.abort,
       lifecyclePublishTarget: lifecycle.publishTarget,
       lifecycleRefreshLease: lifecycle.refreshLease,
       streamId: lifecycle.streamId,
@@ -638,14 +664,32 @@ export async function sendFromMessage(input: SendFromMessageInput): Promise<Send
     plannedPath = []
     sendContext = undefined
     chat = undefined
-    return await requested
+    const result = await requested
+    lifecycleOutcome = result.outcome
+    return result
   } catch (error) {
     if (committedPathProducer) {
       useChatStore.getState().sealCommittedPathProducer(input.chatId, committedPathProducer)
     }
     throw error
   } finally {
-    if (lifecycle) await lifecycle.end(lifecycle.signal.aborted ? 'abort' : 'error')
+    if (lifecycle) {
+      if (lifecycle.signal.aborted) lifecycleOutcome = 'abort'
+      const ended = await lifecycle.end(lifecycleOutcome)
+      if (ended.recoveryPending) {
+        await recoverStreamOrphan(
+          {
+            chatId: input.chatId,
+            streamId: lifecycle.streamId,
+            ...(lifecycle.messageId ? { messageId: lifecycle.messageId } : {}),
+            attemptKind: 'generation',
+            replacementEpoch: lifecycle.replacementEpoch,
+            outcome: lifecycleOutcome,
+          },
+          Date.now(),
+        ).catch(() => {})
+      }
+    }
   }
 }
 
@@ -663,7 +707,8 @@ async function openAssistantStreamUnder(
     assistantMessageId: MessageId
     initialAssistantContent?: ContentItem[]
     signal: AbortSignal
-    lifecyclePreserveLease: () => void
+    lifecyclePreserveLease: (reason?: 'content' | 'cleanup') => void
+    lifecycleAbort: () => void
     lifecyclePublishTarget: () => void
     lifecycleRefreshLease: () => Promise<void>
     requireEmptyParent?: boolean
@@ -851,6 +896,12 @@ async function openAssistantStreamUnder(
     errorPolicy: SEND_GENERATION_ATTEMPT_ERROR_POLICY,
     now,
     isAborted: () => input.signal.aborted,
+    registerLiveProjectionRequester: (requester) => {
+      useStreamStore
+        .getState()
+        .setLiveSnapshotRequester(streamId, streamFence.replacementEpoch, requester)
+    },
+    onLiveProjectionFailure: input.lifecycleAbort,
     prepareLive: ({ accumulator: current, now: publishedAt }) =>
       prepareLiveSnapshot({
         chatId: input.chatId,
@@ -899,20 +950,20 @@ async function openAssistantStreamUnder(
         now: now(),
         ...(calibrationInputs ? { calibrationInputs } : {}),
         ...(streamDebugEnabled(input.connection) ? { debugScope } : {}),
-        ...(committedPathProducer
-          ? {
-              onCommittedPresentation: (presentation: CommittedMessagePresentation) => {
-                useChatStore
-                  .getState()
-                  .updateCommittedMessageForProducer(
-                    input.chatId,
-                    committedPathProducer,
-                    presentation,
-                    'terminal',
-                  )
-              },
-            }
-          : {}),
+        onCommittedPresentation: (presentation: CommittedMessagePresentation) => {
+          const store = useChatStore.getState()
+          const publishedForProducer = committedPathProducer
+            ? store.updateCommittedMessageForProducer(
+                input.chatId,
+                committedPathProducer,
+                presentation,
+                'terminal',
+              )
+            : false
+          if (!publishedForProducer) {
+            store.publishCommittedMessageMutation(input.chatId, selectedPathHeaders, presentation)
+          }
+        },
         onPostCommitPresentation: (presentation: CommittedMessagePresentation) => {
           useChatStore
             .getState()
@@ -924,26 +975,12 @@ async function openAssistantStreamUnder(
     onCanonicalCommitted: (result) => {
       canonicalAnnounced = true
       announceGenerationOutcome(streamId, result.outcome)
-      announceStreamEnded({
-        chatId: input.chatId,
-        streamId,
-        messageId: assistantId,
-        outcome: result.outcome,
-        replacementEpoch: streamFence.replacementEpoch,
-      })
     },
     cleanupJournal: () => repo.deleteStreamChunks(streamId, streamFence),
     cleanup: (result) => {
-      if (result.journalCleanupPending) input.lifecyclePreserveLease()
+      if (result.journalCleanupPending) input.lifecyclePreserveLease('cleanup')
       if (!canonicalAnnounced) {
         announceGenerationOutcome(streamId, result.outcome)
-        announceStreamEnded({
-          chatId: input.chatId,
-          streamId,
-          messageId: assistantId,
-          outcome: result.outcome,
-          replacementEpoch: streamFence.replacementEpoch,
-        })
       }
     },
   }).catch((err) => {
@@ -1100,6 +1137,7 @@ function prepareLiveSnapshot(ctx: {
   apiUsed: GenerationMeta['apiUsed']
   now: number
 }): (() => void) | undefined {
+  if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return undefined
   if (useUiStore.getState().activeChatId !== ctx.chatId) return undefined
   const preparedCursor = useChatStore.getState().getCursor(ctx.chatId)
   if (!ctx.pathGuard.matches(preparedCursor)) return undefined
@@ -1109,9 +1147,10 @@ function prepareLiveSnapshot(ctx: {
     now: ctx.now,
   })
   return () => {
-    if (useUiStore.getState().activeChatId !== ctx.chatId) return
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return false
+    if (useUiStore.getState().activeChatId !== ctx.chatId) return false
     const cursor = useChatStore.getState().getCursor(ctx.chatId)
-    if (!ctx.pathGuard.matches(cursor)) return
+    if (!ctx.pathGuard.matches(cursor)) return false
     useStreamStore.getState().setLiveSnapshot({
       streamId: ctx.streamId,
       chatId: ctx.chatId,
@@ -1119,6 +1158,7 @@ function prepareLiveSnapshot(ctx: {
       replacementEpoch: ctx.replacementEpoch,
       ...projection,
     })
+    return true
   }
 }
 
@@ -1571,12 +1611,151 @@ async function calibrateCommittedAssistant(args: {
 // whose `generation.startedAt` is set without a `finishedAt` is marked
 // `abortReason: 'tab-close'` so the UI can render the "Stream interrupted"
 // banner.
-export async function recoverOrphans(now = Date.now(), chatId?: ChatId): Promise<number> {
+export interface OrphanRecoveryPoint {
+  chatId: ChatId
+  streamId: string
+  messageId?: MessageId
+  attemptKind?: 'generation' | 'continuation'
+  replacementEpoch?: number
+  outcome?: 'done' | 'error' | 'abort'
+}
+
+export async function recoverStreamOrphan(
+  point: OrphanRecoveryPoint,
+  now = Date.now(),
+): Promise<'recovered' | 'retry' | 'deferred' | 'resolved'> {
+  const repo = getWorkspaceRepository()
+  const replacementEpoch = (await repo.getWorkspaceMeta()).replacementEpoch
+  if (point.replacementEpoch !== undefined && point.replacementEpoch !== replacementEpoch) {
+    return 'resolved'
+  }
+  const recovered = await recoverOrphans(now, point.chatId, point)
+  if (recovered > 0) return 'recovered'
+  const lease = await repo.getStreamLease(point.streamId)
+  if (lease) {
+    if (isLocallyRecoveryPendingStream(point.streamId)) return 'retry'
+    if (isFreshStreamLease(lease, now) && !isRecoveryClaimedStreamLease(lease)) return 'deferred'
+    return 'retry'
+  }
+  if (isLocallyRecoveryPendingStream(point.streamId)) return 'retry'
+  if ((await repo.listStreamChunks(point.streamId)).length > 0) {
+    await repo.deleteStreamJournal(point.streamId, {
+      replacementEpoch,
+      expectedLeaseMissing: true,
+    })
+  }
+  return 'resolved'
+}
+
+export async function recoverOrphans(
+  now = Date.now(),
+  chatId?: ChatId,
+  point?: OrphanRecoveryPoint,
+): Promise<number> {
   const repo = getWorkspaceRepository()
   const recoveryReplacementEpoch = (await repo.getWorkspaceMeta()).replacementEpoch
-  const scopedChat = chatId !== undefined ? await repo.getChat(chatId) : undefined
-  const chats = chatId !== undefined ? (scopedChat ? [scopedChat] : []) : await repo.listChats()
-  const allLeases = await repo.listStreamLeases(chatId)
+  if (
+    point?.replacementEpoch !== undefined &&
+    point.replacementEpoch !== recoveryReplacementEpoch
+  ) {
+    return 0
+  }
+  const presentationWorkspace = claimCommittedPresentationWorkspace()
+  const pointLease = point ? await repo.getStreamLease(point.streamId) : undefined
+  const effectiveMessageId = point?.messageId ?? pointLease?.messageId
+  const effectiveAttemptKind =
+    point?.attemptKind ?? (pointLease ? streamLeaseRecoveryKind(pointLease) : undefined)
+  const effectiveReplacementEpoch = point?.replacementEpoch ?? pointLease?.replacementEpoch
+  const scopedPoint: OrphanRecoveryPoint | undefined = point
+    ? {
+        ...point,
+        ...(effectiveMessageId ? { messageId: effectiveMessageId } : {}),
+        ...(effectiveAttemptKind ? { attemptKind: effectiveAttemptKind } : {}),
+        ...(effectiveReplacementEpoch !== undefined
+          ? { replacementEpoch: effectiveReplacementEpoch }
+          : {}),
+      }
+    : undefined
+  const scopedChatId = chatId ?? scopedPoint?.chatId
+  const scopedChat = scopedChatId !== undefined ? await repo.getChat(scopedChatId) : undefined
+  const scopedPointHeader = scopedPoint?.messageId
+    ? await repo.getMessageHeader(scopedPoint.messageId)
+    : undefined
+  const scopedTargetUnavailable = Boolean(
+    scopedPoint &&
+      (!scopedChat || (scopedPoint.messageId && scopedPointHeader?.chatId !== scopedPoint.chatId)),
+  )
+  if (scopedPoint && scopedTargetUnavailable) {
+    return (await cleanupUnavailableRecoveryGroup({
+      repo,
+      point: scopedPoint,
+      now,
+      replacementEpoch: recoveryReplacementEpoch,
+    }))
+      ? 1
+      : 0
+  }
+  const pointTerminalPresentation =
+    scopedPoint && !pointLease
+      ? await pointCanonicalTerminalPresentation(repo, scopedPoint)
+      : undefined
+  if (scopedPoint && !pointLease && pointTerminalPresentation) {
+    await repo.deleteStreamJournal(scopedPoint.streamId, {
+      replacementEpoch: scopedPoint.replacementEpoch ?? recoveryReplacementEpoch,
+      expectedLeaseMissing: true,
+    })
+    useChatStore
+      .getState()
+      .publishCommittedMessageMutation(
+        scopedPoint.chatId,
+        [],
+        pointTerminalPresentation,
+        presentationWorkspace,
+      )
+    announceStreamEnded({
+      chatId: scopedPoint.chatId,
+      streamId: scopedPoint.streamId,
+      ...(scopedPoint.messageId ? { messageId: scopedPoint.messageId } : {}),
+      outcome: scopedPoint.outcome ?? 'abort',
+      replacementEpoch: scopedPoint.replacementEpoch ?? recoveryReplacementEpoch,
+    })
+    return 1
+  }
+  const pointActive = scopedPoint
+    ? useStreamStore.getState().getActive(scopedPoint.streamId)
+    : undefined
+  if (
+    scopedPoint &&
+    !pointLease &&
+    pointActive &&
+    (pointActive.phase === 'recovery-pending' || pointActive.phase === 'cleanup-pending') &&
+    (pointActive.phase === 'cleanup-pending' ||
+      !scopedPoint.messageId ||
+      !scopedChat ||
+      !scopedPointHeader)
+  ) {
+    await repo.deleteStreamJournal(scopedPoint.streamId, {
+      replacementEpoch: scopedPoint.replacementEpoch ?? recoveryReplacementEpoch,
+      expectedLeaseMissing: true,
+    })
+    announceStreamEnded({
+      chatId: scopedPoint.chatId,
+      streamId: scopedPoint.streamId,
+      outcome: scopedPoint.outcome ?? pointActive.recoveryOutcome ?? 'abort',
+      replacementEpoch: scopedPoint.replacementEpoch ?? recoveryReplacementEpoch,
+    })
+    return 1
+  }
+  const chats =
+    scopedChatId !== undefined ? (scopedChat ? [scopedChat] : []) : await repo.listChats()
+  const allLeases = scopedPoint
+    ? effectiveMessageId
+      ? await repo.listStreamLeasesForMessage(effectiveMessageId)
+      : pointLease
+        ? [pointLease]
+        : []
+    : await repo.listStreamLeases(chatId)
+  const initialLeaseIndex = indexStreamLeasesForRecovery(allLeases)
   const ownershipLocksSupported = streamOwnershipLocksSupported()
   const leases = allLeases.filter((lease) => isFreshStreamLease(lease, now))
   const leasedMessageIds = new Set(
@@ -1585,15 +1764,54 @@ export async function recoverOrphans(now = Date.now(), chatId?: ChatId): Promise
       : leases
           .filter((lease) => lease.messageId !== undefined)
           .filter((lease) => !isRecoveryClaimedStreamLease(lease))
+          .filter((lease) => !isLocallyRecoveryPendingStream(lease.streamId))
           .map((lease) => lease.messageId as MessageId),
   )
   let recovered = 0
-  for (const lease of allLeases) {
+  const recoveredPresentations = new Map<ChatId, CommittedMessagePresentation[]>()
+  const retainRecoveredPresentation = (
+    recoveredChatId: ChatId,
+    presentation: CommittedMessagePresentation,
+  ) => {
+    const presentations = recoveredPresentations.get(recoveredChatId)
+    if (presentations) presentations.push(presentation)
+    else recoveredPresentations.set(recoveredChatId, [presentation])
+  }
+  const finalizedGenerationTargetIds = new Set<MessageId>()
+  if (!scopedTargetUnavailable) {
+    for (const [messageId, messageLeases] of initialLeaseIndex.byMessageId) {
+      if (!messageLeases.some((lease) => streamLeaseRecoveryKind(lease) === 'generation')) continue
+      const header = await repo.getMessageHeader(messageId)
+      if (header?.generation?.finishedAt !== undefined) {
+        finalizedGenerationTargetIds.add(messageId)
+      }
+    }
+  }
+  for (const messageId of finalizedGenerationTargetIds) {
+    const initialLeases = initialLeaseIndex.byMessageId.get(messageId) ?? []
     if (
-      lease.attemptKind !== 'generation' ||
+      await cleanupFinalizedGenerationRecoveryGroup({
+        repo,
+        messageId,
+        initialLeases,
+        now,
+        isTargetActive: isLocallyOwnedTargetActive,
+        isRecoveryPending: isLocallyRecoveryPendingStream,
+        recoveryOutcome: locallyPendingRecoveryOutcome,
+        onRecoveredPresentation: retainRecoveredPresentation,
+      })
+    ) {
+      recovered += 1
+    }
+  }
+  for (const lease of allLeases) {
+    if (lease.messageId && finalizedGenerationTargetIds.has(lease.messageId)) continue
+    if (
+      (!scopedTargetUnavailable && streamLeaseRecoveryKind(lease) !== 'generation') ||
       (isFreshStreamLease(lease, now) &&
         !ownershipLocksSupported &&
-        !isRecoveryClaimedStreamLease(lease)) ||
+        !isRecoveryClaimedStreamLease(lease) &&
+        !isLocallyRecoveryPendingStream(lease.streamId)) ||
       (lease.messageId && isLocallyOwnedTargetActive(lease.chatId, lease.messageId))
     ) {
       continue
@@ -1602,32 +1820,50 @@ export async function recoverOrphans(now = Date.now(), chatId?: ChatId): Promise
       if (lease.messageId && isLocallyOwnedTargetActive(lease.chatId, lease.messageId)) {
         return false
       }
-      const currentLease = (await repo.listStreamLeases(lease.chatId)).find(
-        (candidate) => candidate.streamId === lease.streamId,
-      )
+      const currentLease = await repo.getStreamLease(lease.streamId)
       if (
         !currentLease ||
         (isFreshStreamLease(currentLease, now) &&
           !ownershipVerified &&
-          !isRecoveryClaimedStreamLease(currentLease))
+          !isRecoveryClaimedStreamLease(currentLease) &&
+          !isLocallyRecoveryPendingStream(currentLease.streamId))
       ) {
         return false
       }
-      const header = currentLease.messageId
-        ? await repo.getMessageHeader(currentLease.messageId)
-        : undefined
-      if (header?.generation && header.generation.finishedAt === undefined) return false
+      let finalizedPresentation: CommittedMessagePresentation | undefined
+      if (!scopedTargetUnavailable) {
+        const header = currentLease.messageId
+          ? await repo.getMessageHeader(currentLease.messageId)
+          : undefined
+        if (header?.generation && header.generation.finishedAt === undefined) return false
+        if (header?.generation?.finishedAt !== undefined) {
+          const message = await repo.getMessage(header.id)
+          if (message?.chatId === header.chatId && !message.deleted) {
+            finalizedPresentation = {
+              header,
+              message,
+              bodyVersion: header.bodyVersion,
+            }
+          }
+        }
+      }
       const claimedLease = await repo.claimStreamLeaseForRecovery(currentLease, now)
       if (!claimedLease) return false
-      await repo.deleteStreamChunks(claimedLease.streamId)
-      await repo.deleteStreamLease(claimedLease.streamId)
+      const fence = streamWriteFenceForLease(claimedLease)
+      await repo.deleteStreamJournal(claimedLease.streamId, {
+        replacementEpoch: fence.replacementEpoch,
+        streamFence: fence,
+      })
       announceStreamEnded({
         chatId: claimedLease.chatId,
         streamId: claimedLease.streamId,
         ...(claimedLease.messageId ? { messageId: claimedLease.messageId } : {}),
-        outcome: 'abort',
+        outcome: locallyPendingRecoveryOutcome(claimedLease.streamId) ?? 'abort',
         replacementEpoch: streamWriteFenceForLease(claimedLease).replacementEpoch,
       })
+      if (finalizedPresentation) {
+        retainRecoveredPresentation(claimedLease.chatId, finalizedPresentation)
+      }
       return true
     })
     if (guarded.acquired && guarded.value) recovered += 1
@@ -1637,77 +1873,127 @@ export async function recoverOrphans(now = Date.now(), chatId?: ChatId): Promise
     leases: allLeases,
     now,
     isTargetActive: isLocallyOwnedTargetActive,
+    isRecoveryPending: isLocallyRecoveryPendingStream,
+    recoveryOutcome: locallyPendingRecoveryOutcome,
+    onRecoveredPresentation: retainRecoveredPresentation,
   })
   for (const chat of chats) {
-    const headers = await repo.listMessageHeaders(chat.id)
-    const initialMessageLessGenerationLeases = allLeases.filter(
-      (lease) =>
-        lease.chatId === chat.id &&
-        lease.attemptKind === 'generation' &&
-        lease.messageId === undefined,
+    const pointHeader = scopedPointHeader
+    const headers = scopedPoint
+      ? pointHeader
+        ? [pointHeader]
+        : []
+      : await repo.listMessageHeaders(chat.id)
+    const unfinishedHeaders = headers.filter((header) => {
+      const generation = header.generation
+      return Boolean(
+        generation && generation.finishedAt === undefined && generation.abortReason === undefined,
+      )
+    })
+    if (unfinishedHeaders.length === 0) continue
+    const currentMessageLessGenerationLeases = await repo.listMessageLessGenerationStreamLeases(
+      chat.id,
     )
-    for (const header of headers) {
-      const gen = header.generation
-      if (!gen || gen.finishedAt !== undefined || gen.abortReason !== undefined) continue
-      if (now - gen.startedAt < STREAM_LEASE_TTL_MS && !ownershipLocksSupported) continue
+    if (currentMessageLessGenerationLeases.length > 0) continue
+    for (const header of unfinishedHeaders) {
+      const gen = header.generation as NonNullable<typeof header.generation>
+      const observedTarget = useStreamStore.getState().getTargetActive(chat.id, header.id)
+      const targetRecoveryPending = observedTarget?.phase === 'recovery-pending'
+      if (
+        now - gen.startedAt < STREAM_LEASE_TTL_MS &&
+        !ownershipLocksSupported &&
+        !targetRecoveryPending
+      ) {
+        continue
+      }
       if (isLocallyOwnedTargetActive(chat.id, header.id)) continue
       if (leasedMessageIds.has(header.id)) continue
       const initialChunks = await repo.listStreamChunksForMessage(header.id)
-      const initialMessageLeases = allLeases.filter((lease) => lease.messageId === header.id)
-      const observedTarget = useStreamStore.getState().getTargetActive(chat.id, header.id)
+      const initialMessageLeases = initialLeaseIndex.byMessageId.get(header.id) ?? []
       const guardedStreamIds = new Set([
         ...initialChunks.map((chunk) => chunk.streamId),
         ...initialMessageLeases.map((lease) => lease.streamId),
-        ...initialMessageLessGenerationLeases.map((lease) => lease.streamId),
         ...(observedTarget ? [observedTarget.streamId] : []),
       ])
       const guarded = await withStreamRecoveryLocks(
         [...guardedStreamIds],
         async (ownershipVerified) => {
           if (isLocallyOwnedTargetActive(chat.id, header.id)) return false
-          const currentChatLeases = await repo.listStreamLeases(chat.id)
-          const currentMessageLeases = currentChatLeases.filter(
-            (lease) => lease.messageId === header.id,
-          )
-          const currentMessageLessGenerationLeases = currentChatLeases.filter(
-            (lease) => lease.attemptKind === 'generation' && lease.messageId === undefined,
-          )
+          const currentTargetHeader = await repo.getMessageHeader(header.id)
           if (
-            currentMessageLessGenerationLeases.some(
-              (lease) =>
-                !guardedStreamIds.has(lease.streamId) ||
-                (isFreshStreamLease(lease, now) &&
-                  !ownershipVerified &&
-                  !isRecoveryClaimedStreamLease(lease)),
-            )
+            !currentTargetHeader?.generation ||
+            currentTargetHeader.generation.finishedAt !== undefined ||
+            currentTargetHeader.generation.abortReason !== undefined
           ) {
             return false
           }
+          const currentMessageLeases = await repo.listStreamLeasesForMessage(header.id)
           if (
             currentMessageLeases.some(
               (lease) =>
                 !guardedStreamIds.has(lease.streamId) ||
                 (isFreshStreamLease(lease, now) &&
                   !ownershipVerified &&
-                  !isRecoveryClaimedStreamLease(lease)),
+                  !isRecoveryClaimedStreamLease(lease) &&
+                  !isLocallyRecoveryPendingStream(lease.streamId)),
             )
           ) {
             return false
           }
+          const currentChunks = await repo.listStreamChunksForMessage(header.id)
+          if (currentChunks.some((chunk) => !guardedStreamIds.has(chunk.streamId))) return false
           const claimedLeases: StreamLeaseRow[] = []
-          for (const currentLease of currentMessageLeases) {
+          for (const currentLease of [...currentMessageLeases].sort((left, right) =>
+            left.streamId.localeCompare(right.streamId),
+          )) {
             const claimed = await repo.claimStreamLeaseForRecovery(currentLease, now)
             if (!claimed) return false
             claimedLeases.push(claimed)
           }
-          const primaryClaim = claimedLeases[0]
-          for (const claimed of claimedLeases.slice(1)) {
-            await repo.deleteStreamLease(claimed.streamId)
+          const primaryClaim = newestStreamLeaseByAdmission(
+            claimedLeases.filter((claimed) => streamLeaseRecoveryKind(claimed) === 'generation'),
+          )
+          const claimedLeaseByStreamId = new Map(
+            claimedLeases.map((claimed) => [claimed.streamId, claimed]),
+          )
+          const removedSecondaryLeaseIds = new Set<string>()
+          for (const claimed of claimedLeases) {
+            if (claimed.streamId === primaryClaim?.streamId) continue
+            await repo.deleteOwnedStreamLease(claimed.streamId, streamWriteFenceForLease(claimed))
+            removedSecondaryLeaseIds.add(claimed.streamId)
           }
-          const chunks = await repo.listStreamChunksForMessage(header.id)
-          if (chunks.some((chunk) => !guardedStreamIds.has(chunk.streamId))) return false
-          let wroteCanonical = false
-          await repo.runMutation(
+          const cleanupGroupJournals = async (anchor?: StreamLeaseRow) => {
+            const cleanupStreamIds = [...guardedStreamIds].sort()
+            if (anchor && guardedStreamIds.has(anchor.streamId)) {
+              const anchorIndex = cleanupStreamIds.indexOf(anchor.streamId)
+              cleanupStreamIds.splice(anchorIndex, 1)
+              cleanupStreamIds.push(anchor.streamId)
+            }
+            for (const streamId of cleanupStreamIds) {
+              const claimed = claimedLeaseByStreamId.get(streamId)
+              const claimedFence = claimed ? streamWriteFenceForLease(claimed) : undefined
+              const retainedFence =
+                claimed && !removedSecondaryLeaseIds.has(streamId) ? claimedFence : undefined
+              await repo.deleteStreamJournal(streamId, {
+                replacementEpoch: claimedFence?.replacementEpoch ?? recoveryReplacementEpoch,
+                ...(retainedFence
+                  ? { streamFence: retainedFence }
+                  : { expectedLeaseMissing: true }),
+              })
+              announceStreamEnded({
+                chatId: chat.id,
+                streamId,
+                messageId: header.id,
+                outcome: locallyPendingRecoveryOutcome(streamId) ?? 'abort',
+                replacementEpoch: claimedFence?.replacementEpoch ?? recoveryReplacementEpoch,
+              })
+            }
+          }
+          if (!primaryClaim) await cleanupGroupJournals()
+          const chunks = primaryClaim
+            ? currentChunks.filter((chunk) => chunk.streamId === primaryClaim.streamId)
+            : []
+          const recoveredMutation = await repo.runMutation(
             [{ kind: 'message', messageId: header.id }],
             async (ctx) => {
               const current = await ctx.getMessage(header.id)
@@ -1723,8 +2009,7 @@ export async function recoverOrphans(now = Date.now(), chatId?: ChatId): Promise
                     integrity: current.generation.integrity ?? 'clean',
                   },
                 })
-                wroteCanonical = true
-                return
+                return committedMessagePresentation(ctx, header.id)
               }
               const replayed = replayStreamAccumulator({
                 initialContent: current.content,
@@ -1772,7 +2057,7 @@ export async function recoverOrphans(now = Date.now(), chatId?: ChatId): Promise
                   replaceBody: true,
                 },
               )
-              wroteCanonical = true
+              return committedMessagePresentation(ctx, header.id)
             },
             primaryClaim
               ? {
@@ -1781,26 +2066,255 @@ export async function recoverOrphans(now = Date.now(), chatId?: ChatId): Promise
                     fence: streamWriteFenceForLease(primaryClaim),
                   },
                 }
-              : undefined,
+              : { workspaceFence: { replacementEpoch: recoveryReplacementEpoch } },
           )
-          for (const streamId of guardedStreamIds) {
-            await repo.deleteStreamChunks(streamId)
-            await repo.deleteStreamLease(streamId)
-            announceStreamEnded({
-              chatId: chat.id,
-              streamId,
-              messageId: header.id,
-              outcome: 'abort',
-              replacementEpoch: primaryClaim?.replacementEpoch ?? recoveryReplacementEpoch,
-            })
+          if (recoveredMutation.value) {
+            retainRecoveredPresentation(chat.id, recoveredMutation.value)
           }
-          return wroteCanonical
+          if (primaryClaim) await cleanupGroupJournals(primaryClaim)
+          return recoveredMutation.value !== undefined
         },
       )
       if (guarded.acquired && guarded.value) recovered += 1
     }
   }
+  const chatStore = useChatStore.getState()
+  for (const [recoveredChatId, presentations] of recoveredPresentations) {
+    chatStore.publishCommittedMessageBatch(recoveredChatId, presentations, presentationWorkspace)
+  }
   return recovered
+}
+
+async function cleanupUnavailableRecoveryGroup(args: {
+  repo: ReturnType<typeof getWorkspaceRepository>
+  point: OrphanRecoveryPoint
+  now: number
+  replacementEpoch: number
+}): Promise<boolean> {
+  const { messageId } = args.point
+  const [unfilteredInitialLeases, unfilteredInitialChunks] = await Promise.all([
+    messageId
+      ? args.repo.listStreamLeasesForMessage(messageId)
+      : args.repo.listStreamLeases(args.point.chatId),
+    messageId
+      ? args.repo.listStreamChunksForMessage(messageId)
+      : args.repo.listStreamChunksForChat(args.point.chatId),
+  ])
+  const initialLeases = unfilteredInitialLeases.filter(
+    (lease) => lease.chatId === args.point.chatId,
+  )
+  const initialChunks = unfilteredInitialChunks.filter(
+    (chunk) => chunk.chatId === args.point.chatId,
+  )
+  const guardedStreamIds = new Set([
+    args.point.streamId,
+    ...initialLeases.map((lease) => lease.streamId),
+    ...initialChunks.map((chunk) => chunk.streamId),
+  ])
+  const guarded = await withStreamRecoveryLocks(
+    [...guardedStreamIds],
+    async (ownershipVerified) => {
+      const [currentChat, currentHeader] = await Promise.all([
+        args.repo.getChat(args.point.chatId),
+        messageId ? args.repo.getMessageHeader(messageId) : Promise.resolve(undefined),
+      ])
+      if (currentChat && (!messageId || currentHeader?.chatId === args.point.chatId)) return false
+      const [unfilteredCurrentLeases, unfilteredCurrentChunks] = await Promise.all([
+        messageId
+          ? args.repo.listStreamLeasesForMessage(messageId)
+          : args.repo.listStreamLeases(args.point.chatId),
+        messageId
+          ? args.repo.listStreamChunksForMessage(messageId)
+          : args.repo.listStreamChunksForChat(args.point.chatId),
+      ])
+      const currentLeases = unfilteredCurrentLeases.filter(
+        (lease) => lease.chatId === args.point.chatId,
+      )
+      const currentChunks = unfilteredCurrentChunks.filter(
+        (chunk) => chunk.chatId === args.point.chatId,
+      )
+      if (
+        currentLeases.some(
+          (lease) =>
+            !guardedStreamIds.has(lease.streamId) ||
+            (isFreshStreamLease(lease, args.now) &&
+              !ownershipVerified &&
+              !isRecoveryClaimedStreamLease(lease) &&
+              !isLocallyRecoveryPendingStream(lease.streamId)),
+        ) ||
+        currentChunks.some((chunk) => !guardedStreamIds.has(chunk.streamId))
+      ) {
+        return false
+      }
+      const claimedLeases: StreamLeaseRow[] = []
+      for (const lease of [...currentLeases].sort((left, right) =>
+        left.streamId.localeCompare(right.streamId),
+      )) {
+        const claimed = await args.repo.claimStreamLeaseForRecovery(lease, args.now)
+        if (!claimed) return false
+        claimedLeases.push(claimed)
+      }
+      const claimedByStreamId = new Map(claimedLeases.map((lease) => [lease.streamId, lease]))
+      const cleanupStreamIds = [...guardedStreamIds].sort()
+      const pointIndex = cleanupStreamIds.indexOf(args.point.streamId)
+      cleanupStreamIds.splice(pointIndex, 1)
+      cleanupStreamIds.push(args.point.streamId)
+      for (const streamId of cleanupStreamIds) {
+        const claimed = claimedByStreamId.get(streamId)
+        const fence = claimed ? streamWriteFenceForLease(claimed) : undefined
+        const targetMessageId = claimed?.messageId ?? messageId
+        await args.repo.deleteStreamJournal(streamId, {
+          replacementEpoch: fence?.replacementEpoch ?? args.replacementEpoch,
+          ...(fence ? { streamFence: fence } : { expectedLeaseMissing: true }),
+        })
+        announceStreamEnded({
+          chatId: claimed?.chatId ?? args.point.chatId,
+          streamId,
+          ...(targetMessageId ? { messageId: targetMessageId } : {}),
+          outcome:
+            locallyPendingRecoveryOutcome(streamId) ??
+            (streamId === args.point.streamId ? args.point.outcome : undefined) ??
+            'abort',
+          replacementEpoch: fence?.replacementEpoch ?? args.replacementEpoch,
+        })
+      }
+      return true
+    },
+  )
+  return guarded.acquired && guarded.value
+}
+
+async function cleanupFinalizedGenerationRecoveryGroup(args: {
+  repo: ReturnType<typeof getWorkspaceRepository>
+  messageId: MessageId
+  initialLeases: readonly StreamLeaseRow[]
+  now: number
+  isTargetActive: (chatId: ChatId, messageId: MessageId) => boolean
+  isRecoveryPending: (streamId: string) => boolean
+  recoveryOutcome: (streamId: string) => 'done' | 'error' | 'abort' | undefined
+  onRecoveredPresentation: (chatId: ChatId, presentation: CommittedMessagePresentation) => void
+}): Promise<boolean> {
+  const initialLease = args.initialLeases[0]
+  if (!initialLease) return false
+  const initialChunks = await args.repo.listStreamChunksForMessage(args.messageId)
+  const guardedStreamIds = new Set([
+    ...args.initialLeases.map((lease) => lease.streamId),
+    ...initialChunks.map((chunk) => chunk.streamId),
+  ])
+  const guarded = await withStreamRecoveryLocks(
+    [...guardedStreamIds],
+    async (ownershipVerified) => {
+      const currentHeader = await args.repo.getMessageHeader(args.messageId)
+      if (currentHeader?.generation?.finishedAt === undefined) return false
+      const currentLeases = await args.repo.listStreamLeasesForMessage(args.messageId)
+      if (
+        currentLeases.some(
+          (lease) =>
+            !guardedStreamIds.has(lease.streamId) ||
+            (isFreshStreamLease(lease, args.now) &&
+              !ownershipVerified &&
+              !isRecoveryClaimedStreamLease(lease) &&
+              !args.isRecoveryPending(lease.streamId)),
+        ) ||
+        currentLeases.some(
+          (lease) =>
+            streamLeaseOwnsTargetWrites(lease) && args.isTargetActive(lease.chatId, args.messageId),
+        ) ||
+        currentLeases.some(
+          (lease) =>
+            streamLeaseRecoveryKind(lease) === 'continuation' && streamLeaseOwnsTargetWrites(lease),
+        )
+      ) {
+        return false
+      }
+      const currentChunks = await args.repo.listStreamChunksForMessage(args.messageId)
+      if (currentChunks.some((chunk) => !guardedStreamIds.has(chunk.streamId))) return false
+
+      const claimedLeases: StreamLeaseRow[] = []
+      for (const currentLease of [...currentLeases].sort((left, right) =>
+        left.streamId.localeCompare(right.streamId),
+      )) {
+        const claimed = await args.repo.claimStreamLeaseForRecovery(currentLease, args.now)
+        if (!claimed) return false
+        claimedLeases.push(claimed)
+      }
+      const anchor = newestStreamLeaseByAdmission(
+        claimedLeases.filter(
+          (lease) =>
+            streamLeaseRecoveryKind(lease) === 'generation' && streamLeaseOwnsTargetWrites(lease),
+        ),
+      )
+      if (!anchor) return false
+      const anchorFence = streamWriteFenceForLease(anchor)
+
+      const claimedByStreamId = new Map(claimedLeases.map((lease) => [lease.streamId, lease]))
+      const removedLeaseIds = new Set<string>()
+      for (const claimed of claimedLeases) {
+        if (claimed.streamId === anchor.streamId) continue
+        await args.repo.deleteOwnedStreamLease(claimed.streamId, streamWriteFenceForLease(claimed))
+        removedLeaseIds.add(claimed.streamId)
+      }
+      const cleanupStreamIds = [...guardedStreamIds].sort()
+      const anchorIndex = cleanupStreamIds.indexOf(anchor.streamId)
+      cleanupStreamIds.splice(anchorIndex, 1)
+      cleanupStreamIds.push(anchor.streamId)
+      for (const streamId of cleanupStreamIds) {
+        const claimed = claimedByStreamId.get(streamId)
+        const claimedFence = claimed ? streamWriteFenceForLease(claimed) : undefined
+        const retainedFence = claimed && !removedLeaseIds.has(streamId) ? claimedFence : undefined
+        await args.repo.deleteStreamJournal(streamId, {
+          replacementEpoch: claimedFence?.replacementEpoch ?? anchorFence.replacementEpoch,
+          ...(retainedFence ? { streamFence: retainedFence } : { expectedLeaseMissing: true }),
+        })
+        announceStreamEnded({
+          chatId: claimed?.chatId ?? currentHeader.chatId,
+          streamId,
+          messageId: claimed?.messageId ?? args.messageId,
+          outcome: args.recoveryOutcome(streamId) ?? 'abort',
+          replacementEpoch: claimedFence?.replacementEpoch ?? anchorFence.replacementEpoch,
+        })
+      }
+      const message = await args.repo.getMessage(args.messageId)
+      if (message && !message.deleted && message.chatId === currentHeader.chatId) {
+        args.onRecoveredPresentation(currentHeader.chatId, {
+          header: currentHeader,
+          message,
+          bodyVersion: currentHeader.bodyVersion,
+        })
+      }
+      return true
+    },
+  )
+  return guarded.acquired && guarded.value
+}
+
+async function pointCanonicalTerminalPresentation(
+  repo: ReturnType<typeof getWorkspaceRepository>,
+  point: OrphanRecoveryPoint,
+): Promise<CommittedMessagePresentation | undefined> {
+  if (!point.messageId) return undefined
+  const [header, message] = await Promise.all([
+    repo.getMessageHeader(point.messageId),
+    repo.getMessage(point.messageId),
+  ])
+  if (
+    !header ||
+    !message ||
+    header.chatId !== point.chatId ||
+    message.chatId !== point.chatId ||
+    header.deleted ||
+    message.deleted
+  ) {
+    return undefined
+  }
+  if (point.attemptKind === 'continuation') {
+    if (!message.continuationAttempts?.some((attempt) => attempt.streamId === point.streamId)) {
+      return undefined
+    }
+  } else if (header.generation?.finishedAt === undefined) {
+    return undefined
+  }
+  return { header, message, bodyVersion: header.bodyVersion }
 }
 
 export async function nextOrphanRecoveryAt(
@@ -1811,16 +2325,20 @@ export async function nextOrphanRecoveryAt(
   const leases = await repo.listStreamLeases(chatId)
   let next = Number.POSITIVE_INFINITY
   for (const lease of leases) {
-    if (lease.attemptKind !== 'generation' && lease.attemptKind !== 'continuation') continue
+    const active = useStreamStore.getState().getActive(lease.streamId)
     if (
-      useStreamStore.getState().getActive(lease.streamId)?.ownerClientId === getStreamClientId()
+      active?.ownerClientId === getStreamClientId() &&
+      active.phase !== 'recovery-pending' &&
+      active.phase !== 'cleanup-pending'
     ) {
       continue
     }
     const expiresAt = lease.heartbeatAt + STREAM_LEASE_TTL_MS + 1
     next = Math.min(
       next,
-      isRecoveryClaimedStreamLease(lease)
+      active?.phase === 'recovery-pending' ||
+        active?.phase === 'cleanup-pending' ||
+        isRecoveryClaimedStreamLease(lease)
         ? now + ORPHAN_RECOVERY_RETRY_MS
         : expiresAt > now
           ? expiresAt
@@ -1847,10 +2365,27 @@ export async function nextOrphanRecoveryAt(
 }
 
 function isLocallyOwnedTargetActive(chatId: ChatId, messageId: MessageId): boolean {
+  const active = useStreamStore.getState().getTargetActive(chatId, messageId)
   return (
-    useStreamStore.getState().getTargetActive(chatId, messageId)?.ownerClientId ===
-    getStreamClientId()
+    active?.ownerClientId === getStreamClientId() &&
+    active.phase !== 'recovery-pending' &&
+    active.phase !== 'cleanup-pending'
   )
+}
+
+function isLocallyRecoveryPendingStream(streamId: string): boolean {
+  const active = useStreamStore.getState().getActive(streamId)
+  return (
+    active?.ownerClientId === getStreamClientId() &&
+    (active.phase === 'recovery-pending' || active.phase === 'cleanup-pending')
+  )
+}
+
+function locallyPendingRecoveryOutcome(streamId: string): 'done' | 'error' | 'abort' | undefined {
+  const active = useStreamStore.getState().getActive(streamId)
+  return active?.phase === 'recovery-pending' || active?.phase === 'cleanup-pending'
+    ? active.recoveryOutcome
+    : undefined
 }
 
 interface UseChatApi {

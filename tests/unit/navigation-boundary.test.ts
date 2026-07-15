@@ -33,7 +33,12 @@ const COMMITTED_PATH_SELECTION_WRITERS = new Set([
   'ui/chat/MessageActions.tsx',
 ])
 const COMMITTED_PRESENTATION_UPDATE_WRITERS = new Set(['hooks/useChat.ts', 'hooks/useContinue.ts'])
-const COMMITTED_MESSAGE_MUTATION_WRITERS = new Set(['hooks/useChat.ts', 'hooks/useMessageOps.ts'])
+const COMMITTED_MESSAGE_MUTATION_WRITERS = new Set([
+  'hooks/useChat.ts',
+  'hooks/useContinue.ts',
+  'hooks/useMessageOps.ts',
+])
+const COMMITTED_MESSAGE_BATCH_WRITERS = new Set(['hooks/useChat.ts'])
 const COMMITTED_PRESENTATION_SEAL_WRITERS = new Set([
   'app/Shell.tsx',
   'hooks/useChat.ts',
@@ -71,6 +76,9 @@ describe('tab branch navigation boundary', () => {
     expect(filesCalling(/\bpublishCommittedMessageMutation\s*\(/)).toEqual(
       [...COMMITTED_MESSAGE_MUTATION_WRITERS].sort(),
     )
+    expect(filesCalling(/\bpublishCommittedMessageBatch\s*\(/)).toEqual(
+      [...COMMITTED_MESSAGE_BATCH_WRITERS].sort(),
+    )
     expect(filesCalling(/\bsealCommittedPathProducer\s*\(/)).toEqual(
       [...COMMITTED_PRESENTATION_SEAL_WRITERS].sort(),
     )
@@ -95,6 +103,12 @@ describe('tab branch navigation boundary', () => {
 
   it('does not use numeric navigation revisions as async authority', () => {
     expect(filesCalling(/\bnavigationRevision\??\s*:\s*number\b/)).toEqual([])
+  })
+
+  it('centralizes tab-local stream-origin matching with owner identity', () => {
+    expect(filesCalling(/\boriginNavigationRevision\s*(?:===|!==)/)).toEqual([
+      'store/zustand/streamStore.ts',
+    ])
   })
 
   it('keeps delayed whole-route navigation behind the opaque tab intent boundary', () => {

@@ -1,6 +1,6 @@
 import { memo, useCallback, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { Message, MessageRole } from '../../core/types'
-import { useRetainedMessageStreamProjection } from '../../hooks/useMessageStreamProjection'
+import { useMessageStreamProjection } from '../../hooks/useMessageStreamProjection'
 import type { MessageAttachmentRefMutation } from '../../store/attachments'
 import { getStreamClientId } from '../../store/stream-leases'
 import { AttachmentRefChips } from '../attachments/AttachmentRefChips'
@@ -154,9 +154,8 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
   const [occurrenceCount, setOccurrenceCount] = useState(0)
   const [totalOccurrenceCount, setTotalOccurrenceCount] = useState(0)
   const [currentOccurrence, setCurrentOccurrence] = useState(-1)
-  const [activeStream, liveSnapshot] = useRetainedMessageStreamProjection(
+  const [activeStream, liveSnapshot] = useMessageStreamProjection(
     message,
-    bodyVersion,
     message.role === 'assistant',
   )
   const persistedStreamBusy =

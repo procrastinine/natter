@@ -4,16 +4,19 @@ import type { ChatId, CursorMap, Message } from '../../src/core/types'
 import { splitMessageForStorage } from '../../src/store/message-storage'
 import {
   type CommittedPathProducer,
+  claimCommittedPresentationWorkspace,
   type NavigationIntent,
   useChatStore,
 } from '../../src/store/zustand/chatStore'
 import {
   __streamStoreIndexStatsForTests,
   isStreamRelevantToSelectedPath,
+  recoveryPendingChatIds,
   subscribeChatStreams,
   subscribeStreamTarget,
   useIsStreamTargetActive,
   useStreamStore,
+  useStreamTarget,
 } from '../../src/store/zustand/streamStore'
 import { useUiStore } from '../../src/store/zustand/uiStore'
 
@@ -63,6 +66,231 @@ describe('streamStore', () => {
     expect(isTargetActive('C1', 'M1')).toBe(true)
     expect(isTargetActive('C1', 'M2')).toBe(true)
     expect(isTargetActive('C1', 'M3')).toBe(false)
+  })
+
+  it('pairs a target with its newest admitted stream when stale activity overlaps', () => {
+    const state = useStreamStore.getState()
+    const { result } = renderHook(() => useStreamTarget('C1', 'M1'))
+    act(() => {
+      state.setActive({
+        streamId: 'stale-stream',
+        replacementEpoch: 0,
+        chatId: 'C1',
+        messageId: 'M1',
+        startedAt: 100,
+        ownerClientId: 'other-tab',
+      })
+      state.setLiveSnapshot({
+        streamId: 'stale-stream',
+        replacementEpoch: 0,
+        chatId: 'C1',
+        messageId: 'M1',
+        content: [{ type: 'output_text', text: 'stale stream body' }],
+        textLength: 17,
+        reasoningLength: 0,
+        updatedAt: 1,
+      })
+      state.setActive({
+        streamId: 'new-stream',
+        replacementEpoch: 0,
+        chatId: 'C1',
+        messageId: 'M1',
+        startedAt: 1,
+        ownerClientId: 'this-tab',
+        abort: vi.fn(),
+      })
+    })
+    expect(result.current.activeStream?.streamId).toBe('new-stream')
+    expect(result.current.liveSnapshot).toBeUndefined()
+
+    act(() => {
+      state.setLiveSnapshot({
+        streamId: 'new-stream',
+        replacementEpoch: 0,
+        chatId: 'C1',
+        messageId: 'M1',
+        content: [{ type: 'output_text', text: 'new stream body' }],
+        textLength: 15,
+        reasoningLength: 0,
+        updatedAt: 3,
+      })
+    })
+
+    expect(result.current.activeStream?.streamId).toBe('new-stream')
+    expect(result.current.liveSnapshot?.streamId).toBe('new-stream')
+
+    act(() => {
+      state.setLiveSnapshot({
+        streamId: 'stale-stream',
+        replacementEpoch: 0,
+        chatId: 'C1',
+        messageId: 'M1',
+        content: [{ type: 'output_text', text: 'late stale stream body' }],
+        textLength: 22,
+        reasoningLength: 0,
+        updatedAt: 4,
+      })
+      state.clearActive('new-stream', 0)
+    })
+
+    expect(result.current.activeStream).toBeUndefined()
+    expect(result.current.liveSnapshot?.streamId).toBe('new-stream')
+    expect(state.getTargetActive('C1', 'M1')).toBeUndefined()
+  })
+
+  it('uses durable admission order when cross-tab observations arrive out of order', () => {
+    const state = useStreamStore.getState()
+    state.setActive({
+      streamId: 'newer-durable-stream',
+      replacementEpoch: 0,
+      admissionSequence: 12,
+      chatId: 'C1',
+      messageId: 'M1',
+      startedAt: 1,
+      ownerClientId: 'tab-b',
+    })
+    state.setLiveSnapshot({
+      streamId: 'newer-durable-stream',
+      replacementEpoch: 0,
+      chatId: 'C1',
+      messageId: 'M1',
+      content: [{ type: 'output_text', text: 'new durable body' }],
+      textLength: 16,
+      reasoningLength: 0,
+      updatedAt: 2,
+    })
+
+    state.setActive({
+      streamId: 'older-delayed-stream',
+      replacementEpoch: 0,
+      admissionSequence: 11,
+      chatId: 'C1',
+      messageId: 'M1',
+      startedAt: 999,
+      ownerClientId: 'tab-a',
+    })
+    state.setLiveSnapshot({
+      streamId: 'older-delayed-stream',
+      replacementEpoch: 0,
+      chatId: 'C1',
+      messageId: 'M1',
+      content: [{ type: 'output_text', text: 'late old body' }],
+      textLength: 13,
+      reasoningLength: 0,
+      updatedAt: 1_000,
+    })
+    state.clearActive('older-delayed-stream', 0)
+
+    expect(state.getTargetActive('C1', 'M1')?.streamId).toBe('newer-durable-stream')
+    expect(state.getLiveSnapshot('C1', 'M1')?.content).toEqual([
+      { type: 'output_text', text: 'new durable body' },
+    ])
+  })
+
+  it('never lets a tokenless legacy observation displace a durably ordered target', () => {
+    const state = useStreamStore.getState()
+    state.setActive({
+      streamId: 'durable-stream',
+      replacementEpoch: 0,
+      admissionSequence: 4,
+      chatId: 'C1',
+      messageId: 'M1',
+      startedAt: 1,
+      ownerClientId: 'current-tab',
+    })
+    state.setActive({
+      streamId: 'legacy-delayed-stream',
+      replacementEpoch: 0,
+      chatId: 'C1',
+      messageId: 'M1',
+      startedAt: 10_000,
+      ownerClientId: 'legacy-tab',
+    })
+
+    expect(state.getTargetActive('C1', 'M1')?.streamId).toBe('durable-stream')
+    expect(state.listSelectedByChat('C1').map((stream) => stream.streamId)).toEqual([
+      'durable-stream',
+    ])
+  })
+
+  it('keeps cleanup-only predecessors from masking or clearing a newer target', () => {
+    const state = useStreamStore.getState()
+    state.setActive({
+      streamId: 'cleanup-predecessor',
+      replacementEpoch: 0,
+      admissionSequence: 20,
+      chatId: 'C1',
+      messageId: 'M1',
+      startedAt: 1,
+      ownerClientId: 'tab-a',
+    })
+    state.setLiveSnapshot({
+      streamId: 'cleanup-predecessor',
+      replacementEpoch: 0,
+      chatId: 'C1',
+      messageId: 'M1',
+      content: [{ type: 'output_text', text: 'committed predecessor' }],
+      textLength: 21,
+      reasoningLength: 0,
+      updatedAt: 2,
+    })
+    state.setActive({
+      streamId: 'cleanup-predecessor',
+      replacementEpoch: 0,
+      admissionSequence: 20,
+      chatId: 'C1',
+      messageId: 'M1',
+      startedAt: 1,
+      ownerClientId: 'tab-a',
+      phase: 'cleanup-pending',
+      recoveryOutcome: 'done',
+    })
+    expect(state.getTargetActive('C1', 'M1')).toBeUndefined()
+    expect(state.getLiveSnapshot('C1', 'M1')).toBeUndefined()
+
+    state.setActive({
+      streamId: 'replacement-stream',
+      replacementEpoch: 0,
+      admissionSequence: 21,
+      chatId: 'C1',
+      messageId: 'M1',
+      startedAt: 3,
+      ownerClientId: 'tab-b',
+    })
+    state.setLiveSnapshot({
+      streamId: 'replacement-stream',
+      replacementEpoch: 0,
+      chatId: 'C1',
+      messageId: 'M1',
+      content: [{ type: 'output_text', text: 'replacement body' }],
+      textLength: 16,
+      reasoningLength: 0,
+      updatedAt: 4,
+    })
+    state.clearActive('cleanup-predecessor', 0)
+
+    expect(state.getTargetActive('C1', 'M1')?.streamId).toBe('replacement-stream')
+    expect(state.getLiveSnapshot('C1', 'M1')?.streamId).toBe('replacement-stream')
+  })
+
+  it('admits overlapping target streams in constant work without resurrecting displaced activity', () => {
+    const state = useStreamStore.getState()
+    for (let index = 0; index < 10_000; index += 1) {
+      state.setActive({
+        streamId: `overlap-${index}`,
+        replacementEpoch: 0,
+        chatId: 'overlap-chat',
+        messageId: 'overlap-message',
+        startedAt: 10_000 - index,
+        ownerClientId: 'remote-tab',
+      })
+    }
+
+    expect(state.getTargetActive('overlap-chat', 'overlap-message')?.streamId).toBe('overlap-9999')
+    expect(state.listSelectedByChat('overlap-chat')).toHaveLength(1)
+
+    state.clearActive('overlap-9999', 0)
+    expect(state.getTargetActive('overlap-chat', 'overlap-message')).toBeUndefined()
   })
 
   it('subscribes target activity to only the exact message key', () => {
@@ -117,6 +345,7 @@ describe('streamStore', () => {
         selected,
         known,
         'revision-current',
+        'tab-a',
       ),
     ).toBe(true)
     expect(
@@ -130,6 +359,7 @@ describe('streamStore', () => {
         selected,
         known,
         'revision-current',
+        'tab-a',
       ),
     ).toBe(false)
     expect(
@@ -143,8 +373,24 @@ describe('streamStore', () => {
         selected,
         known,
         'revision-current',
+        'tab-a',
       ),
     ).toBe(true)
+    expect(
+      isStreamRelevantToSelectedPath(
+        {
+          ...base,
+          messageId: 'reserved-not-committed',
+          ownerClientId: 'other-tab',
+          attemptKind: 'generation',
+          originNavigationRevision: 'revision-current',
+        },
+        selected,
+        known,
+        'revision-current',
+        'tab-a',
+      ),
+    ).toBe(false)
     expect(
       isStreamRelevantToSelectedPath(
         {
@@ -156,6 +402,7 @@ describe('streamStore', () => {
         selected,
         known,
         'revision-current',
+        'tab-a',
       ),
     ).toBe(false)
     expect(
@@ -169,6 +416,7 @@ describe('streamStore', () => {
         selected,
         known,
         'revision-current',
+        'tab-a',
       ),
     ).toBe(false)
   })
@@ -192,6 +440,53 @@ describe('streamStore', () => {
     clearActive('S1', 0)
     expect(isActive('S1')).toBe(false)
     expect(isActive('S2')).toBe(true)
+  })
+
+  it('lists recovery-pending chats directly from active streams without duplicates', () => {
+    const state = useStreamStore.getState()
+    const listActive = vi.spyOn(state, 'listActive')
+    state.setActive({
+      streamId: 'normal',
+      replacementEpoch: 0,
+      chatId: 'normal-chat',
+      startedAt: 1,
+      ownerClientId: 'tab-a',
+      phase: 'streaming',
+    })
+    state.setActive({
+      streamId: 'pending-a',
+      replacementEpoch: 0,
+      chatId: 'pending-chat',
+      startedAt: 2,
+      ownerClientId: 'tab-a',
+      phase: 'recovery-pending',
+    })
+    state.setActive({
+      streamId: 'pending-b',
+      replacementEpoch: 0,
+      chatId: 'pending-chat',
+      startedAt: 3,
+      ownerClientId: 'tab-a',
+      phase: 'recovery-pending',
+    })
+    state.setActive({
+      streamId: 'pending-other',
+      replacementEpoch: 0,
+      chatId: 'other-pending-chat',
+      startedAt: 4,
+      ownerClientId: 'tab-a',
+      phase: 'recovery-pending',
+    })
+
+    expect(recoveryPendingChatIds()).toEqual(['pending-chat', 'other-pending-chat'])
+    expect(listActive).not.toHaveBeenCalled()
+
+    state.clearActive('pending-a', 0)
+    expect(recoveryPendingChatIds()).toEqual(['pending-chat', 'other-pending-chat'])
+    state.clearActive('pending-b', 0)
+    expect(recoveryPendingChatIds()).toEqual(['other-pending-chat'])
+    state.reset()
+    expect(recoveryPendingChatIds()).toEqual([])
   })
 
   it('retires per-chat lifecycle revisions after the final active stream', () => {
@@ -494,6 +789,23 @@ describe('chatStore cursor map', () => {
     return { header, message, bodyVersion }
   }
 
+  it('rejects recovery receipts captured before a workspace replacement', () => {
+    const staleWorkspace = claimCommittedPresentationWorkspace()
+    const recovered = committedPresentation('recovered', null, 1, 1, 'old workspace')
+
+    useChatStore.getState().resetForWorkspaceReplacement()
+
+    expect(
+      useChatStore.getState().publishCommittedMessageBatch('C1', [recovered], staleWorkspace),
+    ).toBe(0)
+    expect(useChatStore.getState().getCommittedMessagePresentations('C1')).toEqual([])
+
+    const currentWorkspace = claimCommittedPresentationWorkspace()
+    expect(
+      useChatStore.getState().publishCommittedMessageBatch('C1', [recovered], currentWorkspace),
+    ).toBe(1)
+  })
+
   it('navigateToCursor stores an immutable copy (caller mutation does not bleed in)', () => {
     const { navigateToCursor, getCursor } = useChatStore.getState()
     const map = { __root__: 'M1' }
@@ -714,7 +1026,10 @@ describe('chatStore cursor map', () => {
     store.reset()
     const currentIntent = store.beginNavigationIntent('C1')
 
-    expect(BigInt(currentIntent.revision)).toBeGreaterThan(BigInt(staleIntent.revision))
+    const [stalePrefix, staleSequence] = staleIntent.revision.split(':')
+    const [currentPrefix, currentSequence] = currentIntent.revision.split(':')
+    expect(currentPrefix).toBe(stalePrefix)
+    expect(BigInt(currentSequence as string)).toBeGreaterThan(BigInt(staleSequence as string))
     expect(store.setCursorForIntent('C1', staleIntent, { __root__: 'stale' })).toBe(false)
     expect(store.getCursor('C1')).toEqual({})
   })
@@ -1512,7 +1827,7 @@ describe('chatStore cursor map', () => {
     expect(store.getCursor('C1')).toBe(cursor)
     expect(store.getNavigationRevision('C1')).toBe(intent.revision)
     expect(store.getCommittedPathPresentation('C1')).toBeUndefined()
-    expect(store.getCommittedMessagePresentation('C1')).toMatchObject({
+    expect(store.getCommittedMessagePresentation('C1', 'A1')).toMatchObject({
       chatId: 'C1',
       presentation: {
         bodyVersion: 1,
@@ -1531,13 +1846,13 @@ describe('chatStore cursor map', () => {
     expect(
       store.publishCommittedMessageMutation('C1', [root.header, selected.header], offPath),
     ).toBe(true)
-    const exactOffPath = store.getCommittedMessagePresentation('C1')
+    const exactOffPath = store.getCommittedMessagePresentation('C1', 'A1')
     const updatedSelected = committedPresentation('B1', 'U1', 1, 1, 'updated selected answer')
     expect(
       store.publishCommittedMessageMutation('C1', [root.header, selected.header], updatedSelected),
     ).toBe(true)
 
-    expect(store.getCommittedMessagePresentation('C1')).toBe(exactOffPath)
+    expect(store.getCommittedMessagePresentation('C1', 'A1')).toBe(exactOffPath)
     expect(
       store
         .getCommittedPathPresentation('C1')
@@ -1545,29 +1860,132 @@ describe('chatStore cursor map', () => {
     ).toEqual([{ type: 'output_text', text: 'updated selected answer' }])
   })
 
-  it('retains only the latest exact local body per chat and clears it with chat scope', () => {
+  it('rejects a delayed exact body that is older than the committed path body', () => {
+    const store = useChatStore.getState()
+    const intent = store.beginNavigationIntent('C1')
+    const producer = registerProducer('C1', intent)
+    const user = committedPresentation('U1', null, 0, 0, 'prompt')
+    const current = committedPresentation('A1', 'U1', 2, 2, 'current answer')
+    expect(
+      store.selectCommittedPathForProducer(
+        'C1',
+        producer,
+        { __root__: 'U1', U1: 'A1' },
+        {
+          phase: 'terminal',
+          pathHeaders: [user.header, current.header],
+          presentations: [user, current],
+        },
+      ),
+    ).toBe(true)
+    expect(store.getCommittedMessagePresentation('C1', 'A1')).toBeUndefined()
+
+    const delayed = committedPresentation('A1', 'U1', 1, 1, 'delayed stale answer')
+    expect(store.publishCommittedMessageMutation('C1', [], delayed)).toBe(false)
+    expect(store.getCommittedMessagePresentation('C1', 'A1')).toBeUndefined()
+    expect(
+      store
+        .getCommittedPathPresentation('C1')
+        ?.presentations.find((presentation) => presentation.message.id === 'A1')?.message.content,
+    ).toEqual([{ type: 'output_text', text: 'current answer' }])
+  })
+
+  it('retains exact local bodies by message within the bounded chat window', () => {
     const store = useChatStore.getState()
     const first = committedPresentation('A1', 'U1', 1, 1, 'first body')
     const second = committedPresentation('B1', 'U1', 2, 2, 'second body')
     const other = committedPresentation('A2', 'U2', 1, 1, 'other chat body', 'C2')
 
     expect(store.publishCommittedMessageMutation('C1', [], first)).toBe(true)
-    const firstReceipt = store.getCommittedMessagePresentation('C1')
+    const firstReceipt = store.getCommittedMessagePresentation('C1', 'A1')
     expect(firstReceipt?.presentation.message.id).toBe('A1')
     expect(store.publishCommittedMessageMutation('C1', [], second)).toBe(true)
-    const secondReceipt = store.getCommittedMessagePresentation('C1')
+    const secondReceipt = store.getCommittedMessagePresentation('C1', 'B1')
     expect(secondReceipt?.presentation.message.id).toBe('B1')
     expect(secondReceipt).not.toBe(firstReceipt)
+    expect(store.getCommittedMessagePresentation('C1', 'A1')).toBe(firstReceipt)
+    expect(store.getCommittedMessagePresentations('C1')).toEqual([firstReceipt, secondReceipt])
+    expect(Object.isFrozen(store.getCommittedMessagePresentations('C1'))).toBe(true)
     expect(Object.isFrozen(secondReceipt)).toBe(true)
     expect(Object.isFrozen(secondReceipt?.presentation.message)).toBe(true)
 
     expect(store.publishCommittedMessageMutation('C2', [], other)).toBe(true)
     store.clearCursor('C1')
-    expect(store.getCommittedMessagePresentation('C1')).toBeUndefined()
-    expect(store.getCommittedMessagePresentation('C2')?.presentation.message.id).toBe('A2')
+    expect(store.getCommittedMessagePresentation('C1', 'A1')).toBeUndefined()
+    expect(store.getCommittedMessagePresentation('C2', 'A2')?.presentation.message.id).toBe('A2')
 
     store.resetForWorkspaceReplacement()
-    expect(store.getCommittedMessagePresentation('C2')).toBeUndefined()
+    expect(store.getCommittedMessagePresentation('C2', 'A2')).toBeUndefined()
+  })
+
+  it('bounds exact local bodies per chat by the active presentation window', () => {
+    const store = useChatStore.getState()
+    store.setCommittedPresentationWindowLimit('C1', 2)
+
+    for (const [index, messageId] of ['A1', 'A2', 'A3'].entries()) {
+      expect(
+        store.publishCommittedMessageMutation(
+          'C1',
+          [],
+          committedPresentation(messageId, null, index, index, `body ${index}`),
+        ),
+      ).toBe(true)
+    }
+
+    expect(
+      store
+        .getCommittedMessagePresentations('C1')
+        .map((receipt) => receipt.presentation.message.id),
+    ).toEqual(['A2', 'A3'])
+    expect(store.getCommittedMessagePresentation('C1', 'A1')).toBeUndefined()
+  })
+
+  it('keeps one active presentation-window scope and trims the released chat to default', () => {
+    const store = useChatStore.getState()
+    store.setCommittedPresentationWindowLimit('C1', 12)
+    for (let index = 0; index < 12; index += 1) {
+      expect(
+        store.publishCommittedMessageMutation(
+          'C1',
+          [],
+          committedPresentation(`A${index}`, null, index, index, `body ${index}`),
+        ),
+      ).toBe(true)
+    }
+    expect(store.getCommittedMessagePresentations('C1')).toHaveLength(12)
+
+    store.setCommittedPresentationWindowLimit('C2', 12)
+
+    expect(store.getCommittedMessagePresentations('C1')).toHaveLength(10)
+    expect(store.getDebugStats().presentationWindowScopeCount).toBe(1)
+    expect(store.clearCommittedPresentationWindowLimit('C1', 12)).toBe(false)
+    expect(store.clearCommittedPresentationWindowLimit('C2', 11)).toBe(false)
+    expect(store.clearCommittedPresentationWindowLimit('C2', 12)).toBe(true)
+    expect(store.getDebugStats().presentationWindowScopeCount).toBe(0)
+  })
+
+  it('retains the inspected exact body in addition to the active presentation window', () => {
+    const store = useChatStore.getState()
+    store.setCommittedPresentationWindowLimit('C1', 1)
+    const focus = store.beginCommittedPresentationFocus('C1')
+    store.setCommittedPresentationFocusMessage(focus, 'A1')
+
+    for (const [index, messageId] of ['A1', 'B1', 'C1'].entries()) {
+      expect(
+        store.publishCommittedMessageMutation(
+          'C1',
+          [],
+          committedPresentation(messageId, null, index, index, `body ${index}`),
+        ),
+      ).toBe(true)
+    }
+
+    expect(
+      store
+        .getCommittedMessagePresentations('C1')
+        .map((receipt) => receipt.presentation.message.id),
+    ).toEqual(['A1', 'C1'])
+    store.endCommittedPresentationFocus(focus)
   })
 
   it('acknowledges only the exact committed message receipt', () => {
@@ -1576,17 +1994,66 @@ describe('chatStore cursor map', () => {
     const second = committedPresentation('A1', 'U1', 2, 2, 'second body')
 
     expect(store.publishCommittedMessageMutation('C1', [], first)).toBe(true)
-    const staleReceipt = store.getCommittedMessagePresentation('C1')
+    const staleReceipt = store.getCommittedMessagePresentation('C1', 'A1')
     expect(staleReceipt).toBeDefined()
     expect(store.publishCommittedMessageMutation('C1', [], second)).toBe(true)
-    const currentReceipt = store.getCommittedMessagePresentation('C1')
+    const currentReceipt = store.getCommittedMessagePresentation('C1', 'A1')
     expect(currentReceipt).toBeDefined()
     if (!staleReceipt || !currentReceipt) throw new Error('expected committed message receipts')
 
     store.acknowledgeCommittedMessagePresentation('C1', staleReceipt)
-    expect(store.getCommittedMessagePresentation('C1')).toBe(currentReceipt)
+    expect(store.getCommittedMessagePresentation('C1', 'A1')).toBe(currentReceipt)
     store.acknowledgeCommittedMessagePresentation('C1', currentReceipt)
-    expect(store.getCommittedMessagePresentation('C1')).toBeUndefined()
+    expect(store.getCommittedMessagePresentation('C1', 'A1')).toBeUndefined()
+  })
+
+  it('acknowledges an exact committed-message batch with one publication', () => {
+    const store = useChatStore.getState()
+    const first = committedPresentation('A1', 'U1', 1, 1, 'first body')
+    const staleSecond = committedPresentation('A2', 'U1', 1, 1, 'stale second body')
+    const third = committedPresentation('A3', 'U1', 1, 1, 'third body')
+    const currentSecond = committedPresentation('A2', 'U1', 2, 2, 'current second body')
+    const otherChat = committedPresentation('B1', null, 1, 1, 'other chat body', 'C2')
+
+    for (const presentation of [first, staleSecond, third]) {
+      expect(store.publishCommittedMessageMutation('C1', [], presentation)).toBe(true)
+    }
+    const firstReceipt = store.getCommittedMessagePresentation('C1', 'A1')
+    const staleSecondReceipt = store.getCommittedMessagePresentation('C1', 'A2')
+    const thirdReceipt = store.getCommittedMessagePresentation('C1', 'A3')
+    expect(store.publishCommittedMessageMutation('C1', [], currentSecond)).toBe(true)
+    const currentSecondReceipt = store.getCommittedMessagePresentation('C1', 'A2')
+    expect(store.publishCommittedMessageMutation('C2', [], otherChat)).toBe(true)
+    const otherChatReceipt = store.getCommittedMessagePresentation('C2', 'B1')
+    if (
+      !firstReceipt ||
+      !staleSecondReceipt ||
+      !thirdReceipt ||
+      !currentSecondReceipt ||
+      !otherChatReceipt
+    ) {
+      throw new Error('expected committed message receipts')
+    }
+    const publication = useChatStore.getState().publication
+    const listener = vi.fn()
+    const unsubscribe = useChatStore.subscribe(listener)
+
+    expect(
+      store.acknowledgeCommittedMessagePresentations('C1', [
+        firstReceipt,
+        staleSecondReceipt,
+        currentSecondReceipt,
+        thirdReceipt,
+        otherChatReceipt,
+        firstReceipt,
+      ]),
+    ).toBe(3)
+
+    unsubscribe()
+    expect(store.getCommittedMessagePresentations('C1')).toEqual([])
+    expect(store.getCommittedMessagePresentation('C2', 'B1')).toBe(otherChatReceipt)
+    expect(useChatStore.getState().publication).toBe(publication + 1)
+    expect(listener).toHaveBeenCalledOnce()
   })
 
   it('bounds exact message receipts across chats without evicting the newest mutation', () => {
@@ -1604,14 +2071,21 @@ describe('chatStore cursor map', () => {
       expect(store.publishCommittedMessageMutation(chatId, [], presentation)).toBe(true)
     }
 
-    expect(store.getCommittedMessagePresentation('receipt-chat-0')).toBeUndefined()
-    expect(store.getCommittedMessagePresentation('receipt-chat-1')).toBeUndefined()
+    expect(
+      store.getCommittedMessagePresentation('receipt-chat-0', 'receipt-message-0'),
+    ).toBeUndefined()
+    expect(
+      store.getCommittedMessagePresentation('receipt-chat-1', 'receipt-message-1'),
+    ).toBeUndefined()
     for (let index = 2; index < 10; index += 1) {
-      expect(store.getCommittedMessagePresentation(`receipt-chat-${index}`)).toBeDefined()
+      expect(
+        store.getCommittedMessagePresentation(`receipt-chat-${index}`, `receipt-message-${index}`),
+      ).toBeDefined()
     }
-    expect(store.getCommittedMessagePresentation('receipt-chat-9')?.presentation.message.id).toBe(
-      'receipt-message-9',
-    )
+    expect(
+      store.getCommittedMessagePresentation('receipt-chat-9', 'receipt-message-9')?.presentation
+        .message.id,
+    ).toBe('receipt-message-9')
   })
 
   it('protects the focused chat from bounded body eviction with identity-safe cleanup', () => {
@@ -1639,11 +2113,17 @@ describe('chatStore cursor map', () => {
       ).toBe(true)
     }
 
-    expect(store.getCommittedMessagePresentation(focusedChatId)).toBeDefined()
-    expect(store.getCommittedMessagePresentation('receipt-chat-1')).toBeUndefined()
-    expect(store.getCommittedMessagePresentation('receipt-chat-2')).toBeUndefined()
+    expect(store.getCommittedMessagePresentation(focusedChatId, 'receipt-message-0')).toBeDefined()
+    expect(
+      store.getCommittedMessagePresentation('receipt-chat-1', 'receipt-message-1'),
+    ).toBeUndefined()
+    expect(
+      store.getCommittedMessagePresentation('receipt-chat-2', 'receipt-message-2'),
+    ).toBeUndefined()
     for (let index = 3; index < 10; index += 1) {
-      expect(store.getCommittedMessagePresentation(`receipt-chat-${index}`)).toBeDefined()
+      expect(
+        store.getCommittedMessagePresentation(`receipt-chat-${index}`, `receipt-message-${index}`),
+      ).toBeDefined()
     }
     store.endCommittedPresentationFocus(currentFocus)
   })

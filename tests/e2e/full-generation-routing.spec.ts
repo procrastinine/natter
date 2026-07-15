@@ -137,8 +137,12 @@ test('GUI OpenRouter video model uses parent /endpoints architecture for UI and 
   const consoleLines = captureConsole(page)
   const videoRequests: CapturedRequest[] = []
   const videoDownloads: string[] = []
+  let releaseVideoDownloads = () => {}
+  const videoDownloadGate = new Promise<void>((resolve) => {
+    releaseVideoDownloads = resolve
+  })
   await mockOpenRouterDiscovery(page, VIDEO_MODEL)
-  await mockOpenRouterVideos(page, videoRequests, videoDownloads)
+  await mockOpenRouterVideos(page, videoRequests, videoDownloads, videoDownloadGate)
 
   await seedFirstRun(page, { model: VIDEO_MODEL, disablePrivacyFilter: false })
   const profileId = await activeProfileId(page)
@@ -154,32 +158,55 @@ test('GUI OpenRouter video model uses parent /endpoints architecture for UI and 
     'Video generation does not expose a token context window.',
   )
 
+  const videoMedia = page
+    .locator('[data-ui="message"][data-role="assistant"]')
+    .first()
+    .locator('[data-ui="message-output-media"][data-media="video"]')
+  const videoElements = videoMedia.locator('video')
   await composer.press('Enter')
-  await expect(
-    page
-      .locator('[data-ui="message"][data-role="assistant"]')
-      .first()
-      .locator('[data-ui="message-output-media"][data-media="video"]'),
-  ).toHaveCount(2)
+  try {
+    await expect(videoMedia).toHaveCount(2)
+    expect(
+      await videoElements.evaluateAll((nodes) =>
+        nodes.map((node) => ({
+          src: node.getAttribute('src') ?? '',
+          preload: node.getAttribute('preload'),
+        })),
+      ),
+    ).toEqual([
+      {
+        src: 'https://openrouter.ai/api/v1/videos/video-gui-1/content?index=0',
+        preload: 'none',
+      },
+      {
+        src: 'https://openrouter.ai/api/v1/videos/video-gui-1/content?index=1',
+        preload: 'none',
+      },
+    ])
 
-  expect(videoRequests).toHaveLength(1)
-  expect(videoRequests[0]?.url).toContain('/videos')
-  expect(videoRequests[0]?.body).toMatchObject({
-    model: VIDEO_MODEL,
-    prompt: 'GUI video route check',
-  })
-  expect(videoRequests[0]?.body.provider).toMatchObject({ data_collection: 'deny' })
-  expect(videoDownloads).toEqual([
+    expect(videoRequests).toHaveLength(1)
+    expect(videoRequests[0]?.url).toContain('/videos')
+    expect(videoRequests[0]?.body).toMatchObject({
+      model: VIDEO_MODEL,
+      prompt: 'GUI video route check',
+    })
+    expect(videoRequests[0]?.body.provider).toMatchObject({ data_collection: 'deny' })
+  } finally {
+    releaseVideoDownloads()
+  }
+
+  const expectedDownloads = [
     'https://openrouter.ai/api/v1/videos/video-gui-1/content?index=0',
     'https://openrouter.ai/api/v1/videos/video-gui-1/content?index=1',
-  ])
-  const videoSrcs = await page
-    .locator('[data-ui="message-output-media"][data-media="video"] video')
-    .evaluateAll((nodes) =>
-      nodes.map((node) => (node as HTMLVideoElement).currentSrc || node.getAttribute('src') || ''),
+  ]
+  await expect.poll(() => [...videoDownloads]).toEqual(expectedDownloads)
+  await expect
+    .poll(() =>
+      videoElements.evaluateAll((nodes) =>
+        nodes.map((node) => (node.getAttribute('src') ?? '').startsWith('blob:')),
+      ),
     )
-  expect(videoSrcs).toHaveLength(2)
-  expect(videoSrcs.every((src) => src.startsWith('blob:'))).toBe(true)
+    .toEqual([true, true])
 
   expect(consoleLines.filter((line) => line.startsWith('error:'))).toEqual([])
 })
@@ -278,9 +305,11 @@ async function mockOpenRouterVideos(
   page: Page,
   requests: CapturedRequest[],
   downloads: string[],
+  videoDownloadGate: Promise<void> = Promise.resolve(),
 ): Promise<void> {
   await page.route('https://openrouter.ai/api/v1/videos/video-gui-1/content**', async (route) => {
     downloads.push(route.request().url())
+    await videoDownloadGate
     await route.fulfill({
       status: 200,
       contentType: 'video/mp4',

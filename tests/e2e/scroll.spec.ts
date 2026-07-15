@@ -1,3 +1,4 @@
+import { createFakeStreamScenario, retargetOnlyProfileToFakeProvider } from './fake-stream-provider'
 import { expect, type Locator, type Page, test } from './fixtures'
 import {
   buildSseBody,
@@ -385,4 +386,67 @@ test('incremental regenerate keeps following after a long windowed chat switches
   await expect
     .poll(() => scrollDistanceFromBottom(region), { timeout: 5000 })
     .toBeLessThanOrEqual(4)
+})
+
+test("Save & Send from a pinned earlier message follows this tab's new streaming reply", async ({
+  page,
+}) => {
+  const scenario = await createFakeStreamScenario({
+    targetChars: 64_000,
+    reasoningChars: 0,
+    chunkChars: 2_000,
+    initialDelayMs: 100,
+    delayMs: 80,
+  })
+  try {
+    await retargetOnlyProfileToFakeProvider(page, scenario.providerBaseUrl)
+    const chatId = await seedLinearChat(page, {
+      messageCount: 24,
+      chatId: 'save-send-scroll-chat',
+      title: 'Save and send scroll chat',
+      textPrefix: 'save and send history',
+      assistantContentType: 'output_text',
+      settings: {
+        'global:message-render-window-size': 10,
+        'global:message-render-window-load-mode': 'manual',
+      },
+    })
+    await page.goto(`/#/chat/${chatId}`)
+    await page.reload()
+
+    const region = page.locator('[data-ui="scroll-region"]')
+    await expect(page.locator('[data-ui="message"]')).toHaveCount(10)
+    await region.hover()
+    await page.mouse.wheel(0, -5000)
+    await expect(region).toHaveAttribute('data-scroll-state', 'pinned')
+
+    const earlierUser = page.locator('[data-ui="message"][data-role="user"]').first()
+    await earlierUser.locator('[data-action="edit"]').click()
+    await earlierUser.locator('[data-ui="inline-editor-input"]').fill('edited earlier prompt')
+    await earlierUser.locator('[data-role="save-send"]').click()
+
+    await expect(page.getByRole('button', { name: 'Stop generating' })).toBeVisible()
+    await expect.poll(() => scenario.snapshot().then((state) => state.activeStreams)).toBe(1)
+    await expect(
+      page
+        .locator('[data-ui="message"][data-role="assistant"]')
+        .last()
+        .locator('[data-ui="message-body"]'),
+    ).toContainText('Lorem ipsum')
+    await expect(region).toHaveAttribute('data-scroll-state', 'follow', { timeout: 3000 })
+    await expect
+      .poll(() => scrollDistanceFromBottom(region), { timeout: 5000 })
+      .toBeLessThanOrEqual(4)
+
+    await region.hover()
+    await page.mouse.wheel(0, -1000)
+    await expect(region).toHaveAttribute('data-scroll-state', 'pinned')
+    const pinnedDistance = await scrollDistanceFromBottom(region)
+    await expect
+      .poll(() => scrollDistanceFromBottom(region), { timeout: 3000 })
+      .toBeGreaterThanOrEqual(pinnedDistance)
+    await expect.poll(() => scenario.snapshot().then((state) => state.activeStreams)).toBe(0)
+  } finally {
+    await scenario.dispose()
+  }
 })

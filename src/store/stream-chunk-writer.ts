@@ -1,12 +1,12 @@
 import type { StreamLaneEvent } from '../api/stream-transforms'
 import { toPersistedAttemptFailure } from '../core/attempt-outcome'
 import {
-  findMergeTargetIndex,
+  isOpenAiResponsesFamilyFormat,
   mergeReasoningDetail,
   normalizeIncomingReasoningDetail,
 } from '../core/reasoning'
 import { STREAM_DURABLE_BATCH_TEXT_CHARS } from '../core/stream-accumulator'
-import type { ChatId, MessageId, ReasoningDetail } from '../core/types'
+import type { ChatId, MessageId, ReasoningDetail, ReasoningFormat } from '../core/types'
 import { errorFromUnknown } from '../lib/error'
 import type { StreamChunkRow, StreamWriteFence } from './repository'
 
@@ -19,6 +19,7 @@ const STREAM_CHUNK_RECOVERY_MAX_ROWS = 2_048
 const STREAM_CHUNK_RECOVERY_MAX_BYTES = 4 * 1024 * 1024
 const SHARED_APPEND_MAX_ROWS = 2_048
 const SHARED_APPEND_MAX_BYTES = 4 * 1024 * 1024
+const SHARED_APPEND_COMPACT_MIN_REQUESTS = 1_024
 
 const RECOVERABLE_OUTPUT_ITEM_TYPES = new Set<string>([
   'web_search_call',
@@ -52,12 +53,15 @@ export interface StreamChunkAppendPort {
 
 interface SharedStreamChunkAppendRequest {
   rows: readonly StreamChunkRow[]
+  rowCount: number
+  byteCount: number
   resolve: () => void
   reject: (error: unknown) => void
 }
 
 interface SharedStreamChunkAppendQueue {
   requests: SharedStreamChunkAppendRequest[]
+  head: number
   draining: boolean
   scheduled: boolean
 }
@@ -73,6 +77,8 @@ interface StreamChunkWriterSnapshot {
   status: StreamChunkWriterStatus
   bufferedRows: number
   bufferedBytes: number
+  trackedReasoningRows: number
+  trackedReasoningIds: number
   failure?: unknown
 }
 
@@ -80,6 +86,7 @@ export interface StreamChunkWriter {
   append(event: StreamLaneEvent, now: number): void
   flush(request: { mode: 'scheduled'; now: number }): void
   flush(request?: { mode: 'immediate' }): Promise<void>
+  checkpoint(): Promise<void>
   backpressure(): Promise<void> | undefined
   settle(): Promise<void>
   release(): void
@@ -140,11 +147,617 @@ interface ExactStructuredReasoningDetail {
 
 interface TrackedStructuredReasoningRow {
   detail: ReasoningDetail
-  ids: Set<string>
   valueSections: string[]
   pendingValueParts: string[]
   pendingValueLength: number
   valueLength: number
+}
+
+interface TrackedReasoningMetadata {
+  type: ReasoningDetail['type']
+  id: string | undefined
+  index: number | undefined
+  format: ReasoningFormat | undefined
+}
+
+type TrackedReasoningValueChange =
+  | { kind: 'append'; value: string }
+  | { kind: 'set'; value: string }
+
+interface ReasoningRowHeapEntry {
+  rowIndex: number
+  revision: number
+}
+
+class LatestReasoningRowBucket {
+  private readonly members = new Map<number, number>()
+  private heap: ReasoningRowHeapEntry[] = []
+  private nextRevision = 0
+
+  get size(): number {
+    return this.members.size
+  }
+
+  add(rowIndex: number): void {
+    if (this.members.has(rowIndex)) return
+    this.nextRevision += 1
+    const entry = { rowIndex, revision: this.nextRevision }
+    this.members.set(rowIndex, entry.revision)
+    this.heap.push(entry)
+    this.bubbleUp(this.heap.length - 1)
+    this.compactIfNeeded()
+  }
+
+  delete(rowIndex: number): void {
+    this.members.delete(rowIndex)
+    this.prune()
+    this.compactIfNeeded()
+  }
+
+  latest(): number | undefined {
+    this.prune()
+    return this.heap[0]?.rowIndex
+  }
+
+  latestMatching(predicate: (rowIndex: number) => boolean): number | undefined {
+    let latest: number | undefined
+    for (const rowIndex of this.members.keys()) {
+      if (predicate(rowIndex)) latest = newestReasoningRow(latest, rowIndex)
+    }
+    return latest
+  }
+
+  clear(): void {
+    this.members.clear()
+    this.heap = []
+    this.nextRevision = 0
+  }
+
+  private prune(): void {
+    while (this.heap.length > 0) {
+      const head = this.heap[0] as ReasoningRowHeapEntry
+      if (this.members.get(head.rowIndex) === head.revision) return
+      this.pop()
+    }
+  }
+
+  private compactIfNeeded(): void {
+    if (this.heap.length <= Math.max(32, this.members.size * 2)) return
+    this.heap = [...this.members].map(([rowIndex, revision]) => ({ rowIndex, revision }))
+    for (let index = Math.floor(this.heap.length / 2) - 1; index >= 0; index -= 1) {
+      this.bubbleDown(index)
+    }
+  }
+
+  private bubbleUp(start: number): void {
+    let index = start
+    const entry = this.heap[index] as ReasoningRowHeapEntry
+    while (index > 0) {
+      const parent = Math.floor((index - 1) / 2)
+      const parentEntry = this.heap[parent] as ReasoningRowHeapEntry
+      if (parentEntry.rowIndex >= entry.rowIndex) break
+      this.heap[index] = parentEntry
+      index = parent
+    }
+    this.heap[index] = entry
+  }
+
+  private bubbleDown(start: number): void {
+    const entry = this.heap[start]
+    if (!entry) return
+    let index = start
+    while (true) {
+      const left = index * 2 + 1
+      if (left >= this.heap.length) break
+      const right = left + 1
+      const leftEntry = this.heap[left] as ReasoningRowHeapEntry
+      const rightEntry = this.heap[right]
+      const child = rightEntry && rightEntry.rowIndex > leftEntry.rowIndex ? right : left
+      const childEntry = this.heap[child] as ReasoningRowHeapEntry
+      if (childEntry.rowIndex <= entry.rowIndex) break
+      this.heap[index] = childEntry
+      index = child
+    }
+    this.heap[index] = entry
+  }
+
+  private pop(): void {
+    const tail = this.heap.pop()
+    if (!tail || this.heap.length === 0) return
+    this.heap[0] = tail
+    this.bubbleDown(0)
+  }
+}
+
+interface ReasoningValueHash {
+  length: number
+  first: number
+  second: number
+}
+
+const EMPTY_REASONING_VALUE_HASH: ReasoningValueHash = {
+  length: 0,
+  first: 0x811c9dc5,
+  second: 0x9e3779b9,
+}
+
+class ReasoningValueHashIndex {
+  private readonly rowsByHash = new Map<string, LatestReasoningRowBucket>()
+  private readonly hashByRow = new Map<number, ReasoningValueHash>()
+  private readonly rowCountByLength = new Map<number, number>()
+
+  get size(): number {
+    return this.hashByRow.size
+  }
+
+  add(rowIndex: number, value: string): void {
+    this.move(rowIndex, hashReasoningValue(value))
+  }
+
+  append(rowIndex: number, suffix: string): void {
+    if (suffix.length === 0) return
+    const current = this.hashByRow.get(rowIndex)
+    if (!current) return
+    this.move(rowIndex, extendReasoningValueHash(current, suffix))
+  }
+
+  set(rowIndex: number, value: string): void {
+    this.move(rowIndex, hashReasoningValue(value))
+  }
+
+  delete(rowIndex: number): void {
+    const current = this.hashByRow.get(rowIndex)
+    if (!current) return
+    this.hashByRow.delete(rowIndex)
+    this.removeRow(reasoningValueHashKey(current), current.length, rowIndex)
+  }
+
+  latestExact(value: string, matches: (rowIndex: number) => boolean): number | undefined {
+    const bucket = this.rowsByHash.get(reasoningValueHashKey(hashReasoningValue(value)))
+    const latest = bucket?.latest()
+    if (latest === undefined || matches(latest)) return latest
+    return bucket?.latestMatching(matches)
+  }
+
+  latestPrefix(value: string, matches: (rowIndex: number) => boolean): number | undefined {
+    let length = 0
+    let first = EMPTY_REASONING_VALUE_HASH.first
+    let second = EMPTY_REASONING_VALUE_HASH.second
+    let latest: number | undefined
+    for (let index = 0; index < value.length; index += 1) {
+      const code = value.charCodeAt(index)
+      length += 1
+      first = Math.imul(first ^ code, 0x01000193) >>> 0
+      second = Math.imul(second ^ code, 0x85ebca6b) >>> 0
+      if (!this.rowCountByLength.has(length)) continue
+      latest = newestReasoningRow(
+        latest,
+        this.rowsByHash.get(reasoningValueHashKeyParts(length, first, second))?.latest(),
+      )
+    }
+    if (latest === undefined || matches(latest)) return latest
+
+    length = 0
+    first = EMPTY_REASONING_VALUE_HASH.first
+    second = EMPTY_REASONING_VALUE_HASH.second
+    let verified: number | undefined
+    for (let index = 0; index < value.length; index += 1) {
+      const code = value.charCodeAt(index)
+      length += 1
+      first = Math.imul(first ^ code, 0x01000193) >>> 0
+      second = Math.imul(second ^ code, 0x85ebca6b) >>> 0
+      if (!this.rowCountByLength.has(length)) continue
+      verified = newestReasoningRow(
+        verified,
+        this.rowsByHash
+          .get(reasoningValueHashKeyParts(length, first, second))
+          ?.latestMatching(matches),
+      )
+    }
+    return verified
+  }
+
+  clear(): void {
+    this.rowsByHash.clear()
+    this.hashByRow.clear()
+    this.rowCountByLength.clear()
+  }
+
+  private move(rowIndex: number, target: ReasoningValueHash): void {
+    const current = this.hashByRow.get(rowIndex)
+    const targetKey = reasoningValueHashKey(target)
+    if (current && reasoningValueHashKey(current) === targetKey) {
+      this.hashByRow.set(rowIndex, target)
+      return
+    }
+    let targetRows = this.rowsByHash.get(targetKey)
+    if (!targetRows) {
+      targetRows = new LatestReasoningRowBucket()
+      this.rowsByHash.set(targetKey, targetRows)
+    }
+    targetRows.add(rowIndex)
+    this.hashByRow.set(rowIndex, target)
+    this.rowCountByLength.set(target.length, (this.rowCountByLength.get(target.length) ?? 0) + 1)
+    if (current) this.removeRow(reasoningValueHashKey(current), current.length, rowIndex)
+  }
+
+  private removeRow(key: string, length: number, rowIndex: number): void {
+    const rows = this.rowsByHash.get(key)
+    rows?.delete(rowIndex)
+    if (rows?.size === 0) this.rowsByHash.delete(key)
+    const count = this.rowCountByLength.get(length) ?? 0
+    if (count <= 1) this.rowCountByLength.delete(length)
+    else this.rowCountByLength.set(length, count - 1)
+  }
+}
+
+function hashReasoningValue(value: string): ReasoningValueHash {
+  return extendReasoningValueHash(EMPTY_REASONING_VALUE_HASH, value)
+}
+
+function extendReasoningValueHash(initial: ReasoningValueHash, suffix: string): ReasoningValueHash {
+  let length = initial.length
+  let first = initial.first
+  let second = initial.second
+  for (let index = 0; index < suffix.length; index += 1) {
+    const code = suffix.charCodeAt(index)
+    length += 1
+    first = Math.imul(first ^ code, 0x01000193) >>> 0
+    second = Math.imul(second ^ code, 0x85ebca6b) >>> 0
+  }
+  return { length, first, second }
+}
+
+function reasoningValueHashKey(hash: ReasoningValueHash): string {
+  return reasoningValueHashKeyParts(hash.length, hash.first, hash.second)
+}
+
+function reasoningValueHashKeyParts(length: number, first: number, second: number): string {
+  return `${length}:${first}:${second}`
+}
+
+class StructuredReasoningLookup {
+  private readonly rowById = new Map<string, number>()
+  private readonly rowsByTypeIndex = new Map<string, LatestReasoningRowBucket>()
+  private readonly unidentifiedRowsByTypeIndex = new Map<string, LatestReasoningRowBucket>()
+  private readonly anthropicRowsByIndex = new Map<string, LatestReasoningRowBucket>()
+  private readonly unidentifiedAnthropicRowsByIndex = new Map<string, LatestReasoningRowBucket>()
+  private readonly unidentifiedGeminiSummaries = new LatestReasoningRowBucket()
+  private readonly unidentifiedOpenAiSummariesByIndex = new Map<string, LatestReasoningRowBucket>()
+  private readonly unidentifiedSummaryPrefixesByIndex = new Map<string, ReasoningValueHashIndex>()
+  private readonly unidentifiedEncryptedValues = new ReasoningValueHashIndex()
+
+  get idCount(): number {
+    return this.rowById.size
+  }
+
+  add(rowIndex: number, metadata: TrackedReasoningMetadata, value: string): void {
+    this.addMetadata(rowIndex, metadata)
+    this.addValue(rowIndex, metadata, value)
+  }
+
+  update(
+    rowIndex: number,
+    before: TrackedReasoningMetadata,
+    after: TrackedReasoningMetadata,
+    valueChange: TrackedReasoningValueChange,
+    current: () => ReasoningDetail,
+  ): void {
+    const metadataChanged = !sameTrackedReasoningMetadata(before, after)
+    if (metadataChanged) {
+      this.removeMetadata(rowIndex, before)
+      this.addMetadata(rowIndex, after)
+    }
+    const beforeValueIndex = trackedReasoningValueIndex(before)
+    const afterValueIndex = trackedReasoningValueIndex(after)
+    if (beforeValueIndex !== afterValueIndex) {
+      this.removeValue(rowIndex, before)
+      if (afterValueIndex) {
+        this.addValue(rowIndex, after, reasoningDetailValue(current()))
+      }
+      return
+    }
+    if (!afterValueIndex) return
+    const trie = this.valueTrie(after)
+    if (!trie) return
+    if (valueChange.kind === 'append') trie.append(rowIndex, valueChange.value)
+    else trie.set(rowIndex, valueChange.value)
+  }
+
+  find(
+    incoming: ReasoningDetail,
+    mode: 'delta' | 'snapshot' | 'cumulative',
+    rowAt: (rowIndex: number) => TrackedStructuredReasoningRow | undefined,
+  ): number | undefined {
+    const byId = incoming.id ? this.rowById.get(incoming.id) : undefined
+    if (byId !== undefined) return byId
+    if (mode !== 'snapshot') {
+      const key = reasoningTypeIndexKey(incoming.type, incoming.index)
+      return incoming.id
+        ? latestBucket(this.unidentifiedRowsByTypeIndex, key)
+        : latestBucket(this.rowsByTypeIndex, key)
+    }
+    const anthropicSnapshot =
+      incoming.type === 'reasoning.text' && incoming.format === 'anthropic-claude-v1'
+    if (anthropicSnapshot) {
+      const key = reasoningIndexKey(incoming.index)
+      return incoming.id
+        ? latestBucket(this.unidentifiedAnthropicRowsByIndex, key)
+        : latestBucket(this.anthropicRowsByIndex, key)
+    }
+    if (incoming.id) return undefined
+    if (incoming.type === 'reasoning.text') {
+      if (incoming.index === undefined) return undefined
+      return latestBucket(
+        this.unidentifiedRowsByTypeIndex,
+        reasoningTypeIndexKey(incoming.type, incoming.index),
+      )
+    }
+    if (incoming.type === 'reasoning.encrypted') {
+      const byIndex =
+        incoming.index === undefined
+          ? undefined
+          : latestBucket(
+              this.unidentifiedRowsByTypeIndex,
+              reasoningTypeIndexKey(incoming.type, incoming.index),
+            )
+      return newestReasoningRow(
+        byIndex,
+        this.unidentifiedEncryptedValues.latestExact(incoming.data, (rowIndex) => {
+          const row = rowAt(rowIndex)
+          return (
+            row !== undefined &&
+            row.valueLength === incoming.data.length &&
+            incomingStartsWithTrackedReasoningValue(incoming.data, row)
+          )
+        }),
+      )
+    }
+    let target =
+      incoming.index === undefined
+        ? undefined
+        : this.unidentifiedSummaryPrefixesByIndex
+            .get(reasoningIndexKey(incoming.index))
+            ?.latestPrefix(incoming.summary, (rowIndex) => {
+              const row = rowAt(rowIndex)
+              return (
+                row !== undefined &&
+                row.valueLength > 0 &&
+                incomingStartsWithTrackedReasoningValue(incoming.summary, row)
+              )
+            })
+    if (incoming.format === 'google-gemini-v1') {
+      target = newestReasoningRow(target, this.unidentifiedGeminiSummaries.latest())
+    }
+    if (incoming.index !== undefined && isOpenAiResponsesFamilyFormat(incoming.format)) {
+      target = newestReasoningRow(
+        target,
+        latestBucket(this.unidentifiedOpenAiSummariesByIndex, reasoningIndexKey(incoming.index)),
+      )
+    }
+    return target
+  }
+
+  clear(): void {
+    this.rowById.clear()
+    this.rowsByTypeIndex.clear()
+    this.unidentifiedRowsByTypeIndex.clear()
+    this.anthropicRowsByIndex.clear()
+    this.unidentifiedAnthropicRowsByIndex.clear()
+    this.unidentifiedGeminiSummaries.clear()
+    this.unidentifiedOpenAiSummariesByIndex.clear()
+    for (const trie of this.unidentifiedSummaryPrefixesByIndex.values()) trie.clear()
+    this.unidentifiedSummaryPrefixesByIndex.clear()
+    this.unidentifiedEncryptedValues.clear()
+  }
+
+  private addMetadata(rowIndex: number, metadata: TrackedReasoningMetadata): void {
+    if (metadata.id) this.rowById.set(metadata.id, rowIndex)
+    addReasoningBucket(
+      this.rowsByTypeIndex,
+      reasoningTypeIndexKey(metadata.type, metadata.index),
+      rowIndex,
+    )
+    if (!metadata.id) {
+      addReasoningBucket(
+        this.unidentifiedRowsByTypeIndex,
+        reasoningTypeIndexKey(metadata.type, metadata.index),
+        rowIndex,
+      )
+    }
+    if (
+      metadata.type === 'reasoning.text' &&
+      (metadata.format === undefined || metadata.format === 'anthropic-claude-v1')
+    ) {
+      addReasoningBucket(this.anthropicRowsByIndex, reasoningIndexKey(metadata.index), rowIndex)
+      if (!metadata.id) {
+        addReasoningBucket(
+          this.unidentifiedAnthropicRowsByIndex,
+          reasoningIndexKey(metadata.index),
+          rowIndex,
+        )
+      }
+    }
+    if (
+      !metadata.id &&
+      metadata.type === 'reasoning.summary' &&
+      metadata.format === 'google-gemini-v1'
+    ) {
+      this.unidentifiedGeminiSummaries.add(rowIndex)
+    }
+    if (
+      !metadata.id &&
+      metadata.type === 'reasoning.summary' &&
+      metadata.index !== undefined &&
+      isOpenAiResponsesFamilyFormat(metadata.format)
+    ) {
+      addReasoningBucket(
+        this.unidentifiedOpenAiSummariesByIndex,
+        reasoningIndexKey(metadata.index),
+        rowIndex,
+      )
+    }
+  }
+
+  private removeMetadata(rowIndex: number, metadata: TrackedReasoningMetadata): void {
+    if (metadata.id && this.rowById.get(metadata.id) === rowIndex) this.rowById.delete(metadata.id)
+    removeReasoningBucket(
+      this.rowsByTypeIndex,
+      reasoningTypeIndexKey(metadata.type, metadata.index),
+      rowIndex,
+    )
+    if (!metadata.id) {
+      removeReasoningBucket(
+        this.unidentifiedRowsByTypeIndex,
+        reasoningTypeIndexKey(metadata.type, metadata.index),
+        rowIndex,
+      )
+    }
+    if (
+      metadata.type === 'reasoning.text' &&
+      (metadata.format === undefined || metadata.format === 'anthropic-claude-v1')
+    ) {
+      removeReasoningBucket(this.anthropicRowsByIndex, reasoningIndexKey(metadata.index), rowIndex)
+      if (!metadata.id) {
+        removeReasoningBucket(
+          this.unidentifiedAnthropicRowsByIndex,
+          reasoningIndexKey(metadata.index),
+          rowIndex,
+        )
+      }
+    }
+    if (
+      !metadata.id &&
+      metadata.type === 'reasoning.summary' &&
+      metadata.format === 'google-gemini-v1'
+    ) {
+      this.unidentifiedGeminiSummaries.delete(rowIndex)
+    }
+    if (
+      !metadata.id &&
+      metadata.type === 'reasoning.summary' &&
+      metadata.index !== undefined &&
+      isOpenAiResponsesFamilyFormat(metadata.format)
+    ) {
+      removeReasoningBucket(
+        this.unidentifiedOpenAiSummariesByIndex,
+        reasoningIndexKey(metadata.index),
+        rowIndex,
+      )
+    }
+  }
+
+  private addValue(rowIndex: number, metadata: TrackedReasoningMetadata, value: string): void {
+    if (metadata.id) return
+    if (metadata.type === 'reasoning.summary' && metadata.index !== undefined) {
+      const key = reasoningIndexKey(metadata.index)
+      let trie = this.unidentifiedSummaryPrefixesByIndex.get(key)
+      if (!trie) {
+        trie = new ReasoningValueHashIndex()
+        this.unidentifiedSummaryPrefixesByIndex.set(key, trie)
+      }
+      trie.add(rowIndex, value)
+    } else if (metadata.type === 'reasoning.encrypted') {
+      this.unidentifiedEncryptedValues.add(rowIndex, value)
+    }
+  }
+
+  private removeValue(rowIndex: number, metadata: TrackedReasoningMetadata): void {
+    if (metadata.id) return
+    if (metadata.type === 'reasoning.summary' && metadata.index !== undefined) {
+      const key = reasoningIndexKey(metadata.index)
+      const trie = this.unidentifiedSummaryPrefixesByIndex.get(key)
+      trie?.delete(rowIndex)
+      if (trie?.size === 0) this.unidentifiedSummaryPrefixesByIndex.delete(key)
+    } else if (metadata.type === 'reasoning.encrypted') {
+      this.unidentifiedEncryptedValues.delete(rowIndex)
+    }
+  }
+
+  private valueTrie(metadata: TrackedReasoningMetadata): ReasoningValueHashIndex | undefined {
+    if (metadata.id) return undefined
+    if (metadata.type === 'reasoning.summary' && metadata.index !== undefined) {
+      return this.unidentifiedSummaryPrefixesByIndex.get(reasoningIndexKey(metadata.index))
+    }
+    return metadata.type === 'reasoning.encrypted' ? this.unidentifiedEncryptedValues : undefined
+  }
+}
+
+function reasoningTypeIndexKey(type: ReasoningDetail['type'], index: number | undefined): string {
+  return `${type}\u0000${reasoningIndexKey(index)}`
+}
+
+function reasoningIndexKey(index: number | undefined): string {
+  return index === undefined ? 'u' : `n${index}`
+}
+
+function trackedReasoningMetadata(row: TrackedStructuredReasoningRow): TrackedReasoningMetadata {
+  return {
+    type: row.detail.type,
+    id: row.detail.id,
+    index: row.detail.index,
+    format: row.detail.format,
+  }
+}
+
+function sameTrackedReasoningMetadata(
+  left: TrackedReasoningMetadata,
+  right: TrackedReasoningMetadata,
+): boolean {
+  return (
+    left.type === right.type &&
+    left.id === right.id &&
+    left.index === right.index &&
+    left.format === right.format
+  )
+}
+
+function trackedReasoningValueIndex(metadata: TrackedReasoningMetadata): string | undefined {
+  if (metadata.id) return undefined
+  if (metadata.type === 'reasoning.summary' && metadata.index !== undefined) {
+    return `summary\u0000${reasoningIndexKey(metadata.index)}`
+  }
+  return metadata.type === 'reasoning.encrypted' ? 'encrypted' : undefined
+}
+
+function newestReasoningRow(
+  left: number | undefined,
+  right: number | undefined,
+): number | undefined {
+  if (left === undefined) return right
+  if (right === undefined) return left
+  return Math.max(left, right)
+}
+
+function addReasoningBucket(
+  buckets: Map<string, LatestReasoningRowBucket>,
+  key: string,
+  rowIndex: number,
+): void {
+  let bucket = buckets.get(key)
+  if (!bucket) {
+    bucket = new LatestReasoningRowBucket()
+    buckets.set(key, bucket)
+  }
+  bucket.add(rowIndex)
+}
+
+function removeReasoningBucket(
+  buckets: Map<string, LatestReasoningRowBucket>,
+  key: string,
+  rowIndex: number,
+): void {
+  const bucket = buckets.get(key)
+  if (!bucket) return
+  bucket.delete(rowIndex)
+  if (bucket.size === 0) buckets.delete(key)
+}
+
+function latestBucket(
+  buckets: ReadonlyMap<string, LatestReasoningRowBucket>,
+  key: string,
+): number | undefined {
+  return buckets.get(key)?.latest()
 }
 
 class BufferedStreamChunkWriter implements StreamChunkWriter {
@@ -166,6 +779,7 @@ class BufferedStreamChunkWriter implements StreamChunkWriter {
   private persistedModel?: string
   private persistedProvider?: string
   private structuredReasoningRows: TrackedStructuredReasoningRow[] = []
+  private readonly structuredReasoningLookup = new StructuredReasoningLookup()
   private structuredReasoningTrackingReliable = true
   private lastChunkReceivedAt: number
   private status: StreamChunkWriterStatus = 'open'
@@ -226,6 +840,15 @@ class BufferedStreamChunkWriter implements StreamChunkWriter {
     return this.flushNow('immediate')
   }
 
+  async checkpoint(): Promise<void> {
+    try {
+      await this.flushNow('immediate')
+    } catch (error) {
+      if (this.status !== 'degraded') throw error
+      await this.flushNow('immediate')
+    }
+  }
+
   backpressure(): Promise<void> | undefined {
     this.assertAccepting()
     if (!this.backpressureThresholdReached()) return
@@ -260,6 +883,7 @@ class BufferedStreamChunkWriter implements StreamChunkWriter {
     this.bufferedTextLength = 0
     this.bufferedBytes = 0
     this.structuredReasoningRows = []
+    this.structuredReasoningLookup.clear()
     this.structuredReasoningTrackingReliable = false
     this.clearFlushTimer()
   }
@@ -269,6 +893,8 @@ class BufferedStreamChunkWriter implements StreamChunkWriter {
       status: this.status,
       bufferedRows: this.bufferedLogicalRows,
       bufferedBytes: this.bufferedBytes,
+      trackedReasoningRows: this.structuredReasoningRows.length,
+      trackedReasoningIds: this.structuredReasoningLookup.idCount,
       ...(this.failure !== undefined ? { failure: this.failure } : {}),
     }
   }
@@ -322,6 +948,7 @@ class BufferedStreamChunkWriter implements StreamChunkWriter {
     if (!exact) {
       if (reasoningEventMutatesReasoning(event)) {
         this.structuredReasoningRows = []
+        this.structuredReasoningLookup.clear()
         this.structuredReasoningTrackingReliable = false
       }
       return event
@@ -330,19 +957,30 @@ class BufferedStreamChunkWriter implements StreamChunkWriter {
       return event
     }
 
-    const target = this.findStructuredReasoningTarget(exact.detail, exact.mode)
+    const target = this.structuredReasoningLookup.find(
+      exact.detail,
+      exact.mode,
+      (rowIndex) => this.structuredReasoningRows[rowIndex],
+    )
     if (
       exact.mode === 'cumulative' &&
       target !== undefined &&
       cumulativeDetailCanBecomeDelta(this.structuredReasoningRows[target], exact.detail)
     ) {
       const tracked = this.structuredReasoningRows[target] as TrackedStructuredReasoningRow
+      const before = trackedReasoningMetadata(tracked)
       const incomingValue = reasoningDetailValue(exact.detail)
       const suffix = incomingValue.slice(tracked.valueLength)
-      if (exact.detail.id) tracked.ids.add(exact.detail.id)
       replaceTrackedReasoningValue(
         tracked,
         withReasoningDetailValue({ ...tracked.detail, ...exact.detail }, incomingValue),
+      )
+      this.structuredReasoningLookup.update(
+        target,
+        before,
+        trackedReasoningMetadata(tracked),
+        { kind: 'append', value: suffix },
+        () => materializeTrackedReasoningDetail(tracked),
       )
       return {
         ...event,
@@ -355,96 +993,74 @@ class BufferedStreamChunkWriter implements StreamChunkWriter {
     return event
   }
 
-  private findStructuredReasoningTarget(
-    incoming: ReasoningDetail,
-    mode: 'delta' | 'snapshot' | 'cumulative',
-  ): number | undefined {
-    if (incoming.id) {
-      const byId = this.structuredReasoningRows.findIndex((row) =>
-        row.ids.has(incoming.id as string),
-      )
-      if (byId >= 0) return byId
-    }
-    if (mode === 'snapshot') {
-      if (isAnthropicReasoningText(incoming)) {
-        for (let index = this.structuredReasoningRows.length - 1; index >= 0; index -= 1) {
-          const existing = this.structuredReasoningRows[index]?.detail
-          if (
-            existing?.type === 'reasoning.text' &&
-            existing.index === incoming.index &&
-            (existing.format === undefined || existing.format === 'anthropic-claude-v1') &&
-            (!existing.id || !incoming.id || existing.id === incoming.id)
-          ) {
-            return index
-          }
-        }
-        return undefined
-      }
-      const target = findMergeTargetIndex(
-        this.structuredReasoningRows.map(materializeTrackedReasoningDetail),
-        incoming,
-      )
-      return target >= 0 ? target : undefined
-    }
-    for (let index = this.structuredReasoningRows.length - 1; index >= 0; index -= 1) {
-      const existing = this.structuredReasoningRows[index]?.detail
-      if (!existing || existing.type !== incoming.type) continue
-      if (existing.id && incoming.id && existing.id !== incoming.id) continue
-      if (existing.index === incoming.index) return index
-    }
-    return undefined
-  }
-
   private learnStructuredReasoningDetail(
     target: number | undefined,
     incoming: ReasoningDetail,
     mode: 'delta' | 'snapshot' | 'cumulative',
   ): void {
     if (target === undefined) {
-      this.structuredReasoningRows.push(createTrackedReasoningRow(incoming))
+      const tracked = createTrackedReasoningRow(incoming)
+      const rowIndex = this.structuredReasoningRows.length
+      this.structuredReasoningRows.push(tracked)
+      this.structuredReasoningLookup.add(
+        rowIndex,
+        trackedReasoningMetadata(tracked),
+        reasoningDetailValue(incoming),
+      )
       return
     }
     const tracked = this.structuredReasoningRows[target]
     if (!tracked) return
-    if (incoming.id) tracked.ids.add(incoming.id)
+    const before = trackedReasoningMetadata(tracked)
+    const previousValueLength = tracked.valueLength
+    let valueChange: TrackedReasoningValueChange
     if (tracked.detail.type !== incoming.type) {
       replaceTrackedReasoningValue(tracked, incoming)
-      return
-    }
-    if (mode === 'delta') {
-      appendTrackedReasoningDelta(tracked, incoming)
-      return
-    }
-    if (mode === 'snapshot') {
+      valueChange = { kind: 'set', value: reasoningDetailValue(incoming) }
+    } else if (mode === 'delta') {
+      valueChange = { kind: 'append', value: appendTrackedReasoningDelta(tracked, incoming) }
+    } else if (mode === 'snapshot') {
       const next = isAnthropicReasoningText(incoming)
         ? ({ ...materializeTrackedReasoningDetail(tracked), ...incoming } as ReasoningDetail)
         : mergeReasoningDetail(materializeTrackedReasoningDetail(tracked), incoming)
       replaceTrackedReasoningValue(tracked, next)
-      return
-    }
-
-    const incomingValue = reasoningDetailValue(incoming)
-    if (
-      incomingValue.length === tracked.valueLength &&
-      incomingStartsWithTrackedReasoningValue(incomingValue, tracked)
-    ) {
-      replaceTrackedReasoningValue(
-        tracked,
-        withReasoningDetailValue({ ...tracked.detail, ...incoming }, incomingValue),
-      )
-      return
-    }
-    const replacesValue =
-      incomingValue.length > tracked.valueLength &&
-      incomingStartsWithTrackedReasoningValue(incomingValue, tracked)
-    if (replacesValue) {
-      replaceTrackedReasoningValue(
-        tracked,
-        withReasoningDetailValue({ ...tracked.detail, ...incoming }, incomingValue),
-      )
+      valueChange = { kind: 'set', value: reasoningDetailValue(next) }
     } else {
-      appendTrackedReasoningDelta(tracked, incoming)
+      const incomingValue = reasoningDetailValue(incoming)
+      if (
+        incomingValue.length === tracked.valueLength &&
+        incomingStartsWithTrackedReasoningValue(incomingValue, tracked)
+      ) {
+        replaceTrackedReasoningValue(
+          tracked,
+          withReasoningDetailValue({ ...tracked.detail, ...incoming }, incomingValue),
+        )
+        valueChange = { kind: 'append', value: '' }
+      } else {
+        const replacesValue =
+          incomingValue.length > tracked.valueLength &&
+          incomingStartsWithTrackedReasoningValue(incomingValue, tracked)
+        if (replacesValue) {
+          replaceTrackedReasoningValue(
+            tracked,
+            withReasoningDetailValue({ ...tracked.detail, ...incoming }, incomingValue),
+          )
+          valueChange = {
+            kind: 'append',
+            value: incomingValue.slice(previousValueLength),
+          }
+        } else {
+          valueChange = { kind: 'append', value: appendTrackedReasoningDelta(tracked, incoming) }
+        }
+      }
     }
+    this.structuredReasoningLookup.update(
+      target,
+      before,
+      trackedReasoningMetadata(tracked),
+      valueChange,
+      () => materializeTrackedReasoningDetail(tracked),
+    )
   }
 
   private scheduleFlush(now: number): void {
@@ -626,11 +1242,13 @@ function appendSharedStreamChunks(
 ): Promise<void> {
   let queue = sharedStreamChunkAppendQueues.get(port)
   if (!queue) {
-    queue = { requests: [], draining: false, scheduled: false }
+    queue = { requests: [], head: 0, draining: false, scheduled: false }
     sharedStreamChunkAppendQueues.set(port, queue)
   }
+  let byteCount = 0
+  for (const row of rows) byteCount += estimateStreamChunkBytes(row)
   const promise = new Promise<void>((resolve, reject) => {
-    queue.requests.push({ rows, resolve, reject })
+    queue.requests.push({ rows, rowCount: rows.length, byteCount, resolve, reject })
   })
   if (!queue.draining && !queue.scheduled) {
     queue.scheduled = true
@@ -649,13 +1267,13 @@ async function drainSharedStreamChunkAppends(
   if (queue.draining) return
   queue.draining = true
   try {
-    while (queue.requests.length > 0) {
-      const requests = takeSharedAppendBatch(queue.requests)
+    while (sharedAppendPendingCount(queue) > 0) {
+      const requests = takeSharedAppendBatch(queue)
       await appendSharedRequestBatch(port, requests)
     }
   } finally {
     queue.draining = false
-    if (queue.requests.length > 0 && !queue.scheduled) {
+    if (sharedAppendPendingCount(queue) > 0 && !queue.scheduled) {
       queue.scheduled = true
       queueMicrotask(() => {
         queue.scheduled = false
@@ -665,25 +1283,41 @@ async function drainSharedStreamChunkAppends(
   }
 }
 
+function sharedAppendPendingCount(queue: SharedStreamChunkAppendQueue): number {
+  return queue.requests.length - queue.head
+}
+
 function takeSharedAppendBatch(
-  pending: SharedStreamChunkAppendRequest[],
+  queue: SharedStreamChunkAppendQueue,
 ): SharedStreamChunkAppendRequest[] {
-  let requestCount = 0
+  const start = queue.head
+  let end = start
   let rowCount = 0
   let bytes = 0
-  for (const request of pending) {
-    let requestBytes = 0
-    for (const row of request.rows) requestBytes += estimateStreamChunkBytes(row)
+  while (end < queue.requests.length) {
+    const request = queue.requests[end] as SharedStreamChunkAppendRequest
     const exceedsBudget =
-      requestCount > 0 &&
-      (rowCount + request.rows.length > SHARED_APPEND_MAX_ROWS ||
-        bytes + requestBytes > SHARED_APPEND_MAX_BYTES)
+      end > start &&
+      (rowCount + request.rowCount > SHARED_APPEND_MAX_ROWS ||
+        bytes + request.byteCount > SHARED_APPEND_MAX_BYTES)
     if (exceedsBudget) break
-    requestCount += 1
-    rowCount += request.rows.length
-    bytes += requestBytes
+    end += 1
+    rowCount += request.rowCount
+    bytes += request.byteCount
   }
-  return pending.splice(0, Math.max(1, requestCount))
+  const requests = queue.requests.slice(start, end)
+  queue.head = end
+  if (queue.head === queue.requests.length) {
+    queue.requests = []
+    queue.head = 0
+  } else if (
+    queue.head >= SHARED_APPEND_COMPACT_MIN_REQUESTS &&
+    queue.head * 2 >= queue.requests.length
+  ) {
+    queue.requests = queue.requests.slice(queue.head)
+    queue.head = 0
+  }
+  return requests
 }
 
 async function appendSharedRequestBatch(
@@ -982,7 +1616,6 @@ function cumulativeDetailCanBecomeDelta(
 function createTrackedReasoningRow(incoming: ReasoningDetail): TrackedStructuredReasoningRow {
   const tracked: TrackedStructuredReasoningRow = {
     detail: withoutReasoningDetailValue({ ...incoming }),
-    ids: new Set(incoming.id ? [incoming.id] : []),
     valueSections: [],
     pendingValueParts: [],
     pendingValueLength: 0,
@@ -1010,8 +1643,9 @@ function setTrackedReasoningValue(tracked: TrackedStructuredReasoningRow, value:
 function appendTrackedReasoningDelta(
   tracked: TrackedStructuredReasoningRow,
   incoming: ReasoningDetail,
-): void {
+): string {
   const incomingValue = reasoningDetailValue(incoming)
+  let appended = ''
   if (
     tracked.detail.type === 'reasoning.summary' &&
     incoming.type === 'reasoning.summary' &&
@@ -1022,12 +1656,15 @@ function appendTrackedReasoningDelta(
     !/^\s*\n/u.test(incomingValue)
   ) {
     appendTrackedReasoningValue(tracked, '\n\n')
+    appended = '\n\n'
   }
   appendTrackedReasoningValue(tracked, incomingValue)
+  appended += incomingValue
   tracked.detail = withoutReasoningDetailValue({
     ...tracked.detail,
     ...incoming,
   })
+  return appended
 }
 
 function appendTrackedReasoningValue(tracked: TrackedStructuredReasoningRow, value: string): void {

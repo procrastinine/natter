@@ -3,7 +3,6 @@ import type { ComponentProps } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { effectiveCapabilityFromEndpoints } from '../../src/core/capabilities'
 import type { Message as MessageRow, ModelEndpoint } from '../../src/core/types'
-import { __resetMessageStreamProjectionForTests } from '../../src/hooks/useMessageStreamProjection'
 import type * as GeneratedImagesModule from '../../src/store/generated-images'
 import { getStreamClientId } from '../../src/store/stream-leases'
 import { useStreamStore } from '../../src/store/zustand/streamStore'
@@ -38,7 +37,6 @@ vi.mock('../../src/store/generated-images', async (importOriginal) => {
 })
 
 afterEach(() => {
-  __resetMessageStreamProjectionForTests()
   useStreamStore.getState().reset()
   useToastStore.getState().reset()
   generatedImageMocks.schedule.mockClear()
@@ -356,7 +354,7 @@ describe('Message content refresh', () => {
 })
 
 describe('Message presentation-only snapshots', () => {
-  it('retains final stream output until the persisted message version catches up', async () => {
+  it('uses the canonical terminal body before the current generation snapshot clears', async () => {
     const message = makeAssistant({
       id: 'final-persistence-order-message',
       content: [{ type: 'output_text', text: 'Old persisted placeholder.' }],
@@ -373,6 +371,7 @@ describe('Message presentation-only snapshots', () => {
         replacementEpoch: 0,
         chatId: message.chatId,
         messageId: message.id,
+        attemptKind: 'generation',
         startedAt: generation.startedAt,
         ownerClientId: getStreamClientId(),
       })
@@ -403,25 +402,6 @@ describe('Message presentation-only snapshots', () => {
     view.rerender(
       <ChatMessage
         {...props}
-        message={message}
-        presentationOnly
-        allowPresentationStreamProjection
-      />,
-    )
-
-    act(() =>
-      useStreamStore.getState().clearLiveSnapshot(message.id, 'final-persistence-order-stream', 0),
-    )
-    expect(body()).toHaveTextContent('Final live text.')
-    expect(body()).not.toHaveTextContent('Old persisted placeholder.')
-
-    act(() => useStreamStore.getState().clearActive('final-persistence-order-stream', 0))
-    expect(body()).toHaveTextContent('Final live text.')
-    expect(body()).not.toHaveTextContent('Old persisted placeholder.')
-
-    view.rerender(
-      <ChatMessage
-        {...props}
         message={makeAssistant({
           id: message.id,
           content: [{ type: 'output_text', text: 'Canonical persisted text.' }],
@@ -435,6 +415,16 @@ describe('Message presentation-only snapshots', () => {
     await waitFor(() => expect(body()).toHaveTextContent('Canonical persisted text.'))
     expect(body()).not.toHaveTextContent('Final live text.')
     expect(body()).not.toHaveTextContent('Old persisted placeholder.')
+
+    act(() =>
+      useStreamStore.getState().clearLiveSnapshot(message.id, 'final-persistence-order-stream', 0),
+    )
+    expect(body()).toHaveTextContent('Canonical persisted text.')
+    expect(body()).not.toHaveTextContent('Final live text.')
+
+    act(() => useStreamStore.getState().clearActive('final-persistence-order-stream', 0))
+    expect(body()).toHaveTextContent('Canonical persisted text.')
+    expect(body()).not.toHaveTextContent('Final live text.')
   })
 
   it('does not run generated-output persistence migrations', async () => {
@@ -537,6 +527,7 @@ describe('Message streaming info surface', () => {
       replacementEpoch: 0,
       chatId: msg.chatId,
       messageId: msg.id,
+      attemptKind: 'continuation',
       startedAt: generation.startedAt,
       ownerClientId: getStreamClientId(),
     })

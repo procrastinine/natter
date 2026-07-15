@@ -51,7 +51,13 @@ import type {
   MessageRole,
 } from '../core/types'
 import { useBranchUrlSync, useStableStructuralHeaders } from '../hooks/useBranchUrlSync'
-import { nextOrphanRecoveryAt, recoverOrphans, useChat } from '../hooks/useChat'
+import {
+  nextOrphanRecoveryAt,
+  type OrphanRecoveryPoint,
+  recoverOrphans,
+  recoverStreamOrphan,
+  useChat,
+} from '../hooks/useChat'
 import { useEndpoints } from '../hooks/useEndpoints'
 import { useModels } from '../hooks/useModels'
 import { LruMap } from '../lib/lru-map'
@@ -95,9 +101,10 @@ import type {
 } from '../store/repository'
 import { readSidebarSortMode, SIDEBAR_SORT_SETTING_KEY } from '../store/sidebar-preferences'
 import {
+  getStreamClientId,
   installStreamLeaseListener,
+  onAnyRemoteStreamOwnershipReleased,
   onRemoteStreamLeasesExpired,
-  onRemoteStreamOwnershipReleased,
   requestAbortForStream,
 } from '../store/stream-leases'
 import { getWorkspaceRepository } from '../store/workspace-repository'
@@ -106,11 +113,16 @@ import type {
   CommittedMessagePresentation,
   CommittedMessagePresentationReceipt,
   CommittedPathPresentationReceipt,
+  CommittedPresentationFocus,
 } from '../store/zustand/chatStore'
 import { useChatStore } from '../store/zustand/chatStore'
 import {
-  type ActiveStream,
+  isRecoveryPendingStream,
   isStreamRelevantToSelectedPath,
+  mostRecentlyAdmittedStream,
+  recoveryPendingStreams,
+  streamOriginatesFromTabNavigation,
+  subscribeRecoveryPendingStreams,
   useActiveStreamsForChat,
   useStreamStore,
 } from '../store/zustand/streamStore'
@@ -208,6 +220,9 @@ const MOBILE_SHELL_QUERY = '(max-width: 700px)'
 // Stable empty reference so useSyncExternalStore selectors don't allocate a
 // fresh `{}` each render (React 19 flags that as infinite re-render).
 const EMPTY_CURSOR: CursorMap = Object.freeze({})
+const EMPTY_COMMITTED_MESSAGE_RECEIPTS = Object.freeze(
+  [],
+) as readonly CommittedMessagePresentationReceipt[]
 // Matches ModelPicker's MODELS_QUERY — the cache row is keyed on the query
 // signature, so reusing the same one here means the picker and the
 // auto-selector share a single /models fetch instead of triggering two.
@@ -249,20 +264,6 @@ function oppositeRole(role: MessageRole): MessageRole {
   if (role === 'user') return 'assistant'
   if (role === 'assistant') return 'user'
   return role
-}
-
-function newestStream(streams: readonly ActiveStream[]): ActiveStream | undefined {
-  let newest: ActiveStream | undefined
-  for (const stream of streams) {
-    if (
-      !newest ||
-      stream.startedAt > newest.startedAt ||
-      (stream.startedAt === newest.startedAt && stream.streamId > newest.streamId)
-    ) {
-      newest = stream
-    }
-  }
-  return newest
 }
 
 let activeBranchWindowReadEpoch = 0
@@ -378,15 +379,44 @@ interface VisibleHeaderOverlayState {
   windowIndexById: ReadonlyMap<MessageId, number>
   appliedHeaderById: ReadonlyMap<MessageId, MessageHeaderRow>
   latestHeaderSource: MessageHeaderLookup | null
-  committedPresentation: CommittedMessagePresentation | null
+  committedReceipts: readonly CommittedMessagePresentationReceipt[]
 }
+
+function repositorySnapshotObservesCommittedMessage(
+  snapshot: ActiveBranchWindowSnapshot | null,
+  receipt: CommittedMessagePresentationReceipt | undefined,
+  pathIndexById?: ReadonlyMap<MessageId, number>,
+): boolean {
+  if (!snapshot || !receipt || snapshot.chatId !== receipt.chatId) return false
+  const pathIndex =
+    pathIndexById?.get(receipt.presentation.message.id) ??
+    snapshot.branchHeaders.findIndex((header) => header.id === receipt.presentation.message.id)
+  const windowIndex = pathIndex - snapshot.windowOffset
+  if (pathIndex < 0 || windowIndex < 0 || windowIndex >= snapshot.branchWindow.length) return false
+  const header = snapshot.branchHeaders[pathIndex]
+  const message = snapshot.branchWindow[windowIndex]
+  const headerObserved =
+    header !== undefined &&
+    header.nodeVersion >= receipt.presentation.header.nodeVersion &&
+    header.bodyVersion >= receipt.presentation.bodyVersion &&
+    (sameHeaderStructure(header, receipt.presentation.header) ||
+      header.nodeVersion > receipt.presentation.header.nodeVersion)
+  return (
+    header?.id === receipt.presentation.message.id &&
+    message?.id === receipt.presentation.message.id &&
+    headerObserved
+  )
+}
+
+export const __repositorySnapshotObservesCommittedMessageForTests =
+  repositorySnapshotObservesCommittedMessage
 
 function useVisibleMessageHeaderOverlay(
   snapshot: ActiveBranchWindowSnapshot | null,
   latestHeaderById: MessageHeaderLookup,
   changedHeaderKeys: readonly string[] | null,
   changedHeaders: readonly (MessageHeaderRow | undefined)[] | null,
-  committedReceipt: CommittedMessagePresentationReceipt | undefined,
+  committedReceipts: readonly CommittedMessagePresentationReceipt[],
 ): ActiveBranchWindowSnapshot | null {
   const stateRef = useRef<VisibleHeaderOverlayState>({
     source: null,
@@ -394,7 +424,7 @@ function useVisibleMessageHeaderOverlay(
     windowIndexById: new Map(),
     appliedHeaderById: new Map(),
     latestHeaderSource: null,
-    committedPresentation: null,
+    committedReceipts: [],
   })
 
   return useMemo(() => {
@@ -407,7 +437,7 @@ function useVisibleMessageHeaderOverlay(
         windowIndexById: new Map(),
         appliedHeaderById: new Map(),
         latestHeaderSource: latestHeaderById,
-        committedPresentation: null,
+        committedReceipts: [],
       }
       return null
     }
@@ -420,7 +450,10 @@ function useVisibleMessageHeaderOverlay(
       ? new Map<MessageId, MessageHeaderRow>()
       : new Map(previous.appliedHeaderById)
     let value = sourceChanged ? snapshot : (previous.value ?? snapshot)
-    const pendingUpdate: { window: Message[] | null } = { window: null }
+    const pendingUpdate: { headers: MessageHeaderRow[] | null; window: Message[] | null } = {
+      headers: null,
+      window: null,
+    }
 
     const applyHeader = (header: MessageHeaderRow | undefined): void => {
       if (!header || header.chatId !== snapshot.chatId) return
@@ -455,25 +488,65 @@ function useVisibleMessageHeaderOverlay(
       for (const header of changedHeaders) applyHeader(header)
     }
 
-    const committedPresentation = committedReceipt?.presentation ?? null
-    if (
-      committedPresentation &&
-      (sourceChanged || previous.committedPresentation !== committedPresentation)
-    ) {
-      applyHeader(committedPresentation.header)
+    for (const { presentation: committedPresentation } of committedReceipts) {
+      const windowIndex = windowIndexById.get(committedPresentation.message.id)
+      const pathIndex = windowIndex === undefined ? -1 : snapshot.windowOffset + windowIndex
+      const currentHeader =
+        pathIndex < 0 ? undefined : (pendingUpdate.headers ?? value.branchHeaders)[pathIndex]
+      const currentMessage =
+        windowIndex === undefined
+          ? undefined
+          : (pendingUpdate.window ?? value.branchWindow)[windowIndex]
+      const observedHeader = latestHeaderById.get(committedPresentation.message.id)
+      const exactBodyHeader =
+        observedHeader &&
+        observedHeader.bodyVersion === committedPresentation.bodyVersion &&
+        observedHeader.nodeVersion >= committedPresentation.header.nodeVersion &&
+        sameHeaderStructure(observedHeader, committedPresentation.header)
+          ? observedHeader
+          : currentHeader &&
+              currentHeader.bodyVersion === committedPresentation.bodyVersion &&
+              currentHeader.nodeVersion >= committedPresentation.header.nodeVersion &&
+              sameHeaderStructure(currentHeader, committedPresentation.header)
+            ? currentHeader
+            : committedPresentation.header
+      if (
+        windowIndex !== undefined &&
+        currentHeader &&
+        currentMessage?.id === committedPresentation.message.id &&
+        sameHeaderStructure(currentHeader, committedPresentation.header) &&
+        committedPresentation.bodyVersion >= currentHeader.bodyVersion &&
+        (committedPresentation.bodyVersion === currentHeader.bodyVersion ||
+          committedPresentation.header.nodeVersion >= currentHeader.nodeVersion)
+      ) {
+        pendingUpdate.headers ??= [...value.branchHeaders]
+        pendingUpdate.window ??= [...value.branchWindow]
+        pendingUpdate.headers[pathIndex] = exactBodyHeader
+        pendingUpdate.window[windowIndex] = overlayCanonicalMessageHeader(
+          committedPresentation.message,
+          exactBodyHeader,
+        )
+        appliedHeaderById.set(exactBodyHeader.id, exactBodyHeader)
+      }
     }
 
-    if (pendingUpdate.window) value = { ...value, branchWindow: pendingUpdate.window }
+    if (pendingUpdate.headers || pendingUpdate.window) {
+      value = {
+        ...value,
+        ...(pendingUpdate.headers ? { branchHeaders: pendingUpdate.headers } : {}),
+        ...(pendingUpdate.window ? { branchWindow: pendingUpdate.window } : {}),
+      }
+    }
     stateRef.current = {
       source: snapshot,
       value,
       windowIndexById,
       appliedHeaderById,
       latestHeaderSource: latestHeaderById,
-      committedPresentation,
+      committedReceipts,
     }
     return value
-  }, [changedHeaderKeys, changedHeaders, committedReceipt, latestHeaderById, snapshot])
+  }, [changedHeaderKeys, changedHeaders, committedReceipts, latestHeaderById, snapshot])
 }
 
 function composeKnownBranchPage(
@@ -591,6 +664,7 @@ function rebaseBranchSnapshot(
 
 function composeCommittedPathWindow(
   receipt: CommittedPathPresentationReceipt,
+  exactMessagePresentations: readonly CommittedMessagePresentation[],
   structuralPath: readonly MessageHeaderRow[],
   authoritativeHeaderById: MessageHeaderLookup,
   base: ActiveBranchWindowSnapshot | null,
@@ -602,6 +676,19 @@ function composeCommittedPathWindow(
   const committedById = new Map(
     receipt.presentations.map((presentation) => [presentation.message.id, presentation]),
   )
+  for (const exactMessagePresentation of exactMessagePresentations) {
+    if (exactMessagePresentation.message.chatId !== receipt.chatId) continue
+    const pathPresentation = committedById.get(exactMessagePresentation.message.id)
+    if (
+      !pathPresentation ||
+      (exactMessagePresentation.header.nodeVersion >= pathPresentation.header.nodeVersion &&
+        exactMessagePresentation.bodyVersion >= pathPresentation.bodyVersion &&
+        (exactMessagePresentation.header.nodeVersion > pathPresentation.header.nodeVersion ||
+          exactMessagePresentation.bodyVersion > pathPresentation.bodyVersion))
+    ) {
+      committedById.set(exactMessagePresentation.message.id, exactMessagePresentation)
+    }
+  }
   const available = new Map<MessageId, CommittedMessagePresentation>()
   if (base?.chatId === receipt.chatId) {
     for (let index = 0; index < base.branchWindow.length; index += 1) {
@@ -839,6 +926,7 @@ export function Shell() {
     null,
   )
   const [pendingTreeExitChatId, setPendingTreeExitChatId] = useState<ChatId | null>(null)
+  const committedPresentationFocusRef = useRef<CommittedPresentationFocus | null>(null)
   const editTreeMode = useUiStore((s) => s.editTreeMode)
   const setEditTreeMode = useUiStore((s) => s.setEditTreeMode)
   const treeViewChatId = useUiStore((s) => s.treeViewChatId)
@@ -864,8 +952,31 @@ export function Shell() {
   const activeCommittedPathPresentation = useChatStore((s) =>
     activeChatId ? s.getCommittedPathPresentation(activeChatId) : undefined,
   )
-  const activeCommittedMessagePresentation = useChatStore((s) =>
-    activeChatId ? s.getCommittedMessagePresentation(activeChatId) : undefined,
+  const activeCommittedMessagePresentations = useChatStore((s) =>
+    activeChatId
+      ? s.getCommittedMessagePresentations(activeChatId)
+      : EMPTY_COMMITTED_MESSAGE_RECEIPTS,
+  )
+  const activeCommittedMessagePresentationValues = useMemo(
+    () => activeCommittedMessagePresentations.map(({ presentation }) => presentation),
+    [activeCommittedMessagePresentations],
+  )
+  const committedMessageReceiptIds = useMemo(
+    () =>
+      new Set(
+        activeCommittedMessagePresentations.map(({ presentation }) => presentation.message.id),
+      ),
+    [activeCommittedMessagePresentations],
+  )
+  const committedMessageHeaderById = useMemo(
+    () =>
+      new Map(
+        activeCommittedMessagePresentations.map(({ presentation }) => [
+          presentation.message.id,
+          presentation.header,
+        ]),
+      ),
+    [activeCommittedMessagePresentations],
   )
   const committedPathHeaderById = useMemo(
     () =>
@@ -880,14 +991,11 @@ export function Shell() {
       get(messageId) {
         let header = latestTreeHeaderById.get(messageId)
         header = preferStrictlyNewerHeader(header, committedPathHeaderById.get(messageId))
-        const committedMessage = activeCommittedMessagePresentation?.presentation
-        if (committedMessage?.header.id === messageId) {
-          header = preferStrictlyNewerHeader(header, committedMessage.header)
-        }
+        header = preferStrictlyNewerHeader(header, committedMessageHeaderById.get(messageId))
         return header
       },
     }),
-    [activeCommittedMessagePresentation, committedPathHeaderById, latestTreeHeaderById],
+    [committedMessageHeaderById, committedPathHeaderById, latestTreeHeaderById],
   )
   const structuralPathHeaders = useMemo(
     () => activePathProjected(structuralTreeProjection, activeCursor),
@@ -935,22 +1043,27 @@ export function Shell() {
           activePathIntentIdSet,
           knownHeaderMessageIds,
           activeNavigationRevision,
+          getStreamClientId(),
         ),
       ),
     [activeChatStreams, activeNavigationRevision, activePathIntentIdSet, knownHeaderMessageIds],
   )
   const selectedPathStreamActive = selectedPathStreams.length > 0
   const newestSelectedPathStream = useMemo(
-    () => newestStream(selectedPathStreams),
+    () => mostRecentlyAdmittedStream(selectedPathStreams),
     [selectedPathStreams],
   )
   const pendingLocalGenerationStream = useMemo(
     () =>
-      newestStream(
+      mostRecentlyAdmittedStream(
         activeChatStreams.filter(
           (stream) =>
             stream.attemptKind === 'generation' &&
-            stream.originNavigationRevision === activeNavigationRevision &&
+            streamOriginatesFromTabNavigation(
+              stream,
+              activeNavigationRevision,
+              getStreamClientId(),
+            ) &&
             (stream.messageId === undefined || !knownHeaderMessageIds.has(stream.messageId)),
         ),
       ),
@@ -993,9 +1106,15 @@ export function Shell() {
     const receiptFocus = activeChatId
       ? useChatStore.getState().beginCommittedPresentationFocus(activeChatId)
       : null
+    committedPresentationFocusRef.current = receiptFocus
     setEphemeralActiveChatId(activeChatId)
     return () => {
-      if (receiptFocus) useChatStore.getState().endCommittedPresentationFocus(receiptFocus)
+      if (receiptFocus) {
+        if (committedPresentationFocusRef.current === receiptFocus) {
+          committedPresentationFocusRef.current = null
+        }
+        useChatStore.getState().endCommittedPresentationFocus(receiptFocus)
+      }
       if (useUiStore.getState().activeChatId === activeChatId) {
         setEphemeralActiveChatId(null)
       }
@@ -1054,9 +1173,11 @@ export function Shell() {
       : defaultMessageBodyWindowLimit
   useLayoutEffect(() => {
     if (!activeChatId) return
-    useChatStore
-      .getState()
-      .setCommittedPresentationWindowLimit(activeChatId, effectiveMessageBodyWindowLimit)
+    const store = useChatStore.getState()
+    store.setCommittedPresentationWindowLimit(activeChatId, effectiveMessageBodyWindowLimit)
+    return () => {
+      store.clearCommittedPresentationWindowLimit(activeChatId, effectiveMessageBodyWindowLimit)
+    }
   }, [activeChatId, effectiveMessageBodyWindowLimit])
   const alternateViewsRetained = retainedAlternateViewsChatId === activeChatId
   const activeBranchWindowQueryKey =
@@ -1251,6 +1372,7 @@ export function Shell() {
       activeCommittedPathPresentation && committedReceiptMatchesActivePath
         ? composeCommittedPathWindow(
             activeCommittedPathPresentation,
+            activeCommittedMessagePresentationValues,
             authoritativePathHeaders,
             authoritativeHeaderById,
             reactiveBranchSnapshot ?? lastActiveBranchSnapshot?.snapshot ?? null,
@@ -1259,6 +1381,7 @@ export function Shell() {
         : null,
     [
       activeCommittedPathPresentation,
+      activeCommittedMessagePresentationValues,
       authoritativeHeaderById,
       authoritativePathHeaders,
       committedReceiptMatchesActivePath,
@@ -1292,21 +1415,21 @@ export function Shell() {
     if (!activeChatId || !receipt || !committedReceiptObserved) return
     useChatStore.getState().acknowledgeCommittedPathPresentation(activeChatId, receipt)
   }, [activeChatId, activeCommittedPathPresentation, committedReceiptObserved])
-  const committedMessageReceiptObserved = (() => {
-    const presentation = activeCommittedMessagePresentation?.presentation
-    if (!presentation) return false
-    const observed = latestTreeHeaderById.get(presentation.message.id)
-    return (
-      observed !== undefined &&
-      observed.nodeVersion >= presentation.header.nodeVersion &&
-      observed.bodyVersion >= presentation.bodyVersion
+  const observedCommittedMessageReceipts = useMemo(() => {
+    const pathIndexById = new Map<MessageId, number>()
+    repositoryBranchSnapshot?.branchHeaders.forEach((header, index) => {
+      pathIndexById.set(header.id, index)
+    })
+    return activeCommittedMessagePresentations.filter((receipt) =>
+      repositorySnapshotObservesCommittedMessage(repositoryBranchSnapshot, receipt, pathIndexById),
     )
-  })()
+  }, [activeCommittedMessagePresentations, repositoryBranchSnapshot])
   useEffect(() => {
-    const receipt = activeCommittedMessagePresentation
-    if (!activeChatId || !receipt || !committedMessageReceiptObserved) return
-    useChatStore.getState().acknowledgeCommittedMessagePresentation(activeChatId, receipt)
-  }, [activeChatId, activeCommittedMessagePresentation, committedMessageReceiptObserved])
+    if (!activeChatId || observedCommittedMessageReceipts.length === 0) return
+    useChatStore
+      .getState()
+      .acknowledgeCommittedMessagePresentations(activeChatId, observedCommittedMessageReceipts)
+  }, [activeChatId, observedCommittedMessageReceipts])
   const retainedActiveBranchSnapshot =
     !committedEmptyPath &&
     (!treeViewActive || lastActiveBranchSnapshot?.intentKey === activeBranchIntentKey)
@@ -1318,7 +1441,7 @@ export function Shell() {
     latestTreeHeaderById,
     activeChangedHeaderKeys,
     activeChangedHeaders,
-    activeCommittedMessagePresentation,
+    activeCommittedMessagePresentations,
   )
   const workspaceRepository = getWorkspaceRepository()
   const treePresentationSnapshots = useMemo<
@@ -1351,26 +1474,52 @@ export function Shell() {
         bodyVersion: presentation.bodyVersion,
       })
     }
-    addExactMessagePresentationSnapshot(
-      snapshots,
-      activeCommittedMessagePresentation,
-      authoritativeHeaderById,
-    )
+    for (const receipt of activeCommittedMessagePresentations) {
+      addExactMessagePresentationSnapshot(snapshots, receipt, authoritativeHeaderById)
+    }
     return snapshots.size > 0 ? snapshots : undefined
   }, [
-    activeCommittedMessagePresentation,
+    activeCommittedMessagePresentations,
     activeCommittedPathPresentation,
     authoritativeHeaderById,
     resolvedActiveBranchSnapshot,
   ])
+  const acknowledgeVerifiedTreePresentation = useCallback(
+    (messageId: MessageId, snapshot: MessagePresentationSnapshot) => {
+      if (!activeChatId || snapshot.message.id !== messageId) return
+      const store = useChatStore.getState()
+      const receipt = store.getCommittedMessagePresentation(activeChatId, messageId)
+      if (!receipt) return
+      const { message } = snapshot
+      const expected = receipt.presentation.header
+      const sameStructure =
+        message.chatId === expected.chatId &&
+        message.parentId === expected.parentId &&
+        message.siblingIndex === expected.siblingIndex &&
+        message.deleted === expected.deleted
+      if (
+        message.chatId === activeChatId &&
+        message.nodeVersion >= expected.nodeVersion &&
+        snapshot.bodyVersion >= receipt.presentation.bodyVersion &&
+        (sameStructure || message.nodeVersion > expected.nodeVersion)
+      ) {
+        store.acknowledgeCommittedMessagePresentation(activeChatId, receipt)
+      }
+    },
+    [activeChatId],
+  )
+  const focusTreePresentationReceipt = useCallback((messageId: MessageId | null) => {
+    const focus = committedPresentationFocusRef.current
+    if (!focus) return
+    useChatStore.getState().setCommittedPresentationFocusMessage(focus, messageId)
+  }, [])
   const retainedPresentationMatchesActiveStructure =
     exactActiveBranchSnapshot === null &&
     resolvedActiveBranchSnapshot !== null &&
     branchSnapshotMatchesStructure(resolvedActiveBranchSnapshot, authoritativePathHeaders)
   const activeBranchTailId = pendingLeafIntent ?? authoritativePathHeaders.at(-1)?.id ?? null
   const activeBranchTailStream = useMemo(
-    () =>
-      newestStream(activeChatStreams.filter((stream) => stream.messageId === activeBranchTailId)),
+    () => activeChatStreams.find((stream) => stream.messageId === activeBranchTailId),
     [activeBranchTailId, activeChatStreams],
   )
   const composerStream = activeBranchTailStream ?? pendingLocalGenerationStream
@@ -1572,6 +1721,15 @@ export function Shell() {
   const selectedPathFollowKey = newestSelectedPathStream
     ? `${newestSelectedPathStream.streamId}:${newestSelectedPathStream.messageId ?? ''}`
     : activeBranchTailId
+  const selectedPathFollowClaimKey =
+    newestSelectedPathStream &&
+    streamOriginatesFromTabNavigation(
+      newestSelectedPathStream,
+      activeNavigationRevision,
+      getStreamClientId(),
+    )
+      ? newestSelectedPathStream.streamId
+      : null
 
   useEffect(() => {
     if (activeStorageRoute && chatModelOpen) setChatModelOpen(false)
@@ -1590,6 +1748,123 @@ export function Shell() {
 
   useEffect(() => {
     installStreamLeaseListener()
+  }, [])
+
+  useEffect(() => {
+    let stopped = false
+    let timer: number | null = null
+    let running: Promise<void> | null = null
+    let scheduled = false
+    type QueueEntry = { point: OrphanRecoveryPoint; remoteEvidence: boolean }
+    const pointForStream = (stream: ReturnType<typeof recoveryPendingStreams>[number]) => ({
+      chatId: stream.chatId,
+      streamId: stream.streamId,
+      ...(stream.messageId ? { messageId: stream.messageId } : {}),
+      ...(stream.attemptKind ? { attemptKind: stream.attemptKind } : {}),
+      replacementEpoch: stream.replacementEpoch,
+      ...(stream.recoveryOutcome ? { outcome: stream.recoveryOutcome } : {}),
+    })
+    const queued = new Map<string, QueueEntry>()
+    const retries = new Map<string, QueueEntry>()
+    const enqueue = (entry: QueueEntry) => {
+      queued.set(entry.point.streamId, entry)
+      retries.delete(entry.point.streamId)
+      scheduleRun()
+    }
+    for (const stream of recoveryPendingStreams()) {
+      queued.set(stream.streamId, { point: pointForStream(stream), remoteEvidence: false })
+    }
+
+    const scheduleRetry = () => {
+      if (stopped || timer !== null || retries.size === 0) return
+      timer = window.setTimeout(() => {
+        timer = null
+        for (const [streamId, entry] of retries) {
+          if (entry.remoteEvidence || isRecoveryPendingStream(streamId)) {
+            queued.set(streamId, entry)
+          }
+        }
+        retries.clear()
+        scheduleRun()
+      }, ORPHAN_RECOVERY_FAILURE_RETRY_MS)
+    }
+    const perform = async () => {
+      const entries = [...queued.values()]
+      queued.clear()
+      if (entries.length === 0) return
+      const now = Date.now()
+      await Promise.all(
+        entries.map(async (entry) => {
+          try {
+            const result = await recoverStreamOrphan(entry.point, now)
+            if (result === 'retry') {
+              retries.set(entry.point.streamId, entry)
+            }
+          } catch {
+            retries.set(entry.point.streamId, entry)
+          }
+        }),
+      )
+      scheduleRetry()
+    }
+    const run = () => {
+      scheduled = false
+      if (stopped || running || queued.size === 0) return
+      running = perform().finally(() => {
+        running = null
+        if (queued.size > 0) scheduleRun()
+      })
+    }
+    const scheduleRun = () => {
+      if (stopped || scheduled || running || queued.size === 0) return
+      scheduled = true
+      queueMicrotask(run)
+    }
+    const stopPending = subscribeRecoveryPendingStreams((stream) => {
+      enqueue({ point: pointForStream(stream), remoteEvidence: false })
+    })
+    const stopExpiry = onRemoteStreamLeasesExpired((leases) => {
+      for (const lease of leases) {
+        enqueue({
+          point: {
+            chatId: lease.chatId,
+            streamId: lease.streamId,
+            ...(lease.messageId ? { messageId: lease.messageId } : {}),
+            ...(lease.attemptKind ? { attemptKind: lease.attemptKind } : {}),
+            ...(lease.replacementEpoch !== undefined
+              ? { replacementEpoch: lease.replacementEpoch }
+              : {}),
+            outcome: 'abort',
+          },
+          remoteEvidence: true,
+        })
+      }
+    })
+    const stopOwnershipRelease = onAnyRemoteStreamOwnershipReleased((released) => {
+      const active = useStreamStore.getState().getActive(released.streamId)
+      const messageId = released.messageId ?? active?.messageId
+      const attemptKind = released.attemptKind ?? active?.attemptKind
+      const replacementEpoch = released.replacementEpoch ?? active?.replacementEpoch
+      enqueue({
+        point: {
+          chatId: released.chatId,
+          streamId: released.streamId,
+          ...(messageId ? { messageId } : {}),
+          ...(attemptKind ? { attemptKind } : {}),
+          ...(replacementEpoch !== undefined ? { replacementEpoch } : {}),
+          outcome: 'abort',
+        },
+        remoteEvidence: true,
+      })
+    })
+    scheduleRun()
+    return () => {
+      stopped = true
+      stopPending()
+      stopExpiry()
+      stopOwnershipRelease()
+      if (timer !== null) window.clearTimeout(timer)
+    }
   }, [])
 
   const previousActiveChatIdRef = useRef<ChatId | null>(activeChatId)
@@ -1647,15 +1922,9 @@ export function Shell() {
         run()
       })
     }
-    const stopExpirySubscription = onRemoteStreamLeasesExpired((leases) => {
-      if (leases.some((lease) => lease.chatId === activeChatId)) run()
-    })
-    const stopOwnershipReleaseSubscription = onRemoteStreamOwnershipReleased(activeChatId, run)
     run()
     return () => {
       stopped = true
-      stopExpirySubscription()
-      stopOwnershipReleaseSubscription()
       if (timer !== null) window.clearTimeout(timer)
     }
   }, [activeChatId])
@@ -2240,29 +2509,34 @@ export function Shell() {
     [activeChatId, authoritativeStructuralTreeProjection],
   )
   const editAndSendTreeMessage = useCallback(
-    async (message: Message, text: string) => {
+    (message: Message, text: string) => {
       if (!activeChatId || message.chatId !== activeChatId || message.role !== 'user') return
       const navigation = beginTreeActionNavigation(message.id)
       if (!navigation) return
-      try {
-        const { editAndResend } = await import('../hooks/useMessageOps')
-        const result = await editAndResend(
-          { chatId: activeChatId, ...navigation, sendFrom },
-          message,
-          text,
-          message.attachmentRefs ? { attachmentRefs: message.attachmentRefs } : {},
-        )
-        return result.assistantMessageId
-      } catch (error) {
-        pushToast({
-          level: 'danger',
-          text: `Send failed: ${error instanceof Error ? error.message : 'unknown error'}`,
-        })
-        throw error
-      } finally {
-        useChatStore
-          .getState()
-          .sealCommittedPathProducer(activeChatId, navigation.committedPathProducer)
+      return {
+        navigationRevision: navigation.navigationIntent.revision,
+        completion: (async () => {
+          try {
+            const { editAndResend } = await import('../hooks/useMessageOps')
+            const result = await editAndResend(
+              { chatId: activeChatId, ...navigation, sendFrom },
+              message,
+              text,
+              message.attachmentRefs ? { attachmentRefs: message.attachmentRefs } : {},
+            )
+            return result.assistantMessageId
+          } catch (error) {
+            pushToast({
+              level: 'danger',
+              text: `Send failed: ${error instanceof Error ? error.message : 'unknown error'}`,
+            })
+            throw error
+          } finally {
+            useChatStore
+              .getState()
+              .sealCommittedPathProducer(activeChatId, navigation.committedPathProducer)
+          }
+        })(),
       }
     },
     [activeChatId, beginTreeActionNavigation, pushToast, sendFrom],
@@ -2352,32 +2626,38 @@ export function Shell() {
     [activeChatId, effectiveMessageBodyWindowLimit, pushToast],
   )
   const regenerateTreeMessage = useCallback(
-    async (message: Message) => {
+    (message: Message) => {
       if (!activeChatId || message.chatId !== activeChatId || message.role !== 'assistant') return
       const navigation = beginTreeActionNavigation(message.id)
       if (!navigation) return
-      try {
-        const { regenerateFromMessage } = await import('../hooks/useMessageOps')
-        const result = await regenerateFromMessage(
-          { chatId: activeChatId, ...navigation, sendFrom },
-          message,
-        )
-        return result.assistantMessageId
-      } catch (error) {
-        pushToast({
-          level: 'danger',
-          text: `Regenerate failed: ${error instanceof Error ? error.message : 'unknown error'}`,
-        })
-      } finally {
-        useChatStore
-          .getState()
-          .sealCommittedPathProducer(activeChatId, navigation.committedPathProducer)
+      return {
+        navigationRevision: navigation.navigationIntent.revision,
+        completion: (async () => {
+          try {
+            const { regenerateFromMessage } = await import('../hooks/useMessageOps')
+            const result = await regenerateFromMessage(
+              { chatId: activeChatId, ...navigation, sendFrom },
+              message,
+            )
+            return result.assistantMessageId
+          } catch (error) {
+            pushToast({
+              level: 'danger',
+              text: `Regenerate failed: ${error instanceof Error ? error.message : 'unknown error'}`,
+            })
+            return undefined
+          } finally {
+            useChatStore
+              .getState()
+              .sealCommittedPathProducer(activeChatId, navigation.committedPathProducer)
+          }
+        })(),
       }
     },
     [activeChatId, beginTreeActionNavigation, pushToast, sendFrom],
   )
   const continueTreeMessage = useCallback(
-    async (message: Message) => {
+    (message: Message) => {
       if (!activeChatId || message.chatId !== activeChatId || message.role !== 'assistant') return
       if (useStreamStore.getState().isTargetActive(activeChatId, message.id)) {
         pushToast({
@@ -2388,19 +2668,25 @@ export function Shell() {
       }
       const navigation = beginTreeActionNavigation(message.id)
       if (!navigation) return
-      try {
-        const { continueFromMessage } = await import('../hooks/useMessageOps')
-        await continueFromMessage({ chatId: activeChatId, ...navigation, sendFrom }, message)
-        return message.id
-      } catch (error) {
-        pushToast({
-          level: 'danger',
-          text: `Continue failed: ${error instanceof Error ? error.message : 'unknown error'}`,
-        })
-      } finally {
-        useChatStore
-          .getState()
-          .sealCommittedPathProducer(activeChatId, navigation.committedPathProducer)
+      return {
+        navigationRevision: navigation.navigationIntent.revision,
+        completion: (async () => {
+          try {
+            const { continueFromMessage } = await import('../hooks/useMessageOps')
+            await continueFromMessage({ chatId: activeChatId, ...navigation, sendFrom }, message)
+            return message.id
+          } catch (error) {
+            pushToast({
+              level: 'danger',
+              text: `Continue failed: ${error instanceof Error ? error.message : 'unknown error'}`,
+            })
+            return undefined
+          } finally {
+            useChatStore
+              .getState()
+              .sealCommittedPathProducer(activeChatId, navigation.committedPathProducer)
+          }
+        })(),
       }
     },
     [activeChatId, beginTreeActionNavigation, pushToast, sendFrom],
@@ -2731,8 +3017,11 @@ export function Shell() {
                         {...(treePresentationSnapshots
                           ? { presentationSnapshots: treePresentationSnapshots }
                           : {})}
+                        verifyPresentationSnapshotIds={committedMessageReceiptIds}
+                        onPresentationSnapshotVerified={acknowledgeVerifiedTreePresentation}
                         previewFontFamily={fontFamilyStack(prefs.fontFamily)}
                         onActivateNode={activateTreeNode}
+                        onSelectNode={focusTreePresentationReceipt}
                         onInsertAtSharedTrunk={insertAtSharedTreeTrunk}
                         onInsertAtChildLeg={insertAtTreeChildLeg}
                         onInsertAfterLeaf={insertAfterTreeLeaf}
@@ -2766,6 +3055,7 @@ export function Shell() {
                       streamActive={selectedPathStreamActive}
                       resetKey={activeChatId}
                       streamFollowKey={selectedPathFollowKey}
+                      streamFollowClaimKey={selectedPathFollowClaimKey}
                       onStateChange={setScrollState}
                     >
                       {activeTranscriptExists ? (

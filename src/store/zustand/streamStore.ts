@@ -13,10 +13,14 @@ export interface ActiveStream {
   attemptKind?: 'generation' | 'continuation'
   originNavigationRevision?: string
   replacementEpoch: number
+  admissionSequence?: number
   startedAt: number
   heartbeatAt?: number
   ownerClientId: string
   abort?: () => void
+  requestLiveSnapshot?: () => Promise<void>
+  phase?: 'streaming' | 'recovery-pending' | 'cleanup-pending'
+  recoveryOutcome?: 'done' | 'error' | 'abort'
 }
 
 export interface LiveStreamSnapshot {
@@ -51,8 +55,14 @@ interface StreamStoreState {
   listActive: () => ActiveStream[]
   listLiveSnapshots: () => LiveStreamSnapshot[]
   listByChat: (chatId: ChatId) => ActiveStream[]
+  listSelectedByChat: (chatId: ChatId) => ActiveStream[]
   listStreamIds: () => string[]
   setActive: (stream: ActiveStream) => void
+  setLiveSnapshotRequester: (
+    streamId: string,
+    replacementEpoch: number,
+    requester: (() => Promise<void>) | undefined,
+  ) => void
   setLiveSnapshot: (snapshot: LiveStreamSnapshot) => void
   abortStream: (streamId: string, replacementEpoch: number) => boolean
   abortChat: (chatId: ChatId) => number
@@ -67,15 +77,21 @@ interface StreamStoreState {
 }
 
 const activeByStreamId = new Map<string, ActiveStream>()
-const activeStreamIdsByTarget = new Map<string, Set<string>>()
 const activeStreamIdsByChat = new Map<ChatId, Set<string>>()
+const selectedStreamIdByTarget = new Map<string, string>()
+const selectedStreamIdsByChat = new Map<ChatId, Set<string>>()
+const admissionSequenceByStreamId = new Map<string, number>()
+const recoveryPendingStreamCountByChat = new Map<ChatId, number>()
 const liveByTarget = new Map<string, LiveStreamSnapshot>()
 const liveTargetByStreamId = new Map<string, string>()
 const targetSnapshotByKey = new Map<string, StreamTargetSnapshot>()
 const targetListeners = new Map<string, Set<() => void>>()
 const chatListeners = new Map<ChatId, Set<() => void>>()
+const recoveryPendingListeners = new Set<(chatId: ChatId) => void>()
+const recoveryPendingStreamListeners = new Set<(stream: ActiveStream) => void>()
 const chatLifecycleRevision = new Map<ChatId, number>()
 let chatLifecycleSequence = 0
+let admissionSequence = 0
 const EMPTY_TARGET_SNAPSHOT: StreamTargetSnapshot = {
   activeStream: undefined,
   liveSnapshot: undefined,
@@ -86,18 +102,51 @@ function targetKey(chatId: ChatId, messageId?: MessageId): string {
   return `${chatId}\u0000${messageId ?? ''}`
 }
 
-function firstActiveForTarget(key: string): ActiveStream | undefined {
-  const ids = activeStreamIdsByTarget.get(key)
-  if (!ids) return undefined
-  for (const streamId of ids) {
-    const stream = activeByStreamId.get(streamId)
-    if (stream) return stream
+function selectedActiveForTarget(key: string): ActiveStream | undefined {
+  const streamId = selectedStreamIdByTarget.get(key)
+  return streamId ? activeByStreamId.get(streamId) : undefined
+}
+
+function shouldSelectCandidate(key: string, candidate: ActiveStream): boolean {
+  if (candidate.phase === 'cleanup-pending') return false
+  const selected = selectedActiveForTarget(key)
+  if (!selected || selected.streamId === candidate.streamId) return true
+  if (candidate.admissionSequence !== undefined || selected.admissionSequence !== undefined) {
+    if (candidate.admissionSequence === undefined) return false
+    if (selected.admissionSequence === undefined) return true
+    return candidate.admissionSequence > selected.admissionSequence
   }
-  return undefined
+  return (
+    (admissionSequenceByStreamId.get(candidate.streamId) ?? 0) >
+    (admissionSequenceByStreamId.get(selected.streamId) ?? 0)
+  )
+}
+
+function removeSelectedChatIndex(stream: ActiveStream): void {
+  removeIndex(selectedStreamIdsByChat, stream.chatId, stream.streamId)
+}
+
+function selectTargetStream(key: string, stream: ActiveStream): string | undefined {
+  const previousId = selectedStreamIdByTarget.get(key)
+  if (previousId === stream.streamId) return previousId
+  if (previousId) {
+    const previous = activeByStreamId.get(previousId)
+    if (previous) removeSelectedChatIndex(previous)
+  }
+  selectedStreamIdByTarget.set(key, stream.streamId)
+  addIndex(selectedStreamIdsByChat, stream.chatId, stream.streamId)
+  return previousId
+}
+
+function clearSelectedTargetIfMatch(key: string, stream: ActiveStream): boolean {
+  if (selectedStreamIdByTarget.get(key) !== stream.streamId) return false
+  selectedStreamIdByTarget.delete(key)
+  removeSelectedChatIndex(stream)
+  return true
 }
 
 function refreshTargetSnapshot(key: string): void {
-  const activeStream = firstActiveForTarget(key)
+  const activeStream = selectedActiveForTarget(key)
   const liveSnapshot = liveByTarget.get(key)
   const previous = targetSnapshotByKey.get(key)
   if (previous?.activeStream === activeStream && previous?.liveSnapshot === liveSnapshot) return
@@ -145,16 +194,50 @@ function removeIndex(index: Map<string, Set<string>>, key: string, streamId: str
 
 function removeActiveIndexes(stream: ActiveStream): void {
   removeIndex(activeStreamIdsByChat, stream.chatId, stream.streamId)
-  removeIndex(activeStreamIdsByTarget, targetKey(stream.chatId, stream.messageId), stream.streamId)
 }
 
 function addActiveIndexes(stream: ActiveStream): void {
   addIndex(activeStreamIdsByChat, stream.chatId, stream.streamId)
-  addIndex(activeStreamIdsByTarget, targetKey(stream.chatId, stream.messageId), stream.streamId)
+}
+
+function updateRecoveryPendingIndex(
+  previous: ActiveStream | undefined,
+  next: ActiveStream | undefined,
+): void {
+  const previousPending =
+    previous?.phase === 'recovery-pending' || previous?.phase === 'cleanup-pending'
+  const nextPending = next?.phase === 'recovery-pending' || next?.phase === 'cleanup-pending'
+  if (previousPending === nextPending && (!previousPending || previous?.chatId === next?.chatId)) {
+    return
+  }
+  if (previousPending && previous) {
+    const count = recoveryPendingStreamCountByChat.get(previous.chatId) ?? 0
+    if (count <= 1) recoveryPendingStreamCountByChat.delete(previous.chatId)
+    else recoveryPendingStreamCountByChat.set(previous.chatId, count - 1)
+  }
+  if (nextPending && next) {
+    recoveryPendingStreamCountByChat.set(
+      next.chatId,
+      (recoveryPendingStreamCountByChat.get(next.chatId) ?? 0) + 1,
+    )
+    for (const listener of [...recoveryPendingListeners]) listener(next.chatId)
+    for (const listener of [...recoveryPendingStreamListeners]) listener(next)
+  }
 }
 
 function listByChat(chatId: ChatId): ActiveStream[] {
   const ids = activeStreamIdsByChat.get(chatId)
+  if (!ids) return []
+  const streams: ActiveStream[] = []
+  for (const streamId of ids) {
+    const stream = activeByStreamId.get(streamId)
+    if (stream) streams.push(stream)
+  }
+  return streams
+}
+
+function listSelectedByChat(chatId: ChatId): ActiveStream[] {
+  const ids = selectedStreamIdsByChat.get(chatId)
   if (!ids) return []
   const streams: ActiveStream[] = []
   for (const streamId of ids) {
@@ -180,8 +263,8 @@ export const useStreamStore = create<StreamStoreState>((set, get) => ({
   lifecycleRevision: 0,
   isActive: (streamId) => activeByStreamId.has(streamId),
   isTargetActive: (chatId, messageId) =>
-    firstActiveForTarget(targetKey(chatId, messageId)) !== undefined,
-  getTargetActive: (chatId, messageId) => firstActiveForTarget(targetKey(chatId, messageId)),
+    selectedActiveForTarget(targetKey(chatId, messageId)) !== undefined,
+  getTargetActive: (chatId, messageId) => selectedActiveForTarget(targetKey(chatId, messageId)),
   hasStreamForChat: (chatId) => (activeStreamIdsByChat.get(chatId)?.size ?? 0) > 0,
   getActive: (streamId) => activeByStreamId.get(streamId),
   getLiveSnapshot: (chatId, messageId) => liveByTarget.get(targetKey(chatId, messageId)),
@@ -192,6 +275,7 @@ export const useStreamStore = create<StreamStoreState>((set, get) => ({
   listActive: () => [...activeByStreamId.values()],
   listLiveSnapshots: () => [...liveByTarget.values()],
   listByChat,
+  listSelectedByChat,
   listStreamIds: () => [...activeByStreamId.keys()],
   setActive: (stream) => {
     const state = get()
@@ -199,19 +283,67 @@ export const useStreamStore = create<StreamStoreState>((set, get) => ({
       return
     const previous = activeByStreamId.get(stream.streamId)
     const previousTarget = previous ? targetKey(previous.chatId, previous.messageId) : null
-    if (previous) removeActiveIndexes(previous)
+    if (!admissionSequenceByStreamId.has(stream.streamId)) {
+      admissionSequence += 1
+      admissionSequenceByStreamId.set(stream.streamId, admissionSequence)
+    }
+    if (previous) {
+      removeActiveIndexes(previous)
+      if (previousTarget && previousTarget !== targetKey(stream.chatId, stream.messageId)) {
+        clearSelectedTargetIfMatch(previousTarget, previous)
+      }
+    }
     activeByStreamId.set(stream.streamId, stream)
     addActiveIndexes(stream)
+    updateRecoveryPendingIndex(previous, stream)
     const nextTarget = targetKey(stream.chatId, stream.messageId)
+    if (stream.phase === 'cleanup-pending') {
+      clearSelectedTargetIfMatch(nextTarget, stream)
+      const completedLive = liveByTarget.get(nextTarget)
+      if (completedLive?.streamId === stream.streamId) {
+        liveByTarget.delete(nextTarget)
+        liveTargetByStreamId.delete(stream.streamId)
+      }
+    } else if (shouldSelectCandidate(nextTarget, stream)) {
+      const displacedStreamId = selectTargetStream(nextTarget, stream)
+      const displacedLive = liveByTarget.get(nextTarget)
+      if (
+        displacedLive &&
+        displacedLive.streamId !== stream.streamId &&
+        displacedStreamId !== stream.streamId
+      ) {
+        liveByTarget.delete(nextTarget)
+        liveTargetByStreamId.delete(displacedLive.streamId)
+      }
+    }
     bumpLifecycleState(set, stream.replacementEpoch)
     if (previousTarget && previousTarget !== nextTarget) notifyTarget(previousTarget)
     notifyTarget(nextTarget)
     if (previous && previous.chatId !== stream.chatId) notifyChat(previous.chatId)
     notifyChat(stream.chatId)
   },
+  setLiveSnapshotRequester: (streamId, replacementEpoch, requester) => {
+    const current = activeByStreamId.get(streamId)
+    if (
+      current?.replacementEpoch !== replacementEpoch ||
+      current.requestLiveSnapshot === requester
+    ) {
+      return
+    }
+    const { requestLiveSnapshot: _previousRequester, ...rest } = current
+    const next: ActiveStream = requester ? { ...rest, requestLiveSnapshot: requester } : rest
+    get().setActive(next)
+  },
   setLiveSnapshot: (snapshot) => {
     if (get().replacementEpoch !== snapshot.replacementEpoch) return
     const nextTarget = targetKey(snapshot.chatId, snapshot.messageId)
+    const selected = selectedActiveForTarget(nextTarget)
+    if (
+      selected?.streamId !== snapshot.streamId ||
+      selected.replacementEpoch !== snapshot.replacementEpoch
+    ) {
+      return
+    }
     const previousTarget = liveTargetByStreamId.get(snapshot.streamId)
     if (previousTarget && previousTarget !== nextTarget) {
       const previous = liveByTarget.get(previousTarget)
@@ -250,8 +382,11 @@ export const useStreamStore = create<StreamStoreState>((set, get) => ({
     const current = activeByStreamId.get(streamId)
     if (current?.replacementEpoch !== replacementEpoch) return
     const key = targetKey(current.chatId, current.messageId)
+    clearSelectedTargetIfMatch(key, current)
     removeActiveIndexes(current)
     activeByStreamId.delete(streamId)
+    admissionSequenceByStreamId.delete(streamId)
+    updateRecoveryPendingIndex(current, undefined)
     bumpLifecycleState(set)
     notifyTarget(key)
     notifyChat(current.chatId)
@@ -275,12 +410,16 @@ export const useStreamStore = create<StreamStoreState>((set, get) => ({
   replaceWorkspace: (replacementEpoch) => {
     const state = get()
     if (state.replacementEpoch !== null && replacementEpoch <= state.replacementEpoch) return
-    const targets = new Set([...activeStreamIdsByTarget.keys(), ...liveByTarget.keys()])
+    const targets = new Set([...selectedStreamIdByTarget.keys(), ...liveByTarget.keys()])
     const chats = new Set(activeStreamIdsByChat.keys())
     for (const stream of activeByStreamId.values()) stream.abort?.()
     activeByStreamId.clear()
-    activeStreamIdsByTarget.clear()
     activeStreamIdsByChat.clear()
+    selectedStreamIdByTarget.clear()
+    selectedStreamIdsByChat.clear()
+    admissionSequenceByStreamId.clear()
+    admissionSequence = 0
+    recoveryPendingStreamCountByChat.clear()
     liveByTarget.clear()
     liveTargetByStreamId.clear()
     targetSnapshotByKey.clear()
@@ -289,11 +428,15 @@ export const useStreamStore = create<StreamStoreState>((set, get) => ({
     for (const chatId of chats) notifyChat(chatId)
   },
   reset: () => {
-    const targets = new Set([...activeStreamIdsByTarget.keys(), ...liveByTarget.keys()])
+    const targets = new Set([...selectedStreamIdByTarget.keys(), ...liveByTarget.keys()])
     const chats = new Set(activeStreamIdsByChat.keys())
     activeByStreamId.clear()
-    activeStreamIdsByTarget.clear()
     activeStreamIdsByChat.clear()
+    selectedStreamIdByTarget.clear()
+    selectedStreamIdsByChat.clear()
+    admissionSequenceByStreamId.clear()
+    admissionSequence = 0
+    recoveryPendingStreamCountByChat.clear()
     liveByTarget.clear()
     liveTargetByStreamId.clear()
     targetSnapshotByKey.clear()
@@ -303,6 +446,37 @@ export const useStreamStore = create<StreamStoreState>((set, get) => ({
     for (const chatId of chats) notifyChat(chatId)
   },
 }))
+
+export function recoveryPendingChatIds(): readonly ChatId[] {
+  return [...recoveryPendingStreamCountByChat.keys()]
+}
+
+export function isRecoveryPendingChat(chatId: ChatId): boolean {
+  return recoveryPendingStreamCountByChat.has(chatId)
+}
+
+export function subscribeRecoveryPendingChats(listener: (chatId: ChatId) => void): () => void {
+  recoveryPendingListeners.add(listener)
+  return () => recoveryPendingListeners.delete(listener)
+}
+
+export function recoveryPendingStreams(): readonly ActiveStream[] {
+  return [...activeByStreamId.values()].filter(
+    (stream) => stream.phase === 'recovery-pending' || stream.phase === 'cleanup-pending',
+  )
+}
+
+export function isRecoveryPendingStream(streamId: string): boolean {
+  const stream = activeByStreamId.get(streamId)
+  return stream?.phase === 'recovery-pending' || stream?.phase === 'cleanup-pending'
+}
+
+export function subscribeRecoveryPendingStreams(
+  listener: (stream: ActiveStream) => void,
+): () => void {
+  recoveryPendingStreamListeners.add(listener)
+  return () => recoveryPendingStreamListeners.delete(listener)
+}
 
 export function subscribeStreamTarget(
   chatId: ChatId,
@@ -401,7 +575,7 @@ export function useIsStreamTargetActive(
     [active, chatId, messageId],
   )
   const getSnapshot = useCallback(
-    () => active && firstActiveForTarget(targetKey(chatId, messageId)) !== undefined,
+    () => active && selectedActiveForTarget(targetKey(chatId, messageId)) !== undefined,
     [active, chatId, messageId],
   )
   return useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
@@ -412,13 +586,25 @@ export function isStreamRelevantToSelectedPath(
   selectedPathMessageIds: ReadonlySet<MessageId>,
   knownHeaderMessageIds: ReadonlySet<MessageId>,
   currentNavigationRevision: string,
+  localOwnerClientId: string,
 ): boolean {
   const targetMessageId = stream.messageId
   if (targetMessageId && selectedPathMessageIds.has(targetMessageId)) return true
   if (!targetMessageId || knownHeaderMessageIds.has(targetMessageId)) return false
   return (
     stream.attemptKind === 'generation' &&
-    stream.originNavigationRevision === currentNavigationRevision
+    streamOriginatesFromTabNavigation(stream, currentNavigationRevision, localOwnerClientId)
+  )
+}
+
+export function streamOriginatesFromTabNavigation(
+  stream: Pick<ActiveStream, 'ownerClientId' | 'originNavigationRevision'>,
+  navigationRevision: string,
+  localOwnerClientId: string,
+): boolean {
+  return (
+    stream.ownerClientId === localOwnerClientId &&
+    stream.originNavigationRevision === navigationRevision
   )
 }
 
@@ -429,8 +615,39 @@ export function useActiveStreamsForChat(
   const revision = useChatLifecycleRevision(chatId, enabled)
   return useMemo(() => {
     void revision
-    return enabled && chatId !== null ? listByChat(chatId) : EMPTY_STREAMS
+    return enabled && chatId !== null ? listSelectedByChat(chatId) : EMPTY_STREAMS
   }, [chatId, enabled, revision])
+}
+
+export function mostRecentlyAdmittedStream(
+  streams: readonly ActiveStream[],
+): ActiveStream | undefined {
+  let selected: ActiveStream | undefined
+  let selectedSequence = -1
+  let selectedIsDurable = false
+  for (const stream of streams) {
+    const isDurable = stream.admissionSequence !== undefined
+    const sequence =
+      stream.admissionSequence ?? admissionSequenceByStreamId.get(stream.streamId) ?? -1
+    if (selected && selectedIsDurable !== isDurable) {
+      if (!isDurable) continue
+    } else if (sequence <= selectedSequence) {
+      continue
+    }
+    selected = stream
+    selectedSequence = sequence
+    selectedIsDurable = isDurable
+  }
+  return selected
+}
+
+export function currentStreamAdmissionRevision(): number {
+  return admissionSequence
+}
+
+export function wasStreamAdmittedBy(streamId: string, revision: number): boolean {
+  const sequence = admissionSequenceByStreamId.get(streamId)
+  return sequence !== undefined && sequence <= revision
 }
 
 export function clearLiveSnapshotIfPresent(

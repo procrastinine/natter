@@ -1,11 +1,7 @@
 import { act, render, waitFor } from '@testing-library/react'
-import { Activity } from 'react'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Message } from '../../src/core/types'
-import {
-  __resetMessageStreamProjectionForTests,
-  useRetainedMessageStreamProjection,
-} from '../../src/hooks/useMessageStreamProjection'
+import { useMessageStreamProjection } from '../../src/hooks/useMessageStreamProjection'
 import { useStreamStore } from '../../src/store/zustand/streamStore'
 
 const pendingMessage: Message = {
@@ -21,189 +17,204 @@ const pendingMessage: Message = {
   content: [{ type: 'output_text', text: 'Persisted before streaming.' }],
   nodeVersion: 0,
   deleted: false,
+  generation: {
+    id: 'projection-generation',
+    model: 'test/model',
+    requestedModel: 'test/model',
+    apiUsed: 'chat',
+    delivery: 'streaming',
+    status: 'streaming',
+    costSource: 'stream',
+    startedAt: 1,
+  },
 }
 
-function ProjectionProbe({
-  view,
-  message = pendingMessage,
-  bodyVersion = 0,
-}: {
-  view: string
-  message?: Message
-  bodyVersion?: number
-}) {
-  const [, snapshot] = useRetainedMessageStreamProjection(message, bodyVersion)
+function ProjectionProbe({ message = pendingMessage }: { message?: Message }) {
+  const [, snapshot] = useMessageStreamProjection(message)
   const content = snapshot?.content ?? message.content
   const text = content
     .filter((item) => item.type === 'text' || item.type === 'output_text')
     .map((item) => item.text)
     .join('')
-  return <output data-view={view}>{text}</output>
+  return <output>{text}</output>
 }
 
-function AlternateViews({ visible }: { visible: 'tree' | 'transcript' }) {
-  return (
-    <>
-      <Activity mode={visible === 'tree' ? 'visible' : 'hidden'}>
-        <ProjectionProbe view="tree" />
-      </Activity>
-      <Activity mode={visible === 'transcript' ? 'visible' : 'hidden'}>
-        <ProjectionProbe view="transcript" />
-      </Activity>
-    </>
-  )
+function setActiveStream(attemptKind: 'generation' | 'continuation'): void {
+  useStreamStore.getState().setActive({
+    streamId: 'projection-stream',
+    replacementEpoch: 0,
+    chatId: pendingMessage.chatId,
+    messageId: pendingMessage.id,
+    attemptKind,
+    startedAt: 1,
+    ownerClientId: 'projection-client',
+  })
+}
+
+function setLiveSnapshot(text: string): void {
+  useStreamStore.getState().setLiveSnapshot({
+    streamId: 'projection-stream',
+    replacementEpoch: 0,
+    chatId: pendingMessage.chatId,
+    messageId: pendingMessage.id,
+    content: [{ type: 'output_text', text }],
+    textLength: text.length,
+    reasoningLength: 0,
+    updatedAt: 2,
+  })
 }
 
 afterEach(() => {
   useStreamStore.getState().reset()
-  __resetMessageStreamProjectionForTests()
+  vi.restoreAllMocks()
 })
 
-describe('retained message stream projection', () => {
-  it('keeps the newest snapshot when live output hands off between retained views', async () => {
-    const view = render(<AlternateViews visible="tree" />)
-    const tree = () => view.container.querySelector('[data-view="tree"]')
-    const transcript = () => view.container.querySelector('[data-view="transcript"]')
+describe('message stream projection', () => {
+  it('shows the current snapshot for an active generation placeholder', () => {
+    act(() => {
+      setActiveStream('generation')
+      setLiveSnapshot('Generation live output.')
+    })
+
+    const view = render(<ProjectionProbe />)
+
+    expect(view.getByText('Generation live output.')).toBeInTheDocument()
+    expect(view.queryByText('Persisted before streaming.')).not.toBeInTheDocument()
+  })
+
+  it('does not revive an older snapshot while a replacement waits for its first byte', () => {
+    act(() => {
+      setActiveStream('generation')
+      setLiveSnapshot('Superseded live output.')
+    })
+    const view = render(<ProjectionProbe />)
+    expect(view.getByText('Superseded live output.')).toBeInTheDocument()
 
     act(() => {
+      useStreamStore.getState().clearActive('projection-stream', 0)
       useStreamStore.getState().setActive({
-        streamId: 'projection-stream',
+        streamId: 'replacement-stream',
         replacementEpoch: 0,
         chatId: pendingMessage.chatId,
         messageId: pendingMessage.id,
-        startedAt: 1,
+        attemptKind: 'generation',
+        startedAt: 3,
         ownerClientId: 'projection-client',
       })
-      useStreamStore.getState().setLiveSnapshot({
-        streamId: 'projection-stream',
-        replacementEpoch: 0,
-        chatId: pendingMessage.chatId,
-        messageId: pendingMessage.id,
-        content: [{ type: 'output_text', text: 'Snapshot five.' }],
-        textLength: 14,
-        reasoningLength: 0,
-        updatedAt: 5,
-      })
     })
-    await waitFor(() => expect(tree()).toHaveTextContent('Snapshot five.'))
 
-    view.rerender(<AlternateViews visible="transcript" />)
+    expect(view.getByText('Persisted before streaming.')).toBeInTheDocument()
+    expect(view.queryByText('Superseded live output.')).not.toBeInTheDocument()
+  })
+
+  it('uses canonical content when first observing a generation after its body committed', () => {
+    const generation = pendingMessage.generation
+    if (!generation) throw new Error('Expected generation metadata')
     act(() => {
-      useStreamStore.getState().setLiveSnapshot({
-        streamId: 'projection-stream',
-        replacementEpoch: 0,
-        chatId: pendingMessage.chatId,
-        messageId: pendingMessage.id,
-        content: [{ type: 'output_text', text: 'Snapshot ten.' }],
-        textLength: 13,
-        reasoningLength: 0,
-        updatedAt: 10,
-      })
+      setActiveStream('generation')
+      setLiveSnapshot('Stale terminal live output.')
     })
-    await waitFor(() => expect(transcript()).toHaveTextContent('Snapshot ten.'))
+    const committed: Message = {
+      ...pendingMessage,
+      content: [{ type: 'output_text', text: 'Canonical terminal output.' }],
+      nodeVersion: pendingMessage.nodeVersion + 1,
+      generation: {
+        ...generation,
+        status: 'done',
+        finishedAt: 3,
+      },
+    }
+
+    const view = render(<ProjectionProbe message={committed} />)
+
+    expect(view.getByText('Canonical terminal output.')).toBeInTheDocument()
+    expect(view.queryByText('Stale terminal live output.')).not.toBeInTheDocument()
+  })
+
+  it('keeps an active continuation live until its matching attempt commits', () => {
+    const generation = pendingMessage.generation
+    if (!generation) throw new Error('Expected generation metadata')
+    const completed: Message = {
+      ...pendingMessage,
+      generation: {
+        ...generation,
+        status: 'done',
+        finishedAt: 2,
+      },
+    }
+    act(() => {
+      setActiveStream('continuation')
+      setLiveSnapshot('Persisted before streaming. Continued live output.')
+    })
+    const view = render(<ProjectionProbe message={completed} />)
+    expect(view.getByText('Persisted before streaming. Continued live output.')).toBeInTheDocument()
+
+    const committed: Message = {
+      ...completed,
+      content: [
+        { type: 'output_text', text: 'Persisted before streaming. Canonical continuation.' },
+      ],
+      nodeVersion: completed.nodeVersion + 1,
+      continuationAttempts: [
+        {
+          streamId: 'projection-stream',
+          strategy: 'prompt',
+          status: 'done',
+          startedAt: 1,
+          finishedAt: 3,
+        },
+      ],
+    }
+    view.rerender(<ProjectionProbe message={committed} />)
+
+    expect(
+      view.getByText('Persisted before streaming. Canonical continuation.'),
+    ).toBeInTheDocument()
+    expect(
+      view.queryByText('Persisted before streaming. Continued live output.'),
+    ).not.toBeInTheDocument()
+  })
+
+  it('falls back to canonical content as soon as the current snapshot clears', () => {
+    act(() => {
+      setActiveStream('generation')
+      setLiveSnapshot('Transient live output.')
+    })
+    const view = render(<ProjectionProbe />)
+    expect(view.getByText('Transient live output.')).toBeInTheDocument()
 
     act(() => {
       useStreamStore.getState().clearLiveSnapshot(pendingMessage.id, 'projection-stream', 0)
-      useStreamStore.getState().clearActive('projection-stream', 0)
     })
-    view.rerender(<AlternateViews visible="tree" />)
 
-    expect(tree()).toHaveTextContent('Snapshot ten.')
-    expect(tree()).not.toHaveTextContent('Snapshot five.')
+    expect(view.getByText('Persisted before streaming.')).toBeInTheDocument()
+    expect(view.queryByText('Transient live output.')).not.toBeInTheDocument()
   })
 
-  it('does not revive an older stream while a new request is waiting for its first byte', async () => {
-    const view = render(<ProjectionProbe view="single" />)
-    const projection = () => view.container.querySelector('[data-view="single"]')
+  it('requests one current snapshot on mount and again when the document becomes visible', async () => {
+    let visibility: DocumentVisibilityState = 'visible'
+    vi.spyOn(document, 'visibilityState', 'get').mockImplementation(() => visibility)
+    const requestLiveSnapshot = vi.fn(async () => {})
     act(() => {
-      useStreamStore.getState().setActive({
-        streamId: 'old-stream',
-        replacementEpoch: 0,
-        chatId: pendingMessage.chatId,
-        messageId: pendingMessage.id,
-        startedAt: 1,
-        ownerClientId: 'projection-client',
-      })
-      useStreamStore.getState().setLiveSnapshot({
-        streamId: 'old-stream',
-        replacementEpoch: 0,
-        chatId: pendingMessage.chatId,
-        messageId: pendingMessage.id,
-        content: [{ type: 'output_text', text: 'Old live output.' }],
-        textLength: 16,
-        reasoningLength: 0,
-        updatedAt: 5,
-      })
-    })
-    await waitFor(() => expect(projection()).toHaveTextContent('Old live output.'))
-
-    act(() => {
-      useStreamStore.getState().clearLiveSnapshot(pendingMessage.id, 'old-stream', 0)
-      useStreamStore.getState().clearActive('old-stream', 0)
-      useStreamStore.getState().setActive({
-        streamId: 'new-stream',
-        replacementEpoch: 0,
-        chatId: pendingMessage.chatId,
-        messageId: pendingMessage.id,
-        startedAt: 2,
-        ownerClientId: 'projection-client',
-      })
+      setActiveStream('generation')
     })
 
-    await waitFor(() => expect(projection()).toHaveTextContent('Persisted before streaming.'))
-    expect(projection()).not.toHaveTextContent('Old live output.')
-  })
-
-  it('keeps live output across structural versions and retires it only on a body commit', async () => {
-    const view = render(<ProjectionProbe view="single" bodyVersion={4} />)
-    const projection = () => view.container.querySelector('[data-view="single"]')
-    act(() => {
-      useStreamStore.getState().setActive({
-        streamId: 'body-version-stream',
-        replacementEpoch: 0,
-        chatId: pendingMessage.chatId,
-        messageId: pendingMessage.id,
-        startedAt: 1,
-        ownerClientId: 'projection-client',
-      })
-      useStreamStore.getState().setLiveSnapshot({
-        streamId: 'body-version-stream',
-        replacementEpoch: 0,
-        chatId: pendingMessage.chatId,
-        messageId: pendingMessage.id,
-        content: [{ type: 'output_text', text: 'Uncommitted live output.' }],
-        textLength: 24,
-        reasoningLength: 0,
-        updatedAt: 5,
-      })
-    })
-    await waitFor(() => expect(projection()).toHaveTextContent('Uncommitted live output.'))
+    render(<ProjectionProbe />)
+    expect(requestLiveSnapshot).not.toHaveBeenCalled()
 
     act(() => {
-      useStreamStore.getState().clearLiveSnapshot(pendingMessage.id, 'body-version-stream', 0)
-      useStreamStore.getState().clearActive('body-version-stream', 0)
+      useStreamStore
+        .getState()
+        .setLiveSnapshotRequester('projection-stream', 0, requestLiveSnapshot)
     })
-    view.rerender(
-      <ProjectionProbe
-        view="single"
-        bodyVersion={4}
-        message={{ ...pendingMessage, nodeVersion: 99 }}
-      />,
-    )
-    expect(projection()).toHaveTextContent('Uncommitted live output.')
+    await waitFor(() => expect(requestLiveSnapshot).toHaveBeenCalledTimes(1))
 
-    view.rerender(
-      <ProjectionProbe
-        view="single"
-        bodyVersion={5}
-        message={{
-          ...pendingMessage,
-          nodeVersion: 100,
-          content: [{ type: 'output_text', text: 'Committed persisted output.' }],
-        }}
-      />,
-    )
-    await waitFor(() => expect(projection()).toHaveTextContent('Committed persisted output.'))
-    expect(projection()).not.toHaveTextContent('Uncommitted live output.')
+    visibility = 'hidden'
+    act(() => document.dispatchEvent(new Event('visibilitychange')))
+    expect(requestLiveSnapshot).toHaveBeenCalledTimes(1)
+
+    visibility = 'visible'
+    act(() => document.dispatchEvent(new Event('visibilitychange')))
+    await waitFor(() => expect(requestLiveSnapshot).toHaveBeenCalledTimes(2))
   })
 })

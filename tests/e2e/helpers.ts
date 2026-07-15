@@ -1,7 +1,7 @@
-// Every spec that hits the send pipeline uses `mockChatCompletions` to stub
-// `/api/v1/chat/completions` to avoid burning live quota on deterministic
-// assertions. Live-API specs live in `*.live.spec.ts` and gate on
-// `process.env.RUN_LIVE === '1'`.
+// Most send-pipeline specs use `mockChatCompletions`; timing, concurrency, and
+// retention specs retarget a normal connection to the standalone fake provider.
+// Neither path burns live quota. Live-API specs live in `*.live.spec.ts` and gate
+// on `process.env.RUN_LIVE === '1'`.
 
 import type { Message } from '../../src/core/types'
 import {

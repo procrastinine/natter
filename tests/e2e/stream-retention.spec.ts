@@ -10,6 +10,7 @@ import {
   firstChatId,
   seedFirstRun,
   sendMessage,
+  waitForAssistantGenerationFinished,
 } from './helpers'
 
 interface RetentionStorageState {
@@ -250,6 +251,105 @@ function generationRequestCount(
     (request) => request.method === 'POST' && request.path === '/chat/completions',
   ).length
 }
+
+async function streamChunkCountForChat(page: Page, chatId: string): Promise<number> {
+  return page.evaluate(async (id) => {
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open('natter')
+      request.onsuccess = () => resolve(request.result)
+      request.onerror = () => reject(request.error)
+    })
+    try {
+      return await new Promise<number>((resolve, reject) => {
+        const request = db
+          .transaction('streamChunks', 'readonly')
+          .objectStore('streamChunks')
+          .getAll()
+        request.onsuccess = () =>
+          resolve(
+            (request.result as Array<{ chatId?: unknown }>).filter((row) => row.chatId === id)
+              .length,
+          )
+        request.onerror = () => reject(request.error)
+      })
+    } finally {
+      db.close()
+    }
+  }, chatId)
+}
+
+async function activeRouteChatId(page: Page): Promise<string> {
+  await expect(page).toHaveURL(/#\/chat\/[^/]+\/message\//u)
+  return page.evaluate(() => window.location.hash.split('/')[2] ?? '')
+}
+
+test('returning to an offscreen paused stream projects its current durable prefix', async ({
+  page,
+}) => {
+  const pausedPrefix = 'prefix received while another chat was active'
+  const scenario = await createFakeStreamScenario({ targetChars: 8, chunkChars: 8 })
+  scenarios.add(scenario)
+  await clearIndexedDb(page)
+  await seedFirstRun(page, { model: 'natter/fake-stream' })
+  await retargetOnlyProfileToFakeProvider(page, scenario.providerBaseUrl)
+
+  await createChatAndOpen(page)
+  await sendMessage(page, 'first chat baseline')
+  const firstChat = await activeRouteChatId(page)
+  await waitForAssistantGenerationFinished(page, firstChat)
+
+  await createChatAndOpen(page)
+  await sendMessage(page, 'second chat baseline')
+  const secondChat = await activeRouteChatId(page)
+  await waitForAssistantGenerationFinished(page, secondChat)
+  expect(secondChat).not.toBe(firstChat)
+
+  await scenario.update({
+    responses: [
+      {
+        path: '/chat/completions',
+        delayMs: 350,
+        sseFrames: [
+          {
+            data: {
+              id: 'offscreen-paused',
+              object: 'chat.completion.chunk',
+              choices: [{ index: 0, delta: { content: pausedPrefix }, finish_reason: null }],
+            },
+            delayMs: 5_000,
+          },
+          {
+            data: {
+              id: 'offscreen-paused',
+              object: 'chat.completion.chunk',
+              choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+            },
+          },
+          { data: '[DONE]' },
+        ],
+      },
+    ],
+  })
+
+  await openStoredChat(page, firstChat)
+  await sendMessage(page, 'pause while offscreen')
+  await expect.poll(() => scenario.snapshot().then((state) => state.activeStreams)).toBe(1)
+  await openStoredChat(page, secondChat)
+  await expect.poll(() => streamChunkCountForChat(page, firstChat)).toBeGreaterThan(0)
+
+  await openStoredChat(page, firstChat)
+  await expect(page.locator('[data-ui="abort"]')).toBeVisible()
+  await expect(
+    page
+      .locator('[data-ui="message"][data-role="assistant"]')
+      .last()
+      .locator('[data-ui="message-body"]'),
+  ).toHaveText(pausedPrefix, { timeout: 2_000 })
+  await expect.poll(() => scenario.snapshot().then((state) => state.activeStreams)).toBe(1)
+
+  await waitForAssistantGenerationFinished(page, firstChat)
+  await expect.poll(() => scenario.snapshot().then((state) => state.activeStreams)).toBe(0)
+})
 
 async function sendDetachedTurn(
   page: Page,

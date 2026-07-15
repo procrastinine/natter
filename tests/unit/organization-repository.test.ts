@@ -364,4 +364,37 @@ describe('organization repository contract', () => {
     expect(await getDb().chats.get(archived.id)).toBeUndefined()
     expect(await getDb().chats.get(live.id)).toBeDefined()
   })
+
+  it('serializes permanent deletion against stream admission in both orders', async () => {
+    const repo = getBrowserRepository()
+    const admissionFirst = await seedChat({ id: 'admission-first', archived: true })
+    const lease = await repo.upsertStreamLease({
+      streamId: 'admission-first-stream',
+      chatId: admissionFirst.id,
+      ownerClientId: 'other-tab',
+      startedAt: 1,
+      heartbeatAt: 1,
+    })
+
+    await expect(repo.deleteArchivedChat(admissionFirst.id)).rejects.toMatchObject({
+      name: 'ChatStreamBusyError',
+      chatId: admissionFirst.id,
+      streamId: lease.streamId,
+    })
+    expect(await getDb().chats.get(admissionFirst.id)).toBeDefined()
+    expect(await repo.getStreamLease(lease.streamId)).toBeDefined()
+
+    const deleteFirst = await seedChat({ id: 'delete-first', archived: true })
+    await expect(repo.deleteArchivedChat(deleteFirst.id)).resolves.toBe(true)
+    await expect(
+      repo.upsertStreamLease({
+        streamId: 'delete-first-stream',
+        chatId: deleteFirst.id,
+        ownerClientId: 'other-tab',
+        startedAt: 1,
+        heartbeatAt: 1,
+      }),
+    ).rejects.toMatchObject({ name: 'ChatMissingError', chatId: deleteFirst.id })
+    expect(await repo.getStreamLease('delete-first-stream')).toBeUndefined()
+  })
 })

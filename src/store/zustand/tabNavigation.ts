@@ -1,3 +1,5 @@
+import { newId } from '../../lib/ulid'
+
 const tabNavigationAuthorityBrand: unique symbol = Symbol('TabNavigationAuthority')
 
 export interface TabNavigationAuthority {
@@ -7,11 +9,12 @@ export interface TabNavigationAuthority {
 
 let currentAuthority: TabNavigationAuthority | null = null
 let nextRevision = 0n
+const tabRevisionPrefix = newId()
 
 export function claimTabNavigation(): TabNavigationAuthority {
   nextRevision += 1n
   const authority = Object.freeze({
-    revision: nextRevision.toString(),
+    revision: `${tabRevisionPrefix}:${nextRevision.toString()}`,
     [tabNavigationAuthorityBrand]: true as const,
   })
   currentAuthority = authority

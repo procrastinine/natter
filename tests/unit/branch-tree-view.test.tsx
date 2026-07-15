@@ -549,12 +549,14 @@ describe('BranchTreeView', () => {
 
   it('follows a request-created active leaf into the inspector', async () => {
     let resolveRequest: ((messageId: MessageId) => void) | undefined
-    const regenerate = vi.fn(
-      () =>
-        new Promise<MessageId>((resolve) => {
-          resolveRequest = resolve
-        }),
-    )
+    const navigationRevision = 'local-tree-request-revision'
+    const onSelectNode = vi.fn()
+    const regenerate = vi.fn(() => ({
+      navigationRevision,
+      completion: new Promise<MessageId>((resolve) => {
+        resolveRequest = resolve
+      }),
+    }))
     let headers = smallTree
     const getMessage = vi.fn(async (messageId: string): Promise<Message | undefined> => {
       const row = headers.find((header) => header.id === messageId)
@@ -571,6 +573,7 @@ describe('BranchTreeView', () => {
         expanded={false}
         repository={treeRepository}
         onActivateNode={() => undefined}
+        onSelectNode={onSelectNode}
         onRegenerateMessage={regenerate}
         hasConnection
       />,
@@ -579,6 +582,25 @@ describe('BranchTreeView', () => {
     fireEvent.click(document.querySelector('[data-message-id="left"]') as Element)
     fireEvent.click(await screen.findByRole('button', { name: 'Regenerate response' }))
     expect(regenerate).toHaveBeenCalledOnce()
+    onSelectNode.mockClear()
+
+    act(() => {
+      useStreamStore.getState().setActive({
+        streamId: 'remote-tree-request',
+        replacementEpoch: 0,
+        chatId: 'chat-1',
+        messageId: 'left',
+        startedAt: 3,
+        ownerClientId: 'remote-client',
+        originNavigationRevision: navigationRevision,
+      })
+    })
+    await act(async () => Promise.resolve())
+    expect(onSelectNode).not.toHaveBeenCalled()
+    expect(document.querySelector('[data-ui="branch-tree-inspector"]')).toHaveAttribute(
+      'data-message-id',
+      'left',
+    )
 
     headers = [...smallTree, header('regenerated', 'root', 2, 'assistant', 4)]
     act(() => {
@@ -589,6 +611,7 @@ describe('BranchTreeView', () => {
         messageId: 'regenerated',
         startedAt: 4,
         ownerClientId: getStreamClientId(),
+        originNavigationRevision: navigationRevision,
       })
     })
     view.rerender(
@@ -599,6 +622,7 @@ describe('BranchTreeView', () => {
         expanded={false}
         repository={treeRepository}
         onActivateNode={() => undefined}
+        onSelectNode={onSelectNode}
         onRegenerateMessage={regenerate}
         hasConnection
       />,

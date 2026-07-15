@@ -174,8 +174,8 @@ test('user scrolling cancels delayed prepend-anchor corrections', async ({ page 
     )
     .toBeLessThan(2)
 
-  const beforeUserScroll = await scrollRegion.evaluate((element) => element.scrollTop)
   await scrollRegion.hover()
+  const beforeUserScroll = await scrollRegion.evaluate((element) => element.scrollTop)
   await page.mouse.wheel(0, 47)
   await expect
     .poll(() => scrollRegion.evaluate((element) => element.scrollTop))
@@ -204,8 +204,10 @@ async function pinScrollRegionAtTop(page: Page): Promise<Locator> {
   expect(
     await scrollRegion.evaluate((element) => element.scrollHeight - element.clientHeight),
   ).toBeGreaterThan(0)
-  await scrollRegion.hover()
-  await page.mouse.wheel(0, -5000)
+  await scrollRegion.evaluate((element) => {
+    element.scrollTop = 0
+  })
   await expect(scrollRegion).toHaveAttribute('data-scroll-state', 'pinned')
+  await expect.poll(() => scrollRegion.evaluate((element) => element.scrollTop)).toBeLessThan(1)
   return scrollRegion
 }

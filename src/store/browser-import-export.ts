@@ -94,6 +94,10 @@ import {
 } from './workspace-meta'
 import { useStreamStore } from './zustand/streamStore'
 
+function isInternalStreamAdmissionSettingKey(key: string): boolean {
+  return key === 'stream-admission-sequence'
+}
+
 const WORKSPACE_ID = 'browser-idb:natter'
 const IMPORT_EXPORT_PAGE_SIZE = 128
 
@@ -451,7 +455,9 @@ class BrowserImportExportBackend implements WorkspaceImportExportBackend {
         drafts: await readTableInPages(db.drafts),
         keys: await readTableInPages(db.keys),
         settings: (await readTableInPages(db.settings)).filter(
-          (row) => !isChatSidebarProjectionSettingKey(row.key),
+          (row) =>
+            !isChatSidebarProjectionSettingKey(row.key) &&
+            !isInternalStreamAdmissionSettingKey(row.key),
         ),
       }
     })
@@ -520,7 +526,11 @@ class BrowserImportExportBackend implements WorkspaceImportExportBackend {
         await bulkPutInPages(db.promptPresets, envelope.payload.promptPresets)
         await bulkPutInPages(db.keys, envelope.payload.keys)
         for (const page of pages(envelope.payload.settings)) {
-          const authoritative = page.filter((row) => !isChatSidebarProjectionSettingKey(row.key))
+          const authoritative = page.filter(
+            (row) =>
+              !isChatSidebarProjectionSettingKey(row.key) &&
+              !isInternalStreamAdmissionSettingKey(row.key),
+          )
           if (authoritative.length > 0) {
             await db.settings.bulkPut(authoritative)
             recordTableWrite(authoritative.length)

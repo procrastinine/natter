@@ -115,7 +115,7 @@ import {
   WORKSPACE_META_DEPENDENCIES,
 } from '../../store/reactive-dependencies'
 import { useRepositoryQuery } from '../../store/reactive-query'
-import type { AttachmentBundle } from '../../store/repository'
+import { type AttachmentBundle, ChatStreamBusyError } from '../../store/repository'
 import { abortSearchSession, requestSearchSession } from '../../store/search-session'
 import {
   readSidebarSortMode,
@@ -979,14 +979,21 @@ function ChatsStorageSurface() {
     },
     [excludeTagIds, includeTagIds],
   )
-  const withBusyChatAction = useCallback(async (key: string, action: () => Promise<void>) => {
-    setBusyChatAction(key)
-    try {
-      await action()
-    } finally {
-      setBusyChatAction(null)
-    }
-  }, [])
+  const withBusyChatAction = useCallback(
+    async (key: string, action: () => Promise<void>) => {
+      setBusyChatAction(key)
+      try {
+        await action()
+      } catch (error) {
+        const message = permanentDeleteBlockedMessage(error)
+        if (!message) throw error
+        pushToast({ level: 'warning', text: message })
+      } finally {
+        setBusyChatAction(null)
+      }
+    },
+    [pushToast],
+  )
   const handleSelectAllVisible = useCallback(
     (checked: boolean) => {
       setSelectedChatIds(checked ? new Set(tableRowIds) : new Set())
@@ -1778,6 +1785,7 @@ function chatPassesStorageFilters(chat: ChatSidebarRow, filters: SearchFilters):
 }
 
 function ArchiveManager() {
+  const pushToast = useToastStore((s) => s.push)
   const chats = useRepositoryQuery('chats:all', () => listChats(), [], allTable('chats'))
   const [busy, setBusy] = useState<string | null>(null)
   const archived = chats
@@ -1797,6 +1805,10 @@ function ArchiveManager() {
     setBusy(chat.id)
     try {
       await deleteArchivedChatPermanently(chat.id)
+    } catch (error) {
+      const message = permanentDeleteBlockedMessage(error)
+      if (!message) throw error
+      pushToast({ level: 'warning', text: message })
     } finally {
       setBusy(null)
     }
@@ -1807,6 +1819,10 @@ function ArchiveManager() {
     setBusy('__all__')
     try {
       await emptyArchivedChats()
+    } catch (error) {
+      const message = permanentDeleteBlockedMessage(error)
+      if (!message) throw error
+      pushToast({ level: 'warning', text: message })
     } finally {
       setBusy(null)
     }
@@ -1877,6 +1893,11 @@ function ArchiveManager() {
 function displayChatTitle(chat: { title: string }): string {
   const trimmed = chat.title.trim()
   return trimmed.length > 0 ? trimmed : 'Untitled chat'
+}
+
+function permanentDeleteBlockedMessage(error: unknown): string | undefined {
+  if (!(error instanceof ChatStreamBusyError)) return undefined
+  return 'Wait for the active response to finish before permanently deleting this chat.'
 }
 
 function AttachmentManager({

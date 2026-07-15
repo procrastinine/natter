@@ -115,6 +115,7 @@ import type {
 } from './repository'
 import {
   ChatMissingError,
+  ChatStreamBusyError,
   chatMatchesBranchCacheWriteGuard,
   ExpectedLeafChangedError,
   StreamTargetBusyError,
@@ -127,7 +128,7 @@ import {
   readBrowserWorkspaceMetaFromTransaction,
 } from './workspace-meta'
 
-export { ChatMissingError } from './repository'
+export { ChatMissingError, ChatStreamBusyError } from './repository'
 
 interface ChatMutationState {
   beforeChat: Chat
@@ -330,17 +331,52 @@ function nextBranchUpdatedAt(current: number, now: number): number {
 async function assertStreamLeaseTargetAvailable(
   tx: Transaction,
   incoming: StreamLeaseRow,
-): Promise<void> {
-  if (!incoming.messageId) return
-  const competing = await tx
-    .table<StreamLeaseRow, string>('streamLeases')
+): Promise<number> {
+  const settings = tx.table<{ key: string; value: unknown }, string>('settings')
+  const sequenceRow = await settings.get('stream-admission-sequence')
+  const currentSequence =
+    typeof sequenceRow?.value === 'number' &&
+    Number.isSafeInteger(sequenceRow.value) &&
+    sequenceRow.value >= 0
+      ? sequenceRow.value
+      : 0
+  if (currentSequence >= Number.MAX_SAFE_INTEGER)
+    throw new Error('StreamAdmissionSequenceExhausted')
+  const admissionSequence = currentSequence + 1
+  await settings.put({ key: 'stream-admission-sequence', value: admissionSequence })
+  if (!incoming.messageId) return admissionSequence
+  const leaseTable = tx.table<StreamLeaseRow, string>('streamLeases')
+  const chunkTable = tx.table<StreamChunkRow, [string, number]>('streamChunks')
+  const competing = await leaseTable.where('messageId').equals(incoming.messageId).toArray()
+  const finalizedStreamIds: string[] = []
+  for (const previous of competing) {
+    if (previous.streamId === incoming.streamId) continue
+    if (!(await streamLeaseTargetFinalized(tx, previous))) {
+      throw new StreamTargetBusyError(incoming.messageId)
+    }
+    finalizedStreamIds.push(previous.streamId)
+  }
+  await leaseTable.bulkDelete(finalizedStreamIds)
+  await chunkTable
     .where('messageId')
     .equals(incoming.messageId)
-    .toArray()
-  for (const lease of competing) {
-    if (lease.streamId === incoming.streamId) continue
-    if (await streamLeaseTargetFinalized(tx, lease)) continue
-    throw new StreamTargetBusyError(incoming.messageId)
+    .filter((chunk) => chunk.streamId !== incoming.streamId)
+    .delete()
+  return admissionSequence
+}
+
+async function assertStreamLeaseWorkspaceTarget(
+  tx: Transaction,
+  lease: StreamLeaseRow,
+): Promise<void> {
+  const chat = await tx.table<Chat, ChatId>('chats').get(lease.chatId)
+  if (!chat) throw new ChatMissingError(lease.chatId)
+  if (!lease.messageId) return
+  const target = await tx.table<MessageHeaderRow, MessageId>('messages').get(lease.messageId)
+  if (target && target.chatId !== lease.chatId) {
+    throw new Error(
+      `StreamLeaseTargetChatMismatch:${lease.streamId}:${lease.messageId}:${lease.chatId}:${target.chatId}`,
+    )
   }
 }
 
@@ -370,6 +406,10 @@ function isStreamLeaseRow(value: unknown): value is StreamLeaseRow {
     Number.isFinite(row.startedAt) &&
     typeof row.heartbeatAt === 'number' &&
     Number.isFinite(row.heartbeatAt) &&
+    (row.admissionSequence === undefined ||
+      (typeof row.admissionSequence === 'number' &&
+        Number.isSafeInteger(row.admissionSequence) &&
+        row.admissionSequence >= 0)) &&
     (row.attemptKind === undefined ||
       row.attemptKind === 'generation' ||
       row.attemptKind === 'continuation') &&
@@ -2013,36 +2053,51 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
 
   async upsertStreamLease(lease: StreamLeaseRow): Promise<StreamLeaseRow> {
     const db = await openDb()
-    const row = await withNamedLock(`stream-journal:${lease.streamId}`, (grant) =>
-      grant.runTransaction(
-        db,
-        lease.messageId
-          ? [db.streamLeases, db.settings, db.messages, db.messageBodies]
-          : [db.streamLeases, db.settings],
-        async (tx) => {
-          const table = tx.table<StreamLeaseRow, string>('streamLeases')
-          const existing = await table.get(lease.streamId)
-          const meta = await readBrowserWorkspaceMetaFromTransaction(tx)
-          const fenceToken = lease.fenceToken ?? newId()
-          if (existing && existing.chatId !== lease.chatId) {
-            throw new Error(`StreamLeaseChatMismatch:${lease.streamId}`)
-          }
-          if (
-            existing &&
-            (existing.ownerClientId !== lease.ownerClientId || existing.fenceToken !== fenceToken)
-          ) {
-            throw new Error(`StreamLeaseAlreadyOwned:${lease.streamId}`)
-          }
-          const admitted: StreamLeaseRow = {
-            ...lease,
-            fenceToken,
-            replacementEpoch: meta.replacementEpoch,
-          }
-          await assertStreamLeaseTargetAvailable(tx, admitted)
-          await table.put(admitted)
-          return admitted
-        },
-      ),
+    const row = await withNamedLocks(
+      [`chat-meta:${lease.chatId}`, `stream-journal:${lease.streamId}`],
+      (grant) =>
+        grant.runTransaction(
+          db,
+          lease.messageId
+            ? [
+                db.chats,
+                db.streamLeases,
+                db.streamChunks,
+                db.settings,
+                db.messages,
+                db.messageBodies,
+              ]
+            : [db.chats, db.streamLeases, db.settings],
+          async (tx) => {
+            const table = tx.table<StreamLeaseRow, string>('streamLeases')
+            const existing = await table.get(lease.streamId)
+            const meta = await readBrowserWorkspaceMetaFromTransaction(tx)
+            await assertStreamLeaseWorkspaceTarget(tx, lease)
+            const fenceToken = lease.fenceToken ?? newId()
+            if (existing && existing.chatId !== lease.chatId) {
+              throw new Error(`StreamLeaseChatMismatch:${lease.streamId}`)
+            }
+            if (
+              existing &&
+              (existing.ownerClientId !== lease.ownerClientId || existing.fenceToken !== fenceToken)
+            ) {
+              throw new Error(`StreamLeaseAlreadyOwned:${lease.streamId}`)
+            }
+            const targetChanged = existing?.messageId !== lease.messageId
+            const admissionSequence =
+              !existing || targetChanged || existing.admissionSequence === undefined
+                ? await assertStreamLeaseTargetAvailable(tx, lease)
+                : existing.admissionSequence
+            const admitted: StreamLeaseRow = {
+              ...lease,
+              fenceToken,
+              replacementEpoch: meta.replacementEpoch,
+              admissionSequence,
+            }
+            await table.put(admitted)
+            return admitted
+          },
+        ),
     )
     postEvent({ kind: 'stream-heartbeat', lease: row })
     return row
@@ -2055,34 +2110,47 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     const fence = requiredStreamFence(lease)
     const db = await openDb()
     const checkTarget = options.targetChanged !== false
-    const row = await withNamedLock(`stream-journal:${lease.streamId}`, (grant) =>
-      grant.runTransaction(
-        db,
-        checkTarget && lease.messageId
-          ? [db.streamLeases, db.settings, db.messages, db.messageBodies]
-          : [db.streamLeases, db.settings],
-        async (tx) => {
-          const meta = await readBrowserWorkspaceMetaFromTransaction(tx)
-          const table = tx.table<StreamLeaseRow, string>('streamLeases')
-          const existing = await table.get(lease.streamId)
-          assertOwnedStreamFence(existing, fence, meta.replacementEpoch, lease.streamId)
-          if (existing.chatId !== lease.chatId) {
-            throw new Error(`StreamLeaseChatMismatch:${lease.streamId}`)
-          }
-          const renewed: StreamLeaseRow = {
-            ...lease,
-            startedAt: existing.startedAt,
-            fenceToken: fence.fenceToken,
-            replacementEpoch: fence.replacementEpoch,
-          }
-          if (renewed.messageId !== existing.messageId) {
-            if (!checkTarget) throw new Error(`StreamLeaseTargetChanged:${lease.streamId}`)
-            await assertStreamLeaseTargetAvailable(tx, renewed)
-          }
-          await table.put(renewed)
-          return renewed
-        },
-      ),
+    const row = await withNamedLocks(
+      [...(checkTarget ? [`chat-meta:${lease.chatId}`] : []), `stream-journal:${lease.streamId}`],
+      (grant) =>
+        grant.runTransaction(
+          db,
+          checkTarget
+            ? [
+                db.chats,
+                db.streamLeases,
+                db.streamChunks,
+                db.settings,
+                db.messages,
+                db.messageBodies,
+              ]
+            : [db.streamLeases, db.settings],
+          async (tx) => {
+            const meta = await readBrowserWorkspaceMetaFromTransaction(tx)
+            const table = tx.table<StreamLeaseRow, string>('streamLeases')
+            const existing = await table.get(lease.streamId)
+            assertOwnedStreamFence(existing, fence, meta.replacementEpoch, lease.streamId)
+            if (existing.chatId !== lease.chatId) {
+              throw new Error(`StreamLeaseChatMismatch:${lease.streamId}`)
+            }
+            const renewed: StreamLeaseRow = {
+              ...lease,
+              startedAt: existing.startedAt,
+              fenceToken: fence.fenceToken,
+              replacementEpoch: fence.replacementEpoch,
+              ...(existing.admissionSequence !== undefined
+                ? { admissionSequence: existing.admissionSequence }
+                : {}),
+            }
+            if (renewed.messageId !== existing.messageId) {
+              if (!checkTarget) throw new Error(`StreamLeaseTargetChanged:${lease.streamId}`)
+              await assertStreamLeaseWorkspaceTarget(tx, renewed)
+              renewed.admissionSequence = await assertStreamLeaseTargetAvailable(tx, renewed)
+            }
+            await table.put(renewed)
+            return renewed
+          },
+        ),
     )
     postEvent({ kind: 'stream-heartbeat', lease: row })
     return row
@@ -2156,6 +2224,31 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
         ? await db.streamLeases.toArray()
         : await db.streamLeases.where('chatId').equals(chatId).toArray()
     return rows.filter(isStreamLeaseRow).map((lease) => ({ ...lease }))
+  }
+
+  async getStreamLease(streamId: string): Promise<StreamLeaseRow | undefined> {
+    const db = await openDb()
+    const lease = await db.streamLeases.get(streamId)
+    return isStreamLeaseRow(lease) ? { ...lease } : undefined
+  }
+
+  async listStreamLeasesForMessage(messageId: MessageId): Promise<StreamLeaseRow[]> {
+    const db = await openDb()
+    const rows = await db.streamLeases.where('messageId').equals(messageId).toArray()
+    return rows.filter(isStreamLeaseRow).map((lease) => ({ ...lease }))
+  }
+
+  async listMessageLessGenerationStreamLeases(chatId: ChatId): Promise<StreamLeaseRow[]> {
+    const db = await openDb()
+    const rows = await db.streamLeases.where('chatId').equals(chatId).toArray()
+    return rows
+      .filter(
+        (lease) =>
+          isStreamLeaseRow(lease) &&
+          lease.messageId === undefined &&
+          lease.attemptKind === 'generation',
+      )
+      .map((lease) => ({ ...lease }))
   }
 
   async appendStreamChunks(chunks: readonly StreamChunkRow[]): Promise<void> {
@@ -2257,6 +2350,45 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     )
   }
 
+  async deleteStreamJournal(
+    streamId: string,
+    options:
+      | {
+          replacementEpoch: number
+          streamFence: StreamWriteFence
+          expectedLeaseMissing?: never
+        }
+      | {
+          replacementEpoch: number
+          expectedLeaseMissing: true
+          streamFence?: never
+        },
+  ): Promise<{ deletedLease: boolean; deletedChunks: number }> {
+    const db = await openDb()
+    return withNamedLock(`stream-journal:${streamId}`, (grant) =>
+      grant.runTransaction(db, [db.streamChunks, db.streamLeases, db.settings], async (tx) => {
+        const meta = await readBrowserWorkspaceMetaFromTransaction(tx)
+        if (meta.replacementEpoch !== options.replacementEpoch) {
+          throw new WorkspaceReplacementFenceError()
+        }
+        const leases = tx.table<StreamLeaseRow, string>('streamLeases')
+        const existing = await leases.get(streamId)
+        if (options.streamFence) {
+          assertOwnedStreamFence(existing, options.streamFence, meta.replacementEpoch, streamId)
+        } else if (options.expectedLeaseMissing && existing) {
+          throw new Error(`StreamFenceLost:${streamId}`)
+        }
+        const deletedChunks = await tx
+          .table<StreamChunkRow, string>('streamChunks')
+          .where('streamId')
+          .equals(streamId)
+          .delete()
+        if (existing) await leases.delete(streamId)
+        return { deletedLease: existing !== undefined, deletedChunks }
+      }),
+    )
+  }
+
   async listChats(): Promise<Chat[]> {
     return openDb().then((db) => db.chats.toArray())
   }
@@ -2337,6 +2469,14 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
               for (const snapshot of snapshots) {
                 const chat = await chats.get(snapshot.chatId)
                 if (!chat?.archived) continue
+                const activeLease = await tx
+                  .table<StreamLeaseRow, string>('streamLeases')
+                  .where('chatId')
+                  .equals(snapshot.chatId)
+                  .first()
+                if (activeLease) {
+                  throw new ChatStreamBusyError(snapshot.chatId, activeLease.streamId)
+                }
                 const messageRows = await messages.where('chatId').equals(snapshot.chatId).toArray()
                 const draft = await drafts.get(snapshot.chatId)
                 if (!sameArchivedDeleteSnapshot(snapshot, messageRows, draft)) {

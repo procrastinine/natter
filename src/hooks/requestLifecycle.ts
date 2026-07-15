@@ -20,8 +20,8 @@ interface RequestLifecycle {
   abort: () => void
   publishTarget: () => void
   refreshLease: () => Promise<void>
-  preserveLease: () => void
-  end: (outcome: 'done' | 'error' | 'abort') => Promise<void>
+  preserveLease: (reason?: 'content' | 'cleanup') => void
+  end: (outcome: 'done' | 'error' | 'abort') => Promise<{ recoveryPending: boolean }>
 }
 
 type RequestLifecycleInput = {
@@ -40,6 +40,7 @@ export async function startRequestLifecycle(
   const controller = new AbortController()
   const abort = () => controller.abort()
   let shouldPreserveLease = false
+  let requiresContentRecovery = false
   let removeUserAbort: (() => void) | undefined
   const startedAt = Date.now()
 
@@ -74,6 +75,9 @@ export async function startRequestLifecycle(
       ? { originNavigationRevision: args.originNavigationRevision }
       : {}),
     replacementEpoch: fence.replacementEpoch,
+    ...(fence.admissionSequence !== undefined
+      ? { admissionSequence: fence.admissionSequence }
+      : {}),
     startedAt,
     heartbeatAt: startedAt,
     ownerClientId: getStreamClientId(),
@@ -87,6 +91,9 @@ export async function startRequestLifecycle(
     attemptKind: args.attemptKind,
     ownerClientId: getStreamClientId(),
     replacementEpoch: fence.replacementEpoch,
+    ...(fence.admissionSequence !== undefined
+      ? { admissionSequence: fence.admissionSequence }
+      : {}),
   })
 
   return {
@@ -104,6 +111,9 @@ export async function startRequestLifecycle(
         messageId: args.messageId,
         abort,
         replacementEpoch: fence.replacementEpoch,
+        ...(fence.admissionSequence !== undefined
+          ? { admissionSequence: fence.admissionSequence }
+          : {}),
         startedAt,
         attemptKind: args.attemptKind,
         ...(args.originNavigationRevision
@@ -125,24 +135,38 @@ export async function startRequestLifecycle(
         throw normalizeError(error, { midStream: false, cause: 'storage' })
       }
     },
-    preserveLease() {
+    preserveLease(reason = 'content') {
       shouldPreserveLease = true
+      if (reason === 'content') requiresContentRecovery = true
     },
     async end(outcome) {
       removeUserAbort?.()
-      await stopStreamLease(args.streamId, { deleteRow: !shouldPreserveLease })
-      if (
-        useStreamStore.getState().getActive(args.streamId)?.replacementEpoch !==
-        fence.replacementEpoch
-      ) {
-        return
+      try {
+        await stopStreamLease(args.streamId, { deleteRow: !shouldPreserveLease })
+      } catch {
+        shouldPreserveLease = true
+      }
+      const active = useStreamStore.getState().getActive(args.streamId)
+      if (active?.replacementEpoch !== fence.replacementEpoch) {
+        return { recoveryPending: false }
+      }
+      if (shouldPreserveLease) {
+        const { abort: _abort, requestLiveSnapshot: _requestLiveSnapshot, ...recovering } = active
+        useStreamStore.getState().setActive({
+          ...recovering,
+          phase: requiresContentRecovery ? 'recovery-pending' : 'cleanup-pending',
+          recoveryOutcome: outcome,
+        })
+        return { recoveryPending: true }
       }
       announceStreamEnded({
         chatId: args.chatId,
         streamId: args.streamId,
+        ...(args.messageId ? { messageId: args.messageId } : {}),
         outcome,
         replacementEpoch: fence.replacementEpoch,
       })
+      return { recoveryPending: false }
     },
   }
 }
@@ -153,6 +177,7 @@ function publishLifecycleTarget(args: {
   messageId: MessageId
   abort: () => void
   replacementEpoch: number
+  admissionSequence?: number
   startedAt: number
   attemptKind: 'generation' | 'continuation'
   originNavigationRevision?: string
@@ -166,6 +191,7 @@ function publishLifecycleTarget(args: {
       ? { originNavigationRevision: args.originNavigationRevision }
       : {}),
     replacementEpoch: args.replacementEpoch,
+    ...(args.admissionSequence !== undefined ? { admissionSequence: args.admissionSequence } : {}),
     startedAt: args.startedAt,
     heartbeatAt: Date.now(),
     ownerClientId: getStreamClientId(),
@@ -179,6 +205,7 @@ function publishLifecycleTarget(args: {
     attemptKind: args.attemptKind,
     ownerClientId: getStreamClientId(),
     replacementEpoch: args.replacementEpoch,
+    ...(args.admissionSequence !== undefined ? { admissionSequence: args.admissionSequence } : {}),
   })
   useAnnouncementStore.getState().announce({
     text: 'Assistant is responding.',
@@ -220,6 +247,9 @@ export async function markLifecycleTarget(args: {
     messageId: args.messageId,
     abort: args.abort,
     replacementEpoch: fence.replacementEpoch,
+    ...(fence.admissionSequence !== undefined
+      ? { admissionSequence: fence.admissionSequence }
+      : {}),
     startedAt,
     attemptKind: args.attemptKind,
     ...(active?.originNavigationRevision

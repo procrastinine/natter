@@ -16,7 +16,10 @@ import { __resetDbForTests, openDb } from '../../src/store/db'
 import { putCachedEndpoints } from '../../src/store/models-cache'
 import { __resetPrivacyInFlightForTests } from '../../src/store/privacy-cache'
 import { __resetStreamLeasesForTests } from '../../src/store/stream-leases'
-import type { CommittedPathPresentationReceipt } from '../../src/store/zustand/chatStore'
+import type {
+  CommittedMessagePresentationReceipt,
+  CommittedPathPresentationReceipt,
+} from '../../src/store/zustand/chatStore'
 import { useChatStore } from '../../src/store/zustand/chatStore'
 import { useStreamStore } from '../../src/store/zustand/streamStore'
 import { useUiStore } from '../../src/store/zustand/uiStore'
@@ -300,6 +303,8 @@ describe('generation mode contract', () => {
   it('send creates one user and one generated assistant with an explicit local path', async () => {
     const chat = await createChat({ settings: settings() })
     const calls: CapturedOpen[] = []
+    const fallbackReceipt = vi.spyOn(useChatStore.getState(), 'publishCommittedMessageMutation')
+    const producerReceipt = vi.spyOn(useChatStore.getState(), 'updateCommittedMessageForProducer')
 
     const result = await sendText({
       chatId: chat.id,
@@ -348,6 +353,94 @@ describe('generation mode contract', () => {
       result.userMessageId,
       result.assistantMessageId,
     ])
+    const terminalProducerCalls = producerReceipt.mock.calls.filter(
+      ([receiptChatId, , presentation]) =>
+        receiptChatId === chat.id && presentation.message.id === result.assistantMessageId,
+    )
+    expect(terminalProducerCalls).toHaveLength(1)
+    const terminalPresentation = terminalProducerCalls[0]?.[2]
+    expect(terminalPresentation).toBeDefined()
+    expect(
+      fallbackReceipt.mock.calls.some(
+        ([, , presentation]) => presentation === terminalPresentation,
+      ),
+    ).toBe(false)
+    fallbackReceipt.mockRestore()
+    producerReceipt.mockRestore()
+  })
+
+  it('publishes the terminal send body before clearing its stream after newer navigation', async () => {
+    const chat = await createChat({ settings: settings() })
+    let markOpened!: () => void
+    const opened = new Promise<void>((resolve) => {
+      markOpened = resolve
+    })
+    let releaseStream!: () => void
+    const streamGate = new Promise<void>((resolve) => {
+      releaseStream = resolve
+    })
+    const sending = sendText({
+      chatId: chat.id,
+      connection: profile(),
+      apiKey: 'sk-test',
+      content: [{ type: 'text', text: 'question before navigation' }],
+      openStream: () => {
+        markOpened()
+        return (async function* () {
+          await streamGate
+          yield {
+            type: 'delta' as const,
+            chunk: {
+              id: 'navigated-send-generation',
+              choices: [
+                {
+                  delta: { content: 'answer after navigation' },
+                  finish_reason: 'stop' as const,
+                },
+              ],
+            },
+          }
+        })()
+      },
+    })
+
+    await opened
+    expect(useStreamStore.getState().listByChat(chat.id)).toHaveLength(1)
+    useChatStore.getState().navigateToCursor(chat.id, {})
+    const newerCursor = useChatStore.getState().getCursor(chat.id)
+    let receiptAtStreamEnd: CommittedMessagePresentationReceipt | undefined
+    const unsubscribe = useStreamStore.subscribe((state) => {
+      if (!receiptAtStreamEnd && state.listByChat(chat.id).length === 0) {
+        receiptAtStreamEnd = useChatStore
+          .getState()
+          .getCommittedMessagePresentations(chat.id)
+          .at(-1)
+      }
+    })
+
+    releaseStream()
+    const result = await sending.finally(unsubscribe)
+
+    expect(useChatStore.getState().getCursor(chat.id)).toBe(newerCursor)
+    expect(useChatStore.getState().getCommittedPathPresentation(chat.id)).toBeUndefined()
+    expect(receiptAtStreamEnd).toMatchObject({
+      presentation: {
+        message: {
+          id: result.assistantMessageId,
+          content: [{ type: 'output_text', text: 'answer after navigation' }],
+        },
+      },
+    })
+    expect(
+      useChatStore.getState().getCommittedMessagePresentation(chat.id, result.assistantMessageId),
+    ).toMatchObject({
+      presentation: {
+        message: {
+          id: result.assistantMessageId,
+          content: [{ type: 'output_text', text: 'answer after navigation' }],
+        },
+      },
+    })
   })
 
   it('keeps repeated linear sends on their complete explicit local path', async () => {
@@ -696,6 +789,8 @@ describe('generation mode contract', () => {
     const calls: CapturedOpen[] = []
     const messageCountBefore = (await getBrowserRepository().listMessages(chat.id)).length
     const chatCostBefore = (await getBrowserRepository().getChat(chat.id))?.totalCostUsd
+    const fallbackReceipt = vi.spyOn(useChatStore.getState(), 'publishCommittedMessageMutation')
+    const producerReceipt = vi.spyOn(useChatStore.getState(), 'updateCommittedMessageForProducer')
 
     await continueAssistantInPlace({
       chatId: chat.id,
@@ -750,6 +845,112 @@ describe('generation mode contract', () => {
       receipt?.presentations[0]?.header.bodyVersion,
     )
     expect((await getBrowserRepository().getChat(chat.id))?.totalCostUsd).toBe(chatCostBefore)
+    const terminalProducerCalls = producerReceipt.mock.calls.filter(
+      ([receiptChatId, , presentation]) =>
+        receiptChatId === chat.id && presentation.message.id === target.id,
+    )
+    expect(terminalProducerCalls).toHaveLength(1)
+    const terminalPresentation = terminalProducerCalls[0]?.[2]
+    expect(terminalPresentation).toBeDefined()
+    expect(
+      fallbackReceipt.mock.calls.some(
+        ([, , presentation]) => presentation === terminalPresentation,
+      ),
+    ).toBe(false)
+    fallbackReceipt.mockRestore()
+    producerReceipt.mockRestore()
+  })
+
+  it('publishes the terminal Continue body before clearing its stream after newer navigation', async () => {
+    const chat = await createChat({
+      settings: settings({
+        continueSystemPrompt: '',
+        continueUserPrompt: 'Continue.',
+      }),
+    })
+    const user = message(chat.id, 'continue-receipt-user', 'user', 'question')
+    const target = message(chat.id, 'continue-receipt-target', 'assistant', 'partial', {
+      parentId: user.id,
+      siblingIndex: 0,
+      createdAt: 2,
+    })
+    const newerSibling = message(chat.id, 'continue-receipt-sibling', 'assistant', 'other', {
+      parentId: user.id,
+      siblingIndex: 1,
+      createdAt: 3,
+    })
+    await putMessages([user, target, newerSibling])
+    useChatStore.getState().navigateToCursor(chat.id, {
+      [cursorKeyOf(null)]: user.id,
+      [cursorKeyOf(user.id)]: target.id,
+    })
+    let markOpened!: () => void
+    const opened = new Promise<void>((resolve) => {
+      markOpened = resolve
+    })
+    let releaseStream!: () => void
+    const streamGate = new Promise<void>((resolve) => {
+      releaseStream = resolve
+    })
+    const continuing = continueAssistantInPlace({
+      chatId: chat.id,
+      targetMessageId: target.id,
+      connection: profile(),
+      apiKey: 'sk-test',
+      openStream: () => {
+        markOpened()
+        return (async function* () {
+          await streamGate
+          yield {
+            type: 'delta' as const,
+            chunk: {
+              id: 'navigated-continue-generation',
+              choices: [{ delta: { content: ' continued' }, finish_reason: 'stop' as const }],
+            },
+          }
+        })()
+      },
+    })
+
+    await opened
+    expect(useStreamStore.getState().listByChat(chat.id)).toHaveLength(1)
+    useChatStore.getState().navigateToCursor(chat.id, {
+      [cursorKeyOf(null)]: user.id,
+      [cursorKeyOf(user.id)]: newerSibling.id,
+    })
+    const newerCursor = useChatStore.getState().getCursor(chat.id)
+    let receiptAtStreamEnd: CommittedMessagePresentationReceipt | undefined
+    const unsubscribe = useStreamStore.subscribe((state) => {
+      if (!receiptAtStreamEnd && state.listByChat(chat.id).length === 0) {
+        receiptAtStreamEnd = useChatStore
+          .getState()
+          .getCommittedMessagePresentation(chat.id, target.id)
+      }
+    })
+
+    releaseStream()
+    await continuing.finally(unsubscribe)
+
+    expect(useChatStore.getState().getCursor(chat.id)).toBe(newerCursor)
+    expect(useChatStore.getState().getCommittedPathPresentation(chat.id)).toBeUndefined()
+    expect(receiptAtStreamEnd).toMatchObject({
+      presentation: {
+        message: {
+          id: target.id,
+          content: [{ type: 'output_text', text: 'partial continued' }],
+        },
+      },
+    })
+    expect(
+      useChatStore.getState().getCommittedMessagePresentation(chat.id, target.id),
+    ).toMatchObject({
+      presentation: {
+        message: {
+          id: target.id,
+          content: [{ type: 'output_text', text: 'partial continued' }],
+        },
+      },
+    })
   })
 
   it('keeps a 100k base plus 100k fragmented Continue geometrically segmented until final', async () => {

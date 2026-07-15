@@ -28,10 +28,13 @@ export type RemoteStreamLeasesExpiredHandler = (leases: readonly StreamLeaseRow[
 export type RemoteStreamOwnershipReleasedHandler = (stream: {
   chatId: ChatId
   streamId: string
+  messageId?: MessageId
+  attemptKind?: 'generation' | 'continuation'
+  replacementEpoch?: number
 }) => void
 
 interface RemoteStreamOwnershipReleaseSubscription {
-  chatId: ChatId
+  chatId: ChatId | null
   handler: RemoteStreamOwnershipReleasedHandler
   stopped: boolean
   watches: Map<string, AbortController>
@@ -45,6 +48,7 @@ interface ActiveLeaseWriter {
   lease?: StreamLeaseRow
   nextHeartbeatAt: number | null
   releaseOwnership: (() => void) | null
+  ownershipSettled: Promise<void> | null
   closed: boolean
   writeScheduled: boolean
 }
@@ -70,6 +74,7 @@ let refreshGeneration = 0
 let currentReplacementEpoch: number | null = null
 let remoteObservationRevision = 0
 const remoteHeartbeatAtByStreamId = new Map<string, number>()
+const remoteExpiryHeap: Array<{ streamId: string; heartbeatAt: number }> = []
 const remoteObservationRevisionByStreamId = new Map<string, number>()
 const reportedExpiredStreamIds = new Set<string>()
 const remoteExpiryHandlers = new Set<RemoteStreamLeasesExpiredHandler>()
@@ -85,6 +90,71 @@ export function isFreshStreamLease(lease: StreamLeaseRow, now = Date.now()): boo
 
 export function isRecoveryClaimedStreamLease(lease: StreamLeaseRow): boolean {
   return lease.ownerClientId.startsWith('recovery:')
+}
+
+export function streamLeaseRecoveryKind(
+  lease: Pick<
+    StreamLeaseRow,
+    'attemptKind' | 'continuationStrategy' | 'baseNodeVersion' | 'baseBodyVersion'
+  >,
+): 'generation' | 'continuation' {
+  if (lease.attemptKind) return lease.attemptKind
+  return lease.continuationStrategy !== undefined ||
+    lease.baseNodeVersion !== undefined ||
+    lease.baseBodyVersion !== undefined
+    ? 'continuation'
+    : 'generation'
+}
+
+export function compareStreamLeaseAdmissionOrder(
+  left: StreamLeaseRow,
+  right: StreamLeaseRow,
+): number {
+  if (left.admissionSequence !== undefined || right.admissionSequence !== undefined) {
+    if (left.admissionSequence === undefined) return -1
+    if (right.admissionSequence === undefined) return 1
+    if (left.admissionSequence !== right.admissionSequence) {
+      return left.admissionSequence - right.admissionSequence
+    }
+  }
+  const leftEpoch = left.replacementEpoch ?? -1
+  const rightEpoch = right.replacementEpoch ?? -1
+  if (leftEpoch !== rightEpoch) return leftEpoch - rightEpoch
+  if (left.startedAt !== right.startedAt) return left.startedAt - right.startedAt
+  if (left.heartbeatAt !== right.heartbeatAt) return left.heartbeatAt - right.heartbeatAt
+  return left.streamId.localeCompare(right.streamId)
+}
+
+export function newestStreamLeaseByAdmission(
+  leases: readonly StreamLeaseRow[],
+): StreamLeaseRow | undefined {
+  let newest: StreamLeaseRow | undefined
+  for (const lease of leases) {
+    if (!newest || compareStreamLeaseAdmissionOrder(lease, newest) > 0) newest = lease
+  }
+  return newest
+}
+
+export function indexStreamLeasesForRecovery(leases: readonly StreamLeaseRow[]): {
+  byMessageId: ReadonlyMap<MessageId, readonly StreamLeaseRow[]>
+  messageLessGenerationByChatId: ReadonlyMap<ChatId, readonly StreamLeaseRow[]>
+} {
+  const byMessageId = new Map<MessageId, StreamLeaseRow[]>()
+  const messageLessGenerationByChatId = new Map<ChatId, StreamLeaseRow[]>()
+  for (const lease of leases) {
+    const messageId = lease.messageId
+    if (messageId !== undefined) {
+      const indexed = byMessageId.get(messageId)
+      if (indexed) indexed.push(lease)
+      else byMessageId.set(messageId, [lease])
+      continue
+    }
+    if (streamLeaseRecoveryKind(lease) !== 'generation') continue
+    const indexed = messageLessGenerationByChatId.get(lease.chatId)
+    if (indexed) indexed.push(lease)
+    else messageLessGenerationByChatId.set(lease.chatId, [lease])
+  }
+  return { byMessageId, messageLessGenerationByChatId }
 }
 
 export type StreamRecoveryLockResult<T> = { acquired: false } | { acquired: true; value: T }
@@ -190,6 +260,7 @@ function replaceStreamWorkspace(replacementEpoch: number): boolean {
   endedStreamIds.clear()
   remoteObservationRevision = 0
   remoteHeartbeatAtByStreamId.clear()
+  remoteExpiryHeap.length = 0
   remoteObservationRevisionByStreamId.clear()
   reportedExpiredStreamIds.clear()
   for (const subscription of remoteOwnershipReleaseSubscriptions) {
@@ -234,6 +305,19 @@ export function onRemoteStreamOwnershipReleased(
   chatId: ChatId,
   handler: RemoteStreamOwnershipReleasedHandler,
 ): () => void {
+  return subscribeRemoteStreamOwnershipReleased(chatId, handler)
+}
+
+export function onAnyRemoteStreamOwnershipReleased(
+  handler: RemoteStreamOwnershipReleasedHandler,
+): () => void {
+  return subscribeRemoteStreamOwnershipReleased(null, handler)
+}
+
+function subscribeRemoteStreamOwnershipReleased(
+  chatId: ChatId | null,
+  handler: RemoteStreamOwnershipReleasedHandler,
+): () => void {
   const subscription: RemoteStreamOwnershipReleaseSubscription = {
     chatId,
     handler,
@@ -241,11 +325,14 @@ export function onRemoteStreamOwnershipReleased(
     watches: new Map(),
   }
   remoteOwnershipReleaseSubscriptions.add(subscription)
-  for (const stream of useStreamStore.getState().listByChat(chatId)) {
+  const streams = chatId
+    ? useStreamStore.getState().listByChat(chatId)
+    : useStreamStore.getState().listActive()
+  for (const stream of streams) {
     observeRemoteStreamOwnership(subscription, stream)
   }
   void getWorkspaceRepository()
-    .listStreamLeases(chatId)
+    .listStreamLeases(chatId ?? undefined)
     .then(
       (leases) => {
         if (subscription.stopped) return
@@ -292,6 +379,7 @@ export async function startStreamLease(input: {
     replacementEpoch: expectedReplacementEpoch,
     nextHeartbeatAt: null,
     releaseOwnership: null,
+    ownershipSettled: null,
     closed: false,
     writeScheduled: false,
   }
@@ -302,7 +390,7 @@ export async function startStreamLease(input: {
     assertWriterEpochCurrent(writer)
   } catch (error) {
     const closed = closeLeaseWriter(input.streamId)
-    if (closed) releaseOwnershipAfter(closed, pendingStreamOperations(input.streamId))
+    if (closed) void releaseOwnershipAfter(closed, pendingStreamOperations(input.streamId))
     await deleteCrossEpochAdmission(writer)
     throw error
   }
@@ -343,8 +431,7 @@ export function stopStreamLease(
   closeLeaseWriter(streamId)
   if (options.deleteRow === false) {
     const settled = pendingStreamOperations(streamId).catch(() => {})
-    if (writer) releaseOwnershipAfter(writer, settled)
-    return settled
+    return writer ? releaseOwnershipAfter(writer, settled) : settled
   }
   const repo = writer?.repo ?? getWorkspaceRepository()
   const deleted = enqueueStreamOperation(streamId, async () => {
@@ -356,9 +443,7 @@ export function stopStreamLease(
       await repo.deleteOwnedStreamLease(streamId, fence)
     }
   })
-  const settled = deleted.catch(() => {})
-  if (writer) releaseOwnershipAfter(writer, settled)
-  return settled
+  return writer ? releaseOwnershipAfter(writer, deleted) : deleted
 }
 
 export function requestAbortForChat(chatId: ChatId): number {
@@ -421,7 +506,7 @@ function applyRemoteLease(
   if (knownHeartbeatAt !== undefined && lease.heartbeatAt < knownHeartbeatAt && !targetImproves) {
     return
   }
-  remoteHeartbeatAtByStreamId.set(
+  recordRemoteHeartbeat(
     lease.streamId,
     Math.max(knownHeartbeatAt ?? lease.heartbeatAt, lease.heartbeatAt),
   )
@@ -436,6 +521,9 @@ function applyRemoteLease(
     ...(lease.messageId ? { messageId: lease.messageId } : {}),
     ...(attemptKind ? { attemptKind } : {}),
     replacementEpoch: lease.replacementEpoch,
+    ...(lease.admissionSequence !== undefined
+      ? { admissionSequence: lease.admissionSequence }
+      : {}),
     startedAt: lease.startedAt,
     ownerClientId: lease.ownerClientId,
   })
@@ -456,7 +544,7 @@ function applyRemoteStreamStarted(
     remoteHeartbeatAtByStreamId.get(event.streamId) ?? Number.NEGATIVE_INFINITY,
     Date.now(),
   )
-  remoteHeartbeatAtByStreamId.set(event.streamId, heartbeatAt)
+  recordRemoteHeartbeat(event.streamId, heartbeatAt)
   reportedExpiredStreamIds.delete(event.streamId)
   const attemptKind = event.attemptKind ?? current?.attemptKind
   setRemoteActiveIfChanged({
@@ -467,6 +555,9 @@ function applyRemoteStreamStarted(
       : {}),
     ...(attemptKind ? { attemptKind } : {}),
     replacementEpoch: event.replacementEpoch,
+    ...((event.admissionSequence ?? current?.admissionSequence) !== undefined
+      ? { admissionSequence: (event.admissionSequence ?? current?.admissionSequence) as number }
+      : {}),
     startedAt: current?.startedAt ?? heartbeatAt,
     ownerClientId: event.ownerClientId,
   })
@@ -491,6 +582,8 @@ function observeRemoteStreamOwnershipForSubscribers(stream: {
   chatId: ChatId
   streamId: string
   ownerClientId: string
+  messageId?: MessageId
+  attemptKind?: 'generation' | 'continuation'
   replacementEpoch?: number
 }): void {
   for (const subscription of remoteOwnershipReleaseSubscriptions) {
@@ -504,13 +597,15 @@ function observeRemoteStreamOwnership(
     chatId: ChatId
     streamId: string
     ownerClientId: string
+    messageId?: MessageId
+    attemptKind?: 'generation' | 'continuation'
     replacementEpoch?: number
   },
 ): void {
   if (
     subscription.stopped ||
     stream.replacementEpoch !== currentReplacementEpoch ||
-    subscription.chatId !== stream.chatId ||
+    (subscription.chatId !== null && subscription.chatId !== stream.chatId) ||
     stream.ownerClientId === clientId ||
     endedStreamIds.has(stream.streamId) ||
     subscription.watches.has(stream.streamId)
@@ -548,7 +643,15 @@ function observeRemoteStreamOwnership(
         return
       }
       try {
-        subscription.handler({ chatId: stream.chatId, streamId: stream.streamId })
+        subscription.handler({
+          chatId: stream.chatId,
+          streamId: stream.streamId,
+          ...(stream.messageId ? { messageId: stream.messageId } : {}),
+          ...(stream.attemptKind ? { attemptKind: stream.attemptKind } : {}),
+          ...(stream.replacementEpoch !== undefined
+            ? { replacementEpoch: stream.replacementEpoch }
+            : {}),
+        })
       } catch {
         // A release observer only schedules recovery; another observer must still be notified.
       }
@@ -691,6 +794,7 @@ function setRemoteActiveIfChanged(stream: {
   messageId?: MessageId
   attemptKind?: 'generation' | 'continuation'
   replacementEpoch: number
+  admissionSequence?: number
   startedAt: number
   ownerClientId: string
 }): void {
@@ -701,6 +805,7 @@ function setRemoteActiveIfChanged(stream: {
     current.messageId === stream.messageId &&
     current.attemptKind === stream.attemptKind &&
     current.replacementEpoch === stream.replacementEpoch &&
+    current.admissionSequence === stream.admissionSequence &&
     current.startedAt === stream.startedAt &&
     current.ownerClientId === stream.ownerClientId
   ) {
@@ -709,11 +814,54 @@ function setRemoteActiveIfChanged(stream: {
   state.setActive(stream)
 }
 
-function scheduleRemoteExpiryRefresh(notBefore?: number): void {
-  let earliestExpiry = Number.POSITIVE_INFINITY
-  for (const heartbeatAt of remoteHeartbeatAtByStreamId.values()) {
-    earliestExpiry = Math.min(earliestExpiry, heartbeatAt + STREAM_LEASE_TTL_MS + 1)
+function recordRemoteHeartbeat(streamId: string, heartbeatAt: number): void {
+  if (remoteHeartbeatAtByStreamId.get(streamId) === heartbeatAt) return
+  remoteHeartbeatAtByStreamId.set(streamId, heartbeatAt)
+  const entry = { streamId, heartbeatAt }
+  remoteExpiryHeap.push(entry)
+  let index = remoteExpiryHeap.length - 1
+  while (index > 0) {
+    const parent = Math.floor((index - 1) / 2)
+    const parentEntry = remoteExpiryHeap[parent]
+    if (!parentEntry || parentEntry.heartbeatAt <= heartbeatAt) break
+    remoteExpiryHeap[index] = parentEntry
+    index = parent
   }
+  remoteExpiryHeap[index] = entry
+}
+
+function popRemoteExpiryHeap(): void {
+  const tail = remoteExpiryHeap.pop()
+  if (!tail || remoteExpiryHeap.length === 0) return
+  let index = 0
+  while (true) {
+    const left = index * 2 + 1
+    if (left >= remoteExpiryHeap.length) break
+    const right = left + 1
+    const leftEntry = remoteExpiryHeap[left] as { streamId: string; heartbeatAt: number }
+    const rightEntry = remoteExpiryHeap[right]
+    const child = rightEntry && rightEntry.heartbeatAt < leftEntry.heartbeatAt ? right : left
+    const childEntry = remoteExpiryHeap[child] as { streamId: string; heartbeatAt: number }
+    if (childEntry.heartbeatAt >= tail.heartbeatAt) break
+    remoteExpiryHeap[index] = childEntry
+    index = child
+  }
+  remoteExpiryHeap[index] = tail
+}
+
+function earliestRemoteExpiry(): number {
+  for (;;) {
+    const entry = remoteExpiryHeap[0]
+    if (!entry) return Number.POSITIVE_INFINITY
+    if (remoteHeartbeatAtByStreamId.get(entry.streamId) === entry.heartbeatAt) {
+      return entry.heartbeatAt + STREAM_LEASE_TTL_MS + 1
+    }
+    popRemoteExpiryHeap()
+  }
+}
+
+function scheduleRemoteExpiryRefresh(notBefore?: number): void {
+  const earliestExpiry = earliestRemoteExpiry()
   const deadline = Number.isFinite(earliestExpiry)
     ? Math.max(earliestExpiry, notBefore ?? Number.NEGATIVE_INFINITY)
     : notBefore
@@ -759,28 +907,19 @@ function heartbeatSchedulerNow(): number {
 }
 
 function scheduleHeartbeatTimer(now = heartbeatSchedulerNow()): void {
-  let earliest = Number.POSITIVE_INFINITY
-  for (const writer of activeLeaseWriters.values()) {
-    if (writer.closed || writer.nextHeartbeatAt === null) continue
-    earliest = Math.min(earliest, writer.nextHeartbeatAt)
-  }
-  if (!Number.isFinite(earliest)) {
+  if (activeLeaseWriters.size === 0) {
     if (heartbeatTimer !== null) clearTimeout(heartbeatTimer)
     heartbeatTimer = null
     heartbeatDeadline = null
     return
   }
-  if (heartbeatTimer !== null && heartbeatDeadline === earliest) return
-  if (heartbeatTimer !== null) clearTimeout(heartbeatTimer)
-  heartbeatDeadline = earliest
-  heartbeatTimer = setTimeout(
-    () => {
-      heartbeatTimer = null
-      heartbeatDeadline = null
-      runDueHeartbeats(heartbeatSchedulerNow())
-    },
-    Math.max(0, earliest - now),
-  )
+  if (heartbeatTimer !== null && heartbeatDeadline !== null) return
+  heartbeatDeadline = now + STREAM_LEASE_HEARTBEAT_MS
+  heartbeatTimer = setTimeout(() => {
+    heartbeatTimer = null
+    heartbeatDeadline = null
+    runDueHeartbeats(heartbeatSchedulerNow())
+  }, STREAM_LEASE_HEARTBEAT_MS)
 }
 
 function runDueHeartbeats(now: number): void {
@@ -848,6 +987,9 @@ export function streamWriteFenceForLease(lease: StreamLeaseRow): StreamWriteFenc
     ownerClientId: lease.ownerClientId,
     fenceToken: lease.fenceToken,
     replacementEpoch: lease.replacementEpoch,
+    ...(lease.admissionSequence !== undefined
+      ? { admissionSequence: lease.admissionSequence }
+      : {}),
   }
 }
 
@@ -904,6 +1046,7 @@ async function holdStreamOwnership(writer: ActiveLeaseWriter): Promise<void> {
     () => {},
     () => {},
   )
+  writer.ownershipSettled = task
   void ownership.catch((error) => rejectReady(error))
   streamOwnershipTasks.add(task)
   void task.finally(() => streamOwnershipTasks.delete(task))
@@ -943,10 +1086,15 @@ function pendingStreamOperations(streamId: string): Promise<void> {
   return streamOperationTails.get(streamId) ?? Promise.resolve()
 }
 
-function releaseOwnershipAfter(writer: ActiveLeaseWriter, operations: Promise<void>): void {
-  void operations.finally(() => {
+function releaseOwnershipAfter(
+  writer: ActiveLeaseWriter,
+  operations: Promise<void>,
+): Promise<void> {
+  return operations.finally(async () => {
     writer.releaseOwnership?.()
     writer.releaseOwnership = null
+    await writer.ownershipSettled
+    writer.ownershipSettled = null
   })
 }
 
@@ -1011,6 +1159,7 @@ export function __resetStreamLeasesForTests(): void {
   currentReplacementEpoch = 0
   remoteObservationRevision = 0
   remoteHeartbeatAtByStreamId.clear()
+  remoteExpiryHeap.length = 0
   remoteObservationRevisionByStreamId.clear()
   reportedExpiredStreamIds.clear()
   remoteExpiryHandlers.clear()
@@ -1019,7 +1168,7 @@ export function __resetStreamLeasesForTests(): void {
   }
   for (const streamId of activeLeaseWriters.keys()) {
     const writer = closeLeaseWriter(streamId)
-    if (writer) releaseOwnershipAfter(writer, pendingStreamOperations(streamId))
+    if (writer) void releaseOwnershipAfter(writer, pendingStreamOperations(streamId))
   }
   endedStreamIds.clear()
   lockManagerOverride = undefined

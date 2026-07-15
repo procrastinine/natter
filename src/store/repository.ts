@@ -42,6 +42,18 @@ export class ChatMissingError extends Error {
   }
 }
 
+export class ChatStreamBusyError extends Error {
+  readonly chatId: ChatId
+  readonly streamId: string
+
+  constructor(chatId: ChatId, streamId: string) {
+    super(`ChatStreamBusy:${chatId}:${streamId}`)
+    this.name = 'ChatStreamBusyError'
+    this.chatId = chatId
+    this.streamId = streamId
+  }
+}
+
 export interface WorkspaceMeta {
   workspaceId: string
   backendKind: 'browser-idb' | 'daemon' | 'unknown'
@@ -59,6 +71,7 @@ export interface StreamWriteFence {
   ownerClientId: string
   fenceToken: string
   replacementEpoch: number
+  admissionSequence?: number
 }
 
 export const STREAM_LEASE_TTL_MS = 15_000
@@ -173,6 +186,7 @@ export interface StreamLeaseRow {
   replacementEpoch?: number
   startedAt: number
   heartbeatAt: number
+  admissionSequence?: number
   attemptKind?: 'generation' | 'continuation'
   continuationStrategy?: ContinuationStrategy
   baseNodeVersion?: number
@@ -627,12 +641,29 @@ export interface WorkspaceRepository {
   ): Promise<StreamLeaseRow | undefined>
   deleteStreamLease(streamId: string): Promise<boolean>
   deleteOwnedStreamLease(streamId: string, fence: StreamWriteFence): Promise<boolean>
+  getStreamLease(streamId: string): Promise<StreamLeaseRow | undefined>
   listStreamLeases(chatId?: ChatId): Promise<StreamLeaseRow[]>
+  listStreamLeasesForMessage(messageId: MessageId): Promise<StreamLeaseRow[]>
+  listMessageLessGenerationStreamLeases(chatId: ChatId): Promise<StreamLeaseRow[]>
   appendStreamChunks(chunks: readonly StreamChunkRow[]): Promise<void>
   listStreamChunks(streamId: string): Promise<StreamChunkRow[]>
   listStreamChunksForMessage(messageId: MessageId): Promise<StreamChunkRow[]>
   listStreamChunksForChat(chatId: ChatId): Promise<StreamChunkRow[]>
   deleteStreamChunks(streamId: string, fence?: StreamWriteFence): Promise<number>
+  deleteStreamJournal(
+    streamId: string,
+    options:
+      | {
+          replacementEpoch: number
+          streamFence: StreamWriteFence
+          expectedLeaseMissing?: never
+        }
+      | {
+          replacementEpoch: number
+          expectedLeaseMissing: true
+          streamFence?: never
+        },
+  ): Promise<{ deletedLease: boolean; deletedChunks: number }>
   listChats(): Promise<Chat[]>
   getChat(chatId: ChatId): Promise<Chat | undefined>
   deleteArchivedChat(chatId: ChatId): Promise<boolean>

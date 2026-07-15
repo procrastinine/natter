@@ -32,12 +32,16 @@ import {
 import { primaryKeys } from '../../store/reactive-dependencies'
 import { useRepositoryPresentationQuery } from '../../store/reactive-query'
 import type { MessagePresentationSnapshot, WorkspaceRepository } from '../../store/repository'
+import { getStreamClientId } from '../../store/stream-leases'
 import { getWorkspaceRepository } from '../../store/workspace-repository'
 import {
-  type ActiveStream,
+  currentStreamAdmissionRevision,
   isStreamRelevantToSelectedPath,
+  mostRecentlyAdmittedStream,
+  streamOriginatesFromTabNavigation,
   useActiveStreamsForChat,
   useStreamStore,
+  wasStreamAdmittedBy,
 } from '../../store/zustand/streamStore'
 import {
   ChevronIcon,
@@ -138,13 +142,15 @@ interface QueuedCompactPreview {
 type BranchTreeAction = (messageId: MessageId) => void | Promise<void>
 type BranchTreeEditAction = (message: Message, text: string) => void | Promise<void>
 type BranchTreeMessageAction = (message: Message) => void | Promise<void>
-type BranchTreeRequestAction = (
-  message: Message,
-) => MessageId | undefined | Promise<MessageId | undefined>
+export interface BranchTreeRequestTicket {
+  readonly navigationRevision: string
+  readonly completion: Promise<MessageId | undefined>
+}
+type BranchTreeRequestAction = (message: Message) => BranchTreeRequestTicket | undefined
 type BranchTreeEditRequestAction = (
   message: Message,
   text: string,
-) => MessageId | undefined | Promise<MessageId | undefined>
+) => BranchTreeRequestTicket | undefined
 type BranchTreeMessageIndexedAction = (message: Message, index: number) => void | Promise<void>
 type BranchTreeMessageAttachmentAction = (
   message: Message,
@@ -165,6 +171,11 @@ export interface BranchTreeViewProps {
   selectedNodeId?: MessageId | null
   repository?: BranchTreeRepository
   presentationSnapshots?: ReadonlyMap<MessageId, MessagePresentationSnapshot>
+  verifyPresentationSnapshotIds?: ReadonlySet<MessageId>
+  onPresentationSnapshotVerified?: (
+    messageId: MessageId,
+    snapshot: MessagePresentationSnapshot,
+  ) => void
   onActivateNode: BranchTreeAction
   onSelectNode?: (messageId: MessageId | null) => void
   onInsertAtSharedTrunk?: (parentId: MessageId | null) => void | Promise<void>
@@ -229,12 +240,14 @@ interface PanGesture {
 
 interface PendingRequestLeafFollow {
   token: number
+  navigationRevision: string
   initialStreamIds: ReadonlySet<string>
 }
 
 interface EntryStreamFollow {
   chatId: ChatId
-  openedAt: number
+  admissionRevision: number
+  acceptInitialHydration: boolean
   streamIds: ReadonlySet<string>
   messageIds: ReadonlySet<MessageId>
   acceptHydratedStream: boolean
@@ -530,6 +543,8 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
   selectedNodeId,
   repository = getWorkspaceRepository(),
   presentationSnapshots,
+  verifyPresentationSnapshotIds,
+  onPresentationSnapshotVerified,
   onActivateNode,
   onSelectNode,
   onInsertAtSharedTrunk,
@@ -849,6 +864,7 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
           activePathIds,
           knownHeaderMessageIds,
           navigationRevision,
+          getStreamClientId(),
         ),
       ),
     [activePathIds, chatStreams, knownHeaderMessageIds, navigationRevision],
@@ -861,7 +877,8 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
   if (entryStreamFollowRef.current?.chatId !== chatId) {
     entryStreamFollowRef.current = {
       chatId,
-      openedAt: Date.now(),
+      admissionRevision: currentStreamAdmissionRevision(),
+      acceptInitialHydration: headers.length === 0,
       streamIds: new Set(selectedPathStreams.map((stream) => stream.streamId)),
       messageIds: new Set(selectedPersistedStreamTargetIds),
       acceptHydratedStream:
@@ -907,26 +924,9 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
   const selectedBodyVersion = liveSelectedHeader?.bodyVersion ?? null
   inspectedMessageIdRef.current = inspectedMessageId
   const toolbarStream = useMemo(() => {
-    let inspected: ActiveStream | undefined
-    let activeLeaf: ActiveStream | undefined
-    let selectedPath: ActiveStream | undefined
-    for (const stream of chatStreams) {
-      const isNewer = (current: ActiveStream | undefined) =>
-        !current ||
-        stream.startedAt > current.startedAt ||
-        (stream.startedAt === current.startedAt && stream.streamId > current.streamId)
-      if (stream.messageId === inspectedMessageId && isNewer(inspected)) inspected = stream
-      if (stream.messageId === activeLeafId && isNewer(activeLeaf)) activeLeaf = stream
-    }
-    for (const stream of selectedPathStreams) {
-      if (
-        !selectedPath ||
-        stream.startedAt > selectedPath.startedAt ||
-        (stream.startedAt === selectedPath.startedAt && stream.streamId > selectedPath.streamId)
-      ) {
-        selectedPath = stream
-      }
-    }
+    const inspected = chatStreams.find((stream) => stream.messageId === inspectedMessageId)
+    const activeLeaf = chatStreams.find((stream) => stream.messageId === activeLeafId)
+    const selectedPath = mostRecentlyAdmittedStream(selectedPathStreams)
     return inspected ?? activeLeaf ?? selectedPath
   }, [activeLeafId, chatStreams, inspectedMessageId, selectedPathStreams])
   const planeWidth = Math.max(layout.width, viewport.width)
@@ -1045,6 +1045,10 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
     presentationSnapshots,
     liveSelectedHeader,
   )
+  const verifyDirectInspectedPresentation =
+    directInspectedPresentation !== undefined &&
+    inspectedMessageId !== null &&
+    verifyPresentationSnapshotIds?.has(inspectedMessageId) === true
 
   // The local one-body retention below bridges versioned reads without keeping
   // an idle hydrated-body query cache or remounting the inspector.
@@ -1055,10 +1059,12 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
       chatId,
       inspectedMessageId,
       selectedBodyVersion,
+      verifyDirectInspectedPresentation ? (liveSelectedHeader?.nodeVersion ?? null) : null,
+      verifyDirectInspectedPresentation,
     ]),
     async (signal) => {
       if (!inspectedMessageId) return null
-      if (directInspectedPresentation) {
+      if (directInspectedPresentation && !verifyDirectInspectedPresentation) {
         return {
           id: inspectedMessageId,
           bodyVersion: directInspectedPresentation.bodyVersion,
@@ -1109,6 +1115,26 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
         message: directInspectedPresentation.message,
       }
     : queriedInspectedMessage
+
+  useEffect(() => {
+    if (
+      !verifyDirectInspectedPresentation ||
+      !inspectedMessageId ||
+      queriedInspectedMessage?.status !== 'ready' ||
+      queriedInspectedMessage.id !== inspectedMessageId
+    ) {
+      return
+    }
+    onPresentationSnapshotVerified?.(inspectedMessageId, {
+      message: queriedInspectedMessage.message,
+      bodyVersion: queriedInspectedMessage.bodyVersion,
+    })
+  }, [
+    inspectedMessageId,
+    onPresentationSnapshotVerified,
+    queriedInspectedMessage,
+    verifyDirectInspectedPresentation,
+  ])
 
   useEffect(() => {
     if (
@@ -1493,16 +1519,19 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
   )
 
   const runRequestAndFollowLeaf = useCallback(
-    async (action: () => MessageId | undefined | Promise<MessageId | undefined>): Promise<void> => {
+    async (action: () => BranchTreeRequestTicket | undefined): Promise<void> => {
       cancelAutomaticFollow()
       const token = requestLeafFollowTokenRef.current + 1
       requestLeafFollowTokenRef.current = token
+      const ticket = action()
+      if (!ticket) return
       pendingRequestLeafFollowRef.current = {
         token,
+        navigationRevision: ticket.navigationRevision,
         initialStreamIds: new Set(useStreamStore.getState().listStreamIds()),
       }
       try {
-        const targetId = await action()
+        const targetId = await ticket.completion
         if (pendingRequestMatchesToken(pendingRequestLeafFollowRef.current, token) && targetId) {
           pendingRequestLeafFollowRef.current = null
           inspectAndCenterMessage(targetId)
@@ -1520,7 +1549,15 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
     const pending = pendingRequestLeafFollowRef.current
     if (!pending || !activeLeafId) return
     for (const stream of chatStreams) {
-      if (stream.messageId !== activeLeafId || pending.initialStreamIds.has(stream.streamId)) {
+      if (
+        stream.messageId !== activeLeafId ||
+        !streamOriginatesFromTabNavigation(
+          stream,
+          pending.navigationRevision,
+          getStreamClientId(),
+        ) ||
+        pending.initialStreamIds.has(stream.streamId)
+      ) {
         continue
       }
       pendingRequestLeafFollowRef.current = null
@@ -1532,40 +1569,28 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
   useEffect(() => {
     const follow = entryStreamFollowRef.current
     if (!follow || follow.chatId !== chatId || follow.state !== 'pending' || !activeLeafId) return
-    const streams = selectedPathStreams
-      .filter(
-        (candidate) =>
-          (follow.streamIds.has(candidate.streamId) ||
-            (follow.acceptHydratedStream && candidate.startedAt <= follow.openedAt)) &&
-          candidate.messageId !== undefined &&
-          activePathIds.has(candidate.messageId) &&
-          layout.byId.has(candidate.messageId),
-      )
-      .sort((left, right) => right.startedAt - left.startedAt)
-    const stream = streams.find((candidate) => candidate.messageId === activeLeafId) ?? streams[0]
+    const streams = selectedPathStreams.filter(
+      (candidate) =>
+        (follow.streamIds.has(candidate.streamId) ||
+          (follow.acceptHydratedStream &&
+            (follow.acceptInitialHydration ||
+              wasStreamAdmittedBy(candidate.streamId, follow.admissionRevision)))) &&
+        candidate.messageId !== undefined &&
+        activePathIds.has(candidate.messageId) &&
+        layout.byId.has(candidate.messageId),
+    )
+    const stream =
+      streams.find((candidate) => candidate.messageId === activeLeafId) ??
+      mostRecentlyAdmittedStream(streams)
     const messageId =
       stream?.messageId ??
-      ((follow.messageIds.has(activeLeafId) ||
-        (follow.acceptHydratedStream &&
-          selectedPersistedStreamTargetIds.has(activeLeafId) &&
-          (headerById.get(activeLeafId)?.generation?.startedAt ?? Number.POSITIVE_INFINITY) <=
-            follow.openedAt)) &&
-      layout.byId.has(activeLeafId)
+      (follow.messageIds.has(activeLeafId) && layout.byId.has(activeLeafId)
         ? activeLeafId
         : undefined)
     if (!messageId) return
     follow.state = 'done'
     inspectAndCenterMessage(messageId)
-  }, [
-    activeLeafId,
-    activePathIds,
-    chatId,
-    headerById,
-    inspectAndCenterMessage,
-    layout,
-    selectedPathStreams,
-    selectedPersistedStreamTargetIds,
-  ])
+  }, [activeLeafId, activePathIds, chatId, inspectAndCenterMessage, layout, selectedPathStreams])
 
   useEffect(() => {
     if (normalizedQuery.length === 0) {

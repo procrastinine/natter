@@ -21,7 +21,7 @@ import type {
   Message as MessageRow,
   ReasoningDetail,
 } from '../../core/types'
-import { useRetainedMessageStreamProjection } from '../../hooks/useMessageStreamProjection'
+import { useMessageStreamProjection } from '../../hooks/useMessageStreamProjection'
 import type { MessageAttachmentRefMutation } from '../../store/attachments'
 import { updateChatSettings } from '../../store/chats'
 import {
@@ -199,9 +199,8 @@ function MessageInner({
   // caller passes it in; otherwise the store is checked. Either way, the
   // resolved value drives streaming render mode plus reasoning/collapse
   // affordances.
-  const [activeStream, liveSnapshot] = useRetainedMessageStreamProjection(
+  const [activeStream, liveSnapshot] = useMessageStreamProjection(
     message,
-    bodyVersion,
     message.role === 'assistant' && (!presentationOnly || allowPresentationStreamProjection),
   )
   const storeStreaming = activeStream !== undefined

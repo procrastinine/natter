@@ -44,6 +44,9 @@ describe('generation attempt runner', () => {
         log.push(`append:${event.lane}`)
         if (event.lane === 'text') expect(streamAccumulatorText(accumulator)).toBe(event.text)
       },
+      immediateFlush: async () => {
+        log.push('durable')
+      },
       scheduledFlush: () => log.push('schedule'),
       settle: () => {
         log.push('settle')
@@ -88,6 +91,7 @@ describe('generation attempt runner', () => {
     expect(log).toEqual([
       'open',
       'append:text',
+      'durable',
       'publish',
       'schedule',
       'append:finish',
@@ -128,16 +132,28 @@ describe('generation attempt runner', () => {
     expect(publishLive.mock.calls[1]?.[0]).toMatchObject({ now: 0 })
   })
 
-  it('publishes live and canonical output before waiting for recovery-journal durability', async () => {
-    const durable = deferred<void>()
+  it('makes a visible recovery prefix durable before publishing it', async () => {
+    const visiblePrefixDurable = deferred<void>()
+    const visiblePrefixFlushStarted = deferred<void>()
+    const terminalDurability = deferred<void>()
     const settleStarted = deferred<void>()
     const publishLive = vi.fn()
     const order: string[] = []
+    let immediateFlushCount = 0
     const journal = journalDouble({
+      immediateFlush: () => {
+        immediateFlushCount += 1
+        order.push(`flush:${immediateFlushCount}`)
+        if (immediateFlushCount === 1) {
+          visiblePrefixFlushStarted.resolve()
+          return visiblePrefixDurable.promise
+        }
+        return Promise.resolve()
+      },
       settle: () => {
         order.push('settle')
         settleStarted.resolve()
-        return durable.promise
+        return terminalDurability.promise
       },
     })
     const finalize = vi.fn(async () => {
@@ -162,14 +178,20 @@ describe('generation attempt runner', () => {
       completed = true
     })
 
+    await visiblePrefixFlushStarted.promise
+    expect(publishLive).not.toHaveBeenCalled()
+    expect(finalize).not.toHaveBeenCalled()
+    expect(order).toEqual(['flush:1'])
+
+    visiblePrefixDurable.resolve()
     await settleStarted.promise
     expect(publishLive).toHaveBeenCalled()
     expect(finalize).toHaveBeenCalledTimes(1)
-    expect(order).toEqual(['finalize', 'canonical-committed', 'settle'])
+    expect(order).toEqual(['flush:1', 'finalize', 'canonical-committed', 'settle'])
     expect(completed).toBe(false)
-    expect(journal.flush).not.toHaveBeenCalledWith({ mode: 'immediate' })
+    expect(journal.checkpoint).toHaveBeenCalledTimes(1)
 
-    durable.resolve()
+    terminalDurability.resolve()
     await expect(attempt).resolves.toMatchObject({ outcome: 'done' })
   })
 
@@ -193,7 +215,315 @@ describe('generation attempt runner', () => {
     })
 
     expect(prepareLive).toHaveBeenCalled()
-    expect(journal.flush).not.toHaveBeenCalledWith({ mode: 'immediate' })
+    expect(journal.checkpoint).not.toHaveBeenCalled()
+  })
+
+  it('publishes one current durable snapshot when an offscreen paused stream becomes relevant', async () => {
+    const paused = deferred<void>()
+    const release = deferred<void>()
+    const journal = journalDouble()
+    let visible = false
+    let requester: (() => Promise<void>) | undefined
+    const published: string[] = []
+    const source = async function* (): AsyncGenerator<AssistantStreamChunk> {
+      yield { type: 'delta', chunk: { choices: [{ delta: { content: 'waiting' } }] } }
+      paused.resolve()
+      await release.promise
+      yield { type: 'delta', chunk: { choices: [{ delta: {}, finish_reason: 'stop' }] } }
+    }
+
+    const attempt = runGenerationAttempt({
+      open: () => source(),
+      accumulator: createStreamAccumulator({ initialContent: [], now: 0 }),
+      journal,
+      errorPolicy: SEND_GENERATION_ATTEMPT_ERROR_POLICY,
+      prepareLive: ({ accumulator: current }) => {
+        if (!visible) return undefined
+        const text = streamAccumulatorText(current)
+        return () => {
+          published.push(text)
+        }
+      },
+      registerLiveProjectionRequester: (next) => {
+        if (next) requester = next
+      },
+      finalize: async () => {},
+      cleanupJournal: async () => {},
+      cleanup: () => {},
+    })
+
+    await paused.promise
+    expect(requester).toBeTypeOf('function')
+    expect(published).toEqual([])
+    expect(journal.checkpoint).not.toHaveBeenCalled()
+
+    visible = true
+    const currentRequester = requester
+    if (!currentRequester) throw new Error('Expected live projection requester')
+    await Promise.all([currentRequester(), currentRequester()])
+    expect(published).toEqual(['waiting'])
+    expect(journal.checkpoint).toHaveBeenCalledTimes(1)
+
+    release.resolve()
+    await expect(attempt).resolves.toMatchObject({ outcome: 'done' })
+  })
+
+  it('suppresses automatic projection checks after a miss until relevance is requested', async () => {
+    vi.useFakeTimers()
+    try {
+      const firstMiss = deferred<void>()
+      const allowThirdChunk = deferred<void>()
+      const thirdChunkConsumed = deferred<void>()
+      const releaseStream = deferred<void>()
+      let clock = 0
+      let visible = false
+      let requester: (() => Promise<void>) | undefined
+      const published: string[] = []
+      const source = async function* (): AsyncGenerator<AssistantStreamChunk> {
+        yield { type: 'delta', chunk: { choices: [{ delta: { content: 'a' } }] } }
+        clock = 1
+        yield { type: 'delta', chunk: { choices: [{ delta: { content: 'b' } }] } }
+        await allowThirdChunk.promise
+        clock = 2
+        yield { type: 'delta', chunk: { choices: [{ delta: { content: 'c' } }] } }
+        thirdChunkConsumed.resolve()
+        await releaseStream.promise
+        clock = 200
+        yield { type: 'delta', chunk: { choices: [{ delta: {}, finish_reason: 'stop' }] } }
+      }
+      const journal = journalDouble()
+      const prepareLive = vi.fn(({ accumulator: current }: { accumulator: StreamAccumulator }) => {
+        const text = streamAccumulatorText(current)
+        if (!visible) {
+          firstMiss.resolve()
+          return undefined
+        }
+        return () => {
+          published.push(text)
+        }
+      })
+      const attempt = runGenerationAttempt({
+        open: () => source(),
+        accumulator: createStreamAccumulator({ initialContent: [], now: 0 }),
+        journal,
+        errorPolicy: SEND_GENERATION_ATTEMPT_ERROR_POLICY,
+        now: () => clock,
+        prepareLive,
+        registerLiveProjectionRequester: (next) => {
+          if (next) requester = next
+        },
+        finalize: async () => {},
+        cleanupJournal: async () => {},
+        cleanup: () => {},
+      })
+
+      await firstMiss.promise
+      await drainMicrotasks()
+      expect(prepareLive).toHaveBeenCalledTimes(1)
+      expect(journal.checkpoint).not.toHaveBeenCalled()
+      expect(vi.getTimerCount()).toBe(0)
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(prepareLive).toHaveBeenCalledTimes(1)
+      expect(vi.getTimerCount()).toBe(0)
+
+      visible = true
+      const currentRequester = requester
+      if (!currentRequester) throw new Error('Expected live projection requester')
+      await currentRequester()
+      expect(published).toEqual(['ab'])
+      expect(journal.checkpoint).toHaveBeenCalledTimes(1)
+
+      allowThirdChunk.resolve()
+      await thirdChunkConsumed.promise
+      expect(vi.getTimerCount()).toBe(1)
+      await vi.advanceTimersByTimeAsync(123)
+      expect(published).toEqual(['ab'])
+      await vi.advanceTimersByTimeAsync(1)
+      expect(published).toEqual(['ab', 'abc'])
+
+      releaseStream.resolve()
+      await expect(attempt).resolves.toMatchObject({ outcome: 'done' })
+      expect(vi.getTimerCount()).toBe(0)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('deduplicates forced requests against the revision projected ahead of them in the queue', async () => {
+    vi.useFakeTimers()
+    try {
+      const secondChunkConsumed = deferred<void>()
+      const allowThirdChunk = deferred<void>()
+      const thirdChunkConsumed = deferred<void>()
+      const blockedPublishStarted = deferred<void>()
+      const releaseBlockedPublish = deferred<void>()
+      const releaseStream = deferred<void>()
+      let clock = 0
+      let requester: (() => Promise<void>) | undefined
+      const published: string[] = []
+      const source = async function* (): AsyncGenerator<AssistantStreamChunk> {
+        yield { type: 'delta', chunk: { choices: [{ delta: { content: 'a' } }] } }
+        clock = 1
+        yield { type: 'delta', chunk: { choices: [{ delta: { content: 'b' } }] } }
+        secondChunkConsumed.resolve()
+        await allowThirdChunk.promise
+        clock = 2
+        yield { type: 'delta', chunk: { choices: [{ delta: { content: 'c' } }] } }
+        thirdChunkConsumed.resolve()
+        await releaseStream.promise
+        clock = 200
+        yield { type: 'delta', chunk: { choices: [{ delta: {}, finish_reason: 'stop' }] } }
+      }
+      const journal = journalDouble()
+      const attempt = runGenerationAttempt({
+        open: () => source(),
+        accumulator: createStreamAccumulator({ initialContent: [], now: 0 }),
+        journal,
+        errorPolicy: SEND_GENERATION_ATTEMPT_ERROR_POLICY,
+        now: () => clock,
+        prepareLive: ({ accumulator: current }) => {
+          const text = streamAccumulatorText(current)
+          return async () => {
+            if (text === 'ab') {
+              blockedPublishStarted.resolve()
+              await releaseBlockedPublish.promise
+            }
+            published.push(text)
+          }
+        },
+        registerLiveProjectionRequester: (next) => {
+          if (next) requester = next
+        },
+        finalize: async () => {},
+        cleanupJournal: async () => {},
+        cleanup: () => {},
+      })
+
+      await secondChunkConsumed.promise
+      expect(published).toEqual(['a'])
+      await vi.advanceTimersByTimeAsync(124)
+      await blockedPublishStarted.promise
+
+      const currentRequester = requester
+      if (!currentRequester) throw new Error('Expected live projection requester')
+      const earlierRequest = currentRequester()
+      allowThirdChunk.resolve()
+      await thirdChunkConsumed.promise
+      const laterRequest = currentRequester()
+
+      releaseBlockedPublish.resolve()
+      await Promise.all([earlierRequest, laterRequest])
+      expect(published).toEqual(['a', 'ab', 'abc'])
+      expect(journal.checkpoint).toHaveBeenCalledTimes(3)
+
+      releaseStream.resolve()
+      await expect(attempt).resolves.toMatchObject({ outcome: 'done' })
+      expect(vi.getTimerCount()).toBe(0)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('keeps current projection requests available while canonical finalization is pending', async () => {
+    const finalizeStarted = deferred<void>()
+    const releaseFinalize = deferred<void>()
+    const journal = journalDouble()
+    let visible = false
+    let requester: (() => Promise<void>) | undefined
+    const published: string[] = []
+    const attempt = runGenerationAttempt({
+      open: () =>
+        chunks(
+          { type: 'delta', chunk: { choices: [{ delta: { content: 'terminal-prefix' } }] } },
+          { type: 'delta', chunk: { choices: [{ delta: {}, finish_reason: 'stop' }] } },
+        ),
+      accumulator: createStreamAccumulator({ initialContent: [], now: 0 }),
+      journal,
+      errorPolicy: SEND_GENERATION_ATTEMPT_ERROR_POLICY,
+      prepareLive: ({ accumulator: current }) => {
+        if (!visible) return undefined
+        const text = streamAccumulatorText(current)
+        return () => {
+          published.push(text)
+        }
+      },
+      registerLiveProjectionRequester: (next) => {
+        if (next) requester = next
+      },
+      finalize: async () => {
+        finalizeStarted.resolve()
+        await releaseFinalize.promise
+      },
+      cleanupJournal: async () => {},
+      cleanup: () => {},
+    })
+
+    await finalizeStarted.promise
+    visible = true
+    const currentRequester = requester
+    if (!currentRequester) throw new Error('Expected live projection requester')
+    await currentRequester()
+    expect(published).toEqual(['terminal-prefix'])
+    expect(journal.checkpoint).toHaveBeenCalledTimes(1)
+
+    releaseFinalize.resolve()
+    await expect(attempt).resolves.toMatchObject({ outcome: 'done' })
+  })
+
+  it('does not publish an undurable snapshot and classifies the failure as storage', async () => {
+    const publishLive = vi.fn()
+    const finalized = vi.fn()
+
+    const result = await runGenerationAttempt({
+      open: () =>
+        chunks({ type: 'delta', chunk: { choices: [{ delta: { content: 'not-durable' } }] } }),
+      accumulator: createStreamAccumulator({ initialContent: [], now: 0 }),
+      journal: journalDouble({ immediateFlushError: new Error('indexeddb unavailable') }),
+      errorPolicy: SEND_GENERATION_ATTEMPT_ERROR_POLICY,
+      prepareLive: prepareLiveCallback(publishLive),
+      finalize: async (input) => finalized(input),
+      cleanupJournal: async () => {},
+      cleanup: () => {},
+    })
+
+    expect(publishLive).not.toHaveBeenCalled()
+    expect(finalized).toHaveBeenCalledWith(
+      expect.objectContaining({
+        outcome: 'error',
+        error: expect.objectContaining({ kind: 'storage', code: 'STORAGE' }),
+      }),
+    )
+    expect(result).toMatchObject({
+      outcome: 'error',
+      error: { kind: 'storage', code: 'STORAGE' },
+    })
+  })
+
+  it('keeps a projection durability failure classified as storage while aborting transport', async () => {
+    const controller = new AbortController()
+    const onLiveProjectionFailure = vi.fn(() => controller.abort())
+
+    const result = await runGenerationAttempt({
+      open: () =>
+        chunks({ type: 'delta', chunk: { choices: [{ delta: { content: 'not-durable' } }] } }),
+      accumulator: createStreamAccumulator({ initialContent: [], now: 0 }),
+      journal: journalDouble({ immediateFlushError: new Error('indexeddb unavailable') }),
+      errorPolicy: SEND_GENERATION_ATTEMPT_ERROR_POLICY,
+      signal: controller.signal,
+      prepareLive: prepareLiveCallback(vi.fn()),
+      onLiveProjectionFailure,
+      finalize: async () => {},
+      cleanupJournal: async () => {},
+      cleanup: () => {},
+    })
+
+    expect(controller.signal.aborted).toBe(true)
+    expect(onLiveProjectionFailure).toHaveBeenCalledTimes(1)
+    expect(result).toMatchObject({
+      outcome: 'error',
+      error: { kind: 'storage', code: 'STORAGE' },
+    })
+    expect(result).not.toHaveProperty('abortReason')
   })
 
   it('coalesces burst durability writes at the shared 128 KiB publication budget', async () => {
@@ -1108,6 +1438,13 @@ function journalDouble(
     await options.settle?.()
     if (options.settleError) throw options.settleError
   })
+  const checkpoint = vi.fn(async () => {
+    try {
+      await flush({ mode: 'immediate' })
+    } catch {
+      await flush({ mode: 'immediate' })
+    }
+  })
   const backpressure = vi.fn(() => options.backpressure?.())
   const release = vi.fn(() => {
     options.release?.()
@@ -1115,12 +1452,14 @@ function journalDouble(
   return {
     append,
     flush,
+    checkpoint,
     backpressure,
     settle,
     release,
   } as unknown as StreamChunkWriter & {
     append: typeof append
     flush: typeof flush
+    checkpoint: typeof checkpoint
     backpressure: typeof backpressure
     settle: typeof settle
     release: typeof release

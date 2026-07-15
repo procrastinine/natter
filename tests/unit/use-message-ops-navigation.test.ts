@@ -64,6 +64,12 @@ function deferred<T>(): {
   return { promise, resolve }
 }
 
+function navigationCounter(revision: string): bigint {
+  const separator = revision.lastIndexOf(':')
+  if (separator < 0) throw new Error(`InvalidNavigationRevision:${revision}`)
+  return BigInt(revision.slice(separator + 1))
+}
+
 const chat = {
   id: 'chat-1',
   settings: { profileId: 'profile-1', model: 'model-1' },
@@ -205,11 +211,11 @@ describe('message generation navigation intents', () => {
 
     const older = regenerateFromMessage(ctx, message())
     const olderRevision = useChatStore.getState().getNavigationRevision('chat-1')
-    expect(BigInt(olderRevision)).toBeGreaterThan(0n)
+    expect(navigationCounter(olderRevision)).toBeGreaterThan(0n)
 
     const newer = regenerateFromMessage(ctx, message())
     const newerRevision = useChatStore.getState().getNavigationRevision('chat-1')
-    expect(BigInt(newerRevision)).toBeGreaterThan(BigInt(olderRevision))
+    expect(navigationCounter(newerRevision)).toBeGreaterThan(navigationCounter(olderRevision))
     await newer
     expect(useChatStore.getState().getCursor('chat-1')).toEqual({
       'fresh-parent': `generated-${newerRevision}`,
@@ -255,11 +261,11 @@ describe('message generation navigation intents', () => {
 
     const older = editAndResend(ctx, originalUser, 'older')
     const olderRevision = useChatStore.getState().getNavigationRevision('chat-1')
-    expect(BigInt(olderRevision)).toBeGreaterThan(0n)
+    expect(navigationCounter(olderRevision)).toBeGreaterThan(0n)
 
     const newer = editAndResend(ctx, originalUser, 'newer')
     const newerRevision = useChatStore.getState().getNavigationRevision('chat-1')
-    expect(BigInt(newerRevision)).toBeGreaterThan(BigInt(olderRevision))
+    expect(navigationCounter(newerRevision)).toBeGreaterThan(navigationCounter(olderRevision))
     await newer
     expect(useChatStore.getState().getCursor('chat-1')).toEqual({ __root__: 'new-user-2' })
 

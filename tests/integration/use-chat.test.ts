@@ -12,6 +12,7 @@ import {
   __flushPostCommitCalibrationForTests,
   nextOrphanRecoveryAt,
   recoverOrphans,
+  recoverStreamOrphan,
   sendFromMessage,
   sendText,
 } from '../../src/hooks/useChat'
@@ -2945,6 +2946,138 @@ describe('recoverOrphans', () => {
     expect(await repo.getMessage('assistant-id-reserved-before-placeholder')).toBeUndefined()
   })
 
+  it('discards a continuation admission whose reserved target never committed', async () => {
+    const manager = new TestExclusiveLockManager()
+    __setStreamLockManagerForTests(manager)
+    const chat = await createChat({ settings: chatSettings() })
+    const repo = getBrowserRepository()
+    const recoveryNow = Date.now()
+    await repo.upsertStreamLease({
+      streamId: 'continuation-target-without-row',
+      chatId: chat.id,
+      messageId: 'missing-continuation-target',
+      ownerClientId: 'closed-tab',
+      startedAt: recoveryNow,
+      heartbeatAt: recoveryNow,
+      attemptKind: 'continuation',
+      continuationStrategy: 'prompt',
+    })
+
+    expect(await recoverOrphans(recoveryNow, chat.id)).toBe(1)
+    expect(await repo.listStreamLeases(chat.id)).toEqual([])
+    expect(await repo.listStreamChunks('continuation-target-without-row')).toEqual([])
+  })
+
+  it('settles a lease-less local recovery point when its reserved target is absent', async () => {
+    const chat = await createChat({ settings: chatSettings() })
+    const replacementEpoch = (await getBrowserRepository().getWorkspaceMeta()).replacementEpoch
+    useStreamStore.getState().setActive({
+      streamId: 'lease-less-missing-target',
+      replacementEpoch,
+      chatId: chat.id,
+      messageId: 'missing-reserved-target',
+      startedAt: 1,
+      ownerClientId: getStreamClientId(),
+      phase: 'recovery-pending',
+      recoveryOutcome: 'error',
+    })
+
+    await expect(
+      recoverStreamOrphan({
+        chatId: chat.id,
+        streamId: 'lease-less-missing-target',
+        messageId: 'missing-reserved-target',
+        attemptKind: 'generation',
+        replacementEpoch,
+        outcome: 'error',
+      }),
+    ).resolves.toBe('recovered')
+    expect(useStreamStore.getState().getActive('lease-less-missing-target')).toBeUndefined()
+  })
+
+  it('coalesces duplicate target leases and replays only the newest admitted journal', async () => {
+    const manager = new TestExclusiveLockManager()
+    __setStreamLockManagerForTests(manager)
+    const chat = await createChat({ settings: chatSettings() })
+    const repo = getBrowserRepository()
+    const messageId = await seedUnfinishedAssistant(chat.id)
+    const first = await repo.upsertStreamLease({
+      streamId: 'duplicate-recovery-a',
+      chatId: chat.id,
+      messageId,
+      ownerClientId: 'closed-tab-a',
+      startedAt: 100,
+      heartbeatAt: 20_000,
+      attemptKind: 'generation',
+    })
+    const second = {
+      ...first,
+      streamId: 'duplicate-recovery-b',
+      ownerClientId: 'closed-tab-b',
+      fenceToken: 'duplicate-recovery-b-fence',
+      admissionSequence: (first.admissionSequence ?? 0) + 1,
+    }
+    await getDb().streamLeases.put(second)
+    if (first.replacementEpoch === undefined) throw new Error('expected replacement epoch')
+    await repo.appendStreamChunks([
+      {
+        id: `${first.streamId}:0`,
+        streamId: first.streamId,
+        chatId: chat.id,
+        messageId,
+        seq: 0,
+        createdAt: 300,
+        event: { lane: 'text', text: ' older-journal' },
+        ...chunkFence(first),
+      },
+      {
+        id: `${first.streamId}:1`,
+        streamId: first.streamId,
+        chatId: chat.id,
+        messageId,
+        seq: 1,
+        createdAt: 400,
+        event: { lane: 'finish', finishReason: 'stop' },
+        ...chunkFence(first),
+      },
+      {
+        id: `${second.streamId}:0`,
+        streamId: second.streamId,
+        chatId: chat.id,
+        messageId,
+        seq: 0,
+        createdAt: 200,
+        event: { lane: 'text', text: ' newer-journal' },
+        ...chunkFence(second),
+      },
+    ])
+
+    await expect(
+      recoverStreamOrphan(
+        {
+          chatId: chat.id,
+          streamId: first.streamId,
+          messageId,
+          attemptKind: 'generation',
+          replacementEpoch: first.replacementEpoch,
+        },
+        20_000,
+      ),
+    ).resolves.toBe('recovered')
+    expect(await repo.listStreamLeasesForMessage(messageId)).toEqual([])
+    expect(await repo.listStreamChunksForMessage(messageId)).toEqual([])
+    const recovered = await repo.getMessage(messageId)
+    expect(recovered).toMatchObject({
+      generation: { status: 'interrupted', abortReason: 'tab-close', finishedAt: 20_000 },
+    })
+    const output = recovered?.content
+      .filter((item) => item.type === 'output_text' || item.type === 'text')
+      .map((item) => item.text)
+      .join('')
+    expect(output).toContain('newer-journal')
+    expect(output).not.toContain('older-journal')
+  })
+
   it.each([
     'generation',
     'continuation',
@@ -3106,17 +3239,17 @@ describe('recoverOrphans', () => {
     }
   })
 
-  it('defers placeholder recovery when a message-less generation lease appears inside the lock', async () => {
+  it('defers placeholder recovery when a message-less generation lease appears after the initial snapshot', async () => {
     const manager = new TestExclusiveLockManager()
     __setStreamLockManagerForTests(manager)
     const chat = await createChat({ settings: chatSettings() })
     const repo = getBrowserRepository()
     const messageId = await seedUnfinishedAssistant(chat.id)
-    const listStreamLeases = repo.listStreamLeases.bind(repo)
-    let listCalls = 0
-    const listSpy = vi.spyOn(repo, 'listStreamLeases').mockImplementation(async (scopeChatId) => {
-      listCalls += 1
-      if (listCalls === 2) {
+    const listMessageLessGenerationStreamLeases =
+      repo.listMessageLessGenerationStreamLeases.bind(repo)
+    const listSpy = vi
+      .spyOn(repo, 'listMessageLessGenerationStreamLeases')
+      .mockImplementation(async (scopeChatId) => {
         await repo.upsertStreamLease({
           streamId: 'late-placeholder-retarget',
           chatId: chat.id,
@@ -3125,15 +3258,48 @@ describe('recoverOrphans', () => {
           heartbeatAt: 20_000,
           attemptKind: 'generation',
         })
-      }
-      return listStreamLeases(scopeChatId)
-    })
+        return listMessageLessGenerationStreamLeases(scopeChatId)
+      })
 
     expect(await recoverOrphans(20_000, chat.id)).toBe(0)
-    expect(listCalls).toBeGreaterThanOrEqual(2)
+    expect(listSpy).toHaveBeenCalledTimes(1)
     expect((await repo.getMessage(messageId))?.generation?.finishedAt).toBeUndefined()
-    expect(await listStreamLeases(chat.id)).toHaveLength(1)
+    expect(await repo.listStreamLeases(chat.id)).toHaveLength(1)
     listSpy.mockRestore()
+  })
+
+  it('revalidates many orphan targets with point and indexed lease reads', async () => {
+    __setStreamLockManagerForTests(new TestExclusiveLockManager())
+    const chat = await createChat({ settings: chatSettings() })
+    const repo = getBrowserRepository()
+    const targetCount = 24
+    for (let index = 0; index < targetCount; index += 1) {
+      const messageId = await seedUnfinishedAssistant(chat.id)
+      await repo.upsertStreamLease({
+        streamId: `linear-recovery-${index}`,
+        chatId: chat.id,
+        messageId,
+        ownerClientId: `closed-tab-${index}`,
+        startedAt: 100,
+        heartbeatAt: 20_000,
+        attemptKind: 'generation',
+      })
+    }
+    const listAll = vi.spyOn(repo, 'listStreamLeases')
+    const getOne = vi.spyOn(repo, 'getStreamLease')
+    const listTarget = vi.spyOn(repo, 'listStreamLeasesForMessage')
+    const listAdmissions = vi.spyOn(repo, 'listMessageLessGenerationStreamLeases')
+
+    expect(await recoverOrphans(20_000, chat.id)).toBe(targetCount)
+    expect(listAll).toHaveBeenCalledTimes(1)
+    expect(getOne).toHaveBeenCalledTimes(targetCount)
+    expect(listTarget).toHaveBeenCalledTimes(targetCount)
+    expect(listAdmissions).toHaveBeenCalledTimes(1)
+
+    listAll.mockRestore()
+    getOne.mockRestore()
+    listTarget.mockRestore()
+    listAdmissions.mockRestore()
   })
 
   it('does not let a finalized generation lease block later target work', async () => {

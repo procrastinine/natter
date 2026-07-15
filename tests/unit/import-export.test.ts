@@ -1045,7 +1045,7 @@ describe('workspace backup restore', () => {
   })
 
   it('serializes admission started during replacement under Web Locks', async () => {
-    await seedPortableChat()
+    const seeded = await seedPortableChat()
     const exported = await exportWorkspaceBackup()
     expect(exported.payload.settings.map((row) => row.key)).not.toContain(
       'backfill:chat-sidebar-projection-v1',
@@ -1084,7 +1084,7 @@ describe('workspace backup restore', () => {
     await exclusiveEntered.promise
     const admission = getBrowserRepository().upsertStreamLease({
       streamId: 'during-web-lock-restore',
-      chatId: 'restored-chat',
+      chatId: seeded.chat.id,
       ownerClientId: 'new-tab',
       startedAt: 3511,
       heartbeatAt: 3511,
@@ -1102,7 +1102,7 @@ describe('workspace backup restore', () => {
   })
 
   it('fails replacement closed when admission wins the IndexedDB fallback fence', async () => {
-    await seedPortableChat()
+    const seeded = await seedPortableChat()
     const exported = await exportWorkspaceBackup()
     vi.stubGlobal('navigator', { locks: undefined })
     __resetLockTrackerForTests()
@@ -1117,7 +1117,7 @@ describe('workspace backup restore', () => {
     const heartbeatAt = Date.now()
     const admission = getBrowserRepository().upsertStreamLease({
       streamId: 'during-fallback-restore',
-      chatId: 'restored-chat',
+      chatId: seeded.chat.id,
       ownerClientId: 'new-tab',
       startedAt: heartbeatAt,
       heartbeatAt,

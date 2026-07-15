@@ -11,13 +11,13 @@ import {
   __overlayCommittedPathHeadersForTests,
   __rebaseBranchSnapshotForTests,
   __repositoryHeadersResolveReceiptForTests,
+  __repositorySnapshotObservesCommittedMessageForTests,
 } from '../../src/app/Shell'
 import { createMessageTreeProjection, cursorKeyOf } from '../../src/core/active-path'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import type { Chat, ConnectionProfile, Message } from '../../src/core/types'
 import { sendText } from '../../src/hooks/useChat'
 import { editInPlace } from '../../src/hooks/useMessageOps'
-import { __resetMessageStreamProjectionForTests } from '../../src/hooks/useMessageStreamProjection'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import { getBrowserRepository } from '../../src/store/browser-repo'
 import { rebuildChatSidebarProjection } from '../../src/store/chat-sidebar-projection'
@@ -325,6 +325,40 @@ describe('active branch page composition', () => {
       ),
     ).toBe(true)
   })
+
+  it('does not retire an exact body receipt against same-body stale metadata', () => {
+    const committedHeader = { ...pageHeader('body-receipt', null, 0), nodeVersion: 2 }
+    const committedMessage = pageMessage(committedHeader)
+    const receipt: CommittedMessagePresentationReceipt = {
+      chatId: committedHeader.chatId,
+      presentation: {
+        header: committedHeader,
+        message: committedMessage,
+        bodyVersion: committedHeader.bodyVersion,
+      },
+    }
+    const staleHeader = { ...committedHeader, nodeVersion: 1 }
+    const snapshot = {
+      chatId: committedHeader.chatId,
+      branchWindow: [pageMessage(staleHeader)],
+      branchHeaders: [staleHeader],
+      windowOffset: 0,
+      windowLimit: 1,
+      branchLength: 1,
+    }
+
+    expect(__repositorySnapshotObservesCommittedMessageForTests(snapshot, receipt)).toBe(false)
+    expect(
+      __repositorySnapshotObservesCommittedMessageForTests(
+        {
+          ...snapshot,
+          branchWindow: [committedMessage],
+          branchHeaders: [committedHeader],
+        },
+        receipt,
+      ),
+    ).toBe(true)
+  })
 })
 
 describe('shell smoke render', () => {
@@ -499,6 +533,178 @@ describe('shell smoke render', () => {
       },
       { timeout: 2_000 },
     )
+  })
+
+  it('retries recovery-pending cleanup for an inactive chat without changing the route', async () => {
+    __setStreamLockManagerForTests(null)
+    const pendingChat = await createChat({
+      id: 'chat-background-recovery-pending',
+      title: 'Background recovery pending',
+      now: 1,
+    })
+    const pendingMessage: Message = {
+      id: 'background-recovery-assistant',
+      chatId: pendingChat.id,
+      parentId: null,
+      siblingIndex: 0,
+      turnId: 'background-recovery-assistant',
+      turnIndex: 0,
+      createdAt: 2,
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: 'durable background answer' }],
+      nodeVersion: 0,
+      deleted: false,
+      generation: {
+        id: '',
+        model: 'test/model',
+        requestedModel: 'test/model',
+        apiUsed: 'chat',
+        delivery: 'streaming',
+        status: 'done',
+        integrity: 'clean',
+        costSource: 'stream',
+        startedAt: 2,
+        finishedAt: 3,
+      },
+    }
+    await putTestMessages([pendingMessage])
+    await getDb().chats.update(pendingChat.id, {
+      lastUpdatedLeafId: pendingMessage.id,
+      lastBranchUpdatedAt: pendingMessage.createdAt,
+      updatedAt: pendingMessage.createdAt,
+    })
+    const activeChat = await createChat({
+      id: 'chat-active-during-background-recovery',
+      title: 'Active during background recovery',
+      now: 4,
+    })
+    const activeMessage: Message = {
+      id: 'active-chat-message',
+      chatId: activeChat.id,
+      parentId: null,
+      siblingIndex: 0,
+      turnId: 'active-chat-message',
+      turnIndex: 0,
+      createdAt: 5,
+      role: 'user',
+      origin: 'user',
+      content: [{ type: 'text', text: 'active route remains selected' }],
+      nodeVersion: 0,
+      deleted: false,
+    }
+    await putTestMessages([activeMessage])
+    await getDb().chats.update(activeChat.id, {
+      lastUpdatedLeafId: activeMessage.id,
+      lastBranchUpdatedAt: activeMessage.createdAt,
+      updatedAt: activeMessage.createdAt,
+    })
+    window.location.hash = `#/chat/${activeChat.id}/message/${activeMessage.id}`
+
+    const { findByText } = render(<App />)
+    expect(await findByText('active route remains selected')).toBeVisible()
+
+    const replacementEpoch = useStreamStore.getState().replacementEpoch
+    expect(replacementEpoch).toBeTypeOf('number')
+    const streamId = 'background-recovery-stream'
+    await getDb().streamLeases.put({
+      streamId,
+      chatId: pendingChat.id,
+      messageId: pendingMessage.id,
+      ownerClientId: getStreamClientId(),
+      fenceToken: 'background-recovery-fence',
+      replacementEpoch: replacementEpoch as number,
+      startedAt: 6,
+      heartbeatAt: 6,
+      attemptKind: 'generation',
+    })
+
+    const browserRepo = getBrowserRepository()
+    let getLeaseAttempts = 0
+    let deleteLeaseAttempts = 0
+    __setWorkspaceRepositoryForTests(
+      new Proxy(browserRepo, {
+        get(target, property) {
+          if (property === 'getStreamLease') {
+            return async (requestedStreamId: string) => {
+              if (requestedStreamId === streamId) {
+                getLeaseAttempts += 1
+                if (getLeaseAttempts === 1) {
+                  throw new Error('one injected recovery read failure')
+                }
+              }
+              return target.getStreamLease(requestedStreamId)
+            }
+          }
+          if (property === 'deleteStreamJournal') {
+            return async (
+              requestedStreamId: string,
+              options: Parameters<typeof target.deleteStreamJournal>[1],
+            ) => {
+              const deleted = await target.deleteStreamJournal(requestedStreamId, options)
+              if (requestedStreamId === streamId) deleteLeaseAttempts += 1
+              return deleted
+            }
+          }
+          const value = Reflect.get(target, property) as unknown
+          if (typeof value !== 'function') return value
+          const callable = value as (...args: unknown[]) => unknown
+          return (...args: unknown[]) => callable.apply(target, args)
+        },
+      }),
+    )
+
+    act(() => {
+      useStreamStore.getState().setActive({
+        streamId,
+        replacementEpoch: replacementEpoch as number,
+        chatId: pendingChat.id,
+        messageId: pendingMessage.id,
+        startedAt: 6,
+        ownerClientId: getStreamClientId(),
+        phase: 'recovery-pending',
+        recoveryOutcome: 'done',
+      })
+      useStreamStore.getState().setLiveSnapshot({
+        streamId,
+        replacementEpoch: replacementEpoch as number,
+        chatId: pendingChat.id,
+        messageId: pendingMessage.id,
+        content: [{ type: 'output_text', text: 'durable background answer' }],
+        textLength: 25,
+        reasoningLength: 0,
+        updatedAt: 7,
+      })
+    })
+
+    await waitFor(() => {
+      expect(getLeaseAttempts).toBe(1)
+    })
+    expect(deleteLeaseAttempts).toBe(0)
+    expect(useStreamStore.getState().getActive(streamId)).toMatchObject({
+      phase: 'recovery-pending',
+      recoveryOutcome: 'done',
+    })
+    expect(
+      useStreamStore.getState().getLiveSnapshot(pendingChat.id, pendingMessage.id),
+    ).toBeDefined()
+    expect(await getDb().streamLeases.get(streamId)).toBeDefined()
+    expect(window.location.hash).toBe(`#/chat/${activeChat.id}/message/${activeMessage.id}`)
+
+    await waitFor(
+      async () => {
+        expect(getLeaseAttempts).toBeGreaterThanOrEqual(2)
+        expect(getLeaseAttempts).toBeLessThanOrEqual(3)
+        expect(deleteLeaseAttempts).toBe(1)
+        expect(await getDb().streamLeases.get(streamId)).toBeUndefined()
+        expect(useStreamStore.getState().getActive(streamId)).toBeUndefined()
+        expect(
+          useStreamStore.getState().getLiveSnapshot(pendingChat.id, pendingMessage.id),
+        ).toBeUndefined()
+      },
+      { timeout: 4_000 },
+    )
+    expect(window.location.hash).toBe(`#/chat/${activeChat.id}/message/${activeMessage.id}`)
   })
 
   it('does not rewrite an existing chat model just because the chat route opens', async () => {
@@ -1054,7 +1260,14 @@ describe('shell smoke render', () => {
     const stalledHeaderRead = new Promise<Array<MessageHeaderRow | undefined>>((resolve) => {
       resolveHeaderRead = resolve
     })
-    const stalledBodyRead = new Promise<never>(() => {})
+    let markBodyReadStarted!: () => void
+    const bodyReadStarted = new Promise<void>((resolve) => {
+      markBodyReadStarted = resolve
+    })
+    let releaseBodyRead!: () => void
+    const stalledBodyRead = new Promise<void>((resolve) => {
+      releaseBodyRead = resolve
+    })
     let blockHeaderRead = true
     __setWorkspaceRepositoryForTests(
       new Proxy(browserRepo, {
@@ -1068,10 +1281,13 @@ describe('shell smoke render', () => {
             }
           }
           if (property === 'getMessagePresentationSnapshot') {
-            return (messageId: string) =>
-              messageId === inspectedSibling.id
-                ? stalledBodyRead
-                : target.getMessagePresentationSnapshot(messageId)
+            return async (...args: Parameters<typeof target.getMessagePresentationSnapshot>) => {
+              if (args[0] === inspectedSibling.id) {
+                markBodyReadStarted()
+                await stalledBodyRead
+              }
+              return target.getMessagePresentationSnapshot(...args)
+            }
           }
           const value = Reflect.get(target, property) as unknown
           if (typeof value !== 'function') return value
@@ -1097,8 +1313,36 @@ describe('shell smoke render', () => {
     })
     expect(useChatStore.getState().getCursor(chat.id)).toBe(cursorBeforeEdit)
     expect(useChatStore.getState().getNavigationRevision(chat.id)).toBe(revisionBeforeEdit)
-    const activeReceipt = useChatStore.getState().getCommittedMessagePresentation(chat.id)
+    const activeReceipt = useChatStore
+      .getState()
+      .getCommittedMessagePresentation(chat.id, inspectedSibling.id)
     expect(activeReceipt?.presentation.message.id).toBe(inspectedSibling.id)
+    await bodyReadStarted
+
+    const unrelatedSameChatMessage: Message = {
+      ...inspectedSibling,
+      id: 'same-chat-unrelated-receipt',
+      parentId: null,
+      siblingIndex: 0,
+      turnId: 'same-chat-unrelated-receipt',
+      content: [{ type: 'output_text', text: 'unrelated exact body' }],
+      nodeVersion: 1,
+    }
+    const unrelatedSameChatStorage = splitMessageForStorage(unrelatedSameChatMessage, {
+      bodyVersion: 1,
+    })
+    act(() => {
+      useChatStore.getState().publishCommittedMessageMutation(chat.id, [], {
+        header: unrelatedSameChatStorage.header,
+        message: unrelatedSameChatMessage,
+        bodyVersion: 1,
+      })
+    })
+    expect(
+      useChatStore.getState().getCommittedMessagePresentation(chat.id, inspectedSibling.id),
+    ).toBe(activeReceipt)
+    expect(useChatStore.getState().getCommittedMessagePresentations(chat.id)).toHaveLength(2)
+    expect(queryByText('exact edited answer')).toBeVisible()
 
     act(() => {
       for (let index = 0; index < 9; index += 1) {
@@ -1120,7 +1364,9 @@ describe('shell smoke render', () => {
         })
       }
     })
-    expect(useChatStore.getState().getCommittedMessagePresentation(chat.id)).toBe(activeReceipt)
+    expect(
+      useChatStore.getState().getCommittedMessagePresentation(chat.id, inspectedSibling.id),
+    ).toBe(activeReceipt)
     expect(queryByText('exact edited answer')).toBeVisible()
 
     blockHeaderRead = false
@@ -1129,9 +1375,9 @@ describe('shell smoke render', () => {
       resolveHeaderRead([...rows])
       await stalledHeaderRead
     })
-    await waitFor(() => {
-      expect(useChatStore.getState().getCommittedMessagePresentation(chat.id)).toBeUndefined()
-    })
+    expect(
+      useChatStore.getState().getCommittedMessagePresentation(chat.id, inspectedSibling.id),
+    ).toBe(activeReceipt)
     expect(queryByText('exact edited answer')).toBeVisible()
 
     fireEvent.click(treeButton)
@@ -1141,6 +1387,174 @@ describe('shell smoke render', () => {
       const inspector = container.querySelector('[data-ui="branch-tree-inspector"]') as HTMLElement
       expect(within(inspector).getByText('exact edited answer')).toBeVisible()
     })
+    releaseBodyRead()
+    await waitFor(() => {
+      expect(
+        useChatStore.getState().getCommittedMessagePresentation(chat.id, inspectedSibling.id),
+      ).toBeUndefined()
+    })
+    expect(
+      useChatStore.getState().getCommittedMessagePresentation(chat.id, unrelatedSameChatMessage.id),
+    ).toBeDefined()
+  })
+
+  it('keeps an exact terminal body painted while authoritative body hydration is stalled', async () => {
+    const chat = await createChat({
+      id: 'chat-terminal-receipt-return',
+      title: 'Terminal receipt return',
+      settings: cloneDefaultChatSettings(),
+      now: 1,
+    })
+    const root: Message = {
+      id: 'terminal-receipt-root',
+      chatId: chat.id,
+      parentId: null,
+      siblingIndex: 0,
+      turnId: 'terminal-receipt-root',
+      turnIndex: 0,
+      createdAt: 3,
+      role: 'user',
+      origin: 'user',
+      content: [{ type: 'text', text: 'terminal receipt prompt' }],
+      nodeVersion: 0,
+      deleted: false,
+    }
+    const initialGeneration: NonNullable<Message['generation']> = {
+      id: '',
+      model: 'test/model',
+      requestedModel: 'test/model',
+      apiUsed: 'chat',
+      delivery: 'streaming',
+      status: 'done',
+      integrity: 'clean',
+      costSource: 'stream',
+      startedAt: 4,
+      finishedAt: 4,
+    }
+    const placeholder: Message = {
+      id: 'terminal-receipt-assistant',
+      chatId: chat.id,
+      parentId: root.id,
+      siblingIndex: 0,
+      turnId: 'terminal-receipt-assistant',
+      turnIndex: 1,
+      createdAt: 4,
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: '' }],
+      nodeVersion: 0,
+      deleted: false,
+      generation: initialGeneration,
+    }
+    const finalText = 'terminal body stays continuously visible'
+    const finalMessage: Message = {
+      ...placeholder,
+      content: [{ type: 'output_text', text: finalText }],
+      nodeVersion: placeholder.nodeVersion + 1,
+      generation: {
+        ...initialGeneration,
+        status: 'done',
+        finishedAt: 6,
+      },
+    }
+    const placeholderStorage = splitMessageForStorage(placeholder)
+    const finalStorage = splitMessageForStorage(finalMessage, {
+      bodyVersion: placeholderStorage.header.bodyVersion + 1,
+    })
+    const calibratedFinalHeader: MessageHeaderRow = {
+      ...finalStorage.header,
+      nodeVersion: finalStorage.header.nodeVersion + 1,
+      hiddenFromContext: true,
+    }
+    await putTestMessages([root, placeholder])
+    await getDb().chats.put({
+      ...chat,
+      titleStatus: 'manual',
+      lastUpdatedLeafId: placeholder.id,
+      lastBranchUpdatedAt: placeholder.createdAt,
+      updatedAt: placeholder.createdAt,
+    })
+    window.location.hash = `#/chat/${chat.id}/message/${placeholder.id}`
+
+    const { container, findByText, queryByText } = render(<App />)
+    await waitFor(() => {
+      expect(
+        container.querySelector(`[data-ui="message"][data-message-id="${placeholder.id}"]`),
+      ).toBeInTheDocument()
+    })
+    const browserRepo = getBrowserRepository()
+    let markBodyReadStarted!: () => void
+    const bodyReadStarted = new Promise<void>((resolve) => {
+      markBodyReadStarted = resolve
+    })
+    let releaseBodyReads!: () => void
+    const bodyReadsReleased = new Promise<void>((resolve) => {
+      releaseBodyReads = resolve
+    })
+    let stallBodyReads = true
+    __setWorkspaceRepositoryForTests(
+      new Proxy(browserRepo, {
+        get(target, property) {
+          if (property === 'getKnownBranchPageSnapshot') {
+            return async (...args: Parameters<typeof target.getKnownBranchPageSnapshot>) => {
+              if (stallBodyReads && args[0] === chat.id) {
+                markBodyReadStarted()
+                await bodyReadsReleased
+              }
+              return target.getKnownBranchPageSnapshot(...args)
+            }
+          }
+          const value = Reflect.get(target, property) as unknown
+          if (typeof value !== 'function') return value
+          const callable = value as (...args: unknown[]) => unknown
+          return (...args: unknown[]) => callable.apply(target, args)
+        },
+      }),
+    )
+
+    expect(queryByText(finalText)).not.toBeInTheDocument()
+
+    await act(async () => {
+      await getDb().transaction('rw', getDb().messages, getDb().messageBodies, async () => {
+        await getDb().messages.put(calibratedFinalHeader)
+        await getDb().messageBodies.put(finalStorage.body)
+      })
+      useChatStore.getState().publishCommittedMessageMutation(chat.id, [], {
+        header: finalStorage.header,
+        message: finalMessage,
+        bodyVersion: finalStorage.header.bodyVersion,
+      })
+    })
+
+    await bodyReadStarted
+    expect(
+      useChatStore.getState().getCommittedMessagePresentation(chat.id, placeholder.id),
+    ).toBeDefined()
+    expect(await findByText(finalText)).toBeVisible()
+    expect(
+      container.querySelector(
+        `[data-ui="message"][data-message-id="${placeholder.id}"] [data-ui="message-body"]`,
+      ),
+    ).toHaveTextContent(finalText)
+    expect(
+      useChatStore.getState().getCommittedMessagePresentation(chat.id, placeholder.id),
+    ).toBeDefined()
+    await waitFor(() => {
+      expect(
+        container.querySelector(
+          `[data-ui="message"][data-message-id="${placeholder.id}"] [data-action="toggle-visible"]`,
+        ),
+      ).toHaveAttribute('aria-label', 'Show in context (send to model)')
+    })
+
+    stallBodyReads = false
+    releaseBodyReads()
+    await waitFor(() => {
+      expect(
+        useChatStore.getState().getCommittedMessagePresentation(chat.id, placeholder.id),
+      ).toBeUndefined()
+    })
+    expect(queryByText(finalText)).toBeVisible()
   })
 
   it('returns to the active streaming branch when tree view interrupts its reload', async () => {
@@ -1508,9 +1922,6 @@ describe('shell smoke render', () => {
       useChatStore.getState().getCommittedPathPresentation(chat.id)?.pathHeaders.at(-1)?.id,
     ).toBe(result.assistantMessageId)
 
-    act(() => {
-      __resetMessageStreamProjectionForTests()
-    })
     fireEvent.click(treeButton)
     await waitFor(() =>
       expect(container.querySelector('[data-ui="branch-tree-view"]')).toBeVisible(),
@@ -1556,9 +1967,6 @@ describe('shell smoke render', () => {
     await editInPlace(chat.id, firstAssistant, 'edited answer survived', {
       pathHeaders: firstReceipt.pathHeaders,
     })
-    act(() => {
-      __resetMessageStreamProjectionForTests()
-    })
     fireEvent.click(treeButton)
     await waitFor(() =>
       expect(container.querySelector('[data-ui="branch-tree-view"]')).toBeVisible(),
@@ -1589,9 +1997,6 @@ describe('shell smoke render', () => {
     })
     expect(secondResult.outcome).toBe('done')
 
-    act(() => {
-      __resetMessageStreamProjectionForTests()
-    })
     fireEvent.click(treeButton)
     await waitFor(() =>
       expect(container.querySelector('[data-ui="branch-tree-view"]')).toBeVisible(),

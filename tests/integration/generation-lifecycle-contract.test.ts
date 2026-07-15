@@ -1099,8 +1099,9 @@ describe('generation lifecycle contract', () => {
     unknownCapture.stop()
   })
 
-  it('send retains durable chunks when the canonical final write fails', async () => {
+  it('keeps the durable live projection visible when both finalization and immediate recovery fail', async () => {
     const chat = await createChat({ settings: settings() })
+    useUiStore.getState().setActiveChatId(chat.id)
     const repo = getBrowserRepository()
     const capture = captureBroadcasts()
     const originalRunMutation = repo.runMutation.bind(repo)
@@ -1111,7 +1112,7 @@ describe('generation lifecycle contract', () => {
     vi.spyOn(repo, 'runMutation').mockImplementation(async (scopes, fn, options) => {
       if (
         failFinalWrite &&
-        injectedFailures === 0 &&
+        injectedFailures < 2 &&
         scopes.some((scope) => scope.kind === 'message' && scope.messageId === targetMessageId)
       ) {
         injectedFailures += 1
@@ -1157,16 +1158,20 @@ describe('generation lifecycle contract', () => {
         }),
       ).rejects.toThrow('injected final write failure')
       expect(openStream).toHaveBeenCalledTimes(1)
-      expect(injectedFailures).toBe(1)
+      expect(injectedFailures).toBe(2)
       const target = expectDefined(targetMessageId, 'failed target')
-      const endedStreamId = expectLifecycle(capture.events, {
-        chatId: chat.id,
-        messageId: target,
-        outcome: 'error',
-      })
+      const endedStreamId = expectDefined(streamId, 'failed stream')
+      expect(streamEvents(capture.events).filter((event) => event.kind === 'stream-ended')).toEqual(
+        [],
+      )
       expect(endedStreamId).toBe(streamId)
-      expect(useStreamStore.getState().getActive(endedStreamId)).toBeUndefined()
-      expect(useStreamStore.getState().getLiveSnapshot(chat.id, target)).toBeUndefined()
+      expect(useStreamStore.getState().getActive(endedStreamId)).toMatchObject({
+        phase: 'recovery-pending',
+        recoveryOutcome: 'error',
+      })
+      expect(useStreamStore.getState().getLiveSnapshot(chat.id, target)?.textLength).toBe(
+        132 * 1024,
+      )
       expect(await repo.listStreamLeases()).toHaveLength(1)
       expect(
         await getDb().streamChunks.where('streamId').equals(endedStreamId).count(),
@@ -1174,6 +1179,13 @@ describe('generation lifecycle contract', () => {
       expect((await repo.getMessage(target))?.generation?.finishedAt).toBeUndefined()
 
       expect(await recoverOrphans(Date.now() + 60_000, chat.id)).toBe(1)
+      expectLifecycle(capture.events, {
+        chatId: chat.id,
+        messageId: target,
+        outcome: 'error',
+      })
+      expect(useStreamStore.getState().getActive(endedStreamId)).toBeUndefined()
+      expect(useStreamStore.getState().getLiveSnapshot(chat.id, target)).toBeUndefined()
       expect(await repo.listStreamLeases()).toHaveLength(0)
       expect(await getDb().streamChunks.where('streamId').equals(endedStreamId).count()).toBe(0)
       expect((await repo.getMessage(target))?.generation?.finishedAt).toBeDefined()
@@ -1183,19 +1195,17 @@ describe('generation lifecycle contract', () => {
   })
 
   it.each([
-    { name: 'empty SSE', chunks: [] as ChatStreamChunk[], expectedText: '', hasTextChunk: false },
+    { name: 'empty SSE', chunks: [] as ChatStreamChunk[], expectedText: '' },
     {
       name: 'content followed by ordinary EOF',
       chunks: [
         { type: 'delta', chunk: { choices: [{ delta: { content: 'durable partial' } }] } },
       ] as ChatStreamChunk[],
       expectedText: 'durable partial',
-      hasTextChunk: true,
     },
-  ])('recovers $name and its truncated-stream failure after a canonical write failure', async ({
+  ])('immediately recovers $name and its truncated-stream failure after a canonical write failure', async ({
     chunks: sourceChunks,
     expectedText,
-    hasTextChunk,
   }) => {
     const chat = await createChat({ settings: settings() })
     const repo = getBrowserRepository()
@@ -1229,28 +1239,8 @@ describe('generation lifecycle contract', () => {
     ).rejects.toThrow('injected truncated-stream final write failure')
 
     expect(injectedFailure).toBe(true)
-    const assistantBeforeRecovery = expectDefined(
-      (await repo.listMessages(chat.id)).find((message) => message.role === 'assistant'),
-      'truncated assistant before recovery',
-    )
-    expect(assistantBeforeRecovery.content).toEqual([{ type: 'output_text', text: '' }])
-    const [lease] = await repo.listStreamLeases(chat.id)
-    expect(lease).toBeDefined()
-    const chunks = await repo.listStreamChunks(lease?.streamId ?? '')
-    expect(chunks.some((chunk) => (chunk.event as { lane?: unknown }).lane === 'text')).toBe(
-      hasTextChunk,
-    )
-    expect(
-      chunks.some(
-        (chunk) =>
-          (chunk.event as { lane?: unknown; error?: { code?: unknown } }).lane === 'error' &&
-          (chunk.event as { error?: { code?: unknown } }).error?.code === 'STREAM_TRUNCATED',
-      ),
-    ).toBe(true)
-
-    expect(await recoverOrphans(Date.now() + 60_000, chat.id)).toBe(1)
     const recovered = expectDefined(
-      await repo.getMessage(assistantBeforeRecovery.id),
+      (await repo.listMessages(chat.id)).find((message) => message.role === 'assistant'),
       'recovered truncated assistant',
     )
     expect(recovered.content).toEqual([{ type: 'output_text', text: expectedText }])
@@ -1265,10 +1255,10 @@ describe('generation lifecycle contract', () => {
       },
     })
     expect(await repo.listStreamLeases(chat.id)).toEqual([])
-    expect(await repo.listStreamChunks(lease?.streamId ?? '')).toEqual([])
+    expect(await repo.listStreamChunksForMessage(recovered.id)).toEqual([])
   })
 
-  it('recovers partial output and a typed thrown network failure after finalization fails', async () => {
+  it('immediately recovers partial output and a typed thrown network failure after finalization fails', async () => {
     const chat = await createChat({ settings: settings() })
     const repo = getBrowserRepository()
     const originalRunMutation = repo.runMutation.bind(repo)
@@ -1317,24 +1307,8 @@ describe('generation lifecycle contract', () => {
     ).rejects.toThrow('injected network-failure final write failure')
 
     expect(injectedFailure).toBe(true)
-    const assistantBeforeRecovery = expectDefined(
-      (await repo.listMessages(chat.id)).find((message) => message.role === 'assistant'),
-      'network-failed assistant before recovery',
-    )
-    const [lease] = await repo.listStreamLeases(chat.id)
-    expect(lease).toBeDefined()
-    const chunks = await repo.listStreamChunks(lease?.streamId ?? '')
-    expect(
-      chunks.some(
-        (chunk) =>
-          (chunk.event as { lane?: unknown; error?: { kind?: unknown } }).lane === 'error' &&
-          (chunk.event as { error?: { kind?: unknown } }).error?.kind === 'network',
-      ),
-    ).toBe(true)
-
-    expect(await recoverOrphans(Date.now() + 60_000, chat.id)).toBe(1)
     const recovered = expectDefined(
-      await repo.getMessage(assistantBeforeRecovery.id),
+      (await repo.listMessages(chat.id)).find((message) => message.role === 'assistant'),
       'recovered network-failed assistant',
     )
     expect(recovered.content).toEqual([{ type: 'output_text', text: 'durable network partial' }])
@@ -1349,7 +1323,7 @@ describe('generation lifecycle contract', () => {
       },
     })
     expect(await repo.listStreamLeases(chat.id)).toEqual([])
-    expect(await repo.listStreamChunks(lease?.streamId ?? '')).toEqual([])
+    expect(await repo.listStreamChunksForMessage(recovered.id)).toEqual([])
   })
 
   it('prevents a recovered stream from being overwritten by a stale send finalizer', async () => {
@@ -1400,13 +1374,6 @@ describe('generation lifecycle contract', () => {
     ).rejects.toThrow(/StreamFenceLost:/u)
 
     const streamId = expectDefined(claimedStreamId, 'claimed send stream')
-    const beforeRecovery = (await repo.listMessages(chat.id)).find(
-      (message) => message.role === 'assistant',
-    )
-    expect(beforeRecovery?.content).toEqual([{ type: 'output_text', text: '' }])
-    expect(await repo.listStreamChunks(streamId)).not.toHaveLength(0)
-
-    expect(await recoverOrphans(claimAt + 60_000, chat.id)).toBe(1)
     const recovered = expectDefined(
       (await repo.listMessages(chat.id)).find((message) => message.role === 'assistant'),
       'recovered assistant',
@@ -1414,6 +1381,7 @@ describe('generation lifecycle contract', () => {
     expect(recovered.content).toEqual([{ type: 'output_text', text: durableTail }])
     expect(await repo.listStreamLeases(chat.id)).toEqual([])
     expect(await repo.listStreamChunks(streamId)).toEqual([])
+    expect(await recoverOrphans(claimAt + 60_000, chat.id)).toBe(0)
   })
 
   it('recovers an interrupted Continue separately from the original generation provenance', async () => {
@@ -1577,7 +1545,7 @@ describe('generation lifecycle contract', () => {
         ...chunkFence(staleLease),
       },
     ])
-    vi.spyOn(repo, 'deleteStreamChunks').mockRejectedValueOnce(
+    vi.spyOn(repo, 'deleteStreamJournal').mockRejectedValueOnce(
       new Error('injected chunk cleanup failure'),
     )
 
@@ -1738,7 +1706,6 @@ describe('generation lifecycle contract', () => {
         generation: originalGeneration,
       })
     })
-    const baseline = expectDefined(await repo.getMessage(target.id), 'failed Continue baseline')
     const capture = captureBroadcasts()
     const originalRunMutation = repo.runMutation.bind(repo)
     const largeText = 'r'.repeat(132 * 1024)
@@ -1796,19 +1763,12 @@ describe('generation lifecycle contract', () => {
         messageId: target.id,
         outcome: 'error',
       })
-      expect((await repo.getMessage(target.id))?.content).toEqual(baseline.content)
-      expect((await repo.getMessage(target.id))?.generation).toEqual(originalGeneration)
-      expect(await repo.listStreamLeases()).toHaveLength(1)
-      expect(
-        await getDb().streamChunks.where('streamId').equals(failedStreamId).count(),
-      ).toBeGreaterThan(0)
-
-      expect(await recoverOrphans(Date.now() + 60_000, chat.id)).toBe(1)
       const recovered = expectDefined(await repo.getMessage(target.id), 'recovered Continue target')
       expect(recovered.content).toEqual([
         ...originalContent,
         { type: 'output_text', text: largeText },
       ])
+      expect((await repo.getMessage(target.id))?.generation).toEqual(originalGeneration)
       expect(recovered.generation).toEqual(originalGeneration)
       expect(recovered.continuationAttempts).toHaveLength(1)
       expect(recovered.continuationAttempts?.[0]).toMatchObject({
@@ -1820,6 +1780,7 @@ describe('generation lifecycle contract', () => {
       })
       expect(await repo.listStreamLeases()).toHaveLength(0)
       expect(await getDb().streamChunks.where('streamId').equals(failedStreamId).count()).toBe(0)
+      expect(await recoverOrphans(Date.now() + 60_000, chat.id)).toBe(0)
     } finally {
       capture.stop()
     }
@@ -1879,15 +1840,12 @@ describe('generation lifecycle contract', () => {
     ).rejects.toThrow(/StreamFenceLost:/u)
 
     const streamId = expectDefined(claimedStreamId, 'claimed Continue stream')
-    expect((await repo.getMessage(target.id))?.content).toEqual(target.content)
-    expect(await repo.listStreamChunks(streamId)).not.toHaveLength(0)
-
-    expect(await recoverOrphans(claimAt + 60_000, chat.id)).toBe(1)
     const recovered = expectDefined(await repo.getMessage(target.id), 'recovered Continue target')
     expect(recovered.content).toEqual([{ type: 'output_text', text: `original${durableTail}` }])
     expect(recovered.continuationAttempts).toHaveLength(1)
     expect(recovered.continuationAttempts?.[0]?.streamId).toBe(streamId)
     expect(await repo.listStreamLeases(chat.id)).toEqual([])
     expect(await repo.listStreamChunks(streamId)).toEqual([])
+    expect(await recoverOrphans(claimAt + 60_000, chat.id)).toBe(0)
   })
 })

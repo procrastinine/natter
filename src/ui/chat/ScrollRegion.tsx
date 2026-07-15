@@ -38,6 +38,10 @@ interface ScrollRegionProps {
   // active before the new streamed row is mounted; this lets bottom-follow
   // attach when that row actually appears.
   streamFollowKey?: string | number | null
+  // A non-null key grants one stream-start follow claim. The caller must only
+  // provide it for a request started by this tab. It intentionally supersedes
+  // an earlier pin, while later user scrolling still pins.
+  streamFollowClaimKey?: string | number | null
 }
 
 export interface ScrollRegionHandle {
@@ -149,6 +153,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
     streamActive = false,
     resetKey = null,
     streamFollowKey = null,
+    streamFollowClaimKey = null,
   },
   ref,
 ) {
@@ -187,6 +192,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
   const streamActiveRef = useRef(streamActive)
   const previousStreamActiveRef = useRef(streamActive)
   const streamFollowKeyRef = useRef(streamFollowKey)
+  const streamFollowClaimKeyRef = useRef(streamFollowClaimKey)
   thresholdRef.current = pinThresholdPx ?? DEFAULT_THRESHOLD_PX
   autoScrollOnStreamRef.current = autoScrollOnStream
   streamActiveRef.current = streamActive
@@ -649,19 +655,39 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
   }, [autoScrollOnStream, debugScroll, streamActive, scrollToBottomNow])
 
   useLayoutEffect(() => {
-    if (Object.is(streamFollowKeyRef.current, streamFollowKey)) return
-    debugScroll('stream-tail', { from: streamFollowKeyRef.current, to: streamFollowKey })
+    const followKeyChanged = !Object.is(streamFollowKeyRef.current, streamFollowKey)
+    const followClaimChanged = !Object.is(streamFollowClaimKeyRef.current, streamFollowClaimKey)
+    if (!followKeyChanged && !followClaimChanged) return
+    const claimFollow = followClaimChanged && streamFollowClaimKey !== null
+    debugScroll('stream-tail', {
+      from: streamFollowKeyRef.current,
+      to: streamFollowKey,
+      claimFollow,
+    })
     streamFollowKeyRef.current = streamFollowKey
-    if (!autoScrollOnStream || !streamActive || !followIntentRef.current) return
+    streamFollowClaimKeyRef.current = streamFollowClaimKey
+    if (!autoScrollOnStream || !streamActive) return
+    if (claimFollow) {
+      userScrollIntentUntilRef.current = 0
+      clearProgrammaticScrollIntents()
+      clearFollowSettle()
+      followIntentRef.current = true
+      setScrollStateNow('follow', 'stream-claim')
+    }
+    if (!followIntentRef.current) return
     scrollToBottomNow({ smooth: false, reason: 'stream-tail' })
     startFollowSettle('stream-tail')
     streamTailLayoutScrollAllowanceRef.current = true
   }, [
     autoScrollOnStream,
+    clearFollowSettle,
+    clearProgrammaticScrollIntents,
     debugScroll,
     scrollToBottomNow,
+    setScrollStateNow,
     startFollowSettle,
     streamActive,
+    streamFollowClaimKey,
     streamFollowKey,
   ])
 

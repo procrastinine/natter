@@ -1,11 +1,14 @@
 import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { cloneDefaultChatSettings } from '../../src/core/defaults'
+import type { Chat, Message } from '../../src/core/types'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import {
   __resetBrowserRepositoryForTests,
   getBrowserRepository,
 } from '../../src/store/browser-repo'
 import { __resetDbForTests, getDb } from '../../src/store/db'
+import { splitMessageForStorage } from '../../src/store/message-storage'
 import type { StreamChunkRow, StreamLeaseRow } from '../../src/store/repository'
 
 const DB_NAME = 'natter'
@@ -17,10 +20,78 @@ async function resetAll(): Promise<void> {
   await Dexie.delete(DB_NAME)
 }
 
-beforeEach(resetAll)
+beforeEach(async () => {
+  await resetAll()
+  await getBrowserRepository().createChat(testChat('chat-1'))
+})
 afterEach(resetAll)
 
 describe('browser stream repository', () => {
+  it('admits an absent reserved target only in an existing chat and rejects cross-chat targets', async () => {
+    const repo = getBrowserRepository()
+    await expect(
+      repo.upsertStreamLease({
+        streamId: 'reserved-target',
+        chatId: 'chat-1',
+        messageId: 'future-assistant',
+        ownerClientId: 'tab-1',
+        startedAt: 1,
+        heartbeatAt: 1,
+      }),
+    ).resolves.toMatchObject({ chatId: 'chat-1', messageId: 'future-assistant' })
+
+    await expect(
+      repo.upsertStreamLease({
+        streamId: 'missing-chat-reservation',
+        chatId: 'missing-chat',
+        messageId: 'future-assistant-2',
+        ownerClientId: 'tab-1',
+        startedAt: 1,
+        heartbeatAt: 1,
+      }),
+    ).rejects.toMatchObject({ name: 'ChatMissingError', chatId: 'missing-chat' })
+
+    await repo.createChat(testChat('chat-2'))
+    const crossChatTarget = splitMessageForStorage({
+      ...finalizedAssistant('other-chat-target'),
+      chatId: 'chat-2',
+    })
+    await getDb().messages.put(crossChatTarget.header)
+    await getDb().messageBodies.put(crossChatTarget.body)
+    await expect(
+      repo.upsertStreamLease({
+        streamId: 'cross-chat-target',
+        chatId: 'chat-1',
+        messageId: 'other-chat-target',
+        ownerClientId: 'tab-1',
+        startedAt: 1,
+        heartbeatAt: 1,
+      }),
+    ).rejects.toThrow(
+      'StreamLeaseTargetChatMismatch:cross-chat-target:other-chat-target:chat-1:chat-2',
+    )
+    const retargetedReservation = await repo.upsertStreamLease({
+      streamId: 'cross-chat-renewal',
+      chatId: 'chat-1',
+      ownerClientId: 'tab-1',
+      startedAt: 1,
+      heartbeatAt: 1,
+    })
+    await expect(
+      repo.renewStreamLease(
+        { ...retargetedReservation, messageId: 'other-chat-target', heartbeatAt: 2 },
+        { targetChanged: true },
+      ),
+    ).rejects.toThrow(
+      'StreamLeaseTargetChatMismatch:cross-chat-renewal:other-chat-target:chat-1:chat-2',
+    )
+    expect(await repo.getStreamLease('missing-chat-reservation')).toBeUndefined()
+    expect(await repo.getStreamLease('cross-chat-target')).toBeUndefined()
+    const unchangedRenewal = await repo.getStreamLease('cross-chat-renewal')
+    expect(unchangedRenewal?.chatId).toBe('chat-1')
+    expect(unchangedRenewal?.messageId).toBeUndefined()
+  })
+
   it('lists one stream through the compound stream-and-sequence index', async () => {
     const repo = getBrowserRepository()
     const streamA = await repo.upsertStreamLease({
@@ -305,6 +376,77 @@ describe('browser stream repository', () => {
     ).rejects.toThrow('StreamTargetBusy:message-1')
   })
 
+  it('assigns a monotonic durable admission order and prunes finalized target predecessors', async () => {
+    const repo = getBrowserRepository()
+    const finalized = splitMessageForStorage(finalizedAssistant('shared-final-target'))
+    await getDb().messages.put(finalized.header)
+    await getDb().messageBodies.put(finalized.body)
+    const first = await repo.upsertStreamLease({
+      streamId: 'finalized-predecessor',
+      chatId: 'chat-1',
+      messageId: 'shared-final-target',
+      ownerClientId: 'tab-a',
+      startedAt: 1,
+      heartbeatAt: 1,
+      attemptKind: 'generation',
+    })
+    const firstFence = leaseFence(first)
+    await repo.appendStreamChunks([
+      {
+        id: 'finalized-predecessor:0',
+        streamId: first.streamId,
+        chatId: first.chatId,
+        messageId: first.messageId as string,
+        seq: 0,
+        createdAt: 2,
+        event: { lane: 'text', text: 'already committed' },
+        ...firstFence,
+      },
+    ])
+
+    const second = await repo.upsertStreamLease({
+      streamId: 'replacement-after-final',
+      chatId: 'chat-1',
+      messageId: 'shared-final-target',
+      ownerClientId: 'tab-b',
+      startedAt: 3,
+      heartbeatAt: 3,
+      attemptKind: 'generation',
+    })
+
+    expect(first.admissionSequence).toBeTypeOf('number')
+    expect(second.admissionSequence).toBe((first.admissionSequence as number) + 1)
+    expect((await repo.listStreamLeases()).map((lease) => lease.streamId)).toEqual([
+      'replacement-after-final',
+    ])
+    expect(await repo.listStreamChunks(first.streamId)).toEqual([])
+  })
+
+  it('keeps repeated finalized admissions bounded to one target lease', async () => {
+    const repo = getBrowserRepository()
+    const finalized = splitMessageForStorage(finalizedAssistant('bounded-final-target'))
+    await getDb().messages.put(finalized.header)
+    await getDb().messageBodies.put(finalized.body)
+    let previousSequence = 0
+    for (let index = 0; index < 100; index += 1) {
+      const lease = await repo.upsertStreamLease({
+        streamId: `bounded-final-stream-${index}`,
+        chatId: 'chat-1',
+        messageId: 'bounded-final-target',
+        ownerClientId: `tab-${index}`,
+        startedAt: index,
+        heartbeatAt: index,
+        attemptKind: 'generation',
+      })
+      expect(lease.admissionSequence).toBeGreaterThan(previousSequence)
+      previousSequence = lease.admissionSequence as number
+    }
+
+    expect(await getDb().streamLeases.count()).toBe(1)
+    expect((await repo.listStreamLeases())[0]?.streamId).toBe('bounded-final-stream-99')
+    expect(await getDb().streamChunks.count()).toBe(0)
+  })
+
   it('checks a stream fence inside the authoritative mutation transaction', async () => {
     const repo = getBrowserRepository()
     const oldLease = await repo.upsertStreamLease({
@@ -426,6 +568,76 @@ describe('browser stream repository', () => {
     expect((await repo.listStreamLeases())[0]?.heartbeatAt).toBe(20_000)
     await expect(repo.claimStreamLeaseForRecovery(lease, 30_000)).resolves.toBeUndefined()
   })
+
+  it('cannot delete a reused stream journal across a workspace replacement epoch', async () => {
+    const repo = getBrowserRepository()
+    const oldLease = await repo.upsertStreamLease({
+      streamId: 'reused-recovery-stream',
+      chatId: 'chat-1',
+      ownerClientId: 'old-workspace-tab',
+      startedAt: 1,
+      heartbeatAt: 1,
+      attemptKind: 'generation',
+    })
+    const oldFence = leaseFence(oldLease)
+    const db = getDb()
+    const meta = await repo.getWorkspaceMeta()
+    const replacementEpoch = meta.replacementEpoch + 1
+    const replacementLease: StreamLeaseRow = {
+      ...oldLease,
+      ownerClientId: 'new-workspace-tab',
+      fenceToken: 'new-workspace-fence',
+      replacementEpoch,
+      heartbeatAt: 2,
+    }
+    const replacementChunk: StreamChunkRow = {
+      id: 'reused-recovery-stream:0',
+      streamId: replacementLease.streamId,
+      chatId: replacementLease.chatId,
+      messageId: 'new-workspace-message',
+      seq: 0,
+      createdAt: 2,
+      event: { lane: 'text', text: 'new workspace data' },
+      fenceToken: 'new-workspace-fence',
+      replacementEpoch,
+    }
+    await db.transaction('rw', db.settings, db.streamLeases, db.streamChunks, async () => {
+      await db.settings.put({
+        key: 'workspace-meta',
+        value: { ...meta, replacementEpoch },
+      })
+      await db.streamLeases.put(replacementLease)
+      await db.streamChunks.put(replacementChunk)
+    })
+
+    await expect(
+      repo.deleteStreamJournal(oldLease.streamId, {
+        replacementEpoch: oldFence.replacementEpoch,
+        streamFence: oldFence,
+      }),
+    ).rejects.toMatchObject({ name: 'WorkspaceReplacementFenceError' })
+    expect(await db.streamLeases.get(oldLease.streamId)).toEqual(replacementLease)
+    expect(await db.streamChunks.get(replacementChunk.id)).toEqual(replacementChunk)
+  })
+
+  it('does not use a missing-lease cleanup claim to delete a newly admitted lease', async () => {
+    const repo = getBrowserRepository()
+    const lease = await repo.upsertStreamLease({
+      streamId: 'appeared-before-cleanup',
+      chatId: 'chat-1',
+      ownerClientId: 'current-tab',
+      startedAt: 1,
+      heartbeatAt: 1,
+    })
+
+    await expect(
+      repo.deleteStreamJournal(lease.streamId, {
+        replacementEpoch: lease.replacementEpoch as number,
+        expectedLeaseMissing: true,
+      }),
+    ).rejects.toThrow(`StreamFenceLost:${lease.streamId}`)
+    expect(await repo.getStreamLease(lease.streamId)).toEqual(lease)
+  })
 })
 
 function leaseFence(lease: StreamLeaseRow) {
@@ -436,5 +648,55 @@ function leaseFence(lease: StreamLeaseRow) {
     ownerClientId: lease.ownerClientId,
     fenceToken: lease.fenceToken,
     replacementEpoch: lease.replacementEpoch,
+  }
+}
+
+function finalizedAssistant(id: string): Message {
+  return {
+    id,
+    chatId: 'chat-1',
+    parentId: null,
+    siblingIndex: 0,
+    turnId: `turn-${id}`,
+    turnIndex: 0,
+    createdAt: 1,
+    role: 'assistant',
+    origin: 'generated',
+    content: [{ type: 'output_text', text: 'committed' }],
+    nodeVersion: 1,
+    deleted: false,
+    generation: {
+      id: `generation-${id}`,
+      model: 'vendor/model',
+      requestedModel: 'vendor/model',
+      apiUsed: 'chat',
+      delivery: 'streaming',
+      status: 'done',
+      costSource: 'stream',
+      startedAt: 1,
+      finishedAt: 2,
+    },
+  }
+}
+
+function testChat(id: string): Chat {
+  return {
+    id,
+    title: id,
+    titleStatus: 'untitled',
+    createdAt: 1,
+    updatedAt: 1,
+    lastViewedAt: 1,
+    wordCount: 0,
+    totalCostUsd: 0,
+    metaVersion: 0,
+    summaryVersion: 0,
+    settings: cloneDefaultChatSettings(),
+    lastUpdatedLeafId: null,
+    lastBranchUpdatedAt: 1,
+    archived: false,
+    pinned: false,
+    folderId: null,
+    tags: [],
   }
 }

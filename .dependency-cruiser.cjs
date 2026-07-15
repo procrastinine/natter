@@ -46,9 +46,15 @@ module.exports = {
       from: { path: '^src/' },
       to: { path: '^tools/' },
     },
+    {
+      name: 'runtime-must-not-import-scripts',
+      severity: 'error',
+      from: { path: '^src/' },
+      to: { path: '^scripts/' },
+    },
   ],
   options: {
-    includeOnly: '^(src|tools)/',
+    includeOnly: '^(src|tools|scripts)/',
     doNotFollow: { path: 'node_modules' },
     tsPreCompilationDeps: true,
     tsConfig: { fileName: 'tsconfig.app.json' },

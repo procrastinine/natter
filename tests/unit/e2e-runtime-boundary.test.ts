@@ -2,11 +2,13 @@ import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { dirname, relative, resolve, sep } from 'node:path'
 import ts from 'typescript'
 import { describe, expect, it } from 'vitest'
+import { parseE2ePort } from '../../playwright.config'
 
 const ROOT = resolve(__dirname, '../..')
 const E2E_ROOT = resolve(ROOT, 'tests/e2e')
 const SRC_ROOT = resolve(ROOT, 'src')
 const TOOLS_ROOT = resolve(ROOT, 'tools')
+const SCRIPTS_ROOT = resolve(ROOT, 'scripts')
 const SOURCE_EXTENSION_PATTERN = /\.[cm]?[jt]sx?$/u
 const BROWSER_INSTRUMENTATION_PATTERN =
   /(?:['"`]\/src\/|\b__debug[A-Za-z0-9_]*\b|\b__nuke\b|VITE_NATTER_DEBUG|instrumented-helpers|E2E_LANE)/u
@@ -31,15 +33,17 @@ function relativePath(root: string, path: string): string {
   return relative(root, path).split(sep).join('/')
 }
 
-function targetsDevtools(importerPath: string, specifier: string): boolean {
+function targetsRuntimeExcludedTooling(importerPath: string, specifier: string): boolean {
   const withoutQuery = specifier.replace(/[?#].*$/u, '')
   const target = withoutQuery.startsWith('/')
     ? resolve(ROOT, `.${withoutQuery}`)
     : resolve(dirname(importerPath), withoutQuery)
-  return target === TOOLS_ROOT || target.startsWith(`${TOOLS_ROOT}${sep}`)
+  return [TOOLS_ROOT, SCRIPTS_ROOT].some(
+    (root) => target === root || target.startsWith(`${root}${sep}`),
+  )
 }
 
-function devtoolImportOffenders(path: string, source = readFileSync(path, 'utf8')): string[] {
+function toolingImportOffenders(path: string, source = readFileSync(path, 'utf8')): string[] {
   const sourcePath = relativePath(SRC_ROOT, path)
   const sourceFile = ts.createSourceFile(
     sourcePath,
@@ -53,7 +57,7 @@ function devtoolImportOffenders(path: string, source = readFileSync(path, 'utf8'
     const line = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1
     if (!expression || !ts.isStringLiteralLike(expression)) {
       offenders.push(`${sourcePath}:${line}:${kind}:<non-literal>`)
-    } else if (targetsDevtools(path, expression.text)) {
+    } else if (targetsRuntimeExcludedTooling(path, expression.text)) {
       offenders.push(`${sourcePath}:${line}:${kind}:${expression.text}`)
     }
   }
@@ -98,35 +102,48 @@ describe('built-app runtime boundary', () => {
   it('keeps runtime source imports pointed away from dev-only tools', () => {
     const offenders = filesBelow(SRC_ROOT)
       .filter((path) => SOURCE_EXTENSION_PATTERN.test(path))
-      .flatMap((path) => devtoolImportOffenders(path))
+      .flatMap((path) => toolingImportOffenders(path))
       .sort()
     expect(offenders).toEqual([])
 
     const cruiser = readText('.dependency-cruiser.cjs')
     expect(cruiser).toContain("name: 'runtime-must-not-import-devtools'")
+    expect(cruiser).toContain("name: 'runtime-must-not-import-scripts'")
     expect(cruiser).toContain("from: { path: '^src/' }")
     expect(cruiser).toContain("to: { path: '^tools/' }")
-    expect(cruiser).toContain("includeOnly: '^(src|tools)/'")
+    expect(cruiser).toContain("to: { path: '^scripts/' }")
+    expect(cruiser).toContain("includeOnly: '^(src|tools|scripts)/'")
   })
 
   it('recognizes static, dynamic, and unanalyzable imports across the devtool boundary', () => {
     const importer = resolve(SRC_ROOT, 'nested/runtime.ts')
     const source = [
       "import type { One } from '../../tools/static'",
-      "export { Two } from '/tools/reexport?raw'",
+      "export { Two } from '/scripts/reexport?raw'",
       "import Three = require('../../tools/import-equals')",
       'void import(`../../tools/dynamic`)',
       "require('../../tools/commonjs')",
       'void import(runtimeModule)',
     ].join('\n')
-    expect(devtoolImportOffenders(importer, source)).toEqual([
+    expect(toolingImportOffenders(importer, source)).toEqual([
       'nested/runtime.ts:1:import:../../tools/static',
-      'nested/runtime.ts:2:export:/tools/reexport?raw',
+      'nested/runtime.ts:2:export:/scripts/reexport?raw',
       'nested/runtime.ts:3:import-equals:../../tools/import-equals',
       'nested/runtime.ts:4:dynamic-import:../../tools/dynamic',
       'nested/runtime.ts:5:require:../../tools/commonjs',
       'nested/runtime.ts:6:dynamic-import:<non-literal>',
     ])
+  })
+
+  it('canonicalizes E2E ports before checking server separation', () => {
+    expect(parseE2ePort('04174', 'TEST_PORT')).toBe(4174)
+    expect(parseE2ePort('4174', 'TEST_PORT')).toBe(4174)
+    for (const invalid of ['', '0', '-1', '1.5', '65536', 'not-a-port']) {
+      expect(() => parseE2ePort(invalid, 'TEST_PORT')).toThrow(`Invalid TEST_PORT: ${invalid}`)
+    }
+
+    const config = readText('playwright.config.ts')
+    expect(config).toContain('if (fakeProviderPort === port)')
   })
 
   it('keeps every browser spec independent of Vite source modules and debug globals', () => {
@@ -257,5 +274,17 @@ describe('built-app runtime boundary', () => {
       expect(source).toContain(global)
     }
     expect(source).toContain('toEqual([])')
+  })
+
+  it('rejects standalone fake-provider fingerprints from distribution artifacts', () => {
+    const verifier = readText('scripts/verify-dist.mjs')
+    for (const marker of [
+      'natter/fake-stream',
+      '/__control/scenarios/',
+      'E2E_FAKE_PROVIDER_ORIGIN',
+      'fake-stream-server.mjs',
+    ]) {
+      expect(verifier).toContain(`'${marker}'`)
+    }
   })
 })

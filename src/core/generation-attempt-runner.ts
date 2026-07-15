@@ -59,7 +59,9 @@ export interface GenerationAttemptRunnerInput {
   prepareLive?: (input: {
     accumulator: StreamAccumulator
     now: number
-  }) => (() => void | Promise<void>) | undefined
+  }) => (() => unknown | Promise<unknown>) | undefined
+  registerLiveProjectionRequester?: (requester: (() => Promise<void>) | undefined) => void
+  onLiveProjectionFailure?: (error: Error) => void
   finalize: (input: GenerationAttemptFinalizationContext) => Promise<void>
   onCanonicalCommitted?: (result: GenerationAttemptResult) => void
   cleanupJournal: () => Promise<unknown>
@@ -76,8 +78,19 @@ export async function runGenerationAttempt(
   let deferredError: unknown
   let hasDeferredError = false
   let sawTerminalEvidence = false
+  let liveProjectionFailure: Error | undefined
   const attemptState = { beforeDispatchFailed: false, streamIterationFailed: false }
-  const livePublisher = createAttemptLivePublisher(input, now)
+  const livePublisher = createAttemptLivePublisher(
+    {
+      ...input,
+      onLiveProjectionFailure: (projectionError) => {
+        liveProjectionFailure ??= projectionError
+        input.onLiveProjectionFailure?.(projectionError)
+      },
+    },
+    now,
+  )
+  input.registerLiveProjectionRequester?.(livePublisher.requestCurrent)
 
   try {
     let source: AsyncIterable<AssistantStreamChunk>
@@ -181,7 +194,14 @@ export async function runGenerationAttempt(
     }
   } catch (caught) {
     let recoveryFailure: ApiError | undefined
-    if (input.signal?.aborted || input.isAborted?.()) {
+    if (liveProjectionFailure) {
+      outcome = 'error'
+      error =
+        liveProjectionFailure instanceof ApiError
+          ? liveProjectionFailure
+          : normalizeError(liveProjectionFailure, { midStream: true, cause: 'internal' })
+      recoveryFailure = error
+    } else if (input.signal?.aborted || input.isAborted?.()) {
       outcome = 'abort'
       abortReason = resolveAbortReason(input.abortReason)
     } else if (attemptState.beforeDispatchFailed) {
@@ -223,12 +243,11 @@ export async function runGenerationAttempt(
   }
 
   try {
-    await livePublisher.stop()
+    await livePublisher.stopAutomaticPublishing()
   } catch (caught) {
-    if (!error) {
-      outcome = 'error'
-      error = normalizeError(caught, { midStream: true, cause: 'internal' })
-    }
+    outcome = 'error'
+    abortReason = undefined
+    error = normalizeError(caught, { midStream: true, cause: 'internal' })
   }
 
   let effectiveResult: GenerationAttemptResult = {
@@ -278,11 +297,20 @@ export async function runGenerationAttempt(
 
   let cleanupError: unknown
   let hasCleanupError = false
+  input.registerLiveProjectionRequester?.(undefined)
   try {
-    input.journal.release()
+    await livePublisher.close()
   } catch (caught) {
     cleanupError = normalizeError(caught, { midStream: true, cause: 'internal' })
     hasCleanupError = true
+  }
+  try {
+    input.journal.release()
+  } catch (caught) {
+    if (!hasCleanupError) {
+      cleanupError = normalizeError(caught, { midStream: true, cause: 'internal' })
+      hasCleanupError = true
+    }
   }
   releaseStreamAccumulatorBuffers(input.accumulator)
   try {
@@ -317,17 +345,27 @@ async function preserveRecoveryJournal(journal: StreamChunkWriter): Promise<void
 }
 
 function createAttemptLivePublisher(
-  input: Pick<GenerationAttemptRunnerInput, 'accumulator' | 'journal' | 'prepareLive'>,
+  input: Pick<
+    GenerationAttemptRunnerInput,
+    'accumulator' | 'journal' | 'prepareLive' | 'onLiveProjectionFailure'
+  >,
   now: () => number,
 ): {
   afterEvent: (publishNow: number) => Promise<void>
   flush: () => Promise<void>
-  stop: () => Promise<void>
+  requestCurrent: () => Promise<void>
+  stopAutomaticPublishing: () => Promise<void>
+  close: () => Promise<void>
 } {
   let timer: ReturnType<typeof setTimeout> | undefined
   let tail = Promise.resolve()
   let failure: Error | undefined
-  let stopped = false
+  let automaticPublishingStopped = false
+  let closed = false
+  let requestedRevision: number | undefined
+  let requestedPromise: Promise<void> | undefined
+  let projectedRevision: number | undefined
+  let automaticProjectionSuppressed = false
 
   const clearTimer = () => {
     if (timer === undefined) return
@@ -339,21 +377,43 @@ function createAttemptLivePublisher(
     if (failure !== undefined) throw failure
   }
 
-  const enqueue = (publishNow: number): Promise<void> => {
+  const enqueue = (publishNow: number, force = false): Promise<void> => {
     const task = tail.then(async () => {
-      if (stopped || !input.prepareLive || !input.accumulator.dirtySinceLastLivePublish) return
+      if (force) automaticProjectionSuppressed = false
+      if (
+        closed ||
+        !input.prepareLive ||
+        (!force && automaticProjectionSuppressed) ||
+        (!force && !input.accumulator.dirtySinceLastLivePublish)
+      ) {
+        return
+      }
       const revision = input.accumulator.liveMutationRevision
+      if (force && projectedRevision === revision) return
       const apply = input.prepareLive({ accumulator: input.accumulator, now: publishNow })
       if (!apply) {
+        automaticProjectionSuppressed = true
+        clearTimer()
         markStreamAccumulatorPublished(input.accumulator, publishNow, revision)
         return
       }
-      await apply()
+      try {
+        await input.journal.checkpoint()
+      } catch (caught) {
+        throw normalizeError(caught, { midStream: true, cause: 'storage' })
+      }
+      const applied = await apply()
+      automaticProjectionSuppressed = applied === false
+      if (automaticProjectionSuppressed) clearTimer()
+      else projectedRevision = revision
       markStreamAccumulatorPublished(input.accumulator, publishNow, revision)
     })
     const observed = task.catch((error) => {
       const normalized = errorFromUnknown(error)
-      if (failure === undefined) failure = normalized
+      if (failure === undefined) {
+        failure = normalized
+        input.onLiveProjectionFailure?.(normalized)
+      }
       throw normalized
     })
     tail = observed.catch(() => {})
@@ -361,7 +421,15 @@ function createAttemptLivePublisher(
   }
 
   const schedule = (publishNow: number) => {
-    if (timer !== undefined || !input.prepareLive || stopped) return
+    if (
+      timer !== undefined ||
+      !input.prepareLive ||
+      automaticProjectionSuppressed ||
+      automaticPublishingStopped ||
+      closed
+    ) {
+      return
+    }
     const delay = Math.max(
       0,
       STREAM_LIVE_UPDATE_INTERVAL_MS - (publishNow - input.accumulator.lastLivePublishedAt),
@@ -375,7 +443,14 @@ function createAttemptLivePublisher(
   return {
     async afterEvent(publishNow) {
       throwIfFailed()
-      if (!input.prepareLive || !input.accumulator.dirtySinceLastLivePublish) return
+      if (
+        automaticPublishingStopped ||
+        automaticProjectionSuppressed ||
+        !input.prepareLive ||
+        !input.accumulator.dirtySinceLastLivePublish
+      ) {
+        return
+      }
       if (shouldPublishStreamAccumulatorLive(input.accumulator, publishNow)) {
         clearTimer()
         await enqueue(publishNow)
@@ -386,17 +461,45 @@ function createAttemptLivePublisher(
     async flush() {
       clearTimer()
       throwIfFailed()
-      if (input.prepareLive && input.accumulator.dirtySinceLastLivePublish) {
+      if (
+        !automaticPublishingStopped &&
+        !automaticProjectionSuppressed &&
+        input.prepareLive &&
+        input.accumulator.dirtySinceLastLivePublish
+      ) {
         await enqueue(now())
       }
       await tail
       throwIfFailed()
     },
-    async stop() {
+    requestCurrent() {
+      if (failure !== undefined) return Promise.reject(failure)
+      if (closed || !input.prepareLive || input.accumulator.liveMutationRevision === 0) {
+        return Promise.resolve()
+      }
+      const revision = input.accumulator.liveMutationRevision
+      if (projectedRevision === revision) return Promise.resolve()
+      if (requestedRevision === revision && requestedPromise) return requestedPromise
+      requestedRevision = revision
+      const request = enqueue(now(), true).finally(() => {
+        if (requestedPromise !== request) return
+        requestedRevision = undefined
+        requestedPromise = undefined
+      })
+      requestedPromise = request
+      return request
+    },
+    async stopAutomaticPublishing() {
       clearTimer()
-      stopped = true
+      automaticPublishingStopped = true
       await tail
       throwIfFailed()
+    },
+    async close() {
+      clearTimer()
+      automaticPublishingStopped = true
+      closed = true
+      await tail
     },
   }
 }

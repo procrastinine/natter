@@ -453,6 +453,7 @@ describe('BranchTreeInspector', () => {
       replacementEpoch: 0,
       chatId: row.chatId,
       messageId: row.id,
+      attemptKind: 'continuation',
       startedAt: 1,
       ownerClientId: 'client-1',
     })
@@ -509,9 +510,9 @@ describe('BranchTreeInspector', () => {
     useStreamStore.getState().clearLiveSnapshot(row.id, 'stream-1', 0)
     expect(screen.getByRole('button', { name: 'Hide this reasoning block' })).toBeDisabled()
     useStreamStore.getState().clearActive('stream-1', 0)
-    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('Finishing response…'))
-    expect(screen.getByRole('button', { name: 'Hide this reasoning block' })).toBeDisabled()
-    expect(screen.getByRole('button', { name: 'Hide tool call' })).toBeDisabled()
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
+    expect(screen.getByRole('button', { name: 'Hide this reasoning block' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Hide tool call' })).toBeEnabled()
 
     view.rerender(
       <BranchTreeInspector
@@ -547,6 +548,7 @@ describe('BranchTreeInspector', () => {
         replacementEpoch: 0,
         chatId: row.chatId,
         messageId: row.id,
+        attemptKind: 'continuation',
         startedAt: 1,
         ownerClientId: getStreamClientId(),
       })
@@ -584,6 +586,7 @@ describe('BranchTreeInspector', () => {
         replacementEpoch: 0,
         chatId: row.chatId,
         messageId: row.id,
+        attemptKind: 'continuation',
         startedAt: 1,
         ownerClientId: 'different-tab-client',
       })
@@ -599,7 +602,7 @@ describe('BranchTreeInspector', () => {
     )
   })
 
-  it('retains the last live snapshot until the committed message prop arrives', async () => {
+  it('uses the canonical terminal body before the current generation snapshot clears', async () => {
     const completedGeneration = message().generation
     if (!completedGeneration) throw new Error('Expected generated message metadata')
     const { finishedAt: _finishedAt, ...pendingGeneration } = completedGeneration
@@ -610,6 +613,7 @@ describe('BranchTreeInspector', () => {
         replacementEpoch: 0,
         chatId: row.chatId,
         messageId: row.id,
+        attemptKind: 'generation',
         startedAt: 1,
         ownerClientId: getStreamClientId(),
       })
@@ -629,15 +633,6 @@ describe('BranchTreeInspector', () => {
     )
     expect(screen.getByText('Last complete live snapshot.')).toBeInTheDocument()
 
-    act(() => {
-      useStreamStore.getState().clearLiveSnapshot(row.id, 'commit-gap-stream', 0)
-      useStreamStore.getState().clearActive('commit-gap-stream', 0)
-    })
-
-    expect(screen.getByText('Last complete live snapshot.')).toBeInTheDocument()
-    expect(screen.queryByText('Inspector body.')).not.toBeInTheDocument()
-    expect(screen.getByRole('status')).toHaveTextContent('Finishing response…')
-
     view.rerender(
       <BranchTreeInspector
         message={message({
@@ -656,6 +651,12 @@ describe('BranchTreeInspector', () => {
 
     await waitFor(() => expect(screen.getByText('Committed snapshot content.')).toBeInTheDocument())
     expect(screen.queryByText('Last complete live snapshot.')).not.toBeInTheDocument()
+
+    act(() => {
+      useStreamStore.getState().clearLiveSnapshot(row.id, 'commit-gap-stream', 0)
+      useStreamStore.getState().clearActive('commit-gap-stream', 0)
+    })
+    expect(screen.getByText('Committed snapshot content.')).toBeInTheDocument()
   })
 
   it('settles a committed snapshot before the live store clears under StrictMode', async () => {
@@ -669,6 +670,7 @@ describe('BranchTreeInspector', () => {
         replacementEpoch: 0,
         chatId: pending.chatId,
         messageId: pending.id,
+        attemptKind: 'generation',
         startedAt: 1,
         ownerClientId: getStreamClientId(),
       })
@@ -717,7 +719,7 @@ describe('BranchTreeInspector', () => {
     expect(screen.getByRole('button', { name: 'Edit message' })).toBeEnabled()
   })
 
-  it('hands the last live snapshot across a view unmount until the committed row arrives', async () => {
+  it('reads the current snapshot across views without retaining a second copy', async () => {
     const completedGeneration = message().generation
     if (!completedGeneration) throw new Error('Expected generated message metadata')
     const { finishedAt: _finishedAt, ...pendingGeneration } = completedGeneration
@@ -728,6 +730,7 @@ describe('BranchTreeInspector', () => {
         replacementEpoch: 0,
         chatId: pending.chatId,
         messageId: pending.id,
+        attemptKind: 'generation',
         startedAt: 1,
         ownerClientId: getStreamClientId(),
       })
@@ -746,14 +749,10 @@ describe('BranchTreeInspector', () => {
     expect(screen.getByText('Visible before changing views.')).toBeInTheDocument()
     firstView.unmount()
 
-    act(() => {
-      useStreamStore.getState().clearLiveSnapshot(pending.id, 'cross-view-stream', 0)
-      useStreamStore.getState().clearActive('cross-view-stream', 0)
-    })
     const nextView = render(<BranchTreeInspector message={pending} onClose={() => undefined} />)
     expect(screen.getByText('Visible before changing views.')).toBeInTheDocument()
     expect(screen.queryByText('Inspector body.')).not.toBeInTheDocument()
-    expect(screen.getByRole('status')).toHaveTextContent('Finishing response…')
+    expect(screen.getByRole('status')).toHaveTextContent('Streaming response…')
 
     nextView.rerender(
       <BranchTreeInspector
@@ -773,6 +772,12 @@ describe('BranchTreeInspector', () => {
       expect(screen.getByText('Committed after changing views.')).toBeInTheDocument(),
     )
     expect(screen.queryByText('Visible before changing views.')).not.toBeInTheDocument()
+
+    act(() => {
+      useStreamStore.getState().clearLiveSnapshot(pending.id, 'cross-view-stream', 0)
+      useStreamStore.getState().clearActive('cross-view-stream', 0)
+    })
+    expect(screen.getByText('Committed after changing views.')).toBeInTheDocument()
   })
 
   it('treats persisted streaming generation state as target-busy without an active lease', () => {
@@ -897,6 +902,7 @@ describe('BranchTreeInspector', () => {
       replacementEpoch: 0,
       chatId: row.chatId,
       messageId: row.id,
+      attemptKind: 'continuation',
       startedAt: 1,
       ownerClientId: 'client-1',
     })

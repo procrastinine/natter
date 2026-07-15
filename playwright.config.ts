@@ -7,25 +7,26 @@ if (requestedBuildKind !== 'app' && requestedBuildKind !== 'pages') {
 }
 const buildKind: 'app' | 'pages' = requestedBuildKind
 
-const port = process.env.E2E_PORT ?? '4173'
-if (!/^\d+$/u.test(port) || Number(port) < 1 || Number(port) > 65_535) {
-  throw new Error(`Invalid E2E_PORT: ${port}`)
-}
+const port = parseE2ePort(process.env.E2E_PORT ?? '4173', 'E2E_PORT')
 const baseURL = `http://${host}:${port}`
-const fakeProviderPort = process.env.E2E_FAKE_PROVIDER_PORT ?? '4174'
-if (
-  !/^\d+$/u.test(fakeProviderPort) ||
-  Number(fakeProviderPort) < 1 ||
-  Number(fakeProviderPort) > 65_535
-) {
-  throw new Error(`Invalid E2E_FAKE_PROVIDER_PORT: ${fakeProviderPort}`)
-}
+const fakeProviderPort = parseE2ePort(
+  process.env.E2E_FAKE_PROVIDER_PORT ?? '4174',
+  'E2E_FAKE_PROVIDER_PORT',
+)
 if (fakeProviderPort === port) {
   throw new Error('E2E_FAKE_PROVIDER_PORT must differ from E2E_PORT')
 }
 const fakeProviderURL = `http://${host}:${fakeProviderPort}`
 process.env.E2E_FAKE_PROVIDER_ORIGIN = fakeProviderURL
 const buildCommand = buildKind === 'pages' ? 'pnpm build:pages' : 'pnpm build'
+
+export function parseE2ePort(raw: string, name: string): number {
+  const parsed = Number(raw)
+  if (!/^\d+$/u.test(raw) || !Number.isSafeInteger(parsed) || parsed < 1 || parsed > 65_535) {
+    throw new Error(`Invalid ${name}: ${raw}`)
+  }
+  return parsed
+}
 
 export default defineConfig({
   testDir: './tests/e2e',

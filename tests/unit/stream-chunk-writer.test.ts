@@ -618,6 +618,73 @@ describe('stream chunk writer', () => {
     expect(rows.length).toBeLessThan(100)
   })
 
+  it('indexes adversarial changing reasoning ids without per-event row scans or alias growth', async () => {
+    let persistedRows = 0
+    const writer = createWriter(
+      {
+        appendStreamChunks: async (batch) => {
+          persistedRows += batch.length
+        },
+      },
+      100,
+    )
+    const rowCount = 20_000
+
+    for (let index = 0; index < rowCount; index += 1) {
+      writer.append(
+        {
+          lane: 'reasoning',
+          detailsMode: 'delta',
+          details: [
+            {
+              type: 'reasoning.text',
+              id: `changing-id-${index}`,
+              index: 0,
+              format: 'unknown',
+              text: 'x',
+            },
+          ],
+        },
+        101 + index,
+      )
+    }
+
+    expect(writer.inspect()).toMatchObject({
+      trackedReasoningRows: rowCount,
+      trackedReasoningIds: rowCount,
+    })
+    await writer.settle()
+
+    expect(persistedRows).toBe(rowCount)
+  })
+
+  it('keeps one canonical reasoning identity for a long stable-id stream', async () => {
+    const writer = createWriter({ appendStreamChunks: async () => undefined }, 100)
+    const chunkCount = 20_000
+
+    for (let index = 0; index < chunkCount; index += 1) {
+      writer.append(
+        {
+          lane: 'reasoning',
+          detailsMode: 'delta',
+          details: [
+            {
+              type: 'reasoning.text',
+              id: 'stable-reasoning-id',
+              index: 0,
+              format: 'unknown',
+              text: 'x',
+            },
+          ],
+        },
+        101 + index,
+      )
+    }
+
+    expect(writer.inspect()).toMatchObject({ trackedReasoningRows: 1, trackedReasoningIds: 1 })
+    await writer.settle()
+  })
+
   it('replays an equal cumulative mirror after a scalar delta without duplication', async () => {
     const rows: StreamChunkRow[] = []
     const writer = createWriter(
@@ -1079,6 +1146,39 @@ describe('stream chunk writer', () => {
     }
   })
 
+  it('drains shared requests across queue compaction boundaries in bounded FIFO batches', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const batchSizes: number[] = []
+    const committedStreamIds: string[] = []
+    const port: StreamChunkAppendPort = {
+      appendStreamChunks: vi.fn(async (rows: readonly StreamChunkRow[]) => {
+        batchSizes.push(rows.length)
+        committedStreamIds.push(...rows.map((row) => row.streamId))
+      }),
+    }
+    const writerCount = 4_097
+    const writers = Array.from({ length: writerCount }, (_, index) => {
+      const streamId = `compaction-stream-${index}`
+      const writer = createStreamChunkWriter({
+        port,
+        chatId: `compaction-chat-${index}`,
+        streamId,
+        messageId: `compaction-message-${index}`,
+        now: 100,
+        fence: testFence(streamId),
+      })
+      writer.append({ lane: 'text', text: 'x' }, 101)
+      return writer
+    })
+
+    await Promise.all(writers.map((writer) => writer.flush()))
+
+    expect(batchSizes).toEqual([2_048, 2_048, 1])
+    expect(committedStreamIds).toEqual(
+      Array.from({ length: writerCount }, (_, index) => `compaction-stream-${index}`),
+    )
+  })
+
   it('drains later same-port calls after an in-flight batch fails', async () => {
     const firstWrite = deferred<void>()
     const failure = new Error('first transaction failed')
@@ -1315,6 +1415,24 @@ describe('stream chunk writer', () => {
     await expect(writer.settle()).resolves.toBeUndefined()
 
     expect(batches.map((batch) => batch.map((row) => row.seq))).toEqual([[0], [0]])
+    expect(writer.inspect()).toMatchObject({ status: 'open', bufferedRows: 0 })
+  })
+
+  it('checkpoint retries one transient write before acknowledging a visible prefix', async () => {
+    const batches: StreamChunkRow[][] = []
+    const appendStreamChunks = vi.fn(async (rows: readonly StreamChunkRow[]) => {
+      batches.push([...rows])
+      if (batches.length === 1) throw new Error('transient write failure')
+    })
+    const writer = createWriter({ appendStreamChunks }, 100)
+
+    writer.append({ lane: 'text', text: 'visible-prefix' }, 101)
+    await expect(writer.checkpoint()).resolves.toBeUndefined()
+
+    expect(batches.map((batch) => batch.map((row) => row.event))).toEqual([
+      [{ lane: 'text', text: 'visible-prefix' }],
+      [{ lane: 'text', text: 'visible-prefix' }],
+    ])
     expect(writer.inspect()).toMatchObject({ status: 'open', bufferedRows: 0 })
   })
 

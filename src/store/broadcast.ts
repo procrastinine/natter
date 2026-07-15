@@ -57,6 +57,7 @@ export type BroadcastEvent =
       attemptKind?: 'generation' | 'continuation'
       ownerClientId: string
       replacementEpoch: number
+      admissionSequence?: number
     }
   | { kind: 'stream-heartbeat'; lease: StreamLeaseRow }
   | {

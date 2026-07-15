@@ -22,6 +22,10 @@ const forbiddenMarkers = [
   'natter.debug.request_plans',
   'natter.debug.scroll',
   'browser-devtools',
+  'natter/fake-stream',
+  '/__control/scenarios/',
+  'E2E_FAKE_PROVIDER_ORIGIN',
+  'fake-stream-server.mjs',
 ]
 const problems = [...delivery.topologyProblems]
 const javascriptArtifacts = []
